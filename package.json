@@ -1,0 +1,15 @@
+{
+  "name": "opencontainer",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "An open-source WebContainer: run Node-style projects fully client-side in the browser.",
+  "license": "MIT",
+  "scripts": {
+    "dev": "node server.mjs",
+    "verify": "node scripts/verify-node.mjs",
+    "build:kernel": "wasm-pack build packages/kernel --target web --out-dir pkg",
+    "build:kernel:node": "wasm-pack build packages/kernel --target nodejs --out-dir pkg-node",
+    "build": "npm run build:kernel && npm run build:kernel:node"
+  }
+}

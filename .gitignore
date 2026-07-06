@@ -1,0 +1,13 @@
+# Rust
+/packages/kernel/target
+/target
+
+# Node
+node_modules
+
+# Generated wasm packages (rebuild with `npm run build`)
+/packages/kernel/pkg
+/packages/kernel/pkg-node
+
+# OS
+.DS_Store

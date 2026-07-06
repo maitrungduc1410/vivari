@@ -1,0 +1,139 @@
+// Shared syscall ABI between the worker side (caller) and the host/kernel side.
+//
+// The whole point of brick #1: user code runs inside a Web Worker and calls
+// something that *looks* synchronous (e.g. `readFileSync`). The browser does not
+// let you block on async work... except on a Worker thread, where `Atomics.wait`
+// can genuinely park the thread. So we encode a request into a shared buffer,
+// park the worker, let the host (main thread) service it against the Rust VFS,
+// then wake the worker up with the answer already sitting in memory.
+//
+// Brick #2 grew this into a multi-opcode ABI (stat, mkdir, readdir, ...) with a
+// small self-describing request frame, and errno-style error responses.
+//
+// This module is the single source of truth for the wire format, imported by
+// both the kernel host and the runtime. It is environment-agnostic (browser
+// Worker or Node worker_threads).
+//
+// Memory layout of the single SharedArrayBuffer:
+//
+//   [ control region: 4 x Int32 = 16 bytes ][ data region: N bytes ]
+//
+//   control[0] = STATE   (the word we Atomics.wait / Atomics.notify on)
+//   control[1] = OPCODE  (which syscall)
+//   control[2] = REQ_LEN (bytes of request payload in the data region)
+//   control[3] = RES_LEN (bytes of response payload in the data region)
+//
+// Request frame inside the data region:
+//   [ flags: u32 ][ fieldCount: u32 ]( [ len: u32 ][ bytes ] )*
+//
+// Response frame:
+//   STATE_RESPONSE_OK  -> raw bytes, meaning is opcode-specific
+//   STATE_RESPONSE_ERR -> UTF-8 errno code ("ENOENT", "ENOTDIR", ...)
+
+export const CTRL_SLOTS = 4;
+export const CTRL_BYTES = CTRL_SLOTS * 4;
+export const DATA_BYTES = 1 << 20; // 1 MiB payload window, plenty for the PoC
+export const SAB_BYTES = CTRL_BYTES + DATA_BYTES;
+
+// control[0] STATE values
+export const STATE_IDLE = 0;
+export const STATE_REQUEST = 1; // worker -> host: "please service this"
+export const STATE_RESPONSE_OK = 2; // host -> worker: result is in the data region
+export const STATE_RESPONSE_ERR = 3; // host -> worker: data region holds an errno
+
+// control[1] OPCODE values
+export const OP_READ_FILE = 1;
+export const OP_WRITE_FILE = 2;
+export const OP_EXISTS = 3;
+export const OP_READDIR = 4;
+export const OP_MKDIR = 5;
+export const OP_STAT = 6;
+export const OP_LSTAT = 7;
+export const OP_UNLINK = 8;
+export const OP_RMDIR = 9;
+export const OP_RENAME = 10;
+export const OP_SYMLINK = 11;
+export const OP_READLINK = 12;
+
+// process control (brick 4). OP_SPAWN blocks the caller until the child exits;
+// the single field is a JSON spec {command,args,cwd,env,capture} and the OK
+// response is JSON {code,stdout,stderr,pid}. This is how execSync/spawnSync work:
+// the parent parks on Atomics.wait while the kernel drives the child to exit.
+export const OP_SPAWN = 20;
+
+// virtual network (brick 5). A server process registers a port (OP_LISTEN),
+// then blocks on OP_ACCEPT until the kernel hands it the next HTTP request; it
+// replies with OP_RESPOND, which unblocks whoever issued the request (the
+// Service Worker, via the kernel). OP_ACCEPT is a *deferred* syscall: the kernel
+// keeps the process parked on Atomics.wait until a request actually arrives —
+// this blocking accept loop is the process's synchronous "event loop".
+//   OP_LISTEN       field0 = JSON {port}                -> OK empty
+//   OP_ACCEPT       (no fields)                         -> OK JSON {reqId,port,req}
+//   OP_RESPOND      field0 = JSON {reqId,status,headers,body} -> OK empty
+//   OP_CLOSE_SERVER field0 = JSON {port}                -> OK empty
+export const OP_LISTEN = 21;
+export const OP_ACCEPT = 22;
+export const OP_RESPOND = 23;
+export const OP_CLOSE_SERVER = 24;
+
+// request flags (bitmask)
+export const FLAG_RECURSIVE = 1; // mkdir -p
+
+// control[0..3] indices, named for clarity
+export const I_STATE = 0;
+export const I_OPCODE = 1;
+export const I_REQ_LEN = 2;
+export const I_RES_LEN = 3;
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+/** Build the two typed-array views over a shared buffer. */
+export function makeViews(sab) {
+  return {
+    ctrl: new Int32Array(sab, 0, CTRL_SLOTS),
+    data: new Uint8Array(sab, CTRL_BYTES, DATA_BYTES),
+  };
+}
+
+export function encodeString(str) {
+  return encoder.encode(str);
+}
+
+export function decodeBytes(bytes) {
+  return decoder.decode(bytes);
+}
+
+/** Encode a request frame: a flags word + N length-prefixed byte fields. */
+export function encodeRequest(fields, flags = 0) {
+  let total = 8;
+  for (const f of fields) total += 4 + f.length;
+  const buf = new Uint8Array(total);
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(0, flags, true);
+  dv.setUint32(4, fields.length, true);
+  let off = 8;
+  for (const f of fields) {
+    dv.setUint32(off, f.length, true);
+    off += 4;
+    buf.set(f, off);
+    off += f.length;
+  }
+  return buf;
+}
+
+/** Decode a request frame back into { flags, fields: Uint8Array[] }. */
+export function decodeRequest(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const flags = dv.getUint32(0, true);
+  const count = dv.getUint32(4, true);
+  const fields = [];
+  let off = 8;
+  for (let i = 0; i < count; i++) {
+    const len = dv.getUint32(off, true);
+    off += 4;
+    fields.push(bytes.subarray(off, off + len));
+    off += len;
+  }
+  return { flags, fields };
+}

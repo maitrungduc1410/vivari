@@ -1,0 +1,144 @@
+// The Node runtime shim. Given a shared-memory channel to the kernel, it wires
+// up core builtins, globals, and a CommonJS module system, then runs a program
+// exactly like `node <entry>` would — synchronously, inside a worker.
+
+import { createSyscalls } from "./fs-client.js";
+import { createPath } from "./builtins/path.js";
+import { createBuffer } from "./builtins/buffer.js";
+import { EventEmitter } from "./builtins/events.js";
+import { createUtil } from "./builtins/util.js";
+import { createOs } from "./builtins/os.js";
+import { createProcess } from "./builtins/process.js";
+import { createFs } from "./builtins/fs.js";
+import { createAssert } from "./builtins/assert.js";
+import { createChildProcess } from "./builtins/child_process.js";
+import { createHttp } from "./builtins/http.js";
+import { createModuleSystem } from "./module.js";
+
+function createConsole(process, util) {
+  const toOut = (...a) => process.stdout.write(util.format(...a) + "\n");
+  const toErr = (...a) => process.stderr.write(util.format(...a) + "\n");
+  return {
+    log: toOut,
+    info: toOut,
+    debug: toOut,
+    warn: toErr,
+    error: toErr,
+    trace: toErr,
+    dir: (o) => toOut(util.inspect(o)),
+    assert: (cond, ...a) => {
+      if (!cond) toErr("Assertion failed:", ...a);
+    },
+    // no-op timing/grouping helpers
+    time() {},
+    timeEnd() {},
+    group() {},
+    groupEnd() {},
+    table(o) {
+      toOut(util.inspect(o));
+    },
+  };
+}
+
+export function createRuntime({
+  ctrl,
+  data,
+  notify,
+  argv = [],
+  env = {},
+  cwd = "/",
+  stdout = () => {},
+  stderr = () => {},
+}) {
+  const syscalls = createSyscalls({ ctrl, data, notify });
+
+  // Runtime task queue: nextTick/listen callbacks land here and are drained by
+  // the accept loop (below) so they run deterministically even when the worker
+  // is parked on Atomics.wait serving a server.
+  const taskQueue = [];
+  const enqueueTask = (fn) => taskQueue.push(fn);
+  const drainTasks = () => {
+    while (taskQueue.length) taskQueue.shift()();
+  };
+
+  // Open HTTP servers keyed by port. `run()` stays alive while this is non-empty.
+  const servers = new Map();
+
+  const Buffer = createBuffer();
+  const util = createUtil({ Buffer });
+  const os = createOs();
+  const process = createProcess({ argv, env, cwd, stdout, stderr, enqueueTask });
+  const path = createPath(() => process.cwd());
+  const fs = createFs(syscalls, Buffer, path);
+  const assert = createAssert(util);
+  const child_process = createChildProcess({ sys: syscalls, process, Buffer });
+  const http = createHttp({ syscalls, servers, enqueueTask, EventEmitter, Buffer });
+  const consoleObj = createConsole(process, util);
+
+  // Globals visible to user code (both as wrapper params and on globalThis).
+  const globals = {
+    process,
+    Buffer,
+    console: consoleObj,
+    global: globalThis,
+  };
+  globalThis.process = process;
+  globalThis.Buffer = Buffer;
+  globalThis.console = consoleObj;
+  globalThis.global = globalThis;
+  if (typeof globalThis.setImmediate !== "function") {
+    globalThis.setImmediate = (fn, ...a) => setTimeout(fn, 0, ...a);
+    globalThis.clearImmediate = (id) => clearTimeout(id);
+  }
+
+  const builtins = {
+    fs,
+    path,
+    os,
+    process,
+    util,
+    assert,
+    child_process,
+    http,
+    events: EventEmitter,
+    buffer: { Buffer, constants: { MAX_LENGTH: 0x7fffffff } },
+  };
+
+  const moduleSystem = createModuleSystem({ fs, path, builtins, process, globals });
+
+  builtins.module = {
+    createRequire: (from) =>
+      moduleSystem.makeRequire(path.dirname(typeof from === "string" ? from : "/")),
+    builtinModules: Object.keys(builtins),
+    Module: moduleSystem.Module,
+  };
+
+  // Support both `require('fs')` and `require('node:fs')`.
+  for (const name of Object.keys(builtins)) builtins["node:" + name] = builtins[name];
+
+  return {
+    fs,
+    process,
+    require: moduleSystem.makeRequire(cwd),
+    /** Run an entry file like `node <entry>`; returns the process exit code. */
+    run(entry) {
+      try {
+        moduleSystem.runMain(entry);
+        drainTasks();
+        // If the program opened servers, it does not exit: enter the accept loop
+        // and serve requests one at a time until every server is closed. This
+        // blocking loop is the process's synchronous event loop.
+        while (servers.size > 0) {
+          const ev = syscalls.accept(); // parks on Atomics.wait until a request
+          const resp = http._dispatch(ev);
+          syscalls.respond(ev.reqId, resp);
+          drainTasks();
+        }
+        return 0;
+      } catch (err) {
+        if (err && err.__processExit !== undefined) return err.__processExit;
+        throw err;
+      }
+    },
+  };
+}
