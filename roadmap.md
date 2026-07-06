@@ -195,7 +195,8 @@ climb the hard modules (`stream` → `net`/`http` → `zlib`/`crypto`).
 Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture map.
 
 1. **Kernel worker** [M] — *decomp.* Move `Kernel` + Wasm VFS off the main thread into
-   a dedicated worker (our `engineworker`). Main thread = UI + boot only. Do this
+   a dedicated worker (our `kernel-worker.js`, named "Kernel Worker"). Main thread
+   = UI + boot only. Do this
    FIRST: everything below then sits on the real topology; retrofitting later hurts.
 2. **`internalBinding` seam + `primordials` + builtin loader** [S–M] — the Path B
    foundation. Wrap modules as `(exports, require, module, process, internalBinding,
@@ -274,7 +275,7 @@ previewed live in the iframe — with the Path A hand-written builtins deleted.
 | StackBlitz (observed via DevTools) | OpenContainer |
 |---|---|
 | `Main` | Main thread — UI, orchestration |
-| `engineworker.js` | Kernel worker (orchestrator) |
+| `engineworker.js` | Kernel worker — `kernel-worker.js` (orchestrator) |
 | `File System Worker` | VFS worker (Rust/Wasm) |
 | `Fetcher Worker` | Network/registry worker |
 | `Node.js Worker PID n` | Process = 1 worker + Node shim |

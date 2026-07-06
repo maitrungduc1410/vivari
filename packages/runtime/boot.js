@@ -3,7 +3,7 @@
 // calls this to build the runtime and run its program to completion. Messaging
 // is injected via `send` so this stays environment-agnostic.
 //
-// spec = { pid, programPath, args, cwd, env }
+// spec = { pid, ppid, programPath, args, cwd, env }
 
 import { makeViews } from "../protocol/syscall.js";
 import { createRuntime } from "./index.js";
@@ -14,6 +14,9 @@ export function bootProcess({ sab, spec, send }) {
     ctrl,
     data,
     notify: () => send("syscall"),
+    // real kernel-assigned PID (so process.pid matches the worker name / DevTools)
+    pid: spec.pid,
+    ppid: spec.ppid,
     // process.argv becomes ['node', programPath, ...args]
     argv: [spec.programPath, ...(spec.args || [])],
     env: spec.env || {},

@@ -2,7 +2,7 @@
 // injected callbacks; `exit()` throws a sentinel that the runner turns into an
 // exit code.
 
-export function createProcess({ argv = [], env = {}, cwd = "/", stdout, stderr, enqueueTask }) {
+export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/", stdout, stderr, enqueueTask }) {
   let _cwd = cwd || "/";
   // If the runtime has an accept loop (a server is running), route nextTick
   // through its task queue so callbacks drain deterministically even while the
@@ -53,8 +53,8 @@ export function createProcess({ argv = [], env = {}, cwd = "/", stdout, stderr, 
     arch: "wasm32",
     version: "v20.11.0",
     versions: { node: "20.11.0", opencontainer: "0.0.1", v8: "0.0.0" },
-    pid: 1,
-    ppid: 0,
+    pid,
+    ppid,
     title: "node",
     cwd: () => _cwd,
     chdir: (dir) => {

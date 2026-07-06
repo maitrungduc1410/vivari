@@ -142,7 +142,7 @@ export class Kernel {
     proc.handle = this.spawnWorker({
       pid,
       sab,
-      spec: { ...spec, pid },
+      spec: { ...spec, pid, ppid: parentPid ?? 0 },
       on: {
         syscall: () => this.serviceSyscall(pid),
         stdout: (m) => this.onOutput(pid, m.chunk, false),

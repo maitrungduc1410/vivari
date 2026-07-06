@@ -112,6 +112,15 @@ cat /work/note.txt
   assert(self.code === 0, "node selftest exits 0");
   assert(self.stdout.includes("SELFTEST_OK"), "runtime: require/fs/Buffer selftest passes");
 
+  // process.pid must reflect the real kernel-assigned PID, not a hardcoded 1.
+  kernel.writeFile("/t/pid.js", "console.log(process.pid);\n");
+  const pidExpected = kernel.nextPid; // the PID the next spawned process will get
+  const pidRun = await kernel.start("node", ["/t/pid.js"], { cwd: "/t", capture: true });
+  assert(
+    pidRun.stdout.trim() === String(pidExpected),
+    `process: process.pid reflects the kernel PID (got ${pidRun.stdout.trim()}, want ${pidExpected})`,
+  );
+
   // === brick 4: shell session with each command as its own process ===
   const sh = await kernel.start("sh", ["/root.sh"], { cwd: "/", capture: true });
   const o = sh.stdout;

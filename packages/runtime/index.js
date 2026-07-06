@@ -44,6 +44,8 @@ export function createRuntime({
   ctrl,
   data,
   notify,
+  pid = 1,
+  ppid = 0,
   argv = [],
   env = {},
   cwd = "/",
@@ -67,7 +69,7 @@ export function createRuntime({
   const Buffer = createBuffer();
   const util = createUtil({ Buffer });
   const os = createOs();
-  const process = createProcess({ argv, env, cwd, stdout, stderr, enqueueTask });
+  const process = createProcess({ pid, ppid, argv, env, cwd, stdout, stderr, enqueueTask });
   const path = createPath(() => process.cwd());
   const fs = createFs(syscalls, Buffer, path);
   const assert = createAssert(util);

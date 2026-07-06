@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OpenContainer · Brick #5 — Virtual Network & Preview</title>
+    <title>OpenContainer · Phase 2 #1 — Kernel Worker</title>
     <style>
       :root {
         color-scheme: dark;
@@ -101,11 +101,12 @@
   </head>
   <body>
     <header>
-      <h1>OpenContainer · Brick #5 — Virtual Network &amp; Preview</h1>
+      <h1>OpenContainer · Phase 2 #1 — Kernel Worker</h1>
       <p>
-        An in-memory HTTP server runs inside a worker process (parked in a
-        blocking accept loop). A Service Worker intercepts the iframe's requests
-        and routes them through the kernel to that server — no real network.
+        The kernel + Rust/Wasm VFS now run in a dedicated kernel worker, off the
+        main thread; process workers are spawned nested under it. An in-memory
+        HTTP server (parked in a blocking accept loop) is previewed via a Service
+        Worker that routes the iframe's requests through the kernel — no network.
       </p>
     </header>
     <div class="split">
