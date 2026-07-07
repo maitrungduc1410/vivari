@@ -190,6 +190,27 @@ into Rust would slide us back to T3.)
 architecture decomposition early (so later work sits on the target topology); then
 climb the hard modules (`stream` → `net`/`http` → `zlib`/`crypto`).
 
+> ## ⭐ North Star — package managers (never forget the vision)
+>
+> The end state is running the **REAL `npm` / `yarn` / `pnpm` in the browser**, exactly
+> like WebContainer — **and better**: lazy-loaded from the registry, version-pinned, on a
+> Node runtime deep enough to host them (`crypto` #12, `zlib` #11, `tls`, `child_process`,
+> `worker_threads`, full `fs`). The real CLIs then behave *bit-for-bit* like local.
+>
+> **Our current `programs/npm.js` is a deliberately TEMPORARY "Turbo-analog"** — a small
+> hand-written installer engine to bootstrap real-project workflows while Node-compat is
+> still too thin to run the real thing. This mirrors StackBlitz's own history exactly:
+> they shipped **Turbo** (their custom npm client, 2018–2024), then — after a year of
+> deepening Node-compat — **deprecated Turbo (Apr 2024) and switched to native
+> npm/yarn/pnpm**. We follow the same arc: Turbo-analog now → real PMs later.
+>
+> **Rule:** never let the Turbo-analog become the destination, and never over-polish it
+> (anything installer-specific — lifecycle nuance, dedup, `npm ci` — gets thrown away when
+> the real CLIs land). Invest only in what survives the switch (e.g. real `semver`) or in
+> what is *not* installer logic (running scripts: `npm run`/`npx`). Known real-PM caveats
+> to inherit: one pinned version per PM, Wasm packages only (no native add-ons), PM chosen
+> by lockfile.
+
 ## Recommended order (implement one at a time)
 
 Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture map.
@@ -387,11 +408,30 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
    `left-pad` metadata + tarball from `registry.npmjs.org` live in the browser,
    lists versions, proves the cache); headless verify uses a mocked offline Fetcher.
    verify: 40/40 PASS.
-10. **Real `npm install`** [L] — registry proxy (via the Network worker), semver
-    resolution, **tar extraction** into the VFS (use the browser-native
-    `DecompressionStream('gzip')` for `.tgz` → no zlib dependency yet), `node_modules`
-    layout, bin stubs, basic lifecycle scripts. Highest "real project" value; depends
-    only on fs + network, so it can proceed in parallel with steps 6–8.
+10. **Real `npm install`** [L] — **stage 1 DONE.** A real `npm` program (`programs/npm.js`,
+    installed to `/bin/npm.js` as an ordinary process) does: minimal **semver**
+    (caret/tilde/exact/x-range/dist-tag), transitive **dependency-graph** resolution from
+    registry packuments, **tarball download** via the blocking `__ocfetch` (Fetcher Worker
+    + kernel cache, #9), **gunzip** with the platform-native `DecompressionStream('gzip')`
+    (no bundled zlib) + a from-scratch **ustar tar parser** (GNU long-name + pax `path`),
+    files written into **`node_modules`** with **npm-v3 hoisting** (first-seen version to the
+    project root, conflicting versions nested under the dependent), **`.bin` symlinks**, and
+    explicit installs recorded in `package.json`. The event loop can't see native async
+    (`DecompressionStream`) work, so the program holds a ref'd keep-alive interval while it
+    runs and exits from that (loop-run) callback so the exit sentinel is caught.
+    Demo boot runs `npm install is-odd` live in the browser (resolves is-odd → is-number
+    from `registry.npmjs.org`) then `require()`s the freshly installed tree. Headless verify
+    builds real gzipped tarballs offline and proves resolve + hoist + `.bin` + require +
+    `package.json`. verify: 45/45 PASS.
+    **Stage 2 (lean, in progress) — just enough to run a real Vite + Express project:**
+    (a) vendor **real `semver`** to replace the hand-rolled range logic (the hand-rolled
+    `satisfies` only understands caret/tilde/exact/x-range and *fails* on compound ranges
+    like `>=1.2 <2`, unions `1 || 2`, hyphen `1.2 - 2.3` — a real install blocker; and
+    `semver` survives the eventual switch to real npm, per the North Star); (b) **`npm run
+    <script>`** + **`npx`** (run installed `.bin`/package) so `npm run dev` can boot the
+    dev server. Deliberately **still deferred** (thrown away when real npm lands, so not
+    worth polishing now): `package-lock.json`, lifecycle scripts (pre/post-install),
+    peer/optional deps, dedup nuance, `npm ci`.
 11. **`zlib` — Wasm codec + real `lib/zlib.js`** [M] — compile zlib to Wasm; needed for
     http gzip and general compat.
 12. **`crypto` — WebCrypto + Wasm + real `lib/crypto` (partial)** [L] — map to

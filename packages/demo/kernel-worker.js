@@ -392,6 +392,22 @@ async function boot() {
   // Do NOT await: a server never exits — it parks in its accept loop, and the
   // kernel keeps servicing requests to it while everything else runs.
   kernel.start("node", ["/srv/server.js"], { cwd: "/srv" });
+
+  // Phase 2 #10: real `npm install` in the browser. Resolves is-odd + its
+  // transitive dep is-number live from registry.npmjs.org (via the Fetcher
+  // Worker), gunzips/untars each tarball into node_modules, then a node process
+  // require()s the freshly installed tree — no bundler, the real package on disk.
+  kernel.mkdirp("/app");
+  kernel.writeFile("/app/package.json", JSON.stringify({ name: "demo-app", version: "1.0.0" }, null, 2));
+  kernel.writeFile(
+    "/app/index.js",
+    "const isOdd = require('is-odd');\n" +
+      "console.log('[npm demo] is-odd(3) =', isOdd(3), '| is-odd(4) =', isOdd(4));\n",
+  );
+  post("log", { line: "$ cd /app && npm install is-odd", cls: "muted" });
+  await kernel.start("npm", ["install", "is-odd"], { cwd: "/app" });
+  post("log", { line: "$ node /app/index.js", cls: "muted" });
+  await kernel.start("node", ["/app/index.js"], { cwd: "/app" });
 }
 
 self.onmessage = async (event) => {

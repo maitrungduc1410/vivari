@@ -10,8 +10,42 @@
 
 import { Worker } from "node:worker_threads";
 import { createRequire } from "node:module";
+import { gzipSync } from "node:zlib";
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
+
+// Build a real gzipped ustar tarball from { "package/<path>": "<contents>" } so
+// the npm-install proof (Phase 2 #10) exercises the actual gunzip + tar parser
+// on genuine bytes, fully offline.
+function tarHeader(name, size) {
+  const buf = Buffer.alloc(512);
+  buf.write(name, 0, 100, "utf8");
+  buf.write("0000644", 100); // mode
+  buf.write("0000000", 108); // uid
+  buf.write("0000000", 116); // gid
+  buf.write(size.toString(8).padStart(11, "0"), 124); // size (octal)
+  buf.write("00000000000", 136); // mtime
+  buf.write("        ", 148); // checksum placeholder = 8 spaces
+  buf.write("0", 156); // typeflag: regular file
+  buf.write("ustar", 257);
+  buf.write("00", 263);
+  let sum = 0;
+  for (let i = 0; i < 512; i++) sum += buf[i];
+  buf.write(sum.toString(8).padStart(6, "0") + "\0 ", 148);
+  return buf;
+}
+function makeTgz(files) {
+  const chunks = [];
+  for (const [name, content] of Object.entries(files)) {
+    const data = Buffer.from(content, "utf8");
+    chunks.push(tarHeader(name, data.length));
+    const padded = Buffer.alloc(Math.ceil(data.length / 512) * 512);
+    data.copy(padded);
+    chunks.push(padded);
+  }
+  chunks.push(Buffer.alloc(1024)); // two zero blocks terminate the archive
+  return gzipSync(Buffer.concat(chunks));
+}
 
 const require = createRequire(import.meta.url);
 const wasm = require("../packages/kernel/pkg-node/open_webcontainer_kernel.js");
@@ -66,6 +100,53 @@ function makeKernel() {
     "https://registry.example/left-pad/-/left-pad-1.3.0.tgz": {
       contentType: "application/octet-stream",
       body: new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 1, 2, 3, 4, 5, 6, 7, 8]), // fake gzip magic + bytes
+    },
+    // A tiny dependency tree for the npm-install proof: a@1.0.0 -> b@^1.0.0.
+    // Dependencies live in the registry metadata; b's tarball carries a `bin` so
+    // the .bin symlink step is exercised. Registry host matches the npm program's
+    // default (registry.npmjs.org) so no code override is needed.
+    "https://registry.npmjs.org/a": {
+      contentType: "application/json",
+      body: enc.encode(
+        JSON.stringify({
+          name: "a",
+          "dist-tags": { latest: "1.0.0" },
+          versions: {
+            "1.0.0": {
+              dist: { tarball: "https://registry.npmjs.org/a/-/a-1.0.0.tgz" },
+              dependencies: { b: "^1.0.0" },
+            },
+          },
+        }),
+      ),
+    },
+    "https://registry.npmjs.org/b": {
+      contentType: "application/json",
+      body: enc.encode(
+        JSON.stringify({
+          name: "b",
+          "dist-tags": { latest: "1.2.0" },
+          versions: {
+            "1.0.5": { dist: { tarball: "https://registry.npmjs.org/b/-/b-1.0.5.tgz" } },
+            "1.2.0": { dist: { tarball: "https://registry.npmjs.org/b/-/b-1.2.0.tgz" } },
+          },
+        }),
+      ),
+    },
+    "https://registry.npmjs.org/a/-/a-1.0.0.tgz": {
+      contentType: "application/octet-stream",
+      body: makeTgz({
+        "package/package.json": JSON.stringify({ name: "a", version: "1.0.0", main: "index.js", dependencies: { b: "^1.0.0" } }),
+        "package/index.js": "module.exports = () => 'a+' + require('b')();\n",
+      }),
+    },
+    "https://registry.npmjs.org/b/-/b-1.2.0.tgz": {
+      contentType: "application/octet-stream",
+      body: makeTgz({
+        "package/package.json": JSON.stringify({ name: "b", version: "1.2.0", main: "index.js", bin: { "b-cli": "cli.js" } }),
+        "package/index.js": "module.exports = () => 'b-ok';\n",
+        "package/cli.js": "console.log('b-cli ran');\n",
+      }),
     },
   };
   const fetchStats = { calls: 0 };
@@ -704,6 +785,32 @@ console.log('FETCHB_OK');
   // URL was a cache hit, so it did NOT add a 4th.
   assert(kernel.testFetch.calls === 3,
     "Phase 2 #9: kernel content cache skips the network on a repeated URL (3 calls, not 4)");
+
+  // === #10: real `npm install` — resolve + download + gunzip/untar + hoist ===
+  // `npm install a` must resolve a@1.0.0, follow its dependency b@^1.0.0, fetch
+  // both packuments + tarballs, gunzip and untar them into node_modules, hoist b
+  // to the project root, create the .bin symlink, and record a in package.json.
+  kernel.mkdirp("/proj");
+  kernel.writeFile("/proj/package.json", JSON.stringify({ name: "proj", version: "1.0.0" }));
+  const npmI = await kernel.start("npm", ["install", "a"], { cwd: "/proj", capture: true });
+  assert(npmI.code === 0 && npmI.stdout.includes("added 2 packages"),
+    "Phase 2 #10: npm install resolves + installs a transitive tree (a -> b)");
+  assert(kernel.vfs.exists("/proj/node_modules/a/package.json"),
+    "Phase 2 #10: direct dependency extracted into node_modules");
+  assert(kernel.vfs.exists("/proj/node_modules/b/package.json"),
+    "Phase 2 #10: transitive dependency hoisted to the root node_modules");
+  assert(kernel.vfs.exists("/proj/node_modules/.bin/b-cli"),
+    "Phase 2 #10: .bin symlink created for a package with a bin field");
+  kernel.writeFile(
+    "/proj/run.js",
+    `
+const pj = require('/proj/package.json');
+console.log(require('a')() + '|' + pj.dependencies.a);
+`,
+  );
+  const npmRun = await kernel.start("node", ["/proj/run.js"], { cwd: "/proj", capture: true });
+  assert(npmRun.code === 0 && npmRun.stdout.trim() === "a+b-ok|^1.0.0",
+    "Phase 2 #10: installed tree is require-able (a requires hoisted b) + package.json recorded");
 
   // Event loop v2 proof: ordering. nextTick beats Promise microtasks, and both
   // beat timers/immediates — which now actually FIRE (the old synchronous loop

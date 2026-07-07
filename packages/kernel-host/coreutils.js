@@ -4,7 +4,11 @@
 // even the shell — is "just a Node process", exactly like StackBlitz's per-PID
 // Node workers.
 
+import { NPM_PROGRAM } from "./programs/npm.js";
+
 export const COREUTILS = {
+  npm: NPM_PROGRAM,
+
   echo: `process.stdout.write(process.argv.slice(2).join(' ') + '\\n');\n`,
 
   pwd: `process.stdout.write(process.cwd() + '\\n');\n`,
