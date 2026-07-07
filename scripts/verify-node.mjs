@@ -552,16 +552,16 @@ main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
   assert(nb.code === 0 && nb.stdout.includes("NETB_OK"),
     "Path B: real Node lib/net.js runs (echo server/client, address(), 2nd conn, chunked, ECONNREFUSED)");
 
-  // Path B proof (#8, stage 1): require('_http_real') is Node's REAL vendored
-  // lib/http.js + _http_* running on the pure-JS internalBinding('http_parser')
-  // over the net loopback. Proves an in-VM server + client: POST with a body,
-  // GET with no body, a chunked (no content-length) response, response headers,
-  // keep-alive socket reuse across two requests, and ECONNREFUSED.
+  // Path B proof (#8): require('http') is Node's REAL vendored lib/http.js +
+  // _http_* running on the pure-JS internalBinding('http_parser') over the net
+  // loopback. Proves an in-VM server + client: POST with a body, GET with no body,
+  // a chunked (no content-length) response, response headers, keep-alive socket
+  // reuse across two requests, and ECONNREFUSED.
   kernel.writeFile(
     "/t/httpb.js",
     `
 const assert = require('assert');
-const http = require('_http_real');
+const http = require('http');
 
 const server = http.createServer((req, res) => {
   if (req.url === '/chunked') {

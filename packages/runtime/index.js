@@ -9,7 +9,6 @@ import { createOs } from "./builtins/os.js";
 import { createProcess } from "./builtins/process.js";
 import { createAssert } from "./builtins/assert.js";
 import { createChildProcess } from "./builtins/child_process.js";
-import { createHttp } from "./builtins/http.js";
 import { createModuleSystem } from "./module.js";
 
 function createConsole(process, util) {
@@ -51,25 +50,30 @@ export function createRuntime({
 }) {
   const syscalls = createSyscalls({ ctrl, data, notify });
 
-  // Open HTTP servers keyed by port. The event loop stays alive while this is
-  // non-empty; when woken (kernel `net` message) it drains queued requests here.
-  const servers = new Map();
-
   // Liveness counter for real net handles (Phase 2 #8): a listening net.Server or
   // an open socket keeps the loop alive, exactly like libuv's active handles.
   const netLiveness = { active: 0 };
+  // How many ports this process has registered with the kernel (each real
+  // net.Server.listen calls syscalls.listen). While non-zero, `doNet` drains
+  // inbound requests on every `net` wake.
+  const netServers = { count: 0 };
+
+  // Bridges one external request (Service Worker / kernel.handleHttpRequest) into
+  // this process's real http server. Wired below once the real http module exists.
+  let bridgeHttp = null;
 
   // The process event loop (Phase 2 #5): real nextTick > microtask > timers >
-  // immediate ordering, timers firing even while a server is running. `doNet`
-  // drains the server inbox one request at a time (sync dispatch for now).
+  // immediate ordering, timers firing even while a server is idle. On a `net`
+  // wake it drains queued requests and replays each through the real http stack
+  // (Phase 2 #8 stage 2) so the server that answers is Node's own lib/http.js.
   const loop = createEventLoop({
-    isAlive: () => servers.size > 0 || netLiveness.active > 0,
+    isAlive: () => netLiveness.active > 0,
     doNet: () => {
-      while (servers.size > 0) {
+      if (netServers.count === 0 || !bridgeHttp) return;
+      for (;;) {
         const ev = syscalls.tryAccept();
         if (!ev) break;
-        // Fire the handler; respond when it finishes (possibly after await/timers).
-        http._serve(ev, (resp) => syscalls.respond(ev.reqId, resp));
+        bridgeHttp(ev);
       }
     },
   });
@@ -83,7 +87,7 @@ export function createRuntime({
   // internalBinding('buffer'), `fs` is Node's real lib/fs.js over
   // internalBinding('fs') (node/bindings/fs.js -> Rust VFS via the sync bridge),
   // and `events`/`util` run on our shared internal layer (util.inspect bridged).
-  const nodeModules = createNodeModules({ process, syscalls, netLiveness });
+  const nodeModules = createNodeModules({ process, syscalls, netLiveness, netServers });
   const bufferModule = nodeModules.require("buffer");
   const Buffer = bufferModule.Buffer;
   const path = nodeModules.require("path");
@@ -98,20 +102,79 @@ export function createRuntime({
   const timers = nodeModules.require("timers");
   const diagnosticsChannel = nodeModules.require("diagnostics_channel");
   const cluster = nodeModules.require("cluster");
-  // Phase 2 #8, stage 1: real Node lib/http.js is exposed under a TEMP name so it
-  // can be proven in-VM (server+client over net loopback) without disturbing the
-  // Brick 5 `http` that still serves the kernel/Service-Worker preview. Stage 2
-  // (cross-VM loopback) will make `http` the real one and drop this alias.
-  const httpReal = nodeModules.require("http");
+  // Phase 2 #8 stage 2: `http` IS Node's real lib/http.js now (Brick 5 is gone).
+  // The browser preview reaches it through the bridge wired below.
+  const http = nodeModules.require("http");
   const assert = createAssert(util);
   const child_process = createChildProcess({ sys: syscalls, process, Buffer });
-  const http = createHttp({
-    syscalls,
-    servers,
-    enqueueTask: (fn) => loop.setImmediate(fn),
-    EventEmitter,
-    Buffer,
-  });
+
+  // Replay an external request through the real http *client* into the in-VM real
+  // http *server* over the net loopback, then send the collected response back to
+  // the kernel. This is the cross-VM seam: the kernel/SW protocol is unchanged
+  // ({port,method,url,headers,body} in -> {status,headers,body} out), but Node's
+  // own http parses/serves it. Bodies cross as utf8 strings (kernel JSON), same as
+  // the old Brick 5 path; binary payloads are out of scope for the preview.
+  const HOP_BY_HOP = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"];
+  const pickHeaders = (src, drop) => {
+    const out = {};
+    for (const k of Object.keys(src || {})) {
+      const lk = k.toLowerCase();
+      if (drop.includes(lk) || HOP_BY_HOP.includes(lk)) continue;
+      out[k] = src[k];
+    }
+    return out;
+  };
+  bridgeHttp = (ev) => {
+    const { reqId, port, req } = ev;
+    let done = false;
+    const reply = (resp) => {
+      if (done) return;
+      done = true;
+      try {
+        syscalls.respond(reqId, resp);
+      } catch {
+        /* kernel gone */
+      }
+    };
+    const fail = (e) =>
+      reply({
+        status: 502,
+        headers: { "content-type": "text/plain" },
+        body: "Bad Gateway: " + (e && e.message ? e.message : String(e)) + "\n",
+      });
+    let creq;
+    try {
+      creq = http.request(
+        {
+          host: "127.0.0.1",
+          port,
+          method: req.method || "GET",
+          path: req.url || "/",
+          headers: pickHeaders(req.headers, ["host", "content-length"]),
+        },
+        (cres) => {
+          const chunks = [];
+          cres.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+          cres.on("end", () =>
+            reply({
+              status: cres.statusCode || 200,
+              headers: pickHeaders(cres.headers, ["content-length"]),
+              body: Buffer.concat(chunks).toString("utf8"),
+            }),
+          );
+          cres.on("error", fail);
+        },
+      );
+    } catch (e) {
+      fail(e);
+      return;
+    }
+    creq.on("error", fail);
+    const body = req.body;
+    if (body != null && body !== "" && req.method !== "GET" && req.method !== "HEAD") creq.end(body);
+    else creq.end();
+  };
+
   const consoleObj = createConsole(process, util);
 
   // Globals visible to user code (both as wrapper params and on globalThis).
@@ -154,7 +217,6 @@ export function createRuntime({
     timers,
     diagnostics_channel: diagnosticsChannel,
     cluster,
-    _http_real: httpReal,
   };
 
   const moduleSystem = createModuleSystem({ fs, path, builtins, process, globals });

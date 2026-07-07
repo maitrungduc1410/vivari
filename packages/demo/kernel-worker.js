@@ -136,10 +136,9 @@ const server = http.createServer(async (req, res) => {
     // internalBinding('http_parser'), over the net loopback): spin up an
     // in-process http.Server, POST a body to it with an http client, and read
     // the echoed response — real ClientRequest/ServerResponse/IncomingMessage,
-    // all inside this browser worker. (require('http') is still Brick 5 and
-    // serves THIS preview; the real stack is under _http_real until #8 stage 2
-    // wires the cross-VM loopback.)
-    const http = require('_http_real');
+    // all inside this browser worker. This is the SAME require('http') that
+    // serves THIS preview: the request you just made was parsed by Node's real
+    // lib/http.js too, bridged in from the Service Worker (#8 stage 2).
     const result = await new Promise((resolve, reject) => {
       const server = http.createServer((r, s) => {
         let body = '';

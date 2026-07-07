@@ -80,10 +80,12 @@ function getOwnNonIndexProperties(obj, filter) {
   return out;
 }
 
-export function createInternalBinding({ syscalls, process, netLiveness } = {}) {
-  // net (Phase 2 #7): tcp_wrap/stream_wrap/uv/pipe_wrap/cares_wrap for the
+export function createInternalBinding({ syscalls, process, netLiveness, netServers } = {}) {
+  // net (Phase 2 #7/#8): tcp_wrap/stream_wrap/uv/pipe_wrap/cares_wrap for the
   // in-process loopback beneath Node's real lib/net.js. Needs process.nextTick.
-  const net = createNetBindings({ process, liveness: netLiveness });
+  // `syscalls` lets listen() register the port with the kernel (external routing,
+  // stage 2); `netServers` counts kernel-registered listeners for `doNet`.
+  const net = createNetBindings({ process, liveness: netLiveness, syscalls, netServers });
   const bindings = {
     buffer: createBufferBinding(),
     // 'fs' needs the sync-bridge syscalls (to reach the Rust VFS) and process

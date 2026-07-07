@@ -13,6 +13,7 @@
 const out = document.getElementById("output");
 const frame = document.getElementById("preview");
 const previewUrlEl = document.getElementById("preview-url");
+let previewPort = null; // the first server to listen wins the preview iframe
 
 function print(line, cls = "") {
   const el = document.createElement("div");
@@ -70,8 +71,15 @@ async function main() {
       case "listen": {
         const url = `./preview/${m.port}/`;
         print(`  [kernel] pid ${m.pid} is listening on port ${m.port} → preview ${url}`, "ok");
-        previewUrlEl.textContent = `/packages/demo/preview/${m.port}/`;
-        frame.src = url;
+        // Point the preview iframe at the first server that comes up (the app on
+        // :3000). Later listens are real too — e.g. the ephemeral loopback servers
+        // the /api/net and /api/http demos spin up — but they shouldn't hijack the
+        // preview, so we only log them.
+        if (!previewPort) {
+          previewPort = m.port;
+          previewUrlEl.textContent = `/packages/demo/preview/${m.port}/`;
+          frame.src = url;
+        }
         break;
       }
     }

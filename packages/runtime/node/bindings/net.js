@@ -10,12 +10,19 @@
 // `port -> serverHandle` registry lets a TCP handle `connect()` to a `listen()`ing
 // handle in the SAME VM, producing a linked pair of endpoints whose writes appear
 // as the peer's reads. This is exactly what a preview/loopback server needs; it
-// runs Node's unmodified lib/net.js end-to-end. Cross-VM loopback (wiring the
-// kernel + Service Worker) and outbound sockets are deferred (see roadmap #7).
+// runs Node's unmodified lib/net.js end-to-end.
+//
+// Cross-VM reachability (Phase 2 #8 stage 2): `listen()` also registers the port
+// with the kernel (syscalls.listen) so external requests — the browser preview
+// arriving via the Service Worker, or tests calling kernel.handleHttpRequest —
+// are routed to this process. The runtime's `doNet` then replays each request
+// through a real http client into this same server over the in-process loopback.
+// The loopback `connect()` never touches the kernel; kernel registration is purely
+// the "who owns this port" routing table.
 //
 // One process === one worker, so a per-binding registry is correctly per-process.
 
-export function createNetBindings({ process, liveness } = {}) {
+export function createNetBindings({ process, liveness, syscalls, netServers } = {}) {
   const nextTick = (fn, ...args) => process.nextTick(fn, ...args);
   const buf = () => globalThis.Buffer; // real Buffer is installed before sockets run
 
@@ -169,6 +176,7 @@ export function createNetBindings({ process, liveness } = {}) {
       this._refed = true; // sockets/servers are ref'd by default (like libuv)
       this._live = false; // becomes true once listening or connected
       this._counted = false;
+      this._kernelPort = null; // port registered with the kernel (servers only)
       this._localAddress = "0.0.0.0";
       this._localPort = 0;
       this._remoteAddress = "";
@@ -189,8 +197,32 @@ export function createNetBindings({ process, liveness } = {}) {
     }
 
     listen(/* backlog */) {
-      if (this._localPort !== 0 && listeners.has(this._localPort)) return UV_CODES.UV_EADDRINUSE;
-      if (this._localPort === 0) this._localPort = allocPort();
+      const wasEphemeral = this._localPort === 0;
+      if (!wasEphemeral && listeners.has(this._localPort)) return UV_CODES.UV_EADDRINUSE;
+      if (wasEphemeral) this._localPort = allocPort();
+
+      // Register the port with the kernel so external requests (Service Worker /
+      // kernel.handleHttpRequest) route to this process. A cross-process conflict
+      // on an ephemeral port can retry a fresh one; an explicit port fails like
+      // libuv with EADDRINUSE.
+      if (syscalls && syscalls.listen) {
+        let attempts = 0;
+        for (;;) {
+          try {
+            syscalls.listen(this._localPort);
+            break;
+          } catch {
+            if (wasEphemeral && attempts++ < 64) {
+              this._localPort = allocPort();
+              continue;
+            }
+            return UV_CODES.UV_EADDRINUSE;
+          }
+        }
+        this._kernelPort = this._localPort;
+        if (netServers) netServers.count++;
+      }
+
       listeners.set(this._localPort, this);
       this._live = true;
       recount(this);
@@ -285,7 +317,18 @@ export function createNetBindings({ process, liveness } = {}) {
       if (!this._closed) {
         this._closed = true;
         recount(this); // drop from liveness
-        if (this.type === TCPConstants.SERVER) listeners.delete(this._localPort);
+        if (this.type === TCPConstants.SERVER) {
+          listeners.delete(this._localPort);
+          if (this._kernelPort != null && syscalls && syscalls.closeServer) {
+            try {
+              syscalls.closeServer(this._kernelPort);
+            } catch {
+              /* kernel gone */
+            }
+            this._kernelPort = null;
+            if (netServers) netServers.count--;
+          }
+        }
         if (this._peer && !this._peer._closed) enqueueToPeer(this._peer, EOF);
       }
       if (typeof cb === "function") nextTick(cb);

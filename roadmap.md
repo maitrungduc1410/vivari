@@ -350,13 +350,27 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
      `net.Server`/open socket now keeps the loop alive like libuv active handles),
      `internal/http`/`internal/options`/`internal/url`/`internal/freelist` shims,
      `assignFunctionName`/`getOrSetAsyncId` helpers, and lazy `https`/`tls`/`undici`
-     stubs. Exposed as a **temporary `_http_real` builtin**; `require('http')` stays
-     Brick 5 so the kernel/Service-Worker preview keeps working (no regression).
-   - ⏳ **Stage 2 (cross-VM preview swap) — deferred.** Wire the kernel + Service Worker
-     to deliver raw request bytes into the process's `net.Server` (and read raw response
-     bytes back), then make `http` the real module and drop `_http_real` + Brick 5.
+     stubs.
+   - ✅ **Stage 2 (cross-VM preview swap) — DONE.** `require('http')` **is** the real
+     `lib/http.js` now; **Brick 5 is deleted** (`builtins/http.js` gone). The seam is
+     pure JS and keeps the kernel/SW protocol unchanged (`{port,method,url,headers,body}`
+     in → `{status,headers,body}` out): `net.Server.listen(P)` now also registers `P`
+     with the kernel (`tcp_wrap.listen` → `syscalls.listen`, ephemeral ports retry on a
+     cross-process clash) so the Service Worker / `kernel.handleHttpRequest` route to the
+     right process. On a `net` wake the runtime's `doNet` drains each queued request and
+     **replays it through a real http *client* into the in-VM real http *server* over the
+     #7 loopback** (`bridgeHttp` in `index.js`), then `respond()`s with the collected
+     reply — so the browser preview is served by Node's own `http`. Request/response
+     hop-by-hop + framing headers are stripped at the bridge; bodies cross as utf8
+     strings (same limitation as the old path; binary preview payloads out of scope).
+     The whole event-loop liveness now rides on the net ref-count (no more Brick 5
+     `servers` map). The pre-existing `http: server responds 200` / accept-loop /
+     two-concurrent-async verify cases now exercise this full path end-to-end. verify:
+     38/38 PASS.
    - ⏳ **Deferred:** compile **llhttp → Wasm** as a drop-in `http_parser` (perf, after
-     the contract is stable), and **`http2`** (needs `internalBinding('http2')`/nghttp2).
+     the contract is stable), **raw byte-tunnel** streaming (true request/response
+     streaming + binary bodies across the SW seam, replacing the buffered replay), and
+     **`http2`** (needs `internalBinding('http2')`/nghttp2).
 9. **Network/registry worker** [M] — *decomp.* Dedicated fetch worker (our
    `Fetcher Worker`) for the npm registry + tarballs (+ later the outbound fetch
    bridge). Land it just before npm needs it.
