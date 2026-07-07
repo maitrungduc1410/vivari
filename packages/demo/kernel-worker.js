@@ -33,10 +33,42 @@ echo "== booting http server =="
 const SERVER_SRC = `
 const http = require('http');
 
-const server = http.createServer((req, res) => {
+// A background timer that keeps ticking even while the server sits idle with no
+// traffic — proof that Event loop v2 runs real timers alongside the accept loop.
+const bootedAt = Date.now();
+let backgroundTicks = 0;
+setInterval(() => { backgroundTicks++; }, 1000);
+
+// The handler is async: for /api/async we await a real timer before responding,
+// so the reply is deferred until res.end() fires later. The loop keeps turning
+// meanwhile, and concurrent requests are served independently.
+const server = http.createServer(async (req, res) => {
   if (req.url === '/api/time') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ now: Date.now(), pid: process.pid }));
+    res.end(JSON.stringify({
+      now: Date.now(),
+      pid: process.pid,
+      uptimeMs: Date.now() - bootedAt,
+      backgroundTicks,
+    }));
+    return;
+  }
+  if (req.url === '/api/async') {
+    // Real async request handling: await a timer (like a DB/network call would),
+    // THEN finish the response. Nothing blocks; other requests keep flowing.
+    const delayMs = 200;
+    const start = Date.now();
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    const body = Buffer.from(JSON.stringify({
+      node: process.version,
+      awaited: true,
+      requestedDelayMs: delayMs,
+      actualWaitMs: Date.now() - start,
+      backgroundTicks,
+      note: 'This response was sent AFTER an awaited setTimeout, via Event loop v2.',
+    }, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
     return;
   }
   if (req.url === '/api/buffer') {
@@ -124,12 +156,15 @@ const server = http.createServer((req, res) => {
 <body><div class="card">
   <h1>Hello from OpenContainer 🎉</h1>
   <p>Served by <code>http.createServer</code> in worker <code>PID \${process.pid}</code></p>
-  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> vendored, running in your browser</p>
+  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> vendored, on a real event loop, running in your browser</p>
   <p>You requested <code>\${req.url}</code></p>
   <button onclick="fetch('api/time').then(r=>r.json()).then(t=>document.getElementById('t').textContent=JSON.stringify(t))">GET /api/time</button>
+  <button onclick="var el=document.getElementById('a');el.textContent='awaiting setTimeout(200ms)…';fetch('api/async').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2))">GET /api/async (awaits a timer)</button>
   <button onclick="fetch('api/buffer').then(r=>r.json()).then(t=>document.getElementById('b').textContent=JSON.stringify(t,null,2))">GET /api/buffer</button>
   <button onclick="fetch('api/fs').then(r=>r.json()).then(t=>document.getElementById('f').textContent=JSON.stringify(t,null,2))">GET /api/fs</button>
+  <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
   <pre id="t"></pre>
+  <pre id="a"></pre>
   <pre id="b"></pre>
   <pre id="f"></pre>
 </div></body></html>\`);
@@ -159,7 +194,10 @@ async function boot() {
       if (handler) handler(event.data);
     };
     worker.postMessage({ type: "init", sab: info.sab, spec: info.spec });
-    return { terminate: () => worker.terminate() };
+    return {
+      terminate: () => worker.terminate(),
+      postMessage: (m) => worker.postMessage(m),
+    };
   };
 
   kernel = new Kernel({

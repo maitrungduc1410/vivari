@@ -1,18 +1,19 @@
 // A minimal `http` builtin — enough to run `http.createServer(fn).listen(port)`
 // against OpenContainer's virtual network (brick 5).
 //
-// The model is a *synchronous, one-request-at-a-time* server: `listen()` only
-// registers the port with the kernel (OP_LISTEN) and returns immediately; the
-// actual serving happens in the runtime's accept loop (see index.js `run`),
-// which blocks on the kernel for the next request, dispatches it here, and sends
-// the response back. This maps a blocking accept loop onto the same sync bridge
-// as every other syscall.
+// The model is a *one-request-at-a-time* server: `listen()` only registers the
+// port with the kernel (OP_LISTEN) and returns immediately. Serving is driven by
+// the process event loop (index.js `doNet`): when the kernel posts a `net` nudge
+// (a request is queued), the loop drains the inbox via non-blocking accept,
+// dispatches each request here, and sends the response back. Because that runs
+// inside the event loop (Phase 2 #5), timers and microtasks now fire between
+// requests and while the server is idle.
 //
-// Limitations (Path A PoC; the real thing arrives with Node's own `http` on the
-// internalBinding layer): request handlers must finish synchronously (call
-// res.end() before returning); no streaming request bodies, keep-alive, or
-// concurrent in-flight requests per server; timers do not fire while the loop is
-// parked in accept.
+// Handlers may be async: the response is sent when res.end() is called, even if
+// that happens after awaits/timers (Event loop v2), and multiple requests can be
+// in flight at once. Limitations (Path A PoC; the real thing arrives with Node's
+// own `http` on the internalBinding layer): the request body is delivered
+// pre-buffered (no true streaming), and there's no keep-alive yet.
 
 const STATUS_CODES = {
   200: "OK",
@@ -142,26 +143,37 @@ export function createHttp({ syscalls, servers, enqueueTask, EventEmitter, Buffe
     return new Server(handler);
   }
 
-  // Called by the runtime's accept loop for each inbound request. Builds the
-  // req/res pair, drives the handler synchronously, and returns the response.
-  function _dispatch(ev) {
+  // Called by the event loop (index.js `doNet`) for each inbound request. Builds
+  // the req/res pair, invokes the handler, and calls `send(resp)` when the handler
+  // finishes the response — which may be *after* awaits/timers (Event loop v2), so
+  // async handlers work. Not awaited by the caller: the loop keeps turning (firing
+  // the timers that will eventually call res.end()), and each request responds
+  // independently, so multiple can be in flight at once.
+  function _serve(ev, send) {
     const server = servers.get(ev.port);
     if (!server) {
-      return { status: 502, headers: { "content-type": "text/plain" }, body: "No server\n" };
+      send({ status: 502, headers: { "content-type": "text/plain" }, body: "No server\n" });
+      return;
     }
     const req = new IncomingMessage(ev);
     const res = new ServerResponse();
+    let sent = false;
+    const finish = () => {
+      if (sent) return;
+      sent = true;
+      send({ status: res.statusCode, headers: res._headers, body: res._body });
+    };
+    res.on("finish", finish); // res.end() emits 'finish', sync or async
     try {
       server.emit("request", req, res);
-      req._drain(); // let any data/end listeners run (handler was synchronous)
+      req._drain(); // deliver the buffered body to any data/end listeners
     } catch (err) {
       if (!res.finished) {
         res.statusCode = 500;
         res.setHeader("content-type", "text/plain");
-        res.end("Internal Server Error\n");
+        res.end("Internal Server Error\n"); // triggers finish()
       }
     }
-    return { status: res.statusCode, headers: res._headers, body: res._body };
   }
 
   return {
@@ -172,6 +184,6 @@ export function createHttp({ syscalls, servers, enqueueTask, EventEmitter, Buffe
     STATUS_CODES,
     METHODS,
     globalAgent: {},
-    _dispatch,
+    _serve,
   };
 }

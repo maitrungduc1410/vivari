@@ -40,7 +40,10 @@ function makeKernel() {
       if (handler) handler(m);
     });
     worker.postMessage({ type: "init", sab: info.sab, spec: info.spec });
-    return { terminate: () => worker.terminate() };
+    return {
+      terminate: () => worker.terminate(),
+      postMessage: (m) => worker.postMessage(m),
+    };
   };
   const kernel = new Kernel({ vfs, spawnWorker });
   kernel.installCoreutils();
@@ -400,6 +403,53 @@ console.log('UTILB_OK');
   assert(ub.code === 0 && ub.stdout.includes("UTILB_OK"),
     "Path B: real Node lib/util.js runs (format/inherits/promisify/types/isDeepStrictEqual)");
 
+  // Event loop v2 proof: ordering. nextTick beats Promise microtasks, and both
+  // beat timers/immediates — which now actually FIRE (the old synchronous loop
+  // starved them). Printing from inside setImmediate proves the loop drives to it.
+  kernel.writeFile(
+    "/t/loopb.js",
+    `
+const assert = require('assert');
+const order = [];
+setTimeout(() => order.push('timeout'), 0);
+Promise.resolve().then(() => order.push('promise'));
+process.nextTick(() => order.push('nextTick'));
+setImmediate(() => {
+  order.push('immediate');
+  assert.strictEqual(order[0], 'nextTick', 'nextTick runs first');
+  assert.strictEqual(order[1], 'promise', 'microtask before timers/immediate');
+  assert.ok(order.includes('timeout') && order.includes('immediate'), 'timers + immediates fired');
+  console.log('LOOPB_OK ' + order.join(','));
+});
+`,
+  );
+  const lb = await kernel.start("node", ["/t/loopb.js"], { cwd: "/t", capture: true });
+  assert(lb.code === 0 && lb.stdout.includes("LOOPB_OK"),
+    "Event loop: ordering nextTick > microtask > timers/immediate (all fire)");
+
+  // Event loop v2 proof: real timers — setInterval fires repeatedly then stops on
+  // clearInterval, clearTimeout cancels, and nested/chained timers work.
+  kernel.writeFile(
+    "/t/timersb.js",
+    `
+let ticks = 0;
+const iv = setInterval(() => {
+  if (++ticks === 3) { clearInterval(iv); console.log('INTERVAL_OK ' + ticks); }
+}, 4);
+const cancelled = setTimeout(() => console.log('SHOULD_NOT_PRINT'), 8);
+clearTimeout(cancelled);
+setTimeout(() => setTimeout(() => console.log('NESTED_OK'), 4), 4);
+`,
+  );
+  const tb = await kernel.start("node", ["/t/timersb.js"], { cwd: "/t", capture: true });
+  assert(
+    tb.code === 0 &&
+      tb.stdout.includes("INTERVAL_OK 3") &&
+      tb.stdout.includes("NESTED_OK") &&
+      !tb.stdout.includes("SHOULD_NOT_PRINT"),
+    "Event loop: setInterval/clearInterval + clearTimeout + nested timers",
+  );
+
   // === brick 4: shell session with each command as its own process ===
   const sh = await kernel.start("sh", ["/root.sh"], { cwd: "/", capture: true });
   const o = sh.stdout;
@@ -453,6 +503,60 @@ http.createServer((req, res) => {
 
   const r4 = await kernel.handleHttpRequest(9999, { method: "GET", url: "/", headers: {}, body: "" });
   assert(r4.status === 502, "http: request to an unbound port => 502");
+
+  // Event loop v2 flagship: a timer fires WHILE a server is alive and idle (no
+  // traffic). The old synchronous accept loop starved timers; now the loop waits
+  // on the earliest timer even with a server open. The callback does a sync fs
+  // write (proving the SAB channel is free during the idle wait), and the server
+  // still serves afterwards.
+  kernel.writeFile(
+    "/srv/timerserver.js",
+    `
+const http = require('http');
+const fs = require('fs');
+setTimeout(() => fs.writeFileSync('/srv/timer-fired.txt', 'fired'), 20);
+http.createServer((req, res) => res.end('tick ' + fs.existsSync('/srv/timer-fired.txt'))).listen(3100);
+`,
+  );
+  kernel.start("node", ["/srv/timerserver.js"], { cwd: "/srv" });
+  await waitFor(() => kernel.listeners.has(3100), "timer server did not listen on 3100");
+  await waitFor(() => kernel.vfs.exists("/srv/timer-fired.txt"),
+    "background timer did not fire while the server was idle", 60);
+  assert(kernel.vfs.exists("/srv/timer-fired.txt"),
+    "Event loop: a setTimeout fires while a server is running (idle, no traffic)");
+  const r5 = await kernel.handleHttpRequest(3100, { method: "GET", url: "/", headers: {}, body: "" });
+  assert(r5.status === 200 && r5.body === "tick true",
+    "http: server still serves after a background timer fired");
+
+  // Event loop v2: an ASYNC request handler — it awaits a setTimeout before
+  // res.end(), so the response is deferred until the timer fires (the loop keeps
+  // turning meanwhile). Two concurrent requests resolve independently.
+  kernel.writeFile(
+    "/srv/asyncserver.js",
+    `
+const http = require('http');
+let ticks = 0;
+setInterval(() => { ticks++; }, 5);
+http.createServer(async (req, res) => {
+  const start = Date.now();
+  await new Promise((r) => setTimeout(r, 30));
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ awaited: true, tookAtLeast: (Date.now() - start) >= 25, url: req.url }));
+}).listen(3200);
+`,
+  );
+  kernel.start("node", ["/srv/asyncserver.js"], { cwd: "/srv" });
+  await waitFor(() => kernel.listeners.has(3200), "async server did not listen on 3200");
+  const ra = await kernel.handleHttpRequest(3200, { method: "GET", url: "/a", headers: {}, body: "" });
+  const raj = JSON.parse(ra.body);
+  assert(ra.status === 200 && raj.awaited === true && raj.tookAtLeast === true && raj.url === "/a",
+    "Event loop: async request handler (await setTimeout before res.end) responds");
+  const [c1, c2] = await Promise.all([
+    kernel.handleHttpRequest(3200, { method: "GET", url: "/x", headers: {}, body: "" }),
+    kernel.handleHttpRequest(3200, { method: "GET", url: "/y", headers: {}, body: "" }),
+  ]);
+  assert(JSON.parse(c1.body).url === "/x" && JSON.parse(c2.body).url === "/y",
+    "http: two async requests in flight resolve independently");
 
   // === process table actually allocated many PIDs ===
   assert(kernel.nextPid - 1 >= 10, `PID table grew (${kernel.nextPid - 1} processes spawned)`);

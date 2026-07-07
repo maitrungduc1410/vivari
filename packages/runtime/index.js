@@ -3,6 +3,7 @@
 // exactly like `node <entry>` would — synchronously, inside a worker.
 
 import { createSyscalls } from "./fs-client.js";
+import { createEventLoop } from "./loop.js";
 import { createNodeModules } from "./node/loader.js";
 import { createOs } from "./builtins/os.js";
 import { createProcess } from "./builtins/process.js";
@@ -50,20 +51,27 @@ export function createRuntime({
 }) {
   const syscalls = createSyscalls({ ctrl, data, notify });
 
-  // Runtime task queue: nextTick/listen callbacks land here and are drained by
-  // the accept loop (below) so they run deterministically even when the worker
-  // is parked on Atomics.wait serving a server.
-  const taskQueue = [];
-  const enqueueTask = (fn) => taskQueue.push(fn);
-  const drainTasks = () => {
-    while (taskQueue.length) taskQueue.shift()();
-  };
-
-  // Open HTTP servers keyed by port. `run()` stays alive while this is non-empty.
+  // Open HTTP servers keyed by port. The event loop stays alive while this is
+  // non-empty; when woken (kernel `net` message) it drains queued requests here.
   const servers = new Map();
 
+  // The process event loop (Phase 2 #5): real nextTick > microtask > timers >
+  // immediate ordering, timers firing even while a server is running. `doNet`
+  // drains the server inbox one request at a time (sync dispatch for now).
+  const loop = createEventLoop({
+    isAlive: () => servers.size > 0,
+    doNet: () => {
+      while (servers.size > 0) {
+        const ev = syscalls.tryAccept();
+        if (!ev) break;
+        // Fire the handler; respond when it finishes (possibly after await/timers).
+        http._serve(ev, (resp) => syscalls.respond(ev.reqId, resp));
+      }
+    },
+  });
+
   const os = createOs();
-  const process = createProcess({ pid, ppid, argv, env, cwd, stdout, stderr, enqueueTask });
+  const process = createProcess({ pid, ppid, argv, env, cwd, stdout, stderr, nextTick: loop.nextTick });
 
   // Path B: Node's REAL lib/ modules run on top of our internalBinding layer.
   // `path`, `buffer`, `fs`, `events` and `util` are vendored, unmodified Node
@@ -80,7 +88,13 @@ export function createRuntime({
   const fs = nodeModules.require("fs");
   const assert = createAssert(util);
   const child_process = createChildProcess({ sys: syscalls, process, Buffer });
-  const http = createHttp({ syscalls, servers, enqueueTask, EventEmitter, Buffer });
+  const http = createHttp({
+    syscalls,
+    servers,
+    enqueueTask: (fn) => loop.setImmediate(fn),
+    EventEmitter,
+    Buffer,
+  });
   const consoleObj = createConsole(process, util);
 
   // Globals visible to user code (both as wrapper params and on globalThis).
@@ -94,10 +108,15 @@ export function createRuntime({
   globalThis.Buffer = Buffer;
   globalThis.console = consoleObj;
   globalThis.global = globalThis;
-  if (typeof globalThis.setImmediate !== "function") {
-    globalThis.setImmediate = (fn, ...a) => setTimeout(fn, 0, ...a);
-    globalThis.clearImmediate = (id) => clearTimeout(id);
-  }
+  // Route user-facing timers through our event loop so ordering is Node-correct
+  // and callbacks fire even while a server is running (the old host timers never
+  // fired — the synchronous accept loop starved them).
+  globalThis.setTimeout = loop.setTimeout;
+  globalThis.clearTimeout = loop.clearTimeout;
+  globalThis.setInterval = loop.setInterval;
+  globalThis.clearInterval = loop.clearInterval;
+  globalThis.setImmediate = loop.setImmediate;
+  globalThis.clearImmediate = loop.clearImmediate;
 
   const builtins = {
     fs,
@@ -128,25 +147,23 @@ export function createRuntime({
     fs,
     process,
     require: moduleSystem.makeRequire(cwd),
-    /** Run an entry file like `node <entry>`; returns the process exit code. */
-    run(entry) {
+    /** External nudge from the kernel: a network request is queued for us. */
+    wake: loop.wakeNet,
+    /**
+     * Run an entry file like `node <entry>`, then drive the event loop until it
+     * is quiescent (no pending timers/immediates/nextTicks and no open servers).
+     * Async: it yields to the host so Promise microtasks and timers actually
+     * fire. Resolves with the process exit code.
+     */
+    async run(entry) {
       try {
-        moduleSystem.runMain(entry);
-        drainTasks();
-        // If the program opened servers, it does not exit: enter the accept loop
-        // and serve requests one at a time until every server is closed. This
-        // blocking loop is the process's synchronous event loop.
-        while (servers.size > 0) {
-          const ev = syscalls.accept(); // parks on Atomics.wait until a request
-          const resp = http._dispatch(ev);
-          syscalls.respond(ev.reqId, resp);
-          drainTasks();
-        }
-        return 0;
+        moduleSystem.runMain(entry); // synchronous; may throw process.exit sentinel
       } catch (err) {
         if (err && err.__processExit !== undefined) return err.__processExit;
         throw err;
       }
+      await loop.drive();
+      return loop.exiting ? loop.exitCode : 0;
     },
   };
 }

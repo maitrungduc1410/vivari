@@ -144,8 +144,7 @@ export class Kernel {
       finalized: false,
       handle: null,
       command: spec.command,
-      serverInbox: [], // queued { reqId, port, req } awaiting OP_ACCEPT
-      acceptWaiting: false, // process is parked on a deferred OP_ACCEPT
+      serverInbox: [], // queued { reqId, port, req } drained by non-blocking accept
     };
     this.procs.set(pid, proc);
     proc.handle = this.spawnWorker({
@@ -292,11 +291,13 @@ export class Kernel {
     this.respondOk(proc, EMPTY);
   }
 
+  // Non-blocking accept (Phase 2 #5): the process event loop calls this after a
+  // `net` nudge and drains in a loop, so we never park. Empty reply = inbox drained.
   handleAccept(proc) {
     if (proc.serverInbox.length) {
       this.respondOk(proc, encodeString(JSON.stringify(proc.serverInbox.shift())));
     } else {
-      proc.acceptWaiting = true; // parked; delivered by handleHttpRequest
+      this.respondOk(proc, EMPTY);
     }
   }
 
@@ -319,9 +320,12 @@ export class Kernel {
     return new Promise((resolve) => {
       this.pendingHttp.set(reqId, { resolve, pid });
       proc.serverInbox.push({ reqId, port: port | 0, req });
-      if (proc.acceptWaiting) {
-        proc.acceptWaiting = false;
-        this.respondOk(proc, encodeString(JSON.stringify(proc.serverInbox.shift())));
+      // Nudge the process's event loop (Phase 2 #5). It wakes, drains the inbox
+      // via non-blocking accept, and replies through OP_RESPOND.
+      try {
+        proc.handle && proc.handle.postMessage && proc.handle.postMessage({ type: "net" });
+      } catch {
+        /* worker gone; finalize() will 502 the pending request */
       }
     });
   }

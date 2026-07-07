@@ -2,14 +2,13 @@
 // injected callbacks; `exit()` throws a sentinel that the runner turns into an
 // exit code.
 
-export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/", stdout, stderr, enqueueTask }) {
+export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/", stdout, stderr, nextTick }) {
   let _cwd = cwd || "/";
-  // If the runtime has an accept loop (a server is running), route nextTick
-  // through its task queue so callbacks drain deterministically even while the
-  // loop is parked on Atomics.wait. Otherwise fall back to microtasks.
+  // nextTick is owned by the event loop (loop.js): its queue drains ahead of
+  // Promise microtasks each turn. Fall back to a microtask if no loop is wired.
   const scheduleTick =
-    typeof enqueueTask === "function"
-      ? (fn, ...args) => enqueueTask(() => fn(...args))
+    typeof nextTick === "function"
+      ? (fn, ...args) => nextTick(fn, ...args)
       : (fn, ...args) => queueMicrotask(() => fn(...args));
 
   const makeStream = (sink) => ({

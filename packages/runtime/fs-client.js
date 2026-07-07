@@ -127,9 +127,15 @@ export function createSyscalls({ ctrl, data, notify }) {
     // ---- virtual network (brick 5) ----
     // Register a port. Returns nothing; throws EADDRINUSE if taken.
     listen: (port) => call(OP_LISTEN, encodeRequest([b(JSON.stringify({ port }))])),
-    // Block until the kernel hands us the next request. Returns
-    // { reqId, port, req:{method,url,headers,body} }. This is the accept loop.
-    accept: () => JSON.parse(decodeBytes(call(OP_ACCEPT, encodeRequest([])))),
+    // Non-blocking accept: returns the next queued request
+    // { reqId, port, req:{method,url,headers,body} }, or null if none is queued.
+    // The event loop calls this after a `net` wake (kernel postMessage) and drains
+    // in a tight loop; it never parks (the kernel replies immediately, empty when
+    // the inbox is empty), so the SAB channel stays free for other sync syscalls.
+    tryAccept: () => {
+      const p = call(OP_ACCEPT, encodeRequest([]));
+      return p.length ? JSON.parse(decodeBytes(p)) : null;
+    },
     // Reply to a request; unblocks the caller (Service Worker) and lets us loop.
     respond: (reqId, resp) =>
       call(OP_RESPOND, encodeRequest([b(JSON.stringify({ reqId, ...resp }))])),

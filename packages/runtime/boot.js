@@ -8,7 +8,7 @@
 import { makeViews } from "../protocol/syscall.js";
 import { createRuntime } from "./index.js";
 
-export function bootProcess({ sab, spec, send }) {
+export function bootProcess({ sab, spec, send, onReady }) {
   const { ctrl, data } = makeViews(sab);
   const runtime = createRuntime({
     ctrl,
@@ -25,12 +25,17 @@ export function bootProcess({ sab, spec, send }) {
     stderr: (chunk) => send("stderr", { chunk }),
   });
 
-  let code = 0;
-  try {
-    code = runtime.run(spec.programPath);
-  } catch (err) {
-    send("stderr", { chunk: String((err && err.stack) || err) + "\n" });
-    code = 1;
-  }
-  send("exit", { code });
+  // Hand the runtime's network waker back to the worker shell so it can nudge the
+  // event loop when the kernel posts a `net` message (a request is queued).
+  if (typeof onReady === "function") onReady(runtime.wake);
+
+  // run() is async (it drives the event loop). Report the exit code when it
+  // settles; a server process simply never settles (it stays alive).
+  runtime.run(spec.programPath).then(
+    (code) => send("exit", { code: code | 0 }),
+    (err) => {
+      send("stderr", { chunk: String((err && err.stack) || err) + "\n" });
+      send("exit", { code: 1 });
+    },
+  );
 }

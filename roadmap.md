@@ -258,9 +258,23 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
      `internalBinding('constants').fs` (O_*/S_*/UV_DIRENT_*/COPYFILE_*); `primordials`
      gained `uncurryThis` + `Safe{Map,Set}`; more `internal/{errors,util,validators,
      util/types}` symbols. Hand-written `builtins/fs.js` deleted.
-5. **Event loop v2** [M] — real microtask/macrotask ordering: `queueMicrotask` +
-   `process.nextTick` + `setImmediate` + timers, **firing even while a server is parked
-   in `accept`** (fixes the Brick 5 deferral). Foundation for async stream/http.
+5. ✅ **Event loop v2** [M] — each process now has a real, async event loop
+   (`packages/runtime/loop.js`) with Node ordering **nextTick > Promise microtasks >
+   timers > setImmediate**, and **timers/microtasks fire even while a server is
+   running** (fixes the Brick 5 deferral). Foundation for async stream/http.
+   - `run()` is async: it runs `main` synchronously (sync syscalls still block via
+     `Atomics.wait`), then `drive()`s the loop until quiescent (no ref'd timers/
+     immediates/nextTicks and no open servers). Microtasks are flushed by yielding a
+     `MessageChannel` macrotask each turn (a synchronous loop can't drain them).
+   - Full timer API on `globalThis`: `setTimeout`/`setInterval`/`setImmediate` (+
+     `clear*`) with `Timeout`/`Immediate` handles (`ref`/`unref`/`refresh`/
+     `[Symbol.toPrimitive]`); real host-backed delays; `process.nextTick` owned by
+     the loop; `process.exit()` from any callback stops the loop with its code.
+   - Serving is now **message-driven**, not a blocking accept: the kernel
+     `postMessage({type:'net'})` nudges the worker (`handleHttpRequest`); the loop
+     wakes and drains the inbox via a **non-blocking `tryAccept`** (kernel replies
+     empty when drained), so the SAB channel stays free for sync syscalls inside
+     timer callbacks. `boot.js` is async; `spawnWorker` handles expose `postMessage`.
 6. **`stream` — real `lib/stream.js` + `internal/streams/*`** [M–L] — mostly pure JS;
    once the loader + event loop exist, correct backpressure / duplex / `pipe` come
    almost for free. **The flagship Path B win** (hand-writing this correctly is
