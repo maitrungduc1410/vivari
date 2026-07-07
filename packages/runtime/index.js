@@ -3,7 +3,7 @@
 // exactly like `node <entry>` would — synchronously, inside a worker.
 
 import { createSyscalls } from "./fs-client.js";
-import { createPath } from "./builtins/path.js";
+import { createNodeModules } from "./node/loader.js";
 import { createBuffer } from "./builtins/buffer.js";
 import { EventEmitter } from "./builtins/events.js";
 import { createUtil } from "./builtins/util.js";
@@ -70,7 +70,11 @@ export function createRuntime({
   const util = createUtil({ Buffer });
   const os = createOs();
   const process = createProcess({ pid, ppid, argv, env, cwd, stdout, stderr, enqueueTask });
-  const path = createPath(() => process.cwd());
+
+  // Path B: Node's REAL lib/ modules run on top of our internalBinding layer.
+  // `path` is the first — the vendored, unmodified Node v24.18.0 lib/path.js.
+  const nodeModules = createNodeModules({ process });
+  const path = nodeModules.require("path");
   const fs = createFs(syscalls, Buffer, path);
   const assert = createAssert(util);
   const child_process = createChildProcess({ sys: syscalls, process, Buffer });

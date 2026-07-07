@@ -121,6 +121,30 @@ cat /work/note.txt
     `process: process.pid reflects the kernel PID (got ${pidRun.stdout.trim()}, want ${pidExpected})`,
   );
 
+  // Path B proof: require('path') is Node's REAL vendored lib/path.js running on
+  // the internalBinding layer. win32 semantics (backslash) are something the old
+  // hand-written posix-only shim could not do.
+  kernel.writeFile(
+    "/t/pathb.js",
+    `
+const path = require('path');
+const assert = require('assert');
+assert.strictEqual(path.sep, '/');
+assert.strictEqual(path.win32.sep, '\\\\');
+assert.strictEqual(path.posix.join('/a', 'b', '..', 'c'), '/a/c');
+assert.strictEqual(path.win32.join('C:\\\\a', 'b'), 'C:\\\\a\\\\b');
+assert.strictEqual(path.basename('/x/y.txt', '.txt'), 'y');
+assert.deepStrictEqual(
+  path.parse('/a/b/c.js'),
+  { root: '/', dir: '/a/b', base: 'c.js', ext: '.js', name: 'c' },
+);
+console.log('PATHB_OK');
+`,
+  );
+  const pb = await kernel.start("node", ["/t/pathb.js"], { cwd: "/t", capture: true });
+  assert(pb.code === 0 && pb.stdout.includes("PATHB_OK"),
+    "Path B: real Node lib/path.js runs (posix + win32) via the loader");
+
   // === brick 4: shell session with each command as its own process ===
   const sh = await kernel.start("sh", ["/root.sh"], { cwd: "/", capture: true });
   const o = sh.stdout;

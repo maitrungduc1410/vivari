@@ -194,7 +194,7 @@ climb the hard modules (`stream` → `net`/`http` → `zlib`/`crypto`).
 
 Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture map.
 
-1. **Kernel worker** [M] — *decomp.* Move `Kernel` + Wasm VFS off the main thread into
+1. ✅ **Kernel worker** [M] — *decomp.* Move `Kernel` + Wasm VFS off the main thread into
    a dedicated worker (our `kernel-worker.js`, named "Kernel Worker"). Main thread
    = UI + boot only. Do this
    FIRST: everything below then sits on the real topology; retrofitting later hurts.
@@ -203,6 +203,13 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
    primordials)`. **Prove it by running Node's REAL `lib/path.js`, `lib/events.js`,
    `lib/util.js` verbatim** (near-zero bindings), then delete their Path A hand-written
    twins. Smallest step that validates the whole thesis.
+   - ✅ Loader + `primordials` + `internalBinding` seam live in `packages/runtime/node/`.
+     `require('path')` now runs Node v24.18.0's (current LTS) **real, unmodified** `lib/path.js`
+     (vendored verbatim) — win32 + posix semantics — over a minimal, growable
+     `internal/{errors,validators,constants}` layer. Hand-written `builtins/path.js` deleted.
+   - ⏳ Next in this item: `events` and `util` the same way (these pull real
+     `internal/errors`, `internal/util`, `internal/util/types`, so the internal layer
+     graduates from "minimal" to vendored-real as we go).
 3. **`buffer` binding + real `lib/buffer.js`** [S–M] — Buffer is used by fs/stream/http;
    get the real one in early. Backed by Wasm memory / `Uint8Array`.
 4. **`internalBinding('fs')` + real `lib/fs.js` + `internal/fs/*`** [M] — reshape our
