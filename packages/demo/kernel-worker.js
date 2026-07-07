@@ -71,6 +71,33 @@ const server = http.createServer(async (req, res) => {
     res.end(body);
     return;
   }
+  if (req.url === '/api/stream') {
+    // Real Node streams (vendored lib/stream.js + internal/streams/*): pipe a
+    // Readable through a Transform into a Writable, awaiting the promise API.
+    // The response is deferred until the pipeline finishes (Event loop v2).
+    const { Readable, Transform, Writable } = require('stream');
+    const { pipeline } = require('stream/promises');
+    const parts = [];
+    await pipeline(
+      Readable.from(['open', 'container', 'streams', 'in', 'the', 'browser']),
+      new Transform({
+        objectMode: true,
+        transform(word, enc, cb) { cb(null, word.toString().toUpperCase()); },
+      }),
+      new Writable({
+        objectMode: true,
+        write(chunk, enc, cb) { parts.push(chunk.toString()); cb(); },
+      }),
+    );
+    const body = Buffer.from(JSON.stringify({
+      node: process.version,
+      note: 'Built by pipeline(Readable -> Transform(uppercase) -> Writable) — real Node lib/stream.js in the browser.',
+      result: parts.join(' '),
+    }, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
   if (req.url === '/api/buffer') {
     // Exercise Node's REAL Buffer (vendored lib/buffer.js on our
     // internalBinding('buffer')) entirely inside the browser.
@@ -156,15 +183,17 @@ const server = http.createServer(async (req, res) => {
 <body><div class="card">
   <h1>Hello from OpenContainer 🎉</h1>
   <p>Served by <code>http.createServer</code> in worker <code>PID \${process.pid}</code></p>
-  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> vendored, on a real event loop, running in your browser</p>
+  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> + <code>stream</code> vendored, on a real event loop, running in your browser</p>
   <p>You requested <code>\${req.url}</code></p>
   <button onclick="fetch('api/time').then(r=>r.json()).then(t=>document.getElementById('t').textContent=JSON.stringify(t))">GET /api/time</button>
   <button onclick="var el=document.getElementById('a');el.textContent='awaiting setTimeout(200ms)…';fetch('api/async').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2))">GET /api/async (awaits a timer)</button>
+  <button onclick="fetch('api/stream').then(r=>r.json()).then(t=>document.getElementById('s').textContent=JSON.stringify(t,null,2))">GET /api/stream (pipeline)</button>
   <button onclick="fetch('api/buffer').then(r=>r.json()).then(t=>document.getElementById('b').textContent=JSON.stringify(t,null,2))">GET /api/buffer</button>
   <button onclick="fetch('api/fs').then(r=>r.json()).then(t=>document.getElementById('f').textContent=JSON.stringify(t,null,2))">GET /api/fs</button>
   <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
   <pre id="t"></pre>
   <pre id="a"></pre>
+  <pre id="s"></pre>
   <pre id="b"></pre>
   <pre id="f"></pre>
 </div></body></html>\`);

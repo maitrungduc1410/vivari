@@ -403,6 +403,78 @@ console.log('UTILB_OK');
   assert(ub.code === 0 && ub.stdout.includes("UTILB_OK"),
     "Path B: real Node lib/util.js runs (format/inherits/promisify/types/isDeepStrictEqual)");
 
+  // Path B proof: require('stream') is Node's REAL vendored lib/stream.js +
+  // internal/streams/* running on Event loop v2 — Readable/Writable/Transform,
+  // pipeline, finished, async iteration, setEncoding (StringDecoder) and the
+  // stream/promises API. Exercises real backpressure/nextTick/immediate flows.
+  kernel.writeFile(
+    "/t/streamb.js",
+    `
+const assert = require('assert');
+const stream = require('stream');
+const { Readable, Writable, Transform, PassThrough, pipeline, finished, Duplex } = stream;
+const { pipeline: pipelineP, finished: finishedP } = require('stream/promises');
+
+const collect = (r) => new Promise((resolve, reject) => {
+  const chunks = [];
+  r.on('data', (c) => chunks.push(c));
+  r.on('end', () => resolve(chunks));
+  r.on('error', reject);
+});
+
+async function main() {
+  // Readable: object/byte push + async iteration.
+  const r1 = Readable.from(['a', 'b', 'c']);
+  let viaAsyncIter = '';
+  for await (const c of r1) viaAsyncIter += c;
+  assert.strictEqual(viaAsyncIter, 'abc', 'Readable.from + async iteration');
+
+  // Readable push + setEncoding: multibyte char split across chunk boundary
+  // must be reassembled by the StringDecoder ('é' = 0xC3 0xA9).
+  const r2 = new Readable({ read() {} });
+  r2.setEncoding('utf8');
+  r2.push(Buffer.from([0xc3]));
+  r2.push(Buffer.from([0xa9, 0x21])); // continuation of é, then '!'
+  r2.push(null);
+  const dec = (await collect(r2)).join('');
+  assert.strictEqual(dec, 'é!', 'setEncoding reassembles a split multibyte char');
+
+  // Writable: collects writes, finish fires.
+  const sink = [];
+  const w = new Writable({ write(chunk, enc, cb) { sink.push(chunk.toString()); cb(); } });
+  w.write('x'); w.write('y'); w.end('z');
+  await finishedP(w);
+  assert.strictEqual(sink.join(''), 'xyz', 'Writable collects chunks + finished()');
+
+  // Transform: uppercase, piped through PassThrough.
+  const up = new Transform({
+    transform(chunk, enc, cb) { cb(null, chunk.toString().toUpperCase()); },
+  });
+  const out = [];
+  const drain = new Writable({ write(c, e, cb) { out.push(c.toString()); cb(); } });
+  await pipelineP(Readable.from(['ab', 'cd']), up, new PassThrough(), drain);
+  assert.strictEqual(out.join(''), 'ABCD', 'pipeline: Readable -> Transform -> PassThrough -> Writable');
+
+  // callback pipeline + finished on the same run.
+  await new Promise((resolve, reject) => {
+    const dst = new Writable({ write(c, e, cb) { cb(); } });
+    finished(dst, (err) => { if (err) reject(err); });
+    pipeline(Readable.from(['1', '2']), dst, (err) => (err ? reject(err) : resolve()));
+  });
+
+  // Duplex is both readable + writable.
+  const d = new Duplex({ read() {}, write(c, e, cb) { cb(); } });
+  assert.ok(d.writable && d.readable, 'Duplex is readable + writable');
+
+  console.log('STREAMB_OK');
+}
+main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
+`,
+  );
+  const sb = await kernel.start("node", ["/t/streamb.js"], { cwd: "/t", capture: true });
+  assert(sb.code === 0 && sb.stdout.includes("STREAMB_OK"),
+    "Path B: real Node lib/stream.js runs (Readable/Writable/Transform/pipeline/finished/promises)");
+
   // Event loop v2 proof: ordering. nextTick beats Promise microtasks, and both
   // beat timers/immediates — which now actually FIRE (the old synchronous loop
   // starved them). Printing from inside setImmediate proves the loop drives to it.

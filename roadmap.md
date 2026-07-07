@@ -275,10 +275,29 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
      wakes and drains the inbox via a **non-blocking `tryAccept`** (kernel replies
      empty when drained), so the SAB channel stays free for sync syscalls inside
      timer callbacks. `boot.js` is async; `spawnWorker` handles expose `postMessage`.
-6. **`stream` — real `lib/stream.js` + `internal/streams/*`** [M–L] — mostly pure JS;
-   once the loader + event loop exist, correct backpressure / duplex / `pipe` come
-   almost for free. **The flagship Path B win** (hand-writing this correctly is
-   infeasible — the whole reason we pivot).
+6. ✅ **`stream` — real `lib/stream.js` + `internal/streams/*`** [M–L] — `require('stream')`
+   is now Node v24.18.0's **real, unmodified** `lib/stream.js` + the full
+   `internal/streams/*` tree (legacy, utils, destroy, state, from, end-of-stream,
+   add-abort-signal, readable, writable, duplex, duplexify, transform, passthrough,
+   pipeline, compose, operators, duplexpair) + `stream/promises`, all vendored
+   verbatim. Correct backpressure / duplex / `pipe` / async iteration come for
+   free on Event loop v2 — **the flagship Path B win** (hand-writing this correctly
+   is infeasible, the whole reason we pivot). Runs on the existing shared internal
+   layer with a few small additions:
+   - **`string_decoder`**: Node's `lib/string_decoder.js` wraps a native decoder;
+     instead we ship the canonical **pure-JS** StringDecoder (the algorithm
+     readable-stream uses in browsers) over our real Buffer — correct multibyte
+     boundary handling for utf8/utf16le/base64. `Readable.setEncoding` works.
+   - **`async_hooks`**: minimal shim (`AsyncResource.runInAsyncScope`/`bind`, inert
+     `createHook`, synchronous-scope `AsyncLocalStorage`) — enough for
+     `internal/streams/end-of-stream`; real async-context tracking deferred.
+   - **`internal/webstreams/adapters`**: deferred stub — only required lazily by
+     `Readable/Writable/Duplex.{from,to}Web`, which throw until Web Streams land.
+   - Fixed `internal/util/debuglog` to defer its lazy callback (callers assign it
+     into a `let debug` still in its TDZ). Proven by `streamb.js`:
+     Readable.from + async iteration, setEncoding across a split multibyte char,
+     Writable + `finished`, `pipeline` (Readable→Transform→PassThrough→Writable),
+     callback `pipeline`+`finished`, Duplex. verify: 35/35 PASS.
 7. **`net` + `tcp_wrap` binding** [L] — the socket layer under http. Loopback virtual
    net for preview (replaces Brick 5's routing table) + a fetch/WebSocket bridge for
    outbound (CORS-limited — stay honest about it).

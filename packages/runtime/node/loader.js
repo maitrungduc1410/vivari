@@ -44,6 +44,29 @@ import streamsUtilsFactory from "./internal/streams/utils.js";
 import abortControllerFactory from "./internal/abort_controller.js";
 import encodingFactory from "./internal/encoding.js";
 
+// stream (Phase 2 #6): Node's real lib/stream.js + internal/streams/* verbatim.
+import streamFactory from "./lib/stream.js";
+import streamPromisesFactory from "./lib/stream/promises.js";
+import streamsLegacyFactory from "./internal/streams/legacy.js";
+import streamsDestroyFactory from "./internal/streams/destroy.js";
+import streamsStateFactory from "./internal/streams/state.js";
+import streamsFromFactory from "./internal/streams/from.js";
+import streamsEndOfStreamFactory from "./internal/streams/end-of-stream.js";
+import streamsAddAbortSignalFactory from "./internal/streams/add-abort-signal.js";
+import streamsReadableFactory from "./internal/streams/readable.js";
+import streamsWritableFactory from "./internal/streams/writable.js";
+import streamsDuplexFactory from "./internal/streams/duplex.js";
+import streamsDuplexifyFactory from "./internal/streams/duplexify.js";
+import streamsTransformFactory from "./internal/streams/transform.js";
+import streamsPassthroughFactory from "./internal/streams/passthrough.js";
+import streamsPipelineFactory from "./internal/streams/pipeline.js";
+import streamsComposeFactory from "./internal/streams/compose.js";
+import streamsOperatorsFactory from "./internal/streams/operators.js";
+import streamsDuplexpairFactory from "./internal/streams/duplexpair.js";
+import webstreamsAdaptersFactory from "./internal/webstreams/adapters.js";
+import stringDecoderFactory from "./lib/string_decoder.js";
+import asyncHooksFactory from "./lib/async_hooks.js";
+
 // name -> factory. Public builtins (e.g. "path") and internals ("internal/...")
 // live in the same table, just like Node's builtin id space.
 const FACTORIES = {
@@ -77,6 +100,27 @@ const FACTORIES = {
   "internal/streams/utils": streamsUtilsFactory,
   "internal/abort_controller": abortControllerFactory,
   "internal/encoding": encodingFactory,
+  stream: streamFactory,
+  "stream/promises": streamPromisesFactory,
+  "internal/streams/legacy": streamsLegacyFactory,
+  "internal/streams/destroy": streamsDestroyFactory,
+  "internal/streams/state": streamsStateFactory,
+  "internal/streams/from": streamsFromFactory,
+  "internal/streams/end-of-stream": streamsEndOfStreamFactory,
+  "internal/streams/add-abort-signal": streamsAddAbortSignalFactory,
+  "internal/streams/readable": streamsReadableFactory,
+  "internal/streams/writable": streamsWritableFactory,
+  "internal/streams/duplex": streamsDuplexFactory,
+  "internal/streams/duplexify": streamsDuplexifyFactory,
+  "internal/streams/transform": streamsTransformFactory,
+  "internal/streams/passthrough": streamsPassthroughFactory,
+  "internal/streams/pipeline": streamsPipelineFactory,
+  "internal/streams/compose": streamsComposeFactory,
+  "internal/streams/operators": streamsOperatorsFactory,
+  "internal/streams/duplexpair": streamsDuplexpairFactory,
+  "internal/webstreams/adapters": webstreamsAdaptersFactory,
+  string_decoder: stringDecoderFactory,
+  async_hooks: asyncHooksFactory,
 };
 
 const strip = (name) => (name.startsWith("node:") ? name.slice(5) : name);
