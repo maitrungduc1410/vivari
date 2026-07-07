@@ -11,6 +11,7 @@
 import { createBufferBinding } from "./bindings/buffer.js";
 import { createFsBinding } from "./bindings/fs.js";
 import { createNetBindings } from "./bindings/net.js";
+import { createHttpParserBinding } from "./bindings/http_parser.js";
 
 // POSIX/libuv constants exposed as internalBinding('constants').fs. Node's real
 // lib/fs.js and internal/fs/utils.js destructure these; the O_* values MUST
@@ -79,10 +80,10 @@ function getOwnNonIndexProperties(obj, filter) {
   return out;
 }
 
-export function createInternalBinding({ syscalls, process } = {}) {
+export function createInternalBinding({ syscalls, process, netLiveness } = {}) {
   // net (Phase 2 #7): tcp_wrap/stream_wrap/uv/pipe_wrap/cares_wrap for the
   // in-process loopback beneath Node's real lib/net.js. Needs process.nextTick.
-  const net = createNetBindings({ process });
+  const net = createNetBindings({ process, liveness: netLiveness });
   const bindings = {
     buffer: createBufferBinding(),
     // 'fs' needs the sync-bridge syscalls (to reach the Rust VFS) and process
@@ -93,6 +94,13 @@ export function createInternalBinding({ syscalls, process } = {}) {
     uv: net.uv,
     pipe_wrap: net.pipe_wrap,
     cares_wrap: net.cares_wrap,
+    // http_parser (Phase 2 #8): pure-JS HTTP/1.1 parser beneath real lib/http.
+    http_parser: createHttpParserBinding(),
+    // trace_events: inert — internal/http records HTTP trace spans through it.
+    trace_events: {
+      getCategoryEnabledBuffer: () => new Uint8Array(1),
+      trace: () => {},
+    },
     util: {
       constants: { ALL_PROPERTIES, ONLY_ENUMERABLE },
       getOwnNonIndexProperties,

@@ -131,6 +131,49 @@ const server = http.createServer(async (req, res) => {
     res.end(body);
     return;
   }
+  if (req.url === '/api/http') {
+    // Real Node http (vendored lib/http.js + _http_* on the pure-JS
+    // internalBinding('http_parser'), over the net loopback): spin up an
+    // in-process http.Server, POST a body to it with an http client, and read
+    // the echoed response — real ClientRequest/ServerResponse/IncomingMessage,
+    // all inside this browser worker. (require('http') is still Brick 5 and
+    // serves THIS preview; the real stack is under _http_real until #8 stage 2
+    // wires the cross-VM loopback.)
+    const http = require('_http_real');
+    const result = await new Promise((resolve, reject) => {
+      const server = http.createServer((r, s) => {
+        let body = '';
+        r.setEncoding('utf8');
+        r.on('data', (c) => body += c);
+        r.on('end', () => {
+          s.writeHead(200, { 'content-type': 'application/json', 'x-served-by': 'real-node-http' });
+          s.end(JSON.stringify({ echo: body, method: r.method, url: r.url }));
+        });
+      });
+      server.listen(0, () => {
+        const port = server.address().port;
+        const cReq = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/echo' }, (r) => {
+          let data = ''; r.setEncoding('utf8');
+          r.on('data', (c) => data += c);
+          r.on('end', () => server.close(() => resolve({ port, status: r.statusCode, servedBy: r.headers['x-served-by'], reply: data })));
+        });
+        cReq.on('error', reject);
+        cReq.end('hello over HTTP');
+      });
+      server.on('error', reject);
+    });
+    const body = Buffer.from(JSON.stringify({
+      node: process.version,
+      note: 'An http client POSTed "hello over HTTP" to an in-process http.Server on 127.0.0.1:' + result.port + '; the server echoed it back — real Node lib/http.js parsing real HTTP/1.1 in the browser.',
+      ephemeralPort: result.port,
+      status: result.status,
+      servedBy: result.servedBy,
+      reply: result.reply,
+    }, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
   if (req.url === '/api/buffer') {
     // Exercise Node's REAL Buffer (vendored lib/buffer.js on our
     // internalBinding('buffer')) entirely inside the browser.
@@ -216,12 +259,13 @@ const server = http.createServer(async (req, res) => {
 <body><div class="card">
   <h1>Hello from OpenContainer 🎉</h1>
   <p>Served by <code>http.createServer</code> in worker <code>PID \${process.pid}</code></p>
-  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> + <code>stream</code> + <code>net</code> vendored, on a real event loop, running in your browser</p>
+  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> + <code>stream</code> + <code>net</code> + <code>http</code> vendored, on a real event loop, running in your browser</p>
   <p>You requested <code>\${req.url}</code></p>
   <button onclick="fetch('api/time').then(r=>r.json()).then(t=>document.getElementById('t').textContent=JSON.stringify(t))">GET /api/time</button>
   <button onclick="var el=document.getElementById('a');el.textContent='awaiting setTimeout(200ms)…';fetch('api/async').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2))">GET /api/async (awaits a timer)</button>
   <button onclick="fetch('api/stream').then(r=>r.json()).then(t=>document.getElementById('s').textContent=JSON.stringify(t,null,2))">GET /api/stream (pipeline)</button>
   <button onclick="fetch('api/net').then(r=>r.json()).then(t=>document.getElementById('n').textContent=JSON.stringify(t,null,2))">GET /api/net (TCP loopback)</button>
+  <button onclick="fetch('api/http').then(r=>r.json()).then(t=>document.getElementById('h').textContent=JSON.stringify(t,null,2))">GET /api/http (real http server+client)</button>
   <button onclick="fetch('api/buffer').then(r=>r.json()).then(t=>document.getElementById('b').textContent=JSON.stringify(t,null,2))">GET /api/buffer</button>
   <button onclick="fetch('api/fs').then(r=>r.json()).then(t=>document.getElementById('f').textContent=JSON.stringify(t,null,2))">GET /api/fs</button>
   <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
@@ -229,6 +273,7 @@ const server = http.createServer(async (req, res) => {
   <pre id="a"></pre>
   <pre id="s"></pre>
   <pre id="n"></pre>
+  <pre id="h"></pre>
   <pre id="b"></pre>
   <pre id="f"></pre>
 </div></body></html>\`);

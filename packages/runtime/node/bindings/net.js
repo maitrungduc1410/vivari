@@ -15,9 +15,21 @@
 //
 // One process === one worker, so a per-binding registry is correctly per-process.
 
-export function createNetBindings({ process }) {
+export function createNetBindings({ process, liveness } = {}) {
   const nextTick = (fn, ...args) => process.nextTick(fn, ...args);
   const buf = () => globalThis.Buffer; // real Buffer is installed before sockets run
+
+  // Event-loop liveness: a listening server or an open connected socket keeps the
+  // process alive (libuv "active handles"). We reflect that into the loop's
+  // isAlive via a shared counter so a real net.Server behaves like Node's — the
+  // loop stays up between requests and exits once servers/sockets close.
+  const live = liveness || { active: 0 };
+  const recount = (h) => {
+    const on = !!h._live && h._refed && !h._closed;
+    if (on === h._counted) return;
+    h._counted = on;
+    live.active += on ? 1 : -1;
+  };
 
   // ---- uv: error constants (Linux errno-negated, matching libuv) ------------
   const UV_CODES = {
@@ -154,6 +166,9 @@ export function createNetBindings({ process }) {
       this._inbox = [];
       this._closed = false;
       this._pumpScheduled = false;
+      this._refed = true; // sockets/servers are ref'd by default (like libuv)
+      this._live = false; // becomes true once listening or connected
+      this._counted = false;
       this._localAddress = "0.0.0.0";
       this._localPort = 0;
       this._remoteAddress = "";
@@ -177,6 +192,8 @@ export function createNetBindings({ process }) {
       if (this._localPort !== 0 && listeners.has(this._localPort)) return UV_CODES.UV_EADDRINUSE;
       if (this._localPort === 0) this._localPort = allocPort();
       listeners.set(this._localPort, this);
+      this._live = true;
+      recount(this);
       return 0;
     }
 
@@ -203,6 +220,11 @@ export function createNetBindings({ process }) {
           req.oncomplete(UV_CODES.UV_ECONNREFUSED, this, req, false, false);
           return;
         }
+        // Both endpoints are now open connections → keep the loop alive.
+        this._live = true;
+        recount(this);
+        peer._live = true;
+        recount(peer);
         server.onconnection(0, peer); // server wraps peer in a net.Socket
         req.oncomplete(0, this, req, true, true); // client is connected
       });
@@ -262,6 +284,7 @@ export function createNetBindings({ process }) {
     close(cb) {
       if (!this._closed) {
         this._closed = true;
+        recount(this); // drop from liveness
         if (this.type === TCPConstants.SERVER) listeners.delete(this._localPort);
         if (this._peer && !this._peer._closed) enqueueToPeer(this._peer, EOF);
       }
@@ -288,10 +311,16 @@ export function createNetBindings({ process }) {
     setKeepAlive() {
       return 0;
     }
-    ref() {}
-    unref() {}
+    ref() {
+      this._refed = true;
+      recount(this);
+    }
+    unref() {
+      this._refed = false;
+      recount(this);
+    }
     hasRef() {
-      return true;
+      return this._refed;
     }
     getAsyncId() {
       return 1;

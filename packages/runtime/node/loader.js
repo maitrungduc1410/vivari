@@ -79,6 +79,21 @@ import timersFactory from "./lib/timers.js";
 import diagnosticsChannelFactory from "./lib/diagnostics_channel.js";
 import clusterFactory from "./lib/cluster.js";
 
+// http (Phase 2 #8): Node's real lib/http.js + _http_* on stream + net + the
+// pure-JS internalBinding('http_parser'), plus small support shims/stubs.
+import httpFactory from "./lib/http.js";
+import httpCommonFactory from "./lib/_http_common.js";
+import httpIncomingFactory from "./lib/_http_incoming.js";
+import httpOutgoingFactory from "./lib/_http_outgoing.js";
+import httpServerFactory from "./lib/_http_server.js";
+import httpClientFactory from "./lib/_http_client.js";
+import httpAgentFactory from "./lib/_http_agent.js";
+import internalHttpFactory from "./internal/http.js";
+import freelistFactory from "./internal/freelist.js";
+import httpsFactory from "./lib/https.js";
+import tlsFactory from "./lib/tls.js";
+import undiciFactory from "./internal/deps/undici/undici.js";
+
 // name -> factory. Public builtins (e.g. "path") and internals ("internal/...")
 // live in the same table, just like Node's builtin id space.
 const FACTORIES = {
@@ -142,12 +157,24 @@ const FACTORIES = {
   timers: timersFactory,
   diagnostics_channel: diagnosticsChannelFactory,
   cluster: clusterFactory,
+  http: httpFactory,
+  _http_common: httpCommonFactory,
+  _http_incoming: httpIncomingFactory,
+  _http_outgoing: httpOutgoingFactory,
+  _http_server: httpServerFactory,
+  _http_client: httpClientFactory,
+  _http_agent: httpAgentFactory,
+  "internal/http": internalHttpFactory,
+  "internal/freelist": freelistFactory,
+  https: httpsFactory,
+  tls: tlsFactory,
+  "internal/deps/undici/undici": undiciFactory,
 };
 
 const strip = (name) => (name.startsWith("node:") ? name.slice(5) : name);
 
-export function createNodeModules({ process, syscalls }) {
-  const internalBinding = createInternalBinding({ syscalls, process });
+export function createNodeModules({ process, syscalls, netLiveness }) {
+  const internalBinding = createInternalBinding({ syscalls, process, netLiveness });
   const modules = new Map(); // id -> module object (kept for cycle resolution)
 
   function nodeRequire(name) {

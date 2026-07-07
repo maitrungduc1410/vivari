@@ -55,11 +55,15 @@ export function createRuntime({
   // non-empty; when woken (kernel `net` message) it drains queued requests here.
   const servers = new Map();
 
+  // Liveness counter for real net handles (Phase 2 #8): a listening net.Server or
+  // an open socket keeps the loop alive, exactly like libuv's active handles.
+  const netLiveness = { active: 0 };
+
   // The process event loop (Phase 2 #5): real nextTick > microtask > timers >
   // immediate ordering, timers firing even while a server is running. `doNet`
   // drains the server inbox one request at a time (sync dispatch for now).
   const loop = createEventLoop({
-    isAlive: () => servers.size > 0,
+    isAlive: () => servers.size > 0 || netLiveness.active > 0,
     doNet: () => {
       while (servers.size > 0) {
         const ev = syscalls.tryAccept();
@@ -79,7 +83,7 @@ export function createRuntime({
   // internalBinding('buffer'), `fs` is Node's real lib/fs.js over
   // internalBinding('fs') (node/bindings/fs.js -> Rust VFS via the sync bridge),
   // and `events`/`util` run on our shared internal layer (util.inspect bridged).
-  const nodeModules = createNodeModules({ process, syscalls });
+  const nodeModules = createNodeModules({ process, syscalls, netLiveness });
   const bufferModule = nodeModules.require("buffer");
   const Buffer = bufferModule.Buffer;
   const path = nodeModules.require("path");
@@ -94,6 +98,11 @@ export function createRuntime({
   const timers = nodeModules.require("timers");
   const diagnosticsChannel = nodeModules.require("diagnostics_channel");
   const cluster = nodeModules.require("cluster");
+  // Phase 2 #8, stage 1: real Node lib/http.js is exposed under a TEMP name so it
+  // can be proven in-VM (server+client over net loopback) without disturbing the
+  // Brick 5 `http` that still serves the kernel/Service-Worker preview. Stage 2
+  // (cross-VM loopback) will make `http` the real one and drop this alias.
+  const httpReal = nodeModules.require("http");
   const assert = createAssert(util);
   const child_process = createChildProcess({ sys: syscalls, process, Buffer });
   const http = createHttp({
@@ -145,6 +154,7 @@ export function createRuntime({
     timers,
     diagnostics_channel: diagnosticsChannel,
     cluster,
+    _http_real: httpReal,
   };
 
   const moduleSystem = createModuleSystem({ fs, path, builtins, process, globals });

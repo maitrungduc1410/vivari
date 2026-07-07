@@ -334,9 +334,29 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
      `address()`, a second independent connection, 3-write reassembly, and
      `ECONNREFUSED`. Demo gains **`/api/net`** (in-process TCP echo over 127.0.0.1
      in the browser). verify: 37/37 PASS.
-8. **`http`/`http2` — real `lib/http.js` + `_http_*`** [L] — on `stream` + `net` + a
-   Wasm **`http_parser`** (compile **llhttp** to Wasm). Replaces Brick 5's hand-written
-   http with real semantics: async handlers, streaming bodies, keep-alive.
+8. **`http` — real `lib/http.js` + `_http_*`** [L] — on `stream` + `net`.
+   - ✅ **Stage 1 (in-VM real http) — DONE.** Vendored Node v24.18.0 `lib/http.js` +
+     `_http_common`/`_http_incoming`/`_http_outgoing`/`_http_server`/`_http_client`/
+     `_http_agent` **verbatim**, running over a new **pure-JS `internalBinding('http_parser')`**
+     (`node/bindings/http_parser.js`) — a self-contained HTTP/1.1 parser (request &
+     response, Content-Length + **chunked** + EOF-delimited bodies, keep-alive/close,
+     header pairs, trailers). We intentionally don't advertise `isStreamBase` on the TCP
+     handle, so `_http_server` uses the slow `socket.on('data') → parser.execute(buf)`
+     path (no native `consume()`/StreamBase glue needed). Real `ClientRequest`/
+     `ServerResponse`/`IncomingMessage` work end-to-end over the #7 net loopback:
+     POST/GET, streaming/chunked bodies, response headers, and **keep-alive socket
+     reuse** all proven headless (`verify-node.mjs`) + in the browser demo (`/api/http`).
+     Also added: net-handle **event-loop liveness** ref-counting (a listening
+     `net.Server`/open socket now keeps the loop alive like libuv active handles),
+     `internal/http`/`internal/options`/`internal/url`/`internal/freelist` shims,
+     `assignFunctionName`/`getOrSetAsyncId` helpers, and lazy `https`/`tls`/`undici`
+     stubs. Exposed as a **temporary `_http_real` builtin**; `require('http')` stays
+     Brick 5 so the kernel/Service-Worker preview keeps working (no regression).
+   - ⏳ **Stage 2 (cross-VM preview swap) — deferred.** Wire the kernel + Service Worker
+     to deliver raw request bytes into the process's `net.Server` (and read raw response
+     bytes back), then make `http` the real module and drop `_http_real` + Brick 5.
+   - ⏳ **Deferred:** compile **llhttp → Wasm** as a drop-in `http_parser` (perf, after
+     the contract is stable), and **`http2`** (needs `internalBinding('http2')`/nghttp2).
 9. **Network/registry worker** [M] — *decomp.* Dedicated fetch worker (our
    `Fetcher Worker`) for the npm registry + tarballs (+ later the outbound fetch
    bridge). Land it just before npm needs it.

@@ -552,6 +552,90 @@ main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
   assert(nb.code === 0 && nb.stdout.includes("NETB_OK"),
     "Path B: real Node lib/net.js runs (echo server/client, address(), 2nd conn, chunked, ECONNREFUSED)");
 
+  // Path B proof (#8, stage 1): require('_http_real') is Node's REAL vendored
+  // lib/http.js + _http_* running on the pure-JS internalBinding('http_parser')
+  // over the net loopback. Proves an in-VM server + client: POST with a body,
+  // GET with no body, a chunked (no content-length) response, response headers,
+  // keep-alive socket reuse across two requests, and ECONNREFUSED.
+  kernel.writeFile(
+    "/t/httpb.js",
+    `
+const assert = require('assert');
+const http = require('_http_real');
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/chunked') {
+    res.writeHead(200, { 'content-type': 'text/plain' }); // no length => chunked
+    res.write('chunk-a;'); res.write('chunk-b;'); res.end('chunk-c');
+    return;
+  }
+  let body = '';
+  req.setEncoding('utf8');
+  req.on('data', (c) => body += c);
+  req.on('end', () => {
+    res.writeHead(200, { 'content-type': 'application/json', 'x-demo': 'oc' });
+    res.end(JSON.stringify({ ok: true, echo: body, url: req.url, method: req.method }));
+  });
+});
+
+function request(port, path, method, payload, agent) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, method, path, agent }, (res) => {
+      let data = ''; res.setEncoding('utf8');
+      res.on('data', (c) => data += c);
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+    });
+    req.on('error', reject);
+    req.end(payload);
+  });
+}
+
+async function main() {
+  await new Promise((r) => server.listen(0, r)); // ephemeral port
+  const port = server.address().port;
+  assert.ok(port > 0, 'http server.address() returns a bound port');
+
+  const post = await request(port, '/hello?x=1', 'POST', 'ping');
+  assert.strictEqual(post.status, 200, 'POST status 200');
+  assert.strictEqual(JSON.parse(post.body).echo, 'ping', 'POST body echoed');
+  assert.strictEqual(post.headers['x-demo'], 'oc', 'response header propagated');
+
+  const g = await request(port, '/plain', 'GET');
+  assert.strictEqual(JSON.parse(g.body).method, 'GET', 'GET routed');
+  assert.strictEqual(JSON.parse(g.body).echo, '', 'GET has no body');
+
+  const ch = await request(port, '/chunked', 'GET');
+  assert.strictEqual(ch.headers['transfer-encoding'], 'chunked', 'chunked transfer-encoding');
+  assert.strictEqual(ch.body, 'chunk-a;chunk-b;chunk-c', 'chunked body reassembled');
+
+  // keep-alive: reuse a single TCP socket across two requests via one agent.
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const k1 = await request(port, '/k1', 'GET', undefined, agent);
+  const k2 = await request(port, '/k2', 'GET', undefined, agent);
+  assert.strictEqual(JSON.parse(k1.body).url, '/k1', 'keep-alive req 1');
+  assert.strictEqual(JSON.parse(k2.body).url, '/k2', 'keep-alive req 2');
+  agent.destroy();
+
+  // connecting to an unbound port surfaces ECONNREFUSED on the request.
+  await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: 65531, path: '/', agent: false });
+    req.on('error', (e) => {
+      assert.strictEqual(e.code, 'ECONNREFUSED', 'http refused sets ECONNREFUSED');
+      resolve();
+    });
+    req.end();
+  });
+
+  await new Promise((r) => server.close(r));
+  console.log('HTTPB_OK');
+}
+main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
+`,
+  );
+  const hb = await kernel.start("node", ["/t/httpb.js"], { cwd: "/t", capture: true });
+  assert(hb.code === 0 && hb.stdout.includes("HTTPB_OK"),
+    "Path B: real Node lib/http.js runs (POST/GET, chunked, headers, keep-alive, ECONNREFUSED)");
+
   // Event loop v2 proof: ordering. nextTick beats Promise microtasks, and both
   // beat timers/immediates — which now actually FIRE (the old synchronous loop
   // starved them). Printing from inside setImmediate proves the loop drives to it.

@@ -205,11 +205,18 @@ export default function (exports, require, module, process, internalBinding, pri
   // path never calls it; return the TCP type as a safe default if it ever does.
   const guessHandleType = () => "TCP";
 
+  // Node sets a stable, non-enumerable name on dynamically-created functions.
+  const assignFunctionName = (name, fn) => {
+    Object.defineProperty(fn, "name", { value: name, configurable: true });
+    return fn;
+  };
+
   module.exports = {
     isWindows,
     isMacOS,
     getLazy,
     guessHandleType,
+    assignFunctionName,
     customInspectSymbol,
     kIsEncodingSymbol,
     kEmptyObject,

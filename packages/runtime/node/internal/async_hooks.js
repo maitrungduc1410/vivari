@@ -23,6 +23,13 @@ export default function (exports, require, module, process, internalBinding, pri
   // async tracking we just invoke it directly (same call semantics).
   const defaultTriggerAsyncIdScope = (triggerAsyncId, fn, ...args) => fn(...args);
 
+  // Lazily assigns (and caches) an async id on a handle/object. _http_server and
+  // net use this to tag sockets.
+  const getOrSetAsyncId = (object) => {
+    if (object[async_id_symbol] !== undefined) return object[async_id_symbol];
+    return (object[async_id_symbol] = newAsyncId());
+  };
+
   class AsyncResource {
     constructor(type) {
       this.type = type;
@@ -93,6 +100,7 @@ export default function (exports, require, module, process, internalBinding, pri
     AsyncLocalStorage,
     newAsyncId,
     getNewAsyncId,
+    getOrSetAsyncId,
     defaultTriggerAsyncIdScope,
     executionAsyncId: () => 0,
     triggerAsyncId: () => 0,
