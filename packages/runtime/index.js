@@ -90,6 +90,10 @@ export function createRuntime({
   const streamPromises = nodeModules.require("stream/promises");
   const stringDecoder = nodeModules.require("string_decoder");
   const asyncHooks = nodeModules.require("async_hooks");
+  const net = nodeModules.require("net");
+  const timers = nodeModules.require("timers");
+  const diagnosticsChannel = nodeModules.require("diagnostics_channel");
+  const cluster = nodeModules.require("cluster");
   const assert = createAssert(util);
   const child_process = createChildProcess({ sys: syscalls, process, Buffer });
   const http = createHttp({
@@ -137,6 +141,10 @@ export function createRuntime({
     "stream/promises": streamPromises,
     string_decoder: stringDecoder,
     async_hooks: asyncHooks,
+    net,
+    timers,
+    diagnostics_channel: diagnosticsChannel,
+    cluster,
   };
 
   const moduleSystem = createModuleSystem({ fs, path, builtins, process, globals });

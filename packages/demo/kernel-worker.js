@@ -98,6 +98,39 @@ const server = http.createServer(async (req, res) => {
     res.end(body);
     return;
   }
+  if (req.url === '/api/net') {
+    // Real Node net (vendored lib/net.js + internal/stream_base_commons on our
+    // tcp_wrap/stream_wrap loopback binding): spin up an in-process TCP echo
+    // server, connect a client to it over 127.0.0.1, and round-trip a message —
+    // net.Server/net.Socket are real streams, all inside this browser worker.
+    const net = require('net');
+    const result = await new Promise((resolve, reject) => {
+      const echo = net.createServer((sock) => {
+        sock.setEncoding('utf8');
+        sock.on('data', (d) => sock.write('echo:' + d));
+        sock.on('end', () => sock.end());
+      });
+      echo.listen(0, () => {
+        const port = echo.address().port;
+        const client = net.connect(port, '127.0.0.1', () => client.end('hello over TCP'));
+        client.setEncoding('utf8');
+        let buf = '';
+        client.on('data', (d) => { buf += d; });
+        client.on('end', () => echo.close(() => resolve({ port, reply: buf })));
+        client.on('error', reject);
+      });
+      echo.on('error', reject);
+    });
+    const body = Buffer.from(JSON.stringify({
+      node: process.version,
+      note: 'Client wrote "hello over TCP" to an in-process net.Server on 127.0.0.1:' + result.port + '; the server echoed it back — real Node lib/net.js in the browser.',
+      ephemeralPort: result.port,
+      reply: result.reply,
+    }, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
   if (req.url === '/api/buffer') {
     // Exercise Node's REAL Buffer (vendored lib/buffer.js on our
     // internalBinding('buffer')) entirely inside the browser.
@@ -183,17 +216,19 @@ const server = http.createServer(async (req, res) => {
 <body><div class="card">
   <h1>Hello from OpenContainer 🎉</h1>
   <p>Served by <code>http.createServer</code> in worker <code>PID \${process.pid}</code></p>
-  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> + <code>stream</code> vendored, on a real event loop, running in your browser</p>
+  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> + <code>stream</code> + <code>net</code> vendored, on a real event loop, running in your browser</p>
   <p>You requested <code>\${req.url}</code></p>
   <button onclick="fetch('api/time').then(r=>r.json()).then(t=>document.getElementById('t').textContent=JSON.stringify(t))">GET /api/time</button>
   <button onclick="var el=document.getElementById('a');el.textContent='awaiting setTimeout(200ms)…';fetch('api/async').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2))">GET /api/async (awaits a timer)</button>
   <button onclick="fetch('api/stream').then(r=>r.json()).then(t=>document.getElementById('s').textContent=JSON.stringify(t,null,2))">GET /api/stream (pipeline)</button>
+  <button onclick="fetch('api/net').then(r=>r.json()).then(t=>document.getElementById('n').textContent=JSON.stringify(t,null,2))">GET /api/net (TCP loopback)</button>
   <button onclick="fetch('api/buffer').then(r=>r.json()).then(t=>document.getElementById('b').textContent=JSON.stringify(t,null,2))">GET /api/buffer</button>
   <button onclick="fetch('api/fs').then(r=>r.json()).then(t=>document.getElementById('f').textContent=JSON.stringify(t,null,2))">GET /api/fs</button>
   <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
   <pre id="t"></pre>
   <pre id="a"></pre>
   <pre id="s"></pre>
+  <pre id="n"></pre>
   <pre id="b"></pre>
   <pre id="f"></pre>
 </div></body></html>\`);

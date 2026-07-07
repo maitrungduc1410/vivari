@@ -475,6 +475,83 @@ main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
   assert(sb.code === 0 && sb.stdout.includes("STREAMB_OK"),
     "Path B: real Node lib/stream.js runs (Readable/Writable/Transform/pipeline/finished/promises)");
 
+  // Path B proof: require('net') is Node's REAL vendored lib/net.js +
+  // internal/{net,stream_base_commons} running on our tcp_wrap/stream_wrap
+  // loopback binding — net.Server/net.Socket are real Duplex streams. Proves an
+  // echo server + client roundtrip, ephemeral listen + address(), a second
+  // independent connection, chunked reassembly, and ECONNREFUSED.
+  kernel.writeFile(
+    "/t/netb.js",
+    `
+const assert = require('assert');
+const net = require('net');
+
+function echo(sock) {
+  sock.setEncoding('utf8');
+  sock.on('data', (d) => sock.write('echo:' + d));
+  sock.on('end', () => sock.end());
+}
+function drain(port, payload) {
+  return new Promise((resolve, reject) => {
+    const c = net.connect(port, '127.0.0.1', () => c.end(payload));
+    c.setEncoding('utf8');
+    let buf = '';
+    c.on('data', (d) => { buf += d; });
+    c.on('end', () => resolve(buf));
+    c.on('error', reject);
+  });
+}
+
+async function main() {
+  const server = net.createServer(echo);
+  await new Promise((r) => server.listen(0, r)); // ephemeral port
+  const port = server.address().port;
+  assert.ok(port > 0, 'server.address() returns a bound port');
+
+  // echo roundtrip + a second, independent connection on the same server.
+  assert.strictEqual(await drain(port, 'hello'), 'echo:hello', 'echo roundtrip');
+  assert.strictEqual(await drain(port, 'world'), 'echo:world', 'second independent connection');
+
+  // multiple writes on one connection are reassembled in order by the peer.
+  const server2 = net.createServer((sock) => {
+    let n = 0;
+    sock.on('data', (c) => { n += c.length; });
+    sock.on('end', () => { sock.end(String(n)); });
+  });
+  await new Promise((r) => server2.listen(0, r));
+  const p2 = server2.address().port;
+  const total = await new Promise((resolve, reject) => {
+    const c = net.connect(p2, '127.0.0.1', () => {
+      c.write('aaaa'); c.write('bbbb'); c.end('cc'); // 10 bytes
+    });
+    c.setEncoding('utf8'); let b = '';
+    c.on('data', (d) => b += d);
+    c.on('end', () => resolve(b));
+    c.on('error', reject);
+  });
+  assert.strictEqual(total, '10', 'server counted 10 bytes across 3 writes');
+
+  // connecting to an unbound port rejects with ECONNREFUSED.
+  await new Promise((resolve, reject) => {
+    const c = net.connect(65530, '127.0.0.1');
+    c.on('connect', () => reject(new Error('unexpectedly connected')));
+    c.on('error', (e) => {
+      assert.strictEqual(e.code, 'ECONNREFUSED', 'refused sets code ECONNREFUSED');
+      resolve();
+    });
+  });
+
+  await new Promise((r) => server.close(r));
+  await new Promise((r) => server2.close(r));
+  console.log('NETB_OK');
+}
+main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
+`,
+  );
+  const nb = await kernel.start("node", ["/t/netb.js"], { cwd: "/t", capture: true });
+  assert(nb.code === 0 && nb.stdout.includes("NETB_OK"),
+    "Path B: real Node lib/net.js runs (echo server/client, address(), 2nd conn, chunked, ECONNREFUSED)");
+
   // Event loop v2 proof: ordering. nextTick beats Promise microtasks, and both
   // beat timers/immediates — which now actually FIRE (the old synchronous loop
   // starved them). Printing from inside setImmediate proves the loop drives to it.

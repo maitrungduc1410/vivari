@@ -10,6 +10,7 @@
 
 import { createBufferBinding } from "./bindings/buffer.js";
 import { createFsBinding } from "./bindings/fs.js";
+import { createNetBindings } from "./bindings/net.js";
 
 // POSIX/libuv constants exposed as internalBinding('constants').fs. Node's real
 // lib/fs.js and internal/fs/utils.js destructure these; the O_* values MUST
@@ -79,11 +80,19 @@ function getOwnNonIndexProperties(obj, filter) {
 }
 
 export function createInternalBinding({ syscalls, process } = {}) {
+  // net (Phase 2 #7): tcp_wrap/stream_wrap/uv/pipe_wrap/cares_wrap for the
+  // in-process loopback beneath Node's real lib/net.js. Needs process.nextTick.
+  const net = createNetBindings({ process });
   const bindings = {
     buffer: createBufferBinding(),
     // 'fs' needs the sync-bridge syscalls (to reach the Rust VFS) and process
     // (to defer async callbacks onto nextTick).
     fs: syscalls ? createFsBinding({ sys: syscalls, process }) : undefined,
+    tcp_wrap: net.tcp_wrap,
+    stream_wrap: net.stream_wrap,
+    uv: net.uv,
+    pipe_wrap: net.pipe_wrap,
+    cares_wrap: net.cares_wrap,
     util: {
       constants: { ALL_PROPERTIES, ONLY_ENUMERABLE },
       getOwnNonIndexProperties,

@@ -202,17 +202,35 @@ export default function (exports, require, module, process, internalBinding, pri
   }
   ERR_FALSY_VALUE_REJECTION.HideStackFramesError = ERR_FALSY_VALUE_REJECTION;
 
-  // libuv errno-style exception (util._errnoException). Sync-throwing bindings
-  // never reach it, but util.js destructures it at load.
+  // libuv errno-style exceptions. net.js builds connect/read/write errors through
+  // these, so we resolve the code/message via the 'uv' binding (uv.errname) to
+  // match Node — e.g. status -111 => { code: 'ECONNREFUSED', errno: -111 }.
+  const uvErrname = (err) => {
+    try {
+      return internalBinding("uv").errname(err);
+    } catch {
+      return `UNKNOWN(${err})`;
+    }
+  };
+
   function ErrnoException(err, syscall, original) {
-    const e = new Error(`${syscall} ${original || ""} (errno ${err})`);
+    const code = uvErrname(err);
+    const e = new Error(`${syscall} ${code}${original ? ` ${original}` : ""}`);
     e.errno = err;
+    e.code = code;
     e.syscall = syscall;
     return e;
   }
-  function ExceptionWithHostPort(err, syscall, address, port) {
-    const e = new Error(`${syscall} ${address}:${port} (errno ${err})`);
+
+  function ExceptionWithHostPort(err, syscall, address, port, additional) {
+    const code = uvErrname(err);
+    let details = "";
+    if (port && port > 0) details = ` ${address}:${port}`;
+    else if (address) details = ` ${address}`;
+    if (additional) details += ` - Local (${additional})`;
+    const e = new Error(`${syscall} ${code}${details}`);
     e.errno = err;
+    e.code = code;
     e.syscall = syscall;
     e.address = address;
     if (port) e.port = port;

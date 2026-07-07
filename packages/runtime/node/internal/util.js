@@ -201,10 +201,15 @@ export default function (exports, require, module, process, internalBinding, pri
   const SideEffectFreeRegExpPrototypeExec = (regexp, string) =>
     RegExp.prototype.exec.call(regexp, string);
 
+  // net.js uses this only for fd-backed sockets (net.Socket({ fd })). Our TCP
+  // path never calls it; return the TCP type as a safe default if it ever does.
+  const guessHandleType = () => "TCP";
+
   module.exports = {
     isWindows,
     isMacOS,
     getLazy,
+    guessHandleType,
     customInspectSymbol,
     kIsEncodingSymbol,
     kEmptyObject,

@@ -67,6 +67,18 @@ import webstreamsAdaptersFactory from "./internal/webstreams/adapters.js";
 import stringDecoderFactory from "./lib/string_decoder.js";
 import asyncHooksFactory from "./lib/async_hooks.js";
 
+// net (Phase 2 #7): Node's real lib/net.js + internal/{net,stream_base_commons}
+// over the tcp_wrap/stream_wrap loopback binding, plus small support shims.
+import netFactory from "./lib/net.js";
+import internalNetFactory from "./internal/net.js";
+import streamBaseCommonsFactory from "./internal/stream_base_commons.js";
+import internalAsyncHooksFactory from "./internal/async_hooks.js";
+import internalTimersFactory from "./internal/timers.js";
+import perfObserveFactory from "./internal/perf/observe.js";
+import timersFactory from "./lib/timers.js";
+import diagnosticsChannelFactory from "./lib/diagnostics_channel.js";
+import clusterFactory from "./lib/cluster.js";
+
 // name -> factory. Public builtins (e.g. "path") and internals ("internal/...")
 // live in the same table, just like Node's builtin id space.
 const FACTORIES = {
@@ -121,6 +133,15 @@ const FACTORIES = {
   "internal/webstreams/adapters": webstreamsAdaptersFactory,
   string_decoder: stringDecoderFactory,
   async_hooks: asyncHooksFactory,
+  net: netFactory,
+  "internal/net": internalNetFactory,
+  "internal/stream_base_commons": streamBaseCommonsFactory,
+  "internal/async_hooks": internalAsyncHooksFactory,
+  "internal/timers": internalTimersFactory,
+  "internal/perf/observe": perfObserveFactory,
+  timers: timersFactory,
+  diagnostics_channel: diagnosticsChannelFactory,
+  cluster: clusterFactory,
 };
 
 const strip = (name) => (name.startsWith("node:") ? name.slice(5) : name);

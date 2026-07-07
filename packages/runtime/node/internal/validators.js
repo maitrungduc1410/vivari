@@ -12,7 +12,7 @@ export default function (exports, require, module, process, internalBinding, pri
   "use strict";
 
   const {
-    codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE },
+    codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE, ERR_SOCKET_BAD_PORT },
   } = require("internal/errors");
 
   const MIN = Number.MIN_SAFE_INTEGER;
@@ -130,6 +130,26 @@ export default function (exports, require, module, process, internalBinding, pri
   // permissive accept keeps the common write(fd, string, enc) path working.
   function validateEncoding() {}
 
+  function validateStringWithoutNullBytes(value, name) {
+    validateString(value, name);
+    if (value.includes("\u0000")) {
+      throw new ERR_INVALID_ARG_VALUE(name, value, "must be a string without null bytes");
+    }
+  }
+
+  function validatePort(port, name = "Port", allowZero = true) {
+    if (
+      (typeof port !== "number" && typeof port !== "string") ||
+      (typeof port === "string" && String(port).trim().length === 0) ||
+      +port !== +port >>> 0 ||
+      port > 0xffff ||
+      (port === 0 && !allowZero)
+    ) {
+      throw new ERR_SOCKET_BAD_PORT(name, port, allowZero);
+    }
+    return port | 0;
+  }
+
   function validateAbortSignal(signal, name) {
     if (
       signal !== undefined &&
@@ -153,6 +173,8 @@ export default function (exports, require, module, process, internalBinding, pri
     validateOneOf,
     validateEncoding,
     validateAbortSignal,
+    validatePort,
+    validateStringWithoutNullBytes,
     isInt32,
     parseFileMode,
     kValidateObjectNone,

@@ -298,9 +298,42 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
      Readable.from + async iteration, setEncoding across a split multibyte char,
      Writable + `finished`, `pipeline` (Readable→Transform→PassThrough→Writable),
      callback `pipeline`+`finished`, Duplex. verify: 35/35 PASS.
-7. **`net` + `tcp_wrap` binding** [L] — the socket layer under http. Loopback virtual
-   net for preview (replaces Brick 5's routing table) + a fetch/WebSocket bridge for
-   outbound (CORS-limited — stay honest about it).
+7. ✅ **`net` — real `lib/net.js` on a `tcp_wrap`/`stream_wrap` loopback binding** [L] —
+   `require('net')` is now Node v24.18.0's **real, unmodified** `lib/net.js` +
+   `internal/net` + `internal/stream_base_commons`, running over a hand-written
+   `internalBinding` socket layer. `net.Server`/`net.Socket` are genuine Duplex
+   streams (on the #6 stream stack + Event loop v2) — the socket foundation #8's
+   real `lib/http` will extend.
+   - **The binding** (`node/bindings/net.js` → `tcp_wrap`, `stream_wrap`, `uv`,
+     `pipe_wrap`, `cares_wrap`): implements the libuv **StreamBase contract**
+     `internal/stream_base_commons` speaks — `writeBuffer`/`write*String`/`writev`
+     + `readStart`/`readStop` + an `onread` callback driven through a shared
+     `streamBaseState`, plus `listen`/`connect`/`onconnection`, `getsockname`/
+     `getpeername`, `shutdown` (half-close) and `close` (EOF to peer).
+   - **In-process loopback**: a per-process `port → serverHandle` registry links a
+     `connect()`ing handle to a `listen()`ing one in the same VM, producing a
+     linked endpoint pair whose writes surface as the peer's reads (backpressure
+     via `readStop` honored, FIFO delivery, `ECONNREFUSED` for unbound ports).
+     This is exactly what a preview/loopback server needs and runs unmodified
+     `lib/net.js` end-to-end.
+   - **Support shims added** to the shared layer: `internal/timers` (maps
+     `setUnrefTimeout`/`getTimerDuration`/`kTimeout` onto our loop), `timers`
+     (public, delegates to the loop's globals), extended `internal/async_hooks`
+     (owner/async-id symbols, `newAsyncId`, `defaultTriggerAsyncIdScope`) with
+     `async_hooks` re-exporting it (shared symbols), `diagnostics_channel` +
+     `internal/perf/observe` + `cluster` + `pipe_wrap` stubs, and `validatePort`/
+     `validateStringWithoutNullBytes`/`guessHandleType` + `ExceptionWithHostPort`/
+     `ErrnoException` now resolving `.code` via `uv.errname`.
+   - **Deferred (honestly)**: outbound raw TCP is impossible in a browser — real
+     `net.connect(host)` to the internet needs the fetch/WebSocket bridge (#9,
+     CORS-limited); DNS (`cares_wrap`), Unix pipes (`pipe_wrap`), `BlockList`/
+     `SocketAddress`, and socket timeouts beyond the shim are stubbed. Cross-VM
+     loopback (wiring the kernel + Service Worker to replace Brick 5's routing) is
+     folded into #8, where real `http` and the preview path land together.
+   - Proven by `netb.js`: echo server + client roundtrip, ephemeral `listen(0)` +
+     `address()`, a second independent connection, 3-write reassembly, and
+     `ECONNREFUSED`. Demo gains **`/api/net`** (in-process TCP echo over 127.0.0.1
+     in the browser). verify: 37/37 PASS.
 8. **`http`/`http2` — real `lib/http.js` + `_http_*`** [L] — on `stream` + `net` + a
    Wasm **`http_parser`** (compile **llhttp** to Wasm). Replaces Brick 5's hand-written
    http with real semantics: async handlers, streaming bodies, keep-alive.
