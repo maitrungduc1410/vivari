@@ -7,9 +7,12 @@
 // directory/index/package.json "main"), and bare specifiers walked up through
 // node_modules.
 
-export function createModuleSystem({ fs, path, builtins, process, globals }) {
+export function createModuleSystem({ fs, path, builtins, process, globals, nodeModules }) {
   const cache = Object.create(null);
   const builtinNames = new Set(Object.keys(builtins));
+  // Vendored modules the loader can serve lazily (e.g. `semver`) without eagerly
+  // instantiating them for every process — resolved only when actually required.
+  const hasLazyBuiltin = (request) => !!nodeModules && nodeModules.has(request);
 
   function Module(id) {
     this.id = id;
@@ -65,6 +68,7 @@ export function createModuleSystem({ fs, path, builtins, process, globals }) {
 
   function resolveFilename(request, fromDir) {
     if (builtinNames.has(request)) return { builtin: true, id: request };
+    if (hasLazyBuiltin(request)) return { builtin: true, id: request };
 
     let resolved = null;
     if (request.startsWith("/") || request.startsWith("./") || request.startsWith("../")) {
@@ -96,7 +100,10 @@ export function createModuleSystem({ fs, path, builtins, process, globals }) {
 
   function load(request, fromDir) {
     const r = resolveFilename(request, fromDir);
-    if (r.builtin) return builtins[r.id];
+    if (r.builtin) {
+      if (Object.prototype.hasOwnProperty.call(builtins, r.id)) return builtins[r.id];
+      return nodeModules.require(r.id); // lazy vendored module (loader-cached)
+    }
 
     const filename = r.id;
     if (cache[filename]) return cache[filename].exports;
@@ -126,27 +133,20 @@ export function createModuleSystem({ fs, path, builtins, process, globals }) {
     const dirname = path.dirname(filename);
     const require = makeRequire(dirname);
 
-    // The classic CommonJS wrapper. Extra globals (process, Buffer, console,
-    // ...) are provided as trailing parameters bound from `globals`.
-    const globalNames = Object.keys(globals);
+    // The classic CommonJS wrapper. Only the five real wrapper params are
+    // injected; Buffer/process/console/global/timers are true globals (set on
+    // globalThis by the runtime), exactly like Node. Injecting them as params
+    // instead would make a userland `const Buffer = require('buffer').Buffer`
+    // a "Identifier already declared" SyntaxError.
     const wrapper = new Function(
       "exports",
       "require",
       "module",
       "__filename",
       "__dirname",
-      ...globalNames,
       source + "\n",
     );
-    wrapper.call(
-      module.exports,
-      module.exports,
-      require,
-      module,
-      filename,
-      dirname,
-      ...globalNames.map((k) => globals[k]),
-    );
+    wrapper.call(module.exports, module.exports, require, module, filename, dirname);
   }
 
   function runMain(entry) {

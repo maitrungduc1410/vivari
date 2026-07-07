@@ -315,7 +315,48 @@ server.listen(3000, () =>
     ') · Buffer check ' + Buffer.from('ok').toString('hex') + ' · node ' + process.version));
 `;
 
+// A REAL Express app — the framework installed from npm, unmodified — running on
+// our vendored Node stack. express.json() exercises body-parser (needs zlib +
+// crypto for ETag), the router covers params, all inside the browser worker.
+const EXPRESS_SERVER_SRC = `
+const express = require('express');
+const app = express();
+app.use(express.json());
+
+app.get('/api/hello', (req, res) => {
+  res.json({ ok: true, msg: 'hello from express', node: process.version, pid: process.pid });
+});
+app.get('/api/users/:id', (req, res) => {
+  res.json({ id: req.params.id, name: 'user-' + req.params.id });
+});
+app.post('/api/echo', (req, res) => {
+  res.json({ youSent: req.body, at: Date.now() });
+});
+
+app.listen(3100, () =>
+  console.log('[express] listening on http://localhost:3100 (pid ' + process.pid +
+    ') · express ' + require('express/package.json').version));
+`;
+
 let kernel = null;
+const listening = new Set();
+
+// Resolve once a process registers a listener on `port` (kernel.onListen fires).
+function waitListen(port, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    if (listening.has(port)) return resolve();
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (listening.has(port)) {
+        clearInterval(iv);
+        resolve();
+      } else if (Date.now() - t0 > timeoutMs) {
+        clearInterval(iv);
+        reject(new Error("timed out waiting for a listener on port " + port));
+      }
+    }, 50);
+  });
+}
 
 async function boot() {
   await initKernel();
@@ -373,7 +414,10 @@ async function boot() {
     stderr: (chunk) => post("stderr", { chunk }),
   });
   kernel.onProcExit = (pid, res) => post("exit", { pid, code: res.code });
-  kernel.onListen = (port, pid) => post("listen", { port, pid });
+  kernel.onListen = (port, pid) => {
+    listening.add(port);
+    post("listen", { port, pid });
+  };
   kernel.onFetch = (url, info) =>
     post("log", {
       line: `  [fetcher] ${info.cached ? "cache hit " : "downloaded"} ${info.size}B · ${url}`,
@@ -398,7 +442,10 @@ async function boot() {
   // Worker), gunzips/untars each tarball into node_modules, then a node process
   // require()s the freshly installed tree — no bundler, the real package on disk.
   kernel.mkdirp("/app");
-  kernel.writeFile("/app/package.json", JSON.stringify({ name: "demo-app", version: "1.0.0" }, null, 2));
+  kernel.writeFile(
+    "/app/package.json",
+    JSON.stringify({ name: "demo-app", version: "1.0.0", scripts: { start: "node index.js" } }, null, 2),
+  );
   kernel.writeFile(
     "/app/index.js",
     "const isOdd = require('is-odd');\n" +
@@ -406,8 +453,41 @@ async function boot() {
   );
   post("log", { line: "$ cd /app && npm install is-odd", cls: "muted" });
   await kernel.start("npm", ["install", "is-odd"], { cwd: "/app" });
-  post("log", { line: "$ node /app/index.js", cls: "muted" });
-  await kernel.start("node", ["/app/index.js"], { cwd: "/app" });
+  // Run it via `npm run start` (Phase 2 #10 stage 2): resolves the script from
+  // package.json and runs it with node_modules/.bin on PATH.
+  post("log", { line: "$ npm run start", cls: "muted" });
+  await kernel.start("npm", ["run", "start"], { cwd: "/app" });
+
+  // A REAL Express server (Phase 2 #10 + partial #11 zlib / #12 crypto): install
+  // express + its ~70-package dependency tree from the registry, boot it on
+  // :3100, then call three routes through the kernel like a client would. This
+  // proves express's router, params, and express.json() body parsing all run on
+  // our vendored Node stack — the framework itself, unmodified, in the browser.
+  // kernel.mkdirp("/express");
+  // kernel.writeFile(
+  //   "/express/package.json",
+  //   JSON.stringify({ name: "express-demo", version: "1.0.0", scripts: { start: "node server.js" } }, null, 2),
+  // );
+  // kernel.writeFile("/express/server.js", EXPRESS_SERVER_SRC);
+  // post("log", { line: "$ cd /express && npm install express", cls: "muted" });
+  // await kernel.start("npm", ["install", "express"], { cwd: "/express" });
+  // post("log", { line: "$ node server.js  (express, long-running)", cls: "muted" });
+  // kernel.start("node", ["server.js"], { cwd: "/express" });
+  // await waitListen(3100);
+
+  // const callExpress = async (method, url, body) => {
+  //   const resp = await kernel.handleHttpRequest(3100, {
+  //     method,
+  //     url,
+  //     headers: body ? { "content-type": "application/json" } : {},
+  //     body: body || "",
+  //   });
+  //   const text = typeof resp.body === "string" ? resp.body : new TextDecoder().decode(resp.body);
+  //   post("log", { line: `  [express] ${method} ${url} -> ${resp.status} ${text}`, cls: "ok" });
+  // };
+  // await callExpress("GET", "/api/hello");
+  // await callExpress("GET", "/api/users/42");
+  // await callExpress("POST", "/api/echo", JSON.stringify({ hello: "world", n: 7 }));
 }
 
 self.onmessage = async (event) => {

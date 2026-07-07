@@ -102,6 +102,12 @@ export default function (exports, require, module, process, internalBinding, pri
     (enc) => `Unknown encoding: ${enc}`,
   );
 
+  const ERR_INVALID_URI = makeNodeError(
+    URIError,
+    "ERR_INVALID_URI",
+    () => "URI malformed",
+  );
+
   const ERR_MISSING_ARGS = makeNodeError(TypeError, "ERR_MISSING_ARGS", (...args) => {
     const names = args.map((a) => `"${a}"`);
     const list =
@@ -281,6 +287,7 @@ export default function (exports, require, module, process, internalBinding, pri
       ERR_BUFFER_OUT_OF_BOUNDS,
       ERR_INVALID_BUFFER_SIZE,
       ERR_UNKNOWN_ENCODING,
+      ERR_INVALID_URI,
       ERR_MISSING_ARGS,
       ERR_INCOMPATIBLE_OPTION_PAIR,
       ERR_ACCESS_DENIED,

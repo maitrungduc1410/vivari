@@ -34,71 +34,18 @@ const dec = new TextDecoder();
 function out(s) { process.stdout.write(s + NL); }
 function err(s) { process.stderr.write(s + NL); }
 
-// ---- minimal semver: caret / tilde / exact / x-range / dist-tag -------------
-function parseVer(v) {
-  v = String(v).trim();
-  const plus = v.indexOf('+'); if (plus >= 0) v = v.slice(0, plus);
-  let pre = ''; const dash = v.indexOf('-'); if (dash >= 0) { pre = v.slice(dash + 1); v = v.slice(0, dash); }
-  const p = v.split('.');
-  return { major: parseInt(p[0], 10) || 0, minor: parseInt(p[1], 10) || 0, patch: parseInt(p[2], 10) || 0, pre: pre };
-}
-function cmp(a, b) {
-  if (a.major !== b.major) return a.major - b.major;
-  if (a.minor !== b.minor) return a.minor - b.minor;
-  if (a.patch !== b.patch) return a.patch - b.patch;
-  if (!a.pre && b.pre) return 1;
-  if (a.pre && !b.pre) return -1;
-  if (a.pre < b.pre) return -1;
-  if (a.pre > b.pre) return 1;
-  return 0;
-}
-function caretOk(v, b) {
-  if (cmp(v, b) < 0) return false;
-  if (b.major > 0) return v.major === b.major;
-  if (b.minor > 0) return v.major === 0 && v.minor === b.minor;
-  return v.major === 0 && v.minor === 0 && v.patch === b.patch;
-}
-function tildeOk(v, b) {
-  if (cmp(v, b) < 0) return false;
-  return v.major === b.major && v.minor === b.minor;
-}
-function xRangeOk(v, range) {
-  const p = range.split('.');
-  const p0 = p[0];
-  if (p0 === undefined || p0 === '' || p0 === '*' || p0 === 'x' || p0 === 'X') return true;
-  if (parseInt(p0, 10) !== v.major) return false;
-  const p1 = p[1];
-  if (p1 === undefined || p1 === '*' || p1 === 'x' || p1 === 'X') return true;
-  if (parseInt(p1, 10) !== v.minor) return false;
-  const p2 = p[2];
-  if (p2 === undefined || p2 === '*' || p2 === 'x' || p2 === 'X') return true;
-  return parseInt(p2, 10) === v.patch;
-}
-function satisfies(ver, range) {
-  range = String(range).trim();
-  if (range === '' || range === '*' || range === 'x' || range === 'X' || range === 'latest') return true;
-  if (range[0] === '=' || range[0] === 'v') range = range.slice(1).trim();
-  const v = parseVer(ver);
-  if (range[0] === '^') return caretOk(v, parseVer(range.slice(1)));
-  if (range[0] === '~') return tildeOk(v, parseVer(range.slice(1)));
-  if (range.indexOf('x') >= 0 || range.indexOf('X') >= 0 || range.split('.').length < 3) return xRangeOk(v, range);
-  return cmp(v, parseVer(range)) === 0;
-}
+// ---- version selection: REAL node-semver (vendored) -------------------------
+// The full range grammar (caret/tilde/exact/x-range + compound '>=1 <2', unions
+// '1 || 2', hyphen '1 - 2') so resolution matches npm; a plain dist-tag name
+// ('latest'/'next'/...) is honoured before treating the spec as a range.
+const semver = require('semver');
 function pickVersion(meta, range) {
   const dt = meta['dist-tags'] || {};
   range = String(range).trim();
   if (range === '' || range === '*' || range === 'latest') { if (dt.latest) return dt.latest; }
-  if (dt[range]) return dt[range];
+  if (dt[range]) return dt[range]; // dist-tag (e.g. 'next', 'beta')
   const all = Object.keys(meta.versions || {});
-  let best = null, bestP = null;
-  for (let i = 0; i < all.length; i++) {
-    const ver = all[i];
-    if (satisfies(ver, range)) {
-      const pv = parseVer(ver);
-      if (!best || cmp(pv, bestP) > 0) { best = ver; bestP = pv; }
-    }
-  }
-  return best;
+  return semver.maxSatisfying(all, range || '*'); // highest satisfying version, or null
 }
 
 // ---- registry metadata (via blocking __ocfetch) -----------------------------
@@ -237,14 +184,55 @@ function readPkg(cwd) {
   try { return JSON.parse(fs.readFileSync(cwd + '/package.json', 'utf8')); } catch (e) { return {}; }
 }
 
+// ---- npm run <script> (not installer logic; survives the switch to real npm) --
+// PATH with every node_modules/.bin from cwd up to root prepended, so a script's
+// bare bin name (e.g. vite) resolves to the locally installed executable, then
+// the process env, then /bin.
+function binPath(cwd) {
+  const dirs = [];
+  let cur = cwd;
+  for (;;) {
+    dirs.push(cur + '/node_modules/.bin');
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  if (process.env.PATH) dirs.push(process.env.PATH);
+  dirs.push('/bin');
+  return dirs.join(':');
+}
+function runScript(cwd, name, extra) {
+  const cp = require('child_process');
+  const scripts = readPkg(cwd).scripts || {};
+  if (!name) {
+    out('available scripts:');
+    for (const k in scripts) out('  ' + k + ': ' + scripts[k]);
+    return 0;
+  }
+  const script = scripts[name];
+  if (!script) { err('npm: missing script: ' + name); return 1; }
+  const full = extra && extra.length ? script + ' ' + extra.join(' ') : script;
+  const env = Object.assign({}, process.env, { PATH: binPath(cwd) });
+  out('> ' + name + ': ' + full);
+  // spawnSync blocks until the script exits — fine for build/one-off scripts; a
+  // long-running dev server is better launched directly (async spawn is later).
+  const r = cp.spawnSync('sh', ['-c', full], { cwd: cwd, env: env, encoding: 'utf8' });
+  if (r.stdout) process.stdout.write(r.stdout);
+  if (r.stderr) process.stderr.write(r.stderr);
+  return r.status | 0;
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
+  const cwd = process.cwd();
+  // Script running (synchronous, no network) — handle before the installer path.
+  if (cmd === 'run' || cmd === 'run-script') return runScript(cwd, argv[1], argv.slice(2));
+  if (cmd === 'start' || cmd === 'test') return runScript(cwd, cmd, argv.slice(1));
   if (cmd !== 'install' && cmd !== 'i' && cmd !== 'add') {
-    err('usage: npm install [package[@version] ...]');
+    err('usage: npm <install|run|start|test> ...');
     return 1;
   }
-  const cwd = process.cwd();
   const names = argv.slice(1).filter(function (a) { return a[0] !== '-'; });
   const rootDeps = {};
   const explicit = [];

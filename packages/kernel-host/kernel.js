@@ -126,12 +126,19 @@ export class Kernel {
   }
 
   /** Resolve a command name to a program file in the VFS (PATH = /bin). */
-  resolveProgram(command, cwd) {
+  resolveProgram(command, cwd, env = {}) {
     const candidates = [];
     if (command.includes("/")) {
       const abs = this.resolvePath(cwd, command);
       candidates.push(abs, abs + ".js");
     } else {
+      // PATH order first (so a project's node_modules/.bin can shadow /bin),
+      // then /bin. Entries may be relative (resolved against cwd) or absolute.
+      const pathDirs = String(env.PATH || "").split(":").filter(Boolean);
+      for (const dir of pathDirs) {
+        const base = this.resolvePath(cwd, dir) + "/" + command;
+        candidates.push(base, base + ".js");
+      }
       candidates.push("/bin/" + command, "/bin/" + command + ".js");
     }
     return candidates.find((c) => this.isFile(c)) || null;
@@ -216,7 +223,7 @@ export class Kernel {
   /** Start a top-level process; resolves with { pid, code, stdout, stderr }. */
   start(command, args = [], opts = {}) {
     const cwd = opts.cwd || "/";
-    const programPath = this.resolveProgram(command, cwd);
+    const programPath = this.resolveProgram(command, cwd, opts.env || {});
     return new Promise((resolve) => {
       if (!programPath) {
         resolve({ pid: -1, code: 127, stdout: "", stderr: command + ": not found\n" });
@@ -346,7 +353,7 @@ export class Kernel {
 
   handleSpawn(parent, spec) {
     const cwd = spec.cwd || "/";
-    const programPath = this.resolveProgram(spec.command, cwd);
+    const programPath = this.resolveProgram(spec.command, cwd, spec.env || {});
     if (!programPath) {
       this.respondErr(parent, "ENOENT");
       return;

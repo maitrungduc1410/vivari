@@ -148,6 +148,30 @@ function makeKernel() {
         "package/cli.js": "console.log('b-cli ran');\n",
       }),
     },
+    // c@1.0.0 depends on b via a COMPOUND range the hand-rolled semver couldn't
+    // parse — proves the vendored real semver (stage 2). Expect b@1.2.0 (< 2.0.0).
+    "https://registry.npmjs.org/c": {
+      contentType: "application/json",
+      body: enc.encode(
+        JSON.stringify({
+          name: "c",
+          "dist-tags": { latest: "1.0.0" },
+          versions: {
+            "1.0.0": {
+              dist: { tarball: "https://registry.npmjs.org/c/-/c-1.0.0.tgz" },
+              dependencies: { b: ">=1.0.0 <2.0.0" },
+            },
+          },
+        }),
+      ),
+    },
+    "https://registry.npmjs.org/c/-/c-1.0.0.tgz": {
+      contentType: "application/octet-stream",
+      body: makeTgz({
+        "package/package.json": JSON.stringify({ name: "c", version: "1.0.0", main: "index.js", dependencies: { b: ">=1.0.0 <2.0.0" } }),
+        "package/index.js": "module.exports = () => 'c+' + require('b')();\n",
+      }),
+    },
   };
   const fetchStats = { calls: 0 };
   const fetcher = async (url) => {
@@ -811,6 +835,41 @@ console.log(require('a')() + '|' + pj.dependencies.a);
   const npmRun = await kernel.start("node", ["/proj/run.js"], { cwd: "/proj", capture: true });
   assert(npmRun.code === 0 && npmRun.stdout.trim() === "a+b-ok|^1.0.0",
     "Phase 2 #10: installed tree is require-able (a requires hoisted b) + package.json recorded");
+
+  // === #10 stage 2: real semver + npm run/npx + PATH-aware .bin resolution ===
+  // Real vendored semver resolves a COMPOUND range the old hand-rolled logic
+  // could not (c deps b '>=1.0.0 <2.0.0' -> b@1.2.0).
+  kernel.mkdirp("/proj2");
+  kernel.writeFile("/proj2/package.json", JSON.stringify({ name: "proj2", version: "1.0.0" }));
+  const npmC = await kernel.start("npm", ["install", "c"], { cwd: "/proj2", capture: true });
+  assert(npmC.code === 0 && kernel.vfs.exists("/proj2/node_modules/b/package.json"),
+    "Phase 2 #10 st2: real semver resolves a compound range (c deps b '>=1.0.0 <2.0.0')");
+  kernel.writeFile("/proj2/run.js", "console.log(require('c')())");
+  const rc2 = await kernel.start("node", ["/proj2/run.js"], { cwd: "/proj2", capture: true });
+  assert(rc2.code === 0 && rc2.stdout.trim() === "c+b-ok",
+    "Phase 2 #10 st2: compound-range tree require-able (c -> b@1.2.0)");
+
+  // PATH-aware resolution runs a node_modules/.bin symlink (b-cli was installed
+  // into /proj by the earlier `npm install a`).
+  const binRun = await kernel.start("b-cli", [], {
+    cwd: "/proj", env: { PATH: "/proj/node_modules/.bin" }, capture: true,
+  });
+  assert(binRun.code === 0 && binRun.stdout.includes("b-cli ran"),
+    "Phase 2 #10 st2: PATH-aware resolution executes a node_modules/.bin symlink");
+
+  // npm run <script> (passes trailing args through to the script).
+  kernel.mkdirp("/proj3");
+  kernel.writeFile("/proj3/package.json",
+    JSON.stringify({ name: "proj3", version: "1.0.0", scripts: { greet: "node greet.js from-script" } }));
+  kernel.writeFile("/proj3/greet.js", "console.log('greet ' + process.argv.slice(2).join(' '));");
+  const nrun = await kernel.start("npm", ["run", "greet"], { cwd: "/proj3", capture: true });
+  assert(nrun.code === 0 && nrun.stdout.includes("greet from-script"),
+    "Phase 2 #10 st2: npm run <script> executes the package.json script");
+
+  // npx runs an already-installed local bin (resolved via node_modules/.bin).
+  const nx = await kernel.start("npx", ["b-cli"], { cwd: "/proj", capture: true });
+  assert(nx.code === 0 && nx.stdout.includes("b-cli ran"),
+    "Phase 2 #10 st2: npx runs a local node_modules/.bin executable");
 
   // Event loop v2 proof: ordering. nextTick beats Promise microtasks, and both
   // beat timers/immediates — which now actually FIRE (the old synchronous loop

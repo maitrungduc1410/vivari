@@ -35,6 +35,7 @@ import fsUtilsFactory from "./internal/fs/utils.js";
 import fsReadContextFactory from "./internal/fs/read/context.js";
 import urlFactory from "./internal/url.js";
 import blobFactory from "./internal/blob.js";
+import fileFactory from "./internal/file.js";
 import permissionFactory from "./internal/process/permission.js";
 import assertFactory from "./internal/assert.js";
 import abortListenerFactory from "./internal/events/abort_listener.js";
@@ -78,6 +79,12 @@ import perfObserveFactory from "./internal/perf/observe.js";
 import timersFactory from "./lib/timers.js";
 import diagnosticsChannelFactory from "./lib/diagnostics_channel.js";
 import clusterFactory from "./lib/cluster.js";
+import ttyFactory from "./lib/tty.js";
+import cryptoFactory from "./lib/crypto.js";
+import zlibFactory from "./lib/zlib.js";
+import urlPublicFactory from "./lib/url.js";
+import querystringFactory from "./lib/querystring.js";
+import internalQuerystringFactory from "./internal/querystring.js";
 
 // http (Phase 2 #8): Node's real lib/http.js + _http_* on stream + net + the
 // pure-JS internalBinding('http_parser'), plus small support shims/stubs.
@@ -93,6 +100,10 @@ import freelistFactory from "./internal/freelist.js";
 import httpsFactory from "./lib/https.js";
 import tlsFactory from "./lib/tls.js";
 import undiciFactory from "./internal/deps/undici/undici.js";
+
+// Vendored third-party (not a Node core module): real node-semver, used by the
+// npm program (Phase 2 #10 stage 2). Lazy — only instantiated when required.
+import semverFactory from "./vendor/semver.js";
 
 // name -> factory. Public builtins (e.g. "path") and internals ("internal/...")
 // live in the same table, just like Node's builtin id space.
@@ -119,6 +130,7 @@ const FACTORIES = {
   "internal/fs/read/context": fsReadContextFactory,
   "internal/url": urlFactory,
   "internal/blob": blobFactory,
+  "internal/file": fileFactory,
   "internal/process/permission": permissionFactory,
   "internal/assert": assertFactory,
   "internal/events/abort_listener": abortListenerFactory,
@@ -157,6 +169,12 @@ const FACTORIES = {
   timers: timersFactory,
   diagnostics_channel: diagnosticsChannelFactory,
   cluster: clusterFactory,
+  tty: ttyFactory,
+  crypto: cryptoFactory,
+  zlib: zlibFactory,
+  url: urlPublicFactory,
+  querystring: querystringFactory,
+  "internal/querystring": internalQuerystringFactory,
   http: httpFactory,
   _http_common: httpCommonFactory,
   _http_incoming: httpIncomingFactory,
@@ -169,6 +187,7 @@ const FACTORIES = {
   https: httpsFactory,
   tls: tlsFactory,
   "internal/deps/undici/undici": undiciFactory,
+  semver: semverFactory,
 };
 
 const strip = (name) => (name.startsWith("node:") ? name.slice(5) : name);

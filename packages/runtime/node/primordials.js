@@ -80,6 +80,12 @@ const GLOBALS = {
   Infinity,
   NaN,
   undefined,
+  // Bare global functions Node lists in its primordials table (used verbatim by
+  // e.g. lib/querystring.js). They don't follow the <Ns><Member> scheme.
+  decodeURIComponent,
+  encodeURIComponent,
+  decodeURI,
+  encodeURI,
 };
 
 function findDescriptor(obj, prop) {

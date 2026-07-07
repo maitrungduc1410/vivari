@@ -9,6 +9,47 @@ import { NPM_PROGRAM } from "./programs/npm.js";
 export const COREUTILS = {
   npm: NPM_PROGRAM,
 
+  // npx: run a package's bin from node_modules/.bin (installing it first if it is
+  // not already on PATH). Not installer logic, so it survives the switch to the
+  // real npm/npx (North Star). Assumes the bin name matches the package name.
+  npx: `
+const cp = require('child_process');
+const path = require('path');
+const fs = require('fs');
+const argv = process.argv.slice(2).filter((a) => a !== '-y' && a !== '--yes');
+if (!argv.length) { process.stderr.write('usage: npx <command> [args]\\n'); process.exit(1); }
+const name = argv[0];
+const rest = argv.slice(1);
+const cwd = process.cwd();
+function binPath(dir) {
+  const dirs = [];
+  let cur = dir;
+  for (;;) { dirs.push(cur + '/node_modules/.bin'); const p = path.dirname(cur); if (p === cur) break; cur = p; }
+  if (process.env.PATH) dirs.push(process.env.PATH);
+  dirs.push('/bin');
+  return dirs.join(':');
+}
+const PATH = binPath(cwd);
+const env = Object.assign({}, process.env, { PATH });
+function onPath(bin) {
+  for (const d of PATH.split(':')) {
+    try { if (fs.existsSync(d + '/' + bin) || fs.existsSync(d + '/' + bin + '.js')) return true; } catch (e) {}
+  }
+  return false;
+}
+if (!onPath(name)) {
+  process.stdout.write('npx: ' + name + ' not found locally, installing…\\n');
+  const inst = cp.spawnSync('npm', ['install', name], { cwd, env, encoding: 'utf8' });
+  if (inst.stdout) process.stdout.write(inst.stdout);
+  if (inst.stderr) process.stderr.write(inst.stderr);
+  if (inst.status) process.exit(inst.status);
+}
+const r = cp.spawnSync('sh', ['-c', [name].concat(rest).join(' ')], { cwd, env, encoding: 'utf8' });
+if (r.stdout) process.stdout.write(r.stdout);
+if (r.stderr) process.stderr.write(r.stderr);
+process.exit(r.status | 0);
+`,
+
   echo: `process.stdout.write(process.argv.slice(2).join(' ') + '\\n');\n`,
 
   pwd: `process.stdout.write(process.cwd() + '\\n');\n`,
@@ -86,7 +127,10 @@ process.exit(rc);
 
   node: `
 const path = require('path');
-const target = process.argv[2];
+// process.argv is ['node', '/bin/node.js', <script>, ...args]; drop the launcher
+// path so the loaded script sees Node semantics (argv[1] = its own path).
+process.argv.splice(1, 1);
+const target = process.argv[1];
 if (!target) {
   process.stderr.write('node: missing script\\n');
   process.exit(1);

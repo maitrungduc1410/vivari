@@ -224,7 +224,7 @@ export function createRuntime({
     cluster,
   };
 
-  const moduleSystem = createModuleSystem({ fs, path, builtins, process, globals });
+  const moduleSystem = createModuleSystem({ fs, path, builtins, process, globals, nodeModules });
 
   builtins.module = {
     createRequire: (from) =>

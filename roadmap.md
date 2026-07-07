@@ -423,20 +423,48 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     from `registry.npmjs.org`) then `require()`s the freshly installed tree. Headless verify
     builds real gzipped tarballs offline and proves resolve + hoist + `.bin` + require +
     `package.json`. verify: 45/45 PASS.
-    **Stage 2 (lean, in progress) — just enough to run a real Vite + Express project:**
-    (a) vendor **real `semver`** to replace the hand-rolled range logic (the hand-rolled
-    `satisfies` only understands caret/tilde/exact/x-range and *fails* on compound ranges
-    like `>=1.2 <2`, unions `1 || 2`, hyphen `1.2 - 2.3` — a real install blocker; and
-    `semver` survives the eventual switch to real npm, per the North Star); (b) **`npm run
-    <script>`** + **`npx`** (run installed `.bin`/package) so `npm run dev` can boot the
-    dev server. Deliberately **still deferred** (thrown away when real npm lands, so not
-    worth polishing now): `package-lock.json`, lifecycle scripts (pre/post-install),
-    peer/optional deps, dedup nuance, `npm ci`.
-11. **`zlib` — Wasm codec + real `lib/zlib.js`** [M] — compile zlib to Wasm; needed for
-    http gzip and general compat.
-12. **`crypto` — WebCrypto + Wasm + real `lib/crypto` (partial)** [L] — map to
-    WebCrypto where possible, Wasm for the rest. Partial first (hashes, hmac,
-    `randomBytes`) — enough for npm integrity + common libs.
+    **Stage 2 (lean) — DONE.** Just enough to drive a real install→run workflow:
+    (a) vendored **real `semver`** (`node/vendor/semver.js`, bundled from `semver@7` with
+    esbuild, lazy loader builtin) replaces the hand-rolled range logic — now compound
+    ranges (`>=1.2 <2`), unions (`1 || 2`) and hyphen ranges resolve exactly like npm, and
+    it survives the switch to real npm (North Star); (b) **`npm run <script>`** (+ `start`/
+    `test`) and **`npx`** run local executables, backed by **PATH-aware program resolution**
+    in the kernel (`node_modules/.bin` on PATH shadows `/bin`, `.bin` symlinks followed) so
+    a script's bare bin name (e.g. `vite`) resolves to the locally installed tool; also
+    fixed the `node` launcher to drop its own path from `argv` (scripts see Node's
+    `argv[1] = script` semantics). Demo boot now `npm run start`s the installed app. verify:
+    50/50 PASS. Note: a long-running dev server via `npm run` blocks (spawnSync) until
+    async `spawn`/streaming exists; launch servers directly (`node server.js`) meanwhile.
+    Full **Vite** additionally needs ESM (#13) + a Wasm bundler (esbuild-wasm). Deliberately
+    **still deferred** (thrown away when real npm lands): `package-lock.json`, lifecycle
+    scripts, peer/optional deps, dedup nuance, `npm ci`.
+    - **✅ Express runs for real (verified).** `npm install express` pulls the full ~70-package
+      tree from registry.npmjs.org and the unmodified framework boots + serves on our vendored
+      Node stack — router, params, and `express.json()` body parsing all work. Demo boot now
+      installs + runs it and calls three routes; `scripts/verify-express.mjs` is a
+      network-gated e2e smoke test (kept out of the hermetic `verify-node.mjs`). Getting there
+      added several builtins the dependency tree needs: **`tty`** (stub — `isatty()=false` for
+      `debug`), **`url`** (legacy `parse`/`format`/`resolve` over WHATWG URL, for `parseurl`),
+      **`querystring`** (now **vendored verbatim** from Node v24.18.0 — `lib/querystring.js` +
+      `internal/querystring`, output byte-for-byte identical to Node), **`internal/file`**
+      (`buffer.File`), plus partial **`crypto`** (#12) and **`zlib`** (#11). Also added
+      `decodeURIComponent`/`encodeURIComponent`/`decodeURI`/`encodeURI` + `ERR_INVALID_URI` to
+      primordials/errors so the verbatim source links. Also fixed a real CommonJS bug: the module wrapper injected
+      `Buffer`/`process`/… as *parameters*, so a userland `const Buffer = require('buffer').Buffer`
+      threw "Identifier already declared" — now they're true globals (as in Node) and only
+      `exports/require/module/__filename/__dirname` are wrapper params.
+11. **`zlib` — Wasm codec + real `lib/zlib.js`** [M] — **PARTIAL DONE.** `node/lib/zlib.js`
+    wraps the browser `Compression/DecompressionStream` as Node Transform streams, so
+    `createGzip/Gunzip/Deflate/Inflate(+Raw)` and `createUnzip` work for real (gzip/deflate);
+    brotli and the `*Sync` one-shots throw loudly (no Web equivalent). Enough for
+    `body-parser`/`compression` to load and handle encoded bodies. TODO: real `lib/zlib.js`
+    + a Wasm codec for brotli + sync APIs.
+12. **`crypto` — WebCrypto + Wasm + real `lib/crypto` (partial)** [L] — **PARTIAL DONE.**
+    `node/lib/crypto.js` ships synchronous pure-JS `createHash` (MD5/SHA-1/SHA-256) +
+    `createHmac`, plus WebCrypto-backed `randomBytes`/`randomFill`/`randomInt`/`randomUUID`.
+    Enough for the userland happy path (ETag/session libs hash synchronously) — this is what
+    unblocked **Express** (its `etag` dep requires `crypto` at load). Ciphers/sign/verify/KDFs
+    throw loudly. TODO: more digests, ciphers, and a Wasm/`lib/crypto` backing for the rest.
 13. **ESM (`import`/`export`)** [L] — native browser ESM served from the VFS via the
     Service Worker, or Node's esm loader. Unblocks modern packages.
 14. **VFS worker split** [M] — *decomp, deliberately LATE.* Split the Wasm VFS into its
@@ -445,6 +473,15 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     before the contract settles = double churn — that's why it isn't first.)
 15. **Extras (ongoing)** — nested `worker_threads` (our `[worker n]`), heavy toolchains
     (`esbuild`/`vite`/`tsserver` as Wasm), IndexedDB persistence, pre-warm worker pool.
+16. **WASI + napi-rs Wasm runtime (native→wasm packages)** [XL] — *future goal.* Many
+    modern toolchains ship a `wasm32-wasi` build of their native `.node` addon and switch to
+    it when they detect a WebContainer-class host (e.g. Vite's `rolldown` downloads
+    `@rolldown/binding-wasm32-wasi`; also esbuild-wasm, `@swc/wasm`, `@napi-rs/*`). To run
+    them we need (a) a **WASI preview1 shim** bridged to our VFS + a fake clock/argv/env, and
+    (b) **napi-on-wasm** (`emnapi`) so N-API addons compiled via napi-rs load. This is the
+    real unlock for "install Vite and it just builds" without us hand-porting each tool.
+    Depends on: stable fs/VFS contract (#14), ESM (#13). Pairs with the "detect env → fetch
+    the wasm variant" logic real npm/pnpm already have (see North Star).
 
 ## Why this order (the tradeoffs)
 
