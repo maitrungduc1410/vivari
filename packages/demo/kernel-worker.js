@@ -39,6 +39,36 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ now: Date.now(), pid: process.pid }));
     return;
   }
+  if (req.url === '/api/buffer') {
+    // Exercise Node's REAL Buffer (vendored lib/buffer.js on our
+    // internalBinding('buffer')) entirely inside the browser.
+    const alloc = Buffer.alloc(4);
+    alloc.writeUInt32BE(0xdeadbeef, 0);
+    const big = Buffer.alloc(8);
+    big.writeBigUInt64BE(0x0102030405060708n, 0);
+
+    const demo = {
+      node: process.version,
+      isUint8ArraySubclass: Buffer.from('x') instanceof Uint8Array,
+      text: 'OpenContainer · café €',
+      hex: Buffer.from('OpenContainer').toString('hex'),
+      base64: Buffer.from('OpenContainer').toString('base64'),
+      base64urlRoundTrip:
+        Buffer.from(Buffer.from('café €').toString('base64url'), 'base64url').toString('utf8'),
+      utf8ByteLength: Buffer.byteLength('café €', 'utf8'),
+      utf16leHex: Buffer.from('hi', 'utf16le').toString('hex'),
+      u32_BE_hex: alloc.toString('hex'),
+      u32_LE_read: alloc.readUInt32LE(0),
+      bigUInt64: big.readBigUInt64BE(0).toString(),
+      swap16: Buffer.from([1, 2, 3, 4]).swap16().toString('hex'),
+    };
+
+    // The response body is itself built with Buffer, then sent through http.
+    const body = Buffer.from(JSON.stringify(demo, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(\`<!doctype html>
 <html><head><meta charset="utf-8"><title>Hello from OpenContainer</title>
@@ -53,13 +83,18 @@ const server = http.createServer((req, res) => {
 <body><div class="card">
   <h1>Hello from OpenContainer 🎉</h1>
   <p>Served by <code>http.createServer</code> in worker <code>PID \${process.pid}</code></p>
+  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> vendored, running in your browser</p>
   <p>You requested <code>\${req.url}</code></p>
   <button onclick="fetch('api/time').then(r=>r.json()).then(t=>document.getElementById('t').textContent=JSON.stringify(t))">GET /api/time</button>
+  <button onclick="fetch('api/buffer').then(r=>r.json()).then(t=>document.getElementById('b').textContent=JSON.stringify(t,null,2))">GET /api/buffer</button>
   <pre id="t"></pre>
+  <pre id="b"></pre>
 </div></body></html>\`);
 });
 
-server.listen(3000, () => console.log('[server] listening on http://localhost:3000 (pid ' + process.pid + ')'));
+server.listen(3000, () =>
+  console.log('[server] listening on http://localhost:3000 (pid ' + process.pid +
+    ') · Buffer check ' + Buffer.from('ok').toString('hex') + ' · node ' + process.version));
 `;
 
 let kernel = null;

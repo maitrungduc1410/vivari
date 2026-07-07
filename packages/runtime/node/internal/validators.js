@@ -12,11 +12,32 @@ export default function (exports, require, module, process, internalBinding, pri
   "use strict";
 
   const {
-    codes: { ERR_INVALID_ARG_TYPE },
+    codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE },
   } = require("internal/errors");
+
+  const MIN = Number.MIN_SAFE_INTEGER;
+  const MAX = Number.MAX_SAFE_INTEGER;
 
   function validateString(value, name) {
     if (typeof value !== "string") throw new ERR_INVALID_ARG_TYPE(name, "string", value);
+  }
+
+  function validateInteger(value, name, min = MIN, max = MAX) {
+    if (typeof value !== "number") throw new ERR_INVALID_ARG_TYPE(name, "number", value);
+    if (!Number.isInteger(value)) throw new ERR_OUT_OF_RANGE(name, "an integer", value);
+    if (value < min || value > max)
+      throw new ERR_OUT_OF_RANGE(name, `>= ${min} && <= ${max}`, value);
+  }
+
+  function validateArray(value, name, minLength = 0) {
+    if (!Array.isArray(value)) throw new ERR_INVALID_ARG_TYPE(name, "Array", value);
+    if (value.length < minLength)
+      throw new ERR_INVALID_ARG_VALUE(name, value, `must be longer than ${minLength}`);
+  }
+
+  function validateBuffer(buffer, name = "buffer") {
+    if (!ArrayBuffer.isView(buffer))
+      throw new ERR_INVALID_ARG_TYPE(name, ["Buffer", "TypedArray", "DataView"], buffer);
   }
 
   function validateNumber(value, name, min = undefined, max) {
@@ -66,6 +87,9 @@ export default function (exports, require, module, process, internalBinding, pri
     validateNumber,
     validateBoolean,
     validateFunction,
+    validateInteger,
+    validateArray,
+    validateBuffer,
     validateObject,
     kValidateObjectNone,
     kValidateObjectAllowNullable,

@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OpenContainer · Phase 2 #1 — Kernel Worker</title>
+    <title>OpenContainer · Phase 2 — Path B (real Node lib/)</title>
     <style>
       :root {
         color-scheme: dark;
@@ -101,12 +101,13 @@
   </head>
   <body>
     <header>
-      <h1>OpenContainer · Phase 2 #1 — Kernel Worker</h1>
+      <h1>OpenContainer · Phase 2 — Path B (real Node lib/)</h1>
       <p>
-        The kernel + Rust/Wasm VFS now run in a dedicated kernel worker, off the
-        main thread; process workers are spawned nested under it. An in-memory
-        HTTP server (parked in a blocking accept loop) is previewed via a Service
-        Worker that routes the iframe's requests through the kernel — no network.
+        The kernel + Rust/Wasm VFS run in a dedicated kernel worker; process
+        workers are spawned nested under it. Programs run Node's REAL, unmodified
+        <code>lib/path.js</code> and <code>lib/buffer.js</code> (v24.18.0) over our
+        <code>internalBinding</code> layer. The in-memory HTTP server is previewed
+        via a Service Worker — try <code>GET /api/buffer</code> in the preview.
       </p>
     </header>
     <div class="split">

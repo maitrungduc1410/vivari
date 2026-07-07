@@ -210,8 +210,18 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
    - ⏳ Next in this item: `events` and `util` the same way (these pull real
      `internal/errors`, `internal/util`, `internal/util/types`, so the internal layer
      graduates from "minimal" to vendored-real as we go).
-3. **`buffer` binding + real `lib/buffer.js`** [S–M] — Buffer is used by fs/stream/http;
+3. ✅ **`buffer` binding + real `lib/buffer.js`** [S–M] — Buffer is used by fs/stream/http;
    get the real one in early. Backed by Wasm memory / `Uint8Array`.
+   - ✅ `require('buffer').Buffer` (and the global) is now Node v24.18.0's **real,
+     unmodified** `lib/buffer.js` + `internal/buffer.js`, running over a hand-written
+     `internalBinding('buffer')` (`node/bindings/buffer.js`) that maps utf8/base64/hex/
+     ucs2 codecs, indexOf, compare/copy/fill, byteswap and atob/btoa onto
+     `TextEncoder`/`TextDecoder` + typed-array loops. The numeric read/write methods
+     are Node's pure-JS ones. Hand-written `builtins/buffer.js` deleted.
+   - This grew the shared internal layer that everything downstream reuses:
+     `primordials` is now a self-generating Proxy; added `internal/util/{types,inspect}`,
+     `internal/v8/startup_snapshot`, `internal/options`, `internalBinding('util'/'config')`,
+     and more error codes / validators.
 4. **`internalBinding('fs')` + real `lib/fs.js` + `internal/fs/*`** [M] — reshape our
    existing `fs-client.js` (already a hand-rolled fs binding) into the shape Node's
    `lib/fs.js` expects (`FSReqCallback`, `statValues`, sync + async). Backend (Rust

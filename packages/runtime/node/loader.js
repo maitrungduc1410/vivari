@@ -15,19 +15,32 @@ import { primordials } from "./primordials.js";
 import { createInternalBinding } from "./internal-binding.js";
 
 import pathFactory from "./lib/path.js";
+import bufferFactory from "./lib/buffer.js";
 import constantsFactory from "./internal/constants.js";
 import validatorsFactory from "./internal/validators.js";
 import errorsFactory from "./internal/errors.js";
 import utilFactory from "./internal/util.js";
+import utilTypesFactory from "./internal/util/types.js";
+import utilInspectFactory from "./internal/util/inspect.js";
+import internalBufferFactory from "./internal/buffer.js";
+import startupSnapshotFactory from "./internal/v8/startup_snapshot.js";
+import optionsFactory from "./internal/options.js";
 
 // name -> factory. Public builtins (e.g. "path") and internals ("internal/...")
 // live in the same table, just like Node's builtin id space.
 const FACTORIES = {
   path: pathFactory,
+  buffer: bufferFactory,
+  "util/types": utilTypesFactory,
   "internal/constants": constantsFactory,
   "internal/validators": validatorsFactory,
   "internal/errors": errorsFactory,
   "internal/util": utilFactory,
+  "internal/util/types": utilTypesFactory,
+  "internal/util/inspect": utilInspectFactory,
+  "internal/buffer": internalBufferFactory,
+  "internal/v8/startup_snapshot": startupSnapshotFactory,
+  "internal/options": optionsFactory,
 };
 
 const strip = (name) => (name.startsWith("node:") ? name.slice(5) : name);

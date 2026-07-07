@@ -4,7 +4,6 @@
 
 import { createSyscalls } from "./fs-client.js";
 import { createNodeModules } from "./node/loader.js";
-import { createBuffer } from "./builtins/buffer.js";
 import { EventEmitter } from "./builtins/events.js";
 import { createUtil } from "./builtins/util.js";
 import { createOs } from "./builtins/os.js";
@@ -66,15 +65,17 @@ export function createRuntime({
   // Open HTTP servers keyed by port. `run()` stays alive while this is non-empty.
   const servers = new Map();
 
-  const Buffer = createBuffer();
-  const util = createUtil({ Buffer });
   const os = createOs();
   const process = createProcess({ pid, ppid, argv, env, cwd, stdout, stderr, enqueueTask });
 
   // Path B: Node's REAL lib/ modules run on top of our internalBinding layer.
-  // `path` is the first — the vendored, unmodified Node v24.18.0 lib/path.js.
+  // `path` and `buffer` are vendored, unmodified Node v24.18.0 source; `Buffer`
+  // is the real Buffer (Uint8Array subclass) over our internalBinding('buffer').
   const nodeModules = createNodeModules({ process });
+  const bufferModule = nodeModules.require("buffer");
+  const Buffer = bufferModule.Buffer;
   const path = nodeModules.require("path");
+  const util = createUtil({ Buffer });
   const fs = createFs(syscalls, Buffer, path);
   const assert = createAssert(util);
   const child_process = createChildProcess({ sys: syscalls, process, Buffer });
@@ -107,7 +108,7 @@ export function createRuntime({
     child_process,
     http,
     events: EventEmitter,
-    buffer: { Buffer, constants: { MAX_LENGTH: 0x7fffffff } },
+    buffer: bufferModule,
   };
 
   const moduleSystem = createModuleSystem({ fs, path, builtins, process, globals });

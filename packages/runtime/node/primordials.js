@@ -1,103 +1,164 @@
-// primordials — Node's "safe intrinsics" object.
+// primordials — Node's "safe intrinsics" object, generated on demand.
 //
 // Node's real lib/ modules are written against `primordials` (e.g.
-// `StringPrototypeSlice(str, a, b)` instead of `str.slice(a, b)`) so they can't
-// be broken by user code monkey-patching Array/String/Object prototypes. Each
-// entry is the prototype method "uncurried" so the receiver is the first arg.
+// `StringPrototypeSlice(str, a, b)` instead of `str.slice(a, b)`, `ArrayIsArray`
+// instead of `Array.isArray`) so user code can't break them by patching
+// prototypes. Node ships a huge hand-maintained table. We instead resolve names
+// from their well-known naming scheme via a Proxy, so adopting a new real lib/
+// module doesn't require hand-listing dozens of intrinsics:
 //
-// This is our own infrastructure (imported by the loader), not vendored Node
-// source. It starts with the set the vendored modules need and grows as we add
-// more real lib/ modules (Path B). Node generates a much larger table; we add
-// entries on demand.
+//   <Global>                       -> globalThis[Global]              (Array, Uint8Array)
+//   <Ns><Static>                   -> Ns[static]                      (ArrayIsArray, MathFloor)
+//   <Ns>Prototype                  -> Ns.prototype                    (Uint8ArrayPrototype)
+//   <Ns>Prototype<Method>          -> uncurry(Ns.prototype.method)    (StringPrototypeSlice)
+//   <Ns>PrototypeGet<Accessor>     -> uncurry(getter)                 (TypedArrayPrototypeGetBuffer)
+//   <Ns>PrototypeSymbol<WellKnown> -> uncurry(proto[Symbol.wellKnown])(RegExpPrototypeSymbolReplace)
+//   Symbol<WellKnown>              -> Symbol.wellKnown                 (SymbolIterator, SymbolSpecies)
+//
+// Resolved values are memoized so identities stay stable. Unknown names throw
+// loudly, which surfaces the exact intrinsic a newly-vendored module needs.
 
+// Uncurry a prototype method so the receiver is passed as the first argument:
+// StringPrototypeSlice(str, 1, 2) === str.slice(1, 2).
 const uncurryThis =
   (fn) =>
   (self, ...args) =>
     fn.apply(self, args);
 
-export const primordials = {
-  // Globals / constructors
-  globalThis,
+const lowerFirst = (s) => (s.length ? s[0].toLowerCase() + s.slice(1) : s);
+
+// %TypedArray% — the abstract base constructor shared by Uint8Array etc.
+const TypedArray = Object.getPrototypeOf(Uint8Array);
+
+// Namespaces we resolve `<Ns>...` names against, longest first so that e.g.
+// "ArrayBufferIsView" matches ArrayBuffer, not Array.
+const NAMESPACES = {
+  TypedArray,
+  ...(typeof SharedArrayBuffer !== "undefined" ? { SharedArrayBuffer } : {}),
+  ArrayBuffer,
+  Uint8ClampedArray,
+  BigInt64Array,
+  BigUint64Array,
+  Float32Array,
+  Float64Array,
+  Uint16Array,
+  Uint32Array,
+  Int16Array,
+  Int32Array,
+  Uint8Array,
+  Int8Array,
+  WeakMap,
+  WeakSet,
   Array,
-  ArrayIsArray: Array.isArray,
-  Boolean,
-  Error,
-  Number,
   Object,
-  RangeError,
+  Function,
+  Boolean,
+  Number,
+  BigInt,
+  Math,
+  JSON,
   Reflect,
-  ReflectApply: Reflect.apply,
-  ReflectOwnKeys: Reflect.ownKeys,
   String,
   Symbol,
-  SymbolIterator: Symbol.iterator,
+  RegExp,
+  Date,
+  Error,
   TypeError,
-
-  // Number statics
-  NumberIsInteger: Number.isInteger,
-  NumberIsNaN: Number.isNaN,
-  NumberMAX_SAFE_INTEGER: Number.MAX_SAFE_INTEGER,
-  NumberMIN_SAFE_INTEGER: Number.MIN_SAFE_INTEGER,
-  NumberParseInt: Number.parseInt,
-  NumberParseFloat: Number.parseFloat,
-
-  // Object statics
-  ObjectKeys: Object.keys,
-  ObjectValues: Object.values,
-  ObjectEntries: Object.entries,
-  ObjectAssign: Object.assign,
-  ObjectCreate: Object.create,
-  ObjectFreeze: Object.freeze,
-  ObjectDefineProperty: Object.defineProperty,
-  ObjectDefineProperties: Object.defineProperties,
-  ObjectGetPrototypeOf: Object.getPrototypeOf,
-  ObjectSetPrototypeOf: Object.setPrototypeOf,
-  ObjectGetOwnPropertyDescriptor: Object.getOwnPropertyDescriptor,
-  ObjectGetOwnPropertyNames: Object.getOwnPropertyNames,
-  ObjectPrototypeHasOwnProperty: uncurryThis(Object.prototype.hasOwnProperty),
-  ObjectPrototypeToString: uncurryThis(Object.prototype.toString),
-
-  // Function
-  FunctionPrototypeBind: uncurryThis(Function.prototype.bind),
-  FunctionPrototypeCall: uncurryThis(Function.prototype.call),
-  FunctionPrototypeApply: uncurryThis(Function.prototype.apply),
-
-  // Array.prototype
-  ArrayPrototypePush: uncurryThis(Array.prototype.push),
-  ArrayPrototypePop: uncurryThis(Array.prototype.pop),
-  ArrayPrototypeShift: uncurryThis(Array.prototype.shift),
-  ArrayPrototypeUnshift: uncurryThis(Array.prototype.unshift),
-  ArrayPrototypeSlice: uncurryThis(Array.prototype.slice),
-  ArrayPrototypeSplice: uncurryThis(Array.prototype.splice),
-  ArrayPrototypeIncludes: uncurryThis(Array.prototype.includes),
-  ArrayPrototypeIndexOf: uncurryThis(Array.prototype.indexOf),
-  ArrayPrototypeJoin: uncurryThis(Array.prototype.join),
-  ArrayPrototypeMap: uncurryThis(Array.prototype.map),
-  ArrayPrototypeForEach: uncurryThis(Array.prototype.forEach),
-  ArrayPrototypeFilter: uncurryThis(Array.prototype.filter),
-  ArrayPrototypeConcat: uncurryThis(Array.prototype.concat),
-  ArrayPrototypeReverse: uncurryThis(Array.prototype.reverse),
-
-  // String.prototype
-  StringPrototypeCharCodeAt: uncurryThis(String.prototype.charCodeAt),
-  StringPrototypeCodePointAt: uncurryThis(String.prototype.codePointAt),
-  StringPrototypeIndexOf: uncurryThis(String.prototype.indexOf),
-  StringPrototypeLastIndexOf: uncurryThis(String.prototype.lastIndexOf),
-  StringPrototypeSlice: uncurryThis(String.prototype.slice),
-  StringPrototypeSubstring: uncurryThis(String.prototype.substring),
-  StringPrototypeReplace: uncurryThis(String.prototype.replace),
-  StringPrototypeSplit: uncurryThis(String.prototype.split),
-  StringPrototypeStartsWith: uncurryThis(String.prototype.startsWith),
-  StringPrototypeEndsWith: uncurryThis(String.prototype.endsWith),
-  StringPrototypeIncludes: uncurryThis(String.prototype.includes),
-  StringPrototypeToLowerCase: uncurryThis(String.prototype.toLowerCase),
-  StringPrototypeToUpperCase: uncurryThis(String.prototype.toUpperCase),
-  StringPrototypeTrim: uncurryThis(String.prototype.trim),
-  StringPrototypeRepeat: uncurryThis(String.prototype.repeat),
-  StringPrototypePadStart: uncurryThis(String.prototype.padStart),
-
-  // RegExp.prototype
-  RegExpPrototypeExec: uncurryThis(RegExp.prototype.exec),
-  RegExpPrototypeTest: uncurryThis(RegExp.prototype.test),
-  RegExpPrototypeSymbolReplace: uncurryThis(RegExp.prototype[Symbol.replace]),
+  RangeError,
+  SyntaxError,
+  Promise,
+  Map,
+  Set,
+  Proxy,
+  DataView,
 };
+const NS_NAMES = Object.keys(NAMESPACES).sort((a, b) => b.length - a.length);
+
+const GLOBALS = {
+  globalThis,
+  ...NAMESPACES,
+  Infinity,
+  NaN,
+  undefined,
+};
+
+function findDescriptor(obj, prop) {
+  let cur = obj;
+  while (cur) {
+    const d = Object.getOwnPropertyDescriptor(cur, prop);
+    if (d) return d;
+    cur = Object.getPrototypeOf(cur);
+  }
+  return undefined;
+}
+
+function resolvePrototypeMember(proto, methodPart) {
+  // Well-known symbol member, e.g. PrototypeSymbolReplace -> proto[Symbol.replace].
+  if (methodPart.startsWith("Symbol")) {
+    const sym = Symbol[lowerFirst(methodPart.slice(6))];
+    if (sym && typeof proto[sym] === "function") return uncurryThis(proto[sym]);
+    return undefined;
+  }
+  // Direct method or accessor named exactly (lowerFirst).
+  const direct = findDescriptor(proto, lowerFirst(methodPart));
+  if (direct) {
+    if (typeof direct.value === "function") return uncurryThis(direct.value);
+    if (direct.get) return uncurryThis(direct.get);
+  }
+  // Accessor getters/setters spelled Get<Prop> / Set<Prop>.
+  if (methodPart.startsWith("Get")) {
+    const d = findDescriptor(proto, lowerFirst(methodPart.slice(3)));
+    if (d && d.get) return uncurryThis(d.get);
+  }
+  if (methodPart.startsWith("Set")) {
+    const d = findDescriptor(proto, lowerFirst(methodPart.slice(3)));
+    if (d && d.set) return uncurryThis(d.set);
+  }
+  return undefined;
+}
+
+function resolve(name) {
+  if (Object.prototype.hasOwnProperty.call(GLOBALS, name)) return GLOBALS[name];
+
+  for (const ns of NS_NAMES) {
+    if (name.length <= ns.length || !name.startsWith(ns)) continue;
+    const base = NAMESPACES[ns];
+    const rest = name.slice(ns.length);
+
+    if (rest === "Prototype") return base.prototype;
+    if (rest.startsWith("Prototype")) {
+      const hit = resolvePrototypeMember(base.prototype, rest.slice("Prototype".length));
+      if (hit !== undefined) return hit;
+      continue;
+    }
+    // Static method or constant: try lowerFirst (isArray, defineProperty) then
+    // the raw name (MAX_SAFE_INTEGER, POSITIVE_INFINITY).
+    const lf = lowerFirst(rest);
+    if (lf in base) return base[lf];
+    if (rest in base) return base[rest];
+  }
+  return undefined;
+}
+
+const cache = { __proto__: null };
+
+export const primordials = new Proxy(
+  { __proto__: null },
+  {
+    get(_target, prop) {
+      if (typeof prop !== "string") return undefined;
+      if (prop in cache) return cache[prop];
+      const value = resolve(prop);
+      if (value === undefined && !["undefined", "NaN"].includes(prop)) {
+        throw new Error(
+          `OpenContainer: primordials.${prop} is not resolvable — add it to node/primordials.js`,
+        );
+      }
+      cache[prop] = value;
+      return value;
+    },
+    has(_target, prop) {
+      return typeof prop === "string" && resolve(prop) !== undefined;
+    },
+  },
+);

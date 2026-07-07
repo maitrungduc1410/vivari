@@ -1,10 +1,11 @@
-// internal/util — minimal, compatible subset.
+// internal/util — minimal, compatible subset (grows per adopted module).
 //
 // NOT vendored verbatim: Node's real internal/util.js is large and pulls
 // internal/util/types, internalBinding('util'), the encodings table, etc. We
-// provide only what the currently-vendored lib/ modules destructure at load
-// time. v24's lib/path.js needs `{ isWindows, getLazy }`. This grows / is
-// replaced by the real file as we adopt events + util (which need much more).
+// provide only what the currently-vendored lib/ modules destructure.
+//   path   → { isWindows, getLazy }
+//   buffer → { customInspectSymbol, lazyDOMException, normalizeEncoding,
+//              kIsEncodingSymbol, defineLazyProperties, encodingsMap, deprecate }
 //
 // Authored as a builtin factory so the loader treats it like any other module.
 
@@ -13,9 +14,7 @@ export default function (exports, require, module, process, internalBinding, pri
 
   const isWindows = process.platform === "win32";
 
-  // Memoize a value on first access. Matches Node's internal getLazy: returns a
-  // getter function so the (possibly expensive) initializer runs at most once,
-  // and only when actually needed (e.g. path.matchesGlob → internal/fs/glob).
+  // Memoize a value on first access (used for lazy internal requires).
   function getLazy(initializer) {
     let value;
     let initialized = false;
@@ -28,5 +27,96 @@ export default function (exports, require, module, process, internalBinding, pri
     };
   }
 
-  module.exports = { isWindows, getLazy };
+  const customInspectSymbol = Symbol.for("nodejs.util.inspect.custom");
+  const kIsEncodingSymbol = Symbol("kIsEncoding");
+
+  // Canonical encoding names. Buffer indexes this by name and hands the value to
+  // internalBinding('buffer'); since we own both ends, the value is just the name.
+  const encodingsMap = {
+    __proto__: null,
+    ascii: "ascii",
+    utf8: "utf8",
+    "utf-8": "utf8",
+    utf16le: "utf16le",
+    "utf-16le": "utf16le",
+    ucs2: "utf16le",
+    "ucs-2": "utf16le",
+    base64: "base64",
+    base64url: "base64url",
+    latin1: "latin1",
+    binary: "latin1",
+    hex: "hex",
+    buffer: "buffer",
+  };
+
+  function normalizeEncoding(enc) {
+    if (enc == null || enc === "utf8" || enc === "utf-8") return "utf8";
+    const low = ("" + enc).toLowerCase();
+    const mapped = encodingsMap[low];
+    if (mapped) return mapped === "buffer" ? undefined : mapped;
+    return undefined;
+  }
+
+  function defineLazyProperties(target, id, keys, enumerable = true) {
+    for (const key of keys) {
+      let cached;
+      let loaded = false;
+      Object.defineProperty(target, key, {
+        configurable: true,
+        enumerable,
+        get() {
+          if (!loaded) {
+            cached = require(id)[key];
+            loaded = true;
+          }
+          return cached;
+        },
+        set(value) {
+          Object.defineProperty(target, key, {
+            value,
+            writable: true,
+            enumerable,
+            configurable: true,
+          });
+        },
+      });
+    }
+  }
+
+  function deprecate(fn, msg, code) {
+    let warned = false;
+    function deprecated(...args) {
+      if (!warned) {
+        warned = true;
+        if (typeof process.emitWarning === "function") {
+          try {
+            process.emitWarning(msg, "DeprecationWarning", code);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      return Reflect.apply(fn, this, args);
+    }
+    return deprecated;
+  }
+
+  function lazyDOMException(message, name) {
+    if (typeof DOMException === "function") return new DOMException(message, name);
+    const err = new Error(message);
+    err.name = name;
+    return err;
+  }
+
+  module.exports = {
+    isWindows,
+    getLazy,
+    customInspectSymbol,
+    kIsEncodingSymbol,
+    encodingsMap,
+    normalizeEncoding,
+    defineLazyProperties,
+    deprecate,
+    lazyDOMException,
+  };
 }

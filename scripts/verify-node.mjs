@@ -145,6 +145,47 @@ console.log('PATHB_OK');
   assert(pb.code === 0 && pb.stdout.includes("PATHB_OK"),
     "Path B: real Node lib/path.js runs (posix + win32) via the loader");
 
+  // Path B proof: require('buffer') is Node's REAL vendored lib/buffer.js on our
+  // internalBinding('buffer'). Exercise codecs, numeric read/write (incl. BigInt),
+  // byteswap, concat/compare, and the Uint8Array-subclass identity.
+  kernel.writeFile(
+    "/t/bufferb.js",
+    `
+const assert = require('assert');
+const b = require('buffer');
+// It's the real module: Buffer is a Uint8Array subclass.
+assert.strictEqual(Buffer.from('x') instanceof Uint8Array, true);
+assert.strictEqual(Buffer.isBuffer(Buffer.from('x')), true);
+assert.strictEqual(typeof b.kMaxLength, 'number');
+// Codec round-trips.
+assert.strictEqual(Buffer.from('hello').toString('hex'), '68656c6c6f');
+assert.strictEqual(Buffer.from('68656c6c6f', 'hex').toString(), 'hello');
+assert.strictEqual(Buffer.from('hello').toString('base64'), 'aGVsbG8=');
+assert.strictEqual(Buffer.from('aGVsbG8=', 'base64').toString(), 'hello');
+assert.strictEqual(Buffer.from('hi').toString('base64url'), 'aGk');
+assert.strictEqual(Buffer.from('café').toString('utf8'), 'café');
+assert.strictEqual(Buffer.byteLength('€', 'utf8'), 3);
+assert.strictEqual(Buffer.from('hi', 'utf16le').toString('hex'), '68006900');
+assert.strictEqual(Buffer.from('hi', 'utf16le').toString('utf16le'), 'hi');
+// Numeric read/write (pure-JS internal/buffer.js).
+const n = Buffer.alloc(4); n.writeUInt32BE(0xdeadbeef, 0);
+assert.strictEqual(n.toString('hex'), 'deadbeef');
+assert.strictEqual(n.readUInt32BE(0), 0xdeadbeef);
+assert.strictEqual(n.readUInt32LE(0), 0xefbeadde);
+const big = Buffer.alloc(8); big.writeBigUInt64BE(0x0102030405060708n, 0);
+assert.strictEqual(big.readBigUInt64BE(0), 0x0102030405060708n);
+// Byteswap, concat, compare, indexOf.
+assert.strictEqual(Buffer.from([1, 2, 3, 4]).swap16().toString('hex'), '02010403');
+assert.strictEqual(Buffer.concat([Buffer.from('foo'), Buffer.from('bar')]).toString(), 'foobar');
+assert.strictEqual(Buffer.compare(Buffer.from('a'), Buffer.from('b')), -1);
+assert.strictEqual(Buffer.from('hello').indexOf('ll'), 2);
+console.log('BUFFERB_OK');
+`,
+  );
+  const bb = await kernel.start("node", ["/t/bufferb.js"], { cwd: "/t", capture: true });
+  assert(bb.code === 0 && bb.stdout.includes("BUFFERB_OK"),
+    "Path B: real Node lib/buffer.js runs (codecs/numeric/bigint/swap) via internalBinding('buffer')");
+
   // === brick 4: shell session with each command as its own process ===
   const sh = await kernel.start("sh", ["/root.sh"], { cwd: "/", capture: true });
   const o = sh.stdout;

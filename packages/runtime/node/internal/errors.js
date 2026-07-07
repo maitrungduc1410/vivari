@@ -75,17 +75,55 @@ export default function (exports, require, module, process, internalBinding, pri
       `${name} should be ${allowZero ? ">=" : ">"} 0 and < 65536. Received ${port}`,
   );
 
+  const ERR_BUFFER_OUT_OF_BOUNDS = makeNodeError(
+    RangeError,
+    "ERR_BUFFER_OUT_OF_BOUNDS",
+    (name) =>
+      name
+        ? `"${name}" is outside of buffer bounds`
+        : "Attempt to access memory outside buffer bounds",
+  );
+
+  const ERR_INVALID_BUFFER_SIZE = makeNodeError(
+    RangeError,
+    "ERR_INVALID_BUFFER_SIZE",
+    (size) => `Buffer size must be a multiple of ${size}`,
+  );
+
+  const ERR_UNKNOWN_ENCODING = makeNodeError(
+    TypeError,
+    "ERR_UNKNOWN_ENCODING",
+    (enc) => `Unknown encoding: ${enc}`,
+  );
+
+  const ERR_MISSING_ARGS = makeNodeError(TypeError, "ERR_MISSING_ARGS", (...args) => {
+    const names = args.map((a) => `"${a}"`);
+    const list =
+      names.length > 1
+        ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`
+        : names[0];
+    return `The ${list} argument${names.length > 1 ? "s" : ""} must be specified`;
+  });
+
+  // A plain Error carrying extra properties (used by Buffer.transcode et al.).
+  const genericNodeError = (message, props) => Object.assign(new Error(message), props);
+
   // Node hides internal stack frames; for us the identity wrapper is fine.
   const hideStackFrames = (fn) => fn;
 
   module.exports = {
     hideStackFrames,
+    genericNodeError,
     codes: {
       ERR_INVALID_ARG_TYPE,
       ERR_INVALID_ARG_VALUE,
       ERR_OUT_OF_RANGE,
       ERR_UNKNOWN_SIGNAL,
       ERR_SOCKET_BAD_PORT,
+      ERR_BUFFER_OUT_OF_BOUNDS,
+      ERR_INVALID_BUFFER_SIZE,
+      ERR_UNKNOWN_ENCODING,
+      ERR_MISSING_ARGS,
     },
   };
 }
