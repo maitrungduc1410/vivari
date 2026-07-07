@@ -45,7 +45,38 @@ function makeKernel() {
       postMessage: (m) => worker.postMessage(m),
     };
   };
-  const kernel = new Kernel({ vfs, spawnWorker });
+  // Deterministic, offline mock of the Fetcher Worker (Phase 2 #9): canned npm
+  // fixtures + a call counter so we can assert the kernel-side content cache
+  // actually skips the network on a repeated URL.
+  const enc = new TextEncoder();
+  const fixtures = {
+    "https://registry.example/left-pad": {
+      contentType: "application/json",
+      body: enc.encode(
+        JSON.stringify({
+          name: "left-pad",
+          "dist-tags": { latest: "1.3.0" },
+          versions: {
+            "1.0.0": { dist: { tarball: "https://registry.example/left-pad/-/left-pad-1.0.0.tgz" } },
+            "1.3.0": { dist: { tarball: "https://registry.example/left-pad/-/left-pad-1.3.0.tgz" } },
+          },
+        }),
+      ),
+    },
+    "https://registry.example/left-pad/-/left-pad-1.3.0.tgz": {
+      contentType: "application/octet-stream",
+      body: new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 1, 2, 3, 4, 5, 6, 7, 8]), // fake gzip magic + bytes
+    },
+  };
+  const fetchStats = { calls: 0 };
+  const fetcher = async (url) => {
+    fetchStats.calls++;
+    const f = fixtures[url];
+    if (!f) return { ok: false, status: 404, headers: {}, body: enc.encode("not found") };
+    return { ok: true, status: 200, headers: { "content-type": f.contentType }, body: f.body };
+  };
+  const kernel = new Kernel({ vfs, spawnWorker, fetcher });
+  kernel.testFetch = fetchStats;
   kernel.installCoreutils();
   return kernel;
 }
@@ -635,6 +666,44 @@ main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
   const hb = await kernel.start("node", ["/t/httpb.js"], { cwd: "/t", capture: true });
   assert(hb.code === 0 && hb.stdout.includes("HTTPB_OK"),
     "Path B: real Node lib/http.js runs (POST/GET, chunked, headers, keep-alive, ECONNREFUSED)");
+
+  // === #9: network fetch via the Fetcher Worker (mocked offline) ===
+  // A process calls the blocking __ocfetch; the kernel routes to the (mock)
+  // Fetcher Worker, streams the body into the VFS, and returns metadata. Proves:
+  // metadata + tarball land in the VFS, sizes are right, a 404 surfaces ok=false,
+  // and a repeated URL is served from the kernel cache (no extra network call).
+  kernel.writeFile(
+    "/t/fetchb.js",
+    `
+const assert = require('assert');
+const fs = require('fs');
+const metaUrl = 'https://registry.example/left-pad';
+const meta = __ocfetch(metaUrl);
+assert.strictEqual(meta.ok, true, 'metadata ok');
+assert.strictEqual(meta.status, 200, 'metadata 200');
+assert.ok(meta.contentType.includes('json'), 'metadata content-type');
+assert.strictEqual(meta.cached, false, 'metadata first fetch is not cached');
+const doc = JSON.parse(fs.readFileSync(meta.path, 'utf8'));
+const latest = doc['dist-tags'].latest;
+assert.strictEqual(latest, '1.3.0', 'latest dist-tag parsed from VFS file');
+const tar = __ocfetch(doc.versions[latest].dist.tarball);
+assert.ok(tar.ok && tar.size === 12, 'tarball downloaded into VFS (12 bytes)');
+assert.strictEqual(fs.readFileSync(tar.path).length, 12, 'tarball bytes readable from VFS');
+const again = __ocfetch(metaUrl);
+assert.strictEqual(again.cached, true, 'repeated URL served from cache');
+const missing = __ocfetch('https://registry.example/nope');
+assert.strictEqual(missing.ok, false, '404 surfaces ok=false');
+assert.strictEqual(missing.status, 404, '404 status');
+console.log('FETCHB_OK');
+`,
+  );
+  const fb = await kernel.start("node", ["/t/fetchb.js"], { cwd: "/t", capture: true });
+  assert(fb.code === 0 && fb.stdout.includes("FETCHB_OK"),
+    "Phase 2 #9: __ocfetch streams npm metadata + tarball into the VFS via the Fetcher Worker");
+  // metadata(1) + tarball(1) + missing(1) = 3 network calls; the repeated metadata
+  // URL was a cache hit, so it did NOT add a 4th.
+  assert(kernel.testFetch.calls === 3,
+    "Phase 2 #9: kernel content cache skips the network on a repeated URL (3 calls, not 4)");
 
   // Event loop v2 proof: ordering. nextTick beats Promise microtasks, and both
   // beat timers/immediates — which now actually FIRE (the old synchronous loop

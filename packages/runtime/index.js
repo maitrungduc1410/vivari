@@ -197,6 +197,11 @@ export function createRuntime({
   globalThis.clearInterval = loop.clearInterval;
   globalThis.setImmediate = loop.setImmediate;
   globalThis.clearImmediate = loop.clearImmediate;
+  // Phase 2 #9 (internal, temporary): a blocking fetch into the VFS, serviced by
+  // the kernel's Fetcher Worker. Returns { status, ok, contentType, size, path,
+  // cached }; read `path` with fs for the bytes. This is the low-level primitive
+  // the npm client (#10) will build on; it'll get a proper wrapper then.
+  globalThis.__ocfetch = (url) => syscalls.fetch(String(url));
 
   const builtins = {
     fs,

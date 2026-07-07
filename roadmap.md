@@ -371,9 +371,22 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
      the contract is stable), **raw byte-tunnel** streaming (true request/response
      streaming + binary bodies across the SW seam, replacing the buffered replay), and
      **`http2`** (needs `internalBinding('http2')`/nghttp2).
-9. **Network/registry worker** [M] — *decomp.* Dedicated fetch worker (our
-   `Fetcher Worker`) for the npm registry + tarballs (+ later the outbound fetch
-   bridge). Land it just before npm needs it.
+9. **Network/registry worker** [M] — *decomp.* ✅ **DONE.** A dedicated
+   **`Fetcher Worker`** (`packages/demo/fetcher-worker.js`) owns all outbound
+   network so downloading/decompressing large payloads never stalls syscall
+   servicing; it holds no SAB and transfers bodies back as `ArrayBuffer`. New
+   **deferred syscall `OP_FETCH`** (like `OP_SPAWN`): a process calls the blocking
+   `__ocfetch(url)` (`syscalls.fetch`), parks on `Atomics.wait`, and the kernel
+   delegates to the Fetcher, **streams the body straight into the VFS** (bypassing
+   the 1 MiB SAB window), then wakes the caller with small JSON
+   `{status,ok,contentType,size,path,cached}`; the caller reads `path` with `fs`, so
+   arbitrary-size downloads work. Kernel keeps a **content cache** keyed by URL (a
+   repeated fetch skips the network). Direct-to-origin today (npm registry sends
+   `ACAO:*`, verified) with a single **`rewrite(url)` seam** in the Fetcher for
+   slotting a caching/rewriting proxy in later. Demo gains **`/api/fetch`** (pulls
+   `left-pad` metadata + tarball from `registry.npmjs.org` live in the browser,
+   lists versions, proves the cache); headless verify uses a mocked offline Fetcher.
+   verify: 40/40 PASS.
 10. **Real `npm install`** [L] — registry proxy (via the Network worker), semver
     resolution, **tar extraction** into the VFS (use the browser-native
     `DecompressionStream('gzip')` for `.tgz` → no zlib dependency yet), `node_modules`

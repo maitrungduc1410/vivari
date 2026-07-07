@@ -244,6 +244,36 @@ const server = http.createServer(async (req, res) => {
     res.end(body);
     return;
   }
+  if (req.url === '/api/fetch') {
+    // Real outbound network (Phase 2 #9): __ocfetch is a blocking fetch serviced
+    // by the kernel's dedicated Fetcher Worker, which streams the body into the
+    // VFS. We pull left-pad's registry metadata (direct from registry.npmjs.org —
+    // it sends CORS *), list its versions, download the latest tarball, then fetch
+    // the metadata again to prove the kernel-side content cache (no 2nd network hit).
+    const fs = require('fs');
+    const metaUrl = 'https://registry.npmjs.org/left-pad';
+    const meta = __ocfetch(metaUrl);
+    const doc = JSON.parse(fs.readFileSync(meta.path, 'utf8'));
+    const versions = Object.keys(doc.versions || {});
+    const latest = (doc['dist-tags'] || {}).latest;
+    const tarballUrl = doc.versions[latest].dist.tarball;
+    const tar = __ocfetch(tarballUrl);
+    const again = __ocfetch(metaUrl); // cache hit
+    const body = Buffer.from(JSON.stringify({
+      node: process.version,
+      note: '__ocfetch pulled npm registry metadata + tarball directly from the browser (no proxy) via the Fetcher Worker, into the VFS.',
+      metadataUrl: metaUrl,
+      status: meta.status,
+      contentType: meta.contentType,
+      versionCount: versions.length,
+      latest,
+      tarball: { url: tarballUrl, bytes: tar.size, contentType: tar.contentType },
+      cache: { firstFetch: meta.cached, refetch: again.cached },
+    }, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(\`<!doctype html>
 <html><head><meta charset="utf-8"><title>Hello from OpenContainer</title>
@@ -267,6 +297,7 @@ const server = http.createServer(async (req, res) => {
   <button onclick="fetch('api/http').then(r=>r.json()).then(t=>document.getElementById('h').textContent=JSON.stringify(t,null,2))">GET /api/http (real http server+client)</button>
   <button onclick="fetch('api/buffer').then(r=>r.json()).then(t=>document.getElementById('b').textContent=JSON.stringify(t,null,2))">GET /api/buffer</button>
   <button onclick="fetch('api/fs').then(r=>r.json()).then(t=>document.getElementById('f').textContent=JSON.stringify(t,null,2))">GET /api/fs</button>
+  <button onclick="var el=document.getElementById('nf');el.textContent='fetching npm registry…';fetch('api/fetch').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2)).catch(e=>el.textContent=String(e))">GET /api/fetch (npm registry)</button>
   <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
   <pre id="t"></pre>
   <pre id="a"></pre>
@@ -275,6 +306,7 @@ const server = http.createServer(async (req, res) => {
   <pre id="h"></pre>
   <pre id="b"></pre>
   <pre id="f"></pre>
+  <pre id="nf"></pre>
 </div></body></html>\`);
 });
 
@@ -308,14 +340,45 @@ async function boot() {
     };
   };
 
+  // Dedicated Fetcher Worker (Phase 2 #9): all outbound network goes through it,
+  // so downloading/decompressing large npm payloads never stalls syscall
+  // servicing. The kernel calls `fetcher(url)`; we bridge that to the worker.
+  const fetcherWorker = new Worker(new URL("./fetcher-worker.js", import.meta.url), {
+    type: "module",
+    name: "Fetcher Worker",
+  });
+  let fetchSeq = 1;
+  const fetchPending = new Map();
+  fetcherWorker.onmessage = (event) => {
+    const m = event.data;
+    if (m.type !== "fetch-result") return;
+    const p = fetchPending.get(m.id);
+    if (!p) return;
+    fetchPending.delete(m.id);
+    if (m.error) p.reject(new Error(m.error));
+    else p.resolve({ ok: m.ok, status: m.status, headers: m.headers, body: new Uint8Array(m.body) });
+  };
+  const fetcher = (url) =>
+    new Promise((resolve, reject) => {
+      const id = fetchSeq++;
+      fetchPending.set(id, { resolve, reject });
+      fetcherWorker.postMessage({ type: "fetch", id, url });
+    });
+
   kernel = new Kernel({
     vfs,
     spawnWorker,
+    fetcher,
     stdout: (chunk) => post("stdout", { chunk }),
     stderr: (chunk) => post("stderr", { chunk }),
   });
   kernel.onProcExit = (pid, res) => post("exit", { pid, code: res.code });
   kernel.onListen = (port, pid) => post("listen", { port, pid });
+  kernel.onFetch = (url, info) =>
+    post("log", {
+      line: `  [fetcher] ${info.cached ? "cache hit " : "downloaded"} ${info.size}B · ${url}`,
+      cls: "muted",
+    });
 
   kernel.installCoreutils();
   kernel.mkdirp("/srv");

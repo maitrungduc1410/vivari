@@ -56,13 +56,14 @@ import {
   OP_ACCEPT,
   OP_RESPOND,
   OP_CLOSE_SERVER,
+  OP_FETCH,
 } from "../protocol/syscall.js";
 import { COREUTILS } from "./coreutils.js";
 
 const EMPTY = new Uint8Array(0);
 
 export class Kernel {
-  constructor({ vfs, spawnWorker, stdout, stderr }) {
+  constructor({ vfs, spawnWorker, stdout, stderr, fetcher }) {
     this.vfs = vfs;
     this.spawnWorker = spawnWorker;
     this.stdout = stdout || (() => {});
@@ -76,6 +77,15 @@ export class Kernel {
     this.pendingHttp = new Map(); // reqId -> { resolve, pid }
     this.nextReqId = 1;
     this.onListen = null; // optional observer (port, pid) — e.g. wire a preview
+
+    // ---- network fetch (Phase 2 #9) ----
+    // Injected by the environment: (url) => Promise<{ok,status,headers,body:Uint8Array}>.
+    // The browser routes this to a dedicated Fetcher Worker; tests inject a mock.
+    this.fetcher = fetcher || null;
+    // URL -> { path, status, ok, contentType, size } — content cache so a repeated
+    // fetch (npm re-resolving the same package) skips the network entirely.
+    this.fetchCache = new Map();
+    this.onFetch = null; // optional observer (url, {cached,size}) — e.g. a UI log
   }
 
   // ---- VFS helpers ----------------------------------------------------------
@@ -254,6 +264,10 @@ export class Kernel {
       this.handleNet(proc, opcode, JSON.parse(decodeBytes(fields[0])));
       return;
     }
+    if (opcode === OP_FETCH) {
+      this.handleFetch(proc, JSON.parse(decodeBytes(fields[0])));
+      return; // deferred until the network fetch resolves
+    }
     try {
       this.respondOk(proc, this.fsDispatch(opcode, flags, fields));
     } catch (err) {
@@ -354,6 +368,51 @@ export class Kernel {
         ),
       );
     };
+  }
+
+  // ---- network fetch servicing (Phase 2 #9) ---------------------------------
+  // VFS path where a fetched body is materialized. encodeURIComponent keeps the
+  // whole URL in a single flat filename (no '/'), so it is collision-free.
+  _fetchCachePath(url) {
+    return "/var/cache/oc-fetch/" + encodeURIComponent(url);
+  }
+
+  // Deferred like handleSpawn: the caller stays parked on Atomics.wait while we
+  // fetch (off-thread, in the Fetcher Worker) and stream the body into the VFS.
+  async handleFetch(proc, { url }) {
+    try {
+      const cached = this.fetchCache.get(url);
+      if (cached) {
+        if (this.onFetch) this.onFetch(url, { cached: true, size: cached.size });
+        this.respondOk(proc, encodeString(JSON.stringify({ ...cached, cached: true })));
+        return;
+      }
+      if (!this.fetcher) {
+        this.respondErr(proc, "ENETUNREACH");
+        return;
+      }
+      const res = await this.fetcher(url);
+      // Process may have exited while the fetch was in flight.
+      if (!this.procs.has(proc.pid)) return;
+      const body = res.body instanceof Uint8Array ? res.body : new Uint8Array(res.body || 0);
+      const path = this._fetchCachePath(url);
+      this.mkdirp("/var/cache/oc-fetch");
+      this.vfs.write_file(path, body);
+      const headers = res.headers || {};
+      const meta = {
+        status: res.status | 0,
+        ok: !!res.ok,
+        contentType: headers["content-type"] || headers["Content-Type"] || "",
+        size: body.byteLength,
+        path,
+      };
+      this.fetchCache.set(url, meta);
+      if (this.onFetch) this.onFetch(url, { cached: false, size: meta.size });
+      this.respondOk(proc, encodeString(JSON.stringify({ ...meta, cached: false })));
+    } catch (err) {
+      if (!this.procs.has(proc.pid)) return;
+      this.respondErr(proc, typeof err === "string" ? err : String(err?.message || "EFETCH"));
+    }
   }
 
   fsDispatch(opcode, flags, fields) {

@@ -46,6 +46,7 @@ import {
   OP_ACCEPT,
   OP_RESPOND,
   OP_CLOSE_SERVER,
+  OP_FETCH,
 } from "../protocol/syscall.js";
 
 // Cap each fd read/write to keep both request and response inside the 1 MiB
@@ -140,5 +141,11 @@ export function createSyscalls({ ctrl, data, notify }) {
     respond: (reqId, resp) =>
       call(OP_RESPOND, encodeRequest([b(JSON.stringify({ reqId, ...resp }))])),
     closeServer: (port) => call(OP_CLOSE_SERVER, encodeRequest([b(JSON.stringify({ port }))])),
+
+    // ---- network fetch (Phase 2 #9) ----
+    // Blocking fetch: parks until the kernel (via the Fetcher Worker) has streamed
+    // the response body into the VFS. Returns { status, ok, contentType, size,
+    // path, cached }; read `path` with fs to get the bytes. Throws on network error.
+    fetch: (url) => JSON.parse(decodeBytes(call(OP_FETCH, encodeRequest([b(JSON.stringify({ url }))])))),
   };
 }

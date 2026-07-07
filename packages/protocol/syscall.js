@@ -92,6 +92,15 @@ export const OP_ACCEPT = 22;
 export const OP_RESPOND = 23;
 export const OP_CLOSE_SERVER = 24;
 
+// network fetch (Phase 2 #9). A *deferred* syscall like OP_SPAWN: the caller
+// parks on Atomics.wait while the kernel delegates the actual fetch to the
+// Fetcher Worker, streams the body straight into the VFS (bypassing the 1 MiB
+// SAB window entirely), and only then wakes the caller with small JSON metadata.
+//   OP_FETCH  field0 = JSON {url} -> OK JSON {status,ok,contentType,size,path,cached}
+// The body lives at `path` in the VFS; the caller reads it back with normal fs
+// (chunked fd reads), so arbitrary-size downloads (npm tarballs) work.
+export const OP_FETCH = 25;
+
 // request flags (bitmask)
 export const FLAG_RECURSIVE = 1; // mkdir -p
 
