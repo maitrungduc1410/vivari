@@ -8,15 +8,19 @@ export default function (exports, require, module, process, internalBinding, pri
   "use strict";
 
   const hasShared = typeof SharedArrayBuffer !== "undefined";
-  const dateToString = Date.prototype.toString;
-  const isDate = (v) => {
-    if (v instanceof Date) return true;
-    try {
-      dateToString.call(v);
-      return true;
-    } catch {
-      return false;
-    }
+  // Brand-check via the built-in toString tag, so cross-realm / subclassed
+  // values are still recognised (closer to Node's native predicates than
+  // `instanceof`, which is realm-bound).
+  const tagIs = (tag) => {
+    const s = `[object ${tag}]`;
+    return (v) => Object.prototype.toString.call(v) === s;
+  };
+  const isDate = tagIs("Date");
+  const isRegExp = tagIs("RegExp");
+  const isNativeError = (v) => {
+    if (v instanceof Error) return true;
+    const t = Object.prototype.toString.call(v);
+    return t === "[object Error]" || t === "[object DOMException]";
   };
 
   module.exports = {
@@ -28,5 +32,10 @@ export default function (exports, require, module, process, internalBinding, pri
     isTypedArray: (v) => ArrayBuffer.isView(v) && !(v instanceof DataView),
     isDataView: (v) => v instanceof DataView,
     isDate,
+    isRegExp,
+    isNativeError,
+    isPromise: (v) => v instanceof Promise,
+    isMap: (v) => v instanceof Map,
+    isSet: (v) => v instanceof Set,
   };
 }

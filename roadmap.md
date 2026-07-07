@@ -198,18 +198,32 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
    a dedicated worker (our `kernel-worker.js`, named "Kernel Worker"). Main thread
    = UI + boot only. Do this
    FIRST: everything below then sits on the real topology; retrofitting later hurts.
-2. **`internalBinding` seam + `primordials` + builtin loader** [S–M] — the Path B
+2. ✅ **`internalBinding` seam + `primordials` + builtin loader** [S–M] — the Path B
    foundation. Wrap modules as `(exports, require, module, process, internalBinding,
-   primordials)`. **Prove it by running Node's REAL `lib/path.js`, `lib/events.js`,
-   `lib/util.js` verbatim** (near-zero bindings), then delete their Path A hand-written
-   twins. Smallest step that validates the whole thesis.
+   primordials)`. **Proven by running Node's REAL `lib/path.js`, `lib/events.js`,
+   `lib/util.js` verbatim** (near-zero bindings), and their Path A hand-written twins
+   deleted. Smallest step that validates the whole thesis.
    - ✅ Loader + `primordials` + `internalBinding` seam live in `packages/runtime/node/`.
      `require('path')` now runs Node v24.18.0's (current LTS) **real, unmodified** `lib/path.js`
      (vendored verbatim) — win32 + posix semantics — over a minimal, growable
      `internal/{errors,validators,constants}` layer. Hand-written `builtins/path.js` deleted.
-   - ⏳ Next in this item: `events` and `util` the same way (these pull real
-     `internal/errors`, `internal/util`, `internal/util/types`, so the internal layer
-     graduates from "minimal" to vendored-real as we go).
+   - ✅ `require('events')` / `require('util')` are now Node v24.18.0's **real, unmodified**
+     `lib/events.js` (full `EventEmitter` + statics) and `lib/util.js` (`format`/`inherits`/
+     `promisify`/`callbackify`/`types`/`isDeepStrictEqual`/`debuglog`) over the same layer.
+     `console` + `assert` now sit on the real `util`; `http` extends the real `EventEmitter`.
+     Path A `builtins/{events,util}.js` deleted.
+     - `internal/util/inspect` is the one deliberate **bridge** in Path B: Node's real
+       inspect is ~2800 lines wired to native V8 introspection (`getPromiseDetails`,
+       `getProxyDetails`, `previewEntries`…), so we implement its public contract
+       (`inspect`/`format`/`formatWithOptions`/`stripVTControlCharacters`/
+       `identicalSequenceRange`) ourselves. Everything above it is Node's real source.
+     - Grew the shared layer: vendored `internal/events/abort_listener`; shimmed
+       `internal/{event_target,abort_controller,encoding}`, `internal/process/task_queues`,
+       `internal/streams/utils`, `internal/util/{debuglog,colors,comparisons}`; `primordials`
+       gained `AsyncIteratorPrototype` + `Symbol{Dispose,AsyncDispose}`; `internal/util` gained
+       a real `promisify` + `spliceOne`/`getSystemError*`; more `internal/errors` symbols
+       (`ERR_UNHANDLED_ERROR`, `ErrnoException`, `isErrorStackTraceLimitWritable`…) and
+       `internal/util/types` predicates (`isNativeError`/`isRegExp`/…).
 3. ✅ **`buffer` binding + real `lib/buffer.js`** [S–M] — Buffer is used by fs/stream/http;
    get the real one in early. Backed by Wasm memory / `Uint8Array`.
    - ✅ `require('buffer').Buffer` (and the global) is now Node v24.18.0's **real,
@@ -296,6 +310,32 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
 - **Rust sinks come after the contract stabilizes:** only hot paths proven in JS get
   pushed down (llhttp parser, zlib codec, buffer ops) — never the orchestration or
   Node's `lib/`.
+
+## Packaging & delivery (deferred to productionization)
+
+Today the browser loads the runtime as **individual, unbundled ES modules** (`os.js`,
+`process.js`, the vendored `node/lib/*` + `node/internal/*`, …) — one network request
+each. This is a **deliberate DEV choice**, not the shipping shape: it keeps the vendored
+Node source readable, debuggable in DevTools, and trivially diffable against upstream.
+The architecture is already bundle-ready (everything is ESM behind `loader.js`), so this
+is purely a build-pipeline step to add near the end — doing it early would only hurt DX.
+
+When we productionize, the plan is **not** "one giant file" but bundle-by-role:
+
+- **Bundle per worker role** (esbuild/rollup/vite), never dump worker code into main:
+  a *runtime* bundle (runs in the Process Worker), a *kernel* bundle (Kernel Worker),
+  and the UI (main). Minify + tree-shake each.
+- **Runtime stdlib loaded once, shared by every process:** the real spawn-latency lever
+  is caching, not file count. Ship the runtime as one cacheable artifact and
+  **precache it in the Service Worker** (we already have `sw.js`) so every Process Worker
+  spawn and every reload is instant (this is why StackBlitz caches so aggressively).
+- **Lazy-load heavy/rare modules** (`zlib`, `crypto`, full `stream` variants) as split
+  chunks fetched on first `require` — small core bundle + on-demand tail.
+- **Wasm stays a separate binary** (`WebAssembly.instantiateStreaming`), never inlined
+  into JS — the VFS/kernel Wasm is streamed and compiled on its own.
+- **Brotli/gzip on the minified JS** — on already-minified code this is the biggest
+  actual "resource saved" win, bigger than minification alone.
+- **Source maps in dev only**, stripped for prod.
 
 ## Definition of done for T2
 

@@ -141,11 +141,62 @@ export default function (exports, require, module, process, internalBinding, pri
   }
 
   const customPromisifyArgs = Symbol("customPromisifyArgs");
+  const kCustomPromisifiedSymbol = Symbol.for("nodejs.util.promisify.custom");
 
-  function promisify() {
-    throw new Error("OpenContainer: util.promisify is not available in internal/util yet");
+  // Faithful port of util.promisify: honours a pre-attached custom impl
+  // (fn[promisify.custom]) and multi-value callbacks named via customPromisifyArgs.
+  function promisify(original) {
+    if (typeof original !== "function") {
+      throw new TypeError('The "original" argument must be of type function');
+    }
+    if (original[kCustomPromisifiedSymbol]) {
+      const fn = original[kCustomPromisifiedSymbol];
+      if (typeof fn !== "function") {
+        throw new TypeError("The [util.promisify.custom] property must be of type function");
+      }
+      return fn;
+    }
+    const argumentNames = original[customPromisifyArgs];
+    function fn(...args) {
+      return new Promise((resolve, reject) => {
+        Reflect.apply(original, this, [
+          ...args,
+          (err, ...values) => {
+            if (err) return reject(err);
+            if (argumentNames !== undefined && values.length > 1) {
+              const obj = {};
+              for (let i = 0; i < argumentNames.length; i++) obj[argumentNames[i]] = values[i];
+              resolve(obj);
+            } else {
+              resolve(values[0]);
+            }
+          },
+        ]);
+      });
+    }
+    Object.setPrototypeOf(fn, Object.getPrototypeOf(original));
+    Object.defineProperty(fn, kCustomPromisifiedSymbol, {
+      value: fn,
+      enumerable: false,
+      writable: false,
+      configurable: true,
+    });
+    return Object.defineProperties(fn, Object.getOwnPropertyDescriptors(original));
   }
-  promisify.custom = Symbol.for("nodejs.util.promisify.custom");
+  promisify.custom = kCustomPromisifiedSymbol;
+
+  // Remove one element in place, shifting the tail down (Node's spliceOne).
+  function spliceOne(list, index) {
+    for (; index + 1 < list.length; index++) list[index] = list[index + 1];
+    list.pop();
+  }
+
+  // We don't carry libuv's system-error table; expose Node's shape with inert
+  // values (these are only reached by util.getSystemError* helpers).
+  const getSystemErrorMap = () => new Map();
+  const getSystemErrorName = (err) => `Unknown system error ${err}`;
+  const getSystemErrorMessage = (err) => `Unknown system error ${err}`;
+  const convertProcessSignalToExitCode = () => 128;
 
   const SideEffectFreeRegExpPrototypeExec = (regexp, string) =>
     RegExp.prototype.exec.call(regexp, string);
@@ -166,6 +217,11 @@ export default function (exports, require, module, process, internalBinding, pri
     setOwnProperty,
     customPromisifyArgs,
     promisify,
+    spliceOne,
+    getSystemErrorMap,
+    getSystemErrorName,
+    getSystemErrorMessage,
+    convertProcessSignalToExitCode,
     SideEffectFreeRegExpPrototypeExec,
   };
 }

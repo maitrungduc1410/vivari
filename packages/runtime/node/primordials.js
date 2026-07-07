@@ -117,15 +117,26 @@ function resolvePrototypeMember(proto, methodPart) {
   return undefined;
 }
 
+// %AsyncIteratorPrototype% — the shared prototype at the top of the async
+// iterator chain. There is no named global for it, so derive it structurally.
+const AsyncIteratorPrototype = Object.getPrototypeOf(
+  Object.getPrototypeOf(async function* () {}).prototype,
+);
+
 // Names that don't follow the <Ns><Member> scheme. `uncurryThis` is a primordial
 // helper itself; the Safe* collections are Node's monkeypatch-proof subclasses —
 // plain Map/Set/WeakMap are behaviourally equivalent for our vendored modules.
+// Symbol.dispose / Symbol.asyncDispose fall back to fresh symbols on engines
+// that predate the explicit-resource-management proposal.
 const SPECIALS = {
   uncurryThis,
   SafeMap: Map,
   SafeSet: Set,
   SafeWeakMap: WeakMap,
   SafeWeakSet: WeakSet,
+  AsyncIteratorPrototype,
+  SymbolDispose: Symbol.dispose ?? Symbol("nodejs.dispose"),
+  SymbolAsyncDispose: Symbol.asyncDispose ?? Symbol("nodejs.asyncDispose"),
 };
 
 function resolve(name) {

@@ -185,6 +185,53 @@ export default function (exports, require, module, process, internalBinding, pri
     return innerError || outerError;
   }
 
+  const ERR_UNHANDLED_ERROR = makeNodeError(
+    Error,
+    "ERR_UNHANDLED_ERROR",
+    (err) => `Unhandled error.${err === undefined ? "" : ` (${err})`}`,
+  );
+
+  // Thrown by callbackify when a promise rejects with a falsy value.
+  class ERR_FALSY_VALUE_REJECTION extends Error {
+    constructor(reason) {
+      super("Promise was rejected with a falsy value");
+      this.code = "ERR_FALSY_VALUE_REJECTION";
+      this.name = "Error [ERR_FALSY_VALUE_REJECTION]";
+      this.reason = reason;
+    }
+  }
+  ERR_FALSY_VALUE_REJECTION.HideStackFramesError = ERR_FALSY_VALUE_REJECTION;
+
+  // libuv errno-style exception (util._errnoException). Sync-throwing bindings
+  // never reach it, but util.js destructures it at load.
+  function ErrnoException(err, syscall, original) {
+    const e = new Error(`${syscall} ${original || ""} (errno ${err})`);
+    e.errno = err;
+    e.syscall = syscall;
+    return e;
+  }
+  function ExceptionWithHostPort(err, syscall, address, port) {
+    const e = new Error(`${syscall} ${address}:${port} (errno ${err})`);
+    e.errno = err;
+    e.syscall = syscall;
+    e.address = address;
+    if (port) e.port = port;
+    return e;
+  }
+
+  // Node guards stackTraceLimit writes; mirror the real predicate.
+  function isErrorStackTraceLimitWritable() {
+    const desc = Object.getOwnPropertyDescriptor(Error, "stackTraceLimit");
+    if (desc === undefined) return Object.isExtensible(Error);
+    return Object.prototype.hasOwnProperty.call(desc, "writable")
+      ? desc.writable
+      : desc.set !== undefined;
+  }
+
+  // Symbol events.js tags on errors so the inspector can enhance the stack
+  // before printing; we don't massage stacks, so it's an inert marker.
+  const kEnhanceStackBeforeInspector = Symbol("kEnhanceStackBeforeInspector");
+
   // A plain Error carrying extra properties (used by Buffer.transcode et al.).
   const genericNodeError = (message, props) => Object.assign(new Error(message), props);
 
@@ -201,7 +248,13 @@ export default function (exports, require, module, process, internalBinding, pri
     UVException,
     AbortError,
     aggregateTwoErrors,
+    ErrnoException,
+    ExceptionWithHostPort,
+    isErrorStackTraceLimitWritable,
+    kEnhanceStackBeforeInspector,
     codes: {
+      ERR_UNHANDLED_ERROR,
+      ERR_FALSY_VALUE_REJECTION,
       ERR_INVALID_ARG_TYPE,
       ERR_INVALID_ARG_VALUE,
       ERR_OUT_OF_RANGE,

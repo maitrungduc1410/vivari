@@ -294,6 +294,112 @@ fs.writeFile('/t/cb.txt', 'cbdata', (err) => {
   assert(fscb.code === 0 && fscb.stdout.includes("FSCB_OK"),
     "Path B: real Node lib/fs.js callback API (writeFile/readFile/stat) via FSReqCallback + nextTick");
 
+  // Path B proof: require('events') is Node's REAL vendored lib/events.js. Cover
+  // the core EventEmitter surface (on/emit/once/prepend/remove/counts), the
+  // throwing 'error' contract, and real-only statics (getEventListeners, the
+  // captureRejectionSymbol, and the events.once(emitter,name) promise helper).
+  kernel.writeFile(
+    "/t/eventsb.js",
+    `
+const assert = require('assert');
+const EventEmitter = require('events');
+// Real module identity: constructor with self-ref + statics the shim lacked.
+assert.strictEqual(EventEmitter.EventEmitter, EventEmitter);
+assert.strictEqual(typeof EventEmitter.getEventListeners, 'function');
+assert.strictEqual(typeof EventEmitter.captureRejectionSymbol, 'symbol');
+
+const ee = new EventEmitter();
+let sum = 0;
+const add = (a, b) => { sum += a + b; };
+ee.on('add', add);
+ee.emit('add', 2, 3);
+assert.strictEqual(sum, 5);
+assert.strictEqual(ee.listenerCount('add'), 1);
+ee.removeListener('add', add);
+ee.emit('add', 100, 100);
+assert.strictEqual(sum, 5);
+
+let onceCount = 0;
+ee.once('go', () => { onceCount++; });
+ee.emit('go'); ee.emit('go');
+assert.strictEqual(onceCount, 1);
+
+const order = [];
+ee.on('x', () => order.push('b'));
+ee.prependListener('x', () => order.push('a'));
+ee.emit('x');
+assert.deepStrictEqual(order, ['a', 'b']);
+
+assert.deepStrictEqual(ee.eventNames().sort(), ['x']);
+ee.setMaxListeners(3);
+assert.strictEqual(ee.getMaxListeners(), 3);
+
+// 'error' with no listener throws (Node's contract).
+assert.throws(() => new EventEmitter().emit('error', new Error('boom')), /boom/);
+
+// events.once(emitter, name) returns a Promise (the promisified one-shot).
+const waiter = new EventEmitter();
+const p = EventEmitter.once(waiter, 'ready');
+assert.ok(p instanceof Promise);
+waiter.emit('ready', 42);
+console.log('EVENTSB_OK');
+`,
+  );
+  const eb = await kernel.start("node", ["/t/eventsb.js"], { cwd: "/t", capture: true });
+  assert(eb.code === 0 && eb.stdout.includes("EVENTSB_OK"),
+    "Path B: real Node lib/events.js runs (EventEmitter core + statics + once promise)");
+
+  // Path B proof: require('util') is Node's REAL vendored lib/util.js (format,
+  // inherits, promisify, types, isDeepStrictEqual, callbackify, debuglog) over
+  // our internal layer, with util.inspect supplied by our compatible bridge.
+  kernel.writeFile(
+    "/t/utilb.js",
+    `
+const assert = require('assert');
+const util = require('util');
+const ESC = String.fromCharCode(27);
+// Real module: statics the old hand-written shim didn't have.
+assert.strictEqual(typeof util.callbackify, 'function');
+assert.strictEqual(typeof util.debuglog, 'function');
+assert.strictEqual(typeof util.inspect.custom, 'symbol');
+
+// printf-style format (backed by our inspect bridge for %j / objects).
+assert.strictEqual(util.format('%s %d %j', 'a', 3, { x: 1 }), 'a 3 {"x":1}');
+assert.strictEqual(util.format('%d%%', 50), '50%');
+assert.strictEqual(util.format('a', 'b', 'c'), 'a b c');
+assert.strictEqual(util.format('n=%d', 'notnum'), 'n=NaN');
+
+// inspect: nesting + circular guard.
+assert.ok(util.inspect({ a: 1, b: [1, 2] }).includes('a: 1'));
+const circ = {}; circ.self = circ;
+assert.ok(util.inspect(circ).includes('Circular'));
+
+// inherits: prototype chain + super_.
+function P() {} P.prototype.hi = function () { return 'hi'; };
+function C() {} util.inherits(C, P);
+assert.strictEqual(C.super_, P);
+assert.ok(new C() instanceof P);
+assert.strictEqual(new C().hi(), 'hi');
+
+// promisify wraps a Node-style callback fn into a Promise-returning one.
+const later = (x, cb) => cb(null, x * 2);
+const pLater = util.promisify(later);
+assert.strictEqual(typeof pLater, 'function');
+assert.ok(pLater(21) instanceof Promise);
+
+// types + deep equality + ANSI stripping.
+assert.strictEqual(util.types.isDate(new Date()), true);
+assert.strictEqual(util.types.isNativeError(new Error('e')), true);
+assert.strictEqual(util.isDeepStrictEqual({ a: [1, 2] }, { a: [1, 2] }), true);
+assert.strictEqual(util.isDeepStrictEqual({ a: 1 }, { a: 2 }), false);
+assert.strictEqual(util.stripVTControlCharacters(ESC + '[31mred' + ESC + '[39m'), 'red');
+console.log('UTILB_OK');
+`,
+  );
+  const ub = await kernel.start("node", ["/t/utilb.js"], { cwd: "/t", capture: true });
+  assert(ub.code === 0 && ub.stdout.includes("UTILB_OK"),
+    "Path B: real Node lib/util.js runs (format/inherits/promisify/types/isDeepStrictEqual)");
+
   // === brick 4: shell session with each command as its own process ===
   const sh = await kernel.start("sh", ["/root.sh"], { cwd: "/", capture: true });
   const o = sh.stdout;

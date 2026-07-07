@@ -17,12 +17,17 @@ import { createInternalBinding } from "./internal-binding.js";
 import pathFactory from "./lib/path.js";
 import bufferFactory from "./lib/buffer.js";
 import fsFactory from "./lib/fs.js";
+import eventsFactory from "./lib/events.js";
+import utilPublicFactory from "./lib/util.js";
 import constantsFactory from "./internal/constants.js";
 import validatorsFactory from "./internal/validators.js";
 import errorsFactory from "./internal/errors.js";
 import utilFactory from "./internal/util.js";
 import utilTypesFactory from "./internal/util/types.js";
 import utilInspectFactory from "./internal/util/inspect.js";
+import utilDebuglogFactory from "./internal/util/debuglog.js";
+import utilColorsFactory from "./internal/util/colors.js";
+import utilComparisonsFactory from "./internal/util/comparisons.js";
 import internalBufferFactory from "./internal/buffer.js";
 import startupSnapshotFactory from "./internal/v8/startup_snapshot.js";
 import optionsFactory from "./internal/options.js";
@@ -32,6 +37,12 @@ import urlFactory from "./internal/url.js";
 import blobFactory from "./internal/blob.js";
 import permissionFactory from "./internal/process/permission.js";
 import assertFactory from "./internal/assert.js";
+import abortListenerFactory from "./internal/events/abort_listener.js";
+import eventTargetFactory from "./internal/event_target.js";
+import taskQueuesFactory from "./internal/process/task_queues.js";
+import streamsUtilsFactory from "./internal/streams/utils.js";
+import abortControllerFactory from "./internal/abort_controller.js";
+import encodingFactory from "./internal/encoding.js";
 
 // name -> factory. Public builtins (e.g. "path") and internals ("internal/...")
 // live in the same table, just like Node's builtin id space.
@@ -39,6 +50,8 @@ const FACTORIES = {
   path: pathFactory,
   buffer: bufferFactory,
   fs: fsFactory,
+  events: eventsFactory,
+  util: utilPublicFactory,
   "util/types": utilTypesFactory,
   "internal/constants": constantsFactory,
   "internal/validators": validatorsFactory,
@@ -46,6 +59,9 @@ const FACTORIES = {
   "internal/util": utilFactory,
   "internal/util/types": utilTypesFactory,
   "internal/util/inspect": utilInspectFactory,
+  "internal/util/debuglog": utilDebuglogFactory,
+  "internal/util/colors": utilColorsFactory,
+  "internal/util/comparisons": utilComparisonsFactory,
   "internal/buffer": internalBufferFactory,
   "internal/v8/startup_snapshot": startupSnapshotFactory,
   "internal/options": optionsFactory,
@@ -55,6 +71,12 @@ const FACTORIES = {
   "internal/blob": blobFactory,
   "internal/process/permission": permissionFactory,
   "internal/assert": assertFactory,
+  "internal/events/abort_listener": abortListenerFactory,
+  "internal/event_target": eventTargetFactory,
+  "internal/process/task_queues": taskQueuesFactory,
+  "internal/streams/utils": streamsUtilsFactory,
+  "internal/abort_controller": abortControllerFactory,
+  "internal/encoding": encodingFactory,
 };
 
 const strip = (name) => (name.startsWith("node:") ? name.slice(5) : name);
