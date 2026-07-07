@@ -55,6 +55,22 @@ export const OP_RENAME = 10;
 export const OP_SYMLINK = 11;
 export const OP_READLINK = 12;
 
+// file-descriptor layer (Phase 2 #4). These back Node's real lib/fs.js, which
+// routes even readFileSync through open -> fstat -> read -> close on real fds.
+//   OP_OPEN      field0=path, field1=i32 flags, field2=u32 mode -> OK u32 fd
+//   OP_CLOSE     field0=u32 fd                                  -> OK empty
+//   OP_FD_READ   field0=u32 fd, field1=u32 len, field2=f64 pos  -> OK raw bytes
+//   OP_FD_WRITE  field0=u32 fd, field1=f64 pos, field2=bytes    -> OK u32 nwritten
+//   OP_FSTAT     field0=u32 fd                                  -> OK JSON stat
+//   OP_FTRUNCATE field0=u32 fd, field1=u32 len                  -> OK empty
+// pos < 0 means "at the fd cursor" (and advance it); pos >= 0 is positional.
+export const OP_OPEN = 13;
+export const OP_CLOSE = 14;
+export const OP_FD_READ = 15;
+export const OP_FD_WRITE = 16;
+export const OP_FSTAT = 17;
+export const OP_FTRUNCATE = 18;
+
 // process control (brick 4). OP_SPAWN blocks the caller until the child exits;
 // the single field is a JSON spec {command,args,cwd,env,capture} and the OK
 // response is JSON {code,stdout,stderr,pid}. This is how execSync/spawnSync work:
@@ -98,6 +114,26 @@ export function makeViews(sab) {
 
 export function encodeString(str) {
   return encoder.encode(str);
+}
+
+// Little-endian scalar fields, used by the fd syscalls to carry fds/lengths/
+// positions without stringifying them. `f64` covers file positions > 2^32 and
+// the sentinel -1 ("use the current cursor").
+export function u32ToBytes(n) {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, n >>> 0, true);
+  return b;
+}
+export function bytesToU32(b) {
+  return new DataView(b.buffer, b.byteOffset, b.byteLength).getUint32(0, true);
+}
+export function f64ToBytes(n) {
+  const b = new Uint8Array(8);
+  new DataView(b.buffer).setFloat64(0, n, true);
+  return b;
+}
+export function bytesToF64(b) {
+  return new DataView(b.buffer, b.byteOffset, b.byteLength).getFloat64(0, true);
 }
 
 export function decodeBytes(bytes) {

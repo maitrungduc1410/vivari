@@ -13,6 +13,9 @@ import {
   encodeString,
   decodeBytes,
   encodeRequest,
+  u32ToBytes,
+  bytesToU32,
+  f64ToBytes,
   I_STATE,
   I_OPCODE,
   I_REQ_LEN,
@@ -32,12 +35,23 @@ import {
   OP_RENAME,
   OP_SYMLINK,
   OP_READLINK,
+  OP_OPEN,
+  OP_CLOSE,
+  OP_FD_READ,
+  OP_FD_WRITE,
+  OP_FSTAT,
+  OP_FTRUNCATE,
   OP_SPAWN,
   OP_LISTEN,
   OP_ACCEPT,
   OP_RESPOND,
   OP_CLOSE_SERVER,
 } from "../protocol/syscall.js";
+
+// Cap each fd read/write to keep both request and response inside the 1 MiB
+// shared-data window. Node's lib/fs.js loops on short reads/writes, so a large
+// file is transferred in chunks transparently.
+const FD_CHUNK = 512 * 1024;
 
 export function createSyscalls({ ctrl, data, notify }) {
   const b = encodeString;
@@ -85,6 +99,26 @@ export function createSyscalls({ ctrl, data, notify }) {
     rename: (from, to) => call(OP_RENAME, encodeRequest([b(from), b(to)])),
     symlink: (target, link) => call(OP_SYMLINK, encodeRequest([b(target), b(link)])),
     readlink: (p) => decodeBytes(call(OP_READLINK, encodeRequest([b(p)]))),
+
+    // ---- file-descriptor layer (Phase 2 #4) ----
+    open: (p, flags, mode) =>
+      bytesToU32(call(OP_OPEN, encodeRequest([b(p), u32ToBytes(flags), u32ToBytes(mode)]))),
+    close: (fd) => call(OP_CLOSE, encodeRequest([u32ToBytes(fd)])),
+    // Read up to `len` bytes at `pos` (-1 = fd cursor). Returns a Uint8Array,
+    // possibly shorter than requested (short read) — callers loop.
+    fdRead: (fd, len, pos) =>
+      call(
+        OP_FD_READ,
+        encodeRequest([u32ToBytes(fd), u32ToBytes(Math.min(len, FD_CHUNK)), f64ToBytes(pos)]),
+      ),
+    // Write `bytes` at `pos` (-1 = fd cursor). Returns bytes actually written
+    // (<= FD_CHUNK) so callers loop for large buffers.
+    fdWrite: (fd, bytes, pos) => {
+      const chunk = bytes.length > FD_CHUNK ? bytes.subarray(0, FD_CHUNK) : bytes;
+      return bytesToU32(call(OP_FD_WRITE, encodeRequest([u32ToBytes(fd), f64ToBytes(pos), chunk])));
+    },
+    fstat: (fd) => JSON.parse(decodeBytes(call(OP_FSTAT, encodeRequest([u32ToBytes(fd)])))),
+    ftruncate: (fd, len) => call(OP_FTRUNCATE, encodeRequest([u32ToBytes(fd), u32ToBytes(len)])),
     // Spawn a child and block until it exits (waitpid). Returns
     // { code, stdout, stderr, pid }. This is how execSync/spawnSync work.
     spawn: (spec) =>

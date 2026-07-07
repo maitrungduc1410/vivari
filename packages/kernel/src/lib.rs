@@ -24,6 +24,7 @@ enum VfsError {
     NotEmpty, // ENOTEMPTY— directory not empty
     Loop,     // ELOOP    — too many symlink levels
     Inval,    // EINVAL   — invalid argument
+    Badf,     // EBADF    — bad file descriptor
 }
 
 impl VfsError {
@@ -36,9 +37,29 @@ impl VfsError {
             VfsError::NotEmpty => "ENOTEMPTY",
             VfsError::Loop => "ELOOP",
             VfsError::Inval => "EINVAL",
+            VfsError::Badf => "EBADF",
         }
         .to_string()
     }
+}
+
+// POSIX open(2) flag bits (Linux values — must match internalBinding('constants').fs
+// on the JS side, since stringToFlags there produces these numbers).
+const O_WRONLY: i32 = 0o1;
+const O_RDWR: i32 = 0o2;
+const O_CREAT: i32 = 0o100;
+const O_EXCL: i32 = 0o200;
+const O_TRUNC: i32 = 0o1000;
+const O_APPEND: i32 = 0o2000;
+
+/// An open file description: which inode, the read/write cursor, and how it was
+/// opened. This is what a file descriptor points at (fd -> OpenFile).
+struct OpenFile {
+    inode: u64,
+    pos: usize,
+    readable: bool,
+    writable: bool,
+    append: bool,
 }
 
 type VfsResult<T> = Result<T, VfsError>;
@@ -59,6 +80,9 @@ struct Inode {
 pub struct VirtualFileSystem {
     inodes: HashMap<u64, Inode>,
     next_id: u64,
+    open_files: HashMap<u64, OpenFile>,
+    // Descriptors start at 3, leaving 0/1/2 for the stdio the runtime owns.
+    next_fd: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +209,8 @@ impl VirtualFileSystem {
         let mut fs = Self {
             inodes: HashMap::new(),
             next_id: ROOT_ID,
+            open_files: HashMap::new(),
+            next_fd: 3,
         };
         fs.alloc(NodeData::Dir(BTreeMap::new()), 0o755); // root (== ROOT_ID)
 
@@ -368,6 +394,188 @@ impl VirtualFileSystem {
     pub fn exists(&self, path: String) -> bool {
         self.resolve(&path, true).is_ok()
     }
+
+    // ---- file-descriptor layer (brick #4 / Phase 2 #4) --------------------
+    // Real fds let us run Node's actual `lib/fs.js`, which routes even
+    // `readFileSync` through open -> fstat -> read -> close.
+
+    /// open(2). `flags` are POSIX O_* bits (see stringToFlags on the JS side).
+    /// Creates the file with `mode` when O_CREAT is set. Returns a numeric fd.
+    pub fn open(&mut self, path: String, flags: i32, mode: u32) -> Result<u32, String> {
+        (|| {
+            let accmode = flags & 0o3;
+            let writable = accmode == O_WRONLY || accmode == O_RDWR;
+            let readable = accmode == 0 /* O_RDONLY */ || accmode == O_RDWR;
+
+            let inode = match self.resolve(&path, true) {
+                Ok(id) => {
+                    if flags & O_EXCL != 0 && flags & O_CREAT != 0 {
+                        return Err(VfsError::Exist);
+                    }
+                    match &self.inodes.get(&id).unwrap().data {
+                        NodeData::Dir(_) => {
+                            if writable {
+                                return Err(VfsError::IsDir);
+                            }
+                        }
+                        NodeData::File(_) => {
+                            if flags & O_TRUNC != 0 && writable {
+                                if let NodeData::File(buf) =
+                                    &mut self.inodes.get_mut(&id).unwrap().data
+                                {
+                                    buf.clear();
+                                }
+                                self.inodes.get_mut(&id).unwrap().mtime = Self::now();
+                            }
+                        }
+                        NodeData::Symlink(_) => {}
+                    }
+                    id
+                }
+                Err(VfsError::NoEnt) if flags & O_CREAT != 0 => {
+                    let (parent, name) = self.resolve_parent(&path)?;
+                    let id = self.alloc(NodeData::File(Vec::new()), mode & 0o777);
+                    self.link_child(parent, &name, id);
+                    id
+                }
+                Err(e) => return Err(e),
+            };
+
+            let pos = if flags & O_APPEND != 0 {
+                match &self.inodes.get(&inode).unwrap().data {
+                    NodeData::File(b) => b.len(),
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            let fd = self.next_fd;
+            self.next_fd += 1;
+            self.open_files.insert(
+                fd,
+                OpenFile {
+                    inode,
+                    pos,
+                    readable,
+                    writable,
+                    append: flags & O_APPEND != 0,
+                },
+            );
+            Ok(fd as u32)
+        })()
+        .map_err(VfsError::code)
+    }
+
+    /// close(2). Idempotent-ish: an unknown fd is EBADF.
+    pub fn close(&mut self, fd: u32) -> Result<(), String> {
+        self.open_files
+            .remove(&(fd as u64))
+            .map(|_| ())
+            .ok_or(VfsError::Badf)
+            .map_err(VfsError::code)
+    }
+
+    /// pread/read: read up to `len` bytes. `pos < 0` reads at (and advances) the
+    /// fd cursor; `pos >= 0` reads at that absolute offset without moving it.
+    pub fn fd_read(&mut self, fd: u32, len: u32, pos: f64) -> Result<Vec<u8>, String> {
+        (|| {
+            let of = self.open_files.get(&(fd as u64)).ok_or(VfsError::Badf)?;
+            if !of.readable {
+                return Err(VfsError::Badf);
+            }
+            let inode = of.inode;
+            let cursor = of.pos;
+            let start = if pos >= 0.0 { pos as usize } else { cursor };
+            let out = match &self.inodes.get(&inode).ok_or(VfsError::Badf)?.data {
+                NodeData::File(b) => {
+                    if start >= b.len() {
+                        Vec::new()
+                    } else {
+                        let end = (start + len as usize).min(b.len());
+                        b[start..end].to_vec()
+                    }
+                }
+                NodeData::Dir(_) => return Err(VfsError::IsDir),
+                NodeData::Symlink(_) => return Err(VfsError::Inval),
+            };
+            if pos < 0.0 {
+                self.open_files.get_mut(&(fd as u64)).unwrap().pos = start + out.len();
+            }
+            Ok(out)
+        })()
+        .map_err(VfsError::code)
+    }
+
+    /// pwrite/write: write `data`. `pos < 0` writes at (and advances) the cursor;
+    /// `pos >= 0` writes at that absolute offset. O_APPEND always writes at EOF.
+    /// Gaps are zero-filled. Returns the number of bytes written.
+    pub fn fd_write(&mut self, fd: u32, data: Vec<u8>, pos: f64) -> Result<u32, String> {
+        (|| {
+            let of = self.open_files.get(&(fd as u64)).ok_or(VfsError::Badf)?;
+            if !of.writable {
+                return Err(VfsError::Badf);
+            }
+            let inode = of.inode;
+            let cursor = of.pos;
+            let append = of.append;
+            let node = self.inodes.get_mut(&inode).ok_or(VfsError::Badf)?;
+            let buf = match &mut node.data {
+                NodeData::File(b) => b,
+                NodeData::Dir(_) => return Err(VfsError::IsDir),
+                NodeData::Symlink(_) => return Err(VfsError::Inval),
+            };
+            let start = if append {
+                buf.len()
+            } else if pos >= 0.0 {
+                pos as usize
+            } else {
+                cursor
+            };
+            if start > buf.len() {
+                buf.resize(start, 0);
+            }
+            let end = start + data.len();
+            if end > buf.len() {
+                buf.resize(end, 0);
+            }
+            buf[start..end].copy_from_slice(&data);
+            node.mtime = Self::now();
+            if append || pos < 0.0 {
+                self.open_files.get_mut(&(fd as u64)).unwrap().pos = end;
+            }
+            Ok(data.len() as u32)
+        })()
+        .map_err(VfsError::code)
+    }
+
+    /// fstat(2): stat the inode behind an open fd.
+    pub fn fstat(&self, fd: u32) -> Result<String, String> {
+        (|| {
+            let of = self.open_files.get(&(fd as u64)).ok_or(VfsError::Badf)?;
+            Ok(self.stat_node_json(of.inode))
+        })()
+        .map_err(VfsError::code)
+    }
+
+    /// ftruncate(2): grow (zero-filled) or shrink the file behind an open fd.
+    pub fn ftruncate(&mut self, fd: u32, len: u32) -> Result<(), String> {
+        (|| {
+            let of = self.open_files.get(&(fd as u64)).ok_or(VfsError::Badf)?;
+            if !of.writable {
+                return Err(VfsError::Badf);
+            }
+            let inode = of.inode;
+            let node = self.inodes.get_mut(&inode).ok_or(VfsError::Badf)?;
+            match &mut node.data {
+                NodeData::File(b) => b.resize(len as usize, 0),
+                NodeData::Dir(_) => return Err(VfsError::IsDir),
+                NodeData::Symlink(_) => return Err(VfsError::Inval),
+            }
+            node.mtime = Self::now();
+            Ok(())
+        })()
+        .map_err(VfsError::code)
+    }
 }
 
 // Non-#[wasm_bindgen] helpers that need &mut self / shared logic.
@@ -384,16 +592,23 @@ impl VirtualFileSystem {
 
     fn stat_impl(&self, path: &str, follow_last: bool) -> VfsResult<String> {
         let id = self.resolve(path, follow_last)?;
+        Ok(self.stat_node_json(id))
+    }
+
+    /// Format one inode as the small JSON blob the JS `fs` binding parses into a
+    /// Node `Stats`. `ino` is the inode id, so different paths to the same file
+    /// share it; the JS side composes the full `mode` (type bits) from `kind`.
+    fn stat_node_json(&self, id: u64) -> String {
         let node = self.inodes.get(&id).unwrap();
         let (kind, size) = match &node.data {
             NodeData::File(b) => ("file", b.len()),
             NodeData::Dir(m) => ("dir", m.len()),
             NodeData::Symlink(t) => ("symlink", t.len()),
         };
-        Ok(format!(
-            "{{\"kind\":\"{}\",\"size\":{},\"mode\":{},\"mtimeMs\":{}}}",
-            kind, size, node.mode, node.mtime
-        ))
+        format!(
+            "{{\"kind\":\"{}\",\"size\":{},\"mode\":{},\"mtimeMs\":{},\"ino\":{}}}",
+            kind, size, node.mode, node.mtime, id
+        )
     }
 }
 

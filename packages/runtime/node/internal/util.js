@@ -108,15 +108,64 @@ export default function (exports, require, module, process, internalBinding, pri
     return err;
   }
 
+  const isMacOS = process.platform === "darwin";
+
+  // Frozen empty object used as a default option bag (Node's kEmptyObject).
+  const kEmptyObject = Object.freeze({ __proto__: null });
+
+  // Wrap so the underlying fn runs at most once; later calls return the first
+  // result. Used by internal/fs/utils.getDirents to guard its callback.
+  function once(callback) {
+    let called = false;
+    let value;
+    return function (...args) {
+      if (!called) {
+        called = true;
+        value = Reflect.apply(callback, this, args);
+      }
+      return value;
+    };
+  }
+
+  // Define a data property, replacing any accessor already there (used by the
+  // lazy atime/mtime/... getters on Stats to memoize the Date on first access).
+  function setOwnProperty(obj, key, value) {
+    Object.defineProperty(obj, key, {
+      __proto__: null,
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value,
+    });
+    return value;
+  }
+
+  const customPromisifyArgs = Symbol("customPromisifyArgs");
+
+  function promisify() {
+    throw new Error("OpenContainer: util.promisify is not available in internal/util yet");
+  }
+  promisify.custom = Symbol.for("nodejs.util.promisify.custom");
+
+  const SideEffectFreeRegExpPrototypeExec = (regexp, string) =>
+    RegExp.prototype.exec.call(regexp, string);
+
   module.exports = {
     isWindows,
+    isMacOS,
     getLazy,
     customInspectSymbol,
     kIsEncodingSymbol,
+    kEmptyObject,
     encodingsMap,
     normalizeEncoding,
     defineLazyProperties,
     deprecate,
     lazyDOMException,
+    once,
+    setOwnProperty,
+    customPromisifyArgs,
+    promisify,
+    SideEffectFreeRegExpPrototypeExec,
   };
 }

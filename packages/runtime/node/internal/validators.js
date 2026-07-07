@@ -17,6 +17,9 @@ export default function (exports, require, module, process, internalBinding, pri
 
   const MIN = Number.MIN_SAFE_INTEGER;
   const MAX = Number.MAX_SAFE_INTEGER;
+  const INT32_MIN = -2147483648;
+  const INT32_MAX = 2147483647;
+  const UINT32_MAX = 4294967295;
 
   function validateString(value, name) {
     if (typeof value !== "string") throw new ERR_INVALID_ARG_TYPE(name, "string", value);
@@ -82,18 +85,88 @@ export default function (exports, require, module, process, internalBinding, pri
     }
   }
 
+  function validateInt32(value, name, min = INT32_MIN, max = INT32_MAX) {
+    if (typeof value !== "number") throw new ERR_INVALID_ARG_TYPE(name, "number", value);
+    if (!Number.isInteger(value)) throw new ERR_OUT_OF_RANGE(name, "an integer", value);
+    if (value < min || value > max)
+      throw new ERR_OUT_OF_RANGE(name, `>= ${min} && <= ${max}`, value);
+  }
+
+  function validateUint32(value, name, positive = false) {
+    if (typeof value !== "number") throw new ERR_INVALID_ARG_TYPE(name, "number", value);
+    if (!Number.isInteger(value)) throw new ERR_OUT_OF_RANGE(name, "an integer", value);
+    const min = positive ? 1 : 0;
+    if (value < min || value > UINT32_MAX)
+      throw new ERR_OUT_OF_RANGE(name, `>= ${min} && <= ${UINT32_MAX}`, value);
+  }
+
+  const isInt32 = (value) => value === (value | 0);
+
+  function parseFileMode(value, name, def) {
+    value ??= def;
+    if (typeof value === "string") {
+      const parsed = Number.parseInt(value, 8);
+      if (Number.isNaN(parsed)) {
+        throw new ERR_INVALID_ARG_VALUE(
+          name,
+          value,
+          "must be a 32-bit unsigned integer or an octal string",
+        );
+      }
+      value = parsed;
+    }
+    validateUint32(value, name);
+    return value;
+  }
+
+  function validateOneOf(value, name, oneOf) {
+    if (!oneOf.includes(value)) {
+      const list = oneOf.map((v) => (typeof v === "string" ? `'${v}'` : String(v))).join(", ");
+      throw new ERR_INVALID_ARG_VALUE(name, value, `must be one of: ${list}`);
+    }
+  }
+
+  // Node validates the encoding string is real; the Buffer layer re-checks, so a
+  // permissive accept keeps the common write(fd, string, enc) path working.
+  function validateEncoding() {}
+
+  function validateAbortSignal(signal, name) {
+    if (
+      signal !== undefined &&
+      (signal === null || typeof signal !== "object" || !("aborted" in signal))
+    ) {
+      throw new ERR_INVALID_ARG_TYPE(name, "AbortSignal", signal);
+    }
+  }
+
   module.exports = {
     validateString,
     validateNumber,
     validateBoolean,
     validateFunction,
     validateInteger,
+    validateInt32,
+    validateUint32,
     validateArray,
     validateBuffer,
     validateObject,
+    validateOneOf,
+    validateEncoding,
+    validateAbortSignal,
+    isInt32,
+    parseFileMode,
     kValidateObjectNone,
     kValidateObjectAllowNullable,
     kValidateObjectAllowArray,
     kValidateObjectAllowFunction,
   };
+
+  // Node wraps validators with hideStackFrames, which exposes `.withoutStackTrace`.
+  // internal/fs/utils calls e.g. validateInt32.withoutStackTrace(...), so mirror it.
+  for (const key of Object.keys(module.exports)) {
+    const v = module.exports[key];
+    if (typeof v === "function" && v.withoutStackTrace === undefined) {
+      v.withoutStackTrace = v;
+    }
+  }
 }

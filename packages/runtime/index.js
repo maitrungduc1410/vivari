@@ -8,7 +8,6 @@ import { EventEmitter } from "./builtins/events.js";
 import { createUtil } from "./builtins/util.js";
 import { createOs } from "./builtins/os.js";
 import { createProcess } from "./builtins/process.js";
-import { createFs } from "./builtins/fs.js";
 import { createAssert } from "./builtins/assert.js";
 import { createChildProcess } from "./builtins/child_process.js";
 import { createHttp } from "./builtins/http.js";
@@ -69,14 +68,16 @@ export function createRuntime({
   const process = createProcess({ pid, ppid, argv, env, cwd, stdout, stderr, enqueueTask });
 
   // Path B: Node's REAL lib/ modules run on top of our internalBinding layer.
-  // `path` and `buffer` are vendored, unmodified Node v24.18.0 source; `Buffer`
-  // is the real Buffer (Uint8Array subclass) over our internalBinding('buffer').
-  const nodeModules = createNodeModules({ process });
+  // `path`, `buffer` and `fs` are vendored, unmodified Node v24.18.0 source;
+  // `Buffer` is the real Buffer (Uint8Array subclass) over
+  // internalBinding('buffer'), and `fs` is Node's real lib/fs.js over
+  // internalBinding('fs') (node/bindings/fs.js -> Rust VFS via the sync bridge).
+  const nodeModules = createNodeModules({ process, syscalls });
   const bufferModule = nodeModules.require("buffer");
   const Buffer = bufferModule.Buffer;
   const path = nodeModules.require("path");
   const util = createUtil({ Buffer });
-  const fs = createFs(syscalls, Buffer, path);
+  const fs = nodeModules.require("fs");
   const assert = createAssert(util);
   const child_process = createChildProcess({ sys: syscalls, process, Buffer });
   const http = createHttp({ syscalls, servers, enqueueTask, EventEmitter, Buffer });

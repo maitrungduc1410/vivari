@@ -16,6 +16,7 @@ import { createInternalBinding } from "./internal-binding.js";
 
 import pathFactory from "./lib/path.js";
 import bufferFactory from "./lib/buffer.js";
+import fsFactory from "./lib/fs.js";
 import constantsFactory from "./internal/constants.js";
 import validatorsFactory from "./internal/validators.js";
 import errorsFactory from "./internal/errors.js";
@@ -25,12 +26,19 @@ import utilInspectFactory from "./internal/util/inspect.js";
 import internalBufferFactory from "./internal/buffer.js";
 import startupSnapshotFactory from "./internal/v8/startup_snapshot.js";
 import optionsFactory from "./internal/options.js";
+import fsUtilsFactory from "./internal/fs/utils.js";
+import fsReadContextFactory from "./internal/fs/read/context.js";
+import urlFactory from "./internal/url.js";
+import blobFactory from "./internal/blob.js";
+import permissionFactory from "./internal/process/permission.js";
+import assertFactory from "./internal/assert.js";
 
 // name -> factory. Public builtins (e.g. "path") and internals ("internal/...")
 // live in the same table, just like Node's builtin id space.
 const FACTORIES = {
   path: pathFactory,
   buffer: bufferFactory,
+  fs: fsFactory,
   "util/types": utilTypesFactory,
   "internal/constants": constantsFactory,
   "internal/validators": validatorsFactory,
@@ -41,12 +49,18 @@ const FACTORIES = {
   "internal/buffer": internalBufferFactory,
   "internal/v8/startup_snapshot": startupSnapshotFactory,
   "internal/options": optionsFactory,
+  "internal/fs/utils": fsUtilsFactory,
+  "internal/fs/read/context": fsReadContextFactory,
+  "internal/url": urlFactory,
+  "internal/blob": blobFactory,
+  "internal/process/permission": permissionFactory,
+  "internal/assert": assertFactory,
 };
 
 const strip = (name) => (name.startsWith("node:") ? name.slice(5) : name);
 
-export function createNodeModules({ process }) {
-  const internalBinding = createInternalBinding();
+export function createNodeModules({ process, syscalls }) {
+  const internalBinding = createInternalBinding({ syscalls, process });
   const modules = new Map(); // id -> module object (kept for cycle resolution)
 
   function nodeRequire(name) {

@@ -22,6 +22,9 @@ import {
   encodeString,
   decodeBytes,
   decodeRequest,
+  u32ToBytes,
+  bytesToU32,
+  bytesToF64,
   SAB_BYTES,
   I_STATE,
   I_OPCODE,
@@ -42,6 +45,12 @@ import {
   OP_RENAME,
   OP_SYMLINK,
   OP_READLINK,
+  OP_OPEN,
+  OP_CLOSE,
+  OP_FD_READ,
+  OP_FD_WRITE,
+  OP_FSTAT,
+  OP_FTRUNCATE,
   OP_SPAWN,
   OP_LISTEN,
   OP_ACCEPT,
@@ -371,6 +380,18 @@ export class Kernel {
         return vfs.symlink(s(0), s(1)), EMPTY;
       case OP_READLINK:
         return encodeString(vfs.readlink(s(0)));
+      case OP_OPEN:
+        return u32ToBytes(vfs.open(s(0), bytesToU32(fields[1]) | 0, bytesToU32(fields[2])));
+      case OP_CLOSE:
+        return vfs.close(bytesToU32(fields[0])), EMPTY;
+      case OP_FD_READ:
+        return vfs.fd_read(bytesToU32(fields[0]), bytesToU32(fields[1]), bytesToF64(fields[2]));
+      case OP_FD_WRITE:
+        return u32ToBytes(vfs.fd_write(bytesToU32(fields[0]), fields[2], bytesToF64(fields[1])));
+      case OP_FSTAT:
+        return encodeString(vfs.fstat(bytesToU32(fields[0])));
+      case OP_FTRUNCATE:
+        return vfs.ftruncate(bytesToU32(fields[0]), bytesToU32(fields[1])), EMPTY;
       default:
         throw "ENOSYS";
     }

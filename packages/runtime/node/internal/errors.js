@@ -23,14 +23,20 @@ export default function (exports, require, module, process, internalBinding, pri
     return `type ${t}`;
   };
 
-  const makeNodeError = (Base, code, formatter) =>
-    class extends Base {
+  const makeNodeError = (Base, code, formatter) => {
+    const Cls = class extends Base {
       constructor(...args) {
         super(formatter(...args));
         this.code = code;
         this.name = `${Base.name} [${code}]`;
       }
     };
+    // Node exposes a stack-frame-hiding variant on each code; for us it is the
+    // same constructor (we don't massage stacks). Vendored modules call
+    // `new ERR_X.HideStackFramesError(...)`.
+    Cls.HideStackFramesError = Cls;
+    return Cls;
+  };
 
   const ERR_INVALID_ARG_TYPE = makeNodeError(
     TypeError,
@@ -105,15 +111,96 @@ export default function (exports, require, module, process, internalBinding, pri
     return `The ${list} argument${names.length > 1 ? "s" : ""} must be specified`;
   });
 
+  const ERR_INCOMPATIBLE_OPTION_PAIR = makeNodeError(
+    TypeError,
+    "ERR_INCOMPATIBLE_OPTION_PAIR",
+    (a, b) => `Option "${a}" cannot be used in combination with option "${b}"`,
+  );
+
+  const ERR_ACCESS_DENIED = makeNodeError(
+    Error,
+    "ERR_ACCESS_DENIED",
+    (message) => message || "Access to this API has been restricted",
+  );
+
+  const ERR_FS_FILE_TOO_LARGE = makeNodeError(
+    RangeError,
+    "ERR_FS_FILE_TOO_LARGE",
+    (size) => `File size (${size}) is greater than 2 GiB`,
+  );
+
+  // SystemError-shaped: built from a ctx object ({ code, message, path, ... }).
+  const makeSystemError = (code) => {
+    const Cls = class extends Error {
+      constructor(ctx = {}) {
+        super(ctx.message ? `${code}: ${ctx.message}` : code);
+        this.code = ctx.code || code;
+        if (ctx.errno !== undefined) this.errno = ctx.errno;
+        if (ctx.syscall !== undefined) this.syscall = ctx.syscall;
+        if (ctx.path !== undefined) this.path = ctx.path;
+        if (ctx.dest !== undefined) this.dest = ctx.dest;
+        this.name = `SystemError [${this.code}]`;
+      }
+    };
+    Cls.HideStackFramesError = Cls;
+    return Cls;
+  };
+
+  const ERR_FS_EISDIR = makeSystemError("ERR_FS_EISDIR");
+
+  // libuv-style exception constructed from a binding ctx. Only reached via
+  // handleErrorFromBinding, which our sync-throwing binding never triggers, but
+  // fs.js destructures it at load.
+  function UVException(ctx = {}) {
+    const err = new Error(
+      `${ctx.code || "EIO"}: ${ctx.message || "unknown error"}, ${ctx.syscall || ""}`,
+    );
+    err.code = ctx.code;
+    err.errno = ctx.errno;
+    err.syscall = ctx.syscall;
+    if (ctx.path !== undefined) err.path = ctx.path;
+    if (ctx.dest !== undefined) err.dest = ctx.dest;
+    return err;
+  }
+
+  class AbortError extends Error {
+    constructor(message = "The operation was aborted", options = undefined) {
+      super(message, options);
+      this.code = "ABORT_ERR";
+      this.name = "AbortError";
+    }
+  }
+
+  // Combine an error with a prior one (Node returns an AggregateError). We keep
+  // it simple: prefer the newer error, stash the previous on it.
+  function aggregateTwoErrors(innerError, outerError) {
+    if (innerError && outerError && innerError !== outerError) {
+      if (typeof AggregateError === "function") {
+        const err = new AggregateError([outerError, innerError], outerError.message);
+        err.code = outerError.code;
+        return err;
+      }
+      outerError.previous = innerError;
+    }
+    return innerError || outerError;
+  }
+
   // A plain Error carrying extra properties (used by Buffer.transcode et al.).
   const genericNodeError = (message, props) => Object.assign(new Error(message), props);
 
-  // Node hides internal stack frames; for us the identity wrapper is fine.
-  const hideStackFrames = (fn) => fn;
+  // Node hides internal stack frames; we don't massage stacks, but we must still
+  // expose the `.withoutStackTrace` alias the vendored modules call.
+  const hideStackFrames = (fn) => {
+    fn.withoutStackTrace = fn;
+    return fn;
+  };
 
   module.exports = {
     hideStackFrames,
     genericNodeError,
+    UVException,
+    AbortError,
+    aggregateTwoErrors,
     codes: {
       ERR_INVALID_ARG_TYPE,
       ERR_INVALID_ARG_VALUE,
@@ -124,6 +211,13 @@ export default function (exports, require, module, process, internalBinding, pri
       ERR_INVALID_BUFFER_SIZE,
       ERR_UNKNOWN_ENCODING,
       ERR_MISSING_ARGS,
+      ERR_INCOMPATIBLE_OPTION_PAIR,
+      ERR_ACCESS_DENIED,
+      ERR_FS_FILE_TOO_LARGE,
+      ERR_FS_EISDIR,
+      // fs.js also destructures these two but only uses them in edge/async paths.
+      ERR_FS_CP_EINVAL: makeSystemError("ERR_FS_CP_EINVAL"),
+      ERR_INVALID_ARG_TYPE_RANGE: ERR_OUT_OF_RANGE,
     },
   };
 }

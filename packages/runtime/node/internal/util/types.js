@@ -8,13 +8,25 @@ export default function (exports, require, module, process, internalBinding, pri
   "use strict";
 
   const hasShared = typeof SharedArrayBuffer !== "undefined";
+  const dateToString = Date.prototype.toString;
+  const isDate = (v) => {
+    if (v instanceof Date) return true;
+    try {
+      dateToString.call(v);
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   module.exports = {
     isArrayBuffer: (v) => v instanceof ArrayBuffer,
     isAnyArrayBuffer: (v) => v instanceof ArrayBuffer || (hasShared && v instanceof SharedArrayBuffer),
     isArrayBufferView: (v) => ArrayBuffer.isView(v),
     isUint8Array: (v) => v instanceof Uint8Array,
+    isBigInt64Array: (v) => v instanceof BigInt64Array,
     isTypedArray: (v) => ArrayBuffer.isView(v) && !(v instanceof DataView),
     isDataView: (v) => v instanceof DataView,
+    isDate,
   };
 }

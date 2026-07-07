@@ -9,6 +9,56 @@
 // with 'fs' (Rust VFS), 'zlib', etc. to follow.
 
 import { createBufferBinding } from "./bindings/buffer.js";
+import { createFsBinding } from "./bindings/fs.js";
+
+// POSIX/libuv constants exposed as internalBinding('constants').fs. Node's real
+// lib/fs.js and internal/fs/utils.js destructure these; the O_* values MUST
+// match the flag bits the Rust VFS decodes in open(2) (Linux values).
+const FS_CONSTANTS = {
+  O_RDONLY: 0,
+  O_WRONLY: 1,
+  O_RDWR: 2,
+  O_CREAT: 0o100,
+  O_EXCL: 0o200,
+  O_NOCTTY: 0o400,
+  O_TRUNC: 0o1000,
+  O_APPEND: 0o2000,
+  O_DIRECTORY: 0o200000,
+  O_NOFOLLOW: 0o400000,
+  O_SYNC: 0o4010000,
+  O_DSYNC: 0o10000,
+  O_DIRECT: 0o40000,
+  O_NONBLOCK: 0o4000,
+  S_IFMT: 0o170000,
+  S_IFREG: 0o100000,
+  S_IFDIR: 0o040000,
+  S_IFCHR: 0o020000,
+  S_IFBLK: 0o060000,
+  S_IFIFO: 0o010000,
+  S_IFLNK: 0o120000,
+  S_IFSOCK: 0o140000,
+  S_IRWXU: 0o700,
+  S_IRUSR: 0o400,
+  S_IWUSR: 0o200,
+  S_IXUSR: 0o100,
+  F_OK: 0,
+  R_OK: 4,
+  W_OK: 2,
+  X_OK: 1,
+  COPYFILE_EXCL: 1,
+  COPYFILE_FICLONE: 2,
+  COPYFILE_FICLONE_FORCE: 4,
+  UV_FS_SYMLINK_DIR: 1,
+  UV_FS_SYMLINK_JUNCTION: 2,
+  UV_DIRENT_UNKNOWN: 0,
+  UV_DIRENT_FILE: 1,
+  UV_DIRENT_DIR: 2,
+  UV_DIRENT_LINK: 3,
+  UV_DIRENT_FIFO: 4,
+  UV_DIRENT_SOCKET: 5,
+  UV_DIRENT_CHAR: 6,
+  UV_DIRENT_BLOCK: 7,
+};
 
 // Node's v8::PropertyFilter values used by getOwnNonIndexProperties.
 const ALL_PROPERTIES = 0;
@@ -28,9 +78,12 @@ function getOwnNonIndexProperties(obj, filter) {
   return out;
 }
 
-export function createInternalBinding() {
+export function createInternalBinding({ syscalls, process } = {}) {
   const bindings = {
     buffer: createBufferBinding(),
+    // 'fs' needs the sync-bridge syscalls (to reach the Rust VFS) and process
+    // (to defer async callbacks onto nextTick).
+    fs: syscalls ? createFsBinding({ sys: syscalls, process }) : undefined,
     util: {
       constants: { ALL_PROPERTIES, ONLY_ENUMERABLE },
       getOwnNonIndexProperties,
@@ -42,8 +95,8 @@ export function createInternalBinding() {
     // hasIntl=false keeps Buffer.transcode / ICU paths dormant (no icu binding).
     config: { hasIntl: false },
     constants: {
-      os: { signals: {}, errno: {}, priority: {} },
-      fs: {},
+      os: { signals: {}, errno: { EISDIR: 21 }, priority: {} },
+      fs: FS_CONSTANTS,
     },
   };
 

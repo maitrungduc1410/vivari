@@ -117,7 +117,19 @@ function resolvePrototypeMember(proto, methodPart) {
   return undefined;
 }
 
+// Names that don't follow the <Ns><Member> scheme. `uncurryThis` is a primordial
+// helper itself; the Safe* collections are Node's monkeypatch-proof subclasses —
+// plain Map/Set/WeakMap are behaviourally equivalent for our vendored modules.
+const SPECIALS = {
+  uncurryThis,
+  SafeMap: Map,
+  SafeSet: Set,
+  SafeWeakMap: WeakMap,
+  SafeWeakSet: WeakSet,
+};
+
 function resolve(name) {
+  if (Object.prototype.hasOwnProperty.call(SPECIALS, name)) return SPECIALS[name];
   if (Object.prototype.hasOwnProperty.call(GLOBALS, name)) return GLOBALS[name];
 
   for (const ns of NS_NAMES) {

@@ -222,10 +222,28 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
      `primordials` is now a self-generating Proxy; added `internal/util/{types,inspect}`,
      `internal/v8/startup_snapshot`, `internal/options`, `internalBinding('util'/'config')`,
      and more error codes / validators.
-4. **`internalBinding('fs')` + real `lib/fs.js` + `internal/fs/*`** [M] — reshape our
-   existing `fs-client.js` (already a hand-rolled fs binding) into the shape Node's
-   `lib/fs.js` expects (`FSReqCallback`, `statValues`, sync + async). Backend (Rust
-   VFS) already exists → big compat jump for modest effort.
+4. ✅ **`internalBinding('fs')` + real `lib/fs.js` + `internal/fs/*`** [M] — `require('fs')`
+   is now Node v24.18.0's **real, unmodified** `lib/fs.js` (+ `internal/fs/utils.js`,
+   `internal/fs/read/context.js`) over a hand-written `internalBinding('fs')`
+   (`node/bindings/fs.js`). Scope delivered: the **sync + callback** API. Streams,
+   promises and watch are deferred (they lazy-require and want the event loop of #5/#6).
+   - **Real file descriptors, down to Rust.** `lib/fs.js` routes even `readFileSync`
+     through `open → fstat → read → close`, so the Rust VFS grew a real fd layer
+     (`open/close/fd_read/fd_write/fstat/ftruncate`, positional + cursor I/O, O_* flags,
+     zero-fill, `EBADF`; `stat` now carries `ino`). New syscall opcodes
+     (`OP_OPEN/CLOSE/FD_READ/FD_WRITE/FSTAT/FTRUNCATE`) thread through
+     `protocol/syscall.js` → `kernel-host` → `fs-client.js`, chunked to the 1 MiB
+     shared window (lib/fs.js loops on short reads/writes). Wasm rebuilt (web + node).
+   - **The binding maps Node's native contract onto the sync bridge:** `stat/lstat/fstat`
+     fill the shared `statValues` Float64Array (18 fields, s+ns time pairs) in place;
+     async calls carry an `FSReqCallback` whose `oncomplete` we deliver on
+     `process.nextTick` (syscalls are synchronous, only the callback is deferred);
+     relative paths are resolved against `process.cwd()` at the boundary (as libuv does).
+   - Grew the shared internal layer again: vendored `internal/fs/utils`, `read/context`;
+     shimmed `internal/{url,blob,assert}`, `internal/process/permission`;
+     `internalBinding('constants').fs` (O_*/S_*/UV_DIRENT_*/COPYFILE_*); `primordials`
+     gained `uncurryThis` + `Safe{Map,Set}`; more `internal/{errors,util,validators,
+     util/types}` symbols. Hand-written `builtins/fs.js` deleted.
 5. **Event loop v2** [M] — real microtask/macrotask ordering: `queueMicrotask` +
    `process.nextTick` + `setImmediate` + timers, **firing even while a server is parked
    in `accept`** (fixes the Brick 5 deferral). Foundation for async stream/http.

@@ -69,6 +69,47 @@ const server = http.createServer((req, res) => {
     res.end(body);
     return;
   }
+  if (req.url === '/api/fs') {
+    // Exercise Node's REAL fs (vendored lib/fs.js on our internalBinding('fs'),
+    // backed by real file descriptors down to the Rust VFS) inside the browser.
+    const fs = require('fs');
+    const dir = '/tmp/oc-demo';
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir + '/sub', { recursive: true });
+
+    // Low-level fd round-trip: openSync -> writeSync -> fstatSync -> readSync.
+    const fd = fs.openSync(dir + '/hello.txt', 'w');
+    fs.writeSync(fd, 'hello ');
+    fs.writeSync(fd, 'fd world');
+    const fdSize = fs.fstatSync(fd).size;
+    fs.closeSync(fd);
+
+    fs.appendFileSync(dir + '/hello.txt', '!');
+    fs.writeFileSync(dir + '/sub/a.json', JSON.stringify({ ok: true }));
+    fs.symlinkSync(dir + '/hello.txt', dir + '/link');
+    fs.renameSync(dir + '/sub/a.json', dir + '/sub/b.json');
+
+    const st = fs.statSync(dir + '/hello.txt');
+    const demo = {
+      node: process.version,
+      content: fs.readFileSync(dir + '/hello.txt', 'utf8'),
+      viaSymlink: fs.readFileSync(dir + '/link', 'utf8'),
+      fdWrittenBytes: fdSize,
+      size: st.size,
+      ino: st.ino,
+      isFile: st.isFile(),
+      mtimeISO: st.mtime.toISOString(),
+      dirEntries: fs
+        .readdirSync(dir, { withFileTypes: true })
+        .map((d) => d.name + (d.isDirectory() ? '/' : d.isSymbolicLink() ? '@' : '')),
+      subEntries: fs.readdirSync(dir + '/sub'),
+      linkTarget: fs.readlinkSync(dir + '/link'),
+    };
+    const body = Buffer.from(JSON.stringify(demo, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(\`<!doctype html>
 <html><head><meta charset="utf-8"><title>Hello from OpenContainer</title>
@@ -83,12 +124,14 @@ const server = http.createServer((req, res) => {
 <body><div class="card">
   <h1>Hello from OpenContainer 🎉</h1>
   <p>Served by <code>http.createServer</code> in worker <code>PID \${process.pid}</code></p>
-  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> vendored, running in your browser</p>
+  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> vendored, running in your browser</p>
   <p>You requested <code>\${req.url}</code></p>
   <button onclick="fetch('api/time').then(r=>r.json()).then(t=>document.getElementById('t').textContent=JSON.stringify(t))">GET /api/time</button>
   <button onclick="fetch('api/buffer').then(r=>r.json()).then(t=>document.getElementById('b').textContent=JSON.stringify(t,null,2))">GET /api/buffer</button>
+  <button onclick="fetch('api/fs').then(r=>r.json()).then(t=>document.getElementById('f').textContent=JSON.stringify(t,null,2))">GET /api/fs</button>
   <pre id="t"></pre>
   <pre id="b"></pre>
+  <pre id="f"></pre>
 </div></body></html>\`);
 });
 

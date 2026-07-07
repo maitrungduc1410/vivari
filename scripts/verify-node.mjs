@@ -186,6 +186,114 @@ console.log('BUFFERB_OK');
   assert(bb.code === 0 && bb.stdout.includes("BUFFERB_OK"),
     "Path B: real Node lib/buffer.js runs (codecs/numeric/bigint/swap) via internalBinding('buffer')");
 
+  // Path B proof: require('fs') is Node's REAL vendored lib/fs.js running on our
+  // internalBinding('fs') (node/bindings/fs.js -> Rust VFS via real fds). This
+  // exercises the fd layer (open/write/fstat/read/close), whole-file helpers,
+  // real Stats (ino/size/mtime + isFile/isDirectory), Dirent (withFileTypes),
+  // recursive mkdir/rm, rename/copy/symlink/readlink, ftruncate, mkdtemp.
+  kernel.writeFile(
+    "/t/fsb.js",
+    `
+const assert = require('assert');
+const fs = require('fs');
+
+// fd round-trip: openSync/writeSync/fstatSync/readSync/closeSync (real fds).
+const fd = fs.openSync('/t/fdfile.txt', 'w');
+assert.strictEqual(fs.writeSync(fd, 'hello fd'), 8);
+const fst = fs.fstatSync(fd);
+assert.strictEqual(fst.size, 8);
+assert.ok(fst.isFile());
+fs.closeSync(fd);
+const rfd = fs.openSync('/t/fdfile.txt', 'r');
+const buf = Buffer.alloc(5);
+assert.strictEqual(fs.readSync(rfd, buf, 0, 5, 0), 5);
+assert.strictEqual(buf.toString(), 'hello');
+fs.closeSync(rfd);
+
+// whole-file helpers: utf8 fast path + Buffer + append.
+fs.writeFileSync('/t/a.txt', 'abc');
+assert.strictEqual(fs.readFileSync('/t/a.txt', 'utf8'), 'abc');
+assert.ok(Buffer.isBuffer(fs.readFileSync('/t/a.txt')));
+fs.appendFileSync('/t/a.txt', 'def');
+assert.strictEqual(fs.readFileSync('/t/a.txt', 'utf8'), 'abcdef');
+
+// real Stats.
+const s = fs.statSync('/t/a.txt');
+assert.ok(s.isFile() && !s.isDirectory());
+assert.strictEqual(s.size, 6);
+assert.ok(s.mtime instanceof Date);
+assert.ok(typeof s.ino === 'number' && s.ino > 0);
+assert.strictEqual(fs.statSync('/t', { throwIfNoEntry: false }).isDirectory(), true);
+assert.strictEqual(fs.statSync('/t/nope', { throwIfNoEntry: false }), undefined);
+
+// recursive mkdir + readdir (+ withFileTypes Dirent).
+fs.mkdirSync('/t/d/e/f', { recursive: true });
+assert.ok(fs.statSync('/t/d/e/f').isDirectory());
+fs.writeFileSync('/t/d/one.txt', '1');
+fs.mkdirSync('/t/d/sub');
+assert.deepStrictEqual(fs.readdirSync('/t/d').sort(), ['e', 'one.txt', 'sub']);
+const ents = fs.readdirSync('/t/d', { withFileTypes: true });
+const byName = Object.fromEntries(ents.map((d) => [d.name, d]));
+assert.ok(byName['one.txt'].isFile());
+assert.ok(byName['sub'].isDirectory());
+
+// rename / copy / exists / realpath.
+fs.renameSync('/t/a.txt', '/t/a2.txt');
+assert.ok(!fs.existsSync('/t/a.txt') && fs.existsSync('/t/a2.txt'));
+fs.copyFileSync('/t/a2.txt', '/t/a3.txt');
+assert.strictEqual(fs.readFileSync('/t/a3.txt', 'utf8'), 'abcdef');
+assert.strictEqual(fs.realpathSync('/t/a3.txt'), '/t/a3.txt');
+
+// symlink / readlink / lstat (+ follow on read).
+fs.symlinkSync('/t/a3.txt', '/t/link');
+assert.strictEqual(fs.readlinkSync('/t/link'), '/t/a3.txt');
+assert.ok(fs.lstatSync('/t/link').isSymbolicLink());
+assert.strictEqual(fs.readFileSync('/t/link', 'utf8'), 'abcdef');
+
+// ftruncate.
+const tfd = fs.openSync('/t/a3.txt', 'r+');
+fs.ftruncateSync(tfd, 3);
+fs.closeSync(tfd);
+assert.strictEqual(fs.readFileSync('/t/a3.txt', 'utf8'), 'abc');
+
+// recursive rm + mkdtemp.
+fs.rmSync('/t/d', { recursive: true });
+assert.ok(!fs.existsSync('/t/d'));
+const tmp = fs.mkdtempSync('/t/tmp-');
+assert.ok(fs.statSync(tmp).isDirectory());
+
+console.log('FSB_OK');
+`,
+  );
+  const fsb = await kernel.start("node", ["/t/fsb.js"], { cwd: "/t", capture: true });
+  assert(fsb.code === 0 && fsb.stdout.includes("FSB_OK"),
+    "Path B: real Node lib/fs.js sync API runs (fds/Stats/Dirent/rm/rename/symlink) via internalBinding('fs')");
+
+  // Path B proof: the async (callback) fs API, which routes through FSReqCallback
+  // and is delivered on process.nextTick by our binding.
+  kernel.writeFile(
+    "/t/fscb.js",
+    `
+const assert = require('assert');
+const fs = require('fs');
+fs.writeFile('/t/cb.txt', 'cbdata', (err) => {
+  assert.ok(!err, 'writeFile err');
+  fs.readFile('/t/cb.txt', 'utf8', (err2, data) => {
+    assert.ok(!err2, 'readFile err');
+    assert.strictEqual(data, 'cbdata');
+    fs.stat('/t/cb.txt', (err3, st) => {
+      assert.ok(!err3, 'stat err');
+      assert.ok(st.isFile() && st.size === 6);
+      console.log('FSCB_OK');
+    });
+  });
+});
+`,
+  );
+  const fscb = await kernel.start("node", ["/t/fscb.js"], { cwd: "/t", capture: true });
+  assert(fscb.code === 0 && fscb.stdout.includes("FSCB_OK"),
+    "Path B: real Node lib/fs.js callback API (writeFile/readFile/stat) via FSReqCallback + nextTick");
+
   // === brick 4: shell session with each command as its own process ===
   const sh = await kernel.start("sh", ["/root.sh"], { cwd: "/", capture: true });
   const o = sh.stdout;
