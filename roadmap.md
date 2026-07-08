@@ -57,7 +57,32 @@ Upgraded the VFS from a flat map to a POSIX-like filesystem.
 - `scripts/verify-node.mjs`: 17/17 PASS (nested dirs, symlink follow, rename,
   errno behaviour).
 
-**Deferred:** IndexedDB persistence across reloads (later).
+**Persistence across reloads — DONE (OPFS write-behind mirror).** The VFS (Rust/Wasm,
+in RAM) is now mirrored to the **Origin Private File System** so a project + its
+`node_modules` survive F5. We picked OPFS over IndexedDB because it exposes **synchronous
+access handles inside a Worker** (`createSyncAccessHandle`, the SQLite-wasm primitive),
+matching our worker-based, `Atomics`-blocking VFS, and draws from the large per-origin
+quota (shared with Cache API). Design — **write-behind mirror**, not a backing store:
+- The Rust VFS stays the source of truth in RAM (reads never touch OPFS → no regression).
+- `FsServer` forwards every successful mutation (`onWrite`/`onDelete`/`onRename`) to
+  `packages/kernel-host/opfs-persistence.js`. The syscall path is synchronous and OPFS
+  handle acquisition is async, so we only **enqueue a dirty path** and drain it on an async
+  loop (coalesced per path). Durability is eventual (~ms); `flush()` on `pagehide` forces it.
+- fd writes (`fd_write`/`ftruncate`/`close`) resolve their path via an fd→path map kept in
+  `FsServer`; on drain we re-read the file's current bytes from the VFS and write one OPFS file.
+- Layout `oc-vfs/{files/…, manifest.json}`: one OPFS file per VFS file (bytes), plus a small
+  manifest `[path,{kind,mode,target}]` that recreates dirs + symlinks (OPFS has neither).
+- Boot `restore()` replays the manifest into the VFS **before** the FS worker serves any
+  syscall (calls the VFS directly, so it never re-enters the queue).
+- Only the browser wires it (`packages/demo/fs-worker.js`); **headless injects no adapter**
+  (`new FsServer(vfs)`), so `verify-node`/`verify-express` are unchanged and still green.
+- System/volatile dirs are skipped (`/bin` coreutils re-install each boot, `/tmp`,`/proc`,
+  `/dev`). `?reset` (host.js) wipes `oc-vfs` before boot. Demo: `GET /api/persist` bumps a
+  counter in `/data/visits.json` that keeps climbing across reloads.
+**Deferred:** exact `mode` restore (needs a VFS `chmod`; today files get the default mode on
+restore — fine for our spawn/PATH resolution which doesn't gate on the exec bit); quota-pressure
+eviction UX (`navigator.storage.persist()` opt-in); a true OPFS-backed store (contents on disk,
+only metadata in RAM) to cap memory for very large trees.
 
 ---
 

@@ -51,10 +51,23 @@ import {
 
 const EMPTY = new Uint8Array(0);
 
+// POSIX open(2) bits we care about for persistence (must match the Rust VFS /
+// internalBinding('constants').fs). A write-opened file with O_CREAT/O_TRUNC is
+// dirty immediately (it may be created empty and never written before close).
+const O_CREAT = 0o100;
+const O_TRUNC = 0o1000;
+
 export class FsServer {
-  constructor(vfs) {
+  // `persistence` (optional) is the OPFS write-behind adapter. When present we
+  // forward every successful mutation to it so the VFS survives a reload; when
+  // null (headless, or OPFS unavailable) the server behaves exactly as before.
+  constructor(vfs, persistence = null) {
     this.vfs = vfs;
+    this.persistence = persistence;
     this.clients = new Map(); // clientId -> { ctrl, data }
+    // fd -> path, so fd-based writes (fd_write/ftruncate/close) know which file
+    // to re-mirror. Only tracked when persistence is active.
+    this.fdPaths = persistence ? new Map() : null;
   }
 
   /**
@@ -104,48 +117,110 @@ export class FsServer {
    */
   writeLarge(path, bytes) {
     this.vfs.write_file(path, bytes);
+    const p = this.persistence;
+    if (p) p.onWrite(path);
   }
 
   dispatch(opcode, flags, fields) {
     const vfs = this.vfs;
+    const p = this.persistence; // null when persistence is off (headless)
     const s = (i) => decodeBytes(fields[i]);
     switch (opcode) {
       case OP_READ_FILE:
         return vfs.read_file(s(0));
-      case OP_WRITE_FILE:
-        return vfs.write_file(s(0), fields[1]), EMPTY;
+      case OP_WRITE_FILE: {
+        const path = s(0);
+        vfs.write_file(path, fields[1]);
+        if (p) p.onWrite(path);
+        return EMPTY;
+      }
       case OP_EXISTS:
         return new Uint8Array([vfs.exists(s(0)) ? 1 : 0]);
       case OP_READDIR:
         return encodeString(vfs.readdir(s(0)).join("\n"));
-      case OP_MKDIR:
-        return vfs.mkdir(s(0), (flags & FLAG_RECURSIVE) !== 0), EMPTY;
+      case OP_MKDIR: {
+        const path = s(0);
+        vfs.mkdir(path, (flags & FLAG_RECURSIVE) !== 0);
+        if (p) p.onWrite(path);
+        return EMPTY;
+      }
       case OP_STAT:
         return encodeString(vfs.stat(s(0)));
       case OP_LSTAT:
         return encodeString(vfs.lstat(s(0)));
-      case OP_UNLINK:
-        return vfs.unlink(s(0)), EMPTY;
-      case OP_RMDIR:
-        return vfs.rmdir(s(0)), EMPTY;
-      case OP_RENAME:
-        return vfs.rename(s(0), s(1)), EMPTY;
-      case OP_SYMLINK:
-        return vfs.symlink(s(0), s(1)), EMPTY;
+      case OP_UNLINK: {
+        const path = s(0);
+        vfs.unlink(path);
+        if (p) p.onDelete(path);
+        return EMPTY;
+      }
+      case OP_RMDIR: {
+        const path = s(0);
+        vfs.rmdir(path);
+        if (p) p.onDelete(path);
+        return EMPTY;
+      }
+      case OP_RENAME: {
+        const from = s(0);
+        const to = s(1);
+        vfs.rename(from, to);
+        if (p) p.onRename(from, to);
+        return EMPTY;
+      }
+      case OP_SYMLINK: {
+        const target = s(0);
+        const linkpath = s(1);
+        vfs.symlink(target, linkpath);
+        if (p) p.onWrite(linkpath);
+        return EMPTY;
+      }
       case OP_READLINK:
         return encodeString(vfs.readlink(s(0)));
-      case OP_OPEN:
-        return u32ToBytes(vfs.open(s(0), bytesToU32(fields[1]) | 0, bytesToU32(fields[2])));
-      case OP_CLOSE:
-        return vfs.close(bytesToU32(fields[0])), EMPTY;
+      case OP_OPEN: {
+        const path = s(0);
+        const oflags = bytesToU32(fields[1]) | 0;
+        const fd = vfs.open(path, oflags, bytesToU32(fields[2]));
+        if (p) {
+          this.fdPaths.set(fd, path);
+          const accmode = oflags & 0o3;
+          const writable = accmode === 1 /* O_WRONLY */ || accmode === 2 /* O_RDWR */;
+          // A file opened for write with create/truncate is dirty right away.
+          if (writable && (oflags & (O_CREAT | O_TRUNC)) !== 0) p.onWrite(path);
+        }
+        return u32ToBytes(fd);
+      }
+      case OP_CLOSE: {
+        const fd = bytesToU32(fields[0]);
+        vfs.close(fd);
+        if (p) {
+          const path = this.fdPaths.get(fd);
+          this.fdPaths.delete(fd);
+          if (path) p.onWrite(path); // flush the final contents on close
+        }
+        return EMPTY;
+      }
       case OP_FD_READ:
         return vfs.fd_read(bytesToU32(fields[0]), bytesToU32(fields[1]), bytesToF64(fields[2]));
-      case OP_FD_WRITE:
-        return u32ToBytes(vfs.fd_write(bytesToU32(fields[0]), fields[2], bytesToF64(fields[1])));
+      case OP_FD_WRITE: {
+        const fd = bytesToU32(fields[0]);
+        const n = vfs.fd_write(fd, fields[2], bytesToF64(fields[1]));
+        if (p) {
+          const path = this.fdPaths.get(fd);
+          if (path) p.onWrite(path);
+        }
+        return u32ToBytes(n);
+      }
       case OP_FSTAT:
         return encodeString(vfs.fstat(bytesToU32(fields[0])));
-      case OP_FTRUNCATE:
-        return vfs.ftruncate(bytesToU32(fields[0]), bytesToU32(fields[1])), EMPTY;
+      case OP_FTRUNCATE: {
+        const fd = bytesToU32(fields[0]);
+        vfs.ftruncate(fd, bytesToU32(fields[1]));
+        if (p) {
+          const path = this.fdPaths.get(fd);
+          if (path) p.onWrite(path);
+        }
+        return EMPTY;
+      }
       default:
         throw "ENOSYS";
     }

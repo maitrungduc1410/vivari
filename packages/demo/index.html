@@ -108,6 +108,9 @@
         <code>lib/path.js</code> and <code>lib/buffer.js</code> (v24.18.0) over our
         <code>internalBinding</code> layer. The in-memory HTTP server is previewed
         via a Service Worker — try <code>GET /api/buffer</code> in the preview.
+        The VFS is mirrored to <strong>OPFS</strong>, so files survive a reload —
+        try <code>GET /api/persist</code>, then reload. Append <code>?reset</code>
+        to the URL to clear the persisted filesystem.
       </p>
     </header>
     <div class="split">

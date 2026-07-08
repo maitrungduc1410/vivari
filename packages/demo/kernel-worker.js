@@ -497,6 +497,33 @@ const server = http.createServer(async (req, res) => {
     res.end(body);
     return;
   }
+  if (req.url === '/api/persist') {
+    // OPFS persistence proof: read a counter file, bump it, write it back. The
+    // File System Worker mirrors /data/visits.json to the Origin Private File
+    // System, so this count SURVIVES a page reload (F5) — real durable fs in the
+    // browser, no server. Reload the page and hit this again: it keeps climbing.
+    const fs = require('fs');
+    const path = require('path');
+    const file = '/data/visits.json';
+    let state = { visits: 0, firstSeen: new Date().toISOString() };
+    let restored = false;
+    try {
+      state = JSON.parse(fs.readFileSync(file, 'utf8'));
+      restored = true; // the file was already there => it came back from OPFS
+    } catch { /* first ever visit */ }
+    state.visits = (state.visits | 0) + 1;
+    state.lastSeen = new Date().toISOString();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(state));
+    const body = Buffer.from(JSON.stringify({
+      note: 'This counter lives in the VFS at /data/visits.json and is mirrored to OPFS. Reload the page (do NOT use ?reset) and hit this again — visits keeps increasing, proving the filesystem persisted across reloads.',
+      restoredFromDisk: restored,
+      ...state,
+    }, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(\`<!doctype html>
 <html><head><meta charset="utf-8"><title>Hello from OpenContainer</title>
@@ -527,6 +554,7 @@ const server = http.createServer(async (req, res) => {
   <button onclick="fetch('api/napi').then(r=>r.json()).then(t=>document.getElementById('np').textContent=JSON.stringify(t,null,2))">GET /api/napi (N-API addon on wasm)</button>
   <button onclick="fetch('api/spawn').then(r=>r.json()).then(t=>document.getElementById('sp').textContent=JSON.stringify(t,null,2))">GET /api/spawn (async child_process)</button>
   <button onclick="fetch('api/threads').then(r=>r.json()).then(t=>document.getElementById('wt').textContent=JSON.stringify(t,null,2))">GET /api/threads (worker_threads + SAB)</button>
+  <button onclick="fetch('api/persist').then(r=>r.json()).then(t=>document.getElementById('pv').textContent=JSON.stringify(t,null,2))">GET /api/persist (OPFS — survives reload)</button>
   <button onclick="var el=document.getElementById('nf');el.textContent='fetching npm registry…';fetch('api/fetch').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2)).catch(e=>el.textContent=String(e))">GET /api/fetch (npm registry)</button>
   <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
   <pre id="t"></pre>
@@ -543,6 +571,7 @@ const server = http.createServer(async (req, res) => {
   <pre id="np"></pre>
   <pre id="sp"></pre>
   <pre id="wt"></pre>
+  <pre id="pv"></pre>
   <pre id="nf"></pre>
 </div></body></html>\`);
 });
@@ -577,6 +606,9 @@ app.listen(3100, () =>
 
 let kernel = null;
 const listening = new Set();
+// The File System Worker handle, kept module-scoped so the page-hide flush relay
+// (host -> here -> FS worker) can reach it. Set in boot().
+let fsWorkerRef = null;
 
 // Resolve once a process registers a listener on `port` (kernel.onListen fires).
 function waitListen(port, timeoutMs = 20000) {
@@ -611,10 +643,13 @@ async function boot() {
     type: "module",
     name: "File System Worker",
   });
+  fsWorkerRef = fsWorker;
   let onKernelFsMessage = () => {};
   const fsReady = new Promise((resolve) => {
     fsWorker.onmessage = (event) => {
       if (event.data.type === "ready") resolve();
+      // The FS worker logs OPFS restore status; relay it to the host UI.
+      else if (event.data.type === "log") post("log", event.data);
       else onKernelFsMessage(event.data);
     };
   });
@@ -879,6 +914,13 @@ self.onmessage = async (event) => {
 
   if (m.type === "init") {
     boot().catch((err) => post("log", { line: "kernel worker boot failed: " + err, cls: "err" }));
+    return;
+  }
+
+  // The page is hiding — relay a best-effort flush to the FS worker so the OPFS
+  // mirror catches any writes still queued in the write-behind buffer.
+  if (m.type === "fs-flush") {
+    if (fsWorkerRef) fsWorkerRef.postMessage({ type: "fs-flush" });
     return;
   }
 

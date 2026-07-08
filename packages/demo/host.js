@@ -48,10 +48,26 @@ async function main() {
   }
   print("crossOriginIsolated = " + self.crossOriginIsolated, "muted");
 
+  // Persistence reset: `?reset` wipes the OPFS-mirrored VFS before boot, for a
+  // clean slate (e.g. after a schema change or to clear a big node_modules).
+  if (new URLSearchParams(location.search).has("reset")) {
+    try {
+      const dir = await navigator.storage.getDirectory();
+      await dir.removeEntry("oc-vfs", { recursive: true });
+      print("OPFS persistence reset — cleared the persisted VFS.", "muted");
+    } catch {
+      /* nothing persisted yet */
+    }
+  }
+
   const kernelWorker = new Worker(new URL("./kernel-worker.js", import.meta.url), {
     type: "module",
     name: "Kernel Worker",
   });
+
+  // On page hide, ask the kernel to flush the write-behind OPFS mirror so the
+  // last few writes reach disk before the tab is frozen/closed (best-effort).
+  addEventListener("pagehide", () => kernelWorker.postMessage({ type: "fs-flush" }));
 
   kernelWorker.onmessage = (event) => {
     const m = event.data;
