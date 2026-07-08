@@ -440,6 +440,42 @@ const server = http.createServer(async (req, res) => {
     res.end(body);
     return;
   }
+  if (req.url === '/api/threads') {
+    // Phase 2 #16 stage 2b: worker_threads.Worker spawns a REAL nested thread
+    // (its own kernel-allocated syscall SAB + FS registration). It sums 1..N OFF
+    // the main thread, posts the total back over the direct MessageChannel, AND
+    // writes it into a SharedArrayBuffer we read via Atomics — true shared memory.
+    const { Worker } = require('worker_threads');
+    const sab = new SharedArrayBuffer(8);
+    const shared = new Int32Array(sab);
+    const N = 65535; // sum(1..N) = 2147450880, fits in an int32 for a clean proof
+    const result = await new Promise((resolve) => {
+      const w = new Worker('/srv/thread-worker.js', { workerData: { sab, n: N } });
+      let online = false;
+      w.on('online', () => { online = true; });
+      w.on('message', (m) => {
+        if (m === 'ready') w.postMessage('go');
+        else if (m && m.done) {
+          const r = { threadId: w.threadId, online, sum: m.sum, sharedSum: Atomics.load(shared, 0) };
+          w.terminate();
+          resolve(r);
+        }
+      });
+    });
+    const body = Buffer.from(JSON.stringify({
+      node: process.version,
+      note: 'worker_threads.Worker ran a real nested thread: it summed 1..N off the main thread, posted the total back, and wrote it into a SharedArrayBuffer we read via Atomics (#16 stage 2b), in the browser.',
+      n: N,
+      threadId: result.threadId,
+      online: result.online,
+      sumFromMessage: result.sum,
+      sumFromSharedMemory: result.sharedSum,
+      match: result.sum === result.sharedSum,
+    }, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(\`<!doctype html>
 <html><head><meta charset="utf-8"><title>Hello from OpenContainer</title>
@@ -469,6 +505,7 @@ const server = http.createServer(async (req, res) => {
   <button onclick="fetch('api/wasi').then(r=>r.json()).then(t=>document.getElementById('w').textContent=JSON.stringify(t,null,2))">GET /api/wasi (wasm32-wasi CLI)</button>
   <button onclick="fetch('api/napi').then(r=>r.json()).then(t=>document.getElementById('np').textContent=JSON.stringify(t,null,2))">GET /api/napi (N-API addon on wasm)</button>
   <button onclick="fetch('api/spawn').then(r=>r.json()).then(t=>document.getElementById('sp').textContent=JSON.stringify(t,null,2))">GET /api/spawn (async child_process)</button>
+  <button onclick="fetch('api/threads').then(r=>r.json()).then(t=>document.getElementById('wt').textContent=JSON.stringify(t,null,2))">GET /api/threads (worker_threads + SAB)</button>
   <button onclick="var el=document.getElementById('nf');el.textContent='fetching npm registry…';fetch('api/fetch').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2)).catch(e=>el.textContent=String(e))">GET /api/fetch (npm registry)</button>
   <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
   <pre id="t"></pre>
@@ -484,6 +521,7 @@ const server = http.createServer(async (req, res) => {
   <pre id="w"></pre>
   <pre id="np"></pre>
   <pre id="sp"></pre>
+  <pre id="wt"></pre>
   <pre id="nf"></pre>
 </div></body></html>\`);
 });
@@ -572,7 +610,15 @@ async function boot() {
     };
     const { port1, port2 } = new MessageChannel();
     fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
-    worker.postMessage({ type: "init", sab: info.sab, spec: info.spec, fsPort: port1 }, [port1]);
+    // #16 stage 2b: a spawned thread also receives its parentPort (a MessagePort
+    // transferred from its creator through us) alongside its fs doorbell.
+    const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
+    const transfer = [port1];
+    if (info.threadPort) {
+      init.threadPort = info.threadPort;
+      transfer.push(info.threadPort);
+    }
+    worker.postMessage(init, transfer);
     return {
       terminate: () => {
         worker.terminate();
@@ -638,6 +684,21 @@ async function boot() {
       "  n++; console.log('tick ' + n);\n" +
       "  if (n === 3) { clearInterval(iv); console.log('child done'); process.exit(3); }\n" +
       "}, 30);\n",
+  );
+  // #16 stage 2b: the worker the /api/threads route runs via worker_threads. It
+  // sums 1..N off the main thread, writes it into the shared SAB, and replies.
+  kernel.writeFile(
+    "/srv/thread-worker.js",
+    "const { parentPort, workerData } = require('worker_threads');\n" +
+      "parentPort.on('message', (m) => {\n" +
+      "  if (m === 'go') {\n" +
+      "    let sum = 0;\n" +
+      "    for (let i = 1; i <= workerData.n; i++) sum += i;\n" +
+      "    new Int32Array(workerData.sab)[0] = sum;\n" +
+      "    parentPort.postMessage({ done: true, sum });\n" +
+      "  }\n" +
+      "});\n" +
+      "parentPort.postMessage('ready');\n",
   );
   kernel.writeFile("/root.sh", SCRIPT);
 

@@ -8,12 +8,26 @@
 import { makeViews, isFsOpcode } from "../protocol/syscall.js";
 import { createRuntime } from "./index.js";
 
-export function bootProcess({ sab, spec, send, onReady, fsPort = null, codec = null, cryptoCodec = null }) {
+export function bootProcess({
+  sab,
+  spec,
+  send,
+  onReady,
+  fsPort = null,
+  codec = null,
+  cryptoCodec = null,
+  // #16 stage 2b: when this worker is a spawned thread, `threadPort` is the raw
+  // MessagePort to its creator (becomes parentPort) and `postRaw` sends messages
+  // to the kernel with transferables (for Worker() -> kernel port handoff).
+  threadPort = null,
+  postRaw = null,
+}) {
   const { ctrl, data } = makeViews(sab);
   // #14: fs opcodes ring the File System Worker's doorbell directly (a
   // MessagePort handed to us at spawn); non-fs opcodes still nudge the kernel.
   // Without an fsPort (older headless paths) everything falls back to the kernel.
   const ringFs = fsPort ? () => fsPort.postMessage(0) : () => send("syscall");
+  const isThread = !!spec.isThread;
   const runtime = createRuntime({
     ctrl,
     data,
@@ -29,12 +43,22 @@ export function bootProcess({ sab, spec, send, onReady, fsPort = null, codec = n
     cwd: spec.cwd || "/",
     stdout: (chunk) => send("stdout", { chunk }),
     stderr: (chunk) => send("stderr", { chunk }),
+    postRaw,
+    thread: {
+      isMainThread: !isThread,
+      // threadId defaults to our kernel pid (unique, non-zero for threads).
+      threadId: isThread ? (spec.threadId || spec.pid) | 0 : 0,
+      workerData: spec.workerData ?? null,
+      parentPort: threadPort,
+    },
   });
 
   // Hand the runtime's external-event hooks back to the worker shell: `wakeNet`
   // nudges the loop on a queued HTTP request; `dispatchChild` feeds it an async
-  // child's stdout/stderr/exit (#15). Both arrive as kernel postMessages.
-  if (typeof onReady === "function") onReady({ wakeNet: runtime.wake, dispatchChild: runtime.dispatchChild });
+  // child's stdout/stderr/exit (#15); `dispatchThread` feeds it a worker_thread's
+  // online/exit (2b). All arrive as kernel postMessages.
+  if (typeof onReady === "function")
+    onReady({ wakeNet: runtime.wake, dispatchChild: runtime.dispatchChild, dispatchThread: runtime.dispatchThread });
 
   // run() is async (it drives the event loop). Report the exit code when it
   // settles; a server process simply never settles (it stays alive).

@@ -49,6 +49,11 @@ export function createRuntime({
   stderr = () => {},
   codec = null,
   cryptoCodec = null,
+  // Worker threads (#16 stage 2b). `postRaw(msg, transfer)` sends a message to the
+  // kernel with transferables (MessagePorts) — the shell provides it. `thread`
+  // carries this worker's identity when it *is* a spawned thread.
+  postRaw = null,
+  thread = null,
 }) {
   const syscalls = createSyscalls({ ctrl, data, notify });
 
@@ -58,8 +63,14 @@ export function createRuntime({
   // Liveness counter for async children (#15): a running child keeps the parent's
   // loop alive so it can stream the child's output and see its exit.
   const childLiveness = { active: 0 };
+  // Liveness counter for worker_threads (2b): a running Worker (parent side) or an
+  // active parentPort 'message' listener (child side) keeps the loop alive.
+  const threadLiveness = { active: 0 };
   // Assigned once child_process is built; the loop drains child events through it.
   let drainChildEvents = () => {};
+  // Assigned once worker_threads is required; the loop drains its queued events.
+  let drainThreadEvents = () => {};
+  let dispatchThreadEvent = () => {};
   // How many ports this process has registered with the kernel (each real
   // net.Server.listen calls syscalls.listen). While non-zero, `doNet` drains
   // inbound requests on every `net` wake.
@@ -74,7 +85,7 @@ export function createRuntime({
   // wake it drains queued requests and replays each through the real http stack
   // (Phase 2 #8 stage 2) so the server that answers is Node's own lib/http.js.
   const loop = createEventLoop({
-    isAlive: () => netLiveness.active > 0 || childLiveness.active > 0,
+    isAlive: () => netLiveness.active > 0 || childLiveness.active > 0 || threadLiveness.active > 0,
     doNet: () => {
       if (netServers.count === 0 || !bridgeHttp) return;
       for (;;) {
@@ -84,10 +95,41 @@ export function createRuntime({
       }
     },
     doChildren: () => drainChildEvents(),
+    doThreads: () => drainThreadEvents(),
   });
 
   const os = createOs();
   const process = createProcess({ pid, ppid, argv, env, cwd, stdout, stderr, nextTick: loop.nextTick });
+
+  // Wire the worker_threads host onto `process` so the lazily-required
+  // node:worker_threads builtin (2b) can read this thread's identity, spawn nested
+  // workers (brokered by the kernel), and pump its events through our loop.
+  process.__wtHost = {
+    isMainThread: thread ? !!thread.isMainThread : true,
+    threadId: thread ? thread.threadId | 0 : 0,
+    workerData: thread ? thread.workerData : null,
+    parentPort: thread ? thread.parentPort || null : null,
+    wake: () => loop.wakeNet(),
+    retain: () => {
+      threadLiveness.active++;
+      loop.wakeNet();
+    },
+    release: () => {
+      if (threadLiveness.active > 0) threadLiveness.active--;
+    },
+    registerDrain: (fn) => {
+      drainThreadEvents = fn;
+    },
+    registerDispatch: (fn) => {
+      dispatchThreadEvent = fn;
+    },
+    spawn: (reqId, spec, port) => {
+      if (postRaw) postRaw({ type: "thread-spawn", reqId, spec, port }, [port]);
+    },
+    terminate: (reqId) => {
+      if (postRaw) postRaw({ type: "thread-terminate", reqId });
+    },
+  };
 
   // Path B: Node's REAL lib/ modules run on top of our internalBinding layer.
   // `path`, `buffer`, `fs`, `events` and `util` are vendored, unmodified Node
@@ -263,6 +305,9 @@ export function createRuntime({
     /** External delivery from the kernel: an async child's stdout/stderr/exit
      * ({type:'child-stdout'|'child-stderr'|'child-exit', childPid, ...}). #15 */
     dispatchChild: (msg) => child_process._dispatch(msg),
+    /** External delivery from the kernel: a worker_thread's online/exit
+     * ({type:'thread-started'|'thread-exit', reqId, ...}). #16 stage 2b. */
+    dispatchThread: (msg) => dispatchThreadEvent(msg),
     /**
      * Run an entry file like `node <entry>`, then drive the event loop until it
      * is quiescent (no pending timers/immediates/nextTicks and no open servers).

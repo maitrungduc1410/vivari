@@ -87,7 +87,15 @@ async function makeKernel() {
     });
     const { port1, port2 } = new MessageChannel();
     fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
-    worker.postMessage({ type: "init", sab: info.sab, spec: info.spec, fsPort: port1 }, [port1]);
+    // #16 stage 2b: a spawned thread also receives its parentPort (a MessagePort
+    // transferred from its creator through us) alongside its fs doorbell.
+    const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
+    const transfer = [port1];
+    if (info.threadPort) {
+      init.threadPort = info.threadPort;
+      transfer.push(info.threadPort);
+    }
+    worker.postMessage(init, transfer);
     return {
       terminate: () => {
         worker.terminate();
@@ -1378,6 +1386,61 @@ child.on('exit', (code, signal) => {
   const kib = await kernel.start("node", ["/t/killb.js"], { cwd: "/t", capture: true });
   assert(kib.code === 0 && kib.stdout.includes("SPAWN_KILL_OK sawData=true"),
     "Phase 2 #15: child.kill('SIGTERM') terminates a long-running child (exit null + signal)");
+
+  // === #16 stage 2b: worker_threads — real nested Worker + shared memory =======
+  // A Worker runs a real entry file as its own kernel-spawned thread (own syscall
+  // SAB + FS registration). We prove: workerData crosses (incl. a SharedArrayBuffer),
+  // the child sees isMainThread=false/threadId>0, message roundtrips both ways over
+  // the direct MessageChannel, the child mutates shared memory the parent reads via
+  // Atomics, and the child's exit code propagates to the Worker 'exit' event.
+  kernel.writeFile(
+    "/t/wt-child.js",
+    `
+const { parentPort, workerData, threadId, isMainThread } = require('worker_threads');
+const shared = new Int32Array(workerData.sab);
+Atomics.store(shared, 0, workerData.base + threadId); // parent reads this back
+parentPort.on('message', (m) => {
+  if (m === 'ping') parentPort.postMessage({ pong: true, isMainThread, threadId, got: workerData.hello });
+  else if (m === 'bye') process.exit(5);
+});
+parentPort.postMessage('ready');
+`,
+  );
+  kernel.writeFile(
+    "/t/wt-parent.js",
+    `
+const { Worker, isMainThread, threadId } = require('worker_threads');
+const assert = require('assert');
+assert.ok(isMainThread, 'top-level isMainThread is true');
+assert.strictEqual(threadId, 0, 'top-level threadId is 0');
+const sab = new SharedArrayBuffer(8);
+const shared = new Int32Array(sab);
+const w = new Worker('/t/wt-child.js', { workerData: { hello: 'hi', base: 100, sab } });
+let online = false, gotReady = false, childTid = 0;
+w.on('online', () => { online = true; });
+w.on('message', (m) => {
+  if (m === 'ready') { gotReady = true; w.postMessage('ping'); }
+  else if (m && m.pong) {
+    childTid = m.threadId;
+    assert.strictEqual(m.isMainThread, false, 'child sees isMainThread=false');
+    assert.ok(m.threadId > 0, 'child has a non-zero threadId');
+    assert.strictEqual(m.got, 'hi', 'workerData delivered to the child');
+    assert.strictEqual(Atomics.load(shared, 0), 100 + m.threadId, 'child wrote SharedArrayBuffer the parent reads');
+    w.postMessage('bye');
+  }
+});
+w.on('exit', (code) => {
+  assert.ok(online && gotReady, 'saw online + ready before exit');
+  assert.strictEqual(code, 5, "child's process.exit(5) propagates to Worker 'exit'");
+  assert.ok(w.threadId > 0 && w.threadId === childTid, 'Worker.threadId matches the child');
+  console.log('WT_OK code=' + code + ' threadId=' + w.threadId);
+  process.exit(0);
+});
+`,
+  );
+  const wtr = await kernel.start("node", ["/t/wt-parent.js"], { cwd: "/t", capture: true });
+  assert(wtr.code === 0 && wtr.stdout.includes("WT_OK"),
+    "Phase 2 #16 stage 2b: worker_threads.Worker runs a real nested thread (workerData + SAB + message roundtrip + exit code)");
 
   // === brick 4: shell session with each command as its own process ===
   const sh = await kernel.start("sh", ["/root.sh"], { cwd: "/", capture: true });

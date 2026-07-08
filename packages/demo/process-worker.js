@@ -41,13 +41,15 @@ function ensureCodec() {
 }
 
 self.onmessage = async (event) => {
-  const { type, sab, spec, fsPort } = event.data;
+  const { type, sab, spec, fsPort, threadPort } = event.data;
   if (type === "init") {
     await ensureCodec();
     bootProcess({
       sab,
       spec,
       fsPort, // #14: fs syscalls ring the File System Worker over this port
+      threadPort, // #16 stage 2b: our parentPort, if we are a spawned thread
+      postRaw: (msg, transfer) => self.postMessage(msg, transfer || []),
       send: (msgType, extra) => self.postMessage({ type: msgType, ...extra }),
       onReady: (c) => {
         control = c;
@@ -62,4 +64,7 @@ self.onmessage = async (event) => {
   // An async child's output/exit relayed by the kernel (#15).
   else if (type === "child-stdout" || type === "child-stderr" || type === "child-exit")
     control && control.dispatchChild(event.data);
+  // A worker_thread's online/exit relayed by the kernel (#16 stage 2b).
+  else if (type === "thread-started" || type === "thread-exit")
+    control && control.dispatchThread(event.data);
 };

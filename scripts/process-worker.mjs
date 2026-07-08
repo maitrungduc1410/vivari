@@ -32,6 +32,8 @@ parentPort.on("message", (msg) => {
       sab: msg.sab,
       spec: msg.spec,
       fsPort: msg.fsPort, // #14: fs syscalls ring the File System Worker over this port
+      threadPort: msg.threadPort, // #16 stage 2b: our parentPort, if we are a thread
+      postRaw: (m, transfer) => parentPort.postMessage(m, transfer || []),
       send: (type, extra) => parentPort.postMessage({ type, ...extra }),
       onReady: (c) => {
         control = c;
@@ -46,4 +48,7 @@ parentPort.on("message", (msg) => {
   // An async child's output/exit relayed by the kernel (#15).
   else if (msg.type === "child-stdout" || msg.type === "child-stderr" || msg.type === "child-exit")
     control && control.dispatchChild(msg);
+  // A worker_thread's online/exit relayed by the kernel (#16 stage 2b).
+  else if (msg.type === "thread-started" || msg.type === "thread-exit")
+    control && control.dispatchThread(msg);
 });

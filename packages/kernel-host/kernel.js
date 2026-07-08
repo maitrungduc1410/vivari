@@ -130,7 +130,7 @@ export class Kernel {
   }
 
   // ---- process lifecycle ----------------------------------------------------
-  createProcess(spec, { parentPid = null, capture = false, stream = false } = {}) {
+  createProcess(spec, { parentPid = null, capture = false, stream = false, threadPort = null } = {}) {
     const pid = this.nextPid++;
     const sab = new SharedArrayBuffer(SAB_BYTES);
     const { ctrl, data } = makeViews(sab);
@@ -151,20 +151,44 @@ export class Kernel {
       handle: null,
       command: spec.command,
       serverInbox: [], // queued { reqId, port, req } drained by non-blocking accept
+      // #16 stage 2b: reqId -> child pid for worker_threads this process spawned.
+      threads: null,
     };
     this.procs.set(pid, proc);
     proc.handle = this.spawnWorker({
       pid,
       sab,
       spec: { ...spec, pid, ppid: parentPid ?? 0 },
+      // #16 stage 2b: a spawned thread gets its creator's MessageChannel end as a
+      // transferable, delivered to the worker as parentPort at init.
+      threadPort,
       on: {
         syscall: () => this.serviceSyscall(pid),
         stdout: (m) => this.onOutput(pid, m.chunk, false),
         stderr: (m) => this.onOutput(pid, m.chunk, true),
         exit: (m) => this.finalize(pid, m.code | 0),
+        // #16 stage 2b: this process' worker_threads asks the kernel to spawn /
+        // terminate a nested thread worker.
+        "thread-spawn": (m) => this.handleThreadSpawn(pid, m),
+        "thread-terminate": (m) => this.handleThreadTerminate(pid, m),
       },
     });
     return pid;
+  }
+
+  // Post a message to a process' worker (out of band from the SAB). Used to relay
+  // async child (#15) and worker_thread (2b) lifecycle to the parent's loop.
+  postToProc(pid, msg) {
+    const p = this.procs.get(pid);
+    if (p && p.handle && p.handle.postMessage) {
+      try {
+        p.handle.postMessage(msg);
+        return true;
+      } catch {
+        /* worker gone */
+      }
+    }
+    return false;
   }
 
   onOutput(pid, chunk, isErr) {
@@ -428,6 +452,53 @@ export class Kernel {
     const signal = msg.signal || "SIGTERM";
     this.respondOk(proc, EMPTY);
     this.finalize(pid, signal === "SIGKILL" ? 137 : 143, signal);
+  }
+
+  // ---- worker_threads brokering (#16 stage 2b) ------------------------------
+  // A process' worker_threads asks us to spawn a nested thread worker. Unlike a
+  // child process (#15) the thread talks to its creator directly over a
+  // MessageChannel (data.port -> the child's parentPort); we only allocate its
+  // syscall SAB + FS registration and relay online/exit back to the creator.
+  handleThreadSpawn(parentPid, data) {
+    const parent = this.procs.get(parentPid);
+    if (!parent) return;
+    const { reqId, spec, port } = data;
+    const cwd = spec.cwd || "/";
+    const programPath = this.resolvePath(cwd, spec.programPath || "");
+    if (!programPath || !this.isFile(programPath)) {
+      // No such entry: report online then a failed exit so `new Worker()` sees
+      // 'online' -> 'exit' (code 1) rather than hanging.
+      this.postToProc(parentPid, { type: "thread-started", reqId, threadId: -1 });
+      this.postToProc(parentPid, { type: "thread-exit", reqId, code: 1, signal: null });
+      return;
+    }
+    const childPid = this.createProcess(
+      {
+        programPath,
+        args: spec.argv || [],
+        cwd,
+        env: spec.env || {},
+        workerData: spec.workerData,
+        isThread: true,
+      },
+      { parentPid, threadPort: port },
+    );
+    if (!parent.threads) parent.threads = new Map();
+    parent.threads.set(reqId, childPid);
+    const child = this.procs.get(childPid);
+    child.onExit = (res) => {
+      if (parent.threads) parent.threads.delete(reqId);
+      this.postToProc(parentPid, { type: "thread-exit", reqId, code: res.code, signal: res.signal || null });
+    };
+    // 'online' ~ the worker exists and its JS is starting.
+    this.postToProc(parentPid, { type: "thread-started", reqId, threadId: childPid });
+  }
+
+  handleThreadTerminate(parentPid, data) {
+    const parent = this.procs.get(parentPid);
+    if (!parent || !parent.threads) return;
+    const childPid = parent.threads.get(data.reqId);
+    if (childPid != null) this.finalize(childPid, 143, "SIGTERM");
   }
 
   // ---- network fetch servicing (Phase 2 #9) ---------------------------------

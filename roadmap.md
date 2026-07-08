@@ -559,7 +559,7 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
     (needs an IPC channel), pipes (`|`)/redirects in `sh`, `detached`/process groups.
     **Extras (ongoing, unrelated):** nested `worker_threads` (our `[worker n]`, #16 2b), heavy
     toolchains (`esbuild`/`vite`/`tsserver` as Wasm), IndexedDB persistence, pre-warm worker pool.
-16. **WASI + napi-rs Wasm runtime (native→wasm packages)** [XL] — **stage 1 + 2a DONE.**
+16. **WASI + napi-rs Wasm runtime (native→wasm packages)** [XL] — **stage 1 + 2a + 2b core DONE.**
     Many modern toolchains ship a `wasm32-wasi` build of their native `.node` addon and
     switch to it on a WebContainer-class host (e.g. Vite's `rolldown` downloads
     `@rolldown/binding-wasm32-wasi`; also `@napi-rs/*`). Two halves: (a) a **WASI preview1
@@ -596,10 +596,34 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
       Node byte-for-byte) + a browser `/api/napi` route. Addon vendored at
       `packages/demo/vendor/napi-crc32/` (prebuilt `.wasm`, can't be rebuilt locally without
       wasi-sdk/@napi-rs/cli).
-    - **Stage 2b (threads) — TODO.** Multi-threaded addons (and `rolldown`) call emnapi's
-      `onCreateWorker()` (async-work pool / pthreads). Needs **nested worker spawn from inside a
-      process worker** wired to napi-rs's `wasi-worker` + the `fs-proxy` Atomics/SAB protocol —
-      a new architectural capability (today workers are spawned only by the kernel).
+    - **Stage 2b (real `worker_threads`) — core DONE.** `new Worker(entry)` now spawns a **real
+      nested thread**: a process worker asks the kernel to spawn a worker (its own syscall SAB +
+      File System Worker registration, so the thread does real fs/net syscalls), and the kernel
+      brokers only its lifecycle. Parent↔child *data* flows over a plain `MessageChannel` wired end
+      to end — `port1` stays with the `Worker`, `port2` is transferred **through the kernel** to the
+      child as its `parentPort` — so `postMessage()` (incl. `SharedArrayBuffer`) never touches the
+      kernel. Messages pump into the event loop via a new `doThreads` drain step (like #15 child
+      events), and a running `Worker` (parent) / an active `parentPort` 'message' listener (child)
+      keeps the loop alive via a `threadLiveness` counter. Implemented: `Worker(entry,{workerData,
+      argv,env,cwd,eval})`, `postMessage`/`on('message'|'online'|'exit'|'error')`/`terminate`/`ref`/
+      `unref`, `parentPort`, `workerData`, `threadId`, `isMainThread`, `MessageChannel`/`MessagePort`.
+      Wiring: `process.__wtHost` (index.js) → lazy `node:worker_threads` builtin; `boot.js` carries
+      `threadPort`/`postRaw`; `kernel.handleThreadSpawn`/`handleThreadTerminate`; both `spawnWorker`s
+      transfer the port. Verified headless (`verify-node`: workerData incl. a `SharedArrayBuffer`,
+      `isMainThread=false`/`threadId>0` in the child, message roundtrip, Atomics-visible shared
+      memory, child `process.exit(5)` → Worker `'exit'`) + a browser `/api/threads` route (sums
+      1..N off-thread, result matches via message *and* shared memory). Deferred: transferring
+      `MessagePort`s in a `transferList` across threads; `resourceLimits`.
+    - **Stage 2b — napi-rs *async-work* addons: BLOCKED UPSTREAM.** A spike (`@node-rs/bcrypt`,
+      `@node-rs/argon2`, both `wasm32-wasi`) showed emnapi's async-work model (**AWMT**) throws
+      `TypeError: reading 'whenLoaded'` in `initWorkers` **before `onCreateWorker` is ever called** —
+      and it reproduces on **stock Node 22** with `@napi-rs/wasm-runtime` **0.2.12 *and* 1.1.6**
+      (`@emnapi/core` 1.11.2). Root cause: AWMT expects `emnapi_async_worker_create` to spawn the
+      pthread *synchronously*, but web/Node worker load (`load`→`loaded`) is async, so
+      `PThread.pthreads[tid]` is undefined. So real `worker_threads` (above) does **not** unblock
+      async napi addons — the gap is in emnapi, not our layer. Sync napi addons (crc32, 2a) are
+      unaffected. Revisit when napi-rs/emnapi fix the async path, or when we tackle a wasi-threads
+      (rayon/pthreads) workload directly (the likely `rolldown` path).
     - **Stage 2c (npm auto-selects the wasm build) — TODO.** `npm install` must pick the
       `*-wasm32-wasi` variant (napi-rs packages gate it behind `cpu:["wasm32"]` +
       `optionalDependencies` + a JS wrapper), like StackBlitz auto-downloading `rolldown-wasm`.
@@ -699,5 +723,5 @@ previewed live in the iframe — with the Path A hand-written builtins deleted.
 | `File System Worker` | VFS worker (Rust/Wasm) |
 | `Fetcher Worker` | Network/registry worker |
 | `Node.js Worker PID n` | Process = 1 worker + Node shim |
-| `[worker n]` | Nested `worker_threads` (much later) |
+| `[worker n]` | Nested `worker_threads` — real (#16 stage 2b) |
 | `sw.js` | Service Worker preview |
