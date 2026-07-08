@@ -192,8 +192,8 @@ const FACTORIES = {
 
 const strip = (name) => (name.startsWith("node:") ? name.slice(5) : name);
 
-export function createNodeModules({ process, syscalls, netLiveness, netServers }) {
-  const internalBinding = createInternalBinding({ syscalls, process, netLiveness, netServers });
+export function createNodeModules({ process, syscalls, netLiveness, netServers, codec }) {
+  const internalBinding = createInternalBinding({ syscalls, process, netLiveness, netServers, codec });
   const modules = new Map(); // id -> module object (kept for cycle resolution)
 
   function nodeRequire(name) {

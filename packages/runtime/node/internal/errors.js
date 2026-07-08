@@ -108,6 +108,33 @@ export default function (exports, require, module, process, internalBinding, pri
     () => "URI malformed",
   );
 
+  // zlib (Phase 2 #11).
+  const ERR_BUFFER_TOO_LARGE = makeNodeError(
+    RangeError,
+    "ERR_BUFFER_TOO_LARGE",
+    (max) => `Cannot create a Buffer larger than ${max} bytes`,
+  );
+  const ERR_BROTLI_INVALID_PARAM = makeNodeError(
+    RangeError,
+    "ERR_BROTLI_INVALID_PARAM",
+    (param) => `${param} is not a valid Brotli parameter`,
+  );
+  const ERR_ZSTD_INVALID_PARAM = makeNodeError(
+    RangeError,
+    "ERR_ZSTD_INVALID_PARAM",
+    (param) => `${param} is not a valid zstd parameter`,
+  );
+  const ERR_TRAILING_JUNK_AFTER_STREAM_END = makeNodeError(
+    Error,
+    "ERR_TRAILING_JUNK_AFTER_STREAM_END",
+    () => "Trailing junk found after the end of the compressed stream",
+  );
+  const ERR_ZLIB_INITIALIZATION_FAILED = makeNodeError(
+    Error,
+    "ERR_ZLIB_INITIALIZATION_FAILED",
+    () => "Initialization failed",
+  );
+
   const ERR_MISSING_ARGS = makeNodeError(TypeError, "ERR_MISSING_ARGS", (...args) => {
     const names = args.map((a) => `"${a}"`);
     const list =
@@ -288,6 +315,11 @@ export default function (exports, require, module, process, internalBinding, pri
       ERR_INVALID_BUFFER_SIZE,
       ERR_UNKNOWN_ENCODING,
       ERR_INVALID_URI,
+      ERR_BUFFER_TOO_LARGE,
+      ERR_BROTLI_INVALID_PARAM,
+      ERR_ZSTD_INVALID_PARAM,
+      ERR_TRAILING_JUNK_AFTER_STREAM_END,
+      ERR_ZLIB_INITIALIZATION_FAILED,
       ERR_MISSING_ARGS,
       ERR_INCOMPATIBLE_OPTION_PAIR,
       ERR_ACCESS_DENIED,

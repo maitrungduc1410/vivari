@@ -453,12 +453,23 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
       `Buffer`/`process`/… as *parameters*, so a userland `const Buffer = require('buffer').Buffer`
       threw "Identifier already declared" — now they're true globals (as in Node) and only
       `exports/require/module/__filename/__dirname` are wrapper params.
-11. **`zlib` — Wasm codec + real `lib/zlib.js`** [M] — **PARTIAL DONE.** `node/lib/zlib.js`
-    wraps the browser `Compression/DecompressionStream` as Node Transform streams, so
-    `createGzip/Gunzip/Deflate/Inflate(+Raw)` and `createUnzip` work for real (gzip/deflate);
-    brotli and the `*Sync` one-shots throw loudly (no Web equivalent). Enough for
-    `body-parser`/`compression` to load and handle encoded bodies. TODO: real `lib/zlib.js`
-    + a Wasm codec for brotli + sync APIs.
+11. **`zlib` — Wasm codec + real `lib/zlib.js`** [M] — **DONE.** Node's **real `lib/zlib.js`
+    runs verbatim** over `internalBinding('zlib')`, which is a thin JS adapter
+    (`node/bindings/zlib.js`) on top of a **new Rust/Wasm codec** (`packages/codec`,
+    flate2/miniz_oxide, ~53KB). The codec exposes a z_stream-accurate streaming API
+    (`process(input, flush, outLen)` honouring avail_in/avail_out) so Node's chunk loop
+    drives it unchanged; gzip framing (10-byte header + CRC32/ISIZE trailer, header parsing
+    + zlib/gzip auto-detect on decode) is handled in Rust. This replaces the old Web-Streams
+    shim and adds what it couldn't do: the **`*Sync` one-shots** (`gzipSync`, `inflateSync`, …)
+    and a real `crc32`. Covers the whole zlib family — `deflate/inflate`, `deflateRaw/inflateRaw`,
+    `gzip/gunzip`, `unzip` — sync AND async (`createGzip` etc. drive the async `binding.write`
+    over `nextTick`), verified byte-for-byte against `node:zlib` (hermetic `verify-node`).
+    The codec runs **in-process** (per process worker): the browser worker `initCodec()`s the
+    web-target wasm, the headless worker `require`s the node target; both pass a `makeZStream`
+    factory down through `bootProcess → createRuntime → internalBinding`. `memLevel`/`strategy`/
+    preset dictionaries and `params()` retuning are accepted-but-inert (miniz_oxide limitation);
+    **brotli/zstd** handles throw loudly (the codec is zlib-family only) — a follow-up can add
+    the `brotli`/`zstd` Rust crates to the same codec. Wired into `npm run build` (`build:codec`).
 12. **`crypto` — WebCrypto + Wasm + real `lib/crypto` (partial)** [L] — **PARTIAL DONE.**
     `node/lib/crypto.js` ships synchronous pure-JS `createHash` (MD5/SHA-1/SHA-256) +
     `createHmac`, plus WebCrypto-backed `randomBytes`/`randomFill`/`randomInt`/`randomUUID`.
@@ -526,6 +537,36 @@ When we productionize, the plan is **not** "one giant file" but bundle-by-role:
 - **Brotli/gzip on the minified JS** — on already-minified code this is the biggest
   actual "resource saved" win, bigger than minification alone.
 - **Source maps in dev only**, stripped for prod.
+
+### Per-worker Wasm codec (zlib #11) — load strategy [TODO, optimize later]
+
+Symptom (DevTools): `open_webcontainer_codec_bg.wasm` is fetched **many times** on load —
+once per Process Worker. That's correct-but-unoptimized: the kernel Wasm loads once (one
+kernel worker), but the codec runs **in-process**, and today `process-worker.js` calls
+`initCodec()` eagerly on every spawn — even for processes that never touch zlib (`echo`,
+`sh`, most npm steps). The `ZStream` instance is stateful and can't be shared cross-thread,
+so each worker DOES need its own *instance*; what's wasteful is re-fetching + re-compiling
+the *bytes*. Three fixes, in ROI order:
+
+1. **Lazy codec (do first).** Don't `initCodec()` at boot. `require('zlib')` only touches
+   `crc32` (pure-JS) + constants, and `makeZStream` is only called inside `Zlib.init()` —
+   i.e. when a stream is actually created. So load the codec on first `makeZStream()`.
+   Processes that never compress → **0 fetch, 0 compile**. Caveat: `zlib.*Sync` can't
+   `await`, so do a **synchronous** first-load in the worker (sync `XMLHttpRequest` for the
+   bytes + `new WebAssembly.Module(bytes)`); sync-compiling a >4KB module is forbidden on
+   the main thread but **allowed in a Worker** (which already blocks on `Atomics.wait`), so
+   `gzipSync` keeps working.
+2. **Compile-once, share the `Module`.** Have the kernel worker `WebAssembly.compile` one
+   `WebAssembly.Module` and `postMessage` it to each Process Worker (a Module is
+   structured-cloneable across workers). Workers then only `WebAssembly.instantiate(module)`
+   — no fetch, no recompile per spawn.
+3. **`Cache-Control` for `.wasm` in `server.mjs`.** Cheap: turns the remaining fetches into
+   disk-cache hits even before (1)/(2) land.
+
+NB: **lazy-`require` for the JS builtins (`fs`/`net`/`http`/…) is NOT worth it** — they have
+no Wasm and are pulled in by *static* `import`s at the top of `loader.js`, so they're already
+fetched before any `require()` runs. The real fix for the "rain of JS files" is bundling
+(above), not lazy require.
 
 ## Definition of done for T2
 

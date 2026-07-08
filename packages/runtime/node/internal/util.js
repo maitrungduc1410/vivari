@@ -211,12 +211,17 @@ export default function (exports, require, module, process, internalBinding, pri
     return fn;
   };
 
+  // Node warns when a zlib/etc. class is called without `new`, then constructs it
+  // anyway. We keep the construct-anyway behaviour (deprecation notice omitted).
+  const deprecateInstantiation = (ctor, _code, ...args) => new ctor(...args);
+
   module.exports = {
     isWindows,
     isMacOS,
     getLazy,
     guessHandleType,
     assignFunctionName,
+    deprecateInstantiation,
     customInspectSymbol,
     kIsEncodingSymbol,
     kEmptyObject,

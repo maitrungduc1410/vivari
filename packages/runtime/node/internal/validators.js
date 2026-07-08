@@ -159,9 +159,27 @@ export default function (exports, require, module, process, internalBinding, pri
     }
   }
 
+  // From Node internal/validators.js (used by lib/zlib.js option checks).
+  function validateFiniteNumber(number, name) {
+    if (number === undefined) return false;
+    if (Number.isFinite(number)) return true;
+    if (Number.isNaN(number)) return false;
+    validateNumber(number, name);
+    throw new ERR_OUT_OF_RANGE(name, "a finite number", number);
+  }
+
+  function checkRangesOrGetDefault(number, name, lower, upper, def) {
+    if (!validateFiniteNumber(number, name)) return def;
+    if (number < lower || number > upper)
+      throw new ERR_OUT_OF_RANGE(name, `>= ${lower} and <= ${upper}`, number);
+    return number;
+  }
+
   module.exports = {
     validateString,
     validateNumber,
+    validateFiniteNumber,
+    checkRangesOrGetDefault,
     validateBoolean,
     validateFunction,
     validateInteger,

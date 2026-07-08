@@ -8,12 +8,13 @@
 import { makeViews } from "../protocol/syscall.js";
 import { createRuntime } from "./index.js";
 
-export function bootProcess({ sab, spec, send, onReady }) {
+export function bootProcess({ sab, spec, send, onReady, codec = null }) {
   const { ctrl, data } = makeViews(sab);
   const runtime = createRuntime({
     ctrl,
     data,
     notify: () => send("syscall"),
+    codec,
     // real kernel-assigned PID (so process.pid matches the worker name / DevTools)
     pid: spec.pid,
     ppid: spec.ppid,

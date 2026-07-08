@@ -611,6 +611,62 @@ main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
   assert(sb.code === 0 && sb.stdout.includes("STREAMB_OK"),
     "Path B: real Node lib/stream.js runs (Readable/Writable/Transform/pipeline/finished/promises)");
 
+  // Path B proof: require('zlib') is Node's REAL vendored lib/zlib.js running on
+  // internalBinding('zlib') backed by the Rust/Wasm codec (packages/codec). Cover
+  // the sync one-shot API, the async streaming API (createGzip/Gunzip through a
+  // pipeline on Event loop v2), crc32, and cross-compatibility with a gzip buffer
+  // produced by the real Node zlib (decodes byte-for-byte).
+  kernel.writeFile(
+    "/t/zlibb.js",
+    `
+const assert = require('assert');
+const zlib = require('zlib');
+const { pipeline } = require('stream');
+const { Readable, Writable } = require('stream');
+
+const data = Buffer.from('OpenContainer '.repeat(400) + 'café € zlib #11');
+
+// sync round-trips
+assert.ok(zlib.gunzipSync(zlib.gzipSync(data)).equals(data), 'gzipSync/gunzipSync round-trip');
+assert.ok(zlib.inflateSync(zlib.deflateSync(data)).equals(data), 'deflateSync/inflateSync round-trip');
+assert.ok(zlib.inflateRawSync(zlib.deflateRawSync(data)).equals(data), 'deflateRawSync/inflateRawSync round-trip');
+assert.ok(zlib.unzipSync(zlib.gzipSync(data)).equals(data), 'unzipSync auto-detects gzip');
+assert.ok(zlib.unzipSync(zlib.deflateSync(data)).equals(data), 'unzipSync auto-detects zlib');
+
+// cross-compat: a gzip buffer made by the REAL Node zlib must decode here.
+const fromNode = Buffer.from('H4sIAAAAAAAAE/MvSM1zzs8rSczMSy1SqMrJTFJQNjRUeNQwRSE5Me3wSoVHTWsAWCDGcyQAAAA=', 'base64');
+assert.strictEqual(zlib.gunzipSync(fromNode).toString('utf8'), 'OpenContainer zlib #11 — café €', 'gunzip a Node-produced gzip');
+
+// crc32 matches the real Node value.
+assert.strictEqual(zlib.crc32('hello world'), 222957957, 'crc32 matches Node');
+
+async function main() {
+  // async streaming: createGzip -> createGunzip through a pipeline (drives the
+  // async binding.write path over nextTick, exactly like a real gzip stream).
+  const gzipped = await new Promise((resolve, reject) => {
+    const chunks = [];
+    const src = Readable.from([data.subarray(0, 1000), data.subarray(1000)]);
+    const sink = new Writable({ write(c, e, cb) { chunks.push(Buffer.from(c)); cb(); } });
+    pipeline(src, zlib.createGzip(), sink, (err) => err ? reject(err) : resolve(Buffer.concat(chunks)));
+  });
+  assert.ok(zlib.gunzipSync(gzipped).equals(data), 'streaming createGzip output is valid gzip');
+
+  const back = await new Promise((resolve, reject) => {
+    const chunks = [];
+    const sink = new Writable({ write(c, e, cb) { chunks.push(Buffer.from(c)); cb(); } });
+    pipeline(Readable.from([gzipped]), zlib.createGunzip(), sink, (err) => err ? reject(err) : resolve(Buffer.concat(chunks)));
+  });
+  assert.ok(back.equals(data), 'streaming createGunzip round-trips the stream');
+
+  console.log('ZLIBB_OK');
+}
+main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
+`,
+  );
+  const zb = await kernel.start("node", ["/t/zlibb.js"], { cwd: "/t", capture: true });
+  assert(zb.code === 0 && zb.stdout.includes("ZLIBB_OK"),
+    "Path B: real Node lib/zlib.js runs on the Rust/Wasm codec (gzip/deflate/raw, sync + streaming, crc32)");
+
   // Path B proof: require('net') is Node's REAL vendored lib/net.js +
   // internal/{net,stream_base_commons} running on our tcp_wrap/stream_wrap
   // loopback binding — net.Server/net.Socket are real Duplex streams. Proves an

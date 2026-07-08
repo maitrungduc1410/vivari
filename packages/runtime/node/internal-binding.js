@@ -12,6 +12,7 @@ import { createBufferBinding } from "./bindings/buffer.js";
 import { createFsBinding } from "./bindings/fs.js";
 import { createNetBindings } from "./bindings/net.js";
 import { createHttpParserBinding } from "./bindings/http_parser.js";
+import { createZlibBinding, ZLIB_CONSTANTS } from "./bindings/zlib.js";
 
 // POSIX/libuv constants exposed as internalBinding('constants').fs. Node's real
 // lib/fs.js and internal/fs/utils.js destructure these; the O_* values MUST
@@ -80,7 +81,7 @@ function getOwnNonIndexProperties(obj, filter) {
   return out;
 }
 
-export function createInternalBinding({ syscalls, process, netLiveness, netServers } = {}) {
+export function createInternalBinding({ syscalls, process, netLiveness, netServers, codec } = {}) {
   // net (Phase 2 #7/#8): tcp_wrap/stream_wrap/uv/pipe_wrap/cares_wrap for the
   // in-process loopback beneath Node's real lib/net.js. Needs process.nextTick.
   // `syscalls` lets listen() register the port with the kernel (external routing,
@@ -98,6 +99,9 @@ export function createInternalBinding({ syscalls, process, netLiveness, netServe
     cares_wrap: net.cares_wrap,
     // http_parser (Phase 2 #8): pure-JS HTTP/1.1 parser beneath real lib/http.
     http_parser: createHttpParserBinding(),
+    // zlib (Phase 2 #11): Node's real lib/zlib.js over the Rust/Wasm codec.
+    // crc32/constants work without the codec; the stream handle needs `codec`.
+    zlib: createZlibBinding({ makeZStream: codec || null, process }),
     // trace_events: inert — internal/http records HTTP trace spans through it.
     trace_events: {
       getCategoryEnabledBuffer: () => new Uint8Array(1),
@@ -116,6 +120,7 @@ export function createInternalBinding({ syscalls, process, netLiveness, netServe
     constants: {
       os: { signals: {}, errno: { EISDIR: 21 }, priority: {} },
       fs: FS_CONSTANTS,
+      zlib: ZLIB_CONSTANTS,
     },
   };
 
