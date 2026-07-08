@@ -7,6 +7,8 @@
 // directory/index/package.json "main"), and bare specifiers walked up through
 // node_modules.
 
+import { transpileEsm } from "./esm.js";
+
 export function createModuleSystem({ fs, path, builtins, process, globals, nodeModules }) {
   const cache = Object.create(null);
   const builtinNames = new Set(Object.keys(builtins));
@@ -29,26 +31,114 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
       return false;
     }
   };
-  const tryExtensions = (p) =>
-    (isFile(p) && p) || (isFile(p + ".js") && p + ".js") || (isFile(p + ".json") && p + ".json") || null;
+  const EXTS = [".js", ".mjs", ".cjs", ".json"];
+  const tryExtensions = (p) => {
+    if (isFile(p)) return p;
+    for (const ext of EXTS) if (isFile(p + ext)) return p + ext;
+    return null;
+  };
 
-  const loadIndex = (dir) =>
-    (isFile(path.join(dir, "index.js")) && path.join(dir, "index.js")) ||
-    (isFile(path.join(dir, "index.json")) && path.join(dir, "index.json")) ||
-    null;
+  const loadIndex = (dir) => {
+    for (const ext of EXTS) {
+      const f = path.join(dir, "index" + ext);
+      if (isFile(f)) return f;
+    }
+    return null;
+  };
+
+  const readPkg = (dir) => {
+    const p = path.join(dir, "package.json");
+    if (!isFile(p)) return null;
+    try {
+      return JSON.parse(fs.readFileSync(p, "utf8"));
+    } catch {
+      return null;
+    }
+  };
+
+  // package.json "exports"/"imports" condition resolution. We consume both CJS
+  // and (transpiled) ESM, so prefer the CJS "require" entry, then ESM "import",
+  // then "default" — this keeps transpile surface minimal for dual packages.
+  const EXPORT_CONDITIONS = ["node", "require", "import", "default"];
+  function pickCondition(val) {
+    if (typeof val === "string") return val;
+    if (Array.isArray(val)) {
+      for (const v of val) {
+        const r = pickCondition(v);
+        if (r) return r;
+      }
+      return null;
+    }
+    if (val && typeof val === "object") {
+      for (const c of EXPORT_CONDITIONS) {
+        if (Object.prototype.hasOwnProperty.call(val, c)) {
+          const r = pickCondition(val[c]);
+          if (r) return r;
+        }
+      }
+    }
+    return null;
+  }
+
+  function resolveExports(pkgDir, exportsField, sub) {
+    let target = null;
+    if (typeof exportsField === "string" || Array.isArray(exportsField)) {
+      target = sub === "." ? pickCondition(exportsField) : null;
+    } else if (exportsField && typeof exportsField === "object") {
+      const keys = Object.keys(exportsField);
+      const isSubpathMap = keys.some((k) => k.startsWith("."));
+      if (isSubpathMap) {
+        if (Object.prototype.hasOwnProperty.call(exportsField, sub)) {
+          target = pickCondition(exportsField[sub]);
+        } else {
+          for (const k of keys) {
+            if (k.endsWith("/*")) {
+              const pre = k.slice(0, -1);
+              if (sub.startsWith(pre)) {
+                const t = pickCondition(exportsField[k]);
+                if (t) {
+                  target = t.replace("*", sub.slice(pre.length));
+                  break;
+                }
+              }
+            }
+          }
+        }
+      } else {
+        target = sub === "." ? pickCondition(exportsField) : null;
+      }
+    }
+    if (!target) return null;
+    const full = path.join(pkgDir, target);
+    return tryExtensions(full) || (isFile(full) && full) || null;
+  }
+
+  function splitBare(request) {
+    const parts = request.split("/");
+    let name;
+    let rest;
+    if (request[0] === "@") {
+      name = parts.slice(0, 2).join("/");
+      rest = parts.slice(2);
+    } else {
+      name = parts[0];
+      rest = parts.slice(1);
+    }
+    return { name, sub: rest.length ? "./" + rest.join("/") : "." };
+  }
 
   function loadAsDirectory(dir) {
-    const pkgPath = path.join(dir, "package.json");
-    if (isFile(pkgPath)) {
-      try {
-        const main = JSON.parse(fs.readFileSync(pkgPath, "utf8")).main;
-        if (main) {
-          const target = path.join(dir, main);
-          const resolved = tryExtensions(target) || loadIndex(target);
-          if (resolved) return resolved;
-        }
-      } catch {
-        /* fall through to index */
+    const pkg = readPkg(dir);
+    if (pkg) {
+      if (pkg.exports) {
+        const r = resolveExports(dir, pkg.exports, ".");
+        if (r) return r;
+      }
+      const main = pkg.main || (pkg.module && typeof pkg.module === "string" ? pkg.module : null);
+      if (main) {
+        const target = path.join(dir, main);
+        const resolved = tryExtensions(target) || loadIndex(target);
+        if (resolved) return resolved;
       }
     }
     return loadIndex(dir);
@@ -75,8 +165,18 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
       const base = path.resolve(fromDir, request);
       resolved = tryExtensions(base) || loadAsDirectory(base);
     } else {
+      const { name, sub } = splitBare(request);
       for (const nm of nodeModulesPaths(fromDir)) {
-        const base = path.join(nm, request);
+        const pkgDir = path.join(nm, name);
+        const pkg = readPkg(pkgDir);
+        if (pkg && pkg.exports) {
+          const r = resolveExports(pkgDir, pkg.exports, sub);
+          if (r) {
+            resolved = r;
+            break;
+          }
+        }
+        const base = sub === "." ? pkgDir : path.join(pkgDir, sub.slice(2));
         resolved = tryExtensions(base) || loadAsDirectory(base);
         if (resolved) break;
       }
@@ -129,6 +229,15 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     let source = fs.readFileSync(filename, "utf8");
     if (source.charCodeAt(0) === 0xfeff) source = source.slice(1); // strip BOM
     if (source.startsWith("#!")) source = "//" + source.slice(2); // neutralize shebang
+
+    // ESM support (#13): transpile import/export -> our synchronous CJS at load
+    // time. `.cjs` is always CommonJS; everything else is scanned and rewritten
+    // only if it actually uses module syntax (transpileEsm returns null for
+    // plain CJS, so require/module.exports files are untouched).
+    if (path.extname(filename) !== ".cjs") {
+      const esm = transpileEsm(source, filename);
+      if (esm != null) source = esm;
+    }
 
     const dirname = path.dirname(filename);
     const require = makeRequire(dirname);

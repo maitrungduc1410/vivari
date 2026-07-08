@@ -336,6 +336,25 @@ const server = http.createServer(async (req, res) => {
     res.end(body);
     return;
   }
+  if (req.url === '/api/esm') {
+    // Phase 2 #13: this CJS server require()s an ESM module graph. The .mjs files
+    // use import/export, re-export, import.meta, and dynamic import() — all
+    // transpiled to our synchronous CJS at load time (es-module-lexer), no bundler.
+    const demo = require('/srv/esm-demo/index.mjs');
+    const lazy = await demo.loadLazy();
+    const body = Buffer.from(JSON.stringify({
+      node: process.version,
+      note: 'A CJS server require()d an ESM graph (import/export/re-export/import.meta/dynamic import), transpiled ESM->CJS at load time (#13), in the browser.',
+      isEsModule: demo.__esModule === true,
+      pi: demo.pi,
+      info: demo.info,
+      metaUrl: demo.metaUrl,
+      dynamicImport: lazy,
+    }, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(\`<!doctype html>
 <html><head><meta charset="utf-8"><title>Hello from OpenContainer</title>
@@ -350,7 +369,7 @@ const server = http.createServer(async (req, res) => {
 <body><div class="card">
   <h1>Hello from OpenContainer 🎉</h1>
   <p>Served by <code>http.createServer</code> in worker <code>PID \${process.pid}</code></p>
-  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> + <code>stream</code> + <code>net</code> + <code>http</code> + <code>zlib</code> + <code>crypto</code> vendored, on a real event loop, running in your browser</p>
+  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> + <code>stream</code> + <code>net</code> + <code>http</code> + <code>zlib</code> + <code>crypto</code> vendored (+ <code>ESM</code> import/export), on a real event loop, running in your browser</p>
   <p>You requested <code>\${req.url}</code></p>
   <button onclick="fetch('api/time').then(r=>r.json()).then(t=>document.getElementById('t').textContent=JSON.stringify(t))">GET /api/time</button>
   <button onclick="var el=document.getElementById('a');el.textContent='awaiting setTimeout(200ms)…';fetch('api/async').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2))">GET /api/async (awaits a timer)</button>
@@ -361,6 +380,7 @@ const server = http.createServer(async (req, res) => {
   <button onclick="fetch('api/fs').then(r=>r.json()).then(t=>document.getElementById('f').textContent=JSON.stringify(t,null,2))">GET /api/fs</button>
   <button onclick="fetch('api/zlib').then(r=>r.json()).then(t=>document.getElementById('z').textContent=JSON.stringify(t,null,2))">GET /api/zlib (gzip + crc32)</button>
   <button onclick="fetch('api/crypto').then(r=>r.json()).then(t=>document.getElementById('c').textContent=JSON.stringify(t,null,2))">GET /api/crypto (hash + AES-GCM)</button>
+  <button onclick="fetch('api/esm').then(r=>r.json()).then(t=>document.getElementById('e').textContent=JSON.stringify(t,null,2))">GET /api/esm (import/export)</button>
   <button onclick="var el=document.getElementById('nf');el.textContent='fetching npm registry…';fetch('api/fetch').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2)).catch(e=>el.textContent=String(e))">GET /api/fetch (npm registry)</button>
   <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
   <pre id="t"></pre>
@@ -372,6 +392,7 @@ const server = http.createServer(async (req, res) => {
   <pre id="f"></pre>
   <pre id="z"></pre>
   <pre id="c"></pre>
+  <pre id="e"></pre>
   <pre id="nf"></pre>
 </div></body></html>\`);
 });
@@ -494,6 +515,26 @@ async function boot() {
   kernel.mkdirp("/srv");
   kernel.writeFile("/srv/server.js", SERVER_SRC);
   kernel.writeFile("/root.sh", SCRIPT);
+
+  // Phase 2 #13: a tiny ESM graph the CJS server require()s at /api/esm. import/
+  // export/import.meta/dynamic import are transpiled to our sync CJS at load time
+  // (es-module-lexer). Proves real ESM syntax runs in the browser.
+  kernel.mkdirp("/srv/esm-demo");
+  kernel.writeFile(
+    "/srv/esm-demo/math.mjs",
+    "export const pi = 3.14159;\n" +
+      "export function square(n){ return n * n; }\n" +
+      "export default function cube(n){ return n * n * n; }\n",
+  );
+  kernel.writeFile("/srv/esm-demo/lazy.mjs", "export default 'esm-dynamic-import-works';\n");
+  kernel.writeFile(
+    "/srv/esm-demo/index.mjs",
+    "import cube, { pi, square } from './math.mjs';\n" +
+      "export { pi } from './math.mjs';\n" +
+      "export const info = { pi, square4: square(2), cube2: cube(2) };\n" +
+      "export const metaUrl = import.meta.url;\n" +
+      "export async function loadLazy(){ const m = await import('./lazy.mjs'); return m.default; }\n",
+  );
 
   post("log", { line: "$ sh /root.sh", cls: "muted" });
   await kernel.start("sh", ["/root.sh"], { cwd: "/" });

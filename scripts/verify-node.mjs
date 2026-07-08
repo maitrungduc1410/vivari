@@ -757,6 +757,90 @@ console.log('CRYPTOB_OK');
   assert(cb2.code === 0 && cb2.stdout.includes("CRYPTOB_OK"),
     "Path B: our lib/crypto.js runs on the Rust/Wasm crypto codec (digests/HMAC/PBKDF2/AES-GCM+CBC vs node:crypto)");
 
+  // === #13: ESM import/export transpiled to our sync CJS (es-module-lexer) ===
+  // Seed a small ESM/CJS mixed graph: named/default/namespace imports, CJS<->ESM
+  // interop, re-exports, an ESM-syntax .js file, a package resolved via its
+  // package.json "exports" field, dynamic import(), and import.meta.
+  kernel.mkdirp("/esm/node_modules/expkg/lib");
+  kernel.writeFile(
+    "/esm/dep.mjs",
+    "export const answer = 42;\n" +
+    "export function greet(n){ return 'hi ' + n; }\n" +
+    "export class Box { constructor(v){ this.v = v; } }\n" +
+    "export default { kind: 'esm-default' };\n",
+  );
+  kernel.writeFile("/esm/named.mjs", "export const a = 1;\nexport let b = 2;\nb = 3;\n");
+  kernel.writeFile("/esm/lazy.mjs", "export default 'lazy-loaded';\n");
+  kernel.writeFile(
+    "/esm/cjs-dep.cjs",
+    "module.exports = function add(x, y){ return x + y; };\nmodule.exports.tag = 'cjs';\n",
+  );
+  kernel.writeFile(
+    "/esm/reexp.mjs",
+    "export { answer, greet } from './dep.mjs';\n" +
+    "export * from './named.mjs';\n" +
+    "export * as depNs from './dep.mjs';\n" +
+    "export { default as depDefault } from './dep.mjs';\n",
+  );
+  // an ESM module authored as .js (detected by syntax, no .mjs extension)
+  kernel.writeFile("/esm/tool.js", "import { answer } from './dep.mjs';\nexport const doubled = answer * 2;\n");
+  // a package resolved via package.json "exports"
+  kernel.writeFile(
+    "/esm/node_modules/expkg/package.json",
+    JSON.stringify({ name: "expkg", version: "1.0.0", type: "module", exports: { ".": { import: "./lib/index.mjs", require: "./lib/index.mjs" } } }),
+  );
+  kernel.writeFile("/esm/node_modules/expkg/lib/index.mjs", "export const pkgName = 'expkg';\nexport default () => 'pkg-call';\n");
+  // a CJS file that requires an ESM module (interop from the CJS side)
+  kernel.writeFile(
+    "/esm/from-cjs.js",
+    "const dep = require('./dep.mjs');\n" +
+    "module.exports = { esmDefaultKind: dep.default.kind, esmAnswer: dep.answer, hasEsModule: dep.__esModule === true };\n",
+  );
+  kernel.writeFile(
+    "/esm/main.mjs",
+    "import def, { answer, greet, Box } from './dep.mjs';\n" +
+    "import * as ns from './dep.mjs';\n" +
+    "import add from './cjs-dep.cjs';\n" +
+    "import { answer as A2, depNs, depDefault } from './reexp.mjs';\n" +
+    "import { a, b } from './named.mjs';\n" +
+    "import { doubled } from './tool.js';\n" +
+    "import expkg, { pkgName } from 'expkg';\n" +
+    "import fromCjs from './from-cjs.js';\n" +
+    "import './named.mjs';\n" +
+    "export const total = answer + a + b;\n" +
+    "export function label(){ return greet('world'); }\n" +
+    "const sync = {\n" +
+    "  def_kind: def.kind, answer, greeting: greet('x'), boxV: new Box(9).v,\n" +
+    "  nsAnswer: ns.answer, nsDefaultKind: ns.default.kind,\n" +
+    "  add: add(2,3), addTag: add.tag,\n" +
+    "  reAnswer: A2, depNsAnswer: depNs.answer, depDefaultKind: depDefault.kind,\n" +
+    "  named_a: a, named_b: b, total, label: label(), doubled,\n" +
+    "  pkgName, pkgCall: expkg(),\n" +
+    "  fromCjs, metaHasUrl: typeof import.meta.url === 'string',\n" +
+    "};\n" +
+    "console.log('ESM_SYNC:' + JSON.stringify(sync));\n" +
+    "import('./lazy.mjs').then((m) => console.log('ESM_DYN:' + m.default));\n",
+  );
+
+  const esm = await kernel.start("node", ["/esm/main.mjs"], { cwd: "/esm", capture: true });
+  assert(esm.code === 0, "esm: node runs an .mjs entry without error (exit 0)");
+  const esmLine = (esm.stdout.split("\n").find((l) => l.startsWith("ESM_SYNC:")) || "").slice("ESM_SYNC:".length);
+  const R = esmLine ? JSON.parse(esmLine) : {};
+  assert(R.def_kind === "esm-default", "esm: default import interop (ESM default)");
+  assert(R.answer === 42 && R.greeting === "hi x" && R.boxV === 9, "esm: named import (const/function/class)");
+  assert(R.nsAnswer === 42 && R.nsDefaultKind === "esm-default", "esm: namespace import (* as ns, incl .default)");
+  assert(R.add === 5 && R.addTag === "cjs", "esm: default+named interop importing a CJS (.cjs) module");
+  assert(R.reAnswer === 42 && R.depNsAnswer === 42 && R.depDefaultKind === "esm-default",
+    "esm: re-exports (named / * / * as ns / default as)");
+  assert(R.named_a === 1 && R.named_b === 3, "esm: live binding sees post-assignment value (let b = 2; b = 3)");
+  assert(R.total === 46 && R.label === "hi world", "esm: local exports (const + function) are require-able");
+  assert(R.doubled === 84, "esm: an ESM module authored as .js is detected by syntax and transpiled");
+  assert(R.pkgName === "expkg" && R.pkgCall === "pkg-call", "esm: bare package resolved via package.json \"exports\" field");
+  assert(R.fromCjs && R.fromCjs.esmDefaultKind === "esm-default" && R.fromCjs.hasEsModule === true,
+    "esm: a CJS module can require() an ESM module (__esModule + default interop)");
+  assert(R.metaHasUrl === true, "esm: import.meta.url is available");
+  assert(esm.stdout.includes("ESM_DYN:lazy-loaded"), "esm: dynamic import() resolves to a Promise of the module");
+
   // Path B proof: require('net') is Node's REAL vendored lib/net.js +
   // internal/{net,stream_base_commons} running on our tcp_wrap/stream_wrap
   // loopback binding — net.Server/net.Socket are real Duplex streams. Proves an

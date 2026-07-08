@@ -85,8 +85,8 @@ Runs a user's JS project like real Node, synchronously, inside a worker.
 - `scripts/verify-node.mjs`: 14/14 PASS (relative/node_modules/JSON require,
   cache singleton, path/fs/Buffer, `process.exit` codes, MODULE_NOT_FOUND).
 
-**Deferred:** ESM (`import`/`export`) — needs async loading (browser native ESM
-via the Service Worker, or a CJS transform); tackled in a later brick.
+**Deferred → DONE (Phase 2 #13):** ESM (`import`/`export`) — shipped as a load-time
+ESM→CJS transpile over `es-module-lexer` (see Phase 2 #13 below).
 
 ---
 
@@ -435,7 +435,8 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     `argv[1] = script` semantics). Demo boot now `npm run start`s the installed app. verify:
     50/50 PASS. Note: a long-running dev server via `npm run` blocks (spawnSync) until
     async `spawn`/streaming exists; launch servers directly (`node server.js`) meanwhile.
-    Full **Vite** additionally needs ESM (#13) + a Wasm bundler (esbuild-wasm). Deliberately
+    Full **Vite** additionally needs a Wasm bundler (esbuild-wasm / rolldown-wasi); ESM
+    (#13) is now done. Deliberately
     **still deferred** (thrown away when real npm lands): `package-lock.json`, lifecycle
     scripts, peer/optional deps, dedup nuance, `npm ci`.
     - **✅ Express runs for real (verified).** `npm install express` pulls the full ~70-package
@@ -486,8 +487,25 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     process worker (browser `initCrypto()`, headless `require`); wired into `npm run build`
     (`build:crypto`). **Deferred (S3):** sign/verify, RSA/EC keygen, DH, scrypt, X.509 — they
     throw loudly; these want a bigger codec + vendoring Node's real `lib/crypto` internals.
-13. **ESM (`import`/`export`)** [L] — native browser ESM served from the VFS via the
-    Service Worker, or Node's esm loader. Unblocks modern packages.
+13. **ESM (`import`/`export`)** — **DONE (S1: transpile ESM→CJS at load time).** Our
+    module system is synchronous CJS, so instead of a spec ESM loader we rewrite import/
+    export down to `require`/`exports` in `compile()`, exactly like a bundler's interop
+    layer. `es-module-lexer` (vendored `dist/lexer.asm.js` — pure-JS asm build, **sync, no
+    wasm/init**, so no extra per-worker artifact and nothing to thread through boot) locates
+    every import/re-export statement, dynamic `import()`, `import.meta`, and export name;
+    `packages/runtime/esm.js` does the rewrite. Covered: static import (default/named/
+    namespace/side-effect), re-export (`export {x} from`, `export *`, `export * as ns from`,
+    `export {default as}`), local exports (const/let/var/function/class + `export {}` +
+    `export default`), dynamic `import()` (→ Promise, relative to the module), and
+    `import.meta.url`/`resolve`. Interop with CJS uses standard `__esModule` rules; live
+    bindings modeled with getters. Resolver upgraded: `.mjs`/`.cjs` extensions + `index.*`,
+    and package.json **`exports`** conditions (`require`→`import`→`default`, subpaths +
+    `./*` wildcards). Detection: `.cjs` is always CJS; everything else is transpiled only if
+    it actually uses module syntax (pure CJS files are returned untouched — real `express`'s
+    ~70-pkg CJS tree still passes). Verified headless (13 assertions: named/default/ns/
+    re-export/live-binding/`.js`-as-ESM/`exports`-field/CJS↔ESM interop/import.meta/dynamic
+    import) + a browser `/api/esm` route. **Deferred (documented casualties):** top-level
+    await (our wrapper is a sync function) and exact circular-eval binding order.
 14. **VFS worker split** [M] — *decomp, deliberately LATE.* Split the Wasm VFS into its
     own worker (our `File System Worker`) as the single source of truth once the fs
     binding contract is stable; fs opcodes serviced directly over the SAB. (Doing this
