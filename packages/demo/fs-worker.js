@@ -121,7 +121,9 @@ function buildAccess(vfs) {
 // System/volatile dirs we never persist: coreutils are re-installed each boot,
 // and /tmp, /proc, /dev are ephemeral by definition. Everything else (your
 // /app, node_modules, /data, …) is mirrored.
-const IGNORE = ["/bin", "/tmp", "/proc", "/dev"];
+// /etc and /usr are re-seeded by the VFS constructor every boot (os-release, ldd),
+// so persisting them is redundant and would let a stale copy shadow a changed seed.
+const IGNORE = ["/bin", "/tmp", "/proc", "/dev", "/etc", "/usr"];
 const shouldPersist = (p) => {
   for (const pre of IGNORE) if (p === pre || p.startsWith(pre + "/")) return false;
   return true;

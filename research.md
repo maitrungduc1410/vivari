@@ -107,7 +107,8 @@ dominates). ⇒ the cost of running a real toolchain in the browser.
   `socket hang up`. Networking is only in-RAM virtual routing for HTTP preview.
 - Native addons (`.node`) can't run (can't be recompiled to Wasm).
 - `cat /etc/os-release` → **hardcoded** data in the VFS to fool OS-sniffing libs
-  (this project seeds `/etc/os-release` = "OpenContainer-OS").
+  (this project masquerades as Ubuntu 22.04 / glibc, and seeds a glibc `/usr/bin/ldd`,
+  so distro/libc sniffers land on the common well-supported path).
 
 ---
 

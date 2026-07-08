@@ -584,7 +584,7 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
     (needs an IPC channel), pipes (`|`)/redirects in `sh`, `detached`/process groups.
     **Extras (ongoing, unrelated):** nested `worker_threads` (our `[worker n]`, #16 2b), heavy
     toolchains (`esbuild`/`vite`/`tsserver` as Wasm), IndexedDB persistence, pre-warm worker pool.
-16. **WASI + napi-rs Wasm runtime (native→wasm packages)** [XL] — **stage 1 + 2a + 2b core DONE.**
+16. **WASI + napi-rs Wasm runtime (native→wasm packages)** [XL] — **stage 1 + 2a + 2b core + 2c DONE.**
     Many modern toolchains ship a `wasm32-wasi` build of their native `.node` addon and
     switch to it on a WebContainer-class host (e.g. Vite's `rolldown` downloads
     `@rolldown/binding-wasm32-wasi`; also `@napi-rs/*`). Two halves: (a) a **WASI preview1
@@ -649,10 +649,22 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
       async napi addons — the gap is in emnapi, not our layer. Sync napi addons (crc32, 2a) are
       unaffected. Revisit when napi-rs/emnapi fix the async path, or when we tackle a wasi-threads
       (rayon/pthreads) workload directly (the likely `rolldown` path).
-    - **Stage 2c (npm auto-selects the wasm build) — TODO.** `npm install` must pick the
-      `*-wasm32-wasi` variant (napi-rs packages gate it behind `cpu:["wasm32"]` +
-      `optionalDependencies` + a JS wrapper), like StackBlitz auto-downloading `rolldown-wasm`.
-      Pairs with the "detect env → fetch the wasm variant" logic real npm/pnpm have (North Star).
+    - **Stage 2c (npm auto-selects the wasm build) — DONE.** `npm install @node-rs/crc32`
+      now installs **only** the `*-wasm32-wasi` variant. napi-rs publishes one package per
+      platform as `optionalDependencies` (14 for crc32) each gated by a `cpu`/`os` allow-list;
+      the installer (`packages/kernel-host/programs/npm.js`) walks `optionalDependencies` as
+      **non-fatal, platform-gated** jobs: a cheap name pre-filter skips the ~13 native builds
+      with no network round, and `platformOk` (checks the manifest `cpu` allows `wasm32`,
+      honouring `!neg` entries) drops any that slip through. The package's own generated
+      loader then falls back to that wasm binding, so `require('@node-rs/crc32')` works
+      unmodified — no runtime change needed (we already report `process.arch === 'wasm32'`,
+      and `@napi-rs/wasm-runtime` resolves to our vendored builtin). Verified headless
+      (`verify-node`: an offline 3-variant napi fixture — wasm installs, darwin name-skipped,
+      neutral-named x64 fetched-then-cpu-skipped, meta re-export require-able) + a browser boot
+      step doing the real `npm install @node-rs/crc32` live from the registry. Like StackBlitz
+      auto-downloading `rolldown-wasm`; pairs with the North-Star "detect env → fetch wasm".
+      Deferred: `os`/`libc` gating (cpu is the definitive signal for wasm) and skipping deps
+      already provided as builtins (currently re-installed but harmlessly shadowed).
     - *Note:* esbuild-wasm is **Go/js** (uses `wasm_exec.js`, not WASI) and `@swc/wasm` is
       **wasm-bindgen web** (not WASI) — those are separate loaders, not covered by this item.
     Depends on: stable fs/VFS contract (#14 ✓), ESM (#13 ✓).

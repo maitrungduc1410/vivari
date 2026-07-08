@@ -197,6 +197,68 @@ async function makeKernel() {
         "package/index.js": "module.exports = () => 'c+' + require('b')();\n",
       }),
     },
+    // napi-style meta package (Phase 2 #16 stage 2c): its per-platform builds are
+    // optionalDependencies. Only the wasm32 build may install here; the darwin one
+    // is name-skipped (no fetch) and the neutral-named x64 one is fetched then
+    // cpu-skipped. The meta's loader re-exports whatever platform build resolved.
+    "https://registry.npmjs.org/napipkg": {
+      contentType: "application/json",
+      body: enc.encode(
+        JSON.stringify({
+          name: "napipkg",
+          "dist-tags": { latest: "1.0.0" },
+          versions: {
+            "1.0.0": {
+              dist: { tarball: "https://registry.npmjs.org/napipkg/-/napipkg-1.0.0.tgz" },
+              optionalDependencies: {
+                "napipkg-darwin-arm64": "1.0.0", // foreign name -> fast-skipped, never fetched
+                "napipkg-neutralnative": "1.0.0", // neutral name, cpu:[x64] -> fetched then skipped
+                "napipkg-wasm32-wasi": "1.0.0", // cpu:[wasm32] -> the one that installs
+              },
+            },
+          },
+        }),
+      ),
+    },
+    "https://registry.npmjs.org/napipkg/-/napipkg-1.0.0.tgz": {
+      contentType: "application/octet-stream",
+      body: makeTgz({
+        "package/package.json": JSON.stringify({ name: "napipkg", version: "1.0.0", main: "index.js" }),
+        // Mirror the real napi-rs wrapper: node:-prefixed builtins + createRequire.
+        "package/index.js":
+          "const { createRequire } = require('node:module');\n" +
+          "const req = createRequire(__filename);\n" +
+          "require('node:fs');\n" +
+          "module.exports = req('napipkg-wasm32-wasi');\n",
+      }),
+    },
+    "https://registry.npmjs.org/napipkg-neutralnative": {
+      contentType: "application/json",
+      body: enc.encode(
+        JSON.stringify({
+          name: "napipkg-neutralnative",
+          "dist-tags": { latest: "1.0.0" },
+          versions: { "1.0.0": { cpu: ["x64"], dist: { tarball: "https://registry.npmjs.org/napipkg-neutralnative/-/nn-1.0.0.tgz" } } },
+        }),
+      ),
+    },
+    "https://registry.npmjs.org/napipkg-wasm32-wasi": {
+      contentType: "application/json",
+      body: enc.encode(
+        JSON.stringify({
+          name: "napipkg-wasm32-wasi",
+          "dist-tags": { latest: "1.0.0" },
+          versions: { "1.0.0": { cpu: ["wasm32"], dist: { tarball: "https://registry.npmjs.org/napipkg-wasm32-wasi/-/ww-1.0.0.tgz" } } },
+        }),
+      ),
+    },
+    "https://registry.npmjs.org/napipkg-wasm32-wasi/-/ww-1.0.0.tgz": {
+      contentType: "application/octet-stream",
+      body: makeTgz({
+        "package/package.json": JSON.stringify({ name: "napipkg-wasm32-wasi", version: "1.0.0", main: "index.js" }),
+        "package/index.js": "module.exports = { id: 'wasm32-wasi', add: function (a, b) { return a + b; } };\n",
+      }),
+    },
   };
   const fetchStats = { calls: 0 };
   const fetcher = async (url) => {
@@ -1276,6 +1338,25 @@ console.log(require('a')() + '|' + pj.dependencies.a);
   const nx = await kernel.start("npx", ["b-cli"], { cwd: "/proj", capture: true });
   assert(nx.code === 0 && nx.stdout.includes("b-cli ran"),
     "Phase 2 #10 st2: npx runs a local node_modules/.bin executable");
+
+  // === #16 stage 2c: npm auto-selects the wasm build of a native package ===
+  // `npm install napipkg` sees three optionalDependencies (one per platform).
+  // Only napipkg-wasm32-wasi may run on this wasm32 host, so that's the only one
+  // installed; the darwin build is name-skipped and the neutrally-named x64 build
+  // is fetched-then-cpu-skipped. Neither being installed must not fail the run.
+  kernel.mkdirp("/napipkg-app");
+  kernel.writeFile("/napipkg-app/package.json", JSON.stringify({ name: "napipkg-app", version: "1.0.0" }));
+  const npmN = await kernel.start("npm", ["install", "napipkg"], { cwd: "/napipkg-app", capture: true });
+  assert(npmN.code === 0 && kernel.exists("/napipkg-app/node_modules/napipkg-wasm32-wasi/package.json"),
+    "Phase 2 #16 st2c: npm installs the wasm32-wasi optional dependency");
+  assert(!kernel.exists("/napipkg-app/node_modules/napipkg-darwin-arm64") &&
+    !kernel.exists("/napipkg-app/node_modules/napipkg-neutralnative"),
+    "Phase 2 #16 st2c: npm skips the native (darwin/x64) optional dependencies");
+  kernel.writeFile("/napipkg-app/run.js",
+    "const p = require('napipkg'); console.log(p.id + '|' + p.add(2, 3));");
+  const npkgRun = await kernel.start("node", ["/napipkg-app/run.js"], { cwd: "/napipkg-app", capture: true });
+  assert(npkgRun.code === 0 && npkgRun.stdout.trim() === "wasm32-wasi|5",
+    "Phase 2 #16 st2c: meta package loads + re-exports the auto-selected wasm build");
 
   // Event loop v2 proof: ordering. nextTick beats Promise microtasks, and both
   // beat timers/immediates — which now actually FIRE (the old synchronous loop

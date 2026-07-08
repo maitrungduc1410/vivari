@@ -848,6 +848,30 @@ async function boot() {
   post("log", { line: "$ npm run start", cls: "muted" });
   await kernel.start("npm", ["run", "start"], { cwd: "/app" });
 
+  // Phase 2 #16 stage 2c: real `npm install @node-rs/crc32` (the META package).
+  // It lists 14 per-platform builds as optionalDependencies; npm auto-selects the
+  // ONLY one that permits this wasm32 host (@node-rs/crc32-wasm32-wasi) and skips
+  // the 13 native ones. The package's own generated loader then falls back to that
+  // wasm binding — so `require('@node-rs/crc32')` just works, unmodified.
+  try {
+    kernel.mkdirp("/crc-app");
+    kernel.writeFile(
+      "/crc-app/package.json",
+      JSON.stringify({ name: "crc-app", version: "1.0.0", scripts: { start: "node index.js" } }, null, 2),
+    );
+    kernel.writeFile(
+      "/crc-app/index.js",
+      "const { crc32 } = require('@node-rs/crc32');\n" +
+        "console.log('[napi 2c] npm auto-picked wasm; crc32(\"OpenContainer\") =', crc32('OpenContainer'));\n",
+    );
+    post("log", { line: "$ cd /crc-app && npm install @node-rs/crc32  (auto-selects wasm32-wasi)", cls: "muted" });
+    await kernel.start("npm", ["install", "@node-rs/crc32"], { cwd: "/crc-app" });
+    post("log", { line: "$ npm run start", cls: "muted" });
+    await kernel.start("npm", ["run", "start"], { cwd: "/crc-app" });
+  } catch (err) {
+    post("log", { line: "  [napi 2c] demo skipped: " + (err && err.message || err), cls: "muted" });
+  }
+
   // Phase 2 #15: `npm run dev` launching a LONG-RUNNING server. Before async
   // spawn this froze forever (spawnSync buffered stdout and never returned);
   // now npm async-spawns the leaf node process, stays in the foreground streaming

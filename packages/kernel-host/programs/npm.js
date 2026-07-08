@@ -14,8 +14,13 @@
 //     - hoists like npm v3+: first-seen version goes to the project's root
 //       node_modules; a conflicting version is nested under the dependent
 //     - creates .bin symlinks and records explicit installs in package.json
-//   Deferred to stage 2: package-lock.json, lifecycle scripts, peer/optional
-//   deps, dedup nuance, `npm ci`.
+//     - optionalDependencies (Phase 2 #16 stage 2c): installs only the entries
+//       whose `cpu`/`os` allow this (wasm32) host and treats them as non-fatal,
+//       so `npm install @node-rs/x` auto-selects the *-wasm32-wasi build and
+//       skips the ~13 native ones — the package's own loader then falls back to
+//       the wasm binding
+//   Deferred to stage 2: package-lock.json, lifecycle scripts, peerDependencies,
+//   dedup nuance, `npm ci`.
 //
 // Authoring note: this source is embedded as a template string, so to stay
 // escaping-free it deliberately uses NO backticks, NO ${...} and NO backslashes.
@@ -46,6 +51,38 @@ function pickVersion(meta, range) {
   if (dt[range]) return dt[range]; // dist-tag (e.g. 'next', 'beta')
   const all = Object.keys(meta.versions || {});
   return semver.maxSatisfying(all, range || '*'); // highest satisfying version, or null
+}
+
+// ---- platform selection for optional deps (Phase 2 #16 stage 2c) ------------
+// We are a wasm32 host. napi-rs (and friends) publish one platform package per
+// os/arch as optionalDependencies; each manifest declares a 'cpu' (and usually
+// 'os') allow-list, so only the wasm32 build permits us. npm installs just that
+// one, and the package's own generated loader falls back to it. Entries may be
+// negated with a leading '!'.
+const TARGET_CPU = 'wasm32';
+function listAllows(list, value) {
+  if (!list || list.length === 0) return true; // unconstrained -> allowed
+  let hasPositive = false, matched = false;
+  for (let i = 0; i < list.length; i++) {
+    const item = String(list[i]);
+    if (item.charCodeAt(0) === 33) { if (item.slice(1) === value) return false; } // '!x' excludes
+    else { hasPositive = true; if (item === value) matched = true; }
+  }
+  return hasPositive ? matched : true;
+}
+// 'cpu' is the definitive signal: a wasm build permits wasm32 (or is
+// unconstrained). We deliberately ignore 'os' — a wasm module runs on any OS and
+// napi-rs wasm packages leave os unconstrained anyway.
+function platformOk(manifest) { return listAllows(manifest.cpu, TARGET_CPU); }
+// Cheap pre-filter so we skip the ~13 native builds without a metadata fetch:
+// napi-rs names them '<base>-<platform>'. Anything mentioning wasm is kept; a
+// known native os/arch token means "foreign, skip without a network round".
+const FOREIGN_TOKENS = ['darwin', 'win32', 'linux', 'android', 'freebsd', 'openbsd',
+  '-musl', '-gnu', '-msvc', '-eabi', 'arm64', 'x64', 'ia32', 'armv7', 'ppc64', 's390x', 'riscv64'];
+function foreignName(name) {
+  if (name.indexOf('wasm') >= 0 || name.indexOf('wasi') >= 0) return false;
+  for (let i = 0; i < FOREIGN_TOKENS.length; i++) if (name.indexOf(FOREIGN_TOKENS[i]) >= 0) return true;
+  return false;
 }
 
 // ---- registry metadata (via blocking __ocfetch) -----------------------------
@@ -151,9 +188,18 @@ async function installTree(rootDeps, cwd) {
   for (const n in rootDeps) queue.push({ name: n, range: rootDeps[n], parentDir: cwd });
   while (queue.length) {
     const job = queue.shift();
-    const meta = getMeta(job.name);
+    // Optional deps (stage 2c): platform-gated and non-fatal. Skip obvious
+    // foreign builds without a fetch; tolerate missing metadata/versions.
+    if (job.optional && foreignName(job.name)) continue;
+    let meta;
+    try { meta = getMeta(job.name); }
+    catch (e) { if (job.optional) continue; throw e; }
     const version = pickVersion(meta, job.range);
-    if (!version) throw new Error('no version of ' + job.name + ' matches ' + job.range);
+    if (!version) {
+      if (job.optional) continue;
+      throw new Error('no version of ' + job.name + ' matches ' + job.range);
+    }
+    if (job.optional && !platformOk(meta.versions[version])) continue; // native build -> skip
     let dir, nmDir;
     if (rootVersions[job.name] === undefined) {
       rootVersions[job.name] = version;
@@ -172,6 +218,8 @@ async function installTree(rootDeps, cwd) {
     linkBins(dir, nmDir);
     const deps = meta.versions[version].dependencies || {};
     for (const dn in deps) queue.push({ name: dn, range: deps[dn], parentDir: dir });
+    const opt = meta.versions[version].optionalDependencies || {};
+    for (const dn in opt) queue.push({ name: dn, range: opt[dn], parentDir: dir, optional: true });
   }
 }
 

@@ -11,7 +11,10 @@ import { transpileEsm } from "./esm.js";
 
 export function createModuleSystem({ fs, path, builtins, process, globals, nodeModules }) {
   const cache = Object.create(null);
-  const builtinNames = new Set(Object.keys(builtins));
+  // Check the LIVE builtins object, not a snapshot: index.js finishes wiring it
+  // (adds `module`, then every `node:`-prefixed alias) AFTER this system is
+  // constructed, so a Set captured here would miss `node:module`/`node:fs`/... .
+  const hasBuiltin = (request) => Object.prototype.hasOwnProperty.call(builtins, request);
   // Vendored modules the loader can serve lazily (e.g. `semver`) without eagerly
   // instantiating them for every process — resolved only when actually required.
   const hasLazyBuiltin = (request) => !!nodeModules && nodeModules.has(request);
@@ -161,7 +164,7 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
   }
 
   function resolveFilename(request, fromDir) {
-    if (builtinNames.has(request)) return { builtin: true, id: request };
+    if (hasBuiltin(request)) return { builtin: true, id: request };
     if (hasLazyBuiltin(request)) return { builtin: true, id: request };
 
     let resolved = null;

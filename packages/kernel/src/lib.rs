@@ -215,10 +215,21 @@ impl VirtualFileSystem {
         fs.alloc(NodeData::Dir(BTreeMap::new()), 0o755); // root (== ROOT_ID)
 
         // Seed a fake OS release file, StackBlitz-style, to fool env sniffers.
+        // We masquerade as Ubuntu 22.04 (glibc/Debian family) rather than a made-up
+        // distro so libraries that branch on ID / ID_LIKE (e.g. prebuilt selection)
+        // land on the common, well-supported path instead of an "unknown" fallback.
         fs.mkdir("/etc".into(), false).ok();
         fs.write_file(
             "/etc/os-release".into(),
-            b"NAME=\"OpenContainer-OS\"\nVERSION=\"2026.07\"\nID=opencontainer\n".to_vec(),
+            b"PRETTY_NAME=\"Ubuntu 22.04.4 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"22.04\"\nVERSION=\"22.04.4 LTS (Jammy Jellyfish)\"\nVERSION_CODENAME=jammy\nID=ubuntu\nID_LIKE=debian\nUBUNTU_CODENAME=jammy\nHOME_URL=\"https://www.ubuntu.com/\"\n".to_vec(),
+        )
+        .ok();
+        // A glibc `ldd` so musl-vs-glibc sniffers (e.g. napi-rs `isMuslFromFilesystem`
+        // reads /usr/bin/ldd) resolve to glibc and pick glibc prebuilts, not musl.
+        fs.mkdir("/usr/bin".into(), true).ok();
+        fs.write_file(
+            "/usr/bin/ldd".into(),
+            b"#!/bin/sh\necho \"ldd (Ubuntu GLIBC 2.35-0ubuntu3) 2.35\"\n".to_vec(),
         )
         .ok();
         fs
