@@ -506,6 +506,21 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     re-export/live-binding/`.js`-as-ESM/`exports`-field/CJS↔ESM interop/import.meta/dynamic
     import) + a browser `/api/esm` route. **Deferred (documented casualties):** top-level
     await (our wrapper is a sync function) and exact circular-eval binding order.
+**Compatibility consolidation (ongoing, between features):** fill builtins that
+previously threw `no vendored Node builtin`, so more real packages load. Done so far:
+`punycode` (vendored verbatim from punycode.js@2.3.1 — the exact module Node bundles),
+`dns` (loopback-aware shim: every name → 127.0.0.1/::1 since the virtual net is
+in-process loopback — this **unblocks the vendored `net.js` hostname path**, so
+`net.connect(port, 'localhost')` and hostname `listen` now work; callback + promises
+APIs), `timers/promises` (`setTimeout`/`setImmediate`/`setInterval` on the event loop +
+`AbortSignal`), `console` (require-able `Console` class over custom streams via
+`util.format`), and `constants` (deprecated flat aggregate of fs + signal + errno).
+Verified in `verify-node` (7 assertions). Note (honest): `tty`/`url` stay **shims by
+design**, not temporary hacks — there is no real TTY in the browser, and the platform's
+WHATWG `URL` already backs the legacy `url` API; vendoring Node's native-bound versions
+would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `readline`,
+`perf_hooks`, `dgram`, `tls`/`https` (stubbed).
+
 14. **VFS worker split** [M] — *decomp, deliberately LATE.* Split the Wasm VFS into its
     own worker (our `File System Worker`) as the single source of truth once the fs
     binding contract is stable; fs opcodes serviced directly over the SAB. (Doing this

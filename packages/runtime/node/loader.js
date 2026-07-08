@@ -101,6 +101,15 @@ import httpsFactory from "./lib/https.js";
 import tlsFactory from "./lib/tls.js";
 import undiciFactory from "./internal/deps/undici/undici.js";
 
+// Compatibility fill-ins (consolidation): commonly-required builtins that used to
+// throw. dns is loopback-aware (unblocks vendored net.js hostname connect);
+// punycode is vendored verbatim; the rest are small, faithful implementations.
+import dnsFactory from "./lib/dns.js";
+import punycodeFactory from "./lib/punycode.js";
+import timersPromisesFactory from "./lib/timers/promises.js";
+import consoleFactory from "./lib/console.js";
+import constantsFactory2 from "./lib/constants.js";
+
 // Vendored third-party (not a Node core module): real node-semver, used by the
 // npm program (Phase 2 #10 stage 2). Lazy — only instantiated when required.
 import semverFactory from "./vendor/semver.js";
@@ -187,6 +196,11 @@ const FACTORIES = {
   https: httpsFactory,
   tls: tlsFactory,
   "internal/deps/undici/undici": undiciFactory,
+  dns: dnsFactory,
+  punycode: punycodeFactory,
+  "timers/promises": timersPromisesFactory,
+  console: consoleFactory,
+  constants: constantsFactory2,
   semver: semverFactory,
 };
 

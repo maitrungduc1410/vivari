@@ -841,6 +841,91 @@ console.log('CRYPTOB_OK');
   assert(R.metaHasUrl === true, "esm: import.meta.url is available");
   assert(esm.stdout.includes("ESM_DYN:lazy-loaded"), "esm: dynamic import() resolves to a Promise of the module");
 
+  // === Consolidation: fill-in builtins that used to throw on require ===
+  kernel.writeFile(
+    "/t/compat.js",
+    `
+const assert = require('assert');
+
+// punycode (vendored verbatim)
+const punycode = require('punycode');
+assert.strictEqual(punycode.toASCII('mañana.com'), 'xn--maana-pta.com');
+assert.strictEqual(punycode.toUnicode('xn--maana-pta.com'), 'mañana.com');
+assert.deepStrictEqual(punycode.ucs2.decode('A'), [65]);
+console.log('OK punycode');
+
+// constants (deprecated aggregate)
+const constants = require('constants');
+assert.strictEqual(constants.SIGINT, 2);
+assert.strictEqual(constants.ENOENT, 2);
+assert.ok(typeof constants.O_RDONLY === 'number');
+console.log('OK constants');
+
+// console (require-able Console class over custom streams)
+const { Console } = require('console');
+let out = '';
+const stream = { write: (s) => { out += s; } };
+const clog = new Console(stream, stream);
+clog.log('hello %s %d', 'x', 7);
+assert.strictEqual(out, 'hello x 7\\n');
+console.log('OK console');
+
+async function main() {
+  // timers/promises
+  const { setTimeout: sleep, setInterval } = require('timers/promises');
+  assert.strictEqual(await sleep(5, 'v'), 'v');
+  let ticks = 0;
+  for await (const t of setInterval(3, 'tick')) { if (++ticks >= 3) break; }
+  assert.strictEqual(ticks, 3);
+  const ac = new AbortController();
+  const pending = sleep(1000, 'nope', { signal: ac.signal });
+  ac.abort();
+  let aborted = false;
+  try { await pending; } catch (e) { aborted = e && e.name === 'AbortError'; }
+  assert.ok(aborted, 'timers/promises setTimeout rejects on abort');
+  console.log('OK timers/promises');
+
+  // dns (loopback-aware) — callback + promise
+  const dns = require('dns');
+  const cb = await new Promise((res, rej) => dns.lookup('localhost', (e, a, f) => e ? rej(e) : res({ a, f })));
+  assert.strictEqual(cb.a, '127.0.0.1');
+  assert.strictEqual(cb.f, 4);
+  const pr = await dns.promises.lookup('localhost');
+  assert.strictEqual(pr.address, '127.0.0.1');
+  await new Promise((res) => dns.resolve4('localhost', (e, addrs) => { assert.ok(!e && addrs[0] === '127.0.0.1'); res(); }));
+  console.log('OK dns');
+
+  // net.connect BY HOSTNAME — exercises vendored net.js -> require('dns').lookup
+  const net = require('net');
+  const server = net.createServer((s) => { s.setEncoding('utf8'); s.on('data', (d) => s.end('echo:' + d)); });
+  await new Promise((r) => server.listen(0, r));
+  const port = server.address().port;
+  const reply = await new Promise((res, rej) => {
+    const c = net.connect(port, 'localhost', () => c.end('hi'));
+    c.setEncoding('utf8');
+    let b = '';
+    c.on('data', (d) => { b += d; });
+    c.on('end', () => res(b));
+    c.on('error', rej);
+  });
+  assert.strictEqual(reply, 'echo:hi');
+  server.close();
+  console.log('OK net-hostname');
+  console.log('COMPAT_OK');
+}
+main().catch((e) => { console.error('COMPAT_FAIL', (e && e.stack) || e); process.exit(1); });
+`,
+  );
+  const compat = await kernel.start("node", ["/t/compat.js"], { cwd: "/t", capture: true });
+  assert(compat.code === 0, "consolidation: compat program exits 0");
+  assert(compat.stdout.includes("OK punycode"), "consolidation: punycode (toASCII/toUnicode/ucs2) vendored verbatim");
+  assert(compat.stdout.includes("OK constants"), "consolidation: constants (signals + errno + fs) require-able");
+  assert(compat.stdout.includes("OK console"), "consolidation: console.Console writes to a custom stream via util.format");
+  assert(compat.stdout.includes("OK timers/promises"), "consolidation: timers/promises setTimeout/setInterval + AbortSignal");
+  assert(compat.stdout.includes("OK dns"), "consolidation: dns loopback lookup (callback + promises + resolve4)");
+  assert(compat.stdout.includes("OK net-hostname"),
+    "consolidation: net.connect(port, 'localhost') resolves via the new dns (vendored net.js hostname path)");
+
   // Path B proof: require('net') is Node's REAL vendored lib/net.js +
   // internal/{net,stream_base_commons} running on our tcp_wrap/stream_wrap
   // loopback binding — net.Server/net.Socket are real Duplex streams. Proves an
