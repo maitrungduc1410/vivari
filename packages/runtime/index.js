@@ -55,6 +55,11 @@ export function createRuntime({
   // Liveness counter for real net handles (Phase 2 #8): a listening net.Server or
   // an open socket keeps the loop alive, exactly like libuv's active handles.
   const netLiveness = { active: 0 };
+  // Liveness counter for async children (#15): a running child keeps the parent's
+  // loop alive so it can stream the child's output and see its exit.
+  const childLiveness = { active: 0 };
+  // Assigned once child_process is built; the loop drains child events through it.
+  let drainChildEvents = () => {};
   // How many ports this process has registered with the kernel (each real
   // net.Server.listen calls syscalls.listen). While non-zero, `doNet` drains
   // inbound requests on every `net` wake.
@@ -69,7 +74,7 @@ export function createRuntime({
   // wake it drains queued requests and replays each through the real http stack
   // (Phase 2 #8 stage 2) so the server that answers is Node's own lib/http.js.
   const loop = createEventLoop({
-    isAlive: () => netLiveness.active > 0,
+    isAlive: () => netLiveness.active > 0 || childLiveness.active > 0,
     doNet: () => {
       if (netServers.count === 0 || !bridgeHttp) return;
       for (;;) {
@@ -78,6 +83,7 @@ export function createRuntime({
         bridgeHttp(ev);
       }
     },
+    doChildren: () => drainChildEvents(),
   });
 
   const os = createOs();
@@ -108,7 +114,17 @@ export function createRuntime({
   // The browser preview reaches it through the bridge wired below.
   const http = nodeModules.require("http");
   const assert = createAssert(util);
-  const child_process = createChildProcess({ sys: syscalls, process, Buffer });
+  const child_process = createChildProcess({
+    sys: syscalls,
+    process,
+    Buffer,
+    EventEmitter,
+    Readable: stream.Readable,
+    childLiveness,
+    wake: loop.wakeNet,
+  });
+  // The loop drains queued child events (stdout/stderr/exit) each turn (#15).
+  drainChildEvents = child_process._drain;
 
   // Replay an external request through the real http *client* into the in-VM real
   // http *server* over the net loopback, then send the collected response back to
@@ -244,6 +260,9 @@ export function createRuntime({
     require: moduleSystem.makeRequire(cwd),
     /** External nudge from the kernel: a network request is queued for us. */
     wake: loop.wakeNet,
+    /** External delivery from the kernel: an async child's stdout/stderr/exit
+     * ({type:'child-stdout'|'child-stderr'|'child-exit', childPid, ...}). #15 */
+    dispatchChild: (msg) => child_process._dispatch(msg),
     /**
      * Run an entry file like `node <entry>`, then drive the event loop until it
      * is quiescent (no pending timers/immediates/nextTicks and no open servers).

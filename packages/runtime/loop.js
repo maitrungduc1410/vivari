@@ -46,9 +46,12 @@ const makeMacrotask = () => {
   return (fn) => hostSetTimeout(fn, 0);
 };
 
-export function createEventLoop({ isAlive, doNet } = {}) {
+export function createEventLoop({ isAlive, doNet, doChildren } = {}) {
   isAlive = isAlive || (() => false);
   doNet = doNet || (() => {});
+  // #15: drain async child-process events (stdout/stderr/exit delivered as
+  // postMessages) inside a controlled loop turn, like doNet drains HTTP.
+  doChildren = doChildren || (() => {});
 
   const scheduleMacrotask = makeMacrotask();
   const macrotaskYield = () => new Promise((resolve) => scheduleMacrotask(resolve));
@@ -264,7 +267,12 @@ export function createEventLoop({ isAlive, doNet } = {}) {
       await drainMicrotasks();
       runImmediates();
       await drainMicrotasks();
-      doNet(); // drain any queued HTTP requests (sync dispatch for now)
+      // Run inside runCallback so a process.exit() thrown from an http handler or
+      // an async child's 'exit'/'data' listener (emitted synchronously here) is
+      // honoured as an exit, not leaked as an unhandled rejection out of drive().
+      runCallback(doNet, []); // drain any queued HTTP requests
+      await drainMicrotasks();
+      runCallback(doChildren, []); // drain async child stdout/stderr/exit (#15)
       await drainMicrotasks();
       if (exiting || !hasRefWork()) break;
       await waitForNext();

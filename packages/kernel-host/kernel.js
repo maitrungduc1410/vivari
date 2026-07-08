@@ -34,6 +34,8 @@ import {
   STATE_RESPONSE_OK,
   STATE_RESPONSE_ERR,
   OP_SPAWN,
+  OP_SPAWN_ASYNC,
+  OP_KILL,
   OP_LISTEN,
   OP_ACCEPT,
   OP_RESPOND,
@@ -128,7 +130,7 @@ export class Kernel {
   }
 
   // ---- process lifecycle ----------------------------------------------------
-  createProcess(spec, { parentPid = null, capture = false } = {}) {
+  createProcess(spec, { parentPid = null, capture = false, stream = false } = {}) {
     const pid = this.nextPid++;
     const sab = new SharedArrayBuffer(SAB_BYTES);
     const { ctrl, data } = makeViews(sab);
@@ -136,6 +138,10 @@ export class Kernel {
       pid,
       parentPid,
       capture,
+      // #15: async children stream their output to the *parent worker* (so its
+      // event loop can react live) instead of buffering (capture) or going to the
+      // host (default). See onOutput + handleSpawnAsync.
+      stream,
       ctrl,
       data,
       outBuf: [],
@@ -164,11 +170,26 @@ export class Kernel {
   onOutput(pid, chunk, isErr) {
     const proc = this.procs.get(pid);
     if (!proc) return;
-    if (proc.capture) (isErr ? proc.errBuf : proc.outBuf).push(chunk);
-    else (isErr ? this.stderr : this.stdout)(chunk, pid);
+    if (proc.capture) {
+      (isErr ? proc.errBuf : proc.outBuf).push(chunk);
+      return;
+    }
+    if (proc.stream) {
+      // Deliver to the parent worker out of band (it is not parked on its SAB).
+      const parent = this.procs.get(proc.parentPid);
+      if (parent && parent.handle && parent.handle.postMessage) {
+        try {
+          parent.handle.postMessage({ type: isErr ? "child-stderr" : "child-stdout", childPid: pid, chunk });
+          return;
+        } catch {
+          /* parent worker gone — fall through to the host sink */
+        }
+      }
+    }
+    (isErr ? this.stderr : this.stdout)(chunk, pid);
   }
 
-  finalize(pid, code) {
+  finalize(pid, code, signal = null) {
     const proc = this.procs.get(pid);
     if (!proc || proc.finalized) return;
     proc.finalized = true;
@@ -196,6 +217,7 @@ export class Kernel {
     const result = {
       code,
       pid,
+      signal,
       stdout: proc.outBuf.join(""),
       stderr: proc.errBuf.join(""),
     };
@@ -245,6 +267,14 @@ export class Kernel {
     if (opcode === OP_SPAWN) {
       this.handleSpawn(proc, JSON.parse(decodeBytes(fields[0])));
       return; // response is deferred until the child exits
+    }
+    if (opcode === OP_SPAWN_ASYNC) {
+      this.handleSpawnAsync(proc, JSON.parse(decodeBytes(fields[0])));
+      return; // responds immediately with {pid}; stdio/exit stream via postMessage
+    }
+    if (opcode === OP_KILL) {
+      this.handleKill(proc, JSON.parse(decodeBytes(fields[0])));
+      return;
     }
     if (opcode === OP_ACCEPT) {
       this.handleAccept(proc);
@@ -356,6 +386,48 @@ export class Kernel {
         ),
       );
     };
+  }
+
+  // Async spawn (#15): the caller does NOT park — it gets {pid} now and keeps
+  // running its event loop. The child streams stdout/stderr to the parent worker
+  // (proc.stream) and, on exit, we post {type:'child-exit'} to the parent handle.
+  handleSpawnAsync(parent, spec) {
+    const cwd = spec.cwd || "/";
+    const programPath = this.resolveProgram(spec.command, cwd, spec.env || {});
+    if (!programPath) {
+      this.respondErr(parent, "ENOENT");
+      return;
+    }
+    const parentPid = parent.pid;
+    const childPid = this.createProcess(
+      { programPath, args: spec.args || [], cwd, env: spec.env || {} },
+      { parentPid, stream: true },
+    );
+    this.procs.get(childPid).onExit = (res) => {
+      const p = this.procs.get(parentPid);
+      if (p && p.handle && p.handle.postMessage) {
+        try {
+          p.handle.postMessage({ type: "child-exit", childPid, code: res.code, signal: res.signal || null });
+        } catch {
+          /* parent gone */
+        }
+      }
+    };
+    this.respondOk(parent, encodeString(JSON.stringify({ pid: childPid })));
+  }
+
+  // Deliver a signal to a running process. We ack the killer first (it called
+  // sys.kill synchronously and is parked), then finalize the target — which
+  // terminates its worker and posts child-exit to its parent (possibly the killer).
+  handleKill(proc, msg) {
+    const pid = msg.pid | 0;
+    if (!this.procs.has(pid)) {
+      this.respondErr(proc, "ESRCH");
+      return;
+    }
+    const signal = msg.signal || "SIGTERM";
+    this.respondOk(proc, EMPTY);
+    this.finalize(pid, signal === "SIGKILL" ? 137 : 143, signal);
   }
 
   // ---- network fetch servicing (Phase 2 #9) ---------------------------------

@@ -77,6 +77,19 @@ export const OP_FTRUNCATE = 18;
 // the parent parks on Atomics.wait while the kernel drives the child to exit.
 export const OP_SPAWN = 20;
 
+// async process control (Phase 2 #15). Unlike OP_SPAWN, these DO NOT park the
+// caller: the caller stays in its event loop so it can stream the child's output
+// and react to exit — the model behind child_process.spawn() and a dev server
+// launched by `npm run`.
+//   OP_SPAWN_ASYNC  field0 = JSON {command,args,cwd,env} -> OK JSON {pid} (now)
+//   OP_KILL         field0 = JSON {pid,signal}           -> OK empty / ERR ESRCH
+// The child's stdout/stderr and its exit are delivered to the *parent worker* out
+// of band, as postMessages the kernel sends to the parent's handle (never over
+// this SAB — the parent isn't blocked on it): { type:'child-stdout'|'child-stderr',
+// childPid, chunk } and { type:'child-exit', childPid, code, signal }.
+export const OP_SPAWN_ASYNC = 26;
+export const OP_KILL = 27;
+
 // virtual network (brick 5). A server process registers a port (OP_LISTEN),
 // then blocks on OP_ACCEPT until the kernel hands it the next HTTP request; it
 // replies with OP_RESPOND, which unblocks whoever issued the request (the

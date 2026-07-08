@@ -108,8 +108,8 @@ over a shared VFS — mirroring StackBlitz's per-PID Node workers.
   child's syscalls meanwhile), then wakes the parent with `{code,stdout,stderr}`.
   Nesting works (shell → node → execSync → echo), each parked in its own thread.
 - `child_process` builtin: `spawnSync`, `execSync`, `execFileSync` (async
-  `spawn`/`exec`/`fork` throw for now). `fs` now resolves relative paths against
-  `process.cwd()`.
+  `spawn`/`exec`/`execFile` added in #15, below). `fs` now resolves relative paths
+  against `process.cwd()`.
 - Coreutils as real Node programs installed at `/bin` (on PATH): `echo`, `cat`,
   `ls`, `pwd`, `mkdir`, `rm`, `node`, `true`, `false`, and a `sh` shell.
 - `sh`: sequencing `;`, `&&`, `||`, comments, quotes, builtins (`cd`, `pwd`,
@@ -119,8 +119,9 @@ over a shared VFS — mirroring StackBlitz's per-PID Node workers.
 - Demo runs a shell session; `scripts/verify-node.mjs`: 16/16 PASS (shell logic,
   cwd inheritance, nested execSync, exit codes 0/1/127, 15 PIDs spawned).
 
-**Deferred:** async `spawn`/streaming stdio, `kill`/signals, pre-warmed worker
-pool (StackBlitz idle ~8.1 MB), pipes (`|`) and redirects.
+**Deferred:** ~~async `spawn`/streaming stdio, `kill`/signals~~ (DONE in #15),
+parent→child stdin pipe, pre-warmed worker pool (StackBlitz idle ~8.1 MB),
+pipes (`|`) and redirects.
 
 ---
 
@@ -538,8 +539,26 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
     Verified headless (B1 — real split: `verify-node` 72/72 + `verify-express` full tree),
     exercising every fs opcode, `execSync` children, `npm install`, and the deferred
     `__ocfetch` path over the new worker boundary.
-15. **Extras (ongoing)** — nested `worker_threads` (our `[worker n]`), heavy toolchains
-    (`esbuild`/`vite`/`tsserver` as Wasm), IndexedDB persistence, pre-warm worker pool.
+15. **Async spawn + streaming stdio** [M] — **DONE.** `child_process.spawn`/`exec`/`execFile`
+    are now real and **non-blocking** (the sync `spawnSync`/`execSync` path is untouched).
+    New opcodes: **`OP_SPAWN_ASYNC`** returns `{pid}` immediately (no `Atomics.wait`), and
+    **`OP_KILL`** signals a child. The child's stdout/stderr and its exit are delivered to the
+    **parent worker out of band** — kernel `postMessage`s (`child-stdout`/`child-stderr`/
+    `child-exit`) since the parent isn't parked on its SAB — and the runtime replays them onto
+    a real `ChildProcess` (EventEmitter with `Readable` `stdout`/`stderr`, `'exit'`/`'close'`,
+    `.kill()`). Liveness mirrors `net`: a `childLiveness` counter keeps the parent's event loop
+    alive while a child runs, a `doChildren()` drain step (like `doNet()`) delivers events in a
+    controlled turn, and `'close'` waits for the stdio streams to end so a last chunk never
+    races the exit. **Rewired to it:** `npm run <script>` and `npx` now async-spawn the leaf
+    command (going through `sh` only when the script uses shell operators), so a **long-running
+    dev server** (`npm run dev`) streams live and holds the foreground instead of freezing on a
+    buffered `spawnSync` that never returns. Verified headless (`verify-node`: live streaming
+    across timers + exit code + `kill('SIGTERM')` → null code/`SIGTERM`) and in the browser
+    (`/api/spawn`, plus a boot `npm run dev` that boots a real `:3200` server via async spawn).
+    **Deferred:** parent→child **stdin** pipe (`child.stdin` is a no-op sink for now), `fork`
+    (needs an IPC channel), pipes (`|`)/redirects in `sh`, `detached`/process groups.
+    **Extras (ongoing, unrelated):** nested `worker_threads` (our `[worker n]`, #16 2b), heavy
+    toolchains (`esbuild`/`vite`/`tsserver` as Wasm), IndexedDB persistence, pre-warm worker pool.
 16. **WASI + napi-rs Wasm runtime (native→wasm packages)** [XL] — **stage 1 + 2a DONE.**
     Many modern toolchains ship a `wasm32-wasi` build of their native `.node` addon and
     switch to it on a WebContainer-class host (e.g. Vite's `rolldown` downloads

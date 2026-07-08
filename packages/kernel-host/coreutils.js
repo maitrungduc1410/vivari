@@ -44,10 +44,13 @@ if (!onPath(name)) {
   if (inst.stderr) process.stderr.write(inst.stderr);
   if (inst.status) process.exit(inst.status);
 }
-const r = cp.spawnSync('sh', ['-c', [name].concat(rest).join(' ')], { cwd, env, encoding: 'utf8' });
-if (r.stdout) process.stdout.write(r.stdout);
-if (r.stderr) process.stderr.write(r.stderr);
-process.exit(r.status | 0);
+// Run the local bin async (#15) so its output streams and a long-running tool
+// (e.g. a dev server) doesn't freeze npx. Resolved via node_modules/.bin on PATH.
+const child = cp.spawn(name, rest, { cwd, env });
+child.stdout.on('data', (d) => process.stdout.write(d));
+child.stderr.on('data', (d) => process.stderr.write(d));
+child.on('error', (e) => { process.stderr.write('npx: ' + ((e && e.message) || e) + '\\n'); process.exit(127); });
+child.on('close', (code) => process.exit(code | 0));
 `,
 
   echo: `process.stdout.write(process.argv.slice(2).join(' ') + '\\n');\n`,

@@ -201,25 +201,55 @@ function binPath(cwd) {
   dirs.push('/bin');
   return dirs.join(':');
 }
+// A shell-operator sniff: if the script uses any of these, hand it to sh -c;
+// otherwise spawn the leaf command directly so a long-running dev server streams
+// live (going through sh would buffer its output until it exits — never, for a
+// server). A char-code scan keeps this backtick/backslash-free.
+function hasShellOps(s) {
+  return s.indexOf('&') >= 0 || s.indexOf('|') >= 0 || s.indexOf(';') >= 0 ||
+    s.indexOf('>') >= 0 || s.indexOf('<') >= 0 || s.indexOf('$') >= 0 ||
+    s.indexOf('(') >= 0 || s.indexOf('*') >= 0;
+}
+// Split a simple command line into argv, honouring single/double quotes. Any char
+// <= space counts as whitespace (no backslash escapes needed for tab/newline).
+function splitArgs(s) {
+  const out2 = []; let cur = ''; let q = null; let has = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { if (c === q) q = null; else cur += c; }
+    else if (c === '"' || c === "'") { q = c; has = true; }
+    else if (c <= ' ') { if (has) { out2.push(cur); cur = ''; has = false; } }
+    else { cur += c; has = true; }
+  }
+  if (has) out2.push(cur);
+  return out2;
+}
+// Async (#15): spawn the script's process, stream its stdout/stderr through our
+// own, and resolve with its exit code. A dev server that never exits keeps npm in
+// the foreground streaming its output (like a real terminal); a build/one-off
+// exits and so does npm.
 function runScript(cwd, name, extra) {
   const cp = require('child_process');
   const scripts = readPkg(cwd).scripts || {};
   if (!name) {
     out('available scripts:');
     for (const k in scripts) out('  ' + k + ': ' + scripts[k]);
-    return 0;
+    return Promise.resolve(0);
   }
   const script = scripts[name];
-  if (!script) { err('npm: missing script: ' + name); return 1; }
+  if (!script) { err('npm: missing script: ' + name); return Promise.resolve(1); }
   const full = extra && extra.length ? script + ' ' + extra.join(' ') : script;
   const env = Object.assign({}, process.env, { PATH: binPath(cwd) });
   out('> ' + name + ': ' + full);
-  // spawnSync blocks until the script exits — fine for build/one-off scripts; a
-  // long-running dev server is better launched directly (async spawn is later).
-  const r = cp.spawnSync('sh', ['-c', full], { cwd: cwd, env: env, encoding: 'utf8' });
-  if (r.stdout) process.stdout.write(r.stdout);
-  if (r.stderr) process.stderr.write(r.stderr);
-  return r.status | 0;
+  let child;
+  if (hasShellOps(full)) child = cp.spawn('sh', ['-c', full], { cwd: cwd, env: env });
+  else { const av = splitArgs(full); child = cp.spawn(av[0], av.slice(1), { cwd: cwd, env: env }); }
+  return new Promise(function (resolve) {
+    child.stdout.on('data', function (d) { process.stdout.write(d); });
+    child.stderr.on('data', function (d) { process.stderr.write(d); });
+    child.on('error', function (e) { err('npm: ' + ((e && e.message) || e)); resolve(1); });
+    child.on('close', function (code) { resolve(code | 0); });
+  });
 }
 
 async function main() {

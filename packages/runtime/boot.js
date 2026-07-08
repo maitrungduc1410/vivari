@@ -31,9 +31,10 @@ export function bootProcess({ sab, spec, send, onReady, fsPort = null, codec = n
     stderr: (chunk) => send("stderr", { chunk }),
   });
 
-  // Hand the runtime's network waker back to the worker shell so it can nudge the
-  // event loop when the kernel posts a `net` message (a request is queued).
-  if (typeof onReady === "function") onReady(runtime.wake);
+  // Hand the runtime's external-event hooks back to the worker shell: `wakeNet`
+  // nudges the loop on a queued HTTP request; `dispatchChild` feeds it an async
+  // child's stdout/stderr/exit (#15). Both arrive as kernel postMessages.
+  if (typeof onReady === "function") onReady({ wakeNet: runtime.wake, dispatchChild: runtime.dispatchChild });
 
   // run() is async (it drives the event loop). Report the exit code when it
   // settles; a server process simply never settles (it stays alive).

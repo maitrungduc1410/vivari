@@ -1316,6 +1316,69 @@ setTimeout(() => setTimeout(() => console.log('NESTED_OK'), 4), 4);
     "Event loop: setInterval/clearInterval + clearTimeout + nested timers",
   );
 
+  // === #15: async child_process.spawn — streaming stdio + exit + kill =========
+  // A child that prints across timers proves output STREAMS live (arrives as
+  // multiple 'data' events while the child runs its own loop), not buffered until
+  // exit like spawnSync. The parent stays in its event loop the whole time.
+  kernel.writeFile(
+    "/t/child-stream.js",
+    `
+console.log('line1');
+setTimeout(() => console.log('line2'), 10);
+setTimeout(() => { console.log('line3'); process.exit(7); }, 20);
+`,
+  );
+  kernel.writeFile(
+    "/t/spawnb.js",
+    `
+const cp = require('child_process');
+const assert = require('assert');
+const chunks = [];
+let dataEvents = 0;
+let sawFirstBeforeClose = false;
+const child = cp.spawn('node', ['/t/child-stream.js'], { cwd: '/t' });
+assert.ok(child.pid > 0, 'spawn returns a pid immediately (non-blocking)');
+child.stdout.on('data', (d) => { dataEvents++; chunks.push(d.toString()); if (chunks.join('').indexOf('line1') >= 0) sawFirstBeforeClose = true; });
+child.on('exit', (code, signal) => {
+  assert.strictEqual(code, 7, 'child exit code propagates');
+  assert.strictEqual(signal, null, 'no signal on a normal exit');
+});
+child.on('close', (code) => {
+  const out = chunks.join('');
+  assert.ok(out.indexOf('line1') >= 0 && out.indexOf('line2') >= 0 && out.indexOf('line3') >= 0, 'all streamed lines received in order');
+  assert.ok(dataEvents >= 1 && sawFirstBeforeClose, 'stdout arrived as data events before close');
+  console.log('SPAWN_ASYNC_OK events=' + dataEvents + ' code=' + code);
+  process.exit(0);
+});
+`,
+  );
+  const spb = await kernel.start("node", ["/t/spawnb.js"], { cwd: "/t", capture: true });
+  assert(spb.code === 0 && spb.stdout.includes("SPAWN_ASYNC_OK"),
+    "Phase 2 #15: child_process.spawn streams stdout live + fires exit/close with the child's code");
+
+  // kill(): a forever-running child (interval keeps it alive) is terminated by the
+  // parent; the child reports exit code null + signal SIGTERM.
+  kernel.writeFile("/t/child-forever.js", "console.log('alive');\nsetInterval(() => console.log('tick'), 5);\n");
+  kernel.writeFile(
+    "/t/killb.js",
+    `
+const cp = require('child_process');
+const assert = require('assert');
+const child = cp.spawn('node', ['/t/child-forever.js'], { cwd: '/t' });
+let sawData = false;
+child.stdout.on('data', () => { sawData = true; if (!child.killed) child.kill('SIGTERM'); });
+child.on('exit', (code, signal) => {
+  assert.strictEqual(signal, 'SIGTERM', 'killed child reports SIGTERM');
+  assert.strictEqual(code, null, 'killed child has a null exit code');
+  console.log('SPAWN_KILL_OK sawData=' + sawData);
+  process.exit(0);
+});
+`,
+  );
+  const kib = await kernel.start("node", ["/t/killb.js"], { cwd: "/t", capture: true });
+  assert(kib.code === 0 && kib.stdout.includes("SPAWN_KILL_OK sawData=true"),
+    "Phase 2 #15: child.kill('SIGTERM') terminates a long-running child (exit null + signal)");
+
   // === brick 4: shell session with each command as its own process ===
   const sh = await kernel.start("sh", ["/root.sh"], { cwd: "/", capture: true });
   const o = sh.stdout;

@@ -24,7 +24,7 @@ try {
   // codec not built — md5/sha1/sha256 fall back to pure-JS.
 }
 
-let wake = null;
+let control = null;
 
 parentPort.on("message", (msg) => {
   if (msg.type === "init") {
@@ -33,8 +33,8 @@ parentPort.on("message", (msg) => {
       spec: msg.spec,
       fsPort: msg.fsPort, // #14: fs syscalls ring the File System Worker over this port
       send: (type, extra) => parentPort.postMessage({ type, ...extra }),
-      onReady: (w) => {
-        wake = w;
+      onReady: (c) => {
+        control = c;
       },
       codec: makeZStream,
       cryptoCodec,
@@ -42,5 +42,8 @@ parentPort.on("message", (msg) => {
     return;
   }
   // Kernel nudge: a network request is queued for us — wake the event loop.
-  if (msg.type === "net") wake && wake();
+  if (msg.type === "net") control && control.wakeNet();
+  // An async child's output/exit relayed by the kernel (#15).
+  else if (msg.type === "child-stdout" || msg.type === "child-stderr" || msg.type === "child-exit")
+    control && control.dispatchChild(msg);
 });

@@ -42,6 +42,8 @@ import {
   OP_FSTAT,
   OP_FTRUNCATE,
   OP_SPAWN,
+  OP_SPAWN_ASYNC,
+  OP_KILL,
   OP_LISTEN,
   OP_ACCEPT,
   OP_RESPOND,
@@ -127,6 +129,16 @@ export function createSyscalls({ ctrl, data, notify }) {
     // { code, stdout, stderr, pid }. This is how execSync/spawnSync work.
     spawn: (spec) =>
       JSON.parse(decodeBytes(call(OP_SPAWN, encodeRequest([b(JSON.stringify(spec))])))),
+    // Async spawn (Phase 2 #15): returns { pid } immediately without parking. The
+    // child's stdout/stderr/exit arrive later as postMessages to this worker; the
+    // runtime routes them to the ChildProcess object (see child_process.js).
+    spawnAsync: (spec) =>
+      JSON.parse(decodeBytes(call(OP_SPAWN_ASYNC, encodeRequest([b(JSON.stringify(spec))])))),
+    // Send a signal to a running child. Throws ESRCH if the pid is gone.
+    kill: (pid, signal) => {
+      call(OP_KILL, encodeRequest([b(JSON.stringify({ pid: pid | 0, signal: signal || "SIGTERM" }))]));
+      return true;
+    },
 
     // ---- virtual network (brick 5) ----
     // Register a port. Returns nothing; throws EADDRINUSE if taken.

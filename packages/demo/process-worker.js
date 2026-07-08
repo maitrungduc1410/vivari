@@ -6,7 +6,7 @@ import { bootProcess } from "../runtime/boot.js";
 import initCodec, { ZStream } from "../codec/pkg/open_webcontainer_codec.js";
 import initCrypto, * as cryptoWasm from "../crypto/pkg/open_webcontainer_crypto.js";
 
-let wake = null;
+let control = null;
 
 // Native codecs (Phase 2 #11 zlib, #12 crypto): the Rust/Wasm cores beneath
 // Node's real lib/zlib.js and our lib/crypto.js. Instantiated once per worker.
@@ -49,8 +49,8 @@ self.onmessage = async (event) => {
       spec,
       fsPort, // #14: fs syscalls ring the File System Worker over this port
       send: (msgType, extra) => self.postMessage({ type: msgType, ...extra }),
-      onReady: (w) => {
-        wake = w;
+      onReady: (c) => {
+        control = c;
       },
       codec: makeZStream,
       cryptoCodec,
@@ -58,5 +58,8 @@ self.onmessage = async (event) => {
     return;
   }
   // Kernel nudge: a network request is queued for us — wake the event loop.
-  if (type === "net") wake && wake();
+  if (type === "net") control && control.wakeNet();
+  // An async child's output/exit relayed by the kernel (#15).
+  else if (type === "child-stdout" || type === "child-stderr" || type === "child-exit")
+    control && control.dispatchChild(event.data);
 };

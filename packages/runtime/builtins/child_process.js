@@ -1,11 +1,20 @@
-// The synchronous subset of Node's `child_process`, built on the OP_SPAWN
-// syscall. `spawnSync`/`execSync` block the calling process until the child
-// exits — the kernel parks us on Atomics.wait and wakes us with the result.
+// Node's `child_process`, built on the kernel's process syscalls.
 //
-// Async `spawn`/`exec` are not implemented yet (they need an event-driven
-// process handle); they throw so callers fail loudly rather than silently.
+//   - spawnSync / execSync / execFileSync (bricks 4): block the caller via
+//     OP_SPAWN — the kernel parks us on Atomics.wait and wakes us with the
+//     child's exit code and captured output.
+//   - spawn / exec / execFile (Phase 2 #15): DO NOT block. OP_SPAWN_ASYNC returns
+//     a pid immediately; the child's stdout/stderr stream back as postMessages the
+//     kernel sends to this worker, which the runtime routes here via `_dispatch`.
+//     `_drain` (called once per event-loop turn) replays them onto a real
+//     ChildProcess (an EventEmitter with Readable stdout/stderr and 'exit'/'close'
+//     events), so a long-running child (a dev server) streams live instead of
+//     freezing the parent until it exits.
+//
+// stdin (parent -> child) is deferred: `child.stdin` exists but is a no-op sink.
 
-export function createChildProcess({ sys, process, Buffer }) {
+export function createChildProcess({ sys, process, Buffer, EventEmitter, Readable, childLiveness, wake }) {
+  // ---- synchronous subset (unchanged) --------------------------------------
   function spawnSync(command, args = [], opts = {}) {
     if (!Array.isArray(args)) {
       opts = args;
@@ -22,9 +31,6 @@ export function createChildProcess({ sys, process, Buffer }) {
     try {
       r = sys.spawn(spec);
     } catch (e) {
-      // e.g. ENOENT when the program is not found. Node reports status null +
-      // error; we also set 127 so a shell testing the status treats it as
-      // "command not found" without inspecting `.error`.
       return {
         status: 127,
         signal: null,
@@ -61,16 +67,214 @@ export function createChildProcess({ sys, process, Buffer }) {
     return r.stdout;
   }
 
+  // ---- async spawn (#15) ----------------------------------------------------
+  const registry = new Map(); // childPid -> ChildProcess
+  const inbox = []; // queued { type, childPid, chunk?, code?, signal? } events
+
+  // A minimal stdin sink: present so `child.stdin.write(...).end()` never throws.
+  // Real parent->child piping is deferred to a later stage.
+  const makeStdin = () => ({
+    writable: true,
+    write() {
+      return true;
+    },
+    end() {},
+    on() {
+      return this;
+    },
+    once() {
+      return this;
+    },
+    emit() {
+      return false;
+    },
+    destroy() {},
+  });
+
+  class ChildProcess extends EventEmitter {
+    constructor(pid) {
+      super();
+      this.pid = pid;
+      this.exitCode = null;
+      this.signalCode = null;
+      this.killed = false;
+      // read()=noop: we push data as it arrives from the kernel (flowing on a
+      // 'data' listener), exactly like a real child's piped stdio.
+      this.stdout = new Readable({ read() {} });
+      this.stderr = new Readable({ read() {} });
+      this.stdin = makeStdin();
+      this.stdio = [this.stdin, this.stdout, this.stderr];
+    }
+    kill(signal = "SIGTERM") {
+      if (this.pid < 0) return false;
+      try {
+        sys.kill(this.pid, signal);
+        this.killed = true;
+        return true;
+      } catch {
+        return false; // ESRCH: already gone
+      }
+    }
+    ref() {
+      return this;
+    }
+    unref() {
+      return this;
+    }
+  }
+
+  function normalizeArgs(command, args, opts) {
+    if (!Array.isArray(args)) {
+      opts = args || {};
+      args = [];
+    }
+    return { command, args: args || [], opts: opts || {} };
+  }
+
+  function spawn(command, args, opts) {
+    const n = normalizeArgs(command, args, opts);
+    const spec = {
+      command: n.command,
+      args: n.args,
+      cwd: n.opts.cwd || process.cwd(),
+      env: n.opts.env || process.env,
+    };
+    let pid;
+    try {
+      pid = sys.spawnAsync(spec).pid | 0;
+    } catch (e) {
+      // Node reports a spawn failure asynchronously via an 'error' event on the
+      // returned ChildProcess, not by throwing.
+      const cp = new ChildProcess(-1);
+      process.nextTick(() => {
+        const err = e instanceof Error ? e : new Error(String(e));
+        err.code = e && e.code ? e.code : "ENOENT";
+        err.errno = err.code;
+        err.syscall = "spawn " + n.command;
+        err.path = n.command;
+        cp.emit("error", err);
+        cp.stdout.push(null);
+        cp.stderr.push(null);
+        cp.emit("close", null, null);
+      });
+      return cp;
+    }
+    const cp = new ChildProcess(pid);
+    registry.set(pid, cp);
+    childLiveness.active++;
+    process.nextTick(() => cp.emit("spawn"));
+    return cp;
+  }
+
+  // Route a kernel-delivered child event into the loop's queue and nudge it.
+  function _dispatch(msg) {
+    inbox.push(msg);
+    if (typeof wake === "function") wake();
+  }
+
+  // Drained once per event-loop turn (see loop.doChildren): replays queued events
+  // onto the matching ChildProcess. Runs inside a controlled turn so 'exit'
+  // handlers' microtasks are flushed by the loop right after.
+  function _drain() {
+    while (inbox.length) {
+      const m = inbox.shift();
+      const cp = registry.get(m.childPid);
+      if (!cp) continue;
+      if (m.type === "child-stdout") {
+        cp.stdout.push(m.chunk == null ? null : Buffer.from(String(m.chunk), "utf8"));
+      } else if (m.type === "child-stderr") {
+        cp.stderr.push(m.chunk == null ? null : Buffer.from(String(m.chunk), "utf8"));
+      } else if (m.type === "child-exit") {
+        registry.delete(m.childPid);
+        if (childLiveness.active > 0) childLiveness.active--;
+        cp.exitCode = m.signal ? null : m.code | 0;
+        cp.signalCode = m.signal || null;
+        // Node fires 'exit' as soon as the child is gone (stdio may still be
+        // flushing), but 'close' only after the stdio streams end. We honour that
+        // ordering so a listener reading stdout then exiting on 'close' has already
+        // seen every chunk — pushing data is async, so emitting 'close' eagerly
+        // would race ahead of the last 'data'.
+        cp.emit("exit", cp.exitCode, cp.signalCode);
+        let pending = 2;
+        const done = () => {
+          if (--pending === 0) cp.emit("close", cp.exitCode, cp.signalCode);
+        };
+        // If nobody is consuming a stream, resume it so its 'end' still fires.
+        for (const s of [cp.stdout, cp.stderr]) {
+          s.once("end", done);
+          if (s.listenerCount("data") === 0) s.resume();
+        }
+        cp.stdout.push(null);
+        cp.stderr.push(null);
+      }
+    }
+  }
+
+  // exec/execFile: spawn + collect the full output, then a Node-style callback.
+  function collect(child, command, opts, cb) {
+    const encoding = opts && opts.encoding !== undefined ? opts.encoding : "utf8";
+    const outChunks = [];
+    const errChunks = [];
+    child.stdout.on("data", (d) => outChunks.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+    child.stderr.on("data", (d) => errChunks.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+    child.on("error", (err) => {
+      if (cb) cb(err, "", "");
+      cb = null;
+    });
+    child.on("close", (code, signal) => {
+      if (!cb) return;
+      const out = Buffer.concat(outChunks);
+      const errB = Buffer.concat(errChunks);
+      const stdout = encoding === "buffer" || encoding === null ? out : out.toString(encoding);
+      const stderr = encoding === "buffer" || encoding === null ? errB : errB.toString(encoding);
+      if (code !== 0) {
+        const err = new Error("Command failed: " + command);
+        err.code = code;
+        err.signal = signal;
+        cb(err, stdout, stderr);
+      } else {
+        cb(null, stdout, stderr);
+      }
+    });
+    return child;
+  }
+
+  function exec(command, opts, cb) {
+    if (typeof opts === "function") {
+      cb = opts;
+      opts = {};
+    }
+    opts = opts || {};
+    return collect(spawn("sh", ["-c", command], { cwd: opts.cwd, env: opts.env }), command, opts, cb);
+  }
+
+  function execFile(file, args, opts, cb) {
+    if (typeof args === "function") {
+      cb = args;
+      args = [];
+      opts = {};
+    } else if (typeof opts === "function") {
+      cb = opts;
+      opts = {};
+    }
+    opts = opts || {};
+    return collect(spawn(file, args || [], { cwd: opts.cwd, env: opts.env }), file, opts, cb);
+  }
+
   const notImplemented = (name) => () => {
-    throw new Error("child_process." + name + " (async) is not implemented yet");
+    throw new Error("child_process." + name + " is not implemented yet");
   };
 
   return {
     spawnSync,
     execSync,
     execFileSync: (file, args, opts) => spawnSync(file, args || [], opts).stdout,
-    spawn: notImplemented("spawn"),
-    exec: notImplemented("exec"),
+    spawn,
+    exec,
+    execFile,
     fork: notImplemented("fork"),
+    // Internal wiring for the runtime (not part of Node's public API).
+    _dispatch,
+    _drain,
   };
 }

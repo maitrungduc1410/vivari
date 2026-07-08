@@ -416,6 +416,30 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.url === '/api/spawn') {
+    // Phase 2 #15: child_process.spawn() launches a Node child WITHOUT blocking —
+    // its stdout streams back to us live (several 'data' events across timers,
+    // not one buffer at exit), and we await its 'close' to report the exit code.
+    const cp = require('child_process');
+    const result = await new Promise((resolve) => {
+      const child = cp.spawn('node', ['/srv/spawn-child.js'], { cwd: '/srv' });
+      const lines = [];
+      let dataEvents = 0;
+      child.stdout.on('data', (d) => { dataEvents++; lines.push(d.toString()); });
+      child.on('close', (code) => resolve({ pid: child.pid, code, dataEvents, output: lines.join('') }));
+    });
+    const body = Buffer.from(JSON.stringify({
+      node: process.version,
+      note: 'child_process.spawn() ran a Node child; its stdout STREAMED back live over multiple data events and we awaited exit — async spawn (#15), in the browser.',
+      childPid: result.pid,
+      exitCode: result.code,
+      dataEvents: result.dataEvents,
+      output: result.output,
+    }, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(\`<!doctype html>
 <html><head><meta charset="utf-8"><title>Hello from OpenContainer</title>
@@ -444,6 +468,7 @@ const server = http.createServer(async (req, res) => {
   <button onclick="fetch('api/esm').then(r=>r.json()).then(t=>document.getElementById('e').textContent=JSON.stringify(t,null,2))">GET /api/esm (import/export)</button>
   <button onclick="fetch('api/wasi').then(r=>r.json()).then(t=>document.getElementById('w').textContent=JSON.stringify(t,null,2))">GET /api/wasi (wasm32-wasi CLI)</button>
   <button onclick="fetch('api/napi').then(r=>r.json()).then(t=>document.getElementById('np').textContent=JSON.stringify(t,null,2))">GET /api/napi (N-API addon on wasm)</button>
+  <button onclick="fetch('api/spawn').then(r=>r.json()).then(t=>document.getElementById('sp').textContent=JSON.stringify(t,null,2))">GET /api/spawn (async child_process)</button>
   <button onclick="var el=document.getElementById('nf');el.textContent='fetching npm registry…';fetch('api/fetch').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2)).catch(e=>el.textContent=String(e))">GET /api/fetch (npm registry)</button>
   <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
   <pre id="t"></pre>
@@ -458,6 +483,7 @@ const server = http.createServer(async (req, res) => {
   <pre id="e"></pre>
   <pre id="w"></pre>
   <pre id="np"></pre>
+  <pre id="sp"></pre>
   <pre id="nf"></pre>
 </div></body></html>\`);
 });
@@ -602,6 +628,17 @@ async function boot() {
   kernel.installCoreutils();
   kernel.mkdirp("/srv");
   kernel.writeFile("/srv/server.js", SERVER_SRC);
+  // #15: a short-lived child the /api/spawn route runs via child_process.spawn —
+  // it prints across timers (so its output streams live) then exits with a code.
+  kernel.writeFile(
+    "/srv/spawn-child.js",
+    "console.log('child pid ' + process.pid + ' starting');\n" +
+      "let n = 0;\n" +
+      "const iv = setInterval(() => {\n" +
+      "  n++; console.log('tick ' + n);\n" +
+      "  if (n === 3) { clearInterval(iv); console.log('child done'); process.exit(3); }\n" +
+      "}, 30);\n",
+  );
   kernel.writeFile("/root.sh", SCRIPT);
 
   // Phase 2 #13: a tiny ESM graph the CJS server require()s at /api/esm. import/
@@ -680,6 +717,35 @@ async function boot() {
   // package.json and runs it with node_modules/.bin on PATH.
   post("log", { line: "$ npm run start", cls: "muted" });
   await kernel.start("npm", ["run", "start"], { cwd: "/app" });
+
+  // Phase 2 #15: `npm run dev` launching a LONG-RUNNING server. Before async
+  // spawn this froze forever (spawnSync buffered stdout and never returned);
+  // now npm async-spawns the leaf node process, stays in the foreground streaming
+  // its logs, and the server keeps serving. We start it non-blocking (like a real
+  // terminal holding the dev server), wait for it to listen, then hit it once.
+  kernel.mkdirp("/dev-app");
+  kernel.writeFile(
+    "/dev-app/package.json",
+    JSON.stringify({ name: "dev-app", version: "1.0.0", scripts: { dev: "node dev-server.js" } }, null, 2),
+  );
+  kernel.writeFile(
+    "/dev-app/dev-server.js",
+    "const http = require('http');\n" +
+      "http.createServer((req, res) => {\n" +
+      "  res.writeHead(200, { 'content-type': 'application/json' });\n" +
+      "  res.end(JSON.stringify({ from: 'dev-server via npm run dev', pid: process.pid, url: req.url }));\n" +
+      "}).listen(3200, () => console.log('[dev-server] listening on :3200 (pid ' + process.pid + ')'));\n",
+  );
+  post("log", { line: "$ cd /dev-app && npm run dev  (long-running via async spawn)", cls: "muted" });
+  kernel.start("npm", ["run", "dev"], { cwd: "/dev-app" }); // NOT awaited: it stays foreground
+  try {
+    await waitListen(3200);
+    const devResp = await kernel.handleHttpRequest(3200, { method: "GET", url: "/hello", headers: {}, body: "" });
+    const devText = typeof devResp.body === "string" ? devResp.body : new TextDecoder().decode(devResp.body);
+    post("log", { line: "  [dev] GET :3200/hello -> " + devResp.status + " " + devText, cls: "ok" });
+  } catch (err) {
+    post("log", { line: "  [dev] " + (err && err.message), cls: "err" });
+  }
 
   // A REAL Express server (Phase 2 #10 + partial #11 zlib / #12 crypto): install
   // express + its ~70-package dependency tree from the registry, boot it on
