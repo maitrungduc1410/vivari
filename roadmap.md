@@ -676,30 +676,35 @@ When we productionize, the plan is **not** "one giant file" but bundle-by-role:
   actual "resource saved" win, bigger than minification alone.
 - **Source maps in dev only**, stripped for prod.
 
-### Per-worker Wasm codec (zlib #11) — load strategy [TODO, optimize later]
+### Per-worker Wasm codec (zlib #11, crypto #12) — load strategy — DONE
 
-Symptom (DevTools): `open_webcontainer_codec_bg.wasm` is fetched **many times** on load —
-once per Process Worker. That's correct-but-unoptimized: the kernel Wasm loads once (one
-kernel worker), but the codec runs **in-process**, and today `process-worker.js` calls
-`initCodec()` eagerly on every spawn — even for processes that never touch zlib (`echo`,
-`sh`, most npm steps). The `ZStream` instance is stateful and can't be shared cross-thread,
-so each worker DOES need its own *instance*; what's wasteful is re-fetching + re-compiling
-the *bytes*. Three fixes, in ROI order:
+Symptom (DevTools): `open_webcontainer_codec_bg.wasm` was fetched **many times** on load —
+once per Process Worker. That was correct-but-unoptimized: the kernel Wasm loads once (one
+kernel worker), but the codec runs **in-process**, and `process-worker.js` used to call
+`initCodec()`/`initCrypto()` eagerly on every spawn — even for processes that never touch
+zlib/crypto (`echo`, `sh`, most npm steps). The `ZStream` instance is stateful and can't be
+shared cross-thread, so each worker DOES need its own *instance*; what was wasteful is
+re-fetching + re-compiling the *bytes*. All three fixes landed:
 
-1. **Lazy codec (do first).** Don't `initCodec()` at boot. `require('zlib')` only touches
-   `crc32` (pure-JS) + constants, and `makeZStream` is only called inside `Zlib.init()` —
-   i.e. when a stream is actually created. So load the codec on first `makeZStream()`.
-   Processes that never compress → **0 fetch, 0 compile**. Caveat: `zlib.*Sync` can't
-   `await`, so do a **synchronous** first-load in the worker (sync `XMLHttpRequest` for the
-   bytes + `new WebAssembly.Module(bytes)`); sync-compiling a >4KB module is forbidden on
-   the main thread but **allowed in a Worker** (which already blocks on `Atomics.wait`), so
-   `gzipSync` keeps working.
-2. **Compile-once, share the `Module`.** Have the kernel worker `WebAssembly.compile` one
-   `WebAssembly.Module` and `postMessage` it to each Process Worker (a Module is
-   structured-cloneable across workers). Workers then only `WebAssembly.instantiate(module)`
-   — no fetch, no recompile per spawn.
-3. **`Cache-Control` for `.wasm` in `server.mjs`.** Cheap: turns the remaining fetches into
-   disk-cache hits even before (1)/(2) land.
+1. **Lazy codec — DONE.** `process-worker.js` no longer inits at boot. `makeZStream` (zlib)
+   instantiates the module on the first `makeZStream()` (i.e. first gzip/deflate stream), and
+   the crypto binding gets a `Proxy` over the wasm namespace that instantiates on the first
+   `digest`/`hmac`/`pbkdf2`/`aes*` call. Processes that never compress/hash → **0 compile**.
+   `require('zlib')` still works (crc32 is pure-JS + constants). `initSync` from a pre-compiled
+   `Module` is sync and allowed in a Worker (it already blocks on `Atomics.wait`), so
+   `gzipSync`/`createHash` keep working. Headless (`scripts/process-worker.mjs`) defers the
+   wasm-compiling `require(...pkg-node...)` to first use the same way (`require.resolve` still
+   detects an unbuilt codec up front, no compile).
+2. **Compile-once, share the `Module` — DONE.** `kernel-worker.js` `compileWasmModule()`
+   fetches + `WebAssembly.compileStreaming` each codec **exactly once** at boot (concurrently
+   with the VFS boot) and hands each Process Worker the resulting `WebAssembly.Module` in its
+   `init` message (a Module is structured-cloneable across workers — cloned, not transferred,
+   so it stays usable everywhere). Workers only `initSync({ module })` — no fetch, no recompile
+   per spawn.
+3. **`Cache-Control` for `.wasm` in `server.mjs` — DONE.** `.wasm` now serves `no-cache` +
+   `Last-Modified` and answers `304` to `If-Modified-Since`, so page reloads revalidate cheaply
+   (no re-download) while staying correct across `wasm-pack` rebuilds (mtime bump → fresh
+   bytes). Everything else stays `no-store` so edited JS/HTML always reloads in dev.
 
 NB: **lazy-`require` for the JS builtins (`fs`/`net`/`http`/…) is NOT worth it** — they have
 no Wasm and are pulled in by *static* `import`s at the top of `loader.js`, so they're already

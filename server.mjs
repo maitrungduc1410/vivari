@@ -9,7 +9,7 @@
 //   node server.mjs   ->   http://localhost:8080/packages/demo/index.html
 
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -30,7 +30,6 @@ const server = createServer(async (req, res) => {
   // These headers are the reason this file exists.
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
-  res.setHeader("Cache-Control", "no-store");
 
   let urlPath = decodeURIComponent(new URL(req.url, "http://x").pathname);
   if (urlPath === "/") urlPath = "/packages/demo/index.html";
@@ -41,10 +40,36 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  const ext = extname(filePath);
+
+  // [optimize] .wasm is the one asset re-fetched a lot (the kernel now compiles
+  // each codec once, but page reloads still refetch). Let the browser cache it
+  // and revalidate cheaply: no-cache + Last-Modified, answering 304 when the
+  // file is unchanged. This stays correct across `wasm-pack` rebuilds (mtime
+  // bumps → fresh download) unlike a blind max-age. Everything else is no-store
+  // so edited JS/HTML always reloads in dev.
+  if (ext === ".wasm") {
+    try {
+      const st = await stat(filePath);
+      const lastModified = st.mtime.toUTCString();
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Last-Modified", lastModified);
+      if (req.headers["if-modified-since"] === lastModified) {
+        res.writeHead(304).end();
+        return;
+      }
+    } catch {
+      res.writeHead(404, { "Content-Type": "text/plain" }).end("Not found");
+      return;
+    }
+  } else {
+    res.setHeader("Cache-Control", "no-store");
+  }
+
   try {
     const body = await readFile(filePath);
     res.writeHead(200, {
-      "Content-Type": MIME[extname(filePath)] || "application/octet-stream",
+      "Content-Type": MIME[ext] || "application/octet-stream",
     });
     res.end(body);
   } catch {

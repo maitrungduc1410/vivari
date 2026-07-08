@@ -5,21 +5,43 @@ import { parentPort } from "node:worker_threads";
 import { createRequire } from "node:module";
 import { bootProcess } from "../packages/runtime/boot.js";
 
-// Native codecs (Phase 2 #11 zlib, #12 crypto): the Rust/Wasm cores, loaded once
-// per worker. nodejs target loads synchronously via require. makeZStream drives
-// internalBinding('zlib'); cryptoCodec is the module internalBinding('crypto')
-// calls one-shot.
+// Native codecs (Phase 2 #11 zlib, #12 crypto): the Rust/Wasm cores. nodejs
+// target loads synchronously via require (which also compiles the wasm), so we
+// [optimize] defer that require until first real use — a process that never
+// compresses/hashes never compiles the codec. require.resolve only resolves the
+// path (no compile), so we can still detect an unbuilt codec up front.
 const require = createRequire(import.meta.url);
+const CODEC_MOD = "../packages/codec/pkg-node/open_webcontainer_codec.js";
+const CRYPTO_MOD = "../packages/crypto/pkg-node/open_webcontainer_crypto.js";
+
 let makeZStream = null;
 try {
-  const { ZStream } = require("../packages/codec/pkg-node/open_webcontainer_codec.js");
-  makeZStream = (mode, level, windowBits) => new ZStream(mode, level, windowBits);
+  require.resolve(CODEC_MOD); // built? (throws if not — no compile either way)
+  let ZStream = null;
+  makeZStream = (mode, level, windowBits) => {
+    if (!ZStream) ({ ZStream } = require(CODEC_MOD));
+    return new ZStream(mode, level, windowBits);
+  };
 } catch {
   // codec not built — zlib stays unavailable (crc32/constants still work).
 }
+
 let cryptoCodec = null;
 try {
-  cryptoCodec = require("../packages/crypto/pkg-node/open_webcontainer_crypto.js");
+  require.resolve(CRYPTO_MOD); // built? (throws if not)
+  let ns = null;
+  const ensure = () => ns || (ns = require(CRYPTO_MOD));
+  cryptoCodec = new Proxy(
+    {},
+    {
+      get(_t, prop) {
+        if (typeof prop === "symbol") return undefined;
+        const mod = ensure();
+        const v = mod[prop];
+        return typeof v === "function" ? (...a) => mod[prop](...a) : v;
+      },
+    },
+  );
 } catch {
   // codec not built — md5/sha1/sha256 fall back to pure-JS.
 }

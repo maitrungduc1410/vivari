@@ -3,47 +3,68 @@
 // from the kernel nudge the process event loop when a request is queued.
 
 import { bootProcess } from "../runtime/boot.js";
-import initCodec, { ZStream } from "../codec/pkg/open_webcontainer_codec.js";
-import initCrypto, * as cryptoWasm from "../crypto/pkg/open_webcontainer_crypto.js";
+import * as codecNs from "../codec/pkg/open_webcontainer_codec.js";
+import * as cryptoNs from "../crypto/pkg/open_webcontainer_crypto.js";
 
 let control = null;
 
-// Native codecs (Phase 2 #11 zlib, #12 crypto): the Rust/Wasm cores beneath
-// Node's real lib/zlib.js and our lib/crypto.js. Instantiated once per worker.
-// makeZStream drives internalBinding('zlib'); cryptoWasm is the crypto module
-// namespace internalBinding('crypto') calls one-shot. (Eager today; the roadmap
-// tracks lazy load + compile-once-share as an optimization.)
-let codecReady = null;
-let makeZStream = null;
-let cryptoCodec = null;
-function ensureCodec() {
-  if (!codecReady) {
-    codecReady = Promise.all([
-      initCodec()
-        .then(() => {
-          makeZStream = (mode, level, windowBits) => new ZStream(mode, level, windowBits);
-        })
-        .catch(() => {
-          // zlib codec unavailable — crc32/constants still work.
-          makeZStream = null;
-        }),
-      initCrypto()
-        .then(() => {
-          cryptoCodec = cryptoWasm;
-        })
-        .catch(() => {
-          // crypto codec unavailable — md5/sha1/sha256 fall back to pure-JS.
-          cryptoCodec = null;
-        }),
-    ]);
-  }
-  return codecReady;
+// [optimize] Native codecs (Phase 2 #11 zlib, #12 crypto): the Rust/Wasm cores
+// beneath Node's real lib/zlib.js and our lib/crypto.js. The kernel worker
+// compiled the wasm ONCE and handed us the `WebAssembly.Module`s; here we only
+// *instantiate* them — and only LAZILY, on the first real zlib/crypto call.
+// initSync from a pre-compiled Module is sync and allowed in a Worker (which
+// already blocks on Atomics.wait), so gzipSync/createHash keep working. A
+// process that never compresses/hashes instantiates neither (0 fetch/compile).
+function buildCodecs(codecModule, cryptoModule) {
+  // zlib: internalBinding('zlib') calls makeZStream() the first time a
+  // gzip/deflate stream is created (never at boot).
+  let zReady = false;
+  const makeZStream = codecModule
+    ? (mode, level, windowBits) => {
+        if (!zReady) {
+          codecNs.initSync({ module: codecModule });
+          zReady = true;
+        }
+        return new codecNs.ZStream(mode, level, windowBits);
+      }
+    : null;
+
+  // crypto: internalBinding('crypto') reads codec.digest/hmac_digest/... on
+  // demand. Wrap the wasm namespace so the module instantiates on first call.
+  let cReady = false;
+  const ensureCrypto = () => {
+    if (!cReady) {
+      cryptoNs.initSync({ module: cryptoModule });
+      cReady = true;
+    }
+  };
+  const cryptoCodec = cryptoModule
+    ? new Proxy(
+        {},
+        {
+          get(_t, prop) {
+            if (typeof prop === "symbol" || !(prop in cryptoNs)) return undefined;
+            const v = cryptoNs[prop];
+            if (typeof v !== "function") {
+              ensureCrypto();
+              return cryptoNs[prop];
+            }
+            return (...args) => {
+              ensureCrypto();
+              return cryptoNs[prop](...args);
+            };
+          },
+        },
+      )
+    : null;
+
+  return { makeZStream, cryptoCodec };
 }
 
 self.onmessage = async (event) => {
-  const { type, sab, spec, fsPort, threadPort } = event.data;
+  const { type, sab, spec, fsPort, threadPort, codecModule, cryptoModule } = event.data;
   if (type === "init") {
-    await ensureCodec();
+    const { makeZStream, cryptoCodec } = buildCodecs(codecModule, cryptoModule);
     bootProcess({
       sab,
       spec,

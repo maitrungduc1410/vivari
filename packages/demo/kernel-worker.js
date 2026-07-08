@@ -16,6 +16,27 @@ import { createKernelFs } from "../kernel-host/kernel-fs.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
+// [optimize] Compile the Rust/Wasm codecs (zlib #11, crypto #12) EXACTLY ONCE,
+// here in the kernel worker, and hand each Process Worker the resulting
+// `WebAssembly.Module`. A Module is structured-cloneable across workers and
+// carries the already-compiled code, so a spawned process instantiates from it
+// (cheap, sync, no network) instead of re-fetching + re-compiling the bytes on
+// every spawn. Combined with lazy instantiation in the process (only on first
+// real zlib/crypto use), a process that never compresses/hashes pays nothing.
+async function compileWasmModule(url) {
+  try {
+    // Streaming compile (server sends application/wasm) — one fetch, one compile.
+    return await WebAssembly.compileStreaming(fetch(url));
+  } catch {
+    try {
+      const bytes = await (await fetch(url)).arrayBuffer();
+      return await WebAssembly.compile(bytes);
+    } catch {
+      return null; // codec unavailable → process falls back (pure-JS hashes, no zlib)
+    }
+  }
+}
+
 // A small shell session, each command is its own process (PID).
 const SCRIPT = `
 # a small shell session, each command is its own process (PID)
@@ -579,6 +600,13 @@ async function boot() {
   // wait for it to boot, then talk to it: the kernel over its own sync SAB
   // channel (createKernelFs), and each process directly over a MessagePort
   // doorbell wired at spawn.
+  // Kick off the one-time codec compile up front, concurrently with the VFS
+  // boot; we only need the Modules before the first process is spawned below.
+  const codecsReady = Promise.all([
+    compileWasmModule(new URL("../codec/pkg/open_webcontainer_codec_bg.wasm", import.meta.url)),
+    compileWasmModule(new URL("../crypto/pkg/open_webcontainer_crypto_bg.wasm", import.meta.url)),
+  ]);
+
   const fsWorker = new Worker(new URL("./fs-worker.js", import.meta.url), {
     type: "module",
     name: "File System Worker",
@@ -594,6 +622,10 @@ async function boot() {
   const kernelFs = createKernelFs(fsWorker);
   onKernelFsMessage = kernelFs.onMessage;
   post("log", { line: "Rust VFS booted (wasm) in the File System Worker.", cls: "ok" });
+
+  // [optimize] The pre-compiled codec Modules every Process Worker instantiates
+  // from (compiled once above; may be null if the build/fetch failed).
+  const [codecModule, cryptoModule] = await codecsReady;
 
   // Spawn a process as a *nested* worker under this kernel worker. Each gets a
   // human-readable name (shown in DevTools' JS VM instance list) with its PID.
@@ -612,7 +644,9 @@ async function boot() {
     fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
     // #16 stage 2b: a spawned thread also receives its parentPort (a MessagePort
     // transferred from its creator through us) alongside its fs doorbell.
-    const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
+    // [optimize] Hand over the pre-compiled codec Modules (cloned, not
+    // transferred — a Module stays usable here and in every process).
+    const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1, codecModule, cryptoModule };
     const transfer = [port1];
     if (info.threadPort) {
       init.threadPort = info.threadPort;
