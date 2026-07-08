@@ -66,7 +66,10 @@ export function createSyscalls({ ctrl, data, notify }) {
     Atomics.store(ctrl, I_REQ_LEN, request.length);
     Atomics.store(ctrl, I_STATE, STATE_REQUEST);
 
-    notify(); // wake the host's event loop
+    // Wake whoever services this opcode. Since #14 the transport is split: fs
+    // opcodes are serviced by the dedicated File System Worker over this same
+    // SAB, everything else by the kernel. `notify` routes by opcode.
+    notify(opcode);
     Atomics.wait(ctrl, I_STATE, STATE_REQUEST);
 
     const state = Atomics.load(ctrl, I_STATE);

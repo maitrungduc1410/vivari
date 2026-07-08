@@ -11,7 +11,11 @@
 // same sync bridge as brick 1.
 //
 // Injected by the environment:
-//   - vfs:         the Rust/Wasm VirtualFileSystem instance
+//   - fs:          the kernel's synchronous client to the File System Worker
+//                  (Phase 2 #14) — { writeFile, mkdirp, isFile, exists,
+//                  writeLarge }. The Wasm VFS itself now lives in that worker;
+//                  the kernel no longer services fs syscalls (processes ring the
+//                  FS Worker's doorbell directly).
 //   - spawnWorker: (info) => handle   creates a worker (browser Worker or Node
 //                  worker_threads), wires messages to info.on[type], posts
 //                  {type:'init', sab, spec}; returns { terminate() }
@@ -22,9 +26,6 @@ import {
   encodeString,
   decodeBytes,
   decodeRequest,
-  u32ToBytes,
-  bytesToU32,
-  bytesToF64,
   SAB_BYTES,
   I_STATE,
   I_OPCODE,
@@ -32,25 +33,6 @@ import {
   I_RES_LEN,
   STATE_RESPONSE_OK,
   STATE_RESPONSE_ERR,
-  FLAG_RECURSIVE,
-  OP_READ_FILE,
-  OP_WRITE_FILE,
-  OP_EXISTS,
-  OP_READDIR,
-  OP_MKDIR,
-  OP_STAT,
-  OP_LSTAT,
-  OP_UNLINK,
-  OP_RMDIR,
-  OP_RENAME,
-  OP_SYMLINK,
-  OP_READLINK,
-  OP_OPEN,
-  OP_CLOSE,
-  OP_FD_READ,
-  OP_FD_WRITE,
-  OP_FSTAT,
-  OP_FTRUNCATE,
   OP_SPAWN,
   OP_LISTEN,
   OP_ACCEPT,
@@ -63,8 +45,8 @@ import { COREUTILS } from "./coreutils.js";
 const EMPTY = new Uint8Array(0);
 
 export class Kernel {
-  constructor({ vfs, spawnWorker, stdout, stderr, fetcher }) {
-    this.vfs = vfs;
+  constructor({ fs, spawnWorker, stdout, stderr, fetcher }) {
+    this.fs = fs;
     this.spawnWorker = spawnWorker;
     this.stdout = stdout || (() => {});
     this.stderr = stderr || (() => {});
@@ -89,18 +71,19 @@ export class Kernel {
   }
 
   // ---- VFS helpers ----------------------------------------------------------
+  // These proxy to the File System Worker over the kernel's own sync SAB channel
+  // (#14). They stay synchronous so boot seeding and PATH resolution are unchanged.
   writeFile(path, contents) {
-    this.vfs.write_file(path, typeof contents === "string" ? encodeString(contents) : contents);
+    this.fs.writeFile(path, contents);
   }
   mkdirp(path) {
-    this.vfs.mkdir(path, true);
+    this.fs.mkdirp(path);
   }
   isFile(path) {
-    try {
-      return JSON.parse(this.vfs.stat(path)).kind === "file";
-    } catch {
-      return false;
-    }
+    return this.fs.isFile(path);
+  }
+  exists(path) {
+    return this.fs.exists(path);
   }
 
   /** Install the built-in programs into /bin so they are available on PATH. */
@@ -256,7 +239,7 @@ export class Kernel {
     const proc = this.procs.get(pid);
     if (!proc) return;
     const opcode = Atomics.load(proc.ctrl, I_OPCODE);
-    const { flags, fields } = decodeRequest(
+    const { fields } = decodeRequest(
       proc.data.slice(0, Atomics.load(proc.ctrl, I_REQ_LEN)),
     );
     if (opcode === OP_SPAWN) {
@@ -275,11 +258,9 @@ export class Kernel {
       this.handleFetch(proc, JSON.parse(decodeBytes(fields[0])));
       return; // deferred until the network fetch resolves
     }
-    try {
-      this.respondOk(proc, this.fsDispatch(opcode, flags, fields));
-    } catch (err) {
-      this.respondErr(proc, typeof err === "string" ? err : String(err?.message || "EIO"));
-    }
+    // Since #14, fs opcodes are serviced by the File System Worker directly over
+    // the process's SAB — they never reach the kernel. Anything else here is a bug.
+    this.respondErr(proc, "ENOSYS");
   }
 
   // ---- virtual network servicing (brick 5) ----------------------------------
@@ -404,8 +385,9 @@ export class Kernel {
       const body = res.body instanceof Uint8Array ? res.body : new Uint8Array(res.body || 0);
       const path = this._fetchCachePath(url);
       this.mkdirp("/var/cache/oc-fetch");
-      this.vfs.write_file(path, body);
       const headers = res.headers || {};
+      // Capture size before writeLarge: it transfers (detaches) body.buffer, after
+      // which body.byteLength reads 0.
       const meta = {
         status: res.status | 0,
         ok: !!res.ok,
@@ -413,6 +395,9 @@ export class Kernel {
         size: body.byteLength,
         path,
       };
+      // Large body bypasses the 1 MiB SAB: hand it to the FS Worker over a
+      // transferable buffer, then the process reads it back with normal fs (#14).
+      await this.fs.writeLarge(path, body);
       this.fetchCache.set(url, meta);
       if (this.onFetch) this.onFetch(url, { cached: false, size: meta.size });
       this.respondOk(proc, encodeString(JSON.stringify({ ...meta, cached: false })));
@@ -422,48 +407,4 @@ export class Kernel {
     }
   }
 
-  fsDispatch(opcode, flags, fields) {
-    const vfs = this.vfs;
-    const s = (i) => decodeBytes(fields[i]);
-    switch (opcode) {
-      case OP_READ_FILE:
-        return vfs.read_file(s(0));
-      case OP_WRITE_FILE:
-        return vfs.write_file(s(0), fields[1]), EMPTY;
-      case OP_EXISTS:
-        return new Uint8Array([vfs.exists(s(0)) ? 1 : 0]);
-      case OP_READDIR:
-        return encodeString(vfs.readdir(s(0)).join("\n"));
-      case OP_MKDIR:
-        return vfs.mkdir(s(0), (flags & FLAG_RECURSIVE) !== 0), EMPTY;
-      case OP_STAT:
-        return encodeString(vfs.stat(s(0)));
-      case OP_LSTAT:
-        return encodeString(vfs.lstat(s(0)));
-      case OP_UNLINK:
-        return vfs.unlink(s(0)), EMPTY;
-      case OP_RMDIR:
-        return vfs.rmdir(s(0)), EMPTY;
-      case OP_RENAME:
-        return vfs.rename(s(0), s(1)), EMPTY;
-      case OP_SYMLINK:
-        return vfs.symlink(s(0), s(1)), EMPTY;
-      case OP_READLINK:
-        return encodeString(vfs.readlink(s(0)));
-      case OP_OPEN:
-        return u32ToBytes(vfs.open(s(0), bytesToU32(fields[1]) | 0, bytesToU32(fields[2])));
-      case OP_CLOSE:
-        return vfs.close(bytesToU32(fields[0])), EMPTY;
-      case OP_FD_READ:
-        return vfs.fd_read(bytesToU32(fields[0]), bytesToU32(fields[1]), bytesToF64(fields[2]));
-      case OP_FD_WRITE:
-        return u32ToBytes(vfs.fd_write(bytesToU32(fields[0]), fields[2], bytesToF64(fields[1])));
-      case OP_FSTAT:
-        return encodeString(vfs.fstat(bytesToU32(fields[0])));
-      case OP_FTRUNCATE:
-        return vfs.ftruncate(bytesToU32(fields[0]), bytesToU32(fields[1])), EMPTY;
-      default:
-        throw "ENOSYS";
-    }
-  }
 }

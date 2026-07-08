@@ -41,12 +41,13 @@ function ensureCodec() {
 }
 
 self.onmessage = async (event) => {
-  const { type, sab, spec } = event.data;
+  const { type, sab, spec, fsPort } = event.data;
   if (type === "init") {
     await ensureCodec();
     bootProcess({
       sab,
       spec,
+      fsPort, // #14: fs syscalls ring the File System Worker over this port
       send: (msgType, extra) => self.postMessage({ type: msgType, ...extra }),
       onReady: (w) => {
         wake = w;

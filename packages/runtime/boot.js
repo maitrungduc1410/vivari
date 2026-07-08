@@ -5,15 +5,19 @@
 //
 // spec = { pid, ppid, programPath, args, cwd, env }
 
-import { makeViews } from "../protocol/syscall.js";
+import { makeViews, isFsOpcode } from "../protocol/syscall.js";
 import { createRuntime } from "./index.js";
 
-export function bootProcess({ sab, spec, send, onReady, codec = null, cryptoCodec = null }) {
+export function bootProcess({ sab, spec, send, onReady, fsPort = null, codec = null, cryptoCodec = null }) {
   const { ctrl, data } = makeViews(sab);
+  // #14: fs opcodes ring the File System Worker's doorbell directly (a
+  // MessagePort handed to us at spawn); non-fs opcodes still nudge the kernel.
+  // Without an fsPort (older headless paths) everything falls back to the kernel.
+  const ringFs = fsPort ? () => fsPort.postMessage(0) : () => send("syscall");
   const runtime = createRuntime({
     ctrl,
     data,
-    notify: () => send("syscall"),
+    notify: (opcode) => (isFsOpcode(opcode) ? ringFs() : send("syscall")),
     codec,
     cryptoCodec,
     // real kernel-assigned PID (so process.pid matches the worker name / DevTools)

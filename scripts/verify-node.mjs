@@ -8,12 +8,12 @@
 //
 //   node scripts/verify-node.mjs
 
-import { Worker } from "node:worker_threads";
-import { createRequire } from "node:module";
+import { Worker, MessageChannel } from "node:worker_threads";
 import { gzipSync } from "node:zlib";
 import nodeCrypto from "node:crypto";
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
+import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
 
 // Build a real gzipped ustar tarball from { "package/<path>": "<contents>" } so
 // the npm-install proof (Phase 2 #10) exercises the actual gunzip + tar parser
@@ -48,9 +48,6 @@ function makeTgz(files) {
   return gzipSync(Buffer.concat(chunks));
 }
 
-const require = createRequire(import.meta.url);
-const wasm = require("../packages/kernel/pkg-node/open_webcontainer_kernel.js");
-
 let failed = 0;
 const assert = (ok, msg) => {
   console.log((ok ? "  \u2713 " : "  \u2717 ") + msg);
@@ -66,17 +63,35 @@ async function waitFor(cond, msg, tries = 200) {
   throw new Error("waitFor timed out: " + msg);
 }
 
-function makeKernel() {
-  const vfs = new wasm.VirtualFileSystem();
+async function makeKernel() {
+  // #14: the Wasm VFS runs in a dedicated File System Worker, exactly like the
+  // browser. The kernel (this main thread) waits for it to boot, then talks to
+  // it over its own sync SAB channel; processes get a MessagePort doorbell.
+  const fsWorker = new Worker(new URL("./fs-worker.mjs", import.meta.url));
+  let onKernelFsMessage = () => {};
+  await new Promise((resolve) => {
+    fsWorker.on("message", (m) => {
+      if (m.type === "ready") resolve();
+      else onKernelFsMessage(m);
+    });
+  });
+  const kernelFs = createKernelFs(fsWorker);
+  onKernelFsMessage = kernelFs.onMessage;
+
   const spawnWorker = (info) => {
     const worker = new Worker(new URL("./process-worker.mjs", import.meta.url));
     worker.on("message", (m) => {
       const handler = info.on[m.type];
       if (handler) handler(m);
     });
-    worker.postMessage({ type: "init", sab: info.sab, spec: info.spec });
+    const { port1, port2 } = new MessageChannel();
+    fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
+    worker.postMessage({ type: "init", sab: info.sab, spec: info.spec, fsPort: port1 }, [port1]);
     return {
-      terminate: () => worker.terminate(),
+      terminate: () => {
+        worker.terminate();
+        fsWorker.postMessage({ type: "fs-unregister", client: info.pid });
+      },
       postMessage: (m) => worker.postMessage(m),
     };
   };
@@ -181,14 +196,14 @@ function makeKernel() {
     if (!f) return { ok: false, status: 404, headers: {}, body: enc.encode("not found") };
     return { ok: true, status: 200, headers: { "content-type": f.contentType }, body: f.body };
   };
-  const kernel = new Kernel({ vfs, spawnWorker, fetcher });
+  const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, fetcher });
   kernel.testFetch = fetchStats;
   kernel.installCoreutils();
   return kernel;
 }
 
 async function main() {
-  const kernel = makeKernel();
+  const kernel = await makeKernel();
 
   // --- seed a Node project for the runtime regression program ---
   kernel.mkdirp("/t/lib");
@@ -1134,11 +1149,11 @@ console.log('FETCHB_OK');
   const npmI = await kernel.start("npm", ["install", "a"], { cwd: "/proj", capture: true });
   assert(npmI.code === 0 && npmI.stdout.includes("added 2 packages"),
     "Phase 2 #10: npm install resolves + installs a transitive tree (a -> b)");
-  assert(kernel.vfs.exists("/proj/node_modules/a/package.json"),
+  assert(kernel.exists("/proj/node_modules/a/package.json"),
     "Phase 2 #10: direct dependency extracted into node_modules");
-  assert(kernel.vfs.exists("/proj/node_modules/b/package.json"),
+  assert(kernel.exists("/proj/node_modules/b/package.json"),
     "Phase 2 #10: transitive dependency hoisted to the root node_modules");
-  assert(kernel.vfs.exists("/proj/node_modules/.bin/b-cli"),
+  assert(kernel.exists("/proj/node_modules/.bin/b-cli"),
     "Phase 2 #10: .bin symlink created for a package with a bin field");
   kernel.writeFile(
     "/proj/run.js",
@@ -1157,7 +1172,7 @@ console.log(require('a')() + '|' + pj.dependencies.a);
   kernel.mkdirp("/proj2");
   kernel.writeFile("/proj2/package.json", JSON.stringify({ name: "proj2", version: "1.0.0" }));
   const npmC = await kernel.start("npm", ["install", "c"], { cwd: "/proj2", capture: true });
-  assert(npmC.code === 0 && kernel.vfs.exists("/proj2/node_modules/b/package.json"),
+  assert(npmC.code === 0 && kernel.exists("/proj2/node_modules/b/package.json"),
     "Phase 2 #10 st2: real semver resolves a compound range (c deps b '>=1.0.0 <2.0.0')");
   kernel.writeFile("/proj2/run.js", "console.log(require('c')())");
   const rc2 = await kernel.start("node", ["/proj2/run.js"], { cwd: "/proj2", capture: true });
@@ -1303,9 +1318,9 @@ http.createServer((req, res) => res.end('tick ' + fs.existsSync('/srv/timer-fire
   );
   kernel.start("node", ["/srv/timerserver.js"], { cwd: "/srv" });
   await waitFor(() => kernel.listeners.has(3100), "timer server did not listen on 3100");
-  await waitFor(() => kernel.vfs.exists("/srv/timer-fired.txt"),
+  await waitFor(() => kernel.exists("/srv/timer-fired.txt"),
     "background timer did not fire while the server was idle", 60);
-  assert(kernel.vfs.exists("/srv/timer-fired.txt"),
+  assert(kernel.exists("/srv/timer-fired.txt"),
     "Event loop: a setTimeout fires while a server is running (idle, no traffic)");
   const r5 = await kernel.handleHttpRequest(3100, { method: "GET", url: "/", headers: {}, body: "" });
   assert(r5.status === 200 && r5.body === "tick true",

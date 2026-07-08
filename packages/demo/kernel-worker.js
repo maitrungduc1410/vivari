@@ -11,10 +11,8 @@
 // The Kernel class itself stays environment-agnostic: it is handed a
 // `spawnWorker` just like the headless Node test does.
 
-import initKernel, {
-  VirtualFileSystem,
-} from "../kernel/pkg/open_webcontainer_kernel.js";
 import { Kernel } from "../kernel-host/kernel.js";
+import { createKernelFs } from "../kernel-host/kernel-fs.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
@@ -446,12 +444,30 @@ function waitListen(port, timeoutMs = 20000) {
 }
 
 async function boot() {
-  await initKernel();
-  const vfs = new VirtualFileSystem();
-  post("log", { line: "Rust VFS booted (wasm) inside the kernel worker.", cls: "ok" });
+  // The Rust/Wasm VFS now lives in its own nested File System Worker (#14). We
+  // wait for it to boot, then talk to it: the kernel over its own sync SAB
+  // channel (createKernelFs), and each process directly over a MessagePort
+  // doorbell wired at spawn.
+  const fsWorker = new Worker(new URL("./fs-worker.js", import.meta.url), {
+    type: "module",
+    name: "File System Worker",
+  });
+  let onKernelFsMessage = () => {};
+  const fsReady = new Promise((resolve) => {
+    fsWorker.onmessage = (event) => {
+      if (event.data.type === "ready") resolve();
+      else onKernelFsMessage(event.data);
+    };
+  });
+  await fsReady;
+  const kernelFs = createKernelFs(fsWorker);
+  onKernelFsMessage = kernelFs.onMessage;
+  post("log", { line: "Rust VFS booted (wasm) in the File System Worker.", cls: "ok" });
 
   // Spawn a process as a *nested* worker under this kernel worker. Each gets a
   // human-readable name (shown in DevTools' JS VM instance list) with its PID.
+  // We also open a MessageChannel between the process and the File System Worker
+  // so its fs syscalls ring that worker's doorbell directly (never the kernel).
   const spawnWorker = (info) => {
     const worker = new Worker(new URL("./process-worker.js", import.meta.url), {
       type: "module",
@@ -461,9 +477,14 @@ async function boot() {
       const handler = info.on[event.data.type];
       if (handler) handler(event.data);
     };
-    worker.postMessage({ type: "init", sab: info.sab, spec: info.spec });
+    const { port1, port2 } = new MessageChannel();
+    fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
+    worker.postMessage({ type: "init", sab: info.sab, spec: info.spec, fsPort: port1 }, [port1]);
     return {
-      terminate: () => worker.terminate(),
+      terminate: () => {
+        worker.terminate();
+        fsWorker.postMessage({ type: "fs-unregister", client: info.pid });
+      },
       postMessage: (m) => worker.postMessage(m),
     };
   };
@@ -494,7 +515,7 @@ async function boot() {
     });
 
   kernel = new Kernel({
-    vfs,
+    fs: kernelFs.fs,
     spawnWorker,
     fetcher,
     stdout: (chunk) => post("stdout", { chunk }),

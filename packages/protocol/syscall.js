@@ -104,6 +104,15 @@ export const OP_FETCH = 25;
 // request flags (bitmask)
 export const FLAG_RECURSIVE = 1; // mkdir -p
 
+// Which opcodes are pure filesystem ops. Phase 2 #14 splits the Wasm VFS into a
+// dedicated File System Worker: a process routes these directly to that worker's
+// SAB doorbell, while everything else (spawn/net/http/fetch) still goes to the
+// kernel. The two contiguous ranges are OP_READ_FILE..OP_READLINK (whole-file +
+// metadata) and OP_OPEN..OP_FTRUNCATE (the fd layer).
+export function isFsOpcode(op) {
+  return (op >= OP_READ_FILE && op <= OP_READLINK) || (op >= OP_OPEN && op <= OP_FTRUNCATE);
+}
+
 // control[0..3] indices, named for clarity
 export const I_STATE = 0;
 export const I_OPCODE = 1;

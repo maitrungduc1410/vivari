@@ -12,11 +12,8 @@
 // Kept separate from the main suite so `verify-node.mjs` stays offline.
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
-import { Worker } from "node:worker_threads";
-import { createRequire } from "node:module";
-
-const require = createRequire(import.meta.url);
-const wasm = require("../packages/kernel/pkg-node/open_webcontainer_kernel.js");
+import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
+import { Worker, MessageChannel } from "node:worker_threads";
 
 let failures = 0;
 function assert(cond, msg) {
@@ -24,15 +21,34 @@ function assert(cond, msg) {
   if (!cond) failures++;
 }
 
-const vfs = new wasm.VirtualFileSystem();
+// #14: the Wasm VFS lives in a dedicated File System Worker.
+const fsWorker = new Worker(new URL("./fs-worker.mjs", import.meta.url));
+let onKernelFsMessage = () => {};
+await new Promise((resolve) => {
+  fsWorker.on("message", (m) => {
+    if (m.type === "ready") resolve();
+    else onKernelFsMessage(m);
+  });
+});
+const kernelFs = createKernelFs(fsWorker);
+onKernelFsMessage = kernelFs.onMessage;
+
 const spawnWorker = (info) => {
   const w = new Worker(new URL("./process-worker.mjs", import.meta.url));
   w.on("message", (m) => {
     const h = info.on[m.type];
     if (h) h(m);
   });
-  w.postMessage({ type: "init", sab: info.sab, spec: info.spec });
-  return { terminate: () => w.terminate(), postMessage: (m) => w.postMessage(m) };
+  const { port1, port2 } = new MessageChannel();
+  fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
+  w.postMessage({ type: "init", sab: info.sab, spec: info.spec, fsPort: port1 }, [port1]);
+  return {
+    terminate: () => {
+      w.terminate();
+      fsWorker.postMessage({ type: "fs-unregister", client: info.pid });
+    },
+    postMessage: (m) => w.postMessage(m),
+  };
 };
 const fetcher = async (url) => {
   const r = await fetch(url, { redirect: "follow" });
@@ -43,7 +59,7 @@ const fetcher = async (url) => {
 };
 
 const listening = new Set();
-const kernel = new Kernel({ vfs, spawnWorker, fetcher, stdout: () => {}, stderr: () => {} });
+const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, fetcher, stdout: () => {}, stderr: () => {} });
 kernel.onListen = (port) => listening.add(port);
 kernel.installCoreutils();
 

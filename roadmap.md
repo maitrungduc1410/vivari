@@ -521,10 +521,23 @@ WHATWG `URL` already backs the legacy `url` API; vendoring Node's native-bound v
 would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `readline`,
 `perf_hooks`, `dgram`, `tls`/`https` (stubbed).
 
-14. **VFS worker split** [M] — *decomp, deliberately LATE.* Split the Wasm VFS into its
-    own worker (our `File System Worker`) as the single source of truth once the fs
-    binding contract is stable; fs opcodes serviced directly over the SAB. (Doing this
-    before the contract settles = double churn — that's why it isn't first.)
+14. **VFS worker split** [M] — **DONE.** The Rust/Wasm VFS now lives in its own dedicated
+    `File System Worker` (browser `packages/demo/fs-worker.js`, headless `scripts/fs-worker.mjs`),
+    off the kernel's thread. **Routing (A1, direct-SAB):** a process's fs opcodes are
+    serviced by that worker **directly over the process's own SAB** — the kernel is never
+    on the fs path. At spawn the kernel opens a `MessageChannel` between each process and
+    the FS Worker; `fs-client.js` routes by opcode (`isFsOpcode`) — fs ops ring the FS
+    Worker's port doorbell, everything else (spawn/net/http/fetch) still nudges the kernel.
+    No extra hops vs. the old inline path, so no latency regression. **Kernel's own fs**
+    (boot seeding, PATH `isFile`, fetch-cache) stays synchronous via its own SAB channel to
+    the FS Worker (`kernel-fs.js`, blocking `Atomics.wait` on the kernel thread — a Web
+    Worker in the browser, Node's main thread headless). Fetched tarballs bypass the 1 MiB
+    SAB entirely: the kernel hands the body to the FS Worker over a transferable
+    `ArrayBuffer` (`writeLarge`). `Kernel` now takes an injected `fs` (not the raw `vfs`);
+    `fsDispatch` moved into the env-agnostic `FsServer` (`packages/kernel-host/fs-server.js`).
+    Verified headless (B1 — real split: `verify-node` 72/72 + `verify-express` full tree),
+    exercising every fs opcode, `execSync` children, `npm install`, and the deferred
+    `__ocfetch` path over the new worker boundary.
 15. **Extras (ongoing)** — nested `worker_threads` (our `[worker n]`), heavy toolchains
     (`esbuild`/`vite`/`tsserver` as Wasm), IndexedDB persistence, pre-warm worker pool.
 16. **WASI + napi-rs Wasm runtime (native→wasm packages)** [XL] — *future goal.* Many

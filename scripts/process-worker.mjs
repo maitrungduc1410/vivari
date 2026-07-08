@@ -31,6 +31,7 @@ parentPort.on("message", (msg) => {
     bootProcess({
       sab: msg.sab,
       spec: msg.spec,
+      fsPort: msg.fsPort, // #14: fs syscalls ring the File System Worker over this port
       send: (type, extra) => parentPort.postMessage({ type, ...extra }),
       onReady: (w) => {
         wake = w;
