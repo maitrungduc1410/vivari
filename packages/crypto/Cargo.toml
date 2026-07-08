@@ -1,0 +1,27 @@
+[package]
+name = "open-webcontainer-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "OpenContainer crypto core (hashes/HMAC/PBKDF2/AES) compiled to WebAssembly, running in-process beneath Node's real lib/crypto.js"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+# Pure-Rust RustCrypto primitives — all compile cleanly to wasm32-unknown-unknown
+# with no getrandom (we always pass explicit salts/ivs from JS via WebCrypto).
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+aes = "0.8"
+cbc = { version = "0.1", default-features = false, features = ["alloc"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+cipher = { version = "0.4", default-features = false, features = ["block-padding", "alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

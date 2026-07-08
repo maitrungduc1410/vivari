@@ -11,6 +11,7 @@
 import { Worker } from "node:worker_threads";
 import { createRequire } from "node:module";
 import { gzipSync } from "node:zlib";
+import nodeCrypto from "node:crypto";
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 
@@ -666,6 +667,95 @@ main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
   const zb = await kernel.start("node", ["/t/zlibb.js"], { cwd: "/t", capture: true });
   assert(zb.code === 0 && zb.stdout.includes("ZLIBB_OK"),
     "Path B: real Node lib/zlib.js runs on the Rust/Wasm codec (gzip/deflate/raw, sync + streaming, crc32)");
+
+  // Path B proof (#12): require('crypto') is our lib/crypto.js over
+  // internalBinding('crypto') backed by the Rust/Wasm crypto codec
+  // (packages/crypto, RustCrypto). Every value is compared byte-for-byte against
+  // the host's real node:crypto: digests (md5..sha512), HMAC, PBKDF2, and the AES
+  // ciphers (aes-256-gcm with AAD+tag, aes-256-cbc) both ways, plus cross-decrypt
+  // of ciphertext produced by real OpenSSL.
+  const CKEY32 = Buffer.from(Array.from({ length: 32 }, (_, i) => i + 1));
+  const GIV12 = Buffer.from(Array.from({ length: 12 }, (_, i) => i + 7));
+  const CIV16 = Buffer.from(Array.from({ length: 16 }, (_, i) => i + 3));
+  const gcmC = nodeCrypto.createCipheriv("aes-256-gcm", CKEY32, GIV12);
+  gcmC.setAAD(Buffer.from("hdr-aad"));
+  const gcmCt = Buffer.concat([gcmC.update("secret gcm message", "utf8"), gcmC.final()]);
+  const cbcC = nodeCrypto.createCipheriv("aes-256-cbc", CKEY32, CIV16);
+  const cbcCt = Buffer.concat([cbcC.update("secret cbc message", "utf8"), cbcC.final()]);
+  const cryptoExpected = {
+    md5: nodeCrypto.createHash("md5").update("abc").digest("hex"),
+    sha1: nodeCrypto.createHash("sha1").update("abc").digest("hex"),
+    sha224: nodeCrypto.createHash("sha224").update("abc").digest("hex"),
+    sha256: nodeCrypto.createHash("sha256").update("abc").digest("hex"),
+    sha384: nodeCrypto.createHash("sha384").update("abc").digest("hex"),
+    sha512: nodeCrypto.createHash("sha512").update("abc").digest("hex"),
+    hmac: nodeCrypto.createHmac("sha256", "key")
+      .update("The quick brown fox jumps over the lazy dog").digest("hex"),
+    pbkdf2: nodeCrypto.pbkdf2Sync("password", "salt", 1000, 32, "sha256").toString("hex"),
+    key: CKEY32.toString("hex"),
+    giv: GIV12.toString("hex"),
+    civ: CIV16.toString("hex"),
+    gcmCt: gcmCt.toString("hex"),
+    gcmTag: gcmC.getAuthTag().toString("hex"),
+    cbcCt: cbcCt.toString("hex"),
+  };
+  kernel.writeFile(
+    "/t/cryptob.js",
+    `
+const assert = require('assert');
+const crypto = require('crypto');
+const E = ${JSON.stringify(cryptoExpected)};
+
+// digests vs real node:crypto
+for (const algo of ['md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512']) {
+  assert.strictEqual(crypto.createHash(algo).update('abc').digest('hex'), E[algo], algo + ' matches node');
+}
+assert.strictEqual(crypto.createHash('sha256').update('a').update('bc').digest('hex'), E.sha256, 'sha256 multi-update');
+
+// HMAC + PBKDF2
+assert.strictEqual(
+  crypto.createHmac('sha256', 'key').update('The quick brown fox jumps over the lazy dog').digest('hex'),
+  E.hmac, 'hmac-sha256 matches node');
+assert.strictEqual(crypto.pbkdf2Sync('password', 'salt', 1000, 32, 'sha256').toString('hex'), E.pbkdf2, 'pbkdf2Sync matches node');
+
+const key = Buffer.from(E.key, 'hex'), giv = Buffer.from(E.giv, 'hex'), civ = Buffer.from(E.civ, 'hex');
+
+// AES-256-GCM: our ciphertext + tag must equal OpenSSL's, and we must decrypt OpenSSL's.
+const gc = crypto.createCipheriv('aes-256-gcm', key, giv);
+gc.setAAD(Buffer.from('hdr-aad'));
+const gct = Buffer.concat([gc.update('secret gcm message', 'utf8'), gc.final()]);
+assert.strictEqual(gct.toString('hex'), E.gcmCt, 'aes-256-gcm ciphertext matches node');
+assert.strictEqual(gc.getAuthTag().toString('hex'), E.gcmTag, 'aes-256-gcm auth tag matches node');
+const gd = crypto.createDecipheriv('aes-256-gcm', key, giv);
+gd.setAAD(Buffer.from('hdr-aad'));
+gd.setAuthTag(Buffer.from(E.gcmTag, 'hex'));
+assert.strictEqual(Buffer.concat([gd.update(Buffer.from(E.gcmCt, 'hex')), gd.final()]).toString('utf8'),
+  'secret gcm message', 'aes-256-gcm decrypts OpenSSL ciphertext');
+// tampered tag must throw (authenticated).
+assert.throws(() => {
+  const bad = crypto.createDecipheriv('aes-256-gcm', key, giv);
+  bad.setAAD(Buffer.from('hdr-aad'));
+  bad.setAuthTag(Buffer.alloc(16));
+  Buffer.concat([bad.update(Buffer.from(E.gcmCt, 'hex')), bad.final()]);
+}, 'gcm rejects a bad auth tag');
+
+// AES-256-CBC (PKCS#7): ciphertext matches OpenSSL and round-trips.
+const cc = crypto.createCipheriv('aes-256-cbc', key, civ);
+const cct = Buffer.concat([cc.update('secret cbc message', 'utf8'), cc.final()]);
+assert.strictEqual(cct.toString('hex'), E.cbcCt, 'aes-256-cbc ciphertext matches node');
+const cd = crypto.createDecipheriv('aes-256-cbc', key, civ);
+assert.strictEqual(Buffer.concat([cd.update(Buffer.from(E.cbcCt, 'hex')), cd.final()]).toString('utf8'),
+  'secret cbc message', 'aes-256-cbc round-trips');
+
+// randomness sanity (WebCrypto-backed).
+assert.strictEqual(crypto.randomBytes(16).length, 16, 'randomBytes length');
+assert.ok(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(crypto.randomUUID()), 'randomUUID v4 format');
+console.log('CRYPTOB_OK');
+`,
+  );
+  const cb2 = await kernel.start("node", ["/t/cryptob.js"], { cwd: "/t", capture: true });
+  assert(cb2.code === 0 && cb2.stdout.includes("CRYPTOB_OK"),
+    "Path B: our lib/crypto.js runs on the Rust/Wasm crypto codec (digests/HMAC/PBKDF2/AES-GCM+CBC vs node:crypto)");
 
   // Path B proof: require('net') is Node's REAL vendored lib/net.js +
   // internal/{net,stream_base_commons} running on our tcp_wrap/stream_wrap

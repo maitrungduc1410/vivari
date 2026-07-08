@@ -470,12 +470,22 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     preset dictionaries and `params()` retuning are accepted-but-inert (miniz_oxide limitation);
     **brotli/zstd** handles throw loudly (the codec is zlib-family only) — a follow-up can add
     the `brotli`/`zstd` Rust crates to the same codec. Wired into `npm run build` (`build:codec`).
-12. **`crypto` — WebCrypto + Wasm + real `lib/crypto` (partial)** [L] — **PARTIAL DONE.**
-    `node/lib/crypto.js` ships synchronous pure-JS `createHash` (MD5/SHA-1/SHA-256) +
-    `createHmac`, plus WebCrypto-backed `randomBytes`/`randomFill`/`randomInt`/`randomUUID`.
-    Enough for the userland happy path (ETag/session libs hash synchronously) — this is what
-    unblocked **Express** (its `etag` dep requires `crypto` at load). Ciphers/sign/verify/KDFs
-    throw loudly. TODO: more digests, ciphers, and a Wasm/`lib/crypto` backing for the rest.
+12. **`crypto` — Wasm + WebCrypto (S2)** [L] — **DONE (S2).** `node/lib/crypto.js` now runs
+    on `internalBinding('crypto')` backed by a second Rust/Wasm codec (`packages/crypto`,
+    RustCrypto: md-5/sha1/sha2/hmac/pbkdf2/aes/cbc/aes-gcm, ~105KB). Node's crypto API is
+    *synchronous* and SubtleCrypto is async-only, so — exactly like zlib (#11) — the sync
+    primitives live in Wasm; `lib/crypto` buffers streamed input and calls them one-shot.
+    Covers **createHash** (md5/sha1/sha224/256/384/512/512-256), **createHmac**, **pbkdf2/
+    pbkdf2Sync**, and **createCipheriv/createDecipheriv** for **AES-CBC** (128/192/256, PKCS#7)
+    and **AES-GCM** (128/256, incl. `setAAD`/`getAuthTag`/`setAuthTag`), plus WebCrypto-backed
+    `randomBytes`/`randomFill`/`randomInt`/`randomUUID`. Verified byte-for-byte against the host
+    `node:crypto` in `verify-node` (digests/HMAC/PBKDF2, AES-GCM tag + cross-decrypt of OpenSSL
+    ciphertext + tamper-reject, AES-CBC). Robustness: md5/sha1/sha256 keep a pure-JS fallback so
+    `createHash` (e.g. Express's `etag` at load) works even if the codec is missing. Threaded as
+    `cryptoCodec` through `bootProcess → createRuntime → internalBinding`, instantiated per
+    process worker (browser `initCrypto()`, headless `require`); wired into `npm run build`
+    (`build:crypto`). **Deferred (S3):** sign/verify, RSA/EC keygen, DH, scrypt, X.509 — they
+    throw loudly; these want a bigger codec + vendoring Node's real `lib/crypto` internals.
 13. **ESM (`import`/`export`)** [L] — native browser ESM served from the VFS via the
     Service Worker, or Node's esm loader. Unblocks modern packages.
 14. **VFS worker split** [M] — *decomp, deliberately LATE.* Split the Wasm VFS into its

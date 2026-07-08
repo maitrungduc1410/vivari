@@ -13,6 +13,7 @@ import { createFsBinding } from "./bindings/fs.js";
 import { createNetBindings } from "./bindings/net.js";
 import { createHttpParserBinding } from "./bindings/http_parser.js";
 import { createZlibBinding, ZLIB_CONSTANTS } from "./bindings/zlib.js";
+import { createCryptoBinding } from "./bindings/crypto.js";
 
 // POSIX/libuv constants exposed as internalBinding('constants').fs. Node's real
 // lib/fs.js and internal/fs/utils.js destructure these; the O_* values MUST
@@ -81,7 +82,7 @@ function getOwnNonIndexProperties(obj, filter) {
   return out;
 }
 
-export function createInternalBinding({ syscalls, process, netLiveness, netServers, codec } = {}) {
+export function createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec } = {}) {
   // net (Phase 2 #7/#8): tcp_wrap/stream_wrap/uv/pipe_wrap/cares_wrap for the
   // in-process loopback beneath Node's real lib/net.js. Needs process.nextTick.
   // `syscalls` lets listen() register the port with the kernel (external routing,
@@ -102,6 +103,9 @@ export function createInternalBinding({ syscalls, process, netLiveness, netServe
     // zlib (Phase 2 #11): Node's real lib/zlib.js over the Rust/Wasm codec.
     // crc32/constants work without the codec; the stream handle needs `codec`.
     zlib: createZlibBinding({ makeZStream: codec || null, process }),
+    // crypto (Phase 2 #12): our lib/crypto.js over the Rust/Wasm crypto codec.
+    // digest md5/sha1/sha256 fall back to pure-JS when the codec is absent.
+    crypto: createCryptoBinding({ codec: cryptoCodec || null }),
     // trace_events: inert — internal/http records HTTP trace spans through it.
     trace_events: {
       getCategoryEnabledBuffer: () => new Uint8Array(1),

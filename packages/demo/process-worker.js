@@ -4,24 +4,38 @@
 
 import { bootProcess } from "../runtime/boot.js";
 import initCodec, { ZStream } from "../codec/pkg/open_webcontainer_codec.js";
+import initCrypto, * as cryptoWasm from "../crypto/pkg/open_webcontainer_crypto.js";
 
 let wake = null;
 
-// zlib codec (Phase 2 #11): the Rust/Wasm compression core beneath Node's real
-// lib/zlib.js. Instantiate once per worker; makeZStream is the factory the
-// internalBinding('zlib') handle drives. ~70KB wasm, compiled once per worker.
+// Native codecs (Phase 2 #11 zlib, #12 crypto): the Rust/Wasm cores beneath
+// Node's real lib/zlib.js and our lib/crypto.js. Instantiated once per worker.
+// makeZStream drives internalBinding('zlib'); cryptoWasm is the crypto module
+// namespace internalBinding('crypto') calls one-shot. (Eager today; the roadmap
+// tracks lazy load + compile-once-share as an optimization.)
 let codecReady = null;
 let makeZStream = null;
+let cryptoCodec = null;
 function ensureCodec() {
   if (!codecReady) {
-    codecReady = initCodec()
-      .then(() => {
-        makeZStream = (mode, level, windowBits) => new ZStream(mode, level, windowBits);
-      })
-      .catch(() => {
-        // codec unavailable — zlib stays unusable (crc32/constants still work).
-        makeZStream = null;
-      });
+    codecReady = Promise.all([
+      initCodec()
+        .then(() => {
+          makeZStream = (mode, level, windowBits) => new ZStream(mode, level, windowBits);
+        })
+        .catch(() => {
+          // zlib codec unavailable — crc32/constants still work.
+          makeZStream = null;
+        }),
+      initCrypto()
+        .then(() => {
+          cryptoCodec = cryptoWasm;
+        })
+        .catch(() => {
+          // crypto codec unavailable — md5/sha1/sha256 fall back to pure-JS.
+          cryptoCodec = null;
+        }),
+    ]);
   }
   return codecReady;
 }
@@ -38,6 +52,7 @@ self.onmessage = async (event) => {
         wake = w;
       },
       codec: makeZStream,
+      cryptoCodec,
     });
     return;
   }

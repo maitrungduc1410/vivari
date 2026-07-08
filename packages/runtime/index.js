@@ -48,6 +48,7 @@ export function createRuntime({
   stdout = () => {},
   stderr = () => {},
   codec = null,
+  cryptoCodec = null,
 }) {
   const syscalls = createSyscalls({ ctrl, data, notify });
 
@@ -88,7 +89,7 @@ export function createRuntime({
   // internalBinding('buffer'), `fs` is Node's real lib/fs.js over
   // internalBinding('fs') (node/bindings/fs.js -> Rust VFS via the sync bridge),
   // and `events`/`util` run on our shared internal layer (util.inspect bridged).
-  const nodeModules = createNodeModules({ process, syscalls, netLiveness, netServers, codec });
+  const nodeModules = createNodeModules({ process, syscalls, netLiveness, netServers, codec, cryptoCodec });
   const bufferModule = nodeModules.require("buffer");
   const Buffer = bufferModule.Buffer;
   const path = nodeModules.require("path");

@@ -12,6 +12,8 @@
     "build:kernel:node": "wasm-pack build packages/kernel --target nodejs --out-dir pkg-node",
     "build:codec": "wasm-pack build packages/codec --target web --out-dir pkg",
     "build:codec:node": "wasm-pack build packages/codec --target nodejs --out-dir pkg-node",
-    "build": "npm run build:kernel && npm run build:kernel:node && npm run build:codec && npm run build:codec:node"
+    "build:crypto": "wasm-pack build packages/crypto --target web --out-dir pkg",
+    "build:crypto:node": "wasm-pack build packages/crypto --target nodejs --out-dir pkg-node",
+    "build": "npm run build:kernel && npm run build:kernel:node && npm run build:codec && npm run build:codec:node && npm run build:crypto && npm run build:crypto:node"
   }
 }

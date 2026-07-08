@@ -5,9 +5,10 @@ import { parentPort } from "node:worker_threads";
 import { createRequire } from "node:module";
 import { bootProcess } from "../packages/runtime/boot.js";
 
-// zlib codec (Phase 2 #11): the Rust/Wasm compression core, instantiated once
-// per worker. nodejs target loads synchronously via require. makeZStream is the
-// factory internalBinding('zlib') drives.
+// Native codecs (Phase 2 #11 zlib, #12 crypto): the Rust/Wasm cores, loaded once
+// per worker. nodejs target loads synchronously via require. makeZStream drives
+// internalBinding('zlib'); cryptoCodec is the module internalBinding('crypto')
+// calls one-shot.
 const require = createRequire(import.meta.url);
 let makeZStream = null;
 try {
@@ -15,6 +16,12 @@ try {
   makeZStream = (mode, level, windowBits) => new ZStream(mode, level, windowBits);
 } catch {
   // codec not built — zlib stays unavailable (crc32/constants still work).
+}
+let cryptoCodec = null;
+try {
+  cryptoCodec = require("../packages/crypto/pkg-node/open_webcontainer_crypto.js");
+} catch {
+  // codec not built — md5/sha1/sha256 fall back to pure-JS.
 }
 
 let wake = null;
@@ -29,6 +36,7 @@ parentPort.on("message", (msg) => {
         wake = w;
       },
       codec: makeZStream,
+      cryptoCodec,
     });
     return;
   }

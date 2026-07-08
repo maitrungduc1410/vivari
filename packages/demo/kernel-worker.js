@@ -274,6 +274,68 @@ const server = http.createServer(async (req, res) => {
     res.end(body);
     return;
   }
+  if (req.url === '/api/zlib') {
+    // Real Node zlib (vendored lib/zlib.js on internalBinding('zlib'), backed by
+    // the Rust/Wasm codec #11): gzip a payload, gunzip it back, deflate-raw, and
+    // compute a crc32 — all synchronous, all inside this browser worker.
+    const zlib = require('zlib');
+    const text = 'OpenContainer '.repeat(64) + 'café € — real zlib in the browser';
+    const input = Buffer.from(text, 'utf8');
+    const gz = zlib.gzipSync(input);
+    const roundTrip = zlib.gunzipSync(gz).toString('utf8');
+    const raw = zlib.deflateRawSync(input);
+    const body = Buffer.from(JSON.stringify({
+      node: process.version,
+      note: 'gzipSync -> gunzipSync + deflateRawSync + crc32 — Node real lib/zlib.js over the Rust/Wasm codec (#11), in the browser.',
+      originalBytes: input.length,
+      gzippedBytes: gz.length,
+      deflateRawBytes: raw.length,
+      compression: (gz.length / input.length).toFixed(3) + 'x',
+      gzipMagicHex: gz.subarray(0, 3).toString('hex'),
+      crc32: (zlib.crc32(input) >>> 0).toString(16),
+      roundTripOk: roundTrip === text,
+    }, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
+  if (req.url === '/api/crypto') {
+    // Our crypto (lib/crypto.js on internalBinding('crypto'), backed by the
+    // Rust/Wasm crypto codec #12): hashes, HMAC, PBKDF2, and a full AES-256-GCM
+    // encrypt -> decrypt round-trip (with AAD + auth tag), all in the browser.
+    const crypto = require('crypto');
+    const msg = 'OpenContainer secret · café €';
+    const key = crypto.randomBytes(32);
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    cipher.setAAD(Buffer.from('demo-aad'));
+    const enc = Buffer.concat([cipher.update(msg, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAAD(Buffer.from('demo-aad'));
+    decipher.setAuthTag(tag);
+    const decrypted = Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
+    const sha512 = crypto.createHash('sha512').update(msg).digest('hex');
+    const body = Buffer.from(JSON.stringify({
+      node: process.version,
+      note: 'createHash/createHmac/pbkdf2Sync + AES-256-GCM encrypt->decrypt — our lib/crypto.js over the Rust/Wasm crypto codec (#12), in the browser.',
+      sha256: crypto.createHash('sha256').update(msg).digest('hex'),
+      sha512Preview: sha512.slice(0, 32) + '…',
+      hmacSha256: crypto.createHmac('sha256', 'oc-key').update(msg).digest('hex'),
+      pbkdf2: crypto.pbkdf2Sync('password', 'salt', 10000, 32, 'sha256').toString('hex'),
+      aesGcm: {
+        ivHex: iv.toString('hex'),
+        cipherHex: enc.toString('hex'),
+        authTagHex: tag.toString('hex'),
+        decrypted,
+        roundTripOk: decrypted === msg,
+      },
+      randomUUID: crypto.randomUUID(),
+    }, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(\`<!doctype html>
 <html><head><meta charset="utf-8"><title>Hello from OpenContainer</title>
@@ -288,7 +350,7 @@ const server = http.createServer(async (req, res) => {
 <body><div class="card">
   <h1>Hello from OpenContainer 🎉</h1>
   <p>Served by <code>http.createServer</code> in worker <code>PID \${process.pid}</code></p>
-  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> + <code>stream</code> + <code>net</code> + <code>http</code> vendored, on a real event loop, running in your browser</p>
+  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> + <code>stream</code> + <code>net</code> + <code>http</code> + <code>zlib</code> + <code>crypto</code> vendored, on a real event loop, running in your browser</p>
   <p>You requested <code>\${req.url}</code></p>
   <button onclick="fetch('api/time').then(r=>r.json()).then(t=>document.getElementById('t').textContent=JSON.stringify(t))">GET /api/time</button>
   <button onclick="var el=document.getElementById('a');el.textContent='awaiting setTimeout(200ms)…';fetch('api/async').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2))">GET /api/async (awaits a timer)</button>
@@ -297,6 +359,8 @@ const server = http.createServer(async (req, res) => {
   <button onclick="fetch('api/http').then(r=>r.json()).then(t=>document.getElementById('h').textContent=JSON.stringify(t,null,2))">GET /api/http (real http server+client)</button>
   <button onclick="fetch('api/buffer').then(r=>r.json()).then(t=>document.getElementById('b').textContent=JSON.stringify(t,null,2))">GET /api/buffer</button>
   <button onclick="fetch('api/fs').then(r=>r.json()).then(t=>document.getElementById('f').textContent=JSON.stringify(t,null,2))">GET /api/fs</button>
+  <button onclick="fetch('api/zlib').then(r=>r.json()).then(t=>document.getElementById('z').textContent=JSON.stringify(t,null,2))">GET /api/zlib (gzip + crc32)</button>
+  <button onclick="fetch('api/crypto').then(r=>r.json()).then(t=>document.getElementById('c').textContent=JSON.stringify(t,null,2))">GET /api/crypto (hash + AES-GCM)</button>
   <button onclick="var el=document.getElementById('nf');el.textContent='fetching npm registry…';fetch('api/fetch').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2)).catch(e=>el.textContent=String(e))">GET /api/fetch (npm registry)</button>
   <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
   <pre id="t"></pre>
@@ -306,6 +370,8 @@ const server = http.createServer(async (req, res) => {
   <pre id="h"></pre>
   <pre id="b"></pre>
   <pre id="f"></pre>
+  <pre id="z"></pre>
+  <pre id="c"></pre>
   <pre id="nf"></pre>
 </div></body></html>\`);
 });
