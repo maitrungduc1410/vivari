@@ -979,6 +979,36 @@ console.log('out=' + JSON.stringify(fs.readFileSync('/work/out.txt', 'utf8')));
   assert(w.stdout.includes('out="HELLO WASI\\n"'),
     "Phase 2 #16: guest path_open + fd_read/fd_write landed output in the VFS (matches host node:wasi)");
 
+  // === #16 stage 2a: napi-on-wasm — run a REAL N-API native addon =========
+  // @node-rs/crc32-wasm32-wasi is a Rust crate compiled to a wasm32-wasi N-API
+  // addon. It runs unmodified via `require()`: its napi-rs wrapper pulls our
+  // vendored @napi-rs/wasm-runtime (the emnapi host, pure JS) which implements
+  // the napi_* import surface, while the wasm's wasi_snapshot_preview1 imports
+  // are satisfied by our own require('wasi'). crc32/crc32c must match the values
+  // the same addon produces under host Node (907060870 / 2591144780).
+  const crc32Dir = new URL("../packages/demo/vendor/napi-crc32/", import.meta.url);
+  kernel.mkdirp("/napi/node_modules/@node-rs/crc32-wasm32-wasi");
+  const crcBase = "/napi/node_modules/@node-rs/crc32-wasm32-wasi/";
+  kernel.writeFile(crcBase + "package.json", readFileSync(new URL("package.json", crc32Dir), "utf8"));
+  kernel.writeFile(crcBase + "crc32.wasi.cjs", readFileSync(new URL("crc32.wasi.cjs", crc32Dir), "utf8"));
+  kernel.writeFile(crcBase + "crc32.wasm32-wasi.wasm", new Uint8Array(readFileSync(new URL("crc32.wasm32-wasi.wasm", crc32Dir))));
+  kernel.writeFile(
+    "/napi/index.js",
+    `
+const crc = require('@node-rs/crc32-wasm32-wasi');
+console.log('crc32=' + crc.crc32('hello'));
+console.log('crc32c=' + crc.crc32c('hello'));
+console.log('crc32-buf=' + crc.crc32(Buffer.from('hello')));
+`,
+  );
+  const napi = await kernel.start("node", ["/napi/index.js"], { cwd: "/napi", capture: true });
+  assert(napi.code === 0 && napi.stdout.includes("crc32=907060870"),
+    "Phase 2 #16 stage 2a: napi-rs wasm32-wasi addon runs via require() over vendored emnapi + our WASI (crc32 matches host)");
+  assert(napi.stdout.includes("crc32c=2591144780"),
+    "Phase 2 #16 stage 2a: a second N-API export (crc32c) returns the correct value");
+  assert(napi.stdout.includes("crc32-buf=907060870"),
+    "Phase 2 #16 stage 2a: N-API accepts a Buffer arg (napi_get_buffer_info) — same crc32 as the string");
+
   // Path B proof: require('net') is Node's REAL vendored lib/net.js +
   // internal/{net,stream_base_commons} running on our tcp_wrap/stream_wrap
   // loopback binding — net.Server/net.Socket are real Duplex streams. Proves an

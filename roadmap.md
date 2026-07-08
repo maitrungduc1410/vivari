@@ -540,7 +540,7 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
     `__ocfetch` path over the new worker boundary.
 15. **Extras (ongoing)** — nested `worker_threads` (our `[worker n]`), heavy toolchains
     (`esbuild`/`vite`/`tsserver` as Wasm), IndexedDB persistence, pre-warm worker pool.
-16. **WASI + napi-rs Wasm runtime (native→wasm packages)** [XL] — **stage 1 DONE.**
+16. **WASI + napi-rs Wasm runtime (native→wasm packages)** [XL] — **stage 1 + 2a DONE.**
     Many modern toolchains ship a `wasm32-wasi` build of their native `.node` addon and
     switch to it on a WebContainer-class host (e.g. Vite's `rolldown` downloads
     `@rolldown/binding-wasm32-wasi`; also `@napi-rs/*`). Two halves: (a) a **WASI preview1
@@ -560,10 +560,31 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
       directory/unlink/rmdir/rename/symlink/readlink); sockets + a few rare `path_*`/`fd_p*`
       variants are stubbed to sensible errnos. **Deferred:** stdin, `poll_oneoff` (event-driven
       guests), thread/`sock_*` support.
-    - **Stage 2 (napi-on-wasm) — TODO.** `emnapi` runtime so N-API addons compiled via
-      napi-rs load; this is what `rolldown`'s `wasm32-wasi` binding needs on top of WASI.
-      The real unlock for "install Vite and it just builds". Pairs with the "detect env →
-      fetch the wasm variant" logic real npm/pnpm already have (see North Star).
+    - **Stage 2a (napi-on-wasm, sync addons) — DONE.** A **real N-API native addon**
+      (`@node-rs/crc32-wasm32-wasi`, a Rust crate → `wasm32-wasi`) now runs **unmodified via
+      `require()`**. Key finding: the whole napi host is **pure JS** — we vendor
+      `@napi-rs/wasm-runtime` (esbuild-bundled to one self-contained CJS: emnapi
+      `@emnapi/core`+`runtime`+`wasi-threads`, `@tybys/wasm-util`, tslib) as a lazy builtin
+      (`packages/runtime/node/vendor/napi-wasm-runtime.js`). It implements the ~150 `napi_*` C
+      ABI functions in JS over a handle table; the addon's `wasi_snapshot_preview1` imports are
+      satisfied by **our own `require('wasi')`** (compatible because reactor addons take the
+      `wasi.initialize()` path — no `_start`, no `node:wasi` internals). Three runtime enablers:
+      (1) `require()` export-condition order now prefers CJS `default` over ESM `import` (Node's
+      require() semantics — fixed dual packages like tslib); (2) a minimal `worker_threads` shim
+      so napi wrappers load (`Worker` throws until 2b, but sync addons never construct it —
+      emnapi's async-work pool is lazy); (3) `wasi.initialize()` reactor path. Verified headless
+      (`verify-node`: crc32/crc32c + a `Buffer` arg via `napi_get_buffer_info`, matching host
+      Node byte-for-byte) + a browser `/api/napi` route. Addon vendored at
+      `packages/demo/vendor/napi-crc32/` (prebuilt `.wasm`, can't be rebuilt locally without
+      wasi-sdk/@napi-rs/cli).
+    - **Stage 2b (threads) — TODO.** Multi-threaded addons (and `rolldown`) call emnapi's
+      `onCreateWorker()` (async-work pool / pthreads). Needs **nested worker spawn from inside a
+      process worker** wired to napi-rs's `wasi-worker` + the `fs-proxy` Atomics/SAB protocol —
+      a new architectural capability (today workers are spawned only by the kernel).
+    - **Stage 2c (npm auto-selects the wasm build) — TODO.** `npm install` must pick the
+      `*-wasm32-wasi` variant (napi-rs packages gate it behind `cpu:["wasm32"]` +
+      `optionalDependencies` + a JS wrapper), like StackBlitz auto-downloading `rolldown-wasm`.
+      Pairs with the "detect env → fetch the wasm variant" logic real npm/pnpm have (North Star).
     - *Note:* esbuild-wasm is **Go/js** (uses `wasm_exec.js`, not WASI) and `@swc/wasm` is
       **wasm-bindgen web** (not WASI) — those are separate loaders, not covered by this item.
     Depends on: stable fs/VFS contract (#14 ✓), ESM (#13 ✓).

@@ -56,10 +56,14 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     }
   };
 
-  // package.json "exports"/"imports" condition resolution. We consume both CJS
-  // and (transpiled) ESM, so prefer the CJS "require" entry, then ESM "import",
-  // then "default" — this keeps transpile surface minimal for dual packages.
-  const EXPORT_CONDITIONS = ["node", "require", "import", "default"];
+  // package.json "exports"/"imports" condition resolution. Everything in this
+  // runtime is loaded through require() (ESM is transpiled to CJS at load), so we
+  // resolve like Node's require(): "node"/"require" first, then "default", and
+  // only fall to "import" last. Putting "default" ahead of "import" matters for
+  // dual packages that omit a "require" key but ship a CJS "default" (e.g.
+  // tslib: { module, import: <esm>, default: <cjs> }) — require() must land on
+  // the CJS default, not the ESM import.
+  const EXPORT_CONDITIONS = ["node", "require", "default", "import"];
   function pickCondition(val) {
     if (typeof val === "string") return val;
     if (Array.isArray(val)) {

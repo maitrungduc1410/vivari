@@ -113,10 +113,15 @@ import constantsFactory2 from "./lib/constants.js";
 // WASI preview1 runtime (Phase 2 #16 stage 1): run wasm32-wasi commands over
 // our VFS via require('wasi').
 import wasiFactory from "./lib/wasi.js";
+// worker_threads shim (Phase 2 #16 stage 2a): lets napi-rs wasm wrappers load.
+import workerThreadsFactory from "./lib/worker_threads.js";
 
 // Vendored third-party (not a Node core module): real node-semver, used by the
 // npm program (Phase 2 #10 stage 2). Lazy — only instantiated when required.
 import semverFactory from "./vendor/semver.js";
+// Vendored @napi-rs/wasm-runtime (Phase 2 #16 stage 2a): the emnapi host that
+// runs N-API addons compiled to wasm32-wasi. Lazy — only when an addon needs it.
+import napiWasmRuntimeFactory from "./vendor/napi-wasm-runtime.js";
 
 // name -> factory. Public builtins (e.g. "path") and internals ("internal/...")
 // live in the same table, just like Node's builtin id space.
@@ -206,7 +211,9 @@ const FACTORIES = {
   console: consoleFactory,
   constants: constantsFactory2,
   wasi: wasiFactory,
+  worker_threads: workerThreadsFactory,
   semver: semverFactory,
+  "@napi-rs/wasm-runtime": napiWasmRuntimeFactory,
 };
 
 const strip = (name) => (name.startsWith("node:") ? name.slice(5) : name);

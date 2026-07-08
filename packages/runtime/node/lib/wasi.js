@@ -247,10 +247,17 @@ export default function (exports, require, module, process) {
       }
       function random_get(ptr, len) {
         const buf = new Uint8Array(self._memory.buffer, ptr, len);
-        if (globalThis.crypto && globalThis.crypto.getRandomValues) {
-          // getRandomValues caps at 65536 bytes per call.
+        const c = globalThis.crypto;
+        if (c && c.getRandomValues) {
+          // crypto.getRandomValues throws on a view backed by a SharedArrayBuffer
+          // ("must not be shared") — which is exactly the guest's memory when it
+          // uses shared memory (e.g. napi-on-wasm addons). So fill a private,
+          // non-shared buffer and copy in. (getRandomValues caps at 65536/call.)
+          const tmp = new Uint8Array(Math.min(len, 65536));
           for (let off = 0; off < len; off += 65536) {
-            globalThis.crypto.getRandomValues(buf.subarray(off, Math.min(off + 65536, len)));
+            const n = Math.min(65536, len - off);
+            c.getRandomValues(n === tmp.length ? tmp : tmp.subarray(0, n));
+            buf.set(tmp.subarray(0, n), off);
           }
         } else {
           for (let i = 0; i < len; i++) buf[i] = (Math.random() * 256) | 0;

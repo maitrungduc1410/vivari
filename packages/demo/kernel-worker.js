@@ -385,6 +385,37 @@ const server = http.createServer(async (req, res) => {
     res.end(body);
     return;
   }
+  if (req.url === '/api/napi') {
+    // Phase 2 #16 stage 2a: a REAL N-API native addon compiled to wasm32-wasi
+    // (@node-rs/crc32-wasm32-wasi, a Rust crate) run unmodified via require().
+    // Its napi-rs wrapper loads our vendored @napi-rs/wasm-runtime (the emnapi
+    // host, pure JS, implementing the napi_* C ABI in JS) and satisfies the
+    // wasm's wasi_snapshot_preview1 imports with our own require('wasi').
+    try {
+      const crc = require('@node-rs/crc32-wasm32-wasi');
+      const text = 'OpenContainer · napi-on-wasm';
+      const body = Buffer.from(JSON.stringify({
+        node: process.version,
+        note: 'A real N-API native addon (Rust → wasm32-wasi) run via require() over vendored emnapi + our WASI (#16 stage 2a), in the browser.',
+        addon: '@node-rs/crc32-wasm32-wasi',
+        crc32_hello: crc.crc32('hello'),
+        crc32c_hello: crc.crc32c('hello'),
+        crc32_text: crc.crc32(text),
+        crc32_buffer_arg: crc.crc32(Buffer.from(text)),
+      }, null, 2), 'utf8');
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(body);
+    } catch (err) {
+      console.error('[napi] route failed: ' + (err && err.stack || err));
+      const body = Buffer.from(JSON.stringify({
+        error: String(err && err.message || err),
+        stack: String(err && err.stack || ''),
+      }, null, 2), 'utf8');
+      res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(body);
+    }
+    return;
+  }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(\`<!doctype html>
 <html><head><meta charset="utf-8"><title>Hello from OpenContainer</title>
@@ -412,6 +443,7 @@ const server = http.createServer(async (req, res) => {
   <button onclick="fetch('api/crypto').then(r=>r.json()).then(t=>document.getElementById('c').textContent=JSON.stringify(t,null,2))">GET /api/crypto (hash + AES-GCM)</button>
   <button onclick="fetch('api/esm').then(r=>r.json()).then(t=>document.getElementById('e').textContent=JSON.stringify(t,null,2))">GET /api/esm (import/export)</button>
   <button onclick="fetch('api/wasi').then(r=>r.json()).then(t=>document.getElementById('w').textContent=JSON.stringify(t,null,2))">GET /api/wasi (wasm32-wasi CLI)</button>
+  <button onclick="fetch('api/napi').then(r=>r.json()).then(t=>document.getElementById('np').textContent=JSON.stringify(t,null,2))">GET /api/napi (N-API addon on wasm)</button>
   <button onclick="var el=document.getElementById('nf');el.textContent='fetching npm registry…';fetch('api/fetch').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2)).catch(e=>el.textContent=String(e))">GET /api/fetch (npm registry)</button>
   <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
   <pre id="t"></pre>
@@ -425,6 +457,7 @@ const server = http.createServer(async (req, res) => {
   <pre id="c"></pre>
   <pre id="e"></pre>
   <pre id="w"></pre>
+  <pre id="np"></pre>
   <pre id="nf"></pre>
 </div></body></html>\`);
 });
@@ -601,6 +634,22 @@ async function boot() {
     kernel.writeFile("/wasi/wasi_demo.wasm", wasiWasm);
   } catch (err) {
     post("log", { line: "  [wasi] demo wasm unavailable: " + (err && err.message), cls: "muted" });
+  }
+
+  // Phase 2 #16 stage 2a: seed a REAL N-API native addon compiled to wasm32-wasi
+  // (@node-rs/crc32-wasm32-wasi) so /api/napi can `require()` it. Its napi-rs
+  // wrapper runs on our vendored @napi-rs/wasm-runtime (emnapi host) + our WASI.
+  try {
+    const base = new URL("./vendor/napi-crc32/", import.meta.url);
+    const grab = async (f) => new Uint8Array(await (await fetch(new URL(f, base))).arrayBuffer());
+    const dec = new TextDecoder();
+    kernel.mkdirp("/srv/node_modules/@node-rs/crc32-wasm32-wasi");
+    const d = "/srv/node_modules/@node-rs/crc32-wasm32-wasi/";
+    kernel.writeFile(d + "package.json", dec.decode(await grab("package.json")));
+    kernel.writeFile(d + "crc32.wasi.cjs", dec.decode(await grab("crc32.wasi.cjs")));
+    kernel.writeFile(d + "crc32.wasm32-wasi.wasm", await grab("crc32.wasm32-wasi.wasm"));
+  } catch (err) {
+    post("log", { line: "  [napi] crc32 addon unavailable: " + (err && err.message), cls: "muted" });
   }
 
   post("log", { line: "$ sh /root.sh", cls: "muted" });
