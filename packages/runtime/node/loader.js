@@ -110,6 +110,10 @@ import timersPromisesFactory from "./lib/timers/promises.js";
 import consoleFactory from "./lib/console.js";
 import constantsFactory2 from "./lib/constants.js";
 
+// WASI preview1 runtime (Phase 2 #16 stage 1): run wasm32-wasi commands over
+// our VFS via require('wasi').
+import wasiFactory from "./lib/wasi.js";
+
 // Vendored third-party (not a Node core module): real node-semver, used by the
 // npm program (Phase 2 #10 stage 2). Lazy — only instantiated when required.
 import semverFactory from "./vendor/semver.js";
@@ -201,6 +205,7 @@ const FACTORIES = {
   "timers/promises": timersPromisesFactory,
   console: consoleFactory,
   constants: constantsFactory2,
+  wasi: wasiFactory,
   semver: semverFactory,
 };
 

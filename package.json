@@ -14,6 +14,7 @@
     "build:codec:node": "wasm-pack build packages/codec --target nodejs --out-dir pkg-node",
     "build:crypto": "wasm-pack build packages/crypto --target web --out-dir pkg",
     "build:crypto:node": "wasm-pack build packages/crypto --target nodejs --out-dir pkg-node",
-    "build": "npm run build:kernel && npm run build:kernel:node && npm run build:codec && npm run build:codec:node && npm run build:crypto && npm run build:crypto:node"
+    "build:wasi-demo": "cargo build --release --manifest-path packages/wasi-demo/Cargo.toml --target wasm32-wasip1 && cp packages/wasi-demo/target/wasm32-wasip1/release/wasi_demo.wasm packages/wasi-demo/pkg/wasi_demo.wasm",
+    "build": "npm run build:kernel && npm run build:kernel:node && npm run build:codec && npm run build:codec:node && npm run build:crypto && npm run build:crypto:node && npm run build:wasi-demo"
   }
 }

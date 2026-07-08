@@ -353,6 +353,38 @@ const server = http.createServer(async (req, res) => {
     res.end(body);
     return;
   }
+  if (req.url === '/api/wasi') {
+    // Phase 2 #16: a real Rust CLI compiled to wasm32-wasip1 (packages/wasi-demo),
+    // run unmodified via require('wasi'). It reads argv/env, opens a file in a
+    // preopened dir, uppercases it, and writes an output file — every fd/path call
+    // bridged to our VFS. Sync compile+instantiate is allowed here (we're a Worker).
+    const fs = require('fs');
+    const { WASI } = require('wasi');
+    const input = 'hello from the browser · wasm32-wasi';
+    fs.mkdirSync('/work', { recursive: true });
+    fs.writeFileSync('/work/in.txt', input + '\\n');
+    const wasi = new WASI({
+      version: 'preview1',
+      args: ['wasi_demo', '/work/in.txt', '/work/out.txt'],
+      env: { WASI_GREETING: 'browser' },
+      preopens: { '/work': '/work' },
+    });
+    const mod = new WebAssembly.Module(fs.readFileSync('/wasi/wasi_demo.wasm'));
+    const instance = new WebAssembly.Instance(mod, wasi.getImportObject());
+    const exitCode = wasi.start(instance);
+    const output = fs.readFileSync('/work/out.txt', 'utf8');
+    const body = Buffer.from(JSON.stringify({
+      node: process.version,
+      note: 'A real Rust CLI compiled to wasm32-wasip1, run via require("wasi") — argv/env/preopen + fd_read/fd_write bridged to the VFS (#16 stage 1), in the browser.',
+      input,
+      output,
+      exitCode,
+      wasmBytes: fs.statSync('/wasi/wasi_demo.wasm').size,
+    }, null, 2), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(body);
+    return;
+  }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(\`<!doctype html>
 <html><head><meta charset="utf-8"><title>Hello from OpenContainer</title>
@@ -379,6 +411,7 @@ const server = http.createServer(async (req, res) => {
   <button onclick="fetch('api/zlib').then(r=>r.json()).then(t=>document.getElementById('z').textContent=JSON.stringify(t,null,2))">GET /api/zlib (gzip + crc32)</button>
   <button onclick="fetch('api/crypto').then(r=>r.json()).then(t=>document.getElementById('c').textContent=JSON.stringify(t,null,2))">GET /api/crypto (hash + AES-GCM)</button>
   <button onclick="fetch('api/esm').then(r=>r.json()).then(t=>document.getElementById('e').textContent=JSON.stringify(t,null,2))">GET /api/esm (import/export)</button>
+  <button onclick="fetch('api/wasi').then(r=>r.json()).then(t=>document.getElementById('w').textContent=JSON.stringify(t,null,2))">GET /api/wasi (wasm32-wasi CLI)</button>
   <button onclick="var el=document.getElementById('nf');el.textContent='fetching npm registry…';fetch('api/fetch').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2)).catch(e=>el.textContent=String(e))">GET /api/fetch (npm registry)</button>
   <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
   <pre id="t"></pre>
@@ -391,6 +424,7 @@ const server = http.createServer(async (req, res) => {
   <pre id="z"></pre>
   <pre id="c"></pre>
   <pre id="e"></pre>
+  <pre id="w"></pre>
   <pre id="nf"></pre>
 </div></body></html>\`);
 });
@@ -556,6 +590,18 @@ async function boot() {
       "export const metaUrl = import.meta.url;\n" +
       "export async function loadLazy(){ const m = await import('./lazy.mjs'); return m.default; }\n",
   );
+
+  // Phase 2 #16: seed the wasm32-wasip1 CLI so /api/wasi can run it via
+  // require('wasi'). Fetched here (async) and materialized in the VFS.
+  try {
+    const wasiWasm = new Uint8Array(
+      await (await fetch(new URL("../wasi-demo/pkg/wasi_demo.wasm", import.meta.url))).arrayBuffer(),
+    );
+    kernel.mkdirp("/wasi");
+    kernel.writeFile("/wasi/wasi_demo.wasm", wasiWasm);
+  } catch (err) {
+    post("log", { line: "  [wasi] demo wasm unavailable: " + (err && err.message), cls: "muted" });
+  }
 
   post("log", { line: "$ sh /root.sh", cls: "muted" });
   await kernel.start("sh", ["/root.sh"], { cwd: "/" });

@@ -1,0 +1,15 @@
+[package]
+name = "open-webcontainer-wasi-demo"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny wasm32-wasip1 CLI used to prove OpenContainer's WASI preview1 runtime (#16 stage 1): reads args/env, reads a file from a preopened dir, transforms it, writes a file + stdout/stderr — all bridged to our VFS."
+license = "MIT"
+
+[[bin]]
+name = "wasi_demo"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true

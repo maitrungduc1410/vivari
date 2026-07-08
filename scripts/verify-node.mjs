@@ -11,6 +11,7 @@
 import { Worker, MessageChannel } from "node:worker_threads";
 import { gzipSync } from "node:zlib";
 import nodeCrypto from "node:crypto";
+import { readFileSync } from "node:fs";
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
@@ -940,6 +941,43 @@ main().catch((e) => { console.error('COMPAT_FAIL', (e && e.stack) || e); process
   assert(compat.stdout.includes("OK dns"), "consolidation: dns loopback lookup (callback + promises + resolve4)");
   assert(compat.stdout.includes("OK net-hostname"),
     "consolidation: net.connect(port, 'localhost') resolves via the new dns (vendored net.js hostname path)");
+
+  // === #16: WASI preview1 — run a real wasm32-wasi CLI over our VFS ===
+  // A Rust binary compiled to wasm32-wasip1 (packages/wasi-demo) runs unmodified
+  // via require('wasi'): it reads argv/env, opens a file in a preopened dir,
+  // uppercases it, and writes an output file + stdout — every fd/path call
+  // bridged to our VFS. The expected bytes match this same .wasm run under the
+  // host's own node:wasi, so this is a real interop proof, not a self-check.
+  kernel.mkdirp("/wasi");
+  kernel.writeFile("/wasi/wasi_demo.wasm", new Uint8Array(readFileSync(new URL("../packages/wasi-demo/pkg/wasi_demo.wasm", import.meta.url))));
+  kernel.mkdirp("/work");
+  kernel.writeFile("/work/in.txt", "hello wasi\n");
+  kernel.writeFile(
+    "/t/wasitest.js",
+    `
+const fs = require('fs');
+const { WASI } = require('wasi');
+const bytes = fs.readFileSync('/wasi/wasi_demo.wasm');
+const wasi = new WASI({
+  version: 'preview1',
+  args: ['wasi_demo', '/work/in.txt', '/work/out.txt'],
+  env: { WASI_GREETING: 'salut' },
+  preopens: { '/work': '/work' },
+});
+// Sync compile+instantiate — allowed in a Worker for any size (we are one).
+const mod = new WebAssembly.Module(bytes);
+const instance = new WebAssembly.Instance(mod, wasi.getImportObject());
+const code = wasi.start(instance);
+console.log('exit=' + code);
+console.log('out=' + JSON.stringify(fs.readFileSync('/work/out.txt', 'utf8')));
+`,
+  );
+  const w = await kernel.start("node", ["/t/wasitest.js"], { cwd: "/t", capture: true });
+  assert(w.code === 0 && w.stdout.includes("salut: HELLO WASI"),
+    "Phase 2 #16: wasm32-wasi CLI runs via require('wasi') — argv/env/preopen/fd_write to stdout over the VFS");
+  assert(w.stdout.includes("exit=0"), "Phase 2 #16: WASI _start + proc_exit return exit code 0");
+  assert(w.stdout.includes('out="HELLO WASI\\n"'),
+    "Phase 2 #16: guest path_open + fd_read/fd_write landed output in the VFS (matches host node:wasi)");
 
   // Path B proof: require('net') is Node's REAL vendored lib/net.js +
   // internal/{net,stream_base_commons} running on our tcp_wrap/stream_wrap

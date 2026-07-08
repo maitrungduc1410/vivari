@@ -540,15 +540,33 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
     `__ocfetch` path over the new worker boundary.
 15. **Extras (ongoing)** — nested `worker_threads` (our `[worker n]`), heavy toolchains
     (`esbuild`/`vite`/`tsserver` as Wasm), IndexedDB persistence, pre-warm worker pool.
-16. **WASI + napi-rs Wasm runtime (native→wasm packages)** [XL] — *future goal.* Many
-    modern toolchains ship a `wasm32-wasi` build of their native `.node` addon and switch to
-    it when they detect a WebContainer-class host (e.g. Vite's `rolldown` downloads
-    `@rolldown/binding-wasm32-wasi`; also esbuild-wasm, `@swc/wasm`, `@napi-rs/*`). To run
-    them we need (a) a **WASI preview1 shim** bridged to our VFS + a fake clock/argv/env, and
-    (b) **napi-on-wasm** (`emnapi`) so N-API addons compiled via napi-rs load. This is the
-    real unlock for "install Vite and it just builds" without us hand-porting each tool.
-    Depends on: stable fs/VFS contract (#14), ESM (#13). Pairs with the "detect env → fetch
-    the wasm variant" logic real npm/pnpm already have (see North Star).
+16. **WASI + napi-rs Wasm runtime (native→wasm packages)** [XL] — **stage 1 DONE.**
+    Many modern toolchains ship a `wasm32-wasi` build of their native `.node` addon and
+    switch to it on a WebContainer-class host (e.g. Vite's `rolldown` downloads
+    `@rolldown/binding-wasm32-wasi`; also `@napi-rs/*`). Two halves: (a) a **WASI preview1
+    shim** bridged to our VFS, and (b) **napi-on-wasm** (`emnapi`) for N-API addons.
+    - **Stage 1 (WASI preview1) — DONE.** `require('wasi')` (`packages/runtime/node/lib/wasi.js`)
+      implements Node's `WASI` class over our world: fd/path calls → real `fs` (→ VFS in the
+      File System Worker), argv/environ from the constructor, clock from Date/perf, randomness
+      from WebCrypto, stdio through `process`. `.start()` runs `_start` and returns the exit
+      code (proc_exit unwinds). Proven by a **real Rust CLI compiled to `wasm32-wasip1`**
+      (`packages/wasi-demo`, vendored `.wasm`, `npm run build:wasi-demo`) run unmodified via
+      sync `WebAssembly.Module`/`Instance` (allowed in a Worker for any size). It reads
+      argv/env, opens a preopened dir, reads+uppercases a file, writes an output file +
+      stdout — output matches the **host's own `node:wasi`** byte-for-byte (real interop, not
+      a self-check). Verified headless (`verify-node`, 3 assertions) + a browser `/api/wasi`
+      route. CLI-critical calls are real (args/environ/clock/random/fd_read/fd_write/fd_seek/
+      fd_close/fd_fdstat/fd_filestat/fd_prestat/fd_readdir/path_open/path_filestat/path_create_
+      directory/unlink/rmdir/rename/symlink/readlink); sockets + a few rare `path_*`/`fd_p*`
+      variants are stubbed to sensible errnos. **Deferred:** stdin, `poll_oneoff` (event-driven
+      guests), thread/`sock_*` support.
+    - **Stage 2 (napi-on-wasm) — TODO.** `emnapi` runtime so N-API addons compiled via
+      napi-rs load; this is what `rolldown`'s `wasm32-wasi` binding needs on top of WASI.
+      The real unlock for "install Vite and it just builds". Pairs with the "detect env →
+      fetch the wasm variant" logic real npm/pnpm already have (see North Star).
+    - *Note:* esbuild-wasm is **Go/js** (uses `wasm_exec.js`, not WASI) and `@swc/wasm` is
+      **wasm-bindgen web** (not WASI) — those are separate loaders, not covered by this item.
+    Depends on: stable fs/VFS contract (#14 ✓), ESM (#13 ✓).
 
 ## Why this order (the tradeoffs)
 
