@@ -299,6 +299,17 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads } = {}) 
       if (netResolve) netResolve();
       else netPending = true;
     },
+    // Stop the loop with `code` and wake any idle wait so drive() returns promptly.
+    // Used by process.exit() so it works even when its throw-sentinel escapes the
+    // loop (e.g. called from a raw Promise microtask, outside runCallback).
+    requestExit: (code) => {
+      if (!exiting) {
+        exiting = true;
+        exitCode = code | 0;
+      }
+      if (netResolve) netResolve();
+      else netPending = true;
+    },
     drive,
   });
 }

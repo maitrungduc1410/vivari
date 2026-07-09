@@ -1424,6 +1424,37 @@ WebAssembly.compile(bytes).then(
   assert(hw.code === 0 && hw.stdout.includes("WASM_COMPILE_OK true"),
     "Event loop: a pending WebAssembly.compile keeps the loop alive (no manual keep-alive)");
 
+  // process.exit() from a raw Promise microtask (async continuation) — its throw
+  // sentinel escapes the loop's runCallback, but exit() also flags the loop and a
+  // host-realm safety net swallows the escaped sentinel. Must exit with the code,
+  // not crash the worker. (Before the fix this aborted the worker / lost the code.)
+  kernel.writeFile(
+    "/t/exitmicro.js",
+    `
+(async () => {
+  await Promise.resolve();
+  console.log('BEFORE_EXIT');
+  process.exit(3);
+  console.log('AFTER_EXIT_SHOULD_NOT_PRINT');
+})();
+`,
+  );
+  const ex1 = await kernel.start("node", ["/t/exitmicro.js"], { cwd: "/t", capture: true });
+  assert(
+    ex1.code === 3 && ex1.stdout.includes("BEFORE_EXIT") && !ex1.stdout.includes("AFTER_EXIT_SHOULD_NOT_PRINT"),
+    "process.exit(): honoured from an async continuation microtask (code 3, stops synchronously)",
+  );
+
+  // process.exit() from a Promise .catch() handler (the exact shape that crashed
+  // the esbuild test): a rejected chain whose handler exits.
+  kernel.writeFile(
+    "/t/exitcatch.js",
+    `Promise.reject(new Error('boom')).catch(() => { console.log('IN_CATCH'); process.exit(7); });`,
+  );
+  const ex2 = await kernel.start("node", ["/t/exitcatch.js"], { cwd: "/t", capture: true });
+  assert(ex2.code === 7 && ex2.stdout.includes("IN_CATCH"),
+    "process.exit(): honoured from a Promise .catch() handler (code 7)");
+
   // === #15: async child_process.spawn — streaming stdio + exit + kill =========
   // A child that prints across timers proves output STREAMS live (arrives as
   // multiple 'data' events while the child runs its own loop), not buffered until

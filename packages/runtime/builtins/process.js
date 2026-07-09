@@ -2,7 +2,7 @@
 // injected callbacks; `exit()` throws a sentinel that the runner turns into an
 // exit code.
 
-export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/", stdout, stderr, nextTick }) {
+export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/", stdout, stderr, nextTick, onExit }) {
   let _cwd = cwd || "/";
   // nextTick is owned by the event loop (loop.js): its queue drains ahead of
   // Promise microtasks each turn. Fall back to a microtask if no loop is wired.
@@ -60,8 +60,20 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
       _cwd = dir;
     },
     exit: (code = 0) => {
+      const c = code | 0;
+      // Proactively flag the loop to stop so drive() returns `c` even if the
+      // throw below escapes the loop (e.g. exit() called from a Promise
+      // microtask, outside the loop's runCallback try/catch). The throw still
+      // unwinds the current synchronous stack, matching Node's "stop now".
+      if (typeof onExit === "function") {
+        try {
+          onExit(c);
+        } catch {
+          /* ignore */
+        }
+      }
       const err = new Error("process.exit called");
-      err.__processExit = code;
+      err.__processExit = c;
       throw err;
     },
     nextTick: (fn, ...args) => scheduleTick(fn, ...args),

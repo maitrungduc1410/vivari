@@ -119,12 +119,10 @@ kernel.writeFile(
 const fs = require('fs');
 const esbuild = require('esbuild-wasm/lib/browser.js');
 const wasmPath = require.resolve('esbuild-wasm/esbuild.wasm');
-// hostLiveness now keeps the loop alive through async host work, but esbuild's Go
-// service parks on a stdin reader that never ends, so we still exit explicitly —
-// and process.exit() must run from a loop-managed callback (its throw-sentinel is
-// only caught there, not in a raw Promise microtask), hence the keep-alive timer.
-let done = false, code = 0;
-const keepAlive = setInterval(() => { if (done) { clearInterval(keepAlive); process.exit(code); } }, 15);
+// No manual keep-alive: hostLiveness holds the loop through the async
+// WebAssembly.compile, and process.exit() now works from an async continuation
+// (esbuild's Go service parks on a stdin reader that never ends, so we exit
+// explicitly once the work is done).
 (async () => {
   const wasmModule = await WebAssembly.compile(fs.readFileSync(wasmPath));
   await esbuild.initialize({ wasmModule, worker: false });
@@ -135,8 +133,8 @@ const keepAlive = setInterval(() => { if (done) { clearInterval(keepAlive); proc
   });
   console.log('ESB_TRANSFORM:' + JSON.stringify(t.code));
   console.log('ESB_BUILD:' + JSON.stringify(b.outputFiles[0].text));
-  done = true;
-})().catch((e) => { console.error('ESB_ERR:' + (e && e.stack || e)); code = 1; done = true; });
+  process.exit(0);
+})().catch((e) => { console.error('ESB_ERR:' + (e && e.stack || e)); process.exit(1); });
 `,
 );
 const er = await kernel.start("node", ["run.js"], { cwd: "/esb", capture: true });

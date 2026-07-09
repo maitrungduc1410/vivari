@@ -106,7 +106,19 @@ export function createRuntime({
   });
 
   const os = createOs();
-  const process = createProcess({ pid, ppid, argv, env, cwd, stdout, stderr, nextTick: loop.nextTick });
+  const process = createProcess({
+    pid,
+    ppid,
+    argv,
+    env,
+    cwd,
+    stdout,
+    stderr,
+    nextTick: loop.nextTick,
+    // process.exit() flags the loop so drive() returns the right code even when
+    // exit() is called from a raw Promise microtask (its throw would escape).
+    onExit: (code) => loop.requestExit(code),
+  });
 
   // Wire the worker_threads host onto `process` so the lazily-required
   // node:worker_threads builtin (2b) can read this thread's identity, spawn nested
@@ -251,6 +263,10 @@ export function createRuntime({
     console: consoleObj,
     global: globalThis,
   };
+  // Capture the *host realm* process before we shadow it: in a Node worker_threads
+  // runtime this is the real Node process (used for the exit-sentinel safety net
+  // below); in a browser Worker it's undefined and we fall back to event listeners.
+  const hostRealmProcess = globalThis.process;
   globalThis.process = process;
   globalThis.Buffer = Buffer;
   globalThis.console = consoleObj;
@@ -294,6 +310,41 @@ export function createRuntime({
   }
   if (typeof Blob !== "undefined" && Blob.prototype) {
     for (const m of ["arrayBuffer", "text"]) wrapHostAsync(Blob.prototype, m);
+  }
+
+  // Exit-sentinel safety net. process.exit() throws a sentinel that the loop's
+  // runCallback catches — but when exit() is called from a raw Promise microtask
+  // (async continuation / .then / .catch / queueMicrotask) the throw escapes the
+  // loop and would crash the worker realm (Node aborts on an unhandled rejection;
+  // browsers fire 'error'/'unhandledrejection'). exit() already flagged the loop
+  // (onExit -> requestExit) so drive() will still return the right code; here we
+  // just keep the escaped sentinel from taking the whole worker down. Genuine
+  // errors are left untouched.
+  const isExitSentinel = (v) => v && typeof v === "object" && v.__processExit !== undefined;
+  if (hostRealmProcess && typeof hostRealmProcess.on === "function") {
+    hostRealmProcess.on("unhandledRejection", (reason) => {
+      if (isExitSentinel(reason)) loop.requestExit(reason.__processExit);
+      else throw reason; // escalate a genuine rejection to uncaughtException (default reporting)
+    });
+    hostRealmProcess.on("uncaughtException", (err) => {
+      if (isExitSentinel(err)) loop.requestExit(err.__processExit);
+      else throw err; // preserve normal crash reporting for real errors
+    });
+  } else if (typeof globalThis.addEventListener === "function") {
+    globalThis.addEventListener("unhandledrejection", (ev) => {
+      const r = ev && ev.reason;
+      if (isExitSentinel(r)) {
+        ev.preventDefault?.();
+        loop.requestExit(r.__processExit);
+      }
+    });
+    globalThis.addEventListener("error", (ev) => {
+      const r = ev && (ev.error ?? ev.reason);
+      if (isExitSentinel(r)) {
+        ev.preventDefault?.();
+        loop.requestExit(r.__processExit);
+      }
+    });
   }
   // Route user-facing timers through our event loop so ordering is Node-correct
   // and callbacks fire even while a server is running (the old host timers never

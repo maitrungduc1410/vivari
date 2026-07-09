@@ -693,10 +693,18 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
       readers) no longer races the loop to exit — no manual keep-alive needed. The few entry
       points are monkey-patched to track their returned promise (idempotent, per-process
       realm). Verified headless (`verify-node`: a bare `await WebAssembly.compile` prints and
-      exits 0). Remaining ergonomic gap (separate): `process.exit()` throws a sentinel only
-      `runCallback` catches, so calling it from a raw Promise microtask (not a timer/
-      nextTick/handler) still escapes — long-running libs like esbuild's parked stdin service
-      exit via a ref'd keep-alive timer for now.
+      exits 0).
+    - **`process.exit()` from any context — DONE.** exit() used to throw a sentinel that only
+      the loop's `runCallback` caught, so calling it from a raw Promise microtask (async
+      continuation / `.then` / `.catch` / `queueMicrotask`) escaped the loop and crashed the
+      worker (Node aborts on the unhandled rejection). Now exit() also flags the loop
+      (`onExit -> loop.requestExit(code)`, `packages/runtime/{index,loop,builtins/process}.js`)
+      so `drive()` returns the right code, and a host-realm safety net swallows the escaped
+      sentinel (Node: `process.on('unhandledRejection'|'uncaughtException')`, re-throwing
+      genuine errors; browser: `unhandledrejection`/`error` listeners, only preventing the
+      default for our sentinel). Verified headless (exit from an async continuation → code 3;
+      exit from a `.catch` → code 7). The esbuild test now runs in its clean form — no
+      keep-alive timer, `process.exit(0)` straight from the async body.
 
 ## Why this order (the tradeoffs)
 
