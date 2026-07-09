@@ -139,6 +139,15 @@
       .editor-head code {
         color: #79c0ff;
       }
+      #editor-file {
+        font: inherit;
+        font-size: 11px;
+        background: #0b0e14;
+        color: #79c0ff;
+        border: 1px solid #1c2230;
+        border-radius: 6px;
+        padding: 3px 6px;
+      }
       #editor {
         flex: 1 1 auto;
         min-height: 120px;
@@ -188,7 +197,7 @@
         </div>
         <div class="editor-panel" id="editor-panel" hidden>
           <div class="editor-head">
-            <code id="editor-path">—</code>
+            <select id="editor-file" title="file to edit"></select>
             <button id="apply-edit">Save → hot-update (no reload)</button>
           </div>
           <textarea id="editor" spellcheck="false"></textarea>

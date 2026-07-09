@@ -667,7 +667,6 @@ app.listen(3100, () =>
 // full page reload — the classic Vite HMR boundary, proven end to end.
 const VITE_PORT = 5199;
 const VITE_DIR = "/vite-app";
-const VITE_EDIT_PATH = VITE_DIR + "/src/message.js";
 const VITE_APP = {
   "package.json": JSON.stringify(
     { name: "hmr-demo", version: "1.0.0", private: true, type: "module" },
@@ -679,21 +678,37 @@ const VITE_APP = {
     "<style>body{font-family:ui-monospace,Menlo,monospace;background:#0b0e14;color:#d4d7dd;" +
     "display:grid;place-items:center;height:100vh;margin:0}" +
     ".card{border:1px solid #1c2230;border-radius:12px;padding:32px 40px;background:#0e131c;text-align:center;max-width:80%}" +
-    "h1{color:#7ee787;margin:0 0 12px} #msg{font-size:18px;white-space:pre-wrap}" +
+    "h1{color:#7ee787;margin:0 0 12px}" +
     ".hint{color:#6b7385;font-size:12px;margin-top:16px}</style></head>\n" +
     "<body><div class='card'><h1>Vite HMR — live in the browser VM</h1>" +
     "<div id='msg'>…</div>" +
     "<div class='hint'>Served by a real <code>vite</code> dev server running inside OpenContainer.<br>" +
-    "Edit <code>src/message.js</code> in the host editor and save — this updates with no reload.</div>" +
+    "Edit <code>src/message.js</code> (JS module HMR) or <code>src/styles.css</code> (CSS HMR) on the " +
+    "left and save — both update with no page reload.</div>" +
     "</div>\n<script type='module' src='/src/main.js'></script>\n</body>\n</html>\n",
   "src/message.js":
     "export const message =\n  'Hello from Vite HMR running inside OpenContainer!\\n" +
     "Edit me on the left and hit Save — no page reload.';\n",
+  "src/styles.css":
+    "/* Edit me too — Vite hot-swaps CSS with no reload (watch #msg restyle live). */\n" +
+    "#msg {\n" +
+    "  font-size: 20px;\n" +
+    "  white-space: pre-wrap;\n" +
+    "  color: #7ee787;\n" +
+    "  padding: 16px 20px;\n" +
+    "  border: 1px solid #234;\n" +
+    "  border-radius: 10px;\n" +
+    "  background: #0b0e14;\n" +
+    "  transition: color 0.2s, background 0.2s;\n" +
+    "}\n",
   "src/main.js":
+    "import './styles.css';\n" +
     "import { message } from './message.js';\n\n" +
     "const el = document.getElementById('msg');\n" +
     "function render(text) { el.textContent = text; }\n" +
     "render(message);\n\n" +
+    "// JS module HMR boundary. CSS is hot-swapped automatically by Vite (the\n" +
+    "// ./styles.css import is a self-accepting boundary), so no accept() needed.\n" +
     "if (import.meta.hot) {\n" +
     "  import.meta.hot.accept('./message.js', (mod) => {\n" +
     "    render(mod.message);\n" +
@@ -701,6 +716,9 @@ const VITE_APP = {
     "  });\n" +
     "}\n",
 };
+
+// The files the host editor can edit live (absolute VFS paths -> initial text).
+const VITE_EDIT_FILES = [VITE_DIR + "/src/message.js", VITE_DIR + "/src/styles.css"];
 
 // Boots the dev server (HMR enabled). Base stays '/' — the preview SW controls
 // the whole origin and routes Vite's root-absolute URLs (/@vite/client, etc.)
@@ -745,11 +763,9 @@ async function startVite() {
     kernel.start("node", ["dev.js"], { cwd: VITE_DIR }); // NOT awaited
     await waitListen(VITE_PORT);
     post("log", { line: "  [vite] dev server listening on :" + VITE_PORT, cls: "ok" });
-    post("vite-ready", {
-      port: VITE_PORT,
-      editPath: VITE_EDIT_PATH,
-      editContents: VITE_APP["src/message.js"],
-    });
+    const files = {};
+    for (const abs of VITE_EDIT_FILES) files[abs] = VITE_APP[abs.slice(VITE_DIR.length + 1)];
+    post("vite-ready", { port: VITE_PORT, files });
   } catch (err) {
     post("log", { line: "  [vite] " + (err && err.message || err), cls: "err" });
     post("vite-status", { line: "failed to start vite — see the log" });

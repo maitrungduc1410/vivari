@@ -840,15 +840,17 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
       Regression guards: `verify-node` asserts a host write fires a guest process's `fs.watch`
       callback (`'rename'` then `'change'`); `verify-express` asserts editing `/vt/src/main.js`
       invalidates Vite's module graph so the dev server re-transforms it on the next request.
-      - *TODO (optimization, deferred):* fan-out currently loops **every** registered watch on
-        **every** mutation, and runs a `vfs.exists()` per write to pick `rename` vs `change` — even
-        for churn in unwatched subtrees like `node_modules` (e.g. `npm install` running next to a
-        dev server). We don't *watch* node_modules/dist — Vite/chokidar already ignore them, so
-        nothing is registered there — but the matching loop still pays. Fix by **indexing watches by
-        top-level path prefix** so a mutation in a subtree nobody watches is ~O(1) (and skip the
-        `exists()` when no watch can match). Prefer this over a hardcoded ignore list (which risks
-        blocking a legitimate watch and duplicates the client's own `ignored`); an ignore list, if
-        added, should only short-circuit fan-out, never registration.
+      - *Optimization — DONE.* Fan-out used to loop **every** registered watch on **every**
+        mutation and run a `vfs.exists()` per write (to pick `rename` vs `change`), even for churn in
+        unwatched subtrees like `node_modules` (`npm install` next to a dev server). Now watches are
+        **bucketed by their path's top-level segment** (`FsServer.watchesByTop`): a mutation can only
+        be *within* a watch dir if they share a first segment (or the watch is on `/`, bucket `""`,
+        which covers all). `couldNotify(path)` is the ~O(1) gate — it short-circuits both the
+        `exists()` probe and the fan-out when no bucket matches, and `notifyWatch` scans only the
+        path's own bucket (+ the root bucket) instead of the whole registry. Correctness is exact
+        (the coarse bucket only *narrows*; `relWithin` still does the precise check), so a hardcoded
+        ignore list is unnecessary. Guard: `verify-node` asserts churn in an unwatched top-level tree
+        never fires a watcher, while an in-tree write still does.
     - **Stage C — HMR transport — DONE (C1: polyfill `WebSocket` + real RFC6455 framing).** Live
       HMR now pushes to the preview iframe with no reload/poll. Chose C1 (framework-agnostic) over
       C2 (Vite-specific JSON transport): the *frames* are tunnelled, not Vite payloads, so any
@@ -879,12 +881,22 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
         page, which relays to the kernel worker and back. `host.js`/`kernel-worker.js` bridge both
         directions (`oc-ws`).
       - **Demo.** A "Start real Vite dev + HMR" button `npm install vite` + boots `vite dev`
-        (HMR on) in-VM on :5199, swaps the preview to it, and opens a textarea editor on
-        `src/message.js`. The app self-accepts an HMR update on that module (`import.meta.hot.accept`),
-        so saving an edit re-renders the running preview **with no page reload**.
-      - Regression guard: `verify-express` "vite HMR tunnel" boots a hmr-enabled dev server, plays
-        the browser (`handleWsClient` + collect `onWsSend`), and asserts the open ack + Vite's
-        `{type:'connected'}` arrive, then that a file edit pushes a live `update`/`full-reload`.
+        (HMR on) in-VM on :5199, swaps the preview to it, and opens a multi-file editor. Editing
+        `src/message.js` (a `import.meta.hot.accept` JS boundary) re-renders, and editing
+        `src/styles.css` triggers Vite **CSS HMR** — both update the running preview **with no page
+        reload**, showing the transport is content-agnostic.
+      - **Root-scope preview SW.** Vite serves subresources at root-absolute URLs
+        (`/@vite/client`, `/src/main.js`, `/node_modules/...`) that escape a `/packages/demo/`
+        scope, so the preview Service Worker now controls the whole origin (registered with
+        `scope: '/'`, allowed by a `Service-Worker-Allowed: /` header from `server.mjs`) and routes
+        each root-absolute request to the right in-VM port by the **requesting iframe's client URL**
+        (which carries `/preview/<port>/`). This keeps Vite at `base: '/'` and is framework-agnostic.
+      - Regression guards: `verify-express` "vite HMR tunnel" boots a hmr-enabled dev server, plays
+        the browser (`handleWsClient` + collect `onWsSend`), asserts the open ack + Vite's
+        `{type:'connected'}`, then a live `update`/`full-reload` on edit. A second "ws tunnel"
+        section installs the **real `ws` package** (a third-party ws *server*, unmodified, in-VM —
+        proving the http-upgrade path both ways) and round-trips a text frame, a **binary** frame
+        (byte-for-byte, exercising masking + `binaryType`), and a close through the tunnel.
     Order: A → B → C (HMR is meaningless before static serving + change detection work). **All three
     stages are DONE — `vite dev` boots, serves, watches, and hot-reloads in-VM.**
 

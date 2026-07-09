@@ -16,10 +16,11 @@ const previewUrlEl = document.getElementById("preview-url");
 const startViteBtn = document.getElementById("start-vite");
 const hmrStatusEl = document.getElementById("hmr-status");
 const editorPanel = document.getElementById("editor-panel");
-const editorPathEl = document.getElementById("editor-path");
+const editorFileEl = document.getElementById("editor-file");
 const editorEl = document.getElementById("editor");
 const applyEditBtn = document.getElementById("apply-edit");
 let previewPort = null; // the first server to listen wins the preview iframe
+let editorFiles = {}; // absolute VFS path -> current editor text (the HMR demo)
 
 function print(line, cls = "") {
   const el = document.createElement("div");
@@ -128,11 +129,21 @@ async function main() {
         frame.src = `./preview/${m.port}/`;
         startViteBtn.textContent = "Vite dev running";
         startViteBtn.disabled = true;
-        hmrStatusEl.textContent = "edit the file below, then save — the app hot-updates with no reload";
-        editorPathEl.textContent = m.editPath;
-        editorEl.value = m.editContents;
+        hmrStatusEl.textContent = "pick a file, edit, then save — the app hot-updates with no reload";
+        editorFiles = m.files || {};
+        editorFileEl.innerHTML = "";
+        for (const path of Object.keys(editorFiles)) {
+          const opt = document.createElement("option");
+          opt.value = path;
+          opt.textContent = path.split("/").slice(-2).join("/"); // e.g. src/message.js
+          editorFileEl.appendChild(opt);
+        }
+        const first = Object.keys(editorFiles)[0];
+        if (first) {
+          editorFileEl.value = first;
+          editorEl.value = editorFiles[first];
+        }
         editorPanel.hidden = false;
-        editorEl.dataset.path = m.editPath;
         break;
       }
       case "vite-status":
@@ -157,11 +168,18 @@ async function main() {
     kernelWorker.postMessage({ type: "start-vite" });
   });
 
+  // Switching files swaps the textarea to that file's current text (kept locally
+  // so unsaved edits per file survive a switch within the session).
+  editorFileEl.addEventListener("change", () => {
+    editorEl.value = editorFiles[editorFileEl.value] ?? "";
+  });
+
   applyEditBtn.addEventListener("click", () => {
-    const path = editorEl.dataset.path;
+    const path = editorFileEl.value;
     if (!path) return;
+    editorFiles[path] = editorEl.value;
     kernelWorker.postMessage({ type: "oc-write", path, contents: editorEl.value });
-    hmrStatusEl.textContent = "saved " + path + " → hot-updating…";
+    hmrStatusEl.textContent = "saved " + path.split("/").slice(-2).join("/") + " → hot-updating…";
   });
 
   // The Service Worker posts preview requests to this window (it can only reach

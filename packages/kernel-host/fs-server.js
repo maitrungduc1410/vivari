@@ -66,6 +66,18 @@ const relWithin = (dir, path) => {
   const prefix = dir.endsWith("/") ? dir : dir + "/";
   return path.startsWith(prefix) ? path.slice(prefix.length) : null;
 };
+// First path segment (the top-level dir name), or "" for the root "/". Used to
+// bucket watches: a mutation can only be *within* a watch dir if they share the
+// same first segment — unless the watch is on "/" (bucket ""), which covers all.
+// This makes "is anyone watching this path?" ~O(1), so churn in an unwatched
+// top-level subtree (e.g. `npm install` in /app next to a dev server in /vt)
+// costs nothing — no exists() probe, no fan-out scan.
+const firstSeg = (p) => {
+  let i = 0;
+  while (i < p.length && p[i] === "/") i++;
+  const j = p.indexOf("/", i);
+  return j === -1 ? p.slice(i) : p.slice(i, j);
+};
 
 // POSIX open(2) bits we care about for persistence (must match the Rust VFS /
 // internalBinding('constants').fs). A write-opened file with O_CREAT/O_TRUNC is
@@ -84,11 +96,24 @@ export class FsServer {
     // fd -> path, so fd-based ops (fd_write/ftruncate/close) know which file they
     // touch — needed both for persistence re-mirroring and for watch events.
     this.fdPaths = new Map();
-    // Active fs.watch registrations (roadmap #19 stage B). Keyed by
-    // `clientId:watchId` -> { clientId, watchId, path, recursive, port }. A single
-    // flat map keeps fan-out simple; it's empty for the overwhelmingly common case
-    // (no watchers), so mutations pay nothing then.
+    // Active fs.watch registrations (roadmap #19 stage B). `watches` is the flat
+    // map keyed by `clientId:watchId` -> { clientId, watchId, path, recursive,
+    // port, top }, used for size/removal/per-client cleanup. `watchesByTop` is the
+    // same set bucketed by the watch path's first segment (roadmap #19 optimize)
+    // so a mutation only ever scans watches in its own top-level tree (+ root
+    // watches). Both are empty in the common case (no watchers) → mutations pay
+    // nothing, and a mutation under an unwatched top-level dir is ~O(1).
     this.watches = new Map();
+    this.watchesByTop = new Map(); // top segment -> Map<key, watch>
+  }
+
+  // Could a mutation at `path` reach any watcher? Cheap gate for the exists()
+  // probe and the fan-out: true only if some watch shares this path's top segment
+  // (or a root "/" watch exists, which covers everything).
+  couldNotify(path) {
+    if (this.watches.size === 0) return false;
+    const top = firstSeg(path);
+    return this.watchesByTop.has(top) || (top !== "" && this.watchesByTop.has(""));
   }
 
   /**
@@ -109,8 +134,8 @@ export class FsServer {
     this.clients.delete(clientId);
     // Drop any watches this client still held (its process is gone).
     if (this.watches.size) {
-      for (const key of this.watches.keys()) {
-        if (this.watches.get(key).clientId === clientId) this.watches.delete(key);
+      for (const [key, w] of this.watches) {
+        if (w.clientId === clientId) this._deleteWatch(key, w);
       }
     }
   }
@@ -118,11 +143,28 @@ export class FsServer {
   addWatch(clientId, watchId, path, recursive) {
     const c = this.clients.get(clientId);
     if (!c || !c.port) return; // only port-backed clients (processes) can receive events
-    this.watches.set(clientId + ":" + watchId, { clientId, watchId, path, recursive, port: c.port });
+    const key = clientId + ":" + watchId;
+    const top = firstSeg(path);
+    const w = { clientId, watchId, path, recursive, port: c.port, top };
+    this.watches.set(key, w);
+    let bucket = this.watchesByTop.get(top);
+    if (!bucket) this.watchesByTop.set(top, (bucket = new Map()));
+    bucket.set(key, w);
   }
 
   removeWatch(clientId, watchId) {
-    this.watches.delete(clientId + ":" + watchId);
+    const key = clientId + ":" + watchId;
+    const w = this.watches.get(key);
+    if (w) this._deleteWatch(key, w);
+  }
+
+  _deleteWatch(key, w) {
+    this.watches.delete(key);
+    const bucket = this.watchesByTop.get(w.top);
+    if (bucket) {
+      bucket.delete(key);
+      if (bucket.size === 0) this.watchesByTop.delete(w.top);
+    }
   }
 
   // Push a change to every watcher that covers `path`. Node's fs.watch fires
@@ -131,20 +173,30 @@ export class FsServer {
   // 'change' = contents changed; chokidar (Vite's watcher) re-stats either way.
   notifyWatch(path, event) {
     if (this.watches.size === 0) return;
-    for (const w of this.watches.values()) {
-      const rel = relWithin(w.path, path);
-      if (rel === null) continue;
-      let filename;
-      if (rel === "") filename = basename(w.path); // the watched entry itself
-      else if (rel.indexOf("/") === -1) filename = rel; // direct child
-      else if (w.recursive) filename = rel; // nested, recursive watch
-      else continue; // nested but non-recursive: ignore
-      try {
-        w.port.postMessage({ type: "fs-watch", watchId: w.watchId, event, filename });
-      } catch {
-        /* port closed (process gone) — it'll be cleaned up on unregister */
+    // Only watches sharing this path's top segment (or a root "/" watch) can
+    // possibly cover it — scan just those buckets, not every registration.
+    const top = firstSeg(path);
+    const bucket = this.watchesByTop.get(top);
+    const rootBucket = top !== "" ? this.watchesByTop.get("") : undefined;
+    if (!bucket && !rootBucket) return;
+    const fan = (b) => {
+      for (const w of b.values()) {
+        const rel = relWithin(w.path, path);
+        if (rel === null) continue;
+        let filename;
+        if (rel === "") filename = basename(w.path); // the watched entry itself
+        else if (rel.indexOf("/") === -1) filename = rel; // direct child
+        else if (w.recursive) filename = rel; // nested, recursive watch
+        else continue; // nested but non-recursive: ignore
+        try {
+          w.port.postMessage({ type: "fs-watch", watchId: w.watchId, event, filename });
+        } catch {
+          /* port closed (process gone) — it'll be cleaned up on unregister */
+        }
       }
-    }
+    };
+    if (bucket) fan(bucket);
+    if (rootBucket) fan(rootBucket);
   }
 
   /** Service one pending request sitting in the given client's SAB. */
@@ -187,7 +239,7 @@ export class FsServer {
    * lives on this thread now), then the process reads it back with normal fs.
    */
   writeLarge(path, bytes) {
-    const existed = this.watches.size ? this.vfs.exists(path) : false;
+    const existed = this.couldNotify(path) ? this.vfs.exists(path) : false;
     this.vfs.write_file(path, bytes);
     const p = this.persistence;
     if (p) p.onWrite(path);
@@ -197,14 +249,13 @@ export class FsServer {
   dispatch(opcode, flags, fields, clientId) {
     const vfs = this.vfs;
     const p = this.persistence; // null when persistence is off (headless)
-    const watching = this.watches.size > 0; // gate watch bookkeeping to when it matters
     const s = (i) => decodeBytes(fields[i]);
     switch (opcode) {
       case OP_READ_FILE:
         return vfs.read_file(s(0));
       case OP_WRITE_FILE: {
         const path = s(0);
-        const existed = watching ? vfs.exists(path) : false;
+        const existed = this.couldNotify(path) ? vfs.exists(path) : false;
         vfs.write_file(path, fields[1]);
         if (p) p.onWrite(path);
         // A brand-new file is a 'rename' (creation) then its contents 'change';
@@ -267,7 +318,8 @@ export class FsServer {
         const writable = accmode === 1 /* O_WRONLY */ || accmode === 2 /* O_RDWR */;
         // Whether the file existed before the open decides create ('rename') vs
         // truncate ('change') for watchers; only checked when someone's watching.
-        const existedBefore = watching && writable && (oflags & (O_CREAT | O_TRUNC)) !== 0 ? vfs.exists(path) : true;
+        const existedBefore =
+          writable && (oflags & (O_CREAT | O_TRUNC)) !== 0 && this.couldNotify(path) ? vfs.exists(path) : true;
         const fd = vfs.open(path, oflags, bytesToU32(fields[2]));
         if (this.fdPaths) this.fdPaths.set(fd, path);
         if (writable && (oflags & (O_CREAT | O_TRUNC)) !== 0) {

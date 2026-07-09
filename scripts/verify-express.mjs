@@ -362,5 +362,57 @@ let hmrPushed = false;
 }
 assert(hmrPushed, "editing a file pushes a live HMR update over the ws tunnel (no reload/poll)");
 
+// === ws tunnel: text + BINARY + close, via a real `ws` echo server (network) ===
+// The HMR test only exercises Vite's text protocol. Here we install the real
+// `ws` package (a third-party ws SERVER, unmodified, in-VM — proving the http
+// upgrade path both ways) and bounce a text frame, a BINARY frame, and a close
+// through the same browser tunnel to lock in binary framing + teardown.
+console.log("\n== ws tunnel: text + binary echo (network) ==");
+kernel.mkdirp("/wsapp");
+kernel.writeFile(
+  "/wsapp/package.json",
+  JSON.stringify({ name: "wsapp", version: "1.0.0" }, null, 2),
+);
+const wsInstall = await kernel.start("npm", ["install", "ws"], { cwd: "/wsapp", capture: true });
+assert(wsInstall.code === 0 && wsInstall.stdout.includes("added"), "npm install ws (real third-party ws server)");
+kernel.writeFile(
+  "/wsapp/echo.js",
+  `
+const { WebSocketServer } = require('ws');
+const wss = new WebSocketServer({ port: 5480, host: '127.0.0.1' });
+wss.on('connection', (ws) => {
+  ws.on('message', (data, isBinary) => ws.send(data, { binary: isBinary }));
+});
+console.log('WS_ECHO_READY');
+setInterval(() => {}, 1000);
+`,
+);
+kernel.start("node", ["echo.js"], { cwd: "/wsapp" });
+for (let i = 0; i < 1500 && !listening.has(5480); i++) await new Promise((r) => setTimeout(r, 20));
+assert(listening.has(5480), "real `ws` WebSocketServer listens on :5480 (http upgrade in-VM)");
+
+kernel.handleWsClient({ sub: "open", connId: "wsb", port: 5480, path: "/" });
+assert(await waitWs((m) => m.connId === "wsb" && m.sub === "open", 8000),
+  "tunnel: in-VM WebSocket client connects to the ws echo server");
+
+kernel.handleWsClient({ sub: "send", connId: "wsb", data: "hello-text" });
+assert(await waitWs((m) => m.connId === "wsb" && m.sub === "msg" && m.data === "hello-text", 5000),
+  "tunnel: a text frame round-trips through the tunnel");
+
+const binArr = new Uint8Array([0, 1, 2, 3, 250, 251, 252, 255]);
+kernel.handleWsClient({ sub: "send", connId: "wsb", data: binArr.buffer, binary: true });
+assert(
+  await waitWs((m) => {
+    if (m.connId !== "wsb" || m.sub !== "msg" || !m.binary) return false;
+    const u = new Uint8Array(m.data);
+    return u.length === 8 && u[0] === 0 && u[4] === 250 && u[7] === 255;
+  }, 5000),
+  "tunnel: a BINARY frame round-trips byte-for-byte (binaryType + masking)",
+);
+
+kernel.handleWsClient({ sub: "close", connId: "wsb", code: 1000 });
+assert(await waitWs((m) => m.connId === "wsb" && m.sub === "close", 5000),
+  "tunnel: close propagates back to the browser end");
+
 console.log(failures === 0 ? "\nRESULT: PASS" : `\nRESULT: FAIL (${failures})`);
 process.exit(failures === 0 ? 0 : 1);

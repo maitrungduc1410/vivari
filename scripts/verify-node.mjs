@@ -1735,6 +1735,41 @@ setInterval(() => {}, 1000);
   assert(kernel.exists("/wd/fired-change.txt"),
     "fs.watch: a subsequent host write fires 'change' on the same watcher");
 
+  // === fs.watch fan-out is bucketed by top-level tree (roadmap #19 optimize) ===
+  // A watcher on /w1 must NOT fire for churn in a DIFFERENT top-level subtree
+  // (/w2) — the File System Worker buckets watches by first path segment, so a
+  // mutation nobody watches is ~O(1) and never fans out. Then prove the watcher
+  // is still alive by writing inside /w1.
+  kernel.mkdirp("/w1");
+  kernel.mkdirp("/w2");
+  kernel.writeFile(
+    "/w1/watcher2.js",
+    `
+const fs = require('fs');
+let fired = 0;
+fs.watch('/w1', (event, filename) => {
+  if (filename === 'ready.txt' || filename === 'count.txt') return; // ignore own markers
+  fired++;
+  fs.writeFileSync('/w1/count.txt', String(fired));
+});
+fs.writeFileSync('/w1/ready.txt', '1');
+setInterval(() => {}, 1000);
+`,
+  );
+  kernel.start("node", ["/w1/watcher2.js"], { cwd: "/w1" });
+  await waitFor(() => kernel.exists("/w1/ready.txt"), "watcher2 process did not start");
+  // Churn in a different top-level tree — must be ignored by the /w1 watcher.
+  for (let i = 0; i < 5; i++) kernel.writeFile("/w2/junk" + i + ".txt", "x");
+  await new Promise((r) => setTimeout(r, 150));
+  assert(!kernel.exists("/w1/count.txt"),
+    "fs.watch: churn in an unwatched top-level tree does not fire the watcher (bucketed fan-out)");
+  // An in-tree write still fires — the watcher wasn't just dead.
+  kernel.writeFile("/w1/real.txt", "y");
+  await waitFor(() => kernel.exists("/w1/count.txt"),
+    "fs.watch did not fire for an in-tree write after cross-tree churn", 100);
+  assert(kernel.exists("/w1/count.txt"),
+    "fs.watch: an in-tree write still fires after unrelated cross-tree churn");
+
   // === process table actually allocated many PIDs ===
   assert(kernel.nextPid - 1 >= 10, `PID table grew (${kernel.nextPid - 1} processes spawned)`);
 
