@@ -437,6 +437,61 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.url === '/api/esbuild') {
+    // Bundler Stage 1: a REAL bundler (esbuild, Go -> wasm) runs IN-VM. The Node
+    // entry would child_process.spawn a helper and pipe over stdin; instead we use
+    // esbuild's BROWSER build with worker:false, which runs the Go wasm on THIS
+    // thread (postMessage-simulated stdio) — no child process, no stdin fd. The
+    // 11MB wasm is installed on demand (first call) and the service cached after.
+    try {
+      const fs = require('fs');
+      const cp = require('child_process');
+      if (!globalThis.__esbuildSvc) {
+        let present = true;
+        try { require.resolve('esbuild-wasm/lib/browser.js'); } catch (e) { present = false; }
+        if (!present) {
+          console.log('[esbuild] npm install esbuild-wasm (~11MB, first call only)…');
+          await new Promise((resolve, reject) => {
+            const c = cp.spawn('npm', ['install', 'esbuild-wasm'], { cwd: '/srv' });
+            c.stdout.on('data', (d) => process.stdout.write(d));
+            c.stderr.on('data', (d) => process.stderr.write(d));
+            c.on('close', (code) => code === 0 ? resolve() : reject(new Error('npm install esbuild-wasm exited ' + code)));
+          });
+        }
+        const esbuild = require('esbuild-wasm/lib/browser.js');
+        const wasmModule = new WebAssembly.Module(fs.readFileSync(require.resolve('esbuild-wasm/esbuild.wasm')));
+        await esbuild.initialize({ wasmModule, worker: false });
+        globalThis.__esbuildSvc = esbuild;
+        console.log('[esbuild] service ready (esbuild ' + (esbuild.version || '?') + ')');
+      }
+      const esbuild = globalThis.__esbuildSvc;
+      const tsInput = 'export const greet = (name: string): string => "hi " + name;';
+      const t = await esbuild.transform(tsInput, { loader: 'ts' });
+      const b = await esbuild.build({
+        stdin: { contents: 'export const sum = (a, b) => a + b; console.log("sum", sum(2, 3));', loader: 'js' },
+        bundle: true, format: 'iife', write: false,
+      });
+      const body = Buffer.from(JSON.stringify({
+        node: process.version,
+        note: 'esbuild (Go -> wasm) ran IN-VM via its browser build + worker:false — a real, unmodified bundler transpiling TS and bundling ESM to an IIFE, in the browser.',
+        esbuildVersion: esbuild.version,
+        tsInput: tsInput,
+        jsOutput: t.code,
+        bundleOutput: b.outputFiles[0].text,
+      }, null, 2), 'utf8');
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(body);
+    } catch (err) {
+      console.error('[esbuild] route failed: ' + (err && err.stack || err));
+      const body = Buffer.from(JSON.stringify({
+        error: String(err && err.message || err),
+        stack: String(err && err.stack || ''),
+      }, null, 2), 'utf8');
+      res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(body);
+    }
+    return;
+  }
   if (req.url === '/api/spawn') {
     // Phase 2 #15: child_process.spawn() launches a Node child WITHOUT blocking —
     // its stdout streams back to us live (several 'data' events across timers,
@@ -552,6 +607,7 @@ const server = http.createServer(async (req, res) => {
   <button onclick="fetch('api/esm').then(r=>r.json()).then(t=>document.getElementById('e').textContent=JSON.stringify(t,null,2))">GET /api/esm (import/export)</button>
   <button onclick="fetch('api/wasi').then(r=>r.json()).then(t=>document.getElementById('w').textContent=JSON.stringify(t,null,2))">GET /api/wasi (wasm32-wasi CLI)</button>
   <button onclick="fetch('api/napi').then(r=>r.json()).then(t=>document.getElementById('np').textContent=JSON.stringify(t,null,2))">GET /api/napi (N-API addon on wasm)</button>
+  <button onclick="var el=document.getElementById('es');el.textContent='installing esbuild-wasm (~11MB) + bundling… (first call is slow)';fetch('api/esbuild').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2)).catch(e=>el.textContent=String(e))">GET /api/esbuild (real bundler)</button>
   <button onclick="fetch('api/spawn').then(r=>r.json()).then(t=>document.getElementById('sp').textContent=JSON.stringify(t,null,2))">GET /api/spawn (async child_process)</button>
   <button onclick="fetch('api/threads').then(r=>r.json()).then(t=>document.getElementById('wt').textContent=JSON.stringify(t,null,2))">GET /api/threads (worker_threads + SAB)</button>
   <button onclick="fetch('api/persist').then(r=>r.json()).then(t=>document.getElementById('pv').textContent=JSON.stringify(t,null,2))">GET /api/persist (OPFS — survives reload)</button>
@@ -569,6 +625,7 @@ const server = http.createServer(async (req, res) => {
   <pre id="e"></pre>
   <pre id="w"></pre>
   <pre id="np"></pre>
+  <pre id="es"></pre>
   <pre id="sp"></pre>
   <pre id="wt"></pre>
   <pre id="pv"></pre>

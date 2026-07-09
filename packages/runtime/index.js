@@ -248,6 +248,10 @@ export function createRuntime({
   globalThis.Buffer = Buffer;
   globalThis.console = consoleObj;
   globalThis.global = globalThis;
+  // Worker-global alias: browser Workers already have `self`, but the headless
+  // Node worker_threads runtime does not. Some libraries (e.g. esbuild-wasm's
+  // browser build, which mirrors globals off `self`) rely on it existing.
+  if (typeof globalThis.self === "undefined") globalThis.self = globalThis;
   // Route user-facing timers through our event loop so ordering is Node-correct
   // and callbacks fire even while a server is running (the old host timers never
   // fired — the synchronous accept loop starved them).

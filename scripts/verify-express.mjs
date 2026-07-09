@@ -102,5 +102,50 @@ const echo = await kernel.handleHttpRequest(3000, {
 });
 assert(echo.status === 200 && JSON.parse(decode(echo.body)).youSent.a === 1, "POST /api/echo parses JSON body (express.json / body-parser)");
 
+// === real bundler in-VM: esbuild-wasm (Go→wasm) via the browser build =========
+// The Node entry spawns a child `node bin/esbuild` and pipes over stdin/stdout;
+// instead we use the BROWSER build with `worker:false`, which runs the Go wasm on
+// the current thread (postMessage-simulated stdio) — no child process, no stdin
+// fd. It needs only crypto.getRandomValues / performance / TextEncoder / self,
+// which our runtime provides. Proves a real, unmodified bundler runs in-VM.
+console.log("\n== esbuild-wasm e2e (network) ==");
+kernel.mkdirp("/esb");
+kernel.writeFile("/esb/package.json", JSON.stringify({ name: "esb", version: "1.0.0" }));
+const ei = await kernel.start("npm", ["install", "esbuild-wasm"], { cwd: "/esb", capture: true });
+assert(ei.code === 0 && ei.stdout.includes("added"), "npm install esbuild-wasm");
+kernel.writeFile(
+  "/esb/run.js",
+  `
+const fs = require('fs');
+const esbuild = require('esbuild-wasm/lib/browser.js');
+const wasmPath = require.resolve('esbuild-wasm/esbuild.wasm');
+// Synchronous compile (no host-backed WebAssembly.compile promise), and a ref'd
+// keep-alive so the loop keeps turning until the async chain settles — a bare
+// 'node run.js' has no other ref'd work to hold the loop open (like npm.js does).
+let done = false, code = 0;
+const keepAlive = setInterval(() => { if (done) { clearInterval(keepAlive); process.exit(code); } }, 15);
+(async () => {
+  const wasmModule = new WebAssembly.Module(fs.readFileSync(wasmPath));
+  await esbuild.initialize({ wasmModule, worker: false });
+  const t = await esbuild.transform('const x: number = 1; export const y = x+1', { loader: 'ts' });
+  const b = await esbuild.build({
+    stdin: { contents: 'export const sum=(a,b)=>a+b; console.log(sum(2,3))', loader: 'js' },
+    bundle: true, format: 'iife', write: false,
+  });
+  console.log('ESB_TRANSFORM:' + JSON.stringify(t.code));
+  console.log('ESB_BUILD:' + JSON.stringify(b.outputFiles[0].text));
+  done = true;
+})().catch((e) => { console.error('ESB_ERR:' + (e && e.stack || e)); code = 1; done = true; });
+`,
+);
+const er = await kernel.start("node", ["run.js"], { cwd: "/esb", capture: true });
+if (er.code !== 0 || !er.stdout.includes("const x = 1;")) {
+  console.log("  (esbuild run code=" + er.code + ")\n  STDOUT: " + er.stdout + "\n  STDERR: " + er.stderr);
+}
+assert(er.code === 0 && er.stdout.includes('const x = 1;'),
+  "esbuild-wasm transform: TS -> JS (strips the type annotation)");
+assert(er.stdout.includes('sum(2, 3)') && er.stdout.includes('ESB_BUILD:'),
+  "esbuild-wasm build: bundles an ESM entry to an IIFE");
+
 console.log(failures === 0 ? "\nRESULT: PASS" : `\nRESULT: FAIL (${failures})`);
 process.exit(failures === 0 ? 0 : 1);

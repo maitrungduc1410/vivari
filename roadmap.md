@@ -669,6 +669,26 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
       **wasm-bindgen web** (not WASI) — those are separate loaders, not covered by this item.
     Depends on: stable fs/VFS contract (#14 ✓), ESM (#13 ✓).
 
+17. **Real bundler in-VM — Bundler Stage 1 (esbuild-wasm) — DONE.** A real, unmodified
+    bundler (esbuild, Go→wasm) now runs inside OpenContainer. esbuild's Node entry
+    (`lib/main.js`) `child_process.spawn`s a helper `node bin/esbuild` and talks to the Go
+    runtime over **stdin/stdout pipes** (needs a real readable stdin fd + Go's
+    `wasm_exec_node.js` — the hard path we skip). Instead we load its **browser build**
+    (`esbuild-wasm/lib/browser.js`) with **`worker:false`**, which runs the Go wasm on the
+    current thread with postMessage-simulated stdio — no child process, no stdin fd. The
+    only runtime gap was the `self` global (browser Workers have it; the headless Node
+    worker did not) → aliased to `globalThis` in `packages/runtime/index.js`; everything
+    else (crypto.getRandomValues / performance / TextEncoder / WebAssembly / subpath require
+    / `require.resolve` of a `.wasm`) already existed. Verified headless (`verify-express`:
+    `transform` TS→JS + `build` bundle ESM→IIFE) and a browser `/api/esbuild` route
+    (installs the ~11MB wasm on demand, caches the service). Two learnings: use synchronous
+    `new WebAssembly.Module` (the async `WebAssembly.compile` promise resolves off our event
+    loop, which then exits early on a bare `node script.js` — the same liveness gap npm.js
+    works around with a ref'd keep-alive; long-running server processes are unaffected).
+    Stretch (later): full **Vite** (rollup + dozens of deps + a dev server) is much larger;
+    and a runtime fix so host-backed promises (WebAssembly.compile/fetch/DecompressionStream)
+    keep the guest loop alive without a manual keep-alive.
+
 ## Why this order (the tradeoffs)
 
 - **Decomp is split in two on purpose:** Kernel worker is first (pure win, everything
