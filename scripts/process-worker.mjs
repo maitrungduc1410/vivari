@@ -73,4 +73,7 @@ parentPort.on("message", (msg) => {
   // A worker_thread's online/exit relayed by the kernel (#16 stage 2b).
   else if (msg.type === "thread-started" || msg.type === "thread-exit")
     control && control.dispatchThread(msg);
+  // A browser preview ws tunnel message relayed by the kernel (#19 stage C).
+  else if (msg.type === "ws-open" || msg.type === "ws-in" || msg.type === "ws-close")
+    control && control.dispatchWs(msg);
 });

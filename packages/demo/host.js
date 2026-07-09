@@ -13,6 +13,12 @@
 const out = document.getElementById("output");
 const frame = document.getElementById("preview");
 const previewUrlEl = document.getElementById("preview-url");
+const startViteBtn = document.getElementById("start-vite");
+const hmrStatusEl = document.getElementById("hmr-status");
+const editorPanel = document.getElementById("editor-panel");
+const editorPathEl = document.getElementById("editor-path");
+const editorEl = document.getElementById("editor");
+const applyEditBtn = document.getElementById("apply-edit");
 let previewPort = null; // the first server to listen wins the preview iframe
 
 function print(line, cls = "") {
@@ -31,7 +37,13 @@ async function registerServiceWorker() {
     print("Service workers unavailable — preview disabled.", "err");
     return false;
   }
-  await navigator.serviceWorker.register("./sw.js");
+  // Root scope: Vite (and other tools) serve subresources at root-absolute URLs
+  // (/@vite/client, /src/main.js, /node_modules/...). Those escape a
+  // /packages/demo/ scope, so the preview SW must control the whole origin to
+  // intercept them; it routes each to the right in-VM port by the requesting
+  // iframe's client URL. Needs `Service-Worker-Allowed: /` on the script (see
+  // server.mjs) since the script itself lives under /packages/demo/.
+  await navigator.serviceWorker.register("./sw.js", { scope: "/" });
   await navigator.serviceWorker.ready;
   print("Service Worker registered (preview proxy ready).", "ok");
   return true;
@@ -98,8 +110,59 @@ async function main() {
         }
         break;
       }
+      // roadmap #19 stage C: a ws frame the kernel routed OUT of the VM (Vite's
+      // HMR server -> the process' in-VM WebSocket). Deliver it to the preview
+      // iframe's WebSocket polyfill (installed by the Service Worker).
+      case "oc-ws": {
+        // Spread FIRST, then stamp type/dir — m.msg carries the VM relay's own
+        // `type: "ws-out"`, which would otherwise clobber the envelope type the
+        // iframe's polyfill filters on (`type === "oc-ws"`).
+        frame.contentWindow?.postMessage({ ...m.msg, type: "oc-ws", dir: "in" }, "*");
+        break;
+      }
+      // The in-VM Vite dev server is up: swap the preview to it and open the
+      // editor on the file whose edits will hot-update the running app.
+      case "vite-ready": {
+        previewPort = m.port;
+        previewUrlEl.textContent = `/packages/demo/preview/${m.port}/`;
+        frame.src = `./preview/${m.port}/`;
+        startViteBtn.textContent = "Vite dev running";
+        startViteBtn.disabled = true;
+        hmrStatusEl.textContent = "edit the file below, then save — the app hot-updates with no reload";
+        editorPathEl.textContent = m.editPath;
+        editorEl.value = m.editContents;
+        editorPanel.hidden = false;
+        editorEl.dataset.path = m.editPath;
+        break;
+      }
+      case "vite-status":
+        hmrStatusEl.textContent = m.line;
+        break;
     }
   };
+
+  // roadmap #19 stage C: the reverse tunnel. The preview iframe's WebSocket
+  // polyfill posts each connection event UP to this window; relay it to the
+  // kernel worker, which routes it to the process owning the preview port.
+  addEventListener("message", (event) => {
+    const d = event.data;
+    if (!d || d.type !== "oc-ws" || d.dir !== "out") return;
+    kernelWorker.postMessage({ type: "oc-ws", msg: d });
+  });
+
+  startViteBtn.addEventListener("click", () => {
+    startViteBtn.disabled = true;
+    startViteBtn.textContent = "starting Vite… (installing from npm)";
+    hmrStatusEl.textContent = "npm install vite + boot dev server (first run downloads ~20 packages)";
+    kernelWorker.postMessage({ type: "start-vite" });
+  });
+
+  applyEditBtn.addEventListener("click", () => {
+    const path = editorEl.dataset.path;
+    if (!path) return;
+    kernelWorker.postMessage({ type: "oc-write", path, contents: editorEl.value });
+    hmrStatusEl.textContent = "saved " + path + " → hot-updating…";
+  });
 
   // The Service Worker posts preview requests to this window (it can only reach
   // window clients). We forward them to the kernel worker, transferring the SW's

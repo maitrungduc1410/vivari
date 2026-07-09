@@ -661,6 +661,102 @@ app.listen(3100, () =>
     ') · express ' + require('express/package.json').version));
 `;
 
+// roadmap #19 stage C — a real Vite dev server running in-VM with live HMR
+// tunneled to the preview iframe. The app self-accepts an HMR update on
+// ./message.js: editing that file in the host textarea re-renders WITHOUT a
+// full page reload — the classic Vite HMR boundary, proven end to end.
+const VITE_PORT = 5199;
+const VITE_DIR = "/vite-app";
+const VITE_EDIT_PATH = VITE_DIR + "/src/message.js";
+const VITE_APP = {
+  "package.json": JSON.stringify(
+    { name: "hmr-demo", version: "1.0.0", private: true, type: "module" },
+    null,
+    2,
+  ),
+  "index.html":
+    "<!doctype html>\n<html>\n<head><meta charset='utf-8'><title>Vite HMR · OpenContainer</title>\n" +
+    "<style>body{font-family:ui-monospace,Menlo,monospace;background:#0b0e14;color:#d4d7dd;" +
+    "display:grid;place-items:center;height:100vh;margin:0}" +
+    ".card{border:1px solid #1c2230;border-radius:12px;padding:32px 40px;background:#0e131c;text-align:center;max-width:80%}" +
+    "h1{color:#7ee787;margin:0 0 12px} #msg{font-size:18px;white-space:pre-wrap}" +
+    ".hint{color:#6b7385;font-size:12px;margin-top:16px}</style></head>\n" +
+    "<body><div class='card'><h1>Vite HMR — live in the browser VM</h1>" +
+    "<div id='msg'>…</div>" +
+    "<div class='hint'>Served by a real <code>vite</code> dev server running inside OpenContainer.<br>" +
+    "Edit <code>src/message.js</code> in the host editor and save — this updates with no reload.</div>" +
+    "</div>\n<script type='module' src='/src/main.js'></script>\n</body>\n</html>\n",
+  "src/message.js":
+    "export const message =\n  'Hello from Vite HMR running inside OpenContainer!\\n" +
+    "Edit me on the left and hit Save — no page reload.';\n",
+  "src/main.js":
+    "import { message } from './message.js';\n\n" +
+    "const el = document.getElementById('msg');\n" +
+    "function render(text) { el.textContent = text; }\n" +
+    "render(message);\n\n" +
+    "if (import.meta.hot) {\n" +
+    "  import.meta.hot.accept('./message.js', (mod) => {\n" +
+    "    render(mod.message);\n" +
+    "    console.log('[hmr] message.js hot-updated');\n" +
+    "  });\n" +
+    "}\n",
+};
+
+// Boots the dev server (HMR enabled). Base stays '/' — the preview SW controls
+// the whole origin and routes Vite's root-absolute URLs (/@vite/client, etc.)
+// to this port by the requesting iframe's client URL, so no base rewrite needed.
+function viteDevScript() {
+  return (
+    "const vite = require('vite');\n" +
+    "(async () => {\n" +
+    "  try {\n" +
+    "    const server = await vite.createServer({\n" +
+    "      root: '" + VITE_DIR + "', configFile: false, logLevel: 'silent',\n" +
+    "      server: { port: " + VITE_PORT + ", host: '127.0.0.1' }, optimizeDeps: { noDiscovery: true },\n" +
+    "    });\n" +
+    "    await server.listen();\n" +
+    "    console.log('[vite] dev server + HMR ready on :" + VITE_PORT + "');\n" +
+    "    setInterval(() => {}, 1000);\n" +
+    "  } catch (e) { console.error('[vite] ' + (e && e.stack || e)); process.exit(1); }\n" +
+    "})();\n"
+  );
+}
+
+let viteStarted = false;
+async function startVite() {
+  if (viteStarted) return;
+  viteStarted = true;
+  try {
+    kernel.mkdirp(VITE_DIR + "/src");
+    for (const [rel, contents] of Object.entries(VITE_APP)) {
+      kernel.writeFile(VITE_DIR + "/" + rel, contents);
+    }
+    kernel.writeFile(VITE_DIR + "/dev.js", viteDevScript());
+    post("log", { line: "$ cd " + VITE_DIR + " && npm install vite", cls: "muted" });
+    post("vite-status", { line: "installing vite from npm…" });
+    const inst = await kernel.start("npm", ["install", "vite"], { cwd: VITE_DIR, capture: true });
+    if (inst.code !== 0) {
+      post("log", { line: "  [vite] npm install failed: " + (inst.stderr || inst.code), cls: "err" });
+      post("vite-status", { line: "npm install vite failed — see the log" });
+      viteStarted = false;
+      return;
+    }
+    post("log", { line: "$ node dev.js  (vite dev server, long-running)", cls: "muted" });
+    kernel.start("node", ["dev.js"], { cwd: VITE_DIR }); // NOT awaited
+    await waitListen(VITE_PORT);
+    post("log", { line: "  [vite] dev server listening on :" + VITE_PORT, cls: "ok" });
+    post("vite-ready", {
+      port: VITE_PORT,
+      editPath: VITE_EDIT_PATH,
+      editContents: VITE_APP["src/message.js"],
+    });
+  } catch (err) {
+    post("log", { line: "  [vite] " + (err && err.message || err), cls: "err" });
+    post("vite-status", { line: "failed to start vite — see the log" });
+    viteStarted = false;
+  }
+}
+
 let kernel = null;
 const listening = new Set();
 // The File System Worker handle, kept module-scoped so the page-hide flush relay
@@ -796,6 +892,10 @@ async function boot() {
       line: `  [fetcher] ${info.cached ? "cache hit " : "downloaded"} ${info.size}B · ${url}`,
       cls: "muted",
     });
+  // roadmap #19 stage C: a ws frame a process relayed OUT of the VM (Vite's HMR
+  // server) — forward it to the main thread, which delivers it to the preview
+  // iframe's WebSocket polyfill.
+  kernel.onWsSend = (msg) => post("oc-ws", { msg });
 
   kernel.installCoreutils();
   kernel.mkdirp("/srv");
@@ -1002,6 +1102,33 @@ self.onmessage = async (event) => {
   // mirror catches any writes still queued in the write-behind buffer.
   if (m.type === "fs-flush") {
     if (fsWorkerRef) fsWorkerRef.postMessage({ type: "fs-flush" });
+    return;
+  }
+
+  // roadmap #19 stage C: a ws connection event from the preview iframe (relayed
+  // by the main thread). Route it to the process owning the preview port.
+  if (m.type === "oc-ws") {
+    if (kernel) kernel.handleWsClient(m.msg);
+    return;
+  }
+
+  // The user clicked "Start Vite dev + HMR" in the host UI.
+  if (m.type === "start-vite") {
+    if (kernel) startVite();
+    return;
+  }
+
+  // The user saved an edit in the host editor — write it to the VFS. The in-VM
+  // Vite dev server's watcher (our push-based fs.watch) fires and pushes an HMR
+  // update over the tunnel to the preview iframe.
+  if (m.type === "oc-write") {
+    if (kernel) {
+      try {
+        kernel.writeFile(m.path, m.contents);
+      } catch (err) {
+        post("log", { line: "  [edit] write failed: " + (err && err.message || err), cls: "err" });
+      }
+    }
     return;
   }
 

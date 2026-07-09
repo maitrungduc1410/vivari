@@ -34,6 +34,12 @@ const server = createServer(async (req, res) => {
   let urlPath = decodeURIComponent(new URL(req.url, "http://x").pathname);
   if (urlPath === "/") urlPath = "/packages/demo/index.html";
 
+  // The preview Service Worker lives under /packages/demo/ but must control the
+  // whole origin (it routes root-absolute preview subresources like /@vite/client
+  // to the right in-VM port). A worker script can only claim a broader scope if
+  // the server explicitly allows it via this header.
+  if (urlPath.endsWith("/sw.js")) res.setHeader("Service-Worker-Allowed", "/");
+
   const filePath = normalize(join(ROOT, urlPath));
   if (!filePath.startsWith(ROOT)) {
     res.writeHead(403).end("Forbidden");

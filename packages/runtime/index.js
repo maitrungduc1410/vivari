@@ -10,6 +10,7 @@ import { createProcess } from "./builtins/process.js";
 import { createAssert } from "./builtins/assert.js";
 import { createChildProcess } from "./builtins/child_process.js";
 import { createModuleSystem } from "./module.js";
+import { createWebSocket } from "./websocket.js";
 
 function createConsole(process, util) {
   const toOut = (...a) => process.stdout.write(util.format(...a) + "\n");
@@ -76,6 +77,10 @@ export function createRuntime({
   // keeps the loop alive (like libuv's fs_event handle), so a bare `fs.watch`
   // script stays up until the watcher is closed.
   const watchLiveness = { active: 0 };
+  // Liveness counter for WebSocket tunnels (roadmap #19 stage C): each live
+  // browser<->in-VM ws relay connection keeps the loop turning so it can pump
+  // frames (like an open socket handle).
+  const wsLiveness = { active: 0 };
   // Assigned once child_process is built; the loop drains child events through it.
   let drainChildEvents = () => {};
   // Assigned once worker_threads is required; the loop drains its queued events.
@@ -104,7 +109,8 @@ export function createRuntime({
       childLiveness.active > 0 ||
       threadLiveness.active > 0 ||
       hostLiveness.active > 0 ||
-      watchLiveness.active > 0,
+      watchLiveness.active > 0 ||
+      wsLiveness.active > 0,
     doNet: () => {
       if (netServers.count === 0 || !bridgeHttp) return;
       for (;;) {
@@ -338,6 +344,95 @@ export function createRuntime({
     else creq.end();
   };
 
+  // A real in-VM WebSocket *client* (roadmap #19 stage C), over Node's own http
+  // upgrade + the net loopback. Exposed as the `WebSocket` global so guest code
+  // can use it, and used by the HMR relay below to reach an in-VM ws server (e.g.
+  // Vite's dev-server HMR socket) on behalf of the browser preview.
+  const WebSocketClient = createWebSocket({ http, Buffer });
+  // Override any host `WebSocket` (Node's undici one, or a browser Worker's
+  // native one): those reach the REAL network and can't see an in-VM ws server,
+  // so guest code (and our HMR relay) must use the in-VM client instead.
+  globalThis.WebSocket = WebSocketClient;
+
+  // ---- WebSocket tunnel relay (roadmap #19 stage C) -------------------------
+  // The browser preview can't reach an in-VM ws server directly (the Service
+  // Worker can't intercept a real WebSocket upgrade). Instead a `WebSocket`
+  // polyfill in the preview iframe tunnels each logical connection to us as
+  // messages (kernel -> this process): ws-open / ws-in (client->server data) /
+  // ws-close. We open a genuine in-VM WebSocket to 127.0.0.1:<port> for each and
+  // relay decoded messages back out (postRaw -> kernel -> host -> iframe) as
+  // ws-out {sub:'open'|'msg'|'close'}. Framing lives entirely here, in one place.
+  const wsConns = new Map(); // connId -> WebSocket
+  const wsOut = (connId, sub, extra) => {
+    if (postRaw) postRaw({ type: "ws-out", connId, sub, ...extra });
+  };
+  const wsRelay = {
+    open(connId, port, path, protocols, attempt = 0) {
+      if (wsConns.has(connId)) return;
+      let sock;
+      try {
+        sock = new WebSocketClient("ws://127.0.0.1:" + (port | 0) + (path || "/"), protocols || undefined);
+      } catch {
+        wsOut(connId, "close", { code: 1006 });
+        return;
+      }
+      wsConns.set(connId, sock);
+      wsLiveness.active++;
+      loop.wakeNet();
+      sock.binaryType = "arraybuffer";
+      let opened = false;
+      sock.onopen = () => {
+        opened = true;
+        wsOut(connId, "open", { protocol: sock.protocol });
+      };
+      sock.onmessage = (ev) => {
+        const binary = typeof ev.data !== "string";
+        wsOut(connId, "msg", { data: ev.data, binary });
+      };
+      sock.onclose = (ev) => {
+        if (wsConns.delete(connId) && wsLiveness.active > 0) wsLiveness.active--;
+        // Racing the dev server's readiness on the loopback can close a brand-new
+        // socket before it ever opened; retry a few times (the in-VM server is
+        // right here, so this settles fast) before giving up on the browser end.
+        if (!opened && attempt < 5) {
+          loop.setTimeout(() => this.open(connId, port, path, protocols, attempt + 1), 120);
+          return;
+        }
+        wsOut(connId, "close", { code: ev.code, reason: ev.reason });
+      };
+      sock.onerror = () => {
+        /* a following close event carries the teardown (and any retry) */
+      };
+    },
+    inbound(connId, data) {
+      const sock = wsConns.get(connId);
+      if (sock && sock.readyState === 1) {
+        try {
+          sock.send(data);
+        } catch {
+          /* closing */
+        }
+      }
+    },
+    close(connId, code, reason) {
+      const sock = wsConns.get(connId);
+      if (sock) {
+        try {
+          sock.close(code, reason);
+        } catch {
+          /* already gone */
+        }
+      }
+    },
+  };
+  const dispatchWs = (msg) => {
+    if (!msg) return;
+    if (msg.type === "ws-open") wsRelay.open(msg.connId, msg.port, msg.path, msg.protocols);
+    else if (msg.type === "ws-in") wsRelay.inbound(msg.connId, msg.data);
+    else if (msg.type === "ws-close") wsRelay.close(msg.connId, msg.code, msg.reason);
+    loop.wakeNet();
+  };
+
   const consoleObj = createConsole(process, util);
 
   // Globals visible to user code (both as wrapper params and on globalThis).
@@ -493,6 +588,9 @@ export function createRuntime({
     /** External delivery from the File System Worker: an fs.watch change event
      * ({type:'fs-watch', watchId, event, filename}). roadmap #19 stage B. */
     dispatchWatch: (msg) => dispatchWatchEvent(msg),
+    /** External delivery from the kernel: a browser preview ws tunnel message
+     * ({type:'ws-open'|'ws-in'|'ws-close', connId, ...}). roadmap #19 stage C. */
+    dispatchWs: (msg) => dispatchWs(msg),
     /**
      * Run an entry file like `node <entry>`, then drive the event loop until it
      * is quiescent (no pending timers/immediates/nextTicks and no open servers).

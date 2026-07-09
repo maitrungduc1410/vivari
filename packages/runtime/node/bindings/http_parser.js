@@ -89,6 +89,10 @@ export function createHttpParserBinding() {
       this._connKeepAlive = false;
       this._upgrade = false;
       this._hasUpgradeHeader = false;
+      // Set once headers-complete signals an upgrade/CONNECT: parsing stops and
+      // `this.incoming` is preserved (NOT reset) so onParserExecuteCommon can hand
+      // the raw socket to the 'upgrade'/'connect' handler.
+      this._upgradePaused = false;
       this.incoming = null;
     }
 
@@ -131,6 +135,11 @@ export function createHttpParserBinding() {
             const err = this._parseHeaderBlock(headerBlock);
             if (err) return err;
             this._afterHeaders();
+            // Upgrade/CONNECT: stop here. Return the count of bytes consumed as
+            // headers so _http_server/_http_client can slice the leftover (the
+            // first post-handshake frame, if it arrived in the same packet) as
+            // the `head` argument to the upgrade handler.
+            if (this._upgradePaused) return buf.length - this._pending.length;
             progress = true;
           } else if (this._phase === "BODY_CL") {
             progress = this._pumpContentLength();
@@ -262,8 +271,19 @@ export function createHttpParserBinding() {
           shouldKeepAlive,
         );
       }
-      // rv: truthy => skip body (HEAD response / 1xx / etc.); 2 => skip + upgrade
-      this._skipBody = rv === true || rv === 1 || rv === 2;
+      // rv === 2 => Upgrade/CONNECT. Freeze the parser without completing the
+      // message: _complete() would reset() and null `this.incoming`, hiding the
+      // upgrade from onParserExecuteCommon (which checks `parser.incoming.upgrade`
+      // after execute returns). The raw socket now belongs to the ws/CONNECT
+      // handler; llhttp behaves the same (HPE_PAUSED_UPGRADE).
+      if (rv === 2) {
+        this._headers = [];
+        this._upgradePaused = true;
+        this._phase = "DONE";
+        return;
+      }
+      // rv: truthy => skip body (HEAD response / 1xx / etc.).
+      this._skipBody = rv === true || rv === 1;
       this._headers = [];
 
       // Decide body framing.

@@ -62,6 +62,14 @@ export class Kernel {
     this.nextReqId = 1;
     this.onListen = null; // optional observer (port, pid) — e.g. wire a preview
 
+    // ---- WebSocket tunnel (roadmap #19 stage C) ----
+    // The browser preview tunnels each ws connection to us (it can't reach an
+    // in-VM ws server directly). connId (chosen browser-side) -> pid that owns
+    // the port. `onWsSend(msg)` relays a process's outbound frame back out to the
+    // browser; the environment (kernel worker) wires it to the preview iframe.
+    this.wsConns = new Map(); // connId -> pid
+    this.onWsSend = null;
+
     // ---- network fetch (Phase 2 #9) ----
     // Injected by the environment: (url) => Promise<{ok,status,headers,body:Uint8Array}>.
     // The browser routes this to a dedicated Fetcher Worker; tests inject a mock.
@@ -171,6 +179,9 @@ export class Kernel {
         // terminate a nested thread worker.
         "thread-spawn": (m) => this.handleThreadSpawn(pid, m),
         "thread-terminate": (m) => this.handleThreadTerminate(pid, m),
+        // #19 stage C: this process relays a ws frame outward (in-VM ws server ->
+        // browser preview) for a tunneled connection.
+        "ws-out": (m) => this.handleWsOut(pid, m),
       },
     });
     return pid;
@@ -236,6 +247,13 @@ export class Kernel {
           body: "server process exited\n",
         });
         this.pendingHttp.delete(reqId);
+      }
+    }
+    // Tear down any ws tunnels this process owned, telling the browser they closed.
+    for (const [connId, owner] of this.wsConns) {
+      if (owner === pid) {
+        this.wsConns.delete(connId);
+        if (this.onWsSend) this.onWsSend({ connId, sub: "close", code: 1006 });
       }
     }
     const result = {
@@ -387,6 +405,44 @@ export class Kernel {
         /* worker gone; finalize() will 502 the pending request */
       }
     });
+  }
+
+  // ---- WebSocket tunnel routing (roadmap #19 stage C) -----------------------
+  // A message from the browser preview's ws polyfill (relayed by the environment
+  // as {sub:'open'|'send'|'close', connId, ...}). 'open' binds the connId to the
+  // process listening on `port`; 'send'/'close' forward to that process.
+  handleWsClient(msg) {
+    const { sub, connId } = msg;
+    if (sub === "open") {
+      const pid = this.listeners.get(msg.port | 0);
+      if (pid == null || !this.procs.has(pid)) {
+        if (this.onWsSend) this.onWsSend({ connId, sub: "close", code: 1006 });
+        return;
+      }
+      this.wsConns.set(connId, pid);
+      this.postToProc(pid, {
+        type: "ws-open",
+        connId,
+        port: msg.port | 0,
+        path: msg.path || "/",
+        protocols: msg.protocols || null,
+      });
+      return;
+    }
+    const pid = this.wsConns.get(connId);
+    if (pid == null) return;
+    if (sub === "send") {
+      this.postToProc(pid, { type: "ws-in", connId, data: msg.data });
+    } else if (sub === "close") {
+      this.wsConns.delete(connId);
+      this.postToProc(pid, { type: "ws-close", connId, code: msg.code, reason: msg.reason });
+    }
+  }
+
+  // A process relayed a ws frame outward ({connId, sub:'open'|'msg'|'close', ...}).
+  handleWsOut(pid, m) {
+    if (m.sub === "close") this.wsConns.delete(m.connId);
+    if (this.onWsSend) this.onWsSend(m);
   }
 
   handleSpawn(parent, spec) {

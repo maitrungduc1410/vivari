@@ -788,14 +788,12 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
       `prettier`, `engineworker.js`) are just the StackBlitz IDE (Monaco + tsserver), not runtime.
 
     **Current state in OpenContainer:** long-lived in-VM HTTP server ✅ (`http.createServer().listen`
-    + event loop v2 + `netLiveness`). `vite build` ✅. `vite dev` **boots + serves static** ✅
-    (Stage A below): the preview bridge now carries binary bodies (base64), `fs.watch` and
-    `fs.createReadStream` no longer throw, and the listen path handles IPv6 addresses. Remaining
-    gaps: **HMR still needs a transport.** `fs.watch` is now real (Stage B) so the dev server
-    detects edits and re-transforms on the next request, but the browser isn't *pushed* the update
-    — there is **no `WebSocket`** channel yet, so live HMR doesn't work (a manual reload picks up
-    changes). That push is Stage C. The bridge still strips the `upgrade` header, though the http
-    parser/`_http_server.js` already detect+emit `'upgrade'`.
+    + event loop v2 + `netLiveness`). `vite build` ✅. **`vite dev` boots + serves static + watches
+    + live HMR ✅** (Stages A/B/C below, all done): the preview bridge carries binary bodies
+    (base64), `fs.watch`/`fs.createReadStream` are real, the listen path handles IPv6, push-based
+    `fs.watch` drives Vite's watcher, and a `WebSocket` tunnel (in-VM RFC6455 client + iframe
+    polyfill) pushes HMR updates to the preview with no reload. There is a genuine in-VM
+    `WebSocket` over the http-upgrade + net loopback (the parser no longer drops `'upgrade'`).
 
     **Plan (staged, each with a demo):**
     - **Stage A — boot & serve static — DONE.** `vite.createServer().listen()` now boots a
@@ -851,10 +849,44 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
         `exists()` when no watch can match). Prefer this over a hardcoded ignore list (which risks
         blocking a legitimate watch and duplicates the client's own `ignored`); an ignore list, if
         added, should only short-circuit fan-out, never registration.
-    - **Stage C — HMR transport:** decide C1 (polyfill `WebSocket`, general) vs C2 (custom Vite
-      transport + `BroadcastChannel`, Vite-specific). Likely needs a separate preview origin +
-      `BroadcastChannel` for the durable 2-way channel (the SW can't tunnel WS).
-    Order: A → B → C (HMR is meaningless before static serving + change detection work).
+    - **Stage C — HMR transport — DONE (C1: polyfill `WebSocket` + real RFC6455 framing).** Live
+      HMR now pushes to the preview iframe with no reload/poll. Chose C1 (framework-agnostic) over
+      C2 (Vite-specific JSON transport): the *frames* are tunnelled, not Vite payloads, so any
+      library using `WebSocket` works. Data path (both directions):
+      `iframe WebSocket polyfill ⇄ host page (postMessage) ⇄ kernel worker ⇄ kernel (route by
+      preview port) ⇄ the process owning that port ⇄ a genuine in-VM `WebSocket` client ⇄ Vite's
+      `ws` HMR server` — all over the in-VM net loopback + http upgrade, no network.
+      - **In-VM `WebSocket` client (`runtime/websocket.js`).** A real RFC6455 client: does the
+        `Sec-WebSocket-Key`/`Accept` handshake over `http.request`'s `'upgrade'` event, then
+        masks/encodes + parses frames (text/binary/ping/pong/close, continuation, all length forms)
+        on the `net` loopback socket. `runtime/index.js` installs it *unconditionally* as
+        `globalThis.WebSocket` (so guest code — and the relay — never picks up a host `WebSocket`).
+      - **HTTP-parser upgrade fix (`bindings/http_parser.js`).** The parser reset `incoming` on
+        detecting an upgrade (rv===2), so `onParserExecuteCommon` never saw `upgrade` and the
+        `'upgrade'` event never fired. Added an `_upgradePaused` state that preserves `incoming` and
+        stops after headers; `_http_server.js`/the client then complete the upgrade (incl. any
+        first-frame `head` bytes that arrived with the 101).
+      - **VM relay (`runtime/index.js`).** The kernel posts `ws-open`/`ws-in`/`ws-close` to the
+        process owning the port; the relay opens one in-VM `WebSocket` per `connId` to
+        `127.0.0.1:<port><path>` and relays decoded frames back out as `ws-out {sub:open|msg|close}`
+        via `postRaw`. A `wsLiveness` counter refs the loop while tunnels are open; a brand-new
+        socket that loses the loopback race before opening retries a few times.
+      - **Kernel routing (`kernel-host/kernel.js`).** `handleWsClient` maps `connId → pid` (open
+        routes by listening port), forwards frames, and `finalize` closes a process's tunnels on
+        exit. `onWsSend` hands outbound frames to the environment.
+      - **Browser wiring.** The preview Service Worker injects a classic (pre-`/@vite/client`)
+        `WebSocket` polyfill into every served HTML page; it tunnels each connection to the host
+        page, which relays to the kernel worker and back. `host.js`/`kernel-worker.js` bridge both
+        directions (`oc-ws`).
+      - **Demo.** A "Start real Vite dev + HMR" button `npm install vite` + boots `vite dev`
+        (HMR on) in-VM on :5199, swaps the preview to it, and opens a textarea editor on
+        `src/message.js`. The app self-accepts an HMR update on that module (`import.meta.hot.accept`),
+        so saving an edit re-renders the running preview **with no page reload**.
+      - Regression guard: `verify-express` "vite HMR tunnel" boots a hmr-enabled dev server, plays
+        the browser (`handleWsClient` + collect `onWsSend`), and asserts the open ack + Vite's
+        `{type:'connected'}` arrive, then that a file edit pushes a live `update`/`full-reload`.
+    Order: A → B → C (HMR is meaningless before static serving + change detection work). **All three
+    stages are DONE — `vite dev` boots, serves, watches, and hot-reloads in-VM.**
 
 ## Why this order (the tradeoffs)
 

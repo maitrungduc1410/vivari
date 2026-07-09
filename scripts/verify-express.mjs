@@ -295,5 +295,72 @@ assert(
   "editing a file invalidates Vite's module graph via fs.watch (dev re-transforms on next request)",
 );
 
+// === Vite HMR over the WebSocket tunnel (roadmap #19 stage C) ==================
+// The browser preview can't reach an in-VM ws server directly, so a `WebSocket`
+// polyfill in the iframe tunnels each connection to the kernel, which routes it
+// to the process owning the port; the process opens a REAL in-VM WebSocket to
+// Vite's HMR ws server (over http-upgrade + the net loopback) and relays decoded
+// frames back out. Here we play the browser: drive kernel.handleWsClient and
+// collect kernel.onWsSend. A fresh dev server WITH hmr enabled runs on 5373.
+console.log("\n== vite HMR tunnel (network) ==");
+kernel.writeFile(
+  "/vt/dev-hmr.js",
+  `
+const vite = require('vite');
+(async () => {
+  try {
+    const server = await vite.createServer({
+      root: '/vt', configFile: false, logLevel: 'silent',
+      server: { port: 5373, host: '127.0.0.1' }, optimizeDeps: { noDiscovery: true },
+    });
+    await server.listen();
+    console.log('HMR_DEV_READY');
+    setInterval(() => {}, 1000);
+  } catch (e) { console.log('HMR_DEV_ERR ' + (e && e.stack || e)); process.exit(1); }
+})();
+`,
+);
+const wsInbox = [];
+kernel.onWsSend = (m) => wsInbox.push(m);
+kernel.start("node", ["dev-hmr.js"], { cwd: "/vt" });
+for (let i = 0; i < 1500 && !listening.has(5373); i++) await new Promise((r) => setTimeout(r, 20));
+assert(listening.has(5373), "vite dev server (hmr enabled) boots on :5373");
+
+// Warm the server, then open the tunneled HMR socket like /@vite/client would.
+const hmrGet = (url) => kernel.handleHttpRequest(5373, { port: 5373, method: "GET", url, headers: { host: "127.0.0.1:5373" }, body: "" });
+await hmrGet("/");
+kernel.handleWsClient({ sub: "open", connId: "vt1", port: 5373, path: "/", protocols: "vite-hmr" });
+
+const waitWs = async (pred, ms) => {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (wsInbox.some(pred)) return true;
+    await new Promise((r) => setTimeout(r, 30));
+  }
+  return false;
+};
+
+const gotAck = await waitWs((m) => m.sub === "open", 8000);
+assert(gotAck, "browser ws upgrade reaches Vite's HMR server (open ack, subprotocol vite-hmr)");
+const gotConnected = await waitWs((m) => m.sub === "msg" && String(m.data).includes('"connected"'), 5000);
+assert(gotConnected, "Vite pushes {type:'connected'} back through the tunnel to the browser");
+
+// Edit a source file (host write) -> Vite's watcher (our fs.watch) invalidates
+// and pushes an HMR message; assert it arrives at the browser end of the tunnel.
+const wsMark = wsInbox.length;
+kernel.writeFile("/vt/src/main.js", "export const hmr = Date.now();");
+let hmrPushed = false;
+{
+  const t0 = Date.now();
+  while (Date.now() - t0 < 8000) {
+    if (wsInbox.slice(wsMark).some((m) => m.sub === "msg" && /"(update|full-reload|prune)"/.test(String(m.data)))) {
+      hmrPushed = true;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 40));
+  }
+}
+assert(hmrPushed, "editing a file pushes a live HMR update over the ws tunnel (no reload/poll)");
+
 console.log(failures === 0 ? "\nRESULT: PASS" : `\nRESULT: FAIL (${failures})`);
 process.exit(failures === 0 ? 0 : 1);

@@ -69,7 +69,12 @@ export function bootProcess({
   // child's stdout/stderr/exit (#15); `dispatchThread` feeds it a worker_thread's
   // online/exit (2b). All arrive as kernel postMessages.
   if (typeof onReady === "function")
-    onReady({ wakeNet: runtime.wake, dispatchChild: runtime.dispatchChild, dispatchThread: runtime.dispatchThread });
+    onReady({
+      wakeNet: runtime.wake,
+      dispatchChild: runtime.dispatchChild,
+      dispatchThread: runtime.dispatchThread,
+      dispatchWs: runtime.dispatchWs,
+    });
 
   // run() is async (it drives the event loop). Report the exit code when it
   // settles; a server process simply never settles (it stays alive).

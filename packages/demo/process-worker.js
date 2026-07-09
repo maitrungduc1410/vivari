@@ -6,6 +6,25 @@ import { bootProcess } from "../runtime/boot.js";
 import * as codecNs from "../codec/pkg/open_webcontainer_codec.js";
 import * as cryptoNs from "../crypto/pkg/open_webcontainer_crypto.js";
 
+// In a real Worker, `self` is a getter-only accessor on WorkerGlobalScope, so a
+// third-party global shim — e.g. `Object.assign(globalThis, { self, window,
+// global, ... })`, which Vite/rolldown runs in a worker it spawns — throws
+// "Cannot set property self ... which has only a getter". Node makes `self`
+// writable, so mirror that here: shadow the prototype accessor with an OWN
+// writable data property (value is still globalThis, so nothing changes except
+// that assigning to it now works). Only `self` needs this; `window`/`global` are
+// absent in a worker, so the shim's own writes to them succeed on their own.
+try {
+  Object.defineProperty(globalThis, "self", {
+    value: globalThis,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+} catch {
+  /* environment doesn't allow it — leave the native accessor in place */
+}
+
 let control = null;
 
 // [optimize] Native codecs (Phase 2 #11 zlib, #12 crypto): the Rust/Wasm cores
@@ -88,4 +107,7 @@ self.onmessage = async (event) => {
   // A worker_thread's online/exit relayed by the kernel (#16 stage 2b).
   else if (type === "thread-started" || type === "thread-exit")
     control && control.dispatchThread(event.data);
+  // A browser preview ws tunnel message relayed by the kernel (#19 stage C).
+  else if (type === "ws-open" || type === "ws-in" || type === "ws-close")
+    control && control.dispatchWs(event.data);
 };
