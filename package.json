@@ -7,6 +7,7 @@
   "license": "MIT",
   "scripts": {
     "dev": "node server.mjs",
+    "build:demo": "node scripts/build-demo.mjs",
     "verify": "node scripts/verify-node.mjs",
     "build:kernel": "wasm-pack build packages/kernel --target web --out-dir pkg",
     "build:kernel:node": "wasm-pack build packages/kernel --target nodejs --out-dir pkg-node",
@@ -16,5 +17,8 @@
     "build:crypto:node": "wasm-pack build packages/crypto --target nodejs --out-dir pkg-node",
     "build:wasi-demo": "cargo build --release --manifest-path packages/wasi-demo/Cargo.toml --target wasm32-wasip1 && cp packages/wasi-demo/target/wasm32-wasip1/release/wasi_demo.wasm packages/wasi-demo/pkg/wasi_demo.wasm",
     "build": "npm run build:kernel && npm run build:kernel:node && npm run build:codec && npm run build:codec:node && npm run build:crypto && npm run build:crypto:node && npm run build:wasi-demo"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
   }
 }

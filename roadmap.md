@@ -918,30 +918,39 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
   pushed down (llhttp parser, zlib codec, buffer ops) — never the orchestration or
   Node's `lib/`.
 
-## Packaging & delivery (deferred to productionization)
+## Packaging & delivery (bundle-by-role — Stage 1 DONE)
 
-Today the browser loads the runtime as **individual, unbundled ES modules** (`os.js`,
+In dev the browser loads the runtime as **individual, unbundled ES modules** (`os.js`,
 `process.js`, the vendored `node/lib/*` + `node/internal/*`, …) — one network request
-each. This is a **deliberate DEV choice**, not the shipping shape: it keeps the vendored
-Node source readable, debuggable in DevTools, and trivially diffable against upstream.
-The architecture is already bundle-ready (everything is ESM behind `loader.js`), so this
-is purely a build-pipeline step to add near the end — doing it early would only hurt DX.
+each (~120 modules, re-fetched per Worker role on first load). This is a **deliberate DEV
+choice**: it keeps the vendored Node source readable, debuggable in DevTools, and trivially
+diffable against upstream. The shipping shape is produced by a build step instead.
 
-When we productionize, the plan is **not** "one giant file" but bundle-by-role:
+- **Bundle per worker role — DONE.** `npm run build:demo` (`scripts/build-demo.mjs`,
+  esbuild) emits one minified bundle per role into **`packages/demo-dist/`** —
+  `host.js` (main), `kernel-worker.js`, `process-worker.js` (the whole vendored Node
+  runtime, ~120 files → 1), `fs-worker.js`, `fetcher-worker.js`, `sw.js`. Result: the
+  process runtime collapses from ~120 requests to **1**. Serve it at
+  `/packages/demo-dist/index.html`; dev (`packages/demo/`) stays unbundled and unchanged.
+  - *Key trick — sibling output dir.* esbuild leaves `new URL(x, import.meta.url)`
+    expressions **verbatim** (it does not bundle workers or copy url-token assets). Emitting
+    to `packages/demo-dist/` (a sibling of `packages/demo/`, same depth under `packages/`)
+    means the cross-worker refs (`new URL('./process-worker.js', import.meta.url)`) and the
+    wasm refs (`../codec|crypto|wasi-demo/pkg/...`) resolve to the exact same files with
+    **zero URL rewriting**; only `./vendor/` (relative to the demo dir) is copied alongside.
+  - Static asset imports (`../codec/pkg/*.js`, `../crypto/pkg/*.js`, `../kernel-host/*`)
+    are inlined into their role bundle; the `.wasm` binaries stay separate (fetched +
+    compiled once in the kernel worker, the `Module` cloned to each process).
 
-- **Bundle per worker role** (esbuild/rollup/vite), never dump worker code into main:
-  a *runtime* bundle (runs in the Process Worker), a *kernel* bundle (Kernel Worker),
-  and the UI (main). Minify + tree-shake each.
-- **Runtime stdlib loaded once, shared by every process:** the real spawn-latency lever
-  is caching, not file count. Ship the runtime as one cacheable artifact and
-  **precache it in the Service Worker** (we already have `sw.js`) so every Process Worker
-  spawn and every reload is instant (this is why StackBlitz caches so aggressively).
+Further packaging work (deferred, lower value now that request count is solved):
+
+- **Precache the role bundles in the Service Worker** so every Process Worker spawn and
+  every reload is instant (StackBlitz caches this aggressively). We already own `sw.js`.
 - **Lazy-load heavy/rare modules** (`zlib`, `crypto`, full `stream` variants) as split
   chunks fetched on first `require` — small core bundle + on-demand tail.
-- **Wasm stays a separate binary** (`WebAssembly.instantiateStreaming`), never inlined
-  into JS — the VFS/kernel Wasm is streamed and compiled on its own.
-- **Brotli/gzip on the minified JS** — on already-minified code this is the biggest
-  actual "resource saved" win, bigger than minification alone.
+- **Wasm stays a separate binary** (`WebAssembly.instantiateStreaming`), never inlined —
+  already the case.
+- **Brotli/gzip on the minified JS** — biggest actual "bytes saved" win on minified code.
 - **Source maps in dev only**, stripped for prod.
 
 ### Per-worker Wasm codec (zlib #11, crypto #12) — load strategy — DONE
@@ -978,6 +987,31 @@ NB: **lazy-`require` for the JS builtins (`fs`/`net`/`http`/…) is NOT worth it
 no Wasm and are pulled in by *static* `import`s at the top of `loader.js`, so they're already
 fetched before any `require()` runs. The real fix for the "rain of JS files" is bundling
 (above), not lazy require.
+
+## Open items / deferred (consolidated)
+
+All bricks (1–5) and Phase 2 items (#1–19) are ✅. What remains is intentionally deferred —
+none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by kind:
+
+- **Perf / build:**
+  - ⏳ Compile **llhttp → Wasm** as a drop-in `http_parser` (replace the pure-JS parser; #8).
+  - Packaging Stage 2: **SW-precache the role bundles**, split-chunk rare modules, Brotli,
+    dev-only source maps (see "Packaging & delivery").
+- **Node API coverage (stubs/partials to fill on demand):**
+  - `crypto` **S3**: sign/verify, RSA/EC keygen, DH, scrypt, X.509 (#12).
+  - `child_process`: parent→child **stdin** pipe, `fork` (#15).
+  - WASI: **stdin**, `poll_oneoff` (event-driven) (#16 s1).
+  - `worker_threads`: transferring more complex objects (#16 s2b).
+  - Stubbed builtins: `http2` (load-safe stub), `readline` (partial), `tls`/`https`,
+    `dgram`, `perf_hooks`, `cluster`.
+- **Network (browser-platform limits, not just unimplemented):**
+  - Outbound raw TCP is impossible in a browser — only the fetch/WebSocket bridge exists.
+  - HTTP: streaming request/response bodies, keep-alive, more concurrent in-flight (#8).
+- **Persistence:** exact `mode`/`chmod` restore (needs a VFS `chmod`; files get default mode).
+- **npm:** `package-lock.json`, lifecycle scripts, `os`/`libc` optional-dep gating (#10/#16 s2c).
+- **Validation:** exercise a **non-Vite** framework (React/Vue plugin, or another dev server)
+  to surface the next missing Node APIs — the architecture is framework-agnostic, so gaps
+  will be "add API X", not design changes.
 
 ## Definition of done for T2
 

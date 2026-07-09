@@ -130,7 +130,12 @@ const shouldPersist = (p) => {
 };
 
 (async () => {
-  await initKernel();
+  // Pass the wasm URL explicitly instead of relying on the glue's default
+  // `new URL('..._bg.wasm', import.meta.url)`. When this worker is bundled the
+  // glue is inlined here, so its default would resolve next to the bundle
+  // (demo-dist/) and 404. The sibling-dir "../kernel/pkg/" form is correct both
+  // in dev (packages/demo/) and in the bundle (packages/demo-dist/).
+  await initKernel(new URL("../kernel/pkg/open_webcontainer_kernel_bg.wasm", import.meta.url));
   const vfs = new VirtualFileSystem();
 
   // Best-effort OPFS persistence. If the API is missing or throws (private

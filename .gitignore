@@ -6,6 +6,9 @@
 # Node
 node_modules
 
+# Bundled demo (rebuild with `npm run build:demo`)
+/packages/demo-dist
+
 # Generated wasm packages (rebuild with `npm run build`)
 /packages/kernel/pkg
 /packages/kernel/pkg-node
