@@ -119,13 +119,14 @@ kernel.writeFile(
 const fs = require('fs');
 const esbuild = require('esbuild-wasm/lib/browser.js');
 const wasmPath = require.resolve('esbuild-wasm/esbuild.wasm');
-// Synchronous compile (no host-backed WebAssembly.compile promise), and a ref'd
-// keep-alive so the loop keeps turning until the async chain settles — a bare
-// 'node run.js' has no other ref'd work to hold the loop open (like npm.js does).
+// hostLiveness now keeps the loop alive through async host work, but esbuild's Go
+// service parks on a stdin reader that never ends, so we still exit explicitly —
+// and process.exit() must run from a loop-managed callback (its throw-sentinel is
+// only caught there, not in a raw Promise microtask), hence the keep-alive timer.
 let done = false, code = 0;
 const keepAlive = setInterval(() => { if (done) { clearInterval(keepAlive); process.exit(code); } }, 15);
 (async () => {
-  const wasmModule = new WebAssembly.Module(fs.readFileSync(wasmPath));
+  const wasmModule = await WebAssembly.compile(fs.readFileSync(wasmPath));
   await esbuild.initialize({ wasmModule, worker: false });
   const t = await esbuild.transform('const x: number = 1; export const y = x+1', { loader: 'ts' });
   const b = await esbuild.build({

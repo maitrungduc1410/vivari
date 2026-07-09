@@ -1405,6 +1405,25 @@ setTimeout(() => setTimeout(() => console.log('NESTED_OK'), 4), 4);
     "Event loop: setInterval/clearInterval + clearTimeout + nested timers",
   );
 
+  // Loop liveness for host-backed async: a bare script that only `await`s a
+  // WebAssembly.compile (whose promise resolves on the HOST's queue, not ours)
+  // must NOT exit before it settles. No timers, no keep-alive — the empty-module
+  // header is a valid wasm binary. Before the fix this printed nothing (loop saw
+  // no ref'd work and exited); now hostLiveness holds it open until it resolves.
+  kernel.writeFile(
+    "/t/hostwasm.js",
+    `
+const bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+WebAssembly.compile(bytes).then(
+  (m) => console.log('WASM_COMPILE_OK ' + (m instanceof WebAssembly.Module)),
+  (e) => console.log('WASM_COMPILE_ERR ' + e),
+);
+`,
+  );
+  const hw = await kernel.start("node", ["/t/hostwasm.js"], { cwd: "/t", capture: true });
+  assert(hw.code === 0 && hw.stdout.includes("WASM_COMPILE_OK true"),
+    "Event loop: a pending WebAssembly.compile keeps the loop alive (no manual keep-alive)");
+
   // === #15: async child_process.spawn — streaming stdio + exit + kill =========
   // A child that prints across timers proves output STREAMS live (arrives as
   // multiple 'data' events while the child runs its own loop), not buffered until

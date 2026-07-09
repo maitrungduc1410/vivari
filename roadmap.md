@@ -685,9 +685,18 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
     `new WebAssembly.Module` (the async `WebAssembly.compile` promise resolves off our event
     loop, which then exits early on a bare `node script.js` — the same liveness gap npm.js
     works around with a ref'd keep-alive; long-running server processes are unaffected).
-    Stretch (later): full **Vite** (rollup + dozens of deps + a dev server) is much larger;
-    and a runtime fix so host-backed promises (WebAssembly.compile/fetch/DecompressionStream)
-    keep the guest loop alive without a manual keep-alive.
+    Stretch (later): full **Vite** (rollup + dozens of deps + a dev server) is much larger.
+    - **Loop-liveness for host-backed promises — DONE.** A new `hostLiveness` counter
+      (`packages/runtime/index.js`) refs the loop while a host-backed async op is pending and
+      wakes the idle wait when it settles, so a bare `node script.js` that only `await`s
+      `WebAssembly.compile` / `fetch` / a `DecompressionStream` (via `Response`/`Blob` body
+      readers) no longer races the loop to exit — no manual keep-alive needed. The few entry
+      points are monkey-patched to track their returned promise (idempotent, per-process
+      realm). Verified headless (`verify-node`: a bare `await WebAssembly.compile` prints and
+      exits 0). Remaining ergonomic gap (separate): `process.exit()` throws a sentinel only
+      `runCallback` catches, so calling it from a raw Promise microtask (not a timer/
+      nextTick/handler) still escapes — long-running libs like esbuild's parked stdin service
+      exit via a ref'd keep-alive timer for now.
 
 ## Why this order (the tradeoffs)
 

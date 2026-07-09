@@ -66,6 +66,12 @@ export function createRuntime({
   // Liveness counter for worker_threads (2b): a running Worker (parent side) or an
   // active parentPort 'message' listener (child side) keeps the loop alive.
   const threadLiveness = { active: 0 };
+  // Liveness counter for host-backed async (WebAssembly.compile / fetch /
+  // DecompressionStream via Response body readers). Their promises settle on the
+  // HOST's queues, invisible to our loop, so a bare `node script.js` that only
+  // `await`s one would otherwise exit before it resolves. Each in-flight op refs
+  // the loop (like a libuv handle) and wakes the idle wait when it settles.
+  const hostLiveness = { active: 0 };
   // Assigned once child_process is built; the loop drains child events through it.
   let drainChildEvents = () => {};
   // Assigned once worker_threads is required; the loop drains its queued events.
@@ -85,7 +91,8 @@ export function createRuntime({
   // wake it drains queued requests and replays each through the real http stack
   // (Phase 2 #8 stage 2) so the server that answers is Node's own lib/http.js.
   const loop = createEventLoop({
-    isAlive: () => netLiveness.active > 0 || childLiveness.active > 0 || threadLiveness.active > 0,
+    isAlive: () =>
+      netLiveness.active > 0 || childLiveness.active > 0 || threadLiveness.active > 0 || hostLiveness.active > 0,
     doNet: () => {
       if (netServers.count === 0 || !bridgeHttp) return;
       for (;;) {
@@ -252,6 +259,42 @@ export function createRuntime({
   // Node worker_threads runtime does not. Some libraries (e.g. esbuild-wasm's
   // browser build, which mirrors globals off `self`) rely on it existing.
   if (typeof globalThis.self === "undefined") globalThis.self = globalThis;
+
+  // Keep the loop alive while host-backed async work is pending (see hostLiveness
+  // above). We monkey-patch the few entry points whose promises resolve off our
+  // loop so `await`-ing them from a bare script no longer races the loop to exit.
+  const trackHost = (p) => {
+    if (!p || typeof p.then !== "function") return p;
+    hostLiveness.active++;
+    const done = () => {
+      if (hostLiveness.active > 0) hostLiveness.active--;
+      loop.wakeNet(); // break an idle waitForNext so the loop re-evaluates
+    };
+    p.then(done, done); // consumes settlement only for liveness; original p is returned
+    return p;
+  };
+  const wrapHostAsync = (obj, name) => {
+    const orig = obj && obj[name];
+    if (typeof orig !== "function" || orig.__ocHostWrapped) return;
+    const wrapped = function (...args) {
+      return trackHost(orig.apply(this, args));
+    };
+    wrapped.__ocHostWrapped = true;
+    obj[name] = wrapped;
+  };
+  if (typeof WebAssembly !== "undefined") {
+    for (const m of ["compile", "instantiate", "compileStreaming", "instantiateStreaming"]) {
+      wrapHostAsync(WebAssembly, m);
+    }
+  }
+  if (typeof globalThis.fetch === "function") wrapHostAsync(globalThis, "fetch");
+  // DecompressionStream/Blob consumers land here: new Response(stream).arrayBuffer().
+  if (typeof Response !== "undefined" && Response.prototype) {
+    for (const m of ["arrayBuffer", "text", "json", "blob", "formData"]) wrapHostAsync(Response.prototype, m);
+  }
+  if (typeof Blob !== "undefined" && Blob.prototype) {
+    for (const m of ["arrayBuffer", "text"]) wrapHostAsync(Blob.prototype, m);
+  }
   // Route user-facing timers through our event loop so ordering is Node-correct
   // and callbacks fire even while a server is running (the old host timers never
   // fired — the synchronous accept loop starved them).
