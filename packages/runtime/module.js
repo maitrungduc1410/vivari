@@ -315,30 +315,30 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     // declared" SyntaxError.
     //
     // ESM modules get NONE of the CJS wrapper identifiers as their normal names:
-    // real ES modules have no `require`/`__filename`/`__dirname`, and ESM code
-    // routinely reintroduces them itself —
+    // real ES modules have no `require`/`__filename`/`__dirname`/`module`/`exports`
+    // as free variables, and ESM code routinely binds those names itself —
     //   import { createRequire } from 'module';
     //   const require = createRequire(import.meta.url);
+    //   import module from 'node:module';           // TS7's getExePath.js
     //   const __dirname = path.dirname(fileURLToPath(import.meta.url));
-    // Injecting them as params would make those declarations throw "Identifier
-    // already declared". So the transpiler's generated code uses `__oc_require`
-    // (import rewrites, __oc_import, __oc_meta.resolve) and we inject the require
-    // under that name; `exports`/`module` stay (the transpiler writes to them and
-    // ESM code never redeclares those). import.meta.url is provided via __oc_meta.
-    if (isEsm) {
-      const wrapper = new Function("exports", "__oc_require", "module", source + "\n");
-      wrapper.call(module.exports, module.exports, require, module);
-    } else {
-      const wrapper = new Function(
-        "exports",
-        "require",
-        "module",
-        "__filename",
-        "__dirname",
-        source + "\n",
-      );
-      wrapper.call(module.exports, module.exports, require, module, filename, dirname);
+    // Injecting any of them as params would make those declarations throw
+    // "Identifier already declared". So the transpiler's generated code refers to
+    // EVERYTHING under an __oc_ prefix — __oc_require (import rewrites, __oc_import,
+    // __oc_meta.resolve), __oc_exports, __oc_module — and we inject those here.
+    // import.meta.url is provided via __oc_meta.
+    let wrapper;
+    try {
+      wrapper = isEsm
+        ? new Function("__oc_exports", "__oc_require", "__oc_module", source + "\n")
+        : new Function("exports", "require", "module", "__filename", "__dirname", source + "\n");
+    } catch (err) {
+      // Compilation (parse) errors are otherwise anonymous ("<anonymous>"); name
+      // the offending file + module kind so loader bugs are debuggable.
+      err.message += ` (while compiling ${filename}${isEsm ? " [esm]" : " [cjs]"})`;
+      throw err;
     }
+    if (isEsm) wrapper.call(module.exports, module.exports, require, module);
+    else wrapper.call(module.exports, module.exports, require, module, filename, dirname);
   }
 
   function runMain(entry) {

@@ -1019,14 +1019,39 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
   - `worker_threads`: transferring more complex objects (#16 s2b).
   - Stubbed builtins: `http2` (load-safe stub), `readline` (partial), `tls`/`https`,
     `dgram`, `perf_hooks`, `cluster`.
+  - `module` builtin as a real **constructor** (`Module.prototype.require`,
+    `_resolveFilename`, `_load`, `_cache`, `wrap`) so require-patching tools
+    (Next's `require-hook`, `ts-node`, `tsconfig-paths`, jest) can monkeypatch it.
 - **Network (browser-platform limits, not just unimplemented):**
   - Outbound raw TCP is impossible in a browser — only the fetch/WebSocket bridge exists.
   - HTTP: streaming request/response bodies, keep-alive, more concurrent in-flight (#8).
 - **Persistence:** exact `mode`/`chmod` restore (needs a VFS `chmod`; files get default mode).
 - **npm:** `package-lock.json`, lifecycle scripts, `os`/`libc` optional-dep gating (#10/#16 s2c).
-- **Validation:** exercise a **non-Vite** framework (React/Vue plugin, or another dev server)
-  to surface the next missing Node APIs — the architecture is framework-agnostic, so gaps
-  will be "add API X", not design changes.
+- **Validation (framework matrix):** ran three popular stacks in-VM headlessly
+  (`scripts/probe-react.mjs`, `scripts/probe-nest.mjs`, `scripts/probe-next.mjs`) to surface
+  the next missing Node APIs. The architecture held up — every gap was "add API X", not a
+  design change:
+  - ✅ **React + Vite (rolldown) + React Compiler** — dev server serves transformed JSX,
+    Fast Refresh wired, and the compiler emits its `_c(n)` memo cache + `react/compiler-runtime`
+    import (real `@babel/core` running in-VM via `@rolldown/plugin-babel`). Surfaced & fixed:
+    (a) ESM→CJS interop for `export { X as "module.exports" }` (rolldown/tsdown CJS-interop
+    override) and `export { X as default }` brace form; (b) `crypto.hash` (one-shot, Node
+    20.12+) used by Vite's dep optimizer.
+  - ✅ **NestJS** — real `tsc` (TypeScript **5**) compiles the decorated TS app in-VM
+    (`emitDecoratorMetadata`), then Nest boots with DI + `reflect-metadata` over
+    `@nestjs/platform-express` and answers `GET / → 200`. Surfaced & fixed: the ESM wrapper
+    injected `module`/`exports` as params, colliding with ES modules that legally bind those
+    names (TS7's `getExePath.js` does `import module from "node:module"`) — the transpiler now
+    emits `__oc_exports`/`__oc_module` so user bindings never clash. Also: `typescript@7` is the
+    native Go port (`tsgo`, resolves a native `@typescript/*` binary) — pin `typescript@5`.
+  - ❌ **Next.js (16)** — **hard native wall**, not an API gap. Modern Next dropped the
+    `@next/swc-wasm-nodejs` fallback (its optional deps are all native `@next/swc-<platform>`
+    binaries) and Turbopack is native Rust, so there is no JS/WASM path to compile the app in a
+    browser VM. (Immediate crash also revealed a `require('module')` gap: our `module` builtin
+    is a plain object, so `Module.prototype.require` monkeypatching in Next's `require-hook`
+    throws — a real but separate loader-compat gap, deferred since fixing it won't get Next
+    past the SWC wall.) An older Next (13/14 with wasm SWC) might boot but needs the
+    `module`-constructor emulation + webpack-in-VM and is a large, low-priority effort.
 
 ## Definition of done for T2
 

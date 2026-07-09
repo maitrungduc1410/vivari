@@ -142,8 +142,8 @@ function scanExportEdits(src, isFrom) {
       let r = i + 6;
       while (r < n && /\s/.test(src[r])) r++;
       if (src.startsWith("default", r) && !isId(src[r + 7] || " ")) {
-        // export default <expr>  ->  exports.default = <expr>
-        edits.push({ start: i, end: r + 7, text: "exports.default =" });
+        // export default <expr>  ->  __oc_exports.default = <expr>
+        edits.push({ start: i, end: r + 7, text: "__oc_exports.default =" });
         i = r + 7;
         continue;
       }
@@ -236,17 +236,17 @@ export function transpileEsm(source, filename) {
         const rest = clause.slice(1).trimStart();
         const asMatch = rest.match(new RegExp("^as\\s+(" + ID + ")"));
         if (asMatch) {
-          prelude.push("exports[" + JSON.stringify(asMatch[1]) + "]=__oc_ns(" + m + ");");
+          prelude.push("__oc_exports[" + JSON.stringify(asMatch[1]) + "]=__oc_ns(" + m + ");");
         } else {
-          prelude.push("__oc_star(exports," + m + ");");
+          prelude.push("__oc_star(__oc_exports," + m + ");");
         }
       } else {
         for (const { imported, local } of namedFromBraces(clause)) {
           if (imported === "default") {
-            prelude.push("exports[" + JSON.stringify(local) + "]=__oc_def(" + m + ");");
+            prelude.push("__oc_exports[" + JSON.stringify(local) + "]=__oc_def(" + m + ");");
           } else {
             prelude.push(
-              "Object.defineProperty(exports," + JSON.stringify(local) +
+              "Object.defineProperty(__oc_exports," + JSON.stringify(local) +
               ",{enumerable:true,configurable:true,get:function(){return " + m + "[" + JSON.stringify(imported) + "];}});",
             );
           }
@@ -269,26 +269,54 @@ export function transpileEsm(source, filename) {
     }
   }
 
-  // local exports -> getters (skip re-exports already handled above; default is
-  // handled by the keyword rewrite in the body).
   const inFrom = (pos) => fromRanges.some(([s, e]) => pos >= s && pos < e);
+
+  // body edits: strip/rewrite export keywords. Computed first so we can tell an
+  // `export default <expr>` keyword form (rewritten to `exports.default = ...`)
+  // apart from `export { x as default }` (brace form, handled below).
+  const exportEdits = scanExportEdits(source, inFrom);
+  const hasKeywordDefault = exportEdits.some((e) => e.text === "__oc_exports.default =");
+  for (const e of exportEdits) edits.push(e);
+
+  // local exports -> getters, with two special cases the plain getter loop misses:
+  //  - `export { X as "module.exports" }`: the standard CJS-interop override
+  //    (rolldown/tsdown emit it, e.g. @vitejs/plugin-react). Node makes require()
+  //    return X verbatim; we mirror that by reassigning module.exports after the
+  //    body defines X.
+  //  - `export { X as default }` (brace form): the keyword rewrite never sees a
+  //    `default` token here, so wire exports.default to the local X ourselves.
+  let cjsOverride = null;
   for (const ex of exports) {
     if (inFrom(ex.s)) continue;
-    if (ex.n === "default") continue;
     const local = ex.ln || ex.n;
+    if (ex.n === "module.exports") {
+      if (ex.ln) cjsOverride = ex.ln;
+      continue;
+    }
+    if (ex.n === "default") {
+      if (!hasKeywordDefault && ex.ln) {
+        prelude.push(
+          "Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return " +
+            ex.ln + ";}});",
+        );
+      }
+      continue;
+    }
     prelude.push(
-      "Object.defineProperty(exports," + JSON.stringify(ex.n) +
+      "Object.defineProperty(__oc_exports," + JSON.stringify(ex.n) +
       ",{enumerable:true,configurable:true,get:function(){return " + local + ";}});",
     );
   }
 
-  // body edits: strip/rewrite export keywords
-  for (const e of scanExportEdits(source, inFrom)) edits.push(e);
-
   const fileUrl = "file://" + (filename || "");
   const head =
     helpers(fileUrl) +
-    "Object.defineProperty(exports,'__esModule',{value:true});" +
+    "Object.defineProperty(__oc_exports,'__esModule',{value:true});" +
     prelude.join("");
-  return head + applyEdits(source, edits);
+  // The CJS-interop override runs AFTER the body (so the local binding exists) and
+  // intentionally replaces the whole exports object: require() returns it verbatim,
+  // matching `export { x as "module.exports" }` semantics. The override value is
+  // authored to carry its own default/named props, so dropping our getters is fine.
+  const tail = cjsOverride ? "\n;__oc_module.exports=" + cjsOverride + ";" : "";
+  return head + applyEdits(source, edits) + tail;
 }

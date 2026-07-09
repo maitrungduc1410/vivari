@@ -256,6 +256,10 @@ export default function (exports, require, module, process, internalBinding) {
   module.exports = {
     createHash: (algo) => new Hash(algo),
     createHmac: (algo, key) => new Hmac(algo, key),
+    // One-shot hash (Node 20.12+/21.7+). Vite's dep optimizer uses it for the
+    // lockfile/dep hash. Default output is 'hex' (not a Buffer, unlike digest()).
+    hash: (algorithm, data, outputEncoding) =>
+      encodeOut(binding.digest(algorithm, toBytes(data)), outputEncoding || "hex"),
     createCipheriv: (algorithm, key, iv) => new Cipheriv(algorithm, key, iv),
     createDecipheriv: (algorithm, key, iv) => new Decipheriv(algorithm, key, iv),
     Hash,
