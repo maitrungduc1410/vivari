@@ -11,6 +11,96 @@
 
 const PREVIEW_MARKER = "/preview/";
 
+// roadmap: Packaging Stage 2 — precache the role bundles. Every Process Worker
+// spawn (and every reload) otherwise re-fetches its bundle — process-worker.js
+// alone is ~900 KB. With the bundles in the Cache Storage the browser serves
+// them from disk: spawns are instant and the app works offline.
+//
+// This is gated on a build id injected by scripts/build-demo.mjs (esbuild
+// `define`). In dev (packages/demo/sw.js, loaded unbundled) the token is never
+// defined, so BUILD_ID is null and ALL caching is skipped — edits keep hot-
+// reloading exactly as before. `typeof` on an undeclared name is legal and
+// yields "undefined", so this is safe to reference in the un-built file.
+const BUILD_ID = typeof __OC_BUILD_ID__ !== "undefined" ? __OC_BUILD_ID__ : null;
+const CACHE_ON = BUILD_ID !== null;
+const CACHE_PREFIX = "oc-precache-";
+const CACHE_NAME = CACHE_PREFIX + BUILD_ID;
+
+// Directory this SW was served from — e.g. "/packages/demo-dist/" for the build,
+// "/packages/demo/" in dev — and its parent "/packages/". The wasm binaries live
+// in sibling pkg dirs under the parent; everything else (bundles, index.html,
+// vendor) lives under the SW's own dir.
+const SCOPE_DIR = new URL("./", self.location.href).pathname;
+const PARENT_DIR = new URL("../", self.location.href).pathname;
+
+// Precached up front on install (the expensive, frequently-spawned role bundles
+// + the shell). Resolved against the SW location so it works wherever mounted.
+const PRECACHE = [
+  "index.html",
+  "host.js",
+  "kernel-worker.js",
+  "process-worker.js",
+  "fs-worker.js",
+  "fetcher-worker.js",
+].map((f) => new URL(f, self.location.href).href);
+
+// A same-origin GET we own and may serve cache-first: anything under our own dir
+// (bundles, index.html, vendor/*) or a runtime wasm binary in a sibling pkg dir.
+// Preview traffic never reaches here (handled earlier); this is only OUR assets.
+function isOwnStatic(url) {
+  const p = url.pathname;
+  if (p.startsWith(SCOPE_DIR)) return true;
+  if (p.startsWith(PARENT_DIR) && p.endsWith(".wasm")) return true;
+  return false;
+}
+
+// Coalesce concurrent misses for the same URL: a burst of Process Worker spawns
+// all requesting process-worker.js at once must trigger exactly ONE network
+// fetch, not N. Keyed by URL; entry cleared when the fetch settles.
+const inflight = new Map();
+
+// Cache-first with lazy population: serve the cached copy if present, otherwise
+// fetch (deduped), store the successful same-origin response, and return a fresh
+// clone. Falls back to any cached copy if the network is gone (offline).
+async function cacheFirst(request) {
+  const cache = await caches.open(CACHE_NAME);
+  const hit = await cache.match(request);
+  if (hit) return hit;
+
+  const key = request.url;
+  let p = inflight.get(key);
+  if (!p) {
+    p = fetch(request)
+      .then(async (resp) => {
+        // Store any OK same-origin response. (We only reach here for our own
+        // static assets, so there's no opaque/cross-origin case to guard.)
+        if (resp && resp.ok) {
+          try {
+            await cache.put(request, resp.clone());
+          } catch (err) {
+            console.warn("[oc-sw] cache.put failed for", key, "-", err && err.message);
+          }
+        } else {
+          console.warn("[oc-sw] not caching", key, "- status", resp && resp.status, "type", resp && resp.type);
+        }
+        return resp;
+      })
+      .finally(() => inflight.delete(key));
+    inflight.set(key, p);
+  }
+
+  let resp;
+  try {
+    resp = await p;
+  } catch (err) {
+    const any = await cache.match(request);
+    if (any) return any;
+    throw err;
+  }
+  // Each awaiter needs its own readable body; the shared response is only cloned.
+  return resp.clone();
+}
+
 // roadmap #19 stage C — HMR transport. A real WebSocket from the preview iframe
 // would hit the network (there is no server there) and the SW can't intercept a
 // ws upgrade. So we inject this classic (non-module, runs before Vite's deferred
@@ -83,8 +173,60 @@ function injectWsShim(html) {
   return tag + html;
 }
 
-self.addEventListener("install", () => self.skipWaiting());
-self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+self.addEventListener("install", (event) => {
+  self.skipWaiting();
+  if (CACHE_ON) event.waitUntil(precache());
+});
+
+// Best-effort, per-URL precache: unlike cache.addAll (atomic — one 404 discards
+// the whole batch), this stores whatever succeeds and logs the rest, so a stray
+// missing asset can't leave the cache empty (which would make every spawn miss).
+// Entries already present are left untouched: the cache is keyed by build id, so
+// a still-cached asset is byte-identical — no need to refetch. That keeps SW
+// reinstalls (e.g. DevTools "Update on reload", which re-runs install on every
+// navigation) free instead of re-downloading ~1 MB of bundles each time.
+async function precache() {
+  const cache = await caches.open(CACHE_NAME);
+  let fetched = 0;
+  let kept = 0;
+  let failed = 0;
+  await Promise.all(
+    PRECACHE.map(async (url) => {
+      if (await cache.match(url)) {
+        kept++;
+        return;
+      }
+      try {
+        const resp = await fetch(url, { cache: "reload" });
+        if (!resp.ok) throw new Error("status " + resp.status);
+        await cache.put(url, resp.clone());
+        fetched++;
+      } catch (err) {
+        failed++;
+        console.warn("[oc-sw] precache miss:", url, "-", err && err.message);
+      }
+    }),
+  );
+  if (fetched || failed) {
+    console.log(`[oc-sw] precache ${CACHE_NAME}: ${fetched} fetched, ${kept} cached, ${failed} failed`);
+  }
+}
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    (async () => {
+      // Drop caches from previous builds (each build id gets its own cache, so a
+      // redeploy invalidates cleanly — no stale bundles served forever).
+      if (CACHE_ON) {
+        const keys = await caches.keys();
+        await Promise.all(
+          keys.filter((k) => k.startsWith(CACHE_PREFIX) && k !== CACHE_NAME).map((k) => caches.delete(k)),
+        );
+      }
+      await self.clients.claim();
+    })(),
+  );
+});
 
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
@@ -99,6 +241,13 @@ self.addEventListener("fetch", (event) => {
     const port = parseInt(slash === -1 ? rest : rest.slice(0, slash), 10);
     const path = (slash === -1 ? "/" : rest.slice(slash)) + url.search;
     event.respondWith(handlePreview(event, port, path));
+    return;
+  }
+
+  // Our own bundles/wasm/shell: serve from the precache (instant, offline). Only
+  // in the built demo (CACHE_ON); dev stays on the network so edits reload.
+  if (CACHE_ON && event.request.method === "GET" && isOwnStatic(url)) {
+    event.respondWith(cacheFirst(event.request));
     return;
   }
 

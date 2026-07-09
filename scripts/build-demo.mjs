@@ -53,6 +53,13 @@ const kb = (n) => (n / 1024).toFixed(1) + " KB";
 rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
 
+// A per-build id stamped into sw.js (via `define`). It names the Service Worker's
+// precache, so a new build gets a fresh cache and its `activate` drops the old
+// one — a redeploy can never serve stale bundles. Changing bytes → changing
+// sw.js → the browser installs the new SW and re-caches. (Dev never sees this
+// token, so its sw.js keeps caching disabled and edits keep hot-reloading.)
+const BUILD_ID = Date.now().toString(36);
+
 const result = await build({
   entryPoints: ENTRIES.map((f) => join(DEMO, f)),
   outdir: OUT,
@@ -64,6 +71,7 @@ const result = await build({
   legalComments: "none",
   logLevel: "info",
   metafile: true,
+  define: { __OC_BUILD_ID__: JSON.stringify(BUILD_ID) },
 });
 
 // Assets fetched at runtime *relative to the demo dir* (not siblings under
@@ -83,7 +91,8 @@ const devFiles = countJs(DEMO) + countJs(join(ROOT, "packages/runtime"));
 console.log(
   `\nDev loads ~${devFiles} JS modules across the workers; the build collapses that to ${ENTRIES.length} bundles.`,
 );
-console.log("Total demo-dist: " + kb(dirSize(OUT)) + " (incl. copied vendor assets)\n");
+console.log("Total demo-dist: " + kb(dirSize(OUT)) + " (incl. copied vendor assets)");
+console.log("Service Worker precache id: " + BUILD_ID + "\n");
 
 function countJs(dir) {
   let n = 0;

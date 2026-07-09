@@ -918,7 +918,7 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
   pushed down (llhttp parser, zlib codec, buffer ops) — never the orchestration or
   Node's `lib/`.
 
-## Packaging & delivery (bundle-by-role — Stage 1 DONE)
+## Packaging & delivery (bundle-by-role — Stages 1 & 2 DONE)
 
 In dev the browser loads the runtime as **individual, unbundled ES modules** (`os.js`,
 `process.js`, the vendored `node/lib/*` + `node/internal/*`, …) — one network request
@@ -942,15 +942,29 @@ diffable against upstream. The shipping shape is produced by a build step instea
     are inlined into their role bundle; the `.wasm` binaries stay separate (fetched +
     compiled once in the kernel worker, the `Module` cloned to each process).
 
-Further packaging work (deferred, lower value now that request count is solved):
+- **Precache the role bundles in the Service Worker — DONE (Stage 2).** `sw.js` now
+  precaches the six role bundles + `index.html` on `install` and serves them (plus the
+  runtime `.wasm` binaries and `vendor/`, cache-first + lazily populated) from Cache
+  Storage. So every **Process Worker spawn** (which re-fetches `process-worker.js`, ~900 KB)
+  and every reload is served from disk — instant, and the app works **offline**. Cache
+  correctness across redeploys: `scripts/build-demo.mjs` stamps a per-build id into `sw.js`
+  (esbuild `define: { __OC_BUILD_ID__ }`) that names the cache (`oc-precache-<id>`); a new
+  build changes `sw.js` → the browser installs the new SW, whose `activate` deletes every
+  older `oc-precache-*`. All of this is **gated on that build id**, so dev (`packages/demo/`,
+  loaded unbundled) never caches — edits keep hot-reloading unchanged.
 
-- **Precache the role bundles in the Service Worker** so every Process Worker spawn and
-  every reload is instant (StackBlitz caches this aggressively). We already own `sw.js`.
+Further packaging work (deferred, lower value now that request count + spawn cost are solved):
+
 - **Lazy-load heavy/rare modules** (`zlib`, `crypto`, full `stream` variants) as split
   chunks fetched on first `require` — small core bundle + on-demand tail.
 - **Wasm stays a separate binary** (`WebAssembly.instantiateStreaming`), never inlined —
   already the case.
-- **Brotli/gzip on the minified JS** — biggest actual "bytes saved" win on minified code.
+- **Transport compression (gzip/brotli): NOT app-level.** In deployment we sit behind
+  nginx/CDN, which negotiates `Content-Encoding` per `Accept-Encoding` for free — doing it
+  in-app would just duplicate that. Two infra notes for whoever deploys: (1) nginx's default
+  `gzip_types` omits `application/wasm`, so add it (+ `application/javascript`); (2) prefer
+  `gzip_static`/`brotli_static` over on-the-fly if pre-compressing at build time. COOP/COEP
+  headers (needed for SharedArrayBuffer) must be re-set at the proxy — they don't propagate.
 - **Source maps in dev only**, stripped for prod.
 
 ### Per-worker Wasm codec (zlib #11, crypto #12) — load strategy — DONE
@@ -995,8 +1009,9 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
 
 - **Perf / build:**
   - ⏳ Compile **llhttp → Wasm** as a drop-in `http_parser` (replace the pure-JS parser; #8).
-  - Packaging Stage 2: **SW-precache the role bundles**, split-chunk rare modules, Brotli,
-    dev-only source maps (see "Packaging & delivery").
+  - ✅ Packaging Stage 2 (**SW-precache the role bundles**) — DONE. Remaining packaging
+    polish (split-chunk rare modules, dev-only source maps) deferred; transport gzip/brotli
+    is left to the deploy proxy, not app-level (see "Packaging & delivery").
 - **Node API coverage (stubs/partials to fill on demand):**
   - `crypto` **S3**: sign/verify, RSA/EC keygen, DH, scrypt, X.509 (#12).
   - `child_process`: parent→child **stdin** pipe, `fork` (#15).

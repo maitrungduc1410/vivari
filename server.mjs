@@ -76,6 +76,7 @@ const server = createServer(async (req, res) => {
     const body = await readFile(filePath);
     res.writeHead(200, {
       "Content-Type": MIME[ext] || "application/octet-stream",
+      "Content-Length": body.byteLength,
     });
     res.end(body);
   } catch {
