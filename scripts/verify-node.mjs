@@ -1455,6 +1455,29 @@ WebAssembly.compile(bytes).then(
   assert(ex2.code === 7 && ex2.stdout.includes("IN_CATCH"),
     "process.exit(): honoured from a Promise .catch() handler (code 7)");
 
+  // Large whole-file reads: a file bigger than the 1 MiB shared syscall window
+  // must round-trip. readFileSync(path) (buffer) already loops via fd; the utf8
+  // fast path used to read the whole file in one shot and overflowed the window
+  // ("offset is out of bounds") — it now falls back to the chunked fd path on
+  // EFBIG. (This is what blocked `npm install` of packages with big packuments.)
+  kernel.writeFile(
+    "/t/reader.js",
+    `
+const fs = require('fs');
+const big = 'A'.repeat(3 * 1024 * 1024) + 'END'; // ~3 MiB, well over the 1 MiB window
+fs.writeFileSync('/t/big.txt', big);
+const utf8 = fs.readFileSync('/t/big.txt', 'utf8');
+const buf = fs.readFileSync('/t/big.txt');
+console.log('UTF8_OK ' + (utf8.length === big.length && utf8.endsWith('END')));
+console.log('BUF_OK ' + (buf.length === big.length && buf[buf.length - 1] === 68));
+`,
+  );
+  const rd = await kernel.start("node", ["/t/reader.js"], { cwd: "/t", capture: true });
+  assert(
+    rd.code === 0 && rd.stdout.includes("UTF8_OK true") && rd.stdout.includes("BUF_OK true"),
+    "fs: readFileSync (utf8 + buffer) handles a file larger than the shared window",
+  );
+
   // === #15: async child_process.spawn — streaming stdio + exit + kill =========
   // A child that prints across timers proves output STREAMS live (arrives as
   // multiple 'data' events while the child runs its own loop), not buffered until

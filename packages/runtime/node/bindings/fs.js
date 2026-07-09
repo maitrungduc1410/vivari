@@ -72,6 +72,27 @@ export function createFsBinding({ sys: rawSys, process }) {
     readlink: (p) => rawSys.readlink(R(p)),
   };
 
+  // Read a whole file through the chunked fd layer (open + read loop + close),
+  // used when a file is too large for the single-shot whole-file window (EFBIG).
+  const readWholeViaFd = (path) => {
+    const fd = sys.open(path, 0 /* O_RDONLY */, 0);
+    try {
+      const size = sys.fstat(fd).size >>> 0;
+      const out = new Uint8Array(size);
+      let total = 0;
+      for (;;) {
+        const chunk = sys.fdRead(fd, Math.max(1, size - total), -1);
+        if (chunk.length === 0) break;
+        out.set(chunk, total);
+        total += chunk.length;
+        if (total >= size) break;
+      }
+      return total === size ? out : out.subarray(0, total);
+    } finally {
+      sys.close(fd);
+    }
+  };
+
   // The shared, in-place stat scratch buffer (Node's binding.statValues).
   const statValues = new Float64Array(STAT_FIELDS);
 
@@ -135,7 +156,18 @@ export function createFsBinding({ sys: rawSys, process }) {
 
     // -- whole-file fast paths (used by readFileSync/writeFileSync utf8) --
     readFileUtf8(path /* , flags */) {
-      return textDecoder.decode(sys.readFile(path));
+      try {
+        // Fast path: one syscall, whole file through the shared window.
+        return textDecoder.decode(sys.readFile(path));
+      } catch (e) {
+        // File exceeds the 1 MiB shared window (EFBIG): fall back to the chunked
+        // fd loop, exactly like the buffer readFileSync path. Any other error
+        // (ENOENT/EISDIR/...) re-throws unchanged.
+        if (String(e && (e.code || e.message)).includes("EFBIG")) {
+          return textDecoder.decode(readWholeViaFd(path));
+        }
+        throw e;
+      }
     },
     writeFileUtf8(path, data, flags, mode) {
       const fd = sys.open(path, flags, mode);

@@ -96,6 +96,17 @@ export class FsServer {
     const { flags, fields } = decodeRequest(data.slice(0, Atomics.load(ctrl, I_REQ_LEN)));
     try {
       const bytes = this.dispatch(opcode, flags, fields);
+      if (bytes.length > data.length) {
+        // The response doesn't fit the shared window (e.g. a whole-file read of a
+        // >1 MiB file). Signal EFBIG so the client retries via the chunked fd path
+        // instead of throwing an opaque "offset is out of bounds" from data.set().
+        const e = encodeString("EFBIG: response exceeds shared window");
+        data.set(e, 0);
+        Atomics.store(ctrl, I_RES_LEN, e.length);
+        Atomics.store(ctrl, I_STATE, STATE_RESPONSE_ERR);
+        Atomics.notify(ctrl, I_STATE);
+        return;
+      }
       data.set(bytes, 0);
       Atomics.store(ctrl, I_RES_LEN, bytes.length);
       Atomics.store(ctrl, I_STATE, STATE_RESPONSE_OK);
