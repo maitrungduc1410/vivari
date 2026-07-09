@@ -1057,6 +1057,42 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     React Compiler** (live editor + Fast Refresh), and **NestJS API** (`tsc`
     compile → HTML at `/`, JSON at `/api/hello`), driven by the `DEMOS` registry +
     `startDemo()` in `kernel-worker.js`.
+  - ✅ **Fixed (NestJS in the browser — port collision + missing net errors):** the
+    demo page's legacy auto-showcase booted a `dev-app` server on **:3200** (never
+    torn down), the same port the NestJS demo uses. Nest's real `listen(3200)` then
+    got EADDRINUSE from the kernel, and net.js's `new UVExceptionWithHostPort(...)`
+    threw *"not a constructor"* because `internal/errors` didn't export it (nor
+    `NodeAggregateError` / the net `codes`). Two fixes: (a) `errors.js` now defines
+    the net error set (`UVExceptionWithHostPort` aliased to `ExceptionWithHostPort`,
+    `NodeAggregateError`, `ERR_SERVER_ALREADY_LISTEN`, `ERR_SOCKET_*`, …), so a port
+    clash surfaces as a real EADDRINUSE; (b) `boot()` no longer runs the fixed
+    auto-showcase (the /srv server + is-odd/@node-rs/crc32 installs + the :3200 dev
+    server) — the page is a demo *selector* now, so boot just stands up the kernel
+    and reports ready. This also removes the **10-30s cold-load stall** (those npm
+    installs ran on every load, over the Fetcher Worker/SAB — invisible in the XHR
+    panel) before the selected demo could even start.
+  - ✅ **Fixed (large HTTP responses, surfaced by React demo):** the whole HTTP
+    response (headers **and** body) crossed the process→kernel SAB as one
+    `JSON.stringify`'d `OP_RESPOND` field. Vite serves its pre-bundled deps
+    uninlined — `react-dom_client.js` is **~2.8 MB** transformed — and JSON-escaping
+    that text (every `"`, `\`, newline doubles) overflowed the **1 MiB** window, so
+    `call()` threw *"request too large"*; the throw was silently swallowed in
+    `bridgeHttp`'s `reply()` → the request never resolved → 60 s → **504 / blank
+    iframe** (small deps like `react.js` fit, so they worked). Fix: `OP_RESPOND` now
+    carries the body as a **raw length-prefixed field** (no JSON escaping) and
+    **chunks** bodies larger than the window into sequential frames the kernel
+    reassembles by `reqId` (`fs-client.respond` + `kernel.handleRespond`), mirroring
+    the fd read/write chunk loop. Regression-checked in `probe-react.mjs` (asserts
+    the multi-MB `.vite/deps` bundle serves 200).
+  - ✅ **Fixed (browser-only, surfaced by React demo):** `internal/errors` was missing
+    most stream + http error *constructors* (`ERR_STREAM_DESTROYED`,
+    `ERR_STREAM_ALREADY_FINISHED`, `ERR_HTTP_HEADERS_SENT`, …). The vendored modules
+    destructure them from `codes` at load (silently `undefined`) and only build them on
+    **error paths**, so headless tests (clean request/response) never tripped it. In the
+    browser the preview iframe closes sockets mid-response → `socketOnEnd`/`socketOnClose`
+    call `writable.end()` on a destroyed stream → `new ERR_STREAM_DESTROYED('end')` →
+    `"Je is not a constructor"` → crashed response → **502**. All the stream/http codes the
+    vendored modules reference are now defined in `internal/errors.js`.
 
 ## Definition of done for T2
 

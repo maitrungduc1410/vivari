@@ -163,8 +163,35 @@ export function createSyscalls({ ctrl, data, notify }) {
       return p.length ? JSON.parse(decodeBytes(p)) : null;
     },
     // Reply to a request; unblocks the caller (Service Worker) and lets us loop.
-    respond: (reqId, resp) =>
-      call(OP_RESPOND, encodeRequest([b(JSON.stringify({ reqId, ...resp }))])),
+    // The body crosses as a *raw* length-prefixed field (field1), NOT inside the
+    // JSON metadata (field0): JSON-escaping a large text body (every " \\ and
+    // newline doubles) can push it past the 1 MiB window and throw. Bodies larger
+    // than the window are split into sequential frames the kernel reassembles by
+    // reqId (`total` in the metadata marks completion). Frames for one reqId are
+    // sent in a tight synchronous loop, so they never interleave with another.
+    respond: (reqId, resp) => {
+      const body = resp.body == null ? "" : resp.body;
+      const bodyBytes = typeof body === "string" ? b(body) : body;
+      const meta = b(
+        JSON.stringify({
+          reqId,
+          status: resp.status,
+          headers: resp.headers,
+          bodyEncoding: resp.bodyEncoding,
+          total: bodyBytes.length,
+        }),
+      );
+      // Room for the body in one frame: window minus metadata minus frame headers
+      // (8 flags/count + two 4-byte field length prefixes) with a safety margin.
+      const room = data.length - meta.length - 64;
+      if (bodyBytes.length <= room) {
+        call(OP_RESPOND, encodeRequest([meta, bodyBytes]));
+        return;
+      }
+      for (let off = 0; off < bodyBytes.length; off += room) {
+        call(OP_RESPOND, encodeRequest([meta, bodyBytes.subarray(off, off + room)]));
+      }
+    },
     closeServer: (port) => call(OP_CLOSE_SERVER, encodeRequest([b(JSON.stringify({ port }))])),
 
     // ---- network fetch (Phase 2 #9) ----

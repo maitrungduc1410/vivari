@@ -190,4 +190,35 @@ log("  react-refresh wired: " + (appCode.includes("$RefreshReg$") || appCode.inc
 log("  react-compiler applied (c/_c cache): " + (/["']react\/compiler-runtime["']/.test(appCode) || /\b_c\(/.test(appCode)));
 log("\n---- App.jsx transformed (first 1200 chars) ----\n" + appCode.slice(0, 1200));
 
+// Repro for the browser 504: the entry imports react-dom/client, which Vite
+// serves from its pre-bundled .vite/deps. Follow that request and time it out so
+// a hang is visible (the browser hits exactly this URL and 504s after 60s).
+const withTimeout = (p, ms, label) =>
+  Promise.race([p, new Promise((r) => setTimeout(() => r({ status: "TIMEOUT(" + label + ")" }), ms))]);
+
+log("\n== dep-optimizer serving (the browser-504 path) ==");
+const mainMod = await get("/src/main.jsx");
+const mainCode = decode(mainMod.body);
+log("  GET /src/main.jsx -> " + mainMod.status);
+const m = mainCode.match(/\/node_modules\/\.vite\/deps\/[\w.-]*react-dom[\w.-]*\.js(\?v=[0-9a-f]+)?/);
+const depUrl = m ? m[0] : "/node_modules/.vite/deps/react-dom_client.js";
+log("  resolved react-dom/client -> " + depUrl);
+const dep = await withTimeout(get(depUrl), 15000, "dep");
+log("  GET " + depUrl + " -> " + dep.status + (dep.body ? " len=" + decode(dep.body).length : ""));
+
+// Isolate: does the hang follow the FILE (react-dom_client) or the ?v= QUERY?
+const vq = (m && m[1]) || "?v=00000000";
+const base = "/node_modules/.vite/deps/";
+const cases = [
+  base + "react.js",
+  base + "react.js" + vq,
+  base + "react-dom_client.js",
+  base + "react-dom_client.js" + vq,
+  base + "react_compiler-runtime.js" + vq,
+];
+for (const d of cases) {
+  const r = await withTimeout(get(d), 12000, d);
+  log("  GET " + d + " -> " + r.status + (r.body ? " len=" + decode(r.body).length : ""));
+}
+
 process.exit(0);

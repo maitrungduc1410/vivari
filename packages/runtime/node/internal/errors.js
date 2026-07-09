@@ -293,6 +293,213 @@ export default function (exports, require, module, process, internalBinding, pri
     return fn;
   };
 
+  // --- streams (internal/streams/*) --------------------------------------------
+  // These are constructed only on error paths (e.g. writing after end, or calling
+  // .end()/.write() on a destroyed stream — which happens when a peer closes the
+  // socket mid-response). Absent, `new ERR_STREAM_*()` throws "not a constructor"
+  // and crashes the response instead of surfacing a clean stream error.
+  const ERR_METHOD_NOT_IMPLEMENTED = makeNodeError(
+    Error,
+    "ERR_METHOD_NOT_IMPLEMENTED",
+    (method) => `The ${method} method is not implemented`,
+  );
+  const ERR_MULTIPLE_CALLBACK = makeNodeError(
+    Error,
+    "ERR_MULTIPLE_CALLBACK",
+    () => "Callback called multiple times",
+  );
+  const ERR_STREAM_ALREADY_FINISHED = makeNodeError(
+    Error,
+    "ERR_STREAM_ALREADY_FINISHED",
+    (fn) => `Cannot call ${fn} after a stream was finished`,
+  );
+  const ERR_STREAM_CANNOT_PIPE = makeNodeError(
+    Error,
+    "ERR_STREAM_CANNOT_PIPE",
+    () => "Cannot pipe, not readable",
+  );
+  const ERR_STREAM_DESTROYED = makeNodeError(
+    Error,
+    "ERR_STREAM_DESTROYED",
+    (fn) => `Cannot call ${fn} after a stream was destroyed`,
+  );
+  const ERR_STREAM_NULL_VALUES = makeNodeError(
+    TypeError,
+    "ERR_STREAM_NULL_VALUES",
+    () => "May not write null values to stream",
+  );
+  const ERR_STREAM_WRITE_AFTER_END = makeNodeError(
+    Error,
+    "ERR_STREAM_WRITE_AFTER_END",
+    () => "write after end",
+  );
+  const ERR_STREAM_PREMATURE_CLOSE = makeNodeError(
+    Error,
+    "ERR_STREAM_PREMATURE_CLOSE",
+    () => "Premature close",
+  );
+  const ERR_STREAM_UNABLE_TO_PIPE = makeNodeError(
+    Error,
+    "ERR_STREAM_UNABLE_TO_PIPE",
+    () => "Cannot pipe to a closed or destroyed stream",
+  );
+  const ERR_STREAM_PUSH_AFTER_EOF = makeNodeError(
+    Error,
+    "ERR_STREAM_PUSH_AFTER_EOF",
+    () => "stream.push() after EOF",
+  );
+  const ERR_STREAM_UNSHIFT_AFTER_END_EVENT = makeNodeError(
+    Error,
+    "ERR_STREAM_UNSHIFT_AFTER_END_EVENT",
+    () => "stream.unshift() after end event",
+  );
+  const ERR_INVALID_RETURN_VALUE = makeNodeError(
+    TypeError,
+    "ERR_INVALID_RETURN_VALUE",
+    (input, name, value) =>
+      `Expected ${input} to be returned from the "${name}" function but got ${determineType(value)}.`,
+  );
+
+  // --- http (lib/_http_*) ------------------------------------------------------
+  // Likewise only thrown on error paths; kept complete so a misbehaving request
+  // (bad header, headers-after-sent, timeout, content-length mismatch) throws the
+  // real coded error rather than crashing on an undefined constructor.
+  const ERR_HTTP_HEADERS_SENT = makeNodeError(
+    Error,
+    "ERR_HTTP_HEADERS_SENT",
+    (arg) => `Cannot ${arg} headers after they are sent to the client`,
+  );
+  const ERR_HTTP_INVALID_STATUS_CODE = makeNodeError(
+    RangeError,
+    "ERR_HTTP_INVALID_STATUS_CODE",
+    (code) => `Invalid status code: ${code}`,
+  );
+  const ERR_HTTP_REQUEST_TIMEOUT = makeNodeError(
+    Error,
+    "ERR_HTTP_REQUEST_TIMEOUT",
+    () => "Request timeout",
+  );
+  const ERR_HTTP_SOCKET_ASSIGNED = makeNodeError(
+    Error,
+    "ERR_HTTP_SOCKET_ASSIGNED",
+    () => "ServerResponse has an already assigned socket",
+  );
+  const ERR_HTTP_SOCKET_ENCODING = makeNodeError(
+    Error,
+    "ERR_HTTP_SOCKET_ENCODING",
+    () => "Changing the socket encoding is not allowed per RFC7230 Section 3.",
+  );
+  const ERR_HTTP_BODY_NOT_ALLOWED = makeNodeError(
+    Error,
+    "ERR_HTTP_BODY_NOT_ALLOWED",
+    () => "Adding content for this request method or response status is not allowed.",
+  );
+  const ERR_HTTP_CONTENT_LENGTH_MISMATCH = makeNodeError(
+    Error,
+    "ERR_HTTP_CONTENT_LENGTH_MISMATCH",
+    (actual, expected) =>
+      `Response body's content-length of ${actual} byte(s) does not match the content-length of ${expected} byte(s) set in header`,
+  );
+  const ERR_HTTP_INVALID_HEADER_VALUE = makeNodeError(
+    TypeError,
+    "ERR_HTTP_INVALID_HEADER_VALUE",
+    (value, name) => `Invalid value "${value}" for header "${name}"`,
+  );
+  const ERR_HTTP_TRAILER_INVALID = makeNodeError(
+    Error,
+    "ERR_HTTP_TRAILER_INVALID",
+    () => "Trailers are invalid with this transfer encoding",
+  );
+  const ERR_INVALID_CHAR = makeNodeError(
+    TypeError,
+    "ERR_INVALID_CHAR",
+    (name, field) =>
+      field ? `Invalid character in ${name} ["${field}"]` : `Invalid character in ${name}`,
+  );
+  const ERR_INVALID_HTTP_TOKEN = makeNodeError(
+    TypeError,
+    "ERR_INVALID_HTTP_TOKEN",
+    (name, token) => `${name} must be a valid HTTP token ["${token}"]`,
+  );
+  const ERR_INVALID_PROTOCOL = makeNodeError(
+    TypeError,
+    "ERR_INVALID_PROTOCOL",
+    (protocol, expectedProtocol) =>
+      `Protocol "${protocol}" not supported. Expected "${expectedProtocol}"`,
+  );
+  const ERR_UNESCAPED_CHARACTERS = makeNodeError(
+    TypeError,
+    "ERR_UNESCAPED_CHARACTERS",
+    (name) => `${name} contains unescaped characters`,
+  );
+
+  // --- net (lib/net.js) --------------------------------------------------------
+  // Error paths only, but a couple are commonly hit: ERR_SERVER_ALREADY_LISTEN
+  // and, via UVExceptionWithHostPort below, a port already in use (EADDRINUSE).
+  const ERR_SERVER_ALREADY_LISTEN = makeNodeError(
+    Error,
+    "ERR_SERVER_ALREADY_LISTEN",
+    () => "Listen method has been called more than once without closing.",
+  );
+  const ERR_SERVER_NOT_RUNNING = makeNodeError(
+    Error,
+    "ERR_SERVER_NOT_RUNNING",
+    () => "Server is not running.",
+  );
+  const ERR_SOCKET_CLOSED = makeNodeError(Error, "ERR_SOCKET_CLOSED", () => "Socket is closed");
+  const ERR_SOCKET_CLOSED_BEFORE_CONNECTION = makeNodeError(
+    Error,
+    "ERR_SOCKET_CLOSED_BEFORE_CONNECTION",
+    () => "Socket closed before the connection was established",
+  );
+  const ERR_SOCKET_CONNECTION_TIMEOUT = makeNodeError(
+    Error,
+    "ERR_SOCKET_CONNECTION_TIMEOUT",
+    () => "Socket connection timeout",
+  );
+  const ERR_INVALID_ADDRESS_FAMILY = makeNodeError(
+    RangeError,
+    "ERR_INVALID_ADDRESS_FAMILY",
+    (addressType, host, port) => `Invalid address family: ${addressType} ${host}:${port}`,
+  );
+  const ERR_INVALID_FD_TYPE = makeNodeError(
+    TypeError,
+    "ERR_INVALID_FD_TYPE",
+    (type) => `Unsupported fd type: ${type}`,
+  );
+  const ERR_INVALID_HANDLE_TYPE = makeNodeError(
+    TypeError,
+    "ERR_INVALID_HANDLE_TYPE",
+    () => "This handle type cannot be sent",
+  );
+  const ERR_INVALID_IP_ADDRESS = makeNodeError(
+    TypeError,
+    "ERR_INVALID_IP_ADDRESS",
+    (ip) => `Invalid IP address: ${ip}`,
+  );
+  const ERR_IP_BLOCKED = makeNodeError(
+    Error,
+    "ERR_IP_BLOCKED",
+    (ip) => `IP(${ip}) is blocked by net.BlockList`,
+  );
+
+  // errno + host/port exception used by net.js on bind/connect/listen failures
+  // (e.g. EADDRINUSE). Node exposes both a legacy `ExceptionWithHostPort` and a
+  // uv-based `UVExceptionWithHostPort`; for us they're the same errno→message
+  // builder, so alias the second to the first (already defined above).
+  const UVExceptionWithHostPort = ExceptionWithHostPort;
+
+  // Aggregate of several connect attempt errors (net.js "happy eyeballs").
+  const AggregateBase = typeof AggregateError === "function" ? AggregateError : Error;
+  class NodeAggregateError extends AggregateBase {
+    constructor(errors, message) {
+      super(errors, message);
+      this.code = errors && errors[0] && errors[0].code;
+      this.name = "AggregateError";
+      this.errors = errors;
+    }
+  }
+
   module.exports = {
     hideStackFrames,
     genericNodeError,
@@ -301,6 +508,8 @@ export default function (exports, require, module, process, internalBinding, pri
     aggregateTwoErrors,
     ErrnoException,
     ExceptionWithHostPort,
+    UVExceptionWithHostPort,
+    NodeAggregateError,
     isErrorStackTraceLimitWritable,
     kEnhanceStackBeforeInspector,
     codes: {
@@ -328,6 +537,44 @@ export default function (exports, require, module, process, internalBinding, pri
       // fs.js also destructures these two but only uses them in edge/async paths.
       ERR_FS_CP_EINVAL: makeSystemError("ERR_FS_CP_EINVAL"),
       ERR_INVALID_ARG_TYPE_RANGE: ERR_OUT_OF_RANGE,
+      // streams
+      ERR_METHOD_NOT_IMPLEMENTED,
+      ERR_MULTIPLE_CALLBACK,
+      ERR_STREAM_ALREADY_FINISHED,
+      ERR_STREAM_CANNOT_PIPE,
+      ERR_STREAM_DESTROYED,
+      ERR_STREAM_NULL_VALUES,
+      ERR_STREAM_WRITE_AFTER_END,
+      ERR_STREAM_PREMATURE_CLOSE,
+      ERR_STREAM_UNABLE_TO_PIPE,
+      ERR_STREAM_PUSH_AFTER_EOF,
+      ERR_STREAM_UNSHIFT_AFTER_END_EVENT,
+      ERR_INVALID_RETURN_VALUE,
+      // http
+      ERR_HTTP_HEADERS_SENT,
+      ERR_HTTP_INVALID_STATUS_CODE,
+      ERR_HTTP_REQUEST_TIMEOUT,
+      ERR_HTTP_SOCKET_ASSIGNED,
+      ERR_HTTP_SOCKET_ENCODING,
+      ERR_HTTP_BODY_NOT_ALLOWED,
+      ERR_HTTP_CONTENT_LENGTH_MISMATCH,
+      ERR_HTTP_INVALID_HEADER_VALUE,
+      ERR_HTTP_TRAILER_INVALID,
+      ERR_INVALID_CHAR,
+      ERR_INVALID_HTTP_TOKEN,
+      ERR_INVALID_PROTOCOL,
+      ERR_UNESCAPED_CHARACTERS,
+      // net
+      ERR_SERVER_ALREADY_LISTEN,
+      ERR_SERVER_NOT_RUNNING,
+      ERR_SOCKET_CLOSED,
+      ERR_SOCKET_CLOSED_BEFORE_CONNECTION,
+      ERR_SOCKET_CONNECTION_TIMEOUT,
+      ERR_INVALID_ADDRESS_FAMILY,
+      ERR_INVALID_FD_TYPE,
+      ERR_INVALID_HANDLE_TYPE,
+      ERR_INVALID_IP_ADDRESS,
+      ERR_IP_BLOCKED,
     },
   };
 }

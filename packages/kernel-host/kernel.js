@@ -322,7 +322,11 @@ export class Kernel {
       this.handleAccept(proc);
       return; // deferred until a request arrives for one of this proc's ports
     }
-    if (opcode === OP_LISTEN || opcode === OP_RESPOND || opcode === OP_CLOSE_SERVER) {
+    if (opcode === OP_RESPOND) {
+      this.handleRespond(proc, fields);
+      return; // may span multiple frames (large bodies); resolves on the last
+    }
+    if (opcode === OP_LISTEN || opcode === OP_CLOSE_SERVER) {
       this.handleNet(proc, opcode, JSON.parse(decodeBytes(fields[0])));
       return;
     }
@@ -349,22 +353,52 @@ export class Kernel {
       if (this.onListen) this.onListen(port, proc.pid);
       return;
     }
-    if (opcode === OP_CLOSE_SERVER) {
-      const port = msg.port | 0;
-      if (this.listeners.get(port) === proc.pid) this.listeners.delete(port);
-      this.respondOk(proc, EMPTY);
-      return;
-    }
-    // OP_RESPOND: the server produced an HTTP response; resolve the waiting
-    // fetch and unblock the server so it can loop back to accept.
-    const pend = this.pendingHttp.get(msg.reqId);
+    // OP_CLOSE_SERVER
+    const port = msg.port | 0;
+    if (this.listeners.get(port) === proc.pid) this.listeners.delete(port);
+    this.respondOk(proc, EMPTY);
+  }
+
+  // OP_RESPOND: the server produced an HTTP response and unblocks whoever issued
+  // the request. field0 = JSON metadata {reqId,status,headers,bodyEncoding,total},
+  // field1 = a raw body chunk. Large bodies arrive as several sequential frames
+  // (the 1 MiB SAB window can't hold them at once); we accumulate the raw bytes by
+  // reqId and resolve once `total` is reached, decoding the body exactly once.
+  // `bodyEncoding:'base64'` marks a binary body the runtime base64-encoded so it
+  // could cross as text; the Service Worker decodes it back to bytes (#19 stage A).
+  handleRespond(proc, fields) {
+    const meta = JSON.parse(decodeBytes(fields[0]));
+    const chunk = fields[1];
+    const pend = this.pendingHttp.get(meta.reqId);
     if (pend) {
-      // `bodyEncoding:'base64'` marks a binary body the runtime base64-encoded so
-      // it could cross this JSON boundary; the Service Worker decodes it back to
-      // bytes (roadmap #19 stage A).
-      pend.resolve({ status: msg.status, headers: msg.headers, body: msg.body, bodyEncoding: msg.bodyEncoding });
-      this.pendingHttp.delete(msg.reqId);
+      const acc = pend.acc || (pend.acc = { parts: [], len: 0 });
+      // fields are subarray views into the SAB — copy before it's reused.
+      if (chunk && chunk.length) {
+        acc.parts.push(chunk.slice());
+        acc.len += chunk.length;
+      }
+      if (acc.len >= (meta.total | 0)) {
+        let bytes;
+        if (acc.parts.length === 1) {
+          bytes = acc.parts[0];
+        } else {
+          bytes = new Uint8Array(acc.len);
+          let o = 0;
+          for (const p of acc.parts) {
+            bytes.set(p, o);
+            o += p.length;
+          }
+        }
+        pend.resolve({
+          status: meta.status,
+          headers: meta.headers,
+          body: decodeBytes(bytes),
+          bodyEncoding: meta.bodyEncoding,
+        });
+        this.pendingHttp.delete(meta.reqId);
+      }
     }
+    // Unblock the server so it can loop back to accept (per frame).
     this.respondOk(proc, EMPTY);
   }
 

@@ -98,7 +98,10 @@ export const OP_KILL = 27;
 // this blocking accept loop is the process's synchronous "event loop".
 //   OP_LISTEN       field0 = JSON {port}                -> OK empty
 //   OP_ACCEPT       (no fields)                         -> OK JSON {reqId,port,req}
-//   OP_RESPOND      field0 = JSON {reqId,status,headers,body} -> OK empty
+//   OP_RESPOND      field0 = JSON {reqId,status,headers,bodyEncoding,total},
+//                   field1 = raw body chunk -> OK empty. A body larger than the
+//                   1 MiB window arrives as several sequential frames (same field0
+//                   metadata) the kernel reassembles by reqId until `total` bytes.
 //   OP_CLOSE_SERVER field0 = JSON {port}                -> OK empty
 export const OP_LISTEN = 21;
 export const OP_ACCEPT = 22;
