@@ -191,9 +191,28 @@ export function createRuntime({
   // http *server* over the net loopback, then send the collected response back to
   // the kernel. This is the cross-VM seam: the kernel/SW protocol is unchanged
   // ({port,method,url,headers,body} in -> {status,headers,body} out), but Node's
-  // own http parses/serves it. Bodies cross as utf8 strings (kernel JSON), same as
-  // the old Brick 5 path; binary payloads are out of scope for the preview.
+  // own http parses/serves it. Bodies cross through the kernel as JSON strings, so
+  // textual responses go as utf8 and *binary* responses (images, fonts, wasm — the
+  // Vite dev server serves these) go base64-encoded with `bodyEncoding:'base64'`
+  // so the Service Worker can reconstruct the exact bytes (roadmap #19 stage A).
   const HOP_BY_HOP = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"];
+  // Content types we can safely carry as a utf8 string. Everything else is
+  // treated as binary and base64-encoded. `charset=utf-8` types are textual.
+  const isTextualContentType = (ct) => {
+    if (!ct) return false;
+    const t = String(ct).toLowerCase();
+    if (t.startsWith("text/")) return true;
+    if (t.includes("charset=utf-8") || t.includes("charset=utf8")) return true;
+    return (
+      t.includes("javascript") ||
+      t.includes("json") ||
+      t.includes("xml") ||
+      t.includes("+json") ||
+      t.includes("ecmascript") ||
+      t.includes("image/svg") ||
+      t.includes("application/manifest")
+    );
+  };
   const pickHeaders = (src, drop) => {
     const out = {};
     for (const k of Object.keys(src || {})) {
@@ -234,13 +253,28 @@ export function createRuntime({
         (cres) => {
           const chunks = [];
           cres.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
-          cres.on("end", () =>
-            reply({
-              status: cres.statusCode || 200,
-              headers: pickHeaders(cres.headers, ["content-length"]),
-              body: Buffer.concat(chunks).toString("utf8"),
-            }),
-          );
+          cres.on("end", () => {
+            const buf = Buffer.concat(chunks);
+            const headers = pickHeaders(cres.headers, ["content-length"]);
+            const ct = cres.headers && (cres.headers["content-type"] || cres.headers["Content-Type"]);
+            const resp = { status: cres.statusCode || 200, headers };
+            if (isTextualContentType(ct)) {
+              // Fast path: a declared-textual type crosses as utf8.
+              resp.body = buf.toString("utf8");
+            } else {
+              // Unknown/omitted type (e.g. res.end('...') with no content-type) or a
+              // binary type: only base64 when the bytes aren't losslessly utf8, so
+              // plain-text responses stay strings and real binary is preserved.
+              const asUtf8 = buf.toString("utf8");
+              if (Buffer.from(asUtf8, "utf8").equals(buf)) {
+                resp.body = asUtf8;
+              } else {
+                resp.body = buf.toString("base64");
+                resp.bodyEncoding = "base64";
+              }
+            }
+            reply(resp);
+          });
           cres.on("error", fail);
         },
       );

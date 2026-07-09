@@ -341,7 +341,10 @@ export class Kernel {
     // fetch and unblock the server so it can loop back to accept.
     const pend = this.pendingHttp.get(msg.reqId);
     if (pend) {
-      pend.resolve({ status: msg.status, headers: msg.headers, body: msg.body });
+      // `bodyEncoding:'base64'` marks a binary body the runtime base64-encoded so
+      // it could cross this JSON boundary; the Service Worker decodes it back to
+      // bytes (roadmap #19 stage A).
+      pend.resolve({ status: msg.status, headers: msg.headers, body: msg.body, bodyEncoding: msg.bodyEncoding });
       this.pendingHttp.delete(msg.reqId);
     }
     this.respondOk(proc, EMPTY);

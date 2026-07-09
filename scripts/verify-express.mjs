@@ -224,5 +224,60 @@ assert(
   "vite.build() runs the real rolldown wasm bundler and writes dist/ (loop-liveness across napi async work)",
 );
 
+// === Vite DEV server runs in-VM and is reachable through the preview bridge =====
+// Roadmap #19 stage A: `vite.createServer().listen()` boots a long-lived dev
+// server; we drive it exactly like the browser preview (kernel.handleHttpRequest)
+// and assert it serves the transformed HTML/JS AND a *binary* asset from /public
+// (which exercises fs.watch's watcher shim, the IPv6 listen-address fix,
+// fs.createReadStream for static files, and the base64 binary body bridge).
+// Reuses /vt (vite already installed above) to avoid a second install.
+console.log("\n== vite dev (network) ==");
+const PNG_BYTES = [137, 80, 78, 71, 13, 10, 26, 10, 0, 1, 2, 3, 4, 5, 250, 251, 252, 253, 254, 255];
+kernel.writeFile(
+  "/vt/dev.js",
+  `
+const fs = require('fs');
+fs.mkdirSync('/vt/public', { recursive: true });
+fs.writeFileSync('/vt/public/pixel.png', Buffer.from(${JSON.stringify(PNG_BYTES)}));
+const vite = require('vite');
+(async () => {
+  try {
+    const server = await vite.createServer({
+      root: '/vt', configFile: false, logLevel: 'silent',
+      server: { port: 5273, host: '127.0.0.1', hmr: false }, optimizeDeps: { noDiscovery: true },
+    });
+    await server.listen();
+    console.log('DEV_READY');
+    setInterval(() => {}, 1000); // keep the dev server alive for the harness to probe
+  } catch (e) { console.log('DEV_ERR ' + (e && e.stack || e)); process.exit(1); }
+})();
+`,
+);
+kernel.start("node", ["dev.js"], { cwd: "/vt" });
+for (let i = 0; i < 1500 && !listening.has(5273); i++) await new Promise((r) => setTimeout(r, 20));
+assert(listening.has(5273), "vite.createServer().listen() boots a long-lived dev server");
+
+const devGet = (url) => kernel.handleHttpRequest(5273, { port: 5273, method: "GET", url, headers: { host: "127.0.0.1:5273" }, body: "" });
+
+const devRoot = await devGet("/");
+assert(
+  devRoot.status === 200 && decode(devRoot.body).includes("/@vite/client") && decode(devRoot.body).includes('src="/src/main.js"'),
+  "dev server serves index.html with the injected HMR client script",
+);
+const devMain = await devGet("/src/main.js");
+assert(
+  devMain.status === 200 && decode(devMain.body).includes("createElement"),
+  "dev server serves the on-demand transformed /src/main.js",
+);
+const devPng = await devGet("/pixel.png");
+const devPngBytes = devPng.bodyEncoding === "base64" ? [...Buffer.from(devPng.body, "base64")] : null;
+assert(
+  devPng.status === 200 &&
+    devPng.bodyEncoding === "base64" &&
+    devPngBytes.length === PNG_BYTES.length &&
+    devPngBytes.every((b, i) => b === PNG_BYTES[i]),
+  "dev server serves a binary /public asset intact (base64 body bridge)",
+);
+
 console.log(failures === 0 ? "\nRESULT: PASS" : `\nRESULT: FAIL (${failures})`);
 process.exit(failures === 0 ? 0 : 1);

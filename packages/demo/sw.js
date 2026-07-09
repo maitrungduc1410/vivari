@@ -57,9 +57,11 @@ async function handlePreview(event, port, path) {
 
   const resp = await new Promise((resolve) => {
     const mc = new MessageChannel();
+    // Dev servers do slow work on first hit (e.g. Vite optimizeDeps / on-demand
+    // transform), so allow more headroom than a plain static preview.
     const timer = setTimeout(
       () => resolve({ status: 504, headers: {}, body: "Preview timed out\n" }),
-      15000,
+      60000,
     );
     mc.port1.onmessage = (e) => {
       clearTimeout(timer);
@@ -75,5 +77,15 @@ async function handlePreview(event, port, path) {
   respHeaders.set("Cross-Origin-Embedder-Policy", "require-corp");
   if (!respHeaders.has("content-type")) respHeaders.set("content-type", "text/html; charset=utf-8");
 
-  return new Response(resp.body ?? "", { status: resp.status || 200, headers: respHeaders });
+  // Binary responses (images/fonts/wasm from the dev server) cross the kernel
+  // JSON boundary base64-encoded; rebuild the exact bytes here.
+  let outBody = resp.body ?? "";
+  if (resp.bodyEncoding === "base64" && typeof resp.body === "string") {
+    const bin = atob(resp.body);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    outBody = bytes;
+  }
+
+  return new Response(outBody, { status: resp.status || 200, headers: respHeaders });
 }

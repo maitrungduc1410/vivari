@@ -760,7 +760,77 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
       `build`/`createServer`/`defineConfig`, **and runs `vite.build()` to completion** (no
       keep-alive — the process exits naturally), asserting `dist/` is written with the app code.
     Not yet: the **dev server** (`vite dev` / `createServer`) — needs a long-lived HTTP server plus
-    a websocket HMR channel and file watching. Build (the hard bundler path) is done.
+    a websocket HMR channel and file watching. Build (the hard bundler path) is done. See #19.
+
+19. **Real Vite dev server (`vite dev` / `createServer`) — IN PROGRESS.**
+    Goal: `vite dev` boots in-VM, serves the app in the preview iframe, and does live HMR.
+
+    **How StackBlitz/WebContainer does it (reference we're mirroring):**
+    - **rolldown's wasm binding** is downloaded *on demand at runtime* when it detects a
+      WebContainer (rolldown prints `[rolldown] Downloading @rolldown/binding-wasm32-wasi@… on
+      WebContainer…`; detection via `@webcontainer/env` / env heuristics). **We already do this
+      one step earlier** — our npm auto-selects the `wasm32-wasi` build at install time (#16 stage
+      2c) — so we never hit the runtime download.
+    - **Preview** is a *credentialless iframe on a separate origin* (`*.webcontainer.io`); HTTP is
+      served by a Service Worker intercepting the iframe's `fetch` and routing to the in-VM server
+      (no TCP). We do the same today but *same-origin* under `/preview/<port>/` (`demo/sw.js`).
+    - **HMR has no real WebSocket** (confirmed: DevTools ▸ Network ▸ Socket is empty). A native
+      `WebSocket` from the iframe can't reach an in-process `WebSocketServer` — no TCP, and a
+      **Service Worker cannot intercept the WS upgrade**. Two known patterns: (C1) *polyfill the
+      `WebSocket` global* in the runtime so it tunnels over postMessage/loopback instead of the
+      network (StackBlitz's approach — framework-agnostic, needs RFC-6455 framing + a 2-way
+      iframe↔kernel byte tunnel); (C2) a *custom Vite HMR transport* that ships an inlined iframe
+      client speaking `BroadcastChannel` (rifty's approach — no WS framing, but Vite-specific and
+      needs config/inject). Both need a durable 2-way channel across the page↔iframe↔worker realm
+      boundary, likely a separate preview origin + `BroadcastChannel`/`postMessage` (not the SW).
+    - Their worker layout maps ~1:1 to ours (process workers, Fetcher Worker, File System Worker,
+      nested rolldown wasi `[worker N]`, `sw.js`); the rest (`typescript`, `editorWorkerService`,
+      `prettier`, `engineworker.js`) are just the StackBlitz IDE (Monaco + tsserver), not runtime.
+
+    **Current state in OpenContainer:** long-lived in-VM HTTP server ✅ (`http.createServer().listen`
+    + event loop v2 + `netLiveness`). `vite build` ✅. `vite dev` **boots + serves static** ✅
+    (Stage A below): the preview bridge now carries binary bodies (base64), `fs.watch` and
+    `fs.createReadStream` no longer throw, and the listen path handles IPv6 addresses. Remaining
+    gaps: the `fs.watch` watcher is inert (no change events yet → no rebuild) and there is **no
+    `WebSocket`** transport, so **HMR doesn't work yet** — those are Stage B (real watching) and
+    Stage C (HMR transport). The bridge still strips the `upgrade` header, though the http
+    parser/`_http_server.js` already detect+emit `'upgrade'`.
+
+    **Plan (staged, each with a demo):**
+    - **Stage A — boot & serve static — DONE.** `vite.createServer().listen()` now boots a
+      long-lived dev server in-VM and serves the app (HTML + on-demand-transformed JS + binary
+      `/public` assets) through the same preview bridge as the demo. Fixes that got it there:
+      - **`fs.watch` shim (`internal/fs/watchers`).** Vite's dev server always creates a chokidar
+        watcher (`NodeFsHandler` → `fs.watch` per dir); with the binding unvendored that threw and
+        crashed the boot. Added a load-safe, currently *inert* `FSWatcher`/`StatWatcher` (full
+        EventEmitter/close/ref/unref surface, the shape Stage B needs) so the watcher builds and
+        chokidar reaches 'ready'. It just doesn't emit changes yet — that's Stage B.
+      - **IPv6 listen-address parsing (`cares_wrap.convertIpv6StringToBuffer`).** `server.listen()`
+        runs `isIpv6LinkLocal()` over the resolved address (a name can resolve to `::1`); the old
+        throwing stub crashed listen. Implemented a real parser (16-byte form, `::` compression,
+        zone id, embedded IPv4) plus correct `isIP/isIPv4/isIPv6`.
+      - **`fs.createReadStream` (`internal/fs/streams`).** Vite serves static `/public` files by
+        piping `createReadStream(path,{start,end})` to the response; the binding was unvendored so
+        it 500'd. Added a pragmatic `ReadStream`/`WriteStream` on `Readable`/`Writable` + the
+        callback fs API (path|fd, flags, start/end range, hwm, encoding, autoClose, `open`/`ready`/
+        `close`/`error`) — enough for static serving, range requests, log/tar writers.
+      - **Binary body across the bridge (base64).** The kernel HTTP boundary is JSON, so bodies
+        crossed as utf8 and corrupted images/fonts/wasm. `bridgeHttp` now sends a `bodyEncoding:
+        'base64'` body whenever the bytes aren't losslessly utf8 (declared-textual types keep the
+        utf8 fast path; a plain `res.end('...')` without a content-type stays a string), the kernel
+        forwards the flag, and the Service Worker rebuilds exact bytes via `atob`.
+      - **SW dev timeout.** Raised the preview Service Worker's per-request timeout 15 s → 60 s
+        (dev does slow first-hit work: optimizeDeps / on-demand transform).
+      - Regression guard: `verify-express` boots `vite.createServer().listen()` and asserts it
+        serves index.html (with the injected `/@vite/client`), the transformed `/src/main.js`, and
+        a binary `/public/pixel.png` byte-for-byte. (No HMR yet.)
+    - **Stage B — real file watching:** VFS change notifications (File System Worker/kernel push an
+      event when a watched path changes → process worker → `FSWatcher` 'change' → Vite rebuild),
+      instead of mtime polling. Requires wiring "who writes the file" (host editor / in-VM terminal).
+    - **Stage C — HMR transport:** decide C1 (polyfill `WebSocket`, general) vs C2 (custom Vite
+      transport + `BroadcastChannel`, Vite-specific). Likely needs a separate preview origin +
+      `BroadcastChannel` for the durable 2-way channel (the SW can't tunnel WS).
+    Order: A → B → C (HMR is meaningless before static serving + change detection work).
 
 ## Why this order (the tradeoffs)
 

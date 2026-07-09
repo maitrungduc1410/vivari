@@ -389,18 +389,78 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
     constants: { SOCKET: 0, SERVER: 1, IPC: 2 },
   };
 
-  // ---- cares_wrap: DNS binding — only convertIpv6StringToBuffer is used by
-  // net.js at load; real DNS is deferred (loopback connects by IPv4 literal).
+  // ---- cares_wrap: DNS binding. Real name resolution is deferred (loopback
+  // connects by IPv4 literal), but the address helpers below must be real:
+  // lib/net.js calls convertIpv6StringToBuffer() while computing a server's
+  // listen address (isIpv6LinkLocal), e.g. when a name resolves to `::1` — a
+  // throwing stub crashes `server.listen()` (this is on Vite's dev-server path).
+  const isIPv4 = (s) =>
+    typeof s === "string" &&
+    /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(s) &&
+    s.split(".").every((o) => +o <= 255);
+  const isIPv6 = (s) => {
+    if (typeof s !== "string") return false;
+    const a = s.indexOf("%") === -1 ? s : s.slice(0, s.indexOf("%"));
+    if (a.indexOf(":") === -1) return false;
+    try {
+      convertIpv6StringToBuffer(a);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // Parse an IPv6 literal into its 16-byte big-endian form. Handles `::`
+  // zero-compression, an optional zone id (`%eth0`), and an embedded IPv4 tail
+  // (`::ffff:1.2.3.4`). Returns a Uint8Array(16); callers only index bytes.
+  function convertIpv6StringToBuffer(addr) {
+    if (typeof addr !== "string") throw new TypeError("invalid IPv6 address");
+    const pct = addr.indexOf("%");
+    if (pct !== -1) addr = addr.slice(0, pct); // drop zone id
+
+    // Fold a trailing embedded IPv4 (e.g. ::ffff:127.0.0.1) into two hextets.
+    const lastColon = addr.lastIndexOf(":");
+    const tail = addr.slice(lastColon + 1);
+    if (tail.indexOf(".") !== -1) {
+      const p = tail.split(".");
+      if (p.length !== 4) throw new Error("invalid IPv6 address: " + addr);
+      const o = p.map((x) => Number(x));
+      if (!o.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
+        throw new Error("invalid IPv6 address: " + addr);
+      }
+      const hi = ((o[0] << 8) | o[1]).toString(16);
+      const lo = ((o[2] << 8) | o[3]).toString(16);
+      addr = addr.slice(0, lastColon + 1) + hi + ":" + lo;
+    }
+
+    const halves = addr.split("::");
+    if (halves.length > 2) throw new Error("invalid IPv6 address: " + addr);
+    const head = halves[0] === "" ? [] : halves[0].split(":");
+    let groups;
+    if (halves.length === 2) {
+      const rest = halves[1] === "" ? [] : halves[1].split(":");
+      const missing = 8 - head.length - rest.length;
+      if (missing < 0) throw new Error("invalid IPv6 address: " + addr);
+      groups = head.concat(new Array(missing).fill("0"), rest);
+    } else {
+      groups = head;
+      if (groups.length !== 8) throw new Error("invalid IPv6 address: " + addr);
+    }
+
+    const buf = new Uint8Array(16);
+    for (let i = 0; i < 8; i++) {
+      const g = groups[i] || "0";
+      if (!/^[0-9a-fA-F]{1,4}$/.test(g)) throw new Error("invalid IPv6 address: " + addr);
+      const v = parseInt(g, 16) & 0xffff;
+      buf[i * 2] = v >> 8;
+      buf[i * 2 + 1] = v & 0xff;
+    }
+    return buf;
+  }
   const cares_wrap = {
-    convertIpv6StringToBuffer: (addr) => {
-      const err = new Error("OpenContainer: IPv6 address parsing is not implemented yet");
-      err.code = "ERR_METHOD_NOT_IMPLEMENTED";
-      err.addr = addr;
-      throw err;
-    },
-    isIP: () => 0,
-    isIPv4: () => false,
-    isIPv6: () => false,
+    convertIpv6StringToBuffer,
+    isIP: (s) => (isIPv4(s) ? 4 : isIPv6(s) ? 6 : 0),
+    isIPv4,
+    isIPv6,
   };
 
   return { tcp_wrap, stream_wrap, uv, pipe_wrap, cares_wrap };

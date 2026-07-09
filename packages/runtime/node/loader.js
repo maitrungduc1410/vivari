@@ -33,6 +33,8 @@ import startupSnapshotFactory from "./internal/v8/startup_snapshot.js";
 import optionsFactory from "./internal/options.js";
 import fsUtilsFactory from "./internal/fs/utils.js";
 import fsReadContextFactory from "./internal/fs/read/context.js";
+import fsWatchersFactory from "./internal/fs/watchers.js";
+import fsStreamsFactory from "./internal/fs/streams.js";
 import urlFactory from "./internal/url.js";
 import blobFactory from "./internal/blob.js";
 import fileFactory from "./internal/file.js";
@@ -156,6 +158,8 @@ const FACTORIES = {
   "internal/options": optionsFactory,
   "internal/fs/utils": fsUtilsFactory,
   "internal/fs/read/context": fsReadContextFactory,
+  "internal/fs/watchers": fsWatchersFactory,
+  "internal/fs/streams": fsStreamsFactory,
   "internal/url": urlFactory,
   "internal/blob": blobFactory,
   "internal/file": fileFactory,
