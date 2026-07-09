@@ -740,36 +740,269 @@ function viteDevScript() {
   );
 }
 
-let viteStarted = false;
-async function startVite() {
-  if (viteStarted) return;
-  viteStarted = true;
+// ── React + Vite (rolldown) + the React Compiler ────────────────────────────
+// Same dev-server + HMR path as the vanilla Vite demo, but with the real React
+// pipeline: @vitejs/plugin-react (oxc JSX + Fast Refresh) plus the React
+// Compiler run through @rolldown/plugin-babel + @babel/core in-VM. Editing
+// App.jsx hot-updates via Fast Refresh; the transformed module carries the
+// compiler's _c() memo cache + a react/compiler-runtime import.
+const REACT_DIR = "/react-app";
+const REACT_PORT = 5202;
+const REACT_APP = {
+  "package.json": JSON.stringify(
+    { name: "react-hmr-demo", version: "1.0.0", private: true, type: "module" },
+    null,
+    2,
+  ),
+  "index.html":
+    "<!doctype html>\n<html>\n<head><meta charset='utf-8'><title>React + Vite + Compiler · OpenContainer</title></head>\n" +
+    "<body><div id='root'></div>\n<script type='module' src='/src/main.jsx'></script>\n</body>\n</html>\n",
+  "src/main.jsx":
+    "import { StrictMode } from 'react';\n" +
+    "import { createRoot } from 'react-dom/client';\n" +
+    "import './styles.css';\n" +
+    "import App from './App.jsx';\n\n" +
+    "createRoot(document.getElementById('root')).render(<StrictMode><App /></StrictMode>);\n",
+  "src/App.jsx":
+    "import { useState } from 'react';\n\n" +
+    "export default function App() {\n" +
+    "  const [n, setN] = useState(0);\n" +
+    "  const doubled = n * 2; // auto-memoized by the React Compiler\n" +
+    "  return (\n" +
+    "    <div className=\"card\">\n" +
+    "      <h1>React + Vite + React Compiler</h1>\n" +
+    "      <p className=\"count\">count {n} · ×2 = {doubled}</p>\n" +
+    "      <button onClick={() => setN((v) => v + 1)}>increment</button>\n" +
+    "      <p className=\"hint\">Edit <code>src/App.jsx</code> and Save — Fast Refresh updates\n" +
+    "        with no reload. The React Compiler auto-memoizes this component.</p>\n" +
+    "    </div>\n" +
+    "  );\n" +
+    "}\n",
+  "src/styles.css":
+    "body{font-family:ui-monospace,Menlo,monospace;background:#0b0e14;color:#d4d7dd;display:grid;place-items:center;height:100vh;margin:0}\n" +
+    ".card{border:1px solid #1c2230;border-radius:12px;padding:32px 40px;background:#0e131c;text-align:center;max-width:80%}\n" +
+    "h1{color:#61dafb;margin:0 0 12px;font-size:20px}\n" +
+    ".count{font-size:18px;color:#7ee787}\n" +
+    "button{font:inherit;background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:8px 16px;cursor:pointer;margin-top:8px}\n" +
+    ".hint{color:#6b7385;font-size:12px;margin-top:16px;line-height:1.5}\n" +
+    "code{color:#79c0ff}\n",
+};
+const REACT_EDIT_FILES = [REACT_DIR + "/src/App.jsx", REACT_DIR + "/src/styles.css"];
+function reactDevScript() {
+  return (
+    "const vite = require('vite');\n" +
+    "const reactMod = require('@vitejs/plugin-react');\n" +
+    "const reactCompilerPreset = reactMod.reactCompilerPreset;\n" +
+    "let react = reactMod; while (react && typeof react !== 'function' && react.default) react = react.default;\n" +
+    "const babelMod = require('@rolldown/plugin-babel');\n" +
+    "let babel = babelMod; while (babel && typeof babel !== 'function' && babel.default) babel = babel.default;\n" +
+    "(async () => {\n" +
+    "  try {\n" +
+    "    const server = await vite.createServer({\n" +
+    "      root: '" + REACT_DIR + "', configFile: false, logLevel: 'silent',\n" +
+    "      plugins: [ react(), babel({ presets: [reactCompilerPreset({ target: '19' })] }) ],\n" +
+    "      server: { port: " + REACT_PORT + ", host: '127.0.0.1' },\n" +
+    "      optimizeDeps: { include: ['react', 'react-dom', 'react-dom/client'] },\n" +
+    "    });\n" +
+    "    await server.listen();\n" +
+    "    console.log('[react] dev + Fast Refresh + React Compiler ready on :" + REACT_PORT + "');\n" +
+    "    setInterval(() => {}, 1000);\n" +
+    "  } catch (e) { console.error('[react] ' + (e && e.stack || e)); process.exit(1); }\n" +
+    "})();\n"
+  );
+}
+
+// ── NestJS (real tsc compile in-VM, DI + reflect-metadata over Express) ──────
+// Nest needs decorator metadata (emitDecoratorMetadata), which esbuild can't
+// emit, so we compile the TS sources with the REAL `tsc` (TypeScript 5 — v7 is
+// the native Go port) then run the emitted dist/main.js. The controller serves
+// an HTML page at / (for the preview) and a JSON API at /api/hello.
+const NEST_DIR = "/nest-app";
+const NEST_PORT = 3200;
+const NEST_APP = {
+  "package.json": JSON.stringify({ name: "nest-demo", version: "1.0.0", private: true }, null, 2),
+  "tsconfig.json": JSON.stringify(
+    {
+      compilerOptions: {
+        module: "commonjs",
+        target: "es2021",
+        experimentalDecorators: true,
+        emitDecoratorMetadata: true,
+        esModuleInterop: true,
+        skipLibCheck: true,
+        outDir: "dist",
+        sourceMap: false,
+        declaration: false,
+      },
+      include: ["src/**/*.ts"],
+    },
+    null,
+    2,
+  ),
+  "src/app.service.ts":
+    "import { Injectable } from '@nestjs/common';\n" +
+    "@Injectable()\n" +
+    "export class AppService {\n" +
+    "  hello(): string { return 'Hello from NestJS running inside OpenContainer'; }\n" +
+    "}\n",
+  "src/app.controller.ts":
+    "import { Controller, Get, Header } from '@nestjs/common';\n" +
+    "import { AppService } from './app.service';\n" +
+    "@Controller()\n" +
+    "export class AppController {\n" +
+    "  constructor(private readonly svc: AppService) {}\n" +
+    "  @Get()\n" +
+    "  @Header('Content-Type', 'text/html')\n" +
+    "  root(): string {\n" +
+    "    return `<!doctype html><html><head><meta charset=\"utf-8\"><title>NestJS · OpenContainer</title>` +\n" +
+    "      `<style>body{font-family:ui-monospace,Menlo,monospace;background:#0b0e14;color:#d4d7dd;display:grid;place-items:center;height:100vh;margin:0}` +\n" +
+    "      `.card{border:1px solid #1c2230;border-radius:12px;padding:32px 40px;background:#0e131c;text-align:center;max-width:80%}` +\n" +
+    "      `h1{color:#e0234e;margin:0 0 12px}code{color:#79c0ff}.hint{color:#6b7385;font-size:12px;margin-top:16px;line-height:1.5}</style></head>` +\n" +
+    "      `<body><div class=\"card\"><h1>NestJS running inside OpenContainer</h1>` +\n" +
+    "      `<p>${this.svc.hello()}</p>` +\n" +
+    "      `<p class=\"hint\">Compiled from TypeScript by the real <code>tsc</code> in-VM, then booted with ` +\n" +
+    "      `dependency injection + <code>reflect-metadata</code> over <code>@nestjs/platform-express</code>.<br>` +\n" +
+    "      `JSON API: <code>GET /api/hello</code></p></div></body></html>`;\n" +
+    "  }\n" +
+    "  @Get('api/hello')\n" +
+    "  hello(): { ok: boolean; msg: string; node: string } {\n" +
+    "    return { ok: true, msg: this.svc.hello(), node: process.version };\n" +
+    "  }\n" +
+    "}\n",
+  "src/app.module.ts":
+    "import { Module } from '@nestjs/common';\n" +
+    "import { AppController } from './app.controller';\n" +
+    "import { AppService } from './app.service';\n" +
+    "@Module({ controllers: [AppController], providers: [AppService] })\n" +
+    "export class AppModule {}\n",
+  "src/main.ts":
+    "import 'reflect-metadata';\n" +
+    "import { NestFactory } from '@nestjs/core';\n" +
+    "import { AppModule } from './app.module';\n" +
+    "async function bootstrap() {\n" +
+    "  const app = await NestFactory.create(AppModule, { logger: ['error', 'warn'] });\n" +
+    "  await app.listen(" + NEST_PORT + ", '127.0.0.1');\n" +
+    "  console.log('[nest] listening on :" + NEST_PORT + "');\n" +
+    "}\n" +
+    "bootstrap().catch((e) => { console.error('[nest] ' + (e && e.stack || e)); process.exit(1); });\n",
+};
+
+// The selectable demo matrix. Each entry scaffolds files, npm-installs its deps,
+// optionally runs a build step (tsc), then boots a long-running `node` process
+// and waits for its port. `editable`/`hmr` drive the host's live editor panel.
+const DEMOS = {
+  vite: {
+    title: "Vite HMR (vanilla JS/CSS)",
+    dir: VITE_DIR,
+    port: VITE_PORT,
+    files: VITE_APP,
+    install: ["vite"],
+    bootFile: "dev.js",
+    boot: viteDevScript,
+    run: ["dev.js"],
+    editable: VITE_EDIT_FILES,
+    hmr: true,
+  },
+  react: {
+    title: "React + Vite + React Compiler",
+    dir: REACT_DIR,
+    port: REACT_PORT,
+    files: REACT_APP,
+    install: [
+      "react",
+      "react-dom",
+      "vite",
+      "@vitejs/plugin-react",
+      "babel-plugin-react-compiler",
+      "@rolldown/plugin-babel",
+      "@babel/core",
+    ],
+    bootFile: "dev.js",
+    boot: reactDevScript,
+    run: ["dev.js"],
+    editable: REACT_EDIT_FILES,
+    hmr: true,
+  },
+  nest: {
+    title: "NestJS API (tsc + DI)",
+    dir: NEST_DIR,
+    port: NEST_PORT,
+    files: NEST_APP,
+    install: [
+      "@nestjs/core",
+      "@nestjs/common",
+      "@nestjs/platform-express",
+      "reflect-metadata",
+      "rxjs",
+      "typescript@5",
+      "@types/node",
+    ],
+    build: ["node", "node_modules/typescript/bin/tsc", "-p", "tsconfig.json"],
+    run: ["dist/main.js"],
+    editable: null,
+    hmr: false,
+  },
+};
+
+function editablePayload(d) {
+  const files = {};
+  if (d.editable) for (const abs of d.editable) files[abs] = d.files[abs.slice(d.dir.length + 1)];
+  return files;
+}
+
+const demoStarted = new Set();
+async function startDemo(id) {
+  const d = DEMOS[id];
+  if (!d) {
+    post("demo-status", { line: "unknown demo: " + id });
+    return;
+  }
+  // Already running: just re-point the preview + editor at it.
+  if (demoStarted.has(id)) {
+    post("demo-ready", { id, port: d.port, files: editablePayload(d), title: d.title, hmr: !!d.hmr });
+    return;
+  }
+  demoStarted.add(id);
   try {
-    kernel.mkdirp(VITE_DIR + "/src");
-    for (const [rel, contents] of Object.entries(VITE_APP)) {
-      kernel.writeFile(VITE_DIR + "/" + rel, contents);
+    for (const [rel, contents] of Object.entries(d.files)) {
+      const abs = d.dir + "/" + rel;
+      kernel.mkdirp(abs.slice(0, abs.lastIndexOf("/")));
+      kernel.writeFile(abs, contents);
     }
-    kernel.writeFile(VITE_DIR + "/dev.js", viteDevScript());
-    post("log", { line: "$ cd " + VITE_DIR + " && npm install vite", cls: "muted" });
-    post("vite-status", { line: "installing vite from npm…" });
-    const inst = await kernel.start("npm", ["install", "vite"], { cwd: VITE_DIR, capture: true });
+    post("demo-status", { line: "installing " + d.title + " deps from npm…" });
+    post("log", { line: "$ cd " + d.dir + " && npm install " + d.install.join(" "), cls: "muted" });
+    const inst = await kernel.start("npm", ["install", ...d.install], { cwd: d.dir, capture: true });
     if (inst.code !== 0) {
-      post("log", { line: "  [vite] npm install failed: " + (inst.stderr || inst.code), cls: "err" });
-      post("vite-status", { line: "npm install vite failed — see the log" });
-      viteStarted = false;
+      post("log", { line: "  [" + id + "] npm install failed: " + (inst.stderr || inst.code), cls: "err" });
+      post("demo-status", { line: "npm install failed — see the log" });
+      demoStarted.delete(id);
       return;
     }
-    post("log", { line: "$ node dev.js  (vite dev server, long-running)", cls: "muted" });
-    kernel.start("node", ["dev.js"], { cwd: VITE_DIR }); // NOT awaited
-    await waitListen(VITE_PORT);
-    post("log", { line: "  [vite] dev server listening on :" + VITE_PORT, cls: "ok" });
-    const files = {};
-    for (const abs of VITE_EDIT_FILES) files[abs] = VITE_APP[abs.slice(VITE_DIR.length + 1)];
-    post("vite-ready", { port: VITE_PORT, files });
+    if (d.build) {
+      post("demo-status", { line: "compiling with tsc…" });
+      post("log", { line: "$ " + d.build.join(" "), cls: "muted" });
+      const b = await kernel.start(d.build[0], d.build.slice(1), { cwd: d.dir, capture: true });
+      if (b.code !== 0) {
+        post("log", {
+          line: "  [" + id + "] build failed: " + ((b.stdout || "") + (b.stderr || "")).trim().slice(-600),
+          cls: "err",
+        });
+        post("demo-status", { line: "build failed — see the log" });
+        demoStarted.delete(id);
+        return;
+      }
+    }
+    if (d.boot) kernel.writeFile(d.dir + "/" + d.bootFile, d.boot());
+    post("demo-status", { line: "booting " + d.title + "…" });
+    post("log", { line: "$ node " + d.run.join(" ") + "  (long-running)", cls: "muted" });
+    kernel.start("node", d.run, { cwd: d.dir }); // NOT awaited
+    await waitListen(d.port, 60000);
+    post("log", { line: "  [" + id + "] listening on :" + d.port, cls: "ok" });
+    post("demo-ready", { id, port: d.port, files: editablePayload(d), title: d.title, hmr: !!d.hmr });
   } catch (err) {
-    post("log", { line: "  [vite] " + (err && err.message || err), cls: "err" });
-    post("vite-status", { line: "failed to start vite — see the log" });
-    viteStarted = false;
+    post("log", { line: "  [" + id + "] " + (err && err.message || err), cls: "err" });
+    post("demo-status", { line: "failed to start — see the log" });
+    demoStarted.delete(id);
   }
 }
 
@@ -1128,9 +1361,14 @@ self.onmessage = async (event) => {
     return;
   }
 
-  // The user clicked "Start Vite dev + HMR" in the host UI.
+  // The user picked a demo and clicked "Run" in the host UI.
+  if (m.type === "start-demo") {
+    if (kernel) startDemo(m.demo);
+    return;
+  }
+  // Back-compat alias for the original single-button flow.
   if (m.type === "start-vite") {
-    if (kernel) startVite();
+    if (kernel) startDemo("vite");
     return;
   }
 

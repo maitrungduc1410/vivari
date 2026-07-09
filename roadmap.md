@@ -1052,6 +1052,11 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     throws — a real but separate loader-compat gap, deferred since fixing it won't get Next
     past the SWC wall.) An older Next (13/14 with wasm SWC) might boot but needs the
     `module`-constructor emulation + webpack-in-VM and is a large, low-priority effort.
+  - The two working stacks are wired into the browser demo UI as a selector
+    (`packages/demo/index.html` → `▶ Run demo`): **Vite HMR**, **React + Vite +
+    React Compiler** (live editor + Fast Refresh), and **NestJS API** (`tsc`
+    compile → HTML at `/`, JSON at `/api/hello`), driven by the `DEMOS` registry +
+    `startDemo()` in `kernel-worker.js`.
 
 ## Definition of done for T2
 

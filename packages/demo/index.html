@@ -139,7 +139,8 @@
       .editor-head code {
         color: #79c0ff;
       }
-      #editor-file {
+      #editor-file,
+      #demo-select {
         font: inherit;
         font-size: 11px;
         background: #0b0e14;
@@ -147,6 +148,10 @@
         border: 1px solid #1c2230;
         border-radius: 6px;
         padding: 3px 6px;
+      }
+      #demo-select {
+        font-size: 12px;
+        padding: 6px 8px;
       }
       #editor {
         flex: 1 1 auto;
@@ -192,8 +197,13 @@
           sandbox="allow-scripts allow-same-origin"
         ></iframe>
         <div class="hmr-bar">
-          <button id="start-vite">▶ Start real Vite dev + HMR</button>
-          <span id="hmr-status" class="muted">runs <code>vite</code> in-VM, tunnels HMR to the preview</span>
+          <select id="demo-select" title="demo to run">
+            <option value="vite">Vite HMR (vanilla JS/CSS)</option>
+            <option value="react">React + Vite + React Compiler</option>
+            <option value="nest">NestJS API (tsc + DI)</option>
+          </select>
+          <button id="run-demo">▶ Run demo</button>
+          <span id="hmr-status" class="muted">pick a demo and Run — it installs from npm + boots in-VM</span>
         </div>
         <div class="editor-panel" id="editor-panel" hidden>
           <div class="editor-head">

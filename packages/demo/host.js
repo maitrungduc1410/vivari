@@ -13,7 +13,8 @@
 const out = document.getElementById("output");
 const frame = document.getElementById("preview");
 const previewUrlEl = document.getElementById("preview-url");
-const startViteBtn = document.getElementById("start-vite");
+const demoSelect = document.getElementById("demo-select");
+const runDemoBtn = document.getElementById("run-demo");
 const hmrStatusEl = document.getElementById("hmr-status");
 const editorPanel = document.getElementById("editor-panel");
 const editorFileEl = document.getElementById("editor-file");
@@ -121,33 +122,42 @@ async function main() {
         frame.contentWindow?.postMessage({ ...m.msg, type: "oc-ws", dir: "in" }, "*");
         break;
       }
-      // The in-VM Vite dev server is up: swap the preview to it and open the
-      // editor on the file whose edits will hot-update the running app.
-      case "vite-ready": {
+      // A selected demo's in-VM dev/app server is up: swap the preview to it and,
+      // for HMR-capable demos, open the live editor on its editable files.
+      case "demo-ready": {
         previewPort = m.port;
         previewUrlEl.textContent = `/packages/demo/preview/${m.port}/`;
         frame.src = `./preview/${m.port}/`;
-        startViteBtn.textContent = "Vite dev running";
-        startViteBtn.disabled = true;
-        hmrStatusEl.textContent = "pick a file, edit, then save — the app hot-updates with no reload";
+        runDemoBtn.disabled = false;
+        runDemoBtn.textContent = "▶ Run demo";
+        demoSelect.disabled = false;
         editorFiles = m.files || {};
-        editorFileEl.innerHTML = "";
-        for (const path of Object.keys(editorFiles)) {
-          const opt = document.createElement("option");
-          opt.value = path;
-          opt.textContent = path.split("/").slice(-2).join("/"); // e.g. src/message.js
-          editorFileEl.appendChild(opt);
+        const paths = Object.keys(editorFiles);
+        if (m.hmr && paths.length) {
+          hmrStatusEl.textContent = `${m.title} running — pick a file, edit, Save → hot-update (no reload)`;
+          editorFileEl.innerHTML = "";
+          for (const path of paths) {
+            const opt = document.createElement("option");
+            opt.value = path;
+            opt.textContent = path.split("/").slice(-2).join("/"); // e.g. src/App.jsx
+            editorFileEl.appendChild(opt);
+          }
+          editorFileEl.value = paths[0];
+          editorEl.value = editorFiles[paths[0]];
+          editorPanel.hidden = false;
+        } else {
+          hmrStatusEl.textContent = `${m.title} running — served live in the preview`;
+          editorPanel.hidden = true;
         }
-        const first = Object.keys(editorFiles)[0];
-        if (first) {
-          editorFileEl.value = first;
-          editorEl.value = editorFiles[first];
-        }
-        editorPanel.hidden = false;
         break;
       }
-      case "vite-status":
+      case "demo-status":
         hmrStatusEl.textContent = m.line;
+        if (/failed/i.test(m.line)) {
+          runDemoBtn.disabled = false;
+          runDemoBtn.textContent = "▶ Run demo";
+          demoSelect.disabled = false;
+        }
         break;
     }
   };
@@ -161,11 +171,14 @@ async function main() {
     kernelWorker.postMessage({ type: "oc-ws", msg: d });
   });
 
-  startViteBtn.addEventListener("click", () => {
-    startViteBtn.disabled = true;
-    startViteBtn.textContent = "starting Vite… (installing from npm)";
-    hmrStatusEl.textContent = "npm install vite + boot dev server (first run downloads ~20 packages)";
-    kernelWorker.postMessage({ type: "start-vite" });
+  runDemoBtn.addEventListener("click", () => {
+    const demo = demoSelect.value;
+    runDemoBtn.disabled = true;
+    demoSelect.disabled = true;
+    runDemoBtn.textContent = "starting…";
+    hmrStatusEl.textContent = "installing from npm + booting in-VM (first run downloads the dep tree)";
+    editorPanel.hidden = true;
+    kernelWorker.postMessage({ type: "start-demo", demo });
   });
 
   // Switching files swaps the textarea to that file's current text (kept locally

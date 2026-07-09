@@ -105,13 +105,20 @@ export class AppService {
 kernel.writeFile(
   DIR + "/src/app.controller.ts",
   `
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, Header } from '@nestjs/common';
 import { AppService } from './app.service';
 @Controller()
 export class AppController {
   constructor(private readonly svc: AppService) {}
   @Get()
-  root(): { ok: boolean; msg: string } { return { ok: true, msg: this.svc.hello() }; }
+  @Header('Content-Type', 'text/html')
+  root(): string {
+    return \`<!doctype html><h1>NestJS</h1><p>\${this.svc.hello()}</p>\`;
+  }
+  @Get('api/hello')
+  hello(): { ok: boolean; msg: string; node: string } {
+    return { ok: true, msg: this.svc.hello(), node: process.version };
+  }
 }
 `,
 );
@@ -185,6 +192,9 @@ for (let i = 0; i < 40 && root.status === 502; i++) {
   await new Promise((r) => setTimeout(r, 250));
   root = await get("/");
 }
-log("  GET / -> " + root.status);
-log("  body: " + decode(root.body).slice(0, 200));
+log("  GET / -> " + root.status + " (html: " + decode(root.body).includes("<h1>NestJS</h1>") + ")");
+log("  body: " + decode(root.body).slice(0, 120));
+const api = await get("/api/hello");
+log("  GET /api/hello -> " + api.status);
+log("  api body: " + decode(api.body).slice(0, 200));
 process.exit(0);
