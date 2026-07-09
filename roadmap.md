@@ -706,6 +706,37 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
       exit from a `.catch` → code 7). The esbuild test now runs in its clean form — no
       keep-alive timer, `process.exit(0)` straight from the async body.
 
+18. **Toward real Vite — module graph loads in-VM — DONE (load); running deferred.**
+    `npm install vite` (Vite 8 / rolldown-vite, ~21 pkgs) succeeds and `require('vite')` now
+    returns the full public API (`build`, `createServer`, `defineConfig`, `transformWithEsbuild`,
+    …). npm auto-selects `@rolldown/binding-wasm32-wasi` + `@napi-rs/wasm-runtime` (stage 2c
+    path). Getting the whole graph to resolve surfaced (and fixed) a batch of general compat
+    gaps — each is a real capability, not a Vite hack:
+    - **fs whole-file > 1 MiB (EFBIG) — fixed.** `readFileSync(path,'utf8')` took a single-shot
+      whole-file path that overflowed the 1 MiB shared window on big files (this is what blocked
+      installing packages with large packuments). FS server now returns a clear `EFBIG` for any
+      oversized response; the binding falls back to the chunked fd loop. (`fs-server.js`,
+      `node/bindings/fs.js`).
+    - **ESM `__dirname` collision — fixed.** Transpiled ESM modules no longer get
+      `__filename`/`__dirname` wrapper params (real ESM has none; they use `import.meta.url`).
+      Vite's chunks self-declare `const __dirname = fileURLToPath(...)`, which used to throw
+      "already declared". (`module.js`).
+    - **Namespace-import lazy getters — fixed.** `import * as fs` no longer force-evaluates every
+      lazy getter on the source (which eagerly dragged in `internal/fs/streams` via `fs.ReadStream`);
+      `__oc_ns` now defines forwarding getters (also more correct for ESM live bindings). (`esm.js`).
+    - **package.json `imports` (`#…`) field — added.** Subpath imports resolve against the nearest
+      package scope with the same conditions as `exports` (e.g. Vite's `#module-sync-enabled`).
+      (`module.js`).
+    - **New builtins:** `fs/promises` (+`fs.promises`, a faithful promise wrapper over the sync
+      API + a `FileHandle`), `perf_hooks` (over global `performance`), `readline` (non-throwing
+      shim — no real TTY), `v8` (heap stats + JSON-based serialize/deserialize), `http2`
+      (load-safe stub; factories throw only if used — http1 path unaffected).
+    - Regression guard: `verify-express` installs vite and asserts `require('vite')` exposes
+      `build`/`createServer`/`defineConfig`.
+    Not yet: actually **running** `vite build`/dev — that drives rolldown's wasm binding, whose
+    heavy work leans on napi async-work / threads (the emnapi AWMT blocker from #16 stage 2b) and
+    a dev server (ws + file watching). That's the next push.
+
 ## Why this order (the tradeoffs)
 
 - **Decomp is split in two on purpose:** Kernel worker is first (pure win, everything

@@ -109,6 +109,16 @@ import punycodeFactory from "./lib/punycode.js";
 import timersPromisesFactory from "./lib/timers/promises.js";
 import consoleFactory from "./lib/console.js";
 import constantsFactory2 from "./lib/constants.js";
+import readlineFactory from "./lib/readline.js";
+import fsPromisesFactory from "./lib/fs/promises.js";
+import perfHooksFactory from "./lib/perf_hooks.js";
+import v8Factory from "./lib/v8.js";
+import http2Factory from "./lib/http2.js";
+// Bridge so the vendored fs.js `fs.promises` getter (require('internal/fs/promises')
+// .exports) resolves to the same pragmatic promises API as require('fs/promises').
+const internalFsPromisesFactory = (exports, require, module) => {
+  module.exports = { exports: require("fs/promises") };
+};
 
 // WASI preview1 runtime (Phase 2 #16 stage 1): run wasm32-wasi commands over
 // our VFS via require('wasi').
@@ -210,6 +220,13 @@ const FACTORIES = {
   "timers/promises": timersPromisesFactory,
   console: consoleFactory,
   constants: constantsFactory2,
+  readline: readlineFactory,
+  "readline/promises": readlineFactory,
+  "fs/promises": fsPromisesFactory,
+  "internal/fs/promises": internalFsPromisesFactory,
+  perf_hooks: perfHooksFactory,
+  v8: v8Factory,
+  http2: http2Factory,
   wasi: wasiFactory,
   worker_threads: workerThreadsFactory,
   semver: semverFactory,

@@ -163,9 +163,64 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     return dirs;
   }
 
+  // package.json "imports" (subpath imports, specifiers starting with '#'). They
+  // resolve against the package scope (nearest package.json) of the importing
+  // file, honouring the same conditions as "exports". Targets may be relative
+  // paths or bare specifiers (which resolve normally). Used e.g. by Vite's
+  // `#module-sync-enabled` -> ./misc/{true,false}.js condition switch.
+  function resolveImports(request, fromDir) {
+    let cur = fromDir;
+    for (;;) {
+      const pkg = readPkg(cur);
+      if (pkg) {
+        if (pkg.imports && typeof pkg.imports === "object") {
+          let target = null;
+          if (Object.prototype.hasOwnProperty.call(pkg.imports, request)) {
+            target = pickCondition(pkg.imports[request]);
+          } else {
+            for (const k of Object.keys(pkg.imports)) {
+              if (k.endsWith("/*")) {
+                const pre = k.slice(0, -1);
+                if (request.startsWith(pre)) {
+                  const t = pickCondition(pkg.imports[k]);
+                  if (t) {
+                    target = t.replace("*", request.slice(pre.length));
+                    break;
+                  }
+                }
+              }
+            }
+          }
+          if (target) {
+            if (target.startsWith("./") || target.startsWith("../") || target.startsWith("/")) {
+              const full = path.resolve(cur, target);
+              const r = tryExtensions(full) || (isFile(full) ? full : null);
+              if (r) return r;
+            } else {
+              return resolveFilename(target, cur).id; // bare specifier target
+            }
+          }
+        }
+        break; // stop at the first (nearest) package scope, like Node
+      }
+      const parent = path.dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
+    }
+    return null;
+  }
+
   function resolveFilename(request, fromDir) {
     if (hasBuiltin(request)) return { builtin: true, id: request };
     if (hasLazyBuiltin(request)) return { builtin: true, id: request };
+
+    if (request[0] === "#") {
+      const r = resolveImports(request, fromDir);
+      if (r) return { builtin: false, id: r };
+      const err = new Error(`Cannot find package import '${request}' from '${fromDir}'`);
+      err.code = "MODULE_NOT_FOUND";
+      throw err;
+    }
 
     let resolved = null;
     if (request.startsWith("/") || request.startsWith("./") || request.startsWith("../")) {
@@ -241,28 +296,43 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     // time. `.cjs` is always CommonJS; everything else is scanned and rewritten
     // only if it actually uses module syntax (transpileEsm returns null for
     // plain CJS, so require/module.exports files are untouched).
+    let isEsm = false;
     if (path.extname(filename) !== ".cjs") {
       const esm = transpileEsm(source, filename);
-      if (esm != null) source = esm;
+      if (esm != null) {
+        source = esm;
+        isEsm = true;
+      }
     }
 
     const dirname = path.dirname(filename);
     const require = makeRequire(dirname);
 
-    // The classic CommonJS wrapper. Only the five real wrapper params are
-    // injected; Buffer/process/console/global/timers are true globals (set on
-    // globalThis by the runtime), exactly like Node. Injecting them as params
-    // instead would make a userland `const Buffer = require('buffer').Buffer`
-    // a "Identifier already declared" SyntaxError.
-    const wrapper = new Function(
-      "exports",
-      "require",
-      "module",
-      "__filename",
-      "__dirname",
-      source + "\n",
-    );
-    wrapper.call(module.exports, module.exports, require, module, filename, dirname);
+    // The classic CommonJS wrapper. Only the real wrapper params are injected;
+    // Buffer/process/console/global/timers are true globals (set on globalThis by
+    // the runtime), exactly like Node. Injecting them as params instead would make
+    // a userland `const Buffer = require('buffer').Buffer` an "Identifier already
+    // declared" SyntaxError.
+    //
+    // ESM modules get NO __filename/__dirname params: real ES modules don't have
+    // them (they use import.meta.url, which we provide via __oc_meta), and ESM code
+    // that wants them commonly does `const __dirname = fileURLToPath(...)` — which
+    // would collide with an injected param and throw "already declared" (this is
+    // exactly how Vite's bundled chunks are authored).
+    if (isEsm) {
+      const wrapper = new Function("exports", "require", "module", source + "\n");
+      wrapper.call(module.exports, module.exports, require, module);
+    } else {
+      const wrapper = new Function(
+        "exports",
+        "require",
+        "module",
+        "__filename",
+        "__dirname",
+        source + "\n",
+      );
+      wrapper.call(module.exports, module.exports, require, module, filename, dirname);
+    }
   }
 
   function runMain(entry) {

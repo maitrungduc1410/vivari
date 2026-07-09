@@ -146,5 +146,34 @@ assert(er.code === 0 && er.stdout.includes('const x = 1;'),
 assert(er.stdout.includes('sum(2, 3)') && er.stdout.includes('ESB_BUILD:'),
   "esbuild-wasm build: bundles an ESM entry to an IIFE");
 
+// === Vite loads in-VM: the full module graph resolves (compat milestone) =======
+// Vite 8 (rolldown-vite) pulls ~21 packages incl. @rolldown/binding-wasm32-wasi,
+// which our npm auto-selects (stage 2c). require('vite') exercises the whole
+// resolver + builtin surface: fs/promises, perf_hooks, v8, http2, readline, the
+// package.json "imports" (#) field, ESM->CJS transpile (incl. self-declared
+// __dirname), and namespace-import lazy getters. Loading it end-to-end guards all
+// of that. (Actually *running* a build additionally needs rolldown's async work.)
+console.log("\n== vite load (network) ==");
+kernel.mkdirp("/vt");
+kernel.writeFile("/vt/package.json", JSON.stringify({ name: "vt", version: "1.0.0", private: true }));
+const vinst = await kernel.start("npm", ["install", "vite"], { cwd: "/vt", capture: true });
+assert(vinst.code === 0 && vinst.stdout.includes("added"), "npm install vite (auto-selects @rolldown/binding-wasm32-wasi)");
+kernel.writeFile(
+  "/vt/load.js",
+  `
+const vite = require('vite');
+console.log('VITE_OK ' + [typeof vite.build, typeof vite.createServer, typeof vite.defineConfig].join(','));
+process.exit(0);
+`,
+);
+const vload = await kernel.start("node", ["load.js"], { cwd: "/vt", capture: true });
+if (!vload.stdout.includes("VITE_OK function,function,function")) {
+  console.log("  (vite load code=" + vload.code + ")\n  STDOUT: " + vload.stdout + "\n  STDERR: " + vload.stderr);
+}
+assert(
+  vload.code === 0 && vload.stdout.includes("VITE_OK function,function,function"),
+  "require('vite') loads the full module graph (build/createServer/defineConfig)",
+);
+
 console.log(failures === 0 ? "\nRESULT: PASS" : `\nRESULT: FAIL (${failures})`);
 process.exit(failures === 0 ? 0 : 1);
