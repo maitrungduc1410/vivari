@@ -31,8 +31,8 @@ function helpers(fileUrl) {
     "const __oc_def=function(m){return m&&m.__esModule?m.default:m;};" +
     "const __oc_ns=function(m){if(m&&m.__esModule)return m;var ns=Object.create(null);if(m)for(var k of Object.keys(m)){Object.defineProperty(ns,k,{enumerable:true,configurable:true,get:(function(k){return function(){return m[k];};})(k)});}ns.default=m;Object.defineProperty(ns,'__esModule',{value:true});return ns;};" +
     "const __oc_star=function(e,m){if(m)for(var k of Object.keys(m)){if(k!=='default'&&!(k in e))Object.defineProperty(e,k,{enumerable:true,configurable:true,get:function(){return m[k];}});}};" +
-    "const __oc_import=function(s){return Promise.resolve().then(function(){return require(s);});};" +
-    "const __oc_meta={url:" + JSON.stringify(fileUrl) + ",resolve:function(s){return require.resolve?require.resolve(s):s;}};"
+    "const __oc_import=function(s){return Promise.resolve().then(function(){return __oc_require(s);});};" +
+    "const __oc_meta={url:" + JSON.stringify(fileUrl) + ",resolve:function(s){return __oc_require.resolve?__oc_require.resolve(s):s;}};"
   );
 }
 
@@ -231,7 +231,7 @@ export function transpileEsm(source, filename) {
       fromRanges.push([imp.ss, imp.se]);
       const clause = stmt.slice(6).trimStart();
       const m = uniq();
-      prelude.push("const " + m + "=require(" + JSON.stringify(spec) + ");");
+      prelude.push("const " + m + "=__oc_require(" + JSON.stringify(spec) + ");");
       if (clause.startsWith("*")) {
         const rest = clause.slice(1).trimStart();
         const asMatch = rest.match(new RegExp("^as\\s+(" + ID + ")"));
@@ -256,10 +256,10 @@ export function transpileEsm(source, filename) {
       const clause = stmt.slice(6).trimStart();
       const c = parseImportClause(clause);
       if (c.sideEffect) {
-        prelude.push("require(" + JSON.stringify(spec) + ");");
+        prelude.push("__oc_require(" + JSON.stringify(spec) + ");");
       } else {
         const m = uniq();
-        prelude.push("const " + m + "=require(" + JSON.stringify(spec) + ");");
+        prelude.push("const " + m + "=__oc_require(" + JSON.stringify(spec) + ");");
         if (c.default) prelude.push("const " + c.default + "=__oc_def(" + m + ");");
         if (c.namespace) prelude.push("const " + c.namespace + "=__oc_ns(" + m + ");");
         for (const { imported, local } of c.named) {

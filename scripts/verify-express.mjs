@@ -41,7 +41,17 @@ const spawnWorker = (info) => {
   });
   const { port1, port2 } = new MessageChannel();
   fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
-  w.postMessage({ type: "init", sab: info.sab, spec: info.spec, fsPort: port1 }, [port1]);
+  // #16 stage 2b: a spawned thread (e.g. rolldown's wasi-worker) also receives its
+  // parentPort — a MessagePort transferred from its creator through us — so it must
+  // be included in both the init payload and the transfer list. Omitting it makes
+  // nested workers boot with no parentPort and hang (vite build stalls forever).
+  const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
+  const transfer = [port1];
+  if (info.threadPort) {
+    init.threadPort = info.threadPort;
+    transfer.push(info.threadPort);
+  }
+  w.postMessage(init, transfer);
   return {
     terminate: () => {
       w.terminate();
@@ -146,16 +156,22 @@ assert(er.code === 0 && er.stdout.includes('const x = 1;'),
 assert(er.stdout.includes('sum(2, 3)') && er.stdout.includes('ESB_BUILD:'),
   "esbuild-wasm build: bundles an ESM entry to an IIFE");
 
-// === Vite loads in-VM: the full module graph resolves (compat milestone) =======
+// === Vite runs in-VM: load the module graph AND run a real production build ====
 // Vite 8 (rolldown-vite) pulls ~21 packages incl. @rolldown/binding-wasm32-wasi,
 // which our npm auto-selects (stage 2c). require('vite') exercises the whole
 // resolver + builtin surface: fs/promises, perf_hooks, v8, http2, readline, the
 // package.json "imports" (#) field, ESM->CJS transpile (incl. self-declared
-// __dirname), and namespace-import lazy getters. Loading it end-to-end guards all
-// of that. (Actually *running* a build additionally needs rolldown's async work.)
-console.log("\n== vite load (network) ==");
-kernel.mkdirp("/vt");
-kernel.writeFile("/vt/package.json", JSON.stringify({ name: "vt", version: "1.0.0", private: true }));
+// __dirname/require via createRequire), and namespace-import lazy getters.
+// `vite.build()` then drives the REAL rolldown wasm bundler over nested worker
+// threads (napi-on-wasm) — this only completes because (a) the loop drains
+// microtasks before checking for handles, so an async main can start, and (b) the
+// emnapi waiting-request counter is mirrored into our loop liveness, so the parent
+// stays alive across rolldown's unref'd worker-pool async work until it settles.
+console.log("\n== vite build (network) ==");
+kernel.mkdirp("/vt/src");
+kernel.writeFile("/vt/package.json", JSON.stringify({ name: "vt", version: "1.0.0", private: true, type: "module" }));
+kernel.writeFile("/vt/index.html", '<!doctype html><html><body><script type="module" src="/src/main.js"></script></body></html>');
+kernel.writeFile("/vt/src/main.js", "const el = document.createElement('div'); el.textContent = 'hi ' + (1 + 2); document.body.appendChild(el); export {};");
 const vinst = await kernel.start("npm", ["install", "vite"], { cwd: "/vt", capture: true });
 assert(vinst.code === 0 && vinst.stdout.includes("added"), "npm install vite (auto-selects @rolldown/binding-wasm32-wasi)");
 kernel.writeFile(
@@ -173,6 +189,39 @@ if (!vload.stdout.includes("VITE_OK function,function,function")) {
 assert(
   vload.code === 0 && vload.stdout.includes("VITE_OK function,function,function"),
   "require('vite') loads the full module graph (build/createServer/defineConfig)",
+);
+
+// A real production build (no keep-alive timer — exits naturally on completion).
+kernel.writeFile(
+  "/vt/build.js",
+  `
+(async () => {
+  try {
+    const vite = require('vite');
+    await vite.build({
+      root: '/vt',
+      logLevel: 'silent',
+      configFile: false,
+      build: { write: true, minify: false, reportCompressedSize: false, target: 'esnext' },
+    });
+    const fs = require('fs');
+    const out = fs.readdirSync('/vt/dist');
+    const asset = fs.readdirSync('/vt/dist/assets').find((f) => f.endsWith('.js'));
+    const code = fs.readFileSync('/vt/dist/assets/' + asset, 'utf8');
+    console.log('BUILD_OK ' + out.sort().join(',') + ' hasHi=' + code.includes('hi '));
+  } catch (e) {
+    console.log('BUILD_ERR ' + (e && e.stack || e));
+  }
+})();
+`,
+);
+const vbuild = await kernel.start("node", ["build.js"], { cwd: "/vt", capture: true });
+if (!vbuild.stdout.includes("BUILD_OK")) {
+  console.log("  (vite build code=" + vbuild.code + ")\n  STDOUT: " + vbuild.stdout + "\n  STDERR: " + vbuild.stderr);
+}
+assert(
+  vbuild.code === 0 && vbuild.stdout.includes("BUILD_OK assets,index.html") && vbuild.stdout.includes("hasHi=true"),
+  "vite.build() runs the real rolldown wasm bundler and writes dist/ (loop-liveness across napi async work)",
 );
 
 console.log(failures === 0 ? "\nRESULT: PASS" : `\nRESULT: FAIL (${failures})`);

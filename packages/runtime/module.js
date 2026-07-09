@@ -314,13 +314,19 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     // a userland `const Buffer = require('buffer').Buffer` an "Identifier already
     // declared" SyntaxError.
     //
-    // ESM modules get NO __filename/__dirname params: real ES modules don't have
-    // them (they use import.meta.url, which we provide via __oc_meta), and ESM code
-    // that wants them commonly does `const __dirname = fileURLToPath(...)` — which
-    // would collide with an injected param and throw "already declared" (this is
-    // exactly how Vite's bundled chunks are authored).
+    // ESM modules get NONE of the CJS wrapper identifiers as their normal names:
+    // real ES modules have no `require`/`__filename`/`__dirname`, and ESM code
+    // routinely reintroduces them itself —
+    //   import { createRequire } from 'module';
+    //   const require = createRequire(import.meta.url);
+    //   const __dirname = path.dirname(fileURLToPath(import.meta.url));
+    // Injecting them as params would make those declarations throw "Identifier
+    // already declared". So the transpiler's generated code uses `__oc_require`
+    // (import rewrites, __oc_import, __oc_meta.resolve) and we inject the require
+    // under that name; `exports`/`module` stay (the transpiler writes to them and
+    // ESM code never redeclares those). import.meta.url is provided via __oc_meta.
     if (isEsm) {
-      const wrapper = new Function("exports", "require", "module", source + "\n");
+      const wrapper = new Function("exports", "__oc_require", "module", source + "\n");
       wrapper.call(module.exports, module.exports, require, module);
     } else {
       const wrapper = new Function(

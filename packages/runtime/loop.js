@@ -263,8 +263,16 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads } = {}) 
     });
 
   // Drive the loop until no ref'd work remains (or process.exit was called).
+  //
+  // Microtasks are drained FIRST, before checking for ref'd handles. This matters
+  // when `main` is an async function: after runMain the module's top-level promise
+  // chain is still pending (e.g. `await vite.build()`), and no timer/worker/handle
+  // exists yet — a plain `while (hasRefWork())` would see nothing to do and exit
+  // before the chain could run and create its first handle. Node likewise drains
+  // the microtask queue after main and only then consults the handle count.
   const drive = async () => {
-    while (!exiting && hasRefWork()) {
+    for (;;) {
+      if (exiting) break;
       await drainMicrotasks();
       runDueTimers();
       await drainMicrotasks();

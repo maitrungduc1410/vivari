@@ -20,6 +20,20 @@
 //   then wrap the output in this factory (exports, require, module, process).
 /* eslint-disable */
 export default function (exports, require, module, process) {
+// OpenContainer patch (loop-liveness): emnapi's NodejsWaitingRequestCounter keeps
+// Node's event loop alive by ref()/unref()-ing a MessagePort while async N-API
+// requests are outstanding. In OpenContainer a native MessagePort ref/unref is a
+// no-op for our cooperative loop, so an addon that unref's its worker pool (e.g.
+// rolldown's wasi-worker via `t && w.unref()`) would let the parent loop go idle
+// and exit mid-operation. We mirror the counter into our own loop liveness via
+// process.__wtHost.retain/release so `await someNapiAsyncCall()` (rolldown.bundle,
+// bcrypt.hash, ...) keeps the process alive until it settles.
+var __oc_liveRetain = function () {
+  try { var h = (typeof process === "object" && process && process.__wtHost); if (h && h.retain) h.retain(); } catch (e) { /* no host */ }
+};
+var __oc_liveRelease = function () {
+  try { var h = (typeof process === "object" && process && process.__wtHost); if (h && h.release) h.release(); } catch (e) { /* no host */ }
+};
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
@@ -12889,10 +12903,10 @@ var require_emnapi_cjs_min = __commonJS({
         this.refHandle = new f().port1, this.count = 0;
       }
       increase() {
-        0 === this.count && this.refHandle.ref && this.refHandle.ref(), this.count++;
+        0 === this.count && (this.refHandle.ref && this.refHandle.ref(), __oc_liveRetain()), this.count++;
       }
       decrease() {
-        0 !== this.count && (1 === this.count && this.refHandle.unref && this.refHandle.unref(), this.count--);
+        0 !== this.count && (1 === this.count && (this.refHandle.unref && this.refHandle.unref(), __oc_liveRelease()), this.count--);
       }
     };
     var $ = class {
@@ -14169,6 +14183,7 @@ var require_emnapi_cjs = __commonJS({
           if (this.refHandle.ref) {
             this.refHandle.ref();
           }
+          __oc_liveRetain();
         }
         this.count++;
       }
@@ -14179,6 +14194,7 @@ var require_emnapi_cjs = __commonJS({
           if (this.refHandle.unref) {
             this.refHandle.unref();
           }
+          __oc_liveRelease();
         }
         this.count--;
       }
