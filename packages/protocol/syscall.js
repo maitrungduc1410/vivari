@@ -105,6 +105,17 @@ export const OP_ACCEPT = 22;
 export const OP_RESPOND = 23;
 export const OP_CLOSE_SERVER = 24;
 
+// file watching (roadmap #19 stage B). A process registers interest in a path
+// with the File System Worker; the worker then *pushes* change events back over
+// the same doorbell MessagePort (never the SAB — the process isn't parked on it):
+//   { type:'fs-watch', watchId, event:'rename'|'change', filename }.
+// Registration itself is an ordinary (fs-routed) SAB syscall so it's serviced by
+// the worker that owns the VFS and can see every client's mutations.
+//   OP_WATCH    field0 = u32 watchId, field1 = path; flag FLAG_RECURSIVE -> OK empty
+//   OP_UNWATCH  field0 = u32 watchId                                     -> OK empty
+export const OP_WATCH = 28;
+export const OP_UNWATCH = 29;
+
 // network fetch (Phase 2 #9). A *deferred* syscall like OP_SPAWN: the caller
 // parks on Atomics.wait while the kernel delegates the actual fetch to the
 // Fetcher Worker, streams the body straight into the VFS (bypassing the 1 MiB
@@ -123,7 +134,12 @@ export const FLAG_RECURSIVE = 1; // mkdir -p
 // kernel. The two contiguous ranges are OP_READ_FILE..OP_READLINK (whole-file +
 // metadata) and OP_OPEN..OP_FTRUNCATE (the fd layer).
 export function isFsOpcode(op) {
-  return (op >= OP_READ_FILE && op <= OP_READLINK) || (op >= OP_OPEN && op <= OP_FTRUNCATE);
+  return (
+    (op >= OP_READ_FILE && op <= OP_READLINK) ||
+    (op >= OP_OPEN && op <= OP_FTRUNCATE) ||
+    op === OP_WATCH ||
+    op === OP_UNWATCH
+  );
 }
 
 // control[0..3] indices, named for clarity

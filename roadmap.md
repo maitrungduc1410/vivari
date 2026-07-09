@@ -791,9 +791,10 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
     + event loop v2 + `netLiveness`). `vite build` ✅. `vite dev` **boots + serves static** ✅
     (Stage A below): the preview bridge now carries binary bodies (base64), `fs.watch` and
     `fs.createReadStream` no longer throw, and the listen path handles IPv6 addresses. Remaining
-    gaps: the `fs.watch` watcher is inert (no change events yet → no rebuild) and there is **no
-    `WebSocket`** transport, so **HMR doesn't work yet** — those are Stage B (real watching) and
-    Stage C (HMR transport). The bridge still strips the `upgrade` header, though the http
+    gaps: **HMR still needs a transport.** `fs.watch` is now real (Stage B) so the dev server
+    detects edits and re-transforms on the next request, but the browser isn't *pushed* the update
+    — there is **no `WebSocket`** channel yet, so live HMR doesn't work (a manual reload picks up
+    changes). That push is Stage C. The bridge still strips the `upgrade` header, though the http
     parser/`_http_server.js` already detect+emit `'upgrade'`.
 
     **Plan (staged, each with a demo):**
@@ -824,9 +825,32 @@ would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `
       - Regression guard: `verify-express` boots `vite.createServer().listen()` and asserts it
         serves index.html (with the injected `/@vite/client`), the transformed `/src/main.js`, and
         a binary `/public/pixel.png` byte-for-byte. (No HMR yet.)
-    - **Stage B — real file watching:** VFS change notifications (File System Worker/kernel push an
-      event when a watched path changes → process worker → `FSWatcher` 'change' → Vite rebuild),
-      instead of mtime polling. Requires wiring "who writes the file" (host editor / in-VM terminal).
+    - **Stage B — real file watching — DONE.** `fs.watch` is now push-based, driven from the one
+      place that sees every mutation: the **File System Worker**. Registration is an ordinary
+      fs-routed SAB syscall (`OP_WATCH`/`OP_UNWATCH`) so the worker records `{clientId, watchId,
+      path, recursive}` against the client's doorbell port; then on **every** VFS mutation
+      (write/mkdir/unlink/rmdir/rename/symlink/open-create/fd_write/ftruncate/writeLarge) it fans
+      out `{type:'fs-watch', watchId, event, filename}` back over that same duplex port to any
+      watcher covering the path (Node semantics: `'rename'` on create/remove/rename, `'change'` on
+      contents; `filename` relative to the watched dir). `boot.js` receives those on the fs port and
+      hands them to the runtime, which drains them in a loop turn (`doWatch`) and emits Node's
+      `('change', eventType, filename)` from the vendored `internal/fs/watchers` `FSWatcher`
+      (`StatWatcher`/`watchFile` ride the same channel). A persistent watcher refs the loop
+      (`watchLiveness`) like a real fs handle. Crucially this is **cross-client**: a host editor
+      write, an in-VM terminal write, or another process all notify the watching dev server — no
+      polling. Fan-out is zero-cost when nobody is watching (guarded on an empty registry).
+      Regression guards: `verify-node` asserts a host write fires a guest process's `fs.watch`
+      callback (`'rename'` then `'change'`); `verify-express` asserts editing `/vt/src/main.js`
+      invalidates Vite's module graph so the dev server re-transforms it on the next request.
+      - *TODO (optimization, deferred):* fan-out currently loops **every** registered watch on
+        **every** mutation, and runs a `vfs.exists()` per write to pick `rename` vs `change` — even
+        for churn in unwatched subtrees like `node_modules` (e.g. `npm install` running next to a
+        dev server). We don't *watch* node_modules/dist — Vite/chokidar already ignore them, so
+        nothing is registered there — but the matching loop still pays. Fix by **indexing watches by
+        top-level path prefix** so a mutation in a subtree nobody watches is ~O(1) (and skip the
+        `exists()` when no watch can match). Prefer this over a hardcoded ignore list (which risks
+        blocking a legitimate watch and duplicates the client's own `ignored`); an ignore list, if
+        added, should only short-circuit fan-out, never registration.
     - **Stage C — HMR transport:** decide C1 (polyfill `WebSocket`, general) vs C2 (custom Vite
       transport + `BroadcastChannel`, Vite-specific). Likely needs a separate preview origin +
       `BroadcastChannel` for the durable 2-way channel (the SW can't tunnel WS).

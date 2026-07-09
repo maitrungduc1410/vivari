@@ -46,7 +46,7 @@ const makeMacrotask = () => {
   return (fn) => hostSetTimeout(fn, 0);
 };
 
-export function createEventLoop({ isAlive, doNet, doChildren, doThreads } = {}) {
+export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch } = {}) {
   isAlive = isAlive || (() => false);
   doNet = doNet || (() => {});
   // #15: drain async child-process events (stdout/stderr/exit delivered as
@@ -55,6 +55,9 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads } = {}) 
   // #16 stage 2b: drain worker_threads events (a Worker's 'message'/'online'/
   // 'exit', or the child's parentPort 'message'). Same controlled-turn model.
   doThreads = doThreads || (() => {});
+  // roadmap #19 stage B: drain fs.watch change events (pushed by the File System
+  // Worker over the fs doorbell port). Same controlled-turn model.
+  doWatch = doWatch || (() => {});
 
   const scheduleMacrotask = makeMacrotask();
   const macrotaskYield = () => new Promise((resolve) => scheduleMacrotask(resolve));
@@ -286,6 +289,8 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads } = {}) 
       runCallback(doChildren, []); // drain async child stdout/stderr/exit (#15)
       await drainMicrotasks();
       runCallback(doThreads, []); // drain worker_threads message/online/exit (2b)
+      await drainMicrotasks();
+      runCallback(doWatch, []); // drain fs.watch change events (#19 stage B)
       await drainMicrotasks();
       if (exiting || !hasRefWork()) break;
       await waitForNext();

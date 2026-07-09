@@ -279,5 +279,21 @@ assert(
   "dev server serves a binary /public asset intact (base64 body bridge)",
 );
 
+// Stage B: editing a source file must invalidate Vite's module graph so the next
+// request re-transforms it. The dev server's chokidar watcher is driven by our
+// push-based fs.watch, so a host write to /vt/src/main.js is seen in-VM.
+assert(decode(devMain.body).includes("createElement"), "pre-edit module is the original (sanity)");
+kernel.writeFile("/vt/src/main.js", "document.title = 'EDITED_BY_STAGE_B'; export {};");
+let devEdited = "";
+for (let i = 0; i < 100; i++) {
+  await new Promise((r) => setTimeout(r, 50));
+  devEdited = decode((await devGet("/src/main.js")).body);
+  if (devEdited.includes("EDITED_BY_STAGE_B")) break;
+}
+assert(
+  devEdited.includes("EDITED_BY_STAGE_B") && !devEdited.includes("createElement"),
+  "editing a file invalidates Vite's module graph via fs.watch (dev re-transforms on next request)",
+);
+
 console.log(failures === 0 ? "\nRESULT: PASS" : `\nRESULT: FAIL (${failures})`);
 process.exit(failures === 0 ? 0 : 1);

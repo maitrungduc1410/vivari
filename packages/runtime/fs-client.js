@@ -49,6 +49,8 @@ import {
   OP_RESPOND,
   OP_CLOSE_SERVER,
   OP_FETCH,
+  OP_WATCH,
+  OP_UNWATCH,
 } from "../protocol/syscall.js";
 
 // Cap each fd read/write to keep both request and response inside the 1 MiB
@@ -125,6 +127,14 @@ export function createSyscalls({ ctrl, data, notify }) {
     },
     fstat: (fd) => JSON.parse(decodeBytes(call(OP_FSTAT, encodeRequest([u32ToBytes(fd)])))),
     ftruncate: (fd, len) => call(OP_FTRUNCATE, encodeRequest([u32ToBytes(fd), u32ToBytes(len)])),
+
+    // ---- file watching (roadmap #19 stage B) ----
+    // Register interest in `path` with the File System Worker; change events are
+    // pushed back over the fs doorbell port (not this SAB). `watchId` is chosen by
+    // the caller (per-process unique) so it can later unwatch.
+    watch: (watchId, path, recursive) =>
+      call(OP_WATCH, encodeRequest([u32ToBytes(watchId), b(path)], recursive ? FLAG_RECURSIVE : 0)),
+    unwatch: (watchId) => call(OP_UNWATCH, encodeRequest([u32ToBytes(watchId)])),
     // Spawn a child and block until it exits (waitpid). Returns
     // { code, stdout, stderr, pid }. This is how execSync/spawnSync work.
     spawn: (spec) =>

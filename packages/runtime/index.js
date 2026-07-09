@@ -72,11 +72,19 @@ export function createRuntime({
   // `await`s one would otherwise exit before it resolves. Each in-flight op refs
   // the loop (like a libuv handle) and wakes the idle wait when it settles.
   const hostLiveness = { active: 0 };
+  // Liveness counter for fs.watch (roadmap #19 stage B): a persistent FSWatcher
+  // keeps the loop alive (like libuv's fs_event handle), so a bare `fs.watch`
+  // script stays up until the watcher is closed.
+  const watchLiveness = { active: 0 };
   // Assigned once child_process is built; the loop drains child events through it.
   let drainChildEvents = () => {};
   // Assigned once worker_threads is required; the loop drains its queued events.
   let drainThreadEvents = () => {};
   let dispatchThreadEvent = () => {};
+  // fs.watch delivery: change events pushed by the File System Worker are queued
+  // and drained inside a loop turn (like doNet/doChildren). Wired just below.
+  let drainWatchEvents = () => {};
+  let dispatchWatchEvent = () => {};
   // How many ports this process has registered with the kernel (each real
   // net.Server.listen calls syscalls.listen). While non-zero, `doNet` drains
   // inbound requests on every `net` wake.
@@ -92,7 +100,11 @@ export function createRuntime({
   // (Phase 2 #8 stage 2) so the server that answers is Node's own lib/http.js.
   const loop = createEventLoop({
     isAlive: () =>
-      netLiveness.active > 0 || childLiveness.active > 0 || threadLiveness.active > 0 || hostLiveness.active > 0,
+      netLiveness.active > 0 ||
+      childLiveness.active > 0 ||
+      threadLiveness.active > 0 ||
+      hostLiveness.active > 0 ||
+      watchLiveness.active > 0,
     doNet: () => {
       if (netServers.count === 0 || !bridgeHttp) return;
       for (;;) {
@@ -103,6 +115,7 @@ export function createRuntime({
     },
     doChildren: () => drainChildEvents(),
     doThreads: () => drainThreadEvents(),
+    doWatch: () => drainWatchEvents(),
   });
 
   const os = createOs();
@@ -119,6 +132,43 @@ export function createRuntime({
     // exit() is called from a raw Promise microtask (its throw would escape).
     onExit: (code) => loop.requestExit(code),
   });
+
+  // Wire the fs.watch host onto `process` (roadmap #19 stage B). The vendored
+  // internal/fs/watchers builtin reaches this to register a watch with the File
+  // System Worker and to receive the change events it pushes back. Each watchId is
+  // unique per process; a persistent watcher refs the loop like a real fs handle.
+  const watchHandlers = new Map(); // watchId -> (event, filename) => void
+  const watchQueue = [];
+  dispatchWatchEvent = (msg) => {
+    watchQueue.push(msg);
+    loop.wakeNet();
+  };
+  drainWatchEvents = () => {
+    while (watchQueue.length) {
+      const m = watchQueue.shift();
+      const h = watchHandlers.get(m.watchId);
+      if (h) h(m.event, m.filename);
+    }
+  };
+  process.__fsWatch = {
+    add: (watchId, path, recursive, persistent) => {
+      syscalls.watch(watchId, path, !!recursive);
+      if (persistent) {
+        watchLiveness.active++;
+        loop.wakeNet();
+      }
+    },
+    remove: (watchId, persistent) => {
+      try {
+        syscalls.unwatch(watchId);
+      } catch {
+        /* FS worker gone */
+      }
+      if (persistent && watchLiveness.active > 0) watchLiveness.active--;
+    },
+    register: (watchId, handler) => watchHandlers.set(watchId, handler),
+    unregister: (watchId) => watchHandlers.delete(watchId),
+  };
 
   // Wire the worker_threads host onto `process` so the lazily-required
   // node:worker_threads builtin (2b) can read this thread's identity, spawn nested
@@ -440,6 +490,9 @@ export function createRuntime({
     /** External delivery from the kernel: a worker_thread's online/exit
      * ({type:'thread-started'|'thread-exit', reqId, ...}). #16 stage 2b. */
     dispatchThread: (msg) => dispatchThreadEvent(msg),
+    /** External delivery from the File System Worker: an fs.watch change event
+     * ({type:'fs-watch', watchId, event, filename}). roadmap #19 stage B. */
+    dispatchWatch: (msg) => dispatchWatchEvent(msg),
     /**
      * Run an entry file like `node <entry>`, then drive the event loop until it
      * is quiescent (no pending timers/immediates/nextTicks and no open servers).

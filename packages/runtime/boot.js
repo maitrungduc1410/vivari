@@ -53,6 +53,17 @@ export function bootProcess({
     },
   });
 
+  // The fs doorbell port is duplex: we ring it (process -> FS worker) for every
+  // fs syscall, and the FS worker rings *us back* with file-watch change events
+  // (roadmap #19 stage B). Those are the only inbound messages on this port.
+  if (fsPort) {
+    fsPort.onmessage = (e) => {
+      const m = e && e.data;
+      if (m && m.type === "fs-watch") runtime.dispatchWatch(m);
+    };
+    if (fsPort.start) fsPort.start();
+  }
+
   // Hand the runtime's external-event hooks back to the worker shell: `wakeNet`
   // nudges the loop on a queued HTTP request; `dispatchChild` feeds it an async
   // child's stdout/stderr/exit (#15); `dispatchThread` feeds it a worker_thread's

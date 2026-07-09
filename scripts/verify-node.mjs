@@ -1704,6 +1704,37 @@ http.createServer(async (req, res) => {
   assert(JSON.parse(c1.body).url === "/x" && JSON.parse(c2.body).url === "/y",
     "http: two async requests in flight resolve independently");
 
+  // === fs.watch: push-based change events (roadmap #19 stage B) ===
+  // A guest process watches /wd; the HOST (kernel client) then writes a file into
+  // it. The change must be pushed cross-client from the File System Worker to the
+  // watching process, firing its fs.watch callback. The guest signals via marker
+  // files (the kernel's fs client can't read content, only test existence). It
+  // filters on 'target.txt' so its own marker writes don't re-trigger.
+  kernel.mkdirp("/wd");
+  kernel.writeFile(
+    "/wd/watcher.js",
+    `
+const fs = require('fs');
+fs.watch('/wd', (event, filename) => {
+  if (filename === 'target.txt') fs.writeFileSync('/wd/fired-' + event + '.txt', '1');
+});
+fs.writeFileSync('/wd/ready.txt', '1');
+setInterval(() => {}, 1000);
+`,
+  );
+  kernel.start("node", ["/wd/watcher.js"], { cwd: "/wd" });
+  await waitFor(() => kernel.exists("/wd/ready.txt"), "watcher process did not start");
+  kernel.writeFile("/wd/target.txt", "hello"); // creation -> 'rename'
+  await waitFor(() => kernel.exists("/wd/fired-rename.txt"),
+    "fs.watch did not fire on a cross-client create", 100);
+  assert(kernel.exists("/wd/fired-rename.txt"),
+    "fs.watch: a host write fires the watching process's callback ('rename' on create)");
+  kernel.writeFile("/wd/target.txt", "hello again"); // modify -> 'change'
+  await waitFor(() => kernel.exists("/wd/fired-change.txt"),
+    "fs.watch did not fire on a cross-client modify", 100);
+  assert(kernel.exists("/wd/fired-change.txt"),
+    "fs.watch: a subsequent host write fires 'change' on the same watcher");
+
   // === process table actually allocated many PIDs ===
   assert(kernel.nextPid - 1 >= 10, `PID table grew (${kernel.nextPid - 1} processes spawned)`);
 
