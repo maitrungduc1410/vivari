@@ -306,19 +306,42 @@ function addConsole() {
   return term;
 }
 
-function newShellTerminal() {
+// Create the terminal tab/xterm, but DON'T spawn its shell yet. Spawning a shell
+// means booting a Process Worker (~the most expensive single step of a cold
+// start), so for the auto first terminal we defer that off the boot burst and
+// only actually spawn on first interaction (focus/keystroke) or when the browser
+// goes idle — whichever comes first. Explicit "New Terminal" starts immediately.
+function newShellTerminal({ defer = false } = {}) {
   const id = "sh" + ++termSeq;
   const { term, fit, view } = makeTermView();
   const label = "sh " + termSeq;
-  terminals.set(id, { term, fit, view, kind: "shell", label, pid: null, alive: true });
+  const entry = { term, fit, view, kind: "shell", label, pid: null, alive: true, started: false, pendingInput: [] };
+  terminals.set(id, entry);
   term.onData((data) => {
+    if (!entry.started) {
+      startShell(id); // first keystroke wakes the shell; buffer it until ready
+      entry.pendingInput.push(data);
+      return;
+    }
     kernelWorker.postMessage({ type: "term-input", terminalId: id, chunk: data });
   });
+  view.addEventListener("mousedown", () => startShell(id), { once: true });
   renderTermTabs();
   switchTerminal(id);
-  const cwd = currentDemo?.dir;
-  kernelWorker.postMessage({ type: "term-open", terminalId: id, cwd });
+  if (defer) {
+    if (typeof requestIdleCallback === "function") requestIdleCallback(() => startShell(id), { timeout: 2500 });
+    else setTimeout(() => startShell(id), 1500);
+  } else {
+    startShell(id);
+  }
   return id;
+}
+
+function startShell(id) {
+  const entry = terminals.get(id);
+  if (!entry || entry.kind !== "shell" || entry.started) return;
+  entry.started = true;
+  kernelWorker.postMessage({ type: "term-open", terminalId: id, cwd: currentDemo?.dir });
 }
 
 function closeTerminal(id) {
@@ -561,13 +584,15 @@ async function main() {
         consoleWrite(m.chunk);
         break;
       case "log":
-        consoleLine(m.line, m.stream === "stderr" ? "31" : m.dim ? "90" : "");
+        consoleLine(m.line, m.stream === "stderr" ? "31" : m.dim || m.cls === "muted" ? "90" : "");
         break;
       case "ready":
         consoleLine("Kernel ready.", "32");
         statusEl.textContent = "ready — pick a project and press Run";
-        // Give the user a live shell straight away, like a real IDE.
-        newShellTerminal();
+        // Show a shell tab straight away (like a real IDE), but defer actually
+        // spawning it so the Process Worker boot doesn't pile onto the cold-start
+        // burst — it starts on first focus/keystroke, or when the browser idles.
+        newShellTerminal({ defer: true });
         break;
       case "exit":
         consoleLine(`[kernel] pid ${m.pid} exited with code ${m.code}`, "90");
@@ -579,7 +604,15 @@ async function main() {
       // ── interactive terminals ──
       case "term-ready": {
         const t = terminals.get(m.terminalId);
-        if (t) t.pid = m.pid;
+        if (t) {
+          t.pid = m.pid;
+          // Flush any keystrokes typed before the shell finished spawning.
+          if (t.pendingInput && t.pendingInput.length) {
+            for (const chunk of t.pendingInput)
+              kernelWorker.postMessage({ type: "term-input", terminalId: m.terminalId, chunk });
+            t.pendingInput.length = 0;
+          }
+        }
         statusCwdEl.textContent = m.cwd || "";
         break;
       }

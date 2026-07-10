@@ -530,13 +530,22 @@ async function boot() {
   // wait for it to boot, then talk to it: the kernel over its own sync SAB
   // channel (createKernelFs), and each process directly over a MessagePort
   // doorbell wired at spawn.
-  // Kick off the one-time codec compile up front, concurrently with the VFS
-  // boot; we only need the Modules before the first process is spawned below.
+  const t0 = Date.now();
+  post("log", { line: "Booting OpenContainer…", dim: true });
+
+  // Kick off the one-time codec compile up front; it runs concurrently with the
+  // workers below (we only need the Modules before the first process is spawned).
   const codecsReady = Promise.all([
     compileWasmModule(new URL("../codec/pkg/open_webcontainer_codec_bg.wasm", import.meta.url)),
     compileWasmModule(new URL("../crypto/pkg/open_webcontainer_crypto_bg.wasm", import.meta.url)),
   ]);
 
+  // Two independent nested workers, kicked off IN PARALLEL so their scripts load +
+  // boot concurrently instead of one-after-another: the File System Worker (Rust/
+  // Wasm VFS + OPFS restore — the kernel waits on this) and the Fetcher Worker
+  // (outbound npm; depends on neither the VFS nor the codecs, so there's no reason
+  // to create it later — overlapping its load shaves a step off cold boot).
+  post("log", { line: "  [boot] starting file-system + fetcher workers…", dim: true });
   const fsWorker = new Worker(new URL("./fs-worker.js", import.meta.url), {
     type: "module",
     name: "File System Worker",
@@ -551,10 +560,36 @@ async function boot() {
       else onKernelFsMessage(event.data);
     };
   });
+
+  // Fetcher Worker (Phase 2 #9): all outbound network goes through it, so
+  // downloading/decompressing large npm payloads never stalls syscall servicing.
+  // Created here (in parallel with the VFS); the kernel calls `fetcher(url)`.
+  const fetcherWorker = new Worker(new URL("./fetcher-worker.js", import.meta.url), {
+    type: "module",
+    name: "Fetcher Worker",
+  });
+  let fetchSeq = 1;
+  const fetchPending = new Map();
+  fetcherWorker.onmessage = (event) => {
+    const m = event.data;
+    if (m.type !== "fetch-result") return;
+    const p = fetchPending.get(m.id);
+    if (!p) return;
+    fetchPending.delete(m.id);
+    if (m.error) p.reject(new Error(m.error));
+    else p.resolve({ ok: m.ok, status: m.status, headers: m.headers, body: new Uint8Array(m.body) });
+  };
+  const fetcher = (url) =>
+    new Promise((resolve, reject) => {
+      const id = fetchSeq++;
+      fetchPending.set(id, { resolve, reject });
+      fetcherWorker.postMessage({ type: "fetch", id, url });
+    });
+
   await fsReady;
   const kernelFs = createKernelFs(fsWorker);
   onKernelFsMessage = kernelFs.onMessage;
-  post("log", { line: "Rust VFS booted (wasm) in the File System Worker." });
+  post("log", { line: "  [boot] file system ready.", dim: true });
 
   // [optimize] The pre-compiled codec Modules every Process Worker instantiates
   // from (compiled once above; may be null if the build/fetch failed).
@@ -594,31 +629,6 @@ async function boot() {
       postMessage: (m) => worker.postMessage(m),
     };
   };
-
-  // Dedicated Fetcher Worker (Phase 2 #9): all outbound network goes through it,
-  // so downloading/decompressing large npm payloads never stalls syscall
-  // servicing. The kernel calls `fetcher(url)`; we bridge that to the worker.
-  const fetcherWorker = new Worker(new URL("./fetcher-worker.js", import.meta.url), {
-    type: "module",
-    name: "Fetcher Worker",
-  });
-  let fetchSeq = 1;
-  const fetchPending = new Map();
-  fetcherWorker.onmessage = (event) => {
-    const m = event.data;
-    if (m.type !== "fetch-result") return;
-    const p = fetchPending.get(m.id);
-    if (!p) return;
-    fetchPending.delete(m.id);
-    if (m.error) p.reject(new Error(m.error));
-    else p.resolve({ ok: m.ok, status: m.status, headers: m.headers, body: new Uint8Array(m.body) });
-  };
-  const fetcher = (url) =>
-    new Promise((resolve, reject) => {
-      const id = fetchSeq++;
-      fetchPending.set(id, { resolve, reject });
-      fetcherWorker.postMessage({ type: "fetch", id, url });
-    });
 
   kernel = new Kernel({
     fs: kernelFs.fs,
@@ -669,6 +679,7 @@ async function boot() {
 
   kernel.installCoreutils();
   post("ready", {});
+  post("log", { line: `  [boot] kernel ready in ${Date.now() - t0}ms.`, dim: true });
   post("log", { line: "Kernel ready — pick a project and press Run." });
 }
 

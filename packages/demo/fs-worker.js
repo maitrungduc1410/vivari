@@ -135,6 +135,7 @@ const shouldPersist = (p) => {
   // glue is inlined here, so its default would resolve next to the bundle
   // (demo-dist/) and 404. The sibling-dir "../kernel/pkg/" form is correct both
   // in dev (packages/demo/) and in the bundle (packages/demo-dist/).
+  post("log", { line: "  [boot] initializing virtual file system…", cls: "muted" });
   await initKernel(new URL("../kernel/pkg/open_webcontainer_kernel_bg.wasm", import.meta.url));
   const vfs = new VirtualFileSystem();
 
@@ -144,8 +145,25 @@ const shouldPersist = (p) => {
   try {
     if (typeof navigator !== "undefined" && navigator.storage && navigator.storage.getDirectory) {
       persistence = await createOpfsPersistence({ access: buildAccess(vfs), shouldPersist });
-      const n = await persistence.restore();
-      if (n > 0) post("log", { line: `  [opfs] restored ${n} entries from a previous session`, cls: "muted" });
+      // Restoring a saved project (esp. its node_modules) can take a while — the
+      // VFS is re-hydrated entry-by-entry. Report progress so the user knows the
+      // "stall" is real work, not a hang. Only chatter when there's a lot to do.
+      const t0 = Date.now();
+      let announced = false;
+      const n = await persistence.restore((done, total) => {
+        if (total < 400) return; // small project: restore is instant, stay quiet
+        if (!announced) {
+          post("log", { line: `  [opfs] restoring saved project (${total} entries)…`, cls: "muted" });
+          announced = true;
+        } else if (done && done < total) {
+          post("log", { line: `  [opfs] restoring… ${done}/${total}`, cls: "muted" });
+        }
+      });
+      if (n > 0)
+        post("log", {
+          line: `  [opfs] restored ${n} entries from a previous session (${Date.now() - t0}ms)`,
+          cls: "muted",
+        });
     }
   } catch (err) {
     post("log", { line: "  [opfs] persistence unavailable: " + (err?.message || err), cls: "muted" });

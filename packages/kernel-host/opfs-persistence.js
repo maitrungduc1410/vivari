@@ -193,7 +193,7 @@ export async function createOpfsPersistence({ access, shouldPersist = () => true
   // Replay the manifest into the VFS. Returns the number of entries restored (0
   // = nothing persisted yet). Runs BEFORE the FS worker serves any syscall, and
   // calls the VFS directly (via `access`), so it never re-enters the queue.
-  async function restore() {
+  async function restore(onProgress) {
     let arr;
     try {
       arr = JSON.parse(dec.decode(await (async () => {
@@ -226,7 +226,9 @@ export async function createOpfsPersistence({ access, shouldPersist = () => true
       return parts(a[0]).length - parts(b[0]).length; // shallower first
     });
 
+    const total = sorted.length;
     let n = 0;
+    if (typeof onProgress === "function") onProgress(0, total);
     for (const [path, m] of sorted) {
       try {
         if (m.k === "dir") {
@@ -241,10 +243,15 @@ export async function createOpfsPersistence({ access, shouldPersist = () => true
           access.symlink(m.t, path);
         }
         n++;
+        // Report roughly every 5% (min every 200 entries) so a big node_modules
+        // restore shows a moving count instead of a long silent stall.
+        if (typeof onProgress === "function" && (n % Math.max(200, Math.ceil(total / 20)) === 0))
+          onProgress(n, total);
       } catch {
         /* skip a corrupt entry, keep restoring the rest */
       }
     }
+    if (typeof onProgress === "function") onProgress(n, total);
     return n;
   }
 
