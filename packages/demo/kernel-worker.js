@@ -589,11 +589,12 @@ async function boot() {
   await fsReady;
   const kernelFs = createKernelFs(fsWorker);
   onKernelFsMessage = kernelFs.onMessage;
-  post("log", { line: "  [boot] file system ready.", dim: true });
+  post("log", { line: `  [boot] file system ready (+${Date.now() - t0}ms).`, dim: true });
 
   // [optimize] The pre-compiled codec Modules every Process Worker instantiates
   // from (compiled once above; may be null if the build/fetch failed).
   const [codecModule, cryptoModule] = await codecsReady;
+  post("log", { line: `  [boot] codecs compiled (+${Date.now() - t0}ms).`, dim: true });
 
   // Spawn a process as a *nested* worker under this kernel worker. Each gets a
   // human-readable name (shown in DevTools' JS VM instance list) with its PID.

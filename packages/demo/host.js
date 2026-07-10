@@ -341,6 +341,7 @@ function startShell(id) {
   const entry = terminals.get(id);
   if (!entry || entry.kind !== "shell" || entry.started) return;
   entry.started = true;
+  entry.openedAt = performance.now(); // measure Process Worker boot (spawn → ready)
   kernelWorker.postMessage({ type: "term-open", terminalId: id, cwd: currentDemo?.dir });
 }
 
@@ -606,6 +607,8 @@ async function main() {
         const t = terminals.get(m.terminalId);
         if (t) {
           t.pid = m.pid;
+          if (t.openedAt)
+            consoleLine(`[boot] shell (Process Worker) ready in ${Math.round(performance.now() - t.openedAt)}ms`, "90");
           // Flush any keystrokes typed before the shell finished spawning.
           if (t.pendingInput && t.pendingInput.length) {
             for (const chunk of t.pendingInput)
