@@ -1191,6 +1191,19 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     `reloadDemo()`/`tsc`/`stop`+`launch` dance is gone) — it just writes the file and
     lets the project's tooling react, exactly like local dev. `kernel.launch()` (spawn
     a background process, return pid now) is still used to start the dev server.
+  - ✅ **Cold-boot latency work (perceived startup).** The nested workers used to load
+    one-after-another. Now (1) the **Fetcher Worker is created in parallel** with the
+    File System Worker (it needs neither the VFS nor the codecs); (2) a small **warm
+    Process Worker pool** (`kernel-worker.js`) pre-parses the ~900KB process bundle
+    during idle so a spawn just posts `init` instead of paying parse cost on the
+    critical path — refilled after each claim; (3) the demo's **first shell defers its
+    Process Worker spawn** off the boot burst (starts on focus/keystroke/idle). Boot
+    also **narrates its phases** to the Console with timings (`[boot] file system ready
+    (+Xms)`, `codecs compiled`, `kernel ready in Nms`, and per-shell `Process Worker
+    ready in Nms`), and OPFS restore reports progress (`restoring N entries…`) so a big
+    `node_modules` re-hydrate reads as work, not a hang. `opfs-persistence.restore()`
+    took an optional `onProgress(done,total)`. Deeper wins (Performance-panel profiling,
+    a bigger pool, snapshotting the runtime) are open if the numbers justify them.
 
 ## Definition of done for T2
 

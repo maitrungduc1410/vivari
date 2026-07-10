@@ -201,6 +201,14 @@ arrives — this is how blocking `accept()`/`execSync()`/blocking fetch work.
   child. `OP_SPAWN_ASYNC` returns `{pid}` immediately; the child's stdout/stderr/
   exit stream back to the parent worker as postMessages (the model behind
   `child_process.spawn` and a `npm run dev` that launches a long-lived server).
+- **Warm pool (cold-start perf)**: creating a Process Worker means parsing +
+  instantiating the ~900KB bundle before it can even read its `init` — the biggest
+  slice of spawn latency. `kernel-worker.js` keeps a couple of pre-created "warm"
+  workers (built during idle); `spawnWorker` claims one and just posts `init`, then
+  schedules a refill. `bootProcess` (the runtime boot) still runs per-process on
+  `init`; only the static load cost is amortised. The Fetcher + File System workers
+  are likewise created in parallel at boot, and the demo's first shell defers its
+  Process Worker spawn off the boot burst (starts on focus/keystroke/idle).
 - **Signals & teardown**: `process.kill(pid, sig)` and `child.kill()` route to the
   kernel (`OP_KILL`); `finalize` **cascades to the whole subtree** (`parentPid`),
   so killing a shell wrapper (`sh -c "node …"`) takes its server down too.

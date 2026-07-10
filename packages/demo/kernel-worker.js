@@ -596,15 +596,37 @@ async function boot() {
   const [codecModule, cryptoModule] = await codecsReady;
   post("log", { line: `  [boot] codecs compiled (+${Date.now() - t0}ms).`, dim: true });
 
-  // Spawn a process as a *nested* worker under this kernel worker. Each gets a
-  // human-readable name (shown in DevTools' JS VM instance list) with its PID.
-  // We also open a MessageChannel between the process and the File System Worker
-  // so its fs syscalls ring that worker's doorbell directly (never the kernel).
+  // [optimize] Process Worker POOL. Creating a Worker means downloading (or
+  // cache-hitting), parsing and instantiating the ~900KB process bundle and its
+  // whole module graph — the single biggest chunk of spawn latency, and it's paid
+  // BEFORE the worker can even see its `init`. We keep a few pre-created ("warm")
+  // workers around, built during idle so that cost overlaps dead time; a spawn
+  // then just hands a warm worker its `init` and returns immediately. Each claim
+  // schedules a refill so the pool is ready for the next spawn. `bootProcess`
+  // (the actual runtime boot) still runs per-process on `init` — only the static
+  // load cost is amortised, which is exactly the part a warm worker has done.
+  const WARM_POOL_SIZE = 2;
+  const warmPool = [];
+  const makeRawWorker = (name) =>
+    new Worker(new URL("./process-worker.js", import.meta.url), { type: "module", name });
+  const refillPool = () => {
+    while (warmPool.length < WARM_POOL_SIZE) warmPool.push(makeRawWorker("Process Worker (warm)"));
+  };
+  // requestIdleCallback isn't available in a Worker, so fall back to a short timer
+  // — the point is only to keep pool-building off the current task/critical path.
+  const scheduleRefill = () =>
+    typeof requestIdleCallback === "function"
+      ? requestIdleCallback(refillPool, { timeout: 3000 })
+      : setTimeout(refillPool, 200);
+
+  // Spawn a process as a *nested* worker under this kernel worker. Claims a warm
+  // worker if one is ready (fast path), else creates one inline. A claimed worker
+  // keeps the generic "warm" name in DevTools; a cold-created one is tagged with
+  // its PID. We also open a MessageChannel between the process and the File System
+  // Worker so its fs syscalls ring that worker's doorbell directly (not the kernel).
   const spawnWorker = (info) => {
-    const worker = new Worker(new URL("./process-worker.js", import.meta.url), {
-      type: "module",
-      name: "Process Worker PID " + info.pid,
-    });
+    const worker = warmPool.shift() || makeRawWorker("Process Worker PID " + info.pid);
+    scheduleRefill(); // top the pool back up, off the critical path
     worker.onmessage = (event) => {
       const handler = info.on[event.data.type];
       if (handler) handler(event.data);
@@ -682,6 +704,9 @@ async function boot() {
   post("ready", {});
   post("log", { line: `  [boot] kernel ready in ${Date.now() - t0}ms.`, dim: true });
   post("log", { line: "Kernel ready — pick a project and press Run." });
+  // Pre-warm the Process Worker pool now that the boot burst is over, so the
+  // first spawn (the shell, or Run) hands off an already-parsed worker.
+  scheduleRefill();
 }
 
 self.onmessage = async (event) => {
