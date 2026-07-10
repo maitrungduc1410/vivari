@@ -14,7 +14,7 @@
 // the adapter lives here. On boot we restore the manifest into the VFS BEFORE
 // serving any syscall; afterwards FsServer forwards mutations to the adapter.
 
-import initKernel, { VirtualFileSystem } from "../kernel/pkg/open_webcontainer_kernel.js";
+import initKernel, { VirtualFileSystem } from "../vfs/pkg/open_webcontainer_vfs.js";
 import { FsServer } from "../kernel-host/fs-server.js";
 import { createOpfsPersistence } from "../kernel-host/opfs-persistence.js";
 
@@ -133,10 +133,10 @@ const shouldPersist = (p) => {
   // Pass the wasm URL explicitly instead of relying on the glue's default
   // `new URL('..._bg.wasm', import.meta.url)`. When this worker is bundled the
   // glue is inlined here, so its default would resolve next to the bundle
-  // (demo-dist/) and 404. The sibling-dir "../kernel/pkg/" form is correct both
+  // (demo-dist/) and 404. The sibling-dir "../vfs/pkg/" form is correct both
   // in dev (packages/demo/) and in the bundle (packages/demo-dist/).
   post("log", { line: "  [boot] initializing virtual file system…", cls: "muted" });
-  await initKernel(new URL("../kernel/pkg/open_webcontainer_kernel_bg.wasm", import.meta.url));
+  await initKernel(new URL("../vfs/pkg/open_webcontainer_vfs_bg.wasm", import.meta.url));
   const vfs = new VirtualFileSystem();
 
   // Best-effort OPFS persistence. If the API is missing or throws (private

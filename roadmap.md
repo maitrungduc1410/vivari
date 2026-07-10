@@ -14,9 +14,10 @@ The load-bearing primitive of the whole system: user code in a Web Worker calls 
 `SharedArrayBuffer` + `Atomics`.
 
 **Done:**
-- `packages/kernel` — VFS written in Rust (`HashMap<path, bytes>`), compiled to
+- `packages/vfs` — VFS written in Rust (`HashMap<path, bytes>`), compiled to
   Wasm (`wasm-pack`, two targets: `web` for the browser, `nodejs` for headless
-  tests).
+  tests). (Formerly `packages/kernel`; renamed since it holds only the filesystem —
+  the actual kernel/process supervisor is JS in `packages/kernel-host`.)
 - `packages/demo/syscall.js` — shared worker↔host ABI over one SAB
   (control Int32 with STATE/OPCODE/REQ_LEN/RES_LEN + 1 MiB data region).
 - `packages/demo/worker.js` — "user code" + synchronous `fs` facade

@@ -38,10 +38,10 @@ isolation**, so the dev server sends `COOP: same-origin` + `COEP: require-corp`.
 
 ```
 packages/
-  kernel/            Rust crate → Wasm. The in-RAM Virtual File System (VFS).
+  vfs/               Rust crate → Wasm. The in-RAM Virtual File System (VFS).
     src/lib.rs
-    pkg/             generated (web target)     — `npm run build:kernel`
-    pkg-node/        generated (nodejs target)  — `npm run build:kernel:node`
+    pkg/             generated (web target)     — `npm run build:vfs`
+    pkg-node/        generated (nodejs target)  — `npm run build:vfs:node`
   protocol/
     syscall.js       the shared worker↔host ABI over SharedArrayBuffer
   kernel-host/       the supervisor (owns the VFS + process/PID table)

@@ -168,8 +168,8 @@ arrives — this is how blocking `accept()`/`execSync()`/blocking fetch work.
 
 ## 5. Filesystem
 
-- **VFS core**: `packages/kernel/` is a Rust crate compiled to Wasm (`wasm-pack`,
-  `web` + `nodejs` targets). It's an inode table (`HashMap<u64, Inode>`),
+- **VFS core**: `packages/vfs/` is a Rust crate compiled to Wasm (`wasm-pack`,
+  `web` + `nodejs` targets; crate `open-webcontainer-vfs`). It's an inode table (`HashMap<u64, Inode>`),
   directories map names→inode via `BTreeMap` (sorted readdir for free), symlinks
   with an `ELOOP` guard, `stat`/`lstat`, rename, errno-style errors.
 - **Servicing**: `packages/kernel-host/fs-server.js` (`FsServer`) owns the one VFS
@@ -352,7 +352,7 @@ http upgrade + the net loopback) to `127.0.0.1:<port>` and relays frames back ou
 
 ## 9. Native code (Wasm)
 
-- `packages/kernel/` — the Rust VFS → Wasm.
+- `packages/vfs/` — the Rust VFS → Wasm.
 - `packages/codec/` — Rust zlib/deflate core beneath `lib/zlib.js`
   (`internalBinding('zlib')`).
 - `packages/crypto/` — Rust crypto core beneath `lib/crypto.js`.

@@ -30,7 +30,7 @@ event loop, native Wasm), read **[`ARCHITECTURE.md`](./ARCHITECTURE.md)**.
 
 ```
 packages/
-  kernel/          Rust → Wasm VFS (inode tree, stat/symlink/rename, errno).
+  vfs/             Rust → Wasm VFS (inode tree, stat/symlink/rename, errno).
   codec/           Rust → Wasm zlib/deflate core (beneath lib/zlib.js).
   crypto/          Rust → Wasm crypto core (beneath lib/crypto.js).
   wasi-demo/       Rust → wasm32-wasip1 CLI to exercise the WASI layer.

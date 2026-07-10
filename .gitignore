@@ -1,7 +1,7 @@
 # Rust
 /packages/codec/target
 /packages/crypto/target
-/packages/kernel/target
+/packages/vfs/target
 /packages/wasi-demo/target
 /target
 
@@ -16,8 +16,8 @@ node_modules
 /packages/codec/pkg-node
 /packages/crypto/pkg
 /packages/crypto/pkg-node
-/packages/kernel/pkg
-/packages/kernel/pkg-node
+/packages/vfs/pkg
+/packages/vfs/pkg-node
 /packages/wasi-demo/pkg
 
 # OS

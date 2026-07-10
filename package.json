@@ -9,14 +9,14 @@
     "dev": "node server.mjs",
     "build:demo": "node scripts/build-demo.mjs",
     "verify": "node scripts/verify-node.mjs",
-    "build:kernel": "wasm-pack build packages/kernel --target web --out-dir pkg",
-    "build:kernel:node": "wasm-pack build packages/kernel --target nodejs --out-dir pkg-node",
+    "build:vfs": "wasm-pack build packages/vfs --target web --out-dir pkg",
+    "build:vfs:node": "wasm-pack build packages/vfs --target nodejs --out-dir pkg-node",
     "build:codec": "wasm-pack build packages/codec --target web --out-dir pkg",
     "build:codec:node": "wasm-pack build packages/codec --target nodejs --out-dir pkg-node",
     "build:crypto": "wasm-pack build packages/crypto --target web --out-dir pkg",
     "build:crypto:node": "wasm-pack build packages/crypto --target nodejs --out-dir pkg-node",
     "build:wasi-demo": "cargo build --release --manifest-path packages/wasi-demo/Cargo.toml --target wasm32-wasip1 && cp packages/wasi-demo/target/wasm32-wasip1/release/wasi_demo.wasm packages/wasi-demo/pkg/wasi_demo.wasm",
-    "build": "npm run build:kernel && npm run build:kernel:node && npm run build:codec && npm run build:codec:node && npm run build:crypto && npm run build:crypto:node && npm run build:wasi-demo"
+    "build": "npm run build:vfs && npm run build:vfs:node && npm run build:codec && npm run build:codec:node && npm run build:crypto && npm run build:crypto:node && npm run build:wasi-demo"
   },
   "devDependencies": {
     "@xterm/addon-fit": "^0.10.0",
