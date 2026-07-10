@@ -201,14 +201,17 @@ arrives — this is how blocking `accept()`/`execSync()`/blocking fetch work.
   child. `OP_SPAWN_ASYNC` returns `{pid}` immediately; the child's stdout/stderr/
   exit stream back to the parent worker as postMessages (the model behind
   `child_process.spawn` and a `npm run dev` that launches a long-lived server).
-- **Warm pool (cold-start perf)**: creating a Process Worker means parsing +
-  instantiating the ~900KB bundle before it can even read its `init` — the biggest
-  slice of spawn latency. `kernel-worker.js` keeps a couple of pre-created "warm"
-  workers (built during idle); `spawnWorker` claims one and just posts `init`, then
-  schedules a refill. `bootProcess` (the runtime boot) still runs per-process on
-  `init`; only the static load cost is amortised. The Fetcher + File System workers
-  are likewise created in parallel at boot, and the demo's first shell defers its
-  Process Worker spawn off the boot burst (starts on focus/keystroke/idle).
+- **Naming**: each Process Worker is created with the name `Process Worker PID N`.
+  A Worker's name is fixed at creation and can't be changed later, so naming it
+  per-PID at spawn (rather than reusing a pre-warmed, PID-less pool) is what keeps
+  DevTools' worker list legible — every entry maps to a PID. (A warm pool was tried
+  and dropped: it didn't move the needle on the boot numbers — cold start is
+  dominated by the FS worker + VFS wasm init — and it left claimed spares
+  mislabelled.)
+- **Cold-start wins that stuck**: the Fetcher + File System workers are created in
+  parallel at boot, and the demo's first shell defers its Process Worker spawn off
+  the boot burst (starts on focus/keystroke/idle). Boot narrates its phases with
+  timings to the Console.
 - **Signals & teardown**: `process.kill(pid, sig)` and `child.kill()` route to the
   kernel (`OP_KILL`); `finalize` **cascades to the whole subtree** (`parentPid`),
   so killing a shell wrapper (`sh -c "node …"`) takes its server down too.

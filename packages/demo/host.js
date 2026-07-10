@@ -607,8 +607,6 @@ async function main() {
         const t = terminals.get(m.terminalId);
         if (t) {
           t.pid = m.pid;
-          if (t.openedAt)
-            consoleLine(`[boot] shell (Process Worker) ready in ${Math.round(performance.now() - t.openedAt)}ms`, "90");
           // Flush any keystrokes typed before the shell finished spawning.
           if (t.pendingInput && t.pendingInput.length) {
             for (const chunk of t.pendingInput)
@@ -619,9 +617,18 @@ async function main() {
         statusCwdEl.textContent = m.cwd || "";
         break;
       }
-      case "term-out":
-        terminals.get(m.terminalId)?.term.write(m.chunk);
+      case "term-out": {
+        const t = terminals.get(m.terminalId);
+        if (!t) break;
+        // First byte back = the shell actually booted and printed its prompt. This
+        // (not the PID round-trip at term-ready) is the real spawn→ready latency.
+        if (t.openedAt) {
+          consoleLine(`[boot] shell (Process Worker) booted in ${Math.round(performance.now() - t.openedAt)}ms`, "90");
+          t.openedAt = 0;
+        }
+        t.term.write(m.chunk);
         break;
+      }
       case "term-exit": {
         const t = terminals.get(m.terminalId);
         if (t) {
