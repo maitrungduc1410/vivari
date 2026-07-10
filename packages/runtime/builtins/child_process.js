@@ -20,9 +20,10 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
       opts = args;
       args = [];
     }
+    const sh = withShell(command, args, opts);
     const spec = {
-      command,
-      args,
+      command: sh.command,
+      args: sh.args,
       cwd: opts.cwd || process.cwd(),
       env: opts.env || process.env,
       capture: true,
@@ -72,23 +73,74 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
   const inbox = []; // queued { type, childPid, chunk?, code?, signal? } events
 
   // A minimal stdin sink: present so `child.stdin.write(...).end()` never throws.
-  // Real parent->child piping is deferred to a later stage.
+  // Real parent->child piping is deferred to a later stage. It answers to the
+  // whole stream-ish surface tools poke at — NestJS's watch-restart, for one,
+  // calls `child.stdin.pause()` before recompiling, and chokidar/others cork or
+  // set encodings — so every method is a chainable no-op rather than undefined.
   const makeStdin = () => ({
     writable: true,
+    readable: false,
+    destroyed: false,
     write() {
       return true;
     },
-    end() {},
+    end() {
+      return this;
+    },
+    pause() {
+      return this;
+    },
+    resume() {
+      return this;
+    },
+    cork() {},
+    uncork() {},
+    setEncoding() {
+      return this;
+    },
+    setDefaultEncoding() {
+      return this;
+    },
+    pipe(dest) {
+      return dest;
+    },
+    unpipe() {
+      return this;
+    },
+    read() {
+      return null;
+    },
     on() {
       return this;
     },
     once() {
       return this;
     },
+    off() {
+      return this;
+    },
+    addListener() {
+      return this;
+    },
+    removeListener() {
+      return this;
+    },
+    removeAllListeners() {
+      return this;
+    },
     emit() {
       return false;
     },
-    destroy() {},
+    ref() {
+      return this;
+    },
+    unref() {
+      return this;
+    },
+    destroy() {
+      this.destroyed = true;
+      return this;
+    },
   });
 
   class ChildProcess extends EventEmitter {
@@ -131,11 +183,23 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
     return { command, args: args || [], opts: opts || {} };
   }
 
+  // Node's `shell` option: when set, the command (+args) is run through a shell as
+  // a single line — `sh -c "<command> <args...>"`. Tools rely on this (Nest's
+  // `nest start` spawns `spawn('node --enable-source-maps dist/main', {shell})`);
+  // without it we'd try to exec a program literally named "node --enable...".
+  function withShell(command, args, opts) {
+    if (!opts || !opts.shell) return { command, args };
+    const shell = typeof opts.shell === "string" ? opts.shell : "sh";
+    const line = args && args.length ? [command, ...args].join(" ") : command;
+    return { command: shell, args: ["-c", line] };
+  }
+
   function spawn(command, args, opts) {
     const n = normalizeArgs(command, args, opts);
+    const sh = withShell(n.command, n.args, n.opts);
     const spec = {
-      command: n.command,
-      args: n.args,
+      command: sh.command,
+      args: sh.args,
       cwd: n.opts.cwd || process.cwd(),
       env: n.opts.env || process.env,
     };
@@ -162,6 +226,15 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
     const cp = new ChildProcess(pid);
     registry.set(pid, cp);
     childLiveness.active++;
+    // stdio: 'inherit' (or ['...','inherit','inherit']) means the child shares the
+    // parent's stdout/stderr — forward each streamed chunk to our own std streams.
+    // Tools rely on this to surface a nested process's logs (Nest spawns the app
+    // with {stdio:'inherit'}; without this its bootstrap logs never appear).
+    const stdio = n.opts.stdio;
+    const inheritOut = stdio === "inherit" || (Array.isArray(stdio) && stdio[1] === "inherit");
+    const inheritErr = stdio === "inherit" || (Array.isArray(stdio) && stdio[2] === "inherit");
+    if (inheritOut) cp.stdout.on("data", (d) => process.stdout.write(d));
+    if (inheritErr) cp.stderr.on("data", (d) => process.stderr.write(d));
     process.nextTick(() => cp.emit("spawn"));
     return cp;
   }

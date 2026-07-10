@@ -165,8 +165,14 @@ export async function createOpfsPersistence({ access, shouldPersist = () => true
         }
       }
       if (manifestDirty) {
-        await writeManifest();
-        manifestDirty = false;
+        // Best-effort: a transient OPFS hiccup here must not escape as an
+        // unhandled rejection. Leave manifestDirty set so the next drain retries.
+        try {
+          await writeManifest();
+          manifestDirty = false;
+        } catch {
+          /* retry on the next drain */
+        }
       }
     } finally {
       draining = false;

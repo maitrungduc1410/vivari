@@ -139,6 +139,15 @@ export function createRuntime({
     onExit: (code) => loop.requestExit(code),
   });
 
+  // process.kill(pid, signal): send a signal to another process via the kernel,
+  // the same path child.kill() takes. Tools that manage their own children by pid
+  // rely on this — NestJS's watch mode kills the app child with process.kill()
+  // before respawning it on each recompile. signal 0 is an existence probe.
+  process.kill = (targetPid, signal = "SIGTERM") => {
+    syscalls.kill(targetPid | 0, signal);
+    return true;
+  };
+
   // Wire the fs.watch host onto `process` (roadmap #19 stage B). The vendored
   // internal/fs/watchers builtin reaches this to register a watch with the File
   // System Worker and to receive the change events it pushes back. Each watchId is
@@ -598,11 +607,32 @@ export function createRuntime({
      * fire. Resolves with the process exit code.
      */
     async run(entry) {
+      let started;
       try {
-        moduleSystem.runMain(entry); // synchronous; may throw process.exit sentinel
+        // Runs the entry's synchronous body now (may throw the process.exit
+        // sentinel). Returns a Promise if the entry used top-level await.
+        started = moduleSystem.runMain(entry);
       } catch (err) {
         if (err && err.__processExit !== undefined) return err.__processExit;
         throw err;
+      }
+      // A top-level-await entry evaluates to a Promise. Do NOT block on it before
+      // driving the loop — its awaits may depend on timers/microtasks the loop
+      // pumps, so awaiting here would deadlock. Let it settle inside drive() and
+      // just surface a process.exit() sentinel or an uncaught error from it.
+      if (started && typeof started.then === "function") {
+        started.then(undefined, (err) => {
+          if (err && err.__processExit !== undefined) {
+            loop.requestExit(err.__processExit);
+          } else {
+            try {
+              process.stderr.write(String((err && err.stack) || err) + "\n");
+            } catch {
+              /* ignore */
+            }
+            loop.requestExit(1);
+          }
+        });
       }
       await loop.drive();
       return loop.exiting ? loop.exitCode : 0;

@@ -10,8 +10,10 @@
 // (const/let/var/function/class + `export {}` + `export default`), dynamic
 // import (-> a Promise), and import.meta.url/resolve. Named/default/namespace
 // interop with CJS uses the standard __esModule rules. Live bindings are modeled
-// with getters. Known casualties (documented): top-level await (our wrapper is a
-// sync function) and exact circular-eval ordering.
+// with getters. Top-level await is supported for the ENTRY module (module.js
+// recompiles a TLA body as an AsyncFunction and run() awaits it while driving the
+// loop); a non-entry module `require()`d synchronously still can't block on its
+// TLA. Known casualty: exact circular-eval ordering.
 
 import { parse } from "./node/vendor/es-module-lexer.js";
 
@@ -34,6 +36,57 @@ function helpers(fileUrl) {
     "const __oc_import=function(s){return Promise.resolve().then(function(){return __oc_require(s);});};" +
     "const __oc_meta={url:" + JSON.stringify(fileUrl) + ",resolve:function(s){return __oc_require.resolve?__oc_require.resolve(s):s;}};"
   );
+}
+
+// --- robust source skimming: strings, template literals (with ${} interpolation),
+// comments. Returns the index just PAST the construct. A coarse template skip that
+// ignores ${} can desync the export scanner on modern bundled code (a `}` or
+// backtick inside an interpolation), leaving a real `export` unrewritten — which
+// then throws "Unexpected token 'export'" at compile. These descend correctly.
+function skipQuoted(src, i) {
+  const q = src[i++];
+  const n = src.length;
+  while (i < n) {
+    const ch = src[i];
+    if (ch === "\\") { i += 2; continue; }
+    if (ch === q) return i + 1;
+    if (ch === "\n") return i; // unterminated (defensive) — don't run off the end
+    i++;
+  }
+  return i;
+}
+function skipTemplate(src, i) {
+  const n = src.length;
+  i++; // past opening backtick
+  while (i < n) {
+    const ch = src[i];
+    if (ch === "\\") { i += 2; continue; }
+    if (ch === "`") return i + 1;
+    if (ch === "$" && src[i + 1] === "{") {
+      i = skipBalanced(src, i + 2); // skip the ${ ... } expression
+      continue;
+    }
+    i++;
+  }
+  return i;
+}
+// i is just after `${` (or after `{`); skip to the matching `}`, descending into
+// nested strings/templates/braces/comments.
+function skipBalanced(src, i) {
+  const n = src.length;
+  let depth = 1;
+  while (i < n && depth > 0) {
+    const ch = src[i];
+    if (ch === "\\") { i += 2; continue; }
+    if (ch === '"' || ch === "'") { i = skipQuoted(src, i); continue; }
+    if (ch === "`") { i = skipTemplate(src, i); continue; }
+    if (ch === "/" && src[i + 1] === "/") { while (i < n && src[i] !== "\n") i++; continue; }
+    if (ch === "/" && src[i + 1] === "*") { i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++; i += 2; continue; }
+    if (ch === "{") { depth++; i++; continue; }
+    if (ch === "}") { depth--; i++; continue; }
+    i++;
+  }
+  return i;
 }
 
 function namedFromBraces(text) {
@@ -98,19 +151,10 @@ function scanExportEdits(src, isFrom) {
       i += 2;
       continue;
     }
-    // skip strings + templates
-    if (c === '"' || c === "'" || c === "`") {
-      const q = c;
-      i++;
-      while (i < n) {
-        if (src[i] === "\\") { i += 2; continue; }
-        if (src[i] === q) { i++; break; }
-        // (nested template ${} is skipped coarsely; export can't legally start
-        // inside one at top level, so we don't descend)
-        i++;
-      }
-      continue;
-    }
+    // skip strings + templates (templates descend into ${} interpolations so a
+    // brace/backtick inside an expression can't desync the scan)
+    if (c === '"' || c === "'") { i = skipQuoted(src, i); continue; }
+    if (c === "`") { i = skipTemplate(src, i); continue; }
     // skip regex literal (best-effort: only when a '/' can start a regex)
     if (c === "/") {
       const p = prevSignificant();

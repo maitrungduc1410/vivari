@@ -70,15 +70,18 @@ packages/
     fetcher-worker.js  outbound fetch() (npm downloads).
     process-worker.js  one process = one worker (boots the runtime).
     sw.js              preview Service Worker (fetch → kernel → in-VM server).
-    index.html         terminal / preview / editor layout + demo selector.
+    index.html         StackBlitz-style IDE: file tree | Monaco + terminal | preview.
+    vendor/editor/     COMMITTED Monaco + xterm bundle (editor.js/.css) — the page
+                       is cross-origin isolated, so the editor can't come from a CDN.
   demo-dist/       GITIGNORED esbuild bundle of demo/ (one file per worker role).
 
 scripts/
   verify-node.mjs      headless end-to-end proof (no browser).
   verify-express.mjs   installs+runs real Express/Vite/ws (needs network).
-  probe-*.mjs          framework discovery/regression probes (react/nest/next).
+  probe-*.mjs          framework discovery/regression probes (react/nest/realdev).
   process-worker.mjs / fs-worker.mjs   Node worker_threads entries for headless.
   build-demo.mjs       bundles demo/ → demo-dist/ with esbuild.
+  build-editor-vendor.mjs   bundles Monaco+xterm → demo/vendor/editor/ (re-run on bump).
 
 server.mjs             static dev server that sends the COOP/COEP headers.
 README.md · roadmap.md · research.md · ARCHITECTURE.md · AGENTS.md
@@ -149,6 +152,21 @@ constructor` the first time that path runs. When you add a `lib/` module, make
 sure every `ERR_*` / `*Exception*` it references is exported from
 `node/internal/errors.js` (stream, http, and net families are all there now).
 
+### Async `fs.*stat` must not share the `statValues` scratch buffer
+`bindings/fs.js` fills one shared `statValues` Float64Array in place (this is
+Node's real `binding.statValues` contract, and it's fine for **sync** stat — the
+JS reads the array in the same tick). But the **async** path (`stat`/`lstat`/
+`fstat` with an `FSReqCallback`) delivers the result via `process.nextTick`, and
+`makeStatsCallback` only reads the array *then*. If it hands back the shared
+buffer, any stat that runs in between clobbers it, so the callback sees **another
+entry's stats** — classically a directory reported as a regular file. Symptom:
+chokidar/Vite watch the project root, `stat(root)` comes back `isDirectory()===
+false`, so chokidar treats root as a file, never recurses, never file-watches,
+and **HMR/edits silently do nothing** (no error). Fix in place: async stat calls
+pass `fresh=true` to `makeStatArray` so each result is a private snapshot. Rule:
+any deferred/async syscall result that references a shared scratch buffer must
+snapshot it at call time, not at delivery time.
+
 ### ESM ↔ CJS interop
 `esm.js` transpiles ESM to our sync CJS. Two traps already handled — respect them:
 - Generated identifiers are namespaced `__oc_*` (`__oc_exports`, `__oc_module`,
@@ -183,6 +201,22 @@ Each demo binds a port; a leftover long-lived server squatting a port causes
 **not** auto-run any server — demos are started on demand via the `DEMOS` registry
 / `startDemo(id)`. Don't reintroduce a background server into `boot()`.
 
+### Killing a process must kill its subtree
+`kernel.finalize(pid)` cascades to every process whose `parentPid === pid` (and so
+on, recursively). This matters because servers are usually spawned behind a shell
+wrapper: `nest start --watch` runs the app as `spawn("node ... dist/main", {shell:
+true})`, which our `child_process` turns into `sh -c "node ... dist/main"`, and the
+`/bin/sh` builtin then spawns `node` as its **own** child. So `childProcessRef.pid`
+is the *shell's* pid, not the server's. On each recompile NestJS `process.kill()`s
+that pid; without the cascade only the shell dies, the real `node` server is
+orphaned, keeps its port bound, and the respawn hits `EADDRINUSE`. Well-behaved
+parents `await` their children before exiting, so on a *normal* exit there are no
+live children to cascade to — this only fires on an actual kill. Two enablers this
+relies on: `process.kill(pid, sig)` is wired in `runtime/index.js` to
+`syscalls.kill` (Node tools manage their own children by pid), and
+`child.stdin` is a full no-op stream (`pause`/`resume`/`cork`/… all chainable) —
+NestJS's watch restart calls `child.stdin.pause()` before killing.
+
 ### OPFS persistence
 The VFS mirrors to OPFS and **survives reload**. If a demo behaves as if old files
 linger, that's why — use `?reset` on the demo URL to wipe it. Restore happens
@@ -200,11 +234,14 @@ browser first.
   network needed.
 - `node scripts/verify-express.mjs` — installs + runs real Express, esbuild-wasm,
   a Vite build, Vite dev+HMR, and a real `ws` server. **Needs network** (npm).
-- `node scripts/probe-react.mjs` / `probe-nest.mjs` — regression probes for the
-  React+Vite+Compiler and NestJS demos (need network for install).
+- `node scripts/probe-realdev.mjs [vite|nest]` — the demo's exact flow headless:
+  scaffolds the real project, `npm install`s, runs `npm run dev` / `npm run
+  start:dev`, and asserts the colored banner/logs + a served response. **Needs
+  network.** `probe-react.mjs` / `probe-nest.mjs` are the older API-gap probes.
 - Browser smoke test: `npm run dev`, open
-  `http://localhost:8080/packages/demo/index.html`, run a demo from the selector,
-  check the terminal log + preview iframe. For the bundled path, `npm run
+  `http://localhost:8080/packages/demo/index.html`, pick a project + Run, then
+  check the terminal (Vite/Nest colored output), edit a file in Monaco (auto-saves
+  → HMR/restart), and the preview iframe. For the bundled path, `npm run
   build:demo` and open `packages/demo-dist/index.html`.
 
 When you add a Node API or a binding, add/extend a probe or a `verify-*` case so
@@ -217,9 +254,16 @@ the gap can't silently regress.
 - **Fix a framework crash**: reproduce headless with a `probe-*.mjs` (copy an
   existing one), read the minified stack to the offending `lib/`/binding, implement
   the missing piece in `runtime/node/`, re-run the probe + `npm run verify`.
-- **Add a demo**: extend the `DEMOS` registry in `demo/kernel-worker.js` (files,
-  deps, optional build step, run command, `hmr` flag) and add it to the selector in
-  `index.html`/`host.js`.
+- **Add a demo**: extend the `DEMOS` registry in `demo/kernel-worker.js` with a
+  REAL project layout (`files` = relative path → contents, exactly what `npm create
+  …` emits), plus `dir`, `port`, `entry`, and a `runCmd`/`runArgs` that is the
+  project's own dev script (e.g. `npm run dev`). `startDemo()` scaffolds the files,
+  runs `npm install` (streaming to the terminal), `kernel.launch()`es the script,
+  and waits for the port. Add the option to the `<select>` in `index.html`. `hmr:
+  true` = the in-VM dev server hot-updates on save; `reload: true` = no HMR, so the
+  server restarts on change and we reload the preview when it re-`listen`s (Nest
+  `--watch`). Edits from Monaco are written straight to the VFS — the project's own
+  watcher does the rest; there is no build/restart orchestration in the worker.
 - **Change the syscall ABI**: edit `protocol/syscall.js` (+ its format comment) and
   update all three sides (`fs-client.js`, `fs-server.js`, `kernel.js`) together.
 - **Ship a bundle**: `npm run build:demo` (regenerates `demo-dist/`, stamps a new

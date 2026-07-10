@@ -42,6 +42,8 @@ const PRECACHE = [
   "process-worker.js",
   "fs-worker.js",
   "fetcher-worker.js",
+  "vendor/editor/editor.js", // Monaco + xterm (4 MB) — precache so the IDE is instant + offline
+  "vendor/editor/editor.css",
 ].map((f) => new URL(f, self.location.href).href);
 
 // A same-origin GET we own and may serve cache-first: anything under our own dir

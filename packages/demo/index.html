@@ -3,217 +3,311 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OpenContainer · Phase 2 — Path B (real Node lib/)</title>
+    <title>OpenContainer — run real dev servers in your browser</title>
+    <link rel="stylesheet" href="./vendor/editor/editor.css" />
     <style>
       :root {
         color-scheme: dark;
+        --bg: #0b0e14;
+        --panel: #0e131c;
+        --border: #1c2230;
+        --muted: #6b7385;
+        --text: #d4d7dd;
+        --accent: #4a9eff;
       }
       * {
         box-sizing: border-box;
       }
+      html,
       body {
         margin: 0;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        background: #0b0e14;
-        color: #d4d7dd;
-        height: 100vh;
+        height: 100%;
+      }
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--text);
         display: flex;
         flex-direction: column;
+        overflow: hidden;
       }
       header {
-        padding: 16px 24px;
-        border-bottom: 1px solid #1c2230;
-        background: #0e131c;
         flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 10px 16px;
+        border-bottom: 1px solid var(--border);
+        background: var(--panel);
       }
-      header h1 {
-        margin: 0 0 4px;
-        font-size: 15px;
-        color: #e8eaf0;
+      header .brand {
+        font-weight: 600;
+        font-size: 14px;
+        letter-spacing: 0.01em;
+        color: #eaecf2;
       }
-      header p {
-        margin: 0;
+      header .brand small {
+        display: block;
+        font-weight: 400;
+        font-size: 11px;
+        color: var(--muted);
+      }
+      header .spacer {
+        flex: 1 1 auto;
+      }
+      #demo-select {
+        font: inherit;
+        font-size: 13px;
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 7px 10px;
+      }
+      #run-demo {
+        font: inherit;
+        font-size: 13px;
+        font-weight: 600;
+        background: var(--accent);
+        color: #061018;
+        border: 0;
+        border-radius: 8px;
+        padding: 8px 16px;
+        cursor: pointer;
+      }
+      #run-demo:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #status {
         font-size: 12px;
-        color: #7d8597;
+        color: var(--muted);
+        max-width: 42ch;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
-      .split {
+
+      /* Workbench: file tree | editor(+terminal) | preview */
+      .workbench {
         flex: 1 1 auto;
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: 210px minmax(0, 1fr) minmax(0, 1fr);
         min-height: 0;
       }
-      .pane {
+      .col {
         display: flex;
         flex-direction: column;
+        min-width: 0;
         min-height: 0;
+        border-left: 1px solid var(--border);
       }
-      .pane + .pane {
-        border-left: 1px solid #1c2230;
+      .col:first-child {
+        border-left: 0;
       }
-      .pane-title {
-        padding: 8px 16px;
+      .col-head {
+        flex: 0 0 auto;
+        padding: 8px 12px;
         font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 0.08em;
-        color: #6b7385;
-        border-bottom: 1px solid #1c2230;
-        background: #0e131c;
+        color: var(--muted);
+        border-bottom: 1px solid var(--border);
+        background: var(--panel);
         display: flex;
+        align-items: center;
         justify-content: space-between;
         gap: 8px;
       }
-      .pane-title code {
-        color: #79c0ff;
+      .col-head code {
+        text-transform: none;
+        letter-spacing: 0;
+        color: var(--accent);
+        font-size: 11px;
+      }
+
+      /* File tree */
+      #filetree {
+        flex: 1 1 auto;
+        overflow: auto;
+        padding: 6px 0;
+        font-size: 13px;
+      }
+      #filetree .empty {
+        padding: 12px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+      .tree-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 12px;
+        cursor: pointer;
+        white-space: nowrap;
+        color: #c3c7d1;
+      }
+      .tree-item:hover {
+        background: #141a26;
+      }
+      .tree-item.active {
+        background: #1a2333;
+        color: #fff;
+      }
+      .tree-item.dir {
+        color: var(--muted);
+        cursor: default;
+        text-transform: none;
+      }
+      .tree-icon {
+        width: 14px;
+        text-align: center;
+        opacity: 0.7;
+        flex: 0 0 auto;
+      }
+
+      /* Editor column */
+      .editor-col {
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr) auto;
+      }
+      .tabbar {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 12px;
+        height: 34px;
+        border-bottom: 1px solid var(--border);
+        background: var(--panel);
+        font-size: 12px;
+        color: #c3c7d1;
+      }
+      .tabbar .dot {
+        color: var(--accent);
+      }
+      .tabbar .hint {
+        margin-left: auto;
+        color: var(--muted);
+        font-size: 11px;
+      }
+      #editor {
+        min-height: 0;
+        width: 100%;
+      }
+      #editor .placeholder {
+        display: flex;
+        height: 100%;
+        align-items: center;
+        justify-content: center;
+        color: var(--muted);
+        font-size: 13px;
+        padding: 24px;
+        text-align: center;
+      }
+
+      /* Terminal (bottom of editor column) */
+      .terminal-wrap {
+        flex: 0 0 auto;
+        height: 34%;
+        min-height: 120px;
+        display: flex;
+        flex-direction: column;
+        border-top: 1px solid var(--border);
+        background: #05070b;
+      }
+      .terminal-head {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 5px 12px;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        border-bottom: 1px solid var(--border);
+      }
+      .terminal-head button {
+        font: inherit;
+        font-size: 11px;
+        background: transparent;
+        color: var(--muted);
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 2px 8px;
+        cursor: pointer;
         text-transform: none;
         letter-spacing: 0;
       }
-      #output {
-        padding: 12px 16px;
-        overflow: auto;
+      #terminal {
         flex: 1 1 auto;
-        font-size: 12.5px;
-        line-height: 1.5;
+        min-height: 0;
+        padding: 4px 8px;
       }
-      .line {
-        white-space: pre-wrap;
-        border-left: 2px solid #222a3a;
-        padding-left: 10px;
-        margin: 2px 0;
-      }
-      .ok {
-        color: #7ee787;
-        border-left-color: #2ea043;
-      }
-      .err {
-        color: #ff7b72;
-        border-left-color: #f85149;
-      }
-      .muted {
-        color: #6b7385;
-      }
+
+      /* Preview */
       #preview {
         flex: 1 1 auto;
         border: 0;
         width: 100%;
         background: #fff;
       }
-      .hmr-bar {
-        flex: 0 0 auto;
-        padding: 8px 16px;
-        border-top: 1px solid #1c2230;
-        background: #0e131c;
-        display: flex;
-        align-items: center;
-        gap: 12px;
-      }
-      button {
-        font: inherit;
-        font-size: 12px;
-        background: #1f6feb;
-        color: #fff;
-        border: 0;
-        border-radius: 6px;
-        padding: 6px 12px;
-        cursor: pointer;
-      }
-      button:disabled {
-        opacity: 0.5;
-        cursor: default;
-      }
-      .editor-panel {
-        flex: 0 0 auto;
-        display: flex;
-        flex-direction: column;
-        border-top: 1px solid #1c2230;
-        background: #0b0e14;
-        max-height: 40%;
-      }
-      .editor-head {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 6px 16px;
-        font-size: 11px;
-        color: #6b7385;
-      }
-      .editor-head code {
-        color: #79c0ff;
-      }
-      #editor-file,
-      #demo-select {
-        font: inherit;
-        font-size: 11px;
-        background: #0b0e14;
-        color: #79c0ff;
-        border: 1px solid #1c2230;
-        border-radius: 6px;
-        padding: 3px 6px;
-      }
-      #demo-select {
-        font-size: 12px;
-        padding: 6px 8px;
-      }
-      #editor {
-        flex: 1 1 auto;
-        min-height: 120px;
-        resize: none;
-        border: 0;
-        outline: none;
-        background: #0b0e14;
-        color: #d4d7dd;
-        font-family: inherit;
-        font-size: 12.5px;
-        line-height: 1.5;
-        padding: 8px 16px;
-      }
     </style>
   </head>
   <body>
     <header>
-      <h1>OpenContainer · Phase 2 — Path B (real Node lib/)</h1>
-      <p>
-        The kernel + Rust/Wasm VFS run in a dedicated kernel worker; process
-        workers are spawned nested under it. Programs run Node's REAL, unmodified
-        <code>lib/path.js</code> and <code>lib/buffer.js</code> (v24.18.0) over our
-        <code>internalBinding</code> layer. The in-memory HTTP server is previewed
-        via a Service Worker — try <code>GET /api/buffer</code> in the preview.
-        The VFS is mirrored to <strong>OPFS</strong>, so files survive a reload —
-        try <code>GET /api/persist</code>, then reload. Append <code>?reset</code>
-        to the URL to clear the persisted filesystem.
-      </p>
+      <div class="brand">
+        OpenContainer
+        <small>real Vite &amp; NestJS dev servers, running in this tab</small>
+      </div>
+      <div class="spacer"></div>
+      <select id="demo-select" title="project to run">
+        <option value="react">React + Vite + React Compiler</option>
+        <option value="nest">NestJS</option>
+      </select>
+      <button id="run-demo">Run</button>
+      <span id="status">pick a project and press Run</span>
     </header>
-    <div class="split">
-      <section class="pane">
-        <div class="pane-title"><span>Kernel / shell log</span></div>
-        <div id="output"></div>
+
+    <main class="workbench">
+      <aside class="col">
+        <div class="col-head"><span>Files</span></div>
+        <div id="filetree">
+          <div class="empty">Run a project to scaffold its files here — a real
+            <code>npm create vite</code> / <code>nest new</code> layout.</div>
+        </div>
+      </aside>
+
+      <section class="col editor-col">
+        <div class="tabbar">
+          <span class="dot">&#9679;</span>
+          <span id="tab-name">no file open</span>
+          <span class="hint">edits auto-save &amp; hot-reload</span>
+        </div>
+        <div id="editor"><div class="placeholder">The editor opens when a project is running.</div></div>
+        <div class="terminal-wrap">
+          <div class="terminal-head">
+            <span>Terminal</span>
+            <button id="clear-term">clear</button>
+          </div>
+          <div id="terminal"></div>
+        </div>
       </section>
-      <section class="pane">
-        <div class="pane-title">
+
+      <section class="col">
+        <div class="col-head">
           <span>Preview</span><code id="preview-url">(waiting for server…)</code>
         </div>
         <iframe
           id="preview"
           title="preview"
-          sandbox="allow-scripts allow-same-origin"
+          sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
         ></iframe>
-        <div class="hmr-bar">
-          <select id="demo-select" title="demo to run">
-            <option value="vite">Vite HMR (vanilla JS/CSS)</option>
-            <option value="react">React + Vite + React Compiler</option>
-            <option value="nest">NestJS API (tsc + DI)</option>
-          </select>
-          <button id="run-demo">▶ Run demo</button>
-          <span id="hmr-status" class="muted">pick a demo and Run — it installs from npm + boots in-VM</span>
-        </div>
-        <div class="editor-panel" id="editor-panel" hidden>
-          <div class="editor-head">
-            <select id="editor-file" title="file to edit"></select>
-            <button id="apply-edit">Save → hot-update (no reload)</button>
-          </div>
-          <textarea id="editor" spellcheck="false"></textarea>
-        </div>
       </section>
-    </div>
+    </main>
+
     <script type="module" src="./host.js"></script>
   </body>
 </html>

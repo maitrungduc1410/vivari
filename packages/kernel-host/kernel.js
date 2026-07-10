@@ -228,6 +228,18 @@ export class Kernel {
     const proc = this.procs.get(pid);
     if (!proc || proc.finalized) return;
     proc.finalized = true;
+    // Cascade to the subtree: terminating a process takes down every process it
+    // spawned. Tools spawn servers behind a shell wrapper (`nest start` runs the
+    // app as `sh -c "node ... dist/main"`), so if we only killed the shell the
+    // real server would be orphaned and keep its port bound — the next restart
+    // would then hit EADDRINUSE (NestJS's watch-mode reload does exactly this).
+    // Well-behaved parents await their children before exiting, so on a normal
+    // exit there are no live children here; this only bites on an actual kill.
+    for (const [cpid, cproc] of this.procs) {
+      if (cproc.parentPid === pid && !cproc.finalized) {
+        this.finalize(cpid, signal === "SIGKILL" ? 137 : 143, signal || "SIGTERM");
+      }
+    }
     try {
       proc.handle && proc.handle.terminate();
     } catch {
@@ -265,6 +277,27 @@ export class Kernel {
     };
     if (proc.onExit) proc.onExit(result);
     if (this.onProcExit) this.onProcExit(pid, result);
+  }
+
+  /**
+   * Spawn a long-running background process and return its pid *immediately*
+   * (unlike start(), which resolves only when the process exits). Used by the
+   * demo host to launch a server it later needs to stop and restart (e.g. the
+   * NestJS demo's edit → recompile → restart flow). Returns -1 if not found.
+   */
+  launch(command, args = [], opts = {}) {
+    const cwd = opts.cwd || "/";
+    const programPath = this.resolveProgram(command, cwd, opts.env || {});
+    if (!programPath) return -1;
+    return this.createProcess(
+      { programPath, args, cwd, env: opts.env || {} },
+      { capture: !!opts.capture },
+    );
+  }
+
+  /** Stop a running process: terminate its worker + release its ports. */
+  stop(pid) {
+    if (this.procs.has(pid)) this.finalize(pid, 143, "SIGTERM");
   }
 
   /** Start a top-level process; resolves with { pid, code, stdout, stderr }. */

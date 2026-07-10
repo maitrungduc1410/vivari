@@ -9,6 +9,10 @@
 
 import { transpileEsm } from "./esm.js";
 
+// The constructor for `async function () {}` — used to (re)compile an ESM module
+// that uses top-level await (our normal wrapper is a plain, non-async function).
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+
 export function createModuleSystem({ fs, path, builtins, process, globals, nodeModules }) {
   const cache = Object.create(null);
   // Check the LIVE builtins object, not a snapshot: index.js finishes wiring it
@@ -25,6 +29,11 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     this.exports = {};
     this.loaded = false;
     this.children = [];
+    // Node exposes the module's node_modules lookup paths here. Real tools read it
+    // — e.g. @nestjs/cli's getModulePaths() does `module.paths.slice(...)` to build
+    // the `paths` for require.resolve('typescript', {paths}); a missing array threw
+    // and surfaced as "TypeScript could not be found". Filled in load().
+    this.paths = [];
   }
 
   const isFile = (p) => {
@@ -210,7 +219,24 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     return null;
   }
 
+  // Normalize a file:// module specifier to a plain VFS path. Dynamic `import()`
+  // is routinely called with a file:// URL plus a cache-busting query/hash —
+  // Vite's native/runner config loaders do `import(pathToFileURL(cfg)+'?t='+now)`
+  // and its module runner imports `file://.../dist/node/index.js`. Only file://
+  // specifiers are touched: bare specifiers, relative paths, and package.json
+  // subpath imports (`#foo`) must pass through verbatim (a `#` is NOT a URL hash).
+  function fromFileUrl(request) {
+    let r = request.slice("file://".length);
+    try { r = decodeURIComponent(r); } catch { /* leave as-is */ }
+    const h = r.indexOf("#");
+    if (h >= 0) r = r.slice(0, h);
+    const q = r.indexOf("?");
+    if (q >= 0) r = r.slice(0, q);
+    return r;
+  }
+
   function resolveFilename(request, fromDir) {
+    if (request.startsWith("file://")) request = fromFileUrl(request);
     if (hasBuiltin(request)) return { builtin: true, id: request };
     if (hasLazyBuiltin(request)) return { builtin: true, id: request };
 
@@ -252,9 +278,38 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     return { builtin: false, id: resolved };
   }
 
+  // Node resolves a module's path through symlinks to its realpath by default
+  // (preserveSymlinks=false), so `__dirname` / `import.meta.url` / relative
+  // requires resolve from the file's REAL location. This matters for
+  // node_modules/.bin shims: `.bin/vite` is a symlink to `../vite/bin/vite.js`,
+  // and the bin does `import('../dist/node/cli.js')` — which only resolves if the
+  // entry's dirname is `vite/bin`, not `.bin`. Fall back to the given path if the
+  // fs has no realpath or the path doesn't exist.
+  const realpath = (p) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+
   function makeRequire(fromDir) {
     const require = (request) => load(request, fromDir);
-    require.resolve = (request) => resolveFilename(request, fromDir).id;
+    // Honor require.resolve(request, { paths: [...] }) — Node resolves as if
+    // required from each given dir, in order (used by @nestjs/cli to find the
+    // project's typescript). Falls back to this module's own dir.
+    require.resolve = (request, options) => {
+      if (options && Array.isArray(options.paths)) {
+        for (const base of options.paths) {
+          try {
+            return realpath(resolveFilename(request, base).id);
+          } catch {
+            /* try the next candidate path */
+          }
+        }
+      }
+      return realpath(resolveFilename(request, fromDir).id);
+    };
     require.cache = cache;
     require.main = undefined;
     return require;
@@ -267,10 +322,11 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
       return nodeModules.require(r.id); // lazy vendored module (loader-cached)
     }
 
-    const filename = r.id;
+    const filename = realpath(r.id); // canonicalize symlinks (see realpath above)
     if (cache[filename]) return cache[filename].exports;
 
     const module = new Module(filename);
+    module.paths = nodeModulesPaths(path.dirname(filename));
     cache[filename] = module;
     let ok = false;
     try {
@@ -327,23 +383,57 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     // __oc_meta.resolve), __oc_exports, __oc_module — and we inject those here.
     // import.meta.url is provided via __oc_meta.
     let wrapper;
+    let isAsync = false;
     try {
       wrapper = isEsm
         ? new Function("__oc_exports", "__oc_require", "__oc_module", source + "\n")
         : new Function("exports", "require", "module", "__filename", "__dirname", source + "\n");
     } catch (err) {
-      // Compilation (parse) errors are otherwise anonymous ("<anonymous>"); name
-      // the offending file + module kind so loader bugs are debuggable.
-      err.message += ` (while compiling ${filename}${isEsm ? " [esm]" : " [cjs]"})`;
-      throw err;
+      // Top-level await: real ESM allows `await` at the module top level, but our
+      // CJS wrapper is a plain (non-async) function, so `new Function` rejects the
+      // parse. Recompile the ESM body as an AsyncFunction — the module then
+      // evaluates to a Promise we thread through runMain()/run() (the entry) so the
+      // top-level body can await while the loop pumps. Modern CLIs (e.g. Vite's
+      // bin: `await import('node:inspector')`) need this. Only ESM can hit it; CJS
+      // never legally has top-level await.
+      if (isEsm && /\bawait\b.*\b(only|valid|allowed)\b/i.test(err.message)) {
+        try {
+          wrapper = new AsyncFunction("__oc_exports", "__oc_require", "__oc_module", source + "\n");
+          isAsync = true;
+        } catch (e2) {
+          e2.message += ` (while compiling ${filename} [esm+tla])`;
+          throw e2;
+        }
+      } else {
+        // Compilation (parse) errors are otherwise anonymous ("<anonymous>"); name
+        // the offending file + module kind so loader bugs are debuggable.
+        err.message += ` (while compiling ${filename}${isEsm ? " [esm]" : " [cjs]"})`;
+        throw err;
+      }
     }
-    if (isEsm) wrapper.call(module.exports, module.exports, require, module);
-    else wrapper.call(module.exports, module.exports, require, module, filename, dirname);
+    if (isEsm) {
+      const ret = wrapper.call(module.exports, module.exports, require, module);
+      // A top-level-await module evaluates to a Promise; expose it so the entry
+      // (runMain) can await the top-level body. A synchronous ESM module — even one
+      // compiled to an async wrapper — has already fully run by the time this
+      // returns (an async function runs sync up to its first real await, and there
+      // is none), so its exports are complete for require() callers.
+      if (isAsync) module.evaluating = ret;
+    } else {
+      wrapper.call(module.exports, module.exports, require, module, filename, dirname);
+    }
   }
 
   function runMain(entry) {
     const abs = entry.startsWith("/") ? entry : path.resolve(process.cwd(), entry);
-    return load(abs, path.dirname(abs));
+    const dir = path.dirname(abs);
+    const exports = load(abs, dir);
+    // If the entry used top-level await, its module evaluates to a Promise; return
+    // it (instead of the exports) so run() can await the top-level body while the
+    // loop drives timers/microtasks.
+    const r = resolveFilename(abs, dir);
+    const mod = r.builtin ? null : cache[realpath(r.id)];
+    return mod && mod.evaluating ? mod.evaluating : exports;
   }
 
   return { runMain, makeRequire, resolveFilename, Module, cache };

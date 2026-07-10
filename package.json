@@ -19,6 +19,9 @@
     "build": "npm run build:kernel && npm run build:kernel:node && npm run build:codec && npm run build:codec:node && npm run build:crypto && npm run build:crypto:node && npm run build:wasi-demo"
   },
   "devDependencies": {
-    "esbuild": "^0.28.1"
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "esbuild": "^0.28.1",
+    "monaco-editor": "^0.52.2"
   }
 }

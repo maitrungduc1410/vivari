@@ -305,8 +305,11 @@ async function main() {
   const cmd = argv[0];
   const cwd = process.cwd();
   // Script running (synchronous, no network) — handle before the installer path.
-  if (cmd === 'run' || cmd === 'run-script') return runScript(cwd, argv[1], argv.slice(2));
-  if (cmd === 'start' || cmd === 'test') return runScript(cwd, cmd, argv.slice(1));
+  // npm drops the first "--" separator (it divides npm's own flags from the args
+  // forwarded to the script), e.g. npm run dev -- --configLoader native
+  const dropSep = (a) => { const i = a.indexOf('--'); return i >= 0 ? a.slice(0, i).concat(a.slice(i + 1)) : a; };
+  if (cmd === 'run' || cmd === 'run-script') return runScript(cwd, argv[1], dropSep(argv.slice(2)));
+  if (cmd === 'start' || cmd === 'test') return runScript(cwd, cmd, dropSep(argv.slice(1)));
   if (cmd !== 'install' && cmd !== 'i' && cmd !== 'add') {
     err('usage: npm <install|run|start|test> ...');
     return 1;

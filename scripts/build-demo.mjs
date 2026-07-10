@@ -71,6 +71,11 @@ const result = await build({
   legalComments: "none",
   logLevel: "info",
   metafile: true,
+  // The Monaco+xterm vendor is ALREADY a self-contained 4 MB bundle (built by
+  // scripts/build-editor-vendor.mjs). Keep it external so host.js stays tiny and
+  // the editor ships as its own cache-friendly file (copied with vendor/ below,
+  // served cache-first by the SW) rather than being inlined + re-parsed here.
+  external: ["*/vendor/editor/editor.js"],
   define: { __OC_BUILD_ID__: JSON.stringify(BUILD_ID) },
 });
 

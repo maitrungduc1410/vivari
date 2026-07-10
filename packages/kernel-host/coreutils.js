@@ -130,15 +130,57 @@ process.exit(rc);
 
   node: `
 const path = require('path');
-// process.argv is ['node', '/bin/node.js', <script>, ...args]; drop the launcher
-// path so the loaded script sees Node semantics (argv[1] = its own path).
+// argv is ['node', '/bin/node.js', ...cliArgs]; drop the launcher path so the
+// loaded script sees Node semantics (argv[1] = its own path).
 process.argv.splice(1, 1);
-const target = process.argv[1];
-if (!target) {
-  process.stderr.write('node: missing script\\n');
-  process.exit(1);
+const cli = process.argv.slice(1); // node's own args: flags, then script, then its args
+
+// Node CLI flags that consume the FOLLOWING token as a value (space form). Real
+// tools spawn 'node' with flags (Nest: --enable-source-maps; others: -r, etc.),
+// so we must skip flags to find the real entry instead of treating the first
+// flag as the script (which required('/cwd/--enable-source-maps') -> not found).
+const VALUE_FLAGS = new Set([
+  '--loader', '--experimental-loader', '--env-file', '--conditions', '-C',
+  '--title', '--cpu-prof-dir', '--heap-prof-dir', '--diagnostic-dir',
+  '--redirect-warnings', '--disable-proto', '--report-dir', '--report-filename',
+]);
+const preload = [];
+let evalCode = null, printResult = false, entry = null, i = 0;
+for (; i < cli.length; i++) {
+  const a = cli[i];
+  if (a === '--') { i++; break; }
+  if (a === '-e' || a === '--eval') { evalCode = cli[++i] || ''; continue; }
+  if (a === '-p' || a === '--print') { evalCode = cli[++i] || ''; printResult = true; continue; }
+  if (a[0] === '-') {
+    const eq = a.indexOf('=');
+    const name = eq >= 0 ? a.slice(0, eq) : a;
+    if (name === '-r' || name === '--require' || name === '--import') {
+      const val = eq >= 0 ? a.slice(eq + 1) : cli[++i];
+      if (val) preload.push(val);
+      continue;
+    }
+    if (eq < 0 && VALUE_FLAGS.has(name)) i++; // consume the value token
+    continue; // boolean flag (e.g. --enable-source-maps) — ignore
+  }
+  entry = a; break; // first non-flag token is the script
 }
-require(path.resolve(process.cwd(), target));
+const rest = cli.slice(i + 1); // script's own args
+
+const req = (m) => require(m[0] === '.' || m[0] === '/' ? path.resolve(process.cwd(), m) : m);
+for (const m of preload) {
+  try { req(m); } catch (e) { process.stderr.write('node: failed to preload ' + m + ': ' + ((e && e.message) || e) + '\\n'); }
+}
+
+if (evalCode != null) {
+  process.argv = ['node', ...rest];
+  const r = (0, eval)(evalCode);
+  if (printResult) process.stdout.write(require('util').inspect(r) + '\\n');
+} else {
+  if (!entry) { process.stderr.write('node: missing script\\n'); process.exit(1); }
+  const abs = path.resolve(process.cwd(), entry);
+  process.argv = ['node', abs, ...rest]; // script sees argv[1] = its own path
+  require(abs);
+}
 `,
 
   // A minimal POSIX-ish shell: sequencing (;), and/or (&& ||), comments (#),
@@ -173,28 +215,38 @@ function tokenize(s) {
   return out;
 }
 
+// External commands run ASYNC and stream their output live: a long-running server
+// (e.g. \`node dist/main.js\`, spawned by \`nest start\` as \`sh -c 'node ...'\`) never
+// exits, so spawnSync would block forever AND buffer all logs until exit — the
+// Nest/Vite banner would never appear. Async spawn forwards each chunk as it lands.
 function runSimple(tokens) {
-  if (!tokens.length) return 0;
+  if (!tokens.length) return Promise.resolve(0);
   const cmd = tokens[0];
   const args = tokens.slice(1);
   if (cmd === 'cd') {
-    try { process.chdir(args[0] || '/'); return 0; }
-    catch (e) { process.stderr.write('cd: ' + (e.code || e.message) + '\\n'); return 1; }
+    try { process.chdir(args[0] || '/'); return Promise.resolve(0); }
+    catch (e) { process.stderr.write('cd: ' + (e.code || e.message) + '\\n'); return Promise.resolve(1); }
   }
-  if (cmd === 'pwd') { process.stdout.write(process.cwd() + '\\n'); return 0; }
+  if (cmd === 'pwd') { process.stdout.write(process.cwd() + '\\n'); return Promise.resolve(0); }
   if (cmd === 'export') {
     for (const a of args) { const i = a.indexOf('='); if (i > 0) process.env[a.slice(0, i)] = a.slice(i + 1); }
-    return 0;
+    return Promise.resolve(0);
   }
-  if (cmd === ':' || cmd === 'true') return 0;
-  if (cmd === 'false') return 1;
-  const r = cp.spawnSync(cmd, args, { cwd: process.cwd(), env: process.env, encoding: 'utf8' });
-  if (r.stdout) process.stdout.write(r.stdout);
-  if (r.stderr) process.stderr.write(r.stderr);
-  return r.status || 0;
+  if (cmd === ':' || cmd === 'true') return Promise.resolve(0);
+  if (cmd === 'false') return Promise.resolve(1);
+  return new Promise((resolve) => {
+    const child = cp.spawn(cmd, args, { cwd: process.cwd(), env: process.env });
+    child.stdout.on('data', (d) => process.stdout.write(d));
+    child.stderr.on('data', (d) => process.stderr.write(d));
+    child.on('error', (e) => {
+      process.stderr.write('sh: ' + (e && e.code === 'ENOENT' ? cmd + ': not found' : ((e && e.message) || e)) + '\\n');
+      resolve(127);
+    });
+    child.on('close', (code) => resolve(code == null ? 0 : code));
+  });
 }
 
-function runLine(line) {
+async function runLine(line) {
   const segs = line.split(/(&&|\\|\\||;)/);
   let status = 0, op = ';';
   for (let seg of segs) {
@@ -202,17 +254,19 @@ function runLine(line) {
     if (seg === '' || seg === ';') { op = ';'; continue; }
     if (seg === '&&' || seg === '||') { op = seg; continue; }
     const skip = (op === '&&' && status !== 0) || (op === '||' && status === 0);
-    if (!skip) status = runSimple(tokenize(seg));
+    if (!skip) status = await runSimple(tokenize(seg));
     op = ';';
   }
   return status;
 }
 
-let status = 0;
-for (const raw of script.split('\\n')) {
-  const line = raw.replace(/#.*$/, '').trim();
-  if (line) status = runLine(line);
-}
-process.exit(status);
+(async () => {
+  let status = 0;
+  for (const raw of script.split('\\n')) {
+    const line = raw.replace(/#.*$/, '').trim();
+    if (line) status = await runLine(line);
+  }
+  process.exit(status);
+})();
 `,
 };

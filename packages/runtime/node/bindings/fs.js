@@ -143,8 +143,17 @@ export function createFsBinding({ sys: rawSys, process }) {
     return arr;
   }
 
-  const makeStatArray = (st, bigint) =>
-    writeStatsInto(bigint ? new BigInt64Array(STAT_FIELDS) : statValues, st);
+  // `fresh` forces a private buffer. Async (*stat with a req) MUST use one: its
+  // result is read later, in oncomplete's nextTick, by which time a concurrent
+  // stat/lstat would have clobbered the shared `statValues` scratch buffer —
+  // handing the callback another entry's stats (e.g. a directory seen as a file,
+  // which breaks chokidar/Vite's recursive watch). Sync reads the array in the
+  // same tick, so it can keep using the shared buffer.
+  const makeStatArray = (st, bigint, fresh) =>
+    writeStatsInto(
+      bigint ? new BigInt64Array(STAT_FIELDS) : fresh ? new Float64Array(STAT_FIELDS) : statValues,
+      st,
+    );
 
   const kindToDirent = (kind) =>
     kind === "dir" ? UV_DIRENT_DIR : kind === "symlink" ? UV_DIRENT_LINK : UV_DIRENT_FILE;
@@ -286,7 +295,7 @@ export function createFsBinding({ sys: rawSys, process }) {
       const req = findReq(rest);
       // sync: (fd, bigint, undefined, shouldNotThrow)
       const shouldNotThrow = rest[1] === true;
-      if (req) return dispatch(req, () => makeStatArray(sys.fstat(fd), bigint));
+      if (req) return dispatch(req, () => makeStatArray(sys.fstat(fd), bigint, true));
       try {
         return makeStatArray(sys.fstat(fd), bigint);
       } catch (e) {
@@ -320,7 +329,7 @@ export function createFsBinding({ sys: rawSys, process }) {
     stat(path, bigint, ...rest) {
       const req = findReq(rest);
       const throwIfNoEntry = rest[1];
-      if (req) return dispatch(req, () => makeStatArray(sys.stat(path), bigint));
+      if (req) return dispatch(req, () => makeStatArray(sys.stat(path), bigint, true));
       try {
         return makeStatArray(sys.stat(path), bigint);
       } catch (e) {
@@ -331,7 +340,7 @@ export function createFsBinding({ sys: rawSys, process }) {
     lstat(path, bigint, ...rest) {
       const req = findReq(rest);
       const throwIfNoEntry = rest[1];
-      if (req) return dispatch(req, () => makeStatArray(sys.lstat(path), bigint));
+      if (req) return dispatch(req, () => makeStatArray(sys.lstat(path), bigint, true));
       try {
         return makeStatArray(sys.lstat(path), bigint);
       } catch (e) {

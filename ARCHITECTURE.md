@@ -68,7 +68,8 @@ bundles each into one file (§10).
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │ Main thread — packages/demo/host.js                                    │
-│   • UI (terminal log + preview iframe + demo selector + editor)        │
+│   • IDE UI: file tree + Monaco editor + xterm terminal + preview iframe │
+│     (all process/kernel output streams to the terminal, ANSI intact)    │
 │   • registers the preview Service Worker                               │
 │   • relays SW HTTP requests to the Kernel Worker                       │
 │   • NO kernel/user work runs here (keeps the UI responsive)            │
@@ -346,7 +347,12 @@ lazily on first use (a process that never hashes/compresses instantiates neither
   kernel-worker, process-worker, fs-worker, fetcher-worker, sw). `demo-dist` is a
   gitignored build artifact and a **sibling** of `demo/` so the `new URL(x,
   import.meta.url)` worker/wasm refs still resolve. Each build stamps a `BUILD_ID`
-  into the SW to version its precache.
+  into the SW to version its precache. The editor vendor is kept **external** here
+  (it is already bundled) and shipped as its own cache-first file.
+- **Editor vendor**: `scripts/build-editor-vendor.mjs` bundles Monaco + xterm into a
+  committed, same-origin `packages/demo/vendor/editor/editor.{js,css}`. It must be
+  same-origin (not a CDN) because the page is cross-origin isolated (COEP:
+  require-corp). Re-run only when bumping the editor deps; the output is checked in.
 - **Wasm**: `npm run build` compiles all Rust crates (needs Rust + `wasm-pack`).
 
 ---

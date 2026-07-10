@@ -1052,11 +1052,30 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     throws — a real but separate loader-compat gap, deferred since fixing it won't get Next
     past the SWC wall.) An older Next (13/14 with wasm SWC) might boot but needs the
     `module`-constructor emulation + webpack-in-VM and is a large, low-priority effort.
-  - The two working stacks are wired into the browser demo UI as a selector
-    (`packages/demo/index.html` → `▶ Run demo`): **Vite HMR**, **React + Vite +
-    React Compiler** (live editor + Fast Refresh), and **NestJS API** (`tsc`
-    compile → HTML at `/`, JSON at `/api/hello`), driven by the `DEMOS` registry +
-    `startDemo()` in `kernel-worker.js`.
+  - The two working stacks are wired into a **StackBlitz-style IDE** (revamped —
+    see below): a project picker (**React + Vite + React Compiler**, **NestJS**),
+    a file tree + Monaco editor, and an xterm terminal, next to the live preview.
+    Driven by the `DEMOS` registry + `startDemo()` in `kernel-worker.js`.
+  - ✅ **Demo revamp — run the REAL dev flow, not a synthetic one.** Previously the
+    demos hand-wrote `vite.createServer()`/`tsc` scripts and pre-built Nest. Now each
+    demo scaffolds the **exact project layout `npm create vite@latest` / `nest new`
+    emits** (`DEMOS[id].files`, checked into `kernel-worker.js`), runs `npm install`,
+    and launches the project's **own dev script** — `npm run dev` (Vite) and `npm run
+    start:dev` = `nest start --watch` (Nest) — via `kernel.launch()`, exactly like
+    local dev. The vanilla-Vite demo was dropped (React+Compiler covers Vite). The UI
+    (`index.html` + `host.js`) is now a two-pane workbench: **file tree | Monaco +
+    xterm terminal** on the left, **preview** on the right. ALL process/kernel output
+    streams to the terminal verbatim with `FORCE_COLOR=3`, so the Vite banner and
+    Nest's colored logs render **byte-for-byte** like a real terminal (validated by
+    `scripts/probe-realdev.mjs`). Monaco + xterm are bundled once into a committed,
+    same-origin `demo/vendor/editor/editor.{js,css}` (`scripts/build-editor-vendor.mjs`)
+    — a CDN can't be used because the page is cross-origin isolated (COEP). Editing a
+    file auto-saves to the VFS; the project's own watcher does HMR (Vite) or restart
+    (Nest). Enabling the real CLIs required: **top-level await** in the module system,
+    **symlink realpath** for `.bin/*`, **`file://` import** normalization, `module.paths`
+    + `require.resolve(paths)`, Node CLI flag-skipping in the `node` coreutil,
+    `child_process` `shell: true` + `stdio: 'inherit'`, a **streaming `sh`**, and a
+    robust ESM export scanner (all in this cycle).
   - ✅ **Fixed (NestJS in the browser — port collision + missing net errors):** the
     demo page's legacy auto-showcase booted a `dev-app` server on **:3200** (never
     torn down), the same port the NestJS demo uses. Nest's real `listen(3200)` then
@@ -1084,6 +1103,53 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     reassembles by `reqId` (`fs-client.respond` + `kernel.handleRespond`), mirroring
     the fd read/write chunk loop. Regression-checked in `probe-react.mjs` (asserts
     the multi-MB `.vite/deps` bundle serves 200).
+  - ✅ **Fixed (edits didn't hot-reload — async `fs.stat` shared-buffer aliasing):**
+    `bindings/fs.js` fills one shared `statValues` array in place. Sync stat reads it
+    the same tick (fine), but the **async** path (`stat`/`lstat`/`fstat` + an
+    `FSReqCallback`) returned that shared reference and only read it later in
+    `oncomplete`'s `nextTick` — so a concurrent stat clobbered it and the callback got
+    another entry's stats (a **directory reported as a regular file**). Vite 8 bundles
+    chokidar 3, which stats the project root via `promisify(fs.stat)`; it saw the root
+    as a file (`getWatched()` → `{"/":["app"]}`), never recursed, never file-watched
+    `src/*`, so edits silently produced **no HMR** (no error). Fix: async stat snapshots
+    into a private buffer (`makeStatArray(..., fresh=true)`). Added to AGENTS.md gotchas.
+  - ✅ **Fixed (preview flaky 502 on start — Vite rebinds during boot):** Vite 8
+    (rolldown) binds `:5173` several times while starting (bind → close → rebind), so
+    the first `listen` event is transient. `startDemo` announced `demo-ready` on that
+    first listen, and the preview iframe could hit the port while momentarily closed →
+    **502 (live ports: none)**. Fix: `startDemo` now `waitServing()`s after
+    `waitListen()` — it drives real `GET /`s through the kernel until one returns a
+    non-5xx-gateway status (an in-VM server actually answered) before pointing the
+    preview at it. Reproduced headlessly: probe#0 right after first listen = 502, then
+    stable 200.
+  - ✅ **Fixed (cold-start `504 (Gateway Timeout)` wall on the modules):** on a cold
+    `.vite` cache Vite **holds every module request** until its dependency optimizer
+    (rolldown) finishes — the HTML serves but `/@vite/client`, `/src/*`, and
+    `/node_modules/.vite/deps/*` block. Announcing the preview ready immediately let
+    the iframe's subresource fetches race that optimize against the Service Worker's
+    60 s timeout → all 504 (only on a cold cache, so `?reset` reliably reproduced it; a
+    plain reload worked because `.vite/deps` was cached). Fix: `startDemo` now
+    `warmDevServer()`s Vite demos after `waitServing()` — it fetches the HTML, parses
+    the module entry scripts, and requests them (which forces the optimize to complete
+    and `.vite/deps` to be written) **inside the kernel worker, off the SW clock** —
+    before signalling `demo-ready`. The preview then loads against a warm cache
+    (validated headlessly: post-warm subresource GETs all 200 in <130 ms).
+  - ✅ **Fixed (NestJS demo — edits crashed then hit `EADDRINUSE` on restart):** the
+    Nest demo runs `npm run start:dev` = `nest start --watch`; on every save the CLI
+    recompiles and restarts the app child. Three gaps in the restart path, fixed in
+    order: (1) `child.stdin` was a bare sink missing `pause()` — Nest calls
+    `childProcessRef.stdin.pause()` before killing → `TypeError: …stdin.pause is not a
+    function`. `child.stdin` is now a full chainable no-op stream. (2) Nest kills the
+    old child with `process.kill(pid, sig)`, which didn't exist → `TypeError:
+    process.kill is not a function`. Wired `process.kill` → `syscalls.kill` in
+    `runtime/index.js`. (3) With both wired, restart threw `EADDRINUSE :::3000`:
+    `nest start` spawns the app as `spawn("node ... dist/main", {shell:true})`, so
+    `childProcessRef.pid` is the `sh -c "node ..."` wrapper, and `/bin/sh` spawns the
+    real `node` server as *its* child. Killing the shell orphaned `node`, which kept
+    `:3000` bound. Fix: `kernel.finalize()` now cascades to the whole subtree
+    (`parentPid === pid`, recursively), so killing the shell takes the server with it.
+    Validated headlessly (`scripts/probe-nest-watch.mjs`): boot → `GET / → Hello
+    World!`, edit `app.service.ts`, ~1 s later `GET / → Reloaded!`.
   - ✅ **Fixed (browser-only, surfaced by React demo):** `internal/errors` was missing
     most stream + http error *constructors* (`ERR_STREAM_DESTROYED`,
     `ERR_STREAM_ALREADY_FINISHED`, `ERR_HTTP_HEADERS_SENT`, …). The vendored modules
@@ -1093,6 +1159,17 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     call `writable.end()` on a destroyed stream → `new ERR_STREAM_DESTROYED('end')` →
     `"Je is not a constructor"` → crashed response → **502**. All the stream/http codes the
     vendored modules reference are now defined in `internal/errors.js`.
+  - ✅ **Edit-from-browser (server reload, not HMR) — now via the real watcher.** The
+    Vite/React demo hot-updates through the in-VM dev server's own file watcher. Nest
+    has no HMR (true Nest HMR needs webpack's `module.hot`), so `npm run start:dev` =
+    `nest start --watch` does the **recompile + restart** itself: saving a `.ts` file
+    in Monaco writes it to the VFS, `nest`'s watcher recompiles and restarts the app,
+    and when the fresh process re-`listen`s the kernel worker detects the repeat listen
+    on a known demo port (`demoReadyPorts`) and posts `demo-reload`, so the host
+    reloads the preview iframe. The worker no longer orchestrates the rebuild (the old
+    `reloadDemo()`/`tsc`/`stop`+`launch` dance is gone) — it just writes the file and
+    lets the project's tooling react, exactly like local dev. `kernel.launch()` (spawn
+    a background process, return pid now) is still used to start the dev server.
 
 ## Definition of done for T2
 

@@ -1,15 +1,17 @@
 // The kernel worker — OpenContainer's kernel host, off the main thread.
 //
-// Phase 2, item #1 (Kernel worker). Everything heavy lives here now: the
-// Rust/Wasm VFS, the Kernel (process table + syscall servicing + virtual
-// network), and the process workers it spawns. The main thread (host.js) is
-// left free for UI + orchestration only (Main = UI/orchestration in the target
-// architecture map).
+// Phase 2, item #1 (Kernel worker). Everything heavy lives here: the Rust/Wasm
+// VFS, the Kernel (process table + syscall servicing + virtual network), and the
+// process workers it spawns. The main thread (host.js) is left free for UI +
+// orchestration only.
 //
-// Process workers are created as *nested* workers from inside this worker
-// (requires a browser with nested Worker support — Chrome/Firefox, Safari 16.4+).
-// The Kernel class itself stays environment-agnostic: it is handed a
-// `spawnWorker` just like the headless Node test does.
+// The demo is a StackBlitz-style IDE: pick a project (React+Vite+Compiler or
+// NestJS), which is scaffolded from a REAL project structure, `npm install`ed,
+// and run with its REAL dev script (`npm run dev` / `npm run start:dev`). All
+// process output (the Vite banner, Nest's colored logs, npm install) streams to
+// the editor's terminal verbatim; editing a file in Monaco writes it to the VFS,
+// where the real in-VM file watcher drives HMR (Vite) or a recompile+restart
+// (Nest --watch) exactly like local development.
 
 import { Kernel } from "../kernel-host/kernel.js";
 import { createKernelFs } from "../kernel-host/kernel-fs.js";
@@ -37,920 +39,317 @@ async function compileWasmModule(url) {
   }
 }
 
-// A small shell session, each command is its own process (PID).
-const SCRIPT = `
-# a small shell session, each command is its own process (PID)
-echo "== OpenContainer shell =="
-pwd
-mkdir -p /srv
-echo two && echo three
-echo "== booting http server =="
-`;
-
-// A tiny HTTP server, like you'd write in Node. It never exits: the process
-// parks in an accept loop serving requests forwarded by the Service Worker.
-const SERVER_SRC = `
-const http = require('http');
-
-// A background timer that keeps ticking even while the server sits idle with no
-// traffic — proof that Event loop v2 runs real timers alongside the accept loop.
-const bootedAt = Date.now();
-let backgroundTicks = 0;
-setInterval(() => { backgroundTicks++; }, 1000);
-
-// The handler is async: for /api/async we await a real timer before responding,
-// so the reply is deferred until res.end() fires later. The loop keeps turning
-// meanwhile, and concurrent requests are served independently.
-const server = http.createServer(async (req, res) => {
-  if (req.url === '/api/time') {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({
-      now: Date.now(),
-      pid: process.pid,
-      uptimeMs: Date.now() - bootedAt,
-      backgroundTicks,
-    }));
-    return;
-  }
-  if (req.url === '/api/async') {
-    // Real async request handling: await a timer (like a DB/network call would),
-    // THEN finish the response. Nothing blocks; other requests keep flowing.
-    const delayMs = 200;
-    const start = Date.now();
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-    const body = Buffer.from(JSON.stringify({
-      node: process.version,
-      awaited: true,
-      requestedDelayMs: delayMs,
-      actualWaitMs: Date.now() - start,
-      backgroundTicks,
-      note: 'This response was sent AFTER an awaited setTimeout, via Event loop v2.',
-    }, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/stream') {
-    // Real Node streams (vendored lib/stream.js + internal/streams/*): pipe a
-    // Readable through a Transform into a Writable, awaiting the promise API.
-    // The response is deferred until the pipeline finishes (Event loop v2).
-    const { Readable, Transform, Writable } = require('stream');
-    const { pipeline } = require('stream/promises');
-    const parts = [];
-    await pipeline(
-      Readable.from(['open', 'container', 'streams', 'in', 'the', 'browser']),
-      new Transform({
-        objectMode: true,
-        transform(word, enc, cb) { cb(null, word.toString().toUpperCase()); },
-      }),
-      new Writable({
-        objectMode: true,
-        write(chunk, enc, cb) { parts.push(chunk.toString()); cb(); },
-      }),
-    );
-    const body = Buffer.from(JSON.stringify({
-      node: process.version,
-      note: 'Built by pipeline(Readable -> Transform(uppercase) -> Writable) — real Node lib/stream.js in the browser.',
-      result: parts.join(' '),
-    }, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/net') {
-    // Real Node net (vendored lib/net.js + internal/stream_base_commons on our
-    // tcp_wrap/stream_wrap loopback binding): spin up an in-process TCP echo
-    // server, connect a client to it over 127.0.0.1, and round-trip a message —
-    // net.Server/net.Socket are real streams, all inside this browser worker.
-    const net = require('net');
-    const result = await new Promise((resolve, reject) => {
-      const echo = net.createServer((sock) => {
-        sock.setEncoding('utf8');
-        sock.on('data', (d) => sock.write('echo:' + d));
-        sock.on('end', () => sock.end());
-      });
-      echo.listen(0, () => {
-        const port = echo.address().port;
-        const client = net.connect(port, '127.0.0.1', () => client.end('hello over TCP'));
-        client.setEncoding('utf8');
-        let buf = '';
-        client.on('data', (d) => { buf += d; });
-        client.on('end', () => echo.close(() => resolve({ port, reply: buf })));
-        client.on('error', reject);
-      });
-      echo.on('error', reject);
-    });
-    const body = Buffer.from(JSON.stringify({
-      node: process.version,
-      note: 'Client wrote "hello over TCP" to an in-process net.Server on 127.0.0.1:' + result.port + '; the server echoed it back — real Node lib/net.js in the browser.',
-      ephemeralPort: result.port,
-      reply: result.reply,
-    }, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/http') {
-    // Real Node http (vendored lib/http.js + _http_* on the pure-JS
-    // internalBinding('http_parser'), over the net loopback): spin up an
-    // in-process http.Server, POST a body to it with an http client, and read
-    // the echoed response — real ClientRequest/ServerResponse/IncomingMessage,
-    // all inside this browser worker. This is the SAME require('http') that
-    // serves THIS preview: the request you just made was parsed by Node's real
-    // lib/http.js too, bridged in from the Service Worker (#8 stage 2).
-    const result = await new Promise((resolve, reject) => {
-      const server = http.createServer((r, s) => {
-        let body = '';
-        r.setEncoding('utf8');
-        r.on('data', (c) => body += c);
-        r.on('end', () => {
-          s.writeHead(200, { 'content-type': 'application/json', 'x-served-by': 'real-node-http' });
-          s.end(JSON.stringify({ echo: body, method: r.method, url: r.url }));
-        });
-      });
-      server.listen(0, () => {
-        const port = server.address().port;
-        const cReq = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/echo' }, (r) => {
-          let data = ''; r.setEncoding('utf8');
-          r.on('data', (c) => data += c);
-          r.on('end', () => server.close(() => resolve({ port, status: r.statusCode, servedBy: r.headers['x-served-by'], reply: data })));
-        });
-        cReq.on('error', reject);
-        cReq.end('hello over HTTP');
-      });
-      server.on('error', reject);
-    });
-    const body = Buffer.from(JSON.stringify({
-      node: process.version,
-      note: 'An http client POSTed "hello over HTTP" to an in-process http.Server on 127.0.0.1:' + result.port + '; the server echoed it back — real Node lib/http.js parsing real HTTP/1.1 in the browser.',
-      ephemeralPort: result.port,
-      status: result.status,
-      servedBy: result.servedBy,
-      reply: result.reply,
-    }, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/buffer') {
-    // Exercise Node's REAL Buffer (vendored lib/buffer.js on our
-    // internalBinding('buffer')) entirely inside the browser.
-    const alloc = Buffer.alloc(4);
-    alloc.writeUInt32BE(0xdeadbeef, 0);
-    const big = Buffer.alloc(8);
-    big.writeBigUInt64BE(0x0102030405060708n, 0);
-
-    const demo = {
-      node: process.version,
-      isUint8ArraySubclass: Buffer.from('x') instanceof Uint8Array,
-      text: 'OpenContainer · café €',
-      hex: Buffer.from('OpenContainer').toString('hex'),
-      base64: Buffer.from('OpenContainer').toString('base64'),
-      base64urlRoundTrip:
-        Buffer.from(Buffer.from('café €').toString('base64url'), 'base64url').toString('utf8'),
-      utf8ByteLength: Buffer.byteLength('café €', 'utf8'),
-      utf16leHex: Buffer.from('hi', 'utf16le').toString('hex'),
-      u32_BE_hex: alloc.toString('hex'),
-      u32_LE_read: alloc.readUInt32LE(0),
-      bigUInt64: big.readBigUInt64BE(0).toString(),
-      swap16: Buffer.from([1, 2, 3, 4]).swap16().toString('hex'),
-    };
-
-    // The response body is itself built with Buffer, then sent through http.
-    const body = Buffer.from(JSON.stringify(demo, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/fs') {
-    // Exercise Node's REAL fs (vendored lib/fs.js on our internalBinding('fs'),
-    // backed by real file descriptors down to the Rust VFS) inside the browser.
-    const fs = require('fs');
-    const dir = '/tmp/oc-demo';
-    fs.rmSync(dir, { recursive: true, force: true });
-    fs.mkdirSync(dir + '/sub', { recursive: true });
-
-    // Low-level fd round-trip: openSync -> writeSync -> fstatSync -> readSync.
-    const fd = fs.openSync(dir + '/hello.txt', 'w');
-    fs.writeSync(fd, 'hello ');
-    fs.writeSync(fd, 'fd world');
-    const fdSize = fs.fstatSync(fd).size;
-    fs.closeSync(fd);
-
-    fs.appendFileSync(dir + '/hello.txt', '!');
-    fs.writeFileSync(dir + '/sub/a.json', JSON.stringify({ ok: true }));
-    fs.symlinkSync(dir + '/hello.txt', dir + '/link');
-    fs.renameSync(dir + '/sub/a.json', dir + '/sub/b.json');
-
-    const st = fs.statSync(dir + '/hello.txt');
-    const demo = {
-      node: process.version,
-      content: fs.readFileSync(dir + '/hello.txt', 'utf8'),
-      viaSymlink: fs.readFileSync(dir + '/link', 'utf8'),
-      fdWrittenBytes: fdSize,
-      size: st.size,
-      ino: st.ino,
-      isFile: st.isFile(),
-      mtimeISO: st.mtime.toISOString(),
-      dirEntries: fs
-        .readdirSync(dir, { withFileTypes: true })
-        .map((d) => d.name + (d.isDirectory() ? '/' : d.isSymbolicLink() ? '@' : '')),
-      subEntries: fs.readdirSync(dir + '/sub'),
-      linkTarget: fs.readlinkSync(dir + '/link'),
-    };
-    const body = Buffer.from(JSON.stringify(demo, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/fetch') {
-    // Real outbound network (Phase 2 #9): __ocfetch is a blocking fetch serviced
-    // by the kernel's dedicated Fetcher Worker, which streams the body into the
-    // VFS. We pull left-pad's registry metadata (direct from registry.npmjs.org —
-    // it sends CORS *), list its versions, download the latest tarball, then fetch
-    // the metadata again to prove the kernel-side content cache (no 2nd network hit).
-    const fs = require('fs');
-    const metaUrl = 'https://registry.npmjs.org/left-pad';
-    const meta = __ocfetch(metaUrl);
-    const doc = JSON.parse(fs.readFileSync(meta.path, 'utf8'));
-    const versions = Object.keys(doc.versions || {});
-    const latest = (doc['dist-tags'] || {}).latest;
-    const tarballUrl = doc.versions[latest].dist.tarball;
-    const tar = __ocfetch(tarballUrl);
-    const again = __ocfetch(metaUrl); // cache hit
-    const body = Buffer.from(JSON.stringify({
-      node: process.version,
-      note: '__ocfetch pulled npm registry metadata + tarball directly from the browser (no proxy) via the Fetcher Worker, into the VFS.',
-      metadataUrl: metaUrl,
-      status: meta.status,
-      contentType: meta.contentType,
-      versionCount: versions.length,
-      latest,
-      tarball: { url: tarballUrl, bytes: tar.size, contentType: tar.contentType },
-      cache: { firstFetch: meta.cached, refetch: again.cached },
-    }, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/zlib') {
-    // Real Node zlib (vendored lib/zlib.js on internalBinding('zlib'), backed by
-    // the Rust/Wasm codec #11): gzip a payload, gunzip it back, deflate-raw, and
-    // compute a crc32 — all synchronous, all inside this browser worker.
-    const zlib = require('zlib');
-    const text = 'OpenContainer '.repeat(64) + 'café € — real zlib in the browser';
-    const input = Buffer.from(text, 'utf8');
-    const gz = zlib.gzipSync(input);
-    const roundTrip = zlib.gunzipSync(gz).toString('utf8');
-    const raw = zlib.deflateRawSync(input);
-    const body = Buffer.from(JSON.stringify({
-      node: process.version,
-      note: 'gzipSync -> gunzipSync + deflateRawSync + crc32 — Node real lib/zlib.js over the Rust/Wasm codec (#11), in the browser.',
-      originalBytes: input.length,
-      gzippedBytes: gz.length,
-      deflateRawBytes: raw.length,
-      compression: (gz.length / input.length).toFixed(3) + 'x',
-      gzipMagicHex: gz.subarray(0, 3).toString('hex'),
-      crc32: (zlib.crc32(input) >>> 0).toString(16),
-      roundTripOk: roundTrip === text,
-    }, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/crypto') {
-    // Our crypto (lib/crypto.js on internalBinding('crypto'), backed by the
-    // Rust/Wasm crypto codec #12): hashes, HMAC, PBKDF2, and a full AES-256-GCM
-    // encrypt -> decrypt round-trip (with AAD + auth tag), all in the browser.
-    const crypto = require('crypto');
-    const msg = 'OpenContainer secret · café €';
-    const key = crypto.randomBytes(32);
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    cipher.setAAD(Buffer.from('demo-aad'));
-    const enc = Buffer.concat([cipher.update(msg, 'utf8'), cipher.final()]);
-    const tag = cipher.getAuthTag();
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-    decipher.setAAD(Buffer.from('demo-aad'));
-    decipher.setAuthTag(tag);
-    const decrypted = Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
-    const sha512 = crypto.createHash('sha512').update(msg).digest('hex');
-    const body = Buffer.from(JSON.stringify({
-      node: process.version,
-      note: 'createHash/createHmac/pbkdf2Sync + AES-256-GCM encrypt->decrypt — our lib/crypto.js over the Rust/Wasm crypto codec (#12), in the browser.',
-      sha256: crypto.createHash('sha256').update(msg).digest('hex'),
-      sha512Preview: sha512.slice(0, 32) + '…',
-      hmacSha256: crypto.createHmac('sha256', 'oc-key').update(msg).digest('hex'),
-      pbkdf2: crypto.pbkdf2Sync('password', 'salt', 10000, 32, 'sha256').toString('hex'),
-      aesGcm: {
-        ivHex: iv.toString('hex'),
-        cipherHex: enc.toString('hex'),
-        authTagHex: tag.toString('hex'),
-        decrypted,
-        roundTripOk: decrypted === msg,
-      },
-      randomUUID: crypto.randomUUID(),
-    }, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/esm') {
-    // Phase 2 #13: this CJS server require()s an ESM module graph. The .mjs files
-    // use import/export, re-export, import.meta, and dynamic import() — all
-    // transpiled to our synchronous CJS at load time (es-module-lexer), no bundler.
-    const demo = require('/srv/esm-demo/index.mjs');
-    const lazy = await demo.loadLazy();
-    const body = Buffer.from(JSON.stringify({
-      node: process.version,
-      note: 'A CJS server require()d an ESM graph (import/export/re-export/import.meta/dynamic import), transpiled ESM->CJS at load time (#13), in the browser.',
-      isEsModule: demo.__esModule === true,
-      pi: demo.pi,
-      info: demo.info,
-      metaUrl: demo.metaUrl,
-      dynamicImport: lazy,
-    }, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/wasi') {
-    // Phase 2 #16: a real Rust CLI compiled to wasm32-wasip1 (packages/wasi-demo),
-    // run unmodified via require('wasi'). It reads argv/env, opens a file in a
-    // preopened dir, uppercases it, and writes an output file — every fd/path call
-    // bridged to our VFS. Sync compile+instantiate is allowed here (we're a Worker).
-    const fs = require('fs');
-    const { WASI } = require('wasi');
-    const input = 'hello from the browser · wasm32-wasi';
-    fs.mkdirSync('/work', { recursive: true });
-    fs.writeFileSync('/work/in.txt', input + '\\n');
-    const wasi = new WASI({
-      version: 'preview1',
-      args: ['wasi_demo', '/work/in.txt', '/work/out.txt'],
-      env: { WASI_GREETING: 'browser' },
-      preopens: { '/work': '/work' },
-    });
-    const mod = new WebAssembly.Module(fs.readFileSync('/wasi/wasi_demo.wasm'));
-    const instance = new WebAssembly.Instance(mod, wasi.getImportObject());
-    const exitCode = wasi.start(instance);
-    const output = fs.readFileSync('/work/out.txt', 'utf8');
-    const body = Buffer.from(JSON.stringify({
-      node: process.version,
-      note: 'A real Rust CLI compiled to wasm32-wasip1, run via require("wasi") — argv/env/preopen + fd_read/fd_write bridged to the VFS (#16 stage 1), in the browser.',
-      input,
-      output,
-      exitCode,
-      wasmBytes: fs.statSync('/wasi/wasi_demo.wasm').size,
-    }, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/napi') {
-    // Phase 2 #16 stage 2a: a REAL N-API native addon compiled to wasm32-wasi
-    // (@node-rs/crc32-wasm32-wasi, a Rust crate) run unmodified via require().
-    // Its napi-rs wrapper loads our vendored @napi-rs/wasm-runtime (the emnapi
-    // host, pure JS, implementing the napi_* C ABI in JS) and satisfies the
-    // wasm's wasi_snapshot_preview1 imports with our own require('wasi').
-    try {
-      const crc = require('@node-rs/crc32-wasm32-wasi');
-      const text = 'OpenContainer · napi-on-wasm';
-      const body = Buffer.from(JSON.stringify({
-        node: process.version,
-        note: 'A real N-API native addon (Rust → wasm32-wasi) run via require() over vendored emnapi + our WASI (#16 stage 2a), in the browser.',
-        addon: '@node-rs/crc32-wasm32-wasi',
-        crc32_hello: crc.crc32('hello'),
-        crc32c_hello: crc.crc32c('hello'),
-        crc32_text: crc.crc32(text),
-        crc32_buffer_arg: crc.crc32(Buffer.from(text)),
-      }, null, 2), 'utf8');
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(body);
-    } catch (err) {
-      console.error('[napi] route failed: ' + (err && err.stack || err));
-      const body = Buffer.from(JSON.stringify({
-        error: String(err && err.message || err),
-        stack: String(err && err.stack || ''),
-      }, null, 2), 'utf8');
-      res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(body);
-    }
-    return;
-  }
-  if (req.url === '/api/esbuild') {
-    // Bundler Stage 1: a REAL bundler (esbuild, Go -> wasm) runs IN-VM. The Node
-    // entry would child_process.spawn a helper and pipe over stdin; instead we use
-    // esbuild's BROWSER build with worker:false, which runs the Go wasm on THIS
-    // thread (postMessage-simulated stdio) — no child process, no stdin fd. The
-    // 11MB wasm is installed on demand (first call) and the service cached after.
-    try {
-      const fs = require('fs');
-      const cp = require('child_process');
-      if (!globalThis.__esbuildSvc) {
-        let present = true;
-        try { require.resolve('esbuild-wasm/lib/browser.js'); } catch (e) { present = false; }
-        if (!present) {
-          console.log('[esbuild] npm install esbuild-wasm (~11MB, first call only)…');
-          await new Promise((resolve, reject) => {
-            const c = cp.spawn('npm', ['install', 'esbuild-wasm'], { cwd: '/srv' });
-            c.stdout.on('data', (d) => process.stdout.write(d));
-            c.stderr.on('data', (d) => process.stderr.write(d));
-            c.on('close', (code) => code === 0 ? resolve() : reject(new Error('npm install esbuild-wasm exited ' + code)));
-          });
-        }
-        const esbuild = require('esbuild-wasm/lib/browser.js');
-        const wasmModule = new WebAssembly.Module(fs.readFileSync(require.resolve('esbuild-wasm/esbuild.wasm')));
-        await esbuild.initialize({ wasmModule, worker: false });
-        globalThis.__esbuildSvc = esbuild;
-        console.log('[esbuild] service ready (esbuild ' + (esbuild.version || '?') + ')');
-      }
-      const esbuild = globalThis.__esbuildSvc;
-      const tsInput = 'export const greet = (name: string): string => "hi " + name;';
-      const t = await esbuild.transform(tsInput, { loader: 'ts' });
-      const b = await esbuild.build({
-        stdin: { contents: 'export const sum = (a, b) => a + b; console.log("sum", sum(2, 3));', loader: 'js' },
-        bundle: true, format: 'iife', write: false,
-      });
-      const body = Buffer.from(JSON.stringify({
-        node: process.version,
-        note: 'esbuild (Go -> wasm) ran IN-VM via its browser build + worker:false — a real, unmodified bundler transpiling TS and bundling ESM to an IIFE, in the browser.',
-        esbuildVersion: esbuild.version,
-        tsInput: tsInput,
-        jsOutput: t.code,
-        bundleOutput: b.outputFiles[0].text,
-      }, null, 2), 'utf8');
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(body);
-    } catch (err) {
-      console.error('[esbuild] route failed: ' + (err && err.stack || err));
-      const body = Buffer.from(JSON.stringify({
-        error: String(err && err.message || err),
-        stack: String(err && err.stack || ''),
-      }, null, 2), 'utf8');
-      res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(body);
-    }
-    return;
-  }
-  if (req.url === '/api/spawn') {
-    // Phase 2 #15: child_process.spawn() launches a Node child WITHOUT blocking —
-    // its stdout streams back to us live (several 'data' events across timers,
-    // not one buffer at exit), and we await its 'close' to report the exit code.
-    const cp = require('child_process');
-    const result = await new Promise((resolve) => {
-      const child = cp.spawn('node', ['/srv/spawn-child.js'], { cwd: '/srv' });
-      const lines = [];
-      let dataEvents = 0;
-      child.stdout.on('data', (d) => { dataEvents++; lines.push(d.toString()); });
-      child.on('close', (code) => resolve({ pid: child.pid, code, dataEvents, output: lines.join('') }));
-    });
-    const body = Buffer.from(JSON.stringify({
-      node: process.version,
-      note: 'child_process.spawn() ran a Node child; its stdout STREAMED back live over multiple data events and we awaited exit — async spawn (#15), in the browser.',
-      childPid: result.pid,
-      exitCode: result.code,
-      dataEvents: result.dataEvents,
-      output: result.output,
-    }, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/threads') {
-    // Phase 2 #16 stage 2b: worker_threads.Worker spawns a REAL nested thread
-    // (its own kernel-allocated syscall SAB + FS registration). It sums 1..N OFF
-    // the main thread, posts the total back over the direct MessageChannel, AND
-    // writes it into a SharedArrayBuffer we read via Atomics — true shared memory.
-    const { Worker } = require('worker_threads');
-    const sab = new SharedArrayBuffer(8);
-    const shared = new Int32Array(sab);
-    const N = 65535; // sum(1..N) = 2147450880, fits in an int32 for a clean proof
-    const result = await new Promise((resolve) => {
-      const w = new Worker('/srv/thread-worker.js', { workerData: { sab, n: N } });
-      let online = false;
-      w.on('online', () => { online = true; });
-      w.on('message', (m) => {
-        if (m === 'ready') w.postMessage('go');
-        else if (m && m.done) {
-          const r = { threadId: w.threadId, online, sum: m.sum, sharedSum: Atomics.load(shared, 0) };
-          w.terminate();
-          resolve(r);
-        }
-      });
-    });
-    const body = Buffer.from(JSON.stringify({
-      node: process.version,
-      note: 'worker_threads.Worker ran a real nested thread: it summed 1..N off the main thread, posted the total back, and wrote it into a SharedArrayBuffer we read via Atomics (#16 stage 2b), in the browser.',
-      n: N,
-      threadId: result.threadId,
-      online: result.online,
-      sumFromMessage: result.sum,
-      sumFromSharedMemory: result.sharedSum,
-      match: result.sum === result.sharedSum,
-    }, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  if (req.url === '/api/persist') {
-    // OPFS persistence proof: read a counter file, bump it, write it back. The
-    // File System Worker mirrors /data/visits.json to the Origin Private File
-    // System, so this count SURVIVES a page reload (F5) — real durable fs in the
-    // browser, no server. Reload the page and hit this again: it keeps climbing.
-    const fs = require('fs');
-    const path = require('path');
-    const file = '/data/visits.json';
-    let state = { visits: 0, firstSeen: new Date().toISOString() };
-    let restored = false;
-    try {
-      state = JSON.parse(fs.readFileSync(file, 'utf8'));
-      restored = true; // the file was already there => it came back from OPFS
-    } catch { /* first ever visit */ }
-    state.visits = (state.visits | 0) + 1;
-    state.lastSeen = new Date().toISOString();
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(state));
-    const body = Buffer.from(JSON.stringify({
-      note: 'This counter lives in the VFS at /data/visits.json and is mirrored to OPFS. Reload the page (do NOT use ?reset) and hit this again — visits keeps increasing, proving the filesystem persisted across reloads.',
-      restoredFromDisk: restored,
-      ...state,
-    }, null, 2), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(body);
-    return;
-  }
-  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-  res.end(\`<!doctype html>
-<html><head><meta charset="utf-8"><title>Hello from OpenContainer</title>
-<style>
-  body{font-family:ui-monospace,Menlo,monospace;background:#0b0e14;color:#d4d7dd;
-       display:grid;place-items:center;height:100vh;margin:0}
-  .card{border:1px solid #1c2230;border-radius:12px;padding:32px 40px;background:#0e131c;text-align:center}
-  h1{color:#7ee787;margin:0 0 8px} code{color:#79c0ff}
-  button{margin-top:16px;font:inherit;background:#1f6feb;color:#fff;border:0;
-         border-radius:8px;padding:8px 14px;cursor:pointer}
-</style></head>
-<body><div class="card">
-  <h1>Hello from OpenContainer 🎉</h1>
-  <p>Served by <code>http.createServer</code> in worker <code>PID \${process.pid}</code></p>
-  <p>Real Node <code>\${process.version}</code> — <code>path</code> + <code>Buffer</code> + <code>fs</code> + <code>stream</code> + <code>net</code> + <code>http</code> + <code>zlib</code> + <code>crypto</code> vendored (+ <code>ESM</code> import/export), on a real event loop, running in your browser</p>
-  <p>You requested <code>\${req.url}</code></p>
-  <button onclick="fetch('api/time').then(r=>r.json()).then(t=>document.getElementById('t').textContent=JSON.stringify(t))">GET /api/time</button>
-  <button onclick="var el=document.getElementById('a');el.textContent='awaiting setTimeout(200ms)…';fetch('api/async').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2))">GET /api/async (awaits a timer)</button>
-  <button onclick="fetch('api/stream').then(r=>r.json()).then(t=>document.getElementById('s').textContent=JSON.stringify(t,null,2))">GET /api/stream (pipeline)</button>
-  <button onclick="fetch('api/net').then(r=>r.json()).then(t=>document.getElementById('n').textContent=JSON.stringify(t,null,2))">GET /api/net (TCP loopback)</button>
-  <button onclick="fetch('api/http').then(r=>r.json()).then(t=>document.getElementById('h').textContent=JSON.stringify(t,null,2))">GET /api/http (real http server+client)</button>
-  <button onclick="fetch('api/buffer').then(r=>r.json()).then(t=>document.getElementById('b').textContent=JSON.stringify(t,null,2))">GET /api/buffer</button>
-  <button onclick="fetch('api/fs').then(r=>r.json()).then(t=>document.getElementById('f').textContent=JSON.stringify(t,null,2))">GET /api/fs</button>
-  <button onclick="fetch('api/zlib').then(r=>r.json()).then(t=>document.getElementById('z').textContent=JSON.stringify(t,null,2))">GET /api/zlib (gzip + crc32)</button>
-  <button onclick="fetch('api/crypto').then(r=>r.json()).then(t=>document.getElementById('c').textContent=JSON.stringify(t,null,2))">GET /api/crypto (hash + AES-GCM)</button>
-  <button onclick="fetch('api/esm').then(r=>r.json()).then(t=>document.getElementById('e').textContent=JSON.stringify(t,null,2))">GET /api/esm (import/export)</button>
-  <button onclick="fetch('api/wasi').then(r=>r.json()).then(t=>document.getElementById('w').textContent=JSON.stringify(t,null,2))">GET /api/wasi (wasm32-wasi CLI)</button>
-  <button onclick="fetch('api/napi').then(r=>r.json()).then(t=>document.getElementById('np').textContent=JSON.stringify(t,null,2))">GET /api/napi (N-API addon on wasm)</button>
-  <button onclick="var el=document.getElementById('es');el.textContent='installing esbuild-wasm (~11MB) + bundling… (first call is slow)';fetch('api/esbuild').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2)).catch(e=>el.textContent=String(e))">GET /api/esbuild (real bundler)</button>
-  <button onclick="fetch('api/spawn').then(r=>r.json()).then(t=>document.getElementById('sp').textContent=JSON.stringify(t,null,2))">GET /api/spawn (async child_process)</button>
-  <button onclick="fetch('api/threads').then(r=>r.json()).then(t=>document.getElementById('wt').textContent=JSON.stringify(t,null,2))">GET /api/threads (worker_threads + SAB)</button>
-  <button onclick="fetch('api/persist').then(r=>r.json()).then(t=>document.getElementById('pv').textContent=JSON.stringify(t,null,2))">GET /api/persist (OPFS — survives reload)</button>
-  <button onclick="var el=document.getElementById('nf');el.textContent='fetching npm registry…';fetch('api/fetch').then(r=>r.json()).then(t=>el.textContent=JSON.stringify(t,null,2)).catch(e=>el.textContent=String(e))">GET /api/fetch (npm registry)</button>
-  <p style="color:#8b949e;font-size:12px">Tip: hit <code>/api/time</code> repeatedly — <code>backgroundTicks</code> keeps rising because a <code>setInterval</code> runs while the server is idle.</p>
-  <pre id="t"></pre>
-  <pre id="a"></pre>
-  <pre id="s"></pre>
-  <pre id="n"></pre>
-  <pre id="h"></pre>
-  <pre id="b"></pre>
-  <pre id="f"></pre>
-  <pre id="z"></pre>
-  <pre id="c"></pre>
-  <pre id="e"></pre>
-  <pre id="w"></pre>
-  <pre id="np"></pre>
-  <pre id="es"></pre>
-  <pre id="sp"></pre>
-  <pre id="wt"></pre>
-  <pre id="pv"></pre>
-  <pre id="nf"></pre>
-</div></body></html>\`);
-});
-
-server.listen(3000, () =>
-  console.log('[server] listening on http://localhost:3000 (pid ' + process.pid +
-    ') · Buffer check ' + Buffer.from('ok').toString('hex') + ' · node ' + process.version));
-`;
-
-// A REAL Express app — the framework installed from npm, unmodified — running on
-// our vendored Node stack. express.json() exercises body-parser (needs zlib +
-// crypto for ETag), the router covers params, all inside the browser worker.
-const EXPRESS_SERVER_SRC = `
-const express = require('express');
-const app = express();
-app.use(express.json());
-
-app.get('/api/hello', (req, res) => {
-  res.json({ ok: true, msg: 'hello from express', node: process.version, pid: process.pid });
-});
-app.get('/api/users/:id', (req, res) => {
-  res.json({ id: req.params.id, name: 'user-' + req.params.id });
-});
-app.post('/api/echo', (req, res) => {
-  res.json({ youSent: req.body, at: Date.now() });
-});
-
-app.listen(3100, () =>
-  console.log('[express] listening on http://localhost:3100 (pid ' + process.pid +
-    ') · express ' + require('express/package.json').version));
-`;
-
-// roadmap #19 stage C — a real Vite dev server running in-VM with live HMR
-// tunneled to the preview iframe. The app self-accepts an HMR update on
-// ./message.js: editing that file in the host textarea re-renders WITHOUT a
-// full page reload — the classic Vite HMR boundary, proven end to end.
-const VITE_PORT = 5199;
-const VITE_DIR = "/vite-app";
-const VITE_APP = {
-  "package.json": JSON.stringify(
-    { name: "hmr-demo", version: "1.0.0", private: true, type: "module" },
-    null,
-    2,
-  ),
-  "index.html":
-    "<!doctype html>\n<html>\n<head><meta charset='utf-8'><title>Vite HMR · OpenContainer</title>\n" +
-    "<style>body{font-family:ui-monospace,Menlo,monospace;background:#0b0e14;color:#d4d7dd;" +
-    "display:grid;place-items:center;height:100vh;margin:0}" +
-    ".card{border:1px solid #1c2230;border-radius:12px;padding:32px 40px;background:#0e131c;text-align:center;max-width:80%}" +
-    "h1{color:#7ee787;margin:0 0 12px}" +
-    ".hint{color:#6b7385;font-size:12px;margin-top:16px}</style></head>\n" +
-    "<body><div class='card'><h1>Vite HMR — live in the browser VM</h1>" +
-    "<div id='msg'>…</div>" +
-    "<div class='hint'>Served by a real <code>vite</code> dev server running inside OpenContainer.<br>" +
-    "Edit <code>src/message.js</code> (JS module HMR) or <code>src/styles.css</code> (CSS HMR) on the " +
-    "left and save — both update with no page reload.</div>" +
-    "</div>\n<script type='module' src='/src/main.js'></script>\n</body>\n</html>\n",
-  "src/message.js":
-    "export const message =\n  'Hello from Vite HMR running inside OpenContainer!\\n" +
-    "Edit me on the left and hit Save — no page reload.';\n",
-  "src/styles.css":
-    "/* Edit me too — Vite hot-swaps CSS with no reload (watch #msg restyle live). */\n" +
-    "#msg {\n" +
-    "  font-size: 20px;\n" +
-    "  white-space: pre-wrap;\n" +
-    "  color: #7ee787;\n" +
-    "  padding: 16px 20px;\n" +
-    "  border: 1px solid #234;\n" +
-    "  border-radius: 10px;\n" +
-    "  background: #0b0e14;\n" +
-    "  transition: color 0.2s, background 0.2s;\n" +
-    "}\n",
-  "src/main.js":
-    "import './styles.css';\n" +
-    "import { message } from './message.js';\n\n" +
-    "const el = document.getElementById('msg');\n" +
-    "function render(text) { el.textContent = text; }\n" +
-    "render(message);\n\n" +
-    "// JS module HMR boundary. CSS is hot-swapped automatically by Vite (the\n" +
-    "// ./styles.css import is a self-accepting boundary), so no accept() needed.\n" +
-    "if (import.meta.hot) {\n" +
-    "  import.meta.hot.accept('./message.js', (mod) => {\n" +
-    "    render(mod.message);\n" +
-    "    console.log('[hmr] message.js hot-updated');\n" +
-    "  });\n" +
-    "}\n",
-};
-
-// The files the host editor can edit live (absolute VFS paths -> initial text).
-const VITE_EDIT_FILES = [VITE_DIR + "/src/message.js", VITE_DIR + "/src/styles.css"];
-
-// Boots the dev server (HMR enabled). Base stays '/' — the preview SW controls
-// the whole origin and routes Vite's root-absolute URLs (/@vite/client, etc.)
-// to this port by the requesting iframe's client URL, so no base rewrite needed.
-function viteDevScript() {
-  return (
-    "const vite = require('vite');\n" +
-    "(async () => {\n" +
-    "  try {\n" +
-    "    const server = await vite.createServer({\n" +
-    "      root: '" + VITE_DIR + "', configFile: false, logLevel: 'silent',\n" +
-    "      server: { port: " + VITE_PORT + ", host: '127.0.0.1' }, optimizeDeps: { noDiscovery: true },\n" +
-    "    });\n" +
-    "    await server.listen();\n" +
-    "    console.log('[vite] dev server + HMR ready on :" + VITE_PORT + "');\n" +
-    "    setInterval(() => {}, 1000);\n" +
-    "  } catch (e) { console.error('[vite] ' + (e && e.stack || e)); process.exit(1); }\n" +
-    "})();\n"
-  );
-}
-
-// ── React + Vite (rolldown) + the React Compiler ────────────────────────────
-// Same dev-server + HMR path as the vanilla Vite demo, but with the real React
-// pipeline: @vitejs/plugin-react (oxc JSX + Fast Refresh) plus the React
-// Compiler run through @rolldown/plugin-babel + @babel/core in-VM. Editing
-// App.jsx hot-updates via Fast Refresh; the transformed module carries the
-// compiler's _c() memo cache + a react/compiler-runtime import.
+// ─────────────────────────────────────────────────────────────────────────────
+// Demo 1 — React + Vite + the React Compiler.
+//
+// The exact file layout `npm create vite@latest` emits for the React template,
+// plus the React Compiler wired into @vitejs/plugin-react's Babel pass. Run with
+// the real `npm run dev` (the vite CLI). One in-VM caveat: rolldown's config
+// BUNDLER throws "Invalid URL", so we load vite.config.js via `--configLoader
+// native` (passed after `--`); the project files themselves are 100% authentic.
+// ─────────────────────────────────────────────────────────────────────────────
 const REACT_DIR = "/react-app";
-const REACT_PORT = 5202;
-const REACT_APP = {
-  "package.json": JSON.stringify(
-    { name: "react-hmr-demo", version: "1.0.0", private: true, type: "module" },
-    null,
-    2,
-  ),
-  "index.html":
-    "<!doctype html>\n<html>\n<head><meta charset='utf-8'><title>React + Vite + Compiler · OpenContainer</title></head>\n" +
-    "<body><div id='root'></div>\n<script type='module' src='/src/main.jsx'></script>\n</body>\n</html>\n",
-  "src/main.jsx":
-    "import { StrictMode } from 'react';\n" +
-    "import { createRoot } from 'react-dom/client';\n" +
-    "import './styles.css';\n" +
-    "import App from './App.jsx';\n\n" +
-    "createRoot(document.getElementById('root')).render(<StrictMode><App /></StrictMode>);\n",
-  "src/App.jsx":
-    "import { useState } from 'react';\n\n" +
-    "export default function App() {\n" +
-    "  const [n, setN] = useState(0);\n" +
-    "  const doubled = n * 2; // auto-memoized by the React Compiler\n" +
-    "  return (\n" +
-    "    <div className=\"card\">\n" +
-    "      <h1>React + Vite + React Compiler</h1>\n" +
-    "      <p className=\"count\">count {n} · ×2 = {doubled}</p>\n" +
-    "      <button onClick={() => setN((v) => v + 1)}>increment</button>\n" +
-    "      <p className=\"hint\">Edit <code>src/App.jsx</code> and Save — Fast Refresh updates\n" +
-    "        with no reload. The React Compiler auto-memoizes this component.</p>\n" +
-    "    </div>\n" +
-    "  );\n" +
-    "}\n",
-  "src/styles.css":
-    "body{font-family:ui-monospace,Menlo,monospace;background:#0b0e14;color:#d4d7dd;display:grid;place-items:center;height:100vh;margin:0}\n" +
-    ".card{border:1px solid #1c2230;border-radius:12px;padding:32px 40px;background:#0e131c;text-align:center;max-width:80%}\n" +
-    "h1{color:#61dafb;margin:0 0 12px;font-size:20px}\n" +
-    ".count{font-size:18px;color:#7ee787}\n" +
-    "button{font:inherit;background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:8px 16px;cursor:pointer;margin-top:8px}\n" +
-    ".hint{color:#6b7385;font-size:12px;margin-top:16px;line-height:1.5}\n" +
-    "code{color:#79c0ff}\n",
-};
-const REACT_EDIT_FILES = [REACT_DIR + "/src/App.jsx", REACT_DIR + "/src/styles.css"];
-function reactDevScript() {
+const REACT_PORT = 5173;
+const REACT_FILES = {
+  "package.json": `{
+  "name": "vite-react",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.0",
+    "babel-plugin-react-compiler": "latest",
+    "vite": "^8.0.0"
+  }
+}
+`,
+  "vite.config.js": `import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [
+    react({
+      babel: {
+        // The React Compiler — auto-memoizes components at build time.
+        plugins: [['babel-plugin-react-compiler', {}]],
+      },
+    }),
+  ],
+})
+`,
+  "index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vite + React</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+`,
+  "src/main.jsx": `import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+`,
+  "src/App.jsx": `import { useState } from 'react'
+import './App.css'
+
+function App() {
+  const [count, setCount] = useState(0)
+
   return (
-    "const vite = require('vite');\n" +
-    "const reactMod = require('@vitejs/plugin-react');\n" +
-    "const reactCompilerPreset = reactMod.reactCompilerPreset;\n" +
-    "let react = reactMod; while (react && typeof react !== 'function' && react.default) react = react.default;\n" +
-    "const babelMod = require('@rolldown/plugin-babel');\n" +
-    "let babel = babelMod; while (babel && typeof babel !== 'function' && babel.default) babel = babel.default;\n" +
-    "(async () => {\n" +
-    "  try {\n" +
-    "    const server = await vite.createServer({\n" +
-    "      root: '" + REACT_DIR + "', configFile: false, logLevel: 'silent',\n" +
-    "      plugins: [ react(), babel({ presets: [reactCompilerPreset({ target: '19' })] }) ],\n" +
-    "      server: { port: " + REACT_PORT + ", host: '127.0.0.1' },\n" +
-    "      optimizeDeps: { include: ['react', 'react-dom', 'react-dom/client'] },\n" +
-    "    });\n" +
-    "    await server.listen();\n" +
-    "    console.log('[react] dev + Fast Refresh + React Compiler ready on :" + REACT_PORT + "');\n" +
-    "    setInterval(() => {}, 1000);\n" +
-    "  } catch (e) { console.error('[react] ' + (e && e.stack || e)); process.exit(1); }\n" +
-    "})();\n"
-  );
+    <>
+      <h1>Vite + React + Compiler</h1>
+      <div className="card">
+        <button onClick={() => setCount((count) => count + 1)}>
+          count is {count}
+        </button>
+        <p>
+          Edit <code>src/App.jsx</code> and save to test HMR
+        </p>
+      </div>
+      <p className="read-the-docs">
+        Running inside OpenContainer — a real Vite dev server in your browser.
+      </p>
+    </>
+  )
 }
 
-// ── NestJS (real tsc compile in-VM, DI + reflect-metadata over Express) ──────
-// Nest needs decorator metadata (emitDecoratorMetadata), which esbuild can't
-// emit, so we compile the TS sources with the REAL `tsc` (TypeScript 5 — v7 is
-// the native Go port) then run the emitted dist/main.js. The controller serves
-// an HTML page at / (for the preview) and a JSON API at /api/hello.
-const NEST_DIR = "/nest-app";
-const NEST_PORT = 3200;
-const NEST_APP = {
-  "package.json": JSON.stringify({ name: "nest-demo", version: "1.0.0", private: true }, null, 2),
-  "tsconfig.json": JSON.stringify(
-    {
-      compilerOptions: {
-        module: "commonjs",
-        target: "es2021",
-        experimentalDecorators: true,
-        emitDecoratorMetadata: true,
-        esModuleInterop: true,
-        skipLibCheck: true,
-        outDir: "dist",
-        sourceMap: false,
-        declaration: false,
-      },
-      include: ["src/**/*.ts"],
-    },
-    null,
-    2,
-  ),
-  "src/app.service.ts":
-    "import { Injectable } from '@nestjs/common';\n" +
-    "@Injectable()\n" +
-    "export class AppService {\n" +
-    "  hello(): string { return 'Hello from NestJS running inside OpenContainer'; }\n" +
-    "}\n",
-  "src/app.controller.ts":
-    "import { Controller, Get, Header } from '@nestjs/common';\n" +
-    "import { AppService } from './app.service';\n" +
-    "@Controller()\n" +
-    "export class AppController {\n" +
-    "  constructor(private readonly svc: AppService) {}\n" +
-    "  @Get()\n" +
-    "  @Header('Content-Type', 'text/html')\n" +
-    "  root(): string {\n" +
-    "    return `<!doctype html><html><head><meta charset=\"utf-8\"><title>NestJS · OpenContainer</title>` +\n" +
-    "      `<style>body{font-family:ui-monospace,Menlo,monospace;background:#0b0e14;color:#d4d7dd;display:grid;place-items:center;height:100vh;margin:0}` +\n" +
-    "      `.card{border:1px solid #1c2230;border-radius:12px;padding:32px 40px;background:#0e131c;text-align:center;max-width:80%}` +\n" +
-    "      `h1{color:#e0234e;margin:0 0 12px}code{color:#79c0ff}.hint{color:#6b7385;font-size:12px;margin-top:16px;line-height:1.5}</style></head>` +\n" +
-    "      `<body><div class=\"card\"><h1>NestJS running inside OpenContainer</h1>` +\n" +
-    "      `<p>${this.svc.hello()}</p>` +\n" +
-    "      `<p class=\"hint\">Compiled from TypeScript by the real <code>tsc</code> in-VM, then booted with ` +\n" +
-    "      `dependency injection + <code>reflect-metadata</code> over <code>@nestjs/platform-express</code>.<br>` +\n" +
-    "      `JSON API: <code>GET /api/hello</code></p></div></body></html>`;\n" +
-    "  }\n" +
-    "  @Get('api/hello')\n" +
-    "  hello(): { ok: boolean; msg: string; node: string } {\n" +
-    "    return { ok: true, msg: this.svc.hello(), node: process.version };\n" +
-    "  }\n" +
-    "}\n",
-  "src/app.module.ts":
-    "import { Module } from '@nestjs/common';\n" +
-    "import { AppController } from './app.controller';\n" +
-    "import { AppService } from './app.service';\n" +
-    "@Module({ controllers: [AppController], providers: [AppService] })\n" +
-    "export class AppModule {}\n",
-  "src/main.ts":
-    "import 'reflect-metadata';\n" +
-    "import { NestFactory } from '@nestjs/core';\n" +
-    "import { AppModule } from './app.module';\n" +
-    "async function bootstrap() {\n" +
-    "  const app = await NestFactory.create(AppModule, { logger: ['error', 'warn'] });\n" +
-    "  await app.listen(" + NEST_PORT + ", '127.0.0.1');\n" +
-    "  console.log('[nest] listening on :" + NEST_PORT + "');\n" +
-    "}\n" +
-    "bootstrap().catch((e) => { console.error('[nest] ' + (e && e.stack || e)); process.exit(1); });\n",
-};
+export default App
+`,
+  "src/App.css": `#root {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 2rem;
+  text-align: center;
+}
 
-// The selectable demo matrix. Each entry scaffolds files, npm-installs its deps,
-// optionally runs a build step (tsc), then boots a long-running `node` process
-// and waits for its port. `editable`/`hmr` drive the host's live editor panel.
-const DEMOS = {
-  vite: {
-    title: "Vite HMR (vanilla JS/CSS)",
-    dir: VITE_DIR,
-    port: VITE_PORT,
-    files: VITE_APP,
-    install: ["vite"],
-    bootFile: "dev.js",
-    boot: viteDevScript,
-    run: ["dev.js"],
-    editable: VITE_EDIT_FILES,
-    hmr: true,
+.card {
+  padding: 2em;
+}
+
+.read-the-docs {
+  color: #888;
+}
+`,
+  "src/index.css": `:root {
+  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  place-items: center;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+h1 {
+  font-size: 3.2em;
+  line-height: 1.1;
+}
+
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: #1a1a1a;
+  color: white;
+  cursor: pointer;
+  transition: border-color 0.25s;
+}
+
+button:hover {
+  border-color: #646cff;
+}
+`,
+};
+const REACT_ENTRY = "src/App.jsx";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Demo 2 — NestJS.
+//
+// The file layout `nest new` emits (trimmed to the deps needed to boot — no
+// jest/eslint/prettier). Run with the real `npm run start:dev` = `nest start
+// --watch`: the @nestjs/cli compiles the TS with `tsc` in watch mode and forks
+// the emitted app; on save it recompiles and restarts, all in-VM. `emitDecorator
+// Metadata` is what makes DI + reflect-metadata work.
+// ─────────────────────────────────────────────────────────────────────────────
+const NEST_DIR = "/nest-app";
+const NEST_PORT = 3000;
+const NEST_FILES = {
+  "package.json": `{
+  "name": "nest-app",
+  "version": "0.0.1",
+  "description": "",
+  "private": true,
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "nest build",
+    "start": "nest start",
+    "start:dev": "nest start --watch",
+    "start:prod": "node dist/main"
   },
+  "dependencies": {
+    "@nestjs/common": "^11.0.1",
+    "@nestjs/core": "^11.0.1",
+    "@nestjs/platform-express": "^11.0.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^11.0.0",
+    "@nestjs/schematics": "^11.0.0",
+    "@types/node": "^22.10.7",
+    "source-map-support": "^0.5.21",
+    "typescript": "^5.7.3"
+  }
+}
+`,
+  "nest-cli.json": `{
+  "$schema": "https://json.schemastore.org/nest-cli",
+  "collection": "@nestjs/schematics",
+  "sourceRoot": "src",
+  "compilerOptions": {
+    "deleteOutDir": true
+  }
+}
+`,
+  "tsconfig.json": `{
+  "compilerOptions": {
+    "module": "commonjs",
+    "declaration": true,
+    "removeComments": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "allowSyntheticDefaultImports": true,
+    "target": "ES2023",
+    "sourceMap": true,
+    "outDir": "./dist",
+    "baseUrl": "./",
+    "incremental": true,
+    "skipLibCheck": true,
+    "strictNullChecks": true,
+    "forceConsistentCasingInFileNames": true,
+    "noImplicitAny": false,
+    "strictBindCallApply": false,
+    "noFallthroughCasesInSwitch": false
+  }
+}
+`,
+  "tsconfig.build.json": `{
+  "extends": "./tsconfig.json",
+  "exclude": ["node_modules", "test", "dist", "**/*spec.ts"]
+}
+`,
+  "src/main.ts": `import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  await app.listen(process.env.PORT ?? 3000);
+}
+bootstrap();
+`,
+  "src/app.module.ts": `import { Module } from '@nestjs/common';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+
+@Module({
+  imports: [],
+  controllers: [AppController],
+  providers: [AppService],
+})
+export class AppModule {}
+`,
+  "src/app.controller.ts": `import { Controller, Get } from '@nestjs/common';
+import { AppService } from './app.service';
+
+@Controller()
+export class AppController {
+  constructor(private readonly appService: AppService) {}
+
+  @Get()
+  getHello(): string {
+    return this.appService.getHello();
+  }
+}
+`,
+  "src/app.service.ts": `import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class AppService {
+  getHello(): string {
+    return 'Hello World!';
+  }
+}
+`,
+};
+const NEST_ENTRY = "src/app.service.ts";
+
+// The selectable demo matrix. Each entry scaffolds its real project files, runs
+// `npm install` (from package.json), then launches its real dev script and waits
+// for the port to listen. `hmr` = live module replacement (Vite); `reload` = the
+// server restarts on change (Nest --watch) and we refresh the preview when it
+// re-listens. `files`/`entry` drive the host's file tree + Monaco editor.
+const DEMOS = {
   react: {
     title: "React + Vite + React Compiler",
     dir: REACT_DIR,
     port: REACT_PORT,
-    files: REACT_APP,
-    install: [
-      "react",
-      "react-dom",
-      "vite",
-      "@vitejs/plugin-react",
-      "babel-plugin-react-compiler",
-      "@rolldown/plugin-babel",
-      "@babel/core",
-    ],
-    bootFile: "dev.js",
-    boot: reactDevScript,
-    run: ["dev.js"],
-    editable: REACT_EDIT_FILES,
+    files: REACT_FILES,
+    entry: REACT_ENTRY,
+    runCmd: "npm",
+    // Real `npm run dev`; --configLoader native avoids rolldown's in-VM config
+    // bundler ("Invalid URL"). npm drops the first `--` before forwarding.
+    runArgs: ["run", "dev", "--", "--configLoader", "native"],
     hmr: true,
   },
   nest: {
-    title: "NestJS API (tsc + DI)",
+    title: "NestJS",
     dir: NEST_DIR,
     port: NEST_PORT,
-    files: NEST_APP,
-    install: [
-      "@nestjs/core",
-      "@nestjs/common",
-      "@nestjs/platform-express",
-      "reflect-metadata",
-      "rxjs",
-      "typescript@5",
-      "@types/node",
-    ],
-    build: ["node", "node_modules/typescript/bin/tsc", "-p", "tsconfig.json"],
-    run: ["dist/main.js"],
-    editable: null,
+    files: NEST_FILES,
+    entry: NEST_ENTRY,
+    runCmd: "npm",
+    runArgs: ["run", "start:dev"], // nest start --watch (recompile + restart)
     hmr: false,
+    reload: true,
   },
 };
 
-function editablePayload(d) {
-  const files = {};
-  if (d.editable) for (const abs of d.editable) files[abs] = d.files[abs.slice(d.dir.length + 1)];
-  return files;
-}
-
 const demoStarted = new Set();
+const demoReadyPorts = new Set(); // ports that reached "ready" once — a later
+// listen on the same port is a dev-server restart (Nest --watch), not a boot.
+
 async function startDemo(id) {
   const d = DEMOS[id];
   if (!d) {
@@ -959,7 +358,9 @@ async function startDemo(id) {
   }
   // Already running: just re-point the preview + editor at it.
   if (demoStarted.has(id)) {
-    post("demo-ready", { id, port: d.port, files: editablePayload(d), title: d.title, hmr: !!d.hmr });
+    post("demo-ready", {
+      id, dir: d.dir, port: d.port, files: d.files, entry: d.entry, title: d.title, hmr: !!d.hmr, reload: !!d.reload,
+    });
     return;
   }
   demoStarted.add(id);
@@ -969,41 +370,43 @@ async function startDemo(id) {
       kernel.mkdirp(abs.slice(0, abs.lastIndexOf("/")));
       kernel.writeFile(abs, contents);
     }
-    post("demo-status", { line: "installing " + d.title + " deps from npm…" });
-    post("log", { line: "$ cd " + d.dir + " && npm install " + d.install.join(" "), cls: "muted" });
-    const inst = await kernel.start("npm", ["install", ...d.install], { cwd: d.dir, capture: true });
+    post("demo-status", { line: "npm install — resolving " + d.title + " from the registry…" });
+    // Stream install output to the terminal (no capture); resolves with the code.
+    const inst = await kernel.start("npm", ["install"], { cwd: d.dir, env: { FORCE_COLOR: "3" } });
     if (inst.code !== 0) {
-      post("log", { line: "  [" + id + "] npm install failed: " + (inst.stderr || inst.code), cls: "err" });
-      post("demo-status", { line: "npm install failed — see the log" });
+      post("demo-status", { line: "npm install failed — see the terminal" });
       demoStarted.delete(id);
       return;
     }
-    if (d.build) {
-      post("demo-status", { line: "compiling with tsc…" });
-      post("log", { line: "$ " + d.build.join(" "), cls: "muted" });
-      const b = await kernel.start(d.build[0], d.build.slice(1), { cwd: d.dir, capture: true });
-      if (b.code !== 0) {
-        post("log", {
-          line: "  [" + id + "] build failed: " + ((b.stdout || "") + (b.stderr || "")).trim().slice(-600),
-          cls: "err",
-        });
-        post("demo-status", { line: "build failed — see the log" });
-        demoStarted.delete(id);
-        return;
-      }
+    post("demo-status", { line: "starting the dev server…" });
+    // FORCE_COLOR=3 makes Vite/Nest/tsc emit truecolor ANSI so the terminal looks
+    // exactly like a local run. Long-running: launch() returns immediately.
+    kernel.launch(d.runCmd, d.runArgs, { cwd: d.dir, env: { FORCE_COLOR: "3" } });
+    await waitListen(d.port, 120000);
+    // Wait for the server to actually answer — not just bind — before pointing
+    // the preview at it (see waitServing: Vite rebinds during startup).
+    await waitServing(d.port, 60000);
+    // Prime the dev server so the cold dependency-optimize happens now, off the
+    // Service Worker's request clock (see warmDevServer). Vite only.
+    if (d.hmr) {
+      post("demo-status", { line: "optimizing dependencies — first run only…" });
+      await warmDevServer(d.port);
     }
-    if (d.boot) kernel.writeFile(d.dir + "/" + d.bootFile, d.boot());
-    post("demo-status", { line: "booting " + d.title + "…" });
-    post("log", { line: "$ node " + d.run.join(" ") + "  (long-running)", cls: "muted" });
-    kernel.start("node", d.run, { cwd: d.dir }); // NOT awaited
-    await waitListen(d.port, 60000);
-    post("log", { line: "  [" + id + "] listening on :" + d.port, cls: "ok" });
-    post("demo-ready", { id, port: d.port, files: editablePayload(d), title: d.title, hmr: !!d.hmr });
+    demoReadyPorts.add(d.port);
+    post("demo-ready", {
+      id, dir: d.dir, port: d.port, files: d.files, entry: d.entry, title: d.title, hmr: !!d.hmr, reload: !!d.reload,
+    });
   } catch (err) {
-    post("log", { line: "  [" + id + "] " + (err && err.message || err), cls: "err" });
-    post("demo-status", { line: "failed to start — see the log" });
+    post("log", { line: "[" + id + "] " + ((err && err.message) || err) + "\n", stream: "stderr" });
+    post("demo-status", { line: "failed to start — see the terminal" });
     demoStarted.delete(id);
   }
+}
+
+// Which demo listens on this port (for restart → preview-reload detection)?
+function demoForPort(port) {
+  for (const [id, d] of Object.entries(DEMOS)) if (d.port === port) return id;
+  return null;
 }
 
 let kernel = null;
@@ -1027,6 +430,64 @@ function waitListen(port, timeoutMs = 20000) {
       }
     }, 50);
   });
+}
+
+// A bound port isn't the same as a *serving* one: Vite 8 (rolldown) binds :port
+// a few times during startup (bind → close → rebind), so the first `listen`
+// event is transient. If we announced `demo-ready` then, the host's preview
+// iframe can hit the port while it's momentarily closed → 502. So after the port
+// listens we drive real HTTP GET /'s through the kernel until one comes back with
+// a non-5xx-gateway status — i.e. an in-VM server actually answered — and only
+// then is the preview safe to load.
+async function waitServing(port, timeoutMs = 60000) {
+  const t0 = Date.now();
+  for (;;) {
+    try {
+      const resp = await kernel.handleHttpRequest(port, { method: "GET", url: "/", headers: {}, body: "" });
+      if (resp && resp.status !== 502 && resp.status !== 503) return true;
+    } catch {
+      /* not answering yet */
+    }
+    if (Date.now() - t0 > timeoutMs) return false; // give up; host will still try
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+// Cold-start warm-up. On the first load Vite **holds every module request** until
+// its dependency optimizer (rolldown) finishes — the browser shows a blank page
+// with "optimizing dependencies". If we announced the preview ready right away,
+// the iframe's subresource fetches would race that cold optimize against the
+// Service Worker's 60 s timeout → a wall of `504 (Gateway Timeout)` on `/@vite/
+// client`, `/src/*`, and `/node_modules/.vite/deps/*` (only reproducible on a
+// cold `.vite` cache — which is exactly why `?reset` triggers it). So we prime
+// the server HERE, inside the kernel worker (no SW deadline): fetch the HTML, then
+// request its module entry, which forces the optimize to complete and `.vite/deps`
+// to be written. By the time the preview loads everything is warm and instant.
+async function warmDevServer(port, timeoutMs = 180000) {
+  const deadline = Date.now() + timeoutMs;
+  const get = (url) =>
+    kernel.handleHttpRequest(port, { method: "GET", url, headers: { accept: "*/*" }, body: "" });
+  let html;
+  try {
+    const r = await get("/");
+    html = typeof r.body === "string" ? r.body : new TextDecoder().decode(r.body || new Uint8Array());
+  } catch {
+    return; // couldn't fetch the entry; let the browser try anyway
+  }
+  // The module entry scripts (+ Vite's own client) are what pull in — and
+  // therefore optimize — the dependency graph. Requesting the entry blocks until
+  // the optimizer is done, which is the whole point.
+  const mods = new Set(["/@vite/client"]);
+  const re = /<script[^>]*type=["']module["'][^>]*src=["']([^"']+)["']/gi;
+  for (let m; (m = re.exec(html)); ) if (m[1].startsWith("/")) mods.add(m[1]);
+  for (const url of mods) {
+    if (Date.now() > deadline) break;
+    try {
+      await get(url);
+    } catch {
+      /* best effort — a single failed warm request shouldn't block readiness */
+    }
+  }
 }
 
 async function boot() {
@@ -1058,7 +519,7 @@ async function boot() {
   await fsReady;
   const kernelFs = createKernelFs(fsWorker);
   onKernelFsMessage = kernelFs.onMessage;
-  post("log", { line: "Rust VFS booted (wasm) in the File System Worker.", cls: "ok" });
+  post("log", { line: "Rust VFS booted (wasm) in the File System Worker." });
 
   // [optimize] The pre-compiled codec Modules every Process Worker instantiates
   // from (compiled once above; may be null if the build/fetch failed).
@@ -1133,13 +594,19 @@ async function boot() {
   });
   kernel.onProcExit = (pid, res) => post("exit", { pid, code: res.code });
   kernel.onListen = (port, pid) => {
+    const restart = demoReadyPorts.has(port); // seen before => a dev-server restart
     listening.add(port);
     post("listen", { port, pid });
+    if (restart) {
+      const id = demoForPort(port);
+      // Nest --watch recompiled + restarted the app; refresh the preview iframe.
+      if (id) post("demo-reload", { id, port, title: DEMOS[id].title });
+    }
   };
   kernel.onFetch = (url, info) =>
     post("log", {
       line: `  [fetcher] ${info.cached ? "cache hit " : "downloaded"} ${info.size}B · ${url}`,
-      cls: "muted",
+      dim: true,
     });
   // roadmap #19 stage C: a ws frame a process relayed OUT of the VM (Vite's HMR
   // server) — forward it to the main thread, which delivers it to the preview
@@ -1147,23 +614,15 @@ async function boot() {
   kernel.onWsSend = (msg) => post("oc-ws", { msg });
 
   kernel.installCoreutils();
-  // The page is a demo *selector* now (Vite / React + Compiler / NestJS), driven
-  // on demand by startDemo() from the host UI — so boot() just stands up the
-  // kernel + workers and reports ready. (The old fixed auto-showcase — a /srv
-  // server + is-odd/@node-rs/crc32 npm installs + a dev server on :3200 — was
-  // removed: it delayed first paint by 10-30s on a cold load and its :3200 server
-  // collided with the NestJS demo's port, so a real listen there failed.)
-  post("log", {
-    line: "Kernel ready — choose a demo above (Vite / React / NestJS) and click ▶ Run.",
-    cls: "ok",
-  });
+  post("ready", {});
+  post("log", { line: "Kernel ready — pick a project and press Run." });
 }
 
 self.onmessage = async (event) => {
   const m = event.data;
 
   if (m.type === "init") {
-    boot().catch((err) => post("log", { line: "kernel worker boot failed: " + err, cls: "err" }));
+    boot().catch((err) => post("log", { line: "kernel worker boot failed: " + err, stream: "stderr" }));
     return;
   }
 
@@ -1186,21 +645,17 @@ self.onmessage = async (event) => {
     if (kernel) startDemo(m.demo);
     return;
   }
-  // Back-compat alias for the original single-button flow.
-  if (m.type === "start-vite") {
-    if (kernel) startDemo("vite");
-    return;
-  }
 
   // The user saved an edit in the host editor — write it to the VFS. The in-VM
-  // Vite dev server's watcher (our push-based fs.watch) fires and pushes an HMR
-  // update over the tunnel to the preview iframe.
+  // dev server's watcher does the rest: Vite pushes an HMR update over the tunnel
+  // to the preview iframe; Nest --watch recompiles + restarts (its re-listen then
+  // triggers a preview reload via kernel.onListen above). No orchestration here.
   if (m.type === "oc-write") {
     if (kernel) {
       try {
         kernel.writeFile(m.path, m.contents);
       } catch (err) {
-        post("log", { line: "  [edit] write failed: " + (err && err.message || err), cls: "err" });
+        post("log", { line: "[edit] write failed: " + ((err && err.message) || err), stream: "stderr" });
       }
     }
     return;
@@ -1215,6 +670,17 @@ self.onmessage = async (event) => {
       return;
     }
     const resp = await kernel.handleHttpRequest(m.req.port, m.req);
+    // Diagnostic: a 502/503 on a preview request means the kernel has no live
+    // server on that port — usually the dev server process exited after listening.
+    // Surface it in the terminal with the current port registry so it's not silent.
+    if (resp && (resp.status === 502 || resp.status === 503)) {
+      post("log", {
+        line:
+          `[preview] ${m.req.method || "GET"} :${m.req.port}${m.req.url || ""} → ${resp.status} ` +
+          `(live ports: ${[...kernel.listeners.keys()].join(", ") || "none"})`,
+        stream: "stderr",
+      });
+    }
     port.postMessage(resp);
     return;
   }
