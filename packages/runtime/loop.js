@@ -46,7 +46,7 @@ const makeMacrotask = () => {
   return (fn) => hostSetTimeout(fn, 0);
 };
 
-export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch } = {}) {
+export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch, doStdin } = {}) {
   isAlive = isAlive || (() => false);
   doNet = doNet || (() => {});
   // #15: drain async child-process events (stdout/stderr/exit delivered as
@@ -58,6 +58,10 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
   // roadmap #19 stage B: drain fs.watch change events (pushed by the File System
   // Worker over the fs doorbell port). Same controlled-turn model.
   doWatch = doWatch || (() => {});
+  // Interactive stdin: drain keystrokes the kernel pushed (host terminal -> here)
+  // into process.stdin inside a controlled turn, so the 'data' listener (a REPL,
+  // our shell's line editor) runs with microtasks flushed after it, like the rest.
+  doStdin = doStdin || (() => {});
 
   const scheduleMacrotask = makeMacrotask();
   const macrotaskYield = () => new Promise((resolve) => scheduleMacrotask(resolve));
@@ -291,6 +295,8 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
       runCallback(doThreads, []); // drain worker_threads message/online/exit (2b)
       await drainMicrotasks();
       runCallback(doWatch, []); // drain fs.watch change events (#19 stage B)
+      await drainMicrotasks();
+      runCallback(doStdin, []); // drain interactive stdin keystrokes
       await drainMicrotasks();
       if (exiting || !hasRefWork()) break;
       await waitForNext();

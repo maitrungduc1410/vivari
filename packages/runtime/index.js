@@ -81,6 +81,16 @@ export function createRuntime({
   // browser<->in-VM ws relay connection keeps the loop turning so it can pump
   // frames (like an open socket handle).
   const wsLiveness = { active: 0 };
+  // Liveness counter for interactive stdin: while a consumer is actively reading
+  // process.stdin (flowing / has a 'data' listener), it refs the loop like an
+  // open TTY handle so an idle REPL/shell waits for the next keystroke instead of
+  // exiting. Toggled by stdin.resume()/pause() below.
+  const stdinLiveness = { active: 0 };
+  // Interactive stdin delivery: keystrokes the kernel pushes (host terminal ->
+  // process worker -> here) are queued and drained inside a loop turn (doStdin),
+  // like doNet/doChildren. Wired just below once `stream` exists.
+  let drainStdin = () => {};
+  let dispatchStdin = () => {};
   // Assigned once child_process is built; the loop drains child events through it.
   let drainChildEvents = () => {};
   // Assigned once worker_threads is required; the loop drains its queued events.
@@ -110,7 +120,8 @@ export function createRuntime({
       threadLiveness.active > 0 ||
       hostLiveness.active > 0 ||
       watchLiveness.active > 0 ||
-      wsLiveness.active > 0,
+      wsLiveness.active > 0 ||
+      stdinLiveness.active > 0,
     doNet: () => {
       if (netServers.count === 0 || !bridgeHttp) return;
       for (;;) {
@@ -122,6 +133,7 @@ export function createRuntime({
     doChildren: () => drainChildEvents(),
     doThreads: () => drainThreadEvents(),
     doWatch: () => drainWatchEvents(),
+    doStdin: () => drainStdin(),
   });
 
   const os = createOs();
@@ -240,6 +252,66 @@ export function createRuntime({
   // The browser preview reaches it through the bridge wired below.
   const http = nodeModules.require("http");
   const assert = createAssert(util);
+
+  // ---- interactive stdin (real, flowing TTY) --------------------------------
+  // Replace the boot-time no-op stdin with a genuine flowing Readable so a REPL,
+  // readline, or our shell's line editor can read keystrokes the kernel pushes in
+  // (host terminal -> process worker -> dispatchStdin). It presents as a TTY
+  // (isTTY:true, setRawMode) since interactive tools branch on that. While a
+  // consumer is actively reading (flowing / has a 'data' listener) it refs the
+  // loop like an open handle so an idle shell waits for input instead of exiting.
+  const stdin = new stream.Readable({ read() {} });
+  stdin.isTTY = true;
+  stdin.isRaw = false;
+  let stdinRefed = false;
+  const setStdinRef = (on) => {
+    if (on === stdinRefed) return;
+    stdinRefed = on;
+    if (on) stdinLiveness.active++;
+    else if (stdinLiveness.active > 0) stdinLiveness.active--;
+    loop.wakeNet();
+  };
+  const origResume = stdin.resume.bind(stdin);
+  const origPause = stdin.pause.bind(stdin);
+  stdin.resume = () => {
+    setStdinRef(true);
+    return origResume();
+  };
+  stdin.pause = () => {
+    setStdinRef(false);
+    return origPause();
+  };
+  stdin.ref = () => {
+    setStdinRef(true);
+    return stdin;
+  };
+  stdin.unref = () => {
+    setStdinRef(false);
+    return stdin;
+  };
+  // Node's TTY exposes setRawMode(bool); we only record it (there's no cooked-mode
+  // line discipline below us — the terminal/line editor lives in guest code).
+  stdin.setRawMode = (mode) => {
+    stdin.isRaw = !!mode;
+    return stdin;
+  };
+  process.stdin = stdin;
+  // Queue + drain: dispatchStdin (called from the worker's onmessage, off-turn)
+  // enqueues; drainStdin (a loop turn) pushes into the Readable so 'data' fires in
+  // a controlled turn. A null chunk is stdin EOF (Ctrl+D / closed terminal).
+  const stdinQueue = [];
+  drainStdin = () => {
+    while (stdinQueue.length) {
+      const chunk = stdinQueue.shift();
+      if (chunk === null) stdin.push(null);
+      else stdin.push(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk));
+    }
+  };
+  dispatchStdin = (msg) => {
+    stdinQueue.push(msg && msg.chunk != null ? msg.chunk : null);
+    loop.wakeNet();
+  };
+
   const child_process = createChildProcess({
     sys: syscalls,
     process,
@@ -248,6 +320,9 @@ export function createRuntime({
     Readable: stream.Readable,
     childLiveness,
     wake: loop.wakeNet,
+    // Parent -> child stdin: child.stdin.write() relays here to the kernel, which
+    // delivers it to the child process' own stdin (see kernel.handleChildStdin).
+    postRaw,
   });
   // The loop drains queued child events (stdout/stderr/exit) each turn (#15).
   drainChildEvents = child_process._drain;
@@ -600,6 +675,9 @@ export function createRuntime({
     /** External delivery from the kernel: a browser preview ws tunnel message
      * ({type:'ws-open'|'ws-in'|'ws-close', connId, ...}). roadmap #19 stage C. */
     dispatchWs: (msg) => dispatchWs(msg),
+    /** External delivery from the kernel: an interactive stdin chunk for THIS
+     * process ({type:'stdin', chunk} — chunk null = EOF). Feeds process.stdin. */
+    dispatchStdin: (msg) => dispatchStdin(msg),
     /**
      * Run an entry file like `node <entry>`, then drive the event loop until it
      * is quiescent (no pending timers/immediates/nextTicks and no open servers).

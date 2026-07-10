@@ -70,7 +70,8 @@ packages/
     fetcher-worker.js  outbound fetch() (npm downloads).
     process-worker.js  one process = one worker (boots the runtime).
     sw.js              preview Service Worker (fetch → kernel → in-VM server).
-    index.html         StackBlitz-style IDE: file tree | Monaco + terminal | preview.
+    index.html         VS Code-style IDE: activity bar · Explorer · tabbed Monaco ·
+                       tabbed terminal panel (Console + interactive shells) · preview.
     vendor/editor/     COMMITTED Monaco + xterm bundle (editor.js/.css) — the page
                        is cross-origin isolated, so the editor can't come from a CDN.
   demo-dist/       GITIGNORED esbuild bundle of demo/ (one file per worker role).
@@ -217,6 +218,23 @@ relies on: `process.kill(pid, sig)` is wired in `runtime/index.js` to
 `child.stdin` is a full no-op stream (`pause`/`resume`/`cork`/… all chainable) —
 NestJS's watch restart calls `child.stdin.pause()` before killing.
 
+### Interactive stdin is event-driven, delivered off the SAB
+`process.stdin` is a real flowing **TTY Readable** (isTTY, setRawMode), NOT a
+blocking `read()` syscall. Keystrokes arrive from the host as a kernel→worker
+`{type:'stdin', chunk}` postMessage (same out-of-band channel as async child
+stdout), get queued, and are pushed into the Readable inside a loop turn
+(`doStdin`) so the 'data' handler runs with microtasks flushed after it — never
+push straight from the worker's `onmessage`. While a consumer is actively reading
+(flowing / has a 'data' listener) stdin refs the loop (`stdinLiveness`) like an
+open TTY handle, so an idle shell waits for input instead of exiting; `resume()`/
+`pause()` toggle that ref. Parent→child piping (`child.stdin.write`) relays
+`{type:'child-stdin', childPid}` → `kernel.handleChildStdin` → the child's own
+stdin. The host terminal → shell path is `term-input` → `kernel.sendStdin(pid)`.
+The interactive line editor (echo, backspace, Ctrl+C→SIGINT the foreground child)
+lives in the `sh` coreutil, not in a TTY line discipline — there's nothing cooked
+below it. Terminals use xterm `convertEol:true`, so guest code should emit `\n`
+(don't double it to `\r\n`).
+
 ### OPFS persistence
 The VFS mirrors to OPFS and **survives reload**. If a demo behaves as if old files
 linger, that's why — use `?reset` on the demo URL to wipe it. Restore happens
@@ -238,6 +256,9 @@ browser first.
   scaffolds the real project, `npm install`s, runs `npm run dev` / `npm run
   start:dev`, and asserts the colored banner/logs + a served response. **Needs
   network.** `probe-react.mjs` / `probe-nest.mjs` are the older API-gap probes.
+- `node scripts/probe-term.mjs` — interactive terminal: launches a live `sh`, feeds
+  keystrokes via `kernel.sendStdin`, asserts echo + `cd`/`pwd`/backspace. No network.
+  `probe-nest-watch.mjs` validates the Nest save→recompile→restart reload.
 - Browser smoke test: `npm run dev`, open
   `http://localhost:8080/packages/demo/index.html`, pick a project + Run, then
   check the terminal (Vite/Nest colored output), edit a file in Monaco (auto-saves

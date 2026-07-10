@@ -68,8 +68,9 @@ bundles each into one file (§10).
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │ Main thread — packages/demo/host.js                                    │
-│   • IDE UI: file tree + Monaco editor + xterm terminal + preview iframe │
-│     (all process/kernel output streams to the terminal, ANSI intact)    │
+│   • VS Code-style IDE: Explorer + tabbed Monaco + tabbed terminal      │
+│     panel (Console + INTERACTIVE shells) + command palette + preview    │
+│     (ANSI intact; shells have real stdin — type a command, Enter runs)  │
 │   • registers the preview Service Worker                               │
 │   • relays SW HTTP requests to the Kernel Worker                       │
 │   • NO kernel/user work runs here (keeps the UI responsive)            │
@@ -200,8 +201,19 @@ arrives — this is how blocking `accept()`/`execSync()`/blocking fetch work.
   child. `OP_SPAWN_ASYNC` returns `{pid}` immediately; the child's stdout/stderr/
   exit stream back to the parent worker as postMessages (the model behind
   `child_process.spawn` and a `npm run dev` that launches a long-lived server).
+- **Signals & teardown**: `process.kill(pid, sig)` and `child.kill()` route to the
+  kernel (`OP_KILL`); `finalize` **cascades to the whole subtree** (`parentPid`),
+  so killing a shell wrapper (`sh -c "node …"`) takes its server down too.
+- **stdin (interactive)**: delivered OUT of band, not via a blocking syscall. The
+  host terminal's keystrokes → `kernel.sendStdin(pid)` → a `{type:'stdin'}`
+  postMessage → the process' real flowing `process.stdin` (a TTY Readable, drained
+  in a loop turn). `child.stdin.write()` relays parent→child via `{type:'child-
+  stdin'}` → `kernel.handleChildStdin` → the child's own stdin. This is what makes
+  the terminal interactive (a live `sh` REPL, `node`, etc.).
 - **Coreutils + shell**: `packages/kernel-host/coreutils.js` provides
-  `echo/cat/ls/pwd/mkdir/rm/node/true/false` and a small `sh`. Installed into
+  `echo/cat/ls/pwd/mkdir/rm/node/npm/npx/true/false` and a small `sh`. `sh` with
+  no args is an **interactive REPL** (prompt, echo, backspace, Ctrl+C→SIGINT the
+  foreground child, Ctrl+D); with `-c`/a file it runs a batch. Installed into
   `/bin` by `installCoreutils()`.
 - **npm**: `packages/kernel-host/programs/npm.js` is a from-scratch installer:
   semver resolution from registry packuments, tarball download via the blocking

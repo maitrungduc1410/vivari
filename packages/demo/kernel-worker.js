@@ -411,6 +411,41 @@ function demoForPort(port) {
 
 let kernel = null;
 const listening = new Set();
+// Interactive terminals: each xterm in the UI is backed by a long-lived `sh`
+// process. Map both ways so a shell's output goes to the right terminal and the
+// terminal's keystrokes go back to its pid. Demo/build output (npm, dev servers)
+// is NOT in these maps and streams to the host's console instead.
+const termByPid = new Map(); // shell pid -> terminalId
+const pidByTerm = new Map(); // terminalId -> shell pid
+
+// Open a new interactive shell for a terminal. cwd defaults to a running demo's
+// dir (so the terminal opens right in the project) or "/". PATH includes the
+// project's node_modules/.bin so `vite`, `nest`, etc. resolve like a real shell.
+function openTerminal(terminalId, cwd) {
+  if (!kernel) return;
+  const dir = cwd || defaultTermCwd();
+  const env = {
+    PATH: dir + "/node_modules/.bin:/bin",
+    HOME: "/",
+    TERM: "xterm-256color",
+    FORCE_COLOR: "3",
+    PWD: dir,
+  };
+  const pid = kernel.launch("sh", [], { cwd: dir, env });
+  if (pid < 0) {
+    post("term-exit", { terminalId, code: 127 });
+    return;
+  }
+  termByPid.set(pid, terminalId);
+  pidByTerm.set(terminalId, pid);
+  post("term-ready", { terminalId, pid, cwd: dir });
+}
+
+// Where a fresh terminal starts: inside the running demo's project if one is up.
+function defaultTermCwd() {
+  for (const id of demoStarted) if (DEMOS[id]) return DEMOS[id].dir;
+  return "/";
+}
 // The File System Worker handle, kept module-scoped so the page-hide flush relay
 // (host -> here -> FS worker) can reach it. Set in boot().
 let fsWorkerRef = null;
@@ -589,10 +624,29 @@ async function boot() {
     fs: kernelFs.fs,
     spawnWorker,
     fetcher,
-    stdout: (chunk) => post("stdout", { chunk }),
-    stderr: (chunk) => post("stderr", { chunk }),
+    // Route by pid: an interactive shell's output goes to its terminal; anything
+    // else (npm install, dev servers) is demo/console output.
+    stdout: (chunk, pid) => {
+      const tid = termByPid.get(pid);
+      if (tid !== undefined) post("term-out", { terminalId: tid, chunk });
+      else post("stdout", { chunk });
+    },
+    stderr: (chunk, pid) => {
+      const tid = termByPid.get(pid);
+      if (tid !== undefined) post("term-out", { terminalId: tid, chunk });
+      else post("stderr", { chunk });
+    },
   });
-  kernel.onProcExit = (pid, res) => post("exit", { pid, code: res.code });
+  kernel.onProcExit = (pid, res) => {
+    const tid = termByPid.get(pid);
+    if (tid !== undefined) {
+      termByPid.delete(pid);
+      pidByTerm.delete(tid);
+      post("term-exit", { terminalId: tid, code: res.code });
+    } else {
+      post("exit", { pid, code: res.code });
+    }
+  };
   kernel.onListen = (port, pid) => {
     const restart = demoReadyPorts.has(port); // seen before => a dev-server restart
     listening.add(port);
@@ -643,6 +697,25 @@ self.onmessage = async (event) => {
   // The user picked a demo and clicked "Run" in the host UI.
   if (m.type === "start-demo") {
     if (kernel) startDemo(m.demo);
+    return;
+  }
+
+  // ── Interactive terminals ──────────────────────────────────────────────────
+  // Open a new shell for a terminal tab.
+  if (m.type === "term-open") {
+    openTerminal(m.terminalId, m.cwd);
+    return;
+  }
+  // Keystrokes from an xterm — feed them to that terminal's shell stdin.
+  if (m.type === "term-input") {
+    const pid = pidByTerm.get(m.terminalId);
+    if (pid != null && kernel) kernel.sendStdin(pid, m.chunk);
+    return;
+  }
+  // The user closed a terminal tab — kill its shell (and any foreground child).
+  if (m.type === "term-close") {
+    const pid = pidByTerm.get(m.terminalId);
+    if (pid != null && kernel) kernel.stop(pid);
     return;
   }
 

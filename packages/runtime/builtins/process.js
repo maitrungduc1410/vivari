@@ -56,8 +56,18 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     ppid,
     title: "node",
     cwd: () => _cwd,
+    // Resolve `dir` against the current cwd and normalize (., ..) — Node's chdir
+    // accepts relative paths (`cd sub`, `cd ../x`), not just absolute ones.
     chdir: (dir) => {
-      _cwd = dir;
+      if (!dir) return;
+      const base = dir.startsWith("/") ? dir : (_cwd === "/" ? "" : _cwd) + "/" + dir;
+      const parts = [];
+      for (const c of base.split("/")) {
+        if (!c || c === ".") continue;
+        if (c === "..") parts.pop();
+        else parts.push(c);
+      }
+      _cwd = "/" + parts.join("/");
     },
     exit: (code = 0) => {
       const c = code | 0;

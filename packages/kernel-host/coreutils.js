@@ -219,6 +219,11 @@ function tokenize(s) {
 // (e.g. \`node dist/main.js\`, spawned by \`nest start\` as \`sh -c 'node ...'\`) never
 // exits, so spawnSync would block forever AND buffer all logs until exit — the
 // Nest/Vite banner would never appear. Async spawn forwards each chunk as it lands.
+// The foreground child of an interactive shell: while set, the REPL's raw stdin
+// is piped to it (so \`cat\`, a \`node\` REPL, etc. get keystrokes) instead of being
+// line-edited by the shell itself.
+let currentChild = null;
+
 function runSimple(tokens) {
   if (!tokens.length) return Promise.resolve(0);
   const cmd = tokens[0];
@@ -236,13 +241,15 @@ function runSimple(tokens) {
   if (cmd === 'false') return Promise.resolve(1);
   return new Promise((resolve) => {
     const child = cp.spawn(cmd, args, { cwd: process.cwd(), env: process.env });
+    currentChild = child;
     child.stdout.on('data', (d) => process.stdout.write(d));
     child.stderr.on('data', (d) => process.stderr.write(d));
     child.on('error', (e) => {
+      currentChild = null;
       process.stderr.write('sh: ' + (e && e.code === 'ENOENT' ? cmd + ': not found' : ((e && e.message) || e)) + '\\n');
       resolve(127);
     });
-    child.on('close', (code) => resolve(code == null ? 0 : code));
+    child.on('close', (code) => { currentChild = null; resolve(code == null ? 0 : code); });
   });
 }
 
@@ -260,13 +267,72 @@ async function runLine(line) {
   return status;
 }
 
-(async () => {
+// Batch mode: \`sh script\` or \`sh -c "..."\`. Run each line, then exit.
+async function runBatch() {
   let status = 0;
   for (const raw of script.split('\\n')) {
     const line = raw.replace(/#.*$/, '').trim();
     if (line) status = await runLine(line);
   }
   process.exit(status);
-})();
+}
+
+// Interactive mode: \`sh\` with no script. A real REPL over the raw TTY — it echoes
+// keystrokes, edits the current line (backspace), runs on Enter, and forwards raw
+// input to a foreground child while one is running. cwd/env persist across
+// commands (one long-lived process), just like a local shell.
+function runInteractive() {
+  const PROMPT = '\\x1b[36m$\\x1b[0m ';
+  let line = '';
+  let busy = false;
+  const queue = [];
+  const prompt = () => process.stdout.write(PROMPT);
+
+  const drain = async () => {
+    if (busy) return;
+    busy = true;
+    while (queue.length) {
+      const l = queue.shift().replace(/#.*$/, '').trim();
+      if (l) { try { await runLine(l); } catch (e) { process.stderr.write(String((e && e.message) || e) + '\\n'); } }
+    }
+    busy = false;
+    prompt();
+  };
+
+  process.stdin.setRawMode && process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdout.write('OpenContainer shell — type commands, Enter to run.\\n');
+  prompt();
+
+  process.stdin.on('data', (buf) => {
+    const s = typeof buf === 'string' ? buf : buf.toString('utf8');
+    // A foreground child owns stdin: Ctrl+C interrupts it (SIGINT); otherwise pass
+    // keystrokes straight through (Enter as newline), no line-edit/echo — the
+    // program drives the display.
+    if (currentChild) {
+      if (s.indexOf('\\x03') !== -1) { try { currentChild.kill('SIGINT'); } catch (e) {} }
+      else { try { currentChild.stdin.write(s.replace(/\\r/g, '\\n')); } catch (e) {} }
+      return;
+    }
+    for (const ch of s) {
+      if (ch === '\\r' || ch === '\\n') {
+        process.stdout.write('\\n');
+        queue.push(line); line = '';
+        drain();
+      } else if (ch === '\\x7f' || ch === '\\b') {
+        if (line.length) { line = line.slice(0, -1); process.stdout.write('\\b \\b'); }
+      } else if (ch === '\\x03') { // Ctrl+C: abort the current line
+        process.stdout.write('^C\\n'); line = ''; if (!busy) prompt();
+      } else if (ch === '\\x04') { // Ctrl+D on an empty line: exit
+        if (!line.length) { process.stdout.write('\\n'); process.exit(0); }
+      } else if (ch >= ' ') {
+        line += ch; process.stdout.write(ch);
+      }
+    }
+  });
+}
+
+if (argv[2]) runBatch();
+else runInteractive();
 `,
 };

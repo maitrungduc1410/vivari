@@ -76,4 +76,6 @@ parentPort.on("message", (msg) => {
   // A browser preview ws tunnel message relayed by the kernel (#19 stage C).
   else if (msg.type === "ws-open" || msg.type === "ws-in" || msg.type === "ws-close")
     control && control.dispatchWs(msg);
+  // An interactive stdin chunk for this process (host terminal / parent -> child).
+  else if (msg.type === "stdin") control && control.dispatchStdin(msg);
 });

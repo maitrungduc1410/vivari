@@ -110,4 +110,6 @@ self.onmessage = async (event) => {
   // A browser preview ws tunnel message relayed by the kernel (#19 stage C).
   else if (type === "ws-open" || type === "ws-in" || type === "ws-close")
     control && control.dispatchWs(event.data);
+  // An interactive stdin chunk for this process (host terminal / parent -> child).
+  else if (type === "stdin") control && control.dispatchStdin(event.data);
 };

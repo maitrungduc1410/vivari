@@ -1,4 +1,6 @@
 # Rust
+/packages/codec/target
+/packages/crypto/target
 /packages/kernel/target
 /packages/wasi-demo/target
 /target
@@ -10,6 +12,10 @@ node_modules
 /packages/demo-dist
 
 # Generated wasm packages (rebuild with `npm run build`)
+/packages/codec/pkg
+/packages/codec/pkg-node
+/packages/crypto/pkg
+/packages/crypto/pkg-node
 /packages/kernel/pkg
 /packages/kernel/pkg-node
 /packages/wasi-demo/pkg

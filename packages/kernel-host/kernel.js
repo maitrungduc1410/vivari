@@ -179,6 +179,9 @@ export class Kernel {
         // terminate a nested thread worker.
         "thread-spawn": (m) => this.handleThreadSpawn(pid, m),
         "thread-terminate": (m) => this.handleThreadTerminate(pid, m),
+        // Interactive stdin: this process wrote to a child's stdin — deliver the
+        // bytes to that child's own process.stdin.
+        "child-stdin": (m) => this.handleChildStdin(pid, m),
         // #19 stage C: this process relays a ws frame outward (in-VM ws server ->
         // browser preview) for a tunneled connection.
         "ws-out": (m) => this.handleWsOut(pid, m),
@@ -564,6 +567,22 @@ export class Kernel {
       }
     };
     this.respondOk(parent, encodeString(JSON.stringify({ pid: childPid })));
+  }
+
+  // Push an interactive stdin chunk into a running process' own process.stdin.
+  // `chunk` is a string (or null for EOF). Used by the host terminal (a live
+  // shell) and by handleChildStdin (parent -> child piping). No-op if the process
+  // is gone.
+  sendStdin(pid, chunk) {
+    return this.postToProc(pid | 0, { type: "stdin", chunk: chunk == null ? null : String(chunk) });
+  }
+
+  // A process wrote to one of its children's stdin (child.stdin.write): relay the
+  // bytes to that child's own process.stdin. We don't verify parentage — the pid
+  // came from a ChildProcess this parent holds — but only deliver to live procs.
+  handleChildStdin(parentPid, m) {
+    const childPid = m.childPid | 0;
+    if (this.procs.has(childPid)) this.sendStdin(childPid, m.chunk == null ? null : m.chunk);
   }
 
   // Deliver a signal to a running process. We ack the killer first (it called

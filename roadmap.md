@@ -1052,10 +1052,31 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     throws — a real but separate loader-compat gap, deferred since fixing it won't get Next
     past the SWC wall.) An older Next (13/14 with wasm SWC) might boot but needs the
     `module`-constructor emulation + webpack-in-VM and is a large, low-priority effort.
-  - The two working stacks are wired into a **StackBlitz-style IDE** (revamped —
+  - The two working stacks are wired into a **VS Code-style IDE** (revamped —
     see below): a project picker (**React + Vite + React Compiler**, **NestJS**),
-    a file tree + Monaco editor, and an xterm terminal, next to the live preview.
-    Driven by the `DEMOS` registry + `startDemo()` in `kernel-worker.js`.
+    an activity bar + Explorer, a Monaco editor with **multiple file tabs**, a
+    bottom **terminal panel with tabs** (a read-only Console for demo output plus
+    fully **interactive shells**), a command palette / quick-open, and a status
+    bar, next to the live preview. Driven by the `DEMOS` registry + `startDemo()`
+    and the `term-*` messages in `kernel-worker.js`.
+  - ✅ **Interactive terminal (real stdin, VS Code-style workbench).** The demo is
+    now a VS Code-like IDE: `index.html`/`host.js` render an activity bar, Explorer,
+    tabbed Monaco editor, a tabbed terminal panel, a command palette (`Ctrl/Cmd+
+    Shift+P`) + quick-open (`Ctrl/Cmd+P`), and a status bar. Each interactive
+    terminal is backed by a **long-lived in-VM `sh`** — type a command, Enter runs
+    it, cwd/env persist across commands, `+` opens more. This needed a real stdin
+    path the runtime never had (it was a no-op sink): `process.stdin` is now a
+    genuine **flowing TTY Readable** (`isTTY`, `setRawMode`, refs the loop while a
+    consumer reads) fed by a kernel→worker `{type:'stdin'}` message drained in a
+    loop turn (`doStdin`); `child.stdin.write()` relays parent→child via
+    `{type:'child-stdin'}` → `kernel.handleChildStdin` → the child's own stdin; the
+    kernel gained `sendStdin(pid)`; the `sh` coreutil gained a **REPL** (prompt,
+    local echo, backspace, Ctrl+C→SIGINT the foreground child, Ctrl+D exit) that
+    forwards raw input to a foreground child while one runs; `kernel-worker.js`
+    maps each xterm ↔ a shell pid and routes output per-pid (`term-out` vs the
+    Console). Also fixed `process.chdir()` to **resolve relative paths** (`cd sub`).
+    Validated headlessly by `scripts/probe-term.mjs` (echo/cd/pwd/backspace over
+    real stdin).
   - ✅ **Demo revamp — run the REAL dev flow, not a synthetic one.** Previously the
     demos hand-wrote `vite.createServer()`/`tsc` scripts and pre-built Nest. Now each
     demo scaffolds the **exact project layout `npm create vite@latest` / `nest new`

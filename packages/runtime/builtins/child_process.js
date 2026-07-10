@@ -13,7 +13,7 @@
 //
 // stdin (parent -> child) is deferred: `child.stdin` exists but is a no-op sink.
 
-export function createChildProcess({ sys, process, Buffer, EventEmitter, Readable, childLiveness, wake }) {
+export function createChildProcess({ sys, process, Buffer, EventEmitter, Readable, childLiveness, wake, postRaw }) {
   // ---- synchronous subset (unchanged) --------------------------------------
   function spawnSync(command, args = [], opts = {}) {
     if (!Array.isArray(args)) {
@@ -72,19 +72,37 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
   const registry = new Map(); // childPid -> ChildProcess
   const inbox = []; // queued { type, childPid, chunk?, code?, signal? } events
 
-  // A minimal stdin sink: present so `child.stdin.write(...).end()` never throws.
-  // Real parent->child piping is deferred to a later stage. It answers to the
+  // child.stdin: a Writable-ish sink that actually delivers to the child. write()
+  // relays the bytes to the kernel ({type:'child-stdin', childPid, chunk}); the
+  // kernel pushes them into the child process' own process.stdin (see
+  // kernel.handleChildStdin). end() sends EOF (null chunk). It also answers to the
   // whole stream-ish surface tools poke at — NestJS's watch-restart, for one,
   // calls `child.stdin.pause()` before recompiling, and chokidar/others cork or
-  // set encodings — so every method is a chainable no-op rather than undefined.
-  const makeStdin = () => ({
+  // set encodings — so the rest are chainable no-ops rather than undefined.
+  const makeStdin = (childPid) => ({
     writable: true,
     readable: false,
     destroyed: false,
-    write() {
+    write(chunk) {
+      if (childPid >= 0 && postRaw) {
+        const s = typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+        try {
+          postRaw({ type: "child-stdin", childPid, chunk: s });
+        } catch {
+          /* kernel/child gone */
+        }
+      }
       return true;
     },
-    end() {
+    end(chunk) {
+      if (chunk != null) this.write(chunk);
+      if (childPid >= 0 && postRaw) {
+        try {
+          postRaw({ type: "child-stdin", childPid, chunk: null });
+        } catch {
+          /* kernel/child gone */
+        }
+      }
       return this;
     },
     pause() {
@@ -154,7 +172,7 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
       // 'data' listener), exactly like a real child's piped stdio.
       this.stdout = new Readable({ read() {} });
       this.stderr = new Readable({ read() {} });
-      this.stdin = makeStdin();
+      this.stdin = makeStdin(pid);
       this.stdio = [this.stdin, this.stdout, this.stderr];
     }
     kill(signal = "SIGTERM") {
