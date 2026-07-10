@@ -54,6 +54,7 @@ const titlebarCenter = $("titlebar-center");
 
 let previewPort = null; // the demo server that owns the preview iframe
 let currentDemo = null; // { id, dir, reload, title }
+const runningDemos = new Map(); // demo id -> { terminalId, port } (a live dev-server tab)
 const localFiles = {}; // abs VFS path -> latest editor text (per session)
 const models = new Map(); // abs VFS path -> monaco model
 
@@ -311,11 +312,13 @@ function addConsole() {
 // start), so for the auto first terminal we defer that off the boot burst and
 // only actually spawn on first interaction (focus/keystroke) or when the browser
 // goes idle — whichever comes first. Explicit "New Terminal" starts immediately.
-function newShellTerminal({ defer = false } = {}) {
+function newShellTerminal({ defer = false, demo = null, label = null } = {}) {
   const id = "sh" + ++termSeq;
   const { term, fit, view } = makeTermView();
-  const label = "sh " + termSeq;
-  const entry = { term, fit, view, kind: "shell", label, pid: null, alive: true, started: false, pendingInput: [] };
+  const entry = {
+    term, fit, view, kind: "shell", label: label || "sh " + termSeq,
+    demo, pid: null, alive: true, started: false, pendingInput: [],
+  };
   terminals.set(id, entry);
   term.onData((data) => {
     if (!entry.started) {
@@ -342,7 +345,8 @@ function startShell(id) {
   if (!entry || entry.kind !== "shell" || entry.started) return;
   entry.started = true;
   entry.openedAt = performance.now(); // measure Process Worker boot (spawn → ready)
-  kernelWorker.postMessage({ type: "term-open", terminalId: id, cwd: currentDemo?.dir });
+  // A demo shell auto-runs the project's dev command in-VM (OC_RUN, kernel side).
+  kernelWorker.postMessage({ type: "term-open", terminalId: id, demo: entry.demo, cwd: currentDemo?.dir });
 }
 
 function closeTerminal(id) {
@@ -634,6 +638,14 @@ async function main() {
         if (t) {
           t.term.write(`\r\n\x1b[90m[process exited — code ${m.code}]\x1b[0m\r\n`);
           t.alive = false;
+          // A demo's dev-server tab ended → the server is gone. Drop it so Run
+          // starts a fresh one, and warn that the preview will now 502.
+          if (t.demo && runningDemos.get(t.demo)?.terminalId === m.terminalId) {
+            const gone = runningDemos.get(t.demo);
+            runningDemos.delete(t.demo);
+            if (gone?.port === previewPort)
+              statusEl.textContent = "dev server stopped — preview will 502 until you Run again";
+          }
         }
         break;
       }
@@ -645,16 +657,17 @@ async function main() {
         break;
 
       // The selected project's dev/app server is up: open its files + preview.
-      case "demo-ready":
+      case "demo-ready": {
         pointPreview(m.port);
-        runDemoBtn.disabled = false;
-        runDemoBtn.textContent = "Run";
-        demoSelect.disabled = false;
+        const r = runningDemos.get(m.id);
+        if (r) r.port = m.port;
+        else runningDemos.set(m.id, { terminalId: null, port: m.port });
         loadProject(m);
         statusEl.textContent = m.reload
           ? `${m.title} running — edits recompile + restart`
           : `${m.title} running — edits hot-reload`;
         break;
+      }
       // Nest --watch recompiled + restarted after an edit → reload the preview.
       case "demo-reload":
         if (m.port === previewPort) reloadPreview();
@@ -681,13 +694,22 @@ async function main() {
 
   runDemoBtn.addEventListener("click", () => {
     const demo = demoSelect.value;
-    runDemoBtn.disabled = true;
-    demoSelect.disabled = true;
-    runDemoBtn.textContent = "starting…";
-    statusEl.textContent = "installing from npm + booting in-VM…";
     togglePanel(true);
-    switchTerminal("console");
-    kernelWorker.postMessage({ type: "start-demo", demo });
+    // Already running in a tab? Don't start a second server (that would just
+    // EADDRINUSE) — focus its terminal and re-point the preview. To force the
+    // clash on purpose, open a manual shell (+) and type the command yourself.
+    const running = runningDemos.get(demo);
+    if (running && terminals.has(running.terminalId)) {
+      switchTerminal(running.terminalId);
+      if (running.port) pointPreview(running.port);
+      return;
+    }
+    // Fresh run: open a dedicated shell tab that scaffolds + runs the dev command
+    // in-VM (the server lives in this tab; closing it stops the server).
+    const label = demo === "nest" ? "npm run start:dev" : "npm run dev";
+    const tid = newShellTerminal({ demo, label });
+    runningDemos.set(demo, { terminalId: tid, port: null });
+    statusEl.textContent = "installing from npm + booting in-VM…";
   });
 
   // The Service Worker posts preview requests here; forward to the kernel worker,

@@ -346,60 +346,58 @@ const DEMOS = {
   },
 };
 
-const demoStarted = new Set();
-const demoReadyPorts = new Set(); // ports that reached "ready" once — a later
-// listen on the same port is a dev-server restart (Nest --watch), not a boot.
+// Per-demo state. `scaffolded` = starter files written once (never re-written, so
+// browser edits survive a re-run). `demoServing` = a demo's dev server on its port
+// has answered and the preview is pointed at it — a later listen on that port is
+// then a restart (Nest --watch) → reload, not a fresh boot. `demoReadyPending`
+// guards the single async readiness probe per port. `termDemo` maps a demo's shell
+// terminal back to its demo so closing that tab resets the demo's state.
+const scaffolded = new Set();
+const demoServing = new Set();
+const demoReadyPending = new Set();
+const termDemo = new Map(); // terminalId -> demo id
 
-async function startDemo(id) {
+// Write a demo's starter files into the VFS — once. Re-running or opening another
+// shell must NOT clobber edits the user made after the first scaffold.
+function scaffoldDemo(id) {
+  if (scaffolded.has(id)) return;
   const d = DEMOS[id];
-  if (!d) {
-    post("demo-status", { line: "unknown demo: " + id });
-    return;
+  for (const [rel, contents] of Object.entries(d.files)) {
+    const abs = d.dir + "/" + rel;
+    kernel.mkdirp(abs.slice(0, abs.lastIndexOf("/")));
+    kernel.writeFile(abs, contents);
   }
-  // Already running: just re-point the preview + editor at it.
-  if (demoStarted.has(id)) {
-    post("demo-ready", {
-      id, dir: d.dir, port: d.port, files: d.files, entry: d.entry, title: d.title, hmr: !!d.hmr, reload: !!d.reload,
-    });
-    return;
-  }
-  demoStarted.add(id);
+  scaffolded.add(id);
+}
+
+// The command a demo's shell auto-runs (OC_RUN) — exactly what you'd type locally.
+// Install only if node_modules isn't there yet, so a re-run with deps present goes
+// straight to the dev server (and EADDRINUSEs naturally if one is already bound —
+// we deliberately don't paper over that).
+function demoRunCommand(d) {
+  const run = d.runArgs && d.runArgs.length ? `${d.runCmd} ${d.runArgs.join(" ")}` : d.runCmd;
+  return kernel.exists(d.dir + "/node_modules") ? run : `npm install && ${run}`;
+}
+
+// Drive the preview once a demo's server actually answers: wait until it serves
+// (Vite rebinds during boot), prime the cold dep-optimize off the SW clock (Vite
+// only), then point the preview + open the project. At most once per port until
+// the demo's shell is closed (which clears demoServing so a re-run starts fresh).
+async function announceDemoReady(id, port) {
+  const d = DEMOS[id];
   try {
-    for (const [rel, contents] of Object.entries(d.files)) {
-      const abs = d.dir + "/" + rel;
-      kernel.mkdirp(abs.slice(0, abs.lastIndexOf("/")));
-      kernel.writeFile(abs, contents);
-    }
-    post("demo-status", { line: "npm install — resolving " + d.title + " from the registry…" });
-    // Stream install output to the terminal (no capture); resolves with the code.
-    const inst = await kernel.start("npm", ["install"], { cwd: d.dir, env: { FORCE_COLOR: "3" } });
-    if (inst.code !== 0) {
-      post("demo-status", { line: "npm install failed — see the terminal" });
-      demoStarted.delete(id);
-      return;
-    }
-    post("demo-status", { line: "starting the dev server…" });
-    // FORCE_COLOR=3 makes Vite/Nest/tsc emit truecolor ANSI so the terminal looks
-    // exactly like a local run. Long-running: launch() returns immediately.
-    kernel.launch(d.runCmd, d.runArgs, { cwd: d.dir, env: { FORCE_COLOR: "3" } });
-    await waitListen(d.port, 120000);
-    // Wait for the server to actually answer — not just bind — before pointing
-    // the preview at it (see waitServing: Vite rebinds during startup).
-    await waitServing(d.port, 60000);
-    // Prime the dev server so the cold dependency-optimize happens now, off the
-    // Service Worker's request clock (see warmDevServer). Vite only.
+    const ok = await waitServing(port, 60000);
+    if (!ok) return; // never answered; a later listen event can retry
     if (d.hmr) {
       post("demo-status", { line: "optimizing dependencies — first run only…" });
-      await warmDevServer(d.port);
+      await warmDevServer(port);
     }
-    demoReadyPorts.add(d.port);
+    demoServing.add(port);
     post("demo-ready", {
-      id, dir: d.dir, port: d.port, files: d.files, entry: d.entry, title: d.title, hmr: !!d.hmr, reload: !!d.reload,
+      id, dir: d.dir, port, files: d.files, entry: d.entry, title: d.title, hmr: !!d.hmr, reload: !!d.reload,
     });
-  } catch (err) {
-    post("log", { line: "[" + id + "] " + ((err && err.message) || err) + "\n", stream: "stderr" });
-    post("demo-status", { line: "failed to start — see the terminal" });
-    demoStarted.delete(id);
+  } finally {
+    demoReadyPending.delete(port);
   }
 }
 
@@ -418,12 +416,17 @@ const listening = new Set();
 const termByPid = new Map(); // shell pid -> terminalId
 const pidByTerm = new Map(); // terminalId -> shell pid
 
-// Open a new interactive shell for a terminal. cwd defaults to a running demo's
-// dir (so the terminal opens right in the project) or "/". PATH includes the
+// Open a new interactive shell for a terminal tab. A plain shell opens in a
+// running demo's dir (or "/"). A DEMO shell (`demoId` set — the "Run" button)
+// scaffolds the project, opens in its dir, and auto-runs the dev command via
+// OC_RUN, so the dev server lives *inside this tab* (closing it kills the server,
+// running it twice EADDRINUSEs — exactly like local dev). PATH includes the
 // project's node_modules/.bin so `vite`, `nest`, etc. resolve like a real shell.
-function openTerminal(terminalId, cwd) {
+function openTerminal(terminalId, cwd, demoId) {
   if (!kernel) return;
-  const dir = cwd || defaultTermCwd();
+  const d = demoId ? DEMOS[demoId] : null;
+  if (d) scaffoldDemo(demoId);
+  const dir = (d ? d.dir : cwd) || defaultTermCwd();
   const env = {
     PATH: dir + "/node_modules/.bin:/bin",
     HOME: "/",
@@ -431,6 +434,7 @@ function openTerminal(terminalId, cwd) {
     FORCE_COLOR: "3",
     PWD: dir,
   };
+  if (d) env.OC_RUN = demoRunCommand(d);
   const pid = kernel.launch("sh", [], { cwd: dir, env });
   if (pid < 0) {
     post("term-exit", { terminalId, code: 127 });
@@ -438,34 +442,19 @@ function openTerminal(terminalId, cwd) {
   }
   termByPid.set(pid, terminalId);
   pidByTerm.set(terminalId, pid);
+  if (d) termDemo.set(terminalId, demoId);
   post("term-ready", { terminalId, pid, cwd: dir });
 }
 
-// Where a fresh terminal starts: inside the running demo's project if one is up.
+// Where a fresh (non-demo) terminal starts: inside a scaffolded demo project if
+// there is one, else the root.
 function defaultTermCwd() {
-  for (const id of demoStarted) if (DEMOS[id]) return DEMOS[id].dir;
+  for (const id of scaffolded) if (DEMOS[id]) return DEMOS[id].dir;
   return "/";
 }
 // The File System Worker handle, kept module-scoped so the page-hide flush relay
 // (host -> here -> FS worker) can reach it. Set in boot().
 let fsWorkerRef = null;
-
-// Resolve once a process registers a listener on `port` (kernel.onListen fires).
-function waitListen(port, timeoutMs = 20000) {
-  return new Promise((resolve, reject) => {
-    if (listening.has(port)) return resolve();
-    const t0 = Date.now();
-    const iv = setInterval(() => {
-      if (listening.has(port)) {
-        clearInterval(iv);
-        resolve();
-      } else if (Date.now() - t0 > timeoutMs) {
-        clearInterval(iv);
-        reject(new Error("timed out waiting for a listener on port " + port));
-      }
-    }, 50);
-  });
-}
 
 // A bound port isn't the same as a *serving* one: Vite 8 (rolldown) binds :port
 // a few times during startup (bind → close → rebind), so the first `listen`
@@ -655,19 +644,37 @@ async function boot() {
     if (tid !== undefined) {
       termByPid.delete(pid);
       pidByTerm.delete(tid);
+      // If this was a demo's shell (its dev server was a child), the server just
+      // died with it: forget the demo's port state so the preview 502s and a later
+      // Run starts fresh (rather than being treated as a restart → reload).
+      const demoId = termDemo.get(tid);
+      if (demoId) {
+        termDemo.delete(tid);
+        const port = DEMOS[demoId].port;
+        demoServing.delete(port);
+        demoReadyPending.delete(port);
+        listening.delete(port);
+      }
       post("term-exit", { terminalId: tid, code: res.code });
     } else {
       post("exit", { pid, code: res.code });
     }
   };
   kernel.onListen = (port, pid) => {
-    const restart = demoReadyPorts.has(port); // seen before => a dev-server restart
     listening.add(port);
     post("listen", { port, pid });
-    if (restart) {
-      const id = demoForPort(port);
-      // Nest --watch recompiled + restarted the app; refresh the preview iframe.
-      if (id) post("demo-reload", { id, port, title: DEMOS[id].title });
+    const id = demoForPort(port);
+    if (!id) return; // a non-demo server (a user-launched app); nothing to wire
+    if (demoServing.has(port)) {
+      // Already serving on this port and it (re-)listened → a dev-server restart
+      // (Nest --watch recompiled + relaunched the app). Refresh the preview iframe.
+      post("demo-reload", { id, port, title: DEMOS[id].title });
+    } else if (!demoReadyPending.has(port)) {
+      // First real listen for this demo → probe until it serves, then point the
+      // preview. (Vite emits several transient listens during boot; the pending
+      // guard keeps this to a single probe.)
+      demoReadyPending.add(port);
+      announceDemoReady(id, port);
     }
   };
   kernel.onFetch = (url, info) =>
@@ -708,16 +715,12 @@ self.onmessage = async (event) => {
     return;
   }
 
-  // The user picked a demo and clicked "Run" in the host UI.
-  if (m.type === "start-demo") {
-    if (kernel) startDemo(m.demo);
-    return;
-  }
-
   // ── Interactive terminals ──────────────────────────────────────────────────
-  // Open a new shell for a terminal tab.
+  // Open a new shell for a terminal tab. `demo` set = the "Run" button: scaffold
+  // the project and auto-run its dev command in this shell (OC_RUN), so the server
+  // lives in this tab.
   if (m.type === "term-open") {
-    openTerminal(m.terminalId, m.cwd);
+    openTerminal(m.terminalId, m.cwd, m.demo);
     return;
   }
   // Keystrokes from an xterm — feed them to that terminal's shell stdin.

@@ -224,8 +224,17 @@ arrives — this is how blocking `accept()`/`execSync()`/blocking fetch work.
 - **Coreutils + shell**: `packages/kernel-host/coreutils.js` provides
   `echo/cat/ls/pwd/mkdir/rm/node/npm/npx/true/false` and a small `sh`. `sh` with
   no args is an **interactive REPL** (prompt, echo, backspace, Ctrl+C→SIGINT the
-  foreground child, Ctrl+D); with `-c`/a file it runs a batch. Installed into
-  `/bin` by `installCoreutils()`.
+  foreground child, Ctrl+D); with `-c`/a file it runs a batch. If `$OC_RUN` is set
+  it auto-runs that command line at startup (echoed like you'd typed it) then stays
+  interactive — used to run a demo's dev server *inside a terminal tab*. Installed
+  into `/bin` by `installCoreutils()`.
+- **Demos run like local dev**: the "Run" button opens a dedicated shell tab whose
+  `sh` has `OC_RUN="npm install && npm run dev …"` (install skipped once
+  `node_modules` exists). The dev server is therefore a child of that tab's shell:
+  closing the tab kills the server (preview then 502s), and starting the same
+  server again in another shell fails with `EADDRINUSE` — we don't intercept that.
+  The kernel worker watches `onListen` on the demo's port to point/reload the
+  preview (a re-listen on an already-serving port = a Nest `--watch` restart).
 - **npm**: `packages/kernel-host/programs/npm.js` is a from-scratch installer:
   semver resolution from registry packuments, tarball download via the blocking
   `OP_FETCH` (Fetcher Worker), gunzip via the platform-native

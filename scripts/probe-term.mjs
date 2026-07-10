@@ -72,6 +72,15 @@ const bsOk = out.includes("hi") && !out.includes("XYZ\r") && !/\bhi\b[\s\S]*XYZ/
 console.log("  backspace result contains 'hi', not 'XYZ': " + (out.includes("hi") && !/^hi.*XYZ/.test(out)));
 console.log("  raw: " + JSON.stringify(out.slice(-40)));
 
-const pass = sawPrompt && echoed && ran && cwdOk && out.includes("hi");
+section("OC_RUN auto-runs a command at startup (the demo 'Run' mechanism)");
+out = "";
+const autoPid = kernel.launch("sh", [], { cwd: "/work", env: { PATH: "/bin", OC_RUN: "echo autorun-ok" } });
+shellPid = autoPid; // route this shell's stdout into `out`
+await sleep(700);
+const autoRan = out.includes("autorun-ok");
+console.log("  auto-ran OC_RUN without any stdin: " + autoRan);
+console.log("  raw: " + JSON.stringify(out.slice(0, 80)));
+
+const pass = sawPrompt && echoed && ran && cwdOk && out.includes("autorun-ok") && autoRan;
 console.log("\nRESULT: " + (pass ? "PASS" : "FAIL"));
 process.exit(pass ? 0 : 1);

@@ -304,6 +304,15 @@ function runInteractive() {
   process.stdout.write('OpenContainer shell — type commands, Enter to run.\\n');
   prompt();
 
+  // Auto-run a command at startup (OC_RUN), exactly as if the user had typed it.
+  // Used by the demo "Run" button so a dev server runs IN this shell tab (its
+  // lifecycle == the tab's): echo it after the prompt, then execute. If it is a
+  // long-running server the drain stays busy on it (the tab is "held" like a real
+  // \`npm run dev\`); Ctrl+C / closing the tab kills it. Control returns to an
+  // interactive prompt if/when it exits.
+  const auto = process.env.OC_RUN;
+  if (auto) { process.stdout.write(auto + '\\n'); queue.push(auto); drain(); }
+
   process.stdin.on('data', (buf) => {
     const s = typeof buf === 'string' ? buf : buf.toString('utf8');
     // A foreground child owns stdin: Ctrl+C interrupts it (SIGINT); otherwise pass

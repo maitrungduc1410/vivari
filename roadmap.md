@@ -1189,8 +1189,22 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     on a known demo port (`demoReadyPorts`) and posts `demo-reload`, so the host
     reloads the preview iframe. The worker no longer orchestrates the rebuild (the old
     `reloadDemo()`/`tsc`/`stop`+`launch` dance is gone) — it just writes the file and
-    lets the project's tooling react, exactly like local dev. `kernel.launch()` (spawn
-    a background process, return pid now) is still used to start the dev server.
+    lets the project's tooling react, exactly like local dev.
+  - ✅ **Dev servers now run *inside a shell tab* (real local-dev lifecycle).** "Run"
+    no longer orchestrates `npm install` + `launch()` behind the scenes and streams to
+    the Console. Instead it opens a dedicated terminal tab whose interactive `sh`
+    auto-runs `OC_RUN` = `npm install && npm run dev …` (install skipped once
+    `node_modules` exists). Consequences, all intentional and matching local dev: the
+    dev server is a child of that tab's shell, so **closing the tab kills the server**
+    (the preview then 502s on refresh — the process is genuinely gone); **running the
+    same server twice** (Run again, or typing the command in a second shell) fails with
+    `EADDRINUSE` and we **don't intercept it** (Vite may pick another port; its call).
+    Preview wiring moved to `kernel.onListen`: the first real listen on a demo port
+    probes-until-serving + warms (Vite) then points the preview; a later listen on an
+    already-serving port is a Nest `--watch` restart → reload. Closing the demo shell
+    clears that port's state so a later Run is a clean boot. Scaffolding writes the
+    starter files **once** (`scaffolded` set) so browser edits survive a re-run.
+    Validated headlessly by `scripts/probe-term.mjs` (OC_RUN auto-runs with no stdin).
   - ✅ **Cold-boot latency work (perceived startup).** The nested workers used to load
     one-after-another. Now (1) the **Fetcher Worker is created in parallel** with the
     File System Worker (it needs neither the VFS nor the codecs); (2) the demo's

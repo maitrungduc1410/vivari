@@ -65,7 +65,7 @@ packages/
 
   demo/            Browser wiring (dev, loaded as raw ES modules).
     host.js            main thread: UI, SW registration, request relay.
-    kernel-worker.js   hosts the Kernel; DEMOS registry + startDemo().
+    kernel-worker.js   hosts the Kernel; DEMOS registry + demo shell tabs (OC_RUN).
     fs-worker.js       hosts the File System Worker (VFS + OPFS).
     fetcher-worker.js  outbound fetch() (npm downloads).
     process-worker.js  one process = one worker (boots the runtime).
@@ -198,9 +198,11 @@ addition and implement it in the matching `lib/`/binding.
 
 ### Ports & long-lived servers
 Each demo binds a port; a leftover long-lived server squatting a port causes
-`EADDRINUSE` for the next demo. The kernel worker's `boot()` deliberately does
-**not** auto-run any server — demos are started on demand via the `DEMOS` registry
-/ `startDemo(id)`. Don't reintroduce a background server into `boot()`.
+`EADDRINUSE` for the next run. The kernel worker's `boot()` deliberately does
+**not** auto-run any server — a demo starts on demand when "Run" opens a shell tab
+that auto-runs its dev command (`OC_RUN`, via `openTerminal`). Closing that tab
+kills the server subtree and frees the port. Don't reintroduce a background server
+into `boot()`, and don't route dev-server output anywhere but its shell tab.
 
 ### Killing a process must kill its subtree
 `kernel.finalize(pid)` cascades to every process whose `parentPid === pid` (and so
@@ -278,13 +280,17 @@ the gap can't silently regress.
 - **Add a demo**: extend the `DEMOS` registry in `demo/kernel-worker.js` with a
   REAL project layout (`files` = relative path → contents, exactly what `npm create
   …` emits), plus `dir`, `port`, `entry`, and a `runCmd`/`runArgs` that is the
-  project's own dev script (e.g. `npm run dev`). `startDemo()` scaffolds the files,
-  runs `npm install` (streaming to the terminal), `kernel.launch()`es the script,
-  and waits for the port. Add the option to the `<select>` in `index.html`. `hmr:
-  true` = the in-VM dev server hot-updates on save; `reload: true` = no HMR, so the
-  server restarts on change and we reload the preview when it re-`listen`s (Nest
-  `--watch`). Edits from Monaco are written straight to the VFS — the project's own
-  watcher does the rest; there is no build/restart orchestration in the worker.
+  project's own dev script (e.g. `npm run dev`). Add the option to the `<select>` in
+  `index.html`. "Run" opens a dedicated shell tab whose `sh` auto-runs
+  `OC_RUN="npm install && <runCmd runArgs>"` (`scaffoldDemo()` writes the files once;
+  install is skipped once `node_modules` exists), so the **dev server lives in that
+  tab** — closing it stops the server, a double-run `EADDRINUSE`s (not intercepted).
+  Preview wiring is driven by `kernel.onListen` (see `announceDemoReady`): first real
+  listen → probe-until-serving (+ Vite warm) → point preview; a later listen on an
+  already-serving port = a Nest `--watch` restart → reload. `hmr: true` = hot-update
+  on save; `reload: true` = server restarts on change. Edits from Monaco write
+  straight to the VFS — the project's own watcher does the rest; no build/restart
+  orchestration in the worker.
 - **Change the syscall ABI**: edit `protocol/syscall.js` (+ its format comment) and
   update all three sides (`fs-client.js`, `fs-server.js`, `kernel.js`) together.
 - **Ship a bundle**: `npm run build:demo` (regenerates `demo-dist/`, stamps a new
