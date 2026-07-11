@@ -253,6 +253,41 @@ export function createRuntime({
   const http = nodeModules.require("http");
   const assert = createAssert(util);
 
+  // ---- real event surface on `process` --------------------------------------
+  // Node's `process` IS an EventEmitter, and real tools depend on it: npm's
+  // logging/output (`proc-log`) is literally `process.emit('output'|'log', ...)`
+  // consumed by a `process.on('output', ...)` handler, and libraries register
+  // `process.on('exit'|'uncaughtException'|...)`. The boot stub's no-op on/emit
+  // silently dropped every event (npm ran but printed nothing). Mix a genuine
+  // EventEmitter's methods onto the existing process object (keeping its own
+  // props like exit/stdout/cwd) and give it an unlimited listener budget.
+  {
+    const ee = new EventEmitter();
+    ee.setMaxListeners(0);
+    const chainable = new Set([
+      "on", "addListener", "once", "prependListener", "prependOnceListener",
+      "off", "removeListener", "removeAllListeners", "setMaxListeners",
+    ]);
+    const methods = [
+      ...chainable,
+      "getMaxListeners", "listeners", "rawListeners", "listenerCount", "eventNames", "emit",
+    ];
+    for (const m of methods) {
+      process[m] = (...args) => {
+        const r = ee[m](...args);
+        return chainable.has(m) ? process : r; // Node returns the emitter (→ process) for chainable ops
+      };
+    }
+  }
+  // Node's process.exit([code]) defaults to process.exitCode when code is omitted
+  // (npm's exit-handler sets process.exitCode then calls process.exit()). The stub
+  // exit() throws the loop's exit sentinel; wrap it to resolve the default here.
+  {
+    const rawExit = process.exit;
+    process.exit = (code) =>
+      rawExit(code == null ? (process.exitCode == null ? 0 : process.exitCode | 0) : code | 0);
+  }
+
   // ---- interactive stdin (real, flowing TTY) --------------------------------
   // Replace the boot-time no-op stdin with a genuine flowing Readable so a REPL,
   // readline, or our shell's line editor can read keystrokes the kernel pushes in
@@ -685,13 +720,31 @@ export function createRuntime({
      * fire. Resolves with the process exit code.
      */
     async run(entry) {
+      // Node fires a single synchronous 'exit' event with the final code right
+      // before the process goes away — tools flush buffered output/logs there
+      // (npm's exit-handler). Emit it once across every exit path below. A
+      // listener may itself call process.exit() (→ throws the sentinel); we're
+      // already exiting, so swallow it.
+      let exitEmitted = false;
+      const finish = (code) => {
+        if (!exitEmitted) {
+          exitEmitted = true;
+          if (process.exitCode == null) process.exitCode = code;
+          try {
+            process.emit("exit", code);
+          } catch {
+            /* a listener called process.exit() — the sentinel is expected */
+          }
+        }
+        return code;
+      };
       let started;
       try {
         // Runs the entry's synchronous body now (may throw the process.exit
         // sentinel). Returns a Promise if the entry used top-level await.
         started = moduleSystem.runMain(entry);
       } catch (err) {
-        if (err && err.__processExit !== undefined) return err.__processExit;
+        if (err && err.__processExit !== undefined) return finish(err.__processExit);
         throw err;
       }
       // A top-level-await entry evaluates to a Promise. Do NOT block on it before
@@ -713,7 +766,8 @@ export function createRuntime({
         });
       }
       await loop.drive();
-      return loop.exiting ? loop.exitCode : 0;
+      const code = loop.exiting ? loop.exitCode : process.exitCode == null ? 0 : process.exitCode | 0;
+      return finish(code);
     },
   };
 }

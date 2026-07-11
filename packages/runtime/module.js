@@ -7,7 +7,7 @@
 // directory/index/package.json "main"), and bare specifiers walked up through
 // node_modules.
 
-import { transpileEsm } from "./esm.js";
+import { transpileEsm, rewriteCjsDynamicImport } from "./esm.js";
 
 // The constructor for `async function () {}` — used to (re)compile an ESM module
 // that uses top-level await (our normal wrapper is a plain, non-async function).
@@ -359,6 +359,13 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
         source = esm;
         isEsm = true;
       }
+    }
+    // Pure CJS still needs its dynamic `import()` routed through our loader (ESM
+    // files got theirs rewritten above). Otherwise `await import('chalk')` in a
+    // CommonJS module escapes to the host realm's native import(). See esm.js.
+    if (!isEsm) {
+      const rewritten = rewriteCjsDynamicImport(source, filename);
+      if (rewritten != null) source = rewritten;
     }
 
     const dirname = path.dirname(filename);

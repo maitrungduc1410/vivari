@@ -235,6 +235,41 @@ function applyEdits(src, edits) {
 }
 
 /**
+ * Rewrite dynamic `import()` in a PURE-CJS module so it routes through our
+ * synchronous loader instead of the host realm's native `import()`. Without this,
+ * a `const x = await import('esm-only-pkg')` inside a CommonJS file (e.g. npm's
+ * chalk@5 usage) escapes the sandbox — the host Node resolves the specifier
+ * against our runtime source dir and throws ERR_MODULE_NOT_FOUND. Returns the
+ * rewritten source, or null if there are no dynamic imports to rewrite.
+ *
+ * Only for CJS: ESM files already get their dynamic imports rewritten by
+ * transpileEsm. The injected `__oc_import` closes over the CJS wrapper's own
+ * `require`, so relative specifiers resolve from the importing module, and it
+ * synthesizes an ESM-style namespace (with `default`) for CJS targets.
+ */
+export function rewriteCjsDynamicImport(source, filename) {
+  let parsed;
+  try {
+    parsed = parse(source, filename || "module");
+  } catch {
+    return null;
+  }
+  const imports = parsed[0];
+  const edits = [];
+  for (const imp of imports) {
+    if (imp.t === T_DYNAMIC) edits.push({ start: imp.ss, end: imp.d, text: "__oc_import" });
+  }
+  if (!edits.length) return null;
+  // One leading line (preserves user line numbers). Uses the wrapper's `require`.
+  const head =
+    "const __oc_import=function(s){return Promise.resolve().then(function(){" +
+    "var m=require(s);if(m&&m.__esModule)return m;" +
+    "var ns=Object.create(null);if(m&&typeof m==='object')for(var k of Object.keys(m))ns[k]=m[k];ns.default=m;return ns;" +
+    "});};";
+  return head + applyEdits(source, edits);
+}
+
+/**
  * Transpile ESM source to our CJS. Returns the rewritten source, or null if the
  * file has no module syntax at all (pure CJS — load it unchanged).
  */
