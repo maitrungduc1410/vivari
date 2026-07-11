@@ -1,4 +1,5 @@
-import { Files, TerminalIcon, Play, Search } from "lucide-react";
+import Files from "~icons/lucide/files";
+import Search from "~icons/lucide/search";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { useIde } from "./useIde";
@@ -26,19 +27,20 @@ function ActBtn({
 
 export function ActivityBar() {
   const { c, snap } = useIde();
+  // Clicking the active view toggles the sidebar (VS Code behaviour); otherwise
+  // switch to it.
+  const select = (view: "explorer" | "search") => {
+    if (snap.activeView === view && !snap.sidebarCollapsed) c.toggleSidebar();
+    else c.setActiveView(view);
+  };
+  const shown = (view: "explorer" | "search") => snap.activeView === view && !snap.sidebarCollapsed;
   return (
     <div className="flex w-12 shrink-0 flex-col items-center border-r bg-sidebar py-1">
-      <ActBtn label="Explorer" active={!snap.sidebarCollapsed} onClick={() => c.toggleSidebar()}>
+      <ActBtn label="Explorer" active={shown("explorer")} onClick={() => select("explorer")}>
         <Files className="size-5" />
       </ActBtn>
-      <ActBtn label="Run project" onClick={() => c.runDemo()}>
-        <Play className="size-5" />
-      </ActBtn>
-      <ActBtn label="Quick open (⌘P)" onClick={() => c.openPalette("file")}>
+      <ActBtn label="Search" active={shown("search")} onClick={() => select("search")}>
         <Search className="size-5" />
-      </ActBtn>
-      <ActBtn label="Terminal (⌃`)" active={!snap.panelCollapsed} onClick={() => c.togglePanel()}>
-        <TerminalIcon className="size-5" />
       </ActBtn>
     </div>
   );

@@ -64,7 +64,7 @@ packages/
       internal-binding.js / primordials.js / loader.js   glue for the above.
 
   studio/          The primary UI: a Vite + React 19 (React Compiler) + Tailwind v4
-                   + shadcn/ui + lucide app. Vite is the single toolchain and also
+                   + shadcn/ui + Iconify app. Vite is the single toolchain and also
                    BUNDLES the worker roles below + the wasm (nested module workers
                    via `new Worker(new URL(...), {type:'module'})`, wasm via
                    `new URL(..._bg.wasm, import.meta.url)`). Run with `npm run dev`.
@@ -77,10 +77,15 @@ packages/
     src/oc/kernel.ts      KernelBridge: spawns demo/kernel-worker.js, SW register +
                           oc-http relay, typed pub/sub over the worker protocol.
     src/oc/controller.ts  IdeController: the imperative core ported from demo/host.js
-                          (Monaco, xterm terminals, demo Run via OC_RUN, preview) as an
-                          external store React reads via useSyncExternalStore.
-    src/components/ide/   AppShell · ActivityBar · Explorer · EditorGroup · TerminalPanel ·
-                          PreviewPanel · StatusBar · CommandPalette (shadcn/Tailwind/lucide).
+                          (Monaco, xterm terminals, demo Run via OC_RUN, preview, Explorer
+                          file ops via oc-rename/oc-rm/oc-copy) as an external store React
+                          reads via useSyncExternalStore.
+    src/components/ide/   AppShell · ActivityBar (Explorer/Search) · Explorer (context-menu
+                          file ops) · SearchPane · EditorGroup (preview/permanent tabs) ·
+                          TerminalPanel (Console/Terminal/Ports) · PreviewPanel · StatusBar ·
+                          CommandPalette · fileIcon (vscode-icons). Icons are Iconify via
+                          unplugin-icons (`~icons/lucide/*`, `~icons/vscode-icons/*`; needs
+                          @svgr/core) — do NOT reintroduce lucide-react.
 
   demo/            LEGACY raw-ESM UI (still runnable via `npm run dev:legacy` on
                    server.mjs). Its WORKER files are the shared runtime host and are
@@ -286,7 +291,7 @@ browser first.
   `probe-nest-watch.mjs` validates the Nest save→recompile→restart reload.
 - Browser smoke test: `npm run dev` (studio, Vite — opens on `http://localhost:5173`
   by default), pick a project + Run, then check the terminal (Vite/Nest colored
-  output), edit a file in Monaco (auto-saves → HMR/restart), and the preview iframe.
+  output), edit a file in Monaco (⌘S to save → HMR/restart), and the preview iframe.
   Legacy UI: `npm run dev:legacy` → `http://localhost:8080/packages/demo/index.html`
   (bundled: `npm run build:demo` → `packages/demo-dist/index.html`).
 - Headless studio check (no manual browser): the studio exposes `window.__ide` (the

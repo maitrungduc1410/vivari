@@ -86,14 +86,35 @@ export class Kernel {
   writeFile(path, contents) {
     this.fs.writeFile(path, contents);
   }
+  readFile(path) {
+    return this.fs.readFile(path);
+  }
+  readFileBytes(path) {
+    return this.fs.readFileBytes(path);
+  }
   mkdirp(path) {
     this.fs.mkdirp(path);
+  }
+  readdir(path) {
+    return this.fs.readdir(path);
+  }
+  stat(path) {
+    return this.fs.stat(path);
   }
   isFile(path) {
     return this.fs.isFile(path);
   }
   exists(path) {
     return this.fs.exists(path);
+  }
+  unlink(path) {
+    this.fs.unlink(path);
+  }
+  rmdir(path) {
+    this.fs.rmdir(path);
+  }
+  rename(from, to) {
+    this.fs.rename(from, to);
   }
 
   /** Install the built-in programs into /bin so they are available on PATH. */

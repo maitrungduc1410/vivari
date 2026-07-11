@@ -10,6 +10,7 @@
 
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { toast } from "sonner";
 import type * as Monaco from "monaco-editor";
 import { KernelBridge, type KernelMessage } from "./kernel";
 
@@ -34,6 +35,16 @@ export interface TerminalMeta {
   alive: boolean;
 }
 
+export interface PortInfo {
+  port: number;
+  pid: number;
+}
+
+export interface Clipboard {
+  mode: "copy" | "cut";
+  rel: string;
+}
+
 export interface IdeSnapshot {
   booted: boolean;
   status: string;
@@ -42,14 +53,19 @@ export interface IdeSnapshot {
   files: string[]; // rel paths (tree + quick-open)
   openTabs: string[]; // rel paths
   activeTab: string | null;
+  previewTab: string | null; // the single "preview" (italic, single-click) tab
   dirty: string[]; // rel paths with unsaved edits
   terminals: TerminalMeta[];
   activeTermId: string | null;
+  ports: PortInfo[];
   previewPort: number | null;
   previewNonce: number;
   selectedDemo: string;
+  activeView: "explorer" | "search";
   sidebarCollapsed: boolean;
   panelCollapsed: boolean;
+  panelTab: "console" | "terminal" | "ports";
+  clipboard: Clipboard | null;
   paletteOpen: boolean;
   paletteMode: "command" | "file";
 }
@@ -112,14 +128,19 @@ export class IdeController {
     files: [],
     openTabs: [],
     activeTab: null,
+    previewTab: null,
     dirty: [],
     terminals: [],
     activeTermId: null,
+    ports: [],
     previewPort: null,
     previewNonce: 0,
     selectedDemo: DEMOS[0].id,
+    activeView: "explorer",
     sidebarCollapsed: false,
     panelCollapsed: true,
+    panelTab: "console",
+    clipboard: null,
     paletteOpen: false,
     paletteMode: "command",
   };
@@ -137,7 +158,7 @@ export class IdeController {
   private projectFiles: Record<string, string> = {}; // rel -> contents
   private localFiles: Record<string, string> = {}; // abs -> latest text
   private runningDemos = new Map<string, { terminalId: string | null; port: number | null }>();
-  private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private portMap = new Map<number, number>(); // port -> pid (live listeners)
   private started = false;
 
   constructor() {
@@ -162,6 +183,13 @@ export class IdeController {
         const t = this.terms.get(id)!;
         return { id, label: t.label, kind: t.kind, alive: t.alive };
       }),
+    });
+  }
+  private syncPorts() {
+    this.set({
+      ports: [...this.portMap]
+        .map(([port, pid]) => ({ port, pid }))
+        .sort((a, b) => a.port - b.port),
     });
   }
 
@@ -206,13 +234,13 @@ export class IdeController {
       pid: null, alive: true, started: true, opened: false, openedAt: 0, pendingInput: [],
     });
     this.termOrder.push("console");
-    this.snap.activeTermId = "console";
   }
 
   // Create a shell terminal tab (defer = spawn the Process Worker lazily, off the
-  // cold-boot burst; explicit New Terminal / Run start it right away).
-  newShellTerminal({ defer = false, demo = null, label = null }: {
-    defer?: boolean; demo?: string | null; label?: string | null;
+  // cold-boot burst; explicit New Terminal / Run start it right away). `activate`
+  // = switch the panel to this terminal (false for the background boot shell).
+  newShellTerminal({ defer = false, demo = null, label = null, activate = true }: {
+    defer?: boolean; demo?: string | null; label?: string | null; activate?: boolean;
   } = {}): string {
     const id = "sh" + ++this.termSeq;
     const { term, fit } = this.makeTerm();
@@ -230,8 +258,11 @@ export class IdeController {
       }
       this.bridge.post("term-input", { terminalId: id, chunk: data });
     });
+    // Adopt as the active shell if none is selected yet (keeps the Terminal tab
+    // pointing at a real shell even for the background boot terminal).
+    if (this.snap.activeTermId === null) this.set({ activeTermId: id });
     this.syncTerminals();
-    this.switchTerminal(id);
+    if (activate) this.switchTerminal(id);
     if (defer) {
       if (typeof requestIdleCallback === "function") requestIdleCallback(() => this.startShell(id), { timeout: 2500 });
       else setTimeout(() => this.startShell(id), 1500);
@@ -250,8 +281,14 @@ export class IdeController {
   }
 
   switchTerminal(id: string) {
-    if (!this.terms.has(id)) return;
-    this.set({ activeTermId: id, panelCollapsed: false });
+    const t0 = this.terms.get(id);
+    if (!t0) return;
+    // The console has its own panel tab; shells live under the Terminal tab.
+    const patch: Partial<IdeSnapshot> =
+      t0.kind === "console"
+        ? { panelTab: "console", panelCollapsed: false }
+        : { panelTab: "terminal", activeTermId: id, panelCollapsed: false };
+    this.set(patch);
     // Fit + focus once React has flipped visibility.
     requestAnimationFrame(() => {
       const t = this.terms.get(id);
@@ -259,6 +296,24 @@ export class IdeController {
       try { t.fit.fit(); } catch { /* not visible */ }
       t.term.focus();
     });
+  }
+
+  setPanelTab(tab: "console" | "terminal" | "ports") {
+    this.set({ panelTab: tab, panelCollapsed: false });
+    if (tab === "console" || tab === "terminal") {
+      const id = tab === "console" ? "console" : this.snap.activeTermId;
+      requestAnimationFrame(() => {
+        if (!id) return;
+        const t = this.terms.get(id);
+        if (!t) return;
+        try { t.fit.fit(); } catch { /* hidden */ }
+        t.term.focus();
+      });
+    }
+  }
+
+  setActiveView(view: "explorer" | "search") {
+    this.set({ activeView: view, sidebarCollapsed: false });
   }
 
   closeTerminal(id: string) {
@@ -269,8 +324,9 @@ export class IdeController {
     this.terms.delete(id);
     this.termOrder = this.termOrder.filter((x) => x !== id);
     if (this.snap.activeTermId === id) {
-      const next = this.termOrder[this.termOrder.length - 1] || "console";
-      this.switchTerminal(next);
+      const nextShell = [...this.termOrder].reverse().find((x) => this.terms.get(x)?.kind === "shell") ?? null;
+      if (nextShell) this.switchTerminal(nextShell);
+      else this.set({ activeTermId: null, panelTab: "console" });
     }
     this.syncTerminals();
   }
@@ -299,7 +355,8 @@ export class IdeController {
   }
 
   clearActiveTerminal() {
-    this.terms.get(this.snap.activeTermId ?? "")?.term.clear();
+    const id = this.snap.panelTab === "console" ? "console" : this.snap.activeTermId;
+    this.terms.get(id ?? "")?.term.clear();
   }
 
   // ── editor ──────────────────────────────────────────────────────────────
@@ -343,12 +400,33 @@ export class IdeController {
     if (this.snap.activeTab) this.openFile(this.snap.activeTab);
   }
 
-  openFile(rel: string) {
+  // Open a file. `preview` (single-click from the Explorer) reuses a single
+  // italic "preview" tab; a permanent open (double-click, or an edit) pins it.
+  openFile(rel: string, { preview = false }: { preview?: boolean } = {}) {
     if (!this.currentDemo) return;
+
+    // Reconcile the tab strip + preview slot.
+    const already = this.snap.openTabs.includes(rel);
+    let openTabs = this.snap.openTabs;
+    let previewTab = this.snap.previewTab;
+    if (preview) {
+      if (already) {
+        // existing tab — activate it; a permanent tab stays permanent.
+      } else if (previewTab && this.snap.openTabs.includes(previewTab)) {
+        openTabs = this.snap.openTabs.map((t) => (t === previewTab ? rel : t)); // reuse the slot
+        previewTab = rel;
+      } else {
+        openTabs = [...this.snap.openTabs, rel];
+        previewTab = rel;
+      }
+    } else {
+      if (!already) openTabs = [...this.snap.openTabs, rel];
+      if (previewTab === rel) previewTab = null; // promote to permanent
+    }
+
     if (!this.editor || !this.monaco) {
       // editor still loading — remember the intent
-      if (!this.snap.openTabs.includes(rel)) this.set({ openTabs: [...this.snap.openTabs, rel] });
-      this.set({ activeTab: rel });
+      this.set({ openTabs, previewTab, activeTab: rel });
       return;
     }
     const monaco = this.monaco;
@@ -358,42 +436,67 @@ export class IdeController {
       const uri = monaco.Uri.file(abs);
       model = monaco.editor.getModel(uri) || monaco.editor.createModel(this.localFiles[abs] ?? "", languageFor(rel), uri);
       model.onDidChangeContent(() => {
-        if (!this.snap.dirty.includes(rel)) this.set({ dirty: [...this.snap.dirty, rel] });
-        this.scheduleSave(abs, rel);
+        // No auto-save — an edit just marks the tab dirty (⌘S / the close prompt
+        // persists it). Reverting back to the saved text clears the dirty flag.
+        const changed = model!.getValue() !== (this.localFiles[abs] ?? "");
+        const isDirty = this.snap.dirty.includes(rel);
+        if (changed && !isDirty) this.set({ dirty: [...this.snap.dirty, rel] });
+        else if (!changed && isDirty) this.set({ dirty: this.snap.dirty.filter((x) => x !== rel) });
+        if (changed && this.snap.previewTab === rel) this.set({ previewTab: null }); // editing pins the tab
       });
       this.models.set(abs, model);
     }
     this.editor.setModel(model);
-    const openTabs = this.snap.openTabs.includes(rel) ? this.snap.openTabs : [...this.snap.openTabs, rel];
-    this.set({ activeTab: rel, openTabs });
+    this.set({ activeTab: rel, openTabs, previewTab });
     this.editor.focus();
+  }
+
+  // Double-clicking a preview tab (or Explorer entry) pins it permanently.
+  pinTab(rel: string) {
+    if (this.snap.previewTab === rel) this.set({ previewTab: null });
   }
 
   closeTab(rel: string) {
     const i = this.snap.openTabs.indexOf(rel);
     if (i === -1) return;
     const openTabs = this.snap.openTabs.filter((x) => x !== rel);
+    const previewTab = this.snap.previewTab === rel ? null : this.snap.previewTab;
     if (this.snap.activeTab === rel) {
       const next = openTabs[i] || openTabs[i - 1] || null;
-      this.set({ openTabs, activeTab: next });
+      this.set({ openTabs, previewTab, activeTab: next });
       if (next) this.openFile(next);
       else this.editor?.setModel(null);
     } else {
-      this.set({ openTabs });
+      this.set({ openTabs, previewTab });
     }
   }
 
-  private scheduleSave(abs: string, rel: string) {
-    if (this.saveTimer) clearTimeout(this.saveTimer);
-    this.saveTimer = setTimeout(() => {
-      const contents = this.models.get(abs)?.getValue() ?? this.localFiles[abs] ?? "";
-      this.localFiles[abs] = contents;
-      this.bridge.post("oc-write", { path: abs, contents });
-      this.set({
-        dirty: this.snap.dirty.filter((x) => x !== rel),
-        status: this.currentDemo?.reload ? `saved ${rel} — recompiling…` : `saved ${rel} — hot-updating…`,
-      });
-    }, 350); // debounce a burst of keystrokes into one write
+  // Persist a file to the VFS (⌘S, or "Save" in the close prompt). The dev server
+  // hot-updates/recompiles off the resulting notifyWatch.
+  saveFile(rel: string) {
+    if (!this.currentDemo || !this.snap.dirty.includes(rel)) return;
+    const abs = this.currentDemo.dir + "/" + rel;
+    const contents = this.models.get(abs)?.getValue() ?? this.localFiles[abs] ?? "";
+    this.localFiles[abs] = contents;
+    this.bridge.post("oc-write", { path: abs, contents });
+    this.set({
+      dirty: this.snap.dirty.filter((x) => x !== rel),
+      status: this.currentDemo.reload ? `saved ${rel} — recompiling…` : `saved ${rel} — hot-updating…`,
+    });
+  }
+
+  saveActiveFile() {
+    if (this.snap.activeTab) this.saveFile(this.snap.activeTab);
+  }
+
+  // Throw away unsaved edits, reverting the model to the last-saved text.
+  discardFile(rel: string) {
+    if (!this.currentDemo) return;
+    const abs = this.currentDemo.dir + "/" + rel;
+    const model = this.models.get(abs);
+    const saved = this.localFiles[abs] ?? "";
+    if (model && model.getValue() !== saved) model.setValue(saved); // fires onDidChangeContent → clears dirty
+    this.set({ dirty: this.snap.dirty.filter((x) => x !== rel) });
   }
 
   private loadProject(m: KernelMessage) {
@@ -408,6 +511,131 @@ export class IdeController {
     else {
       const first = Object.keys(this.projectFiles)[0];
       if (first) this.openFile(first);
+    }
+  }
+
+  // ── file operations (Explorer context menu) ──────────────────────────────
+  private absOf(rel: string): string {
+    return this.currentDemo ? this.currentDemo.dir + "/" + rel : rel;
+  }
+  // Is `rel` an existing file, or a directory prefix of existing files?
+  private pathExists(rel: string): boolean {
+    return this.snap.files.some((f) => f === rel || f.startsWith(rel + "/"));
+  }
+  // Return `rel` (or `name-copy.ext`, `-copy-2`, …) so a paste never clobbers.
+  private uniqueName(rel: string): string {
+    if (!this.pathExists(rel)) return rel;
+    const slash = rel.lastIndexOf("/");
+    const dir = slash === -1 ? "" : rel.slice(0, slash + 1);
+    const base = slash === -1 ? rel : rel.slice(slash + 1);
+    const dot = base.lastIndexOf("."); // leading dot (dotfile) => treat as no extension
+    const stem = dot > 0 ? base.slice(0, dot) : base;
+    const ext = dot > 0 ? base.slice(dot) : "";
+    for (let n = 1; ; n++) {
+      const candidate = `${dir}${stem}-copy${n > 1 ? `-${n}` : ""}${ext}`;
+      if (!this.pathExists(candidate)) return candidate;
+    }
+  }
+
+  private disposeModel(abs: string) {
+    const model = this.models.get(abs);
+    if (!model) return;
+    if (this.editor && this.editor.getModel() === model) this.editor.setModel(null);
+    model.dispose();
+    this.models.delete(abs);
+  }
+
+  // Remap every rel that is `oldRel` or lives under it → the `newRel` subtree,
+  // updating the file list, cached contents, Monaco models, tabs, and dirty set.
+  private applyMove(oldRel: string, newRel: string) {
+    const map = (r: string) =>
+      r === oldRel ? newRel : r.startsWith(oldRel + "/") ? newRel + r.slice(oldRel.length) : r;
+    const affected = this.snap.files.filter((f) => f === oldRel || f.startsWith(oldRel + "/"));
+    for (const rel of affected) {
+      const oldAbs = this.absOf(rel);
+      const newAbs = this.absOf(map(rel));
+      this.disposeModel(oldAbs);
+      if (oldAbs in this.localFiles) { this.localFiles[newAbs] = this.localFiles[oldAbs]; delete this.localFiles[oldAbs]; }
+      if (rel in this.projectFiles) { this.projectFiles[map(rel)] = this.projectFiles[rel]; delete this.projectFiles[rel]; }
+    }
+    this.set({
+      files: this.snap.files.map(map),
+      openTabs: this.snap.openTabs.map(map),
+      activeTab: this.snap.activeTab ? map(this.snap.activeTab) : null,
+      previewTab: this.snap.previewTab ? map(this.snap.previewTab) : null,
+      dirty: this.snap.dirty.map(map),
+    });
+    if (this.snap.activeTab) this.openFile(this.snap.activeTab, { preview: this.snap.previewTab === this.snap.activeTab });
+  }
+
+  private removePaths(rel: string) {
+    const affected = new Set(this.snap.files.filter((f) => f === rel || f.startsWith(rel + "/")));
+    for (const r of affected) {
+      this.disposeModel(this.absOf(r));
+      delete this.localFiles[this.absOf(r)];
+      delete this.projectFiles[r];
+    }
+    const openTabs = this.snap.openTabs.filter((t) => !affected.has(t));
+    let activeTab = this.snap.activeTab;
+    if (activeTab && affected.has(activeTab)) activeTab = openTabs[openTabs.length - 1] ?? null;
+    this.set({
+      files: this.snap.files.filter((f) => !affected.has(f)),
+      openTabs,
+      activeTab,
+      previewTab: this.snap.previewTab && affected.has(this.snap.previewTab) ? null : this.snap.previewTab,
+      dirty: this.snap.dirty.filter((d) => !affected.has(d)),
+    });
+    if (activeTab) this.openFile(activeTab);
+    else this.editor?.setModel(null);
+  }
+
+  private copyPaths(srcRel: string, destRel: string) {
+    const affected = this.snap.files.filter((f) => f === srcRel || f.startsWith(srcRel + "/"));
+    const added: string[] = [];
+    for (const rel of affected) {
+      const newRel = rel === srcRel ? destRel : destRel + rel.slice(srcRel.length);
+      const srcAbs = this.absOf(rel);
+      const destAbs = this.absOf(newRel);
+      if (srcAbs in this.localFiles) this.localFiles[destAbs] = this.localFiles[srcAbs];
+      if (rel in this.projectFiles) this.projectFiles[newRel] = this.projectFiles[rel];
+      added.push(newRel);
+    }
+    this.set({ files: [...this.snap.files, ...added] });
+  }
+
+  copyEntry(rel: string) { this.set({ clipboard: { mode: "copy", rel } }); }
+  cutEntry(rel: string) { this.set({ clipboard: { mode: "cut", rel } }); }
+
+  renameEntry(oldRel: string, newRel: string) {
+    if (!this.currentDemo || !newRel || oldRel === newRel) return;
+    if (this.pathExists(newRel)) { toast.error(`"${newRel}" already exists`); return; }
+    this.bridge.post("oc-rename", { from: this.absOf(oldRel), to: this.absOf(newRel) });
+    this.applyMove(oldRel, newRel);
+    if (this.snap.clipboard?.rel === oldRel) this.set({ clipboard: null });
+  }
+
+  deleteEntry(rel: string) {
+    if (!this.currentDemo) return;
+    this.bridge.post("oc-rm", { path: this.absOf(rel) });
+    this.removePaths(rel);
+    if (this.snap.clipboard?.rel === rel) this.set({ clipboard: null });
+  }
+
+  // Paste the clipboard entry into `destDir` ("" = project root).
+  pasteInto(destDir: string) {
+    const cb = this.snap.clipboard;
+    if (!cb || !this.currentDemo) return;
+    const name = cb.rel.split("/").pop()!;
+    // Cutting a folder into itself/descendant would be invalid — ignore.
+    if (cb.mode === "cut" && (destDir === cb.rel || destDir.startsWith(cb.rel + "/"))) return;
+    const target = this.uniqueName(destDir ? destDir + "/" + name : name);
+    if (cb.mode === "copy") {
+      this.bridge.post("oc-copy", { from: this.absOf(cb.rel), to: this.absOf(target) });
+      this.copyPaths(cb.rel, target);
+    } else {
+      this.bridge.post("oc-rename", { from: this.absOf(cb.rel), to: this.absOf(target) });
+      this.applyMove(cb.rel, target);
+      this.set({ clipboard: null });
     }
   }
 
@@ -448,7 +676,7 @@ export class IdeController {
   togglePanel(force?: boolean) {
     const collapsed = force === undefined ? !this.snap.panelCollapsed : !force;
     this.set({ panelCollapsed: collapsed });
-    if (!collapsed) this.switchTerminal(this.snap.activeTermId || "console");
+    if (!collapsed) this.setPanelTab(this.snap.panelTab);
   }
   toggleSidebar(force?: boolean) {
     const collapsed = force === undefined ? !this.snap.sidebarCollapsed : !force;
@@ -477,10 +705,23 @@ export class IdeController {
     b.on("ready", () => {
       this.consoleLine("Kernel ready.", "32");
       this.set({ booted: true, status: "ready — pick a project and press Run" });
-      this.newShellTerminal({ defer: true });
+      this.newShellTerminal({ defer: true, activate: false });
     });
-    b.on("exit", (m) => this.consoleLine(`[kernel] pid ${m.pid} exited with code ${m.code}`, "90"));
-    b.on("listen", (m) => this.consoleLine(`[kernel] pid ${m.pid} listening on :${m.port}`, "90"));
+    b.on("exit", (m) => {
+      this.consoleLine(`[kernel] pid ${m.pid} exited with code ${m.code}`, "90");
+      // A listener process died — drop any port it owned from the Ports view.
+      const pid = m.pid as number;
+      let changed = false;
+      for (const [port, owner] of this.portMap) {
+        if (owner === pid) { this.portMap.delete(port); changed = true; }
+      }
+      if (changed) this.syncPorts();
+    });
+    b.on("listen", (m) => {
+      this.consoleLine(`[kernel] pid ${m.pid} listening on :${m.port}`, "90");
+      this.portMap.set(m.port as number, m.pid as number);
+      this.syncPorts();
+    });
 
     // interactive terminals
     b.on("term-ready", (m) => {
@@ -513,6 +754,7 @@ export class IdeController {
       if (t.demo && this.runningDemos.get(t.demo)?.terminalId === id) {
         const gone = this.runningDemos.get(t.demo);
         this.runningDemos.delete(t.demo);
+        if (gone?.port != null && this.portMap.delete(gone.port)) this.syncPorts();
         if (gone?.port === this.snap.previewPort)
           this.set({ status: "dev server stopped — preview will 502 until you Run again" });
       }
@@ -539,5 +781,11 @@ export class IdeController {
       this.set({ status: `${m.title} restarted — preview reloaded` });
     });
     b.on("demo-status", (m) => this.set({ status: m.line as string }));
+
+    // Result of an Explorer file operation (rename/rm/copy). The UI already updated
+    // optimistically; surface any failure so the user knows the VFS is out of sync.
+    b.on("oc-fs-result", (m) => {
+      if (!m.ok) toast.error(`${m.op} failed: ${m.error ?? "unknown error"}`);
+    });
   }
 }

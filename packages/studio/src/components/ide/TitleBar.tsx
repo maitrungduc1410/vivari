@@ -1,4 +1,4 @@
-import { Play } from "lucide-react";
+import Play from "~icons/lucide/play";
 import { Button } from "@/components/ui/button";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,

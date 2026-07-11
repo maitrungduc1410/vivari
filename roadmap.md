@@ -1258,6 +1258,46 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
       is now studio**; the legacy demo stays runnable via `npm run dev:legacy` and its
       worker files remain the shared runtime source (not deleted — studio bundles them).
 
+  - ✅ **Studio — the VS Code experience pass.** Pushed the UI closer to a real editor:
+    - **Icons → Iconify.** Dropped `lucide-react` for **`unplugin-icons`** (build-time
+      inlined SVG components, offline → COEP-safe, tree-shaken): `~icons/vscode-icons/*`
+      for the file hierarchy (`src/components/ide/fileIcon.tsx` maps ext/filename →
+      `file-type-*`) and `~icons/lucide/*` for chrome. Needs `@svgr/core` for the JSX
+      compiler; every generated shadcn `ui/*` that imported lucide was rewired too.
+    - **Bottom panel → Console | Terminal | Ports.** `IdeController` gained
+      `panelTab` and a `ports[]` view (a `port→pid` map fed by the kernel `listen`/`exit`
+      events, plus demo-shell exit cleanup). Console is its own tab; shells live under
+      Terminal with a right-hand list (trash-on-hover to kill); Ports lists `{port, pid,
+      address}` with open-in-new-tab. All xterm hosts stay mounted (hidden) so scrollback
+      survives tab switches.
+    - **Activity bar → Explorer + Search** (`activeView`); a lightweight `SearchPane`
+      does a filename filter over the snapshot (full-text is out of scope).
+    - **Editor tabs → preview vs permanent.** `previewTab` + `openFile(rel, {preview})`:
+      single-click reuses one italic preview slot, double-click (or the first edit) pins
+      it. Close `X` shows on hover / when active; a `beforeunload` guard warns before the
+      tab (VFS + dev server) is torn down (browsers reserve ⌘W, so it can't close only an
+      editor tab).
+    - **Explorer file operations.** Right-click context menu + keyboard (Enter rename,
+      ⌘/Ctrl C/X/V, Delete) for Open/Rename/Copy/Cut/Paste/Delete, inline rename, and an
+      `AlertDialog` delete confirmation (shadcn base `context-menu`/`alert-dialog`). Wired
+      through the kernel: new sync fs verbs in `kernel-fs.js`/`kernel.js` (`readFile[Bytes]`,
+      `readdir`, `stat`, `unlink`, `rmdir`, `rename`) and `oc-rename`/`oc-rm`/`oc-copy`
+      handlers in `kernel-worker.js` (recursive rm/copy) that ack via `oc-fs-result`
+      (errors surfaced with sonner). VFS mutations already `notifyWatch`, so a running dev
+      server HMRs/restarts on rename/delete/paste automatically. The controller updates the
+      tree, Monaco models, tabs, dirty set, and clipboard optimistically.
+    - **Verified** (headless Chrome/CDP): boot + Run react demo, file-type icons render,
+      preview→permanent tabs, copy/paste/rename/delete reflected in the tree, second shell
+      + Ports tab lists the dev-server port/pid, preview serves HTML, zero page exceptions.
+    - **Follow-up — explicit save + editor UX.** Dropped the debounced auto-save: an edit
+      now just marks the tab dirty (a filled dot in the close-button slot, swapping to `X`
+      on hover; reverting to the saved text clears it). `⌘S` (`saveActiveFile`) persists;
+      closing a dirty tab pops a VS Code-style prompt ("Do you want to save the changes you
+      made to X?" → Save / Don't Save / Cancel). Editor tab context menu adds Close / Close
+      Others / Close to the Right / Close Saved / Close All (bulk closes run through a queue
+      that prompts per dirty file). Shortcuts: `⌘B` toggles the sidebar, `⌘J` the bottom
+      panel.
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

@@ -1,7 +1,12 @@
 import { useMemo } from "react";
-import {
-  Plus, Play, TerminalIcon, PanelLeft, Eraser, RefreshCw, RotateCcw, FileCode,
-} from "lucide-react";
+import Plus from "~icons/lucide/plus";
+import Play from "~icons/lucide/play";
+import TerminalIcon from "~icons/lucide/terminal";
+import PanelLeft from "~icons/lucide/panel-left";
+import Eraser from "~icons/lucide/eraser";
+import RefreshCw from "~icons/lucide/refresh-cw";
+import RotateCcw from "~icons/lucide/rotate-ccw";
+import FileCode from "~icons/lucide/file-code";
 import {
   CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList,
 } from "@/components/ui/command";

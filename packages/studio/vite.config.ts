@@ -2,6 +2,7 @@ import { defineConfig, type Plugin } from "vite";
 import react, { reactCompilerPreset } from "@vitejs/plugin-react";
 import babel from "@rolldown/plugin-babel";
 import tailwindcss from "@tailwindcss/vite";
+import Icons from "unplugin-icons/vite";
 import { fileURLToPath, URL } from "node:url";
 
 // The two headers that unlock SharedArrayBuffer (cross-origin isolation). Without
@@ -42,6 +43,9 @@ export default defineConfig({
     react(),
     babel({ presets: [reactCompilerPreset()] }),
     tailwindcss(),
+    // Iconify icons compiled to inline SVG React components at build time — offline
+    // (no CDN → COEP-safe) and tree-shaken. Used as `~icons/<collection>/<name>`.
+    Icons({ compiler: "jsx", jsx: "react" }),
     swScope(),
   ],
   resolve: {

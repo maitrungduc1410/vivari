@@ -5,6 +5,7 @@ import {
 import { TitleBar } from "./TitleBar";
 import { ActivityBar } from "./ActivityBar";
 import { Explorer } from "./Explorer";
+import { SearchPane } from "./SearchPane";
 import { EditorGroup } from "./EditorGroup";
 import { TerminalPanel } from "./TerminalPanel";
 import { PreviewPanel } from "./PreviewPanel";
@@ -29,6 +30,15 @@ export function AppShell() {
       } else if (k === "`") {
         e.preventDefault();
         c.togglePanel();
+      } else if (k === "b") {
+        e.preventDefault();
+        c.toggleSidebar();
+      } else if (k === "j") {
+        e.preventDefault();
+        c.togglePanel();
+      } else if (k === "s") {
+        e.preventDefault();
+        c.saveActiveFile();
       } else if (e.shiftKey && k === "c") {
         e.preventDefault();
         c.newShellTerminal();
@@ -37,6 +47,21 @@ export function AppShell() {
     addEventListener("keydown", onKey);
     return () => removeEventListener("keydown", onKey);
   }, [c]);
+
+  // Guard the browser tab close (⌘W / ⌃W): browsers reserve that shortcut, so we
+  // can't repurpose it to close an editor tab — instead warn before the whole
+  // session (VFS + running dev server) is torn down. Only nag once a project is
+  // live or there are unsaved edits.
+  useEffect(() => {
+    const shouldWarn = snap.projectTitle != null || snap.dirty.length > 0;
+    if (!shouldWarn) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    addEventListener("beforeunload", onBeforeUnload);
+    return () => removeEventListener("beforeunload", onBeforeUnload);
+  }, [snap.projectTitle, snap.dirty.length]);
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden text-foreground">
@@ -47,7 +72,7 @@ export function AppShell() {
           {!snap.sidebarCollapsed && (
             <>
               <ResizablePanel id="explorer" defaultSize="16%" minSize="10%" maxSize="30%">
-                <Explorer />
+                {snap.activeView === "search" ? <SearchPane /> : <Explorer />}
               </ResizablePanel>
               <ResizableHandle />
             </>

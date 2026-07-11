@@ -25,10 +25,15 @@ import {
   STATE_REQUEST,
   STATE_RESPONSE_ERR,
   FLAG_RECURSIVE,
+  OP_READ_FILE,
   OP_WRITE_FILE,
   OP_MKDIR,
   OP_STAT,
   OP_EXISTS,
+  OP_READDIR,
+  OP_UNLINK,
+  OP_RMDIR,
+  OP_RENAME,
 } from "../protocol/syscall.js";
 
 // The kernel registers as client 0; processes use their (>= 1) pid.
@@ -103,6 +108,14 @@ export function createKernelFs(fsWorker) {
 
   const enc = encodeString;
   const fs = {
+    readFile(path) {
+      return decodeBytes(call(OP_READ_FILE, encodeRequest([enc(path)])));
+    },
+    // Raw bytes — use for binary files (images) so a read→write round-trip through
+    // copy doesn't corrupt them by decoding to a JS string.
+    readFileBytes(path) {
+      return call(OP_READ_FILE, encodeRequest([enc(path)]));
+    },
     writeFile(path, contents) {
       const body = typeof contents === "string" ? enc(contents) : contents;
       call(OP_WRITE_FILE, encodeRequest([enc(path), body]));
@@ -110,15 +123,31 @@ export function createKernelFs(fsWorker) {
     mkdirp(path) {
       call(OP_MKDIR, encodeRequest([enc(path)], FLAG_RECURSIVE));
     },
+    readdir(path) {
+      const s = decodeBytes(call(OP_READDIR, encodeRequest([enc(path)])));
+      return s ? s.split("\n").filter(Boolean) : [];
+    },
+    stat(path) {
+      return JSON.parse(decodeBytes(call(OP_STAT, encodeRequest([enc(path)]))));
+    },
     isFile(path) {
       try {
-        return JSON.parse(decodeBytes(call(OP_STAT, encodeRequest([enc(path)])))).kind === "file";
+        return this.stat(path).kind === "file";
       } catch {
         return false;
       }
     },
     exists(path) {
       return call(OP_EXISTS, encodeRequest([enc(path)]))[0] === 1;
+    },
+    unlink(path) {
+      call(OP_UNLINK, encodeRequest([enc(path)]));
+    },
+    rmdir(path) {
+      call(OP_RMDIR, encodeRequest([enc(path)]));
+    },
+    rename(from, to) {
+      call(OP_RENAME, encodeRequest([enc(from), enc(to)]));
     },
     writeLarge,
   };

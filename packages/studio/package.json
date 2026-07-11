@@ -17,7 +17,6 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
-    "lucide-react": "^1.24.0",
     "monaco-editor": "^0.55.1",
     "next-themes": "^0.4.6",
     "react": "^19.2.7",
@@ -30,7 +29,11 @@
   },
   "devDependencies": {
     "@babel/core": "^8.0.1",
+    "@iconify-json/lucide": "^1.2.116",
+    "@iconify-json/vscode-icons": "^1.2.66",
     "@rolldown/plugin-babel": "^0.2.3",
+    "@svgr/core": "^8.1.0",
+    "@svgr/plugin-jsx": "^8.1.0",
     "@tailwindcss/vite": "^4.3.2",
     "@types/babel__core": "^7.20.5",
     "@types/node": "^24.13.2",
@@ -41,6 +44,7 @@
     "oxlint": "^1.71.0",
     "tailwindcss": "^4.3.2",
     "typescript": "~6.0.2",
+    "unplugin-icons": "^23.0.1",
     "vite": "^8.1.1"
   }
 }

@@ -70,9 +70,10 @@ in dev and esbuild-bundles them for production (§10).
 ┌──────────────────────────────────────────────────────────────────────┐
 │ Main thread — packages/studio (React 19 + shadcn)                      │
 │   (legacy: packages/demo/host.js — same protocol, plain-JS UI)         │
-│   • VS Code-style IDE: Explorer + tabbed Monaco + tabbed terminal      │
-│     panel (Console + INTERACTIVE shells) + command palette + preview    │
-│     (ANSI intact; shells have real stdin — type a command, Enter runs)  │
+│   • VS Code-style IDE: Explorer (context-menu file ops) + Search +     │
+│     tabbed Monaco (preview/permanent tabs) + bottom panel with         │
+│     Console / Terminal (INTERACTIVE shells) / Ports + command palette   │
+│     + preview (ANSI intact; shells have real stdin — type, Enter runs)  │
 │   • src/oc/kernel.ts (KernelBridge) + src/oc/controller.ts (IdeController)│
 │   • registers the preview Service Worker                               │
 │   • relays SW HTTP requests to the Kernel Worker                       │

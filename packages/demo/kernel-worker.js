@@ -693,6 +693,36 @@ async function boot() {
   post("log", { line: "Kernel ready — pick a project and press Run." });
 }
 
+// ── File-operation helpers (host Explorer: delete / copy / cut-paste) ────────
+const errMsg = (err) => (err && err.message) || String(err);
+
+// Recursively remove a path (file, or directory + contents).
+function rmRecursive(path) {
+  let st;
+  try {
+    st = kernel.stat(path);
+  } catch {
+    return; // already gone
+  }
+  if (st.kind === "dir") {
+    for (const name of kernel.readdir(path)) rmRecursive(path + "/" + name);
+    kernel.rmdir(path);
+  } else {
+    kernel.unlink(path);
+  }
+}
+
+// Recursively copy `from` → `to` (bytes for files, mkdir + walk for dirs).
+function copyRecursive(from, to) {
+  const st = kernel.stat(from);
+  if (st.kind === "dir") {
+    kernel.mkdirp(to);
+    for (const name of kernel.readdir(from)) copyRecursive(from + "/" + name, to + "/" + name);
+  } else {
+    kernel.writeFile(to, kernel.readFileBytes(from));
+  }
+}
+
 self.onmessage = async (event) => {
   const m = event.data;
 
@@ -747,6 +777,26 @@ self.onmessage = async (event) => {
       } catch (err) {
         post("log", { line: "[edit] write failed: " + ((err && err.message) || err), stream: "stderr" });
       }
+    }
+    return;
+  }
+
+  // Explorer file operations. The VFS ops go through the FS Worker which calls
+  // notifyWatch, so a running dev server picks the changes up (HMR / restart) on
+  // its own. Each replies with `oc-fs-result` so the host can surface errors.
+  if (m.type === "oc-rename" || m.type === "oc-rm" || m.type === "oc-copy") {
+    const op = m.type.slice(3); // rename | rm | copy
+    if (!kernel) {
+      post("oc-fs-result", { op, ok: false, error: "kernel not ready", ...m });
+      return;
+    }
+    try {
+      if (m.type === "oc-rename") kernel.rename(m.from, m.to);
+      else if (m.type === "oc-rm") rmRecursive(m.path);
+      else copyRecursive(m.from, m.to);
+      post("oc-fs-result", { op, ok: true, from: m.from, to: m.to, path: m.path });
+    } catch (err) {
+      post("oc-fs-result", { op, ok: false, error: errMsg(err), from: m.from, to: m.to, path: m.path });
     }
     return;
   }

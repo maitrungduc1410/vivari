@@ -1,5 +1,6 @@
 import { useCallback } from "react";
-import { RefreshCw, ExternalLink } from "lucide-react";
+import RefreshCw from "~icons/lucide/refresh-cw";
+import ExternalLink from "~icons/lucide/external-link";
 import { useIde } from "./useIde";
 
 export function PreviewPanel() {

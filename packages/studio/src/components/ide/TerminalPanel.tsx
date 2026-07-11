@@ -1,64 +1,77 @@
 import { useEffect, useRef } from "react";
-import { Plus, X, ChevronDown } from "lucide-react";
+import Plus from "~icons/lucide/plus";
+import Trash2 from "~icons/lucide/trash-2";
+import ChevronDown from "~icons/lucide/chevron-down";
+import ExternalLink from "~icons/lucide/external-link";
+import SquareTerminal from "~icons/lucide/square-terminal";
 import { cn } from "@/lib/utils";
 import { useIde } from "./useIde";
+
+const PANEL_TABS = [
+  { id: "console", label: "Console" },
+  { id: "terminal", label: "Terminal" },
+  { id: "ports", label: "Ports" },
+] as const;
 
 export function TerminalPanel() {
   const { c, snap } = useIde();
   const bodyRef = useRef<HTMLDivElement | null>(null);
 
-  // Fit the active terminal whenever the panel resizes or the active tab changes.
+  const visibleTermId =
+    snap.panelTab === "console" ? "console" : snap.panelTab === "terminal" ? snap.activeTermId : null;
+
+  // Fit the visible terminal whenever the panel resizes or the visible tab/term changes.
   useEffect(() => {
     const el = bodyRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => c.fitTerminal(snap.activeTermId));
+    const ro = new ResizeObserver(() => c.fitTerminal(visibleTermId));
     ro.observe(el);
     return () => ro.disconnect();
-  }, [c, snap.activeTermId]);
+  }, [c, visibleTermId]);
 
   useEffect(() => {
-    c.fitTerminal(snap.activeTermId);
-  }, [c, snap.activeTermId]);
+    c.fitTerminal(visibleTermId);
+  }, [c, visibleTermId]);
+
+  const shells = snap.terminals.filter((t) => t.kind === "shell");
 
   return (
     <div className="flex h-full flex-col bg-[#181818]">
+      {/* panel tab strip */}
       <div className="flex h-8 shrink-0 items-center border-b pr-2">
-        <div className="flex flex-1 items-stretch overflow-x-auto">
-          {snap.terminals.map((t) => {
-            const active = t.id === snap.activeTermId;
+        <div className="flex flex-1 items-stretch">
+          {PANEL_TABS.map((tab) => {
+            const active = tab.id === snap.panelTab;
             return (
-              <div
-                key={t.id}
-                onClick={() => c.switchTerminal(t.id)}
+              <button
+                key={tab.id}
+                onClick={() => c.setPanelTab(tab.id)}
                 className={cn(
-                  "group flex cursor-pointer items-center gap-2 border-r px-3 text-xs",
-                  active ? "text-foreground" : "text-muted-foreground hover:text-foreground",
-                  !t.alive && "italic opacity-60",
+                  "flex items-center border-b-2 px-3 text-xs font-medium uppercase tracking-wide transition-colors",
+                  active
+                    ? "border-primary text-foreground"
+                    : "border-transparent text-muted-foreground hover:text-foreground",
                 )}
               >
-                <span>{t.label}</span>
-                {t.kind !== "console" && (
-                  <button
-                    className="flex size-4 items-center justify-center rounded hover:bg-accent"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      c.closeTerminal(t.id);
-                    }}
-                  >
-                    <X className="size-3" />
-                  </button>
+                {tab.label}
+                {tab.id === "ports" && snap.ports.length > 0 && (
+                  <span className="ml-1.5 rounded bg-muted px-1 text-[10px] leading-4 text-muted-foreground">
+                    {snap.ports.length}
+                  </span>
                 )}
-              </div>
+              </button>
             );
           })}
         </div>
-        <button
-          title="New Terminal"
-          className="flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
-          onClick={() => c.newShellTerminal()}
-        >
-          <Plus className="size-4" />
-        </button>
+        {snap.panelTab === "terminal" && (
+          <button
+            title="New Terminal"
+            className="flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            onClick={() => c.newShellTerminal()}
+          >
+            <Plus className="size-4" />
+          </button>
+        )}
         <button
           title="Hide panel"
           className="flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
@@ -68,14 +81,101 @@ export function TerminalPanel() {
         </button>
       </div>
 
+      {/* body — all xterm hosts stay mounted so scrollback survives tab switches */}
       <div ref={bodyRef} className="relative flex-1 overflow-hidden">
-        {snap.terminals.map((t) => (
-          <div
-            key={t.id}
-            className={cn("oc-term-host absolute inset-0", t.id === snap.activeTermId ? "block" : "hidden")}
-            ref={(el) => c.mountTerminal(t.id, el)}
-          />
-        ))}
+        {/* Console */}
+        <div className={cn("absolute inset-0", snap.panelTab === "console" ? "block" : "hidden")}>
+          <div className="oc-term-host absolute inset-0" ref={(el) => c.mountTerminal("console", el)} />
+        </div>
+
+        {/* Terminal: xterm on the left, terminal list on the right */}
+        <div className={cn("absolute inset-0 flex", snap.panelTab === "terminal" ? "flex" : "hidden")}>
+          <div className="relative min-w-0 flex-1">
+            {shells.length === 0 && (
+              <div className="absolute inset-0 flex items-center justify-center text-xs text-muted-foreground">
+                No terminals. Press <span className="mx-1 text-foreground">+</span> to create one.
+              </div>
+            )}
+            {shells.map((t) => (
+              <div
+                key={t.id}
+                className={cn(
+                  "oc-term-host absolute inset-0",
+                  snap.panelTab === "terminal" && t.id === snap.activeTermId ? "block" : "hidden",
+                )}
+                ref={(el) => c.mountTerminal(t.id, el)}
+              />
+            ))}
+          </div>
+          <ul className="w-40 shrink-0 overflow-y-auto border-l bg-sidebar py-1 text-xs">
+            {shells.map((t) => {
+              const active = t.id === snap.activeTermId;
+              return (
+                <li key={t.id}>
+                  <div
+                    onClick={() => c.switchTerminal(t.id)}
+                    className={cn(
+                      "group flex cursor-pointer items-center gap-1.5 px-2 py-1",
+                      active ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
+                      !t.alive && "italic opacity-60",
+                    )}
+                  >
+                    <SquareTerminal className="size-3.5 shrink-0 opacity-70" />
+                    <span className="truncate">{t.label}</span>
+                    <button
+                      title="Kill terminal"
+                      className="ml-auto hidden size-4 items-center justify-center rounded text-muted-foreground hover:bg-background hover:text-foreground group-hover:flex"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        c.closeTerminal(t.id);
+                      }}
+                    >
+                      <Trash2 className="size-3" />
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+
+        {/* Ports */}
+        <div className={cn("absolute inset-0 overflow-auto", snap.panelTab === "ports" ? "block" : "hidden")}>
+          {snap.ports.length === 0 ? (
+            <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
+              No ports are being forwarded. Run a project to start a server.
+            </div>
+          ) : (
+            <table className="w-full text-xs">
+              <thead className="text-muted-foreground">
+                <tr className="border-b">
+                  <th className="px-3 py-1.5 text-left font-medium">Port</th>
+                  <th className="px-3 py-1.5 text-left font-medium">Process ID</th>
+                  <th className="px-3 py-1.5 text-left font-medium">Address</th>
+                  <th className="px-3 py-1.5 text-right font-medium" />
+                </tr>
+              </thead>
+              <tbody>
+                {snap.ports.map((p) => (
+                  <tr key={p.port} className="border-b border-border/50 hover:bg-accent/40">
+                    <td className="px-3 py-1.5 font-mono text-foreground">{p.port}</td>
+                    <td className="px-3 py-1.5 font-mono text-muted-foreground">{p.pid}</td>
+                    <td className="px-3 py-1.5 font-mono text-muted-foreground">localhost:{p.port}</td>
+                    <td className="px-3 py-1.5 text-right">
+                      <button
+                        title="Open in new tab"
+                        className="inline-flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                        onClick={() => window.open(`/preview/${p.port}/`, "_blank")}
+                      >
+                        <ExternalLink className="size-3.5" />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
       </div>
     </div>
   );
