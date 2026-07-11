@@ -1298,6 +1298,32 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
       that prompts per dirty file). Shortcuts: `⌘B` toggles the sidebar, `⌘J` the bottom
       panel.
 
+  - ✅ **Studio — preview mini-browser: local address bar + in-browser DevTools.**
+    - **Local-only address bar.** `PreviewTab` gained a `path`; `navigatePreview` parses a
+      typed address (`localhost`/`127.0.0.1`/bare path/port), loads the in-VM dev server via
+      the SW proxy (bump nonce → reload), and rejects external URLs with a toast. Reload now
+      natively reloads the iframe (keeps the SPA route). An injected **nav notifier** (in
+      `sw.js`, next to the WS shim) posts `oc-nav` on `pushState`/`replaceState`/`popstate`/
+      `load`; the controller syncs the address bar display without re-driving the src.
+    - **Full chii DevTools, vendored locally (no CDN → COEP-safe).** The SW injects
+      **chobitsu** (`/oc-devtools/chobitsu.js`, a JS CDP backend) into every preview page
+      plus a CDP bridge; `/oc-devtools/*` is passed straight through (never proxied into the
+      VM). A new `serveDevtools()` Vite plugin streams chobitsu + the chii **Chrome DevTools
+      frontend** (`/devtools/**`, from `node_modules/chii/public`) same-origin in dev and
+      copies both into `dist` on build. The frontend runs in a resizable bottom split of the
+      preview (`public/devtools-host.html` loaded with `#?embedded=<origin>` → chii's
+      postMessage transport). The controller's `window`-message relay bridges raw CDP strings
+      between the shared frontend and the **active** tab's chobitsu (per-tab backend; the
+      frontend reloads to re-attach when you switch tabs).
+    - **Fix — blank/hanging DevTools panel.** Two bugs made the frontend load forever (and
+      cascade into `Failed to fetch` / a renderer crash): (1) `serveDevtools()` streamed
+      assets with `createReadStream().pipe()`, so the frontend's burst of ~50 concurrent
+      module imports left many chunked responses **pending forever** over HTTP/1.1 keep-alive
+      (and a client abort could crash the dev server). Now it sends buffered bodies with an
+      explicit `Content-Length`. (2) The SW routed `/devtools-host.html` + `/devtools/**`
+      through `routeByClient`, whose `fetch(event.request)` on the iframe navigation could
+      fail; they're now passed straight to the network like `/oc-devtools/*`.
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

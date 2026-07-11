@@ -45,6 +45,15 @@ export interface Clipboard {
   rel: string;
 }
 
+// One browser tab in the Preview panel.
+export interface PreviewTab {
+  id: string;
+  url: string; // editable address-bar text (what the user sees / types)
+  port: number | null; // the in-VM dev-server port this tab mirrors (null = empty tab)
+  path: string; // the request path within the dev server (starts with "/")
+  nonce: number; // per-tab reload counter (bump to force the iframe to reload)
+}
+
 export interface IdeSnapshot {
   booted: boolean;
   status: string;
@@ -58,8 +67,10 @@ export interface IdeSnapshot {
   terminals: TerminalMeta[];
   activeTermId: string | null;
   ports: PortInfo[];
-  previewPort: number | null;
-  previewNonce: number;
+  previewTabs: PreviewTab[];
+  activePreviewId: string | null;
+  devtoolsOpen: boolean; // the chii DevTools panel (bottom split of the preview)
+  devtoolsNonce: number; // bump to reload the DevTools frontend (re-attach to a new target)
   selectedDemo: string;
   activeView: "explorer" | "search";
   sidebarCollapsed: boolean;
@@ -133,8 +144,10 @@ export class IdeController {
     terminals: [],
     activeTermId: null,
     ports: [],
-    previewPort: null,
-    previewNonce: 0,
+    previewTabs: [],
+    activePreviewId: null,
+    devtoolsOpen: false,
+    devtoolsNonce: 0,
     selectedDemo: DEMOS[0].id,
     activeView: "explorer",
     sidebarCollapsed: false,
@@ -153,7 +166,10 @@ export class IdeController {
   private editor: Monaco.editor.IStandaloneCodeEditor | null = null;
   private editorMounting = false; // guards the async create against StrictMode double-mount
   private models = new Map<string, Monaco.editor.ITextModel>(); // abs -> model
-  private previewFrame: HTMLIFrameElement | null = null;
+  private previewFrames = new Map<string, HTMLIFrameElement>(); // preview tab id -> iframe
+  private previewSeq = 0;
+  private devtoolsFrame: HTMLIFrameElement | null = null; // the chii DevTools frontend iframe
+  private devtoolsTargetId: string | null = null; // which preview tab DevTools is attached to
   private currentDemo: CurrentDemo | null = null;
   private projectFiles: Record<string, string> = {}; // rel -> contents
   private localFiles: Record<string, string> = {}; // abs -> latest text
@@ -165,6 +181,7 @@ export class IdeController {
     this.bridge = new KernelBridge();
     this.createConsole();
     this.wireBridge();
+    this.wirePreviewMessages();
   }
 
   // ── store plumbing ──
@@ -174,7 +191,20 @@ export class IdeController {
   };
   getSnapshot = (): IdeSnapshot => this.snap;
   private set(partial: Partial<IdeSnapshot>) {
+    const prevActive = this.snap.activePreviewId;
     this.snap = { ...this.snap, ...partial };
+    // DevTools follows the active preview tab. If the active tab changed while the
+    // panel is open, re-attach the (shared) frontend to the new target: close it
+    // when there's no tab left, else reload the frontend against the new tab.
+    if (this.snap.devtoolsOpen && this.snap.activePreviewId !== prevActive) {
+      if (this.snap.activePreviewId == null) {
+        this.devtoolsTargetId = null;
+        this.snap = { ...this.snap, devtoolsOpen: false };
+      } else if (this.snap.activePreviewId !== this.devtoolsTargetId) {
+        this.devtoolsTargetId = this.snap.activePreviewId;
+        this.snap = { ...this.snap, devtoolsNonce: this.snap.devtoolsNonce + 1 };
+      }
+    }
     for (const l of this.listeners) l();
   }
   private syncTerminals() {
@@ -639,18 +669,239 @@ export class IdeController {
     }
   }
 
-  // ── preview ──
-  setPreviewFrame(el: HTMLIFrameElement | null) {
-    this.previewFrame = el;
+  // ── preview (a multi-tab mini browser) ───────────────────────────────────
+  setPreviewFrame(id: string, el: HTMLIFrameElement | null) {
+    if (el) this.previewFrames.set(id, el);
+    else this.previewFrames.delete(id);
   }
+  // The iframe URL for a tab: the SW preview proxy for demo ports, else blank.
+  // Includes the in-server path plus a per-tab cache-bust so reload/navigate force
+  // a fresh document (the SW re-injects the WS shim + DevTools bootstrap each time).
+  previewSrc(tab: PreviewTab): string {
+    if (tab.port == null) return "about:blank";
+    const path = tab.path && tab.path.startsWith("/") ? tab.path : "/";
+    const bust = tab.nonce > 1 ? `${path.includes("?") ? "&" : "?"}t=${tab.nonce}` : "";
+    return `/preview/${tab.port}${path}${bust}`;
+  }
+  private setTab(id: string, patch: Partial<PreviewTab>) {
+    this.set({ previewTabs: this.snap.previewTabs.map((t) => (t.id === id ? { ...t, ...patch } : t)) });
+  }
+
+  // A demo's dev server is up — reuse the tab that already mirrors this port, or
+  // open one, and make it active.
   private pointPreview(port: number) {
-    this.set({ previewPort: port, previewNonce: this.snap.previewNonce + 1 });
+    const existing = this.snap.previewTabs.find((t) => t.port === port);
+    if (existing) {
+      this.setTab(existing.id, { nonce: existing.nonce + 1 });
+      this.set({ activePreviewId: existing.id });
+      return;
+    }
+    const id = "pv" + ++this.previewSeq;
+    const tab: PreviewTab = { id, url: `localhost:${port}`, port, path: "/", nonce: 1 };
+    this.set({ previewTabs: [...this.snap.previewTabs, tab], activePreviewId: id });
+  }
+
+  addPreviewTab(url = "") {
+    const id = "pv" + ++this.previewSeq;
+    const tab: PreviewTab = { id, url, port: null, path: "/", nonce: 1 };
+    this.set({ previewTabs: [...this.snap.previewTabs, tab], activePreviewId: id });
+  }
+  activatePreviewTab(id: string) {
+    this.set({ activePreviewId: id });
+  }
+  // Live edits to the address-bar text (does not navigate — Enter does that).
+  setPreviewUrl(id: string, url: string) {
+    this.setTab(id, { url });
+  }
+
+  // Navigate a tab to a typed address. Local-only for now: localhost / 127.0.0.1
+  // (or a bare path / port) load the in-VM dev server; anything else is rejected.
+  navigatePreview(id: string, input: string) {
+    const tab = this.snap.previewTabs.find((t) => t.id === id);
+    if (!tab) return;
+    const raw = input.trim();
+    if (!raw) return;
+
+    // Strip an optional scheme, then split host[:port] from the path.
+    const noScheme = raw.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+    let hostPort = noScheme;
+    let path = "/";
+    const slash = noScheme.indexOf("/");
+    if (noScheme.startsWith("/")) {
+      // Bare path — keep the tab's current port.
+      hostPort = "";
+      path = noScheme;
+    } else if (slash !== -1) {
+      hostPort = noScheme.slice(0, slash);
+      path = noScheme.slice(slash);
+    }
+
+    let port = tab.port;
+    if (/^\d+$/.test(hostPort)) {
+      // Bare port, e.g. "3000".
+      port = parseInt(hostPort, 10);
+    } else if (hostPort) {
+      const [host, portStr] = hostPort.split(":");
+      const isLocal = host === "localhost" || host === "127.0.0.1" || host === "";
+      if (!isLocal) {
+        toast.error("Only local URLs are supported for now");
+        return;
+      }
+      if (portStr) port = parseInt(portStr, 10);
+    }
+    if (port == null || Number.isNaN(port)) {
+      toast.error("Enter a local port, e.g. localhost:3000");
+      return;
+    }
+    if (!path.startsWith("/")) path = "/" + path;
+
+    this.setTab(id, { url: `localhost:${port}${path === "/" ? "" : path}`, port, path, nonce: tab.nonce + 1 });
+  }
+  reloadPreviewTab(id: string) {
+    const t = this.snap.previewTabs.find((x) => x.id === id);
+    if (!t) return;
+    // Reload the *current* in-app location natively (keeps the SPA route + re-runs
+    // the SW HTML injection). Fall back to a src cache-bust if the frame is gone.
+    const frame = this.previewFrames.get(id);
+    if (t.port != null && frame?.contentWindow) {
+      try {
+        frame.contentWindow.location.reload();
+        return;
+      } catch {
+        /* cross-origin / detached — fall through to the src bump */
+      }
+    }
+    this.setTab(id, { nonce: t.nonce + 1 });
   }
   reloadPreview() {
-    if (this.snap.previewPort) this.set({ previewNonce: this.snap.previewNonce + 1 });
+    if (this.snap.activePreviewId) this.reloadPreviewTab(this.snap.activePreviewId);
   }
-  openPreviewTab() {
-    if (this.snap.previewPort) window.open(`/preview/${this.snap.previewPort}/`, "_blank");
+  previewBack(id: string) {
+    try { this.previewFrames.get(id)?.contentWindow?.history.back(); } catch { /* cross-origin */ }
+  }
+  previewForward(id: string) {
+    try { this.previewFrames.get(id)?.contentWindow?.history.forward(); } catch { /* cross-origin */ }
+  }
+  openPreviewExternal(id: string) {
+    const t = this.snap.previewTabs.find((x) => x.id === id);
+    if (t?.port != null) window.open(`/preview/${t.port}/`, "_blank");
+  }
+
+  closePreviewTab(id: string) {
+    const i = this.snap.previewTabs.findIndex((t) => t.id === id);
+    if (i === -1) return;
+    const previewTabs = this.snap.previewTabs.filter((t) => t.id !== id);
+    let activePreviewId = this.snap.activePreviewId;
+    if (activePreviewId === id) activePreviewId = (previewTabs[i] || previewTabs[i - 1])?.id ?? null;
+    this.previewFrames.delete(id);
+    this.set({ previewTabs, activePreviewId });
+  }
+  closeOtherPreviewTabs(id: string) {
+    this.set({ previewTabs: this.snap.previewTabs.filter((t) => t.id === id), activePreviewId: id });
+  }
+  closePreviewTabsToRight(id: string) {
+    const i = this.snap.previewTabs.findIndex((t) => t.id === id);
+    if (i === -1) return;
+    const previewTabs = this.snap.previewTabs.slice(0, i + 1);
+    const active = this.snap.activePreviewId;
+    const activePreviewId = previewTabs.some((t) => t.id === active) ? active : id;
+    this.set({ previewTabs, activePreviewId });
+  }
+  closeAllPreviewTabs() {
+    this.previewFrames.clear();
+    this.devtoolsTargetId = null;
+    this.set({ previewTabs: [], activePreviewId: null, devtoolsOpen: false });
+  }
+
+  // ── DevTools (chii frontend ↔ per-tab chobitsu backend) ──────────────────
+  setDevtoolsFrame(el: HTMLIFrameElement | null) {
+    this.devtoolsFrame = el;
+  }
+  // The chii frontend URL: local host page + `#?embedded=<origin>` flips chii into
+  // its postMessage transport (chii reads `location.search || location.hash`, so the
+  // param MUST live in the hash — a `?query` cache-bust would shadow it and break the
+  // transport). Re-attach reload is handled by remounting the iframe (React `key`).
+  devtoolsSrc(): string {
+    return `/devtools-host.html#?embedded=${encodeURIComponent(location.origin)}`;
+  }
+  toggleDevtools() {
+    if (this.snap.devtoolsOpen) this.closeDevtools();
+    else this.openDevtools();
+  }
+  openDevtools() {
+    if (!this.snap.activePreviewId) {
+      toast.error("Open a preview tab first");
+      return;
+    }
+    this.devtoolsTargetId = this.snap.activePreviewId;
+    this.set({ devtoolsOpen: true, devtoolsNonce: this.snap.devtoolsNonce + 1 });
+  }
+  closeDevtools() {
+    this.devtoolsTargetId = null;
+    this.set({ devtoolsOpen: false });
+  }
+  // Called when the DevTools frontend iframe finishes loading — kick the target's
+  // chobitsu into replaying the page state (frameNavigated + domain enables).
+  onDevtoolsReady() {
+    if (!this.snap.devtoolsOpen || !this.devtoolsTargetId) return;
+    const target = this.previewFrames.get(this.devtoolsTargetId);
+    target?.contentWindow?.postMessage({ source: "oc-cdp", dir: "init" }, "*");
+  }
+
+  private tabIdForSource(src: MessageEventSource | null): string | null {
+    if (!src) return null;
+    for (const [id, el] of this.previewFrames) {
+      if (el.contentWindow === src) return id;
+    }
+    return null;
+  }
+
+  // Update a tab's displayed address from an in-app navigation. Display only — it
+  // must NOT touch `path` (which drives previewSrc), or React would reload the
+  // iframe on every SPA route change (a navigation loop).
+  private syncTabLocation(id: string, href: string) {
+    const tab = this.snap.previewTabs.find((t) => t.id === id);
+    if (!tab || tab.port == null) return;
+    // The preview iframe lives at /preview/<port>/… — strip that proxy prefix and
+    // our own cache-bust to recover the in-server path.
+    const m = href.match(/^\/preview\/\d+(\/.*)?$/);
+    let path = m ? m[1] || "/" : href.startsWith("/") ? href : "/" + href;
+    path = path.replace(/([?&])t=\d+(&|$)/, (_all, p1: string, p2: string) => (p2 === "&" ? p1 : "")).replace(/[?&]$/, "");
+    this.setTab(id, { url: `localhost:${tab.port}${path && path !== "/" ? path : ""}` });
+  }
+
+  // The host-page relay: bridges CDP between each preview tab's chobitsu and the
+  // shared chii frontend, and syncs the address bar from in-app navigation.
+  private wirePreviewMessages() {
+    window.addEventListener("message", (event: MessageEvent) => {
+      const src = event.source;
+      const data = event.data;
+
+      // DevTools frontend → target tab. chii posts raw CDP JSON strings.
+      if (this.devtoolsFrame && src && src === this.devtoolsFrame.contentWindow) {
+        if (typeof data !== "string") return;
+        const target = this.devtoolsTargetId ? this.previewFrames.get(this.devtoolsTargetId) : null;
+        target?.contentWindow?.postMessage({ source: "oc-cdp", dir: "frontend", data }, "*");
+        return;
+      }
+
+      if (!data || typeof data !== "object") return;
+
+      // Preview tab's chobitsu → frontend (only if this tab is the attached target).
+      if (data.source === "oc-cdp" && data.dir === "target") {
+        const tabId = this.tabIdForSource(src);
+        if (tabId && tabId === this.devtoolsTargetId) {
+          this.devtoolsFrame?.contentWindow?.postMessage(data.data, "*");
+        }
+        return;
+      }
+
+      // Preview tab navigated (link click / SPA route) → sync the address bar.
+      if (data.source === "oc-nav") {
+        const tabId = this.tabIdForSource(src);
+        if (tabId) this.syncTabLocation(tabId, String(data.href || "/"));
+      }
+    });
   }
 
   // ── demo run ──
@@ -755,15 +1006,20 @@ export class IdeController {
         const gone = this.runningDemos.get(t.demo);
         this.runningDemos.delete(t.demo);
         if (gone?.port != null && this.portMap.delete(gone.port)) this.syncPorts();
-        if (gone?.port === this.snap.previewPort)
+        if (gone?.port != null && this.snap.previewTabs.some((t) => t.port === gone.port))
           this.set({ status: "dev server stopped — preview will 502 until you Run again" });
       }
       this.syncTerminals();
     });
 
-    // HMR tunnel: ws frame routed OUT of the VM → preview iframe.
+    // HMR tunnel: ws frame routed OUT of the VM → preview iframes. The frame
+    // doesn't carry a port, so deliver to every tab bound to a dev server; the
+    // HMR client in each iframe ignores frames that aren't its own.
     b.on("oc-ws", (m) => {
-      this.previewFrame?.contentWindow?.postMessage({ ...(m.msg as object), type: "oc-ws", dir: "in" }, "*");
+      const payload = { ...(m.msg as object), type: "oc-ws", dir: "in" };
+      for (const t of this.snap.previewTabs) {
+        if (t.port != null) this.previewFrames.get(t.id)?.contentWindow?.postMessage(payload, "*");
+      }
     });
 
     b.on("demo-ready", (m) => {
@@ -777,7 +1033,7 @@ export class IdeController {
       });
     });
     b.on("demo-reload", (m) => {
-      if (m.port === this.snap.previewPort) this.reloadPreview();
+      for (const t of this.snap.previewTabs) if (t.port === m.port) this.reloadPreviewTab(t.id);
       this.set({ status: `${m.title} restarted — preview reloaded` });
     });
     b.on("demo-status", (m) => this.set({ status: m.line as string }));

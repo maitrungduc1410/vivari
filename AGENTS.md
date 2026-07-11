@@ -72,17 +72,30 @@ packages/
                      for /sw.js + `worker.format:'es'` + `server.fs.allow` (repo root,
                      so it can read the sibling worker/wasm sources) + React Compiler
                      (plugin-react v6 is oxc-based; the compiler is wired via
-                     `reactCompilerPreset()` + `@rolldown/plugin-babel`).
+                     `reactCompilerPreset()` + `@rolldown/plugin-babel`) + `serveDevtools()`
+                     (vendors the in-browser DevTools locally, no CDN → COEP-safe:
+                     `/oc-devtools/chobitsu.js` = chobitsu UMD, `/devtools/**` = the chii
+                     Chrome-DevTools frontend; streamed from node_modules in dev, copied
+                     into dist on build).
     public/sw.js     the preview Service Worker, served at root scope (copied from demo/).
+                     Injects, into every preview HTML: the WS shim (HMR) + chobitsu (CDP
+                     backend) + a CDP/nav bridge; passes /oc-devtools/* straight through.
+    public/devtools-host.html  host page for the chii DevTools frontend iframe (loaded
+                     with `#?embedded=<origin>` → chii's postMessage transport).
     src/oc/kernel.ts      KernelBridge: spawns demo/kernel-worker.js, SW register +
                           oc-http relay, typed pub/sub over the worker protocol.
     src/oc/controller.ts  IdeController: the imperative core ported from demo/host.js
                           (Monaco, xterm terminals, demo Run via OC_RUN, preview, Explorer
                           file ops via oc-rename/oc-rm/oc-copy) as an external store React
-                          reads via useSyncExternalStore.
+                          reads via useSyncExternalStore. Also hosts the DevTools relay:
+                          a window-message bridge routing CDP between each preview tab's
+                          chobitsu and the shared chii frontend, plus local-only address-bar
+                          navigation (navigatePreview) + in-app nav sync (oc-nav).
     src/components/ide/   AppShell · ActivityBar (Explorer/Search) · Explorer (context-menu
                           file ops) · SearchPane · EditorGroup (preview/permanent tabs) ·
-                          TerminalPanel (Console/Terminal/Ports) · PreviewPanel · StatusBar ·
+                          TerminalPanel (Console/Terminal/Ports) · PreviewPanel (multi-tab
+                          mini-browser: local address bar, back/forward, reload, chii
+                          DevTools in a resizable bottom split) · StatusBar ·
                           CommandPalette · fileIcon (vscode-icons). Icons are Iconify via
                           unplugin-icons (`~icons/lucide/*`, `~icons/vscode-icons/*`; needs
                           @svgr/core) — do NOT reintroduce lucide-react.

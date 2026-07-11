@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>DevTools</title>
+  <meta name="referrer" content="no-referrer" />
+  <style>
+    html, body { height: 100%; margin: 0; }
+    @media (prefers-color-scheme: dark) { body { background-color: rgb(41 42 45); } }
+  </style>
+  <!-- The chii (Chrome DevTools) frontend. Served same-origin from node_modules
+       via the serveDevtools() Vite plugin so it loads under COEP:require-corp with
+       no CDN. Launched with `#?embedded=<origin>` (see controller.openDevtools),
+       which flips chii into its postMessage transport: it relays CDP as raw JSON
+       strings to window.parent, which the controller bridges to the target tab's
+       injected chobitsu. -->
+  <script type="module" src="/devtools/front_end/entrypoints/chii_app/chii_app.js"></script>
+</head>
+<body class="undocked" id="-blink-dev-tools"></body>
+</html>

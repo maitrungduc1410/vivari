@@ -159,9 +159,71 @@ OCWebSocket.prototype._emit = function(t, e){
 window.WebSocket = OCWebSocket;
 })();`;
 
+// In-browser DevTools bridge. Injected into every preview page next to the WS
+// shim. It (1) loads chobitsu — the CDP backend — as a classic script so it hooks
+// console/network before the app's module scripts run, (2) tunnels CDP messages
+// between chobitsu and the chii DevTools frontend (which lives in a sibling iframe
+// on the host page; the host relays by window.postMessage), and (3) reports every
+// SPA/MPA navigation up to the host so the preview address bar stays in sync.
+//
+// Protocol on the host page:
+//   preview → host : { source:'oc-cdp', dir:'target',   data:<cdp json string> }
+//                     { source:'oc-nav', href:<path>                          }
+//   host  → preview: { source:'oc-cdp', dir:'frontend', data:<cdp json string> }  (forward to chobitsu)
+//                     { source:'oc-cdp', dir:'init'                            }  (run the attach handshake)
+const CDP_BOOTSTRAP = `(function(){
+if (window.__ocCdpInstalled) return; window.__ocCdpInstalled = true;
+function post(m){ parent.postMessage(m, '*'); }
+var seq = 0;
+function setup(){
+  if (!window.chobitsu) return false;
+  window.chobitsu.setOnMessage(function(msg){
+    // Drop responses to our own internal enable requests (ids prefixed 'ocdt');
+    // pass through events and responses the frontend actually asked for.
+    if (typeof msg === 'string' && msg.indexOf('"id":"ocdt') !== -1) return;
+    post({ source:'oc-cdp', dir:'target', data: msg });
+  });
+  return true;
+}
+if (!setup()) { var tries = 0, iv = setInterval(function(){ if (setup() || ++tries > 100) clearInterval(iv); }, 20); }
+function sendToChobitsu(method){ if (window.chobitsu) window.chobitsu.sendRawMessage(JSON.stringify({ id:'ocdt'+(++seq), method:method, params:{} })); }
+function sendToDevtools(msg){ post({ source:'oc-cdp', dir:'target', data: JSON.stringify(msg) }); }
+function init(){
+  sendToDevtools({ method:'Page.frameNavigated', params:{ frame:{ id:'1', mimeType:'text/html', securityOrigin: location.origin, url: location.href }, type:'Navigation' } });
+  sendToChobitsu('Network.enable');
+  sendToDevtools({ method:'Runtime.executionContextsCleared' });
+  sendToChobitsu('Runtime.enable');
+  sendToChobitsu('Debugger.enable');
+  sendToChobitsu('DOMStorage.enable');
+  sendToChobitsu('DOM.enable');
+  sendToChobitsu('CSS.enable');
+  sendToChobitsu('Overlay.enable');
+  sendToDevtools({ method:'DOM.documentUpdated' });
+}
+window.addEventListener('message', function(ev){
+  var d = ev.data;
+  if (!d || d.source !== 'oc-cdp') return;
+  if (d.dir === 'frontend') { if (window.chobitsu) window.chobitsu.sendRawMessage(d.data); }
+  else if (d.dir === 'init') { init(); }
+});
+function notifyNav(){ post({ source:'oc-nav', href: location.pathname + location.search + location.hash }); }
+var _ps = history.pushState, _rs = history.replaceState;
+history.pushState = function(){ var r = _ps.apply(this, arguments); notifyNav(); return r; };
+history.replaceState = function(){ var r = _rs.apply(this, arguments); notifyNav(); return r; };
+window.addEventListener('popstate', notifyNav);
+window.addEventListener('hashchange', notifyNav);
+window.addEventListener('load', notifyNav);
+notifyNav();
+})();`;
+
+const DEVTOOLS_TAGS =
+  '<script src="/oc-devtools/chobitsu.js"><\/script>' + "<script>" + CDP_BOOTSTRAP + "<\/script>";
+
 // Insert the shim as the first child of <head> (so it runs before any script).
+// The WS shim runs first (inline), then chobitsu (classic src → executes before
+// the app's deferred module scripts), then the CDP bootstrap.
 function injectWsShim(html) {
-  const tag = "<script>" + WS_SHIM + "<\/script>";
+  const tag = "<script>" + WS_SHIM + "<\/script>" + DEVTOOLS_TAGS;
   const headOpen = /<head[^>]*>/i.exec(html);
   if (headOpen) {
     const at = headOpen.index + headOpen[0].length;
@@ -252,6 +314,20 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(cacheFirst(event.request));
     return;
   }
+
+  // The vendored DevTools CDP backend (chobitsu). A preview page loads it via an
+  // absolute /oc-devtools/... URL, so without this exception routeByClient would
+  // proxy it into the VM (which has no such file). It's always OUR app asset —
+  // let it hit the network (served same-origin by the serveDevtools Vite plugin).
+  if (url.pathname.startsWith("/oc-devtools/")) return;
+
+  // The vendored DevTools frontend (chii): the host document itself and all of
+  // its module assets. These are OUR app files (served same-origin by the
+  // serveDevtools Vite plugin), never anything in the VM. Pass them straight to
+  // the network — routing them through routeByClient risks a spurious
+  // `fetch(event.request)` failure on the iframe navigation and, worse, could
+  // proxy them into a preview that has no such file.
+  if (url.pathname === "/devtools-host.html" || url.pathname.startsWith("/devtools/")) return;
 
   // Root-absolute request (e.g. Vite's /@vite/client, /src/main.js,
   // /node_modules/...). It only belongs to a preview if a preview iframe issued

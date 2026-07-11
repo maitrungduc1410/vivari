@@ -352,6 +352,37 @@ process opens a genuine **in-VM WebSocket client** (`websocket.js`, over Node's 
 http upgrade + the net loopback) to `127.0.0.1:<port>` and relays frames back out
 (`ws-out`). This is what makes Vite HMR work live in the preview.
 
+### 8.5 In-browser DevTools + local address bar (studio)
+
+Each `PreviewPanel` tab is a mini-browser. The address bar is **local-only**:
+`localhost` / `127.0.0.1` / a bare path loads the in-VM dev server (`navigatePreview`
+sets the tab's `path` and bumps a nonce → the iframe reloads via the SW proxy);
+external URLs are rejected. Back/forward drive the same-origin iframe's native
+`history`; the injected **nav notifier** posts `oc-nav` on every SPA/MPA navigation so
+the address bar stays in sync (display-only — it never re-drives the iframe src, which
+would loop).
+
+DevTools is the **full chii (Chrome DevTools) frontend**, vendored locally (no CDN, so
+COEP holds). The SW injects **chobitsu** (a JS CDP backend) into every preview page.
+The `controller` bridges CDP over `window.postMessage`: the chii frontend iframe (loaded
+with `#?embedded=<origin>`, which selects chii's postMessage transport) exchanges raw CDP
+strings with the controller, which relays them to/from the target tab's chobitsu. One
+shared frontend attaches to the **active** tab (per-tab chobitsu backend); switching tabs
+reloads the frontend against the new target. Assets are served from `node_modules` in
+dev by the `serveDevtools()` Vite plugin and copied into `dist` on build.
+
+Two non-obvious constraints keep this working:
+
+- **`serveDevtools()` must send fixed-length bodies** (`fs.readFile` + `Content-Length`),
+  not `createReadStream().pipe()`. The frontend fires a burst of ~50 concurrent module
+  imports; over HTTP/1.1 keep-alive, chunked-transfer responses left many of them
+  **pending forever** (spinner never stops), and an unhandled read-stream `error` on a
+  client abort could take down the whole dev server.
+- **The SW passes `/devtools-host.html` and `/devtools/**` straight to the network**
+  (like `/oc-devtools/`). They are our own app assets; routing them through
+  `routeByClient` risked a spurious `fetch(event.request)` failure on the iframe
+  navigation and could even proxy them into a preview that has no such file.
+
 ---
 
 ## 9. Native code (Wasm)
