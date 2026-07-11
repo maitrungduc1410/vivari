@@ -62,15 +62,18 @@ nothing runs — `host.js` checks and bails early.)
 ## 3. Worker topology
 
 Work is split across several Web Workers so no single thread is on the critical
-path of everything. All of them are plain ES modules in dev; the production build
-bundles each into one file (§10).
+path of everything. The worker roles below are ES modules; **studio's Vite build
+bundles each** (nested module workers + wasm), while the legacy demo loads them raw
+in dev and esbuild-bundles them for production (§10).
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ Main thread — packages/demo/host.js                                    │
+│ Main thread — packages/studio (React 19 + shadcn)                      │
+│   (legacy: packages/demo/host.js — same protocol, plain-JS UI)         │
 │   • VS Code-style IDE: Explorer + tabbed Monaco + tabbed terminal      │
 │     panel (Console + INTERACTIVE shells) + command palette + preview    │
 │     (ANSI intact; shells have real stdin — type a command, Enter runs)  │
+│   • src/oc/kernel.ts (KernelBridge) + src/oc/controller.ts (IdeController)│
 │   • registers the preview Service Worker                               │
 │   • relays SW HTTP requests to the Kernel Worker                       │
 │   • NO kernel/user work runs here (keeps the UI responsive)            │
@@ -370,21 +373,29 @@ lazily on first use (a process that never hashes/compresses instantiates neither
 
 ## 10. Build & run
 
-- **Dev**: `npm run dev` → `server.mjs` on `:8080` with COOP/COEP. Open
-  `http://localhost:8080/packages/demo/index.html`. In dev the browser loads the
-  runtime as ~120 individual ES modules per worker (readable, debuggable,
-  diffable against upstream Node).
-- **Production bundle**: `npm run build:demo` → `scripts/build-demo.mjs` bundles
-  **one esbuild file per worker role** into `packages/demo-dist/` (host,
-  kernel-worker, process-worker, fs-worker, fetcher-worker, sw). `demo-dist` is a
-  gitignored build artifact and a **sibling** of `demo/` so the `new URL(x,
-  import.meta.url)` worker/wasm refs still resolve. Each build stamps a `BUILD_ID`
-  into the SW to version its precache. The editor vendor is kept **external** here
-  (it is already bundled) and shipped as its own cache-first file.
-- **Editor vendor**: `scripts/build-editor-vendor.mjs` bundles Monaco + xterm into a
-  committed, same-origin `packages/demo/vendor/editor/editor.{js,css}`. It must be
-  same-origin (not a CDN) because the page is cross-origin isolated (COEP:
-  require-corp). Re-run only when bumping the editor deps; the output is checked in.
+- **Dev (studio, default)**: `npm run dev` → `cd packages/studio && bun run dev`
+  (Vite, default `:5173`). `vite.config.ts` sends COOP/COEP on the dev + preview
+  servers, stamps `Service-Worker-Allowed: /` on `/sw.js`, sets `worker.format:'es'`,
+  and widens `server.fs.allow` to the repo root so it can read the sibling worker/wasm
+  sources. Vite bundles the kernel worker AND — recursively — its nested module
+  workers (`new Worker(new URL('./fs-worker.js'|'./process-worker.js'|'./fetcher-worker
+  .js', import.meta.url), {type:'module'})`) and every `new URL('../*/pkg/*_bg.wasm',
+  import.meta.url)` asset, all emitted same-origin so COEP holds. Monaco + xterm come
+  from npm (no vendored bundle). `npm run build:studio` / `npm run preview:studio` are
+  the production build + preview.
+- **Dev (legacy demo)**: `npm run dev:legacy` → `server.mjs` on `:8080` with COOP/COEP.
+  Open `http://localhost:8080/packages/demo/index.html`. Loads the runtime as ~120
+  individual ES modules per worker (readable, debuggable, diffable against upstream Node).
+- **Legacy production bundle**: `npm run build:demo` → `scripts/build-demo.mjs` bundles
+  **one esbuild file per worker role** into `packages/demo-dist/` (host, kernel-worker,
+  process-worker, fs-worker, fetcher-worker, sw). `demo-dist` is a gitignored build
+  artifact and a **sibling** of `demo/` so the `new URL(x, import.meta.url)` worker/wasm
+  refs still resolve. Each build stamps a `BUILD_ID` into the SW to version its precache.
+  The editor vendor is kept **external** here and shipped as its own cache-first file.
+- **Editor vendor (legacy only)**: `scripts/build-editor-vendor.mjs` bundles Monaco +
+  xterm into a committed, same-origin `packages/demo/vendor/editor/editor.{js,css}`. It
+  must be same-origin (not a CDN) because the page is cross-origin isolated. Studio does
+  not use it (Vite bundles Monaco/xterm from npm).
 - **Wasm**: `npm run build` compiles all Rust crates (needs Rust + `wasm-pack`).
 
 ---

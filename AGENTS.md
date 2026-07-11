@@ -63,28 +63,47 @@ packages/
       bindings/    our internalBinding shims (fs, tcp_wrap, zlib, crypto, ...).
       internal-binding.js / primordials.js / loader.js   glue for the above.
 
-  demo/            Browser wiring (dev, loaded as raw ES modules).
-    host.js            main thread: UI, SW registration, request relay.
-    kernel-worker.js   hosts the Kernel; DEMOS registry + demo shell tabs (OC_RUN).
-    fs-worker.js       hosts the File System Worker (VFS + OPFS).
-    fetcher-worker.js  outbound fetch() (npm downloads).
-    process-worker.js  one process = one worker (boots the runtime).
-    sw.js              preview Service Worker (fetch → kernel → in-VM server).
-    index.html         VS Code-style IDE: activity bar · Explorer · tabbed Monaco ·
-                       tabbed terminal panel (Console + interactive shells) · preview.
-    vendor/editor/     COMMITTED Monaco + xterm bundle (editor.js/.css) — the page
-                       is cross-origin isolated, so the editor can't come from a CDN.
-  demo-dist/       GITIGNORED esbuild bundle of demo/ (one file per worker role).
+  studio/          The primary UI: a Vite + React 19 (React Compiler) + Tailwind v4
+                   + shadcn/ui + lucide app. Vite is the single toolchain and also
+                   BUNDLES the worker roles below + the wasm (nested module workers
+                   via `new Worker(new URL(...), {type:'module'})`, wasm via
+                   `new URL(..._bg.wasm, import.meta.url)`). Run with `npm run dev`.
+    vite.config.ts   COOP/COEP headers (dev + preview) + `Service-Worker-Allowed:/`
+                     for /sw.js + `worker.format:'es'` + `server.fs.allow` (repo root,
+                     so it can read the sibling worker/wasm sources) + React Compiler
+                     (plugin-react v6 is oxc-based; the compiler is wired via
+                     `reactCompilerPreset()` + `@rolldown/plugin-babel`).
+    public/sw.js     the preview Service Worker, served at root scope (copied from demo/).
+    src/oc/kernel.ts      KernelBridge: spawns demo/kernel-worker.js, SW register +
+                          oc-http relay, typed pub/sub over the worker protocol.
+    src/oc/controller.ts  IdeController: the imperative core ported from demo/host.js
+                          (Monaco, xterm terminals, demo Run via OC_RUN, preview) as an
+                          external store React reads via useSyncExternalStore.
+    src/components/ide/   AppShell · ActivityBar · Explorer · EditorGroup · TerminalPanel ·
+                          PreviewPanel · StatusBar · CommandPalette (shadcn/Tailwind/lucide).
+
+  demo/            LEGACY raw-ESM UI (still runnable via `npm run dev:legacy` on
+                   server.mjs). Its WORKER files are the shared runtime host and are
+                   bundled by studio — do NOT delete them:
+    host.js            legacy main thread: UI, SW registration, request relay.
+    kernel-worker.js   hosts the Kernel; DEMOS registry + demo shell tabs (OC_RUN). [shared]
+    fs-worker.js       hosts the File System Worker (VFS + OPFS). [shared]
+    fetcher-worker.js  outbound fetch() (npm downloads). [shared]
+    process-worker.js  one process = one worker (boots the runtime). [shared]
+    sw.js              preview Service Worker (fetch → kernel → in-VM server). [shared source]
+    index.html         legacy VS Code-style IDE (activity bar · Explorer · Monaco · terminal · preview).
+    vendor/editor/     COMMITTED Monaco + xterm bundle for the legacy UI (studio uses npm instead).
+  demo-dist/       GITIGNORED esbuild bundle of demo/ (legacy bundled path).
 
 scripts/
   verify-node.mjs      headless end-to-end proof (no browser).
   verify-express.mjs   installs+runs real Express/Vite/ws (needs network).
   probe-*.mjs          framework discovery/regression probes (react/nest/realdev).
   process-worker.mjs / fs-worker.mjs   Node worker_threads entries for headless.
-  build-demo.mjs       bundles demo/ → demo-dist/ with esbuild.
-  build-editor-vendor.mjs   bundles Monaco+xterm → demo/vendor/editor/ (re-run on bump).
+  build-demo.mjs       bundles demo/ → demo-dist/ with esbuild (legacy path).
+  build-editor-vendor.mjs   bundles Monaco+xterm → demo/vendor/editor/ (legacy, re-run on bump).
 
-server.mjs             static dev server that sends the COOP/COEP headers.
+server.mjs             static dev server for the legacy demo (sends COOP/COEP headers).
 README.md · roadmap.md · research.md · ARCHITECTURE.md · AGENTS.md
 ```
 
@@ -93,8 +112,12 @@ README.md · roadmap.md · research.md · ARCHITECTURE.md · AGENTS.md
 ## Golden rules
 
 1. **Cross-origin isolation is mandatory.** `SharedArrayBuffer`/`Atomics` need
-   `COOP: same-origin` + `COEP: require-corp`. `server.mjs` sends them; don't
-   serve the demo another way and expect it to work.
+   `COOP: same-origin` + `COEP: require-corp`. Studio sends them from
+   `packages/studio/vite.config.ts` (`server.headers` + `preview.headers` + a plugin
+   that also stamps `Service-Worker-Allowed: /` on `/sw.js`); the legacy demo uses
+   `server.mjs`. Serve it any other way and nothing works. All assets stay
+   same-origin (no CDN) so COEP is satisfied — that's why Monaco/xterm are bundled
+   from npm (studio) or vendored (legacy).
 2. **Prefer matching real Node over special-casing.** We vendor Node's `lib/`. If
    a framework crashes, the usual root cause is a missing/incorrect
    `internalBinding` shim or `internal/*` export — fix that, not the framework.
@@ -261,11 +284,15 @@ browser first.
 - `node scripts/probe-term.mjs` — interactive terminal: launches a live `sh`, feeds
   keystrokes via `kernel.sendStdin`, asserts echo + `cd`/`pwd`/backspace. No network.
   `probe-nest-watch.mjs` validates the Nest save→recompile→restart reload.
-- Browser smoke test: `npm run dev`, open
-  `http://localhost:8080/packages/demo/index.html`, pick a project + Run, then
-  check the terminal (Vite/Nest colored output), edit a file in Monaco (auto-saves
-  → HMR/restart), and the preview iframe. For the bundled path, `npm run
-  build:demo` and open `packages/demo-dist/index.html`.
+- Browser smoke test: `npm run dev` (studio, Vite — opens on `http://localhost:5173`
+  by default), pick a project + Run, then check the terminal (Vite/Nest colored
+  output), edit a file in Monaco (auto-saves → HMR/restart), and the preview iframe.
+  Legacy UI: `npm run dev:legacy` → `http://localhost:8080/packages/demo/index.html`
+  (bundled: `npm run build:demo` → `packages/demo-dist/index.html`).
+- Headless studio check (no manual browser): the studio exposes `window.__ide` (the
+  IdeController) in dev, so a CDP script can drive the whole flow — boot, assert
+  `crossOriginIsolated` + kernel ready, `window.__ide.setSelectedDemo('react'|'nest')`
+  + `window.__ide.runDemo()`, then poll the preview iframe's src + rendered content.
 
 When you add a Node API or a binding, add/extend a probe or a `verify-*` case so
 the gap can't silently regress.
@@ -280,8 +307,9 @@ the gap can't silently regress.
 - **Add a demo**: extend the `DEMOS` registry in `demo/kernel-worker.js` with a
   REAL project layout (`files` = relative path → contents, exactly what `npm create
   …` emits), plus `dir`, `port`, `entry`, and a `runCmd`/`runArgs` that is the
-  project's own dev script (e.g. `npm run dev`). Add the option to the `<select>` in
-  `index.html`. "Run" opens a dedicated shell tab whose `sh` auto-runs
+  project's own dev script (e.g. `npm run dev`). Add the option to the `DEMOS` array
+  in `studio/src/oc/controller.ts` (id + title + run label) — and, for the legacy UI,
+  the `<select>` in `demo/index.html`. "Run" opens a dedicated shell tab whose `sh` auto-runs
   `OC_RUN="npm install && <runCmd runArgs>"` (`scaffoldDemo()` writes the files once;
   install is skipped once `node_modules` exists), so the **dev server lives in that
   tab** — closing it stops the server, a double-run `EADDRINUSE`s (not intercepted).

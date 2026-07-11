@@ -1224,6 +1224,40 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
       Reverted to per-PID naming. Deeper wins (snapshotting the runtime, a smaller
       process bundle) remain open if the numbers ever justify them.
 
+  - ✅ **Studio — the React/shadcn UI (`packages/studio`).** The demo front-end was
+    rebuilt as a modern app: **Vite 8 + React 19 (React Compiler) + Tailwind v4 +
+    shadcn/ui + lucide**, scaffolded with Bun. Vite is now the **single toolchain and
+    also bundles the runtime**: `new Worker(new URL('../../../demo/kernel-worker.js',
+    import.meta.url), {type:'module'})` and, recursively, its nested module workers
+    (`fs`/`fetcher`/`process`) and every `new URL('../*/pkg/*_bg.wasm', import.meta.url)`
+    — all emitted same-origin so COEP holds. The accepted risk (nested module workers +
+    wasm + SAB under Vite) was validated first on a bare page (headless Chrome/CDP:
+    `crossOriginIsolated===true`, kernel ready ~33ms), before any UI.
+    - **Layout**: the imperative core of `demo/host.js` was ported verbatim into an
+      `IdeController` (`src/oc/controller.ts`) that owns Monaco, the xterm terminals
+      (read-only Console + interactive shells), the demo "Run" lifecycle (`OC_RUN`), and
+      the preview; React reads an immutable snapshot via `useSyncExternalStore` and
+      renders the chrome (AppShell/ActivityBar/Explorer/EditorGroup/TerminalPanel/
+      PreviewPanel/StatusBar/CommandPalette). The **kernel-worker.js protocol is
+      unchanged** — studio speaks the exact same messages, so both UIs share one runtime.
+    - **Isolation plumbing** lives in `vite.config.ts` (COOP/COEP on dev + preview, a
+      plugin that stamps `Service-Worker-Allowed:/` on `/sw.js`, `worker.format:'es'`,
+      and `server.fs.allow` widened to the repo root). `public/sw.js` is the same preview
+      SW at root scope. Monaco/xterm come from npm (no vendored bundle); Monaco's language
+      workers stay disabled (no-op `MonacoEnvironment`), COEP-safe as before.
+    - **Gotchas hit**: `@vitejs/plugin-react` v6 is oxc-based (no `babel` option) — the
+      React Compiler is wired via the exported `reactCompilerPreset()` + `@rolldown/plugin-
+      babel`; TS 6 removed `baseUrl` (paths are tsconfig-relative); shadcn's `base-nova`
+      style is built on **Base UI**, not Radix (`delay` not `delayDuration`, trigger
+      composition via `render`/no `asChild`); `react-resizable-panels` v4 uses `Group/
+      Panel/Separator` + `orientation` (no `direction`/`order`). Monaco's async import +
+      StrictMode double-mount needed a create guard.
+    - **Parity verified** (headless Chrome/CDP driving `window.__ide`): both React (`:5173`,
+      renders "Vite + React + Compiler") and Nest (`:3000`, renders "Hello World!") run
+      end-to-end through the preview proxy with zero console errors. **Default `npm run dev`
+      is now studio**; the legacy demo stays runnable via `npm run dev:legacy` and its
+      worker files remain the shared runtime source (not deleted — studio bundles them).
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server
