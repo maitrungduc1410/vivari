@@ -46,6 +46,16 @@ import { COREUTILS } from "./coreutils.js";
 
 const EMPTY = new Uint8Array(0);
 
+// Decode a base64 request body (from the http/https client shim) to bytes,
+// working in both the Node kernel host (Buffer) and a browser main thread (atob).
+function b64ToBytes(b64) {
+  if (typeof Buffer !== "undefined") return new Uint8Array(Buffer.from(b64, "base64"));
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 export class Kernel {
   constructor({ fs, spawnWorker, stdout, stderr, fetcher }) {
     this.fs = fs;
@@ -668,17 +678,30 @@ export class Kernel {
   }
 
   // ---- network fetch servicing (Phase 2 #9) ---------------------------------
-  // VFS path where a fetched body is materialized. encodeURIComponent keeps the
-  // whole URL in a single flat filename (no '/'), so it is collision-free.
-  _fetchCachePath(url) {
-    return "/var/cache/oc-fetch/" + encodeURIComponent(url);
+  // VFS path where a fetched body is materialized. The cache key (method + url +
+  // accept) is encodeURIComponent'd into a single flat filename (no '/'), so
+  // distinct request variants of the same URL never share a body file.
+  _fetchCachePath(cacheKey) {
+    return "/var/cache/oc-fetch/" + encodeURIComponent(cacheKey);
+  }
+
+  _fetchCacheKey(method, url, headers) {
+    const accept = headers ? headers.accept || headers.Accept || "" : "";
+    return method + " " + url + (accept ? " " + accept : "");
   }
 
   // Deferred like handleSpawn: the caller stays parked on Atomics.wait while we
   // fetch (off-thread, in the Fetcher Worker) and stream the body into the VFS.
-  async handleFetch(proc, { url }) {
+  // `method`/`headers`/`bodyB64` (from the http/https client shim, lib/https.js)
+  // let a real ClientRequest egress; a bare `{url}` still works (GET).
+  async handleFetch(proc, { url, method = "GET", headers = null, bodyB64 = null }) {
     try {
-      const cached = this.fetchCache.get(url);
+      method = String(method || "GET").toUpperCase();
+      // Only idempotent bodyless GETs are cached (npm re-resolving the same
+      // packument). Anything with a body / non-GET always hits the network.
+      const cacheable = method === "GET" && !bodyB64;
+      const cacheKey = this._fetchCacheKey(method, url, headers);
+      const cached = cacheable ? this.fetchCache.get(cacheKey) : null;
       if (cached) {
         if (this.onFetch) this.onFetch(url, { cached: true, size: cached.size });
         this.respondOk(proc, encodeString(JSON.stringify({ ...cached, cached: true })));
@@ -688,26 +711,43 @@ export class Kernel {
         this.respondErr(proc, "ENETUNREACH");
         return;
       }
-      const res = await this.fetcher(url);
+      const init = { method, headers: headers || undefined };
+      if (bodyB64) init.body = b64ToBytes(bodyB64);
+      const res = await this.fetcher(url, init);
       // Process may have exited while the fetch was in flight.
       if (!this.procs.has(proc.pid)) return;
       const body = res.body instanceof Uint8Array ? res.body : new Uint8Array(res.body || 0);
-      const path = this._fetchCachePath(url);
+      const path = this._fetchCachePath(cacheKey);
       this.mkdirp("/var/cache/oc-fetch");
-      const headers = res.headers || {};
+      // Normalize response headers to a lowercased plain object and drop the
+      // content-* encoding hints: the Fetcher Worker's fetch() already returns a
+      // DECODED body (gzip/br transfer-encoding stripped), so leaving these would
+      // make the client (npm) try to gunzip an already-plain body or mismatch the
+      // length. The body's own format (e.g. a .tgz) is untouched.
+      const headersOut = {};
+      const raw = res.headers || {};
+      const put = (k, v) => {
+        const lk = String(k).toLowerCase();
+        if (lk === "content-encoding" || lk === "content-length") return;
+        headersOut[lk] = v;
+      };
+      if (typeof raw.forEach === "function" && !Array.isArray(raw)) raw.forEach((v, k) => put(k, v));
+      else for (const k of Object.keys(raw)) put(k, raw[k]);
       // Capture size before writeLarge: it transfers (detaches) body.buffer, after
       // which body.byteLength reads 0.
       const meta = {
         status: res.status | 0,
+        statusText: res.statusText || "",
         ok: !!res.ok,
-        contentType: headers["content-type"] || headers["Content-Type"] || "",
+        headers: headersOut,
+        contentType: headersOut["content-type"] || "",
         size: body.byteLength,
         path,
       };
       // Large body bypasses the 1 MiB SAB: hand it to the FS Worker over a
       // transferable buffer, then the process reads it back with normal fs (#14).
       await this.fs.writeLarge(path, body);
-      this.fetchCache.set(url, meta);
+      if (cacheable) this.fetchCache.set(cacheKey, meta);
       if (this.onFetch) this.onFetch(url, { cached: false, size: meta.size });
       this.respondOk(proc, encodeString(JSON.stringify({ ...meta, cached: false })));
     } catch (err) {

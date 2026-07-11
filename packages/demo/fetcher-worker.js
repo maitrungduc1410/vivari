@@ -8,8 +8,8 @@
 // ArrayBuffer — it never travels through the 1 MiB syscall window.
 //
 // Protocol (kernel <-> fetcher):
-//   kernel  -> { type: 'fetch', id, url }
-//   fetcher -> { type: 'fetch-result', id, ok, status, headers, body }   (body transferred)
+//   kernel  -> { type: 'fetch', id, url, init }   init = {method, headers, body} | null
+//   fetcher -> { type: 'fetch-result', id, ok, status, statusText, headers, body } (body transferred)
 //           -> { type: 'fetch-result', id, error }                       (network failure)
 
 // Pluggable registry endpoint (the "direct now, proxy later" seam). The npm
@@ -25,23 +25,39 @@ function rewrite(url) {
   return url;
 }
 
-async function doFetch(url) {
+async function doFetch(url, init) {
   // Default mode is 'cors'; with ACAO:* the response is readable and satisfies
   // COEP:require-corp. Follows redirects (registry tarballs may 3xx to a CDN).
-  const res = await fetch(rewrite(url), { redirect: "follow" });
+  // `init` (from the http/https client shim) carries method/headers/body so a
+  // real ClientRequest can egress; forbidden headers were already stripped shim-side.
+  const opts = { redirect: "follow" };
+  if (init) {
+    if (init.method) opts.method = init.method;
+    if (init.headers) opts.headers = init.headers;
+    if (init.body) opts.body = init.body;
+  }
+  const res = await fetch(rewrite(url), opts);
   const buf = await res.arrayBuffer();
   const headers = {};
   for (const [k, v] of res.headers) headers[k] = v;
-  return { ok: res.ok, status: res.status, headers, body: buf };
+  return { ok: res.ok, status: res.status, statusText: res.statusText, headers, body: buf };
 }
 
 self.onmessage = async (event) => {
   const m = event.data;
   if (m.type !== "fetch") return;
   try {
-    const r = await doFetch(m.url);
+    const r = await doFetch(m.url, m.init);
     self.postMessage(
-      { type: "fetch-result", id: m.id, ok: r.ok, status: r.status, headers: r.headers, body: r.body },
+      {
+        type: "fetch-result",
+        id: m.id,
+        ok: r.ok,
+        status: r.status,
+        statusText: r.statusText,
+        headers: r.headers,
+        body: r.body,
+      },
       [r.body],
     );
   } catch (err) {

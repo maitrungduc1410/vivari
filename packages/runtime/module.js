@@ -249,7 +249,18 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     }
 
     let resolved = null;
-    if (request.startsWith("/") || request.startsWith("./") || request.startsWith("../")) {
+    // Node treats "." and ".." (bare, no slash) as relative too — e.g.
+    // `require('.')` loads the current directory's index/main. They don't match a
+    // startsWith('./') check, so handle them explicitly or they'd fall through to
+    // the node_modules branch and look for a package literally named "." (npm's
+    // @sigstore/tuf does `require('.')`).
+    if (
+      request === "." ||
+      request === ".." ||
+      request.startsWith("/") ||
+      request.startsWith("./") ||
+      request.startsWith("../")
+    ) {
       const base = path.resolve(fromDir, request);
       resolved = tryExtensions(base) || loadAsDirectory(base);
     } else {

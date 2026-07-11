@@ -657,7 +657,7 @@ export function createRuntime({
   // the kernel's Fetcher Worker. Returns { status, ok, contentType, size, path,
   // cached }; read `path` with fs for the bytes. This is the low-level primitive
   // the npm client (#10) will build on; it'll get a proper wrapper then.
-  globalThis.__ocfetch = (url) => syscalls.fetch(String(url));
+  globalThis.__ocfetch = (url, opts) => syscalls.fetch(String(url), opts);
 
   const builtins = {
     fs,

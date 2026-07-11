@@ -566,13 +566,25 @@ async function boot() {
     if (!p) return;
     fetchPending.delete(m.id);
     if (m.error) p.reject(new Error(m.error));
-    else p.resolve({ ok: m.ok, status: m.status, headers: m.headers, body: new Uint8Array(m.body) });
+    else
+      p.resolve({
+        ok: m.ok,
+        status: m.status,
+        statusText: m.statusText,
+        headers: m.headers,
+        body: new Uint8Array(m.body),
+      });
   };
-  const fetcher = (url) =>
+  // `init` (from the http/https client shim: {method, headers, body}) lets a real
+  // ClientRequest egress; a bare fetcher(url) still does a GET.
+  const fetcher = (url, init) =>
     new Promise((resolve, reject) => {
       const id = fetchSeq++;
       fetchPending.set(id, { resolve, reject });
-      fetcherWorker.postMessage({ type: "fetch", id, url });
+      const msg = { type: "fetch", id, url, init: init || null };
+      // Transfer the request body's buffer when present (avoids a copy).
+      const transfer = init && init.body && init.body.buffer ? [init.body.buffer] : [];
+      fetcherWorker.postMessage(msg, transfer);
     });
 
   await fsReady;

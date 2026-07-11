@@ -63,16 +63,28 @@ const spawnWorker = (info) => {
     postMessage: (m) => w.postMessage(m),
   };
 };
-const fetcher = async (url) => {
-  const r = await fetch(url, { redirect: "follow" });
+const fetcher = async (url, init) => {
+  const r = await fetch(url, { redirect: "follow", ...(init || {}) });
   const body = new Uint8Array(await r.arrayBuffer());
   const headers = {};
   r.headers.forEach((v, k) => (headers[k] = v));
-  return { ok: r.ok, status: r.status, headers, body };
+  return { ok: r.ok, status: r.status, statusText: r.statusText, headers, body };
 };
 
-const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, fetcher });
+const LIVE = process.env.OC_LIVE === "1";
+const kernel = new Kernel({
+  fs: kernelFs.fs,
+  spawnWorker,
+  fetcher,
+  stdout: LIVE ? (s) => process.stderr.write(s) : undefined,
+  stderr: LIVE ? (s) => process.stderr.write(s) : undefined,
+});
 kernel.installCoreutils();
+let fetchN = 0;
+kernel.onFetch = (url, info) => {
+  fetchN++;
+  process.stderr.write(`  [net ${fetchN}] ${info.cached ? "cache" : "GET"} ${((info.size / 1024) | 0)}k  ${url}\n`);
+};
 
 // ── load the vendored npm tree into the VFS ──────────────────────────────────
 let fileCount = 0;
@@ -143,7 +155,7 @@ console.log(`(prim exit ${prim.code})\n`);
 
 // ── the gate: real npm --version ─────────────────────────────────────────────
 console.log("── npm --version (real npm-cli.js on Path B) ──");
-const env = { HOME: "/home/user", PATH: "/bin", npm_config_cache: "/tmp/.npm" };
+const env = { HOME: "/home/user", PATH: "/bin", npm_config_cache: "/tmp/.npm", OC_LIVE: LIVE ? "1" : "" };
 
 // Wrapper that taps npm's proc-log events (process.emit('log'|'output', ...)) and
 // catches a synchronous throw, so we can SEE what npm tried to say even if its
@@ -156,7 +168,8 @@ const util = require('util');
 const LOG = '/npmlog.txt';
 try { fs.writeFileSync(LOG, ''); } catch (e) {}
 const fmt = (a) => a.map((x) => (typeof x === 'string' ? x : util.inspect(x, { depth: 3 }))).join(' ');
-const append = (s) => { try { fs.appendFileSync(LOG, s + '\\n'); } catch (e) {} };
+    const LIVE = process.env.OC_LIVE === '1';
+    const append = (s) => { try { fs.appendFileSync(LOG, s + '\\n'); } catch (e) {} if (LIVE) { try { process.stderr.write('[npm] ' + s + '\\n'); } catch (e) {} } };
 process.on('output', (level, ...a) => append('OUTPUT[' + level + '] ' + fmt(a)));
 process.on('log', (level, ...a) => append('LOG[' + level + '] ' + fmt(a)));
 process.on('uncaughtException', (e) => append('UNCAUGHT ' + ((e && e.stack) || e)));
@@ -185,6 +198,73 @@ console.log(`exit=${v.code}  (${Date.now() - t1}ms)`);
 console.log("stdout:", JSON.stringify(v.stdout));
 if (v.stderr && v.stderr.trim()) console.log("stderr:\n" + v.stderr);
 
-const ok = v.code === 0 && /^\s*10\.9\.2\s*$/.test(v.stdout || "");
-console.log("\nRESULT: " + (ok ? "PASS — real npm booted + printed its version" : "FAIL — see stderr above"));
+const versionOk = v.code === 0 && /^\s*10\.9\.2\s*$/.test(v.stdout || "");
+console.log("version gate: " + (versionOk ? "PASS" : "FAIL"));
+
+// ── https shim self-test (isolate the shim from npm's plumbing) ──────────────
+console.log("\n── https.get self-test ──");
+kernel.writeFile(
+  "/https-test.js",
+  `
+const https = require('https');
+const req = https.get('https://registry.npmjs.org/is-number', (res) => {
+  let n = 0;
+  res.on('data', (c) => { n += c.length; });
+  res.on('end', () => { console.log('SELFTEST status=' + res.statusCode + ' bytes=' + n); process.exit(0); });
+  res.on('error', (e) => { console.log('SELFTEST res-error ' + e.message); process.exit(1); });
+});
+req.on('error', (e) => { console.log('SELFTEST req-error ' + e.message); process.exit(1); });
+setTimeout(() => { console.log('SELFTEST TIMEOUT'); process.exit(2); }, 20000);
+`,
+);
+const st = await Promise.race([
+  kernel.start("node", ["/https-test.js"], { cwd: "/app", env, capture: true }),
+  new Promise((r) => setTimeout(() => r({ code: 124, stdout: "", stderr: "outer timeout" }), 25000)),
+]);
+console.log("selftest exit=" + st.code + " stdout=" + JSON.stringify((st.stdout || "").trim()));
+if (st.stderr && st.stderr.trim()) console.log("selftest stderr:\n" + st.stderr.trim());
+
+// ── phase 1 gate: real `npm install <pkg>` over the Fetcher Worker ────────────
+const PKG = process.env.OC_PKG || "is-number";
+console.log(`\n── npm install ${PKG} (real registry via Fetcher Worker) ──`);
+kernel.mkdirp("/home/user");
+kernel.mkdirp("/tmp/.npm/_logs");
+kernel.writeFile("/app/package.json", JSON.stringify({ name: "app", version: "1.0.0" }, null, 2));
+const t2 = Date.now();
+const TIMEOUT_MS = Number(process.env.OC_TIMEOUT || 90000);
+let timedOut = false;
+const inst = await Promise.race([
+  kernel.start(
+    "node",
+    ["/run-npm.js", "install", PKG, "--no-audit", "--no-fund", "--loglevel=silly"],
+    { cwd: "/app", env, capture: !LIVE },
+  ),
+  new Promise((r) => setTimeout(() => { timedOut = true; r({ code: 124, stdout: "", stderr: "TIMEOUT" }); }, TIMEOUT_MS)),
+]);
+console.log(`exit=${inst.code}${timedOut ? " (TIMED OUT)" : ""}  (${Date.now() - t2}ms)`);
+if (inst.stdout && inst.stdout.trim()) console.log("stdout:\n" + inst.stdout.trim());
+try {
+  const logtxt = kernel.readFile("/npmlog.txt") || "";
+  // show only the tail — silly logs are huge
+  const tail = logtxt.split("\n").slice(-40).join("\n");
+  console.log("── npm proc-log tap (tail) ──\n" + tail);
+} catch (e) {
+  console.log("(no /npmlog.txt: " + (e && e.message) + ")");
+}
+
+const installedPkgJson = `/app/node_modules/${PKG}/package.json`;
+const installed = kernel.exists(installedPkgJson);
+console.log(`\nnode_modules/${PKG}/package.json exists: ${installed}`);
+
+let requireOk = false;
+if (installed) {
+  kernel.writeFile("/app/use.js", `const p = require(${JSON.stringify(PKG)}); console.log('REQUIRE_OK ' + typeof p);`);
+  const use = await kernel.start("node", ["/app/use.js"], { cwd: "/app", env, capture: true });
+  requireOk = use.code === 0 && /REQUIRE_OK/.test(use.stdout || "");
+  console.log("require installed pkg: " + (requireOk ? "PASS " + use.stdout.trim() : "FAIL\n" + (use.stderr || use.stdout)));
+}
+
+const installOk = inst.code === 0 && installed && requireOk;
+const ok = versionOk && installOk;
+console.log("\nRESULT: " + (ok ? "PASS — real npm boots, installs, and the tree is require-able" : "FAIL — see logs above"));
 process.exit(ok ? 0 : 1);

@@ -196,8 +196,23 @@ export function createSyscalls({ ctrl, data, notify }) {
 
     // ---- network fetch (Phase 2 #9) ----
     // Blocking fetch: parks until the kernel (via the Fetcher Worker) has streamed
-    // the response body into the VFS. Returns { status, ok, contentType, size,
-    // path, cached }; read `path` with fs to get the bytes. Throws on network error.
-    fetch: (url) => JSON.parse(decodeBytes(call(OP_FETCH, encodeRequest([b(JSON.stringify({ url }))])))),
+    // the response body into the VFS. Returns { status, statusText, ok, headers,
+    // contentType, size, path, cached }; read `path` with fs to get the bytes.
+    // Throws on network error.
+    //
+    // opts (optional): { method, headers, bodyB64 } — the http/https client shim
+    // (lib/https.js) passes these so a real ClientRequest can egress. Request body
+    // is base64 (JSON can't carry bytes) and must fit the 1 MiB syscall window
+    // (fine for registry GET/PUT metadata; large tarball PUT is future work).
+    fetch: (url, opts) => {
+      const o = opts || {};
+      const req = {
+        url,
+        method: o.method || "GET",
+        headers: o.headers || null,
+        bodyB64: o.bodyB64 || null,
+      };
+      return JSON.parse(decodeBytes(call(OP_FETCH, encodeRequest([b(JSON.stringify(req))]))));
+    },
   };
 }
