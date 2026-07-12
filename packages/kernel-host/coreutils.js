@@ -167,13 +167,26 @@ for (; i < cli.length; i++) {
 const rest = cli.slice(i + 1); // script's own args
 
 const req = (m) => require(m[0] === '.' || m[0] === '/' ? path.resolve(process.cwd(), m) : m);
+if (typeof require.resolve === 'function') {
+  req.resolve = (m) => require.resolve(m[0] === '.' || m[0] === '/' ? path.resolve(process.cwd(), m) : m);
+}
 for (const m of preload) {
   try { req(m); } catch (e) { process.stderr.write('node: failed to preload ' + m + ': ' + ((e && e.message) || e) + '\\n'); }
 }
 
 if (evalCode != null) {
   process.argv = ['node', ...rest];
-  const r = (0, eval)(evalCode);
+  // Real \`node -e\`/\`-p\` runs the code in a CommonJS module scope: require, module,
+  // exports, __filename ('[eval]'), __dirname (cwd) are all in scope, and require
+  // resolves relative to cwd. Indirect eval ran it in the GLOBAL scope where none
+  // of these exist ('require is not defined' — the exact failure npm lifecycle
+  // scripts hit, since they're literally \`node -e "require('fs')..."\`). Build the
+  // Node module wrapper explicitly and pass a cwd-aware require (\`req\`).
+  const mod = { exports: {}, id: '[eval]', filename: '[eval]', loaded: false, paths: [] };
+  const dir = process.cwd();
+  const body = printResult ? 'return (' + evalCode + '\\n);' : evalCode;
+  const fn = new Function('require', 'module', 'exports', '__filename', '__dirname', body);
+  const r = fn(req, mod, mod.exports, '[eval]', dir);
   if (printResult) process.stdout.write(require('util').inspect(r) + '\\n');
 } else {
   if (!entry) { process.stderr.write('node: missing script\\n'); process.exit(1); }

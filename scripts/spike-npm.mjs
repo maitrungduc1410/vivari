@@ -265,6 +265,82 @@ if (installed) {
 }
 
 const installOk = inst.code === 0 && installed && requireOk;
-const ok = versionOk && installOk;
+
+// ── phase 2 gate: lifecycle scripts + .bin + non-fatal native (node-gyp) ─────
+let lifecycleOk = true;
+const PHASE2 = process.env.OC_PHASE2 === "1";
+if (PHASE2) {
+  console.log("\n══ PHASE 2: lifecycle scripts + .bin + node-gyp stub ══");
+  kernel.mkdirp("/app2");
+  // repro: run the exact script npm runs for a lifecycle hook, capture stderr.
+  {
+    const script = `node -e "require('fs').writeFileSync('preinstall.flag','ok')"`;
+    const r = await kernel.start("sh", ["-c", script], { cwd: "/app2", env, capture: true });
+    console.log(
+      `[repro] sh -c ... exit=${r.code} stdout=${JSON.stringify((r.stdout || "").trim())} stderr=${JSON.stringify((r.stderr || "").trim())} flag=${kernel.exists("/app2/preinstall.flag")}`,
+    );
+    try { kernel.unlink("/app2/preinstall.flag"); } catch {}
+  }
+  // Root project with lifecycle scripts (preinstall/postinstall write markers, and
+  // an `install` that shells out to node-gyp — must be non-fatal via the stub), a
+  // dep that ships its own JS postinstall (core-js), and a dep with a bin (semver).
+  kernel.writeFile(
+    "/app2/package.json",
+    JSON.stringify(
+      {
+        name: "app2",
+        version: "1.0.0",
+        scripts: {
+          preinstall: "node -e \"require('fs').writeFileSync('preinstall.flag','ok')\"",
+          install: "node-gyp rebuild",
+          postinstall: "node -e \"require('fs').writeFileSync('postinstall.flag','ok')\"",
+        },
+        dependencies: { semver: "^7.6.0", "core-js": "3.38.1" },
+      },
+      null,
+      2,
+    ),
+  );
+  const t3 = Date.now();
+  const inst2 = await Promise.race([
+    kernel.start("node", ["/run-npm.js", "install", "--no-audit", "--no-fund", "--loglevel=silly"], {
+      cwd: "/app2",
+      env,
+      capture: !LIVE,
+    }),
+    new Promise((r) => setTimeout(() => r({ code: 124, stdout: "", stderr: "TIMEOUT" }), TIMEOUT_MS)),
+  ]);
+  console.log(`install(app2) exit=${inst2.code}  (${Date.now() - t3}ms)`);
+  if (inst2.stdout && inst2.stdout.trim()) console.log("stdout:\n" + inst2.stdout.trim());
+  if (!LIVE) {
+    try {
+      const tail = (kernel.readFile("/npmlog.txt") || "").split("\n").slice(-50).join("\n");
+      console.log("── npm proc-log tap (tail) ──\n" + tail);
+    } catch {}
+  }
+  const checks = {
+    "root preinstall ran": kernel.exists("/app2/preinstall.flag"),
+    "root postinstall ran": kernel.exists("/app2/postinstall.flag"),
+    "core-js installed": kernel.exists("/app2/node_modules/core-js/package.json"),
+    "semver installed": kernel.exists("/app2/node_modules/semver/package.json"),
+    ".bin/semver shim": kernel.exists("/app2/node_modules/.bin/semver"),
+  };
+  for (const [k, val] of Object.entries(checks)) console.log(`  ${val ? "PASS" : "FAIL"}  ${k}`);
+  // .bin runnable via the local tool (semver CLI prints the coerced version)
+  let binRun = false;
+  if (checks[".bin/semver shim"]) {
+    const r = await kernel.start("node", ["/run-npm.js", "exec", "--", "semver", "1.2.3"], {
+      cwd: "/app2",
+      env,
+      capture: true,
+    });
+    binRun = r.code === 0 && /1\.2\.3/.test(r.stdout || "");
+    console.log(`  ${binRun ? "PASS" : "FAIL"}  npx semver 1.2.3 -> ${JSON.stringify((r.stdout || "").trim())}`);
+  }
+  lifecycleOk = inst2.code === 0 && Object.values(checks).every(Boolean) && binRun;
+  console.log("phase 2: " + (lifecycleOk ? "PASS" : "FAIL"));
+}
+
+const ok = versionOk && installOk && lifecycleOk;
 console.log("\nRESULT: " + (ok ? "PASS — real npm boots, installs, and the tree is require-able" : "FAIL — see logs above"));
 process.exit(ok ? 0 : 1);
