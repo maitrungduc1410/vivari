@@ -271,6 +271,26 @@ if (installed) {
 
 const installOk = inst.code === 0 && installed && requireOk;
 
+// ── npm ci gate: clean, lockfile-driven reinstall ────────────────────────────
+// `npm ci` is the CI/production install: it requires an existing package-lock.json,
+// blows away node_modules, and reinstalls strictly from the lock. It exercises a
+// different Arborist path (loadVirtual, not loadActual) plus a recursive rm of the
+// tree — a good stress test of fs.rm(recursive) + re-extraction in the VFS.
+let ciOk = false;
+let ciRan = false;
+if (installOk && kernel.exists("/app/package-lock.json")) {
+  ciRan = true;
+  console.log("\n── npm ci (clean install from package-lock.json) ──");
+  const tci = Date.now();
+  const ci = await kernel.start("node", ["/run-npm.js", "ci", "--no-audit", "--no-fund"], { cwd: "/app", env, capture: !LIVE });
+  const ciInstalled = kernel.exists(installedPkgJson);
+  ciOk = ci.code === 0 && ciInstalled;
+  console.log(`npm ci exit=${ci.code} (${((Date.now() - tci) / 1000).toFixed(1)}s), ${PKG} present: ${ciInstalled} → ${ciOk ? "PASS" : "FAIL"}`);
+  if (!ciOk && !LIVE && ci.stderr) console.log("npm ci stderr (tail):\n" + ci.stderr.trim().split("\n").slice(-15).join("\n"));
+} else if (installOk) {
+  console.log("\n── npm ci: SKIP (no package-lock.json produced) ──");
+}
+
 // ── phase 2 gate: lifecycle scripts + .bin + non-fatal native (node-gyp) ─────
 let lifecycleOk = true;
 const PHASE2 = process.env.OC_PHASE2 === "1";
@@ -346,6 +366,6 @@ if (PHASE2) {
   console.log("phase 2: " + (lifecycleOk ? "PASS" : "FAIL"));
 }
 
-const ok = versionOk && installOk && lifecycleOk;
-console.log("\nRESULT: " + (ok ? "PASS — real npm boots, installs, and the tree is require-able" : "FAIL — see logs above"));
+const ok = versionOk && installOk && lifecycleOk && (!ciRan || ciOk);
+console.log("\nRESULT: " + (ok ? "PASS — real npm boots, installs, npm ci reinstalls, and the tree is require-able" : "FAIL — see logs above"));
 process.exit(ok ? 0 : 1);

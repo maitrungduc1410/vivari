@@ -246,6 +246,37 @@ export class FsServer {
     this.notifyWatch(path, existed ? "change" : "rename");
   }
 
+  /**
+   * Write MANY files in ONE call — the boot-time delivery of a package manager's
+   * tree (npm ~2400 files, pnpm/corepack/yarn) used to be one SAB round-trip per
+   * file, which dominated cold-boot. Here the whole batch arrives over a single
+   * transferable ArrayBuffer (see kernel-fs.writeFilesBatch): `entries` are
+   * `{ path, byteOffset, byteLength }` slices into `buffer`. We create each unique
+   * parent dir once and write every file against the VFS on this thread, so the
+   * cost is one message + one loop instead of N doorbell/Atomics.wait cycles.
+   */
+  writeBatch(entries, buffer) {
+    const view = new Uint8Array(buffer);
+    const p = this.persistence;
+    const madeDirs = new Set();
+    for (const e of entries) {
+      const slash = e.path.lastIndexOf("/");
+      if (slash > 0) {
+        const dir = e.path.slice(0, slash);
+        if (!madeDirs.has(dir)) {
+          try { this.vfs.mkdir(dir, true); } catch { /* exists */ }
+          madeDirs.add(dir);
+        }
+      }
+      const bytes = view.subarray(e.byteOffset, e.byteOffset + e.byteLength);
+      const existed = this.couldNotify(e.path) ? this.vfs.exists(e.path) : false;
+      this.vfs.write_file(e.path, bytes);
+      if (p) p.onWrite(e.path);
+      if (this.watches.size) this.notifyWatch(e.path, existed ? "change" : "rename");
+    }
+    return entries.length;
+  }
+
   dispatch(opcode, flags, fields, clientId) {
     const vfs = this.vfs;
     const p = this.persistence; // null when persistence is off (headless)

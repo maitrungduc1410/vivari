@@ -747,11 +747,11 @@ async function boot() {
 
   kernel.installCoreutils();
 
-  // North Star: make the shell's `npm`/`npx` the REAL npm CLI. installCoreutils
-  // just (re)wrote the Turbo-analog to /bin/npm.js, so this must run AFTER it to
-  // win. The tree persists in OPFS, so after the first boot ensureRealNpm only
-  // re-applies the cheap shims; a fresh origin fetches + unpacks the asset once.
-  // Falls back to the Turbo-analog if the asset is missing (e.g. legacy server).
+  // North Star: the shell's `npm`/`npx` IS the REAL npm CLI. The Turbo-analog is
+  // retired (no longer in COREUTILS), so this is the only npm — the tree persists
+  // in OPFS, so after the first boot ensureRealNpm only re-applies the cheap
+  // shims; a fresh origin fetches + unpacks the ~12 MB asset once (one batched
+  // VFS transfer). A missing asset simply means no `npm` on PATH, like yarn/pnpm.
   kernel.mkdirp("/home/user");
   kernel.mkdirp("/tmp/.npm/_logs");
   kernel.mkdirp("/tmp/.yarn-cache");
@@ -773,10 +773,10 @@ async function boot() {
         dim: true,
       });
     } else {
-      post("log", { line: "  [boot] real npm asset unavailable — using built-in npm.", dim: true });
+      post("log", { line: "  [boot] real npm asset unavailable — `npm` not installed.", dim: true });
     }
   } catch (e) {
-    post("log", { line: `  [boot] real npm load failed (${(e && e.message) || e}) — using built-in npm.`, dim: true });
+    post("log", { line: `  [boot] real npm load failed (${(e && e.message) || e}) — 'npm' not installed.`, dim: true });
   }
 
   // Same delivery/shim path for real yarn (classic). No fallback CLI exists, so a

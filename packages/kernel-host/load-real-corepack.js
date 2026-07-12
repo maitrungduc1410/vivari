@@ -31,11 +31,6 @@
 
 export const COREPACK_VFS_ROOT = "/usr/lib/node_modules/corepack";
 
-// corepack's dist/lib/corepack.cjs is ~520 KB — near the 1 MiB SAB window
-// kernel.writeFile uses. Route anything ≥ this size through the transferred
-// writeLarge path to stay safe if the bundle grows.
-const LARGE_THRESHOLD = 512 * 1024;
-
 // Thin shim on PATH. `node /bin/corepack.js <args>` loads the real entry
 // (dist/corepack.js), which reads process.argv exactly like the spike wrapper
 // proved.
@@ -85,23 +80,11 @@ export function applyRealCorepackShims(kernel) {
 
 /**
  * Unpack the corepack tree into the VFS and install the shim. `packBytes` is the
- * gzipped vendor asset. Large files use the async writeLarge transfer path; the
- * rest use the sync SAB writeFile.
+ * gzipped vendor asset. The whole tree is written in one batched transfer.
  */
 export async function loadRealCorepack(kernel, packBytes) {
   const { version, files } = await decodeCorepackPack(packBytes);
-  const madeDirs = new Set();
-  for (const f of files) {
-    const abs = COREPACK_VFS_ROOT + "/" + f.path;
-    const slash = abs.lastIndexOf("/");
-    const dir = abs.slice(0, slash);
-    if (!madeDirs.has(dir)) {
-      kernel.mkdirp(dir);
-      madeDirs.add(dir);
-    }
-    if (f.bytes.length >= LARGE_THRESHOLD) await kernel.fs.writeLarge(abs, f.bytes);
-    else kernel.writeFile(abs, f.bytes);
-  }
+  await kernel.writeFilesBatch(files.map((f) => ({ path: COREPACK_VFS_ROOT + "/" + f.path, bytes: f.bytes })));
   applyRealCorepackShims(kernel);
   return { version, fileCount: files.length };
 }

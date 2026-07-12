@@ -99,15 +99,47 @@ export function createKernelFs(fsWorker) {
     });
   }
 
+  // Write many files in ONE transfer instead of one SAB round-trip each. Used to
+  // deliver a package manager's tree at boot (npm ~2400 files): all bodies are
+  // concatenated into a single fresh ArrayBuffer, transferred once, and written
+  // by the FS Worker's writeBatch() (which also mkdirp's parents). `files` is
+  // `[{ path, bytes }]` (bytes: Uint8Array|Buffer|string). Returns a Promise.
+  function writeFilesBatch(files) {
+    let total = 0;
+    const norm = files.map((f) => {
+      const bytes = typeof f.contents === "string" || typeof f.bytes === "string"
+        ? enc(f.contents ?? f.bytes)
+        : (f.bytes ?? f.contents);
+      const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || 0);
+      total += u8.byteLength;
+      return { path: f.path, u8 };
+    });
+    const buffer = new ArrayBuffer(total);
+    const out = new Uint8Array(buffer);
+    const entries = new Array(norm.length);
+    let offset = 0;
+    for (let i = 0; i < norm.length; i++) {
+      const { path, u8 } = norm[i];
+      out.set(u8, offset);
+      entries[i] = { path, byteOffset: offset, byteLength: u8.byteLength };
+      offset += u8.byteLength;
+    }
+    return new Promise((resolve, reject) => {
+      const id = seq++;
+      pending.set(id, { resolve, reject });
+      fsWorker.postMessage({ type: "fs-write-batch", id, entries, buffer }, [buffer]);
+    });
+  }
+
   function onMessage(msg) {
     if (!msg) return;
-    if (msg.type === "fs-write-large-ok") {
+    if (msg.type === "fs-write-large-ok" || msg.type === "fs-write-batch-ok") {
       const p = pending.get(msg.id);
       if (p) {
         pending.delete(msg.id);
-        p.resolve();
+        p.resolve(msg.count);
       }
-    } else if (msg.type === "fs-write-large-err") {
+    } else if (msg.type === "fs-write-large-err" || msg.type === "fs-write-batch-err") {
       const p = pending.get(msg.id);
       if (p) {
         pending.delete(msg.id);
@@ -160,6 +192,7 @@ export function createKernelFs(fsWorker) {
       call(OP_RENAME, encodeRequest([enc(from), enc(to)]));
     },
     writeLarge,
+    writeFilesBatch,
   };
 
   return { fs, onMessage };
