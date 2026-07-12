@@ -28,24 +28,6 @@ const post = (type, extra) => self.postMessage({ type, ...extra });
 // browser auto-decompresses, breaking our own gunzip).
 const REAL_NPM_ASSET = "/vendor/npm-pack.bin";
 
-// Where a fresh (non-demo) terminal starts. NOT the filesystem root: real npm's
-// Arborist throws `Tracker "idealTree" already exists` when you `npm install
-// <pkg>` at `/` with no package.json (a nameless root at the top of the tree —
-// you'd never do this on a real machine). A normal workspace dir with a minimal
-// package.json behaves like a fresh project, so `npm install` just works.
-const WORKSPACE_DIR = "/home/user";
-const WORKSPACE_PKG_JSON =
-  JSON.stringify({ name: "workspace", version: "1.0.0", private: true }, null, 2) + "\n";
-
-// Idempotent: seed the workspace + a minimal package.json, but never clobber a
-// package.json the user already created (OPFS persists it across reloads).
-function ensureWorkspace() {
-  kernel.mkdirp(WORKSPACE_DIR);
-  if (!kernel.exists(WORKSPACE_DIR + "/package.json")) {
-    kernel.writeFile(WORKSPACE_DIR + "/package.json", WORKSPACE_PKG_JSON);
-  }
-}
-
 // [optimize] Compile the Rust/Wasm codecs (zlib #11, crypto #12) EXACTLY ONCE,
 // here in the kernel worker, and hand each Process Worker the resulting
 // `WebAssembly.Module`. A Module is structured-cloneable across workers and
@@ -457,7 +439,7 @@ function openTerminal(terminalId, cwd, demoId) {
   const dir = (d ? d.dir : cwd) || defaultTermCwd();
   const env = {
     PATH: dir + "/node_modules/.bin:/bin",
-    HOME: WORKSPACE_DIR,
+    HOME: "/",
     // Real npm needs a writable cache (+ _logs) dir; created at boot. Without
     // this it defaults to $HOME/.npm and can trip on the read-only-ish root.
     npm_config_cache: "/tmp/.npm",
@@ -478,11 +460,10 @@ function openTerminal(terminalId, cwd, demoId) {
 }
 
 // Where a fresh (non-demo) terminal starts: inside a scaffolded demo project if
-// there is one, else the workspace dir (NOT `/` — see WORKSPACE_DIR: real npm
-// can't install into the nameless filesystem root).
+// there is one, else the root.
 function defaultTermCwd() {
   for (const id of scaffolded) if (DEMOS[id]) return DEMOS[id].dir;
-  return WORKSPACE_DIR;
+  return "/";
 }
 // The File System Worker handle, kept module-scoped so the page-hide flush relay
 // (host -> here -> FS worker) can reach it. Set in boot().
@@ -738,7 +719,7 @@ async function boot() {
   // win. The tree persists in OPFS, so after the first boot ensureRealNpm only
   // re-applies the cheap shims; a fresh origin fetches + unpacks the asset once.
   // Falls back to the Turbo-analog if the asset is missing (e.g. legacy server).
-  ensureWorkspace();
+  kernel.mkdirp("/home/user");
   kernel.mkdirp("/tmp/.npm/_logs");
   try {
     const npmT0 = Date.now();
