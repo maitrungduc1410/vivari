@@ -329,6 +329,14 @@ self.addEventListener("fetch", (event) => {
   // proxy them into a preview that has no such file.
   if (url.pathname === "/devtools-host.html" || url.pathname.startsWith("/devtools/")) return;
 
+  // Our own vendored assets (the real-npm delivery pack, editor bundles). These
+  // are same-origin OUR files and must hit the network directly — routing them
+  // through routeByClient fails under cross-origin isolation (a spurious
+  // `fetch(event.request)` failure), exactly like /oc-devtools/ + /packages/.
+  // The kernel worker fetches /vendor/npm-pack.gz here; without this bypass it
+  // gets "Failed to fetch" and falls back to the built-in npm.
+  if (url.pathname.startsWith("/vendor/")) return;
+
   // Root-absolute request (e.g. Vite's /@vite/client, /src/main.js,
   // /node_modules/...). It only belongs to a preview if a preview iframe issued
   // it; the demo's own files live under /packages/ and go straight to network.
