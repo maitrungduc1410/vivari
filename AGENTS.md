@@ -291,6 +291,37 @@ pnpm is wired like npm/yarn (`scripts/vendor-pnpm.mjs` → `pnpm-pack.bin`;
 - Headless browser-shape gate: `scripts/spike-pnpm-studio.mjs` (`OC_NET=1`), which
   uses the SAME env (not CLI flags) so it verifies studio's actual config.
 
+### Real corepack is the studio's PM version manager — DOWNLOADS + runs pinned PMs
+corepack is wired like the PMs but is a *version manager*, not a package manager
+(`scripts/vendor-corepack.mjs` → `corepack-pack.bin`;
+`packages/kernel-host/load-real-corepack.js` `ensureRealCorepack` → installs ONLY
+`/bin/corepack.js`; called after `ensureRealPnpm()`). It reads a project's
+`packageManager` field, downloads that exact yarn/pnpm/npm release (gunzip + untar +
+sha512 integrity), and execs it. What's special / must-not-regress:
+- It ONLY adds `/bin/corepack.js`; it deliberately does NOT overwrite the direct
+  `/bin/{npm,yarn,pnpm}.js` shims — those stay the defaults. corepack is the extra
+  "run a project-pinned version" path (`corepack yarn …`, `corepack use pnpm@x`).
+- It downloads via the GLOBAL `fetch()` (not the http/https kernel fetcher) and
+  streams the tarball out of `response.body` through `Readable.fromWeb` —
+  implemented in `node/internal/webstreams/adapters.js` as a reader pump. The
+  reader's `read()`/`cancel()` promises settle off our loop, so they're wrapped to
+  ref the event loop in `runtime/index.js` (next to the `fetch`/`Response` wraps);
+  without that the process exits mid-download.
+- It execs the downloaded PM in-process via `require('module').runMain(binPath)` —
+  `runMain` is exposed on the `module` builtin (`runtime/index.js`), plus no-op
+  `enableCompileCache`/`flushCompileCache` (so corepack skips `v8-compile-cache`).
+- `crypto.Hash`/`Hmac` extend `stream.Writable` now (real Node's Hash is a
+  Transform), because corepack does `stream.pipe(createHash(algo))` then
+  `hash.digest()`. Don't revert them to plain objects.
+- We can't do corepack's registry ECDSA signature check (`crypto.verify` is
+  unsupported), so the shell sets `COREPACK_INTEGRITY_KEYS=0` — corepack's official
+  escape hatch; the sha512 tarball-integrity check (via `createHash`) still runs.
+  The env also carries `COREPACK_HOME=/tmp/.corepack` (cache) +
+  `COREPACK_ENABLE_DOWNLOAD_PROMPT=0` (see `openTerminal`). Keep these.
+- Headless browser-shape gate: `scripts/spike-corepack-studio.mjs` (`OC_NET=1`
+  downloads+runs yarn AND pnpm), using the SAME env (not CLI flags). The off-disk
+  Path B proof is `scripts/spike-corepack.mjs`.
+
 ### fs.ReadStream / fs.WriteStream MUST stay ES5 function-constructors
 `node/internal/fs/streams.js` defines `ReadStream`/`WriteStream` as plain
 `function`s (auto-`new` guard + `Readable.call(this)`/`Writable.call(this)` init),

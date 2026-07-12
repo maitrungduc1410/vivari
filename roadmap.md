@@ -351,6 +351,43 @@ gate; needs network — hits `registry.npmjs.org`).
   `scripts/spike-pnpm-studio.mjs`, which uses that SAME env (not CLI flags) so it verifies the
   studio config. Deferred: corepack version management (Phase 6).
 
+- **Phase 6 — corepack proven AND wired (this change).** corepack is Node's PM *version
+  manager*: it reads a project's `packageManager` field, **downloads that exact yarn/pnpm/npm
+  release** (gunzip + untar + sha512 integrity), and execs it — so a project can pin any version,
+  not just our hard-vendored one. `scripts/spike-corepack.mjs` (off-disk Path B) passes A
+  `corepack --version` → `0.35.0`, B https egress, C real `corepack yarn --version` in a project
+  pinned to `yarn@1.22.22` → downloads from `registry.yarnpkg.com`, extracts, and prints
+  `1.22.22`. Five runtime gaps surfaced along the download→extract→exec path, all fixed
+  generically (each helps the wider ecosystem, not just corepack):
+  1. `require('module').runMain` — corepack execs the downloaded PM in-process via it
+     (added to the `module` builtin in `runtime/index.js`, plus no-op `enableCompileCache`/
+     `flushCompileCache` so corepack skips bundling `v8-compile-cache`).
+  2. `internal/fs/dir` now reads **eagerly** in the `Dir` constructor, so `opendir` on a missing
+     dir fails at OPEN time (ENOENT) like real Node — corepack probes install dirs that way and
+     relies on catching ENOENT to decide it must download.
+  3. `Readable.fromWeb` is implemented (a reader pump) in `internal/webstreams/adapters.js` —
+     corepack streams the tarball out of the global `fetch()` response body through it.
+  4. A WHATWG stream reader's `read()`/`cancel()` promises now **ref the event loop**
+     (`ReadableStreamDefaultReader`/`BYOBReader` wrapped in `runtime/index.js`, like `fetch`),
+     so consuming a `fetch` body incrementally doesn't race the loop to exit mid-download.
+  5. `crypto.Hash`/`Hmac` now extend `stream.Writable`, so idiomatic
+     `stream.pipe(createHash(algo))` + `hash.digest()` works (real Node's Hash *is* a Transform).
+  The one thing our crypto layer *can't* do is corepack's registry ECDSA **signature** check
+  (no `crypto.verify`), so the shell sets `COREPACK_INTEGRITY_KEYS=0` — corepack's official
+  escape hatch that skips the signature check while KEEPING the sha512 tarball-integrity check
+  (which uses `createHash`). Then wired into the studio like the others:
+  `scripts/vendor-corepack.mjs` packs `corepack@0.35.0` into
+  `packages/studio/public/vendor/corepack-pack.bin` (~0.12 MB gz / 0.6 MB raw, 54 files);
+  `packages/kernel-host/load-real-corepack.js` (`ensureRealCorepack`) unpacks to
+  `/usr/lib/node_modules/corepack` and installs **only** `/bin/corepack.js` (the direct
+  npm/yarn/pnpm shims stay the defaults — corepack is the extra "run a project-pinned version"
+  path); the kernel worker calls it after `ensureRealPnpm()`. The shell env adds
+  `COREPACK_HOME=/tmp/.corepack` + `COREPACK_INTEGRITY_KEYS=0` +
+  `COREPACK_ENABLE_DOWNLOAD_PROMPT=0`. Gated headlessly by `scripts/spike-corepack-studio.mjs`
+  (`OC_NET=1` downloads+runs `yarn@1.22.22` AND `pnpm@9.15.9` via the shim, env config only).
+  This completes the package-manager North Star: npm, yarn, pnpm all run for real, and corepack
+  manages their versions.
+
 ## Recommended order (implement one at a time)
 
 Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture map.
@@ -625,8 +662,12 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     `createHash` (e.g. Express's `etag` at load) works even if the codec is missing. Threaded as
     `cryptoCodec` through `bootProcess → createRuntime → internalBinding`, instantiated per
     process worker (browser `initCrypto()`, headless `require`); wired into `npm run build`
-    (`build:crypto`). **Deferred (S3):** sign/verify, RSA/EC keygen, DH, scrypt, X.509 — they
-    throw loudly; these want a bigger codec + vendoring Node's real `lib/crypto` internals.
+    (`build:crypto`). `Hash`/`Hmac` extend `stream.Writable` (Phase 6), so idiomatic
+    `stream.pipe(createHash(algo))` + `digest()` works — real Node's Hash is a Transform.
+    **Deferred (S3):** sign/verify, RSA/EC keygen, DH, scrypt, X.509 — they throw loudly; these
+    want a bigger codec + vendoring Node's real `lib/crypto` internals. (corepack's registry
+    ECDSA signature check needs `verify`; it's skipped via corepack's `COREPACK_INTEGRITY_KEYS=0`
+    escape hatch, keeping the sha512 tarball-integrity check that only needs `createHash`.)
 13. **ESM (`import`/`export`)** — **DONE (S1: transpile ESM→CJS at load time).** Our
     module system is synchronous CJS, so instead of a spec ESM loader we rewrite import/
     export down to `require`/`exports` in `compile()`, exactly like a bundler's interop

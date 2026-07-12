@@ -40,41 +40,79 @@ export default function (exports, require, module, process, internalBinding) {
   }
 
   // --- Hash / Hmac (one-shot over the binding, buffered in JS) -------------
-  class Hash {
-    constructor(algo) {
-      this._algo = algo;
-      this._chunks = [];
-      this._done = false;
-    }
-    update(data, inputEncoding) {
-      if (this._done) throw new Error("Digest already called");
-      this._chunks.push(toBytes(data, inputEncoding));
-      return this;
-    }
-    digest(encoding) {
-      if (this._done) throw new Error("Digest already called");
-      this._done = true;
-      return encodeOut(binding.digest(this._algo, concat(this._chunks)), encoding);
-    }
-  }
+  // Real Node's Hash/Hmac ARE streams (Transform), so idiomatic code pipes bytes
+  // *into* them and then calls .digest() — e.g. corepack does
+  // `hash = stream.pipe(createHash(algo))` on a package-manager tarball download,
+  // then `hash.digest('hex')`. So Hash/Hmac extend the vendored `Writable`: piped
+  // chunks land in `_write` -> update(), and digest() finalises the buffer as
+  // before. Built lazily so requiring `crypto` never forces `stream` at boot.
+  let _classes = null;
+  function classes() {
+    if (_classes) return _classes;
+    const { Writable } = require("stream");
 
-  class Hmac {
-    constructor(algo, key) {
-      this._algo = algo;
-      this._key = toBytes(key);
-      this._chunks = [];
-      this._done = false;
+    class Hash extends Writable {
+      constructor(algo, options) {
+        super(options);
+        this._algo = algo;
+        this._chunks = [];
+        this._done = false;
+      }
+      _write(chunk, _enc, cb) {
+        try {
+          this._chunks.push(toBytes(chunk));
+          cb();
+        } catch (e) {
+          cb(e);
+        }
+      }
+      update(data, inputEncoding) {
+        if (this._done) throw new Error("Digest already called");
+        this._chunks.push(toBytes(data, inputEncoding));
+        return this;
+      }
+      digest(encoding) {
+        if (this._done) throw new Error("Digest already called");
+        this._done = true;
+        return encodeOut(binding.digest(this._algo, concat(this._chunks)), encoding);
+      }
+      copy() {
+        const h = new Hash(this._algo);
+        h._chunks = this._chunks.slice();
+        return h;
+      }
     }
-    update(data, inputEncoding) {
-      if (this._done) throw new Error("Digest already called");
-      this._chunks.push(toBytes(data, inputEncoding));
-      return this;
+
+    class Hmac extends Writable {
+      constructor(algo, key, options) {
+        super(options);
+        this._algo = algo;
+        this._key = toBytes(key);
+        this._chunks = [];
+        this._done = false;
+      }
+      _write(chunk, _enc, cb) {
+        try {
+          this._chunks.push(toBytes(chunk));
+          cb();
+        } catch (e) {
+          cb(e);
+        }
+      }
+      update(data, inputEncoding) {
+        if (this._done) throw new Error("Digest already called");
+        this._chunks.push(toBytes(data, inputEncoding));
+        return this;
+      }
+      digest(encoding) {
+        if (this._done) throw new Error("Digest already called");
+        this._done = true;
+        return encodeOut(binding.hmac(this._algo, this._key, concat(this._chunks)), encoding);
+      }
     }
-    digest(encoding) {
-      if (this._done) throw new Error("Digest already called");
-      this._done = true;
-      return encodeOut(binding.hmac(this._algo, this._key, concat(this._chunks)), encoding);
-    }
+
+    _classes = { Hash, Hmac };
+    return _classes;
   }
 
   // --- AES ciphers --------------------------------------------------------
@@ -254,16 +292,20 @@ export default function (exports, require, module, process, internalBinding) {
   };
 
   module.exports = {
-    createHash: (algo) => new Hash(algo),
-    createHmac: (algo, key) => new Hmac(algo, key),
+    createHash: (algo, options) => new (classes().Hash)(algo, options),
+    createHmac: (algo, key, options) => new (classes().Hmac)(algo, key, options),
     // One-shot hash (Node 20.12+/21.7+). Vite's dep optimizer uses it for the
     // lockfile/dep hash. Default output is 'hex' (not a Buffer, unlike digest()).
     hash: (algorithm, data, outputEncoding) =>
       encodeOut(binding.digest(algorithm, toBytes(data)), outputEncoding || "hex"),
     createCipheriv: (algorithm, key, iv) => new Cipheriv(algorithm, key, iv),
     createDecipheriv: (algorithm, key, iv) => new Decipheriv(algorithm, key, iv),
-    Hash,
-    Hmac,
+    get Hash() {
+      return classes().Hash;
+    },
+    get Hmac() {
+      return classes().Hmac;
+    },
     Cipheriv,
     Decipheriv,
     pbkdf2,

@@ -18,6 +18,7 @@ import { createKernelFs } from "../kernel-host/kernel-fs.js";
 import { ensureRealNpm } from "../kernel-host/load-real-npm.js";
 import { ensureRealYarn } from "../kernel-host/load-real-yarn.js";
 import { ensureRealPnpm } from "../kernel-host/load-real-pnpm.js";
+import { ensureRealCorepack } from "../kernel-host/load-real-corepack.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
@@ -35,6 +36,10 @@ const REAL_YARN_ASSET = "/vendor/yarn-pack.bin";
 // The real-pnpm delivery asset, same shape/rationale as npm/yarn's (built by
 // `npm run vendor:pnpm`). Unpacked into the VFS so `pnpm` on PATH is the real CLI.
 const REAL_PNPM_ASSET = "/vendor/pnpm-pack.bin";
+// The real-corepack delivery asset (built by `npm run vendor:corepack`). Unpacked
+// into the VFS so `corepack` on PATH can DOWNLOAD + run project-pinned yarn/pnpm/
+// npm versions (`packageManager` field), on top of the direct vendored defaults.
+const REAL_COREPACK_ASSET = "/vendor/corepack-pack.bin";
 
 // [optimize] Compile the Rust/Wasm codecs (zlib #11, crypto #12) EXACTLY ONCE,
 // here in the kernel worker, and hand each Process Worker the resulting
@@ -463,6 +468,14 @@ function openTerminal(terminalId, cwd, demoId) {
     XDG_CACHE_HOME: "/home/user/.cache",
     XDG_STATE_HOME: "/home/user/.local/state",
     XDG_CONFIG_HOME: "/home/user/.config",
+    // Real corepack: it caches the PM versions it downloads here (created at boot).
+    COREPACK_HOME: "/tmp/.corepack",
+    // corepack verifies the registry's ECDSA signature, which our crypto layer
+    // can't do (no crypto.verify). "0" is corepack's official escape hatch — it
+    // skips that signature check; the sha512 tarball integrity check still runs.
+    COREPACK_INTEGRITY_KEYS: "0",
+    // A user typing bare `corepack yarn …` can't answer an interactive prompt.
+    COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
     TERM: "xterm-256color",
     FORCE_COLOR: "3",
     PWD: dir,
@@ -743,6 +756,7 @@ async function boot() {
   kernel.mkdirp("/tmp/.npm/_logs");
   kernel.mkdirp("/tmp/.yarn-cache");
   kernel.mkdirp("/tmp/.pnpm-store");
+  kernel.mkdirp("/tmp/.corepack");
   try {
     const npmT0 = Date.now();
     const res = await ensureRealNpm(kernel, async () => {
@@ -811,6 +825,32 @@ async function boot() {
     }
   } catch (e) {
     post("log", { line: `  [boot] real pnpm load failed (${(e && e.message) || e}).`, dim: true });
+  }
+
+  // Same delivery/shim path for real corepack (Node's PM version manager). It only
+  // adds `/bin/corepack.js`; the direct npm/yarn/pnpm shims above stay the
+  // defaults. `corepack yarn|pnpm|npm …` (or a project `packageManager` field)
+  // downloads + runs the pinned version. A missing asset just means no `corepack`.
+  try {
+    const cpT0 = Date.now();
+    const res = await ensureRealCorepack(kernel, async () => {
+      const base = (self.location && self.location.origin) || "";
+      const r = await fetch(base + REAL_COREPACK_ASSET);
+      if (!r.ok) return null;
+      return new Uint8Array(await r.arrayBuffer());
+    });
+    if (res && res.restored) {
+      post("log", { line: `  [boot] real corepack ready (restored from OPFS, +${Date.now() - cpT0}ms).`, dim: true });
+    } else if (res) {
+      post("log", {
+        line: `  [boot] real corepack ${res.version} loaded (${res.fileCount} files, +${Date.now() - cpT0}ms).`,
+        dim: true,
+      });
+    } else {
+      post("log", { line: "  [boot] real corepack asset unavailable — `corepack` not installed.", dim: true });
+    }
+  } catch (e) {
+    post("log", { line: `  [boot] real corepack load failed (${(e && e.message) || e}).`, dim: true });
   }
 
   post("ready", {});

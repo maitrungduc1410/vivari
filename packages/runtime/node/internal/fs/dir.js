@@ -23,6 +23,12 @@ export default function (exports, require, module) {
       this[Symbol.for("kDirEntries")] = null;
       this[Symbol.for("kDirIndex")] = 0;
       this[Symbol.for("kDirClosed")] = false;
+      // Read eagerly: real `opendir`/`opendirSync` fail at OPEN time when the
+      // directory is missing (ENOENT/ENOTDIR). Deferring the readdir to the first
+      // `read()` surfaced that error at the wrong place — corepack probes install
+      // dirs with `opendir` and relies on catching ENOENT there to decide it must
+      // download, so a late throw crashed it. Doing the listing now matches Node.
+      this.#ensure();
     }
 
     #ensure() {

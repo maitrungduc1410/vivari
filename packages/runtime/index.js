@@ -646,6 +646,19 @@ export function createRuntime({
   if (typeof Blob !== "undefined" && Blob.prototype) {
     for (const m of ["arrayBuffer", "text"]) wrapHostAsync(Blob.prototype, m);
   }
+  // A WHATWG ReadableStream reader's read()/cancel() promises also settle off our
+  // loop. Consuming a `fetch()` response body incrementally (rather than
+  // buffering it whole via Response.arrayBuffer) drives these — e.g. corepack
+  // streams a package-manager tarball through Readable.fromWeb (see
+  // internal/webstreams/adapters.js), which pumps one reader.read() per chunk.
+  // Without refing the loop it would exit mid-download.
+  for (const ctor of ["ReadableStreamDefaultReader", "ReadableStreamBYOBReader"]) {
+    const C = globalThis[ctor];
+    if (typeof C === "function" && C.prototype) {
+      wrapHostAsync(C.prototype, "read");
+      wrapHostAsync(C.prototype, "cancel");
+    }
+  }
 
   // Exit-sentinel safety net. process.exit() throws a sentinel that the loop's
   // runCallback catches — but when exit() is called from a raw Promise microtask
@@ -724,7 +737,18 @@ export function createRuntime({
       moduleSystem.makeRequire(path.dirname(typeof from === "string" ? from : "/")),
     builtinModules: Object.keys(builtins),
     Module: moduleSystem.Module,
+    // Node exposes `runMain` on the `module` builtin (=== Module.runMain); real
+    // tools call it to hand control to another entry in-process. corepack does
+    // exactly this to exec the package-manager version it just downloaded
+    // (`require('module').runMain(binPath)`).
+    runMain: (entry) => moduleSystem.runMain(entry),
+    // V8 compile-cache hooks: no-ops here (no persistent code cache in the
+    // sandbox). Callers guard with `?.`/`if`, but expose them so they don't throw.
+    enableCompileCache: () => ({ status: 0 }),
+    flushCompileCache: () => {},
+    getCompileCacheDir: () => null,
   };
+  moduleSystem.Module.runMain = moduleSystem.runMain;
 
   // Support both `require('fs')` and `require('node:fs')`.
   for (const name of Object.keys(builtins)) builtins["node:" + name] = builtins[name];
