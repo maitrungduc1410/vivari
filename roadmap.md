@@ -387,6 +387,70 @@ gate; needs network — hits `registry.npmjs.org`).
   This completes the package-manager North Star: npm, yarn, pnpm all run for real, and corepack
   manages their versions.
 
+### A real test runner in-VM — Vitest 4 (this change)
+
+Proof that the runtime runs a **full modern test runner**, not just package managers.
+`scripts/spike-vitest.mjs` installs `vitest@4.1.10` in-VM with the real npm (which selects the
+**wasm** rolldown/lightningcss builds, same as the studio Vite demo), then runs a two-test suite to
+green AND a negative-control suite that must be REPORTED as failing (guards against false-positive
+green from tests that never execute). Vitest is Vite/rolldown-based and drives tests through a
+worker pool; our process model has `worker_threads` but not `fork`, so the runner is invoked with
+`--pool=threads --no-file-parallelism --no-isolate`. Six runtime gaps surfaced along
+boot→transform→collect→execute, each fixed **generically** (all help the wider ecosystem):
+
+1. **`process.execArgv`** was missing — vitest's bundled `cac` chunk does
+   `process.execArgv.map(...)` at module top level. Added as `[]` (`builtins/process.js`).
+2. **ESM→CJS transpiler desync on regex-in-template-interpolation.** `skipBalanced` (used when the
+   scanner descends into `` `${…}` ``) didn't handle regex literals, so a `"` inside a regex (e.g.
+   `` `"${v.replaceAll(/"|\\/g, "\\$&")}"` `` in `@vitest/pretty-format`) was misread as a string,
+   swallowing the matching `}` and losing later top-level `export`s → "Unexpected token 'export'".
+   `skipBalanced` now descends regex literals with the same `canRegex` heuristic as the top-level
+   scanner (`esm.js`).
+3. **`node:path/posix` / `node:path/win32`** subpath builtins weren't registered (vitest's mocker
+   requires `node:path/posix`). We're posix, so both map to what `path` carries (`runtime/index.js`).
+4. **`worker_threads` `Worker.stdout`/`.stderr` were `null`** — the pool does
+   `new Worker(entry, { stdout: true, stderr: true })` then `worker.stdout.pipe(logger.outputStream)`.
+   They're now inert but pipe-able `Readable`-shaped stubs (the child's real output already flows
+   through the kernel; test results travel over the message channel). Also added
+   `process.stdout.getMaxListeners()` (the pool bumps `setMaxListeners(1 + getMaxListeners())`).
+5. **`module.isBuiltin`** was missing — vitest's module runner classifies specifiers with it. Added
+   as part of the `module`-constructor work below.
+6. **`vm.runInThisContext` must return the script's completion value.** Vitest wraps each module as
+   `'use strict';async (…)=>{…}` and *calls* what `runInThisContext` returns. Our shim used
+   `new Function(body)` which returns `undefined` for a body with no `return` → "is not a function".
+   It now uses **indirect `eval`** (runs in the global scope AND yields the trailing expression's
+   value — the arrow function), matching real `vm` (`node/lib/vm.js`).
+
+Known follow-up: **vitest.config / vite.config file bundling** fails with "Invalid URL" deep inside
+rolldown-wasm's config bundler, so options are passed as CLI flags for now (config-less run). And
+the default `--pool=forks` needs `child_process.fork` (unsupported) — `--pool=threads` is the
+supported path.
+
+### `module` builtin is a real, patchable constructor (this change)
+
+Node's `module` builtin default export **is** the `Module` class; tools reach for its seams
+directly. Previously `require('module')` returned a plain object. Now `builtins.module` **is** the
+`Module` constructor (`runtime/index.js` + `module.js`), with:
+- `Module.Module === Module` (self-ref), `createRequire` (now also accepts `file://` URLs, e.g.
+  `createRequire(import.meta.url)`), `builtinModules` (public list, no `node:`/`_` names),
+  `isBuiltin`, `runMain`, `syncBuiltinESMExports`, no-op `register`/`registerHooks`,
+  `enableCompileCache`/`flushCompileCache`.
+- Static resolver/loader seams: `_cache`, `_extensions`, `globalPaths`, `wrapper`/`wrap`,
+  `_nodeModulePaths`, `_resolveFilename(request, parent, isMain, options)` (honors `options.paths`),
+  and **`_load(request, parent, isMain)`** — the central require funnel. `makeRequire`'s `require`
+  now routes through `Module._load`/`Module._resolveFilename`, so monkey-patching those (ts-node,
+  tsx, jest, proxyquire, module-alias) actually intercepts every require, exactly like Node.
+- Instance methods: `prototype.require` (→ `_load`), `prototype.load(filename)`, and
+  `prototype._compile(content, filename)` (ts-node/tsx build a Module then `_compile` transpiled
+  source). `compile()` gained an optional pre-supplied source for this.
+- `require.main` is a **live getter** and `runMain` publishes the entry as `require.main` /
+  `process.mainModule` / `Module.main` **before** the entry body runs, so the ubiquitous
+  `if (require.main === module)` guard is true inside the entry itself.
+
+Debug aid also added: `OC_TRACE_MODULES=1` names the module whose top-level evaluation throws (a
+runtime throw in a module body is otherwise anonymous in the stack) — invaluable for bringing up
+big bundled tools.
+
 - **PM capstone — retire the Turbo-analog, `npm ci`, and batch the boot write-storm (this
   change).** Three loose ends from Phase 3's "Still deferred" list, now closed:
   1. **Turbo-analog retired from the shipped product.** `programs/npm.js` is no longer in
@@ -723,13 +787,16 @@ Verified in `verify-node` (7 assertions). Note (honest): `tty`/`url` stay **shim
 design**, not temporary hacks — there is no real TTY in the browser, and the platform's
 WHATWG `URL` already backs the legacy `url` API; vendoring Node's native-bound versions
 would add no fidelity. `vm` is likewise a **pragmatic shim** (`node/lib/vm.js`): a Worker/Wasm
-sandbox has no reachable V8 `contextify`, so `runInThisContext` compiles + runs via `new
-Function` in the real global scope (faithful — it shares the caller's global), while
-`runInNewContext`/`Script`/`createContext` approximate a sandbox by binding its keys as
-parameters (not a true realm/boundary). Enough for config/template evaluators like npm's
-`promzard` (`npm init`), which also needs the `Module` statics `Module._nodeModulePaths` /
-`Module._resolveFilename` + `mod.require()` — now wired in `module.js`. Still missing (throw):
-`dgram`; `tls`/`https` remain fetch-backed shims (no real TLS sockets).
+sandbox has no reachable V8 `contextify`, so `runInThisContext` runs via **indirect `eval`** in the
+real global scope (faithful — it shares the caller's global AND returns the script's completion
+value, which vitest's module evaluator relies on), while `runInNewContext`/`Script`/`createContext`
+approximate a sandbox by binding its keys as parameters (not a true realm/boundary). Enough for
+config/template evaluators (npm's `promzard`) and vitest's per-module wrapper. The `module` builtin
+is now a **real, patchable `Module` constructor** (see "`module` builtin is a real, patchable
+constructor" above): `_load`/`_resolveFilename`/`_nodeModulePaths`/`_cache`/`_extensions`/`wrap`/
+`isBuiltin`/`createRequire`/`prototype.{require,load,_compile}` — so npm's `promzard`, ts-node/tsx
+(`_compile`), and require-interceptors (jest/proxyquire patching `_load`) all work. Still missing
+(throw): `dgram`; `tls`/`https` remain fetch-backed shims (no real TLS sockets).
 
 14. **VFS worker split** [M] — **DONE.** The Rust/Wasm VFS now lives in its own dedicated
     `File System Worker` (browser `packages/demo/fs-worker.js`, headless `scripts/fs-worker.mjs`),
@@ -1203,9 +1270,11 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
   - `worker_threads`: transferring more complex objects (#16 s2b).
   - Stubbed builtins: `http2` (load-safe stub), `readline` (partial), `tls`/`https`,
     `dgram`, `perf_hooks`, `cluster`.
-  - `module` builtin as a real **constructor** (`Module.prototype.require`,
-    `_resolveFilename`, `_load`, `_cache`, `wrap`) so require-patching tools
-    (Next's `require-hook`, `ts-node`, `tsconfig-paths`, jest) can monkeypatch it.
+  - ✅ `module` builtin is now a real **constructor** (`Module.prototype.{require,load,_compile}`,
+    `_resolveFilename`, `_load`, `_cache`, `_extensions`, `wrap`, `isBuiltin`, `createRequire`) and
+    `require` routes through `Module._load`, so require-patching tools (`ts-node`, `tsconfig-paths`,
+    jest, proxyquire, module-alias) can monkeypatch it. (Next's `require-hook` no longer trips on
+    this, though Next stays blocked on the native SWC wall.)
 - **Network (browser-platform limits, not just unimplemented):**
   - Outbound raw TCP is impossible in a browser — only the fetch/WebSocket bridge exists.
   - HTTP: streaming request/response bodies, keep-alive, more concurrent in-flight (#8).
@@ -1234,11 +1303,11 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
   - ❌ **Next.js (16)** — **hard native wall**, not an API gap. Modern Next dropped the
     `@next/swc-wasm-nodejs` fallback (its optional deps are all native `@next/swc-<platform>`
     binaries) and Turbopack is native Rust, so there is no JS/WASM path to compile the app in a
-    browser VM. (Immediate crash also revealed a `require('module')` gap: our `module` builtin
-    is a plain object, so `Module.prototype.require` monkeypatching in Next's `require-hook`
-    throws — a real but separate loader-compat gap, deferred since fixing it won't get Next
-    past the SWC wall.) An older Next (13/14 with wasm SWC) might boot but needs the
-    `module`-constructor emulation + webpack-in-VM and is a large, low-priority effort.
+    browser VM. (The immediate crash also once revealed a `require('module')` gap — our `module`
+    builtin used to be a plain object, so `Module.prototype.require` monkeypatching in Next's
+    `require-hook` threw. That's **now fixed** — `module` is a real constructor — but it won't get
+    Next past the SWC wall.) An older Next (13/14 with wasm SWC) might boot but still needs
+    webpack-in-VM and is a large, low-priority effort.
   - The two working stacks are wired into a **VS Code-style IDE** (revamped —
     see below): a project picker (**React + Vite + React Compiler**, **NestJS**),
     an activity bar + Explorer, a Monaco editor with **multiple file tabs**, a

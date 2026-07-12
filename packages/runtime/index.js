@@ -730,25 +730,41 @@ export function createRuntime({
     cluster,
   };
 
+  // Node exposes the posix/win32 path flavors as their own subpath builtins
+  // (`require('node:path/posix')`). We're posix, so `path` already IS posix;
+  // map both to what `path` carries (vitest's mocker requires `node:path/posix`).
+  builtins["path/posix"] = path.posix || path;
+  builtins["path/win32"] = path.win32 || path;
+
   const moduleSystem = createModuleSystem({ fs, path, builtins, process, globals, nodeModules });
 
-  builtins.module = {
-    createRequire: (from) =>
-      moduleSystem.makeRequire(path.dirname(typeof from === "string" ? from : "/")),
-    builtinModules: Object.keys(builtins),
-    Module: moduleSystem.Module,
-    // Node exposes `runMain` on the `module` builtin (=== Module.runMain); real
-    // tools call it to hand control to another entry in-process. corepack does
-    // exactly this to exec the package-manager version it just downloaded
-    // (`require('module').runMain(binPath)`).
-    runMain: (entry) => moduleSystem.runMain(entry),
-    // V8 compile-cache hooks: no-ops here (no persistent code cache in the
-    // sandbox). Callers guard with `?.`/`if`, but expose them so they don't throw.
-    enableCompileCache: () => ({ status: 0 }),
-    flushCompileCache: () => {},
-    getCompileCacheDir: () => null,
-  };
-  moduleSystem.Module.runMain = moduleSystem.runMain;
+  // Node's `module` builtin default export IS the Module class, with the
+  // namespace helpers hung off it as statics (createRequire, builtinModules,
+  // isBuiltin, runMain, …) and a self-reference `Module.Module`. Attaching them
+  // to the constructor — rather than returning a separate plain object — is what
+  // lets `const { Module } = require('module')`, `require('module') === Module`,
+  // and monkey-patching `Module.prototype`/`_load`/`_extensions` all behave.
+  const Module = moduleSystem.Module;
+  // `builtinModules` must be the public list only (no `node:`-prefixed dupes and
+  // no internal names). Snapshot before the node: aliases are added below.
+  Module.builtinModules = Object.keys(builtins).filter((n) => !n.startsWith("node:") && !n.startsWith("_"));
+  Module.Module = Module;
+  Module.createRequire = Module.createRequire || ((from) => moduleSystem.makeRequire(path.dirname(typeof from === "string" ? from : "/")));
+  // Node exposes `runMain` on the `module` builtin (=== Module.runMain); real
+  // tools call it to hand control to another entry in-process. corepack does
+  // exactly this to exec the package-manager version it just downloaded
+  // (`require('module').runMain(binPath)`).
+  Module.runMain = (entry) => moduleSystem.runMain(entry);
+  // V8 compile-cache hooks: no-ops here (no persistent code cache in the
+  // sandbox). Callers guard with `?.`/`if`, but expose them so they don't throw.
+  Module.enableCompileCache = () => ({ status: 0 });
+  Module.flushCompileCache = () => {};
+  Module.getCompileCacheDir = () => null;
+  // registerHooks/register (ESM loader hooks) — accept & ignore so tools that
+  // call them at startup (tsx, ts-node/esm) don't crash; our loader is CJS-based.
+  Module.register = () => undefined;
+  Module.registerHooks = () => ({ deregister() {} });
+  builtins.module = Module;
 
   // Support both `require('fs')` and `require('node:fs')`.
   for (const name of Object.keys(builtins)) builtins["node:" + name] = builtins[name];

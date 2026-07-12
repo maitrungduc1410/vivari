@@ -439,6 +439,37 @@ const listening = new Set();
 const termByPid = new Map(); // shell pid -> terminalId
 const pidByTerm = new Map(); // terminalId -> shell pid
 
+// Walk a pid up its parent chain to the interactive shell that owns it, so a
+// fetch made by a shell's CHILD (npm/yarn/pnpm/corepack) can be attributed to
+// that shell's terminal. Returns the terminalId, or undefined for non-terminal
+// processes (demo dev servers, builds) — those keep the plain console log.
+function terminalForPid(pid) {
+  let p = pid;
+  const seen = new Set();
+  while (p != null && !seen.has(p)) {
+    const tid = termByPid.get(p);
+    if (tid !== undefined) return tid;
+    seen.add(p);
+    const proc = kernel && kernel.procs ? kernel.procs.get(p) : null;
+    p = proc ? proc.parentPid : null;
+  }
+  return undefined;
+}
+
+// Live download progress per terminal. Package managers make hundreds of fetches
+// with little stdout in between, so an install looks frozen without feedback. We
+// coalesce fetch events into ONE in-place (\r) spinner line per terminal,
+// throttled, and clear it the instant the shell prints real output (below).
+const SPINNER = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"];
+const fetchProg = new Map(); // terminalId -> { count, bytes, last, frame, active }
+function clearProgress(tid) {
+  const s = fetchProg.get(tid);
+  if (s && s.active) {
+    s.active = false;
+    post("term-out", { terminalId: tid, chunk: "\r\x1b[2K" });
+  }
+}
+
 // Open a new interactive shell for a terminal tab. A plain shell opens in a
 // running demo's dir (or "/"). A DEMO shell (`demoId` set — the "Run" button)
 // scaffolds the project, opens in its dir, and auto-runs the dev command via
@@ -456,6 +487,12 @@ function openTerminal(terminalId, cwd, demoId) {
     // Real npm needs a writable cache (+ _logs) dir; created at boot. Without
     // this it defaults to $HOME/.npm and can trip on the read-only-ish root.
     npm_config_cache: "/tmp/.npm",
+    // npm's audit + funding steps POST to registry endpoints that don't send
+    // Access-Control-Allow-Origin, so from the browser they fail CORS preflight
+    // (noisy console errors + a wasted round-trip) with no benefit here. Turn
+    // both off by default; a user can still run `npm audit` explicitly.
+    npm_config_audit: "false",
+    npm_config_fund: "false",
     // Real yarn likewise needs a writable cache; created at boot (its global
     // config/cache default under $HOME would land on the read-only-ish root).
     YARN_CACHE_FOLDER: "/tmp/.yarn-cache",
@@ -688,13 +725,17 @@ async function boot() {
     // else (npm install, dev servers) is demo/console output.
     stdout: (chunk, pid) => {
       const tid = termByPid.get(pid);
-      if (tid !== undefined) post("term-out", { terminalId: tid, chunk });
-      else post("stdout", { chunk });
+      if (tid !== undefined) {
+        clearProgress(tid); // wipe any live fetch spinner before real output lands
+        post("term-out", { terminalId: tid, chunk });
+      } else post("stdout", { chunk });
     },
     stderr: (chunk, pid) => {
       const tid = termByPid.get(pid);
-      if (tid !== undefined) post("term-out", { terminalId: tid, chunk });
-      else post("stderr", { chunk });
+      if (tid !== undefined) {
+        clearProgress(tid);
+        post("term-out", { terminalId: tid, chunk });
+      } else post("stderr", { chunk });
     },
   });
   kernel.onProcExit = (pid, res) => {
@@ -702,6 +743,7 @@ async function boot() {
     if (tid !== undefined) {
       termByPid.delete(pid);
       pidByTerm.delete(tid);
+      fetchProg.delete(tid);
       // If this was a demo's shell (its dev server was a child), the server just
       // died with it: forget the demo's port state so the preview 502s and a later
       // Run starts fresh (rather than being treated as a restart → reload).
@@ -735,11 +777,32 @@ async function boot() {
       announceDemoReady(id, port);
     }
   };
-  kernel.onFetch = (url, info) =>
-    post("log", {
-      line: `  [fetcher] ${info.cached ? "cache hit " : "downloaded"} ${info.size}B · ${url}`,
-      dim: true,
-    });
+  kernel.onFetch = (url, info) => {
+    const tid = terminalForPid(info.pid);
+    if (tid === undefined) {
+      // Non-terminal fetch (a demo/build) — keep the plain console log.
+      post("log", {
+        line: `  [fetcher] ${info.cached ? "cache hit " : "downloaded"} ${info.size}B · ${url}`,
+        dim: true,
+      });
+      return;
+    }
+    const s = fetchProg.get(tid) || { count: 0, bytes: 0, last: 0, frame: 0, active: false };
+    s.count++;
+    s.bytes += info.size || 0;
+    const now = Date.now();
+    if (now - s.last >= 80) {
+      s.last = now;
+      s.frame = (s.frame + 1) % SPINNER.length;
+      s.active = true;
+      const mb = (s.bytes / 1048576).toFixed(1);
+      post("term-out", {
+        terminalId: tid,
+        chunk: `\r\x1b[2K\x1b[2m${SPINNER[s.frame]} fetching \u00b7 ${s.count} requests \u00b7 ${mb} MB\x1b[0m`,
+      });
+    }
+    fetchProg.set(tid, s);
+  };
   // roadmap #19 stage C: a ws frame a process relayed OUT of the VM (Vite's HMR
   // server) — forward it to the main thread, which delivers it to the preview
   // iframe's WebSocket polyfill.

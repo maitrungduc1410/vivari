@@ -87,7 +87,7 @@ export class Kernel {
     // URL -> { path, status, ok, contentType, size } — content cache so a repeated
     // fetch (npm re-resolving the same package) skips the network entirely.
     this.fetchCache = new Map();
-    this.onFetch = null; // optional observer (url, {cached,size}) — e.g. a UI log
+    this.onFetch = null; // optional observer (url, {cached,size,pid}) — e.g. a UI log / per-terminal progress
   }
 
   // ---- VFS helpers ----------------------------------------------------------
@@ -714,7 +714,7 @@ export class Kernel {
       const cacheKey = this._fetchCacheKey(method, url, headers);
       const cached = cacheable ? this.fetchCache.get(cacheKey) : null;
       if (cached) {
-        if (this.onFetch) this.onFetch(url, { cached: true, size: cached.size });
+        if (this.onFetch) this.onFetch(url, { cached: true, size: cached.size, pid: proc.pid });
         this.respondOk(proc, encodeString(JSON.stringify({ ...cached, cached: true })));
         return;
       }
@@ -759,7 +759,7 @@ export class Kernel {
       // transferable buffer, then the process reads it back with normal fs (#14).
       await this.fs.writeLarge(path, body);
       if (cacheable) this.fetchCache.set(cacheKey, meta);
-      if (this.onFetch) this.onFetch(url, { cached: false, size: meta.size });
+      if (this.onFetch) this.onFetch(url, { cached: false, size: meta.size, pid: proc.pid });
       this.respondOk(proc, encodeString(JSON.stringify({ ...meta, cached: false })));
     } catch (err) {
       if (!this.procs.has(proc.pid)) return;

@@ -98,6 +98,25 @@ export default function (exports, require, module, process) {
     return { ...optEnv };
   }
 
+  // A minimal, inert Readable-shaped stub for Worker.stdout/stderr. It never
+  // emits data (the child's output is forwarded by the kernel), but supports the
+  // pipe/unpipe/listener surface pool libraries poke at.
+  function makeInertReadable() {
+    const s = new EventEmitter();
+    s.readable = true;
+    s.readableEnded = false;
+    s.destroyed = false;
+    s.pipe = (dest) => dest;
+    s.unpipe = () => s;
+    s.read = () => null;
+    s.pause = () => s;
+    s.resume = () => s;
+    s.isPaused = () => false;
+    s.setEncoding = () => s;
+    s.destroy = () => { s.destroyed = true; return s; };
+    return s;
+  }
+
   class Worker extends EventEmitter {
     constructor(filename, options = {}) {
       super();
@@ -148,10 +167,14 @@ export default function (exports, require, module, process) {
     ref() { if (!this._refed && !this._exited) { this._refed = true; host && host.retain(); } }
     unref() { if (this._refed && !this._exited) { this._refed = false; host && host.release(); } }
 
-    // stdio piping to the parent is not modelled (Node defaults to inheriting the
-    // parent's stdout/stderr, which our kernel already does for the child worker).
-    get stdout() { return null; }
-    get stderr() { return null; }
+    // The child's real stdout/stderr already flow through the kernel to the
+    // parent, so we don't re-pipe bytes here. But pool libraries (vitest/tinypool
+    // with `{ stdout: true, stderr: true }`) do `worker.stdout.pipe(dest)` and
+    // `.unpipe()` around each run — so these must be pipe-able Readable-shaped
+    // objects, not null. They're inert (never emit data); test results travel
+    // over the message channel, not stdout.
+    get stdout() { return (this._stdout ||= makeInertReadable()); }
+    get stderr() { return (this._stderr ||= makeInertReadable()); }
     get stdin() { return null; }
   }
 

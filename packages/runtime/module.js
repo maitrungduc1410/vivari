@@ -15,6 +15,9 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
 export function createModuleSystem({ fs, path, builtins, process, globals, nodeModules }) {
   const cache = Object.create(null);
+  // The entry module (Node's `require.main` / `process.mainModule`). Set by
+  // runMain; every require's `require.main` points at it.
+  let mainModule = undefined;
   // Check the LIVE builtins object, not a snapshot: index.js finishes wiring it
   // (adds `module`, then every `node:`-prefixed alias) AFTER this system is
   // constructed, so a Set captured here would miss `node:module`/`node:fs`/... .
@@ -305,24 +308,22 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
   };
 
   function makeRequire(fromDir) {
-    const require = (request) => load(request, fromDir);
+    // Route through Module._load / Module._resolveFilename (rather than calling
+    // `load`/`resolveFilename` directly) so tools that monkey-patch those seams
+    // — ts-node, tsx, jest, proxyquire, module-alias — actually intercept every
+    // require, exactly as they do in Node.
+    const parent = { filename: path.join(fromDir, "__oc_require__") };
+    const require = (request) => Module._load(request, parent, false);
     // Honor require.resolve(request, { paths: [...] }) — Node resolves as if
     // required from each given dir, in order (used by @nestjs/cli to find the
     // project's typescript). Falls back to this module's own dir.
-    require.resolve = (request, options) => {
-      if (options && Array.isArray(options.paths)) {
-        for (const base of options.paths) {
-          try {
-            return realpath(resolveFilename(request, base).id);
-          } catch {
-            /* try the next candidate path */
-          }
-        }
-      }
-      return realpath(resolveFilename(request, fromDir).id);
-    };
+    require.resolve = (request, options) => Module._resolveFilename(request, parent, false, options);
     require.cache = cache;
-    require.main = undefined;
+    // Live view of the entry module: it's set during runMain AFTER the entry
+    // begins compiling, so a static snapshot here would read undefined for the
+    // very module that needs `require.main === module` to be true.
+    Object.defineProperty(require, "main", { configurable: true, enumerable: true, get: () => mainModule });
+    require.extensions = Module._extensions;
     return require;
   }
 
@@ -350,12 +351,13 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     return module.exports;
   }
 
-  function compile(module, filename) {
+  function compile(module, filename, providedSource) {
     if (path.extname(filename) === ".json") {
-      module.exports = JSON.parse(fs.readFileSync(filename, "utf8"));
+      const txt = providedSource != null ? providedSource : fs.readFileSync(filename, "utf8");
+      module.exports = JSON.parse(txt);
       return;
     }
-    let source = fs.readFileSync(filename, "utf8");
+    let source = providedSource != null ? providedSource : fs.readFileSync(filename, "utf8");
     if (source.charCodeAt(0) === 0xfeff) source = source.slice(1); // strip BOM
     if (source.startsWith("#!")) source = "//" + source.slice(2); // neutralize shebang
 
@@ -429,6 +431,26 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
         throw err;
       }
     }
+    // Debug aid: name the module whose TOP-LEVEL evaluation throws. Parse errors
+    // already get the filename appended above, but a runtime throw during a
+    // module's body (e.g. an ESM/CJS interop mismatch → `undefined.map`) is
+    // otherwise anonymous in the stack. Gated so it's zero-cost in normal runs.
+    if (process.env.OC_TRACE_MODULES) {
+      try {
+        if (isEsm) {
+          const ret = wrapper.call(module.exports, module.exports, require, module);
+          if (isAsync) module.evaluating = ret;
+        } else {
+          wrapper.call(module.exports, module.exports, require, module, filename, dirname);
+        }
+      } catch (e) {
+        try {
+          process.stderr.write(`[oc-module-throw] ${filename}: ${(e && e.message) || e}\n`);
+        } catch {}
+        throw e;
+      }
+      return;
+    }
     if (isEsm) {
       const ret = wrapper.call(module.exports, module.exports, require, module);
       // A top-level-await module evaluates to a Promise; expose it so the entry
@@ -445,29 +467,124 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
   function runMain(entry) {
     const abs = entry.startsWith("/") ? entry : path.resolve(process.cwd(), entry);
     const dir = path.dirname(abs);
-    const exports = load(abs, dir);
-    // If the entry used top-level await, its module evaluates to a Promise; return
-    // it (instead of the exports) so run() can await the top-level body while the
-    // loop drives timers/microtasks.
     const r = resolveFilename(abs, dir);
-    const mod = r.builtin ? null : cache[realpath(r.id)];
-    return mod && mod.evaluating ? mod.evaluating : exports;
+    if (r.builtin) return load(abs, dir); // degenerate: entry is a builtin id
+    const filename = realpath(r.id);
+    let mod = cache[filename];
+    if (!mod) {
+      mod = new Module(filename);
+      mod.paths = nodeModulesPaths(path.dirname(filename));
+      // Publish the entry as require.main / process.mainModule BEFORE its body
+      // runs, so the extremely common `if (require.main === module)` guard is
+      // true inside the entry itself (Node sets the main module up front too).
+      mod.main = true;
+      mainModule = mod;
+      Module.main = mod;
+      try { process.mainModule = mod; } catch {}
+      cache[filename] = mod;
+      let ok = false;
+      try {
+        compile(mod, filename);
+        ok = true;
+      } finally {
+        if (!ok) delete cache[filename];
+      }
+      mod.loaded = true;
+    } else {
+      mod.main = true;
+      mainModule = mod;
+      Module.main = mod;
+      try { process.mainModule = mod; } catch {}
+    }
+    // A top-level-await entry evaluates to a Promise; return it so run() can await
+    // the top-level body while the loop drives timers/microtasks.
+    return mod.evaluating ? mod.evaluating : mod.exports;
   }
 
-  // Node's `Module` statics that real tools reach for directly. npm's `promzard`
-  // (used by `npm init`) constructs a Module by hand, then calls
-  // `Module._nodeModulePaths(dir)`, `Module._resolveFilename(req, mod)` and
-  // `mod.require(req)`. Wire them to the same resolver the loader uses.
+  // ── Make `Module` a real, patchable constructor ────────────────────────────
+  // Node's `module` builtin default export IS this class. Real tools reach for
+  // these seams directly: npm's `promzard` hand-builds a Module and calls
+  // `_nodeModulePaths`/`_resolveFilename`/`mod.require`; ts-node/tsx/jest patch
+  // `_load`, `_resolveFilename`, `prototype.require`, or `_extensions['.js']` to
+  // intercept requires; module runners read `_cache`, `wrap`, `_compile`.
+  Module._cache = cache;
+  Module._extensions = Object.create(null);
+  Module.globalPaths = [];
+  Module.wrapper = [
+    "(function (exports, require, module, __filename, __dirname) { ",
+    "\n});",
+  ];
+  Module.wrap = (script) => Module.wrapper[0] + script + Module.wrapper[1];
+
   Module._nodeModulePaths = (dir) => nodeModulesPaths(dir);
-  Module._resolveFilename = (request, parent) => {
+
+  Module._resolveFilename = function _resolveFilename(request, parent, _isMain, options) {
+    // require.resolve(request, { paths: [...] }) — resolve as if required from
+    // each given dir, in order (used by @nestjs/cli to find project typescript).
+    if (options && Array.isArray(options.paths)) {
+      for (const base of options.paths) {
+        try {
+          const r = resolveFilename(request, base);
+          return r.builtin ? r.id : realpath(r.id);
+        } catch {
+          /* try the next candidate path */
+        }
+      }
+    }
     const base = parent && parent.filename ? path.dirname(parent.filename) : process.cwd();
     const r = resolveFilename(request, base);
     return r.builtin ? r.id : realpath(r.id);
   };
-  Module.prototype.require = function moduleRequire(request) {
-    const base = this.filename ? path.dirname(this.filename) : process.cwd();
-    return makeRequire(base)(request);
+
+  // The central require funnel — patch this to intercept every require (jest,
+  // proxyquire, module-alias do). Mirrors Node's Module._load(request, parent).
+  Module._load = function _load(request, parent, _isMain) {
+    const base = parent && parent.filename ? path.dirname(parent.filename) : process.cwd();
+    return load(request, base);
   };
 
-  return { runMain, makeRequire, resolveFilename, Module, cache };
+  Module.isBuiltin = (request) => {
+    if (typeof request !== "string") return false;
+    const name = request.startsWith("node:") ? request.slice(5) : request;
+    return hasBuiltin(name) || hasBuiltin("node:" + name) || hasLazyBuiltin(name);
+  };
+
+  // syncBuiltinESMExports is a no-op for us (no separate ESM builtin namespace to
+  // resync); real tools call it after mutating a builtin and expect it to exist.
+  Module.syncBuiltinESMExports = () => {};
+
+  Module.createRequire = (from) => {
+    let p = typeof from === "string" ? from : "/";
+    if (p.startsWith("file://")) {
+      try {
+        p = decodeURIComponent(p.slice("file://".length));
+      } catch {
+        p = p.slice("file://".length);
+      }
+    }
+    return makeRequire(path.dirname(p));
+  };
+
+  Module.prototype.require = function moduleRequire(request) {
+    return Module._load(request, this, false);
+  };
+
+  // Instance load()/_compile(): run a file (or a source string) into THIS
+  // module — ts-node/tsx build a Module then call `mod._compile(transpiled, fn)`.
+  Module.prototype.load = function moduleLoad(filename) {
+    this.filename = filename;
+    this.paths = nodeModulesPaths(path.dirname(filename));
+    if (!cache[filename]) cache[filename] = this;
+    compile(this, filename);
+    this.loaded = true;
+  };
+  Module.prototype._compile = function moduleCompile(content, filename) {
+    this.filename = filename;
+    if (!this.paths || !this.paths.length) this.paths = nodeModulesPaths(path.dirname(filename));
+    compile(this, filename, content);
+    this.loaded = true;
+    return this.exports;
+  };
+
+  return { runMain, makeRequire, resolveFilename, Module, cache, setMainModule: (m) => (mainModule = m) };
 }

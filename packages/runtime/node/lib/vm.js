@@ -44,10 +44,18 @@ export default function (exports, require, module) {
     return fn.apply(ctx, keys.map((k) => ctx[k]));
   }
 
+  // Indirect eval: runs in the GLOBAL scope (sees real globals — the defining
+  // property of runInThisContext) AND yields the script's completion value, like
+  // real vm. `new Function(body)` can't do the latter: a script whose last
+  // statement is an expression (e.g. vitest wraps modules as
+  // `'use strict';async (…)=>{…}` and calls the returned function) has no
+  // `return`, so a Function body would evaluate to undefined → "is not a
+  // function". Indirect eval returns that trailing arrow function verbatim.
+  const indirectEval = eval;
+
   function runInThisContext(code, options) {
-    // No sandbox params: the function's lexical scope is the global scope, so the
-    // script sees real globals — the defining property of runInThisContext.
-    return compile([], code, options).call(globalThis);
+    const src = `${String(code)}\n//# sourceURL=${filenameOf(options)}`;
+    return indirectEval(src);
   }
 
   function runInNewContext(code, sandbox, options) {

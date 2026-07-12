@@ -331,6 +331,45 @@ sha512 integrity), and execs it. What's special / must-not-regress:
   downloads+runs yarn AND pnpm), using the SAME env (not CLI flags). The off-disk
   Path B proof is `scripts/spike-corepack.mjs`.
 
+### `module` is a REAL constructor — route requires through `Module._load`
+`require('module')` returns the `Module` **constructor** (not a plain object);
+`builtins.module = Module` in `runtime/index.js`, statics/prototype wired in
+`module.js`. The load-bearing rules:
+- `makeRequire`'s `require` calls `Module._load(request, parent)` and
+  `require.resolve` calls `Module._resolveFilename(...)`. Keep it that way — it's
+  what lets ts-node/tsx/jest/proxyquire/module-alias monkeypatch requires. Don't
+  "optimize" it back to calling `load()`/`resolveFilename()` directly.
+- `runMain` publishes the entry as `require.main`/`process.mainModule`/`Module.main`
+  **before** compiling its body (so `require.main === module` is true in the entry),
+  and `require.main` is a **live getter**. Don't snapshot it.
+- Exposed: `_load`, `_resolveFilename` (honors `options.paths`), `_nodeModulePaths`,
+  `_cache`, `_extensions`, `wrap`/`wrapper`, `isBuiltin`, `createRequire` (accepts
+  `file://` URLs), `syncBuiltinESMExports`, no-op `register`/`registerHooks`,
+  `prototype.{require,load,_compile}`. `builtinModules` is the public list only
+  (snapshot BEFORE the `node:` aliases are added — don't move that line after).
+
+### vitest runs in-VM — pool=threads, and don't break these
+Real `vitest@4` (Vite/rolldown) runs a suite to green in-VM — gated by
+`scripts/spike-vitest.mjs` (installs it with real npm → wasm rolldown, runs a
+2-test suite + a negative-control failing suite). Must-not-regress:
+- `vm.runInThisContext` uses **indirect `eval`** (returns the script's completion
+  value). Vitest wraps each module as `'use strict';async(…)=>{…}` and *calls* what
+  `runInThisContext` returns; `new Function(body)` would return `undefined`. Don't
+  revert to `new Function`.
+- `esm.js` `skipBalanced` descends **regex literals** inside `` `${…}` ``
+  interpolations. Without it, a `"` inside a regex desyncs the scanner and drops
+  later top-level `export`s ("Unexpected token 'export'" in bundled files like
+  `@vitest/pretty-format`). Keep the regex branch.
+- `worker_threads` `Worker.stdout`/`.stderr` are inert but **pipe-able** Readable
+  stubs (the pool does `worker.stdout.pipe(...)`); `process.stdout` has
+  `getMaxListeners()`. `process.execArgv` is `[]`. `node:path/posix`/`win32` are
+  registered.
+- Invoke with `--pool=threads` (we have `worker_threads`, not `fork`).
+  Config-file bundling (`vitest.config.*`) still fails in rolldown-wasm
+  ("Invalid URL") — pass options as CLI flags for now.
+- `OC_TRACE_MODULES=1` (propagate via the process env) names the module whose
+  top-level eval throws — the fastest way to localize a bundled-tool bring-up bug.
+
 ### fs.ReadStream / fs.WriteStream MUST stay ES5 function-constructors
 `node/internal/fs/streams.js` defines `ReadStream`/`WriteStream` as plain
 `function`s (auto-`new` guard + `Readable.call(this)`/`Writable.call(this)` init),
