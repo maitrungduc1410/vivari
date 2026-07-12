@@ -454,5 +454,20 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     return mod && mod.evaluating ? mod.evaluating : exports;
   }
 
+  // Node's `Module` statics that real tools reach for directly. npm's `promzard`
+  // (used by `npm init`) constructs a Module by hand, then calls
+  // `Module._nodeModulePaths(dir)`, `Module._resolveFilename(req, mod)` and
+  // `mod.require(req)`. Wire them to the same resolver the loader uses.
+  Module._nodeModulePaths = (dir) => nodeModulesPaths(dir);
+  Module._resolveFilename = (request, parent) => {
+    const base = parent && parent.filename ? path.dirname(parent.filename) : process.cwd();
+    const r = resolveFilename(request, base);
+    return r.builtin ? r.id : realpath(r.id);
+  };
+  Module.prototype.require = function moduleRequire(request) {
+    const base = this.filename ? path.dirname(this.filename) : process.cwd();
+    return makeRequire(base)(request);
+  };
+
   return { runMain, makeRequire, resolveFilename, Module, cache };
 }

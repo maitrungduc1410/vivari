@@ -183,6 +183,21 @@ throw that gets swallowed. Rules:
 - **Downloads** (`OP_FETCH`) stream straight into the VFS, bypassing the window.
 - If you add a syscall that can carry big data, chunk it from day one.
 
+### The Fetcher strips non-CORS-safelisted request headers (browser only)
+`demo/fetcher-worker.js` (`corsSafeHeaders`) keeps ONLY the CORS-safelisted
+request headers (`accept`, `accept-language`, `content-language`, a simple
+`content-type`) before calling the browser `fetch()`. Real npm/pacote attach
+custom headers (`npm-command`, `npm-session`, `npm-auth-type`, `pacote-*`,
+`authorization`, …); any non-safelisted header makes the browser fire a
+preflight `OPTIONS`, and `registry.npmjs.org` does not answer it with a matching
+`Access-Control-Allow-Headers` — so the request is blocked even though the
+actual GET returns `Access-Control-Allow-Origin: *`. None of those headers are
+needed to fetch public packuments/tarballs, so dropping them turns every
+registry request back into a simple, preflight-free GET. This is a browser-only
+concern (Node has no CORS), so the headless fetchers in `scripts/spike-*.mjs`
+deliberately keep the full header set. (Symptom if you regress it: "blocked by
+CORS policy … No 'Access-Control-Allow-Origin' header" for every registry URL.)
+
 ### `writeLarge` must transfer a STANDALONE ArrayBuffer
 The kernel hands a fetched tarball to the FS Worker over a *transferred* buffer
 (`kernel-fs.js` `writeLarge`), to bypass the 1 MiB SAB. The trap: a `Uint8Array`

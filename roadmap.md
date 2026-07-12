@@ -600,8 +600,14 @@ APIs), `timers/promises` (`setTimeout`/`setImmediate`/`setInterval` on the event
 Verified in `verify-node` (7 assertions). Note (honest): `tty`/`url` stay **shims by
 design**, not temporary hacks — there is no real TTY in the browser, and the platform's
 WHATWG `URL` already backs the legacy `url` API; vendoring Node's native-bound versions
-would add no fidelity. Still missing (throw): `vm`, `http2`, `worker_threads`, `readline`,
-`perf_hooks`, `dgram`, `tls`/`https` (stubbed).
+would add no fidelity. `vm` is likewise a **pragmatic shim** (`node/lib/vm.js`): a Worker/Wasm
+sandbox has no reachable V8 `contextify`, so `runInThisContext` compiles + runs via `new
+Function` in the real global scope (faithful — it shares the caller's global), while
+`runInNewContext`/`Script`/`createContext` approximate a sandbox by binding its keys as
+parameters (not a true realm/boundary). Enough for config/template evaluators like npm's
+`promzard` (`npm init`), which also needs the `Module` statics `Module._nodeModulePaths` /
+`Module._resolveFilename` + `mod.require()` — now wired in `module.js`. Still missing (throw):
+`dgram`; `tls`/`https` remain fetch-backed shims (no real TLS sockets).
 
 14. **VFS worker split** [M] — **DONE.** The Rust/Wasm VFS now lives in its own dedicated
     `File System Worker` (browser `packages/demo/fs-worker.js`, headless `scripts/fs-worker.mjs`),

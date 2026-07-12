@@ -25,6 +25,42 @@ function rewrite(url) {
   return url;
 }
 
+// CORS-safelisted request headers: a cross-origin request that carries ONLY
+// these is a "simple" request the browser sends without a preflight OPTIONS.
+// See https://fetch.spec.whatwg.org/#cors-safelisted-request-header.
+const CORS_SAFELISTED = new Set(["accept", "accept-language", "content-language", "content-type"]);
+const SAFE_CONTENT_TYPES = new Set([
+  "application/x-www-form-urlencoded",
+  "multipart/form-data",
+  "text/plain",
+]);
+
+// Keep only CORS-safelisted request headers. npm/pacote attach custom headers
+// (`npm-command`, `npm-session`, `npm-auth-type`, `pacote-*`, `authorization`,
+// …) which are NOT safelisted, so the browser fires a preflight OPTIONS that
+// registry.npmjs.org does not answer with the matching
+// `Access-Control-Allow-Headers` — the request is then blocked even though the
+// registry returns `Access-Control-Allow-Origin: *` on the actual GET. None of
+// those headers are needed to fetch public packuments/tarballs, so dropping
+// them turns every registry request back into a simple, preflight-free GET.
+// This is a browser-only concern (Node has no CORS), so the headless fetchers
+// used by scripts/spike-*.mjs deliberately keep the full header set.
+function corsSafeHeaders(headers) {
+  if (!headers) return undefined;
+  const entries = headers instanceof Headers ? [...headers] : Object.entries(headers);
+  const out = {};
+  for (const [k, v] of entries) {
+    const lk = String(k).toLowerCase();
+    if (!CORS_SAFELISTED.has(lk)) continue;
+    // A non-simple Content-Type value still triggers a preflight, so drop it too.
+    if (lk === "content-type" && !SAFE_CONTENT_TYPES.has(String(v).split(";")[0].trim().toLowerCase())) {
+      continue;
+    }
+    out[k] = v;
+  }
+  return out;
+}
+
 async function doFetch(url, init) {
   // Default mode is 'cors'; with ACAO:* the response is readable and satisfies
   // COEP:require-corp. Follows redirects (registry tarballs may 3xx to a CDN).
@@ -33,7 +69,8 @@ async function doFetch(url, init) {
   const opts = { redirect: "follow" };
   if (init) {
     if (init.method) opts.method = init.method;
-    if (init.headers) opts.headers = init.headers;
+    // Strip non-safelisted headers so cross-origin GETs stay preflight-free.
+    if (init.headers) opts.headers = corsSafeHeaders(init.headers);
     if (init.body) opts.body = init.body;
   }
   const res = await fetch(rewrite(url), opts);
