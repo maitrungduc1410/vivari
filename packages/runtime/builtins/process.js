@@ -70,6 +70,11 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     setMaxListeners() {
       return this;
     },
+    // vitest's pool bumps the stream's max-listener count around each worker
+    // (`setMaxListeners(1 + getMaxListeners())`), so this must return a number.
+    getMaxListeners() {
+      return 10;
+    },
     setDefaultEncoding() {
       return this;
     },
@@ -112,6 +117,10 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
   const process = {
     argv: ["node", ...argv],
     argv0: "node",
+    // Node-level flags passed before the script (e.g. `--enable-source-maps`).
+    // We never inject any, but real code reads/maps it unconditionally — vitest's
+    // bundled cac chunk does `process.execArgv.map(...)` at module top level.
+    execArgv: [],
     execPath: "/usr/bin/node",
     env,
     platform: "linux",

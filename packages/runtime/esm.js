@@ -82,6 +82,32 @@ function skipBalanced(src, i) {
     if (ch === "`") { i = skipTemplate(src, i); continue; }
     if (ch === "/" && src[i + 1] === "/") { while (i < n && src[i] !== "\n") i++; continue; }
     if (ch === "/" && src[i + 1] === "*") { i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++; i += 2; continue; }
+    // regex literal — must descend so its inner quotes/slashes don't desync the
+    // brace scan. Real bundled code puts regexes inside `${...}` interpolations
+    // (e.g. `` `"${v.replaceAll(/"|\\/g, "\\$&")}"` ``); the `"` in the regex was
+    // being misread as a string, swallowing the matching `}` and losing later
+    // top-level `export`s. Same canRegex heuristic as scanExportEdits.
+    if (ch === "/") {
+      let j = i - 1;
+      while (j >= 0 && /\s/.test(src[j])) j--;
+      const p = src[j];
+      const canRegex = p === undefined || "(,=:[!&|?{};+-*%<>~^".includes(p);
+      if (canRegex) {
+        i++;
+        let inClass = false;
+        while (i < n) {
+          if (src[i] === "\\") { i += 2; continue; }
+          if (src[i] === "[") inClass = true;
+          else if (src[i] === "]") inClass = false;
+          else if (src[i] === "/" && !inClass) { i++; break; }
+          else if (src[i] === "\n") break;
+          i++;
+        }
+        continue;
+      }
+      i++;
+      continue;
+    }
     if (ch === "{") { depth++; i++; continue; }
     if (ch === "}") { depth--; i++; continue; }
     i++;
