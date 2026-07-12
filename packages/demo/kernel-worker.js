@@ -17,6 +17,7 @@ import { Kernel } from "../kernel-host/kernel.js";
 import { createKernelFs } from "../kernel-host/kernel-fs.js";
 import { ensureRealNpm } from "../kernel-host/load-real-npm.js";
 import { ensureRealYarn } from "../kernel-host/load-real-yarn.js";
+import { ensureRealPnpm } from "../kernel-host/load-real-pnpm.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
@@ -31,6 +32,9 @@ const REAL_NPM_ASSET = "/vendor/npm-pack.bin";
 // The real-yarn (classic) delivery asset, same shape/rationale as npm's (built by
 // `npm run vendor:yarn`). Unpacked into the VFS so `yarn` on PATH is the real CLI.
 const REAL_YARN_ASSET = "/vendor/yarn-pack.bin";
+// The real-pnpm delivery asset, same shape/rationale as npm/yarn's (built by
+// `npm run vendor:pnpm`). Unpacked into the VFS so `pnpm` on PATH is the real CLI.
+const REAL_PNPM_ASSET = "/vendor/pnpm-pack.bin";
 
 // [optimize] Compile the Rust/Wasm codecs (zlib #11, crypto #12) EXACTLY ONCE,
 // here in the kernel worker, and hand each Process Worker the resulting
@@ -450,6 +454,15 @@ function openTerminal(terminalId, cwd, demoId) {
     // Real yarn likewise needs a writable cache; created at boot (its global
     // config/cache default under $HOME would land on the read-only-ish root).
     YARN_CACHE_FOLDER: "/tmp/.yarn-cache",
+    // Real pnpm: our VFS has no hardlink/reflink CoW, so packages must be COPIED
+    // into node_modules from the store (npm_config_* is how pnpm reads config from
+    // env). Give it a writable store + state/cache dirs off the root, too.
+    npm_config_package_import_method: "copy",
+    npm_config_store_dir: "/tmp/.pnpm-store",
+    XDG_DATA_HOME: "/home/user/.local/share",
+    XDG_CACHE_HOME: "/home/user/.cache",
+    XDG_STATE_HOME: "/home/user/.local/state",
+    XDG_CONFIG_HOME: "/home/user/.config",
     TERM: "xterm-256color",
     FORCE_COLOR: "3",
     PWD: dir,
@@ -729,6 +742,7 @@ async function boot() {
   kernel.mkdirp("/home/user");
   kernel.mkdirp("/tmp/.npm/_logs");
   kernel.mkdirp("/tmp/.yarn-cache");
+  kernel.mkdirp("/tmp/.pnpm-store");
   try {
     const npmT0 = Date.now();
     const res = await ensureRealNpm(kernel, async () => {
@@ -773,6 +787,30 @@ async function boot() {
     }
   } catch (e) {
     post("log", { line: `  [boot] real yarn load failed (${(e && e.message) || e}).`, dim: true });
+  }
+
+  // Same delivery/shim path for real pnpm. pnpm drives worker_threads and a
+  // symlinked node_modules (both supported); the shell forces copy import method.
+  try {
+    const pnpmT0 = Date.now();
+    const res = await ensureRealPnpm(kernel, async () => {
+      const base = (self.location && self.location.origin) || "";
+      const r = await fetch(base + REAL_PNPM_ASSET);
+      if (!r.ok) return null;
+      return new Uint8Array(await r.arrayBuffer());
+    });
+    if (res && res.restored) {
+      post("log", { line: `  [boot] real pnpm ready (restored from OPFS, +${Date.now() - pnpmT0}ms).`, dim: true });
+    } else if (res) {
+      post("log", {
+        line: `  [boot] real pnpm ${res.version} loaded (${res.fileCount} files, +${Date.now() - pnpmT0}ms).`,
+        dim: true,
+      });
+    } else {
+      post("log", { line: "  [boot] real pnpm asset unavailable — `pnpm` not installed.", dim: true });
+    }
+  } catch (e) {
+    post("log", { line: `  [boot] real pnpm load failed (${(e && e.message) || e}).`, dim: true });
   }
 
   post("ready", {});

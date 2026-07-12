@@ -329,7 +329,27 @@ gate; needs network — hits `registry.npmjs.org`).
   (created at boot). The SAME shared loader + shim path is gated headlessly by
   `scripts/spike-yarn-studio.mjs` (`yarn --version` → `1.22.22` via the PATH shim; `OC_NET=1` adds
   a real `yarn add is-number` through the shim). Deferred: the cosmetic DNS-probe "no internet"
-  warning, and pnpm (Phase 5).
+  warning.
+- **Phase 5 — pnpm proven AND wired (this change).** The riskiest PM: pnpm drives real
+  `worker_threads` (`dist/worker.js` for fetch/extract) and builds a **symlinked** `node_modules`
+  (`node_modules/<pkg>` → `.pnpm/<pkg>@<ver>/node_modules/<pkg>`). Both work as-is — the
+  Process-Worker model runs the nested threads, and the Rust VFS's `symlink`/`readlink`/`lstat`
+  back the virtual store, so `require()` resolves through the links. `scripts/spike-pnpm.mjs`
+  (off-disk Path B) passes A `pnpm --version` → `9.15.9`, B https egress, C real `pnpm add
+  is-number` (`.pnpm` store + `pnpm-lock.yaml`, require-able via the symlink). The ONLY runtime
+  gap was `util.types.isBoxedPrimitive` (pnpm's registry/JSON path) — added with the rest of the
+  boxed-primitive + typed-array predicates in `node/internal/util/types.js`. Then wired into the
+  studio exactly like npm/yarn: `scripts/vendor-pnpm.mjs` packs `pnpm@9.15.9` into
+  `packages/studio/public/vendor/pnpm-pack.bin` (~3.7 MB gz / 16 MB raw, 898 files — the 4
+  darwin/win `*.node` reflink addons are dropped since Linux uses the JS fallback);
+  `packages/kernel-host/load-real-pnpm.js` (`ensureRealPnpm`) unpacks to `/usr/lib/node_modules/
+  pnpm` (the ~8.8 MB `dist/pnpm.cjs` via `writeLarge`) and installs `/bin/pnpm.js` + `/bin/pnpx.js`
+  shims; the kernel worker calls it after `ensureRealYarn()`. Since a user types bare `pnpm add`
+  (no room for flags), the shell env supplies pnpm's config the npm way: `npm_config_
+  package_import_method=copy` (no hardlink/reflink CoW in our VFS) + `npm_config_store_dir=
+  /tmp/.pnpm-store` + `XDG_*` under `/home/user`. Gated headlessly by
+  `scripts/spike-pnpm-studio.mjs`, which uses that SAME env (not CLI flags) so it verifies the
+  studio config. Deferred: corepack version management (Phase 6).
 
 ## Recommended order (implement one at a time)
 
