@@ -288,6 +288,43 @@ export function createRuntime({
       rawExit(code == null ? (process.exitCode == null ? 0 : process.exitCode | 0) : code | 0);
   }
 
+  // ---- legacy process.binding(name) shim ------------------------------------
+  // Deprecated in real Node but still called by bundled deps: yarn's vendored
+  // `safer-buffer` (`process.binding('buffer').kStringMaxLength`), `builtin-modules`
+  // (`Object.keys(process.binding('natives'))`), a `constants` polyfill
+  // (`process.binding('constants')`), and a `util` legacy path. Delegate to the
+  // same internalBinding seam the vendored Node lib uses; `natives` (source
+  // strings — we have none) becomes a name→'' map so `Object.keys` yields the
+  // core module list. Unknown names return {} rather than throwing.
+  {
+    const NATIVE_MODULE_NAMES = [
+      "assert", "async_hooks", "buffer", "child_process", "cluster", "console",
+      "constants", "crypto", "dgram", "diagnostics_channel", "dns", "domain",
+      "events", "fs", "http", "http2", "https", "inspector", "module", "net",
+      "os", "path", "perf_hooks", "process", "punycode", "querystring",
+      "readline", "repl", "stream", "string_decoder", "sys", "timers", "tls",
+      "tty", "url", "util", "v8", "vm", "wasi", "worker_threads", "zlib",
+    ];
+    process.binding = (name) => {
+      if (name === "natives") {
+        const out = {};
+        for (const n of NATIVE_MODULE_NAMES) out[n] = "";
+        return out;
+      }
+      let b = {};
+      try {
+        b = nodeModules.internalBinding(name) || {};
+      } catch {
+        b = {};
+      }
+      // safer-buffer reads .kStringMaxLength off the buffer binding.
+      if (name === "buffer" && b.kStringMaxLength == null) {
+        return { ...b, kStringMaxLength: (1 << 29) - 1 };
+      }
+      return b;
+    };
+  }
+
   // ---- interactive stdin (real, flowing TTY) --------------------------------
   // Replace the boot-time no-op stdin with a genuine flowing Readable so a REPL,
   // readline, or our shell's line editor can read keystrokes the kernel pushes in

@@ -253,6 +253,56 @@ runs `stubNodeGyp`, and overwrites `/bin/npm.js` + `/bin/npx.js` with shims that
 - Verify browser-shape changes headlessly with `scripts/spike-npm-studio.mjs`
   (it drives the SAME shared loader + PATH shims), not just `spike-npm.mjs`.
 
+### Real yarn (classic) is the studio shell's `yarn` — same pattern as npm
+Yarn is wired exactly like npm, one tier up: `scripts/vendor-yarn.mjs` packs
+`yarn@1.22.22` into `packages/studio/public/vendor/yarn-pack.bin` (same archive
+format; gitignored; `npm run vendor:yarn`, auto-run by `predev`/`prebuild:studio`).
+`packages/kernel-host/load-real-yarn.js` (`ensureRealYarn`) unpacks it into
+`/usr/lib/node_modules/yarn` and writes `/bin/yarn.js` + `/bin/yarnpkg.js` shims;
+the kernel worker calls it right AFTER `ensureRealNpm()` at boot. Differences from
+npm worth knowing:
+- yarn's `lib/cli.js` is a single ~5 MB webpack bundle — TOO big for the 1 MiB SAB
+  `writeFile`, so the loader routes files ≥ 512 KB through `kernel.fs.writeLarge`
+  (the transferred path). Any new large-asset loader must do the same.
+- No Turbo-analog fallback: a missing asset just means `yarn` isn't on PATH (npm
+  still is). There's nothing to "win" over, but the shim is still applied last.
+- yarn needs a writable cache: the shell env sets `YARN_CACHE_FOLDER=/tmp/.yarn-cache`
+  (created at boot), mirroring `npm_config_cache`.
+- Headless browser-shape gate: `scripts/spike-yarn-studio.mjs` (`OC_NET=1` for the
+  real `yarn add`). The off-disk Path B proof is `scripts/spike-yarn.mjs`.
+
+### fs.ReadStream / fs.WriteStream MUST stay ES5 function-constructors
+`node/internal/fs/streams.js` defines `ReadStream`/`WriteStream` as plain
+`function`s (auto-`new` guard + `Readable.call(this)`/`Writable.call(this)` init),
+NOT ES6 `class`es — matching real Node on purpose. graceful-fs (bundled by yarn,
+fs-extra, and much of the ecosystem) subclasses them by doing
+`fs$WriteStream.apply(this, arguments)` on a bare object; an ES6 class throws
+"Class constructor WriteStream cannot be invoked without 'new'" there and kills
+the install at the "Fetching packages" step. It also reassigns `fs.WriteStream`
+via `lib/fs.js`'s `set WriteStream(val)` setter, so `createWriteStream` then runs
+graceful-fs's wrapper. If you ever rewrite these as classes, yarn/fs-extra break.
+
+### Enumerating `fs` trips its lazy getters — vendor every internal it names
+`lib/fs.js` exposes several members as lazy getters (`get Utf8Stream` →
+`internal/streams/fast-utf8-stream`, and `defineLazyProperties(fs,
+'internal/fs/dir', ['Dir','opendir','opendirSync'])`, plus streams/promises).
+Code that *enumerates* `fs` — yarn's `thenify-all` does `promisifyAll(fs)`, i.e.
+touches EVERY key — fires those getters, and a missing target module throws
+`no vendored Node builtin '…'` even though nothing uses the feature. Both
+`internal/streams/fast-utf8-stream` and `internal/fs/dir` are now provided
+(pragmatic, functional shims) and registered in `node/loader.js`. If you add a new
+lazy `fs` getter, register its module too, or bare enumeration will crash.
+
+### `process.binding(name)` is a real (legacy) surface some bundles need
+Deprecated in Node but still called by bundled deps (yarn's `safer-buffer` →
+`process.binding('buffer').kStringMaxLength`, `builtin-modules` →
+`Object.keys(process.binding('natives'))`, a `constants` polyfill, a `util`
+legacy path). `runtime/index.js` wires `process.binding` to delegate to the same
+`internalBinding` seam the vendored Node lib uses (`loader.js` exports it);
+`'natives'` (source strings we don't have) becomes a name→'' map so `Object.keys`
+still yields the core-module list, and unknown names return `{}` instead of
+throwing. Don't remove it — several ecosystem packages break without it.
+
 ### Never silently swallow a syscall throw
 `bridgeHttp`'s `reply()` once wrapped `respond()` in a bare `try/catch`, so a
 "too large" throw turned into a silent hang. Any catch around a syscall must

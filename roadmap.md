@@ -292,6 +292,44 @@ gate; needs network — hits `registry.npmjs.org`).
   Still deferred (installer nuance / breadth): `package-lock.json`-driven `npm ci`, deleting
   `programs/npm.js` entirely, reducing the first-load VFS/OPFS write storm (batch writes),
   and yarn/pnpm (Phases 4-6).
+- **Phase 4 — yarn (classic) proven headless (spike only, this change).** Same arc as npm's
+  Phase 0-1: load the unmodified `yarn@1.22.22` package into the VFS and run its REAL CLI on
+  Path B — a go/no-go gate before any studio delivery/wiring. Yarn classic is tiny to deliver
+  (just `bin/yarn.js` + a ~5 MB `lib/cli.js` webpack bundle + `lib/v8-compile-cache.js`), so
+  `scripts/spike-yarn.mjs` loads it (large `cli.js` via the transferred `writeLarge` path, not
+  the 1 MiB SAB window) and gates three things: **A** `yarn --version` → `1.22.22`, **B** an
+  `https.get` egress self-test, **C** a real `yarn add is-number` (resolve → fetch tarball via
+  the Fetcher Worker → link → build → `yarn.lock`), then `require()`s the installed package.
+  **All three PASS.** Getting there filled five real Node-compat gaps that yarn exercises but
+  npm didn't (fixed in `packages/runtime/`, so they benefit the whole runtime): (1)
+  `process.stdout`/`stderr` grew the EventEmitter/Writable surface (`prependListener` et al.)
+  yarn registers during bootstrap; (2) `process.memoryUsage()` (yarn's reporter tracks peak
+  RSS); (3) a legacy `process.binding(name)` shim delegating to `internalBinding` (+ a
+  `natives` name-map) for yarn's bundled `safer-buffer`/`builtin-modules`/`constants`; (4) two
+  missing lazy `fs` internals — `internal/streams/fast-utf8-stream` (`fs.Utf8Stream`) and
+  `internal/fs/dir` (`fs.opendir`) — which yarn's `thenify-all` `promisifyAll(fs)` trips by
+  merely *enumerating* every `fs` getter; (5) **the important one:** `internal/fs/streams`
+  now defines `ReadStream`/`WriteStream` as ES5 function-constructors (callable without `new`,
+  `Readable.call(this)` init) instead of ES6 `class`, exactly like real Node — graceful-fs
+  (bundled by yarn/fs-extra) subclasses them via `fs$WriteStream.apply(this, …)`, which throws
+  against a `class`. Known cosmetic-only finding: yarn prints "You don't appear to have an
+  internet connection" (its DNS-based connectivity probe isn't satisfied by our fetch-backed
+  net), yet the install still succeeds over the Fetcher Worker.
+- **Phase 4 (cont.) — real yarn IS the studio shell's `yarn` (this change).** With the spike
+  green, yarn is now wired into the interactive studio exactly like npm: `scripts/vendor-yarn.mjs`
+  packs pinned `yarn@1.22.22` into one gzipped asset
+  (`packages/studio/public/vendor/yarn-pack.bin`, ~1.2 MB gz / 5.3 MB raw, 11 files; gitignored,
+  built by `npm run vendor:yarn`, wired as `predev`/`prebuild:studio`). A shared loader
+  (`packages/kernel-host/load-real-yarn.js`) decodes it with the platform-native
+  `DecompressionStream`, unpacks into the VFS at `/usr/lib/node_modules/yarn` (the ~5 MB
+  `lib/cli.js` goes through the transferred `writeLarge` path, not the 1 MiB SAB window), and
+  installs `/bin/yarn.js` + `/bin/yarnpkg.js` shims that `require()` the real entry. The kernel
+  worker calls `ensureRealYarn()` right after `ensureRealNpm()` at boot (OPFS-persisted, so later
+  boots only re-apply the cheap shims); the shell env gains `YARN_CACHE_FOLDER=/tmp/.yarn-cache`
+  (created at boot). The SAME shared loader + shim path is gated headlessly by
+  `scripts/spike-yarn-studio.mjs` (`yarn --version` → `1.22.22` via the PATH shim; `OC_NET=1` adds
+  a real `yarn add is-number` through the shim). Deferred: the cosmetic DNS-probe "no internet"
+  warning, and pnpm (Phase 5).
 
 ## Recommended order (implement one at a time)
 

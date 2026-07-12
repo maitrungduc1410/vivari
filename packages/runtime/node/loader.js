@@ -116,6 +116,8 @@ import fsPromisesFactory from "./lib/fs/promises.js";
 import perfHooksFactory from "./lib/perf_hooks.js";
 import v8Factory from "./lib/v8.js";
 import vmFactory from "./lib/vm.js";
+import fastUtf8StreamFactory from "./lib/fast-utf8-stream.js";
+import fsDirFactory from "./internal/fs/dir.js";
 import http2Factory from "./lib/http2.js";
 // Bridge so the vendored fs.js `fs.promises` getter (require('internal/fs/promises')
 // .exports) resolves to the same pragmatic promises API as require('fs/promises').
@@ -232,6 +234,8 @@ const FACTORIES = {
   perf_hooks: perfHooksFactory,
   v8: v8Factory,
   vm: vmFactory,
+  "internal/streams/fast-utf8-stream": fastUtf8StreamFactory,
+  "internal/fs/dir": fsDirFactory,
   http2: http2Factory,
   wasi: wasiFactory,
   worker_threads: workerThreadsFactory,
@@ -263,5 +267,8 @@ export function createNodeModules({ process, syscalls, netLiveness, netServers, 
     require: nodeRequire,
     /** True if `name` is served by the vendored Node lib (public ids only). */
     has: (name) => Object.prototype.hasOwnProperty.call(FACTORIES, strip(name)),
+    /** The internalBinding seam — exposed so the legacy `process.binding(name)`
+     *  shim (index.js) can delegate to the same bindings (e.g. constants). */
+    internalBinding,
   };
 }
