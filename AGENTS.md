@@ -230,16 +230,24 @@ and packed into one gzipped asset (`scripts/vendor-npm.mjs` →
 `packages/studio/public/vendor/npm-pack.bin`, gitignored, built by
 `npm run vendor:npm`, auto-run as `predev`/`prebuild:studio`). At boot the kernel
 worker calls `ensureRealNpm()` (`packages/kernel-host/load-real-npm.js`) right
-AFTER `installCoreutils()` — order matters, since `installCoreutils()` rewrites
-the Turbo-analog to `/bin/npm.js` on every boot, so the real-npm shim must be
-applied last to win. The loader unpacks the tree to `/usr/lib/node_modules/npm`,
-runs `stubNodeGyp`, and overwrites `/bin/npm.js` + `/bin/npx.js` with shims that
-`require()` the real CLI. Gotchas:
+AFTER `installCoreutils()`. The loader unpacks the tree to
+`/usr/lib/node_modules/npm`, runs `stubNodeGyp`, and writes `/bin/npm.js` +
+`/bin/npx.js` shims that `require()` the real CLI. Gotchas:
 - The npm tree persists in OPFS, so `ensureRealNpm` skips re-unpacking on later
   boots and only re-applies the shims (`hasRealNpm` guard). If you change the
   vendored version, bump/clear it or reset OPFS (`?reset`).
-- `programs/npm.js` is now only the FALLBACK (asset missing, e.g. legacy
-  `server.mjs`). Don't invest in analog-specific behavior; fix things in real npm.
+- **The Turbo-analog `programs/npm.js` is RETIRED** — it's no longer in
+  `COREUTILS`, so real npm is the ONLY npm; a missing asset means "no `npm` on
+  PATH" (like yarn/pnpm), NOT a downgrade to the analog. The analog lives on only
+  as an offline test fixture that `scripts/verify-node.mjs` /
+  `scripts/verify-express.mjs` install to `/bin/npm.js` themselves (they import
+  `NPM_PROGRAM`). Don't reintroduce it into the product; fix things in real npm.
+- Delivery uses ONE batched VFS transfer: the loaders call
+  `kernel.writeFilesBatch(files)` (→ `FsServer.writeBatch`), which concatenates
+  all bodies into a single transferable `ArrayBuffer` and mkdirp's+writes them in
+  the FS Worker in one message — replacing the old per-file `writeFile` loop and
+  the per-large-file `writeLarge` path (the batch carries multi-MB bundles
+  inline). Any new tree-delivery loader should use `writeFilesBatch`, not a loop.
 - Real npm needs `npm_config_cache` writable — the shell env sets `/tmp/.npm`
   (created at boot). Keep that when editing `openTerminal` env.
 - The delivery asset is gzip-compressed but named `npm-pack.bin`, NOT `.gz`, on
@@ -261,11 +269,12 @@ format; gitignored; `npm run vendor:yarn`, auto-run by `predev`/`prebuild:studio
 `/usr/lib/node_modules/yarn` and writes `/bin/yarn.js` + `/bin/yarnpkg.js` shims;
 the kernel worker calls it right AFTER `ensureRealNpm()` at boot. Differences from
 npm worth knowing:
-- yarn's `lib/cli.js` is a single ~5 MB webpack bundle — TOO big for the 1 MiB SAB
-  `writeFile`, so the loader routes files ≥ 512 KB through `kernel.fs.writeLarge`
-  (the transferred path). Any new large-asset loader must do the same.
-- No Turbo-analog fallback: a missing asset just means `yarn` isn't on PATH (npm
-  still is). There's nothing to "win" over, but the shim is still applied last.
+- yarn's `lib/cli.js` is a single ~5 MB webpack bundle — far bigger than the 1 MiB
+  SAB `writeFile` window, but that's a non-issue now: the loader delivers the whole
+  tree via `kernel.writeFilesBatch` (one transferable `ArrayBuffer`), which carries
+  the big bundle inline. No `writeLarge` per-file path needed.
+- No fallback CLI: a missing asset just means `yarn` isn't on PATH (like npm now,
+  since the Turbo-analog is retired). The shim is just applied after unpack.
 - yarn needs a writable cache: the shell env sets `YARN_CACHE_FOLDER=/tmp/.yarn-cache`
   (created at boot), mirroring `npm_config_cache`.
 - Headless browser-shape gate: `scripts/spike-yarn-studio.mjs` (`OC_NET=1` for the

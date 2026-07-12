@@ -15,6 +15,9 @@ import { readFileSync } from "node:fs";
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
+// Retained Turbo-analog npm — no longer shipped in COREUTILS; installed here as
+// an offline test fixture (see makeKernel below).
+import { NPM_PROGRAM } from "../packages/kernel-host/programs/npm.js";
 
 // Build a real gzipped ustar tarball from { "package/<path>": "<contents>" } so
 // the npm-install proof (Phase 2 #10) exercises the actual gunzip + tar parser
@@ -270,6 +273,12 @@ async function makeKernel() {
   const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, fetcher });
   kernel.testFetch = fetchStats;
   kernel.installCoreutils();
+  // The Turbo-analog npm is retired from the shipped product (studio boots the
+  // REAL npm CLI). It lives on here purely as a test fixture: it installs from a
+  // canned, offline registry with zero network, so #9/#10/#11 (metadata fetch,
+  // resolve+gunzip+untar+hoist, .bin, napi optional deps) stay green without
+  // vendoring the ~12 MB real-npm asset into this fast unit gate.
+  kernel.writeFile("/bin/npm.js", NPM_PROGRAM);
   return kernel;
 }
 

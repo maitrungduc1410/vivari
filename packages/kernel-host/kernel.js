@@ -96,6 +96,17 @@ export class Kernel {
   writeFile(path, contents) {
     this.fs.writeFile(path, contents);
   }
+  // Write many files in one transfer (boot delivery of a PM tree). Falls back to
+  // per-file writes if the fs client predates writeFilesBatch. Returns a Promise.
+  writeFilesBatch(files) {
+    if (typeof this.fs.writeFilesBatch === "function") return this.fs.writeFilesBatch(files);
+    for (const f of files) {
+      const slash = f.path.lastIndexOf("/");
+      if (slash > 0) this.mkdirp(f.path.slice(0, slash));
+      this.writeFile(f.path, f.bytes ?? f.contents);
+    }
+    return Promise.resolve(files.length);
+  }
   readFile(path) {
     return this.fs.readFile(path);
   }

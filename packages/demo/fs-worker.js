@@ -42,6 +42,14 @@ function handle(msg) {
         post("fs-write-large-err", { id: msg.id, error: String(err?.message || err) });
       }
       break;
+    case "fs-write-batch":
+      try {
+        const n = server.writeBatch(msg.entries, msg.buffer);
+        post("fs-write-batch-ok", { id: msg.id, count: n });
+      } catch (err) {
+        post("fs-write-batch-err", { id: msg.id, error: String(err?.message || err) });
+      }
+      break;
     case "fs-flush": // page is hiding — best-effort force the mirror to disk
       if (server && server.persistence) server.persistence.flush();
       break;

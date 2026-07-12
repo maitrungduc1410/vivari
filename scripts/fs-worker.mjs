@@ -31,6 +31,14 @@ parentPort.on("message", (msg) => {
         parentPort.postMessage({ type: "fs-write-large-err", id: msg.id, error: String(err?.message || err) });
       }
       break;
+    case "fs-write-batch":
+      try {
+        const n = server.writeBatch(msg.entries, msg.buffer);
+        parentPort.postMessage({ type: "fs-write-batch-ok", id: msg.id, count: n });
+      } catch (err) {
+        parentPort.postMessage({ type: "fs-write-batch-err", id: msg.id, error: String(err?.message || err) });
+      }
+      break;
   }
 });
 

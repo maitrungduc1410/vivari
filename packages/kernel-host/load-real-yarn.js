@@ -14,11 +14,6 @@
 
 export const YARN_VFS_ROOT = "/usr/lib/node_modules/yarn";
 
-// yarn's lib/cli.js is a single ~5 MB webpack bundle — bigger than the 1 MiB SAB
-// window kernel.writeFile uses, so files at/above this size go through the
-// transferred writeLarge path (kernel.fs.writeLarge), like fetched tarballs.
-const LARGE_THRESHOLD = 512 * 1024;
-
 // Thin shims installed on PATH. `node /bin/yarn.js <args>` just loads the real
 // entry (bin/yarn.js → lib/cli.js), which reads process.argv exactly like the
 // spike's /run-yarn.js wrapper proved on Path B. `yarnpkg` is yarn's own alias.
@@ -74,18 +69,10 @@ export function applyRealYarnShims(kernel) {
  */
 export async function loadRealYarn(kernel, packBytes) {
   const { version, files } = await decodeYarnPack(packBytes);
-  const madeDirs = new Set();
-  for (const f of files) {
-    const abs = YARN_VFS_ROOT + "/" + f.path;
-    const slash = abs.lastIndexOf("/");
-    const dir = abs.slice(0, slash);
-    if (!madeDirs.has(dir)) {
-      kernel.mkdirp(dir);
-      madeDirs.add(dir);
-    }
-    if (f.bytes.length >= LARGE_THRESHOLD) await kernel.fs.writeLarge(abs, f.bytes);
-    else kernel.writeFile(abs, f.bytes);
-  }
+  // One batched transfer (mkdirp + write in the FS Worker). The batch goes over a
+  // transferable ArrayBuffer, so even yarn's ~5 MB cli.js rides along — no need
+  // for the separate writeLarge path or the 1 MiB SAB window.
+  await kernel.writeFilesBatch(files.map((f) => ({ path: YARN_VFS_ROOT + "/" + f.path, bytes: f.bytes })));
   applyRealYarnShims(kernel);
   return { version, fileCount: files.length };
 }

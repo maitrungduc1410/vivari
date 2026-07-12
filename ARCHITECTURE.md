@@ -239,25 +239,25 @@ arrives — this is how blocking `accept()`/`execSync()`/blocking fetch work.
   server again in another shell fails with `EADDRINUSE` — we don't intercept that.
   The kernel worker watches `onListen` on the demo's port to point/reload the
   preview (a re-listen on an already-serving port = a Nest `--watch` restart).
-- **npm**: `packages/kernel-host/programs/npm.js` is a from-scratch installer:
-  semver resolution from registry packuments, tarball download via the blocking
-  `OP_FETCH` (Fetcher Worker), gunzip via the platform-native
-  `DecompressionStream('gzip')` + a ustar tar parser, npm-v3 hoisting into
-  `node_modules`, `.bin` symlinks. It walks `optionalDependencies` platform-gated
-  (so `@node-rs/*` auto-selects the `wasm32-wasi` build and skips native ones).
-  This is now a **fallback**: the North Star (see roadmap) is running the **real,
-  unmodified npm CLI** on Path B, and in the studio that is live. Real npm@10.9.2
-  is vendored + packed into one gzipped asset (`scripts/vendor-npm.mjs` →
+- **npm**: the shell's `npm`/`npx` is the **real, unmodified npm CLI** on Path B
+  (the North Star; see roadmap). Real npm@10.9.2 is vendored + packed into one
+  gzipped asset (`scripts/vendor-npm.mjs` →
   `packages/studio/public/vendor/npm-pack.bin`); at boot the kernel worker fetches
   it once and `load-real-npm.js` unpacks the tree into the VFS at
-  `/usr/lib/node_modules/npm`, then overwrites `/bin/npm.js` + `/bin/npx.js` with
-  shims that `require()` the real CLI (so `npm` on PATH is real npm; the tree
-  persists in OPFS across reloads). Native builds can't run in-browser, so
-  `node-gyp` is a non-fatal no-op via `node-gyp-stub.js` (`stubNodeGyp()`
-  overwrites npm's node-gyp shims in the vendored tree; a `node-gyp` coreutil is
-  the PATH fallback) — the package's JS / `wasm32-wasi` fallback is what loads
-  instead. The Turbo-analog `programs/npm.js` is only used if the asset is
-  unavailable (e.g. the legacy `server.mjs` demo).
+  `/usr/lib/node_modules/npm` via a single batched transfer
+  (`kernel.writeFilesBatch` → `FsServer.writeBatch`, ~2400 files in one message),
+  then writes `/bin/npm.js` + `/bin/npx.js` shims that `require()` the real CLI (so
+  `npm` on PATH is real npm; the tree persists in OPFS across reloads). Native
+  builds can't run in-browser, so `node-gyp` is a non-fatal no-op via
+  `node-gyp-stub.js` (`stubNodeGyp()` overwrites npm's node-gyp shims in the
+  vendored tree; a `node-gyp` coreutil is the PATH fallback) — the package's JS /
+  `wasm32-wasi` fallback is what loads instead.
+  The from-scratch installer `packages/kernel-host/programs/npm.js` (semver
+  resolution from registry packuments, `OP_FETCH` tarball download, gunzip +
+  ustar parser, npm-v3 hoisting, `.bin` symlinks, platform-gated
+  `optionalDependencies`) was the temporary "Turbo-analog" — it is now **retired**
+  from the shipped product (not in `COREUTILS`) and survives only as an offline
+  fixture the `verify-node`/`verify-express` harnesses install themselves.
 
 ---
 
