@@ -31,13 +31,51 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     isTTY: false,
     columns: 80,
     rows: 24,
+    writable: true,
+    destroyed: false,
+    // Writes go straight to the sink (never backpressured), so the EventEmitter /
+    // Writable surface is a no-op — but it must EXIST: real tools register
+    // listeners on stdout/stderr (e.g. yarn does `process.stdout.prependListener`
+    // during bootstrap). Missing methods throw "is not a function" and abort.
     on() {
       return this;
     },
     once() {
       return this;
     },
+    addListener() {
+      return this;
+    },
+    prependListener() {
+      return this;
+    },
+    prependOnceListener() {
+      return this;
+    },
     removeListener() {
+      return this;
+    },
+    removeAllListeners() {
+      return this;
+    },
+    emit() {
+      return false;
+    },
+    listeners() {
+      return [];
+    },
+    listenerCount() {
+      return 0;
+    },
+    setMaxListeners() {
+      return this;
+    },
+    setDefaultEncoding() {
+      return this;
+    },
+    cork() {},
+    uncork() {},
+    destroy() {
       return this;
     },
   });
@@ -60,6 +98,16 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     return [s, n];
   };
   hrtime.bigint = () => nowNs();
+
+  const MB = 1024 * 1024;
+  const memoryUsage = () => ({
+    rss: 64 * MB,
+    heapTotal: 32 * MB,
+    heapUsed: 20 * MB,
+    external: 2 * MB,
+    arrayBuffers: MB,
+  });
+  memoryUsage.rss = () => 64 * MB;
 
   const process = {
     argv: ["node", ...argv],
@@ -113,6 +161,10 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     hrtime,
     umask: () => 0,
     uptime: () => (globalThis.performance?.now?.() ?? 0) / 1000,
+    // No V8 heap introspection in a Wasm/Worker sandbox — return plausible,
+    // stable numbers. Real tools only read these for reporting (e.g. yarn's
+    // ConsoleReporter peak-memory counter), not correctness.
+    memoryUsage,
     stdout: makeStream(stdout),
     stderr: makeStream(stderr),
     stdin: { on() {}, once() {}, read: () => null, isTTY: false },

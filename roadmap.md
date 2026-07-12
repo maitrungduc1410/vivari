@@ -292,6 +292,31 @@ gate; needs network — hits `registry.npmjs.org`).
   Still deferred (installer nuance / breadth): `package-lock.json`-driven `npm ci`, deleting
   `programs/npm.js` entirely, reducing the first-load VFS/OPFS write storm (batch writes),
   and yarn/pnpm (Phases 4-6).
+- **Phase 4 — yarn (classic) proven headless (spike only, this change).** Same arc as npm's
+  Phase 0-1: load the unmodified `yarn@1.22.22` package into the VFS and run its REAL CLI on
+  Path B — a go/no-go gate before any studio delivery/wiring. Yarn classic is tiny to deliver
+  (just `bin/yarn.js` + a ~5 MB `lib/cli.js` webpack bundle + `lib/v8-compile-cache.js`), so
+  `scripts/spike-yarn.mjs` loads it (large `cli.js` via the transferred `writeLarge` path, not
+  the 1 MiB SAB window) and gates three things: **A** `yarn --version` → `1.22.22`, **B** an
+  `https.get` egress self-test, **C** a real `yarn add is-number` (resolve → fetch tarball via
+  the Fetcher Worker → link → build → `yarn.lock`), then `require()`s the installed package.
+  **All three PASS.** Getting there filled five real Node-compat gaps that yarn exercises but
+  npm didn't (fixed in `packages/runtime/`, so they benefit the whole runtime): (1)
+  `process.stdout`/`stderr` grew the EventEmitter/Writable surface (`prependListener` et al.)
+  yarn registers during bootstrap; (2) `process.memoryUsage()` (yarn's reporter tracks peak
+  RSS); (3) a legacy `process.binding(name)` shim delegating to `internalBinding` (+ a
+  `natives` name-map) for yarn's bundled `safer-buffer`/`builtin-modules`/`constants`; (4) two
+  missing lazy `fs` internals — `internal/streams/fast-utf8-stream` (`fs.Utf8Stream`) and
+  `internal/fs/dir` (`fs.opendir`) — which yarn's `thenify-all` `promisifyAll(fs)` trips by
+  merely *enumerating* every `fs` getter; (5) **the important one:** `internal/fs/streams`
+  now defines `ReadStream`/`WriteStream` as ES5 function-constructors (callable without `new`,
+  `Readable.call(this)` init) instead of ES6 `class`, exactly like real Node — graceful-fs
+  (bundled by yarn/fs-extra) subclasses them via `fs$WriteStream.apply(this, …)`, which throws
+  against a `class`. Known cosmetic-only finding: yarn prints "You don't appear to have an
+  internet connection" (its DNS-based connectivity probe isn't satisfied by our fetch-backed
+  net), yet the install still succeeds over the Fetcher Worker. **Go** for studio wiring next
+  (mirror npm's `vendor-npm.mjs` → `npm-pack.bin` delivery + `load-real-*.js` shim), pending
+  the user's call.
 
 ## Recommended order (implement one at a time)
 
