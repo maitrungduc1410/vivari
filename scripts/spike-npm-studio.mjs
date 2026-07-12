@@ -76,7 +76,7 @@ const fetcher = async (url, init) => {
 };
 
 const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, fetcher });
-kernel.installCoreutils(); // writes the Turbo-analog to /bin/npm.js …
+kernel.installCoreutils(); // node/sh/npx/etc — no built-in npm anymore (retired)
 
 // ── the wiring under test: the SHARED loader, fed the vendor asset ───────────
 // This is exactly what packages/demo/kernel-worker.js does at boot (there the
@@ -88,7 +88,8 @@ const t0 = Date.now();
 const loaded = await ensureRealNpm(kernel, async () => new Uint8Array(fs.readFileSync(ASSET)));
 console.log(`ensureRealNpm: version=${loaded && loaded.version} files=${loaded && loaded.fileCount} (${Date.now() - t0}ms)`);
 
-// Gate A: /bin/npm.js is now the real-npm shim, not the Turbo-analog.
+// Gate A: /bin/npm.js is the real-npm shim (the Turbo-analog is retired; without
+// ensureRealNpm there would be no /bin/npm.js at all).
 const shim = kernel.readFile("/bin/npm.js") || "";
 const shimOk = /real npm shim/.test(shim) && shim.includes(NPM_VFS_ROOT + "/bin/npm-cli.js");
 console.log(`shim gate: ${shimOk ? "PASS" : "FAIL"}  (/bin/npm.js -> real npm-cli.js)`);

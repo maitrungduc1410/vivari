@@ -1,5 +1,7 @@
 // load-real-npm — put the REAL, unmodified npm CLI into the VFS and make `npm`
-// (and `npx`) on PATH resolve to it instead of our Turbo-analog `programs/npm.js`.
+// (and `npx`) on PATH resolve to it. This is the ONLY npm in the shipped product:
+// the Turbo-analog `programs/npm.js` is retired (it lives on only as an offline
+// verify-node fixture).
 //
 // This is the browser-side counterpart to what scripts/spike-npm.mjs did off the
 // host disk. The npm tree is delivered as one gzipped asset (built by
@@ -9,9 +11,8 @@
 // The SAME functions are exercised headlessly by scripts/spike-npm-studio.mjs,
 // so the exact code path that studio ships is what gets verified.
 //
-// Ordering matters (installCoreutils writes the Turbo-analog to /bin/npm.js on
-// every boot): the caller must run installCoreutils() FIRST, then ensureRealNpm()
-// so the real-npm shims win.
+// Ordering: the caller runs installCoreutils() FIRST (node/sh/npx/etc), then
+// ensureRealNpm() to install the /bin/npm.js + /bin/npx.js shims.
 
 import { stubNodeGyp } from "./node-gyp-stub.js";
 
@@ -59,9 +60,8 @@ export async function decodeNpmPack(packBytes) {
 }
 
 /**
- * Overwrite /bin/npm.js and /bin/npx.js so the shell resolves the real CLI.
- * Safe to call on every boot (idempotent) — needed because installCoreutils()
- * re-writes the Turbo-analog npm each time.
+ * Write /bin/npm.js and /bin/npx.js so the shell resolves the real CLI.
+ * Safe to call on every boot (idempotent).
  */
 export function applyRealNpmShims(kernel) {
   kernel.writeFile("/bin/npm.js", NPM_SHIM);
@@ -74,17 +74,10 @@ export function applyRealNpmShims(kernel) {
  */
 export async function loadRealNpm(kernel, packBytes) {
   const { version, files } = await decodeNpmPack(packBytes);
-  const madeDirs = new Set();
-  for (const f of files) {
-    const abs = NPM_VFS_ROOT + "/" + f.path;
-    const slash = abs.lastIndexOf("/");
-    const dir = abs.slice(0, slash);
-    if (!madeDirs.has(dir)) {
-      kernel.mkdirp(dir);
-      madeDirs.add(dir);
-    }
-    kernel.writeFile(abs, f.bytes);
-  }
+  // One batched transfer instead of ~2400 per-file SAB round-trips — the FS
+  // Worker mkdirp's parents and writes every file in a single message. This is
+  // the dominant cost of cold boot, so it's the big win of the write-storm batch.
+  await kernel.writeFilesBatch(files.map((f) => ({ path: NPM_VFS_ROOT + "/" + f.path, bytes: f.bytes })));
   // Native addon builds can't run in-browser — make node-gyp a non-fatal no-op
   // (see node-gyp-stub.js) so a native package's install lifecycle still passes.
   const stubbed = stubNodeGyp(kernel, NPM_VFS_ROOT);
@@ -95,8 +88,8 @@ export async function loadRealNpm(kernel, packBytes) {
 /**
  * Ensure the real npm is active. If already in the VFS (OPFS-restored), just
  * (re)apply the shims — cheap. Otherwise fetch + unpack via `fetchPackBytes()`.
- * Returns a small status object, or null if the asset was unavailable (caller
- * keeps the Turbo-analog fallback so the shell still has a working `npm`).
+ * Returns a small status object, or null if the asset was unavailable (in which
+ * case the shell simply has no `npm` on PATH — there is no analog fallback).
  */
 export async function ensureRealNpm(kernel, fetchPackBytes) {
   if (hasRealNpm(kernel)) {

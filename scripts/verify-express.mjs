@@ -13,6 +13,10 @@
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
+// Retained Turbo-analog npm — no longer shipped in COREUTILS; installed below as
+// the installer for this network smoke test (kept lightweight vs. vendoring the
+// ~12 MB real-npm asset just to drive an install against the live registry).
+import { NPM_PROGRAM } from "../packages/kernel-host/programs/npm.js";
 import { Worker, MessageChannel } from "node:worker_threads";
 
 let failures = 0;
@@ -72,6 +76,7 @@ const listening = new Set();
 const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, fetcher, stdout: () => {}, stderr: () => {} });
 kernel.onListen = (port) => listening.add(port);
 kernel.installCoreutils();
+kernel.writeFile("/bin/npm.js", NPM_PROGRAM); // retired analog, used here as the installer
 
 kernel.mkdirp("/app");
 kernel.writeFile("/app/package.json", JSON.stringify({ name: "exp", version: "1.0.0" }));

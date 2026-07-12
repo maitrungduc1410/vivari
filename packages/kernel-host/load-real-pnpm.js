@@ -16,11 +16,6 @@
 
 export const PNPM_VFS_ROOT = "/usr/lib/node_modules/pnpm";
 
-// pnpm's dist/pnpm.cjs is a single ~8.8 MB bundle — bigger than the 1 MiB SAB
-// window kernel.writeFile uses, so files ≥ this size go through the transferred
-// writeLarge path (kernel.fs.writeLarge).
-const LARGE_THRESHOLD = 512 * 1024;
-
 // Thin shims on PATH. `node /bin/pnpm.js <args>` loads the real entry
 // (bin/pnpm.cjs → dist/pnpm.cjs), which reads process.argv exactly like the
 // spike's /run-pnpm.js wrapper proved. `pnpx` is pnpm's `dlx` alias.
@@ -74,23 +69,13 @@ export function applyRealPnpmShims(kernel) {
 
 /**
  * Unpack the pnpm tree into the VFS and install the shims. `packBytes` is the
- * gzipped vendor asset. Large files (dist/pnpm.cjs) use the async writeLarge
- * transfer path; the rest use the sync SAB writeFile.
+ * gzipped vendor asset. The whole tree is written in one batched transfer.
  */
 export async function loadRealPnpm(kernel, packBytes) {
   const { version, files } = await decodePnpmPack(packBytes);
-  const madeDirs = new Set();
-  for (const f of files) {
-    const abs = PNPM_VFS_ROOT + "/" + f.path;
-    const slash = abs.lastIndexOf("/");
-    const dir = abs.slice(0, slash);
-    if (!madeDirs.has(dir)) {
-      kernel.mkdirp(dir);
-      madeDirs.add(dir);
-    }
-    if (f.bytes.length >= LARGE_THRESHOLD) await kernel.fs.writeLarge(abs, f.bytes);
-    else kernel.writeFile(abs, f.bytes);
-  }
+  // One batched transfer (mkdirp + write in the FS Worker). Rides the whole tree
+  // — including pnpm's ~8.8 MB dist/pnpm.cjs — over a single transferable buffer.
+  await kernel.writeFilesBatch(files.map((f) => ({ path: PNPM_VFS_ROOT + "/" + f.path, bytes: f.bytes })));
   applyRealPnpmShims(kernel);
   return { version, fileCount: files.length };
 }

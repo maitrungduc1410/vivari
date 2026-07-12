@@ -4,11 +4,17 @@
 // even the shell — is "just a Node process", exactly like StackBlitz's per-PID
 // Node workers.
 
-import { NPM_PROGRAM } from "./programs/npm.js";
 import { NODE_GYP_STUB } from "./node-gyp-stub.js";
 
 export const COREUTILS = {
-  npm: NPM_PROGRAM,
+  // NOTE: there is no built-in `npm` here anymore. The Turbo-analog installer
+  // (packages/kernel-host/programs/npm.js) has been RETIRED from the shipped
+  // product — studio now boots the REAL npm CLI unconditionally (see
+  // load-real-npm.js + demo/kernel-worker.js). The analog survives ONLY as an
+  // offline test fixture: scripts/verify-node.mjs imports NPM_PROGRAM directly
+  // and installs it to /bin/npm.js, so its deterministic install/tar/hoist
+  // coverage keeps running without network. See roadmap.md ("Retiring the
+  // Turbo-analog").
 
   // node-gyp stub on /bin: native addon builds can't run in-browser, so make
   // them a non-fatal no-op (North Star: real package managers). This is the

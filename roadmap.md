@@ -289,9 +289,8 @@ gate; needs network — hits `registry.npmjs.org`).
   `scripts/spike-npm-studio.mjs` (`npm --version`/`npx --version` → `10.9.2` via the PATH
   shim, `OC_NET=1` adds a real `npm install`). Fixes the reported `npm -v`/`node -v` oddity:
   `npm -v` now answers `10.9.2` (real npm), and the `node` coreutil learned `-v`/`--version`.
-  Still deferred (installer nuance / breadth): `package-lock.json`-driven `npm ci`, deleting
-  `programs/npm.js` entirely, reducing the first-load VFS/OPFS write storm (batch writes),
-  and yarn/pnpm (Phases 4-6).
+  (Phase-3 deferrals — `npm ci`, retiring `programs/npm.js`, and batching the first-load write
+  storm — are all closed in the "PM capstone" entry below; yarn/pnpm/corepack are Phases 4-6.)
 - **Phase 4 — yarn (classic) proven headless (spike only, this change).** Same arc as npm's
   Phase 0-1: load the unmodified `yarn@1.22.22` package into the VFS and run its REAL CLI on
   Path B — a go/no-go gate before any studio delivery/wiring. Yarn classic is tiny to deliver
@@ -387,6 +386,30 @@ gate; needs network — hits `registry.npmjs.org`).
   (`OC_NET=1` downloads+runs `yarn@1.22.22` AND `pnpm@9.15.9` via the shim, env config only).
   This completes the package-manager North Star: npm, yarn, pnpm all run for real, and corepack
   manages their versions.
+
+- **PM capstone — retire the Turbo-analog, `npm ci`, and batch the boot write-storm (this
+  change).** Three loose ends from Phase 3's "Still deferred" list, now closed:
+  1. **Turbo-analog retired from the shipped product.** `programs/npm.js` is no longer in
+     `COREUTILS`, so `installCoreutils()` no longer writes a fake `/bin/npm.js` — studio boots the
+     REAL npm CLI (`ensureRealNpm`) as the *only* npm, and a missing asset now means "no `npm` on
+     PATH" (like yarn/pnpm), not a silent downgrade to the analog. The analog survives ONLY as an
+     **offline test fixture**: `scripts/verify-node.mjs` and `scripts/verify-express.mjs` import
+     `NPM_PROGRAM` and write it to `/bin/npm.js` themselves, so `verify-node`'s deterministic,
+     network-free install/tar/hoist/`.bin`/napi coverage (#9–#11) keeps running without vendoring
+     the ~12 MB real-npm asset into that fast unit gate. `npm run verify` stays green.
+  2. **`npm ci` proven.** `scripts/spike-npm.mjs` gained a gate: after a real `npm install`
+     produces `package-lock.json`, `npm ci` does a clean, lockfile-driven reinstall (Arborist's
+     `loadVirtual` path + a recursive `node_modules` wipe + re-extract into the VFS) and the tree is
+     still present — **PASS**.
+  3. **Boot write-storm batched.** Delivering a PM tree used to be one SAB round-trip per file
+     (~2400 for npm), each a separate cross-worker hop. New `kernel.writeFilesBatch(files)` →
+     `kernel-fs.writeFilesBatch` concatenates every body into ONE transferable `ArrayBuffer` and
+     sends a single `fs-write-batch` message; the FS Worker's `FsServer.writeBatch` mkdirp's parents
+     and `write_file`s each slice in one pass. All four loaders (`load-real-{npm,yarn,pnpm,corepack}
+     .js`) now use it, replacing both the per-file `writeFile` loop AND the per-large-file
+     `writeLarge` path (the batch transfer carries yarn's 5 MB `cli.js` / pnpm's 8.8 MB `pnpm.cjs`
+     inline). Headless load of npm's 2408 files is ~135 ms; the real win is in the browser, where
+     ~2400 worker hops collapse to one. Gated by the existing `spike-*-studio.mjs` (all green).
 
 ## Recommended order (implement one at a time)
 
