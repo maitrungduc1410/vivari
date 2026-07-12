@@ -271,8 +271,26 @@ gate; needs network — hits `registry.npmjs.org`).
   a fetched/mock body backed by a pooled/offset `ArrayBuffer` (Node's Buffer pool) is not
   transferable ("Cannot transfer object of unsupported type") — `writeLarge` now transfers a
   standalone buffer (own buffer, or an exact-bytes copy). `npm run verify` is green (92/92).
-  Still deferred (installer nuance, thrown away when this lands in the product UI):
-  `package-lock.json`, `npm ci`, dedup nuance, wiring real npm in place of `programs/npm.js`.
+- **Phase 3 — real npm IS the shell's `npm` in the studio (this change).** The first two
+  phases proved real npm headless (off the host disk); this makes it the actual `npm`/`npx`
+  the interactive studio terminal runs, retiring the Turbo-analog in that UI. The hard part
+  is **delivery**: the browser can't `fs.readdirSync` the host, so `scripts/vendor-npm.mjs`
+  installs pinned npm@10.9.2 and packs its whole tree (~2400 files) into one gzipped asset
+  (`packages/studio/public/vendor/npm-pack.gz`, ~2.8 MB; gitignored, built by
+  `npm run vendor:npm`, wired as `predev`/`prebuild:studio`). A shared loader
+  (`packages/kernel-host/load-real-npm.js`) decodes that asset with the platform-native
+  `DecompressionStream` and unpacks it into the VFS at `/usr/lib/node_modules/npm`, applies
+  `stubNodeGyp`, and overwrites `/bin/npm.js` + `/bin/npx.js` with thin shims that
+  `require()` the real CLI. The kernel worker calls `ensureRealNpm()` right after
+  `installCoreutils()` at boot (fetches the asset once; on later boots the tree is already
+  OPFS-persisted, so it only re-applies the cheap shims); it falls back to the Turbo-analog
+  if the asset is missing. The **same shared loader + shim path** is gated headlessly by
+  `scripts/spike-npm-studio.mjs` (`npm --version`/`npx --version` → `10.9.2` via the PATH
+  shim, `OC_NET=1` adds a real `npm install`). Fixes the reported `npm -v`/`node -v` oddity:
+  `npm -v` now answers `10.9.2` (real npm), and the `node` coreutil learned `-v`/`--version`.
+  Still deferred (installer nuance / breadth): `package-lock.json`-driven `npm ci`, deleting
+  `programs/npm.js` entirely, reducing the first-load VFS/OPFS write storm (batch writes),
+  and yarn/pnpm (Phases 4-6).
 
 ## Recommended order (implement one at a time)
 
@@ -1063,9 +1081,10 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
   - Outbound raw TCP is impossible in a browser — only the fetch/WebSocket bridge exists.
   - HTTP: streaming request/response bodies, keep-alive, more concurrent in-flight (#8).
 - **Persistence:** exact `mode`/`chmod` restore (needs a VFS `chmod`; files get default mode).
-- **npm:** `package-lock.json`, `os`/`libc` optional-dep gating (#10/#16 s2c). (Real-npm
-  lifecycle scripts + `.bin` + non-fatal `node-gyp` are DONE — see "Real package managers —
-  progress" above; wiring real npm in place of `programs/npm.js` in the studio UI is next.)
+- **npm:** `package-lock.json`, `os`/`libc` optional-dep gating (#10/#16 s2c). (Real npm now
+  BOOTS/installs/runs lifecycle scripts AND is the studio shell's `npm`/`npx` via a vendored
+  delivery asset — see "Real package managers — progress" above. Remaining: `npm ci`, deleting
+  the Turbo-analog `programs/npm.js`, batching the first-load write storm, and yarn/pnpm.)
 - **Validation (framework matrix):** ran three popular stacks in-VM headlessly
   (`scripts/probe-react.mjs`, `scripts/probe-nest.mjs`, `scripts/probe-next.mjs`) to surface
   the next missing Node APIs. The architecture held up — every gap was "add API X", not a

@@ -47,7 +47,8 @@ packages/
     coreutils.js   echo/cat/ls/pwd/... + a small `sh`.
     opfs-persistence.js  write-behind mirror of the VFS to OPFS (survives reload).
     node-gyp-stub.js     node-gyp no-op stub (native builds non-fatal) for real npm.
-    programs/npm.js      from-scratch npm installer (resolve, tarball, hoist).
+    load-real-npm.js     unpack the vendored real-npm asset into the VFS + shim /bin/npm.
+    programs/npm.js       from-scratch npm installer — LEGACY fallback (see real npm below).
 
   runtime/         The Node runtime that runs INSIDE each process worker.
     index.js       createRuntime(): wires builtins/globals/http-bridge/ws + run().
@@ -206,6 +207,28 @@ the vendored tree with a JS stub (exit 0, warns), and a `node-gyp` coreutil is
 the PATH fallback. Native compilation is skipped; the package's JS or
 `wasm32-wasi` build is what actually loads. Don't "fix" a node-gyp failure by
 trying to compile — that path is intentionally stubbed.
+
+### Real npm is the studio shell's `npm` (delivery + shims)
+The North Star is running the real npm/yarn/pnpm CLIs, not our from-scratch
+`programs/npm.js`. In the studio that is now live: real npm@10.9.2 is vendored
+and packed into one gzipped asset (`scripts/vendor-npm.mjs` →
+`packages/studio/public/vendor/npm-pack.gz`, gitignored, built by
+`npm run vendor:npm`, auto-run as `predev`/`prebuild:studio`). At boot the kernel
+worker calls `ensureRealNpm()` (`packages/kernel-host/load-real-npm.js`) right
+AFTER `installCoreutils()` — order matters, since `installCoreutils()` rewrites
+the Turbo-analog to `/bin/npm.js` on every boot, so the real-npm shim must be
+applied last to win. The loader unpacks the tree to `/usr/lib/node_modules/npm`,
+runs `stubNodeGyp`, and overwrites `/bin/npm.js` + `/bin/npx.js` with shims that
+`require()` the real CLI. Gotchas:
+- The npm tree persists in OPFS, so `ensureRealNpm` skips re-unpacking on later
+  boots and only re-applies the shims (`hasRealNpm` guard). If you change the
+  vendored version, bump/clear it or reset OPFS (`?reset`).
+- `programs/npm.js` is now only the FALLBACK (asset missing, e.g. legacy
+  `server.mjs`). Don't invest in analog-specific behavior; fix things in real npm.
+- Real npm needs `npm_config_cache` writable — the shell env sets `/tmp/.npm`
+  (created at boot). Keep that when editing `openTerminal` env.
+- Verify browser-shape changes headlessly with `scripts/spike-npm-studio.mjs`
+  (it drives the SAME shared loader + PATH shims), not just `spike-npm.mjs`.
 
 ### Never silently swallow a syscall throw
 `bridgeHttp`'s `reply()` once wrapped `respond()` in a bare `try/catch`, so a

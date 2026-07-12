@@ -157,6 +157,9 @@ let evalCode = null, printResult = false, entry = null, i = 0;
 for (; i < cli.length; i++) {
   const a = cli[i];
   if (a === '--') { i++; break; }
+  // \`node -v\`/\`--version\` prints the runtime version and exits (some tooling,
+  // and users, probe it). Answer with the spoofed process.version.
+  if (a === '-v' || a === '--version') { process.stdout.write(process.version + '\\n'); process.exit(0); }
   if (a === '-e' || a === '--eval') { evalCode = cli[++i] || ''; continue; }
   if (a === '-p' || a === '--print') { evalCode = cli[++i] || ''; printResult = true; continue; }
   if (a[0] === '-') {

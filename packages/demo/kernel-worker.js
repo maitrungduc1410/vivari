@@ -15,8 +15,15 @@
 
 import { Kernel } from "../kernel-host/kernel.js";
 import { createKernelFs } from "../kernel-host/kernel-fs.js";
+import { ensureRealNpm } from "../kernel-host/load-real-npm.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
+
+// The real-npm delivery asset (built by `npm run vendor:npm`, served from
+// packages/studio/public/vendor). Fetched once and unpacked into the VFS so the
+// shell's `npm` is the real CLI, not the Turbo-analog (North Star). Absolute
+// path so it resolves against the app origin from inside this worker.
+const REAL_NPM_ASSET = "/vendor/npm-pack.gz";
 
 // [optimize] Compile the Rust/Wasm codecs (zlib #11, crypto #12) EXACTLY ONCE,
 // here in the kernel worker, and hand each Process Worker the resulting
@@ -430,6 +437,9 @@ function openTerminal(terminalId, cwd, demoId) {
   const env = {
     PATH: dir + "/node_modules/.bin:/bin",
     HOME: "/",
+    // Real npm needs a writable cache (+ _logs) dir; created at boot. Without
+    // this it defaults to $HOME/.npm and can trip on the read-only-ish root.
+    npm_config_cache: "/tmp/.npm",
     TERM: "xterm-256color",
     FORCE_COLOR: "3",
     PWD: dir,
@@ -700,6 +710,36 @@ async function boot() {
   kernel.onWsSend = (msg) => post("oc-ws", { msg });
 
   kernel.installCoreutils();
+
+  // North Star: make the shell's `npm`/`npx` the REAL npm CLI. installCoreutils
+  // just (re)wrote the Turbo-analog to /bin/npm.js, so this must run AFTER it to
+  // win. The tree persists in OPFS, so after the first boot ensureRealNpm only
+  // re-applies the cheap shims; a fresh origin fetches + unpacks the asset once.
+  // Falls back to the Turbo-analog if the asset is missing (e.g. legacy server).
+  kernel.mkdirp("/home/user");
+  kernel.mkdirp("/tmp/.npm/_logs");
+  try {
+    const npmT0 = Date.now();
+    const res = await ensureRealNpm(kernel, async () => {
+      const base = (self.location && self.location.origin) || "";
+      const r = await fetch(base + REAL_NPM_ASSET);
+      if (!r.ok) return null;
+      return new Uint8Array(await r.arrayBuffer());
+    });
+    if (res && res.restored) {
+      post("log", { line: `  [boot] real npm ready (restored from OPFS, +${Date.now() - npmT0}ms).`, dim: true });
+    } else if (res) {
+      post("log", {
+        line: `  [boot] real npm ${res.version} loaded (${res.fileCount} files, +${Date.now() - npmT0}ms).`,
+        dim: true,
+      });
+    } else {
+      post("log", { line: "  [boot] real npm asset unavailable — using built-in npm.", dim: true });
+    }
+  } catch (e) {
+    post("log", { line: `  [boot] real npm load failed (${(e && e.message) || e}) — using built-in npm.`, dim: true });
+  }
+
   post("ready", {});
   post("log", { line: `  [boot] kernel ready in ${Date.now() - t0}ms.`, dim: true });
   post("log", { line: "Kernel ready — pick a project and press Run." });
