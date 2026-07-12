@@ -227,6 +227,16 @@ runs `stubNodeGyp`, and overwrites `/bin/npm.js` + `/bin/npx.js` with shims that
   `server.mjs`). Don't invest in analog-specific behavior; fix things in real npm.
 - Real npm needs `npm_config_cache` writable — the shell env sets `/tmp/.npm`
   (created at boot). Keep that when editing `openTerminal` env.
+- A fresh terminal must NOT start at the filesystem root `/`. Real npm's Arborist
+  throws `Tracker "idealTree" already exists` when you `npm install <pkg>` at `/`
+  with no `package.json` (the nameless root sits at the top of the dep tree —
+  `#buildDeps` calls `addTracker('idealTree', tree.name, '')` with
+  `tree.name === undefined`, which collapses to the no-subsection branch and
+  re-adds the already-created top tracker). So `boot()` seeds `WORKSPACE_DIR`
+  (`/home/user`) with a minimal `package.json` (idempotent — never clobbers the
+  user's) and `defaultTermCwd()` returns it instead of `/`. Any dir with a
+  `package.json` works (named or not; even `/` works WITH one) — the trigger is
+  specifically installing into the nameless `/` root.
 - The delivery asset is gzip-compressed but named `npm-pack.bin`, NOT `.gz`, on
   purpose: static servers (Vite's sirv, CDNs) serve a `.gz` file with
   `Content-Encoding: gzip`, so the browser auto-decompresses it and our own
