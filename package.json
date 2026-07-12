@@ -8,9 +8,10 @@
   "scripts": {
     "vendor:npm": "node scripts/vendor-npm.mjs",
     "vendor:yarn": "node scripts/vendor-yarn.mjs",
-    "predev": "npm run vendor:npm && npm run vendor:yarn",
+    "vendor:pnpm": "node scripts/vendor-pnpm.mjs",
+    "predev": "npm run vendor:npm && npm run vendor:yarn && npm run vendor:pnpm",
     "dev": "cd packages/studio && bun run dev",
-    "prebuild:studio": "npm run vendor:npm && npm run vendor:yarn",
+    "prebuild:studio": "npm run vendor:npm && npm run vendor:yarn && npm run vendor:pnpm",
     "build:studio": "cd packages/studio && bun run build",
     "preview:studio": "cd packages/studio && bun run preview",
     "dev:legacy": "node server.mjs",

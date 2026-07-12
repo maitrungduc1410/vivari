@@ -271,6 +271,26 @@ npm worth knowing:
 - Headless browser-shape gate: `scripts/spike-yarn-studio.mjs` (`OC_NET=1` for the
   real `yarn add`). The off-disk Path B proof is `scripts/spike-yarn.mjs`.
 
+### Real pnpm is the studio shell's `pnpm` — worker_threads + symlinked store
+pnpm is wired like npm/yarn (`scripts/vendor-pnpm.mjs` → `pnpm-pack.bin`;
+`packages/kernel-host/load-real-pnpm.js` `ensureRealPnpm` → `/bin/pnpm.js` +
+`/bin/pnpx.js`; called after `ensureRealYarn()` at boot). What makes pnpm special:
+- It drives real `worker_threads` (`dist/worker.js`) and a SYMLINKED `node_modules`
+  (`node_modules/<pkg>` → `.pnpm/<pkg>@<ver>/…`). Both work because the
+  Process-Worker model runs nested threads and the Rust VFS backs
+  `symlink`/`readlink`/`lstat`. If either regresses, pnpm installs break where
+  npm/yarn still pass — the canary is `scripts/spike-pnpm.mjs`.
+- No hardlink/reflink CoW in our VFS, so packages must be COPIED from the store.
+  A user types bare `pnpm add` (no room for flags), so the shell env carries the
+  config the npm way: `npm_config_package_import_method=copy` +
+  `npm_config_store_dir=/tmp/.pnpm-store` + `XDG_*` under `/home/user`
+  (see `openTerminal`). Keep these when editing the env.
+- `vendor-pnpm.mjs` DROPS `*.node` files: pnpm ships prebuilt reflink addons only
+  for darwin/win; Linux uses the JS fallback, so they're ~1.3 MB of dead weight.
+- `dist/pnpm.cjs` (~8.8 MB) exceeds the 1 MiB SAB window → loader uses writeLarge.
+- Headless browser-shape gate: `scripts/spike-pnpm-studio.mjs` (`OC_NET=1`), which
+  uses the SAME env (not CLI flags) so it verifies studio's actual config.
+
 ### fs.ReadStream / fs.WriteStream MUST stay ES5 function-constructors
 `node/internal/fs/streams.js` defines `ReadStream`/`WriteStream` as plain
 `function`s (auto-`new` guard + `Readable.call(this)`/`Writable.call(this)` init),
