@@ -314,9 +314,22 @@ gate; needs network — hits `registry.npmjs.org`).
   (bundled by yarn/fs-extra) subclasses them via `fs$WriteStream.apply(this, …)`, which throws
   against a `class`. Known cosmetic-only finding: yarn prints "You don't appear to have an
   internet connection" (its DNS-based connectivity probe isn't satisfied by our fetch-backed
-  net), yet the install still succeeds over the Fetcher Worker. **Go** for studio wiring next
-  (mirror npm's `vendor-npm.mjs` → `npm-pack.bin` delivery + `load-real-*.js` shim), pending
-  the user's call.
+  net), yet the install still succeeds over the Fetcher Worker.
+- **Phase 4 (cont.) — real yarn IS the studio shell's `yarn` (this change).** With the spike
+  green, yarn is now wired into the interactive studio exactly like npm: `scripts/vendor-yarn.mjs`
+  packs pinned `yarn@1.22.22` into one gzipped asset
+  (`packages/studio/public/vendor/yarn-pack.bin`, ~1.2 MB gz / 5.3 MB raw, 11 files; gitignored,
+  built by `npm run vendor:yarn`, wired as `predev`/`prebuild:studio`). A shared loader
+  (`packages/kernel-host/load-real-yarn.js`) decodes it with the platform-native
+  `DecompressionStream`, unpacks into the VFS at `/usr/lib/node_modules/yarn` (the ~5 MB
+  `lib/cli.js` goes through the transferred `writeLarge` path, not the 1 MiB SAB window), and
+  installs `/bin/yarn.js` + `/bin/yarnpkg.js` shims that `require()` the real entry. The kernel
+  worker calls `ensureRealYarn()` right after `ensureRealNpm()` at boot (OPFS-persisted, so later
+  boots only re-apply the cheap shims); the shell env gains `YARN_CACHE_FOLDER=/tmp/.yarn-cache`
+  (created at boot). The SAME shared loader + shim path is gated headlessly by
+  `scripts/spike-yarn-studio.mjs` (`yarn --version` → `1.22.22` via the PATH shim; `OC_NET=1` adds
+  a real `yarn add is-number` through the shim). Deferred: the cosmetic DNS-probe "no internet"
+  warning, and pnpm (Phase 5).
 
 ## Recommended order (implement one at a time)
 

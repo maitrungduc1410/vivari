@@ -16,6 +16,7 @@
 import { Kernel } from "../kernel-host/kernel.js";
 import { createKernelFs } from "../kernel-host/kernel-fs.js";
 import { ensureRealNpm } from "../kernel-host/load-real-npm.js";
+import { ensureRealYarn } from "../kernel-host/load-real-yarn.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
@@ -27,6 +28,9 @@ const post = (type, extra) => self.postMessage({ type, ...extra });
 // (a `.gz` name makes static servers set Content-Encoding: gzip, which the
 // browser auto-decompresses, breaking our own gunzip).
 const REAL_NPM_ASSET = "/vendor/npm-pack.bin";
+// The real-yarn (classic) delivery asset, same shape/rationale as npm's (built by
+// `npm run vendor:yarn`). Unpacked into the VFS so `yarn` on PATH is the real CLI.
+const REAL_YARN_ASSET = "/vendor/yarn-pack.bin";
 
 // [optimize] Compile the Rust/Wasm codecs (zlib #11, crypto #12) EXACTLY ONCE,
 // here in the kernel worker, and hand each Process Worker the resulting
@@ -443,6 +447,9 @@ function openTerminal(terminalId, cwd, demoId) {
     // Real npm needs a writable cache (+ _logs) dir; created at boot. Without
     // this it defaults to $HOME/.npm and can trip on the read-only-ish root.
     npm_config_cache: "/tmp/.npm",
+    // Real yarn likewise needs a writable cache; created at boot (its global
+    // config/cache default under $HOME would land on the read-only-ish root).
+    YARN_CACHE_FOLDER: "/tmp/.yarn-cache",
     TERM: "xterm-256color",
     FORCE_COLOR: "3",
     PWD: dir,
@@ -721,6 +728,7 @@ async function boot() {
   // Falls back to the Turbo-analog if the asset is missing (e.g. legacy server).
   kernel.mkdirp("/home/user");
   kernel.mkdirp("/tmp/.npm/_logs");
+  kernel.mkdirp("/tmp/.yarn-cache");
   try {
     const npmT0 = Date.now();
     const res = await ensureRealNpm(kernel, async () => {
@@ -741,6 +749,30 @@ async function boot() {
     }
   } catch (e) {
     post("log", { line: `  [boot] real npm load failed (${(e && e.message) || e}) — using built-in npm.`, dim: true });
+  }
+
+  // Same delivery/shim path for real yarn (classic). No fallback CLI exists, so a
+  // missing asset just means `yarn` isn't on PATH (npm still is).
+  try {
+    const yarnT0 = Date.now();
+    const res = await ensureRealYarn(kernel, async () => {
+      const base = (self.location && self.location.origin) || "";
+      const r = await fetch(base + REAL_YARN_ASSET);
+      if (!r.ok) return null;
+      return new Uint8Array(await r.arrayBuffer());
+    });
+    if (res && res.restored) {
+      post("log", { line: `  [boot] real yarn ready (restored from OPFS, +${Date.now() - yarnT0}ms).`, dim: true });
+    } else if (res) {
+      post("log", {
+        line: `  [boot] real yarn ${res.version} loaded (${res.fileCount} files, +${Date.now() - yarnT0}ms).`,
+        dim: true,
+      });
+    } else {
+      post("log", { line: "  [boot] real yarn asset unavailable — `yarn` not installed.", dim: true });
+    }
+  } catch (e) {
+    post("log", { line: `  [boot] real yarn load failed (${(e && e.message) || e}).`, dim: true });
   }
 
   post("ready", {});

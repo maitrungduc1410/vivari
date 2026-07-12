@@ -7,9 +7,10 @@
   "license": "MIT",
   "scripts": {
     "vendor:npm": "node scripts/vendor-npm.mjs",
-    "predev": "npm run vendor:npm",
+    "vendor:yarn": "node scripts/vendor-yarn.mjs",
+    "predev": "npm run vendor:npm && npm run vendor:yarn",
     "dev": "cd packages/studio && bun run dev",
-    "prebuild:studio": "npm run vendor:npm",
+    "prebuild:studio": "npm run vendor:npm && npm run vendor:yarn",
     "build:studio": "cd packages/studio && bun run build",
     "preview:studio": "cd packages/studio && bun run preview",
     "dev:legacy": "node server.mjs",

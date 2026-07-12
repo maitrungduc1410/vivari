@@ -253,6 +253,24 @@ runs `stubNodeGyp`, and overwrites `/bin/npm.js` + `/bin/npx.js` with shims that
 - Verify browser-shape changes headlessly with `scripts/spike-npm-studio.mjs`
   (it drives the SAME shared loader + PATH shims), not just `spike-npm.mjs`.
 
+### Real yarn (classic) is the studio shell's `yarn` — same pattern as npm
+Yarn is wired exactly like npm, one tier up: `scripts/vendor-yarn.mjs` packs
+`yarn@1.22.22` into `packages/studio/public/vendor/yarn-pack.bin` (same archive
+format; gitignored; `npm run vendor:yarn`, auto-run by `predev`/`prebuild:studio`).
+`packages/kernel-host/load-real-yarn.js` (`ensureRealYarn`) unpacks it into
+`/usr/lib/node_modules/yarn` and writes `/bin/yarn.js` + `/bin/yarnpkg.js` shims;
+the kernel worker calls it right AFTER `ensureRealNpm()` at boot. Differences from
+npm worth knowing:
+- yarn's `lib/cli.js` is a single ~5 MB webpack bundle — TOO big for the 1 MiB SAB
+  `writeFile`, so the loader routes files ≥ 512 KB through `kernel.fs.writeLarge`
+  (the transferred path). Any new large-asset loader must do the same.
+- No Turbo-analog fallback: a missing asset just means `yarn` isn't on PATH (npm
+  still is). There's nothing to "win" over, but the shim is still applied last.
+- yarn needs a writable cache: the shell env sets `YARN_CACHE_FOLDER=/tmp/.yarn-cache`
+  (created at boot), mirroring `npm_config_cache`.
+- Headless browser-shape gate: `scripts/spike-yarn-studio.mjs` (`OC_NET=1` for the
+  real `yarn add`). The off-disk Path B proof is `scripts/spike-yarn.mjs`.
+
 ### fs.ReadStream / fs.WriteStream MUST stay ES5 function-constructors
 `node/internal/fs/streams.js` defines `ReadStream`/`WriteStream` as plain
 `function`s (auto-`new` guard + `Readable.call(this)`/`Writable.call(this)` init),
