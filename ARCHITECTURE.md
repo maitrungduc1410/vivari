@@ -245,13 +245,19 @@ arrives — this is how blocking `accept()`/`execSync()`/blocking fetch work.
   `DecompressionStream('gzip')` + a ustar tar parser, npm-v3 hoisting into
   `node_modules`, `.bin` symlinks. It walks `optionalDependencies` platform-gated
   (so `@node-rs/*` auto-selects the `wasm32-wasi` build and skips native ones).
-  This is a deliberately temporary "Turbo-analog": the North Star (see roadmap)
-  is running the **real, unmodified npm CLI** on Path B, which now boots, installs
-  from the live registry, and runs lifecycle scripts + `.bin` (proven headless by
-  `scripts/spike-npm.mjs`). Native builds can't run in-browser, so `node-gyp` is a
-  non-fatal no-op via `node-gyp-stub.js` (`stubNodeGyp()` overwrites npm's node-gyp
-  shims in the vendored tree; a `node-gyp` coreutil is the PATH fallback) — the
-  package's JS / `wasm32-wasi` fallback is what loads instead.
+  This is now a **fallback**: the North Star (see roadmap) is running the **real,
+  unmodified npm CLI** on Path B, and in the studio that is live. Real npm@10.9.2
+  is vendored + packed into one gzipped asset (`scripts/vendor-npm.mjs` →
+  `packages/studio/public/vendor/npm-pack.bin`); at boot the kernel worker fetches
+  it once and `load-real-npm.js` unpacks the tree into the VFS at
+  `/usr/lib/node_modules/npm`, then overwrites `/bin/npm.js` + `/bin/npx.js` with
+  shims that `require()` the real CLI (so `npm` on PATH is real npm; the tree
+  persists in OPFS across reloads). Native builds can't run in-browser, so
+  `node-gyp` is a non-fatal no-op via `node-gyp-stub.js` (`stubNodeGyp()`
+  overwrites npm's node-gyp shims in the vendored tree; a `node-gyp` coreutil is
+  the PATH fallback) — the package's JS / `wasm32-wasi` fallback is what loads
+  instead. The Turbo-analog `programs/npm.js` is only used if the asset is
+  unavailable (e.g. the legacy `server.mjs` demo).
 
 ---
 

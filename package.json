@@ -6,7 +6,10 @@
   "description": "An open-source WebContainer: run Node-style projects fully client-side in the browser.",
   "license": "MIT",
   "scripts": {
+    "vendor:npm": "node scripts/vendor-npm.mjs",
+    "predev": "npm run vendor:npm",
     "dev": "cd packages/studio && bun run dev",
+    "prebuild:studio": "npm run vendor:npm",
     "build:studio": "cd packages/studio && bun run build",
     "preview:studio": "cd packages/studio && bun run preview",
     "dev:legacy": "node server.mjs",

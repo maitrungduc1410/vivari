@@ -115,6 +115,7 @@ import readlineFactory from "./lib/readline.js";
 import fsPromisesFactory from "./lib/fs/promises.js";
 import perfHooksFactory from "./lib/perf_hooks.js";
 import v8Factory from "./lib/v8.js";
+import vmFactory from "./lib/vm.js";
 import http2Factory from "./lib/http2.js";
 // Bridge so the vendored fs.js `fs.promises` getter (require('internal/fs/promises')
 // .exports) resolves to the same pragmatic promises API as require('fs/promises').
@@ -230,6 +231,7 @@ const FACTORIES = {
   "internal/fs/promises": internalFsPromisesFactory,
   perf_hooks: perfHooksFactory,
   v8: v8Factory,
+  vm: vmFactory,
   http2: http2Factory,
   wasi: wasiFactory,
   worker_threads: workerThreadsFactory,

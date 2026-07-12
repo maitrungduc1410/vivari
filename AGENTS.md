@@ -47,7 +47,8 @@ packages/
     coreutils.js   echo/cat/ls/pwd/... + a small `sh`.
     opfs-persistence.js  write-behind mirror of the VFS to OPFS (survives reload).
     node-gyp-stub.js     node-gyp no-op stub (native builds non-fatal) for real npm.
-    programs/npm.js      from-scratch npm installer (resolve, tarball, hoist).
+    load-real-npm.js     unpack the vendored real-npm asset into the VFS + shim /bin/npm.
+    programs/npm.js       from-scratch npm installer — LEGACY fallback (see real npm below).
 
   runtime/         The Node runtime that runs INSIDE each process worker.
     index.js       createRuntime(): wires builtins/globals/http-bridge/ws + run().
@@ -182,6 +183,21 @@ throw that gets swallowed. Rules:
 - **Downloads** (`OP_FETCH`) stream straight into the VFS, bypassing the window.
 - If you add a syscall that can carry big data, chunk it from day one.
 
+### The Fetcher strips non-CORS-safelisted request headers (browser only)
+`demo/fetcher-worker.js` (`corsSafeHeaders`) keeps ONLY the CORS-safelisted
+request headers (`accept`, `accept-language`, `content-language`, a simple
+`content-type`) before calling the browser `fetch()`. Real npm/pacote attach
+custom headers (`npm-command`, `npm-session`, `npm-auth-type`, `pacote-*`,
+`authorization`, …); any non-safelisted header makes the browser fire a
+preflight `OPTIONS`, and `registry.npmjs.org` does not answer it with a matching
+`Access-Control-Allow-Headers` — so the request is blocked even though the
+actual GET returns `Access-Control-Allow-Origin: *`. None of those headers are
+needed to fetch public packuments/tarballs, so dropping them turns every
+registry request back into a simple, preflight-free GET. This is a browser-only
+concern (Node has no CORS), so the headless fetchers in `scripts/spike-*.mjs`
+deliberately keep the full header set. (Symptom if you regress it: "blocked by
+CORS policy … No 'Access-Control-Allow-Origin' header" for every registry URL.)
+
 ### `writeLarge` must transfer a STANDALONE ArrayBuffer
 The kernel hands a fetched tarball to the FS Worker over a *transferred* buffer
 (`kernel-fs.js` `writeLarge`), to bypass the 1 MiB SAB. The trap: a `Uint8Array`
@@ -206,6 +222,36 @@ the vendored tree with a JS stub (exit 0, warns), and a `node-gyp` coreutil is
 the PATH fallback. Native compilation is skipped; the package's JS or
 `wasm32-wasi` build is what actually loads. Don't "fix" a node-gyp failure by
 trying to compile — that path is intentionally stubbed.
+
+### Real npm is the studio shell's `npm` (delivery + shims)
+The North Star is running the real npm/yarn/pnpm CLIs, not our from-scratch
+`programs/npm.js`. In the studio that is now live: real npm@10.9.2 is vendored
+and packed into one gzipped asset (`scripts/vendor-npm.mjs` →
+`packages/studio/public/vendor/npm-pack.bin`, gitignored, built by
+`npm run vendor:npm`, auto-run as `predev`/`prebuild:studio`). At boot the kernel
+worker calls `ensureRealNpm()` (`packages/kernel-host/load-real-npm.js`) right
+AFTER `installCoreutils()` — order matters, since `installCoreutils()` rewrites
+the Turbo-analog to `/bin/npm.js` on every boot, so the real-npm shim must be
+applied last to win. The loader unpacks the tree to `/usr/lib/node_modules/npm`,
+runs `stubNodeGyp`, and overwrites `/bin/npm.js` + `/bin/npx.js` with shims that
+`require()` the real CLI. Gotchas:
+- The npm tree persists in OPFS, so `ensureRealNpm` skips re-unpacking on later
+  boots and only re-applies the shims (`hasRealNpm` guard). If you change the
+  vendored version, bump/clear it or reset OPFS (`?reset`).
+- `programs/npm.js` is now only the FALLBACK (asset missing, e.g. legacy
+  `server.mjs`). Don't invest in analog-specific behavior; fix things in real npm.
+- Real npm needs `npm_config_cache` writable — the shell env sets `/tmp/.npm`
+  (created at boot). Keep that when editing `openTerminal` env.
+- The delivery asset is gzip-compressed but named `npm-pack.bin`, NOT `.gz`, on
+  purpose: static servers (Vite's sirv, CDNs) serve a `.gz` file with
+  `Content-Encoding: gzip`, so the browser auto-decompresses it and our own
+  `DecompressionStream('gzip')` then fails on the already-decompressed bytes
+  (symptom: fetch 200 but "load failed"). Don't rename it back to `.gz`.
+- The kernel worker's fetch of the asset is same-origin and must bypass the
+  preview Service Worker (`/vendor/` early-return in `sw.js`) — routing our own
+  assets through `routeByClient` fails under COEP `require-corp`.
+- Verify browser-shape changes headlessly with `scripts/spike-npm-studio.mjs`
+  (it drives the SAME shared loader + PATH shims), not just `spike-npm.mjs`.
 
 ### Never silently swallow a syscall throw
 `bridgeHttp`'s `reply()` once wrapped `respond()` in a bare `try/catch`, so a
