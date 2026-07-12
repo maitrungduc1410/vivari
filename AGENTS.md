@@ -46,6 +46,7 @@ packages/
     kernel-fs.js   kernel-side sync fs helper.
     coreutils.js   echo/cat/ls/pwd/... + a small `sh`.
     opfs-persistence.js  write-behind mirror of the VFS to OPFS (survives reload).
+    node-gyp-stub.js     node-gyp no-op stub (native builds non-fatal) for real npm.
     programs/npm.js      from-scratch npm installer (resolve, tarball, hoist).
 
   runtime/         The Node runtime that runs INSIDE each process worker.
@@ -180,6 +181,31 @@ throw that gets swallowed. Rules:
   reassembles by `reqId` (`fs-client.respond` + `kernel.handleRespond`).
 - **Downloads** (`OP_FETCH`) stream straight into the VFS, bypassing the window.
 - If you add a syscall that can carry big data, chunk it from day one.
+
+### `writeLarge` must transfer a STANDALONE ArrayBuffer
+The kernel hands a fetched tarball to the FS Worker over a *transferred* buffer
+(`kernel-fs.js` `writeLarge`), to bypass the 1 MiB SAB. The trap: a `Uint8Array`
+is often a **view** into a bigger buffer — a `subarray`, or (the classic) a Node
+`Buffer` carved out of the shared Buffer **pool**. Transferring that backing
+`ArrayBuffer` either clobbers unrelated Buffers or, for a pooled Buffer under
+Node ≥ 22, throws `Cannot transfer object of unsupported type` (the pool buffer
+isn't transferable). Symptom: `npm install` dies mid-download with that error.
+`writeLarge` now detaches the buffer only when the view owns it whole
+(`byteOffset === 0 && byteLength === buffer.byteLength`); otherwise it transfers
+an exact-bytes copy. Any new code that puts a typed-array's `.buffer` in a
+`postMessage` transfer list must do the same.
+
+### Native builds (node-gyp) are a non-fatal stub
+Real npm runs a native package's `install`/`rebuild` lifecycle as
+`node-gyp rebuild`; there's no compiler toolchain in-browser (and a `.node`
+binary couldn't load — we run wasm), and our runtime can't execute npm's POSIX
+`node-gyp` shell shim (it compiles programs as JS). So a non-zero node-gyp exit
+would abort the whole install. `packages/kernel-host/node-gyp-stub.js` makes it a
+no-op: `stubNodeGyp(kernel, npmRoot)` overwrites npm's node-gyp entry points in
+the vendored tree with a JS stub (exit 0, warns), and a `node-gyp` coreutil is
+the PATH fallback. Native compilation is skipped; the package's JS or
+`wasm32-wasi` build is what actually loads. Don't "fix" a node-gyp failure by
+trying to compile — that path is intentionally stubbed.
 
 ### Never silently swallow a syscall throw
 `bridgeHttp`'s `reply()` once wrapped `respond()` in a bare `try/catch`, so a

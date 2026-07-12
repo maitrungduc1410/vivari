@@ -15,6 +15,7 @@
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
+import { stubNodeGyp } from "../packages/kernel-host/node-gyp-stub.js";
 import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
@@ -104,7 +105,11 @@ function loadDir(hostDir, vfsDir) {
 }
 const t0 = Date.now();
 loadDir(VENDOR_NPM, VFS_NPM);
-console.log(`Loaded real npm into VFS: ${fileCount} files at ${VFS_NPM} (${Date.now() - t0}ms)\n`);
+// Neutralize node-gyp so a native package's install/rebuild lifecycle is a
+// non-fatal no-op (Phase 2 — see packages/kernel-host/node-gyp-stub.js).
+const stubbed = stubNodeGyp(kernel, VFS_NPM);
+console.log(`Loaded real npm into VFS: ${fileCount} files at ${VFS_NPM} (${Date.now() - t0}ms)`);
+console.log(`node-gyp stub applied to ${stubbed.length} path(s):\n  ${stubbed.join("\n  ")}\n`);
 
 kernel.mkdirp("/home/user");
 kernel.mkdirp("/app");

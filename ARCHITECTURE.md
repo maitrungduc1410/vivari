@@ -245,6 +245,13 @@ arrives — this is how blocking `accept()`/`execSync()`/blocking fetch work.
   `DecompressionStream('gzip')` + a ustar tar parser, npm-v3 hoisting into
   `node_modules`, `.bin` symlinks. It walks `optionalDependencies` platform-gated
   (so `@node-rs/*` auto-selects the `wasm32-wasi` build and skips native ones).
+  This is a deliberately temporary "Turbo-analog": the North Star (see roadmap)
+  is running the **real, unmodified npm CLI** on Path B, which now boots, installs
+  from the live registry, and runs lifecycle scripts + `.bin` (proven headless by
+  `scripts/spike-npm.mjs`). Native builds can't run in-browser, so `node-gyp` is a
+  non-fatal no-op via `node-gyp-stub.js` (`stubNodeGyp()` overwrites npm's node-gyp
+  shims in the vendored tree; a `node-gyp` coreutil is the PATH fallback) — the
+  package's JS / `wasm32-wasi` fallback is what loads instead.
 
 ---
 
