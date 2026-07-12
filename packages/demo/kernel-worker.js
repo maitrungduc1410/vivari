@@ -22,8 +22,11 @@ const post = (type, extra) => self.postMessage({ type, ...extra });
 // The real-npm delivery asset (built by `npm run vendor:npm`, served from
 // packages/studio/public/vendor). Fetched once and unpacked into the VFS so the
 // shell's `npm` is the real CLI, not the Turbo-analog (North Star). Absolute
-// path so it resolves against the app origin from inside this worker.
-const REAL_NPM_ASSET = "/vendor/npm-pack.gz";
+// path so it resolves against the app origin from inside this worker. The file
+// is gzip-compressed but NOT named `.gz` on purpose — see scripts/vendor-npm.mjs
+// (a `.gz` name makes static servers set Content-Encoding: gzip, which the
+// browser auto-decompresses, breaking our own gunzip).
+const REAL_NPM_ASSET = "/vendor/npm-pack.bin";
 
 // [optimize] Compile the Rust/Wasm codecs (zlib #11, crypto #12) EXACTLY ONCE,
 // here in the kernel worker, and hand each Process Worker the resulting

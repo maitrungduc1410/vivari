@@ -30,7 +30,12 @@ const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
 const VENDOR_DIR = process.env.OC_VENDOR_DIR || "/tmp/oc-vendor";
 const VENDOR_NPM = path.join(VENDOR_DIR, "node_modules", "npm");
 const OUT_DIR = path.join(ROOT, "packages", "studio", "public", "vendor");
-const OUT_FILE = path.join(OUT_DIR, "npm-pack.gz");
+// NOTE: the payload is gzip-compressed, but the file is deliberately NOT named
+// `.gz`. Static servers (Vite's sirv, many CDNs) treat a `.gz` file as
+// TRANSFER-encoded and serve it with `Content-Encoding: gzip`, so the browser
+// transparently decompresses it before our fetch sees it — then our own gunzip
+// fails on already-decompressed bytes. A neutral extension is served verbatim.
+const OUT_FILE = path.join(OUT_DIR, "npm-pack.bin");
 
 const force = process.argv.includes("--force");
 

@@ -3,7 +3,7 @@
 // spike-npm.mjs proved real npm boots when loaded off the host disk and invoked
 // via a require() wrapper. This proves the BROWSER path studio actually ships:
 //
-//   1) the vendor asset (packages/studio/public/vendor/npm-pack.gz, built by
+//   1) the vendor asset (packages/studio/public/vendor/npm-pack.bin, built by
 //      `npm run vendor:npm`) decodes + unpacks into the VFS via the SHARED
 //      loader packages/kernel-host/load-real-npm.js (same code studio's kernel
 //      worker calls), and
@@ -25,7 +25,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
-const ASSET = path.join(ROOT, "packages", "studio", "public", "vendor", "npm-pack.gz");
+const ASSET = path.join(ROOT, "packages", "studio", "public", "vendor", "npm-pack.bin");
 
 if (!fs.existsSync(ASSET)) {
   console.error(`No vendor asset at ${path.relative(ROOT, ASSET)} — run \`npm run vendor:npm\` first.`);
@@ -80,7 +80,7 @@ kernel.installCoreutils(); // writes the Turbo-analog to /bin/npm.js …
 
 // ── the wiring under test: the SHARED loader, fed the vendor asset ───────────
 // This is exactly what packages/demo/kernel-worker.js does at boot (there the
-// bytes come from fetch('/vendor/npm-pack.gz'); here from disk).
+// bytes come from fetch('/vendor/npm-pack.bin'); here from disk).
 kernel.mkdirp("/home/user");
 kernel.mkdirp("/tmp/.npm/_logs");
 kernel.mkdirp("/app");

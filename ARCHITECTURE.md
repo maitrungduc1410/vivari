@@ -248,7 +248,7 @@ arrives — this is how blocking `accept()`/`execSync()`/blocking fetch work.
   This is now a **fallback**: the North Star (see roadmap) is running the **real,
   unmodified npm CLI** on Path B, and in the studio that is live. Real npm@10.9.2
   is vendored + packed into one gzipped asset (`scripts/vendor-npm.mjs` →
-  `packages/studio/public/vendor/npm-pack.gz`); at boot the kernel worker fetches
+  `packages/studio/public/vendor/npm-pack.bin`); at boot the kernel worker fetches
   it once and `load-real-npm.js` unpacks the tree into the VFS at
   `/usr/lib/node_modules/npm`, then overwrites `/bin/npm.js` + `/bin/npx.js` with
   shims that `require()` the real CLI (so `npm` on PATH is real npm; the tree

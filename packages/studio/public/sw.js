@@ -333,7 +333,7 @@ self.addEventListener("fetch", (event) => {
   // are same-origin OUR files and must hit the network directly — routing them
   // through routeByClient fails under cross-origin isolation (a spurious
   // `fetch(event.request)` failure), exactly like /oc-devtools/ + /packages/.
-  // The kernel worker fetches /vendor/npm-pack.gz here; without this bypass it
+  // The kernel worker fetches /vendor/npm-pack.bin here; without this bypass it
   // gets "Failed to fetch" and falls back to the built-in npm.
   if (url.pathname.startsWith("/vendor/")) return;
 

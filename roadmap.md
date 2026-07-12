@@ -276,7 +276,8 @@ gate; needs network — hits `registry.npmjs.org`).
   the interactive studio terminal runs, retiring the Turbo-analog in that UI. The hard part
   is **delivery**: the browser can't `fs.readdirSync` the host, so `scripts/vendor-npm.mjs`
   installs pinned npm@10.9.2 and packs its whole tree (~2400 files) into one gzipped asset
-  (`packages/studio/public/vendor/npm-pack.gz`, ~2.8 MB; gitignored, built by
+  (`packages/studio/public/vendor/npm-pack.bin`, ~2.8 MB gzipped but named `.bin`
+  so static servers don't Content-Encoding it; gitignored, built by
   `npm run vendor:npm`, wired as `predev`/`prebuild:studio`). A shared loader
   (`packages/kernel-host/load-real-npm.js`) decodes that asset with the platform-native
   `DecompressionStream` and unpacks it into the VFS at `/usr/lib/node_modules/npm`, applies

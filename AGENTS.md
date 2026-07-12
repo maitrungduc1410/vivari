@@ -212,7 +212,7 @@ trying to compile — that path is intentionally stubbed.
 The North Star is running the real npm/yarn/pnpm CLIs, not our from-scratch
 `programs/npm.js`. In the studio that is now live: real npm@10.9.2 is vendored
 and packed into one gzipped asset (`scripts/vendor-npm.mjs` →
-`packages/studio/public/vendor/npm-pack.gz`, gitignored, built by
+`packages/studio/public/vendor/npm-pack.bin`, gitignored, built by
 `npm run vendor:npm`, auto-run as `predev`/`prebuild:studio`). At boot the kernel
 worker calls `ensureRealNpm()` (`packages/kernel-host/load-real-npm.js`) right
 AFTER `installCoreutils()` — order matters, since `installCoreutils()` rewrites
@@ -227,6 +227,14 @@ runs `stubNodeGyp`, and overwrites `/bin/npm.js` + `/bin/npx.js` with shims that
   `server.mjs`). Don't invest in analog-specific behavior; fix things in real npm.
 - Real npm needs `npm_config_cache` writable — the shell env sets `/tmp/.npm`
   (created at boot). Keep that when editing `openTerminal` env.
+- The delivery asset is gzip-compressed but named `npm-pack.bin`, NOT `.gz`, on
+  purpose: static servers (Vite's sirv, CDNs) serve a `.gz` file with
+  `Content-Encoding: gzip`, so the browser auto-decompresses it and our own
+  `DecompressionStream('gzip')` then fails on the already-decompressed bytes
+  (symptom: fetch 200 but "load failed"). Don't rename it back to `.gz`.
+- The kernel worker's fetch of the asset is same-origin and must bypass the
+  preview Service Worker (`/vendor/` early-return in `sw.js`) — routing our own
+  assets through `routeByClient` fails under COEP `require-corp`.
 - Verify browser-shape changes headlessly with `scripts/spike-npm-studio.mjs`
   (it drives the SAME shared loader + PATH shims), not just `spike-npm.mjs`.
 
