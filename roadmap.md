@@ -238,6 +238,42 @@ climb the hard modules (`stream` → `net`/`http` → `zlib`/`crypto`).
 > to inherit: one pinned version per PM, Wasm packages only (no native add-ons), PM chosen
 > by lockfile.
 
+### Real package managers — progress (the North Star, in motion)
+
+De-risked with a throwaway harness (`scripts/spike-npm.mjs`) that loads a vendored,
+unmodified **npm@10.9.2** into the VFS and runs its real `bin/npm-cli.js` on Path B, gated
+end to end. Run it with `node scripts/spike-npm.mjs` (add `OC_PHASE2=1` for the lifecycle
+gate; needs network — hits `registry.npmjs.org`).
+
+- **Phase 0 — real npm BOOTS (`baeacbf`).** `npm -v` → `10.9.2`, exit 0. Fixed three
+  Node-fidelity gaps the real CLI exposed: `process` is a genuine `EventEmitter` (npm's
+  `proc-log`), dynamic `import()` inside CJS routes through our loader (npm's
+  `await import('chalk')`), and `stdout.write(cb)` / `process.exitCode` / a single `'exit'`
+  event behave like Node (npm's exit-handler).
+- **Phase 1 — real `npm install <pkg>` (`2299c62`).** Resolves, downloads, and extracts from
+  the live registry. `lib/https.js` is now a fetch-backed client (npm's
+  `npm-registry-fetch → make-fetch-happen → minipass-fetch` stack runs unmodified); the fetch
+  syscall carries `{method, headers, body}` + full response headers; the Fetcher Worker +
+  kernel-worker forward the request init so it works in the browser too. Verified:
+  `npm install is-number` → `added 1 package`, `npm install debug` → `added 2 packages`
+  (transitive `ms`), tree require-able.
+- **Phase 2 — lifecycle scripts + `.bin` + non-fatal native (this change).** A root project
+  with `preinstall`/`install`/`postinstall`, a dep that ships a JS `postinstall` (`core-js`),
+  and a dep with a bin (`semver`) all install cleanly; `.bin/semver` is linked and runnable
+  via `npm exec`. The one missing piece was **native builds**: a package whose `install` is
+  `node-gyp rebuild` aborted the whole install (no compiler toolchain in-browser, and our
+  runtime can't execute npm's POSIX `node-gyp` shell shim — it compiles programs as JS). Fix
+  = a **node-gyp stub** (`packages/kernel-host/node-gyp-stub.js`): `stubNodeGyp()` overwrites
+  npm's node-gyp entry points in the vendored tree with a JS no-op (exit 0, warns), and a
+  `node-gyp` coreutil is the PATH fallback. Native compilation is now a non-fatal skip — the
+  package's JS/`wasm32-wasi` fallback is what loads at runtime — so `preinstall`→`install`→
+  `postinstall` completes. Also fixed a latent `writeLarge` bug this surfaced under Node ≥ 22:
+  a fetched/mock body backed by a pooled/offset `ArrayBuffer` (Node's Buffer pool) is not
+  transferable ("Cannot transfer object of unsupported type") — `writeLarge` now transfers a
+  standalone buffer (own buffer, or an exact-bytes copy). `npm run verify` is green (92/92).
+  Still deferred (installer nuance, thrown away when this lands in the product UI):
+  `package-lock.json`, `npm ci`, dedup nuance, wiring real npm in place of `programs/npm.js`.
+
 ## Recommended order (implement one at a time)
 
 Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture map.
@@ -1027,7 +1063,9 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
   - Outbound raw TCP is impossible in a browser — only the fetch/WebSocket bridge exists.
   - HTTP: streaming request/response bodies, keep-alive, more concurrent in-flight (#8).
 - **Persistence:** exact `mode`/`chmod` restore (needs a VFS `chmod`; files get default mode).
-- **npm:** `package-lock.json`, lifecycle scripts, `os`/`libc` optional-dep gating (#10/#16 s2c).
+- **npm:** `package-lock.json`, `os`/`libc` optional-dep gating (#10/#16 s2c). (Real-npm
+  lifecycle scripts + `.bin` + non-fatal `node-gyp` are DONE — see "Real package managers —
+  progress" above; wiring real npm in place of `programs/npm.js` in the studio UI is next.)
 - **Validation (framework matrix):** ran three popular stacks in-VM headlessly
   (`scripts/probe-react.mjs`, `scripts/probe-nest.mjs`, `scripts/probe-next.mjs`) to surface
   the next missing Node APIs. The architecture held up — every gap was "add API X", not a

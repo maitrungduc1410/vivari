@@ -5,9 +5,17 @@
 // Node workers.
 
 import { NPM_PROGRAM } from "./programs/npm.js";
+import { NODE_GYP_STUB } from "./node-gyp-stub.js";
 
 export const COREUTILS = {
   npm: NPM_PROGRAM,
+
+  // node-gyp stub on /bin: native addon builds can't run in-browser, so make
+  // them a non-fatal no-op (North Star: real package managers). This is the
+  // fallback for any node-gyp that resolves via PATH; real npm's own bundled
+  // node-gyp shim is separately overwritten by stubNodeGyp() when it is loaded
+  // into the VFS. See node-gyp-stub.js.
+  "node-gyp": NODE_GYP_STUB,
 
   // npx: run a package's bin from node_modules/.bin (installing it first if it is
   // not already on PATH). Not installer logic, so it survives the switch to the

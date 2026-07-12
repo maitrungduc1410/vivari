@@ -77,14 +77,24 @@ export function createKernelFs(fsWorker) {
 
   function writeLarge(path, bytes) {
     const body = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || 0);
+    // The transfer list needs a standalone, transferable ArrayBuffer. A
+    // Uint8Array can be a VIEW into a larger buffer — a subarray, or (the common
+    // trap) a Node `Buffer` carved out of the shared Buffer pool, whose backing
+    // ArrayBuffer is oversized and shared with other Buffers. Transferring that
+    // either clobbers unrelated data or, for a pooled Buffer, throws "Cannot
+    // transfer object of unsupported type". Detach only when the view owns its
+    // whole buffer; otherwise copy the exact bytes into a fresh ArrayBuffer.
+    const ownsWhole = body.byteOffset === 0 && body.byteLength === body.buffer.byteLength && body.buffer instanceof ArrayBuffer;
+    const ab = ownsWhole ? body.buffer : body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
     return new Promise((resolve, reject) => {
       const id = seq++;
       pending.set(id, { resolve, reject });
-      // Transfer the underlying buffer so a multi-MB tarball never touches the
-      // 1 MiB SAB. `body` is a fresh array from the fetcher, so detaching is safe.
+      // Transfer the standalone buffer so a multi-MB tarball never touches the
+      // 1 MiB SAB. `ab` is either the body's own buffer or a fresh copy, so
+      // detaching it is always safe.
       fsWorker.postMessage(
-        { type: "fs-write-large", id, path, buffer: body.buffer, byteOffset: body.byteOffset, byteLength: body.byteLength },
-        [body.buffer],
+        { type: "fs-write-large", id, path, buffer: ab, byteOffset: 0, byteLength: body.byteLength },
+        [ab],
       );
     });
   }
