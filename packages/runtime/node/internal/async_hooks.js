@@ -61,39 +61,97 @@ export default function (exports, require, module, process, internalBinding, pri
     }
   }
 
-  // Synchronous-scope store: correct for run() bodies that finish before
-  // yielding; context is not propagated across awaits (no async tracking).
-  class AsyncLocalStorage {
+  // Prefer the host realm's real AsyncLocalStorage when this runtime runs on a
+  // Node worker (headless / Node twin): it is backed by V8's PromiseHook, so
+  // context propagates across `await` — which Next.js App Router (RSC) requires
+  // (`workAsyncStorage`/`workUnitAsyncStorage`). In the browser there is no such
+  // binding and we fall back to the synchronous-scope polyfill below.
+  let hostAsyncHooks = null;
+  try {
+    hostAsyncHooks = internalBinding("async_hooks_host");
+  } catch {
+    hostAsyncHooks = null;
+  }
+  const HostAsyncLocalStorage =
+    hostAsyncHooks && typeof hostAsyncHooks.AsyncLocalStorage === "function"
+      ? hostAsyncHooks.AsyncLocalStorage
+      : null;
+
+  // Best-effort store for realms without async tracking (the browser). There is
+  // no PromiseHook, so we can't follow context across *unrelated* async hops the
+  // way Node does. Instead we hold `run(store, cb)`'s store as the current value
+  // for the ENTIRE duration of cb — synchronously AND, when cb returns a thenable,
+  // until that promise settles. This makes `getStore()` after an `await` inside
+  // the same run() chain return the store (enough for Next.js App Router's
+  // workStore in the common single-render case). Caveat: with a single `_current`
+  // per instance, truly concurrent run() calls that overlap across an await can
+  // observe each other's store — acceptable for a low-concurrency dev preview,
+  // and the Node path uses the host's real AsyncLocalStorage anyway.
+  class AsyncLocalStoragePolyfill {
     constructor() {
-      this._stack = [];
+      this._current = undefined;
+      this._enabled = true;
     }
     run(store, callback, ...args) {
-      this._stack.push(store);
+      const prev = this._current;
+      this._current = store;
+      let result;
       try {
-        return callback(...args);
-      } finally {
-        this._stack.pop();
+        result = callback(...args);
+      } catch (e) {
+        this._current = prev;
+        throw e;
       }
+      if (result && typeof result.then === "function") {
+        const restore = () => {
+          this._current = prev;
+        };
+        return result.then(
+          (v) => {
+            restore();
+            return v;
+          },
+          (e) => {
+            restore();
+            throw e;
+          },
+        );
+      }
+      this._current = prev;
+      return result;
     }
     exit(callback, ...args) {
-      const saved = this._stack;
-      this._stack = [];
+      const prev = this._current;
+      this._current = undefined;
       try {
         return callback(...args);
       } finally {
-        this._stack = saved;
+        this._current = prev;
       }
     }
     getStore() {
-      return this._stack.length ? this._stack[this._stack.length - 1] : undefined;
+      return this._enabled ? this._current : undefined;
     }
     enterWith(store) {
-      this._stack.push(store);
+      this._current = store;
     }
     disable() {
-      this._stack = [];
+      this._enabled = false;
+      this._current = undefined;
+    }
+    // Static context helpers (Node 19.8+). Without real async tracking a snapshot
+    // can't restore *all* stores, so it captures nothing and just runs the fn;
+    // bind() returns it unchanged. Next.js's App Router calls both. (On the Node
+    // path the host's real AsyncLocalStorage provides these.)
+    static bind(fn) {
+      return fn;
+    }
+    static snapshot() {
+      return (cb, ...args) => cb(...args);
     }
   }
+
+  const AsyncLocalStorage = HostAsyncLocalStorage || AsyncLocalStoragePolyfill;
 
   module.exports = {
     AsyncResource,

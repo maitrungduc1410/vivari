@@ -126,7 +126,11 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     platform: "linux",
     arch: "wasm32",
     version: "v24.18.0",
-    versions: { node: "24.18.0", opencontainer: "0.0.1", v8: "0.0.0" },
+    // `webcontainer` marks this as a WebContainer-class runtime (no native
+    // binaries). Tools that special-case browser sandboxes read it — notably
+    // Next.js's SWC loader, which then prefers the `@next/swc-wasm-nodejs` wasm
+    // build over the (unloadable) native `@next/swc-<platform>` addon.
+    versions: { node: "24.18.0", opencontainer: "0.0.1", webcontainer: "1.0.0", v8: "0.0.0" },
     // Real tools read process.release.name (e.g. to branch node vs electron) and
     // process.exitCode as the default exit code. Keep them Node-shaped.
     release: { name: "node", sourceUrl: "", headersUrl: "", libUrl: "" },

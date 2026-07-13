@@ -22,26 +22,47 @@ export default function (exports, require, module) {
   const filenameOf = (options) =>
     typeof options === "string" ? options : (options && options.filename) || "evalmachine.<anonymous>";
 
-  // Compile `code` with the given parameter names. Try expression form first so
-  // the completion value is returned (matches vm semantics for a single
-  // expression, e.g. `runInNewContext('1 + 1')`); fall back to a statement list.
-  function compile(paramNames, code, options) {
-    const src = String(code);
-    const filename = filenameOf(options);
-    try {
-      // eslint-disable-next-line no-new-func
-      return new Function(...paramNames, `return (\n${src}\n);\n//# sourceURL=${filename}`);
-    } catch {
-      // eslint-disable-next-line no-new-func
-      return new Function(...paramNames, `${src}\n//# sourceURL=${filename}`);
-    }
-  }
-
+  // Real vm.runInNewContext makes the sandbox THE global object: bare and
+  // `globalThis.`/`self.`/`global.` assignments become own properties of the
+  // sandbox, and free identifiers resolve against it (falling back to real
+  // globals for Object/JSON/etc.). We approximate that with a `with`-scoped
+  // Proxy whose `has` claims every name so the `with` block intercepts all free
+  // identifier reads/writes. This matters for e.g. Next.js manifest files that
+  // do `globalThis.__RSC_MANIFEST = …` and expect it back on the context object.
   function runWithSandbox(code, sandbox, options) {
     const ctx = sandbox && typeof sandbox === "object" ? sandbox : {};
-    const keys = Object.keys(ctx);
-    const fn = compile(keys, code, options);
-    return fn.apply(ctx, keys.map((k) => ctx[k]));
+    const realGlobal = globalThis;
+    let proxyRef;
+    proxyRef = new Proxy(ctx, {
+      has() {
+        return true;
+      },
+      get(target, key) {
+        if (key === "globalThis" || key === "global" || key === "self") return proxyRef;
+        if (key === Symbol.unscopables) return undefined;
+        if (key in target) return target[key];
+        return realGlobal[key];
+      },
+      set(target, key, value) {
+        target[key] = value;
+        return true;
+      },
+      deleteProperty(target, key) {
+        delete target[key];
+        return true;
+      },
+    });
+    const src = String(code);
+    const filename = filenameOf(options);
+    let fn;
+    try {
+      // eslint-disable-next-line no-new-func
+      fn = new Function("__oc_ctx__", `with(__oc_ctx__){ return (\n${src}\n); }\n//# sourceURL=${filename}`);
+    } catch {
+      // eslint-disable-next-line no-new-func
+      fn = new Function("__oc_ctx__", `with(__oc_ctx__){ ${src}\n }\n//# sourceURL=${filename}`);
+    }
+    return fn.call(proxyRef, proxyRef);
   }
 
   // Indirect eval: runs in the GLOBAL scope (sees real globals — the defining

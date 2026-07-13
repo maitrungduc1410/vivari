@@ -667,6 +667,9 @@ export class Kernel {
         env: spec.env || {},
         workerData: spec.workerData,
         isThread: true,
+        // child_process.fork rides this same path but boots in fork mode (a
+        // main-thread process whose transferred port is a process IPC channel).
+        isFork: !!spec.isFork,
       },
       { parentPid, threadPort: port },
     );

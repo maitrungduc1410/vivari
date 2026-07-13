@@ -61,6 +61,17 @@ export default function (exports, require, module, process, internalBinding, pri
     urlToHttpOptions,
     fileURLToPath,
     toPathIfFileURL,
-    pathToFileURL: (p) => new URL("file://" + p),
+    // Node resolves a relative path to absolute (against cwd) before building the
+    // file: URL and percent-encodes the pathname. The old `new URL("file://"+p)`
+    // threw "Invalid URL" for relative inputs (it parsed the first segment as the
+    // host) — e.g. `pathToFileURL("@next/swc-wasm-nodejs")`, which Next.js's SWC
+    // loader relies on. Match Node: resolve, then let URL#pathname encode it.
+    pathToFileURL: (p) => {
+      const path = require("path");
+      const resolved = path.resolve(String(p));
+      const u = new URL("file:///");
+      u.pathname = resolved;
+      return u;
+    },
   };
 }

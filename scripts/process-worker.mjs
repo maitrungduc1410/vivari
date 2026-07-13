@@ -3,6 +3,7 @@
 
 import { parentPort } from "node:worker_threads";
 import { createRequire } from "node:module";
+import * as hostAsyncHooks from "node:async_hooks";
 import { bootProcess } from "../packages/runtime/boot.js";
 
 // Native codecs (Phase 2 #11 zlib, #12 crypto): the Rust/Wasm cores. nodejs
@@ -62,6 +63,11 @@ parentPort.on("message", (msg) => {
       },
       codec: makeZStream,
       cryptoCodec,
+      // Real AsyncLocalStorage (V8 PromiseHook) for cross-await context — Next.js
+      // App Router (RSC) workStore. The browser twin has no equivalent binding and
+      // uses the runtime's best-effort polyfill instead; set OC_NO_HOST_ALS=1 to
+      // force that polyfill here and exercise the browser path headlessly.
+      hostAsyncHooks: process.env.OC_NO_HOST_ALS ? null : hostAsyncHooks,
     });
     return;
   }

@@ -148,6 +148,10 @@ export default function (exports, require, module, process) {
         cwd: options.cwd || process.cwd(),
         workerData: options.workerData,
         isThread: true,
+        // child_process.fork rides the same spawn plumbing but boots the child in
+        // *fork mode*: a normal (main-thread) process whose transferred port is an
+        // IPC channel (process.send / 'message'), not a worker parentPort.
+        isFork: !!options._ocFork,
       };
       // Hand the child's end of the channel to the kernel, which transfers it on
       // to the new worker as its parentPort. Data traffic then flows port1<->port2

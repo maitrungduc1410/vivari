@@ -1265,7 +1265,8 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     is left to the deploy proxy, not app-level (see "Packaging & delivery").
 - **Node API coverage (stubs/partials to fill on demand):**
   - `crypto` **S3**: sign/verify, RSA/EC keygen, DH, scrypt, X.509 (#12).
-  - `child_process`: parent→child **stdin** pipe, `fork` (#15).
+  - `child_process`: parent→child **stdin** pipe (#15). (`fork` is now implemented — an IPC
+    channel over the worker-thread spawn path — which unblocked `next dev`.)
   - WASI: **stdin**, `poll_oneoff` (event-driven) (#16 s1).
   - `worker_threads`: transferring more complex objects (#16 s2b).
   - Stubbed builtins: `http2` (load-safe stub), `readline` (partial), `tls`/`https`,
@@ -1274,7 +1275,7 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     `_resolveFilename`, `_load`, `_cache`, `_extensions`, `wrap`, `isBuiltin`, `createRequire`) and
     `require` routes through `Module._load`, so require-patching tools (`ts-node`, `tsconfig-paths`,
     jest, proxyquire, module-alias) can monkeypatch it. (Next's `require-hook` no longer trips on
-    this, though Next stays blocked on the native SWC wall.)
+    this — and Next 16 now boots in-VM on webpack + wasm SWC; see the framework matrix below.)
 - **Network (browser-platform limits, not just unimplemented):**
   - Outbound raw TCP is impossible in a browser — only the fetch/WebSocket bridge exists.
   - HTTP: streaming request/response bodies, keep-alive, more concurrent in-flight (#8).
@@ -1300,14 +1301,26 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     names (TS7's `getExePath.js` does `import module from "node:module"`) — the transpiler now
     emits `__oc_exports`/`__oc_module` so user bindings never clash. Also: `typescript@7` is the
     native Go port (`tsgo`, resolves a native `@typescript/*` binary) — pin `typescript@5`.
-  - ❌ **Next.js (16)** — **hard native wall**, not an API gap. Modern Next dropped the
-    `@next/swc-wasm-nodejs` fallback (its optional deps are all native `@next/swc-<platform>`
-    binaries) and Turbopack is native Rust, so there is no JS/WASM path to compile the app in a
-    browser VM. (The immediate crash also once revealed a `require('module')` gap — our `module`
-    builtin used to be a plain object, so `Module.prototype.require` monkeypatching in Next's
-    `require-hook` threw. That's **now fixed** — `module` is a real constructor — but it won't get
-    Next past the SWC wall.) An older Next (13/14 with wasm SWC) might boot but still needs
-    webpack-in-VM and is a large, low-priority effort.
+  - ✅ **Next.js (16, App Router)** — **boots in-VM and serves `GET / → 200`** on
+    `next dev --webpack` + the `@next/swc-wasm-nodejs` wasm SWC compiler
+    (`scripts/spike-next.mjs`). The old "hard native wall" verdict was wrong: Next 16 did **not**
+    drop the wasm SWC fallback, and webpack is still selectable (only Turbopack — native Rust with
+    no wasm build — is unavailable). Next's `loadBindings` prefers the wasm SWC when
+    `process.versions.webcontainer` is set (now reported by the runtime), and npm skips the native
+    `@next/swc-<platform>` optionalDeps on arch `wasm32`, so the wasm build is the only binding
+    present. Surfaced & fixed to get RSC rendering working: (a) `vm.runInNewContext` now makes the
+    sandbox the real global (`globalThis.__RSC_MANIFEST=…` lands on the context) so the client-
+    reference manifest loads; (b) **real cross-`await` `AsyncLocalStorage`** — the runtime delegates
+    to the host worker's async_hooks (V8 PromiseHook), without which the App Router `workStore`
+    invariant fails — on the browser the polyfill instead holds context for the whole `run()`
+    callback, which renders in the common single-request case; (c) `child_process.fork` (Next forks
+    its dev server over IPC); (d)
+    `pathToFileURL` relative→absolute; (e) `dns/promises`, `stream/web`, `inspector` stub, and the
+    full `Console` method surface for `@edge-runtime/primitives`; (f) `module.findSourceMap`. The
+    wasm SWC is seeded into Next's cache on `postinstall` (offline first compile; Next's own
+    on-demand download is the fallback). Shipped as the **Next.js** template (TS + JS,
+    `experimental`). The earlier `require('module')` monkeypatch gap (Next's `require-hook`) is also
+    fixed — `module` is a real constructor.
   - The two working stacks are wired into a **VS Code-style IDE** (revamped —
     see below): a project picker (**React + Vite + React Compiler**, **NestJS**),
     an activity bar + Explorer, a Monaco editor with **multiple file tabs**, a
@@ -1605,14 +1618,16 @@ screen, and ten pre-authored templates that auto-install + boot their dev server
   / copy / create / install, which bumps `treeVersion` — so an `npm install` or a file op
   shows up in the tree automatically. `node_modules`, `.git`, `dist`, `.vite`, `build` are
   skipped from the quick-open/search index (bounded walk).
-- **Templates (`oc/templates.ts`).** Ten real, runnable templates — **React, Vue, Svelte,
-  Express, NestJS**, each in **TypeScript and JavaScript** (Next.js deferred). Each carries a
+- **Templates (`oc/templates.ts`).** Twelve real, runnable templates — **React, Vue, Svelte,
+  Express, NestJS, Next.js (App Router)**, each in **TypeScript and JavaScript**. Each carries a
   manifest (`install`, `dev`, `port`, `entry`, `hmr`/`reload`) plus its full source. Creating
   writes the files in one batched VFS transfer (`oc-create-project` → `writeFilesBatch`) and
   registers the run manifest in the worker — instant, deterministic, offline (no in-VM
   `create-vite`/`nest new`). The Vite templates run with `--configLoader native` (the
   rolldown config bundler throws "Invalid URL" in-VM); `express-ts` compiles with `tsc`
   (no native esbuild/tsx in-VM); `nest-js` uses Babel legacy decorators + is marked
+  **experimental**. The **Next.js** templates run `next dev --webpack` with the
+  `@next/swc-wasm-nodejs` wasm SWC (a `postinstall` seeds it into Next's cache) and are marked
   **experimental**.
 - **Generalised run + preview attribution.** Created/opened projects don't have fixed ports,
   so a dev-server `listen` is attributed to its project by walking the listening pid up its
@@ -1699,9 +1714,40 @@ headless spike (`scripts/spike-*.mjs`) before wiring, per the repo's spike-first
      Expected: `status: 200` and `body: hello from the host machine`. The target MUST send
      `Access-Control-Allow-Origin` (the `*` above), else the browser blocks the cross-origin read.
 
-Deferred (next): **Next.js** (native SWC/Turbopack/LightningCSS need wasm/JS replacements),
-cross-host WebSockets from in-VM (the tunnel only dials `127.0.0.1`), and moving Vitest's
-config off CLI flags.
+Deferred (next): cross-host WebSockets from in-VM (the tunnel only dials `127.0.0.1`), and
+moving Vitest's config off CLI flags. (**Next.js** is no longer deferred — it now boots in-VM;
+see the next section.)
+
+## Next.js 16 (App Router) — `next dev --webpack` + wasm SWC (this change)
+
+Reverses the earlier "hard native wall" verdict. Proven headless first
+(`scripts/spike-next.mjs`): `npm install next react react-dom @next/swc-wasm-nodejs`, then
+`next dev --webpack` binds its port, compiles the App Router page with the **`@next/swc-wasm-nodejs`
+wasm SWC** (no native binding on arch `wasm32`), and `GET / → 200` with the rendered HTML.
+
+- **Why it works now.** Next 16 kept the wasm SWC fallback and webpack is still selectable (only
+  Turbopack — native Rust — has no wasm build). Next's `loadBindings` prefers the wasm SWC when
+  `process.versions.webcontainer` is set, which the runtime now reports.
+- **Runtime gaps surfaced & fixed** (each generic, not Next-specific):
+  - **`vm.runInNewContext` makes the sandbox the real global** — `globalThis`/`self`/`global`
+    assignments (e.g. Next's `globalThis.__RSC_MANIFEST=…` manifest files) now land on the context
+    object, via a `with`-scoped proxy. Without this the RSC client-reference manifest never loads.
+  - **Cross-`await` `AsyncLocalStorage`** — the App Router `workStore` invariant needs context to
+    survive `await`. On a Node worker the runtime delegates `AsyncLocalStorage` to the host's
+    async_hooks (V8 PromiseHook) through the `internalBinding` seam (exact). The browser has no such
+    binding, so the polyfill now holds `run(store, cb)`'s store for the whole duration of `cb`
+    (synchronously and until a returned promise settles) — enough to render in the common
+    single-request case (validated headlessly with `OC_NO_HOST_ALS=1`, which forces the polyfill).
+  - **`child_process.fork`** — an IPC channel (`process.send`/`'message'`/`disconnect`) built on the
+    worker-thread spawn path; `next dev` forks its dev server and gates boot on `process.send`.
+  - **`pathToFileURL`** resolves relative→absolute (Node parity); `dns/promises`, `stream/web`,
+    an `inspector` stub, the full `Console` method surface (`@edge-runtime/primitives` binds them),
+    and `module.findSourceMap`.
+- **Offline wasm SWC.** Next resolves the wasm SWC by downloading it into its own cache on first
+  compile (its intended path for wasm environments — real Node behaves the same). The template's
+  `postinstall` seeds that cache from the already-installed package so the first compile is offline;
+  the on-demand download remains the fallback.
+- **Shipped** as the **Next.js** template (TS + JS, `experimental`) with a picker icon.
 
 ## Definition of done for T2
 

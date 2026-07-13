@@ -410,8 +410,9 @@ Two non-obvious constraints keep this working:
 The studio is a real workspace, not a two-demo switcher. State (`controller.ts`):
 `workspaceFolders: {id,name,rootPath}[]` + `activeFolderId`; **every tab/model/dirty flag is
 keyed by ABSOLUTE path** so files from different roots can't collide. Home (`Home.tsx`) is an
-overlay over the kept-mounted IDE offering Start-from-blank, Start-from-template (10 templates
-in `oc/templates.ts`: React/Vue/Svelte/Express/Nest × TS/JS), and a `localStorage` recent list.
+overlay over the kept-mounted IDE offering Start-from-blank, Start-from-template (12 templates
+in `oc/templates.ts`: React/Vue/Svelte/Express/Nest/Next × TS/JS), and a `localStorage` recent
+list.
 
 The Explorer reads the **live VFS** rather than a static map. The bridge gained a
 request/response channel (`KernelBridge.request()` → reqId → `oc-reply`) backing
@@ -506,8 +507,9 @@ No browser is needed to validate the runtime — the same runtime runs under Nod
   shell, http, timers, fs.watch, …).
 - `scripts/verify-express.mjs` — installs + runs real Express, esbuild-wasm, Vite
   build, Vite dev + HMR over the ws tunnel, and a real `ws` server (needs network).
-- `scripts/probe-*.mjs` — discovery/regression probes for React+Vite+Compiler,
-  NestJS, and Next.js (documents the native SWC wall).
+- `scripts/probe-*.mjs` — discovery/regression probes for React+Vite+Compiler and
+  NestJS. `scripts/spike-next.mjs` proves Next.js 16 (App Router) boots on
+  `next dev --webpack` + wasm SWC and serves `GET / → 200`.
 
 See [`AGENTS.md`](./AGENTS.md) §"Testing & verification" for exactly when to run
 each and the network requirement.

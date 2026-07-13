@@ -125,6 +125,35 @@ const internalFsPromisesFactory = (exports, require, module) => {
   module.exports = { exports: require("fs/promises") };
 };
 
+// `inspector` / `inspector/promises` — inert stub (no V8 inspector in-sandbox).
+const inspectorFactory = (exports, require, module, process) => {
+  const EventEmitter = require("events");
+  class Session extends EventEmitter {
+    connect() {}
+    connectToMainThread() {}
+    disconnect() {}
+    post(method, params, callback) {
+      const cb = typeof params === "function" ? params : callback;
+      if (typeof cb === "function") {
+        const err = new Error("The inspector is not available");
+        err.code = "ERR_INSPECTOR_NOT_AVAILABLE";
+        process.nextTick(() => cb(err));
+      }
+    }
+  }
+  module.exports = {
+    Session,
+    Network: { requestWillBeSent() {}, responseReceived() {}, loadingFinished() {}, loadingFailed() {}, dataReceived() {} },
+    console: globalThis.console,
+    open() {},
+    close() {},
+    url() {
+      return undefined;
+    },
+    waitForDebugger() {},
+  };
+};
+
 // WASI preview1 runtime (Phase 2 #16 stage 1): run wasm32-wasi commands over
 // our VFS via require('wasi').
 import wasiFactory from "./lib/wasi.js";
@@ -176,6 +205,23 @@ const FACTORIES = {
   "internal/encoding": encodingFactory,
   stream: streamFactory,
   "stream/promises": streamPromisesFactory,
+  // `stream/web` = the WHATWG streams, which the host realm provides as globals.
+  // @edge-runtime/primitives (pulled by Next.js) does `require('stream/web')`.
+  "stream/web": (exports, require, module) => {
+    const g = globalThis;
+    const pick = {};
+    for (const name of [
+      "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamBYOBReader",
+      "ReadableStreamDefaultController", "ReadableByteStreamController", "ReadableStreamBYOBRequest",
+      "WritableStream", "WritableStreamDefaultWriter", "WritableStreamDefaultController",
+      "TransformStream", "TransformStreamDefaultController",
+      "ByteLengthQueuingStrategy", "CountQueuingStrategy",
+      "TextEncoderStream", "TextDecoderStream", "CompressionStream", "DecompressionStream",
+    ]) {
+      if (typeof g[name] !== "undefined") pick[name] = g[name];
+    }
+    module.exports = pick;
+  },
   "internal/streams/legacy": streamsLegacyFactory,
   "internal/streams/destroy": streamsDestroyFactory,
   "internal/streams/state": streamsStateFactory,
@@ -223,6 +269,15 @@ const FACTORIES = {
   tls: tlsFactory,
   "internal/deps/undici/undici": undiciFactory,
   dns: dnsFactory,
+  // `dns/promises` is the same promise API dns.js already exposes as `.promises`.
+  "dns/promises": (exports, require, module) => {
+    module.exports = require("dns").promises;
+  },
+  // `inspector` — there is no V8 inspector in this sandbox, so this is an inert
+  // stub. Real tools require it defensively (Next.js reads `inspector.url()` /
+  // `inspector.console`); the debugging surface is simply unavailable.
+  inspector: inspectorFactory,
+  "inspector/promises": inspectorFactory,
   punycode: punycodeFactory,
   "timers/promises": timersPromisesFactory,
   console: consoleFactory,
@@ -245,8 +300,8 @@ const FACTORIES = {
 
 const strip = (name) => (name.startsWith("node:") ? name.slice(5) : name);
 
-export function createNodeModules({ process, syscalls, netLiveness, netServers, codec, cryptoCodec }) {
-  const internalBinding = createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec });
+export function createNodeModules({ process, syscalls, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks }) {
+  const internalBinding = createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks });
   const modules = new Map(); // id -> module object (kept for cycle resolution)
 
   function nodeRequire(name) {

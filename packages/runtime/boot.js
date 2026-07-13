@@ -16,6 +16,9 @@ export function bootProcess({
   fsPort = null,
   codec = null,
   cryptoCodec = null,
+  // Host's real async_hooks (Node worker only) — enables cross-await context
+  // propagation for AsyncLocalStorage (Next.js RSC). Null in the browser.
+  hostAsyncHooks = null,
   // #16 stage 2b: when this worker is a spawned thread, `threadPort` is the raw
   // MessagePort to its creator (becomes parentPort) and `postRaw` sends messages
   // to the kernel with transferables (for Worker() -> kernel port handoff).
@@ -27,13 +30,18 @@ export function bootProcess({
   // MessagePort handed to us at spawn); non-fs opcodes still nudge the kernel.
   // Without an fsPort (older headless paths) everything falls back to the kernel.
   const ringFs = fsPort ? () => fsPort.postMessage(0) : () => send("syscall");
-  const isThread = !!spec.isThread;
+  // A fork child (child_process.fork) is spawned over the same thread plumbing but
+  // is NOT a worker thread: it runs as a normal main-thread process, and its
+  // transferred port is an IPC channel (process.send / 'message'), not parentPort.
+  const isFork = !!spec.isFork;
+  const isThread = !!spec.isThread && !isFork;
   const runtime = createRuntime({
     ctrl,
     data,
     notify: (opcode) => (isFsOpcode(opcode) ? ringFs() : send("syscall")),
     codec,
     cryptoCodec,
+    hostAsyncHooks,
     // real kernel-assigned PID (so process.pid matches the worker name / DevTools)
     pid: spec.pid,
     ppid: spec.ppid,
@@ -44,12 +52,14 @@ export function bootProcess({
     stdout: (chunk) => send("stdout", { chunk }),
     stderr: (chunk) => send("stderr", { chunk }),
     postRaw,
+    // fork mode: the transferred port is the process IPC channel, not parentPort.
+    ipcPort: isFork ? threadPort : null,
     thread: {
       isMainThread: !isThread,
       // threadId defaults to our kernel pid (unique, non-zero for threads).
       threadId: isThread ? (spec.threadId || spec.pid) | 0 : 0,
       workerData: spec.workerData ?? null,
-      parentPort: threadPort,
+      parentPort: isThread ? threadPort : null,
     },
   });
 
