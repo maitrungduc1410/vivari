@@ -168,6 +168,28 @@ OCWebSocket.prototype._emit = function(t, e){
   var a = this._l[t]; if (a) for (var i=0;i<a.length;i++){ try{ a[i].call(this, e); }catch(x){} }
 };
 window.WebSocket = OCWebSocket;
+// Next.js 16's dev "debug channel" treats a navigation whose
+// PerformanceNavigationTiming reports transferSize===0 as a bfcache/HTTP-cache
+// restore (wasServedFromCache). Our Service Worker proxy synthesizes every
+// preview response, so the browser always reports transferSize===0 for the
+// document — a false positive that makes Next try to rehydrate the debug channel
+// from sessionStorage, fail (self.__next_r is random per load, so nothing is
+// stored), and call location.reload() on every load → an infinite reload loop.
+// Report a realistic non-zero transferSize for navigation entries so Next uses
+// its live WebSocket-backed debug channel instead of the reload fallback.
+try {
+  var _gebt = performance.getEntriesByType.bind(performance);
+  var _ge = performance.getEntries.bind(performance);
+  var fixNav = function(e){
+    if (!e || e.entryType !== 'navigation' || e.transferSize > 0) return e;
+    return new Proxy(e, { get: function(t, p){
+      if (p === 'transferSize') return ((t.encodedBodySize || 0) + 300) || 1000;
+      var v = t[p]; return typeof v === 'function' ? v.bind(t) : v;
+    }});
+  };
+  performance.getEntriesByType = function(type){ var l = _gebt(type); return type === 'navigation' ? l.map(fixNav) : l; };
+  performance.getEntries = function(){ return _ge().map(fixNav); };
+} catch(_){}
 })();`;
 
 // In-browser DevTools bridge. Injected into every preview page next to the WS
