@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import Plus from "~icons/lucide/plus";
 import Play from "~icons/lucide/play";
+import Home from "~icons/lucide/house";
 import TerminalIcon from "~icons/lucide/terminal";
 import PanelLeft from "~icons/lucide/panel-left";
 import Eraser from "~icons/lucide/eraser";
@@ -12,15 +13,16 @@ import {
 } from "@/components/ui/command";
 import { useIde } from "./useIde";
 
-const baseName = (rel: string) => rel.split("/").pop() ?? rel;
+const baseName = (abs: string) => abs.split("/").pop() ?? abs;
 
 export function CommandPalette() {
   const { c, snap } = useIde();
 
   const commands = useMemo(
     () => [
+      { label: "Go Home / New Project", icon: Home, run: () => c.goHome() },
       { label: "New Terminal", icon: Plus, run: () => c.newShellTerminal() },
-      { label: "Run Project", icon: Play, run: () => c.runDemo() },
+      { label: "Run Project", icon: Play, run: () => c.runActiveFolder() },
       { label: "Toggle Terminal Panel", icon: TerminalIcon, run: () => c.togglePanel() },
       { label: "Toggle Sidebar", icon: PanelLeft, run: () => c.toggleSidebar() },
       { label: "Clear Active Terminal", icon: Eraser, run: () => c.clearActiveTerminal() },

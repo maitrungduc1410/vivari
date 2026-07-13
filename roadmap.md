@@ -1579,6 +1579,55 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
       through `routeByClient`, whose `fetch(event.request)` on the iframe navigation could
       fail; they're now passed straight to the network like `/oc-devtools/*`.
 
+## A real product shell — multi-root workspace + project templates (this change)
+
+Up to here the studio was a two-demo, single-project IDE: picking a project **wiped**
+the editor and re-scaffolded from a hard-coded file map. This change turns it into a
+product you'd actually start a project in — a VSCode-style multi-root workspace, a Home
+screen, and ten pre-authored templates that auto-install + boot their dev server.
+
+- **Home screen (`components/ide/Home.tsx`).** On load (and via the title bar / `⌘K` →
+  "Go Home") the studio shows a Home overlay: **Start from blank** and **Start from
+  template** big buttons, plus a **Recent projects** list sorted by last-modified. Recents
+  persist in `localStorage` (`oc-workspace-projects`) — content itself lives in the VFS/OPFS,
+  so the registry is just names + paths + timestamps. Home overlays the (kept-mounted) IDE
+  so the Monaco editor and terminals survive a round-trip Home → workspace → Home.
+- **Multi-root workspace (`oc/controller.ts`).** The single `currentDemo` is gone. The
+  workspace is now `workspaceFolders: {id,name,rootPath}[]` with an `activeFolderId`, and
+  **every open file / tab / model / dirty flag is keyed by its ABSOLUTE path** so files from
+  different roots never collide. Opening a second project adds a root instead of wiping the
+  first. `closeFolder` drops just that root's tabs/models/index.
+- **VFS-backed Explorer (`components/ide/Explorer.tsx`).** The Explorer no longer renders a
+  static file map — it reads the live VFS. New worker request/response messages
+  (`oc-readdir` / `oc-read` / `oc-stat`, correlated by `reqId` → `oc-reply` via
+  `KernelBridge.request()`) let it lazy-load a directory's children on expand and re-read on
+  a `treeVersion` bump. The kernel worker emits `oc-fs-changed` after any write / rename / rm
+  / copy / create / install, which bumps `treeVersion` — so an `npm install` or a file op
+  shows up in the tree automatically. `node_modules`, `.git`, `dist`, `.vite`, `build` are
+  skipped from the quick-open/search index (bounded walk).
+- **Templates (`oc/templates.ts`).** Ten real, runnable templates — **React, Vue, Svelte,
+  Express, NestJS**, each in **TypeScript and JavaScript** (Next.js deferred). Each carries a
+  manifest (`install`, `dev`, `port`, `entry`, `hmr`/`reload`) plus its full source. Creating
+  writes the files in one batched VFS transfer (`oc-create-project` → `writeFilesBatch`) and
+  registers the run manifest in the worker — instant, deterministic, offline (no in-VM
+  `create-vite`/`nest new`). The Vite templates run with `--configLoader native` (the
+  rolldown config bundler throws "Invalid URL" in-VM); `express-ts` compiles with `tsc`
+  (no native esbuild/tsx in-VM); `nest-js` uses Babel legacy decorators + is marked
+  **experimental**.
+- **Generalised run + preview attribution.** Created/opened projects don't have fixed ports,
+  so a dev-server `listen` is attributed to its project by walking the listening pid up its
+  parent chain to the **run shell** (`projectDirByTerm`) rather than by a hard-coded port
+  table (`demoForPort`, which the two legacy DEMOS still use). On first serve the worker
+  probes + warms the server then posts `project-ready {dir,port,entry,…}`; a re-listen posts
+  `project-reload`. "Run init script" (default on) opens a terminal that runs
+  `install && dev` (install auto-skipped once `node_modules` exists).
+- **Explorer UX.** Context menu adds **Open in Integrated Terminal** (opens a shell rooted at
+  the folder / the file's parent) and **Copy Path**, alongside New File/Folder, Rename,
+  Copy/Cut/Paste, Delete, and Close Folder on roots.
+
+Deferred: full-text search (still filename-only), drag-and-drop in the tree, an "Add existing
+folder" picker (paths are typed), and hardening the `express-ts`/`nest-js` dev servers in-VM.
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

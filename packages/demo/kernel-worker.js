@@ -380,6 +380,47 @@ const demoServing = new Set();
 const demoReadyPending = new Set();
 const termDemo = new Map(); // terminalId -> demo id
 
+// Dynamically created / opened projects (Home → New / Template, or Open Folder).
+// Unlike the two hard-coded DEMOS these have user-chosen dirs and are attributed
+// to a listened port by the pid chain of the run-shell that spawned the server
+// (see kernel.onListen), so their ports don't need to be known in advance.
+const projects = new Map(); // dir -> { id, dir, port, entry, title, hmr, reload, install, dev, serving, pending }
+const projectDirByTerm = new Map(); // terminalId -> project dir (a "Run" shell)
+
+// Register (or refresh) a project's run manifest so a listen on its dev-server
+// port can be attributed back to it.
+function registerProject(dir, manifest, title) {
+  const prev = projects.get(dir);
+  projects.set(dir, {
+    ...(prev || {}),
+    ...manifest,
+    dir,
+    title: title || manifest.name || dir,
+    serving: prev ? prev.serving : false,
+    pending: prev ? prev.pending : false,
+    port: manifest.port,
+  });
+}
+
+// Drive the preview once a created project's dev server actually answers — the
+// generic sibling of announceDemoReady (which is bound to the fixed DEMOS ports).
+async function announceProjectReady(dir, port) {
+  const p = projects.get(dir);
+  if (!p) return;
+  try {
+    const ok = await waitServing(port, 60000);
+    if (!ok) return;
+    if (p.hmr) {
+      post("demo-status", { line: "optimizing dependencies — first run only…" });
+      await warmDevServer(port);
+    }
+    p.serving = true;
+    post("project-ready", { dir, port, entry: p.entry, title: p.title, hmr: !!p.hmr, reload: !!p.reload });
+  } finally {
+    p.pending = false;
+  }
+}
+
 // Write a demo's starter files into the VFS — once. Re-running or opening another
 // shell must NOT clobber edits the user made after the first scaffold.
 function scaffoldDemo(id) {
@@ -476,7 +517,7 @@ function clearProgress(tid) {
 // OC_RUN, so the dev server lives *inside this tab* (closing it kills the server,
 // running it twice EADDRINUSEs — exactly like local dev). PATH includes the
 // project's node_modules/.bin so `vite`, `nest`, etc. resolve like a real shell.
-function openTerminal(terminalId, cwd, demoId) {
+function openTerminal(terminalId, cwd, demoId, run) {
   if (!kernel) return;
   const d = demoId ? DEMOS[demoId] : null;
   if (d) scaffoldDemo(demoId);
@@ -518,6 +559,15 @@ function openTerminal(terminalId, cwd, demoId) {
     PWD: dir,
   };
   if (d) env.OC_RUN = demoRunCommand(d);
+  // A created/opened project's "Run" (or auto-run after create) hands us an
+  // explicit command; install is skipped automatically once node_modules exists.
+  else if (run) {
+    const p = projects.get(dir);
+    const install = p && p.install ? p.install : "npm install";
+    const devCmd = run;
+    env.OC_RUN = kernel.exists(dir + "/node_modules") ? devCmd : `${install} && ${devCmd}`;
+    projectDirByTerm.set(terminalId, dir);
+  }
   const pid = kernel.launch("sh", [], { cwd: dir, env });
   if (pid < 0) {
     post("term-exit", { terminalId, code: 127 });
@@ -755,6 +805,19 @@ async function boot() {
         demoReadyPending.delete(port);
         listening.delete(port);
       }
+      // A created/opened project's "Run" shell died → its dev server went with
+      // it. Reset the project's readiness so a re-run starts fresh (and the
+      // preview 502s rather than being treated as a live restart → reload).
+      const pdir = projectDirByTerm.get(tid);
+      if (pdir) {
+        projectDirByTerm.delete(tid);
+        const p = projects.get(pdir);
+        if (p) {
+          p.serving = false;
+          p.pending = false;
+          if (p.port != null) listening.delete(p.port);
+        }
+      }
       post("term-exit", { terminalId: tid, code: res.code });
     } else {
       post("exit", { pid, code: res.code });
@@ -763,6 +826,22 @@ async function boot() {
   kernel.onListen = (port, pid) => {
     listening.add(port);
     post("listen", { port, pid });
+    // Created/opened project attribution FIRST (by pid chain), so a project's
+    // dev server is matched to *its* run-shell regardless of the port it picked
+    // (and never confused with a hard-coded DEMO that shares e.g. 5173/3000).
+    const tid = terminalForPid(pid);
+    const pdir = tid !== undefined ? projectDirByTerm.get(tid) : undefined;
+    if (pdir && projects.has(pdir)) {
+      const p = projects.get(pdir);
+      p.port = port;
+      if (p.serving) {
+        post("project-reload", { dir: pdir, port, title: p.title });
+      } else if (!p.pending) {
+        p.pending = true;
+        announceProjectReady(pdir, port);
+      }
+      return;
+    }
     const id = demoForPort(port);
     if (!id) return; // a non-demo server (a user-launched app); nothing to wire
     if (demoServing.has(port)) {
@@ -820,6 +899,12 @@ async function boot() {
   kernel.mkdirp("/tmp/.yarn-cache");
   kernel.mkdirp("/tmp/.pnpm-store");
   kernel.mkdirp("/tmp/.corepack");
+
+  // The kernel + VFS can now service filesystem RPCs (oc-stat / oc-readdir /
+  // oc-create-project), so the studio can create/open projects immediately —
+  // WITHOUT waiting for the (multi-second) real npm/yarn/pnpm/corepack loads
+  // below, which only matter once you actually run install/dev.
+  post("kernel-online", {});
   try {
     const npmT0 = Date.now();
     const res = await ensureRealNpm(kernel, async () => {
@@ -978,7 +1063,7 @@ self.onmessage = async (event) => {
   // the project and auto-run its dev command in this shell (OC_RUN), so the server
   // lives in this tab.
   if (m.type === "term-open") {
-    openTerminal(m.terminalId, m.cwd, m.demo);
+    openTerminal(m.terminalId, m.cwd, m.demo, m.run);
     return;
   }
   // Keystrokes from an xterm — feed them to that terminal's shell stdin.
@@ -1001,11 +1086,91 @@ self.onmessage = async (event) => {
   if (m.type === "oc-write") {
     if (kernel) {
       try {
-        kernel.writeFile(m.path, m.contents);
+        const slash = m.path.lastIndexOf("/");
+        if (slash > 0) kernel.mkdirp(m.path.slice(0, slash));
+        kernel.writeFile(m.path, m.contents ?? "");
+        post("oc-fs-changed", { path: m.path });
       } catch (err) {
         post("log", { line: "[edit] write failed: " + ((err && err.message) || err), stream: "stderr" });
       }
     }
+    if (m.reqId != null) post("oc-reply", { reqId: m.reqId, ok: true });
+    return;
+  }
+
+  // ── VFS queries for the multi-root Explorer (request/response via oc-reply) ──
+  if (m.type === "oc-readdir") {
+    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    try {
+      const base = m.path.replace(/\/+$/, "");
+      const names = kernel.readdir(m.path);
+      const entries = names.map((name) => {
+        let dir = false;
+        try { dir = kernel.stat(base + "/" + name).kind === "dir"; } catch { /* race: gone */ }
+        return { name, dir };
+      });
+      post("oc-reply", { reqId: m.reqId, ok: true, path: m.path, entries });
+    } catch (err) {
+      post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+    }
+    return;
+  }
+  if (m.type === "oc-read") {
+    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    try {
+      post("oc-reply", { reqId: m.reqId, ok: true, path: m.path, contents: kernel.readFile(m.path) });
+    } catch (err) {
+      post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+    }
+    return;
+  }
+  // Existence + kind check used to validate a new project's target directory.
+  if (m.type === "oc-stat") {
+    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: true, exists: false, isDir: false }); return; }
+    try {
+      if (!kernel.exists(m.path)) { post("oc-reply", { reqId: m.reqId, ok: true, exists: false, isDir: false }); return; }
+      const st = kernel.stat(m.path);
+      post("oc-reply", { reqId: m.reqId, ok: true, exists: true, isDir: st.kind === "dir" });
+    } catch {
+      post("oc-reply", { reqId: m.reqId, ok: true, exists: false, isDir: false });
+    }
+    return;
+  }
+  if (m.type === "oc-mkdirp") {
+    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    try {
+      kernel.mkdirp(m.path);
+      post("oc-reply", { reqId: m.reqId, ok: true });
+      post("oc-fs-changed", { path: m.path });
+    } catch (err) {
+      post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+    }
+    return;
+  }
+
+  // Create a project: write its files in one batch and register its run manifest
+  // so a later listen on its dev-server port points the preview at it.
+  if (m.type === "oc-create-project") {
+    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    try {
+      const dir = m.dir;
+      kernel.mkdirp(dir);
+      const files = m.files || {};
+      const batch = Object.entries(files).map(([rel, contents]) => ({ path: dir + "/" + rel, contents }));
+      if (batch.length) await kernel.writeFilesBatch(batch);
+      if (m.manifest) registerProject(dir, m.manifest, m.title);
+      post("oc-reply", { reqId: m.reqId, ok: true });
+      post("oc-fs-changed", { path: dir });
+    } catch (err) {
+      post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+    }
+    return;
+  }
+  // Re-attach a run manifest to an already-existing project dir (Open Folder /
+  // "Run" on a reopened project), without rewriting its files.
+  if (m.type === "oc-register-project") {
+    if (kernel && m.manifest) registerProject(m.dir, m.manifest, m.title);
+    if (m.reqId != null) post("oc-reply", { reqId: m.reqId, ok: true });
     return;
   }
 
@@ -1023,6 +1188,7 @@ self.onmessage = async (event) => {
       else if (m.type === "oc-rm") rmRecursive(m.path);
       else copyRecursive(m.from, m.to);
       post("oc-fs-result", { op, ok: true, from: m.from, to: m.to, path: m.path });
+      post("oc-fs-changed", { path: m.to || m.path });
     } catch (err) {
       post("oc-fs-result", { op, ok: false, error: errMsg(err), from: m.from, to: m.to, path: m.path });
     }

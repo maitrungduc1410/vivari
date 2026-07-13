@@ -85,16 +85,21 @@ packages/
     public/devtools-host.html  host page for the chii DevTools frontend iframe (loaded
                      with `#?embedded=<origin>` → chii's postMessage transport).
     src/oc/kernel.ts      KernelBridge: spawns demo/kernel-worker.js, SW register +
-                          oc-http relay, typed pub/sub over the worker protocol.
-    src/oc/controller.ts  IdeController: the imperative core ported from demo/host.js
-                          (Monaco, xterm terminals, demo Run via OC_RUN, preview, Explorer
-                          file ops via oc-rename/oc-rm/oc-copy) as an external store React
-                          reads via useSyncExternalStore. Also hosts the DevTools relay:
-                          a window-message bridge routing CDP between each preview tab's
-                          chobitsu and the shared chii frontend, plus local-only address-bar
-                          navigation (navigatePreview) + in-app nav sync (oc-nav).
-    src/components/ide/   AppShell · ActivityBar (Explorer/Search) · Explorer (context-menu
-                          file ops) · SearchPane · EditorGroup (preview/permanent tabs) ·
+                          oc-http relay, typed pub/sub over the worker protocol, PLUS
+                          request()/oc-reply request-response (reqId-correlated) for VFS
+                          queries (oc-readdir/oc-read/oc-stat) + oc-create-project.
+    src/oc/controller.ts  IdeController: the imperative core (Monaco, xterm terminals,
+                          preview, DevTools relay) as an external store React reads via
+                          useSyncExternalStore. Since the multi-root rewrite: workspace =
+                          workspaceFolders[] + activeFolderId; EVERY tab/model/dirty flag is
+                          keyed by ABSOLUTE path; project create/open/run flows + a
+                          localStorage recent-projects registry (oc-workspace-projects).
+    src/oc/templates.ts   10 project templates (React/Vue/Svelte/Express/Nest × TS/JS) —
+                          manifest (install/dev/port/entry) + full source, inline.
+    src/components/ide/   AppShell (+ Home overlay) · Home (Start blank / from template,
+                          recents) · ActivityBar (Explorer/Search) · Explorer (VFS-backed
+                          multi-root tree; context menu incl. Open in Integrated Terminal,
+                          Copy Path) · SearchPane · EditorGroup (preview/permanent tabs) ·
                           TerminalPanel (Console/Terminal/Ports) · PreviewPanel (multi-tab
                           mini-browser: local address bar, back/forward, reload, chii
                           DevTools in a resizable bottom split) · StatusBar ·
@@ -106,7 +111,10 @@ packages/
                    server.mjs). Its WORKER files are the shared runtime host and are
                    bundled by studio — do NOT delete them:
     host.js            legacy main thread: UI, SW registration, request relay.
-    kernel-worker.js   hosts the Kernel; DEMOS registry + demo shell tabs (OC_RUN). [shared]
+    kernel-worker.js   hosts the Kernel; DEMOS registry + demo shell tabs (OC_RUN); the
+                       multi-root VFS protocol (oc-readdir/read/stat/mkdirp/create-project,
+                       oc-fs-changed) + dynamic project run/attribution (projectDirByTerm,
+                       project-ready/-reload). [shared]
     fs-worker.js       hosts the File System Worker (VFS + OPFS). [shared]
     fetcher-worker.js  outbound fetch() (npm downloads). [shared]
     process-worker.js  one process = one worker (boots the runtime). [shared]
@@ -222,6 +230,26 @@ the vendored tree with a JS stub (exit 0, warns), and a `node-gyp` coreutil is
 the PATH fallback. Native compilation is skipped; the package's JS or
 `wasm32-wasi` build is what actually loads. Don't "fix" a node-gyp failure by
 trying to compile — that path is intentionally stubbed.
+
+### The studio is a multi-root workspace — absolute paths + the VFS is truth
+Since the workspace rewrite there is NO single "current project" and NO static file
+map. Rules that bite if ignored:
+- **Tabs/models/dirty are keyed by ABSOLUTE path**, never a project-relative one.
+  `controller.openFile/saveFile/renameEntry/...` all take abs; the Explorer + quick-open
+  pass abs. Don't reintroduce a `currentDemo`/rel-based path anywhere.
+- **The Explorer reads the live VFS**, it does NOT render a JS file map. It lazy-loads a
+  dir via `controller.readdir(abs)` (→ `oc-readdir` → `oc-reply`) and re-reads on a
+  `treeVersion` bump. Any code that mutates the VFS from the worker MUST `post("oc-fs-changed")`
+  so the tree/quick-open index refresh (writes, rename/rm/copy, create, installs).
+- **Request/response goes through `KernelBridge.request(type)`** (reqId → `oc-reply`), used
+  by oc-readdir/oc-read/oc-stat/oc-mkdirp/oc-create-project. Fire-and-forget `post()` stays
+  for streaming stuff (term I/O, oc-write on save).
+- **Created/opened projects are attributed to a dev-server port by pid chain**, not a port
+  table: the run shell records `projectDirByTerm[terminalId]`, and `kernel.onListen` walks
+  the listening pid up to that shell (`terminalForPid`) → project → `project-ready`. The two
+  legacy DEMOS still use the fixed-port `demoForPort` path; keep them separate.
+- **Templates live in `src/oc/templates.ts`** (manifest + full source, inline) — not a
+  scaffolder run in-VM. Creation writes them in ONE `writeFilesBatch` via `oc-create-project`.
 
 ### Real npm is the studio shell's `npm` (delivery + shims)
 The North Star is running the real npm/yarn/pnpm CLIs, not our from-scratch

@@ -25,14 +25,27 @@ export class KernelBridge {
   private readonly handlers = new Map<string, Set<Handler>>();
   private readonly anyHandlers = new Set<Handler>();
   private swRegistered = false;
+  // Correlation table for request()/oc-reply round-trips (readdir, read, etc.).
+  private readonly pending = new Map<number, (m: KernelMessage) => void>();
+  private reqSeq = 1;
 
   constructor() {
     this.worker = new Worker(
       new URL("../../../demo/kernel-worker.js", import.meta.url),
       { type: "module", name: "Kernel Worker" },
     );
-    this.worker.onmessage = (event: MessageEvent<KernelMessage>) =>
-      this.emit(event.data);
+    this.worker.onmessage = (event: MessageEvent<KernelMessage>) => {
+      const m = event.data;
+      if (m.type === "oc-reply") {
+        const resolve = this.pending.get(m.reqId as number);
+        if (resolve) {
+          this.pending.delete(m.reqId as number);
+          resolve(m);
+        }
+        return;
+      }
+      this.emit(m);
+    };
 
     // Best-effort flush of the OPFS write-behind buffer as the page goes away.
     addEventListener("pagehide", () =>
@@ -71,6 +84,19 @@ export class KernelBridge {
   /** Post a message to the kernel worker (optionally transferring objects). */
   post(type: string, extra?: Record<string, unknown>, transfer?: Transferable[]) {
     this.worker.postMessage({ type, ...extra }, transfer ?? []);
+  }
+
+  /**
+   * Request/response round-trip: post `type` with a correlation id and resolve
+   * when the worker answers with `{type:"oc-reply", reqId, ...}`. Used for VFS
+   * queries (readdir/read/stat) and project creation.
+   */
+  request(type: string, extra?: Record<string, unknown>): Promise<KernelMessage> {
+    const reqId = this.reqSeq++;
+    return new Promise((resolve) => {
+      this.pending.set(reqId, resolve);
+      this.worker.postMessage({ type, reqId, ...extra });
+    });
   }
 
   /** Register the preview Service Worker and wire its HTTP relay into the VM. */

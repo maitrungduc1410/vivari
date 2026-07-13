@@ -1,6 +1,10 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import ChevronDown from "~icons/lucide/chevron-down";
 import ChevronRight from "~icons/lucide/chevron-right";
+import Home from "~icons/lucide/house";
+import FilePlus from "~icons/lucide/file-plus";
+import FolderPlus from "~icons/lucide/folder-plus";
+import RefreshCw from "~icons/lucide/refresh-cw";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator,
@@ -10,280 +14,253 @@ import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { FileIcon, FolderIcon } from "./fileIcon";
 import { useIde } from "./useIde";
 
-interface DirNode {
-  dirs: Map<string, DirNode>;
-  files: { name: string; rel: string }[];
+interface Entry {
+  name: string;
+  dir: boolean;
 }
 
-function buildTree(paths: string[]): DirNode {
-  const root: DirNode = { dirs: new Map(), files: [] };
-  for (const rel of paths) {
-    const parts = rel.split("/");
-    let node = root;
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
-      if (i === parts.length - 1) {
-        node.files.push({ name: part, rel });
-      } else {
-        let child = node.dirs.get(part);
-        if (!child) node.dirs.set(part, (child = { dirs: new Map(), files: [] }));
-        node = child;
-      }
-    }
-  }
-  return root;
-}
-
-const parentDir = (rel: string) => (rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "");
+const baseName = (abs: string) => abs.split("/").filter(Boolean).pop() ?? abs;
+const parentDir = (abs: string) => abs.slice(0, abs.lastIndexOf("/")) || "/";
 const modKey = (e: React.KeyboardEvent) => e.metaKey || e.ctrlKey;
 
-interface RowCtx {
-  activeTab: string | null;
-  selected: string | null;
-  renaming: string | null;
-  renameValue: string;
-  canPaste: boolean;
-  expanded: Set<string>;
-  setRenameValue: (v: string) => void;
-  select: (rel: string, isDir: boolean) => void;
-  toggle: (path: string) => void;
-  openFile: (rel: string, preview: boolean) => void;
-  startRename: (rel: string) => void;
-  commitRename: () => void;
-  cancelRename: () => void;
-  copy: (rel: string) => void;
-  cut: (rel: string) => void;
-  paste: (destDir: string) => void;
-  requestDelete: (rel: string) => void;
-}
-
-function RenameInput({ ctx }: { ctx: RowCtx }) {
-  return (
-    <input
-      autoFocus
-      value={ctx.renameValue}
-      onChange={(e) => ctx.setRenameValue(e.target.value)}
-      onClick={(e) => e.stopPropagation()}
-      onKeyDown={(e) => {
-        e.stopPropagation();
-        if (e.key === "Enter") ctx.commitRename();
-        else if (e.key === "Escape") ctx.cancelRename();
-      }}
-      onBlur={() => ctx.commitRename()}
-      ref={(el) => {
-        if (!el) return;
-        const dot = el.value.indexOf(".");
-        el.setSelectionRange(0, dot > 0 ? dot : el.value.length);
-      }}
-      className="min-w-0 flex-1 rounded-sm bg-background px-1 text-sm text-foreground outline outline-1 outline-primary"
-    />
-  );
-}
-
-function RowMenu({
-  rel, isDir, destDir, ctx, children,
-}: {
-  rel: string; isDir: boolean; destDir: string; ctx: RowCtx; children: React.ReactNode;
-}) {
-  return (
-    <ContextMenu>
-      <ContextMenuTrigger
-        className="block w-full"
-        onContextMenu={() => ctx.select(rel, isDir)}
-      >
-        {children}
-      </ContextMenuTrigger>
-      <ContextMenuContent className="w-44">
-        <ContextMenuItem onClick={() => (isDir ? ctx.toggle(rel) : ctx.openFile(rel, false))}>
-          Open
-        </ContextMenuItem>
-        <ContextMenuItem onClick={() => ctx.startRename(rel)}>
-          Rename<ContextMenuShortcut>↵</ContextMenuShortcut>
-        </ContextMenuItem>
-        <ContextMenuSeparator />
-        <ContextMenuItem onClick={() => ctx.copy(rel)}>
-          Copy<ContextMenuShortcut>⌘C</ContextMenuShortcut>
-        </ContextMenuItem>
-        <ContextMenuItem onClick={() => ctx.cut(rel)}>
-          Cut<ContextMenuShortcut>⌘X</ContextMenuShortcut>
-        </ContextMenuItem>
-        <ContextMenuItem disabled={!ctx.canPaste} onClick={() => ctx.paste(destDir)}>
-          Paste<ContextMenuShortcut>⌘V</ContextMenuShortcut>
-        </ContextMenuItem>
-        <ContextMenuSeparator />
-        <ContextMenuItem variant="destructive" onClick={() => ctx.requestDelete(rel)}>
-          Delete permanently
-        </ContextMenuItem>
-      </ContextMenuContent>
-    </ContextMenu>
-  );
-}
-
-function TreeLevel({ node, prefix, depth, ctx }: {
-  node: DirNode; prefix: string; depth: number; ctx: RowCtx;
-}) {
-  const dirs = [...node.dirs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  const files = [...node.files].sort((a, b) => a.name.localeCompare(b.name));
-  return (
-    <>
-      {dirs.map(([name, child]) => {
-        const path = prefix + name;
-        const open = ctx.expanded.has(path);
-        const isRenaming = ctx.renaming === path;
-        return (
-          <div key={path}>
-            <RowMenu rel={path} isDir destDir={path} ctx={ctx}>
-              <div
-                className={cn(
-                  "flex w-full items-center gap-1 py-0.5 text-left text-sm",
-                  ctx.selected === path ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-                )}
-                style={{ paddingLeft: 8 + depth * 12 }}
-                onClick={() => { ctx.select(path, true); ctx.toggle(path); }}
-              >
-                {open ? <ChevronDown className="size-3.5 shrink-0" /> : <ChevronRight className="size-3.5 shrink-0" />}
-                <FolderIcon open={open} className="size-4 shrink-0" />
-                {isRenaming ? <RenameInput ctx={ctx} /> : <span className="truncate">{name}</span>}
-              </div>
-            </RowMenu>
-            {open && <TreeLevel node={child} prefix={path + "/"} depth={depth + 1} ctx={ctx} />}
-          </div>
-        );
-      })}
-      {files.map((f) => {
-        const isRenaming = ctx.renaming === f.rel;
-        const isSelected = ctx.selected === f.rel;
-        return (
-          <RowMenu key={f.rel} rel={f.rel} isDir={false} destDir={parentDir(f.rel)} ctx={ctx}>
-            <div
-              className={cn(
-                "flex w-full items-center gap-1.5 py-0.5 text-left text-sm",
-                isSelected || ctx.activeTab === f.rel
-                  ? "bg-accent text-foreground"
-                  : "text-muted-foreground hover:bg-accent/50",
-              )}
-              style={{ paddingLeft: 8 + depth * 12 + 16 }}
-              onClick={() => { ctx.select(f.rel, false); ctx.openFile(f.rel, true); }}
-              onDoubleClick={() => ctx.openFile(f.rel, false)}
-            >
-              <FileIcon name={f.name} className="size-4 shrink-0" />
-              {isRenaming ? <RenameInput ctx={ctx} /> : <span className="truncate">{f.name}</span>}
-            </div>
-          </RowMenu>
-        );
-      })}
-    </>
-  );
+// A pending inline "new file" / "new folder" input.
+interface Creating {
+  dir: string;
+  kind: "file" | "folder";
 }
 
 export function Explorer() {
   const { c, snap } = useIde();
-  const tree = useMemo(() => buildTree(snap.files), [snap.files]);
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  const [selected, setSelected] = useState<{ rel: string; isDir: boolean } | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [children, setChildren] = useState<Record<string, Entry[]>>({});
+  const [selected, setSelected] = useState<{ abs: string; isDir: boolean } | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [creating, setCreating] = useState<Creating | null>(null);
+  const [createValue, setCreateValue] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const loading = useRef<Set<string>>(new Set());
 
-  // Directories are open by default; `collapsed` tracks the ones the user closed.
-  const allDirs = useMemo(() => {
-    const acc = new Set<string>();
-    const walk = (n: DirNode, prefix: string) => {
-      for (const [name, child] of n.dirs) {
-        acc.add(prefix + name);
-        walk(child, prefix + name + "/");
-      }
-    };
-    walk(tree, "");
-    return acc;
-  }, [tree]);
-  const expanded = useMemo(() => {
-    const s = new Set(allDirs);
-    for (const p of collapsed) s.delete(p);
-    return s;
-  }, [allDirs, collapsed]);
+  // Load a directory's children from the live VFS (once, unless refreshed).
+  const load = useCallback(
+    async (dir: string) => {
+      if (loading.current.has(dir)) return;
+      loading.current.add(dir);
+      const entries = await c.readdir(dir);
+      loading.current.delete(dir);
+      entries.sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
+      setChildren((prev) => ({ ...prev, [dir]: entries }));
+    },
+    [c],
+  );
 
-  const toggle = (path: string) =>
-    setCollapsed((prev) => {
+  // Auto-expand roots as they open.
+  useEffect(() => {
+    setExpanded((prev) => {
       const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
+      for (const f of snap.workspaceFolders) next.add(f.rootPath);
+      return next;
+    });
+  }, [snap.workspaceFolders]);
+
+  // Fetch the children of every expanded dir that we haven't loaded yet.
+  useEffect(() => {
+    for (const dir of expanded) if (!(dir in children)) void load(dir);
+  }, [expanded, children, load]);
+
+  // A VFS change (file op / install / create) bumps treeVersion → re-read every
+  // directory we currently have loaded, so the tree reflects reality.
+  useEffect(() => {
+    if (!snap.treeVersion) return;
+    for (const dir of Object.keys(children)) void load(dir);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [snap.treeVersion]);
+
+  const toggle = (dir: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(dir)) next.delete(dir);
+      else { next.add(dir); if (!(dir in children)) void load(dir); }
       return next;
     });
 
-  const startRename = (rel: string) => {
-    setRenaming(rel);
-    setRenameValue(rel.split("/").pop() ?? rel);
+  const startRename = (abs: string) => {
+    setCreating(null);
+    setRenaming(abs);
+    setRenameValue(baseName(abs));
   };
   const commitRename = () => {
     if (!renaming) return;
     const name = renameValue.trim();
-    const parent = parentDir(renaming);
-    if (name && name !== renaming.split("/").pop()) c.renameEntry(renaming, parent ? parent + "/" + name : name);
+    if (name && name !== baseName(renaming)) c.renameEntry(renaming, name);
     setRenaming(null);
   };
-  const cancelRename = () => setRenaming(null);
 
-  const pasteDestFor = (sel: { rel: string; isDir: boolean }) => (sel.isDir ? sel.rel : parentDir(sel.rel));
-
-  const ctx: RowCtx = {
-    activeTab: snap.activeTab,
-    selected: selected?.rel ?? null,
-    renaming,
-    renameValue,
-    canPaste: snap.clipboard != null,
-    expanded,
-    setRenameValue,
-    select: (rel, isDir) => setSelected({ rel, isDir }),
-    toggle,
-    openFile: (rel, preview) => c.openFile(rel, { preview }),
-    startRename,
-    commitRename,
-    cancelRename,
-    copy: (rel) => c.copyEntry(rel),
-    cut: (rel) => c.cutEntry(rel),
-    paste: (destDir) => c.pasteInto(destDir),
-    requestDelete: (rel) => setConfirmDelete(rel),
+  const startCreate = (dir: string, kind: "file" | "folder") => {
+    setRenaming(null);
+    if (!expanded.has(dir)) toggle(dir);
+    setCreating({ dir, kind });
+    setCreateValue("");
   };
+  const commitCreate = () => {
+    if (!creating) return;
+    const name = createValue.trim();
+    if (name) {
+      if (creating.kind === "file") void c.newFile(creating.dir, name);
+      else void c.newFolder(creating.dir, name);
+    }
+    setCreating(null);
+  };
+
+  const select = (abs: string, isDir: boolean, folderId: string) => {
+    setSelected({ abs, isDir });
+    c.setActiveFolder(folderId);
+  };
+
+  const pasteDestFor = (sel: { abs: string; isDir: boolean }) => (sel.isDir ? sel.abs : parentDir(sel.abs));
 
   const onKeyDown = (e: React.KeyboardEvent) => {
-    if (renaming || !selected) return;
-    if (e.key === "Enter") { e.preventDefault(); startRename(selected.rel); }
-    else if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); setConfirmDelete(selected.rel); }
-    else if (modKey(e) && e.key.toLowerCase() === "c") { e.preventDefault(); c.copyEntry(selected.rel); }
-    else if (modKey(e) && e.key.toLowerCase() === "x") { e.preventDefault(); c.cutEntry(selected.rel); }
-    else if (modKey(e) && e.key.toLowerCase() === "v") { e.preventDefault(); c.pasteInto(pasteDestFor(selected)); }
+    if (renaming || creating || !selected) return;
+    if (e.key === "Enter") { e.preventDefault(); startRename(selected.abs); }
+    else if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); setConfirmDelete(selected.abs); }
+    else if (modKey(e) && e.key.toLowerCase() === "c") { e.preventDefault(); c.copyEntry(selected.abs); }
+    else if (modKey(e) && e.key.toLowerCase() === "x") { e.preventDefault(); c.cutEntry(selected.abs); }
+    else if (modKey(e) && e.key.toLowerCase() === "v") { e.preventDefault(); void c.pasteInto(pasteDestFor(selected)); }
   };
 
+  const nameInput = (value: string, onChange: (v: string) => void, commit: () => void, cancel: () => void) => (
+    <NameInput value={value} onChange={onChange} commit={commit} cancel={cancel} />
+  );
+
+  // Render the children of `dir` (must be expanded). `folderId` = owning root.
+  const renderChildren = (dir: string, depth: number, folderId: string): React.ReactNode => {
+    const entries = children[dir];
+    return (
+      <>
+        {creating?.dir === dir && (
+          <div className="flex items-center gap-1.5 py-0.5" style={{ paddingLeft: 8 + depth * 12 + 4 }}>
+            {creating.kind === "folder" ? <FolderIcon open={false} className="size-4 shrink-0" /> : <FileIcon name={createValue || "x"} className="size-4 shrink-0" />}
+            {nameInput(createValue, setCreateValue, commitCreate, () => setCreating(null))}
+          </div>
+        )}
+        {entries === undefined ? (
+          <div className="py-0.5 text-xs text-muted-foreground" style={{ paddingLeft: 8 + depth * 12 + 16 }}>…</div>
+        ) : entries.length === 0 && creating?.dir !== dir ? null : (
+          entries.map((e) => {
+            const abs = dir + "/" + e.name;
+            return e.dir
+              ? renderDir(abs, e.name, depth, folderId)
+              : renderFile(abs, e.name, depth, folderId);
+          })
+        )}
+      </>
+    );
+  };
+
+  const renderDir = (abs: string, name: string, depth: number, folderId: string): React.ReactNode => {
+    const open = expanded.has(abs);
+    const isRenaming = renaming === abs;
+    return (
+      <div key={abs}>
+        <RowMenu abs={abs} isDir destDir={abs} folderId={folderId} c={c} canPaste={snap.clipboard != null}
+          onOpen={() => toggle(abs)} onRename={() => startRename(abs)} onDelete={() => setConfirmDelete(abs)}
+          onNewFile={() => startCreate(abs, "file")} onNewFolder={() => startCreate(abs, "folder")}>
+          <div
+            className={cn(
+              "flex w-full items-center gap-1 py-0.5 text-left text-sm",
+              selected?.abs === abs ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+            )}
+            style={{ paddingLeft: 8 + depth * 12 }}
+            onClick={() => { select(abs, true, folderId); toggle(abs); }}
+          >
+            {open ? <ChevronDown className="size-3.5 shrink-0" /> : <ChevronRight className="size-3.5 shrink-0" />}
+            <FolderIcon open={open} className="size-4 shrink-0" />
+            {isRenaming ? nameInput(renameValue, setRenameValue, commitRename, () => setRenaming(null)) : <span className="truncate">{name}</span>}
+          </div>
+        </RowMenu>
+        {open && renderChildren(abs, depth + 1, folderId)}
+      </div>
+    );
+  };
+
+  const renderFile = (abs: string, name: string, depth: number, folderId: string): React.ReactNode => {
+    const isRenaming = renaming === abs;
+    const isSelected = selected?.abs === abs;
+    return (
+      <RowMenu key={abs} abs={abs} isDir={false} destDir={parentDir(abs)} folderId={folderId} c={c} canPaste={snap.clipboard != null}
+        onOpen={() => c.openFile(abs, { preview: false })} onRename={() => startRename(abs)} onDelete={() => setConfirmDelete(abs)}
+        onNewFile={() => startCreate(parentDir(abs), "file")} onNewFolder={() => startCreate(parentDir(abs), "folder")}>
+        <div
+          className={cn(
+            "flex w-full items-center gap-1.5 py-0.5 text-left text-sm",
+            isSelected || snap.activeTab === abs ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50",
+          )}
+          style={{ paddingLeft: 8 + depth * 12 + 16 }}
+          onClick={() => { select(abs, false, folderId); void c.openFile(abs, { preview: true }); }}
+          onDoubleClick={() => void c.openFile(abs, { preview: false })}
+        >
+          <FileIcon name={name} className="size-4 shrink-0" />
+          {isRenaming ? nameInput(renameValue, setRenameValue, commitRename, () => setRenaming(null)) : <span className="truncate">{name}</span>}
+        </div>
+      </RowMenu>
+    );
+  };
+
+  const active = c.activeFolder;
+
   return (
-    <div className="flex h-full flex-col bg-sidebar">
-      <div className="flex h-8 shrink-0 items-center px-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-        Explorer
+    <div className="flex h-full flex-col bg-sidebar" onKeyDown={onKeyDown}>
+      <div className="flex h-8 shrink-0 items-center gap-1 pl-3 pr-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        <span className="flex-1 truncate">Explorer</span>
+        <HeaderBtn label="New File" onClick={() => active && startCreate(active.rootPath, "file")} disabled={!active}>
+          <FilePlus className="size-3.5" />
+        </HeaderBtn>
+        <HeaderBtn label="New Folder" onClick={() => active && startCreate(active.rootPath, "folder")} disabled={!active}>
+          <FolderPlus className="size-3.5" />
+        </HeaderBtn>
+        <HeaderBtn label="Refresh" onClick={() => setChildren({})}>
+          <RefreshCw className="size-3.5" />
+        </HeaderBtn>
+        <HeaderBtn label="Home" onClick={() => c.goHome()}>
+          <Home className="size-3.5" />
+        </HeaderBtn>
       </div>
       <ScrollArea className="flex-1">
-        {/* Right-clicking empty space pastes into the project root. */}
-        <ContextMenu>
-          <ContextMenuTrigger className="block min-h-full">
-            <div className="pb-4 outline-none" tabIndex={0} onKeyDown={onKeyDown}>
-              {snap.files.length === 0 ? (
-                <div className="px-3 py-2 text-xs text-muted-foreground">
-                  Press <span className="text-foreground">Run</span> to scaffold a project.
-                </div>
-              ) : (
-                <TreeLevel node={tree} prefix="" depth={0} ctx={ctx} />
-              )}
+        <div className="pb-4 outline-none" tabIndex={0}>
+          {snap.workspaceFolders.length === 0 ? (
+            <div className="px-3 py-2 text-xs text-muted-foreground">
+              No folder open. Go <button className="text-foreground underline" onClick={() => c.goHome()}>Home</button> to create or open a project.
             </div>
-          </ContextMenuTrigger>
-          <ContextMenuContent className="w-44">
-            <ContextMenuItem disabled={snap.clipboard == null} onClick={() => c.pasteInto("")}>
-              Paste<ContextMenuShortcut>⌘V</ContextMenuShortcut>
-            </ContextMenuItem>
-          </ContextMenuContent>
-        </ContextMenu>
+          ) : (
+            snap.workspaceFolders.map((f) => {
+              const open = expanded.has(f.rootPath);
+              return (
+                <div key={f.id}>
+                  <RowMenu abs={f.rootPath} isDir destDir={f.rootPath} folderId={f.id} c={c} canPaste={snap.clipboard != null} isRoot
+                    onOpen={() => toggle(f.rootPath)} onRename={() => { /* roots aren't renamed */ }} onDelete={() => c.closeFolder(f.id)}
+                    onNewFile={() => startCreate(f.rootPath, "file")} onNewFolder={() => startCreate(f.rootPath, "folder")}>
+                    <div
+                      className={cn(
+                        "flex w-full items-center gap-1 py-1 pl-2 text-left text-[11px] font-semibold uppercase tracking-wide",
+                        snap.activeFolderId === f.id ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+                      )}
+                      onClick={() => { c.setActiveFolder(f.id); toggle(f.rootPath); }}
+                    >
+                      {open ? <ChevronDown className="size-3.5 shrink-0" /> : <ChevronRight className="size-3.5 shrink-0" />}
+                      <span className="truncate">{f.name}</span>
+                    </div>
+                  </RowMenu>
+                  {open && renderChildren(f.rootPath, 1, f.id)}
+                </div>
+              );
+            })
+          )}
+        </div>
       </ScrollArea>
 
       <AlertDialog open={confirmDelete != null} onOpenChange={(o) => { if (!o) setConfirmDelete(null); }}>
@@ -292,7 +269,7 @@ export function Explorer() {
             <AlertDialogTitle>Delete permanently?</AlertDialogTitle>
             <AlertDialogDescription>
               <span className="font-mono text-foreground">{confirmDelete}</span> will be permanently
-              removed from the project. This cannot be undone.
+              removed. This cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -310,5 +287,109 @@ export function Explorer() {
         </AlertDialogContent>
       </AlertDialog>
     </div>
+  );
+}
+
+// Inline rename / create field. The initial selection must happen exactly once
+// (on mount) — doing it in an inline `ref` re-selects the whole value on every
+// keystroke's re-render, which makes typed characters replace the selection so
+// only the last character survives.
+function NameInput({ value, onChange, commit, cancel }: {
+  value: string; onChange: (v: string) => void; commit: () => void; cancel: () => void;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.focus();
+    const dot = el.value.indexOf(".");
+    el.setSelectionRange(0, dot > 0 ? dot : el.value.length);
+    // Run once on mount only — never re-select on subsequent renders.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return (
+    <input
+      ref={ref}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") commit();
+        else if (e.key === "Escape") cancel();
+      }}
+      onBlur={commit}
+      className="min-w-0 flex-1 rounded-sm bg-background px-1 text-sm text-foreground outline outline-1 outline-primary"
+    />
+  );
+}
+
+function HeaderBtn({ label, onClick, disabled, children }: {
+  label: string; onClick: () => void; disabled?: boolean; children: React.ReactNode;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        onClick={onClick}
+        disabled={disabled}
+        className="flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-40"
+      >
+        {children}
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+function RowMenu({
+  abs, isDir, destDir, folderId, c, canPaste, isRoot, children,
+  onOpen, onRename, onDelete, onNewFile, onNewFolder,
+}: {
+  abs: string; isDir: boolean; destDir: string; folderId: string;
+  c: ReturnType<typeof useIde>["c"]; canPaste: boolean; isRoot?: boolean; children: React.ReactNode;
+  onOpen: () => void; onRename: () => void; onDelete: () => void; onNewFile: () => void; onNewFolder: () => void;
+}) {
+  const termDir = isDir ? abs : destDir;
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger className="block w-full" onContextMenu={() => c.setActiveFolder(folderId)}>
+        {children}
+      </ContextMenuTrigger>
+      <ContextMenuContent className="w-56">
+        <ContextMenuItem onClick={onOpen}>Open</ContextMenuItem>
+        {isDir && (
+          <>
+            <ContextMenuItem onClick={onNewFile}>New File…</ContextMenuItem>
+            <ContextMenuItem onClick={onNewFolder}>New Folder…</ContextMenuItem>
+          </>
+        )}
+        <ContextMenuSeparator />
+        <ContextMenuItem onClick={() => c.openTerminalIn(termDir)}>Open in Integrated Terminal</ContextMenuItem>
+        <ContextMenuItem onClick={() => c.copyPath(abs)}>Copy Path</ContextMenuItem>
+        <ContextMenuSeparator />
+        {!isRoot && (
+          <ContextMenuItem onClick={onRename}>
+            Rename<ContextMenuShortcut>↵</ContextMenuShortcut>
+          </ContextMenuItem>
+        )}
+        <ContextMenuItem onClick={() => c.copyEntry(abs)}>
+          Copy<ContextMenuShortcut>⌘C</ContextMenuShortcut>
+        </ContextMenuItem>
+        {!isRoot && (
+          <ContextMenuItem onClick={() => c.cutEntry(abs)}>
+            Cut<ContextMenuShortcut>⌘X</ContextMenuShortcut>
+          </ContextMenuItem>
+        )}
+        <ContextMenuItem disabled={!canPaste} onClick={() => void c.pasteInto(destDir)}>
+          Paste<ContextMenuShortcut>⌘V</ContextMenuShortcut>
+        </ContextMenuItem>
+        <ContextMenuSeparator />
+        {isRoot ? (
+          <ContextMenuItem onClick={onDelete}>Close Folder</ContextMenuItem>
+        ) : (
+          <ContextMenuItem variant="destructive" onClick={onDelete}>Delete permanently</ContextMenuItem>
+        )}
+      </ContextMenuContent>
+    </ContextMenu>
   );
 }

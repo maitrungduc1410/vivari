@@ -70,8 +70,9 @@ in dev and esbuild-bundles them for production (§10).
 ┌──────────────────────────────────────────────────────────────────────┐
 │ Main thread — packages/studio (React 19 + shadcn)                      │
 │   (legacy: packages/demo/host.js — same protocol, plain-JS UI)         │
-│   • VS Code-style IDE: Explorer (context-menu file ops) + Search +     │
-│     tabbed Monaco (preview/permanent tabs) + bottom panel with         │
+│   • Home screen (blank / template / recents) + VS Code-style IDE:      │
+│     multi-root VFS-backed Explorer (abs-path tabs) + Search + tabbed    │
+│     Monaco (preview/permanent tabs) + bottom panel with                 │
 │     Console / Terminal (INTERACTIVE shells) / Ports + command palette   │
 │     + preview (ANSI intact; shells have real stdin — type, Enter runs)  │
 │   • src/oc/kernel.ts (KernelBridge) + src/oc/controller.ts (IdeController)│
@@ -395,6 +396,24 @@ Two non-obvious constraints keep this working:
   (like `/oc-devtools/`). They are our own app assets; routing them through
   `routeByClient` risked a spurious `fetch(event.request)` failure on the iframe
   navigation and could even proxy them into a preview that has no such file.
+
+### 8.6 Multi-root workspace, Home + templates (studio)
+
+The studio is a real workspace, not a two-demo switcher. State (`controller.ts`):
+`workspaceFolders: {id,name,rootPath}[]` + `activeFolderId`; **every tab/model/dirty flag is
+keyed by ABSOLUTE path** so files from different roots can't collide. Home (`Home.tsx`) is an
+overlay over the kept-mounted IDE offering Start-from-blank, Start-from-template (10 templates
+in `oc/templates.ts`: React/Vue/Svelte/Express/Nest × TS/JS), and a `localStorage` recent list.
+
+The Explorer reads the **live VFS** rather than a static map. The bridge gained a
+request/response channel (`KernelBridge.request()` → reqId → `oc-reply`) backing
+`oc-readdir` / `oc-read` / `oc-stat` / `oc-mkdirp` / `oc-create-project`; the worker emits
+`oc-fs-changed` after any VFS mutation, which bumps `treeVersion` so the tree + quick-open
+index refresh (including after an in-VM `npm install`). Creating a project writes its files in
+one `writeFilesBatch` (`oc-create-project`) and registers a run manifest; "Run init script"
+opens a shell that runs `install && dev`. A dev server's `listen` is attributed to its project
+by walking the pid up to the run shell (`projectDirByTerm` / `terminalForPid`) → `project-ready`
+points the preview (the two legacy DEMOS still use the fixed-port `demoForPort` path).
 
 ---
 
