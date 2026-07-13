@@ -77,22 +77,92 @@ export default function (exports, require, module, process, internalBinding, pri
       ? hostAsyncHooks.AsyncLocalStorage
       : null;
 
-  // Best-effort store for realms without async tracking (the browser). There is
-  // no PromiseHook, so we can't follow context across *unrelated* async hops the
-  // way Node does. Instead we hold `run(store, cb)`'s store as the current value
-  // for the ENTIRE duration of cb — synchronously AND, when cb returns a thenable,
-  // until that promise settles. This makes `getStore()` after an `await` inside
-  // the same run() chain return the store (enough for Next.js App Router's
-  // workStore in the common single-render case). Caveat: with a single `_current`
-  // per instance, truly concurrent run() calls that overlap across an await can
-  // observe each other's store — acceptable for a low-concurrency dev preview,
-  // and the Node path uses the host's real AsyncLocalStorage anyway.
+  // ── Best-effort AsyncLocalStorage for realms without async tracking (browser) ──
+  //
+  // There is no PromiseHook, so we approximate cross-`await` context two ways that
+  // together cover Next.js's App Router:
+  //   1) `run(store, cb)` holds the store for the ENTIRE duration of cb — the sync
+  //      body and, if cb returns a thenable, until it settles (covers raw `await`
+  //      inside cb, e.g. workAsyncStorage wrapping the whole render).
+  //   2) Context propagation across the async scheduling primitives React uses
+  //      (`Promise.prototype.then`, `queueMicrotask`, timers): each captures a
+  //      SNAPSHOT of every live store at schedule time and restores it while the
+  //      callback runs. This covers the pattern that (1) misses — a synchronous
+  //      `run(store, () => scheduleWork())` whose work runs detached later (that is
+  //      exactly how Next enters workUnitAsyncStorage per render).
+  //
+  // Caveat: still not a real async-context boundary (a single `_current` per
+  // instance), so heavy concurrent overlap can bleed — acceptable for a dev
+  // preview. The Node path uses the host's real AsyncLocalStorage instead.
+
+  // Every live polyfill instance, so a snapshot can capture/restore all stores.
+  const liveStores = new Set();
+  // The original Promise.prototype.then, captured before we patch it, so run()'s
+  // own restore hook is never itself re-wrapped (which would clobber the restore).
+  const nativeThen = Promise.prototype.then;
+
+  function captureContext() {
+    const snap = [];
+    for (const inst of liveStores) snap.push([inst, inst._current]);
+    return snap;
+  }
+  function wrapWithContext(fn) {
+    if (typeof fn !== "function" || liveStores.size === 0) return fn;
+    const snap = captureContext();
+    return function (...args) {
+      const saved = [];
+      for (const [inst, val] of snap) {
+        saved.push([inst, inst._current]);
+        inst._current = val;
+      }
+      try {
+        return fn.apply(this, args);
+      } finally {
+        for (const [inst, val] of saved) inst._current = val;
+      }
+    };
+  }
+
+  // Patch the worker's scheduling primitives ONCE (browser path only) so detached
+  // continuations carry the context that was active when they were scheduled.
+  let propagationInstalled = false;
+  function installContextPropagation() {
+    if (propagationInstalled) return;
+    propagationInstalled = true;
+    const g = globalThis;
+    if (g.Promise && g.Promise.prototype && g.Promise.prototype.then === nativeThen) {
+      g.Promise.prototype.then = function (onFulfilled, onRejected) {
+        return nativeThen.call(this, wrapWithContext(onFulfilled), wrapWithContext(onRejected));
+      };
+    }
+    const patchScheduler = (name) => {
+      const orig = g[name];
+      if (typeof orig !== "function") return;
+      g[name] = function (cb, ...rest) {
+        return orig.call(this, typeof cb === "function" ? wrapWithContext(cb) : cb, ...rest);
+      };
+    };
+    patchScheduler("queueMicrotask");
+    patchScheduler("setTimeout");
+    patchScheduler("setInterval");
+    patchScheduler("setImmediate");
+  }
+
   class AsyncLocalStoragePolyfill {
     constructor() {
       this._current = undefined;
       this._enabled = true;
+      liveStores.add(this);
     }
     run(store, callback, ...args) {
+      // Two mechanisms cooperate (see installContextPropagation):
+      //   • For the sync body and any raw `await` inside cb, we hold `store` as the
+      //     current value until cb's returned promise settles. This is what keeps a
+      //     long-lived scope (workAsyncStorage wrapping a whole render) readable
+      //     across awaits that the scheduler patches can't see.
+      //   • For work scheduled onto then/microtask/timers, the scheduler patches
+      //     carry a per-hop snapshot, so nested/short-lived scopes stay correct even
+      //     when this instance's sticky value has moved on.
       const prev = this._current;
       this._current = store;
       let result;
@@ -104,9 +174,13 @@ export default function (exports, require, module, process, internalBinding, pri
       }
       if (result && typeof result.then === "function") {
         const restore = () => {
-          this._current = prev;
+          // Only pop if we're still the top: a nested run() that is still live may
+          // have set a newer value we must not clobber (out-of-order settling).
+          if (this._current === store) this._current = prev;
         };
-        return result.then(
+        // Use the *native* then so this restore isn't itself context-wrapped.
+        return nativeThen.call(
+          result,
           (v) => {
             restore();
             return v;
@@ -139,15 +213,27 @@ export default function (exports, require, module, process, internalBinding, pri
       this._enabled = false;
       this._current = undefined;
     }
-    // Static context helpers (Node 19.8+). Without real async tracking a snapshot
-    // can't restore *all* stores, so it captures nothing and just runs the fn;
-    // bind() returns it unchanged. Next.js's App Router calls both. (On the Node
-    // path the host's real AsyncLocalStorage provides these.)
+    // Static context helpers (Node 19.8+). snapshot() captures every live store
+    // now and restores it when the returned runner is invoked; bind() binds a fn
+    // to the current context. Next.js's App Router uses both. (The Node path uses
+    // the host's real AsyncLocalStorage.)
     static bind(fn) {
-      return fn;
+      return wrapWithContext(fn);
     }
     static snapshot() {
-      return (cb, ...args) => cb(...args);
+      const snap = captureContext();
+      return (cb, ...args) => {
+        const saved = [];
+        for (const [inst, val] of snap) {
+          saved.push([inst, inst._current]);
+          inst._current = val;
+        }
+        try {
+          return cb(...args);
+        } finally {
+          for (const [inst, val] of saved) inst._current = val;
+        }
+      };
     }
   }
 
@@ -165,5 +251,10 @@ export default function (exports, require, module, process, internalBinding, pri
     executionAsyncResource: () => ({}),
     createHook: () => ({ enable() { return this; }, disable() { return this; } }),
     symbols: { owner_symbol, async_id_symbol, trigger_async_id_symbol },
+    // Runtime-internal: on the polyfill (browser) path the runtime calls this AFTER
+    // it has installed its own timer globals (loop.setTimeout/setImmediate/…) so the
+    // context wrappers land on the *final* primitives, not the ones we later clobber.
+    // No-op when the host's real AsyncLocalStorage is in use.
+    __ocInstallContextPropagation: HostAsyncLocalStorage ? () => {} : installContextPropagation,
   };
 }

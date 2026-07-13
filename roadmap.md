@@ -1310,11 +1310,18 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     `@next/swc-<platform>` optionalDeps on arch `wasm32`, so the wasm build is the only binding
     present. Surfaced & fixed to get RSC rendering working: (a) `vm.runInNewContext` now makes the
     sandbox the real global (`globalThis.__RSC_MANIFEST=…` lands on the context) so the client-
-    reference manifest loads; (b) **real cross-`await` `AsyncLocalStorage`** — the runtime delegates
-    to the host worker's async_hooks (V8 PromiseHook), without which the App Router `workStore`
-    invariant fails — on the browser the polyfill instead holds context for the whole `run()`
-    callback, which renders in the common single-request case; (c) `child_process.fork` (Next forks
-    its dev server over IPC); (d)
+    reference manifest loads; (b) **real cross-`await` `AsyncLocalStorage`** — on a Node worker the
+    runtime delegates to the host's async_hooks (V8 PromiseHook), without which the App Router
+    `workStore`/`workUnitAsyncStorage` invariants fail. The browser has no PromiseHook, so the
+    polyfill (i) holds `run(store, cb)`'s store across `cb` and its returned promise (covers raw
+    `await` in a long-lived scope like `workAsyncStorage`) and (ii) propagates a per-hop context
+    snapshot through the scheduling primitives React drives rendering with
+    (`then`/`queueMicrotask`/`setImmediate`/`setTimeout`), so nested per-render scopes
+    (`workUnitAsyncStorage`) stay correct even when promises settle out of order — the restore is
+    "pop only if still top" to avoid clobbering a live nested scope. Validated headlessly with
+    `OC_NO_HOST_ALS=1` (forces the polyfill): 0 invariant errors, GET / 200; (c) `child_process.fork`
+    (Next forks its dev server over IPC) — its stdio streams to the parent (default `inherit`
+    surfaces on the terminal, not the kernel console); (d)
     `pathToFileURL` relative→absolute; (e) `dns/promises`, `stream/web`, `inspector` stub, and the
     full `Console` method surface for `@edge-runtime/primitives`; (f) `module.findSourceMap`. The
     wasm SWC is seeded into Next's cache on `postinstall` (offline first compile; Next's own
@@ -1732,14 +1739,22 @@ wasm SWC** (no native binding on arch `wasm32`), and `GET / → 200` with the re
   - **`vm.runInNewContext` makes the sandbox the real global** — `globalThis`/`self`/`global`
     assignments (e.g. Next's `globalThis.__RSC_MANIFEST=…` manifest files) now land on the context
     object, via a `with`-scoped proxy. Without this the RSC client-reference manifest never loads.
-  - **Cross-`await` `AsyncLocalStorage`** — the App Router `workStore` invariant needs context to
-    survive `await`. On a Node worker the runtime delegates `AsyncLocalStorage` to the host's
-    async_hooks (V8 PromiseHook) through the `internalBinding` seam (exact). The browser has no such
-    binding, so the polyfill now holds `run(store, cb)`'s store for the whole duration of `cb`
-    (synchronously and until a returned promise settles) — enough to render in the common
-    single-request case (validated headlessly with `OC_NO_HOST_ALS=1`, which forces the polyfill).
+  - **Cross-`await` `AsyncLocalStorage`** — the App Router `workStore`/`workUnitAsyncStorage`
+    invariants need context to survive `await`. On a Node worker the runtime delegates
+    `AsyncLocalStorage` to the host's async_hooks (V8 PromiseHook) through the `internalBinding` seam
+    (exact). The browser has no such binding, so the polyfill combines two mechanisms: it holds
+    `run(store, cb)`'s store across `cb` and its returned promise (raw `await` in a long-lived scope),
+    AND propagates a per-hop snapshot of every live store through the scheduling primitives React uses
+    (`Promise.prototype.then`, `queueMicrotask`, `setImmediate`, `setTimeout`) so short-lived
+    per-render scopes stay correct across detached continuations. The store patches are installed once
+    at boot, after the runtime's own timer globals are in place and before any framework code runs (so
+    React captures the wrapped primitives), and only on the polyfill path. `run`'s restore is
+    "pop only if still top" to avoid clobbering a live nested scope when promises settle out of order.
+    Validated headlessly with `OC_NO_HOST_ALS=1`: 0 invariant errors, GET / 200.
   - **`child_process.fork`** — an IPC channel (`process.send`/`'message'`/`disconnect`) built on the
-    worker-thread spawn path; `next dev` forks its dev server and gates boot on `process.send`.
+    worker-thread spawn path; `next dev` forks its dev server and gates boot on `process.send`. The
+    fork child streams its stdout/stderr to the parent (kernel `stream: true`), so `fork`'s default
+    `inherit` stdio surfaces on the parent's terminal instead of the kernel's global console.
   - **`pathToFileURL`** resolves relative→absolute (Node parity); `dns/promises`, `stream/web`,
     an `inspector` stub, the full `Console` method surface (`@edge-runtime/primitives` binds them),
     and `module.findSourceMap`.

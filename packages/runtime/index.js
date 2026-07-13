@@ -483,6 +483,11 @@ export function createRuntime({
   // The loop drains queued child events (stdout/stderr/exit) each turn (#15).
   drainChildEvents = child_process._drain;
 
+  // Fork children stream their stdout/stderr to us (kernel `stream: true`), keyed
+  // by child pid. We route those chunks here rather than through the async-spawn
+  // ChildProcess registry (fork rides the worker_threads path, not spawnAsync).
+  const forkChildren = new Map(); // childPid -> { onOut(chunk), onErr(chunk) }
+
   // child_process.fork(modulePath[, args][, options]) — a forked child is a
   // separate process running <modulePath> with a bidirectional IPC channel. We
   // build it on the worker_threads spawn plumbing (same kernel spawn + lifecycle
@@ -499,12 +504,24 @@ export function createRuntime({
     child.exitCode = null;
     child.signalCode = null;
     child.killed = false;
-    // fork's stdio defaults to 'inherit' → the child's stdout/stderr already flow
-    // through the kernel to this process's terminal, so we expose no pipes here.
-    child.stdout = null;
-    child.stderr = null;
+    // fork stdio: default (silent:false) is 'inherit' — the child's output shows on
+    // OUR std streams (which bubble to the terminal). silent:true (or stdio 'pipe')
+    // pipes it onto child.stdout/child.stderr Readables instead.
+    const stdio = options.stdio;
+    const silent = options.silent === true || stdio === "pipe" || (Array.isArray(stdio) && stdio[1] === "pipe");
+    const outStream = silent ? new stream.Readable({ read() {} }) : null;
+    const errStream = silent ? new stream.Readable({ read() {} }) : null;
+    child.stdout = outStream;
+    child.stderr = errStream;
     child.stdin = null;
-    child.stdio = [null, null, null, null];
+    child.stdio = [null, outStream, errStream, null];
+    const pushOut = (s, chunk) => {
+      if (s) s.push(chunk == null ? null : Buffer.from(String(chunk), "utf8"));
+    };
+    const handlers = {
+      onOut: (chunk) => (silent ? pushOut(outStream, chunk) : process.stdout.write(chunk)),
+      onErr: (chunk) => (silent ? pushOut(errStream, chunk) : process.stderr.write(chunk)),
+    };
     let worker;
     try {
       worker = new wt.Worker(String(modulePath), {
@@ -546,12 +563,15 @@ export function createRuntime({
     };
     child.ref = () => { worker.ref(); return child; };
     child.unref = () => { worker.unref(); return child; };
-    worker.on("online", () => { child.pid = worker.threadId; child.emit("spawn"); });
+    worker.on("online", () => { child.pid = worker.threadId; forkChildren.set(child.pid, handlers); child.emit("spawn"); });
     worker.on("message", (m) => child.emit("message", m));
     worker.on("error", (e) => child.emit("error", e));
     worker.on("exit", (code) => {
       child.connected = false;
       child.exitCode = code | 0;
+      if (child.pid > 0) forkChildren.delete(child.pid);
+      pushOut(outStream, null);
+      pushOut(errStream, null);
       loop.nextTick(() => { child.emit("exit", code | 0, null); child.emit("close", code | 0, null); });
     });
     return child;
@@ -902,6 +922,12 @@ export function createRuntime({
   globalThis.clearInterval = loop.clearInterval;
   globalThis.setImmediate = loop.setImmediate;
   globalThis.clearImmediate = loop.clearImmediate;
+  // Browser (no host async_hooks) only: now that our timer globals are in place,
+  // let AsyncLocalStorage propagate context across the scheduling primitives React's
+  // App Router uses (then/queueMicrotask/setImmediate/setTimeout). Must run AFTER the
+  // reassignments above and BEFORE any framework code so React captures the wrapped
+  // primitives (it caches `scheduleMicrotask = queueMicrotask` at module eval).
+  asyncHooks.__ocInstallContextPropagation?.();
   // Phase 2 #9 (internal, temporary): a blocking fetch into the VFS, serviced by
   // the kernel's Fetcher Worker. Returns { status, ok, contentType, size, path,
   // cached }; read `path` with fs for the bytes. This is the low-level primitive
@@ -983,8 +1009,18 @@ export function createRuntime({
     /** External nudge from the kernel: a network request is queued for us. */
     wake: loop.wakeNet,
     /** External delivery from the kernel: an async child's stdout/stderr/exit
-     * ({type:'child-stdout'|'child-stderr'|'child-exit', childPid, ...}). #15 */
-    dispatchChild: (msg) => child_process._dispatch(msg),
+     * ({type:'child-stdout'|'child-stderr'|'child-exit', childPid, ...}). #15.
+     * Fork children (child_process.fork) stream through here too; route their
+     * output to the fork handlers (exit arrives separately as a thread-exit). */
+    dispatchChild: (msg) => {
+      const h = msg && msg.childPid != null ? forkChildren.get(msg.childPid) : undefined;
+      if (h) {
+        if (msg.type === "child-stdout") h.onOut(msg.chunk);
+        else if (msg.type === "child-stderr") h.onErr(msg.chunk);
+        return;
+      }
+      child_process._dispatch(msg);
+    },
     /** External delivery from the kernel: a worker_thread's online/exit
      * ({type:'thread-started'|'thread-exit', reqId, ...}). #16 stage 2b. */
     dispatchThread: (msg) => dispatchThreadEvent(msg),
