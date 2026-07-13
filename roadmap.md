@@ -1315,14 +1315,19 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     `workStore`/`workUnitAsyncStorage` invariants fail. The browser has no PromiseHook, so the
     polyfill can't follow a native `await`; on a single-request-at-a-time dev preview it instead (i)
     holds a thenable-returning `run(store, cb)`'s store until it settles then pops "only if still
-    top", (ii) does NOT restore on a plain (non-thenable) return — Next's `renderToFlightStream`
+    top" **and never back to `undefined`** — a streaming RSC render returns its promise EARLY (when
+    the stream is created) while React keeps rendering components detached across native awaits, so
+    zeroing the store on settle throws `Expected workStore/workUnitStore to be initialized`;
+    restoring a *defined* parent store is still safe (keeps nested scopes correct), (ii) does NOT
+    restore on a plain (non-thenable) return — Next's `renderToFlightStream`
     returns a stream synchronously and renders later across raw awaits, so leaving `store` current
     keeps `getStore()` correct for that detached work until the next `run()` overwrites it, and (iii)
     propagates a per-hop context snapshot through the scheduling primitives React uses
     (`then`/`queueMicrotask`/`setImmediate`/`setTimeout`). Together these make the invariant
     deterministic (not timing-dependent). Validated headlessly with `OC_NO_HOST_ALS=1` (forces the
-    polyfill, incl. under heavy-I/O timing perturbation): 0 invariant errors, GET / 200, output
-    byte-identical to the host-async_hooks path; (c) `child_process.fork`
+    polyfill): the RSC refresh render (the App Router's HMR "on save" re-render, `RSC: 1`) returns
+    200 with 0 invariant errors across repeats — the same path that threw `workStore` in the studio —
+    plus GET / 200, output byte-identical to the host-async_hooks path; (c) `child_process.fork`
     (Next forks its dev server over IPC) — its stdio streams to the parent (default `inherit`
     surfaces on the terminal, not the kernel console); (d)
     `pathToFileURL` relative→absolute; (e) `dns/promises`, `stream/web`, `inspector` stub, and the

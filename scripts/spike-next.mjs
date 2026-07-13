@@ -322,6 +322,40 @@ if (bound) {
   console.log("\n---- dev output tail (last 4000 chars) ----\n" + out.slice(devStart).join("").slice(-4000));
 }
 
+// ── gate 4: RSC refresh render (the HMR "on save" re-render path) ─────────────
+// The studio "error/flash on save" bug surfaced as a *server* invariant
+// (Expected workStore/workUnitStore to be initialized) serialized into the Flight
+// stream — thrown only during the App Router's RSC refresh render (the request the
+// client re-issues after `serverComponentChanges`), never on a plain document GET.
+// It only reproduces on the best-effort AsyncLocalStorage polyfill (the studio's
+// browser-worker path), so run this gate with OC_NO_HOST_ALS=1 to guard against a
+// regression there — a streaming render returns its promise early while React
+// keeps rendering across awaits, so run() must not zero the store on settle.
+let rscOk = true;
+if (bound) {
+  console.log("\n== RSC refresh render (App Router HMR re-render) ==");
+  const rsc = (url) =>
+    kernel.handleHttpRequest(PORT, {
+      port: PORT,
+      method: "GET",
+      url,
+      headers: { host: "127.0.0.1:" + PORT, RSC: "1", "Next-Url": "/" },
+      body: "",
+    });
+  const decodeB = (b) => (typeof b === "string" ? b : Buffer.from(b).toString());
+  let invariants = 0;
+  for (let i = 0; i < 8; i++) {
+    const before = out.length;
+    const r = await rsc("/");
+    const body = decodeB(r.body || "");
+    const chunk = out.slice(before).join("") + body;
+    if (r.status !== 200 || /Expected work(Unit)?Store to be initialized/.test(chunk)) invariants++;
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  rscOk = invariants === 0;
+  console.log(`  RSC refresh renders clean: ${rscOk} (${8 - invariants}/8 ok)${rscOk ? "" : " ← workStore/workUnit invariant REGRESSED"}`);
+}
+
 // ── optional: probe the HMR WebSocket exactly like the browser preview does ───
 // (OC_WSPROBE=1) Reveals what the dev server pushes over /_next/webpack-hmr:
 // SYNC/RELOAD_PAGE/SERVER_COMPONENT_CHANGES, or connection flapping — the drivers
@@ -355,6 +389,6 @@ if (process.env.OC_WSPROBE === "1" && bound) {
   console.log(`  ws summary: opens=${opens} msgs=${msgs} closes=${closes} over 8s`);
 }
 
-const ok = inst.code === 0 && nextBin && wasmSwc && bound && getOk;
+const ok = inst.code === 0 && nextBin && wasmSwc && bound && getOk && rscOk;
 console.log("\nRESULT: " + (ok ? "PASS — Next 16 App Router boots on webpack + wasm SWC and serves / with 200" : "FAIL — see logs above"));
 process.exit(ok ? 0 : 1);

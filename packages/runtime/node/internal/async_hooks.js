@@ -160,14 +160,20 @@ export default function (exports, require, module, process, internalBinding, pri
       // single-request-at-a-time dev preview:
       //   • Sync throw → the scope is truly finished; restore `prev`.
       //   • Thenable return → hold `store` until it settles, then "pop only if still
-      //     top" (a still-live nested run may have set a newer value we must keep).
+      //     top" — but NEVER back to `undefined`. A streaming render (React RSC)
+      //     returns its promise EARLY (when the stream is created) and keeps
+      //     rendering components detached across native `await`s our patched
+      //     scheduler can't see; at the request boundary `prev` is undefined, so
+      //     restoring it would zero `_current` mid-render and throw the "Expected
+      //     workStore/workUnitStore to be initialized" invariant. Restoring a
+      //     *defined* parent store is still safe (keeps nested scopes correct).
       //   • Plain (non-thenable) return → DO NOT restore. The callback may have
       //     handed back a value while scheduling detached async work that still
       //     needs this store — e.g. Next's `renderToFlightStream` returns a stream
       //     synchronously and renders later across raw awaits the scheduler patches
       //     can't see. Leaving `store` current keeps getStore() correct for that
       //     work; the next run() on this instance overwrites it. Combined with the
-      //     scheduler-snapshot propagation, this makes the workUnitAsyncStorage
+      //     scheduler-snapshot propagation, this makes the work(Unit)AsyncStorage
       //     invariant deterministic instead of timing-dependent.
       const prev = this._current;
       this._current = store;
@@ -180,7 +186,7 @@ export default function (exports, require, module, process, internalBinding, pri
       }
       if (result && typeof result.then === "function") {
         const restore = () => {
-          if (this._current === store) this._current = prev;
+          if (this._current === store && prev !== undefined) this._current = prev;
         };
         // Use the *native* then so this restore isn't itself context-wrapped.
         return nativeThen.call(
