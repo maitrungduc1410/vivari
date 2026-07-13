@@ -128,8 +128,19 @@ function OCWebSocket(url, protocols){
   this.url = String(url); this.readyState = 0; this.protocol = ''; this.binaryType = 'blob';
   this._id = tok + '-' + (nextId++); this._l = { open:[], message:[], close:[], error:[] };
   conns[this._id] = this;
-  var path = '/'; try { var u = new URL(this.url, location.href); path = u.pathname + u.search; } catch(e){}
-  post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:previewPort, path:path, protocols: protocols || null });
+  var path = '/'; var targetPort = previewPort;
+  try {
+    var u = new URL(this.url, location.href);
+    path = u.pathname + u.search;
+    // Cross-service: a ws URL under /preview/<port>/ addresses ANOTHER in-VM
+    // server (e.g. a backend on a different port), not this iframe's own dev
+    // server. Route to that port and strip the proxy prefix so the server sees
+    // its real path. URLs without the prefix (Vite HMR, same-app sockets) keep
+    // the iframe's own port — so HMR is unaffected.
+    var pm = u.pathname.match(/^\\/preview\\/(\\d+)(\\/.*)?$/);
+    if (pm) { targetPort = parseInt(pm[1], 10); path = (pm[2] || '/') + u.search; }
+  } catch(e){}
+  post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, path:path, protocols: protocols || null });
 }
 OCWebSocket.CONNECTING = 0; OCWebSocket.OPEN = 1; OCWebSocket.CLOSING = 2; OCWebSocket.CLOSED = 3;
 OCWebSocket.prototype._deliver = function(d){

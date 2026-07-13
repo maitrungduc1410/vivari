@@ -1628,6 +1628,81 @@ screen, and ten pre-authored templates that auto-install + boot their dev server
 Deferred: full-text search (still filename-only), drag-and-drop in the tree, an "Add existing
 folder" picker (paths are typed), and hardening the `express-ts`/`nest-js` dev servers in-VM.
 
+## TypeScript 7 (tsgo), cross-service WebSockets, host↔preview bridge (this change)
+
+Three product features shipped together (Next.js still deferred). Each is proven by a
+headless spike (`scripts/spike-*.mjs`) before wiring, per the repo's spike-first rule.
+
+- **Real TypeScript 7 — `tsc`/`tsgo` (Go/wasm).** TS 7's compiler is compiled Go, not JS,
+  so it can't be `require()`d. We ship the community **`tsgo-wasm`** build: a
+  `GOOS=js/GOARCH=wasm` module (`tsgo.wasm`, ~47 MB) driven by the standard Go `wasm_exec`
+  glue, which routes everything through `globalThis.fs` — **which is our real Node `lib/fs.js`
+  over the Rust VFS** — plus `crypto.getRandomValues`, `performance.now`, `TextEncoder`, and
+  `WebAssembly`. The only shim: Go writes program output to fd 1/2 via `fs.writeSync`/`write`,
+  which the VFS fs doesn't wire to the terminal, so the runner routes those two fds to
+  `process.stdout`/`stderr`. Delivery mirrors npm/corepack: `scripts/vendor-tsgo.mjs` packs
+  the wasm + a CJS-normalised copy of the Go engine into `public/vendor/tsgo-pack.bin`
+  (~11 MB gz); `packages/kernel-host/load-real-tsgo.js` unpacks it into the VFS and installs
+  `/bin/tsc.js` + `/bin/tsgo.js`. Because it's big and nothing at boot needs it, it loads
+  **lazily in the background after `ready`** (a placeholder shim answers "still downloading"
+  until then) and persists in OPFS. Spikes: `spike-tsgo.mjs` (boots + type-checks VFS files,
+  catches `TS2322`) and `spike-tsgo-studio.mjs` (the shipped shim + shared-loader path).
+- **Cross-service WebSockets (FE ↔ BE in two preview tabs).** The preview ws shim (in `sw.js`)
+  now recognises a **`/preview/<port>/…` ws URL** and routes the tunneled connection to that
+  in-VM port (stripping the prefix), exactly like the HTTP preview proxy. URLs without the
+  prefix (Vite HMR, same-app sockets) keep the iframe's own port, so **HMR is unaffected**.
+  The kernel already routes a ws `open` by port (`handleWsClient` → `listeners.get(port)`), so
+  no kernel change was needed. To surface a multi-server project, port attribution
+  (`kernel.onListen`) now opens a **preview tab per distinct port** a run shell binds (primary
+  → full `project-ready`; extras → `project-ready {extra:true}`), and clears the port set when
+  the run shell exits. New **WebSocket template** (`oc/templates.ts`): an Express + `ws`
+  backend (:3001) and a Vite frontend (:5173) started together by a tiny CJS orchestrator
+  (`dev.js`, since our `sh` has no `&`); the frontend talks to the backend over
+  `/preview/3001/ws`, exercising both directions (server→client tick, client→server echo).
+  Spike: `spike-ws-demo.mjs` drives the real `ws` backend through the kernel tunnel and
+  asserts both directions.
+- **Host ↔ preview bridge.** In-VM code can reach a service on the **host machine** by addressing
+  `http://host.opencontainer.internal:<port>/…`, mapped to the studio's own hostname (only reaches
+  the host when the studio is served locally). Both egress paths honor the alias: `http`/`https`
+  (and npm) via the fetcher's `rewrite()` (`fetcher-worker.js`), and the global `fetch()` — which
+  is the host realm's real fetch used directly — via `rewriteHostAlias` in
+  `packages/runtime/index.js`. The reverse direction needs no alias — the host reaches an in-VM
+  server at `<studio-origin>/preview/<port>/…` (the same SW preview proxy the iframes use). This
+  is addressing convenience, **not** a CORS/auth bypass: the target must still allow the studio
+  origin (ACAO + a COEP-satisfying CORP).
+
+  Note: `host.opencontainer.internal` is an **outbound-fetch** alias only — it is NOT wired into
+  the preview tab URL bar (which loads in-VM ports and rejects non-`localhost` hosts). Test it
+  from in-VM code, not by typing it in a preview tab:
+
+  1. On your Mac (outside the studio), run a CORS-enabled server on :3000:
+
+     ```js
+     // host-server.mjs  ->  node host-server.mjs
+     import { createServer } from "node:http";
+     createServer((req, res) => {
+       res.writeHead(200, { "content-type": "text/plain", "access-control-allow-origin": "*" });
+       res.end("hello from the host machine\n");
+     }).listen(3000, () => console.log("host server on http://localhost:3000"));
+     ```
+
+  2. In the studio, create `probe.mjs` (a file avoids terminal quoting issues) and run
+     `node probe.mjs`:
+
+     ```js
+     // probe.mjs  ->  node probe.mjs
+     const res = await fetch("http://host.opencontainer.internal:3000/");
+     console.log("status:", res.status);
+     console.log("body:", await res.text());
+     ```
+
+     Expected: `status: 200` and `body: hello from the host machine`. The target MUST send
+     `Access-Control-Allow-Origin` (the `*` above), else the browser blocks the cross-origin read.
+
+Deferred (next): **Next.js** (native SWC/Turbopack/LightningCSS need wasm/JS replacements),
+cross-host WebSockets from in-VM (the tunnel only dials `127.0.0.1`), and moving Vitest's
+config off CLI flags.
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

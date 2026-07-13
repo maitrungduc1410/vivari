@@ -19,7 +19,31 @@
 // at it and rewrite() below is the ONLY place that needs to change.
 const REGISTRY_PROXY = null;
 
+// Host alias. In-VM code can reach a service running on the HOST machine (the
+// machine running the browser, e.g. a real dev server on localhost:3000) by
+// addressing it as `http://host.opencontainer.internal:<port>/…`. We map the alias
+// to the studio's OWN hostname (the fetcher runs in the browser, so
+// self.location.hostname IS the host), preserving scheme/port/path. This only
+// reaches the host when the studio is served locally (localhost).
+//
+// This is addressing convenience, not a CORS/auth bypass: the target server still
+// must allow the studio origin (Access-Control-Allow-Origin + a Cross-Origin-
+// Resource-Policy that satisfies the page's COEP), exactly like any other
+// cross-origin fetch. The reverse direction (host → preview) needs no alias: the
+// host reaches an in-VM server at `<studio-origin>/preview/<port>/…` (the same
+// Service Worker preview proxy the iframes use).
+const HOST_ALIAS = "host.opencontainer.internal";
+
 function rewrite(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname === HOST_ALIAS) {
+      u.hostname = (self.location && self.location.hostname) || "localhost";
+      url = u.toString();
+    }
+  } catch {
+    // Not an absolute URL — leave it untouched.
+  }
   if (!REGISTRY_PROXY) return url;
   // e.g. return REGISTRY_PROXY + "/" + encodeURIComponent(url);
   return url;

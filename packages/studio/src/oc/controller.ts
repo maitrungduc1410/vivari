@@ -1401,6 +1401,13 @@ export class IdeController {
     b.on("project-ready", (m) => {
       const dir = normDir(m.dir as string);
       this.pointPreview(m.port as number);
+      // An EXTRA service of a multi-server project (e.g. a backend/ws server
+      // alongside the frontend): just add its preview tab — the primary already
+      // opened the folder + entry file.
+      if (m.extra) {
+        this.set({ status: `${m.title as string}: service on :${m.port} ready` });
+        return;
+      }
       const r = this.runningProjects.get(dir);
       if (r) r.port = m.port as number;
       else this.runningProjects.set(dir, { terminalId: null, port: m.port as number });

@@ -128,8 +128,16 @@ function OCWebSocket(url, protocols){
   this.url = String(url); this.readyState = 0; this.protocol = ''; this.binaryType = 'blob';
   this._id = tok + '-' + (nextId++); this._l = { open:[], message:[], close:[], error:[] };
   conns[this._id] = this;
-  var path = '/'; try { var u = new URL(this.url, location.href); path = u.pathname + u.search; } catch(e){}
-  post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:previewPort, path:path, protocols: protocols || null });
+  var path = '/'; var targetPort = previewPort;
+  try {
+    var u = new URL(this.url, location.href);
+    path = u.pathname + u.search;
+    // Cross-service: /preview/<port>/ ws URLs address another in-VM server; route
+    // to that port and strip the prefix. Prefix-less URLs (HMR) keep this port.
+    var pm = u.pathname.match(/^\\/preview\\/(\\d+)(\\/.*)?$/);
+    if (pm) { targetPort = parseInt(pm[1], 10); path = (pm[2] || '/') + u.search; }
+  } catch(e){}
+  post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, path:path, protocols: protocols || null });
 }
 OCWebSocket.CONNECTING = 0; OCWebSocket.OPEN = 1; OCWebSocket.CLOSING = 2; OCWebSocket.CLOSED = 3;
 OCWebSocket.prototype._deliver = function(d){

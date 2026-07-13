@@ -816,6 +816,208 @@ module.exports = { AppService };
   };
 }
 
+// ── WebSocket demo (Express + ws backend + Vite frontend, TWO preview tabs) ──
+// One project that starts TWO in-VM servers from a single `dev` run: a backend
+// (Express + `ws`) on :3001 and a Vite frontend on :5173. The studio's port
+// attribution opens a preview tab for each (see kernel.onListen). The frontend
+// reaches the backend's WebSocket cross-service via `/preview/3001/ws` — the SW's
+// ws shim routes that prefix to the backend port (the same convention the HTTP
+// preview proxy uses). It exercises BOTH directions: the backend pushes a tick
+// every second (server→client) and echoes anything the client sends (client→
+// server→client).
+function wsDemoTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "ws-demo",
+      framework: "express",
+      name: "WebSocket",
+      language: "JavaScript",
+      description: "Express + ws backend & Vite frontend talking over a WebSocket — two live preview tabs",
+      port: 5173,
+      openPath: "/",
+      entry: "src/main.js",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      // sh has no job control (&), so a tiny CJS orchestrator starts both servers.
+      dev: "node dev.js",
+    },
+    files: {
+      "package.json": `{
+  "name": "ws-demo",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "node dev.js",
+    "server": "node server/index.js",
+    "client": "vite --configLoader native --port 5173 --strictPort"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "vite": "^8.0.0"
+  }
+}
+`,
+      // Start the backend AND the Vite frontend together, tearing both down if
+      // either exits. Both are descendants of this run shell, so each server's
+      // listen is attributed to this project and gets its own preview tab.
+      "dev.js": `const { spawn } = require('child_process');
+
+const procs = [];
+let exiting = false;
+function run(label, cmd, args) {
+  const child = spawn(cmd, args, { stdio: 'inherit' });
+  procs.push(child);
+  child.on('exit', (code) => {
+    if (exiting) return;
+    exiting = true;
+    console.log('[dev] ' + label + ' exited (' + code + ') — stopping the other server.');
+    for (const p of procs) { if (p !== child) { try { p.kill(); } catch (e) {} } }
+    process.exit(code || 0);
+  });
+  return child;
+}
+
+console.log('[dev] starting backend (:3001) and frontend (:5173)…');
+run('backend', 'node', ['server/index.js']);
+run('frontend', 'npm', ['run', 'client']);
+`,
+      "vite.config.js": `import { defineConfig } from 'vite'
+
+// The frontend runs on 5173; it reaches the backend WebSocket cross-service via
+// /preview/3001/ws (the studio's ws shim routes that to the in-VM :3001 server).
+export default defineConfig({
+  server: { port: 5173, strictPort: true },
+})
+`,
+      "index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebSocket demo — frontend</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
+`,
+      "src/style.css": `:root { font-family: system-ui, sans-serif; color-scheme: light dark; }
+body { margin: 0; padding: 2rem; }
+#app { max-width: 640px; margin: 0 auto; }
+h1 { font-size: 1.4rem; }
+.status { font-size: .9rem; padding: .25rem .6rem; border-radius: 999px; display: inline-block; }
+.status.on { background: #16a34a22; color: #16a34a; }
+.status.off { background: #dc262622; color: #dc2626; }
+#log { background: #0b0b0c; color: #d1d5db; border-radius: 8px; padding: .75rem; height: 260px;
+  overflow: auto; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: .82rem; margin-top: 1rem; }
+.row { display: flex; gap: .5rem; margin-top: .75rem; }
+input { flex: 1; padding: .5rem .6rem; border-radius: 6px; border: 1px solid #8884; background: transparent; color: inherit; }
+button { padding: .5rem .9rem; border-radius: 6px; border: 1px solid #646cff; background: #646cff; color: #fff; cursor: pointer; }
+`,
+      // Frontend: connect to the backend ws cross-service, render both directions.
+      "src/main.js": `import './style.css'
+
+const BACKEND_PORT = 3001
+const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
+// Cross-service address: the studio's ws shim maps /preview/<port>/ to that
+// in-VM server, exactly like the HTTP preview proxy.
+const WS_URL = scheme + '://' + location.host + '/preview/' + BACKEND_PORT + '/ws'
+
+document.querySelector('#app').innerHTML = \`
+  <h1>WebSocket demo — frontend (:5173)</h1>
+  <p>Talking to the backend on <code>:\${BACKEND_PORT}</code> via <code>/preview/\${BACKEND_PORT}/ws</code>.</p>
+  <p><span id="status" class="status off">connecting…</span></p>
+  <div class="row">
+    <input id="msg" placeholder="Type a message and press Send" />
+    <button id="send">Send</button>
+  </div>
+  <div id="log"></div>
+\`
+
+const logEl = document.querySelector('#log')
+const statusEl = document.querySelector('#status')
+const log = (line) => {
+  const t = new Date().toLocaleTimeString()
+  logEl.textContent += '[' + t + '] ' + line + '\\n'
+  logEl.scrollTop = logEl.scrollHeight
+}
+
+log('connecting to ' + WS_URL)
+const ws = new WebSocket(WS_URL)
+ws.onopen = () => { statusEl.textContent = 'connected'; statusEl.className = 'status on'; log('open — connected to backend') }
+ws.onclose = () => { statusEl.textContent = 'disconnected'; statusEl.className = 'status off'; log('close') }
+ws.onerror = () => log('error')
+ws.onmessage = (e) => {
+  try {
+    const m = JSON.parse(e.data)
+    if (m.type === 'tick') log('server tick → ' + m.time)
+    else if (m.type === 'echo') log('echo ← "' + m.msg + '"')
+    else log('recv ← ' + e.data)
+  } catch { log('recv ← ' + e.data) }
+}
+
+const send = () => {
+  const input = document.querySelector('#msg')
+  const v = input.value.trim()
+  if (!v || ws.readyState !== WebSocket.OPEN) return
+  ws.send(v)
+  log('sent → "' + v + '"')
+  input.value = ''
+}
+document.querySelector('#send').onclick = send
+document.querySelector('#msg').addEventListener('keydown', (e) => { if (e.key === 'Enter') send() })
+`,
+      // Backend: Express status page on / + a ws server on /ws. Pushes a tick each
+      // second (server→client) and echoes client messages (client→server→client).
+      "server/index.js": `const express = require('express');
+const http = require('http');
+const { WebSocketServer } = require('ws');
+
+const PORT = 3001;
+const app = express();
+let clients = 0;
+
+app.get('/', (_req, res) => {
+  res.type('html').send(
+    '<!doctype html><meta charset="utf-8">' +
+    '<title>WebSocket demo — backend</title>' +
+    '<body style="font-family:system-ui;padding:2rem;max-width:640px;margin:auto">' +
+    '<h1>WebSocket demo — backend (:' + PORT + ')</h1>' +
+    '<p>This Express server also hosts a WebSocket at <code>/ws</code>.</p>' +
+    '<p>Open the <b>frontend</b> preview tab (:5173) to see live two-way messages.</p>' +
+    '<p>Connected ws clients: <b>' + clients + '</b> (reload to refresh).</p>'
+  );
+});
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+wss.on('connection', (ws) => {
+  clients++;
+  console.log('[backend] client connected (' + clients + ' total)');
+  ws.send(JSON.stringify({ type: 'echo', msg: 'welcome — you are connected to the backend' }));
+  const tick = setInterval(() => {
+    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'tick', time: new Date().toLocaleTimeString() }));
+  }, 1000);
+  ws.on('message', (data) => {
+    const msg = String(data);
+    console.log('[backend] recv: ' + msg);
+    ws.send(JSON.stringify({ type: 'echo', msg }));
+  });
+  ws.on('close', () => { clients--; clearInterval(tick); console.log('[backend] client disconnected'); });
+});
+
+server.listen(PORT, () => console.log('[backend] listening on :' + PORT + ' (http + ws /ws)'));
+`,
+    },
+  };
+}
+
 // The full matrix, in picker order (matches the reference create-vite layout:
 // framework first, then language variants side by side).
 export const TEMPLATES: TemplateDef[] = [
@@ -829,6 +1031,7 @@ export const TEMPLATES: TemplateDef[] = [
   expressTemplate(true),
   nestTemplate(true),
   nestTemplate(false),
+  wsDemoTemplate(),
 ];
 
 export function getTemplate(id: string): TemplateDef | undefined {
