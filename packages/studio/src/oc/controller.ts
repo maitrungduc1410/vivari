@@ -5,19 +5,23 @@
 // here via useSyncExternalStore. This controller owns the *imperative* pieces
 // that don't belong in React's render cycle: the kernel worker bridge, the Monaco
 // editor + its models, the xterm terminals (Console + interactive shells), the
-// demo "Run" lifecycle, and the preview wiring. Components hand it DOM mount
+// project "Run" lifecycle, and the preview wiring. Components hand it DOM mount
 // points (editor host, terminal containers, preview iframe) and call its methods.
+//
+// Since the multi-root rewrite, the workspace is a set of folders (roots), the
+// Explorer reads the VFS live, and every open file / tab / model is keyed by its
+// ABSOLUTE path so files from different roots never collide.
 
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { toast } from "sonner";
 import type * as Monaco from "monaco-editor";
-import { KernelBridge, type KernelMessage } from "./kernel";
+import { KernelBridge } from "./kernel";
+import { getTemplate, type TemplateManifest } from "./templates";
 
 // ── Demo matrix (UI side) ────────────────────────────────────────────────────
-// The kernel worker owns the real project files + scaffolding; the host only
-// needs the id + a human label for the shell tab it opens (which auto-runs the
-// dev command in-VM via OC_RUN). Mirrors the DEMOS keys in kernel-worker.js.
+// The two hard-coded example projects the kernel worker still scaffolds on demand
+// (the "Run" button's legacy path). New projects come from Home (blank/template).
 export interface DemoOption {
   id: string;
   title: string;
@@ -42,7 +46,24 @@ export interface PortInfo {
 
 export interface Clipboard {
   mode: "copy" | "cut";
-  rel: string;
+  abs: string; // absolute path of the copied/cut entry
+}
+
+// A root folder open in the workspace (VSCode-style multi-root).
+export interface WorkspaceFolder {
+  id: string;
+  name: string;
+  rootPath: string; // absolute, no trailing slash
+}
+
+// A persisted project (Home "recent projects" list). Content lives in the VFS
+// (OPFS); this registry just tracks what exists + when it was last touched.
+export interface ProjectMeta {
+  name: string;
+  rootPath: string;
+  template: string | null;
+  createdAt: number;
+  lastModified: number;
 }
 
 // One browser tab in the Preview panel.
@@ -56,14 +77,20 @@ export interface PreviewTab {
 
 export interface IdeSnapshot {
   booted: boolean;
+  kernelReady: boolean; // kernel + VFS up (can create/open projects) — earlier than `booted`
   status: string;
   cwd: string;
+  view: "home" | "workspace";
   projectTitle: string | null;
-  files: string[]; // rel paths (tree + quick-open)
-  openTabs: string[]; // rel paths
+  workspaceFolders: WorkspaceFolder[];
+  activeFolderId: string | null;
+  recentProjects: ProjectMeta[];
+  treeVersion: number; // bump to make the Explorer re-read expanded dirs
+  files: string[]; // absolute paths (flat index for quick-open + search)
+  openTabs: string[]; // absolute paths
   activeTab: string | null;
   previewTab: string | null; // the single "preview" (italic, single-click) tab
-  dirty: string[]; // rel paths with unsaved edits
+  dirty: string[]; // absolute paths with unsaved edits
   terminals: TerminalMeta[];
   activeTermId: string | null;
   ports: PortInfo[];
@@ -94,12 +121,20 @@ const TERM_THEME = {
 };
 
 const ESC = "\x1b[";
+const REGISTRY_KEY = "oc-workspace-projects";
+
+const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
+const normDir = (p: string) => {
+  const n = "/" + p.split("/").filter((s) => s && s !== ".").join("/");
+  return n === "/" ? "/" : n.replace(/\/+$/, "");
+};
+const folderIdFor = (rootPath: string) => "wf:" + rootPath;
 
 function languageFor(path: string): string {
   if (/\.(jsx?|mjs|cjs)$/.test(path)) return "javascript";
   if (/\.tsx?$/.test(path)) return "typescript";
   if (/\.css$/.test(path)) return "css";
-  if (/\.html?$/.test(path)) return "html";
+  if (/\.(html?|vue|svelte)$/.test(path)) return "html";
   if (/\.json$/.test(path)) return "json";
   if (/\.md$/.test(path)) return "markdown";
   return "plaintext";
@@ -111,19 +146,14 @@ interface TermEntry {
   kind: "console" | "shell";
   label: string;
   demo: string | null;
+  cwd: string | null;
+  run: string | null; // explicit OC_RUN (created/opened project run shells)
   pid: number | null;
   alive: boolean;
   started: boolean;
   opened: boolean;
   openedAt: number;
   pendingInput: string[];
-}
-
-interface CurrentDemo {
-  id: string;
-  dir: string;
-  reload: boolean;
-  title: string;
 }
 
 export class IdeController {
@@ -133,9 +163,15 @@ export class IdeController {
   private listeners = new Set<() => void>();
   private snap: IdeSnapshot = {
     booted: false,
+    kernelReady: false,
     status: "booting…",
     cwd: "",
+    view: "home",
     projectTitle: null,
+    workspaceFolders: [],
+    activeFolderId: null,
+    recentProjects: [],
+    treeVersion: 0,
     files: [],
     openTabs: [],
     activeTab: null,
@@ -170,15 +206,18 @@ export class IdeController {
   private previewSeq = 0;
   private devtoolsFrame: HTMLIFrameElement | null = null; // the chii DevTools frontend iframe
   private devtoolsTargetId: string | null = null; // which preview tab DevTools is attached to
-  private currentDemo: CurrentDemo | null = null;
-  private projectFiles: Record<string, string> = {}; // rel -> contents
-  private localFiles: Record<string, string> = {}; // abs -> latest text
+  private localFiles: Record<string, string> = {}; // abs -> latest saved text (editor cache)
+  private fileIndex = new Map<string, string[]>(); // rootPath -> abs files (quick-open/search)
+  private folderManifests = new Map<string, TemplateManifest>(); // rootPath -> run manifest
+  private runningProjects = new Map<string, { terminalId: string | null; port: number | null }>();
   private runningDemos = new Map<string, { terminalId: string | null; port: number | null }>();
   private portMap = new Map<number, number>(); // port -> pid (live listeners)
+  private treeBump: ReturnType<typeof setTimeout> | null = null;
   private started = false;
 
   constructor() {
     this.bridge = new KernelBridge();
+    this.snap.recentProjects = this.loadRegistry();
     this.createConsole();
     this.wireBridge();
     this.wirePreviewMessages();
@@ -235,6 +274,62 @@ export class IdeController {
     this.bridge.boot();
   }
 
+  // ── VFS queries (request/response over the bridge) ─────────────────────────
+  async readdir(absPath: string): Promise<{ name: string; dir: boolean }[]> {
+    const m = await this.bridge.request("oc-readdir", { path: absPath });
+    return m.ok ? ((m.entries as { name: string; dir: boolean }[]) ?? []) : [];
+  }
+  async readFileText(absPath: string): Promise<string> {
+    const m = await this.bridge.request("oc-read", { path: absPath });
+    return m.ok ? String(m.contents ?? "") : "";
+  }
+  async pathInfo(absPath: string): Promise<{ exists: boolean; isDir: boolean }> {
+    const m = await this.bridge.request("oc-stat", { path: absPath });
+    return { exists: !!m.exists, isDir: !!m.isDir };
+  }
+
+  // ── workspace registry (localStorage) ──────────────────────────────────────
+  private loadRegistry(): ProjectMeta[] {
+    try {
+      const raw = localStorage.getItem(REGISTRY_KEY);
+      const list = raw ? (JSON.parse(raw) as ProjectMeta[]) : [];
+      return list.sort((a, b) => b.lastModified - a.lastModified);
+    } catch {
+      return [];
+    }
+  }
+  private saveRegistry(list: ProjectMeta[]) {
+    const sorted = [...list].sort((a, b) => b.lastModified - a.lastModified);
+    try {
+      localStorage.setItem(REGISTRY_KEY, JSON.stringify(sorted));
+    } catch {
+      /* storage full / disabled — the in-memory list still works this session */
+    }
+    this.set({ recentProjects: sorted });
+  }
+  private upsertProjectMeta(meta: { name: string; rootPath: string; template: string | null }) {
+    const now = Date.now();
+    const list = this.snap.recentProjects.filter((p) => p.rootPath !== meta.rootPath);
+    const existing = this.snap.recentProjects.find((p) => p.rootPath === meta.rootPath);
+    list.push({
+      name: meta.name,
+      rootPath: meta.rootPath,
+      template: meta.template,
+      createdAt: existing?.createdAt ?? now,
+      lastModified: now,
+    });
+    this.saveRegistry(list);
+  }
+  private touchProject(rootPath: string) {
+    const list = this.snap.recentProjects.map((p) =>
+      p.rootPath === rootPath ? { ...p, lastModified: Date.now() } : p,
+    );
+    if (list.some((p) => p.rootPath === rootPath)) this.saveRegistry(list);
+  }
+  removeProjectMeta(rootPath: string) {
+    this.saveRegistry(this.snap.recentProjects.filter((p) => p.rootPath !== rootPath));
+  }
+
   // ── console + terminals ───────────────────────────────────────────────────
   private consoleWrite(chunk: string) {
     this.terms.get("console")?.term.write(chunk);
@@ -260,7 +355,7 @@ export class IdeController {
   private createConsole() {
     const { term, fit } = this.makeTerm();
     this.terms.set("console", {
-      term, fit, kind: "console", label: "Console", demo: null,
+      term, fit, kind: "console", label: "Console", demo: null, cwd: null, run: null,
       pid: null, alive: true, started: true, opened: false, openedAt: 0, pendingInput: [],
     });
     this.termOrder.push("console");
@@ -269,13 +364,16 @@ export class IdeController {
   // Create a shell terminal tab (defer = spawn the Process Worker lazily, off the
   // cold-boot burst; explicit New Terminal / Run start it right away). `activate`
   // = switch the panel to this terminal (false for the background boot shell).
-  newShellTerminal({ defer = false, demo = null, label = null, activate = true }: {
+  // `cwd`/`run` = start the shell in a project dir and (optionally) auto-run its
+  // dev command (created/opened projects).
+  newShellTerminal({ defer = false, demo = null, label = null, activate = true, cwd = null, run = null }: {
     defer?: boolean; demo?: string | null; label?: string | null; activate?: boolean;
+    cwd?: string | null; run?: string | null;
   } = {}): string {
     const id = "sh" + ++this.termSeq;
     const { term, fit } = this.makeTerm();
     const entry: TermEntry = {
-      term, fit, kind: "shell", label: label || "sh " + this.termSeq, demo,
+      term, fit, kind: "shell", label: label || "sh " + this.termSeq, demo, cwd, run,
       pid: null, alive: true, started: false, opened: false, openedAt: 0, pendingInput: [],
     };
     this.terms.set(id, entry);
@@ -307,7 +405,8 @@ export class IdeController {
     if (!entry || entry.kind !== "shell" || entry.started) return;
     entry.started = true;
     entry.openedAt = performance.now();
-    this.bridge.post("term-open", { terminalId: id, demo: entry.demo, cwd: this.currentDemo?.dir });
+    const cwd = entry.cwd ?? this.activeFolder?.rootPath ?? undefined;
+    this.bridge.post("term-open", { terminalId: id, demo: entry.demo, cwd, run: entry.run ?? undefined });
   }
 
   switchTerminal(id: string) {
@@ -427,74 +526,78 @@ export class IdeController {
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
     });
     // Open whatever tab was requested before the editor finished loading.
-    if (this.snap.activeTab) this.openFile(this.snap.activeTab);
+    if (this.snap.activeTab) void this.openFile(this.snap.activeTab);
   }
 
-  // Open a file. `preview` (single-click from the Explorer) reuses a single
-  // italic "preview" tab; a permanent open (double-click, or an edit) pins it.
-  openFile(rel: string, { preview = false }: { preview?: boolean } = {}) {
-    if (!this.currentDemo) return;
+  // Ensure a Monaco model exists for `abs` (loading its content from the VFS on
+  // first open). Wires dirty tracking against the last-saved text.
+  private async ensureModel(abs: string): Promise<Monaco.editor.ITextModel | null> {
+    if (!this.monaco) return null;
+    const cached = this.models.get(abs);
+    if (cached) return cached;
+    if (!(abs in this.localFiles)) this.localFiles[abs] = await this.readFileText(abs);
+    const monaco = this.monaco;
+    const uri = monaco.Uri.file(abs);
+    const model =
+      monaco.editor.getModel(uri) ||
+      monaco.editor.createModel(this.localFiles[abs] ?? "", languageFor(abs), uri);
+    model.onDidChangeContent(() => {
+      const changed = model.getValue() !== (this.localFiles[abs] ?? "");
+      const isDirty = this.snap.dirty.includes(abs);
+      if (changed && !isDirty) this.set({ dirty: [...this.snap.dirty, abs] });
+      else if (!changed && isDirty) this.set({ dirty: this.snap.dirty.filter((x) => x !== abs) });
+      if (changed && this.snap.previewTab === abs) this.set({ previewTab: null }); // editing pins the tab
+    });
+    this.models.set(abs, model);
+    return model;
+  }
 
+  // Open a file by ABSOLUTE path. `preview` (single-click from the Explorer)
+  // reuses a single italic "preview" tab; a permanent open (double-click, or an
+  // edit) pins it.
+  async openFile(abs: string, { preview = false }: { preview?: boolean } = {}) {
     // Reconcile the tab strip + preview slot.
-    const already = this.snap.openTabs.includes(rel);
+    const already = this.snap.openTabs.includes(abs);
     let openTabs = this.snap.openTabs;
     let previewTab = this.snap.previewTab;
     if (preview) {
       if (already) {
         // existing tab — activate it; a permanent tab stays permanent.
       } else if (previewTab && this.snap.openTabs.includes(previewTab)) {
-        openTabs = this.snap.openTabs.map((t) => (t === previewTab ? rel : t)); // reuse the slot
-        previewTab = rel;
+        openTabs = this.snap.openTabs.map((t) => (t === previewTab ? abs : t)); // reuse the slot
+        previewTab = abs;
       } else {
-        openTabs = [...this.snap.openTabs, rel];
-        previewTab = rel;
+        openTabs = [...this.snap.openTabs, abs];
+        previewTab = abs;
       }
     } else {
-      if (!already) openTabs = [...this.snap.openTabs, rel];
-      if (previewTab === rel) previewTab = null; // promote to permanent
+      if (!already) openTabs = [...this.snap.openTabs, abs];
+      if (previewTab === abs) previewTab = null; // promote to permanent
     }
+    this.set({ openTabs, previewTab, activeTab: abs });
 
-    if (!this.editor || !this.monaco) {
-      // editor still loading — remember the intent
-      this.set({ openTabs, previewTab, activeTab: rel });
-      return;
+    if (!this.editor || !this.monaco) return; // editor still loading — intent remembered
+    const model = await this.ensureModel(abs);
+    if (model && this.snap.activeTab === abs) {
+      this.editor.setModel(model);
+      this.editor.focus();
     }
-    const monaco = this.monaco;
-    const abs = this.currentDemo.dir + "/" + rel;
-    let model = this.models.get(abs);
-    if (!model) {
-      const uri = monaco.Uri.file(abs);
-      model = monaco.editor.getModel(uri) || monaco.editor.createModel(this.localFiles[abs] ?? "", languageFor(rel), uri);
-      model.onDidChangeContent(() => {
-        // No auto-save — an edit just marks the tab dirty (⌘S / the close prompt
-        // persists it). Reverting back to the saved text clears the dirty flag.
-        const changed = model!.getValue() !== (this.localFiles[abs] ?? "");
-        const isDirty = this.snap.dirty.includes(rel);
-        if (changed && !isDirty) this.set({ dirty: [...this.snap.dirty, rel] });
-        else if (!changed && isDirty) this.set({ dirty: this.snap.dirty.filter((x) => x !== rel) });
-        if (changed && this.snap.previewTab === rel) this.set({ previewTab: null }); // editing pins the tab
-      });
-      this.models.set(abs, model);
-    }
-    this.editor.setModel(model);
-    this.set({ activeTab: rel, openTabs, previewTab });
-    this.editor.focus();
   }
 
   // Double-clicking a preview tab (or Explorer entry) pins it permanently.
-  pinTab(rel: string) {
-    if (this.snap.previewTab === rel) this.set({ previewTab: null });
+  pinTab(abs: string) {
+    if (this.snap.previewTab === abs) this.set({ previewTab: null });
   }
 
-  closeTab(rel: string) {
-    const i = this.snap.openTabs.indexOf(rel);
+  closeTab(abs: string) {
+    const i = this.snap.openTabs.indexOf(abs);
     if (i === -1) return;
-    const openTabs = this.snap.openTabs.filter((x) => x !== rel);
-    const previewTab = this.snap.previewTab === rel ? null : this.snap.previewTab;
-    if (this.snap.activeTab === rel) {
+    const openTabs = this.snap.openTabs.filter((x) => x !== abs);
+    const previewTab = this.snap.previewTab === abs ? null : this.snap.previewTab;
+    if (this.snap.activeTab === abs) {
       const next = openTabs[i] || openTabs[i - 1] || null;
       this.set({ openTabs, previewTab, activeTab: next });
-      if (next) this.openFile(next);
+      if (next) void this.openFile(next);
       else this.editor?.setModel(null);
     } else {
       this.set({ openTabs, previewTab });
@@ -503,15 +606,17 @@ export class IdeController {
 
   // Persist a file to the VFS (⌘S, or "Save" in the close prompt). The dev server
   // hot-updates/recompiles off the resulting notifyWatch.
-  saveFile(rel: string) {
-    if (!this.currentDemo || !this.snap.dirty.includes(rel)) return;
-    const abs = this.currentDemo.dir + "/" + rel;
+  saveFile(abs: string) {
+    if (!this.snap.dirty.includes(abs)) return;
     const contents = this.models.get(abs)?.getValue() ?? this.localFiles[abs] ?? "";
     this.localFiles[abs] = contents;
     this.bridge.post("oc-write", { path: abs, contents });
+    const folder = this.folderForPath(abs);
+    if (folder) this.touchProject(folder.rootPath);
+    const reload = folder ? this.folderManifests.get(folder.rootPath)?.reload : false;
     this.set({
-      dirty: this.snap.dirty.filter((x) => x !== rel),
-      status: this.currentDemo.reload ? `saved ${rel} — recompiling…` : `saved ${rel} — hot-updating…`,
+      dirty: this.snap.dirty.filter((x) => x !== abs),
+      status: reload ? `saved ${baseName(abs)} — recompiling…` : `saved ${baseName(abs)} — hot-updating…`,
     });
   }
 
@@ -520,53 +625,256 @@ export class IdeController {
   }
 
   // Throw away unsaved edits, reverting the model to the last-saved text.
-  discardFile(rel: string) {
-    if (!this.currentDemo) return;
-    const abs = this.currentDemo.dir + "/" + rel;
+  discardFile(abs: string) {
     const model = this.models.get(abs);
     const saved = this.localFiles[abs] ?? "";
     if (model && model.getValue() !== saved) model.setValue(saved); // fires onDidChangeContent → clears dirty
-    this.set({ dirty: this.snap.dirty.filter((x) => x !== rel) });
+    this.set({ dirty: this.snap.dirty.filter((x) => x !== abs) });
   }
 
-  private loadProject(m: KernelMessage) {
-    this.currentDemo = { id: m.id as string, dir: m.dir as string, reload: !!m.reload, title: m.title as string };
-    this.projectFiles = (m.files as Record<string, string>) || {};
-    for (const [rel, contents] of Object.entries(this.projectFiles)) {
-      this.localFiles[(m.dir as string) + "/" + rel] = contents;
+  // ── workspace folders ──────────────────────────────────────────────────────
+  get activeFolder(): WorkspaceFolder | null {
+    return this.snap.workspaceFolders.find((f) => f.id === this.snap.activeFolderId) ?? null;
+  }
+  private folderForPath(abs: string): WorkspaceFolder | null {
+    let best: WorkspaceFolder | null = null;
+    for (const f of this.snap.workspaceFolders) {
+      if (abs === f.rootPath || abs.startsWith(f.rootPath + "/")) {
+        if (!best || f.rootPath.length > best.rootPath.length) best = f;
+      }
     }
-    this.set({ projectTitle: (m.title as string) || (m.id as string), files: Object.keys(this.projectFiles) });
-    const entry = m.entry as string | undefined;
-    if (entry && this.projectFiles[entry]) this.openFile(entry);
-    else {
-      const first = Object.keys(this.projectFiles)[0];
-      if (first) this.openFile(first);
+    return best;
+  }
+
+  // Add a root to the workspace (or focus it if already open) and show it.
+  openFolder(rootPath: string, name?: string): WorkspaceFolder {
+    const root = normDir(rootPath);
+    const id = folderIdFor(root);
+    let folder = this.snap.workspaceFolders.find((f) => f.id === id);
+    if (!folder) {
+      folder = { id, name: name || baseName(root) || root, rootPath: root };
+      this.set({ workspaceFolders: [...this.snap.workspaceFolders, folder] });
+    }
+    this.set({
+      activeFolderId: id,
+      view: "workspace",
+      projectTitle: folder.name,
+      treeVersion: this.snap.treeVersion + 1,
+    });
+    void this.indexFolder(root);
+    return folder;
+  }
+
+  closeFolder(id: string) {
+    const folder = this.snap.workspaceFolders.find((f) => f.id === id);
+    if (!folder) return;
+    const root = folder.rootPath;
+    // Drop the folder's open tabs/models + its file index.
+    for (const abs of [...this.snap.openTabs]) {
+      if (abs === root || abs.startsWith(root + "/")) {
+        this.disposeModel(abs);
+        delete this.localFiles[abs];
+      }
+    }
+    const keep = (p: string) => !(p === root || p.startsWith(root + "/"));
+    const openTabs = this.snap.openTabs.filter(keep);
+    let activeTab = this.snap.activeTab && keep(this.snap.activeTab) ? this.snap.activeTab : openTabs[openTabs.length - 1] ?? null;
+    this.fileIndex.delete(root);
+    this.folderManifests.delete(root);
+    const folders = this.snap.workspaceFolders.filter((f) => f.id !== id);
+    const activeFolderId = this.snap.activeFolderId === id ? folders[folders.length - 1]?.id ?? null : this.snap.activeFolderId;
+    this.set({
+      workspaceFolders: folders,
+      activeFolderId,
+      openTabs,
+      activeTab,
+      previewTab: this.snap.previewTab && keep(this.snap.previewTab) ? this.snap.previewTab : null,
+      dirty: this.snap.dirty.filter(keep),
+      files: this.rebuildFileIndex(),
+      view: folders.length ? "workspace" : "home",
+      projectTitle: folders.length ? (folders.find((f) => f.id === activeFolderId)?.name ?? null) : null,
+    });
+    if (activeTab) void this.openFile(activeTab);
+    else this.editor?.setModel(null);
+  }
+
+  setActiveFolder(id: string) {
+    const f = this.snap.workspaceFolders.find((x) => x.id === id);
+    if (f) this.set({ activeFolderId: id, projectTitle: f.name });
+  }
+
+  // Recursively index a folder's files (skipping heavy dirs) for quick-open +
+  // filename search. Bounded so a giant tree can't lock up the UI.
+  private async indexFolder(root: string) {
+    const skip = new Set(["node_modules", ".git", "dist", ".vite", ".next", "build", ".cache"]);
+    const out: string[] = [];
+    const walk = async (dir: string, depth: number) => {
+      if (depth > 8 || out.length > 4000) return;
+      const entries = await this.readdir(dir);
+      for (const e of entries) {
+        const abs = dir + "/" + e.name;
+        if (e.dir) {
+          if (!skip.has(e.name)) await walk(abs, depth + 1);
+        } else {
+          out.push(abs);
+        }
+      }
+    };
+    await walk(root, 0);
+    this.fileIndex.set(root, out);
+    this.set({ files: this.rebuildFileIndex() });
+  }
+  private rebuildFileIndex(): string[] {
+    const all: string[] = [];
+    for (const list of this.fileIndex.values()) all.push(...list);
+    return all.sort();
+  }
+
+  // ── project creation / opening (Home) ──────────────────────────────────────
+  private slug(name: string): string {
+    return name.trim().toLowerCase().replace(/[^a-z0-9-_]+/g, "-").replace(/^-+|-+$/g, "") || "project";
+  }
+  // A sensible default directory for a new project of the given name.
+  defaultDirFor(name: string): string {
+    return "/home/user/projects/" + this.slug(name);
+  }
+
+  // Validate a target directory for a NEW project. Returns an error string or null.
+  async validateNewDir(dir: string): Promise<string | null> {
+    const abs = normDir(dir);
+    if (!abs.startsWith("/")) return "Path must be absolute (start with /).";
+    if (abs === "/" || this.snap.workspaceFolders.some((f) => f.rootPath === abs))
+      return "That directory is already open in the workspace.";
+    if (this.snap.recentProjects.some((p) => p.rootPath === abs))
+      return "A project already exists at that path.";
+    const info = await this.pathInfo(abs);
+    if (info.exists && !info.isDir) return "A file already exists at that path.";
+    if (info.exists && info.isDir) {
+      const entries = await this.readdir(abs);
+      if (entries.length) return "That directory is not empty.";
+    }
+    return null;
+  }
+
+  async createBlankProject({ name, dir }: { name: string; dir: string }) {
+    const root = normDir(dir);
+    const files: Record<string, string> = {
+      "package.json": JSON.stringify(
+        { name: this.slug(name), version: "0.0.0", private: true, type: "module", scripts: { start: "node index.js" } },
+        null,
+        2,
+      ) + "\n",
+      "index.js": `console.log("Hello from ${name}!");\n`,
+      "README.md": `# ${name}\n\nA blank project created in OpenContainer Studio.\n`,
+    };
+    const res = await this.bridge.request("oc-create-project", { dir: root, files, title: name });
+    if (!res.ok) {
+      toast.error(`Couldn't create project: ${res.error ?? "unknown error"}`);
+      return;
+    }
+    this.upsertProjectMeta({ name, rootPath: root, template: null });
+    this.openFolder(root, name);
+    void this.openFile(root + "/index.js");
+    this.set({ status: `created ${name}` });
+  }
+
+  async createFromTemplate({ templateId, name, dir, runInit }: {
+    templateId: string; name: string; dir: string; runInit: boolean;
+  }) {
+    const t = getTemplate(templateId);
+    if (!t) {
+      toast.error("Unknown template");
+      return;
+    }
+    const root = normDir(dir);
+    const title = `${t.manifest.name} · ${t.manifest.language}`;
+    const res = await this.bridge.request("oc-create-project", {
+      dir: root,
+      files: t.files,
+      manifest: t.manifest,
+      title,
+    });
+    if (!res.ok) {
+      toast.error(`Couldn't create project: ${res.error ?? "unknown error"}`);
+      return;
+    }
+    this.folderManifests.set(root, t.manifest);
+    this.upsertProjectMeta({ name, rootPath: root, template: templateId });
+    this.openFolder(root, name);
+    void this.openFile(root + "/" + t.manifest.entry);
+    if (runInit) {
+      this.runProject(root);
+    } else {
+      this.set({ status: `${name} created — run \`${t.manifest.install}\` then \`${t.manifest.dev}\`` });
     }
   }
 
-  // ── file operations (Explorer context menu) ──────────────────────────────
-  private absOf(rel: string): string {
-    return this.currentDemo ? this.currentDemo.dir + "/" + rel : rel;
-  }
-  // Is `rel` an existing file, or a directory prefix of existing files?
-  private pathExists(rel: string): boolean {
-    return this.snap.files.some((f) => f === rel || f.startsWith(rel + "/"));
-  }
-  // Return `rel` (or `name-copy.ext`, `-copy-2`, …) so a paste never clobbers.
-  private uniqueName(rel: string): string {
-    if (!this.pathExists(rel)) return rel;
-    const slash = rel.lastIndexOf("/");
-    const dir = slash === -1 ? "" : rel.slice(0, slash + 1);
-    const base = slash === -1 ? rel : rel.slice(slash + 1);
-    const dot = base.lastIndexOf("."); // leading dot (dotfile) => treat as no extension
-    const stem = dot > 0 ? base.slice(0, dot) : base;
-    const ext = dot > 0 ? base.slice(dot) : "";
-    for (let n = 1; ; n++) {
-      const candidate = `${dir}${stem}-copy${n > 1 ? `-${n}` : ""}${ext}`;
-      if (!this.pathExists(candidate)) return candidate;
+  // Open a previously-created project from the Home recent list.
+  async openProject(meta: ProjectMeta) {
+    const root = normDir(meta.rootPath);
+    const info = await this.pathInfo(root);
+    if (!info.exists) {
+      toast.error("This project's files are no longer on disk.");
+      this.removeProjectMeta(root);
+      return;
     }
+    if (meta.template) {
+      const t = getTemplate(meta.template);
+      if (t) {
+        this.folderManifests.set(root, t.manifest);
+        this.bridge.post("oc-register-project", { dir: root, manifest: t.manifest, title: meta.name });
+      }
+    }
+    this.touchProject(root);
+    this.openFolder(root, meta.name);
+    const manifest = this.folderManifests.get(root);
+    if (manifest) void this.openFile(root + "/" + manifest.entry);
   }
 
+  // Run a project: open a shell in its dir and auto-run install && dev. Re-uses
+  // the existing run terminal if it's still alive.
+  runProject(rootPath: string) {
+    const root = normDir(rootPath);
+    const manifest = this.folderManifests.get(root);
+    this.set({ panelCollapsed: false });
+    const running = this.runningProjects.get(root);
+    if (running && running.terminalId && this.terms.has(running.terminalId)) {
+      this.switchTerminal(running.terminalId);
+      if (running.port) this.pointPreview(running.port);
+      return;
+    }
+    if (!manifest) {
+      // No known dev command — just drop the user into a shell in the project.
+      this.openTerminalIn(root);
+      return;
+    }
+    const tid = this.newShellTerminal({ cwd: root, run: manifest.dev, label: manifest.dev });
+    this.runningProjects.set(root, { terminalId: tid, port: null });
+    this.set({ status: "installing from npm + booting in-VM…" });
+  }
+
+  // Run the currently-focused folder (TitleBar / command palette Run).
+  runActiveFolder() {
+    const f = this.activeFolder;
+    if (f) this.runProject(f.rootPath);
+    else toast.error("Open a project first");
+  }
+
+  // Open a new terminal rooted at `absDir` (Explorer "Open in Integrated Terminal").
+  openTerminalIn(absDir: string) {
+    const dir = normDir(absDir);
+    this.set({ panelCollapsed: false });
+    this.newShellTerminal({ cwd: dir, label: baseName(dir) || "sh", activate: true });
+  }
+
+  goHome() {
+    this.set({ view: "home" });
+  }
+  showWorkspace() {
+    if (this.snap.workspaceFolders.length) this.set({ view: "workspace" });
+  }
+
+  // ── file operations (Explorer) — all absolute-path based ──────────────────
   private disposeModel(abs: string) {
     const model = this.models.get(abs);
     if (!model) return;
@@ -575,97 +883,127 @@ export class IdeController {
     this.models.delete(abs);
   }
 
-  // Remap every rel that is `oldRel` or lives under it → the `newRel` subtree,
-  // updating the file list, cached contents, Monaco models, tabs, and dirty set.
-  private applyMove(oldRel: string, newRel: string) {
-    const map = (r: string) =>
-      r === oldRel ? newRel : r.startsWith(oldRel + "/") ? newRel + r.slice(oldRel.length) : r;
-    const affected = this.snap.files.filter((f) => f === oldRel || f.startsWith(oldRel + "/"));
-    for (const rel of affected) {
-      const oldAbs = this.absOf(rel);
-      const newAbs = this.absOf(map(rel));
-      this.disposeModel(oldAbs);
-      if (oldAbs in this.localFiles) { this.localFiles[newAbs] = this.localFiles[oldAbs]; delete this.localFiles[oldAbs]; }
-      if (rel in this.projectFiles) { this.projectFiles[map(rel)] = this.projectFiles[rel]; delete this.projectFiles[rel]; }
+  private bumpTree() {
+    if (this.treeBump) clearTimeout(this.treeBump);
+    this.treeBump = setTimeout(() => {
+      this.treeBump = null;
+      const root = this.activeFolder?.rootPath;
+      if (root) void this.indexFolder(root);
+      this.set({ treeVersion: this.snap.treeVersion + 1 });
+    }, 60);
+  }
+
+  // Remap every open path that is `oldAbs` (or lives under it) onto `newAbs`.
+  private remapOpenPaths(oldAbs: string, newAbs: string) {
+    const map = (p: string) =>
+      p === oldAbs ? newAbs : p.startsWith(oldAbs + "/") ? newAbs + p.slice(oldAbs.length) : p;
+    for (const abs of this.snap.openTabs) {
+      if (abs === oldAbs || abs.startsWith(oldAbs + "/")) {
+        const dest = map(abs);
+        this.disposeModel(abs);
+        if (abs in this.localFiles) { this.localFiles[dest] = this.localFiles[abs]; delete this.localFiles[abs]; }
+      }
     }
     this.set({
-      files: this.snap.files.map(map),
       openTabs: this.snap.openTabs.map(map),
       activeTab: this.snap.activeTab ? map(this.snap.activeTab) : null,
       previewTab: this.snap.previewTab ? map(this.snap.previewTab) : null,
       dirty: this.snap.dirty.map(map),
     });
-    if (this.snap.activeTab) this.openFile(this.snap.activeTab, { preview: this.snap.previewTab === this.snap.activeTab });
+    if (this.snap.activeTab) void this.openFile(this.snap.activeTab, { preview: this.snap.previewTab === this.snap.activeTab });
   }
 
-  private removePaths(rel: string) {
-    const affected = new Set(this.snap.files.filter((f) => f === rel || f.startsWith(rel + "/")));
-    for (const r of affected) {
-      this.disposeModel(this.absOf(r));
-      delete this.localFiles[this.absOf(r)];
-      delete this.projectFiles[r];
-    }
-    const openTabs = this.snap.openTabs.filter((t) => !affected.has(t));
+  private dropOpenPaths(abs: string) {
+    const affected = new Set(this.snap.openTabs.filter((p) => p === abs || p.startsWith(abs + "/")));
+    for (const p of affected) { this.disposeModel(p); delete this.localFiles[p]; }
+    const openTabs = this.snap.openTabs.filter((p) => !affected.has(p));
     let activeTab = this.snap.activeTab;
     if (activeTab && affected.has(activeTab)) activeTab = openTabs[openTabs.length - 1] ?? null;
     this.set({
-      files: this.snap.files.filter((f) => !affected.has(f)),
       openTabs,
       activeTab,
       previewTab: this.snap.previewTab && affected.has(this.snap.previewTab) ? null : this.snap.previewTab,
-      dirty: this.snap.dirty.filter((d) => !affected.has(d)),
+      dirty: this.snap.dirty.filter((p) => !affected.has(p)),
     });
-    if (activeTab) this.openFile(activeTab);
+    if (activeTab) void this.openFile(activeTab);
     else this.editor?.setModel(null);
   }
 
-  private copyPaths(srcRel: string, destRel: string) {
-    const affected = this.snap.files.filter((f) => f === srcRel || f.startsWith(srcRel + "/"));
-    const added: string[] = [];
-    for (const rel of affected) {
-      const newRel = rel === srcRel ? destRel : destRel + rel.slice(srcRel.length);
-      const srcAbs = this.absOf(rel);
-      const destAbs = this.absOf(newRel);
-      if (srcAbs in this.localFiles) this.localFiles[destAbs] = this.localFiles[srcAbs];
-      if (rel in this.projectFiles) this.projectFiles[newRel] = this.projectFiles[rel];
-      added.push(newRel);
-    }
-    this.set({ files: [...this.snap.files, ...added] });
+  copyEntry(abs: string) { this.set({ clipboard: { mode: "copy", abs } }); }
+  cutEntry(abs: string) { this.set({ clipboard: { mode: "cut", abs } }); }
+
+  renameEntry(oldAbs: string, newName: string) {
+    const name = newName.trim();
+    if (!name || name === baseName(oldAbs)) return;
+    const parent = oldAbs.slice(0, oldAbs.lastIndexOf("/"));
+    const newAbs = parent + "/" + name;
+    this.bridge.post("oc-rename", { from: oldAbs, to: newAbs });
+    this.remapOpenPaths(oldAbs, newAbs);
+    if (this.snap.clipboard?.abs === oldAbs) this.set({ clipboard: null });
+    this.bumpTree();
   }
 
-  copyEntry(rel: string) { this.set({ clipboard: { mode: "copy", rel } }); }
-  cutEntry(rel: string) { this.set({ clipboard: { mode: "cut", rel } }); }
-
-  renameEntry(oldRel: string, newRel: string) {
-    if (!this.currentDemo || !newRel || oldRel === newRel) return;
-    if (this.pathExists(newRel)) { toast.error(`"${newRel}" already exists`); return; }
-    this.bridge.post("oc-rename", { from: this.absOf(oldRel), to: this.absOf(newRel) });
-    this.applyMove(oldRel, newRel);
-    if (this.snap.clipboard?.rel === oldRel) this.set({ clipboard: null });
+  deleteEntry(abs: string) {
+    this.bridge.post("oc-rm", { path: abs });
+    this.dropOpenPaths(abs);
+    if (this.snap.clipboard?.abs === abs) this.set({ clipboard: null });
+    this.bumpTree();
   }
 
-  deleteEntry(rel: string) {
-    if (!this.currentDemo) return;
-    this.bridge.post("oc-rm", { path: this.absOf(rel) });
-    this.removePaths(rel);
-    if (this.snap.clipboard?.rel === rel) this.set({ clipboard: null });
-  }
-
-  // Paste the clipboard entry into `destDir` ("" = project root).
-  pasteInto(destDir: string) {
+  // Paste the clipboard entry into `destDirAbs`.
+  async pasteInto(destDirAbs: string) {
     const cb = this.snap.clipboard;
-    if (!cb || !this.currentDemo) return;
-    const name = cb.rel.split("/").pop()!;
+    if (!cb) return;
+    const dest = normDir(destDirAbs);
+    const name = baseName(cb.abs);
     // Cutting a folder into itself/descendant would be invalid — ignore.
-    if (cb.mode === "cut" && (destDir === cb.rel || destDir.startsWith(cb.rel + "/"))) return;
-    const target = this.uniqueName(destDir ? destDir + "/" + name : name);
+    if (cb.mode === "cut" && (dest === cb.abs || dest.startsWith(cb.abs + "/"))) return;
+    let target = dest + "/" + name;
+    // Avoid clobbering: append -copy, -copy-2, … until the path is free.
+    if ((await this.pathInfo(target)).exists) {
+      const dot = name.lastIndexOf(".");
+      const stem = dot > 0 ? name.slice(0, dot) : name;
+      const ext = dot > 0 ? name.slice(dot) : "";
+      for (let n = 1; ; n++) {
+        const cand = `${dest}/${stem}-copy${n > 1 ? `-${n}` : ""}${ext}`;
+        if (!(await this.pathInfo(cand)).exists) { target = cand; break; }
+      }
+    }
     if (cb.mode === "copy") {
-      this.bridge.post("oc-copy", { from: this.absOf(cb.rel), to: this.absOf(target) });
-      this.copyPaths(cb.rel, target);
+      this.bridge.post("oc-copy", { from: cb.abs, to: target });
     } else {
-      this.bridge.post("oc-rename", { from: this.absOf(cb.rel), to: this.absOf(target) });
-      this.applyMove(cb.rel, target);
+      this.bridge.post("oc-rename", { from: cb.abs, to: target });
+      this.remapOpenPaths(cb.abs, target);
       this.set({ clipboard: null });
+    }
+    this.bumpTree();
+  }
+
+  // Create an empty file / folder (Explorer "New File" / "New Folder").
+  async newFile(destDirAbs: string, name: string) {
+    const clean = name.trim();
+    if (!clean) return;
+    const abs = normDir(destDirAbs) + "/" + clean;
+    if ((await this.pathInfo(abs)).exists) { toast.error(`"${clean}" already exists`); return; }
+    await this.bridge.request("oc-write", { path: abs, contents: "" });
+    this.bumpTree();
+    void this.openFile(abs);
+  }
+  async newFolder(destDirAbs: string, name: string) {
+    const clean = name.trim();
+    if (!clean) return;
+    const abs = normDir(destDirAbs) + "/" + clean;
+    if ((await this.pathInfo(abs)).exists) { toast.error(`"${clean}" already exists`); return; }
+    await this.bridge.request("oc-mkdirp", { path: abs });
+    this.bumpTree();
+  }
+
+  copyPath(abs: string) {
+    try {
+      void navigator.clipboard?.writeText(abs);
+      this.set({ status: `copied path: ${abs}` });
+    } catch {
+      toast.error("Clipboard unavailable");
     }
   }
 
@@ -904,13 +1242,13 @@ export class IdeController {
     });
   }
 
-  // ── demo run ──
+  // ── demo run (legacy built-in examples) ────────────────────────────────────
   setSelectedDemo(id: string) {
     this.set({ selectedDemo: id });
   }
   runDemo() {
     const demo = this.snap.selectedDemo;
-    this.set({ panelCollapsed: false });
+    this.set({ panelCollapsed: false, view: "workspace" });
     const running = this.runningDemos.get(demo);
     if (running && running.terminalId && this.terms.has(running.terminalId)) {
       this.switchTerminal(running.terminalId);
@@ -953,9 +1291,12 @@ export class IdeController {
       const dim = (m.dim as boolean) || m.cls === "muted";
       this.consoleLine(m.line as string, stderr ? "31" : dim ? "90" : undefined);
     });
+    // The kernel + VFS are up (before the PM tarballs finish loading) — the Home
+    // screen can create/open projects now, so don't make the user wait for `ready`.
+    b.on("kernel-online", () => this.set({ kernelReady: true }));
     b.on("ready", () => {
       this.consoleLine("Kernel ready.", "32");
-      this.set({ booted: true, status: "ready — pick a project and press Run" });
+      this.set({ booted: true, kernelReady: true, status: "ready — create or open a project" });
       this.newShellTerminal({ defer: true, activate: false });
     });
     b.on("exit", (m) => {
@@ -1009,6 +1350,15 @@ export class IdeController {
         if (gone?.port != null && this.snap.previewTabs.some((t) => t.port === gone.port))
           this.set({ status: "dev server stopped — preview will 502 until you Run again" });
       }
+      // A created/opened project's run tab ended → server gone.
+      for (const [dir, r] of this.runningProjects) {
+        if (r.terminalId === id) {
+          this.runningProjects.delete(dir);
+          if (r.port != null && this.portMap.delete(r.port)) this.syncPorts();
+          if (r.port != null && this.snap.previewTabs.some((t) => t.port === r.port))
+            this.set({ status: "dev server stopped — preview will 502 until you Run again" });
+        }
+      }
       this.syncTerminals();
     });
 
@@ -1022,12 +1372,21 @@ export class IdeController {
       }
     });
 
+    // Legacy built-in demo became ready.
     b.on("demo-ready", (m) => {
       this.pointPreview(m.port as number);
       const r = this.runningDemos.get(m.id as string);
       if (r) r.port = m.port as number;
       else this.runningDemos.set(m.id as string, { terminalId: null, port: m.port as number });
-      this.loadProject(m);
+      const dir = m.dir as string;
+      const runLabel = DEMOS.find((d) => d.id === m.id)?.runLabel ?? "npm run dev";
+      this.folderManifests.set(normDir(dir), {
+        id: m.id as string, framework: "react", name: m.title as string, language: "JavaScript",
+        description: "", port: m.port as number, openPath: "/", entry: m.entry as string,
+        hmr: !!m.hmr, reload: !!m.reload, install: "npm install", dev: runLabel,
+      });
+      this.openFolder(dir, m.title as string);
+      if (m.entry) void this.openFile(dir + "/" + (m.entry as string));
       this.set({
         status: m.reload ? `${m.title} running — edits recompile + restart` : `${m.title} running — edits hot-reload`,
       });
@@ -1037,6 +1396,29 @@ export class IdeController {
       this.set({ status: `${m.title} restarted — preview reloaded` });
     });
     b.on("demo-status", (m) => this.set({ status: m.line as string }));
+
+    // A created/opened project's dev server is up.
+    b.on("project-ready", (m) => {
+      const dir = normDir(m.dir as string);
+      this.pointPreview(m.port as number);
+      const r = this.runningProjects.get(dir);
+      if (r) r.port = m.port as number;
+      else this.runningProjects.set(dir, { terminalId: null, port: m.port as number });
+      if (!this.snap.workspaceFolders.some((f) => f.rootPath === dir)) this.openFolder(dir, m.title as string);
+      if (m.entry) void this.openFile(dir + "/" + (m.entry as string));
+      this.touchProject(dir);
+      this.set({
+        status: m.reload ? `${m.title} running — edits recompile + restart` : `${m.title} running — edits hot-reload`,
+      });
+    });
+    b.on("project-reload", (m) => {
+      for (const t of this.snap.previewTabs) if (t.port === m.port) this.reloadPreviewTab(t.id);
+      this.set({ status: `${m.title} restarted — preview reloaded` });
+    });
+
+    // The VFS changed under us (a file op, an install, a create) — refresh the
+    // Explorer's live tree + re-index the active folder for quick-open/search.
+    b.on("oc-fs-changed", () => this.bumpTree());
 
     // Result of an Explorer file operation (rename/rm/copy). The UI already updated
     // optimistically; surface any failure so the user knows the VFS is out of sync.

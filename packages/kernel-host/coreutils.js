@@ -312,11 +312,31 @@ async function runBatch() {
 // input to a foreground child while one is running. cwd/env persist across
 // commands (one long-lived process), just like a local shell.
 function runInteractive() {
-  const PROMPT = '\\x1b[36m$\\x1b[0m ';
-  let line = '';
+  // Prompt shows the current folder name (basename of cwd) so you always know
+  // where you are, e.g. \`asd$ \`. Root shows \`/\`. Recomputed each print so it
+  // tracks \`cd\`.
+  const cwdName = () => {
+    const parts = process.cwd().split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : '/';
+  };
+  const promptStr = () => '\\x1b[36m' + cwdName() + '$\\x1b[0m ';
+
+  let line = '';   // current input buffer
+  let pos = 0;     // cursor position within \`line\`
+  const history = [];
+  let histIdx = 0; // == history.length means "editing a fresh line"
   let busy = false;
   const queue = [];
-  const prompt = () => process.stdout.write(PROMPT);
+
+  const prompt = () => process.stdout.write(promptStr());
+  // Redraw the current line in place (col 0 → clear → prompt+line) and put the
+  // cursor back at \`pos\`. Used for edits that aren't a plain append-at-end.
+  const redraw = () => {
+    process.stdout.write('\\r\\x1b[K' + promptStr() + line);
+    const back = line.length - pos;
+    if (back > 0) process.stdout.write('\\x1b[' + back + 'D');
+  };
+  const setLine = (s) => { line = s; pos = s.length; redraw(); };
 
   const drain = async () => {
     if (busy) return;
@@ -327,6 +347,16 @@ function runInteractive() {
     }
     busy = false;
     prompt();
+  };
+
+  const submit = () => {
+    process.stdout.write('\\n');
+    const cmd = line;
+    if (cmd.trim() && history[history.length - 1] !== cmd) history.push(cmd);
+    histIdx = history.length;
+    queue.push(cmd);
+    line = ''; pos = 0;
+    drain();
   };
 
   process.stdin.setRawMode && process.stdin.setRawMode(true);
@@ -353,19 +383,44 @@ function runInteractive() {
       else { try { currentChild.stdin.write(s.replace(/\\r/g, '\\n')); } catch (e) {} }
       return;
     }
-    for (const ch of s) {
-      if (ch === '\\r' || ch === '\\n') {
-        process.stdout.write('\\n');
-        queue.push(line); line = '';
-        drain();
-      } else if (ch === '\\x7f' || ch === '\\b') {
-        if (line.length) { line = line.slice(0, -1); process.stdout.write('\\b \\b'); }
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      // CSI sequence: ESC [ <code>. Arrow keys, Home/End, Delete.
+      if (ch === '\\x1b' && s[i + 1] === '[') {
+        const code = s[i + 2];
+        if (code === 'A') { // up → previous history entry
+          if (histIdx > 0) { histIdx--; setLine(history[histIdx]); }
+          i += 2; continue;
+        }
+        if (code === 'B') { // down → next history entry (or a fresh empty line)
+          if (histIdx < history.length - 1) { histIdx++; setLine(history[histIdx]); }
+          else if (histIdx < history.length) { histIdx = history.length; setLine(''); }
+          i += 2; continue;
+        }
+        if (code === 'C') { if (pos < line.length) { pos++; process.stdout.write('\\x1b[C'); } i += 2; continue; } // right
+        if (code === 'D') { if (pos > 0) { pos--; process.stdout.write('\\x1b[D'); } i += 2; continue; }          // left
+        if (code === 'H') { pos = 0; redraw(); i += 2; continue; }               // Home
+        if (code === 'F') { pos = line.length; redraw(); i += 2; continue; }     // End
+        if (code === '3' && s[i + 3] === '~') { // Delete (forward)
+          if (pos < line.length) { line = line.slice(0, pos) + line.slice(pos + 1); redraw(); }
+          i += 3; continue;
+        }
+        if (code === '1' && s[i + 3] === '~') { pos = 0; redraw(); i += 3; continue; }            // Home
+        if (code === '4' && s[i + 3] === '~') { pos = line.length; redraw(); i += 3; continue; }  // End
+        i += 2; continue; // unknown CSI: swallow so it isn't echoed as garbage
+      }
+      if (ch === '\\r' || ch === '\\n') { submit(); }
+      else if (ch === '\\x7f' || ch === '\\b') { // backspace: delete before cursor
+        if (pos > 0) { line = line.slice(0, pos - 1) + line.slice(pos); pos--; redraw(); }
       } else if (ch === '\\x03') { // Ctrl+C: abort the current line
-        process.stdout.write('^C\\n'); line = ''; if (!busy) prompt();
+        process.stdout.write('^C\\n'); line = ''; pos = 0; histIdx = history.length; if (!busy) prompt();
       } else if (ch === '\\x04') { // Ctrl+D on an empty line: exit
         if (!line.length) { process.stdout.write('\\n'); process.exit(0); }
-      } else if (ch >= ' ') {
-        line += ch; process.stdout.write(ch);
+      } else if (ch === '\\x01') { pos = 0; redraw(); }          // Ctrl+A → start of line
+      else if (ch === '\\x05') { pos = line.length; redraw(); }  // Ctrl+E → end of line
+      else if (ch >= ' ') { // printable: insert at cursor
+        line = line.slice(0, pos) + ch + line.slice(pos); pos++;
+        if (pos === line.length) process.stdout.write(ch); else redraw();
       }
     }
   });

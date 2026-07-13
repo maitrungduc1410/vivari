@@ -11,6 +11,7 @@ import { TerminalPanel } from "./TerminalPanel";
 import { PreviewPanel } from "./PreviewPanel";
 import { StatusBar } from "./StatusBar";
 import { CommandPalette } from "./CommandPalette";
+import { HomeView } from "./Home";
 import { useIde } from "./useIde";
 
 export function AppShell() {
@@ -100,6 +101,9 @@ export function AppShell() {
       </div>
       <StatusBar />
       <CommandPalette />
+      {/* Home overlays the (kept-mounted) IDE so the editor/terminals survive a
+          round-trip to Home and back. */}
+      {snap.view === "home" && <HomeView />}
     </div>
   );
 }
