@@ -19,6 +19,7 @@ import { ensureRealNpm } from "../kernel-host/load-real-npm.js";
 import { ensureRealYarn } from "../kernel-host/load-real-yarn.js";
 import { ensureRealPnpm } from "../kernel-host/load-real-pnpm.js";
 import { ensureRealCorepack } from "../kernel-host/load-real-corepack.js";
+import { ensureRealTsgo, applyTsgoLoadingShims } from "../kernel-host/load-real-tsgo.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
@@ -40,6 +41,10 @@ const REAL_PNPM_ASSET = "/vendor/pnpm-pack.bin";
 // into the VFS so `corepack` on PATH can DOWNLOAD + run project-pinned yarn/pnpm/
 // npm versions (`packageManager` field), on top of the direct vendored defaults.
 const REAL_COREPACK_ASSET = "/vendor/corepack-pack.bin";
+// The real-TypeScript-7 (tsgo, Go/wasm) delivery asset (built by `npm run
+// vendor:tsgo`). ~11 MB gz, so it's loaded LAZILY in the background after boot;
+// unpacked into the VFS so `tsc`/`tsgo` on PATH are the real Go compiler.
+const REAL_TSGO_ASSET = "/vendor/tsgo-pack.bin";
 
 // [optimize] Compile the Rust/Wasm codecs (zlib #11, crypto #12) EXACTLY ONCE,
 // here in the kernel worker, and hand each Process Worker the resulting
@@ -419,6 +424,17 @@ async function announceProjectReady(dir, port) {
   } finally {
     p.pending = false;
   }
+}
+
+// A project's run started ANOTHER server (a second/third port from the same run
+// shell — e.g. a backend alongside the frontend) — surface it as an EXTRA preview
+// tab once it answers, without re-opening the folder/entry (the primary did that).
+async function announceProjectExtra(dir, port) {
+  const p = projects.get(dir);
+  if (!p) return;
+  const ok = await waitServing(port, 60000);
+  if (!ok) return;
+  post("project-ready", { dir, port, title: p.title, hmr: !!p.hmr, reload: !!p.reload, extra: true });
 }
 
 // Write a demo's starter files into the VFS — once. Re-running or opening another
@@ -815,6 +831,12 @@ async function boot() {
         if (p) {
           p.serving = false;
           p.pending = false;
+          // Drop every port this project surfaced so a re-run re-announces them
+          // (and each server's tab reopens) instead of being treated as restarts.
+          if (p.ports) {
+            for (const pt of p.ports) listening.delete(pt);
+            p.ports.clear();
+          }
           if (p.port != null) listening.delete(p.port);
         }
       }
@@ -833,12 +855,23 @@ async function boot() {
     const pdir = tid !== undefined ? projectDirByTerm.get(tid) : undefined;
     if (pdir && projects.has(pdir)) {
       const p = projects.get(pdir);
-      p.port = port;
-      if (p.serving) {
+      if (!p.ports) p.ports = new Set();
+      if (p.ports.has(port)) {
+        // A re-listen on a port we already surfaced → the server restarted →
+        // reload the preview tab(s) bound to it.
         post("project-reload", { dir: pdir, port, title: p.title });
-      } else if (!p.pending) {
-        p.pending = true;
-        announceProjectReady(pdir, port);
+      } else {
+        p.ports.add(port);
+        p.port = port;
+        if (!p.serving && !p.pending) {
+          // First server of this project → primary preview (opens folder + entry).
+          p.pending = true;
+          announceProjectReady(pdir, port);
+        } else {
+          // A second/third server started by the SAME run (e.g. a backend API or
+          // ws server alongside the frontend) → open an ADDITIONAL preview tab.
+          announceProjectExtra(pdir, port);
+        }
       }
       return;
     }
@@ -905,6 +938,13 @@ async function boot() {
   // WITHOUT waiting for the (multi-second) real npm/yarn/pnpm/corepack loads
   // below, which only matter once you actually run install/dev.
   post("kernel-online", {});
+
+  // `tsc`/`tsgo` exist immediately as a "still downloading" placeholder; the real
+  // TypeScript 7 (tsgo, ~11 MB) is loaded lazily in the background after `ready`
+  // (loadTsgoInBackground), then these shims are overwritten with the real runner.
+  // (When the tree is OPFS-restored the background load re-applies the real shims
+  // almost instantly, so the placeholder window is negligible.)
+  applyTsgoLoadingShims(kernel);
   try {
     const npmT0 = Date.now();
     const res = await ensureRealNpm(kernel, async () => {
@@ -1004,6 +1044,37 @@ async function boot() {
   post("ready", {});
   post("log", { line: `  [boot] kernel ready in ${Date.now() - t0}ms.`, dim: true });
   post("log", { line: "Kernel ready — pick a project and press Run." });
+
+  // Real TypeScript 7 (tsgo, Go/wasm) is ~11 MB, and nothing at boot needs it, so
+  // load it AFTER ready without blocking — `tsc`/`tsgo` flip from the "still
+  // downloading" placeholder to the real compiler when this settles. Persists in
+  // OPFS, so only the first origin visit pays the download.
+  void loadTsgoInBackground();
+}
+
+// Lazy, non-blocking loader for the real TypeScript 7 compiler (see above).
+async function loadTsgoInBackground() {
+  try {
+    const t0 = Date.now();
+    const res = await ensureRealTsgo(kernel, async () => {
+      const base = (self.location && self.location.origin) || "";
+      const r = await fetch(base + REAL_TSGO_ASSET);
+      if (!r.ok) return null;
+      return new Uint8Array(await r.arrayBuffer());
+    });
+    if (res && res.restored) {
+      post("log", { line: `  [tsgo] TypeScript 7 ready (restored from OPFS, +${Date.now() - t0}ms).`, dim: true });
+    } else if (res) {
+      post("log", {
+        line: `  [tsgo] TypeScript 7 (tsgo ${res.version}) loaded (${res.fileCount} files, +${Date.now() - t0}ms) — 'tsc'/'tsgo' ready.`,
+        dim: true,
+      });
+    } else {
+      post("log", { line: "  [tsgo] TypeScript 7 asset unavailable — `tsc`/`tsgo` not installed.", dim: true });
+    }
+  } catch (e) {
+    post("log", { line: `  [tsgo] TypeScript 7 load failed (${(e && e.message) || e}) — 'tsc'/'tsgo' not installed.`, dim: true });
+  }
 }
 
 // ── File-operation helpers (host Explorer: delete / copy / cut-paste) ────────

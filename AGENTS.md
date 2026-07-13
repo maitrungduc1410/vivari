@@ -48,6 +48,7 @@ packages/
     opfs-persistence.js  write-behind mirror of the VFS to OPFS (survives reload).
     node-gyp-stub.js     node-gyp no-op stub (native builds non-fatal) for real npm.
     load-real-npm.js     unpack the vendored real-npm asset into the VFS + shim /bin/npm.
+    load-real-tsgo.js     unpack the vendored TypeScript-7 (tsgo, Go/wasm) asset + shim /bin/tsc,/bin/tsgo.
     programs/npm.js       from-scratch npm installer — LEGACY fallback (see real npm below).
 
   runtime/         The Node runtime that runs INSIDE each process worker.
@@ -358,6 +359,48 @@ sha512 integrity), and execs it. What's special / must-not-regress:
 - Headless browser-shape gate: `scripts/spike-corepack-studio.mjs` (`OC_NET=1`
   downloads+runs yarn AND pnpm), using the SAME env (not CLI flags). The off-disk
   Path B proof is `scripts/spike-corepack.mjs`.
+
+### Real TypeScript 7 (`tsc`/`tsgo`) is Go compiled to wasm — don't try to `require` it
+
+TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
+(`scripts/vendor-tsgo.mjs` → `tsgo-pack.bin`; `packages/kernel-host/load-real-tsgo.js`
+`ensureRealTsgo` → installs `/bin/tsc.js` + `/bin/tsgo.js`). It runs on Path B because Go's
+`wasm_exec` glue drives everything through `globalThis.fs` — which IS our real Node
+`lib/fs.js` over the VFS — plus `crypto.getRandomValues`/`performance.now`/`TextEncoder`/
+`WebAssembly`. Must-not-regress:
+- The runner (written into `/usr/lib/tsgo/tsgo-run.js`) installs an `fs` whose **fd 1/2
+  writes go to `process.stdout`/`stderr`** (Go writes program output via `fs.writeSync`/
+  `fs.write`, which the VFS fs otherwise drops). It decodes to a UTF-8 string — passing a raw
+  `Uint8Array` to `process.stdout.write` renders as CSV byte codes.
+- `go.env` MUST stay tiny: Go's `wasm_exec` caps argv+env at ~12 KB of linear memory, so the
+  runner passes only `TMPDIR`/`HOME`/`PATH`, not the whole shell env.
+- It's ~11 MB gz, so the kernel worker loads it **lazily in the background after `ready`**
+  (`loadTsgoInBackground`), with a "still downloading" placeholder shim installed at boot; the
+  tree persists in OPFS. Don't move it into the awaited boot block.
+- Headless proofs: `scripts/spike-tsgo.mjs` (off-disk Path B) + `scripts/spike-tsgo-studio.mjs`
+  (shipped shim + shared loader). NOTE these need host **Node ≥ 22** — the vendored `fs.js`
+  uses `Array.fromAsync`, which the browser's V8 has but Node 20 lacks (a headless-only quirk;
+  in the browser it just works).
+
+### Cross-service WebSockets + host↔preview bridge
+
+- **`/preview/<port>/` ws routing.** The preview ws shim (in both `packages/studio/public/sw.js`
+  and `packages/demo/sw.js`) parses a `/preview/<port>/…` ws URL and tunnels to THAT in-VM
+  port (stripping the prefix); prefix-less URLs keep the iframe's own port, so **Vite HMR is
+  untouched**. The kernel already routes ws `open` by port, so this is a shim-only change.
+  Keep the two `sw.js` shims in sync. Regex lives in a template literal → backslashes are
+  DOUBLED (`\\/preview\\/(\\d+)…`).
+- **A preview tab per server.** `kernel.onListen` (in `kernel-worker.js`) opens a preview tab
+  for each distinct port a project's run shell binds — primary → `project-ready`, extras →
+  `project-ready {extra:true}` (the controller only adds a tab for extras). Ports are cleared
+  when the run shell exits so a re-run re-announces. The `ws-demo` template exploits this: one
+  `dev.js` starts an Express+`ws` backend (:3001) and a Vite frontend (:5173).
+- **`host.opencontainer.internal`.** `packages/demo/fetcher-worker.js` `rewrite()` maps that
+  alias (and `host.docker.internal`) to the studio's own hostname so in-VM code can reach a
+  service on the HOST machine. Reverse direction: the host hits `<studio-origin>/preview/<port>/…`.
+  Addressing convenience only — the target still needs ACAO + a COEP-satisfying CORP.
+- Headless proof: `scripts/spike-ws-demo.mjs` (real `ws` backend, both directions via the
+  kernel tunnel).
 
 ### `module` is a REAL constructor — route requires through `Module._load`
 `require('module')` returns the `Module` **constructor** (not a plain object);

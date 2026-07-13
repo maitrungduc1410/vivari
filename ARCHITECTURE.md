@@ -366,6 +366,14 @@ process opens a genuine **in-VM WebSocket client** (`websocket.js`, over Node's 
 http upgrade + the net loopback) to `127.0.0.1:<port>` and relays frames back out
 (`ws-out`). This is what makes Vite HMR work live in the preview.
 
+**Cross-service ws (FE ↔ BE).** The shim picks the target port from the ws URL: a
+`/preview/<port>/…` URL tunnels to THAT in-VM port (prefix stripped), the same convention
+as the HTTP preview proxy — so a frontend on :5173 can open a socket to a backend on :3001
+via `/preview/3001/ws`. URLs without the prefix keep the iframe's own port (HMR unchanged).
+The kernel routes the `open` by port (`handleWsClient` → `listeners.get(port)`), so this is
+a shim-only change. The `ws-demo` template (Express + `ws` backend, Vite frontend, started
+together) demonstrates both directions; each server gets its own preview tab (see 8.6).
+
 ### 8.5 In-browser DevTools + local address bar (studio)
 
 Each `PreviewPanel` tab is a mini-browser. The address bar is **local-only**:
@@ -414,6 +422,27 @@ one `writeFilesBatch` (`oc-create-project`) and registers a run manifest; "Run i
 opens a shell that runs `install && dev`. A dev server's `listen` is attributed to its project
 by walking the pid up to the run shell (`projectDirByTerm` / `terminalForPid`) → `project-ready`
 points the preview (the two legacy DEMOS still use the fixed-port `demoForPort` path).
+A run shell that binds **multiple ports** (e.g. a frontend + a backend) gets a preview tab per
+port — the first is the primary (`project-ready`), the rest are extras (`project-ready {extra}`);
+the port set is cleared when the run shell exits so a re-run re-announces.
+
+### 8.7 TypeScript 7 (tsgo, Go/wasm) + host↔preview bridge
+
+**`tsc`/`tsgo`.** TS 7's compiler is compiled Go. We ship the community `tsgo-wasm` build
+(`tsgo.wasm`, ~47 MB + the Go `wasm_exec` glue). It runs on Path B because `wasm_exec` drives
+everything through `globalThis.fs` — which IS our real Node `lib/fs.js` over the VFS — plus
+`crypto.getRandomValues`/`performance.now`/`TextEncoder`/`WebAssembly`. The only shim: Go writes
+program output to fd 1/2 via `fs.writeSync`/`write`, so the runner routes those two fds to
+`process.stdout`/`stderr`. Delivery mirrors npm/corepack (`scripts/vendor-tsgo.mjs` → a gzipped
+pack; `packages/kernel-host/load-real-tsgo.js` unpacks + installs `/bin/tsc.js` + `/bin/tsgo.js`),
+but it loads **lazily in the background after boot** (placeholder shim until then) and persists in
+OPFS. Proofs: `scripts/spike-tsgo.mjs`, `scripts/spike-tsgo-studio.mjs`.
+
+**Host ↔ preview.** In-VM code reaches a service on the HOST machine via
+`http://host.opencontainer.internal:<port>/…` — the fetcher (`fetcher-worker.js` `rewrite()`)
+maps the alias (and `host.docker.internal`) to the studio's own hostname. The reverse direction
+needs no alias: the host hits `<studio-origin>/preview/<port>/…` (the SW preview proxy). It's
+addressing convenience, not a CORS/auth bypass — the target must still allow the studio origin.
 
 ---
 
