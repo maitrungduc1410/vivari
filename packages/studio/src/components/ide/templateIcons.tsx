@@ -51,12 +51,32 @@ function ExpressIcon({ className }: IconProps) {
   );
 }
 
+function NextIcon({ className }: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} aria-hidden>
+      <circle cx="12" cy="12" r="10" fill="#000" />
+      <text
+        x="12"
+        y="16.5"
+        textAnchor="middle"
+        fontSize="12"
+        fontFamily="ui-sans-serif, system-ui, sans-serif"
+        fontWeight="700"
+        fill="#fff"
+      >
+        N
+      </text>
+    </svg>
+  );
+}
+
 const ICONS: Record<Framework, (p: IconProps) => React.ReactElement> = {
   react: ReactIcon,
   vue: VueIcon,
   svelte: (p) => <SvelteIcon className={p.className} />,
   express: ExpressIcon,
   nest: (p) => <NestIcon className={p.className} />,
+  next: NextIcon,
 };
 
 export function TemplateIcon({ framework, className }: { framework: Framework; className?: string }) {

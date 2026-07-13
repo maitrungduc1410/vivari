@@ -14,7 +14,7 @@
 // globbed via import.meta.glob) so it is bundled reliably and never dragged into
 // the studio's own tsc/eslint pass.
 
-export type Framework = "react" | "vue" | "svelte" | "express" | "nest";
+export type Framework = "react" | "vue" | "svelte" | "express" | "nest" | "next";
 export type Language = "TypeScript" | "JavaScript";
 
 export interface TemplateManifest {
@@ -1018,6 +1018,195 @@ server.listen(PORT, () => console.log('[backend] listening on :' + PORT + ' (htt
   };
 }
 
+// ── Next.js (App Router) ─────────────────────────────────────────────────────
+// Next 16 runs in-VM on `next dev --webpack` (Turbopack has no wasm build) with
+// the `@next/swc-wasm-nodejs` wasm SWC compiler — selected because the runtime
+// reports `process.versions.webcontainer` and npm skips the native
+// `@next/swc-<platform>` addon on arch wasm32. See scripts/spike-next.mjs.
+//
+// postinstall seeds Next's wasm cache from the installed package so first compile
+// is offline; if it is skipped, Next downloads the wasm on demand (also works).
+const nextSeedSwc = `// Best-effort: copy the installed @next/swc-wasm-nodejs into Next's wasm cache
+// dir so \`next dev\` loads the wasm SWC locally instead of downloading it at
+// first compile. Safe to fail — Next falls back to its own on-demand download.
+import fs from "node:fs";
+import path from "node:path";
+
+try {
+  const src = path.resolve("node_modules/@next/swc-wasm-nodejs");
+  const dst = path.resolve("node_modules/next/wasm/@next/swc-wasm-nodejs");
+  if (fs.existsSync(src) && !fs.existsSync(dst)) {
+    const cp = (s, d) => {
+      fs.mkdirSync(d, { recursive: true });
+      for (const e of fs.readdirSync(s, { withFileTypes: true })) {
+        const sp = path.join(s, e.name);
+        const dp = path.join(d, e.name);
+        if (e.isDirectory()) cp(sp, dp);
+        else fs.writeFileSync(dp, fs.readFileSync(sp));
+      }
+    };
+    cp(src, dst);
+    console.log("[seed-swc] seeded wasm SWC cache");
+  }
+} catch (e) {
+  console.warn("[seed-swc] skipped:", e && e.message);
+}
+`;
+
+const nextConfigMjs = `/** @type {import('next').NextConfig} */
+const nextConfig = {};
+
+export default nextConfig;
+`;
+
+const nextPageBody = (ts: boolean) => `export default function Home() {
+  return (
+    <main
+      style={{
+        minHeight: "100vh",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: "1rem",
+        fontFamily: "system-ui, sans-serif",
+        background: "#0a0a0a",
+        color: "#ededed",
+        textAlign: "center",
+        padding: "2rem",
+      }}
+    >
+      <h1 id="marker" style={{ fontSize: "2.25rem", margin: 0 }}>
+        Next.js App Router
+      </h1>
+      <p style={{ opacity: 0.7, margin: 0 }}>
+        Running in OpenContainer${ts ? " with TypeScript" : ""} — compiled by wasm SWC + webpack.
+      </p>
+      <p style={{ opacity: 0.5, margin: 0, fontSize: "0.9rem" }}>
+        Edit <code>app/page.${ts ? "tsx" : "js"}</code> and save to see changes.
+      </p>
+    </main>
+  );
+}
+`;
+
+function nextTemplate(ts: boolean): TemplateDef {
+  const ext = ts ? "tsx" : "js";
+  const files: Record<string, string> = {
+    "package.json": `{
+  "name": "next-app${ts ? "-ts" : ""}",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --webpack -p 3000",
+    "build": "next build --webpack",
+    "start": "next start -p 3000",
+    "postinstall": "node scripts/seed-swc.mjs"
+  },
+  "dependencies": {
+    "next": "^16.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "@next/swc-wasm-nodejs": "^16.0.0"
+  }${
+    ts
+      ? `,
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  }`
+      : ""
+  }
+}
+`,
+    "next.config.mjs": nextConfigMjs,
+    "scripts/seed-swc.mjs": nextSeedSwc,
+    [`app/layout.${ext}`]: ts
+      ? `import type { ReactNode } from "react";
+
+export const metadata = {
+  title: "Next.js in OpenContainer",
+  description: "Next.js 16 App Router (webpack + wasm SWC)",
+};
+
+export default function RootLayout({ children }: { children: ReactNode }) {
+  return (
+    <html lang="en">
+      <body style={{ margin: 0 }}>{children}</body>
+    </html>
+  );
+}
+`
+      : `export const metadata = {
+  title: "Next.js in OpenContainer",
+  description: "Next.js 16 App Router (webpack + wasm SWC)",
+};
+
+export default function RootLayout({ children }) {
+  return (
+    <html lang="en">
+      <body style={{ margin: 0 }}>{children}</body>
+    </html>
+  );
+}
+`,
+    [`app/page.${ext}`]: nextPageBody(ts),
+  };
+  if (ts) {
+    files["tsconfig.json"] = `{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [{ "name": "next" }]
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}
+`;
+    files["next-env.d.ts"] = `/// <reference types="next" />
+/// <reference types="next/image-types/global" />
+
+// NOTE: This file should not be edited
+// see https://nextjs.org/docs/app/api-reference/config/typescript for more information.
+`;
+  }
+  return {
+    manifest: {
+      id: ts ? "next-ts" : "next-js",
+      framework: "next",
+      name: "Next.js",
+      language: ts ? "TypeScript" : "JavaScript",
+      description: "Next.js 16 App Router (webpack + wasm SWC)",
+      port: 3000,
+      openPath: "/",
+      entry: `app/page.${ext}`,
+      // Next drives its own Fast Refresh over the preview websocket tunnel; the
+      // dev server neither restarts on change nor uses Vite-style dep pre-bundling.
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      // Newly proven in-VM (Next 16 webpack + wasm SWC); keep flagged until it has
+      // more mileage in the studio.
+      experimental: true,
+    },
+    files,
+  };
+}
+
 // The full matrix, in picker order (matches the reference create-vite layout:
 // framework first, then language variants side by side).
 export const TEMPLATES: TemplateDef[] = [
@@ -1031,6 +1220,8 @@ export const TEMPLATES: TemplateDef[] = [
   expressTemplate(true),
   nestTemplate(true),
   nestTemplate(false),
+  nextTemplate(true),
+  nextTemplate(false),
   wsDemoTemplate(),
 ];
 

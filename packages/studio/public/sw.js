@@ -168,6 +168,28 @@ OCWebSocket.prototype._emit = function(t, e){
   var a = this._l[t]; if (a) for (var i=0;i<a.length;i++){ try{ a[i].call(this, e); }catch(x){} }
 };
 window.WebSocket = OCWebSocket;
+// Next.js 16's dev "debug channel" treats a navigation whose
+// PerformanceNavigationTiming reports transferSize===0 as a bfcache/HTTP-cache
+// restore (wasServedFromCache). Our Service Worker proxy synthesizes every
+// preview response, so the browser always reports transferSize===0 for the
+// document — a false positive that makes Next try to rehydrate the debug channel
+// from sessionStorage, fail (self.__next_r is random per load, so nothing is
+// stored), and call location.reload() on every load → an infinite reload loop.
+// Report a realistic non-zero transferSize for navigation entries so Next uses
+// its live WebSocket-backed debug channel instead of the reload fallback.
+try {
+  var _gebt = performance.getEntriesByType.bind(performance);
+  var _ge = performance.getEntries.bind(performance);
+  var fixNav = function(e){
+    if (!e || e.entryType !== 'navigation' || e.transferSize > 0) return e;
+    return new Proxy(e, { get: function(t, p){
+      if (p === 'transferSize') return ((t.encodedBodySize || 0) + 300) || 1000;
+      var v = t[p]; return typeof v === 'function' ? v.bind(t) : v;
+    }});
+  };
+  performance.getEntriesByType = function(type){ var l = _gebt(type); return type === 'navigation' ? l.map(fixNav) : l; };
+  performance.getEntries = function(){ return _ge().map(fixNav); };
+} catch(_){}
 })();`;
 
 // In-browser DevTools bridge. Injected into every preview page next to the WS
@@ -225,6 +247,31 @@ window.addEventListener('popstate', notifyNav);
 window.addEventListener('hashchange', notifyNav);
 window.addEventListener('load', notifyNav);
 notifyNav();
+// Reload-loop diagnostics. When a preview "flashes" it is reloading the whole
+// document in a loop. Location methods cannot be reliably overridden on the
+// Location object, so the actual loop-break happens in the Service Worker (which
+// sees every navigation). Here we just surface the cause: (1) HOW this document
+// was loaded -- navigation type (reload vs navigate vs back_forward) + referrer,
+// which distinguishes a self-reload from an href/src navigation; and (2) any
+// client-side error (a hydration/chunk-load error often drives the loop),
+// reported up to the kernel console.
+try {
+  var nav = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
+  var navType = nav ? nav.type
+    : (performance.navigation ? ['navigate','reload','back_forward','prerender'][performance.navigation.type] : 'unknown');
+  post({ source:'oc-preview-nav', kind:'load', target: location.href,
+    stack: 'navType=' + navType + '  referrer=' + (document.referrer || '(none)') });
+} catch(_){}
+window.addEventListener('error', function(ev){
+  var e = ev && ev.error;
+  post({ source:'oc-preview-nav', kind:'window.error', target: (ev && ev.message) || String(ev),
+    stack: (e && e.stack ? String(e.stack).split('\\n').slice(0, 6).join('\\n') : ((ev && ev.filename ? ev.filename + ':' + ev.lineno : ''))) });
+});
+window.addEventListener('unhandledrejection', function(ev){
+  var r = ev && ev.reason;
+  post({ source:'oc-preview-nav', kind:'unhandledrejection', target: (r && r.message) || String(r),
+    stack: (r && r.stack ? String(r.stack).split('\\n').slice(0, 6).join('\\n') : '') });
+});
 })();`;
 
 const DEVTOOLS_TAGS =
@@ -303,6 +350,45 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+// Preview reload-loop breaker. A "flashing" preview reloads its top-level
+// document over and over; the trigger lives in the iframe's own JS (Next's dev
+// client / app-router) and can't be intercepted there (Location methods aren't
+// overridable). But every reload is a `mode:"navigate"` request the SW sees, so
+// we break the loop here: if a port's document navigates too many times within a
+// few seconds, serve a static halt page (which never reloads) instead of proxying
+// — the flashing stops and the injected diagnostics from the preceding loads stay
+// readable. The window ages out, so a manual retry proxies normally again.
+const previewNavTimes = new Map(); // port -> recent navigation timestamps (ms)
+function previewNavLoop(port) {
+  const now = Date.now();
+  const arr = (previewNavTimes.get(port) || []).filter((t) => now - t < 6000);
+  arr.push(now);
+  previewNavTimes.set(port, arr);
+  return arr.length >= 8;
+}
+function loopHaltResponse() {
+  const html =
+    '<!doctype html><html><head><meta charset="utf-8"><title>Preview paused</title>' +
+    '<style>html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;' +
+    'font:14px/1.5 system-ui,sans-serif;color:#334;background:#fafafa}' +
+    '.c{max-width:32rem;padding:2rem;text-align:center}h1{font-size:1rem;margin:0 0 .5rem}' +
+    'p{margin:.4rem 0;color:#667}button{margin-top:1rem;padding:.5rem 1rem;border:1px solid #cbd;' +
+    'border-radius:.5rem;background:#fff;cursor:pointer;font:inherit}button:hover{background:#f0f2f5}</style>' +
+    '</head><body><div class="c"><h1>Preview paused — reload loop</h1>' +
+    '<p>This page reloaded itself repeatedly, so OpenContainer paused it to stop the flashing.</p>' +
+    '<p>Check the kernel console for <code>[preview]</code> lines to see the cause.</p>' +
+    '<button onclick="location.replace(location.pathname)">Reload preview</button>' +
+    '</div></body></html>';
+  return new Response(html, {
+    status: 200,
+    headers: new Headers({
+      "content-type": "text/html; charset=utf-8",
+      "Cross-Origin-Resource-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "require-corp",
+    }),
+  });
+}
+
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return; // never touch cross-origin
@@ -315,6 +401,10 @@ self.addEventListener("fetch", (event) => {
     const slash = rest.indexOf("/");
     const port = parseInt(slash === -1 ? rest : rest.slice(0, slash), 10);
     const path = (slash === -1 ? "/" : rest.slice(slash)) + url.search;
+    if (event.request.mode === "navigate" && previewNavLoop(port)) {
+      event.respondWith(loopHaltResponse());
+      return;
+    }
     event.respondWith(handlePreview(event, port, path));
     return;
   }

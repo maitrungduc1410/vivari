@@ -667,8 +667,14 @@ export class Kernel {
         env: spec.env || {},
         workerData: spec.workerData,
         isThread: true,
+        // child_process.fork rides this same path but boots in fork mode (a
+        // main-thread process whose transferred port is a process IPC channel).
+        isFork: !!spec.isFork,
       },
-      { parentPid, threadPort: port },
+      // A fork child streams its stdout/stderr to the parent worker (like an async
+      // spawn child) so `fork`'s default 'inherit' stdio surfaces on the PARENT's
+      // terminal — not the kernel's global console. Plain worker threads don't.
+      { parentPid, threadPort: port, stream: !!spec.isFork },
     );
     if (!parent.threads) parent.threads = new Map();
     parent.threads.set(reqId, childPid);

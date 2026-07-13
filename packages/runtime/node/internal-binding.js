@@ -82,7 +82,7 @@ function getOwnNonIndexProperties(obj, filter) {
   return out;
 }
 
-export function createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec } = {}) {
+export function createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks } = {}) {
   // net (Phase 2 #7/#8): tcp_wrap/stream_wrap/uv/pipe_wrap/cares_wrap for the
   // in-process loopback beneath Node's real lib/net.js. Needs process.nextTick.
   // `syscalls` lets listen() register the port with the kernel (external routing,
@@ -106,6 +106,12 @@ export function createInternalBinding({ syscalls, process, netLiveness, netServe
     // crypto (Phase 2 #12): our lib/crypto.js over the Rust/Wasm crypto codec.
     // digest md5/sha1/sha256 fall back to pure-JS when the codec is absent.
     crypto: createCryptoBinding({ codec: cryptoCodec || null }),
+    // async_hooks_host: when this runtime runs on a real Node worker (headless /
+    // Node twin), the host exposes genuine async-context tracking (PromiseHook).
+    // internal/async_hooks delegates AsyncLocalStorage to it so context survives
+    // across awaits — required by Next.js App Router (RSC workStore). Null in the
+    // browser realm, where the sync-scope polyfill is used instead.
+    async_hooks_host: hostAsyncHooks || null,
     // trace_events: inert — internal/http records HTTP trace spans through it.
     trace_events: {
       getCategoryEnabledBuffer: () => new Uint8Array(1),

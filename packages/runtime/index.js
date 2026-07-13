@@ -26,11 +26,24 @@ function createConsole(process, util) {
     assert: (cond, ...a) => {
       if (!cond) toErr("Assertion failed:", ...a);
     },
-    // no-op timing/grouping helpers
+    // no-op timing/grouping/counting helpers. Kept complete (matching Node's
+    // Console surface) because some libraries bind every method up front — e.g.
+    // @edge-runtime/primitives (pulled by Next.js) does
+    // `console.count.bind(console)`, `console.timeLog.bind(console)`, … at load,
+    // which throws "reading 'bind' of undefined" if any method is missing.
     time() {},
     timeEnd() {},
+    timeLog() {},
+    timeStamp() {},
+    count() {},
+    countReset() {},
     group() {},
+    groupCollapsed() {},
     groupEnd() {},
+    clear() {},
+    dirxml(...a) {
+      toOut(...a);
+    },
     table(o) {
       toOut(util.inspect(o));
     },
@@ -50,11 +63,19 @@ export function createRuntime({
   stderr = () => {},
   codec = null,
   cryptoCodec = null,
+  // Host async_hooks (real AsyncLocalStorage) when running on a Node worker; null
+  // in the browser. Delegated to by internal/async_hooks for cross-await context
+  // propagation (Next.js App Router / RSC). See internal-binding.js.
+  hostAsyncHooks = null,
   // Worker threads (#16 stage 2b). `postRaw(msg, transfer)` sends a message to the
   // kernel with transferables (MessagePorts) — the shell provides it. `thread`
   // carries this worker's identity when it *is* a spawned thread.
   postRaw = null,
   thread = null,
+  // child_process.fork child side: a dedicated IPC MessagePort to the parent.
+  // When set, `process.send` / 'message' / connected / channel / disconnect are
+  // bridged onto it (see below). Null for normal processes and worker threads.
+  ipcPort = null,
 }) {
   const syscalls = createSyscalls({ ctrl, data, notify });
 
@@ -233,7 +254,7 @@ export function createRuntime({
   // internalBinding('buffer'), `fs` is Node's real lib/fs.js over
   // internalBinding('fs') (node/bindings/fs.js -> Rust VFS via the sync bridge),
   // and `events`/`util` run on our shared internal layer (util.inspect bridged).
-  const nodeModules = createNodeModules({ process, syscalls, netLiveness, netServers, codec, cryptoCodec });
+  const nodeModules = createNodeModules({ process, syscalls, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks });
   const bufferModule = nodeModules.require("buffer");
   const Buffer = bufferModule.Buffer;
   const path = nodeModules.require("path");
@@ -286,6 +307,69 @@ export function createRuntime({
     const rawExit = process.exit;
     process.exit = (code) =>
       rawExit(code == null ? (process.exitCode == null ? 0 : process.exitCode | 0) : code | 0);
+  }
+
+  // ---- fork IPC (child side): process.send / 'message' / disconnect ----------
+  // A forked child (child_process.fork) runs as a normal main-thread process, but
+  // gets a dedicated IPC MessagePort to its parent. Expose Node's fork surface —
+  // process.send(), 'message' events, process.connected / process.channel /
+  // process.disconnect() — bridged onto that port. Next.js's `next dev` forks its
+  // dev server and gates the whole boot on `process.send` existing, then hands
+  // over start options across this channel, so this is what unlocks Next dev.
+  if (ipcPort) {
+    process.connected = true;
+    let msgListeners = 0;
+    let ipcRefed = false;
+    const ipcRetain = () => {
+      if (!ipcRefed) { ipcRefed = true; threadLiveness.active++; loop.wakeNet(); }
+    };
+    const ipcRelease = () => {
+      if (ipcRefed) { ipcRefed = false; if (threadLiveness.active > 0) threadLiveness.active--; loop.wakeNet(); }
+    };
+    const doDisconnect = () => {
+      if (!process.connected) return;
+      process.connected = false;
+      process.channel = null;
+      ipcRelease();
+      try { ipcPort.close && ipcPort.close(); } catch { /* ignore */ }
+      loop.nextTick(() => process.emit("disconnect"));
+      loop.wakeNet();
+    };
+    // process.channel is a truthy object in a fork child; ref/unref toggle liveness.
+    process.channel = { ref: ipcRetain, unref: ipcRelease, hasRef: () => ipcRefed };
+    ipcPort.onmessage = (e) => {
+      const data = e && e.data;
+      if (data && data.__ocIpcDisconnect) { doDisconnect(); return; }
+      // Deliver inside a loop turn (like worker_threads / stdin), so a process.exit()
+      // from the handler is honoured and microtasks flush after it.
+      loop.nextTick(() => process.emit("message", data));
+      loop.wakeNet();
+    };
+    try { ipcPort.start && ipcPort.start(); } catch { /* auto-starts */ }
+    // A live IPC channel with a 'message' consumer refs the loop (Node semantics),
+    // so a fork child doesn't exit between boot and binding its server port.
+    process.on("newListener", (name) => { if (name === "message" && msgListeners++ === 0) ipcRetain(); });
+    process.on("removeListener", (name) => { if (name === "message" && msgListeners > 0 && --msgListeners === 0) ipcRelease(); });
+    process.send = (msg, sendHandle, options, cb) => {
+      if (typeof sendHandle === "function") cb = sendHandle;
+      else if (typeof options === "function") cb = options;
+      if (!process.connected) {
+        const err = new Error("Channel closed");
+        err.code = "ERR_IPC_CHANNEL_CLOSED";
+        if (cb) loop.nextTick(() => cb(err));
+        else loop.nextTick(() => process.emit("error", err));
+        return false;
+      }
+      try {
+        ipcPort.postMessage(msg);
+      } catch (e) {
+        if (cb) loop.nextTick(() => cb(e));
+        return false;
+      }
+      if (cb) loop.nextTick(() => cb(null));
+      return true;
+    };
+    process.disconnect = doDisconnect;
   }
 
   // ---- legacy process.binding(name) shim ------------------------------------
@@ -398,6 +482,100 @@ export function createRuntime({
   });
   // The loop drains queued child events (stdout/stderr/exit) each turn (#15).
   drainChildEvents = child_process._drain;
+
+  // Fork children stream their stdout/stderr to us (kernel `stream: true`), keyed
+  // by child pid. We route those chunks here rather than through the async-spawn
+  // ChildProcess registry (fork rides the worker_threads path, not spawnAsync).
+  const forkChildren = new Map(); // childPid -> { onOut(chunk), onErr(chunk) }
+
+  // child_process.fork(modulePath[, args][, options]) — a forked child is a
+  // separate process running <modulePath> with a bidirectional IPC channel. We
+  // build it on the worker_threads spawn plumbing (same kernel spawn + lifecycle
+  // + MessageChannel), but boot the child in fork mode so it gets process.send /
+  // 'message' rather than a worker parentPort. This is what makes `next dev`
+  // (which forks its dev server and talks to it over IPC) run.
+  child_process.fork = (modulePath, args, options) => {
+    if (args && !Array.isArray(args)) { options = args; args = undefined; }
+    args = args || [];
+    options = options || {};
+    const wt = nodeModules.require("worker_threads");
+    const child = new EventEmitter();
+    child.connected = true;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.killed = false;
+    // fork stdio: default (silent:false) is 'inherit' — the child's output shows on
+    // OUR std streams (which bubble to the terminal). silent:true (or stdio 'pipe')
+    // pipes it onto child.stdout/child.stderr Readables instead.
+    const stdio = options.stdio;
+    const silent = options.silent === true || stdio === "pipe" || (Array.isArray(stdio) && stdio[1] === "pipe");
+    const outStream = silent ? new stream.Readable({ read() {} }) : null;
+    const errStream = silent ? new stream.Readable({ read() {} }) : null;
+    child.stdout = outStream;
+    child.stderr = errStream;
+    child.stdin = null;
+    child.stdio = [null, outStream, errStream, null];
+    const pushOut = (s, chunk) => {
+      if (s) s.push(chunk == null ? null : Buffer.from(String(chunk), "utf8"));
+    };
+    const handlers = {
+      onOut: (chunk) => (silent ? pushOut(outStream, chunk) : process.stdout.write(chunk)),
+      onErr: (chunk) => (silent ? pushOut(errStream, chunk) : process.stderr.write(chunk)),
+    };
+    let worker;
+    try {
+      worker = new wt.Worker(String(modulePath), {
+        argv: (args || []).map(String),
+        env: options.env || process.env,
+        cwd: options.cwd || process.cwd(),
+        _ocFork: true,
+      });
+    } catch (e) {
+      child.pid = -1;
+      loop.nextTick(() => { child.emit("error", e); child.emit("exit", 1, null); });
+      return child;
+    }
+    child.pid = 0; // real pid arrives with 'online' (the kernel-assigned threadId)
+    child.channel = { ref: () => worker.ref(), unref: () => worker.unref() };
+    child.send = (msg, sendHandle, sendOpts, cb) => {
+      if (typeof sendHandle === "function") cb = sendHandle;
+      else if (typeof sendOpts === "function") cb = sendOpts;
+      if (!child.connected) {
+        const err = new Error("Channel closed");
+        err.code = "ERR_IPC_CHANNEL_CLOSED";
+        if (cb) loop.nextTick(() => cb(err));
+        return false;
+      }
+      try { worker.postMessage(msg); } catch (e) { if (cb) loop.nextTick(() => cb(e)); return false; }
+      if (cb) loop.nextTick(() => cb(null));
+      return true;
+    };
+    child.disconnect = () => {
+      if (!child.connected) return;
+      child.connected = false;
+      try { worker.postMessage({ __ocIpcDisconnect: true }); } catch { /* ignore */ }
+      loop.nextTick(() => child.emit("disconnect"));
+    };
+    child.kill = (signal) => {
+      child.killed = true;
+      worker.terminate();
+      return true;
+    };
+    child.ref = () => { worker.ref(); return child; };
+    child.unref = () => { worker.unref(); return child; };
+    worker.on("online", () => { child.pid = worker.threadId; forkChildren.set(child.pid, handlers); child.emit("spawn"); });
+    worker.on("message", (m) => child.emit("message", m));
+    worker.on("error", (e) => child.emit("error", e));
+    worker.on("exit", (code) => {
+      child.connected = false;
+      child.exitCode = code | 0;
+      if (child.pid > 0) forkChildren.delete(child.pid);
+      pushOut(outStream, null);
+      pushOut(errStream, null);
+      loop.nextTick(() => { child.emit("exit", code | 0, null); child.emit("close", code | 0, null); });
+    });
+    return child;
+  };
 
   // Replay an external request through the real http *client* into the in-VM real
   // http *server* over the net loopback, then send the collected response back to
@@ -744,6 +922,12 @@ export function createRuntime({
   globalThis.clearInterval = loop.clearInterval;
   globalThis.setImmediate = loop.setImmediate;
   globalThis.clearImmediate = loop.clearImmediate;
+  // Browser (no host async_hooks) only: now that our timer globals are in place,
+  // let AsyncLocalStorage propagate context across the scheduling primitives React's
+  // App Router uses (then/queueMicrotask/setImmediate/setTimeout). Must run AFTER the
+  // reassignments above and BEFORE any framework code so React captures the wrapped
+  // primitives (it caches `scheduleMicrotask = queueMicrotask` at module eval).
+  asyncHooks.__ocInstallContextPropagation?.();
   // Phase 2 #9 (internal, temporary): a blocking fetch into the VFS, serviced by
   // the kernel's Fetcher Worker. Returns { status, ok, contentType, size, path,
   // cached }; read `path` with fs for the bytes. This is the low-level primitive
@@ -805,6 +989,14 @@ export function createRuntime({
   // call them at startup (tsx, ts-node/esm) don't crash; our loader is CJS-based.
   Module.register = () => undefined;
   Module.registerHooks = () => ({ deregister() {} });
+  // Source-map lookups: no source-map registry in the sandbox. Return undefined
+  // (Node's contract for "no map found") so callers that probe error stacks — e.g.
+  // Next.js's dev overlay — get a clean miss instead of a TypeError.
+  Module.findSourceMap = () => undefined;
+  Module.SourceMap = class SourceMap {
+    constructor(payload) { this.payload = payload; }
+    findEntry() { return {}; }
+  };
   builtins.module = Module;
 
   // Support both `require('fs')` and `require('node:fs')`.
@@ -817,8 +1009,18 @@ export function createRuntime({
     /** External nudge from the kernel: a network request is queued for us. */
     wake: loop.wakeNet,
     /** External delivery from the kernel: an async child's stdout/stderr/exit
-     * ({type:'child-stdout'|'child-stderr'|'child-exit', childPid, ...}). #15 */
-    dispatchChild: (msg) => child_process._dispatch(msg),
+     * ({type:'child-stdout'|'child-stderr'|'child-exit', childPid, ...}). #15.
+     * Fork children (child_process.fork) stream through here too; route their
+     * output to the fork handlers (exit arrives separately as a thread-exit). */
+    dispatchChild: (msg) => {
+      const h = msg && msg.childPid != null ? forkChildren.get(msg.childPid) : undefined;
+      if (h) {
+        if (msg.type === "child-stdout") h.onOut(msg.chunk);
+        else if (msg.type === "child-stderr") h.onErr(msg.chunk);
+        return;
+      }
+      child_process._dispatch(msg);
+    },
     /** External delivery from the kernel: a worker_thread's online/exit
      * ({type:'thread-started'|'thread-exit', reqId, ...}). #16 stage 2b. */
     dispatchThread: (msg) => dispatchThreadEvent(msg),

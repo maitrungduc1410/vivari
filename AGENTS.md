@@ -529,9 +529,13 @@ addition and implement it in the matching `lib/`/binding.
 ### TypeScript / native-binary walls
 - Pin `typescript@5` for in-VM `tsc`: **`typescript@7` is the native Go compiler**
   and won't run.
-- **Next.js is a hard wall** (documented in roadmap): Next 16 requires native SWC
-  (no wasm fallback) + native Turbopack. Vite (rolldown, wasm) is the supported
-  bundler path.
+- **Next.js 16 (App Router) works in-VM** on `next dev --webpack` + the
+  `@next/swc-wasm-nodejs` wasm SWC (the runtime reports `process.versions.webcontainer`,
+  so Next's `loadBindings` prefers the wasm build; npm skips native
+  `@next/swc-<platform>` on arch `wasm32`). Only **Turbopack** is out (native Rust,
+  no wasm build) — use `--webpack`. Proven by `scripts/spike-next.mjs`; shipped as the
+  `experimental` **Next.js** template. Vite (rolldown, wasm) is still the default
+  bundler path for the other templates.
 
 ### Ports & long-lived servers
 Each demo binds a port; a leftover long-lived server squatting a port causes

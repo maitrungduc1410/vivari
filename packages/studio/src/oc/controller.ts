@@ -1239,6 +1239,29 @@ export class IdeController {
         const tabId = this.tabIdForSource(src);
         if (tabId) this.syncTabLocation(tabId, String(data.href || "/"));
       }
+
+      // HMR frames the preview iframe sent OUT to the dev server. Several Next
+      // reload paths emit a marker event over the socket right before calling
+      // location.reload() — surfacing it here names the exact reload trigger that
+      // Location-method wrapping couldn't catch.
+      if (data.type === "oc-ws" && data.dir === "out" && data.sub === "send" && typeof data.data === "string") {
+        const ev = data.data.match(/"event"\s*:\s*"(client-full-reload|client-reload-page|server-component-reload-page)"/);
+        if (ev) this.consoleLine(`[preview] HMR->server ${ev[1]}: ${data.data.slice(0, 240)}`, "35");
+      }
+
+      // Preview tab initiated a full-document reload/navigation (the tracer in the
+      // injected bootstrap). Surface the trigger + caller stack in the kernel
+      // console so a "flashing" (reload-loop) preview is diagnosable.
+      if (data.source === "oc-preview-nav") {
+        const kind = String(data.kind || "reload");
+        const target = data.target ? ` -> ${String(data.target)}` : "";
+        this.consoleLine(`[preview] ${kind}${target}`, "33");
+        if (data.stack) {
+          for (const line of String(data.stack).split("\n")) {
+            if (line.trim()) this.consoleLine(`    ${line.trim()}`, "90");
+          }
+        }
+      }
     });
   }
 
@@ -1366,6 +1389,23 @@ export class IdeController {
     // doesn't carry a port, so deliver to every tab bound to a dev server; the
     // HMR client in each iframe ignores frames that aren't its own.
     b.on("oc-ws", (m) => {
+      // Diagnostic: name each server→client HMR frame so a preview reload loop is
+      // traceable (`reloadPage`/`serverComponentChanges` from the dev server drive
+      // a full reload). High-frequency/no-op frames are filtered to cut noise.
+      const msg = m.msg as { sub?: string; data?: unknown; code?: number };
+      if (msg.sub === "msg" && typeof msg.data === "string") {
+        const t = msg.data.match(/"type"\s*:\s*"?(\w+)"?/);
+        const type = t?.[1];
+        if (type === "sync") {
+          // A hash that changes between loads would drive web-socket.js to reload.
+          const h = msg.data.match(/"hash"\s*:\s*"?([0-9a-f]+)"?/);
+          this.consoleLine(`[preview] HMR<-server sync hash=${h?.[1] ?? "?"}`, "36");
+        } else if (type && !/^(pong|isrManifest)$/i.test(type)) {
+          this.consoleLine(`[preview] HMR<-server ${type}: ${msg.data.slice(0, 200)}`, "35");
+        }
+      } else if (msg.sub === "close") {
+        this.consoleLine(`[preview] HMR ws closed by server (code ${msg.code ?? ""})`, "35");
+      }
       const payload = { ...(m.msg as object), type: "oc-ws", dir: "in" };
       for (const t of this.snap.previewTabs) {
         if (t.port != null) this.previewFrames.get(t.id)?.contentWindow?.postMessage(payload, "*");
