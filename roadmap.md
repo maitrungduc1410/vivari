@@ -1313,13 +1313,16 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     reference manifest loads; (b) **real cross-`await` `AsyncLocalStorage`** — on a Node worker the
     runtime delegates to the host's async_hooks (V8 PromiseHook), without which the App Router
     `workStore`/`workUnitAsyncStorage` invariants fail. The browser has no PromiseHook, so the
-    polyfill (i) holds `run(store, cb)`'s store across `cb` and its returned promise (covers raw
-    `await` in a long-lived scope like `workAsyncStorage`) and (ii) propagates a per-hop context
-    snapshot through the scheduling primitives React drives rendering with
-    (`then`/`queueMicrotask`/`setImmediate`/`setTimeout`), so nested per-render scopes
-    (`workUnitAsyncStorage`) stay correct even when promises settle out of order — the restore is
-    "pop only if still top" to avoid clobbering a live nested scope. Validated headlessly with
-    `OC_NO_HOST_ALS=1` (forces the polyfill): 0 invariant errors, GET / 200; (c) `child_process.fork`
+    polyfill can't follow a native `await`; on a single-request-at-a-time dev preview it instead (i)
+    holds a thenable-returning `run(store, cb)`'s store until it settles then pops "only if still
+    top", (ii) does NOT restore on a plain (non-thenable) return — Next's `renderToFlightStream`
+    returns a stream synchronously and renders later across raw awaits, so leaving `store` current
+    keeps `getStore()` correct for that detached work until the next `run()` overwrites it, and (iii)
+    propagates a per-hop context snapshot through the scheduling primitives React uses
+    (`then`/`queueMicrotask`/`setImmediate`/`setTimeout`). Together these make the invariant
+    deterministic (not timing-dependent). Validated headlessly with `OC_NO_HOST_ALS=1` (forces the
+    polyfill, incl. under heavy-I/O timing perturbation): 0 invariant errors, GET / 200, output
+    byte-identical to the host-async_hooks path; (c) `child_process.fork`
     (Next forks its dev server over IPC) — its stdio streams to the parent (default `inherit`
     surfaces on the terminal, not the kernel console); (d)
     `pathToFileURL` relative→absolute; (e) `dns/promises`, `stream/web`, `inspector` stub, and the
@@ -1742,15 +1745,18 @@ wasm SWC** (no native binding on arch `wasm32`), and `GET / → 200` with the re
   - **Cross-`await` `AsyncLocalStorage`** — the App Router `workStore`/`workUnitAsyncStorage`
     invariants need context to survive `await`. On a Node worker the runtime delegates
     `AsyncLocalStorage` to the host's async_hooks (V8 PromiseHook) through the `internalBinding` seam
-    (exact). The browser has no such binding, so the polyfill combines two mechanisms: it holds
-    `run(store, cb)`'s store across `cb` and its returned promise (raw `await` in a long-lived scope),
-    AND propagates a per-hop snapshot of every live store through the scheduling primitives React uses
-    (`Promise.prototype.then`, `queueMicrotask`, `setImmediate`, `setTimeout`) so short-lived
-    per-render scopes stay correct across detached continuations. The store patches are installed once
-    at boot, after the runtime's own timer globals are in place and before any framework code runs (so
-    React captures the wrapped primitives), and only on the polyfill path. `run`'s restore is
-    "pop only if still top" to avoid clobbering a live nested scope when promises settle out of order.
-    Validated headlessly with `OC_NO_HOST_ALS=1`: 0 invariant errors, GET / 200.
+    (exact). The browser has no such binding and can't hook a native `await`, so the polyfill targets
+    the single-request-at-a-time dev model with three rules: (a) a thenable-returning `run(store, cb)`
+    holds `store` until it settles, then pops "only if still top" (so out-of-order settling can't
+    clobber a live nested scope); (b) a plain (non-thenable) return does NOT restore — Next's
+    `renderToFlightStream` returns a stream synchronously and renders later across raw awaits, so
+    leaving `store` current keeps `getStore()` correct for that detached work until the next `run()`
+    overwrites it; (c) a per-hop snapshot of every live store is propagated through the scheduling
+    primitives React uses (`Promise.prototype.then`, `queueMicrotask`, `setImmediate`, `setTimeout`).
+    The primitive patches install once at boot — after the runtime's own timer globals and before any
+    framework code (so React captures the wrapped primitives), polyfill path only. Result is
+    deterministic (not timing-dependent): validated with `OC_NO_HOST_ALS=1` under heavy-I/O
+    perturbation — 0 invariant errors, GET / 200, output byte-identical to the host path.
   - **`child_process.fork`** — an IPC channel (`process.send`/`'message'`/`disconnect`) built on the
     worker-thread spawn path; `next dev` forks its dev server and gates boot on `process.send`. The
     fork child streams its stdout/stderr to the parent (kernel `stream: true`), so `fork`'s default

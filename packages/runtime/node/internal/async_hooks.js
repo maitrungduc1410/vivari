@@ -155,14 +155,20 @@ export default function (exports, require, module, process, internalBinding, pri
       liveStores.add(this);
     }
     run(store, callback, ...args) {
-      // Two mechanisms cooperate (see installContextPropagation):
-      //   • For the sync body and any raw `await` inside cb, we hold `store` as the
-      //     current value until cb's returned promise settles. This is what keeps a
-      //     long-lived scope (workAsyncStorage wrapping a whole render) readable
-      //     across awaits that the scheduler patches can't see.
-      //   • For work scheduled onto then/microtask/timers, the scheduler patches
-      //     carry a per-hop snapshot, so nested/short-lived scopes stay correct even
-      //     when this instance's sticky value has moved on.
+      // No PromiseHook here, so context can't follow a native `await` the way Node
+      // does. Three cooperating rules keep Next.js's App Router correct on a
+      // single-request-at-a-time dev preview:
+      //   • Sync throw → the scope is truly finished; restore `prev`.
+      //   • Thenable return → hold `store` until it settles, then "pop only if still
+      //     top" (a still-live nested run may have set a newer value we must keep).
+      //   • Plain (non-thenable) return → DO NOT restore. The callback may have
+      //     handed back a value while scheduling detached async work that still
+      //     needs this store — e.g. Next's `renderToFlightStream` returns a stream
+      //     synchronously and renders later across raw awaits the scheduler patches
+      //     can't see. Leaving `store` current keeps getStore() correct for that
+      //     work; the next run() on this instance overwrites it. Combined with the
+      //     scheduler-snapshot propagation, this makes the workUnitAsyncStorage
+      //     invariant deterministic instead of timing-dependent.
       const prev = this._current;
       this._current = store;
       let result;
@@ -174,8 +180,6 @@ export default function (exports, require, module, process, internalBinding, pri
       }
       if (result && typeof result.then === "function") {
         const restore = () => {
-          // Only pop if we're still the top: a nested run() that is still live may
-          // have set a newer value we must not clobber (out-of-order settling).
           if (this._current === store) this._current = prev;
         };
         // Use the *native* then so this restore isn't itself context-wrapped.
@@ -191,7 +195,6 @@ export default function (exports, require, module, process, internalBinding, pri
           },
         );
       }
-      this._current = prev;
       return result;
     }
     exit(callback, ...args) {
