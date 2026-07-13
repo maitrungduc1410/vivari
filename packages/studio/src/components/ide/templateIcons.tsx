@@ -14,6 +14,7 @@ import ReactRouterIcon from "~icons/vscode-icons/file-type-reactrouter";
 import NodeIcon from "~icons/vscode-icons/file-type-node";
 import PnpmIcon from "~icons/vscode-icons/file-type-pnpm";
 import SqliteIcon from "~icons/vscode-icons/file-type-sqlite";
+import NextjsIcon from "~icons/vscode-icons/file-type-next";
 
 type IconProps = { className?: string };
 
@@ -82,25 +83,6 @@ function ExpressIcon({ className }: IconProps) {
   );
 }
 
-function NextIcon({ className }: IconProps) {
-  return (
-    <svg viewBox="0 0 24 24" className={className} aria-hidden>
-      <circle cx="12" cy="12" r="10" fill="#000" />
-      <text
-        x="12"
-        y="16.5"
-        textAnchor="middle"
-        fontSize="12"
-        fontFamily="ui-sans-serif, system-ui, sans-serif"
-        fontWeight="700"
-        fill="#fff"
-      >
-        N
-      </text>
-    </svg>
-  );
-}
-
 function GenericIcon({ className }: IconProps) {
   return (
     <svg viewBox="0 0 24 24" className={className} fill="none" aria-hidden>
@@ -116,7 +98,7 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   svelte: (p) => <SvelteIcon className={p.className} />,
   express: ExpressIcon,
   nest: (p) => <NestIcon className={p.className} />,
-  next: NextIcon,
+  next: (p) => <NextjsIcon className={p.className} />,
   vanilla: Badge({ text: "JS", bg: "#f7df1e", fg: "#000" }),
   ts: Badge({ text: "TS", bg: "#3178c6" }),
   html: Badge({ text: "</>", bg: "#e34f26" }),
