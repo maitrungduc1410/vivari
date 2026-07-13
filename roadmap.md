@@ -1775,6 +1775,45 @@ wasm SWC** (no native binding on arch `wasm32`), and `GET / → 200` with the re
   the on-demand download remains the fallback.
 - **Shipped** as the **Next.js** template (TS + JS, `experimental`) with a picker icon.
 
+## Template catalog — StackBlitz parity + OpenContainer showcases (this change)
+
+Grew the studio's "Start from template" picker from a flat 13-template grid into a
+**category-tabbed catalog** (base-ui `Tabs`) modelled on StackBlitz's tabs. `TemplateManifest`
+gained a `category` (the tab) and an `icon` slug; the icon is **decoupled from the framework**
+(a string-keyed registry in `templateIcons.tsx` with a generic fallback) so new stacks never
+force widening a TypeScript union. Templates stay inline/vendored with pinned deps; every
+Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild).
+
+**Phased delivery** (from the catalog plan — Parts A/B/C = what to build, Part D = how; the
+"Phase" numbers below are Part D's build order):
+
+- ✅ **Phase 1 (`[DO]`, proven substrate)** — Frontend: Vanilla JS/TS, Static (zero-dep Node
+  server), Bootstrap 5. Backend: Koa, Hono, H3. Creative: Three.js, GSAP+React. Tooling:
+  Node.js blank. Showcase: Vite+Express fullstack (two preview tabs), Server-Sent Events. Existing
+  13 re-categorised.
+- ✅ **Phase 2 (`[SPIKE]`, meta-frameworks — shipped `experimental`)** — Fullstack: Nuxt 3,
+  SvelteKit, React Router 7 (Remix), Astro. Docs: VitePress, Slidev.
+- ✅ **Phase 3 (`[SPIKE]` — shipped `experimental`)** — Frontend variants: Preact, Lit, Solid,
+  Qwik. Backends: Fastify, Nitro, GraphQL (Yoga), Feathers. Showcases: Socket.IO, tRPC, pnpm
+  monorepo, SQLite (sql.js WASM).
+- ⏳ **Phase 4 — deferred (high-risk, address later):**
+  - **Angular** — the application builder uses **native esbuild**; only viable if we alias
+    `esbuild`→`esbuild-wasm`. Needs a spike; may end `[IGNORE]`.
+  - **Standalone Webpack** / **Docusaurus** — only Next's `webpack` path is proven; standalone
+    `webpack` + `webpack-dev-server` is unspiked. Docusaurus rides on it.
+  - **Rust → WebAssembly** starter — needs a Rust toolchain (rustc/wasm-pack) in-VM that we haven't
+    proven; consider an **AssemblyScript → WASM** substitute (pure-JS `asc` compiler) as the
+    "compile & run WASM in a tab" showcase.
+- ⏳ **Phase 5 — documented drops (won't build):** all **NativeScript** (Mobile & XR — need a
+  device/emulator runtime), **Python** (needs CPython/Pyodide WASM), **WordPress/PHP** (php-wasm),
+  **jq**, **Ember** (embroider = standalone webpack + native tooling), **Egg.js** (`cluster.fork`
+  throws), **Nuxt 2** (webpack), **WebContainer API** (StackBlitz-proprietary).
+
+**On `experimental`.** Phase 2/3 templates are shipped `experimental` (the picker shows an `exp`
+badge) because they haven't yet passed a headless `scripts/spike-*.mjs` gate — the risk is that a
+framework's own CLI drives a Vite/esbuild path we haven't routed through rolldown. They graduate to
+non-experimental once their spike is green.
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

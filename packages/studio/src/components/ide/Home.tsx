@@ -10,7 +10,8 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
-import { TEMPLATES, type TemplateDef } from "@/oc/templates";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { TEMPLATES, TEMPLATE_CATEGORIES, type TemplateCategory, type TemplateDef } from "@/oc/templates";
 import { TemplateIcon } from "./templateIcons";
 import { useIde } from "./useIde";
 import type { ProjectMeta } from "@/oc/controller";
@@ -66,7 +67,7 @@ export function HomeView() {
             </div>
             <div>
               <div className="font-medium">Start from template</div>
-              <div className="text-sm text-muted-foreground">React, Vue, Svelte, Express, NestJS…</div>
+              <div className="text-sm text-muted-foreground">React, Vue, Next.js, Express, Three.js, WebSocket…</div>
             </div>
           </button>
         </div>
@@ -191,9 +192,15 @@ function NewBlankDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (
   );
 }
 
+// Categories that actually have at least one template, in canonical tab order.
+const ACTIVE_CATEGORIES = TEMPLATE_CATEGORIES.filter((cat) =>
+  TEMPLATES.some((t) => t.manifest.category === cat),
+);
+
 function NewTemplateDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
   const { c, snap } = useIde();
   const [selected, setSelected] = useState<TemplateDef | null>(null);
+  const [activeCat, setActiveCat] = useState<TemplateCategory>(ACTIVE_CATEGORIES[0]);
   const [name, setName] = useState("");
   const [dir, setDir] = useState("");
   const [dirTouched, setDirTouched] = useState(false);
@@ -202,7 +209,8 @@ function NewTemplateDialog({ open, onOpenChange }: { open: boolean; onOpenChange
 
   useEffect(() => {
     if (open) {
-      setSelected(null); setName(""); setDir(""); setDirTouched(false); setRunInit(true); setBusy(false);
+      setSelected(null); setActiveCat(ACTIVE_CATEGORIES[0]);
+      setName(""); setDir(""); setDirTouched(false); setRunInit(true); setBusy(false);
     }
   }, [open]);
 
@@ -234,11 +242,25 @@ function NewTemplateDialog({ open, onOpenChange }: { open: boolean; onOpenChange
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>Start from a template</DialogTitle>
-          <DialogDescription>Pick a framework — we'll scaffold it and (optionally) install + run it.</DialogDescription>
+          <DialogDescription>Pick a template — we'll scaffold it and (optionally) install + run it.</DialogDescription>
         </DialogHeader>
 
+        <Tabs
+          value={activeCat}
+          onValueChange={(v) => setActiveCat(v as TemplateCategory)}
+          className="border-b pb-2"
+        >
+          <TabsList variant="line" className="flex-wrap">
+            {ACTIVE_CATEGORIES.map((cat) => (
+              <TabsTrigger key={cat} value={cat}>
+                {cat}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </Tabs>
+
         <div className="grid max-h-64 grid-cols-2 gap-1.5 overflow-auto sm:grid-cols-3">
-          {TEMPLATES.map((t) => {
+          {TEMPLATES.filter((t) => t.manifest.category === activeCat).map((t) => {
             const isSel = selected?.manifest.id === t.manifest.id;
             return (
               <button
@@ -249,9 +271,16 @@ function NewTemplateDialog({ open, onOpenChange }: { open: boolean; onOpenChange
                   isSel ? "border-primary bg-accent/50" : "border-transparent",
                 )}
               >
-                <TemplateIcon framework={t.manifest.framework} className="size-7 shrink-0" />
+                <TemplateIcon icon={t.manifest.icon} className="size-7 shrink-0" />
                 <div className="min-w-0">
-                  <div className="truncate text-sm font-medium">{t.manifest.name}</div>
+                  <div className="flex items-center gap-1">
+                    <span className="truncate text-sm font-medium">{t.manifest.name}</span>
+                    {t.manifest.experimental && (
+                      <span className="shrink-0 rounded bg-yellow-500/15 px-1 text-[9px] font-medium text-yellow-600 dark:text-yellow-400">
+                        exp
+                      </span>
+                    )}
+                  </div>
                   <div className="truncate text-xs text-muted-foreground">{t.manifest.language}</div>
                 </div>
               </button>
@@ -262,7 +291,7 @@ function NewTemplateDialog({ open, onOpenChange }: { open: boolean; onOpenChange
         {selected && (
           <div className="flex flex-col gap-3 border-t pt-3">
             <div className="flex items-center gap-2 text-sm">
-              <TemplateIcon framework={selected.manifest.framework} className="size-5" />
+              <TemplateIcon icon={selected.manifest.icon} className="size-5" />
               <span className="font-medium">{selected.manifest.name}</span>
               <span className="text-muted-foreground">· {selected.manifest.language}</span>
               {selected.manifest.experimental && (
