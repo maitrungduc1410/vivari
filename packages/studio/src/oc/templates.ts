@@ -658,9 +658,8 @@ export class AppService {
 `,
 };
 
-function nestTemplate(ts: boolean): TemplateDef {
-  if (ts) {
-    return {
+function nestTemplate(): TemplateDef {
+  return {
       manifest: {
         id: "nest-ts",
         framework: "nest",
@@ -744,114 +743,6 @@ function nestTemplate(ts: boolean): TemplateDef {
         ...nestSharedTs,
       },
     };
-  }
-  // Nest with plain JS: compiled with Babel (legacy decorators + metadata) so DI
-  // works without TypeScript. Experimental — decorator metadata in-VM is less
-  // battle-tested than the tsc path.
-  return {
-    manifest: {
-      id: "nest-js",
-      framework: "nest",
-      icon: "nest",
-      category: "Backend",
-      name: "NestJS",
-      language: "JavaScript",
-      description: "NestJS + Babel (experimental)",
-      port: 3000,
-      openPath: "/",
-      entry: "src/app.service.js",
-      hmr: false,
-      reload: false,
-      install: "npm install",
-      dev: "npm run build && node dist/main.js",
-      experimental: true,
-    },
-    files: {
-      "package.json": `{
-  "name": "nest-js",
-  "version": "0.0.1",
-  "private": true,
-  "license": "UNLICENSED",
-  "type": "commonjs",
-  "scripts": {
-    "build": "babel src --out-dir dist --extensions .js",
-    "start": "node dist/main.js",
-    "dev": "npm run build && node dist/main.js"
-  },
-  "dependencies": {
-    "@nestjs/common": "^11.0.1",
-    "@nestjs/core": "^11.0.1",
-    "@nestjs/platform-express": "^11.0.1",
-    "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.1"
-  },
-  "devDependencies": {
-    "@babel/cli": "^7.25.0",
-    "@babel/core": "^7.25.0",
-    "@babel/plugin-proposal-decorators": "^7.25.0",
-    "babel-plugin-transform-typescript-metadata": "^0.3.2"
-  }
-}
-`,
-      "babel.config.json": `{
-  "plugins": [
-    "babel-plugin-transform-typescript-metadata",
-    ["@babel/plugin-proposal-decorators", { "version": "legacy" }]
-  ]
-}
-`,
-      "src/main.js": `require('reflect-metadata');
-const { NestFactory } = require('@nestjs/core');
-const { AppModule } = require('./app.module');
-
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-  await app.listen(process.env.PORT ?? 3000);
-}
-bootstrap();
-`,
-      "src/app.module.js": `const { Module } = require('@nestjs/common');
-const { AppController } = require('./app.controller');
-const { AppService } = require('./app.service');
-
-@Module({
-  controllers: [AppController],
-  providers: [AppService],
-})
-class AppModule {}
-
-module.exports = { AppModule };
-`,
-      "src/app.controller.js": `const { Controller, Get } = require('@nestjs/common');
-const { AppService } = require('./app.service');
-
-@Controller()
-class AppController {
-  constructor(appService) {
-    this.appService = appService;
-  }
-
-  @Get()
-  getHello() {
-    return this.appService.getHello();
-  }
-}
-
-module.exports = { AppController };
-`,
-      "src/app.service.js": `const { Injectable } = require('@nestjs/common');
-
-@Injectable()
-class AppService {
-  getHello() {
-    return 'Hello World!';
-  }
-}
-
-module.exports = { AppService };
-`,
-    },
-  };
 }
 
 // ── WebSocket demo (Express + ws backend + Vite frontend, TWO preview tabs) ──
@@ -3437,8 +3328,7 @@ export const TEMPLATES: TemplateDef[] = [
   // Backend
   expressTemplate(false),
   expressTemplate(true),
-  nestTemplate(true),
-  nestTemplate(false),
+  nestTemplate(),
   koaTemplate(),
   honoTemplate(),
   h3Template(),
