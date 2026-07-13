@@ -225,6 +225,40 @@ window.addEventListener('popstate', notifyNav);
 window.addEventListener('hashchange', notifyNav);
 window.addEventListener('load', notifyNav);
 notifyNav();
+// Reload tracer + loop-breaker. When a preview "flashes" (reloads in a tight
+// loop) the trigger is a full-document reload/navigation from the app's own JS
+// (e.g. Next's dev client or app-router). We (1) report the caller's stack up to
+// the host so it's visible in the kernel console, and (2) if the document has
+// reloaded many times within a few seconds — an unmistakable loop — suppress
+// further programmatic reloads so the last render stays on screen and the cause is
+// readable instead of an endless flash. A single genuine reload (an HMR full
+// reload, a manual refresh) stays well under the threshold and is untouched; the
+// counter ages out, so normal reloading resumes once the loop stops.
+var OC_RELOAD_KEY = '__oc_reloads';
+function ocReloadCount(){
+  try {
+    var now = Date.now();
+    var arr = JSON.parse(sessionStorage.getItem(OC_RELOAD_KEY) || '[]').filter(function(t){ return now - t < 6000; });
+    arr.push(now);
+    sessionStorage.setItem(OC_RELOAD_KEY, JSON.stringify(arr));
+    return arr.length;
+  } catch(_) { return 1; }
+}
+var ocLooping = ocReloadCount() >= 5;
+if (ocLooping) {
+  post({ source:'oc-preview-nav', kind:'reload-loop-detected', target: location.href, stack:'>=5 document loads in 6s — suppressing further programmatic reloads so the trigger below is readable' });
+  try { console.error('[oc-preview] reload loop detected — suppressing further programmatic reloads (reload/replace/assign) so the cause is visible'); } catch(_){}
+}
+function traceNav(kind, target){
+  var stack = '';
+  try { throw new Error(); } catch(e){ stack = (e && e.stack ? String(e.stack).split('\\n').slice(2, 9).join('\\n') : ''); }
+  post({ source:'oc-preview-nav', kind:kind, target: target != null ? String(target) : location.href, stack:stack });
+  try { console.warn('[oc-preview] ' + kind + (target != null ? (' -> ' + target) : '') + '\\n' + stack); } catch(_){}
+  return ocLooping; // true → caller skips the actual navigation to break the loop
+}
+try { var _rl = location.reload.bind(location); location.reload = function(){ if (traceNav('location.reload')) return; return _rl.apply(location, arguments); }; } catch(_){}
+try { var _as = location.assign.bind(location); location.assign = function(u){ if (traceNav('location.assign', u)) return; return _as.apply(location, arguments); }; } catch(_){}
+try { var _rp = location.replace.bind(location); location.replace = function(u){ if (traceNav('location.replace', u)) return; return _rp.apply(location, arguments); }; } catch(_){}
 })();`;
 
 const DEVTOOLS_TAGS =

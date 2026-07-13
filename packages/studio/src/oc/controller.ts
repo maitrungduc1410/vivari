@@ -1239,6 +1239,20 @@ export class IdeController {
         const tabId = this.tabIdForSource(src);
         if (tabId) this.syncTabLocation(tabId, String(data.href || "/"));
       }
+
+      // Preview tab initiated a full-document reload/navigation (the tracer in the
+      // injected bootstrap). Surface the trigger + caller stack in the kernel
+      // console so a "flashing" (reload-loop) preview is diagnosable.
+      if (data.source === "oc-preview-nav") {
+        const kind = String(data.kind || "reload");
+        const target = data.target ? ` -> ${String(data.target)}` : "";
+        this.consoleLine(`[preview] ${kind}${target}`, "33");
+        if (data.stack) {
+          for (const line of String(data.stack).split("\n")) {
+            if (line.trim()) this.consoleLine(`    ${line.trim()}`, "90");
+          }
+        }
+      }
     });
   }
 

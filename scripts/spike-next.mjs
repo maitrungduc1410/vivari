@@ -96,7 +96,11 @@ const kernel = new Kernel({
   stdout: cap,
   stderr: cap,
 });
-kernel.onListen = (port) => listening.add(port);
+const listenLog = []; // every OP_LISTEN: {port, pid, t} — reveals re-listen loops
+kernel.onListen = (port, pid) => {
+  listening.add(port);
+  listenLog.push({ port, pid, t: Date.now() });
+};
 kernel.installCoreutils();
 let fetchN = 0;
 kernel.onFetch = (url, info) => {
@@ -298,8 +302,57 @@ if (bound) {
   console.log("  body head: " + body.slice(0, 200).replace(/\n/g, " "));
   compiledWasm = /wasm build @next\/swc-wasm-nodejs|next-swc build: wasm/.test(out.join(""));
   console.log("  compiled via wasm SWC (log): " + compiledWasm);
+
+  // ── re-listen loop check ────────────────────────────────────────────────────
+  // The studio treats a re-listen on an already-surfaced port as a server restart
+  // and reloads the preview (kernel-worker.js onListen → project-reload). If Next's
+  // server (or its forked child) issues OP_LISTEN per request/accept, that reload
+  // fires on every GET → the preview "flashes" infinitely. Drive several requests
+  // and count listens on PORT before/after to catch it.
+  const listensBefore = listenLog.filter((l) => l.port === PORT).length;
+  for (let i = 0; i < 6; i++) { await get("/"); await new Promise((r) => setTimeout(r, 150)); }
+  const portListens = listenLog.filter((l) => l.port === PORT);
+  const listensAfter = portListens.length;
+  console.log(`  OP_LISTEN on ${PORT}: total=${listensAfter} (before extra GETs=${listensBefore}, +${listensAfter - listensBefore} across 6 requests)`);
+  if (listensAfter - listensBefore > 0) {
+    console.log("  ⚠ re-listen on each request → studio would emit project-reload → preview flash loop");
+    console.log("    listen pids: " + portListens.map((l) => l.pid).join(", "));
+  }
 } else {
   console.log("\n---- dev output tail (last 4000 chars) ----\n" + out.slice(devStart).join("").slice(-4000));
+}
+
+// ── optional: probe the HMR WebSocket exactly like the browser preview does ───
+// (OC_WSPROBE=1) Reveals what the dev server pushes over /_next/webpack-hmr:
+// SYNC/RELOAD_PAGE/SERVER_COMPONENT_CHANGES, or connection flapping — the drivers
+// of the client's reload loop.
+if (process.env.OC_WSPROBE === "1" && bound) {
+  console.log("\n== HMR ws probe ==");
+  const frames = [];
+  kernel.onWsSend = (m) => {
+    let text = m.data;
+    if (m.data && typeof m.data !== "string") {
+      try { text = Buffer.from(m.data).toString("utf8"); } catch { text = "<binary " + (m.data.byteLength || m.data.length) + "b>"; }
+    }
+    frames.push({ t: Date.now(), sub: m.sub, code: m.code, data: typeof text === "string" ? text.slice(0, 300) : text });
+    console.log(`  [ws ${m.sub}] ${m.code ? "code=" + m.code + " " : ""}${typeof text === "string" ? text.slice(0, 200) : ""}`);
+  };
+  const connId = "probe-" + Math.random().toString(36).slice(2, 8);
+  kernel.handleWsClient({ sub: "open", connId, port: PORT, path: "/_next/webpack-hmr?id=probe" });
+  // Trigger a render meanwhile (the browser has the page open) and watch ~8s.
+  const t = Date.now();
+  let pinged = false;
+  while (Date.now() - t < 8000) {
+    await new Promise((r) => setTimeout(r, 500));
+    if (!pinged && frames.some((f) => f.sub === "open")) {
+      pinged = true;
+      kernel.handleWsClient({ sub: "send", connId, data: JSON.stringify({ event: "ping", appDirRoute: true, tree: [] }) });
+    }
+  }
+  const opens = frames.filter((f) => f.sub === "open").length;
+  const closes = frames.filter((f) => f.sub === "close").length;
+  const msgs = frames.filter((f) => f.sub === "msg").length;
+  console.log(`  ws summary: opens=${opens} msgs=${msgs} closes=${closes} over 8s`);
 }
 
 const ok = inst.code === 0 && nextBin && wasmSwc && bound && getOk;
