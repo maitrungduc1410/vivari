@@ -14,13 +14,37 @@
 // globbed via import.meta.glob) so it is bundled reliably and never dragged into
 // the studio's own tsc/eslint pass.
 
-export type Framework = "react" | "vue" | "svelte" | "express" | "nest" | "next";
 export type Language = "TypeScript" | "JavaScript";
+
+// Picker tabs, StackBlitz-style. The order here drives the tab order in the UI.
+export type TemplateCategory =
+  | "Frontend"
+  | "Backend"
+  | "Fullstack"
+  | "Docs"
+  | "Creative"
+  | "Tooling"
+  | "Showcase";
+
+export const TEMPLATE_CATEGORIES: TemplateCategory[] = [
+  "Frontend",
+  "Backend",
+  "Fullstack",
+  "Docs",
+  "Creative",
+  "Tooling",
+  "Showcase",
+];
 
 export interface TemplateManifest {
   /** Stable id, e.g. "react-ts". */
   id: string;
-  framework: Framework;
+  /** Short slug used only to suggest a project name, e.g. "react". */
+  framework: string;
+  /** Icon key for the picker (see templateIcons.tsx); falls back to a generic mark. */
+  icon: string;
+  /** Which picker tab this template appears under. */
+  category: TemplateCategory;
   /** Human label for the picker, e.g. "React". */
   name: string;
   language: Language;
@@ -193,6 +217,8 @@ function reactTemplate(ts: boolean): TemplateDef {
     manifest: {
       id: ts ? "react-ts" : "react-js",
       framework: "react",
+      icon: "react",
+      category: "Frontend",
       name: "React",
       language: ts ? "TypeScript" : "JavaScript",
       description: "React + Vite" + (ts ? " + TypeScript" : ""),
@@ -319,6 +345,8 @@ function vueTemplate(ts: boolean): TemplateDef {
     manifest: {
       id: ts ? "vue-ts" : "vue-js",
       framework: "vue",
+      icon: "vue",
+      category: "Frontend",
       name: "Vue",
       language: ts ? "TypeScript" : "JavaScript",
       description: "Vue 3 + Vite" + (ts ? " + TypeScript" : ""),
@@ -437,6 +465,8 @@ function svelteTemplate(ts: boolean): TemplateDef {
     manifest: {
       id: ts ? "svelte-ts" : "svelte-js",
       framework: "svelte",
+      icon: "svelte",
+      category: "Frontend",
       name: "Svelte",
       language: ts ? "TypeScript" : "JavaScript",
       description: "Svelte 5 + Vite" + (ts ? " + TypeScript" : ""),
@@ -461,6 +491,8 @@ function expressTemplate(ts: boolean): TemplateDef {
       manifest: {
         id: "express-ts",
         framework: "express",
+        icon: "express",
+        category: "Backend",
         name: "Express",
         language: "TypeScript",
         description: "Express + TypeScript (tsc build)",
@@ -531,6 +563,8 @@ app.listen(port, () => {
     manifest: {
       id: "express-js",
       framework: "express",
+      icon: "express",
+      category: "Backend",
       name: "Express",
       language: "JavaScript",
       description: "Express + Node",
@@ -630,6 +664,8 @@ function nestTemplate(ts: boolean): TemplateDef {
       manifest: {
         id: "nest-ts",
         framework: "nest",
+        icon: "nest",
+        category: "Backend",
         name: "NestJS",
         language: "TypeScript",
         description: "NestJS (tsc --watch)",
@@ -716,6 +752,8 @@ function nestTemplate(ts: boolean): TemplateDef {
     manifest: {
       id: "nest-js",
       framework: "nest",
+      icon: "nest",
+      category: "Backend",
       name: "NestJS",
       language: "JavaScript",
       description: "NestJS + Babel (experimental)",
@@ -830,6 +868,8 @@ function wsDemoTemplate(): TemplateDef {
     manifest: {
       id: "ws-demo",
       framework: "express",
+      icon: "ws",
+      category: "Showcase",
       name: "WebSocket",
       language: "JavaScript",
       description: "Express + ws backend & Vite frontend talking over a WebSocket — two live preview tabs",
@@ -1187,6 +1227,8 @@ export default function RootLayout({ children }) {
     manifest: {
       id: ts ? "next-ts" : "next-js",
       framework: "next",
+      icon: "next",
+      category: "Fullstack",
       name: "Next.js",
       language: ts ? "TypeScript" : "JavaScript",
       description: "Next.js 16 App Router (webpack + wasm SWC)",
@@ -1207,22 +1249,2226 @@ export default function RootLayout({ children }) {
   };
 }
 
-// The full matrix, in picker order (matches the reference create-vite layout:
-// framework first, then language variants side by side).
+// ── Vanilla (Vite) ───────────────────────────────────────────────────────────
+function vanillaTemplate(ts: boolean): TemplateDef {
+  const ext = ts ? "ts" : "js";
+  const q = ts ? "!" : "";
+  const files: Record<string, string> = {
+    "package.json": `{
+  "name": "vanilla${ts ? "-ts" : ""}",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^8.0.0"${ts ? `,
+    "typescript": "^5.7.0"` : ""}
+  }
+}
+`,
+    "index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vite + Vanilla${ts ? " TS" : ""}</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.${ext}"></script>
+  </body>
+</html>
+`,
+    "src/index.css": VITE_INDEX_CSS,
+    [`src/main.${ext}`]: `import './index.css'
+
+const app = document.querySelector${ts ? "<HTMLDivElement>" : ""}('#app')${q}
+let count = 0
+app.innerHTML = \`
+  <h1>Vite + Vanilla${ts ? " + TS" : ""}</h1>
+  <div class="card"><button id="counter" type="button"></button></div>
+  <p>Running inside OpenContainer — a real Vite dev server in your browser.</p>
+\`
+const btn = document.querySelector${ts ? "<HTMLButtonElement>" : ""}('#counter')${q}
+const render = () => (btn.textContent = \`count is \${count}\`)
+btn.addEventListener('click', () => { count++; render() })
+render()
+`,
+  };
+  if (ts) {
+    files["tsconfig.json"] = `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "skipLibCheck": true,
+    "noEmit": true,
+    "strict": true
+  },
+  "include": ["src"]
+}
+`;
+  }
+  return {
+    manifest: {
+      id: ts ? "vanilla-ts" : "vanilla-js",
+      framework: "vanilla",
+      icon: ts ? "ts" : "vanilla",
+      category: "Frontend",
+      name: "Vanilla",
+      language: ts ? "TypeScript" : "JavaScript",
+      description: "Vanilla" + (ts ? " TypeScript" : " JavaScript") + " + Vite",
+      port: 5173,
+      openPath: "/",
+      entry: `src/main.${ext}`,
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: VITE_DEV,
+    },
+    files,
+  };
+}
+
+// ── Static (zero-dependency Node static server) ──────────────────────────────
+function staticTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "static",
+      framework: "static",
+      icon: "html",
+      category: "Frontend",
+      name: "Static",
+      language: "JavaScript",
+      description: "Plain HTML/CSS/JS served by a zero-dependency Node server",
+      port: 3000,
+      openPath: "/",
+      entry: "public/index.html",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "node server.js",
+    },
+    files: {
+      "package.json": `{
+  "name": "static-site",
+  "private": true,
+  "version": "0.0.0",
+  "type": "commonjs",
+  "scripts": { "dev": "node server.js", "start": "node server.js" }
+}
+`,
+      "server.js": `// A tiny static file server — no dependencies, nothing to install.
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+const ROOT = path.join(__dirname, 'public');
+const PORT = Number(process.env.PORT ?? 3000);
+const TYPES = {
+  '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript',
+  '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png',
+  '.jpg': 'image/jpeg', '.ico': 'image/x-icon',
+};
+
+http.createServer((req, res) => {
+  let urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
+  if (urlPath.endsWith('/')) urlPath += 'index.html';
+  const file = path.join(ROOT, path.normalize(urlPath));
+  if (!file.startsWith(ROOT)) { res.writeHead(403).end('Forbidden'); return; }
+  fs.readFile(file, (err, data) => {
+    if (err) { res.writeHead(404, { 'content-type': 'text/html' }).end('<h1>404</h1>'); return; }
+    res.writeHead(200, { 'content-type': TYPES[path.extname(file)] || 'application/octet-stream' });
+    res.end(data);
+  });
+}).listen(PORT, () => console.log('Static server on http://localhost:' + PORT));
+`,
+      "public/index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Static site</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Static HTML/CSS/JS</h1>
+      <p>Served by a zero-dependency Node server inside OpenContainer.</p>
+      <button id="btn" type="button">Click me</button>
+    </main>
+    <script src="/main.js"></script>
+  </body>
+</html>
+`,
+      "public/styles.css": `body { font-family: system-ui, sans-serif; margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0a0a0a; color: #ededed; }
+main { text-align: center; padding: 2rem; }
+button { padding: .6rem 1.2rem; border-radius: 8px; border: 1px solid #646cff; background: #646cff; color: #fff; font-size: 1rem; cursor: pointer; }
+`,
+      "public/main.js": `let n = 0;
+const btn = document.getElementById('btn');
+btn.addEventListener('click', () => { n++; btn.textContent = 'Clicked ' + n + '\\u00d7'; });
+`,
+    },
+  };
+}
+
+// ── Bootstrap 5 (Vite) ───────────────────────────────────────────────────────
+function bootstrapTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "bootstrap",
+      framework: "bootstrap",
+      icon: "bootstrap",
+      category: "Frontend",
+      name: "Bootstrap 5",
+      language: "TypeScript",
+      description: "Bootstrap 5 + Vite + TypeScript",
+      port: 5173,
+      openPath: "/",
+      entry: "src/main.ts",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: VITE_DEV,
+    },
+    files: {
+      "package.json": `{
+  "name": "bootstrap-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
+  "dependencies": { "bootstrap": "^5.3.3" },
+  "devDependencies": { "typescript": "^5.7.0", "vite": "^8.0.0" }
+}
+`,
+      "index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vite + Bootstrap 5</title>
+  </head>
+  <body>
+    <div id="app" class="container py-5"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+`,
+      "src/main.ts": `import 'bootstrap/dist/css/bootstrap.min.css'
+import { Modal } from 'bootstrap'
+
+const app = document.querySelector<HTMLDivElement>('#app')!
+app.innerHTML = \`
+  <h1 class="mb-3">Vite + Bootstrap 5</h1>
+  <p class="text-muted">Running inside OpenContainer.</p>
+  <button class="btn btn-primary" id="open" type="button">Open modal</button>
+  <div class="modal fade" id="demo" tabindex="-1">
+    <div class="modal-dialog"><div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title">Hello</h5></div>
+      <div class="modal-body">Bootstrap's JS works too.</div>
+      <div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal" type="button">Close</button></div>
+    </div></div>
+  </div>
+\`
+const modal = new Modal('#demo')
+document.querySelector('#open')!.addEventListener('click', () => modal.show())
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "skipLibCheck": true,
+    "noEmit": true,
+    "strict": true
+  },
+  "include": ["src"]
+}
+`,
+    },
+  };
+}
+
+// ── Three.js (Vite) ──────────────────────────────────────────────────────────
+function threeTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "three",
+      framework: "three",
+      icon: "three",
+      category: "Creative",
+      name: "Three.js",
+      language: "TypeScript",
+      description: "Three.js + Vite — a spinning cube in WebGL",
+      port: 5173,
+      openPath: "/",
+      entry: "src/main.ts",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: VITE_DEV,
+    },
+    files: {
+      "package.json": `{
+  "name": "three-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
+  "dependencies": { "three": "^0.171.0" },
+  "devDependencies": { "@types/three": "^0.171.0", "typescript": "^5.7.0", "vite": "^8.0.0" }
+}
+`,
+      "index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vite + Three.js</title>
+    <style>body { margin: 0; overflow: hidden; background: #0a0a0a; }</style>
+  </head>
+  <body>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+`,
+      "src/main.ts": `import * as THREE from 'three'
+
+const scene = new THREE.Scene()
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 100)
+camera.position.z = 3
+
+const renderer = new THREE.WebGLRenderer({ antialias: true })
+renderer.setSize(innerWidth, innerHeight)
+renderer.setPixelRatio(devicePixelRatio)
+document.body.appendChild(renderer.domElement)
+
+const cube = new THREE.Mesh(
+  new THREE.BoxGeometry(),
+  new THREE.MeshStandardMaterial({ color: 0x646cff }),
+)
+scene.add(cube)
+scene.add(new THREE.HemisphereLight(0xffffff, 0x222233, 1.5))
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight
+  camera.updateProjectionMatrix()
+  renderer.setSize(innerWidth, innerHeight)
+})
+
+renderer.setAnimationLoop((t) => {
+  cube.rotation.x = t / 2000
+  cube.rotation.y = t / 1000
+  renderer.render(scene, camera)
+})
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "skipLibCheck": true,
+    "noEmit": true,
+    "strict": true
+  },
+  "include": ["src"]
+}
+`,
+    },
+  };
+}
+
+// ── GreenSock (GSAP) + React (Vite) ──────────────────────────────────────────
+function gsapReactTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "gsap-react",
+      framework: "gsap",
+      icon: "gsap",
+      category: "Creative",
+      name: "GSAP + React",
+      language: "JavaScript",
+      description: "GreenSock (GSAP) animation with React + Vite",
+      port: 5173,
+      openPath: "/",
+      entry: "src/App.jsx",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: VITE_DEV,
+    },
+    files: {
+      "package.json": `{
+  "name": "gsap-react",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
+  "dependencies": { "gsap": "^3.12.5", "react": "^19.0.0", "react-dom": "^19.0.0" },
+  "devDependencies": { "@vitejs/plugin-react": "^5.0.0", "vite": "^8.0.0" }
+}
+`,
+      "vite.config.js": reactViteConfig,
+      "index.html": reactIndexHtml("jsx"),
+      "src/index.css": VITE_INDEX_CSS,
+      "src/main.jsx": reactMain(false),
+      "src/App.jsx": `import { useRef, useEffect } from 'react'
+import gsap from 'gsap'
+
+export default function App() {
+  const boxRef = useRef(null)
+  useEffect(() => {
+    const ctx = gsap.context(() => {
+      gsap.to(boxRef.current, {
+        rotation: 360, x: 120, borderRadius: '50%',
+        repeat: -1, yoyo: true, duration: 1.5, ease: 'power1.inOut',
+      })
+    })
+    return () => ctx.revert()
+  }, [])
+  return (
+    <>
+      <h1>GSAP + React</h1>
+      <p>GreenSock animating a React element inside OpenContainer.</p>
+      <div ref={boxRef} style={{ width: 80, height: 80, margin: '3rem auto', background: '#646cff' }} />
+    </>
+  )
+}
+`,
+    },
+  };
+}
+
+// ── Koa ──────────────────────────────────────────────────────────────────────
+function koaTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "koa",
+      framework: "koa",
+      icon: "koa",
+      category: "Backend",
+      name: "Koa",
+      language: "JavaScript",
+      description: "Koa + @koa/router HTTP server on Node",
+      port: 3000,
+      openPath: "/",
+      entry: "src/index.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "node src/index.js",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "koa-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": { "start": "node src/index.js", "dev": "node src/index.js" },
+  "dependencies": { "koa": "^2.15.3", "@koa/router": "^13.1.0" }
+}
+`,
+      "src/index.js": `const Koa = require('koa');
+const Router = require('@koa/router');
+
+const app = new Koa();
+const router = new Router();
+const port = Number(process.env.PORT ?? 3000);
+
+router.get('/', (ctx) => { ctx.body = 'Hello from Koa, running inside OpenContainer!'; });
+router.get('/api/hello', (ctx) => { ctx.body = { message: 'Hello, world!' }; });
+
+app.use(router.routes()).use(router.allowedMethods());
+app.listen(port, () => console.log('Koa listening on http://localhost:' + port));
+`,
+    },
+  };
+}
+
+// ── Hono (Node) ──────────────────────────────────────────────────────────────
+function honoTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "hono",
+      framework: "hono",
+      icon: "hono",
+      category: "Backend",
+      name: "Hono",
+      language: "JavaScript",
+      description: "Hono on Node (@hono/node-server)",
+      port: 3000,
+      openPath: "/",
+      entry: "src/index.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "node src/index.js",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "hono-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "node src/index.js", "dev": "node src/index.js" },
+  "dependencies": { "hono": "^4.6.0", "@hono/node-server": "^1.13.0" }
+}
+`,
+      "src/index.js": `import { serve } from '@hono/node-server'
+import { Hono } from 'hono'
+
+const app = new Hono()
+app.get('/', (c) => c.text('Hello from Hono, running inside OpenContainer!'))
+app.get('/api/hello', (c) => c.json({ message: 'Hello, world!' }))
+
+const port = Number(process.env.PORT ?? 3000)
+serve({ fetch: app.fetch, port }, (info) => {
+  console.log('Hono listening on http://localhost:' + info.port)
+})
+`,
+    },
+  };
+}
+
+// ── H3 (unjs) ────────────────────────────────────────────────────────────────
+function h3Template(): TemplateDef {
+  return {
+    manifest: {
+      id: "h3",
+      framework: "h3",
+      icon: "h3",
+      category: "Backend",
+      name: "H3",
+      language: "JavaScript",
+      description: "H3 (unjs) HTTP server on Node",
+      port: 3000,
+      openPath: "/",
+      entry: "src/index.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "node src/index.js",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "h3-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "node src/index.js", "dev": "node src/index.js" },
+  "dependencies": { "h3": "^1.13.0" }
+}
+`,
+      "src/index.js": `import { createServer } from 'node:http'
+import { createApp, createRouter, defineEventHandler, toNodeListener } from 'h3'
+
+const app = createApp()
+const router = createRouter()
+router.get('/', defineEventHandler(() => 'Hello from H3, running inside OpenContainer!'))
+router.get('/api/hello', defineEventHandler(() => ({ message: 'Hello, world!' })))
+app.use(router)
+
+const port = Number(process.env.PORT ?? 3000)
+createServer(toNodeListener(app)).listen(port, () => {
+  console.log('H3 listening on http://localhost:' + port)
+})
+`,
+    },
+  };
+}
+
+// ── Node.js (blank) ──────────────────────────────────────────────────────────
+function nodeTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "node",
+      framework: "node",
+      icon: "node",
+      category: "Tooling",
+      name: "Node.js",
+      language: "JavaScript",
+      description: "A blank Node.js project with a minimal HTTP server",
+      port: 3000,
+      openPath: "/",
+      entry: "index.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "node index.js",
+    },
+    files: {
+      "package.json": `{
+  "name": "node-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": { "start": "node index.js", "dev": "node index.js" }
+}
+`,
+      "index.js": `// A blank Node.js starter — no dependencies. Edit away.
+const http = require('http');
+
+const port = Number(process.env.PORT ?? 3000);
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ hello: 'world', url: req.url, node: process.version }));
+});
+server.listen(port, () => console.log('Node server on http://localhost:' + port));
+`,
+    },
+  };
+}
+
+// ── Server-Sent Events (Express) ─────────────────────────────────────────────
+function sseTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "sse",
+      framework: "sse",
+      icon: "sse",
+      category: "Showcase",
+      name: "Server-Sent Events",
+      language: "JavaScript",
+      description: "Express streaming live updates to the browser via EventSource",
+      port: 3000,
+      openPath: "/",
+      entry: "server/index.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "node server/index.js",
+    },
+    files: {
+      "package.json": `{
+  "name": "sse-demo",
+  "private": true,
+  "version": "0.0.0",
+  "type": "commonjs",
+  "scripts": { "start": "node server/index.js", "dev": "node server/index.js" },
+  "dependencies": { "express": "^4.21.0" }
+}
+`,
+      "server/index.js": `const express = require('express');
+const path = require('path');
+
+const app = express();
+const port = Number(process.env.PORT ?? 3000);
+
+app.get('/events', (req, res) => {
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  res.flushHeaders();
+  let n = 0;
+  const id = setInterval(() => {
+    n++;
+    res.write('data: ' + JSON.stringify({ n, time: new Date().toISOString() }) + '\\n\\n');
+  }, 1000);
+  req.on('close', () => clearInterval(id));
+});
+
+app.use(express.static(path.join(__dirname, '..', 'public')));
+app.listen(port, () => console.log('SSE demo on http://localhost:' + port));
+`,
+      "public/index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Server-Sent Events</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0a0a0a; color: #ededed; }
+      #log { margin-top: 1rem; font-family: ui-monospace, monospace; font-size: .85rem; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>Server-Sent Events</h1>
+    <p>The Express server is streaming a tick every second — no polling.</p>
+    <div id="log"></div>
+    <script>
+      const log = document.getElementById('log');
+      const es = new EventSource('/events');
+      es.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        log.textContent = 'tick #' + d.n + ' @ ' + d.time + '\\n' + log.textContent;
+      };
+    </script>
+  </body>
+</html>
+`,
+    },
+  };
+}
+
+// ── Fullstack: React (Vite) + Express API (two preview tabs) ─────────────────
+// Mirrors the WebSocket demo's process model: one `dev` run starts BOTH an
+// Express JSON API (:3001) and the Vite frontend (:5173); each listening port
+// gets its own preview tab. The frontend reaches the API cross-service through
+// the studio's preview proxy at /preview/3001/ (no CORS, no manual proxy).
+function fullstackTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "fullstack",
+      framework: "fullstack",
+      icon: "fullstack",
+      category: "Showcase",
+      name: "Vite + Express",
+      language: "JavaScript",
+      description: "React (Vite :5173) calling an Express JSON API (:3001) — two live preview tabs",
+      port: 5173,
+      openPath: "/",
+      entry: "src/App.jsx",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "node dev.js",
+    },
+    files: {
+      "package.json": `{
+  "name": "fullstack-vite-express",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "node dev.js",
+    "server": "node server/index.js",
+    "client": "vite --configLoader native --port 5173 --strictPort"
+  },
+  "dependencies": { "express": "^4.21.0", "react": "^19.0.0", "react-dom": "^19.0.0" },
+  "devDependencies": { "@vitejs/plugin-react": "^5.0.0", "vite": "^8.0.0" }
+}
+`,
+      "dev.js": `const { spawn } = require('child_process');
+
+const procs = [];
+let exiting = false;
+function run(label, cmd, args) {
+  const child = spawn(cmd, args, { stdio: 'inherit' });
+  procs.push(child);
+  child.on('exit', (code) => {
+    if (exiting) return;
+    exiting = true;
+    console.log('[dev] ' + label + ' exited (' + code + ') — stopping the other server.');
+    for (const p of procs) { if (p !== child) { try { p.kill(); } catch (e) {} } }
+    process.exit(code || 0);
+  });
+}
+
+console.log('[dev] starting API (:3001) and frontend (:5173)…');
+run('api', 'node', ['server/index.js']);
+run('frontend', 'npm', ['run', 'client']);
+`,
+      "vite.config.js": `import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  server: { port: 5173, strictPort: true },
+})
+`,
+      "index.html": reactIndexHtml("jsx"),
+      "src/index.css": VITE_INDEX_CSS,
+      "src/main.jsx": reactMain(false),
+      "src/App.jsx": `import { useEffect, useState } from 'react'
+
+const API_PORT = 3001
+// Cross-service: the studio's preview proxy maps /preview/<port>/ to that in-VM
+// server, so the frontend reaches the Express API with no CORS and no proxy.
+const API = '/preview/' + API_PORT + '/api'
+
+export default function App() {
+  const [msg, setMsg] = useState('loading…')
+  useEffect(() => {
+    fetch(API + '/hello')
+      .then((r) => r.json())
+      .then((d) => setMsg(d.message))
+      .catch((e) => setMsg('error: ' + e))
+  }, [])
+  return (
+    <>
+      <h1>Vite + Express fullstack</h1>
+      <p>Frontend (:5173) fetched from the Express API (:{API_PORT}):</p>
+      <pre>{msg}</pre>
+      <p>Two servers, two preview tabs — one <code>npm run dev</code>.</p>
+    </>
+  )
+}
+`,
+      "server/index.js": `const express = require('express');
+
+const app = express();
+const PORT = 3001;
+
+app.get('/api/hello', (_req, res) => res.json({ message: 'Hello from the Express API!' }));
+app.get('/', (_req, res) =>
+  res.type('html').send(
+    '<h1>Express API (:3001)</h1><p>Try <a href="/api/hello">/api/hello</a>. Open the frontend tab (:5173).</p>',
+  ),
+);
+
+app.listen(PORT, () => console.log('[api] listening on :' + PORT));
+`,
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 2 — meta-frameworks (experimental until each has a green headless spike)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Nuxt 3 ───────────────────────────────────────────────────────────────────
+function nuxtTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "nuxt",
+      framework: "nuxt",
+      icon: "nuxt",
+      category: "Fullstack",
+      name: "Nuxt",
+      language: "TypeScript",
+      description: "Nuxt 3 — Vue meta-framework (Vite + Nitro dev server)",
+      port: 3000,
+      openPath: "/",
+      entry: "app.vue",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "nuxt-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "nuxt dev",
+    "build": "nuxt build",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview"
+  },
+  "devDependencies": { "nuxt": "^3.14.0", "vue": "^3.5.0" }
+}
+`,
+      "nuxt.config.ts": `export default defineNuxtConfig({
+  devtools: { enabled: false },
+})
+`,
+      "app.vue": `<template>
+  <div class="page">
+    <h1>Nuxt 3 on OpenContainer</h1>
+    <p>Edit <code>app.vue</code> and save — HMR is live.</p>
+    <button @click="count++">count is {{ count }}</button>
+  </div>
+</template>
+
+<script setup>
+import { ref } from 'vue'
+const count = ref(0)
+</script>
+
+<style>
+.page { font-family: system-ui, sans-serif; text-align: center; padding: 3rem; }
+button { padding: .6rem 1.2rem; border-radius: 8px; border: 1px solid #00dc82; background: #00dc82; color: #05240f; cursor: pointer; }
+</style>
+`,
+    },
+  };
+}
+
+// ── SvelteKit ────────────────────────────────────────────────────────────────
+function svelteKitTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "sveltekit",
+      framework: "sveltekit",
+      icon: "sveltekit",
+      category: "Fullstack",
+      name: "SvelteKit",
+      language: "TypeScript",
+      description: "SvelteKit — the official Svelte app framework (Vite dev server)",
+      port: 5173,
+      openPath: "/",
+      entry: "src/routes/+page.svelte",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: VITE_DEV,
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "sveltekit-app",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-auto": "^3.3.0",
+    "@sveltejs/kit": "^2.8.0",
+    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "svelte": "^5.1.0",
+    "vite": "^8.0.0"
+  }
+}
+`,
+      "svelte.config.js": `import adapter from '@sveltejs/adapter-auto'
+import { vitePreprocess } from '@sveltejs/vite-plugin-svelte'
+
+export default {
+  preprocess: vitePreprocess(),
+  kit: { adapter: adapter() },
+}
+`,
+      "vite.config.js": `import { sveltekit } from '@sveltejs/kit/vite'
+import { defineConfig } from 'vite'
+
+export default defineConfig({
+  plugins: [sveltekit()],
+})
+`,
+      "src/app.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    %sveltekit.head%
+  </head>
+  <body data-sveltekit-preload-data="hover">
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>
+`,
+      "src/routes/+page.svelte": `<script>
+  let count = $state(0)
+</script>
+
+<main style="font-family: system-ui, sans-serif; text-align: center; padding: 3rem">
+  <h1>SvelteKit on OpenContainer</h1>
+  <p>Edit <code>src/routes/+page.svelte</code> and save.</p>
+  <button onclick={() => count++}>count is {count}</button>
+</main>
+`,
+    },
+  };
+}
+
+// ── React Router 7 (Remix) ───────────────────────────────────────────────────
+function remixTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "react-router",
+      framework: "react-router",
+      icon: "remix",
+      category: "Fullstack",
+      name: "React Router 7",
+      language: "TypeScript",
+      description: "React Router 7 framework mode (formerly Remix) — SSR + Vite",
+      port: 5173,
+      openPath: "/",
+      entry: "app/routes/home.tsx",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "react-router-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "react-router dev",
+    "build": "react-router build",
+    "start": "react-router-serve ./build/server/index.js",
+    "typecheck": "react-router typegen && tsc"
+  },
+  "dependencies": {
+    "@react-router/node": "^7.1.0",
+    "@react-router/serve": "^7.1.0",
+    "isbot": "^5.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router": "^7.1.0"
+  },
+  "devDependencies": {
+    "@react-router/dev": "^7.1.0",
+    "vite": "^8.0.0"
+  }
+}
+`,
+      "react-router.config.ts": `import type { Config } from '@react-router/dev/config'
+
+export default {
+  ssr: true,
+} satisfies Config
+`,
+      "vite.config.ts": `import { reactRouter } from '@react-router/dev/vite'
+import { defineConfig } from 'vite'
+
+export default defineConfig({
+  plugins: [reactRouter()],
+})
+`,
+      "app/root.tsx": `import { Links, Meta, Outlet, Scripts, ScrollRestoration } from 'react-router'
+
+export default function Root() {
+  return (
+    <html lang="en">
+      <head>
+        <meta charSet="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <Meta />
+        <Links />
+      </head>
+      <body>
+        <Outlet />
+        <ScrollRestoration />
+        <Scripts />
+      </body>
+    </html>
+  )
+}
+`,
+      "app/routes.ts": `import { type RouteConfig, index } from '@react-router/dev/routes'
+
+export default [index('routes/home.tsx')] satisfies RouteConfig
+`,
+      "app/routes/home.tsx": `export default function Home() {
+  return (
+    <main style={{ fontFamily: 'system-ui, sans-serif', textAlign: 'center', padding: '3rem' }}>
+      <h1>React Router 7 on OpenContainer</h1>
+      <p>Edit <code>app/routes/home.tsx</code> and save.</p>
+    </main>
+  )
+}
+`,
+    },
+  };
+}
+
+// ── Astro ────────────────────────────────────────────────────────────────────
+function astroTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "astro",
+      framework: "astro",
+      icon: "astro",
+      category: "Fullstack",
+      name: "Astro",
+      language: "TypeScript",
+      description: "Astro — content-driven web framework (Vite dev server)",
+      port: 4321,
+      openPath: "/",
+      entry: "src/pages/index.astro",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "astro-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": { "astro": "^5.1.0" }
+}
+`,
+      "astro.config.mjs": `import { defineConfig } from 'astro/config'
+
+export default defineConfig({})
+`,
+      "src/pages/index.astro": `---
+const title = 'Astro on OpenContainer'
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+  </head>
+  <body style="font-family: system-ui, sans-serif; text-align: center; padding: 3rem">
+    <h1>{title}</h1>
+    <p>Edit <code>src/pages/index.astro</code> and save.</p>
+  </body>
+</html>
+`,
+    },
+  };
+}
+
+// ── VitePress ────────────────────────────────────────────────────────────────
+function vitepressTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "vitepress",
+      framework: "vitepress",
+      icon: "vitepress",
+      category: "Docs",
+      name: "VitePress",
+      language: "TypeScript",
+      description: "VitePress — Vite & Vue powered static site generator for docs",
+      port: 5173,
+      openPath: "/",
+      entry: "docs/index.md",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "vitepress-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vitepress dev docs",
+    "build": "vitepress build docs",
+    "preview": "vitepress preview docs"
+  },
+  "devDependencies": { "vitepress": "^1.5.0" }
+}
+`,
+      "docs/.vitepress/config.mjs": `import { defineConfig } from 'vitepress'
+
+export default defineConfig({
+  title: 'OpenContainer Docs',
+  description: 'VitePress running inside OpenContainer',
+  themeConfig: {
+    nav: [{ text: 'Home', link: '/' }, { text: 'Guide', link: '/guide' }],
+    sidebar: [
+      { text: 'Introduction', items: [
+        { text: 'Home', link: '/' },
+        { text: 'Guide', link: '/guide' },
+      ] },
+    ],
+  },
+})
+`,
+      "docs/index.md": `---
+layout: home
+hero:
+  name: OpenContainer
+  text: VitePress in the browser
+  tagline: Edit docs/index.md and save — HMR is live.
+  actions:
+    - theme: brand
+      text: Read the guide
+      link: /guide
+---
+`,
+      "docs/guide.md": `# Guide
+
+This VitePress site is running entirely inside OpenContainer.
+
+- Markdown with Vue components
+- Instant hot reload
+- Zero native dependencies
+`,
+    },
+  };
+}
+
+// ── Slidev ───────────────────────────────────────────────────────────────────
+function slidevTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "slidev",
+      framework: "slidev",
+      icon: "slidev",
+      category: "Docs",
+      name: "Slidev",
+      language: "JavaScript",
+      description: "Slidev — presentation slides for developers (Vite + Vue)",
+      port: 3030,
+      openPath: "/",
+      entry: "slides.md",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "slidev-deck",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "slidev --port 3030",
+    "build": "slidev build",
+    "export": "slidev export"
+  },
+  "dependencies": {
+    "@slidev/cli": "^0.50.0",
+    "@slidev/theme-default": "^0.25.0",
+    "vue": "^3.5.0"
+  }
+}
+`,
+      "slides.md": `---
+theme: default
+title: Slidev on OpenContainer
+---
+
+# Slidev on OpenContainer
+
+Presentation slides for developers — running in the browser
+
+---
+
+## Powered by Vite + Vue
+
+- Write slides in Markdown
+- Live hot reload as you edit \`slides.md\`
+- Code highlighting, embedded components, and more
+`,
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 3 — frontend variants (Vite 8 / rolldown; experimental until spiked)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Preact ───────────────────────────────────────────────────────────────────
+function preactTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "preact",
+      framework: "preact",
+      icon: "preact",
+      category: "Frontend",
+      name: "Preact",
+      language: "TypeScript",
+      description: "Preact + Vite — a fast 3kB alternative to React",
+      port: 5173,
+      openPath: "/",
+      entry: "src/app.tsx",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: VITE_DEV,
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "preact-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
+  "dependencies": { "preact": "^10.25.0" },
+  "devDependencies": { "@preact/preset-vite": "^2.9.0", "typescript": "^5.7.0", "vite": "^8.0.0" }
+}
+`,
+      "vite.config.ts": `import { defineConfig } from 'vite'
+import preact from '@preact/preset-vite'
+
+export default defineConfig({
+  plugins: [preact()],
+})
+`,
+      "index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vite + Preact</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+`,
+      "src/index.css": VITE_INDEX_CSS,
+      "src/main.tsx": `import { render } from 'preact'
+import { App } from './app'
+import './index.css'
+
+render(<App />, document.getElementById('app')!)
+`,
+      "src/app.tsx": `import { useState } from 'preact/hooks'
+
+export function App() {
+  const [count, setCount] = useState(0)
+  return (
+    <>
+      <h1>Vite + Preact</h1>
+      <div class="card">
+        <button onClick={() => setCount((c) => c + 1)}>count is {count}</button>
+      </div>
+      <p>Running inside OpenContainer.</p>
+    </>
+  )
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
+    "skipLibCheck": true,
+    "noEmit": true,
+    "strict": true
+  },
+  "include": ["src"]
+}
+`,
+    },
+  };
+}
+
+// ── Lit ──────────────────────────────────────────────────────────────────────
+function litTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "lit",
+      framework: "lit",
+      icon: "lit",
+      category: "Frontend",
+      name: "Lit",
+      language: "TypeScript",
+      description: "Lit + Vite — fast, lightweight web components",
+      port: 5173,
+      openPath: "/",
+      entry: "src/my-element.ts",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: VITE_DEV,
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "lit-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
+  "dependencies": { "lit": "^3.2.0" },
+  "devDependencies": { "typescript": "^5.7.0", "vite": "^8.0.0" }
+}
+`,
+      "index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vite + Lit</title>
+  </head>
+  <body>
+    <my-element></my-element>
+    <script type="module" src="/src/my-element.ts"></script>
+  </body>
+</html>
+`,
+      "src/my-element.ts": `import { LitElement, html, css } from 'lit'
+
+export class MyElement extends LitElement {
+  static properties = { count: { type: Number } }
+
+  static styles = css\`
+    :host { display: block; font-family: system-ui, sans-serif; text-align: center; padding: 3rem; }
+    button { padding: .6rem 1.2rem; border-radius: 8px; border: 1px solid #324fff; background: #324fff; color: #fff; cursor: pointer; }
+  \`
+
+  declare count: number
+  constructor() {
+    super()
+    this.count = 0
+  }
+
+  render() {
+    return html\`
+      <h1>Vite + Lit</h1>
+      <button @click=\${() => this.count++}>count is \${this.count}</button>
+      <p>A web component running inside OpenContainer.</p>
+    \`
+  }
+}
+
+customElements.define('my-element', MyElement)
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "skipLibCheck": true,
+    "noEmit": true,
+    "strict": true,
+    "useDefineForClassFields": false
+  },
+  "include": ["src"]
+}
+`,
+    },
+  };
+}
+
+// ── Solid ────────────────────────────────────────────────────────────────────
+function solidTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "solid",
+      framework: "solid",
+      icon: "solid",
+      category: "Frontend",
+      name: "Solid",
+      language: "TypeScript",
+      description: "SolidJS + Vite — fine-grained reactive UI",
+      port: 5173,
+      openPath: "/",
+      entry: "src/App.tsx",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: VITE_DEV,
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "solid-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
+  "dependencies": { "solid-js": "^1.9.0" },
+  "devDependencies": { "typescript": "^5.7.0", "vite": "^8.0.0", "vite-plugin-solid": "^2.11.0" }
+}
+`,
+      "vite.config.ts": `import { defineConfig } from 'vite'
+import solid from 'vite-plugin-solid'
+
+export default defineConfig({
+  plugins: [solid()],
+})
+`,
+      "index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vite + Solid</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/index.tsx"></script>
+  </body>
+</html>
+`,
+      "src/index.css": VITE_INDEX_CSS,
+      "src/index.tsx": `import { render } from 'solid-js/web'
+import App from './App'
+import './index.css'
+
+render(() => <App />, document.getElementById('root')!)
+`,
+      "src/App.tsx": `import { createSignal } from 'solid-js'
+
+export default function App() {
+  const [count, setCount] = createSignal(0)
+  return (
+    <>
+      <h1>Vite + Solid</h1>
+      <div class="card">
+        <button onClick={() => setCount(count() + 1)}>count is {count()}</button>
+      </div>
+      <p>Running inside OpenContainer.</p>
+    </>
+  )
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
+    "skipLibCheck": true,
+    "noEmit": true,
+    "strict": true
+  },
+  "include": ["src"]
+}
+`,
+    },
+  };
+}
+
+// ── Qwik ─────────────────────────────────────────────────────────────────────
+function qwikTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "qwik",
+      framework: "qwik",
+      icon: "qwik",
+      category: "Frontend",
+      name: "Qwik",
+      language: "TypeScript",
+      description: "Qwik + Vite — resumable, O(1) loading UI",
+      port: 5173,
+      openPath: "/",
+      entry: "src/app.tsx",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: VITE_DEV,
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "qwik-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
+  "dependencies": { "@builder.io/qwik": "^1.12.0" },
+  "devDependencies": { "typescript": "^5.7.0", "vite": "^8.0.0" }
+}
+`,
+      "vite.config.ts": `import { defineConfig } from 'vite'
+import { qwikVite } from '@builder.io/qwik/optimizer'
+
+export default defineConfig({
+  plugins: [qwikVite()],
+})
+`,
+      "index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vite + Qwik</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+`,
+      "src/main.tsx": `import { render } from '@builder.io/qwik'
+import { App } from './app'
+
+render(document.getElementById('app')!, <App />)
+`,
+      "src/app.tsx": `import { component$, useSignal } from '@builder.io/qwik'
+
+export const App = component$(() => {
+  const count = useSignal(0)
+  return (
+    <main style="font-family: system-ui, sans-serif; text-align: center; padding: 3rem">
+      <h1>Vite + Qwik</h1>
+      <button onClick$={() => count.value++}>count is {count.value}</button>
+      <p>Running inside OpenContainer.</p>
+    </main>
+  )
+})
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "@builder.io/qwik",
+    "skipLibCheck": true,
+    "noEmit": true,
+    "strict": true
+  },
+  "include": ["src"]
+}
+`,
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 3 — backends (experimental until spiked)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Fastify ──────────────────────────────────────────────────────────────────
+function fastifyTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "fastify",
+      framework: "fastify",
+      icon: "fastify",
+      category: "Backend",
+      name: "Fastify",
+      language: "JavaScript",
+      description: "Fastify — fast and low-overhead Node web framework",
+      port: 3000,
+      openPath: "/",
+      entry: "src/index.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "fastify-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": { "start": "node src/index.js", "dev": "node src/index.js" },
+  "dependencies": { "fastify": "^5.1.0" }
+}
+`,
+      "src/index.js": `const Fastify = require('fastify');
+
+const app = Fastify({ logger: true });
+const port = Number(process.env.PORT ?? 3000);
+
+app.get('/', async () => 'Hello from Fastify, running inside OpenContainer!');
+app.get('/api/hello', async () => ({ message: 'Hello, world!' }));
+
+app.listen({ port, host: '0.0.0.0' }).catch((err) => {
+  app.log.error(err);
+  process.exit(1);
+});
+`,
+    },
+  };
+}
+
+// ── Nitro ────────────────────────────────────────────────────────────────────
+function nitroTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "nitro",
+      framework: "nitro",
+      icon: "nitro",
+      category: "Backend",
+      name: "Nitro",
+      language: "TypeScript",
+      description: "Nitro (unjs) — universal server framework",
+      port: 3000,
+      openPath: "/",
+      entry: "routes/index.ts",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "nitro-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "nitro dev",
+    "build": "nitro build",
+    "preview": "node .output/server/index.mjs"
+  },
+  "devDependencies": { "nitropack": "^2.10.0" }
+}
+`,
+      "nitro.config.ts": `export default defineNitroConfig({
+  compatibilityDate: 'latest',
+})
+`,
+      "routes/index.ts": `export default defineEventHandler(() => 'Hello from Nitro, running inside OpenContainer!')
+`,
+      "routes/api/hello.ts": `export default defineEventHandler(() => ({ message: 'Hello, world!' }))
+`,
+    },
+  };
+}
+
+// ── GraphQL (Yoga) ───────────────────────────────────────────────────────────
+function graphqlTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "graphql",
+      framework: "graphql",
+      icon: "graphql",
+      category: "Backend",
+      name: "GraphQL",
+      language: "JavaScript",
+      description: "GraphQL Yoga server with GraphiQL, on Node",
+      port: 4000,
+      openPath: "/graphql",
+      entry: "src/index.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "graphql-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": { "start": "node src/index.js", "dev": "node src/index.js" },
+  "dependencies": { "graphql": "^16.10.0", "graphql-yoga": "^5.10.0" }
+}
+`,
+      "src/index.js": `const { createServer } = require('node:http');
+const { createYoga, createSchema } = require('graphql-yoga');
+
+const yoga = createYoga({
+  schema: createSchema({
+    typeDefs: \`
+      type Query {
+        hello: String
+        greet(name: String!): String
+      }
+    \`,
+    resolvers: {
+      Query: {
+        hello: () => 'Hello from GraphQL Yoga!',
+        greet: (_parent, args) => 'Hello ' + args.name + '!',
+      },
+    },
+  }),
+});
+
+const port = Number(process.env.PORT ?? 4000);
+createServer(yoga).listen(port, () => {
+  console.log('GraphQL ready at http://localhost:' + port + '/graphql');
+});
+`,
+    },
+  };
+}
+
+// ── Feathers ─────────────────────────────────────────────────────────────────
+function feathersTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "feathers",
+      framework: "feathers",
+      icon: "feathers",
+      category: "Backend",
+      name: "Feathers",
+      language: "JavaScript",
+      description: "FeathersJS — real-time APIs and services (Koa transport)",
+      port: 3030,
+      openPath: "/messages",
+      entry: "src/index.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "feathers-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": { "start": "node src/index.js", "dev": "node src/index.js" },
+  "dependencies": { "@feathersjs/feathers": "^5.0.0", "@feathersjs/koa": "^5.0.0" }
+}
+`,
+      "src/index.js": `const { feathers } = require('@feathersjs/feathers');
+const { koa, rest, bodyParser, errorHandler } = require('@feathersjs/koa');
+
+class MessageService {
+  constructor() {
+    this.messages = [{ id: 0, text: 'Hello from Feathers!' }];
+  }
+  async find() {
+    return this.messages;
+  }
+  async create(data) {
+    const message = { id: this.messages.length, text: data.text };
+    this.messages.push(message);
+    return message;
+  }
+}
+
+const app = koa(feathers());
+app.use(errorHandler());
+app.use(bodyParser());
+app.configure(rest());
+app.use('messages', new MessageService());
+
+const port = Number(process.env.PORT ?? 3030);
+app.listen(port).then(() => console.log('Feathers on http://localhost:' + port + '/messages'));
+`,
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 3 — showcases that lean into OpenContainer's strengths
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Socket.IO ────────────────────────────────────────────────────────────────
+function socketioTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "socketio",
+      framework: "socketio",
+      icon: "socketio",
+      category: "Showcase",
+      name: "Socket.IO",
+      language: "JavaScript",
+      description: "Real-time chat over Socket.IO — WebSockets tunneled through the preview",
+      port: 3000,
+      openPath: "/",
+      entry: "server.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "socketio-chat",
+  "private": true,
+  "version": "0.0.0",
+  "type": "commonjs",
+  "scripts": { "start": "node server.js", "dev": "node server.js" },
+  "dependencies": { "express": "^4.21.0", "socket.io": "^4.8.0" }
+}
+`,
+      "server.js": `const express = require('express');
+const { createServer } = require('node:http');
+const { Server } = require('socket.io');
+const path = require('path');
+
+const app = express();
+const httpServer = createServer(app);
+const io = new Server(httpServer);
+
+io.on('connection', (socket) => {
+  console.log('client connected:', socket.id);
+  socket.on('chat', (msg) => io.emit('chat', msg));
+  socket.on('disconnect', () => console.log('client left:', socket.id));
+});
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+const port = Number(process.env.PORT ?? 3000);
+httpServer.listen(port, () => console.log('Socket.IO chat on http://localhost:' + port));
+`,
+      "public/index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Socket.IO chat</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0a0a0a; color: #ededed; }
+      #log { margin: 1rem 0; height: 240px; overflow: auto; border: 1px solid #333; border-radius: 8px; padding: .75rem; }
+      form { display: flex; gap: .5rem; }
+      input { flex: 1; padding: .5rem; border-radius: 6px; border: 1px solid #333; background: #111; color: #ededed; }
+      button { padding: .5rem 1rem; border-radius: 6px; border: 0; background: #646cff; color: #fff; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <h1>Socket.IO chat</h1>
+    <p>Open this preview in two tabs and watch messages sync in real time.</p>
+    <div id="log"></div>
+    <form id="form">
+      <input id="input" autocomplete="off" placeholder="Type a message…" />
+      <button type="submit">Send</button>
+    </form>
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+      var socket = io();
+      var log = document.getElementById('log');
+      var form = document.getElementById('form');
+      var input = document.getElementById('input');
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        if (input.value) { socket.emit('chat', input.value); input.value = ''; }
+      });
+      socket.on('chat', function (msg) {
+        var line = document.createElement('div');
+        line.textContent = msg;
+        log.appendChild(line);
+        log.scrollTop = log.scrollHeight;
+      });
+    </script>
+  </body>
+</html>
+`,
+    },
+  };
+}
+
+// ── tRPC (React + Node) ──────────────────────────────────────────────────────
+function trpcTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "trpc",
+      framework: "trpc",
+      icon: "trpc",
+      category: "Showcase",
+      name: "tRPC",
+      language: "TypeScript",
+      description: "tRPC end-to-end typed API: React (Vite :5173) calling a Node server (:3001)",
+      port: 5173,
+      openPath: "/",
+      entry: "src/App.tsx",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "trpc-app",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "node dev.js",
+    "server": "node --experimental-strip-types server/index.ts",
+    "client": "vite --configLoader native --port 5173 --strictPort"
+  },
+  "dependencies": {
+    "@trpc/client": "^11.0.0",
+    "@trpc/server": "^11.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": { "@vitejs/plugin-react": "^5.0.0", "typescript": "^5.7.0", "vite": "^8.0.0" }
+}
+`,
+      "dev.js": `const { spawn } = require('child_process');
+
+const procs = [];
+let exiting = false;
+function run(label, cmd, args) {
+  const child = spawn(cmd, args, { stdio: 'inherit' });
+  procs.push(child);
+  child.on('exit', (code) => {
+    if (exiting) return;
+    exiting = true;
+    console.log('[dev] ' + label + ' exited (' + code + ') — stopping the other process.');
+    for (const p of procs) { if (p !== child) { try { p.kill(); } catch (e) {} } }
+    process.exit(code || 0);
+  });
+}
+
+console.log('[dev] starting tRPC server (:3001) and frontend (:5173)…');
+run('server', 'npm', ['run', 'server']);
+run('frontend', 'npm', ['run', 'client']);
+`,
+      "vite.config.js": `import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  server: { port: 5173, strictPort: true },
+})
+`,
+      "server/index.ts": `import { initTRPC } from '@trpc/server'
+import { createHTTPServer } from '@trpc/server/adapters/standalone'
+import { z } from 'zod'
+
+const t = initTRPC.create()
+
+export const appRouter = t.router({
+  greeting: t.procedure
+    .input(z.object({ name: z.string() }).optional())
+    .query(({ input }) => 'Hello ' + (input?.name ?? 'world') + ' from tRPC!'),
+})
+
+export type AppRouter = typeof appRouter
+
+createHTTPServer({ router: appRouter }).listen(3001)
+console.log('[trpc] server listening on :3001')
+`,
+      "index.html": reactIndexHtml("tsx"),
+      "src/index.css": VITE_INDEX_CSS,
+      "src/main.tsx": reactMain(true),
+      "src/App.tsx": `import { useEffect, useState } from 'react'
+import { createTRPCClient, httpBatchLink } from '@trpc/client'
+import type { AppRouter } from '../server/index'
+
+// The studio's preview proxy maps /preview/<port>/ to the in-VM server, so the
+// browser reaches the tRPC server (:3001) with no CORS and no manual proxy.
+const trpc = createTRPCClient<AppRouter>({
+  links: [httpBatchLink({ url: '/preview/3001' })],
+})
+
+export default function App() {
+  const [msg, setMsg] = useState('loading…')
+  useEffect(() => {
+    trpc.greeting
+      .query({ name: 'OpenContainer' })
+      .then(setMsg)
+      .catch((e) => setMsg('error: ' + e))
+  }, [])
+  return (
+    <>
+      <h1>tRPC + React</h1>
+      <p>Fully-typed call from the frontend (:5173) to the tRPC server (:3001):</p>
+      <pre>{msg}</pre>
+    </>
+  )
+}
+`,
+    },
+  };
+}
+
+// ── pnpm monorepo ────────────────────────────────────────────────────────────
+function monorepoTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "monorepo",
+      framework: "monorepo",
+      icon: "monorepo",
+      category: "Showcase",
+      name: "pnpm monorepo",
+      language: "JavaScript",
+      description: "pnpm workspaces: a Vite React app importing a shared workspace package",
+      port: 5173,
+      openPath: "/",
+      entry: "apps/web/src/App.jsx",
+      hmr: true,
+      reload: false,
+      install: "pnpm install",
+      dev: "pnpm --filter web dev -- --configLoader native",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "monorepo",
+  "private": true,
+  "scripts": { "dev": "pnpm --filter web dev" }
+}
+`,
+      "pnpm-workspace.yaml": `packages:
+  - 'apps/*'
+  - 'packages/*'
+`,
+      "packages/ui/package.json": `{
+  "name": "@repo/ui",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": { ".": "./src/index.js" }
+}
+`,
+      "packages/ui/src/index.js": `export function greeting(name) {
+  return 'Hello ' + name + ' from the shared @repo/ui package!'
+}
+`,
+      "apps/web/package.json": `{
+  "name": "web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
+  "dependencies": { "@repo/ui": "workspace:*", "react": "^19.0.0", "react-dom": "^19.0.0" },
+  "devDependencies": { "@vitejs/plugin-react": "^5.0.0", "vite": "^8.0.0" }
+}
+`,
+      "apps/web/vite.config.js": reactViteConfig,
+      "apps/web/index.html": reactIndexHtml("jsx"),
+      "apps/web/src/index.css": VITE_INDEX_CSS,
+      "apps/web/src/main.jsx": reactMain(false),
+      "apps/web/src/App.jsx": `import { greeting } from '@repo/ui'
+
+export default function App() {
+  return (
+    <>
+      <h1>pnpm monorepo</h1>
+      <p>{greeting('OpenContainer')}</p>
+      <p>
+        The <code>web</code> app imports a shared <code>@repo/ui</code> workspace package —
+        pnpm workspaces working inside OpenContainer.
+      </p>
+    </>
+  )
+}
+`,
+    },
+  };
+}
+
+// ── SQLite (sql.js) ──────────────────────────────────────────────────────────
+function sqliteTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "sqlite",
+      framework: "sqlite",
+      icon: "sqlite",
+      category: "Showcase",
+      name: "SQLite (sql.js)",
+      language: "JavaScript",
+      description: "A real SQLite database in the browser via sql.js (WASM) + Express — zero native deps",
+      port: 3000,
+      openPath: "/",
+      entry: "server.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "sqlite-demo",
+  "private": true,
+  "version": "0.0.0",
+  "type": "commonjs",
+  "scripts": { "start": "node server.js", "dev": "node server.js" },
+  "dependencies": { "express": "^4.21.0", "sql.js": "^1.12.0" }
+}
+`,
+      "server.js": `const express = require('express');
+const path = require('path');
+const initSqlJs = require('sql.js');
+
+async function main() {
+  const SQL = await initSqlJs({ locateFile: (f) => require.resolve('sql.js/dist/' + f) });
+  const db = new SQL.Database();
+  db.run('CREATE TABLE todos (id INTEGER PRIMARY KEY, task TEXT, done INTEGER);');
+  db.run("INSERT INTO todos (task, done) VALUES ('Try OpenContainer', 1), ('Run SQLite in the browser', 0);");
+
+  const app = express();
+  app.get('/api/todos', (_req, res) => {
+    const rows = [];
+    const stmt = db.prepare('SELECT * FROM todos');
+    while (stmt.step()) rows.push(stmt.getAsObject());
+    stmt.free();
+    res.json(rows);
+  });
+  app.use(express.static(path.join(__dirname, 'public')));
+
+  const port = Number(process.env.PORT ?? 3000);
+  app.listen(port, () => console.log('SQLite demo on http://localhost:' + port));
+}
+
+main().catch((err) => { console.error(err); process.exit(1); });
+`,
+      "public/index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SQLite (sql.js)</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0a0a0a; color: #ededed; }
+      li { margin: .25rem 0; }
+      .done { text-decoration: line-through; opacity: .6; }
+    </style>
+  </head>
+  <body>
+    <h1>SQLite in the browser</h1>
+    <p>Rows queried from an in-memory SQLite database (sql.js WASM) via Express:</p>
+    <ul id="list"></ul>
+    <script>
+      fetch('/api/todos')
+        .then(function (r) { return r.json(); })
+        .then(function (rows) {
+          var list = document.getElementById('list');
+          rows.forEach(function (row) {
+            var li = document.createElement('li');
+            li.textContent = row.task;
+            if (row.done) li.className = 'done';
+            list.appendChild(li);
+          });
+        });
+    </script>
+  </body>
+</html>
+`,
+    },
+  };
+}
+
+// The full catalog, grouped by picker category (see TEMPLATE_CATEGORIES). The
+// picker renders one tab per category; order within a category follows this list.
 export const TEMPLATES: TemplateDef[] = [
+  // Frontend
   reactTemplate(false),
   reactTemplate(true),
   vueTemplate(false),
   vueTemplate(true),
   svelteTemplate(false),
   svelteTemplate(true),
+  vanillaTemplate(false),
+  vanillaTemplate(true),
+  staticTemplate(),
+  bootstrapTemplate(),
+  preactTemplate(),
+  litTemplate(),
+  solidTemplate(),
+  qwikTemplate(),
+  // Backend
   expressTemplate(false),
   expressTemplate(true),
   nestTemplate(true),
   nestTemplate(false),
+  koaTemplate(),
+  honoTemplate(),
+  h3Template(),
+  fastifyTemplate(),
+  nitroTemplate(),
+  graphqlTemplate(),
+  feathersTemplate(),
+  // Fullstack
   nextTemplate(true),
   nextTemplate(false),
+  nuxtTemplate(),
+  svelteKitTemplate(),
+  remixTemplate(),
+  astroTemplate(),
+  // Docs
+  vitepressTemplate(),
+  slidevTemplate(),
+  // Creative
+  threeTemplate(),
+  gsapReactTemplate(),
+  // Tooling
+  nodeTemplate(),
+  // Showcase
+  fullstackTemplate(),
+  sseTemplate(),
   wsDemoTemplate(),
+  socketioTemplate(),
+  trpcTemplate(),
+  monorepoTemplate(),
+  sqliteTemplate(),
 ];
 
 export function getTemplate(id: string): TemplateDef | undefined {
