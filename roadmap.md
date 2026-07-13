@@ -1661,13 +1661,43 @@ headless spike (`scripts/spike-*.mjs`) before wiring, per the repo's spike-first
   `/preview/3001/ws`, exercising both directions (server→client tick, client→server echo).
   Spike: `spike-ws-demo.mjs` drives the real `ws` backend through the kernel tunnel and
   asserts both directions.
-- **Host ↔ preview bridge (`fetcher-worker.js`).** The analog of Docker's
-  `host.docker.internal`: in-VM code can reach a service on the **host machine** by addressing
-  `http://host.opencontainer.internal:<port>/…`; the fetcher's `rewrite()` maps the alias to
-  the studio's own hostname (the fetcher runs in the browser). The reverse direction needs no
-  alias — the host reaches an in-VM server at `<studio-origin>/preview/<port>/…` (the same SW
-  preview proxy the iframes use). This is addressing convenience, **not** a CORS/auth bypass:
-  the target must still allow the studio origin (ACAO + a COEP-satisfying CORP).
+- **Host ↔ preview bridge.** In-VM code can reach a service on the **host machine** by addressing
+  `http://host.opencontainer.internal:<port>/…`, mapped to the studio's own hostname (only reaches
+  the host when the studio is served locally). Both egress paths honor the alias: `http`/`https`
+  (and npm) via the fetcher's `rewrite()` (`fetcher-worker.js`), and the global `fetch()` — which
+  is the host realm's real fetch used directly — via `rewriteHostAlias` in
+  `packages/runtime/index.js`. The reverse direction needs no alias — the host reaches an in-VM
+  server at `<studio-origin>/preview/<port>/…` (the same SW preview proxy the iframes use). This
+  is addressing convenience, **not** a CORS/auth bypass: the target must still allow the studio
+  origin (ACAO + a COEP-satisfying CORP).
+
+  Note: `host.opencontainer.internal` is an **outbound-fetch** alias only — it is NOT wired into
+  the preview tab URL bar (which loads in-VM ports and rejects non-`localhost` hosts). Test it
+  from in-VM code, not by typing it in a preview tab:
+
+  1. On your Mac (outside the studio), run a CORS-enabled server on :3000:
+
+     ```js
+     // host-server.mjs  ->  node host-server.mjs
+     import { createServer } from "node:http";
+     createServer((req, res) => {
+       res.writeHead(200, { "content-type": "text/plain", "access-control-allow-origin": "*" });
+       res.end("hello from the host machine\n");
+     }).listen(3000, () => console.log("host server on http://localhost:3000"));
+     ```
+
+  2. In the studio, create `probe.mjs` (a file avoids terminal quoting issues) and run
+     `node probe.mjs`:
+
+     ```js
+     // probe.mjs  ->  node probe.mjs
+     const res = await fetch("http://host.opencontainer.internal:3000/");
+     console.log("status:", res.status);
+     console.log("body:", await res.text());
+     ```
+
+     Expected: `status: 200` and `body: hello from the host machine`. The target MUST send
+     `Access-Control-Allow-Origin` (the `*` above), else the browser blocks the cross-origin read.
 
 Deferred (next): **Next.js** (native SWC/Turbopack/LightningCSS need wasm/JS replacements),
 cross-host WebSockets from in-VM (the tunnel only dials `127.0.0.1`), and moving Vitest's

@@ -395,10 +395,14 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   `project-ready {extra:true}` (the controller only adds a tab for extras). Ports are cleared
   when the run shell exits so a re-run re-announces. The `ws-demo` template exploits this: one
   `dev.js` starts an Express+`ws` backend (:3001) and a Vite frontend (:5173).
-- **`host.opencontainer.internal`.** `packages/demo/fetcher-worker.js` `rewrite()` maps that
-  alias (and `host.docker.internal`) to the studio's own hostname so in-VM code can reach a
-  service on the HOST machine. Reverse direction: the host hits `<studio-origin>/preview/<port>/…`.
-  Addressing convenience only — the target still needs ACAO + a COEP-satisfying CORP.
+- **`host.opencontainer.internal`.** Maps to the studio's own hostname so in-VM code can reach a
+  service on the HOST machine (only when the studio is served locally). Two egress paths both
+  honor it: `http`/`https` (and npm) go through `packages/demo/fetcher-worker.js` `rewrite()`;
+  the **global `fetch()`** is the host realm's real fetch (used directly, not via the Fetcher
+  Worker), so `packages/runtime/index.js` rewrites the alias in its own `fetch` wrapper
+  (`rewriteHostAlias`). Reverse direction: the host hits `<studio-origin>/preview/<port>/…`.
+  Addressing convenience only — the target still needs ACAO + a COEP-satisfying CORP. Not wired
+  into the preview tab URL bar; test it from in-VM code (`node probe.mjs`), not the address bar.
 - Headless proof: `scripts/spike-ws-demo.mjs` (real `ws` backend, both directions via the
   kernel tunnel).
 

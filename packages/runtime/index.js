@@ -638,7 +638,48 @@ export function createRuntime({
       wrapHostAsync(WebAssembly, m);
     }
   }
-  if (typeof globalThis.fetch === "function") wrapHostAsync(globalThis, "fetch");
+  // Host alias for the *global* fetch(). Unlike http/https (which egress via
+  // __ocfetch -> the Fetcher Worker, where rewrite() already maps the alias), the
+  // global fetch is the host realm's real fetch used directly, so it needs its own
+  // rewrite. Map `http://host.opencontainer.internal:<port>/…` to the studio's own
+  // hostname (this realm is a Worker on the studio origin, so location.hostname IS
+  // the host) — reaching a service on the HOST machine when the studio is served
+  // locally. Headless (no browser realm) has no location and no-ops.
+  const HOST_ALIAS = "host.opencontainer.internal";
+  const rewriteHostAlias = (input) => {
+    const host = globalThis.location && globalThis.location.hostname;
+    if (!host) return input;
+    const rewriteStr = (s) => {
+      try {
+        const u = new URL(String(s));
+        if (u.hostname === HOST_ALIAS) {
+          u.hostname = host;
+          return u.toString();
+        }
+      } catch {
+        /* not an absolute URL — leave untouched */
+      }
+      return s;
+    };
+    if (typeof input === "string") return rewriteStr(input);
+    if (typeof URL !== "undefined" && input instanceof URL) return new URL(rewriteStr(input.href));
+    // Request: rebuild only if the URL actually changed (preserves method/headers/body).
+    if (typeof Request !== "undefined" && input instanceof Request) {
+      const next = rewriteStr(input.url);
+      return next === input.url ? input : new Request(next, input);
+    }
+    return input;
+  };
+  if (typeof globalThis.fetch === "function") {
+    const hostFetch = globalThis.fetch;
+    if (!hostFetch.__ocHostWrapped) {
+      const wrappedFetch = function (input, init) {
+        return trackHost(hostFetch.call(this, rewriteHostAlias(input), init));
+      };
+      wrappedFetch.__ocHostWrapped = true;
+      globalThis.fetch = wrappedFetch;
+    }
+  }
   // DecompressionStream/Blob consumers land here: new Response(stream).arrayBuffer().
   if (typeof Response !== "undefined" && Response.prototype) {
     for (const m of ["arrayBuffer", "text", "json", "blob", "formData"]) wrapHostAsync(Response.prototype, m);

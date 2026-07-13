@@ -439,10 +439,14 @@ but it loads **lazily in the background after boot** (placeholder shim until the
 OPFS. Proofs: `scripts/spike-tsgo.mjs`, `scripts/spike-tsgo-studio.mjs`.
 
 **Host ↔ preview.** In-VM code reaches a service on the HOST machine via
-`http://host.opencontainer.internal:<port>/…` — the fetcher (`fetcher-worker.js` `rewrite()`)
-maps the alias (and `host.docker.internal`) to the studio's own hostname. The reverse direction
-needs no alias: the host hits `<studio-origin>/preview/<port>/…` (the SW preview proxy). It's
-addressing convenience, not a CORS/auth bypass — the target must still allow the studio origin.
+`http://host.opencontainer.internal:<port>/…`, mapped to the studio's own hostname (only reaches
+the host when the studio is served locally). Both egress paths honor the alias: `http`/`https`
+(and npm) go through the fetcher (`fetcher-worker.js` `rewrite()`); the global `fetch()` is the
+host realm's real fetch used directly, so `packages/runtime/index.js` rewrites the alias in its
+own `fetch` wrapper (`rewriteHostAlias`). The reverse direction needs no alias: the host hits
+`<studio-origin>/preview/<port>/…` (the SW preview proxy). It's addressing convenience, not a
+CORS/auth bypass — the target must still allow the studio origin. It is not wired into the
+preview tab address bar (that only loads in-VM ports); test it from in-VM code.
 
 ---
 
