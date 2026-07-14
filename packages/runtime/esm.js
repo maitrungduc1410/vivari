@@ -56,13 +56,30 @@ function canStartRegex(src, i) {
 // code line numbers are preserved. They close over the wrapper's `require`/
 // `__filename`, so dynamic import + import.meta.resolve resolve relative to the
 // importing module.
-function helpers(fileUrl) {
+//
+// import.meta carries url + resolve AND filename/dirname: Node has exposed
+// `import.meta.filename` / `import.meta.dirname` (for file: modules) since
+// v20.11, and modern bundled ESM uses them directly instead of the older
+// `fileURLToPath(import.meta.url)` shim — e.g. unplugin 2.x:
+//   const LOADER = resolve(import.meta.dirname, "webpack/loaders/transform.mjs");
+// Without them `import.meta.dirname` is undefined and path.resolve throws
+// (`"paths[0]" argument must be of type string`).
+function helpers(fileUrl, filename) {
+  const fp = filename || "";
+  let dir;
+  const idx = fp.lastIndexOf("/");
+  if (idx < 0) dir = ".";
+  else if (idx === 0) dir = "/";
+  else dir = fp.slice(0, idx);
   return (
     "const __oc_def=function(m){return m&&m.__esModule?m.default:m;};" +
     "const __oc_ns=function(m){if(m&&m.__esModule)return m;var ns=Object.create(null);if(m)for(var k of Object.keys(m)){Object.defineProperty(ns,k,{enumerable:true,configurable:true,get:(function(k){return function(){return m[k];};})(k)});}ns.default=m;Object.defineProperty(ns,'__esModule',{value:true});return ns;};" +
     "const __oc_star=function(e,m){if(m)for(var k of Object.keys(m)){if(k!=='default'&&!(k in e))Object.defineProperty(e,k,{enumerable:true,configurable:true,get:function(){return m[k];}});}};" +
     "const __oc_import=function(s){return Promise.resolve().then(function(){return __oc_require(s);});};" +
-    "const __oc_meta={url:" + JSON.stringify(fileUrl) + ",resolve:function(s){return __oc_require.resolve?__oc_require.resolve(s):s;}};"
+    "const __oc_meta={url:" + JSON.stringify(fileUrl) +
+      ",filename:" + JSON.stringify(fp) +
+      ",dirname:" + JSON.stringify(dir) +
+      ",resolve:function(s){return __oc_require.resolve?__oc_require.resolve(s):s;}};"
   );
 }
 
@@ -505,7 +522,7 @@ export function transpileEsm(source, filename) {
 
   const fileUrl = "file://" + (filename || "");
   const head =
-    helpers(fileUrl) +
+    helpers(fileUrl, filename) +
     "Object.defineProperty(__oc_exports,'__esModule',{value:true});" +
     // Local export getters first (live bindings visible to circular importers),
     // then import requires + import-derived bindings + re-export getters.
