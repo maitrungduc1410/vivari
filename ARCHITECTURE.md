@@ -494,6 +494,34 @@ The codec + crypto Wasm are compiled **once** in the Kernel Worker and the
 `WebAssembly.Module`s are handed to each Process Worker, which instantiates them
 lazily on first use (a process that never hashes/compresses instantiates neither).
 
+### 9.1 Toolchain shims (esbuild, rollup, worker pools)
+
+`wasm32-wasi` auto-select (above) covers native addons that publish a wasm build
+as an optional dependency (rolldown, `@node-rs/*`). Two toolchain packages don't
+fit that mould — **esbuild** and **rollup** ship their WASM builds under a
+*different package name* (`esbuild-wasm`, `@rollup/wasm-node`), which npm's
+platform gating can't reach. The runtime bridges the gap so projects stay vanilla
+(no `package.json` "overrides", no per-project launcher):
+
+- **Registry aliasing** (`packages/demo/fetcher-worker.js`): when npm requests the
+  packument for `esbuild`/`rollup`, the Fetcher Worker serves the drop-in's
+  packument rewritten under the source name; npm resolves a lockstep version and
+  downloads the drop-in's real tarball (its own `dist`/integrity) straight into
+  `node_modules/<source>`. Tarballs need no interception. This realizes the
+  `REGISTRY_PROXY`/`rewrite()` seam.
+- **In-process esbuild** (`packages/runtime/esbuild-inproc-patch.js`, applied by
+  `module.js` at compile time): esbuild-wasm's Node build spawns a child service
+  whose stdio pipe deadlocks the single-threaded kernel against a Piscina/tinypool
+  loop. The loader rewrites `lib/main.js` to run the Go service in-thread (fd 0/1/2
+  multiplexed onto the protocol). Idempotent; a strict no-op for native esbuild.
+- **Worker-pool default** (`packages/runtime/builtins/process.js`):
+  `PISCINA_DISABLE_ATOMICS=1` by default, so pools use async message passing (our
+  cooperative worker_threads don't serve the Atomics fast-path).
+
+Together these let Angular's stock `@angular/build` (esbuild + Vite) run from an
+unmodified `ng new` project, and benefit any esbuild/worker-pool tool (Vitest,
+tsup, ...).
+
 ---
 
 ## 10. Build & run

@@ -49,6 +49,79 @@ function rewrite(url) {
   return url;
 }
 
+// ---- transparent wasm drop-in aliasing --------------------------------------
+// Some packages ship no wasm32 native build, so a plain install leaves them
+// unusable in-VM. Their official WASM drop-in lives under a DIFFERENT package
+// name, which npm's platform auto-select can't reach. Rather than force every
+// project to add a package.json "overrides" block, we alias at the registry
+// layer (StackBlitz-style): when npm asks for the packument of a source package,
+// we serve the TARGET's packument rewritten to carry the source name. npm then
+// resolves a version and downloads the TARGET's tarball (whose dist URL +
+// integrity are the target's real ones) straight into node_modules/<source>.
+//
+// This works because each pair is published in lockstep (same version numbers),
+// so a range like "esbuild@^0.28.0" resolves against esbuild-wasm's versions.
+// Tarball requests need no interception: the rewritten packument already points
+// at the target's tarballs. Keeps project package.json / angular.json pristine.
+const PACKAGE_ALIASES = {
+  esbuild: "esbuild-wasm",
+  rollup: "@rollup/wasm-node",
+};
+
+// Encode a package name for a registry path segment (scoped -> @scope%2fname).
+function encodePkgSegment(name) {
+  return name.startsWith("@") ? "@" + encodeURIComponent(name.slice(1)) : encodeURIComponent(name);
+}
+
+// If `url` is a packument (or single-version manifest) request for an aliased
+// SOURCE package, return { targetUrl, src, dst }; otherwise null. Tarball
+// requests (…/<name>/-/<file>.tgz) are deliberately left untouched.
+function matchPackumentAlias(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return null;
+  }
+  const segs = u.pathname.split("/").filter(Boolean);
+  if (!segs.length || segs.includes("-")) return null; // empty or a tarball path
+  // Packument is …/<name>; a single-version manifest is …/<name>/<version|tag>.
+  let nameIdx = segs.length - 1;
+  const last = decodeURIComponent(segs[nameIdx]);
+  const looksLikeVersion = /^\d/.test(last) || last === "latest";
+  if (looksLikeVersion && segs.length >= 2) nameIdx = segs.length - 2;
+  const src = decodeURIComponent(segs[nameIdx]);
+  const dst = PACKAGE_ALIASES[src];
+  if (!dst) return null;
+  const newSegs = segs.slice();
+  newSegs[nameIdx] = encodePkgSegment(dst);
+  u.pathname = "/" + newSegs.join("/");
+  return { targetUrl: u.toString(), src, dst };
+}
+
+// Rewrite a fetched packument JSON so the consumer sees it under `src` while the
+// version tarballs still resolve to `dst`. Only identity fields are touched; the
+// per-version `dist` (tarball + integrity), dependencies and optionalDependencies
+// are preserved verbatim — the target's lack of native platform deps is exactly
+// what makes it install cleanly in-VM.
+function rewritePackument(json, src) {
+  if (json && typeof json === "object") {
+    if ("name" in json) json.name = src;
+    if ("_id" in json) json._id = src;
+    const versions = json.versions;
+    if (versions && typeof versions === "object") {
+      for (const v of Object.keys(versions)) {
+        const m = versions[v];
+        if (m && typeof m === "object") {
+          if ("name" in m) m.name = src;
+          if ("_id" in m) m._id = src + "@" + (m.version || v);
+        }
+      }
+    }
+  }
+  return json;
+}
+
 // CORS-safelisted request headers: a cross-origin request that carries ONLY
 // these is a "simple" request the browser sends without a preflight OPTIONS.
 // See https://fetch.spec.whatwg.org/#cors-safelisted-request-header.
@@ -97,6 +170,32 @@ async function doFetch(url, init) {
     if (init.headers) opts.headers = corsSafeHeaders(init.headers);
     if (init.body) opts.body = init.body;
   }
+
+  // Transparent wasm drop-in: serve the target's packument under the source name
+  // for GET metadata requests only (never for tarballs or writes). On any failure
+  // we fall through to the normal fetch so aliasing can't make things worse.
+  const method = (opts.method || "GET").toUpperCase();
+  if (method === "GET") {
+    const alias = matchPackumentAlias(url);
+    if (alias) {
+      try {
+        const res = await fetch(rewrite(alias.targetUrl), opts);
+        if (res.ok) {
+          const json = rewritePackument(await res.json(), alias.src);
+          const body = new TextEncoder().encode(JSON.stringify(json)).buffer;
+          const headers = {};
+          for (const [k, v] of res.headers) headers[k] = v;
+          headers["content-type"] = "application/json";
+          delete headers["content-length"]; // body length changed after rewrite
+          delete headers["content-encoding"]; // we return decoded JSON bytes
+          return { ok: true, status: res.status, statusText: res.statusText, headers, body };
+        }
+      } catch {
+        // Network/parse failure — fall back to the un-aliased fetch below.
+      }
+    }
+  }
+
   const res = await fetch(rewrite(url), opts);
   const buf = await res.arrayBuffer();
   const headers = {};
