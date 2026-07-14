@@ -184,7 +184,33 @@ function createPool() {
   allocBuffer = createUnsafeBuffer(poolSize);
   allocPool = allocBuffer.buffer;
   markAsUntransferable(allocPool);
+  // Our internal markAsUntransferable only sets a private symbol the *platform's*
+  // transfer machinery doesn't recognise. On the Node worker host a guest that
+  // transfers a small (pooled) Buffer's `.buffer` — e.g. Angular's
+  // `pool.run(task, { transferList: [data.buffer] })` on a <32 KB file, where
+  // `data.buffer` IS this shared pool — would DETACH the whole pool, corrupting
+  // every other live pooled Buffer and throwing ERR_BUFFER_OUT_OF_BOUNDS on the
+  // next allocation. Marking with the host's real markAsUntransferable makes the
+  // platform clone that buffer instead of detaching the pool. Best-effort: absent
+  // in the browser, where the detached-pool guard below is the safety net.
+  const hostMark = globalThis.__ocHostMarkUntransferable;
+  if (typeof hostMark === "function") {
+    try {
+      hostMark(allocPool);
+    } catch {
+      /* best effort */
+    }
+  }
   poolOffset = 0;
+}
+
+// The pool can't satisfy `need` bytes when it is exhausted OR when its backing
+// ArrayBuffer was DETACHED out from under us (a pooled Buffer's `.buffer` got
+// transferred via postMessage). Recreating on detach keeps allocations working
+// instead of throwing ERR_BUFFER_OUT_OF_BOUNDS deep inside an async callback,
+// which silently wedges the caller (observed: Angular's esbuild bundling hang).
+function poolExhaustedOrDetached(need) {
+  return need > poolSize - poolOffset || allocBuffer.byteLength === 0;
 }
 createPool();
 if (isBuildingSnapshot()) {
@@ -486,7 +512,7 @@ function allocate(size) {
     return new FastBuffer();
   }
   if (size < (Buffer.poolSize >>> 1)) {
-    if (size > (poolSize - poolOffset))
+    if (poolExhaustedOrDetached(size))
       createPool();
     const b = new FastBuffer(allocPool, poolOffset, size);
     poolOffset += size;
@@ -512,7 +538,7 @@ function fromStringFast(string, ops) {
   if (length >= maxLength)
     return createFromString(string, ops, length);
 
-  if (length > (poolSize - poolOffset))
+  if (poolExhaustedOrDetached(length))
     createPool();
 
   const actual = ops.write(allocBuffer, string, poolOffset, length);
@@ -576,7 +602,7 @@ function fromArrayLike(obj) {
   if (length <= 0)
     return new FastBuffer();
   if (length < (Buffer.poolSize >>> 1)) {
-    if (length > (poolSize - poolOffset))
+    if (poolExhaustedOrDetached(length))
       createPool();
     const b = new FastBuffer(allocPool, poolOffset, length);
     TypedArrayPrototypeSet(b, obj, 0);

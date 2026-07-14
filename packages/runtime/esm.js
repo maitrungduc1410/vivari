@@ -312,6 +312,34 @@ export function rewriteCjsDynamicImport(source, filename) {
 }
 
 /**
+ * Rewrite dynamic `import()` in a FUNCTION-CONSTRUCTOR BODY so it routes through
+ * our loader instead of the host realm's native `import()`.
+ *
+ * Some libraries deliberately obtain a "clean" dynamic import that transpilers
+ * won't touch by building it at runtime: `new Function('s','return import(s)')`
+ * (piscina & tinypool worker harnesses do exactly this). The Function
+ * constructor compiles that string in the host realm, so the inner `import()`
+ * escapes the sandbox and can't see our VFS. The Function-constructor wrapper
+ * (index.js) feeds such bodies here; we point each dynamic import at the global
+ * `__ocImport` shim (loader-backed). Returns the rewritten body, or null when
+ * there are no dynamic imports to redirect.
+ */
+export function rewriteDynamicImportToGlobal(body) {
+  let parsed;
+  try {
+    parsed = parse(body, "fn");
+  } catch {
+    return null;
+  }
+  const edits = [];
+  for (const imp of parsed[0]) {
+    if (imp.t === T_DYNAMIC) edits.push({ start: imp.ss, end: imp.d, text: "globalThis.__ocImport" });
+  }
+  if (!edits.length) return null;
+  return applyEdits(body, edits);
+}
+
+/**
  * Transpile ESM source to our CJS. Returns the rewritten source, or null if the
  * file has no module syntax at all (pure CJS — load it unchanged).
  */
