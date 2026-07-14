@@ -12,6 +12,13 @@ import { transpileEsm, rewriteCjsDynamicImport } from "./esm.js";
 // The constructor for `async function () {}` — used to (re)compile an ESM module
 // that uses top-level await (our normal wrapper is a plain, non-async function).
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+// Our module compiler must always use the NATIVE Function constructor. The
+// runtime later wraps the *global* Function (to redirect dynamic import() in
+// escape-hatch bodies like piscina's `new Function('s','return import(s)')`);
+// module wrappers already have their imports rewritten, so routing them through
+// that wrapper would only re-lex every module for nothing. Captured at import
+// time, before the global is wrapped.
+const RealFunction = Function;
 
 export function createModuleSystem({ fs, path, builtins, process, globals, nodeModules }) {
   const cache = Object.create(null);
@@ -406,8 +413,8 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     let isAsync = false;
     try {
       wrapper = isEsm
-        ? new Function("__oc_exports", "__oc_require", "__oc_module", source + "\n")
-        : new Function("exports", "require", "module", "__filename", "__dirname", source + "\n");
+        ? new RealFunction("__oc_exports", "__oc_require", "__oc_module", source + "\n")
+        : new RealFunction("exports", "require", "module", "__filename", "__dirname", source + "\n");
     } catch (err) {
       // Top-level await: real ESM allows `await` at the module top level, but our
       // CJS wrapper is a plain (non-async) function, so `new Function` rejects the

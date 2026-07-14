@@ -31,6 +31,32 @@ export default function (exports, require, module) {
         }
       });
 
+  // Node's async fs.promises.readFile (readFileHandle) returns a buffer backed by a
+  // DEDICATED, exactly-sized ArrayBuffer (allocUnsafeSlow) — unlike readFileSync,
+  // which hands back a slice of the shared Buffer pool. Some consumers rely on this:
+  // e.g. Angular's javascript-transformer does
+  //   pool.run(task, { transferList: [data.buffer] })
+  // where `data = await readFile(file)`. Transferring a pooled `.buffer` would move
+  // the *entire* shared pool (corrupting every other live buffer, or — now that the
+  // pool is marked untransferable — throwing "Cannot transfer object of unsupported
+  // type"). Mirror Node exactly by returning a standalone buffer.
+  const toDedicated = (result) => {
+    if (typeof result === "string" || !ArrayBuffer.isView(result)) return result; // encoding => string
+    const len = result.length;
+    if (result.byteOffset === 0 && result.buffer.byteLength === len) return result; // already standalone
+    const out = Buffer.allocUnsafeSlow(len);
+    out.set(result);
+    return out;
+  };
+  const readFileDedicated = (...args) =>
+    new Promise((resolve, reject) => {
+      try {
+        resolve(toDedicated(fs.readFileSync(...args)));
+      } catch (e) {
+        reject(e);
+      }
+    });
+
   class FileHandle {
     constructor(fd, path) {
       this.fd = fd;
@@ -82,7 +108,7 @@ export default function (exports, require, module) {
       return fs.appendFileSync(this.fd, data, options);
     }
     async readFile(options) {
-      return fs.readFileSync(this.fd, options);
+      return toDedicated(fs.readFileSync(this.fd, options));
     }
     async stat(options) {
       return fs.fstatSync(this.fd, options);
@@ -148,7 +174,7 @@ export default function (exports, require, module) {
     lstat: wrap("lstatSync"),
     mkdir: wrap("mkdirSync"),
     mkdtemp: wrap("mkdtempSync"),
-    readFile: wrap("readFileSync"),
+    readFile: readFileDedicated,
     readdir: wrap("readdirSync"),
     readlink: wrap("readlinkSync"),
     realpath: wrap("realpathSync"),

@@ -77,6 +77,21 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
   let netResolve = null; // resolver of an in-flight waitForNext (net branch)
   let netPending = false; // a wake arrived while not waiting
 
+  // Wake a parked waitForNext (or remember that a wake is due). Used both for
+  // external nudges (net/worker messages) AND whenever new loop work is scheduled
+  // (timers/immediates/nextTick). The latter matters because activity driven
+  // entirely by native callbacks — e.g. a user MessageChannel like Piscina's task
+  // port, whose 'message' fires outside our controlled turn — can schedule a
+  // setImmediate or a short setTimeout while drive() is parked in waitForNext().
+  // Without a nudge the loop keeps sleeping until the *previously* computed nextDue
+  // (which may be ~forever if only a long-lived liveness timer exists), so that
+  // freshly-scheduled work never runs. Nudging makes waitForNext resolve and the
+  // loop re-evaluate due timers / recompute the nearest wait.
+  const wake = () => {
+    if (netResolve) netResolve();
+    else netPending = true;
+  };
+
   const loop = {
     get exiting() {
       return exiting;
@@ -138,6 +153,7 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
     refresh() {
       this._due = now() + this._delay;
       timers.set(this._id, this);
+      wake();
       return this;
     }
     close() {
@@ -154,8 +170,16 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
     timers.delete(id);
   };
 
-  const setTimeout = (fn, delay, ...args) => new Timeout(fn, delay, args, false);
-  const setInterval = (fn, delay, ...args) => new Timeout(fn, delay, args, true);
+  const setTimeout = (fn, delay, ...args) => {
+    const t = new Timeout(fn, delay, args, false);
+    wake(); // a newly-added (possibly sooner) timer must re-arm a parked wait
+    return t;
+  };
+  const setInterval = (fn, delay, ...args) => {
+    const t = new Timeout(fn, delay, args, true);
+    wake();
+    return t;
+  };
 
   const runDueTimers = () => {
     if (exiting) return;
@@ -202,6 +226,7 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
   const setImmediate = (fn, ...args) => {
     const im = new Immediate(fn, args);
     immediates.push(im);
+    wake(); // run on the next turn even if drive() is parked in waitForNext
     return im;
   };
   const clearImmediate = (im) => {
@@ -306,6 +331,7 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
   return Object.assign(loop, {
     nextTick: (fn, ...args) => {
       nextTickQueue.push({ fn, args });
+      wake(); // drain even if scheduled while drive() is parked (native-callback ctx)
     },
     setTimeout,
     clearTimeout: clearTimer,
@@ -314,10 +340,7 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
     setImmediate,
     clearImmediate,
     // External nudge: a network request is queued for this process.
-    wakeNet: () => {
-      if (netResolve) netResolve();
-      else netPending = true;
-    },
+    wakeNet: wake,
     // Stop the loop with `code` and wake any idle wait so drive() returns promptly.
     // Used by process.exit() so it works even when its throw-sentinel escapes the
     // loop (e.g. called from a raw Promise microtask, outside runCallback).
@@ -326,8 +349,7 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
         exiting = true;
         exitCode = code | 0;
       }
-      if (netResolve) netResolve();
-      else netPending = true;
+      wake();
     },
     drive,
   });

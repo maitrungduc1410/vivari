@@ -11,6 +11,7 @@ import { createAssert } from "./builtins/assert.js";
 import { createChildProcess } from "./builtins/child_process.js";
 import { createModuleSystem } from "./module.js";
 import { createWebSocket } from "./websocket.js";
+import { rewriteDynamicImportToGlobal } from "./esm.js";
 
 function createConsole(process, util) {
   const toOut = (...a) => process.stdout.write(util.format(...a) + "\n");
@@ -67,6 +68,10 @@ export function createRuntime({
   // in the browser. Delegated to by internal/async_hooks for cross-await context
   // propagation (Next.js App Router / RSC). See internal-binding.js.
   hostAsyncHooks = null,
+  // Host worker_threads.markAsUntransferable (Node worker only) — used to protect the
+  // Buffer pool's ArrayBuffer from being detached by a guest transferList. Null in
+  // the browser (where the buffer.js detached-pool guard is the fallback).
+  hostMarkUntransferable = null,
   // Worker threads (#16 stage 2b). `postRaw(msg, transfer)` sends a message to the
   // kernel with transferables (MessagePorts) — the shell provides it. `thread`
   // carries this worker's identity when it *is* a spawned thread.
@@ -247,6 +252,13 @@ export function createRuntime({
       if (postRaw) postRaw({ type: "thread-terminate", reqId });
     },
   };
+
+  // Expose the host's real markAsUntransferable so buffer.js's createPool() can mark
+  // the shared pool untransferable to the platform's postMessage. Must be set BEFORE
+  // the buffer module is first required (its top-level createPool runs on load).
+  if (typeof hostMarkUntransferable === "function") {
+    globalThis.__ocHostMarkUntransferable = hostMarkUntransferable;
+  }
 
   // Path B: Node's REAL lib/ modules run on top of our internalBinding layer.
   // `path`, `buffer`, `fs`, `events` and `util` are vendored, unmodified Node
@@ -963,6 +975,44 @@ export function createRuntime({
   builtins["path/win32"] = path.win32 || path;
 
   const moduleSystem = createModuleSystem({ fs, path, builtins, process, globals, nodeModules });
+
+  // Dynamic-import escape hatch. Libraries that ship dual ESM/CJS sometimes build
+  // a dynamic import at runtime to dodge transpiler rewrites — piscina & tinypool
+  // (Angular's parallel compiler, vitest's worker pool) do
+  // `new Function('s', 'return import(s)')`. The Function constructor compiles that
+  // in the host realm, so the inner import() escapes the sandbox and can't see our
+  // VFS (it throws ERR_MODULE_NOT_FOUND against the host FS). We (a) expose a
+  // loader-backed dynamic import as a global, and (b) wrap the Function
+  // constructor so such bodies' import() is redirected to it.
+  const ocRootRequire = moduleSystem.makeRequire("/");
+  globalThis.__ocImport = (spec) =>
+    Promise.resolve().then(() => {
+      const m = ocRootRequire(String(spec));
+      if (m && m.__esModule) return m;
+      const ns = Object.create(null);
+      if (m && typeof m === "object") for (const k of Object.keys(m)) ns[k] = m[k];
+      ns.default = m;
+      return ns;
+    });
+  {
+    const NativeFunction = globalThis.Function;
+    const OcFunction = function Function(...args) {
+      if (args.length) {
+        const body = args[args.length - 1];
+        // Only touch bodies that actually contain a dynamic import (cheap guard —
+        // virtually every `new Function` body doesn't), then rewrite precisely.
+        if (typeof body === "string" && body.includes("import(")) {
+          const rewritten = rewriteDynamicImportToGlobal(body);
+          if (rewritten != null) args = args.slice(0, -1).concat(rewritten);
+        }
+      }
+      return NativeFunction.apply(this, args);
+    };
+    // Preserve prototype identity so `x instanceof Function` and the shared
+    // Function.prototype methods (call/apply/bind) keep working.
+    OcFunction.prototype = NativeFunction.prototype;
+    globalThis.Function = OcFunction;
+  }
 
   // Node's `module` builtin default export IS the Module class, with the
   // namespace helpers hung off it as statics (createRequire, builtinModules,

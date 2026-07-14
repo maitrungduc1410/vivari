@@ -1,7 +1,7 @@
 // Node worker_threads entry for a single process (used by the headless test and
 // as the Node-side twin of the browser's demo/process-worker.js).
 
-import { parentPort } from "node:worker_threads";
+import { parentPort, markAsUntransferable } from "node:worker_threads";
 import { createRequire } from "node:module";
 import * as hostAsyncHooks from "node:async_hooks";
 import { bootProcess } from "../packages/runtime/boot.js";
@@ -68,6 +68,10 @@ parentPort.on("message", (msg) => {
       // uses the runtime's best-effort polyfill instead; set OC_NO_HOST_ALS=1 to
       // force that polyfill here and exercise the browser path headlessly.
       hostAsyncHooks: process.env.OC_NO_HOST_ALS ? null : hostAsyncHooks,
+      // Real worker_threads.markAsUntransferable so the runtime's Buffer pool can be
+      // marked untransferable to the *platform's* postMessage — otherwise a guest
+      // transferring a pooled Buffer's .buffer would detach (corrupt) the whole pool.
+      hostMarkUntransferable: markAsUntransferable,
     });
     return;
   }

@@ -19,6 +19,9 @@ export function bootProcess({
   // Host's real async_hooks (Node worker only) — enables cross-await context
   // propagation for AsyncLocalStorage (Next.js RSC). Null in the browser.
   hostAsyncHooks = null,
+  // Host's real worker_threads.markAsUntransferable (Node worker only) — lets the
+  // runtime protect its shared Buffer pool from being detached by a transferList.
+  hostMarkUntransferable = null,
   // #16 stage 2b: when this worker is a spawned thread, `threadPort` is the raw
   // MessagePort to its creator (becomes parentPort) and `postRaw` sends messages
   // to the kernel with transferables (for Worker() -> kernel port handoff).
@@ -42,6 +45,7 @@ export function bootProcess({
     codec,
     cryptoCodec,
     hostAsyncHooks,
+    hostMarkUntransferable,
     // real kernel-assigned PID (so process.pid matches the worker name / DevTools)
     pid: spec.pid,
     ppid: spec.ppid,
