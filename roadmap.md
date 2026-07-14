@@ -1926,7 +1926,10 @@ and a headless spike:
   aliases `esbuild -> esbuild-wasm` at the registry layer and runs its service in-process
   (`packages/runtime/esbuild-inproc-patch.js`). The last blocker was structural — `qwikVite()`
   defaults to SSR mode and demanded a `src/root.tsx` server entry; switching to `qwikVite({ csr: true })`
-  makes it a plain client-rendered SPA. **Proven** by `scripts/spike-qwik.mjs` → graduated to
+  makes it a plain client-rendered SPA. One extra CSR gotcha: the **qwikloader** (the global
+  event listener that lazy-loads `onXxx$` handlers) is normally inlined by SSR, so a CSR entry must
+  `import '@builder.io/qwik/qwikloader.js'` or the app renders but is dead (buttons don't respond) —
+  the template's `src/main.tsx` now does. **Proven** by `scripts/spike-qwik.mjs` → graduated to
   non-experimental.
 - **Svelte** — `@sveltejs/vite-plugin-svelte@^5.0.0` peers `vite ^6`; only `@sveltejs/vite-plugin-svelte@^7`
   peers Vite 8. Bumped to `^7.0.0`, which **fixes `npm install`**. But the plugin forces an **SSR
@@ -1939,6 +1942,17 @@ and a headless spike:
   optimize/server-restart path; `scripts/spike-svelte.mjs` captures the red.
 - **React** — no change needed: `@vitejs/plugin-react@^5.0.0` resolves to `5.2.0`, which already peers
   `^8.0.0`.
+
+**Deferred / follow-up — Svelte (and the SSR meta-frameworks) SSR dep-optimizer.** The one remaining
+gap: Vite's **SSR dependency optimizer** (`(ssr) [optimizer] bundling dependencies...`) never
+completes in-VM. It's what keeps `svelte` experimental, and it's almost certainly the same wall
+behind SvelteKit / Nuxt / Astro. The client-side optimizer (rolldown-wasm) works; the SSR pass either
+stalls (browser: preview spins forever) or, headless, drains the loop so the worker exits right after
+the port binds ("No server listening"). It is NOT the esbuild path (no esbuild tarball is installed
+for the Svelte tree) and can't be turned off from user config (`ssr.optimizeDeps` /
+`environments.ssr.dev.optimizeDeps` with `noDiscovery` + empty `include` don't stop it). Next step is
+a runtime investigation of the SSR-environment optimize/server-restart liveness path (sibling to the
+Angular esbuild work). Reproduce with `node scripts/spike-svelte.mjs`.
 
 ## Definition of done for T2
 

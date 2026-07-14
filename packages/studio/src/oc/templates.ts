@@ -2694,7 +2694,11 @@ export default defineConfig({
   </body>
 </html>
 `,
-      "src/main.tsx": `import { render } from '@builder.io/qwik'
+      "src/main.tsx": `// The qwikloader is the tiny global listener that intercepts DOM events and
+// lazy-loads their onXxx$ handlers. SSR normally inlines it; a CSR app must import
+// it explicitly or nothing is interactive (buttons render but clicks do nothing).
+import '@builder.io/qwik/qwikloader.js'
+import { render } from '@builder.io/qwik'
 import { App } from './app'
 
 render(document.getElementById('app')!, <App />)
