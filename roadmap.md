@@ -1793,9 +1793,11 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   13 re-categorised.
 - ✅ **Phase 2 (`[SPIKE]`, meta-frameworks — shipped `experimental`)** — Fullstack: Nuxt 3,
   SvelteKit, React Router 7 (Remix), Astro. Docs: VitePress, Slidev.
-- ✅ **Phase 3 (`[SPIKE]` — shipped `experimental`)** — Frontend variants: Preact, Lit, Solid,
-  Qwik. Backends: Fastify, Nitro, GraphQL (Yoga), Feathers. Showcases: Socket.IO, tRPC, pnpm
-  monorepo, SQLite (sql.js WASM).
+- ✅ **Phase 3 (`[SPIKE]`)** — Frontend variants: Preact, Lit, Solid, Qwik (now proven headless by
+  `scripts/spike-{preact,lit,solid,qwik}.mjs` → **graduated to non-experimental**; Qwik rides the
+  merged esbuild-wasm aliasing + in-process service and runs `qwikVite({ csr: true })`). Backends:
+  Fastify, Nitro, GraphQL (Yoga),
+  Feathers. Showcases: Socket.IO, tRPC, pnpm monorepo, SQLite (sql.js WASM).
 - ✅ **Phase 4 (cont.) — standalone Webpack + Docusaurus proven headless AND shipped.** Two
   new templates, each gated by a green spike (validated alongside the Next.js spike, which still
   PASSes incl. the RSC-refresh gate):
@@ -1899,6 +1901,58 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
 badge) because they haven't yet passed a headless `scripts/spike-*.mjs` gate — the risk is that a
 framework's own CLI drives a Vite/esbuild path we haven't routed through rolldown. They graduate to
 non-experimental once their spike is green.
+
+**Frontend variants graduated (this change).** A shared harness `scripts/spike-vite-lib.mjs` (real
+`npm install` → boot `vite` → GET `/` 200 with the title marker + `/@vite/client` 200 + the entry
+module transforms through the framework plugin) backs
+`scripts/spike-{preact,lit,solid,qwik,vue,svelte}.mjs`. Preact, Lit, Solid, **Vue and Qwik** are
+green and non-experimental; **Svelte** stays experimental (SSR-optimizer gap, below).
+
+The harness fetcher now mirrors the browser kernel's transparent wasm drop-in aliasing
+(`esbuild -> esbuild-wasm`, `rollup -> @rollup/wasm-node`; see `packages/demo/fetcher-worker.js`) so
+a headless spike installs the exact same tree the studio does — without it, Qwik's Vite-7 tree pulls
+the native esbuild the browser never sees.
+
+**Vite-8 peer-dependency sweep (this change).** All the Vite templates pin `vite ^8.0.0` (Vite 8 =
+rolldown, the only optimizer proven in-VM), but several framework plugins had not yet widened their
+peer range to Vite 8, so `npm install` ERESOLVEd. Findings + fixes, each checked against the registry
+and a headless spike:
+
+- **Vue** — `@vitejs/plugin-vue@^5.2.0` peers `vite ^5||^6`. Bumped to `^6.0.0` (v6.0.5+ peers
+  `^8.0.0`). Fixed **and proven** by `scripts/spike-vue.mjs` (GET `/` 200, `/src/App.vue` compiles).
+- **Qwik** — `@builder.io/qwik@1.x` hard-caps `peer vite ">=5 <8"` (no v2 published), so it can't use
+  Vite 8 at all; pinned the template to `vite ^7.0.0`. Vite 7's dep optimizer wants esbuild's native
+  binary (no wasm32 build), which now Just Works on top of the merged Angular support: the runtime
+  aliases `esbuild -> esbuild-wasm` at the registry layer and runs its service in-process
+  (`packages/runtime/esbuild-inproc-patch.js`). The last blocker was structural — `qwikVite()`
+  defaults to SSR mode and demanded a `src/root.tsx` server entry; switching to `qwikVite({ csr: true })`
+  makes it a plain client-rendered SPA. One extra CSR gotcha: the **qwikloader** (the global
+  event listener that lazy-loads `onXxx$` handlers) is normally inlined by SSR, so a CSR entry must
+  `import '@builder.io/qwik/qwikloader.js'` or the app renders but is dead (buttons don't respond) —
+  the template's `src/main.tsx` now does. **Proven** by `scripts/spike-qwik.mjs` → graduated to
+  non-experimental.
+- **Svelte** — `@sveltejs/vite-plugin-svelte@^5.0.0` peers `vite ^6`; only `@sveltejs/vite-plugin-svelte@^7`
+  peers Vite 8. Bumped to `^7.0.0`, which **fixes `npm install`**. But the plugin forces an **SSR
+  dep-optimizer** pass on boot (`(ssr) [optimizer] bundling dependencies...`) that never completes
+  in-VM: the client optimizer runs, the port binds, then the SSR optimize stalls and the worker exits
+  ("No server listening"). This is **not** the esbuild path (no esbuild tarball is even installed) —
+  it's the same in-VM SSR-optimizer gap the meta-framework templates (SvelteKit/Nuxt/Astro) hit, and
+  it can't be disabled from user config (tried `ssr.optimizeDeps` / `environments.ssr.dev.optimizeDeps`
+  with `noDiscovery` + empty `include`). **Stays `experimental`** until the runtime hardens the SSR
+  optimize/server-restart path; `scripts/spike-svelte.mjs` captures the red.
+- **React** — no change needed: `@vitejs/plugin-react@^5.0.0` resolves to `5.2.0`, which already peers
+  `^8.0.0`.
+
+**Deferred / follow-up — Svelte (and the SSR meta-frameworks) SSR dep-optimizer.** The one remaining
+gap: Vite's **SSR dependency optimizer** (`(ssr) [optimizer] bundling dependencies...`) never
+completes in-VM. It's what keeps `svelte` experimental, and it's almost certainly the same wall
+behind SvelteKit / Nuxt / Astro. The client-side optimizer (rolldown-wasm) works; the SSR pass either
+stalls (browser: preview spins forever) or, headless, drains the loop so the worker exits right after
+the port binds ("No server listening"). It is NOT the esbuild path (no esbuild tarball is installed
+for the Svelte tree) and can't be turned off from user config (`ssr.optimizeDeps` /
+`environments.ssr.dev.optimizeDeps` with `noDiscovery` + empty `include` don't stop it). Next step is
+a runtime investigation of the SSR-environment optimize/server-restart liveness path (sibling to the
+Angular esbuild work). Reproduce with `node scripts/spike-svelte.mjs`.
 
 ## Definition of done for T2
 
