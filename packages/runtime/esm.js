@@ -228,6 +228,18 @@ function scanExportEdits(src, isFrom) {
       if (isFrom(i)) { i += 6; continue; }
       let r = i + 6;
       while (r < n && /\s/.test(src[r])) r++;
+      // `export` is only a keyword when a real export form follows: `default`,
+      // `{`, `*`, or a declaration (function/class/const/let/var/async/... —
+      // i.e. an identifier-start char). When the next token is `:` / `.` / `(`
+      // / `=` / `,` etc. this `export` is actually a property name or member
+      // access (`{ export: x }`, `obj.export`, `export()`), NOT a statement.
+      // Stripping it there corrupts the code (e.g. `export: name` -> `: name`,
+      // "Unexpected token ':'"). Skip it and keep scanning.
+      const follow = src[r];
+      if (follow !== "{" && follow !== "*" && !/[A-Za-z_$]/.test(follow || " ")) {
+        i += 6;
+        continue;
+      }
       if (src.startsWith("default", r) && !isId(src[r + 7] || " ")) {
         // A NAMED `export default function foo`/`class foo` is a *declaration*: it
         // binds `foo` at module scope (and, for functions, hoists it). Rewriting it
