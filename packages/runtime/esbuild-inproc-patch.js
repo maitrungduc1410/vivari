@@ -1,28 +1,21 @@
-// OpenContainer Angular launcher.
+// Transparent in-process esbuild service (framework-agnostic).
 //
-// Angular's @angular/build compiles with esbuild (a filesystem-backed binary
-// SERVICE) and serves via Vite. Two things need adapting for the in-browser VM,
-// which this script handles before delegating to the Angular CLI:
+// esbuild-wasm's Node build (lib/main.js) starts its service by spawning
+// `node bin/esbuild --service` as a CHILD and talking a byte-accurate binary
+// protocol over its stdio pipe. Brokered through the single-threaded in-VM
+// kernel, that pipe deadlocks whenever the same event loop also drives a worker
+// pool (Piscina/tinypool) — e.g. Angular's compiler, but also tsup, Vitest and
+// anything else that bundles-under-a-pool. The fix is to run the Go wasm IN THIS
+// THREAD: fd 0/1/2 are multiplexed onto the protocol in memory and every other
+// fd delegates to the real fs (the VFS).
 //
-//   1. esbuild's Node build spawns `node bin/esbuild --service` as a CHILD and
-//      talks a byte-accurate binary protocol over its stdio pipe. Brokered
-//      through the single-threaded in-VM kernel, that pipe deadlocks against
-//      Angular's Piscina linker pool + inline AOT (all contend for one event
-//      loop). We rewrite esbuild-wasm's ensureServiceIsRunning() to run the Go
-//      wasm IN THIS THREAD: fd 0/1/2 are multiplexed onto the protocol in memory
-//      and every other fd delegates to the real fs (the VFS).
-//   2. Angular's AOT + JS/CSS transforms use worker pools with an Atomics
-//      fast-path our cooperative worker_threads can't serve; NG_BUILD_PARALLEL_TS
-//      selects the inline AotCompilation and PISCINA_DISABLE_ATOMICS switches the
-//      transform pool to async message passing.
-//
-// The esbuild patch is a string replacement of esbuild-wasm@0.28.1's shipped
-// lib/main.js (pinned via package.json "overrides"); it is idempotent and a
-// no-op if the spawn block isn't found (esbuild then falls back to its child).
-
-import { spawn } from "node:child_process";
-import fs from "node:fs";
-import path from "node:path";
+// This used to live in a per-project launcher (scripts/oc-ng.mjs). It now runs
+// in the module loader (see module.js) so ANY project that ends up with an
+// esbuild-wasm-backed install gets the deadlock-free service automatically, with
+// no project-level script or config. It is a string replacement of the exact
+// spawn block esbuild-wasm@0.28.x ships; it is idempotent and a strict no-op
+// when the block isn't found (version drift) or when the wasm assets aren't
+// present next to main.js (a genuine native esbuild install is left untouched).
 
 // The exact child-spawn block esbuild-wasm@0.28.1 ships in lib/main.js.
 const ESB_INPROC_OLD = `  let [command, args] = esbuildCommandAndArgs();
@@ -76,7 +69,8 @@ const ESB_INPROC_OLD = `  let [command, args] = esbuildCommandAndArgs();
 // In-process replacement: runs the Go wasm in this thread, multiplexing fd 0/1/2
 // onto esbuild's binary protocol. References esbuild's own main.js locals
 // (path2, fs2, os2, node_exports, createChannel, initializeWasCalled,
-// longLivedService, stopService), so it is injected into that scope verbatim.
+// longLivedService, stopService) plus the CJS wrapper's __dirname/require, so it
+// is injected into that scope verbatim.
 const ESB_INPROC_NEW = `  // [OpenContainer] in-process esbuild service (no child spawn).
   require(path2.join(__dirname, "..", "wasm_exec.js"));
   const __ocWasmBytes = fs2.readFileSync(path2.join(__dirname, "..", "esbuild.wasm"));
@@ -162,39 +156,30 @@ const ESB_INPROC_NEW = `  // [OpenContainer] in-process esbuild service (no chil
     unref() { if (--__ocRefCount === 0 && __ocRefTimer) { clearInterval(__ocRefTimer); __ocRefTimer = null; } },
   };`;
 
-function patchEsbuild() {
-  for (const dir of ["node_modules/esbuild", "node_modules/esbuild-wasm"]) {
-    const mainPath = path.resolve(dir, "lib/main.js");
-    if (!fs.existsSync(mainPath)) continue;
-    let src;
-    try {
-      src = fs.readFileSync(mainPath, "utf8");
-    } catch {
-      continue;
-    }
-    if (src.includes("[OpenContainer] in-process esbuild service")) continue; // already patched
-    if (!src.includes(ESB_INPROC_OLD)) {
-      console.warn("[oc-ng] esbuild spawn block not found in " + dir + " — leaving it to spawn a child");
-      continue;
-    }
-    fs.writeFileSync(mainPath, src.replace(ESB_INPROC_OLD, ESB_INPROC_NEW));
-    console.log("[oc-ng] patched " + dir + " to run esbuild in-process");
+const OC_MARKER = "[OpenContainer] in-process esbuild service";
+
+// True when `filename` is an esbuild(-wasm) lib/main.js whose package also ships
+// the Go wasm assets (esbuild.wasm + wasm_exec.js) one directory up. A genuine
+// native esbuild install has no such assets and is deliberately skipped.
+function isEsbuildWasmMain(filename, fs, path) {
+  if (!filename.endsWith("/lib/main.js") && !filename.endsWith("\\lib\\main.js")) return false;
+  const pkgDir = path.dirname(path.dirname(filename)); // <pkg>/lib/main.js -> <pkg>
+  try {
+    return fs.existsSync(path.join(pkgDir, "esbuild.wasm")) && fs.existsSync(path.join(pkgDir, "wasm_exec.js"));
+  } catch {
+    return false;
   }
 }
 
-patchEsbuild();
-
-if (!process.env.NG_BUILD_PARALLEL_TS) process.env.NG_BUILD_PARALLEL_TS = "0";
-if (!process.env.PISCINA_DISABLE_ATOMICS) process.env.PISCINA_DISABLE_ATOMICS = "1";
-if (!process.env.NG_CLI_ANALYTICS) process.env.NG_CLI_ANALYTICS = "false";
-
-// Run the Angular CLI as its own process (the proven model): args after this
-// script pass straight through, e.g. `node scripts/oc-ng.mjs serve --port 4200`.
-const ng = path.resolve("node_modules/@angular/cli/bin/ng.js");
-// Spawn the bare command "node" (resolved to /bin/node.js by the kernel), matching
-// the proven scripts/spike-angular.mjs. Do NOT use process.execPath here.
-const child = spawn("node", [ng, ...process.argv.slice(2)], {
-  stdio: "inherit",
-  env: process.env,
-});
-child.on("exit", (code, signal) => process.exit(signal ? 1 : code ?? 0));
+/**
+ * If `source` is esbuild-wasm's lib/main.js, return it rewritten to run the Go
+ * service in-process; otherwise return null (leave the source untouched).
+ * Idempotent: already-patched sources return null.
+ */
+export function maybePatchEsbuildInProcess(source, filename, fs, path) {
+  if (typeof source !== "string" || source.length < 64) return null;
+  if (source.includes(OC_MARKER)) return null; // already patched
+  if (!source.includes(ESB_INPROC_OLD)) return null; // not the block we know (or drift)
+  if (!isEsbuildWasmMain(filename, fs, path)) return null; // native esbuild — leave it
+  return source.replace(ESB_INPROC_OLD, ESB_INPROC_NEW);
+}
