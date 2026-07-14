@@ -264,7 +264,7 @@ const vuePkg = (ts: boolean) => `{
     "vue": "^3.5.0"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": "^5.2.0",
+    "@vitejs/plugin-vue": "^6.0.0",
     "vite": "^8.0.0"${ts ? `,
     "typescript": "^5.7.0",
     "vue-tsc": "^2.2.0"` : ""}
@@ -389,7 +389,7 @@ const sveltePkg = (ts: boolean) => `{
     "preview": "vite preview"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "svelte": "^5.0.0",
     "vite": "^8.0.0"${ts ? `,
     "svelte-check": "^4.0.0",
@@ -492,6 +492,12 @@ function svelteTemplate(ts: boolean): TemplateDef {
       reload: false,
       install: "npm install",
       dev: VITE_DEV,
+      // @sveltejs/vite-plugin-svelte@^7 fixes the install (v5/v6 peer Vite <=7 and
+      // ERESOLVE against the pinned Vite 8), but the plugin's SSR dep-optimizer tears
+      // down the dev server on boot in-VM (port binds, then the worker exits →
+      // "No server listening"). Flagged until that path is hardened. See
+      // scripts/spike-svelte.mjs.
+      experimental: true,
     },
     files,
   };
@@ -2356,7 +2362,14 @@ Presentation slides for developers — running in the browser
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Phase 3 — frontend variants (Vite 8 / rolldown; experimental until spiked)
+// Phase 3 — frontend variants (Vite 8 / rolldown). Preact, Lit, and Solid are
+// proven in-VM by headless spikes (scripts/spike-{preact,lit,solid}.mjs) and are
+// no longer experimental. Qwik stays experimental: @builder.io/qwik@1.x declares
+// `peer vite ">=5 <8"`, so it cannot use Vite 8 (rolldown) at all. Pinning it to
+// Vite 7 clears the ERESOLVE but drags in esbuild's *native* binary, which has no
+// wasm32 build ("Unsupported platform: linux wasm32 LE"), so `npm install` (and the
+// Vite 7 dep optimizer) fail in-VM. It needs the Angular-style esbuild-wasm override
+// + in-process launcher to run — see scripts/spike-qwik.mjs.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── Preact ───────────────────────────────────────────────────────────────────
@@ -2377,7 +2390,6 @@ function preactTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: VITE_DEV,
-      experimental: true,
     },
     files: {
       "package.json": `{
@@ -2469,7 +2481,6 @@ function litTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: VITE_DEV,
-      experimental: true,
     },
     files: {
       "package.json": `{
@@ -2558,7 +2569,6 @@ function solidTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: VITE_DEV,
-      experimental: true,
     },
     files: {
       "package.json": `{
@@ -2660,7 +2670,7 @@ function qwikTemplate(): TemplateDef {
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
   "dependencies": { "@builder.io/qwik": "^1.12.0" },
-  "devDependencies": { "typescript": "^5.7.0", "vite": "^8.0.0" }
+  "devDependencies": { "typescript": "^5.7.0", "vite": "^7.0.0" }
 }
 `,
       "vite.config.ts": `import { defineConfig } from 'vite'

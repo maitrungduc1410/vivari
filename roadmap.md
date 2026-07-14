@@ -1793,9 +1793,12 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   13 re-categorised.
 - ✅ **Phase 2 (`[SPIKE]`, meta-frameworks — shipped `experimental`)** — Fullstack: Nuxt 3,
   SvelteKit, React Router 7 (Remix), Astro. Docs: VitePress, Slidev.
-- ✅ **Phase 3 (`[SPIKE]` — shipped `experimental`)** — Frontend variants: Preact, Lit, Solid,
-  Qwik. Backends: Fastify, Nitro, GraphQL (Yoga), Feathers. Showcases: Socket.IO, tRPC, pnpm
-  monorepo, SQLite (sql.js WASM).
+- ✅ **Phase 3 (`[SPIKE]`)** — Frontend variants: Preact, Lit, Solid (now proven headless by
+  `scripts/spike-{preact,lit,solid}.mjs` → **graduated to non-experimental**), Qwik (stays
+  `experimental` — `@builder.io/qwik@1.x` declares `peer vite ">=5 <8"`, so it can't run on Vite 8;
+  pinning it to Vite 7 clears the ERESOLVE but pulls native esbuild, which has no wasm32 build;
+  `scripts/spike-qwik.mjs` captures it). Backends: Fastify, Nitro, GraphQL (Yoga),
+  Feathers. Showcases: Socket.IO, tRPC, pnpm monorepo, SQLite (sql.js WASM).
 - ✅ **Phase 4 (cont.) — standalone Webpack + Docusaurus proven headless AND shipped.** Two
   new templates, each gated by a green spike (validated alongside the Next.js spike, which still
   PASSes incl. the RSC-refresh gate):
@@ -1899,6 +1902,32 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
 badge) because they haven't yet passed a headless `scripts/spike-*.mjs` gate — the risk is that a
 framework's own CLI drives a Vite/esbuild path we haven't routed through rolldown. They graduate to
 non-experimental once their spike is green.
+
+**Frontend variants graduated (this change).** A shared harness `scripts/spike-vite-lib.mjs` (real
+`npm install` → boot `vite` → GET `/` 200 with the title marker + `/@vite/client` 200 + the entry
+module transforms through the framework plugin) backs
+`scripts/spike-{preact,lit,solid,qwik,vue,svelte}.mjs`. Preact, Lit, and Solid are green, so they
+dropped `experimental`.
+
+**Vite-8 peer-dependency sweep (this change).** All the Vite templates pin `vite ^8.0.0` (Vite 8 =
+rolldown, the only optimizer proven in-VM), but several framework plugins had not yet widened their
+peer range to Vite 8, so `npm install` ERESOLVEd. Findings + fixes, each checked against the registry
+and (where possible) a headless spike:
+
+- **Vue** — `@vitejs/plugin-vue@^5.2.0` peers `vite ^5||^6`. Bumped to `^6.0.0` (v6.0.5+ peers
+  `^8.0.0`). Fixed **and proven** by `scripts/spike-vue.mjs` (GET `/` 200, `/src/App.vue` compiles).
+- **Svelte** — `@sveltejs/vite-plugin-svelte@^5.0.0` peers `vite ^6`; only `@sveltejs/vite-plugin-svelte@^7`
+  peers Vite 8. Bumped to `^7.0.0`, which **fixes `npm install`**, but the plugin's SSR dep-optimizer
+  now tears the dev server down on boot in-VM (port binds, worker exits → "No server listening"), so
+  Svelte is **demoted to `experimental`** until that path is hardened. `scripts/spike-svelte.mjs`
+  documents the red.
+- **Qwik** — `@builder.io/qwik@1.x` hard-caps `peer vite ">=5 <8"` (no v2 published), so it can't use
+  Vite 8 at all. Pinned the template to `vite ^7.0.0`, which clears the ERESOLVE but pulls esbuild's
+  *native* binary (no wasm32 build → "Unsupported platform: linux wasm32 LE"), so install and the
+  Vite 7 dep optimizer fail in-VM. Stays `experimental`; needs the Angular-style esbuild-wasm override
+  + in-process launcher (`scripts/spike-qwik.mjs`).
+- **React** — no change needed: `@vitejs/plugin-react@^5.0.0` resolves to `5.2.0`, which already peers
+  `^8.0.0`.
 
 ## Definition of done for T2
 
