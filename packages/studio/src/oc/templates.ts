@@ -3764,8 +3764,6 @@ code {
       // studio-side install choice; the project's package.json stays vanilla.
       install: "npm install --ignore-scripts",
       dev: "npm start",
-      // Heavy toolchain (esbuild-wasm + Piscina worker pools); newly proven in-VM.
-      experimental: true,
     },
     files,
   };
