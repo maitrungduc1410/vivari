@@ -82,12 +82,13 @@ function getOwnNonIndexProperties(obj, filter) {
   return out;
 }
 
-export function createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks } = {}) {
+export function createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks, pipeBridge } = {}) {
   // net (Phase 2 #7/#8): tcp_wrap/stream_wrap/uv/pipe_wrap/cares_wrap for the
   // in-process loopback beneath Node's real lib/net.js. Needs process.nextTick.
   // `syscalls` lets listen() register the port with the kernel (external routing,
-  // stage 2); `netServers` counts kernel-registered listeners for `doNet`.
-  const net = createNetBindings({ process, liveness: netLiveness, syscalls, netServers });
+  // stage 2); `netServers` counts kernel-registered listeners for `doNet`;
+  // `pipeBridge` carries cross-process UNIX-socket traffic through the kernel.
+  const net = createNetBindings({ process, liveness: netLiveness, syscalls, netServers, pipeBridge });
   const bindings = {
     buffer: createBufferBinding(),
     // 'fs' needs the sync-bridge syscalls (to reach the Rust VFS) and process

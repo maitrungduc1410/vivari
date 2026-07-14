@@ -22,7 +22,7 @@
 //
 // One process === one worker, so a per-binding registry is correctly per-process.
 
-export function createNetBindings({ process, liveness, syscalls, netServers } = {}) {
+export function createNetBindings({ process, liveness, syscalls, netServers, pipeBridge } = {}) {
   const nextTick = (fn, ...args) => process.nextTick(fn, ...args);
   const buf = () => globalThis.Buffer; // real Buffer is installed before sockets run
 
@@ -159,6 +159,14 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
     copy.set(bytes);
     streamBaseState[kBytesWritten] = copy.byteLength;
     streamBaseState[kLastWriteWasAsync] = 0; // loopback writes complete sync
+    // Cross-process pipe endpoint: the peer lives in another process, so relay the
+    // bytes through the kernel (postMessage) instead of the in-process inbox.
+    if (handle._xproc) {
+      if (pipeBridge && pipeBridge.postRaw && !handle._closed) {
+        pipeBridge.postRaw({ type: "pipe-data", connId: handle._connId, chunk: copy });
+      }
+      return 0;
+    }
     if (handle._peer && !handle._peer._closed) enqueueToPeer(handle._peer, copy);
     return 0;
   };
@@ -385,6 +393,11 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
   // `\0…`), listening and connecting within the same dev process.
   const PipeConstants = { SOCKET: 0, SERVER: 1, IPC: 2 };
   const pipeServers = new Map(); // path -> server Pipe handle
+  // Cross-process pipe endpoints in THIS process, keyed by the kernel's connId.
+  // Both the client (that dialed another process) and the server-side endpoint
+  // (accepted from a `pipe-open`) live here; kernel-relayed pipe messages find
+  // their endpoint by connId. See dispatchPipe below.
+  const xpipeConns = new Map(); // connId -> local Pipe endpoint
 
   class Pipe {
     constructor(type) {
@@ -401,6 +414,9 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
       this._counted = false;
       this._pipePath = null;
       this._remotePath = "";
+      this._kernelPipe = null; // socket path registered with the kernel (servers)
+      this._xproc = false; // true once this endpoint bridges to another process
+      this._connId = 0; // kernel-assigned id of the cross-process connection
       this.bytesRead = 0;
       this.writeQueueSize = 0;
     }
@@ -413,6 +429,18 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
     listen(/* backlog */) {
       if (this._pipePath == null) return UV_CODES.UV_EINVAL;
       if (pipeServers.has(this._pipePath)) return UV_CODES.UV_EADDRINUSE;
+      // Also register the socket path with the kernel so a Pipe.connect() in
+      // ANOTHER process can reach this server (e.g. Nuxt/Nitro's dev worker <->
+      // the main process, or vite-node's module socket). A cross-process conflict
+      // fails like libuv with EADDRINUSE.
+      if (pipeBridge && pipeBridge.postRaw && syscalls && syscalls.pipeListen) {
+        try {
+          syscalls.pipeListen(this._pipePath);
+          this._kernelPipe = this._pipePath;
+        } catch {
+          return UV_CODES.UV_EADDRINUSE;
+        }
+      }
       pipeServers.set(this._pipePath, this);
       this._live = true;
       recount(this);
@@ -424,28 +452,51 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
       this._pipePath = "";
       this._remotePath = target;
       const server = pipeServers.get(target);
-      if (!server || server._closed) {
-        // No such socket file → libuv reports ENOENT for a missing pipe.
-        nextTick(() => req.oncomplete(UV_CODES.UV_ENOENT, this, req, false, false));
+      if (server && !server._closed) {
+        // Same-process loopback: link a fresh server-side endpoint to this one.
+        const peer = new Pipe(PipeConstants.SOCKET);
+        peer._pipePath = target;
+        peer._remotePath = target;
+        this._peer = peer;
+        peer._peer = this;
+        nextTick(() => {
+          if (server._closed) {
+            req.oncomplete(UV_CODES.UV_ECONNREFUSED, this, req, false, false);
+            return;
+          }
+          this._live = true;
+          recount(this);
+          peer._live = true;
+          recount(peer);
+          server.onconnection(0, peer);
+          req.oncomplete(0, this, req, true, true);
+        });
         return 0;
       }
-      const peer = new Pipe(PipeConstants.SOCKET);
-      peer._pipePath = target;
-      peer._remotePath = target;
-      this._peer = peer;
-      peer._peer = this;
-      nextTick(() => {
-        if (server._closed) {
-          req.oncomplete(UV_CODES.UV_ECONNREFUSED, this, req, false, false);
-          return;
+      // Not in this process — try a cross-process connect through the kernel. The
+      // server (in another process) will get a `pipe-open` and accept; bytes then
+      // flow both ways as relayed `pipe-data` messages, keyed by connId.
+      if (pipeBridge && pipeBridge.postRaw && syscalls && syscalls.pipeConnect) {
+        let connId = 0;
+        try {
+          connId = syscalls.pipeConnect(target).connId | 0;
+        } catch {
+          connId = 0; // ENOENT — no process listening on that path
         }
-        this._live = true;
-        recount(this);
-        peer._live = true;
-        recount(peer);
-        server.onconnection(0, peer);
-        req.oncomplete(0, this, req, true, true);
-      });
+        if (connId > 0) {
+          this._xproc = true;
+          this._connId = connId;
+          xpipeConns.set(connId, this);
+          nextTick(() => {
+            this._live = true;
+            recount(this);
+            req.oncomplete(0, this, req, true, true);
+          });
+          return 0;
+        }
+      }
+      // No such socket file → libuv reports ENOENT for a missing pipe.
+      nextTick(() => req.oncomplete(UV_CODES.UV_ENOENT, this, req, false, false));
       return 0;
     }
 
@@ -490,7 +541,12 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
     }
 
     shutdown(req) {
-      if (this._peer && !this._peer._closed) enqueueToPeer(this._peer, EOF);
+      // Half-close: signal EOF to the peer's read side (cross-process or local).
+      if (this._xproc) {
+        if (pipeBridge && pipeBridge.postRaw) pipeBridge.postRaw({ type: "pipe-shutdown", connId: this._connId });
+      } else if (this._peer && !this._peer._closed) {
+        enqueueToPeer(this._peer, EOF);
+      }
       nextTick(() => req.oncomplete(0));
       return 0;
     }
@@ -501,8 +557,21 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
         recount(this);
         if (this.type === PipeConstants.SERVER && this._pipePath != null) {
           if (pipeServers.get(this._pipePath) === this) pipeServers.delete(this._pipePath);
+          if (this._kernelPipe != null && syscalls && syscalls.pipeCloseServer) {
+            try {
+              syscalls.pipeCloseServer(this._kernelPipe);
+            } catch {
+              /* kernel gone */
+            }
+            this._kernelPipe = null;
+          }
         }
-        if (this._peer && !this._peer._closed) enqueueToPeer(this._peer, EOF);
+        if (this._xproc) {
+          if (pipeBridge && pipeBridge.postRaw) pipeBridge.postRaw({ type: "pipe-close", connId: this._connId });
+          xpipeConns.delete(this._connId);
+        } else if (this._peer && !this._peer._closed) {
+          enqueueToPeer(this._peer, EOF);
+        }
       }
       if (typeof cb === "function") nextTick(cb);
     }
@@ -551,6 +620,55 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
     PipeConnectWrap,
     constants: PipeConstants,
   };
+
+  // Route a kernel-relayed cross-process pipe message into the right local
+  // endpoint. `pipe-open` means a client in another process dialed a server we
+  // host: build the server-side endpoint and hand it to the listening server as a
+  // connection. `pipe-data`/`pipe-shutdown`/`pipe-close` feed the peer's bytes /
+  // EOF into the matching endpoint's read side. Wired to the loop via pipeBridge.
+  function dispatchPipe(msg) {
+    if (!msg) return;
+    const connId = msg.connId | 0;
+    if (msg.type === "pipe-open") {
+      const server = pipeServers.get(String(msg.path));
+      if (!server || server._closed) {
+        // Server vanished between listen and connect — tell the client it closed.
+        if (pipeBridge && pipeBridge.postRaw) pipeBridge.postRaw({ type: "pipe-close", connId });
+        return;
+      }
+      const peer = new Pipe(PipeConstants.SOCKET);
+      peer._xproc = true;
+      peer._connId = connId;
+      peer._remotePath = String(msg.path);
+      xpipeConns.set(connId, peer);
+      peer._live = true;
+      recount(peer);
+      // Accept on a fresh turn so onconnection runs in loop context (Node wraps
+      // `peer` in a net.Socket and calls readStart, draining any buffered inbox).
+      nextTick(() => {
+        if (server._closed || peer._closed) return;
+        server.onconnection(0, peer);
+      });
+      if (pipeBridge && pipeBridge.wake) pipeBridge.wake();
+      return;
+    }
+    const ep = xpipeConns.get(connId);
+    if (!ep) return;
+    if (msg.type === "pipe-data") {
+      let chunk = msg.chunk;
+      if (chunk && !(chunk instanceof Uint8Array)) chunk = new Uint8Array(chunk);
+      if (chunk && chunk.byteLength) enqueueToPeer(ep, chunk);
+    } else if (msg.type === "pipe-shutdown") {
+      ep._inbox.push(EOF);
+      schedulePump(ep);
+    } else if (msg.type === "pipe-close") {
+      ep._inbox.push(EOF);
+      schedulePump(ep);
+      xpipeConns.delete(connId);
+    }
+    if (pipeBridge && pipeBridge.wake) pipeBridge.wake();
+  }
+  if (pipeBridge) pipeBridge.dispatch = dispatchPipe;
 
   // ---- cares_wrap: DNS binding. Real name resolution is deferred (loopback
   // connects by IPv4 literal), but the address helpers below must be real:
