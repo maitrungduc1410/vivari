@@ -28,6 +28,12 @@ if (!fs.existsSync(path.join(VENDOR_NPM, "bin/npm-cli.js"))) {
 const LIVE = process.env.OC_LIVE === "1";
 const DIR = "/docs-site";
 const PORT = Number(process.env.OC_PORT || 3000);
+// The shipped studio template serves Docusaurus under the preview proxy prefix
+// (baseUrl "/preview/3000/", keepPreviewPrefix) so its client router resolves the
+// first route. Set OC_BASEURL=/preview/3000/ to exercise that base-prefixed path
+// here (GET the base, plus an asset under it, should both 200); default "/" keeps
+// the fast/plain regression run.
+const BASEURL = process.env.OC_BASEURL || "/";
 
 // ── kernel setup (same shape as spike-webpack.mjs) ───────────────────────────
 const fsWorker = new Worker(new URL("./fs-worker.mjs", import.meta.url));
@@ -148,7 +154,7 @@ kernel.writeFile(
   title: "Docusaurus in OpenContainer",
   tagline: "Docs run in-VM",
   url: "http://localhost",
-  baseUrl: "/",
+  baseUrl: "${BASEURL}",
   onBrokenLinks: "ignore",
   onBrokenMarkdownLinks: "ignore",
   favicon: undefined,
@@ -258,15 +264,32 @@ let getOk = false;
 if (bound) {
   const decode = (b) => (typeof b === "string" ? b : Buffer.from(b).toString());
   const get = (url) => kernel.handleHttpRequest(PORT, { port: PORT, method: "GET", url, headers: { host: "127.0.0.1:" + PORT }, body: "" });
-  let root = await get("/");
+  // Mirror the SW's keep-prefix behaviour: request paths exactly as the browser
+  // would under this baseUrl (the dev server serves the app AT baseUrl).
+  const home = BASEURL;
+  let root = await get(home);
   for (let i = 0; i < 120 && (root.status === 502 || root.status === 404 || root.status >= 500); i++) {
     await new Promise((r) => setTimeout(r, 1000));
-    root = await get("/");
+    root = await get(home);
   }
   const body = decode(root.body || "");
   getOk = root.status === 200 && /__docusaurus|Docusaurus in OpenContainer/.test(body);
-  console.log(`  GET / -> ${root.status}  (${body.length} bytes)`);
+  console.log(`  GET ${home} -> ${root.status}  (${body.length} bytes)`);
   console.log("  body head: " + body.slice(0, 220).replace(/\n/g, " "));
+  // For a base-prefixed run, prove an asset also serves under the prefix — this is
+  // exactly the path the browser requests and the SW forwards un-stripped.
+  if (getOk && BASEURL !== "/") {
+    const sm = body.match(/<script[^>]+src="([^"]+)"/i);
+    if (sm) {
+      const asset = await get(sm[1]);
+      const ct = (asset.headers && (asset.headers["content-type"] || asset.headers["Content-Type"])) || "";
+      const assetOk = asset.status === 200 && !/text\/html/.test(ct);
+      console.log(`  GET ${sm[1]} -> ${asset.status} (${ct}) assetOk=${assetOk}`);
+      getOk = assetOk;
+    } else {
+      console.log("  (no <script src> found in shell to verify asset serving)");
+    }
+  }
 } else {
   console.log("\n---- dev output tail (last 4000 chars) ----\n" + out.slice(devStart).join("").slice(-4000));
 }

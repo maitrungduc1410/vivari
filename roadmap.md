@@ -1825,6 +1825,25 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
      — `http2-wrapper` (a transitive dep of `got`, pulled by Docusaurus) reads exactly that at load
      time (`new tls.TLSSocket(new PassThrough())._handle._parentWrap.constructor`) and would
      otherwise crash on `null`. http/2-over-TLS is unused, so the harmless class is fine.
+
+  Post-ship polish (same MR):
+  - **Update-notifier noise silenced (`demo/kernel-worker.js`).** Docusaurus (via the
+    `update-notifier` package) spawns a *detached* child to check npm for a newer version; that
+    spawn fails `ENOENT` in-VM and, since no `'error'` listener is attached, surfaced as a harmless
+    (server-still-boots) uncaught error. Update checks are pointless in the VM, so the shell env now
+    sets `NO_UPDATE_NOTIFIER=1` + `npm_config_update_notifier=false` (also kills npm's own "new
+    version" notice).
+  - **Keep-prefix preview routing (`public/sw.js` + controller + `templates.ts`).** A *client-routed*
+    SPA (Docusaurus — also VitePress/Slidev in future) resolves its route from the iframe's own
+    `location.pathname`, which is `/preview/<port>/…`. The preview SW normally *strips* that proxy
+    prefix before hitting the dev server (so `/`-based servers like Next/Vite see clean paths), so
+    Docusaurus's router landed on its NotFound page until you clicked a link. Fix: the template sets
+    `baseUrl: "/preview/3000/"` and a `keepPreviewPrefix` manifest flag; the controller pushes the set
+    of keep-prefix ports to the SW (persisted in a Cache so a revived SW still routes right); for
+    those ports the SW forwards the **un-stripped** path so the app runs consistently under the proxy
+    base — first-route + deep-links resolve and `location.reload()` still targets a real preview URL.
+    Default (strip) behaviour is unchanged for every other template. `scripts/spike-docusaurus.mjs`
+    gained an `OC_BASEURL` knob to exercise the base-prefixed path headlessly.
 - ⏳ **Phase 4 (cont.) — Angular spiked, blocked on the esbuild-service hard path (`scripts/spike-angular.mjs`).**
   The spike got Angular 21 (`@angular/build:dev-server`) from "the CLI won't even start" all the way
   to "`ng serve` binds its port, Vite + Rollup load, the esbuild Go/wasm actually runs, and the build

@@ -65,6 +65,16 @@ export interface TemplateManifest {
   dev: string;
   /** Marks templates whose in-VM dev server is not yet fully proven. */
   experimental?: boolean;
+  /**
+   * The preview proxy serves every app under `/preview/<port>/` and, by default,
+   * strips that prefix before hitting the dev server. A *client-routed* SPA
+   * (Docusaurus, VitePress, Slidev…) resolves its route from the iframe's own
+   * `location.pathname`, so served at `/` its router lands on NotFound. Such a
+   * template instead sets its base (baseUrl / Vite `base`) to `/preview/<port>/`
+   * and flags this so the SW keeps the prefix — the app then runs consistently
+   * under the proxy path (deep-links + `location.reload()` work).
+   */
+  keepPreviewPrefix?: boolean;
 }
 
 export interface TemplateDef {
@@ -3423,6 +3433,11 @@ function docusaurusTemplate(): TemplateDef {
       install: "npm install",
       dev: "npm run dev",
       experimental: true,
+      // Docusaurus is a client-routed SPA: it reads its route from the iframe's
+      // location, which is /preview/3000/. Serve it under that base (baseUrl below)
+      // and keep the proxy prefix so its router matches — otherwise the first load
+      // lands on Docusaurus's NotFound page until you click a link.
+      keepPreviewPrefix: true,
     },
     files: {
       "package.json": `{
@@ -3449,7 +3464,10 @@ function docusaurusTemplate(): TemplateDef {
   title: "Docusaurus in OpenContainer",
   tagline: "Docs run in the browser VM",
   url: "http://localhost",
-  baseUrl: "/",
+  // The OpenContainer preview serves this app under /preview/3000/ (see the
+  // template's keepPreviewPrefix flag). Match that base so Docusaurus's client
+  // router resolves routes correctly on first load and deep-links work.
+  baseUrl: "/preview/3000/",
   onBrokenLinks: "ignore",
   onBrokenMarkdownLinks: "ignore",
   presets: [

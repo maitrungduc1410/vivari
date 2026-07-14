@@ -11,6 +11,51 @@
 
 const PREVIEW_MARKER = "/preview/";
 
+// "Keep-prefix" ports. By default the SW strips the `/preview/<port>` proxy prefix
+// before handing a request to the in-VM dev server (so a server that assumes it
+// lives at `/` — Next, Vite, Express… — sees clean paths). But a *client-routed*
+// SPA (Docusaurus, VitePress, Slidev…) resolves its route from the iframe's own
+// `location.pathname`, which IS `/preview/<port>/…`. Serving such an app at `/`
+// makes its router land on its NotFound page. The fix: configure that app's base
+// (baseUrl / Vite `base`) to `/preview/<port>/` and tell the SW to NOT strip the
+// prefix for that port — so the app runs consistently under the proxy path,
+// deep-links resolve, and (crucially) `location.reload()` still targets a real
+// preview URL. The controller pushes the current set here; we also persist it so a
+// terminated-then-revived SW (which loses in-memory state) still routes correctly.
+const KEEP_PREFIX_CACHE = "oc-config";
+const KEEP_PREFIX_KEY = "https://oc.config/keep-prefix-ports";
+let keepPrefixPorts = null; // Set<number> once loaded (null = not yet loaded)
+
+async function loadKeepPrefixPorts() {
+  if (keepPrefixPorts) return keepPrefixPorts;
+  const set = new Set();
+  try {
+    const cache = await caches.open(KEEP_PREFIX_CACHE);
+    const hit = await cache.match(KEEP_PREFIX_KEY);
+    if (hit) for (const p of await hit.json()) set.add(p | 0);
+  } catch (_) {
+    /* no persisted config yet */
+  }
+  keepPrefixPorts = set;
+  return set;
+}
+
+self.addEventListener("message", (event) => {
+  const d = event.data;
+  if (!d || d.type !== "oc-keep-prefix-ports" || !Array.isArray(d.ports)) return;
+  keepPrefixPorts = new Set(d.ports.map((p) => p | 0));
+  event.waitUntil(
+    (async () => {
+      try {
+        const cache = await caches.open(KEEP_PREFIX_CACHE);
+        await cache.put(KEEP_PREFIX_KEY, new Response(JSON.stringify([...keepPrefixPorts])));
+      } catch (_) {
+        /* best-effort persistence */
+      }
+    })(),
+  );
+});
+
 // roadmap: Packaging Stage 2 — precache the role bundles. Every Process Worker
 // spawn (and every reload) otherwise re-fetches its bundle — process-worker.js
 // alone is ~900 KB. With the bundles in the Cache Storage the browser serves
@@ -138,7 +183,15 @@ function OCWebSocket(url, protocols){
     // its real path. URLs without the prefix (Vite HMR, same-app sockets) keep
     // the iframe's own port — so HMR is unaffected.
     var pm = u.pathname.match(/^\\/preview\\/(\\d+)(\\/.*)?$/);
-    if (pm) { targetPort = parseInt(pm[1], 10); path = (pm[2] || '/') + u.search; }
+    if (pm) {
+      targetPort = parseInt(pm[1], 10);
+      // A keep-prefix dev server (e.g. Docusaurus/VitePress with base
+      // /preview/<port>/) serves its OWN HMR socket under that prefix too — keep it
+      // so the server sees its real path. Only strip when tunnelling to a DIFFERENT
+      // in-VM port (a genuine cross-service socket).
+      if (window.__ocKeepPrefix && targetPort === previewPort) path = u.pathname + u.search;
+      else path = (pm[2] || '/') + u.search;
+    }
   } catch(e){}
   post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, path:path, protocols: protocols || null });
 }
@@ -255,8 +308,12 @@ const DEVTOOLS_TAGS =
 // Insert the shim as the first child of <head> (so it runs before any script).
 // The WS shim runs first (inline), then chobitsu (classic src → executes before
 // the app's deferred module scripts), then the CDP bootstrap.
-function injectWsShim(html) {
-  const tag = "<script>" + WS_SHIM + "<\/script>" + DEVTOOLS_TAGS;
+function injectWsShim(html, keepPrefix) {
+  // For keep-prefix ports, tell the injected WS shim (and any app code that cares)
+  // that this document lives under its real base — so its own HMR socket path is
+  // left prefixed rather than stripped.
+  const flag = keepPrefix ? "<script>window.__ocKeepPrefix=true;<\/script>" : "";
+  const tag = flag + "<script>" + WS_SHIM + "<\/script>" + DEVTOOLS_TAGS;
   const headOpen = /<head[^>]*>/i.exec(html);
   if (headOpen) {
     const at = headOpen.index + headOpen[0].length;
@@ -336,8 +393,15 @@ self.addEventListener("fetch", (event) => {
     const rest = url.pathname.slice(idx + PREVIEW_MARKER.length);
     const slash = rest.indexOf("/");
     const port = parseInt(slash === -1 ? rest : rest.slice(0, slash), 10);
-    const path = (slash === -1 ? "/" : rest.slice(slash)) + url.search;
-    event.respondWith(handlePreview(event, port, path));
+    const stripped = (slash === -1 ? "/" : rest.slice(slash)) + url.search;
+    const full = url.pathname + url.search;
+    // Keep-prefix ports serve UNDER /preview/<port>/ (see loadKeepPrefixPorts);
+    // everyone else gets the prefix stripped as before.
+    event.respondWith(
+      loadKeepPrefixPorts().then((keep) =>
+        handlePreview(event, port, keep.has(port) ? full : stripped, keep.has(port)),
+      ),
+    );
     return;
   }
 
@@ -392,7 +456,7 @@ async function routeByClient(event, url) {
   return handlePreview(event, parseInt(m[1], 10), url.pathname + url.search);
 }
 
-async function handlePreview(event, port, path) {
+async function handlePreview(event, port, path, keepPrefix) {
   if (!Number.isInteger(port)) {
     return new Response("Bad preview URL\n", { status: 400 });
   }
@@ -452,7 +516,7 @@ async function handlePreview(event, port, path) {
     outBody = bytes;
   } else if (typeof outBody === "string" && (respHeaders.get("content-type") || "").includes("text/html")) {
     // roadmap #19 stage C: install the ws tunnel polyfill before /@vite/client.
-    outBody = injectWsShim(outBody);
+    outBody = injectWsShim(outBody, keepPrefix);
     respHeaders.delete("content-length"); // body grew; let the browser recompute
   }
 
