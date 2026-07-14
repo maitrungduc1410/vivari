@@ -54,6 +54,7 @@ packages/
   runtime/         The Node runtime that runs INSIDE each process worker.
     index.js       createRuntime(): wires builtins/globals/http-bridge/ws + run().
     module.js      synchronous CommonJS loader (require + resolution).
+    esbuild-inproc-patch.js  load-time rewrite of esbuild-wasm's service to run in-process.
     esm.js         ESM→CJS transpiler (import/export → sync CJS).
     loop.js        the per-process event loop (nextTick→micro→timers→immediate).
     boot.js        process bootstrap shared by browser + Node worker entries.
@@ -256,6 +257,27 @@ the vendored tree with a JS stub (exit 0, warns), and a `node-gyp` coreutil is
 the PATH fallback. Native compilation is skipped; the package's JS or
 `wasm32-wasi` build is what actually loads. Don't "fix" a node-gyp failure by
 trying to compile — that path is intentionally stubbed.
+
+### esbuild/rollup are aliased to their wasm drop-ins — DON'T add per-project overrides
+esbuild and rollup ship no `wasm32` build, and their WASM drop-ins live under a
+DIFFERENT package name (`esbuild-wasm`, `@rollup/wasm-node`) that npm's
+platform auto-select (which handles `*-wasm32-wasi` optional deps) can't reach.
+Three runtime pieces close that gap generically, so projects stay vanilla — do
+NOT re-introduce a `package.json` "overrides" block or a per-project launcher:
+- **Registry aliasing** (`demo/fetcher-worker.js`, `PACKAGE_ALIASES`): a packument
+  request for `esbuild`/`rollup` is served the drop-in's packument rewritten
+  under the source name; npm then downloads the drop-in's real tarball into
+  `node_modules/<source>` (versions are published in lockstep). Falls back to the
+  un-aliased fetch on error. This is the `REGISTRY_PROXY`/`rewrite()` seam realized.
+- **In-process esbuild** (`runtime/esbuild-inproc-patch.js`, invoked from
+  `module.js` compile): esbuild-wasm's Node build spawns a child service whose
+  stdio pipe deadlocks under a Piscina/tinypool loop; we rewrite `lib/main.js` at
+  load time to run the Go service in this thread. Idempotent; strict no-op for a
+  genuine native esbuild (guarded on the wasm assets sitting next to `main.js`).
+- **Worker-pool default** (`runtime/builtins/process.js`): `PISCINA_DISABLE_ATOMICS`
+  defaults to `1` so pools use async message passing (our cooperative
+  worker_threads can't serve the Atomics fast-path). This is why the Angular
+  template is now plain `ng serve`/`ng build` with no `scripts/oc-ng.mjs`.
 
 ### The studio is a multi-root workspace — absolute paths + the VFS is truth
 Since the workspace rewrite there is NO single "current project" and NO static file
