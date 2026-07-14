@@ -142,7 +142,7 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     // We never inject any, but real code reads/maps it unconditionally — vitest's
     // bundled cac chunk does `process.execArgv.map(...)` at module top level.
     execArgv: [],
-    execPath: "/usr/bin/node",
+    execPath: "/bin/node",
     env,
     platform: "linux",
     arch: "wasm32",

@@ -14,6 +14,11 @@
 // globbed via import.meta.glob) so it is bundled reliably and never dragged into
 // the studio's own tsc/eslint pass.
 
+// The Angular launcher is a real .mjs (backtick/${}-heavy esbuild patch) imported
+// as a raw string rather than an escaped inline literal. It is not tsc/eslint'd
+// (no allowJs) but is bundled verbatim into the template's files.
+import angularOcNg from "./templates/angular/oc-ng.mjs?raw";
+
 export type Language = "TypeScript" | "JavaScript";
 
 // Picker tabs, StackBlitz-style. The order here drives the tab order in the UI.
@@ -3506,12 +3511,281 @@ Hello from OpenContainer — a full Docusaurus dev server compiled in the browse
   };
 }
 
+// ── Angular ──────────────────────────────────────────────────────────────────
+// Angular 21 runs in-VM on its default `@angular/build` toolchain (esbuild +
+// Vite dev server). Neither esbuild nor Rollup ships a wasm32 native binary, so
+// package.json "overrides" alias each to its official WASM drop-in (esbuild ->
+// esbuild-wasm, rollup -> @rollup/wasm-node). The dev/build commands go through
+// scripts/oc-ng.mjs, which patches esbuild-wasm to run in-process (its child
+// service deadlocks the single-threaded kernel against Angular's worker pools)
+// and selects the inline AOT + async transform paths. See scripts/spike-angular.mjs.
+function angularTemplate(): TemplateDef {
+  const NG = "^21.1.0";
+  const files: Record<string, string> = {
+    "package.json": `{
+  "name": "angular-app",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "ng": "ng",
+    "dev": "node scripts/oc-ng.mjs serve --port 4200 --host 127.0.0.1",
+    "build": "node scripts/oc-ng.mjs build",
+    "start": "node scripts/oc-ng.mjs serve --port 4200 --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@angular/common": "${NG}",
+    "@angular/compiler": "${NG}",
+    "@angular/core": "${NG}",
+    "@angular/forms": "${NG}",
+    "@angular/platform-browser": "${NG}",
+    "@angular/router": "${NG}",
+    "rxjs": "^7.8.1",
+    "tslib": "^2.5.0"
+  },
+  "devDependencies": {
+    "@angular/build": "${NG}",
+    "@angular/cli": "${NG}",
+    "@angular/compiler-cli": "${NG}",
+    "typescript": "~5.9.2"
+  },
+  "overrides": {
+    "esbuild": "npm:esbuild-wasm@0.28.1",
+    "rollup": "npm:@rollup/wasm-node@^4.62.0"
+  }
+}
+`,
+    "angular.json": `{
+  "$schema": "./node_modules/@angular/cli/lib/config/schema.json",
+  "version": 1,
+  "cli": { "packageManager": "npm", "analytics": false },
+  "newProjectRoot": "projects",
+  "projects": {
+    "angular-app": {
+      "projectType": "application",
+      "schematics": {},
+      "root": "",
+      "sourceRoot": "src",
+      "prefix": "app",
+      "architect": {
+        "build": {
+          "builder": "@angular/build:application",
+          "options": {
+            "browser": "src/main.ts",
+            "tsConfig": "tsconfig.app.json",
+            "index": "src/index.html",
+            "styles": ["src/styles.css"]
+          },
+          "configurations": {
+            "production": { "outputHashing": "all" },
+            "development": { "optimization": false, "extractLicenses": false, "sourceMap": true }
+          },
+          "defaultConfiguration": "development"
+        },
+        "serve": {
+          "builder": "@angular/build:dev-server",
+          "configurations": {
+            "production": { "buildTarget": "angular-app:build:production" },
+            "development": { "buildTarget": "angular-app:build:development" }
+          },
+          "defaultConfiguration": "development"
+        }
+      }
+    }
+  }
+}
+`,
+    "tsconfig.json": `{
+  "compileOnSave": false,
+  "compilerOptions": {
+    "outDir": "./dist/out-tsc",
+    "strict": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "experimentalDecorators": true,
+    "moduleResolution": "bundler",
+    "importHelpers": true,
+    "target": "ES2022",
+    "module": "preserve"
+  },
+  "angularCompilerOptions": { "strictTemplates": true }
+}
+`,
+    "tsconfig.app.json": `{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "outDir": "./out-tsc/app", "types": [] },
+  "files": ["src/main.ts"]
+}
+`,
+    "src/index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Angular in OpenContainer</title>
+    <base href="/" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <app-root></app-root>
+  </body>
+</html>
+`,
+    "src/main.ts": `import { bootstrapApplication } from '@angular/platform-browser';
+import { App } from './app/app';
+
+bootstrapApplication(App).catch((err) => console.error(err));
+`,
+    "src/styles.css": `:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: radial-gradient(1200px 600px at 50% -10%, #1a1030, #0a0a0f 60%);
+  color: #ededed;
+}
+`,
+    "src/app/app.ts": `import { Component, signal } from '@angular/core';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  templateUrl: './app.html',
+  styleUrl: './app.css',
+})
+export class App {
+  protected readonly count = signal(0);
+
+  increment(): void {
+    this.count.update((c) => c + 1);
+  }
+}
+`,
+    "src/app/app.html": `<main class="app">
+  <div class="badge">Angular 21</div>
+  <h1 id="marker">Angular in OpenContainer</h1>
+  <p class="subtitle">
+    esbuild-wasm + Vite dev server — compiled and served entirely in your browser.
+  </p>
+
+  <button class="counter" type="button" (click)="increment()">
+    count is {{ count() }}
+  </button>
+
+  <p class="hint">
+    Edit <code>src/app/app.html</code> and save — hot module replacement updates the
+    page instantly.
+  </p>
+</main>
+`,
+    "src/app/app.css": `.app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  padding: 2rem;
+  text-align: center;
+}
+
+.badge {
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #dd0031, #c3002f);
+  color: #fff;
+}
+
+h1 {
+  font-size: clamp(1.8rem, 5vw, 2.75rem);
+  margin: 0;
+}
+
+.subtitle {
+  max-width: 34rem;
+  margin: 0;
+  opacity: 0.7;
+  line-height: 1.5;
+}
+
+.counter {
+  margin-top: 0.5rem;
+  font: inherit;
+  font-weight: 600;
+  padding: 0.7rem 1.4rem;
+  border: 1px solid #3a3a4a;
+  border-radius: 0.6rem;
+  background: #16161f;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s ease, transform 0.05s ease;
+}
+
+.counter:hover {
+  border-color: #dd0031;
+}
+
+.counter:active {
+  transform: translateY(1px);
+}
+
+.hint {
+  margin: 0;
+  font-size: 0.9rem;
+  opacity: 0.5;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #ffffff14;
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.3rem;
+}
+`,
+    "scripts/oc-ng.mjs": angularOcNg,
+  };
+  return {
+    manifest: {
+      id: "angular",
+      framework: "angular",
+      icon: "angular",
+      category: "Frontend",
+      name: "Angular",
+      language: "TypeScript",
+      description: "Angular 21 (esbuild-wasm + Vite) with hot reload",
+      port: 4200,
+      openPath: "/",
+      entry: "src/app/app.ts",
+      // Vite drives Angular's HMR over the preview websocket tunnel.
+      hmr: true,
+      reload: false,
+      // esbuild-wasm has no native postinstall; --ignore-scripts also avoids any
+      // transitive native install step (the in-process patch runs from the dev
+      // launcher, not a postinstall).
+      install: "npm install --ignore-scripts",
+      dev: "npm run dev",
+      // Heavy toolchain (esbuild-wasm + Piscina worker pools); newly proven in-VM.
+      experimental: true,
+    },
+    files,
+  };
+}
+
 // The full catalog, grouped by picker category (see TEMPLATE_CATEGORIES). The
 // picker renders one tab per category; order within a category follows this list.
 export const TEMPLATES: TemplateDef[] = [
   // Frontend
   reactTemplate(false),
   reactTemplate(true),
+  angularTemplate(),
   vueTemplate(false),
   vueTemplate(true),
   svelteTemplate(false),

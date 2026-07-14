@@ -26,6 +26,15 @@ export default function (exports, require, module, process) {
   const EventEmitter = require("events");
   const host = process.__wtHost || null;
 
+  // Node's MessagePort is an EventEmitter — `port.on('message', (value) => ...)`
+  // with the posted value delivered directly. The platform MessagePort is an
+  // EventTarget — `addEventListener('message', (e) => e.data)`. Worker pools
+  // (Piscina, which backs Angular's compiler and vitest) call `port.on(...)`
+  // straight on ports returned by `new MessageChannel()`, so bridge the
+  // EventEmitter surface onto the platform prototype. The ports stay real (and
+  // therefore transferable in a transferList); we only add methods.
+  patchMessagePortPrototype(g.MessagePort);
+
   // ---- a single event queue drained inside a loop turn (like #15) -----------
   // Emitting 'message'/'exit' directly from a raw port's onmessage would run user
   // code outside the loop's runCallback (a process.exit() there would leak). So we
@@ -235,4 +244,81 @@ export default function (exports, require, module, process) {
   exports.moveMessagePortToContext = () => {
     throw new Error("worker_threads.moveMessagePortToContext is not supported");
   };
+
+  // Add Node's EventEmitter-style methods to the platform MessagePort prototype,
+  // mapping onto addEventListener/removeEventListener. Idempotent (guarded by a
+  // marker) and additive, so platform `onmessage`/`addEventListener` users are
+  // unaffected. A first `on('message')` call auto-starts the port (Node
+  // semantics). Ports remain real MessagePort instances, so `instanceof` and
+  // transfer still work.
+  function patchMessagePortPrototype(MessagePort) {
+    const proto = MessagePort && MessagePort.prototype;
+    if (!proto || proto.__ocNodeEvents) return;
+    proto.__ocNodeEvents = true;
+    const LISTENERS = Symbol("ocPortListeners");
+    const bag = (port) => port[LISTENERS] || (port[LISTENERS] = new Map());
+    const dataEvents = new Set(["message", "messageerror"]);
+    proto.addListener = proto.on = function on(type, listener) {
+      const wrapped = dataEvents.has(type) ? (e) => listener(e.data) : (e) => listener(e);
+      const b = bag(this);
+      let byType = b.get(type);
+      if (!byType) b.set(type, (byType = new Map()));
+      byType.set(listener, wrapped);
+      this.addEventListener(type, wrapped);
+      if (type === "message") {
+        try {
+          this.start();
+        } catch {
+          /* onmessage/addEventListener already auto-started it */
+        }
+      }
+      return this;
+    };
+    proto.once = function once(type, listener) {
+      const self = this;
+      const one = function (value) {
+        self.removeListener(type, one);
+        listener(value);
+      };
+      return this.on(type, one);
+    };
+    proto.removeListener = proto.off = function off(type, listener) {
+      const byType = bag(this).get(type);
+      const wrapped = byType && byType.get(listener);
+      if (wrapped) {
+        this.removeEventListener(type, wrapped);
+        byType.delete(listener);
+      }
+      return this;
+    };
+    proto.removeAllListeners = function removeAllListeners(type) {
+      const b = bag(this);
+      for (const t of type ? [type] : [...b.keys()]) {
+        const byType = b.get(t);
+        if (byType) for (const w of byType.values()) this.removeEventListener(t, w);
+        b.delete(t);
+      }
+      return this;
+    };
+    proto.emit = function emit(type, arg) {
+      try {
+        this.dispatchEvent(dataEvents.has(type) ? new MessageEvent(type, { data: arg }) : new Event(type));
+      } catch {
+        /* best effort */
+      }
+      return true;
+    };
+    proto.listeners = function listeners(type) {
+      const byType = bag(this).get(type);
+      return byType ? [...byType.keys()] : [];
+    };
+    proto.listenerCount = function listenerCount(type) {
+      const byType = bag(this).get(type);
+      return byType ? byType.size : 0;
+    };
+    if (!proto.ref) proto.ref = function ref() { return this; };
+    if (!proto.unref) proto.unref = function unref() { return this; };
+    if (!proto.setMaxListeners) proto.setMaxListeners = function setMaxListeners() { return this; };
+    if (!proto.getMaxListeners) proto.getMaxListeners = function getMaxListeners() { return 0; };
+  }
 }
