@@ -135,6 +135,15 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
   });
   memoryUsage.rss = () => 64 * MB;
 
+  // Worker pools (Piscina, which backs Angular's compiler, Vitest, tsup, ...) have
+  // an Atomics fast-path that reads task results synchronously via
+  // receiveMessageOnPort. Our cooperative worker_threads can't serve that reliably
+  // (the reader parks the single event loop), so default the pool to async message
+  // passing unless the project overrode it. Inherited by children via process.env.
+  if (env && typeof env === "object" && env.PISCINA_DISABLE_ATOMICS == null) {
+    env.PISCINA_DISABLE_ATOMICS = "1";
+  }
+
   const process = {
     argv: ["node", ...argv],
     argv0: "node",

@@ -8,6 +8,7 @@
 // node_modules.
 
 import { transpileEsm, rewriteCjsDynamicImport } from "./esm.js";
+import { maybePatchEsbuildInProcess } from "./esbuild-inproc-patch.js";
 
 // The constructor for `async function () {}` — used to (re)compile an ESM module
 // that uses top-level await (our normal wrapper is a plain, non-async function).
@@ -367,6 +368,14 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     let source = providedSource != null ? providedSource : fs.readFileSync(filename, "utf8");
     if (source.charCodeAt(0) === 0xfeff) source = source.slice(1); // strip BOM
     if (source.startsWith("#!")) source = "//" + source.slice(2); // neutralize shebang
+
+    // Transparent in-process esbuild service: rewrite esbuild-wasm's lib/main.js
+    // so its Go service runs in this thread instead of spawning a child whose
+    // stdio pipe deadlocks under a worker pool. No-op for everything else. This
+    // replaces the old per-project scripts/oc-ng.mjs patch (see
+    // esbuild-inproc-patch.js).
+    const esbPatched = maybePatchEsbuildInProcess(source, filename, fs, path);
+    if (esbPatched != null) source = esbPatched;
 
     // ESM support (#13): transpile import/export -> our synchronous CJS at load
     // time. `.cjs` is always CommonJS; everything else is scanned and rewritten
