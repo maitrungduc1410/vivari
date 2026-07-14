@@ -14,11 +14,6 @@
 // globbed via import.meta.glob) so it is bundled reliably and never dragged into
 // the studio's own tsc/eslint pass.
 
-// The Angular launcher is a real .mjs (backtick/${}-heavy esbuild patch) imported
-// as a raw string rather than an escaped inline literal. It is not tsc/eslint'd
-// (no allowJs) but is bundled verbatim into the template's files.
-import angularOcNg from "./templates/angular/oc-ng.mjs?raw";
-
 export type Language = "TypeScript" | "JavaScript";
 
 // Picker tabs, StackBlitz-style. The order here drives the tab order in the UI.
@@ -3512,13 +3507,14 @@ Hello from OpenContainer — a full Docusaurus dev server compiled in the browse
 }
 
 // ── Angular ──────────────────────────────────────────────────────────────────
-// Angular 21 runs in-VM on its default `@angular/build` toolchain (esbuild +
-// Vite dev server). Neither esbuild nor Rollup ships a wasm32 native binary, so
-// package.json "overrides" alias each to its official WASM drop-in (esbuild ->
-// esbuild-wasm, rollup -> @rollup/wasm-node). The dev/build commands go through
-// scripts/oc-ng.mjs, which patches esbuild-wasm to run in-process (its child
-// service deadlocks the single-threaded kernel against Angular's worker pools)
-// and selects the inline AOT + async transform paths. See scripts/spike-angular.mjs.
+// Angular 21 runs in-VM on its stock `@angular/build` toolchain (esbuild + Vite
+// dev server) from a completely vanilla project — same package.json / angular.json
+// you'd get from `ng new`, so it exports and runs locally unchanged. Everything
+// that makes esbuild/Rollup work in-browser lives in the runtime now, not the
+// project: the fetcher aliases esbuild -> esbuild-wasm and rollup -> @rollup/
+// wasm-node at the registry layer (fetcher-worker.js), the module loader runs
+// esbuild-wasm's service in-process (esbuild-inproc-patch.js), and the runtime
+// defaults PISCINA_DISABLE_ATOMICS so the worker pools use message passing.
 function angularTemplate(): TemplateDef {
   const NG = "^21.1.0";
   const files: Record<string, string> = {
@@ -3528,9 +3524,9 @@ function angularTemplate(): TemplateDef {
   "private": true,
   "scripts": {
     "ng": "ng",
-    "dev": "node scripts/oc-ng.mjs serve --port 4200 --host 127.0.0.1",
-    "build": "node scripts/oc-ng.mjs build",
-    "start": "node scripts/oc-ng.mjs serve --port 4200 --host 127.0.0.1"
+    "start": "ng serve",
+    "build": "ng build",
+    "watch": "ng build --watch --configuration development"
   },
   "dependencies": {
     "@angular/common": "${NG}",
@@ -3547,10 +3543,6 @@ function angularTemplate(): TemplateDef {
     "@angular/cli": "${NG}",
     "@angular/compiler-cli": "${NG}",
     "typescript": "~5.9.2"
-  },
-  "overrides": {
-    "esbuild": "npm:esbuild-wasm@0.28.1",
-    "rollup": "npm:@rollup/wasm-node@^4.62.0"
   }
 }
 `,
@@ -3583,6 +3575,7 @@ function angularTemplate(): TemplateDef {
         },
         "serve": {
           "builder": "@angular/build:dev-server",
+          "options": { "host": "127.0.0.1", "port": 4200 },
           "configurations": {
             "production": { "buildTarget": "angular-app:build:production" },
             "development": { "buildTarget": "angular-app:build:development" }
@@ -3750,7 +3743,6 @@ code {
   border-radius: 0.3rem;
 }
 `,
-    "scripts/oc-ng.mjs": angularOcNg,
   };
   return {
     manifest: {
@@ -3760,18 +3752,18 @@ code {
       category: "Frontend",
       name: "Angular",
       language: "TypeScript",
-      description: "Angular 21 (esbuild-wasm + Vite) with hot reload",
+      description: "Angular 21 (@angular/build + Vite) with hot reload",
       port: 4200,
       openPath: "/",
       entry: "src/app/app.ts",
       // Vite drives Angular's HMR over the preview websocket tunnel.
       hmr: true,
       reload: false,
-      // esbuild-wasm has no native postinstall; --ignore-scripts also avoids any
-      // transitive native install step (the in-process patch runs from the dev
-      // launcher, not a postinstall).
+      // --ignore-scripts skips any transitive native postinstall (esbuild's is
+      // moot: the registry aliases it to esbuild-wasm, which has none). This is a
+      // studio-side install choice; the project's package.json stays vanilla.
       install: "npm install --ignore-scripts",
-      dev: "npm run dev",
+      dev: "npm start",
       // Heavy toolchain (esbuild-wasm + Piscina worker pools); newly proven in-VM.
       experimental: true,
     },
