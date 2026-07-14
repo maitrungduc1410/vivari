@@ -447,6 +447,18 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
         try {
           process.stderr.write(`[oc-module-throw] ${filename}: ${(e && e.message) || e}\n`);
         } catch {}
+        // process.stderr routes through the kernel asynchronously, so it's lost if
+        // the worker crashes right after. Also prepend the throwing module's path
+        // to the error message (once per module up the require chain) so the
+        // synchronous worker-error line shows the full chain: `[outer] [inner] …`.
+        try {
+          if (e && typeof e === "object" && !e.__ocTraced) {
+            e.__ocTraced = true;
+            const tag = `[${filename}] `;
+            if (typeof e.stack === "string") e.stack = tag + e.stack;
+            e.message = tag + e.message;
+          }
+        } catch {}
         throw e;
       }
       return;
@@ -508,7 +520,18 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
   // `_load`, `_resolveFilename`, `prototype.require`, or `_extensions['.js']` to
   // intercept requires; module runners read `_cache`, `wrap`, `_compile`.
   Module._cache = cache;
+  // Node ships `.js`/`.json`/`.node` handlers on Module._extensions (aka
+  // require.extensions). Tools both PATCH them (ts-node/tsx) and READ their keys
+  // to decide an extension is natively loadable — rechoir (webpack-cli's config
+  // loader) does `Object.keys(require.extensions).includes('.js')` and throws
+  // "No module loader found for '.js'" if it's absent. Delegate to our compiler so
+  // a direct `_extensions['.js'](module, filename)` call still works.
   Module._extensions = Object.create(null);
+  Module._extensions[".js"] = (module, filename) => compile(module, filename);
+  Module._extensions[".json"] = (module, filename) => compile(module, filename);
+  Module._extensions[".node"] = () => {
+    throw new Error("Native .node addons are not supported in OpenContainer");
+  };
   Module.globalPaths = [];
   Module.wrapper = [
     "(function (exports, require, module, __filename, __dirname) { ",

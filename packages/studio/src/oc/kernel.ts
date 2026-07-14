@@ -117,6 +117,22 @@ export class KernelBridge {
     return true;
   }
 
+  /**
+   * Tell the preview Service Worker which in-VM ports serve UNDER the
+   * `/preview/<port>/` proxy prefix (keep-prefix templates like Docusaurus) so it
+   * doesn't strip the prefix for them. Safe to call before the SW is active — it
+   * resolves against the ready registration.
+   */
+  setKeepPrefixPorts(ports: number[]): void {
+    if (!("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.ready
+      .then((reg) => {
+        const sw = reg.active || navigator.serviceWorker.controller;
+        sw?.postMessage({ type: "oc-keep-prefix-ports", ports });
+      })
+      .catch(() => {});
+  }
+
   /** Start the kernel (spawns fs/fetcher workers + VFS, then posts `ready`). */
   boot() {
     this.worker.postMessage({ type: "init" });

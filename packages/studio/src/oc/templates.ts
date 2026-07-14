@@ -65,6 +65,16 @@ export interface TemplateManifest {
   dev: string;
   /** Marks templates whose in-VM dev server is not yet fully proven. */
   experimental?: boolean;
+  /**
+   * The preview proxy serves every app under `/preview/<port>/` and, by default,
+   * strips that prefix before hitting the dev server. A *client-routed* SPA
+   * (Docusaurus, VitePress, Slidev…) resolves its route from the iframe's own
+   * `location.pathname`, so served at `/` its router lands on NotFound. Such a
+   * template instead sets its base (baseUrl / Vite `base`) to `/preview/<port>/`
+   * and flags this so the SW keeps the prefix — the app then runs consistently
+   * under the proxy path (deep-links + `location.reload()` work).
+   */
+  keepPreviewPrefix?: boolean;
 }
 
 export interface TemplateDef {
@@ -3307,6 +3317,195 @@ main().catch((err) => { console.error(err); process.exit(1); });
   };
 }
 
+// ── Webpack (standalone) ─────────────────────────────────────────────────────
+// Not Vite: webpack 5 + webpack-dev-server (connect + `ws` HMR + chokidar) +
+// html-webpack-plugin. Proven headless (scripts/spike-webpack.mjs) — binds :8080
+// and serves the app with live HMR.
+function webpackTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "webpack",
+      framework: "webpack",
+      icon: "webpack",
+      category: "Tooling",
+      name: "Webpack",
+      language: "JavaScript",
+      description: "Webpack 5 + webpack-dev-server with hot module replacement",
+      port: 8080,
+      openPath: "/",
+      entry: "src/index.js",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+    },
+    files: {
+      "package.json": `{
+  "name": "webpack-app",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "webpack serve --mode development",
+    "build": "webpack --mode production"
+  },
+  "devDependencies": {
+    "webpack": "^5.97.1",
+    "webpack-cli": "^5.1.4",
+    "webpack-dev-server": "^5.2.0",
+    "html-webpack-plugin": "^5.6.3",
+    "css-loader": "^7.1.2",
+    "style-loader": "^4.0.0"
+  }
+}
+`,
+      "webpack.config.js": `const path = require("path");
+const HtmlWebpackPlugin = require("html-webpack-plugin");
+
+module.exports = {
+  mode: "development",
+  entry: "./src/index.js",
+  output: { path: path.resolve(__dirname, "dist"), filename: "main.js", clean: true },
+  module: { rules: [{ test: /\\.css$/i, use: ["style-loader", "css-loader"] }] },
+  plugins: [new HtmlWebpackPlugin({ template: "./src/index.html" })],
+  devServer: {
+    port: 8080,
+    host: "127.0.0.1",
+    hot: true,
+    open: false,
+    allowedHosts: "all",
+    client: { overlay: false },
+  },
+};
+`,
+      "src/index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Webpack in OpenContainer</title>
+  </head>
+  <body>
+    <h1 id="marker">Webpack in OpenContainer</h1>
+    <p>webpack 5 + webpack-dev-server with hot module replacement</p>
+    <div id="app"></div>
+  </body>
+</html>
+`,
+      "src/styles.css": `body { font-family: system-ui, sans-serif; padding: 2rem; line-height: 1.5; }
+button { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }
+`,
+      "src/index.js": `import "./styles.css";
+
+let count = 0;
+const app = document.getElementById("app");
+const btn = document.createElement("button");
+const render = () => (btn.textContent = "count is " + count);
+btn.addEventListener("click", () => { count++; render(); });
+render();
+app.appendChild(btn);
+
+// Edit this file and save — webpack HMR swaps the module without a full reload.
+if (module.hot) module.hot.accept();
+`,
+    },
+  };
+}
+
+// ── Docusaurus (standalone webpack) ──────────────────────────────────────────
+// Docusaurus 3's dev server is webpack + webpack-dev-server + MDX/React. Proven
+// headless (scripts/spike-docusaurus.mjs) — binds :3000 and serves the site.
+// Heavy install (100s+), so kept experimental.
+function docusaurusTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "docusaurus",
+      framework: "docusaurus",
+      icon: "docusaurus",
+      category: "Docs",
+      name: "Docusaurus",
+      language: "JavaScript",
+      description: "Docusaurus 3 — React docs site (webpack + MDX) with hot reload",
+      port: 3000,
+      openPath: "/",
+      entry: "docs/intro.md",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      experimental: true,
+      // Docusaurus is a client-routed SPA: it reads its route from the iframe's
+      // location, which is /preview/3000/. Serve it under that base (baseUrl below)
+      // and keep the proxy prefix so its router matches — otherwise the first load
+      // lands on Docusaurus's NotFound page until you click a link.
+      keepPreviewPrefix: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "docusaurus-site",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "docusaurus start --no-open",
+    "build": "docusaurus build",
+    "serve": "docusaurus serve"
+  },
+  "dependencies": {
+    "@docusaurus/core": "^3.6.0",
+    "@docusaurus/preset-classic": "^3.6.0",
+    "@mdx-js/react": "^3.0.0",
+    "clsx": "^2.0.0",
+    "prism-react-renderer": "^2.3.0",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0"
+  }
+}
+`,
+      "docusaurus.config.js": `module.exports = {
+  title: "Docusaurus in OpenContainer",
+  tagline: "Docs run in the browser VM",
+  url: "http://localhost",
+  // The OpenContainer preview serves this app under /preview/3000/ (see the
+  // template's keepPreviewPrefix flag). Match that base so Docusaurus's client
+  // router resolves routes correctly on first load and deep-links work.
+  baseUrl: "/preview/3000/",
+  onBrokenLinks: "ignore",
+  onBrokenMarkdownLinks: "ignore",
+  presets: [
+    [
+      "@docusaurus/preset-classic",
+      {
+        docs: { sidebarPath: require.resolve("./sidebars.js"), routeBasePath: "/" },
+        blog: false,
+        theme: { customCss: require.resolve("./src/css/custom.css") },
+      },
+    ],
+  ],
+  themeConfig: {
+    navbar: { title: "Docusaurus in OpenContainer", items: [] },
+  },
+};
+`,
+      "sidebars.js": `module.exports = { tutorialSidebar: [{ type: "autogenerated", dirName: "." }] };
+`,
+      "src/css/custom.css": `:root { --ifm-color-primary: #2e8555; }
+`,
+      "docs/intro.md": `---
+slug: /
+title: Docusaurus in OpenContainer
+---
+
+# Docusaurus in OpenContainer
+
+Hello from OpenContainer — a full Docusaurus dev server compiled in the browser VM.
+
+- Write docs in Markdown / MDX
+- Live hot reload as you edit
+- Zero native dependencies
+`,
+    },
+  };
+}
+
 // The full catalog, grouped by picker category (see TEMPLATE_CATEGORIES). The
 // picker renders one tab per category; order within a category follows this list.
 export const TEMPLATES: TemplateDef[] = [
@@ -3346,11 +3545,13 @@ export const TEMPLATES: TemplateDef[] = [
   // Docs
   vitepressTemplate(),
   slidevTemplate(),
+  docusaurusTemplate(),
   // Creative
   threeTemplate(),
   gsapReactTemplate(),
   // Tooling
   nodeTemplate(),
+  webpackTemplate(),
   // Showcase
   fullstackTemplate(),
   sseTemplate(),

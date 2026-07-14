@@ -1039,6 +1039,18 @@ export class IdeController {
     this.set({ previewTabs: [...this.snap.previewTabs, tab], activePreviewId: id });
   }
 
+  // Push the set of in-VM ports that serve UNDER the /preview/<port>/ prefix
+  // (keep-prefix templates) to the preview Service Worker, so it doesn't strip the
+  // prefix for them. Recomputed from the live run manifests whenever a project's
+  // server starts or stops.
+  private syncKeepPrefixPorts() {
+    const ports: number[] = [];
+    for (const [dir, r] of this.runningProjects) {
+      if (r.port != null && this.folderManifests.get(dir)?.keepPreviewPrefix) ports.push(r.port);
+    }
+    this.bridge.setKeepPrefixPorts(ports);
+  }
+
   addPreviewTab(url = "") {
     const id = "pv" + ++this.previewSeq;
     const tab: PreviewTab = { id, url, port: null, path: "/", nonce: 1 };
@@ -1355,6 +1367,7 @@ export class IdeController {
         if (r.terminalId === id) {
           this.runningProjects.delete(dir);
           if (r.port != null && this.portMap.delete(r.port)) this.syncPorts();
+          this.syncKeepPrefixPorts();
           if (r.port != null && this.snap.previewTabs.some((t) => t.port === r.port))
             this.set({ status: "dev server stopped — preview will 502 until you Run again" });
         }
@@ -1400,17 +1413,22 @@ export class IdeController {
     // A created/opened project's dev server is up.
     b.on("project-ready", (m) => {
       const dir = normDir(m.dir as string);
-      this.pointPreview(m.port as number);
       // An EXTRA service of a multi-server project (e.g. a backend/ws server
       // alongside the frontend): just add its preview tab — the primary already
       // opened the folder + entry file.
       if (m.extra) {
+        this.pointPreview(m.port as number);
         this.set({ status: `${m.title as string}: service on :${m.port} ready` });
         return;
       }
       const r = this.runningProjects.get(dir);
       if (r) r.port = m.port as number;
       else this.runningProjects.set(dir, { terminalId: null, port: m.port as number });
+      // Tell the SW whether this port serves under the /preview/<port>/ prefix
+      // (keep-prefix templates like Docusaurus) BEFORE the iframe loads, so a
+      // client-routed SPA resolves its first route instead of hitting NotFound.
+      this.syncKeepPrefixPorts();
+      this.pointPreview(m.port as number);
       if (!this.snap.workspaceFolders.some((f) => f.rootPath === dir)) this.openFolder(dir, m.title as string);
       if (m.entry) void this.openFile(dir + "/" + (m.entry as string));
       this.touchProject(dir);

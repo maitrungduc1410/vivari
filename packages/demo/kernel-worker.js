@@ -550,6 +550,14 @@ function openTerminal(terminalId, cwd, demoId, run) {
     // both off by default; a user can still run `npm audit` explicitly.
     npm_config_audit: "false",
     npm_config_fund: "false",
+    // Update checks are pointless in the VM (you can't `npm i -g` a new global),
+    // and the `update-notifier` package (used by many CLIs, incl. Docusaurus)
+    // spawns a *detached* background child to run the check — which fails ENOENT
+    // in-VM and, since callers attach no 'error' listener, surfaces as an ugly
+    // (harmless) uncaught error in the terminal. Disable both npm's own notice and
+    // the update-notifier package outright.
+    npm_config_update_notifier: "false",
+    NO_UPDATE_NOTIFIER: "1",
     // Real yarn likewise needs a writable cache; created at boot (its global
     // config/cache default under $HOME would land on the read-only-ish root).
     YARN_CACHE_FOLDER: "/tmp/.yarn-cache",
