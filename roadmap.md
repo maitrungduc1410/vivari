@@ -1844,11 +1844,13 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
     base — first-route + deep-links resolve and `location.reload()` still targets a real preview URL.
     Default (strip) behaviour is unchanged for every other template. `scripts/spike-docusaurus.mjs`
     gained an `OC_BASEURL` knob to exercise the base-prefixed path headlessly.
-- ⏳ **Phase 4 (cont.) — Angular spiked, blocked on the esbuild-service hard path (`scripts/spike-angular.mjs`).**
-  The spike got Angular 21 (`@angular/build:dev-server`) from "the CLI won't even start" all the way
-  to "`ng serve` binds its port, Vite + Rollup load, the esbuild Go/wasm actually runs, and the build
-  begins" — fixing **five real runtime bugs** along the way (all validated against the Next.js spike,
-  which still PASSes incl. the RSC-refresh gate):
+- ✅ **Phase 4 (cont.) — Angular proven headless AND shipped (`scripts/spike-angular.mjs`, `Angular` template).**
+  Angular 21 (`@angular/build`) now builds on esbuild-wasm + Vite and serves `/` with a 200 in-VM
+  (~5s dev build). `esbuild`→`esbuild-wasm` and `rollup`→`@rollup/wasm-node` are aliased via npm
+  `overrides`; the studio template's `scripts/oc-ng.mjs` applies the in-process esbuild patch (below),
+  sets `NG_BUILD_PARALLEL_TS=0` + `PISCINA_DISABLE_ATOMICS=1`, and launches the CLI. Getting here
+  fixed **five earlier runtime bugs** (all validated against the Next.js spike, which still PASSes
+  incl. the RSC-refresh gate):
   1. **ESM transpiler — named `export default function/class` (`esm.js`).** A named default
      declaration is a *binding* (hoisted for functions). Rewriting `export default function ui(){}`
      to `__oc_exports.default = function ui(){}` demoted it to an expression, so `ui` was no longer a
@@ -1870,16 +1872,21 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
      of stringifying them to `"48,46,…"`. Go's `wasm_exec_node` fast-paths fd-1/2 writes through these,
      so the esbuild wasm's output is no longer silently dropped.
 
-  **Remaining blocker (the deferred "hard path").** Angular's builder runs esbuild as a
+  **The "hard path", solved by running esbuild in-process.** Angular's builder runs esbuild as a
   filesystem-backed **binary service**: `esbuild-wasm`'s Node entry `child_process.spawn`s
-  `node bin/esbuild` and exchanges a **length-prefixed binary protocol** over a stdin pipe (parent
-  writes) + stdout pipe (parent reads), with the child's Go runtime reading commands via
-  `fs.read(0, …)`. Two capabilities are still missing: (a) **byte-accurate** child stdio through the
-  kernel — today every layer string-coerces (`Buffer.from(String(chunk))`), which corrupts the binary
-  frames — and (b) an **`fs.read`/`readSync` on fd 0** wired to the delivered stdin bytes (Go doesn't
-  use the `process.stdin` stream). Both are the roadmap's heavy-toolchain "hard path"; until they land
-  the spike ends `The service was stopped`. (`esbuild`→`esbuild-wasm` and `rollup`→`@rollup/wasm-node`
-  are handled cleanly via npm `overrides` aliases — no file patching.)
+  `node bin/esbuild` and exchanges a length-prefixed binary protocol over a stdin/stdout pipe, with the
+  child's Go runtime reading commands via `fs.read(0, …)`. Brokered through the single-threaded kernel,
+  that pipe **deadlocks** against Angular's Piscina linker pool + inline AOT (all three contend for the
+  one event loop). Rather than make child stdio byte-accurate, we **eliminate the child**: a string
+  patch of `esbuild-wasm/lib/main.js` rewrites `ensureServiceIsRunning()` to instantiate the Go wasm
+  **in this thread**, multiplexing fd 0/1/2 onto the protocol in memory and delegating every other fd
+  to the VFS (`scripts/oc-ng.mjs`, kept in sync with the spike). This surfaced **three general runtime
+  fixes** (landed separately — see "worker-pool + async-bundler support"): the event-loop **wake** nudge
+  (native MessagePort callbacks — Piscina — now re-arm a parked `waitForNext`), the **Buffer-pool
+  untransferable guard** (Angular transfers a pooled Buffer's `.buffer`, which detached the whole pool),
+  **dedicated `fs.promises.readFile` buffers**, and the **dynamic-import escape hatch** (piscina's
+  `new Function('s','return import(s)')` now routes through our loader). `esbuild`→`esbuild-wasm` and
+  `rollup`→`@rollup/wasm-node` are aliased via npm `overrides`.
   - **Rust → WebAssembly** starter — needs a Rust toolchain (rustc/wasm-pack) in-VM that we haven't
     proven; consider an **AssemblyScript → WASM** substitute (pure-JS `asc` compiler) as the
     "compile & run WASM in a tab" showcase.
