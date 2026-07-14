@@ -191,7 +191,9 @@ if (!process.env.NG_CLI_ANALYTICS) process.env.NG_CLI_ANALYTICS = "false";
 // Run the Angular CLI as its own process (the proven model): args after this
 // script pass straight through, e.g. `node scripts/oc-ng.mjs serve --port 4200`.
 const ng = path.resolve("node_modules/@angular/cli/bin/ng.js");
-const child = spawn(process.execPath, [ng, ...process.argv.slice(2)], {
+// Spawn the bare command "node" (resolved to /bin/node.js by the kernel), matching
+// the proven scripts/spike-angular.mjs. Do NOT use process.execPath here.
+const child = spawn("node", [ng, ...process.argv.slice(2)], {
   stdio: "inherit",
   env: process.env,
 });
