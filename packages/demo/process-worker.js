@@ -112,4 +112,6 @@ self.onmessage = async (event) => {
     control && control.dispatchWs(event.data);
   // An interactive stdin chunk for this process (host terminal / parent -> child).
   else if (type === "stdin") control && control.dispatchStdin(event.data);
+  // An async fetch result relayed by the kernel (parallel downloads).
+  else if (type === "fetch-done") control && control.dispatchFetch(event.data);
 };

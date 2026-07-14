@@ -207,6 +207,31 @@ concern (Node has no CORS), so the headless fetchers in `scripts/spike-*.mjs`
 deliberately keep the full header set. (Symptom if you regress it: "blocked by
 CORS policy … No 'Access-Control-Allow-Origin' header" for every registry URL.)
 
+### Package downloads run in parallel via a NON-blocking async fetch
+`OP_FETCH` parks the calling worker on `Atomics.wait` until the body lands, so
+back-to-back downloads from ONE process (real npm pulling many packuments +
+tarballs) serialize into a slow one-at-a-time crawl. `OP_FETCH_ASYNC`
+(`packages/protocol/syscall.js`) is the non-blocking twin: the kernel ACKs the
+syscall immediately (empty OK) and later posts the outcome back as a
+`{type:'fetch-done', fetchId, …}` message, so a single worker can keep many
+downloads in flight at once. The wiring, keep every link intact:
+- `fs-client.fetchAsync(fetchId, url, opts)` sends `OP_FETCH_ASYNC` WITHOUT
+  blocking (modeled on `spawnAsync`); `fetchId` is caller-chosen and must be
+  per-process unique so the reply matches its request.
+- `runtime/index.js` exposes `globalThis.__ocfetchAsync(url, opts)` (a Promise)
+  and `dispatchFetch(msg)` which settles the pending promise on `fetch-done`.
+  **Both** process-worker entries — `packages/demo/process-worker.js` (browser)
+  and `scripts/process-worker.mjs` (headless) — MUST route `fetch-done` →
+  `control.dispatchFetch`, or downloads hang.
+- `node/lib/https.js` `_dispatch()` prefers `__ocfetchAsync` and falls back to the
+  blocking `globalThis.__ocfetch`; keep the fallback (it's the compatibility path
+  when async isn't wired).
+- The kernel bounds fan-out: `fetchConcurrency` (10) via `_scheduleFetch` /
+  `_drainFetchQueue`, dedupes identical in-flight URLs (`_fetchInflight`), and
+  streams each body into the VFS (`_fetchIntoVfs` / `_doNetworkFetch`) with the
+  SAME cache + dedupe as the blocking path. Don't drop the cap or the dedupe — a
+  burst of npm downloads would otherwise open hundreds of sockets at once.
+
 ### `writeLarge` must transfer a STANDALONE ArrayBuffer
 The kernel hands a fetched tarball to the FS Worker over a *transferred* buffer
 (`kernel-fs.js` `writeLarge`), to bypass the 1 MiB SAB. The trap: a `Uint8Array`
@@ -405,6 +430,26 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   into the preview tab URL bar; test it from in-VM code (`node probe.mjs`), not the address bar.
 - Headless proof: `scripts/spike-ws-demo.mjs` (real `ws` backend, both directions via the
   kernel tunnel).
+
+### Preview iframes must start at about:blank, THEN navigate
+On a FRESH page load the studio document is fetched before the preview Service
+Worker takes control, so a brand-new iframe whose *first* navigation is a direct
+`/preview/<port>/` URL is NOT intercepted by the SW — the request escapes to the
+network and the studio's own SPA fallback serves its Home page INSIDE the frame
+(symptom: "Run React template → preview shows the OpenContainer Studio page, not
+the app"). The manual address-bar path never hit this because its iframe starts at
+`about:blank` (a client the SW already controls) and only THEN navigates. The fix
+lives on the client (the SW can't intercept a frame it doesn't control), and the
+invariant to preserve:
+- `PreviewPanel.tsx` renders every preview iframe through the `PreviewFrame`
+  component, which mounts with NO in-scope `src` (about:blank) and sets the real
+  `c.previewSrc(t)` imperatively in an effect (guarded by a `lastSrc` ref so
+  StrictMode / re-renders don't double-navigate). Do NOT go back to
+  `src={c.previewSrc(t)}` on a freshly created iframe.
+- `kernel.ts` `registerServiceWorker()` also waits for the page to actually be
+  controlled (`controllerchange`, with a 1 s safety timeout) when
+  `navigator.serviceWorker.controller` is null, so control is established before
+  boot/preview.
 
 ### `module` is a REAL constructor — route requires through `Module._load`
 `require('module')` returns the `Module` **constructor** (not a plain object);

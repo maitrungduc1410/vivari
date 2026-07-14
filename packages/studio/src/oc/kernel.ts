@@ -105,6 +105,18 @@ export class KernelBridge {
     if (!("serviceWorker" in navigator)) return false;
     await navigator.serviceWorker.register("/sw.js", { scope: "/" });
     await navigator.serviceWorker.ready;
+    // On a fresh load the document was fetched before the SW existed, so the page
+    // isn't controlled yet even though the SW is active. Wait for `clients.claim()`
+    // to take effect (controllerchange) so that preview iframes created afterwards
+    // are actually intercepted by the SW instead of escaping to the network (which
+    // would make the studio's SPA fallback render its home page inside the frame).
+    if (!navigator.serviceWorker.controller) {
+      await new Promise<void>((resolve) => {
+        const done = () => resolve();
+        navigator.serviceWorker.addEventListener("controllerchange", done, { once: true });
+        setTimeout(done, 1000); // safety net: claim may already be in flight
+      });
+    }
     // The SW posts each preview request here; forward it to the kernel worker,
     // transferring the reply port so the worker answers the SW directly.
     navigator.serviceWorker.addEventListener("message", (event) => {

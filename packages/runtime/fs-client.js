@@ -49,6 +49,7 @@ import {
   OP_RESPOND,
   OP_CLOSE_SERVER,
   OP_FETCH,
+  OP_FETCH_ASYNC,
   OP_WATCH,
   OP_UNWATCH,
 } from "../protocol/syscall.js";
@@ -213,6 +214,25 @@ export function createSyscalls({ ctrl, data, notify }) {
         bodyB64: o.bodyB64 || null,
       };
       return JSON.parse(decodeBytes(call(OP_FETCH, encodeRequest([b(JSON.stringify(req))]))));
+    },
+
+    // Async, non-blocking fetch (parallel downloads). Unlike `fetch` above, this
+    // does NOT park on the response: the `call` is just a quick handoff — the
+    // kernel acks immediately (empty OK) and later posts the outcome back as a
+    // { type:'fetch-done', fetchId, ... } message to this worker. `fetchId` is
+    // chosen by the caller (see runtime index.js) so it can match the reply. A
+    // single process can thus have many fetches in flight at once (the whole
+    // point — npm's registry requests no longer serialize on Atomics.wait).
+    fetchAsync: (fetchId, url, opts) => {
+      const o = opts || {};
+      const req = {
+        fetchId: fetchId | 0,
+        url,
+        method: o.method || "GET",
+        headers: o.headers || null,
+        bodyB64: o.bodyB64 || null,
+      };
+      call(OP_FETCH_ASYNC, encodeRequest([b(JSON.stringify(req))]));
     },
   };
 }

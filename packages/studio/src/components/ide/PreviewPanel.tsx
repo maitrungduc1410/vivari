@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import ArrowLeft from "~icons/lucide/arrow-left";
 import ArrowRight from "~icons/lucide/arrow-right";
 import RotateCw from "~icons/lucide/rotate-cw";
@@ -37,6 +38,51 @@ function ToolButton({
 
 function tabTitle(t: PreviewTab) {
   return t.port != null ? `Preview (${t.port})` : "New Tab";
+}
+
+// A single preview iframe. It deliberately starts at `about:blank` and only
+// navigates to the real `/preview/<port>/` URL once mounted (imperatively, in an
+// effect). On a fresh page load the preview Service Worker may not yet control a
+// brand-new iframe whose *first* navigation is a direct in-scope URL — that
+// request escapes to the network and the studio's own SPA fallback serves its
+// home page inside the frame. Navigating from an already-existing about:blank
+// client (which is what the manual address-bar path does) is reliably
+// intercepted by the SW, so we do the same for every tab.
+function PreviewFrame({
+  tab,
+  active,
+  src,
+  setFrame,
+}: {
+  tab: PreviewTab;
+  active: boolean;
+  src: string;
+  setFrame: (id: string, el: HTMLIFrameElement | null) => void;
+}) {
+  const ref = useRef<HTMLIFrameElement | null>(null);
+  const lastSrc = useRef<string | null>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || lastSrc.current === src) return;
+    lastSrc.current = src;
+    el.src = src;
+  }, [src]);
+
+  return (
+    <iframe
+      ref={(el) => {
+        ref.current = el;
+        setFrame(tab.id, el);
+      }}
+      title={tabTitle(tab)}
+      className={cn(
+        "absolute inset-0 h-full w-full border-0",
+        active ? "block" : "hidden",
+      )}
+      sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+    />
+  );
 }
 
 export function PreviewPanel() {
@@ -147,16 +193,12 @@ export function PreviewPanel() {
       <ResizablePanelGroup orientation="vertical" className="min-h-0 flex-1">
         <ResizablePanel id="preview-body" className="relative overflow-hidden bg-white">
           {tabs.map((t) => (
-            <iframe
+            <PreviewFrame
               key={t.id}
-              ref={(el) => c.setPreviewFrame(t.id, el)}
-              title={tabTitle(t)}
+              tab={t}
+              active={t.id === snap.activePreviewId}
               src={c.previewSrc(t)}
-              className={cn(
-                "absolute inset-0 h-full w-full border-0",
-                t.id === snap.activePreviewId ? "block" : "hidden",
-              )}
-              sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+              setFrame={(id, el) => c.setPreviewFrame(id, el)}
             />
           ))}
           {active && active.port == null && (

@@ -128,6 +128,20 @@ export const OP_UNWATCH = 29;
 // (chunked fd reads), so arbitrary-size downloads (npm tarballs) work.
 export const OP_FETCH = 25;
 
+// async network fetch (parallel downloads). Unlike OP_FETCH, this DOES NOT park
+// the caller on the result: the kernel acknowledges receipt immediately (empty
+// OK) so the caller keeps running its event loop and can issue more fetches,
+// then delivers each outcome out of band as a postMessage to the caller's worker
+// (never over this SAB — the caller isn't parked on it):
+//   { type:'fetch-done', fetchId, ok:true,  meta:{status,ok,headers,size,path,cached} }
+//   { type:'fetch-done', fetchId, ok:false, error:'<code>' }
+// `fetchId` is chosen by the caller (per-process unique) so it can match the
+// async reply back to its pending request. This is what lets a single process
+// (e.g. the real npm) keep many packument/tarball downloads in flight at once
+// instead of one-at-a-time.
+//   OP_FETCH_ASYNC  field0 = JSON {fetchId,url,method,headers,bodyB64} -> OK empty (now)
+export const OP_FETCH_ASYNC = 30;
+
 // request flags (bitmask)
 export const FLAG_RECURSIVE = 1; // mkdir -p
 
