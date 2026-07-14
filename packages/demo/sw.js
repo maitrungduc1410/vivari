@@ -273,6 +273,17 @@ self.addEventListener("fetch", (event) => {
   // /node_modules/...). It only belongs to a preview if a preview iframe issued
   // it; the demo's own files live under /packages/ and go straight to network.
   if (url.pathname.startsWith("/packages/")) return;
+
+  // A top-level navigation that reached here is NOT a preview (preview navigations
+  // match the PREVIEW_MARKER branch above). It is the app's own document — never
+  // proxy it: let the browser fetch it from the network so it loads even when
+  // this SW controls the client. Proxying it means routeByClient can't yet
+  // identify the (not-yet-existing) resulting client, so the SW ends up owning a
+  // response that never settles and the page hangs forever ("keeps loading" on
+  // every load where the SW is already in control). Preview *subresources* aren't
+  // navigations, so they still flow through routeByClient below.
+  if (event.request.mode === "navigate") return;
+
   event.respondWith(routeByClient(event, url));
 });
 
