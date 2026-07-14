@@ -28,6 +28,8 @@ import utilInspectFactory from "./internal/util/inspect.js";
 import utilDebuglogFactory from "./internal/util/debuglog.js";
 import utilColorsFactory from "./internal/util/colors.js";
 import utilComparisonsFactory from "./internal/util/comparisons.js";
+import parseArgsFactory from "./internal/util/parse_args/parse_args.js";
+import parseArgsUtilsFactory from "./internal/util/parse_args/utils.js";
 import internalBufferFactory from "./internal/buffer.js";
 import startupSnapshotFactory from "./internal/v8/startup_snapshot.js";
 import optionsFactory from "./internal/options.js";
@@ -186,6 +188,8 @@ const FACTORIES = {
   "internal/util/debuglog": utilDebuglogFactory,
   "internal/util/colors": utilColorsFactory,
   "internal/util/comparisons": utilComparisonsFactory,
+  "internal/util/parse_args/parse_args": parseArgsFactory,
+  "internal/util/parse_args/utils": parseArgsUtilsFactory,
   "internal/buffer": internalBufferFactory,
   "internal/v8/startup_snapshot": startupSnapshotFactory,
   "internal/options": optionsFactory,

@@ -126,6 +126,28 @@ export default function (exports, require, module, process, internalBinding, pri
     }
   }
 
+  // Used by internal/util/parse_args. Logic copied from Node's validators.
+  function validateUnion(value, name, union) {
+    if (!union.includes(value)) {
+      const list = union.map((v) => (typeof v === "string" ? `'${v}'` : String(v))).join("|");
+      throw new ERR_INVALID_ARG_TYPE(name, list, value);
+    }
+  }
+
+  function validateStringArray(value, name) {
+    validateArray(value, name);
+    for (let i = 0; i < value.length; i++) {
+      validateString(value[i], `${name}[${i}]`);
+    }
+  }
+
+  function validateBooleanArray(value, name) {
+    validateArray(value, name);
+    for (let i = 0; i < value.length; i++) {
+      validateBoolean(value[i], `${name}[${i}]`);
+    }
+  }
+
   // Node validates the encoding string is real; the Buffer layer re-checks, so a
   // permissive accept keeps the common write(fd, string, enc) path working.
   function validateEncoding() {}
@@ -189,6 +211,9 @@ export default function (exports, require, module, process, internalBinding, pri
     validateBuffer,
     validateObject,
     validateOneOf,
+    validateUnion,
+    validateStringArray,
+    validateBooleanArray,
     validateEncoding,
     validateAbortSignal,
     validatePort,
