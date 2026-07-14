@@ -417,6 +417,7 @@ export function createRuntime({
   // consumer is actively reading (flowing / has a 'data' listener) it refs the
   // loop like an open handle so an idle shell waits for input instead of exiting.
   const stdin = new stream.Readable({ read() {} });
+  stdin.fd = 0;
   stdin.isTTY = true;
   stdin.isRaw = false;
   let stdinRefed = false;

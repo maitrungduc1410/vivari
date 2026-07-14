@@ -562,7 +562,13 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
         p = p.slice("file://".length);
       }
     }
-    return makeRequire(path.dirname(p));
+    // Node treats a base path ENDING IN '/' as the directory itself (so its own
+    // node_modules is searched), not that directory's parent. The trailing slash
+    // is load-bearing: the Angular CLI does `createRequire(projectRoot + '/')` to
+    // resolve `@angular/core/package.json` from the project root. A plain
+    // `path.dirname('/ng/')` yields '/', which drops '/ng/node_modules'.
+    const dir = p.endsWith("/") ? p.replace(/\/+$/, "") || "/" : path.dirname(p);
+    return makeRequire(dir);
   };
 
   Module.prototype.require = function moduleRequire(request) {

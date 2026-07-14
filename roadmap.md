@@ -1796,9 +1796,42 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
 - ✅ **Phase 3 (`[SPIKE]` — shipped `experimental`)** — Frontend variants: Preact, Lit, Solid,
   Qwik. Backends: Fastify, Nitro, GraphQL (Yoga), Feathers. Showcases: Socket.IO, tRPC, pnpm
   monorepo, SQLite (sql.js WASM).
-- ⏳ **Phase 4 — deferred (high-risk, address later):**
-  - **Angular** — the application builder uses **native esbuild**; only viable if we alias
-    `esbuild`→`esbuild-wasm`. Needs a spike; may end `[IGNORE]`.
+- ⏳ **Phase 4 — Angular spiked, blocked on the esbuild-service hard path (`scripts/spike-angular.mjs`).**
+  The spike got Angular 21 (`@angular/build:dev-server`) from "the CLI won't even start" all the way
+  to "`ng serve` binds its port, Vite + Rollup load, the esbuild Go/wasm actually runs, and the build
+  begins" — fixing **five real runtime bugs** along the way (all validated against the Next.js spike,
+  which still PASSes incl. the RSC-refresh gate):
+  1. **ESM transpiler — named `export default function/class` (`esm.js`).** A named default
+     declaration is a *binding* (hoisted for functions). Rewriting `export default function ui(){}`
+     to `__oc_exports.default = function ui(){}` demoted it to an expression, so `ui` was no longer a
+     local — a later `export { ui as 'module.exports' }` (cliui/yargs) threw `ui is not defined`. Now
+     the declaration is kept intact and `exports.default` is wired via a lazy getter.
+  2. **ESM transpiler — circular live bindings (`esm.js`).** Local export getters are now emitted
+     **before** import `require`s, so a module read mid-cycle sees a live binding (a hoisted exported
+     function) instead of `undefined`. Fixed `isYargsInstance is not a function` (yargs command.js ↔
+     yargs-factory.js cycle).
+  3. **`node:assert` / `assert/strict` (`node/lib/assert.js` + loader).** These public builtins were
+     missing entirely; added a compact but faithful impl over the vendored `isDeepStrictEqual`.
+  4. **`createRequire` trailing-slash base (`module.js`).** Node treats `createRequire(dir + '/')` as
+     *inside* `dir` (so `dir/node_modules` is searched). We took `path.dirname` unconditionally, so
+     the Angular CLI's `createRequire(projectRoot + '/')('@angular/core/package.json')` searched the
+     parent and reported `@angular/core` "missing as a dependency". Now trailing-slash bases resolve
+     to the directory itself.
+  5. **std stream fds + byte-accurate writes (`builtins/process.js`, `index.js`).** `process.stdout`/
+     `stderr`/`stdin` now carry their Node fds (1/2/0), and `.write(Uint8Array)` decodes bytes instead
+     of stringifying them to `"48,46,…"`. Go's `wasm_exec_node` fast-paths fd-1/2 writes through these,
+     so the esbuild wasm's output is no longer silently dropped.
+
+  **Remaining blocker (the deferred "hard path").** Angular's builder runs esbuild as a
+  filesystem-backed **binary service**: `esbuild-wasm`'s Node entry `child_process.spawn`s
+  `node bin/esbuild` and exchanges a **length-prefixed binary protocol** over a stdin pipe (parent
+  writes) + stdout pipe (parent reads), with the child's Go runtime reading commands via
+  `fs.read(0, …)`. Two capabilities are still missing: (a) **byte-accurate** child stdio through the
+  kernel — today every layer string-coerces (`Buffer.from(String(chunk))`), which corrupts the binary
+  frames — and (b) an **`fs.read`/`readSync` on fd 0** wired to the delivered stdin bytes (Go doesn't
+  use the `process.stdin` stream). Both are the roadmap's heavy-toolchain "hard path"; until they land
+  the spike ends `The service was stopped`. (`esbuild`→`esbuild-wasm` and `rollup`→`@rollup/wasm-node`
+  are handled cleanly via npm `overrides` aliases — no file patching.)
   - **Standalone Webpack** / **Docusaurus** — only Next's `webpack` path is proven; standalone
     `webpack` + `webpack-dev-server` is unspiked. Docusaurus rides on it.
   - **Rust → WebAssembly** starter — needs a Rust toolchain (rustc/wasm-pack) in-VM that we haven't
