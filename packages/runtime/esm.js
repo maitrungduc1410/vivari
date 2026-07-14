@@ -24,6 +24,34 @@ const T_META = 3;
 
 const ID = "[A-Za-z_$][\\w$]*";
 
+// Keywords after which a `/` begins a regex literal, not division. Bundlers
+// routinely omit the space (`return/re/.test(x)`, `typeof/re/`), so a single
+// previous-char check misreads the `/` as division and then mis-lexes the
+// regex body — desyncing the whole scan and losing later top-level `export`s.
+const REGEX_PRECEDING_KEYWORDS = new Set([
+  "return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
+  "case", "do", "else", "yield", "await", "throw",
+]);
+
+// Whether the `/` at `src[i]` can start a regex literal (vs. be a division).
+// A `/` is a regex start after nothing, after most operators/punctuation, or
+// after a regex-preceding keyword; it is division after an identifier, number,
+// or a closing `)`/`]`/`}`.
+function canStartRegex(src, i) {
+  let j = i - 1;
+  while (j >= 0 && /\s/.test(src[j])) j--;
+  if (j < 0) return true; // start of input
+  const p = src[j];
+  if ("(,=:[!&|?{};+-*%<>~^".includes(p)) return true;
+  if (/[\w$]/.test(p)) {
+    // Read the identifier/keyword ending at j; a regex follows only keywords.
+    let k = j;
+    while (k >= 0 && /[\w$]/.test(src[k])) k--;
+    return REGEX_PRECEDING_KEYWORDS.has(src.slice(k + 1, j + 1));
+  }
+  return false;
+}
+
 // Per-module interop helpers + import.meta, kept on ONE leading line so user
 // code line numbers are preserved. They close over the wrapper's `require`/
 // `__filename`, so dynamic import + import.meta.resolve resolve relative to the
@@ -88,11 +116,7 @@ function skipBalanced(src, i) {
     // being misread as a string, swallowing the matching `}` and losing later
     // top-level `export`s. Same canRegex heuristic as scanExportEdits.
     if (ch === "/") {
-      let j = i - 1;
-      while (j >= 0 && /\s/.test(src[j])) j--;
-      const p = src[j];
-      const canRegex = p === undefined || "(,=:[!&|?{};+-*%<>~^".includes(p);
-      if (canRegex) {
+      if (canStartRegex(src, i)) {
         i++;
         let inClass = false;
         while (i < n) {
@@ -157,11 +181,6 @@ function scanExportEdits(src, isFrom) {
   const n = src.length;
   let i = 0;
   const isId = (c) => /[\w$]/.test(c);
-  const prevSignificant = () => {
-    let j = i - 1;
-    while (j >= 0 && /\s/.test(src[j])) j--;
-    return src[j];
-  };
   while (i < n) {
     const c = src[i];
     // skip line comment
@@ -183,9 +202,7 @@ function scanExportEdits(src, isFrom) {
     if (c === "`") { i = skipTemplate(src, i); continue; }
     // skip regex literal (best-effort: only when a '/' can start a regex)
     if (c === "/") {
-      const p = prevSignificant();
-      const canRegex = p === undefined || "(,=:[!&|?{};+-*%<>~^".includes(p);
-      if (canRegex) {
+      if (canStartRegex(src, i)) {
         i++;
         let inClass = false;
         while (i < n) {
