@@ -17,6 +17,7 @@ import SqliteIcon from "~icons/vscode-icons/file-type-sqlite";
 import NextjsIcon from "~icons/vscode-icons/file-type-next";
 import WebpackIcon from "~icons/vscode-icons/file-type-webpack";
 import DocusaurusIcon from "~icons/vscode-icons/file-type-docusaurus";
+import AngularIcon from "~icons/vscode-icons/file-type-angular";
 
 type IconProps = { className?: string };
 
@@ -96,6 +97,7 @@ function GenericIcon({ className }: IconProps) {
 
 const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   react: ReactIcon,
+  angular: (p) => <AngularIcon className={p.className} />,
   vue: VueIcon,
   svelte: (p) => <SvelteIcon className={p.className} />,
   express: ExpressIcon,
