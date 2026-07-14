@@ -212,6 +212,22 @@ function scanExportEdits(src, isFrom) {
       let r = i + 6;
       while (r < n && /\s/.test(src[r])) r++;
       if (src.startsWith("default", r) && !isId(src[r + 7] || " ")) {
+        // A NAMED `export default function foo`/`class foo` is a *declaration*: it
+        // binds `foo` at module scope (and, for functions, hoists it). Rewriting it
+        // to `__oc_exports.default = function foo(){}` demotes it to an expression,
+        // so `foo` is no longer a local binding — any later reference to it (e.g.
+        // `export { foo as 'module.exports' }`, as cliui/index.mjs does) then throws
+        // "foo is not defined". Keep the declaration intact (strip only `export
+        // default `) and record the name so transpileEsm wires exports.default via a
+        // lazy getter (which is safe for both hoisted functions and TDZ classes).
+        let d = r + 7;
+        while (d < n && /\s/.test(src[d])) d++;
+        const declMatch = /^(?:async\s+)?function(?:\s*\*)?\s+([A-Za-z_$][\w$]*)|^class\s+([A-Za-z_$][\w$]*)/.exec(src.slice(d));
+        if (declMatch) {
+          edits.push({ start: i, end: d, text: "", defaultLocal: declMatch[1] || declMatch[2] });
+          i = d;
+          continue;
+        }
         // export default <expr>  ->  __oc_exports.default = <expr>
         edits.push({ start: i, end: r + 7, text: "__oc_exports.default =" });
         i = r + 7;
@@ -310,7 +326,15 @@ export function transpileEsm(source, filename) {
   if (!hasModuleSyntax) return null;
 
   const edits = [];
-  const prelude = []; // hoisted lines (helpers, requires, export getters)
+  const prelude = []; // import requires + import-derived bindings + re-export getters
+  // Local export getters (for `export function/class/const`, `export {local}`,
+  // named `export default`). Emitted BEFORE the import requires so a circular
+  // import that reads this module's exports mid-cycle sees a live binding rather
+  // than `undefined`: an exported (hoisted) function is already reachable through
+  // the getter even before this module's body runs. This is the ESM live-binding
+  // contract — real transpilers (esbuild/rollup) model it the same way. yargs is
+  // the canonical case: command.js `import { isYargsInstance }` <-> yargs-factory.js.
+  const exportGetters = [];
   const fromRanges = [];
   let tmp = 0;
   const uniq = () => "__oc_m" + tmp++;
@@ -381,6 +405,15 @@ export function transpileEsm(source, filename) {
   // apart from `export { x as default }` (brace form, handled below).
   const exportEdits = scanExportEdits(source, inFrom);
   const hasKeywordDefault = exportEdits.some((e) => e.text === "__oc_exports.default =");
+  // A named `export default function/class` we kept as a declaration: wire
+  // exports.default to the surviving local binding via a lazy getter.
+  const keptDefault = exportEdits.find((e) => e.defaultLocal)?.defaultLocal;
+  if (keptDefault) {
+    exportGetters.push(
+      "Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return " +
+        keptDefault + ";}});",
+    );
+  }
   for (const e of exportEdits) edits.push(e);
 
   // local exports -> getters, with two special cases the plain getter loop misses:
@@ -399,15 +432,15 @@ export function transpileEsm(source, filename) {
       continue;
     }
     if (ex.n === "default") {
-      if (!hasKeywordDefault && ex.ln) {
-        prelude.push(
+      if (!hasKeywordDefault && !keptDefault && ex.ln) {
+        exportGetters.push(
           "Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return " +
             ex.ln + ";}});",
         );
       }
       continue;
     }
-    prelude.push(
+    exportGetters.push(
       "Object.defineProperty(__oc_exports," + JSON.stringify(ex.n) +
       ",{enumerable:true,configurable:true,get:function(){return " + local + ";}});",
     );
@@ -417,6 +450,9 @@ export function transpileEsm(source, filename) {
   const head =
     helpers(fileUrl) +
     "Object.defineProperty(__oc_exports,'__esModule',{value:true});" +
+    // Local export getters first (live bindings visible to circular importers),
+    // then import requires + import-derived bindings + re-export getters.
+    exportGetters.join("") +
     prelude.join("");
   // The CJS-interop override runs AFTER the body (so the local binding exists) and
   // intentionally replaces the whole exports object: require() returns it verbatim,

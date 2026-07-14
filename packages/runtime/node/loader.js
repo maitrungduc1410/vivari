@@ -40,6 +40,7 @@ import blobFactory from "./internal/blob.js";
 import fileFactory from "./internal/file.js";
 import permissionFactory from "./internal/process/permission.js";
 import assertFactory from "./internal/assert.js";
+import assertPublicFactory from "./lib/assert.js";
 import abortListenerFactory from "./internal/events/abort_listener.js";
 import eventTargetFactory from "./internal/event_target.js";
 import taskQueuesFactory from "./internal/process/task_queues.js";
@@ -197,6 +198,11 @@ const FACTORIES = {
   "internal/file": fileFactory,
   "internal/process/permission": permissionFactory,
   "internal/assert": assertFactory,
+  assert: assertPublicFactory,
+  // `assert/strict` is the strict-mode variant the public module exposes as `.strict`.
+  "assert/strict": (exports, require, module) => {
+    module.exports = require("assert").strict;
+  },
   "internal/events/abort_listener": abortListenerFactory,
   "internal/event_target": eventTargetFactory,
   "internal/process/task_queues": taskQueuesFactory,

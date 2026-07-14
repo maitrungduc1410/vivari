@@ -11,7 +11,28 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
       ? (fn, ...args) => nextTick(fn, ...args)
       : (fn, ...args) => queueMicrotask(() => fn(...args));
 
-  const makeStream = (sink) => ({
+  // A write chunk is either a string or bytes (Buffer/Uint8Array/ArrayBuffer).
+  // `Uint8Array.prototype.toString()` yields "72,105" (decimal CSV), not text —
+  // so byte writes (e.g. Go's wasm_exec writing to fd 1) must be decoded, not
+  // stringified. Honour a string encoding arg (Node's write(chunk, encoding)).
+  const decodeChunk = (chunk, encoding) => {
+    if (typeof chunk === "string") return chunk;
+    const enc = typeof encoding === "string" ? encoding : "utf8";
+    const B = globalThis.Buffer;
+    try {
+      if (B) return (B.isBuffer(chunk) ? chunk : B.from(chunk.buffer || chunk)).toString(enc);
+      return new TextDecoder().decode(chunk.buffer ? chunk : new Uint8Array(chunk));
+    } catch {
+      return String(chunk);
+    }
+  };
+
+  const makeStream = (sink, fd) => ({
+    // Node's std streams carry their integer fd (stdout=1, stderr=2). Go's
+    // wasm_exec_node fast-path (`fd === process.stdout.fd`) routes the wasm's
+    // fd-1/fd-2 writes through here; without a real `.fd` those writes are lost
+    // (that's why `esbuild --version`, and the whole esbuild service, went silent).
+    fd,
     // Node's Writable.write(chunk[, encoding][, callback]) invokes the callback
     // once the chunk is handled. Real tools rely on it: npm's exit-handler does
     // `stdout.write('', () => process.exit())`, so a dropped callback would hang
@@ -19,13 +40,13 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     // next tick, like Node.
     write(chunk, encoding, cb) {
       const done = typeof encoding === "function" ? encoding : cb;
-      sink(typeof chunk === "string" ? chunk : chunk.toString());
+      sink(decodeChunk(chunk, encoding));
       if (typeof done === "function") scheduleTick(done);
       return true;
     },
     end(chunk, encoding, cb) {
       const done = typeof chunk === "function" ? chunk : typeof encoding === "function" ? encoding : cb;
-      if (chunk != null && typeof chunk !== "function") sink(typeof chunk === "string" ? chunk : chunk.toString());
+      if (chunk != null && typeof chunk !== "function") sink(decodeChunk(chunk, encoding));
       if (typeof done === "function") scheduleTick(done);
     },
     isTTY: false,
@@ -178,9 +199,9 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     // stable numbers. Real tools only read these for reporting (e.g. yarn's
     // ConsoleReporter peak-memory counter), not correctness.
     memoryUsage,
-    stdout: makeStream(stdout),
-    stderr: makeStream(stderr),
-    stdin: { on() {}, once() {}, read: () => null, isTTY: false },
+    stdout: makeStream(stdout, 1),
+    stderr: makeStream(stderr, 2),
+    stdin: { fd: 0, on() {}, once() {}, read: () => null, isTTY: false },
     // No-op event surface so libraries calling process.on(...) don't crash.
     on() {
       return process;
