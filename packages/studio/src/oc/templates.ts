@@ -488,10 +488,14 @@ function svelteTemplate(ts: boolean): TemplateDef {
       install: "npm install",
       dev: VITE_DEV,
       // @sveltejs/vite-plugin-svelte@^7 fixes the install (v5/v6 peer Vite <=7 and
-      // ERESOLVE against the pinned Vite 8), but the plugin's SSR dep-optimizer tears
-      // down the dev server on boot in-VM (port binds, then the worker exits →
-      // "No server listening"). Flagged until that path is hardened. See
-      // scripts/spike-svelte.mjs.
+      // ERESOLVE against the pinned Vite 8). The CLIENT dep optimizer runs fine, but
+      // the plugin also forces an SSR dep-optimizer pass on boot ("(ssr) [optimizer]
+      // bundling dependencies...") that never completes in-VM — the dev server binds
+      // its port, then the SSR optimize stalls and the worker exits ("No server
+      // listening"). This is NOT the esbuild path (no esbuild tarball is even
+      // installed); it's the same in-VM SSR-optimizer gap the meta-framework
+      // templates (SvelteKit/Nuxt/Astro) hit, and it can't be turned off from user
+      // config. Flagged until that runtime path is hardened. See scripts/spike-svelte.mjs.
       experimental: true,
     },
     files,
@@ -2357,14 +2361,15 @@ Presentation slides for developers — running in the browser
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Phase 3 — frontend variants (Vite 8 / rolldown). Preact, Lit, and Solid are
-// proven in-VM by headless spikes (scripts/spike-{preact,lit,solid}.mjs) and are
-// no longer experimental. Qwik stays experimental: @builder.io/qwik@1.x declares
-// `peer vite ">=5 <8"`, so it cannot use Vite 8 (rolldown) at all. Pinning it to
-// Vite 7 clears the ERESOLVE but drags in esbuild's *native* binary, which has no
-// wasm32 build ("Unsupported platform: linux wasm32 LE"), so `npm install` (and the
-// Vite 7 dep optimizer) fail in-VM. It needs the Angular-style esbuild-wasm override
-// + in-process launcher to run — see scripts/spike-qwik.mjs.
+// Phase 3 — frontend variants. Preact, Lit, and Solid (Vite 8 / rolldown) and now
+// Qwik are all proven in-VM by headless spikes (scripts/spike-{preact,lit,solid,qwik}.mjs)
+// and are no longer experimental. Qwik is special: @builder.io/qwik@1.x declares
+// `peer vite ">=5 <8"`, so it can't use Vite 8 and is pinned to Vite 7, whose dep
+// optimizer wants esbuild's native binary (no wasm32 build). That now Just Works
+// because the runtime aliases esbuild -> esbuild-wasm at the registry layer and runs
+// its service in-process (see packages/demo/fetcher-worker.js +
+// packages/runtime/esbuild-inproc-patch.js), and qwikVite runs in `csr: true` mode
+// so it doesn't demand an SSR src/root.tsx entry.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── Preact ───────────────────────────────────────────────────────────────────
@@ -2655,7 +2660,6 @@ function qwikTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: VITE_DEV,
-      experimental: true,
     },
     files: {
       "package.json": `{
@@ -2671,8 +2675,10 @@ function qwikTemplate(): TemplateDef {
       "vite.config.ts": `import { defineConfig } from 'vite'
 import { qwikVite } from '@builder.io/qwik/optimizer'
 
+// csr: true = client-side-rendered SPA (no SSR). Without it qwikVite runs in SSR
+// mode and demands a src/root.tsx server entry ("Qwik input src/root not found").
 export default defineConfig({
-  plugins: [qwikVite()],
+  plugins: [qwikVite({ csr: true })],
 })
 `,
       "index.html": `<!doctype html>

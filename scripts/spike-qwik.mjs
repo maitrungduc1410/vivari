@@ -25,8 +25,10 @@ const ok = await runViteSpike({
     "vite.config.ts": `import { defineConfig } from 'vite'
 import { qwikVite } from '@builder.io/qwik/optimizer'
 
+// csr: true = client-side-rendered SPA (no SSR). Without it qwikVite runs in SSR
+// mode and demands a src/root.tsx server entry ("Qwik input src/root not found").
 export default defineConfig({
-  plugins: [qwikVite()],
+  plugins: [qwikVite({ csr: true })],
 })
 `,
     "index.html": `<!doctype html>
