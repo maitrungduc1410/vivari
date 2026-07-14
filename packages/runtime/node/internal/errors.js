@@ -68,6 +68,31 @@ export default function (exports, require, module, process, internalBinding, pri
       `The value of "${name}" is out of range. It must be ${range}. Received ${value}`,
   );
 
+  // util.parseArgs error codes (copied from Node's lib/internal/errors.js).
+  const ERR_PARSE_ARGS_INVALID_OPTION_VALUE = makeNodeError(
+    TypeError,
+    "ERR_PARSE_ARGS_INVALID_OPTION_VALUE",
+    (msg) => msg,
+  );
+
+  const ERR_PARSE_ARGS_UNKNOWN_OPTION = makeNodeError(
+    TypeError,
+    "ERR_PARSE_ARGS_UNKNOWN_OPTION",
+    (option, allowPositionals) => {
+      const suggestDashDash = allowPositionals
+        ? ` To specify a positional argument starting with a '-', place it at the end of the command after '--', as in '-- ${JSON.stringify(option)}`
+        : "";
+      return `Unknown option '${option}'.${suggestDashDash}`;
+    },
+  );
+
+  const ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL = makeNodeError(
+    TypeError,
+    "ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL",
+    (positional) =>
+      `Unexpected argument '${positional}'. This command does not take positional arguments`,
+  );
+
   const ERR_UNKNOWN_SIGNAL = makeNodeError(
     TypeError,
     "ERR_UNKNOWN_SIGNAL",
@@ -518,6 +543,9 @@ export default function (exports, require, module, process, internalBinding, pri
       ERR_INVALID_ARG_TYPE,
       ERR_INVALID_ARG_VALUE,
       ERR_OUT_OF_RANGE,
+      ERR_PARSE_ARGS_INVALID_OPTION_VALUE,
+      ERR_PARSE_ARGS_UNKNOWN_OPTION,
+      ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL,
       ERR_UNKNOWN_SIGNAL,
       ERR_SOCKET_BAD_PORT,
       ERR_BUFFER_OUT_OF_BOUNDS,
