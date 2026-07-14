@@ -229,6 +229,17 @@ export default function (exports, require, module, process, internalBinding, pri
     }
   }
 
+  // Copied from Node's internal/errors.js. The http client/server construct it
+  // on a reset/hang-up connection: `new ConnResetException('socket hang up')`.
+  // Without it these paths threw "ConnResetException is not a constructor" —
+  // e.g. Nuxt's dev server tearing down a proxied socket during `nuxt dev`.
+  class ConnResetException extends Error {
+    constructor(msg) {
+      super(msg);
+      this.code = "ECONNRESET";
+    }
+  }
+
   // Combine an error with a prior one (Node returns an AggregateError). We keep
   // it simple: prefer the newer error, stash the previous on it.
   function aggregateTwoErrors(innerError, outerError) {
@@ -530,6 +541,7 @@ export default function (exports, require, module, process, internalBinding, pri
     genericNodeError,
     UVException,
     AbortError,
+    ConnResetException,
     aggregateTwoErrors,
     ErrnoException,
     ExceptionWithHostPort,
