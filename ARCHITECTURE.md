@@ -152,7 +152,10 @@ repeatedly:
   reassembles by `reqId`. See `fs-client.respond` + `kernel.handleRespond`.
 - **Downloads bypass the window.** `OP_FETCH` streams the response body straight
   into the VFS via the Fetcher Worker; the caller then reads it back with normal
-  (chunked) fs. So npm tarballs of any size work.
+  (chunked) fs. So npm tarballs of any size work. `OP_FETCH` is *blocking* (the
+  caller parks until the body lands); `OP_FETCH_ASYNC` is the non-blocking twin —
+  the kernel ACKs immediately and posts the result back later as a `fetch-done`
+  message, so one process can keep many downloads in flight (parallel npm; see §6).
 
 ### 4.2 Opcode routing
 
@@ -162,12 +165,15 @@ Opcodes split into two families (`isFsOpcode`):
   `OP_WATCH`/`OP_UNWATCH`) → serviced by the **File System Worker** over the
   process's SAB, woken via the fs `MessagePort` doorbell.
 - **Everything else** (`OP_SPAWN`/`OP_SPAWN_ASYNC`/`OP_KILL`, `OP_LISTEN`/
-  `OP_ACCEPT`/`OP_RESPOND`/`OP_CLOSE_SERVER`, `OP_FETCH`) → serviced by the
-  **Kernel**, woken via a `send("syscall")` postMessage.
+  `OP_ACCEPT`/`OP_RESPOND`/`OP_CLOSE_SERVER`, `OP_FETCH`/`OP_FETCH_ASYNC`) →
+  serviced by the **Kernel**, woken via a `send("syscall")` postMessage.
 
 Some opcodes are **deferred**: `OP_ACCEPT`, `OP_SPAWN`, `OP_FETCH` keep the caller
 parked on `Atomics.wait` until the awaited event (a request, child exit, download)
 arrives — this is how blocking `accept()`/`execSync()`/blocking fetch work.
+`OP_FETCH_ASYNC` is the opposite: the kernel returns an empty OK immediately and
+posts the outcome back as a `{type:'fetch-done', fetchId}` message, so the caller
+never parks and many downloads can overlap (§6).
 
 ---
 
@@ -253,6 +259,17 @@ arrives — this is how blocking `accept()`/`execSync()`/blocking fetch work.
   `node-gyp-stub.js` (`stubNodeGyp()` overwrites npm's node-gyp shims in the
   vendored tree; a `node-gyp` coreutil is the PATH fallback) — the package's JS /
   `wasm32-wasi` fallback is what loads instead.
+  **Downloads are parallel.** npm issues many packument + tarball requests at once,
+  but the blocking `OP_FETCH` would serialize them (each parks the worker until its
+  body lands). So the `https` shim (`node/lib/https.js`) prefers a NON-blocking
+  fetch: `globalThis.__ocfetchAsync` (wired in `runtime/index.js` over
+  `fs-client.fetchAsync` → `OP_FETCH_ASYNC`) returns a Promise and the kernel posts
+  each result back as a `fetch-done` message (`dispatchFetch` settles it), so npm's
+  own concurrency actually overlaps on the wire. The kernel bounds fan-out to
+  `fetchConcurrency` (10) via `_scheduleFetch`/`_drainFetchQueue`, dedupes identical
+  in-flight URLs (`_fetchInflight`), and streams each body into the VFS
+  (`_fetchIntoVfs`/`_doNetworkFetch`) with the same cache/dedupe as the blocking
+  path; the blocking `__ocfetch` remains the fallback.
   The from-scratch installer `packages/kernel-host/programs/npm.js` (semver
   resolution from registry packuments, `OP_FETCH` tarball download, gunzip +
   ustar parser, npm-v3 hoisting, `.bin` symlinks, platform-gated
@@ -356,6 +373,16 @@ UTF-8; binary (images/fonts/wasm) crosses base64 with `bodyEncoding: 'base64'`
 Kernel Worker → `handleHttpRequest` → the in-VM server. No real network is
 involved. The SW also **precaches** the worker-role bundles in production (keyed by
 a per-build id) so a redeploy can't serve stale bundles.
+
+**Preview iframes start at about:blank, then navigate.** On a fresh page load the
+studio document is fetched before the SW takes control, so a brand-new iframe whose
+*first* navigation is a direct `/preview/<port>/` URL isn't intercepted — the
+request escapes to the network and the studio's own SPA fallback renders its Home
+page inside the frame. So `PreviewPanel.tsx`'s `PreviewFrame` mounts each iframe at
+`about:blank` (a client the SW already controls) and sets the real `previewSrc`
+imperatively in an effect; `registerServiceWorker()` additionally waits for
+`controllerchange` when the page isn't yet controlled. Both ensure the SW proxies
+the very first preview navigation instead of the app leaking through.
 
 ### 8.4 WebSocket tunnel (Vite HMR)
 
