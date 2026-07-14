@@ -374,19 +374,182 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
 
   const tcp_wrap = { TCP, TCPConnectWrap, constants: TCPConstants };
 
-  // ---- pipe_wrap: deferred stub (unix domain sockets / IPC not implemented) --
+  // ---- pipe_wrap: in-process UNIX-domain-socket / named-pipe loopback --------
+  // Node's lib/net.js drives a pipe server as `new Pipe(SERVER); bind(path);
+  // listen(backlog)` and a client as `new Pipe(SOCKET); connect(req, path)`.
+  // We back both with the SAME StreamBase loopback the TCP handle uses, keyed by
+  // socket path instead of port. One process === one binding instance, so a
+  // server and the client that dials it (both in this process) find each other
+  // through `pipeServers`. This is exactly what Nuxt's dev server needs:
+  // @nuxt/vite-builder runs vite-node over a UNIX socket (`*.sock` / abstract
+  // `\0…`), listening and connecting within the same dev process.
+  const PipeConstants = { SOCKET: 0, SERVER: 1, IPC: 2 };
+  const pipeServers = new Map(); // path -> server Pipe handle
+
   class Pipe {
-    constructor() {
-      const err = new Error("OpenContainer: named pipes / IPC are not implemented yet");
-      err.code = "ERR_METHOD_NOT_IMPLEMENTED";
-      throw err;
+    constructor(type) {
+      this.type = type;
+      this.reading = false;
+      this.onread = null;
+      this.onconnection = null;
+      this._peer = null;
+      this._inbox = [];
+      this._closed = false;
+      this._pumpScheduled = false;
+      this._refed = true;
+      this._live = false;
+      this._counted = false;
+      this._pipePath = null;
+      this._remotePath = "";
+      this.bytesRead = 0;
+      this.writeQueueSize = 0;
+    }
+
+    bind(path) {
+      this._pipePath = String(path);
+      return 0;
+    }
+
+    listen(/* backlog */) {
+      if (this._pipePath == null) return UV_CODES.UV_EINVAL;
+      if (pipeServers.has(this._pipePath)) return UV_CODES.UV_EADDRINUSE;
+      pipeServers.set(this._pipePath, this);
+      this._live = true;
+      recount(this);
+      return 0;
+    }
+
+    connect(req, path) {
+      const target = String(path);
+      this._pipePath = "";
+      this._remotePath = target;
+      const server = pipeServers.get(target);
+      if (!server || server._closed) {
+        // No such socket file → libuv reports ENOENT for a missing pipe.
+        nextTick(() => req.oncomplete(UV_CODES.UV_ENOENT, this, req, false, false));
+        return 0;
+      }
+      const peer = new Pipe(PipeConstants.SOCKET);
+      peer._pipePath = target;
+      peer._remotePath = target;
+      this._peer = peer;
+      peer._peer = this;
+      nextTick(() => {
+        if (server._closed) {
+          req.oncomplete(UV_CODES.UV_ECONNREFUSED, this, req, false, false);
+          return;
+        }
+        this._live = true;
+        recount(this);
+        peer._live = true;
+        recount(peer);
+        server.onconnection(0, peer);
+        req.oncomplete(0, this, req, true, true);
+      });
+      return 0;
+    }
+
+    readStart() {
+      this.reading = true;
+      schedulePump(this);
+      return 0;
+    }
+    readStop() {
+      this.reading = false;
+      return 0;
+    }
+
+    writeBuffer(req, data) {
+      return doWrite(this, req, data);
+    }
+    writeLatin1String(req, str) {
+      return doWrite(this, req, buf().from(str, "latin1"));
+    }
+    writeUtf8String(req, str) {
+      return doWrite(this, req, buf().from(str, "utf8"));
+    }
+    writeAsciiString(req, str) {
+      return doWrite(this, req, buf().from(str, "ascii"));
+    }
+    writeUcs2String(req, str) {
+      return doWrite(this, req, buf().from(str, "ucs2"));
+    }
+    writev(req, chunks, allBuffers) {
+      const parts = [];
+      if (allBuffers) {
+        for (let i = 0; i < chunks.length; i++) parts.push(chunks[i]);
+      } else {
+        for (let i = 0; i < chunks.length; i += 2) {
+          const chunk = chunks[i];
+          const enc = chunks[i + 1];
+          parts.push(typeof chunk === "string" ? buf().from(chunk, enc) : chunk);
+        }
+      }
+      const merged = buf().concat(parts.map((p) => (buf().isBuffer(p) ? p : buf().from(p))));
+      return doWrite(this, req, merged);
+    }
+
+    shutdown(req) {
+      if (this._peer && !this._peer._closed) enqueueToPeer(this._peer, EOF);
+      nextTick(() => req.oncomplete(0));
+      return 0;
+    }
+
+    close(cb) {
+      if (!this._closed) {
+        this._closed = true;
+        recount(this);
+        if (this.type === PipeConstants.SERVER && this._pipePath != null) {
+          if (pipeServers.get(this._pipePath) === this) pipeServers.delete(this._pipePath);
+        }
+        if (this._peer && !this._peer._closed) enqueueToPeer(this._peer, EOF);
+      }
+      if (typeof cb === "function") nextTick(cb);
+    }
+
+    // A pipe's "name" is its filesystem path; net.Server.address() surfaces it.
+    getsockname(out) {
+      out.address = this._pipePath || "";
+      return 0;
+    }
+    getpeername(out) {
+      if (!this._remotePath) return UV_CODES.UV_ENOTCONN;
+      out.address = this._remotePath;
+      return 0;
+    }
+
+    setNoDelay() {
+      return 0;
+    }
+    setKeepAlive() {
+      return 0;
+    }
+    ref() {
+      this._refed = true;
+      recount(this);
+    }
+    unref() {
+      this._refed = false;
+      recount(this);
+    }
+    hasRef() {
+      return this._refed;
+    }
+    getAsyncId() {
+      return 1;
+    }
+    fchmod() {
+      return 0;
+    }
+    setPendingInstances() {
+      return 0;
     }
   }
   class PipeConnectWrap {}
   const pipe_wrap = {
     Pipe,
     PipeConnectWrap,
-    constants: { SOCKET: 0, SERVER: 1, IPC: 2 },
+    constants: PipeConstants,
   };
 
   // ---- cares_wrap: DNS binding. Real name resolution is deferred (loopback
