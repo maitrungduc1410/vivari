@@ -12,14 +12,23 @@
 // This used to live in a per-project launcher (scripts/oc-ng.mjs). It now runs
 // in the module loader (see module.js) so ANY project that ends up with an
 // esbuild-wasm-backed install gets the deadlock-free service automatically, with
-// no project-level script or config. It is a string replacement of the exact
-// spawn block esbuild-wasm@0.28.x ships; it is idempotent and a strict no-op
-// when the block isn't found (version drift) or when the wasm assets aren't
-// present next to main.js (a genuine native esbuild install is left untouched).
+// no project-level script or config. It is a string replacement of the child-
+// spawn block esbuild-wasm ships in lib/main.js; it is idempotent and a strict
+// no-op when the wasm assets aren't present next to main.js (a genuine native
+// esbuild install is left untouched).
+//
+// VERSION-DRIFT RESILIENCE: the block's only per-release variable is the version
+// literal in `--service=${"x.y.z"}`, so we match with a regex that TEMPLATES that
+// literal (capturing the version and threading it into the replacement). A point/
+// minor bump with the same block shape keeps patching automatically. If the block
+// SHAPE changes (a real esbuild-wasm refactor) the regex won't match and we emit a
+// loud one-time console.warn — esbuild would otherwise silently deadlock under a
+// worker pool, so we fail loud instead of failing silent.
 
-// The exact child-spawn block esbuild-wasm@0.28.1 ships in lib/main.js.
+// Template of the child-spawn block esbuild-wasm ships in lib/main.js, with the
+// version literal replaced by the %VER% placeholder. Compiled to a regex below.
 const ESB_INPROC_OLD = `  let [command, args] = esbuildCommandAndArgs();
-  let child = child_process.spawn(command, args.concat(\`--service=\${"0.28.1"}\`, "--ping"), {
+  let child = child_process.spawn(command, args.concat(\`--service=\${"%VER%"}\`, "--ping"), {
     windowsHide: true,
     stdio: ["pipe", "pipe", "inherit"],
     cwd: defaultWD
@@ -113,7 +122,7 @@ const ESB_INPROC_NEW = `  // [OpenContainer] in-process esbuild service (no chil
   };
   globalThis.fs = __ocFs;
   const __ocGo = new globalThis.Go();
-  __ocGo.argv = ["node", \`--service=\${"0.28.1"}\`];
+  __ocGo.argv = ["node", \`--service=\${"%VER%"}\`];
   __ocGo.env = Object.assign({ TMPDIR: os2.tmpdir() }, process.env);
   let { readFromStdout, afterClose, service } = createChannel({
     writeToStdin(bytes) {
@@ -158,6 +167,17 @@ const ESB_INPROC_NEW = `  // [OpenContainer] in-process esbuild service (no chil
 
 const OC_MARKER = "[OpenContainer] in-process esbuild service";
 
+// A semver-ish version literal: 1-3 dotted numbers + optional prerelease/build.
+const VER_CAPTURE = "([0-9]+(?:\\.[0-9]+){0,3}(?:-[0-9A-Za-z.]+)?)";
+
+// Compile the spawn-block template into a regex that captures the version literal,
+// so a patch-compatible release (same block shape, new version) still matches.
+function compileOldRegex() {
+  const escaped = ESB_INPROC_OLD.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(escaped.replace("%VER%", VER_CAPTURE));
+}
+const ESB_OLD_RE = compileOldRegex();
+
 // True when `filename` is an esbuild(-wasm) lib/main.js whose package also ships
 // the Go wasm assets (esbuild.wasm + wasm_exec.js) one directory up. A genuine
 // native esbuild install has no such assets and is deliberately skipped.
@@ -171,15 +191,45 @@ function isEsbuildWasmMain(filename, fs, path) {
   }
 }
 
+// Warn at most once per file so a drift (esbuild-wasm refactored the spawn block)
+// is visible in the console instead of surfacing as a mysterious build hang.
+const _driftWarned = new Set();
+function warnDrift(filename) {
+  if (_driftWarned.has(filename)) return;
+  _driftWarned.add(filename);
+  try {
+    console.warn(
+      "[OpenContainer] esbuild-wasm in-process patch did NOT apply to " +
+        filename +
+        ": the spawn block shape changed (version drift). esbuild may deadlock " +
+        "under worker pools (Angular/Vite/Vitest/tsup). Update the ESB_INPROC_OLD " +
+        "template in packages/runtime/esbuild-inproc-patch.js to match the new " +
+        "esbuild-wasm lib/main.js.",
+    );
+  } catch {
+    /* console may be unavailable in some worker contexts */
+  }
+}
+
 /**
  * If `source` is esbuild-wasm's lib/main.js, return it rewritten to run the Go
  * service in-process; otherwise return null (leave the source untouched).
- * Idempotent: already-patched sources return null.
+ * Idempotent: already-patched sources return null. If the file IS esbuild-wasm's
+ * main.js but the known spawn block can't be found (version drift), it warns
+ * loudly and returns null rather than deadlocking silently.
  */
 export function maybePatchEsbuildInProcess(source, filename, fs, path) {
   if (typeof source !== "string" || source.length < 64) return null;
   if (source.includes(OC_MARKER)) return null; // already patched
-  if (!source.includes(ESB_INPROC_OLD)) return null; // not the block we know (or drift)
   if (!isEsbuildWasmMain(filename, fs, path)) return null; // native esbuild — leave it
-  return source.replace(ESB_INPROC_OLD, ESB_INPROC_NEW);
+  const m = source.match(ESB_OLD_RE);
+  if (!m) {
+    warnDrift(filename);
+    return null;
+  }
+  const version = m[1];
+  const replacement = ESB_INPROC_NEW.replaceAll("%VER%", version);
+  // Function replacement: return the string verbatim so `$`-sequences in the
+  // esbuild source (e.g. `${...}` template holes) are never treated as $-patterns.
+  return source.replace(ESB_OLD_RE, () => replacement);
 }

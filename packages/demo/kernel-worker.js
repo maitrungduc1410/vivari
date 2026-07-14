@@ -543,7 +543,14 @@ function openTerminal(terminalId, cwd, demoId, run) {
     HOME: "/",
     // Real npm needs a writable cache (+ _logs) dir; created at boot. Without
     // this it defaults to $HOME/.npm and can trip on the read-only-ish root.
-    npm_config_cache: "/tmp/.npm",
+    //
+    // PERSISTED content-addressed cache: this lives under /home/user/.cache
+    // (NOT /tmp, which the OPFS mirror excludes), so npm's own integrity-keyed
+    // _cacache survives reloads AND is shared across projects — install a package
+    // once and every later project/boot reuses the tarball with no re-download.
+    // This is the durable "package cache in OPFS"; the kernel's transient
+    // /var/cache/oc-fetch buffer is intentionally NOT persisted (see fs-worker).
+    npm_config_cache: "/home/user/.cache/npm",
     // npm's audit + funding steps POST to registry endpoints that don't send
     // Access-Control-Allow-Origin, so from the browser they fail CORS preflight
     // (noisy console errors + a wasted round-trip) with no benefit here. Turn
@@ -558,20 +565,22 @@ function openTerminal(terminalId, cwd, demoId, run) {
     // the update-notifier package outright.
     npm_config_update_notifier: "false",
     NO_UPDATE_NOTIFIER: "1",
-    // Real yarn likewise needs a writable cache; created at boot (its global
-    // config/cache default under $HOME would land on the read-only-ish root).
-    YARN_CACHE_FOLDER: "/tmp/.yarn-cache",
+    // Real yarn likewise needs a writable cache; persisted (see npm_config_cache)
+    // so yarn's tarball cache is reused across projects/reloads.
+    YARN_CACHE_FOLDER: "/home/user/.cache/yarn",
     // Real pnpm: our VFS has no hardlink/reflink CoW, so packages must be COPIED
     // into node_modules from the store (npm_config_* is how pnpm reads config from
-    // env). Give it a writable store + state/cache dirs off the root, too.
+    // env). The content-addressed store is persisted so it is shared across
+    // projects/reloads too.
     npm_config_package_import_method: "copy",
-    npm_config_store_dir: "/tmp/.pnpm-store",
+    npm_config_store_dir: "/home/user/.local/share/pnpm/store",
     XDG_DATA_HOME: "/home/user/.local/share",
     XDG_CACHE_HOME: "/home/user/.cache",
     XDG_STATE_HOME: "/home/user/.local/state",
     XDG_CONFIG_HOME: "/home/user/.config",
-    // Real corepack: it caches the PM versions it downloads here (created at boot).
-    COREPACK_HOME: "/tmp/.corepack",
+    // Real corepack: it caches the PM versions it downloads here (created at boot);
+    // persisted so a downloaded yarn/pnpm binary is reused across reloads.
+    COREPACK_HOME: "/home/user/.cache/corepack",
     // corepack verifies the registry's ECDSA signature, which our crypto layer
     // can't do (no crypto.verify). "0" is corepack's official escape hatch — it
     // skips that signature check; the sha512 tarball integrity check still runs.
@@ -936,10 +945,12 @@ async function boot() {
   // shims; a fresh origin fetches + unpacks the ~12 MB asset once (one batched
   // VFS transfer). A missing asset simply means no `npm` on PATH, like yarn/pnpm.
   kernel.mkdirp("/home/user");
-  kernel.mkdirp("/tmp/.npm/_logs");
-  kernel.mkdirp("/tmp/.yarn-cache");
-  kernel.mkdirp("/tmp/.pnpm-store");
-  kernel.mkdirp("/tmp/.corepack");
+  // Package-manager caches live under /home/user/.cache (persisted in OPFS), so
+  // downloaded tarballs/binaries are reused across projects and page reloads.
+  kernel.mkdirp("/home/user/.cache/npm/_logs");
+  kernel.mkdirp("/home/user/.cache/yarn");
+  kernel.mkdirp("/home/user/.local/share/pnpm/store");
+  kernel.mkdirp("/home/user/.cache/corepack");
 
   // The kernel + VFS can now service filesystem RPCs (oc-stat / oc-readdir /
   // oc-create-project), so the studio can create/open projects immediately —

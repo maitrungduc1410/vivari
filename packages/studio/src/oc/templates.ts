@@ -1152,9 +1152,8 @@ export default function RootLayout({ children }) {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      // Newly proven in-VM (Next 16 webpack + wasm SWC); keep flagged until it has
-      // more mileage in the studio.
-      experimental: true,
+      // Graduated: Next 16 (webpack + wasm SWC) boots + serves in-VM, gated by
+      // scripts/spike-next.mjs (incl. the RSC-refresh invariant check).
     },
     files,
   };
@@ -1577,7 +1576,8 @@ function koaTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "node src/index.js",
-      experimental: true,
+      // Graduated: plain Node HTTP server on the proven Express/Nest substrate,
+      // gated by scripts/spike-koa.mjs.
     },
     files: {
       "package.json": `{
@@ -1624,7 +1624,8 @@ function honoTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "node src/index.js",
-      experimental: true,
+      // Graduated: plain Node HTTP server on the proven Express/Nest substrate,
+      // gated by scripts/spike-hono.mjs.
     },
     files: {
       "package.json": `{
@@ -1670,7 +1671,8 @@ function h3Template(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "node src/index.js",
-      experimental: true,
+      // Graduated: plain Node HTTP server on the proven Express/Nest substrate,
+      // gated by scripts/spike-h3.mjs.
     },
     files: {
       "package.json": `{
@@ -2757,7 +2759,8 @@ function fastifyTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
+      // Graduated: plain Node HTTP server on the proven Express/Nest substrate,
+      // gated by scripts/spike-fastify.mjs.
     },
     files: {
       "package.json": `{
@@ -3434,7 +3437,7 @@ if (module.hot) module.hot.accept();
 // ── Docusaurus (standalone webpack) ──────────────────────────────────────────
 // Docusaurus 3's dev server is webpack + webpack-dev-server + MDX/React. Proven
 // headless (scripts/spike-docusaurus.mjs) — binds :3000 and serves the site.
-// Heavy install (100s+), so kept experimental.
+// Graduated (spike green); note the install is heavy (100s+).
 function docusaurusTemplate(): TemplateDef {
   return {
     manifest: {
@@ -3452,7 +3455,6 @@ function docusaurusTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
       // Docusaurus is a client-routed SPA: it reads its route from the iframe's
       // location, which is /preview/3000/. Serve it under that base (baseUrl below)
       // and keep the proxy prefix so its router matches — otherwise the first load

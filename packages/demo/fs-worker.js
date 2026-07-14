@@ -128,10 +128,15 @@ function buildAccess(vfs) {
 
 // System/volatile dirs we never persist: coreutils are re-installed each boot,
 // and /tmp, /proc, /dev are ephemeral by definition. Everything else (your
-// /app, node_modules, /data, …) is mirrored.
+// /app, node_modules, /data, the package-manager caches under /home/user/.cache,
+// …) is mirrored.
 // /etc and /usr are re-seeded by the VFS constructor every boot (os-release, ldd),
 // so persisting them is redundant and would let a stale copy shadow a changed seed.
-const IGNORE = ["/bin", "/tmp", "/proc", "/dev", "/etc", "/usr"];
+// /var/cache holds the kernel's transient outbound-fetch buffer (oc-fetch): its
+// in-memory index is rebuilt per session and never read back across reloads, so
+// persisting those tarball bodies is pure dead weight — the durable, reusable copy
+// is npm/yarn/pnpm's own content-addressed cache under /home/user/.cache.
+const IGNORE = ["/bin", "/tmp", "/proc", "/dev", "/etc", "/usr", "/var/cache"];
 const shouldPersist = (p) => {
   for (const pre of IGNORE) if (p === pre || p.startsWith(pre + "/")) return false;
   return true;

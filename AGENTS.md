@@ -54,7 +54,8 @@ packages/
   runtime/         The Node runtime that runs INSIDE each process worker.
     index.js       createRuntime(): wires builtins/globals/http-bridge/ws + run().
     module.js      synchronous CommonJS loader (require + resolution).
-    esbuild-inproc-patch.js  load-time rewrite of esbuild-wasm's service to run in-process.
+    toolchain-shims.js  single source of truth for native->wasm drop-ins (NATIVE_WASM_ALIASES).
+    esbuild-inproc-patch.js  load-time, version-agnostic rewrite of esbuild-wasm's service to run in-process.
     esm.js         ESM→CJS transpiler (import/export → sync CJS).
     loop.js        the per-process event loop (nextTick→micro→timers→immediate).
     boot.js        process bootstrap shared by browser + Node worker entries.
@@ -129,6 +130,9 @@ scripts/
   verify-node.mjs      headless end-to-end proof (no browser).
   verify-express.mjs   installs+runs real Express/Vite/ws (needs network).
   probe-*.mjs          framework discovery/regression probes (react/nest/realdev).
+  spike-*.mjs          per-template/subsystem "does it boot + serve in-VM" proofs.
+  lib/spike-harness.mjs   shared kernel-boot/install/waitListen/httpGet helper for spikes.
+  run-spikes.mjs       CI runner over the spikes (tiers: --offline / --net / --all).
   process-worker.mjs / fs-worker.mjs   Node worker_threads entries for headless.
   build-demo.mjs       bundles demo/ → demo-dist/ with esbuild (legacy path).
   build-editor-vendor.mjs   bundles Monaco+xterm → demo/vendor/editor/ (legacy, re-run on bump).
@@ -264,20 +268,29 @@ DIFFERENT package name (`esbuild-wasm`, `@rollup/wasm-node`) that npm's
 platform auto-select (which handles `*-wasm32-wasi` optional deps) can't reach.
 Three runtime pieces close that gap generically, so projects stay vanilla — do
 NOT re-introduce a `package.json` "overrides" block or a per-project launcher:
-- **Registry aliasing** (`demo/fetcher-worker.js`, `PACKAGE_ALIASES`): a packument
-  request for `esbuild`/`rollup` is served the drop-in's packument rewritten
-  under the source name; npm then downloads the drop-in's real tarball into
-  `node_modules/<source>` (versions are published in lockstep). Falls back to the
-  un-aliased fetch on error. This is the `REGISTRY_PROXY`/`rewrite()` seam realized.
+The native->wasm alias table is the single source of truth in
+`runtime/toolchain-shims.js` (`NATIVE_WASM_ALIASES`) — add drop-ins THERE, not in
+the fetcher. Requirements for a new entry: source+target published in lockstep,
+target pure-JS/wasm, proven by a spike. It is guarded by `scripts/spike-toolchain.mjs`.
+- **Registry aliasing** (`demo/fetcher-worker.js` imports `NATIVE_WASM_ALIASES`): a
+  packument request for `esbuild`/`rollup` is served the drop-in's packument
+  rewritten under the source name; npm then downloads the drop-in's real tarball
+  into `node_modules/<source>` (versions are published in lockstep). Falls back to
+  the un-aliased fetch on error. This is the `REGISTRY_PROXY`/`rewrite()` seam realized.
 - **In-process esbuild** (`runtime/esbuild-inproc-patch.js`, invoked from
   `module.js` compile): esbuild-wasm's Node build spawns a child service whose
   stdio pipe deadlocks under a Piscina/tinypool loop; we rewrite `lib/main.js` at
-  load time to run the Go service in this thread. Idempotent; strict no-op for a
-  genuine native esbuild (guarded on the wasm assets sitting next to `main.js`).
+  load time to run the Go service in this thread. VERSION-AGNOSTIC: it matches the
+  spawn block with the version literal templated, so a point/minor bump still
+  patches; on block-shape drift it `console.warn`s LOUDLY (never patch-fails
+  silently → a hang). Idempotent; strict no-op for a genuine native esbuild
+  (guarded on the wasm assets sitting next to `main.js`).
 - **Worker-pool default** (`runtime/builtins/process.js`): `PISCINA_DISABLE_ATOMICS`
-  defaults to `1` so pools use async message passing (our cooperative
-  worker_threads can't serve the Atomics fast-path). This is why the Angular
-  template is now plain `ng serve`/`ng build` with no `scripts/oc-ng.mjs`.
+  defaults to `1` so pools use async message passing (a browser `MessagePort`
+  can't be drained synchronously across a worker boundary, so the Atomics fast-path
+  can't work). `worker_threads.receiveMessageOnPort` IS implemented (lazy per-port
+  inbox) for libraries that poll it directly; just keep the Atomics path off. This
+  is why the Angular template is now plain `ng serve`/`ng build` with no `scripts/oc-ng.mjs`.
 
 ### The studio is a multi-root workspace — absolute paths + the VFS is truth
 Since the workspace rewrite there is NO single "current project" and NO static file
@@ -324,8 +337,16 @@ AFTER `installCoreutils()`. The loader unpacks the tree to
   the FS Worker in one message — replacing the old per-file `writeFile` loop and
   the per-large-file `writeLarge` path (the batch carries multi-MB bundles
   inline). Any new tree-delivery loader should use `writeFilesBatch`, not a loop.
-- Real npm needs `npm_config_cache` writable — the shell env sets `/tmp/.npm`
-  (created at boot). Keep that when editing `openTerminal` env.
+- Real npm needs `npm_config_cache` writable — the shell env sets it (created at
+  boot). It (and the yarn/pnpm/corepack caches) now live under `/home/user/.cache`
+  (+ pnpm store under `/home/user/.local/share/pnpm/store`), which IS mirrored to
+  OPFS, so the content-addressed package cache PERSISTS and is shared across
+  projects/reloads — install a dep once, later projects reuse the tarball with no
+  re-download. Do NOT move these back under `/tmp` (excluded from persistence). The
+  kernel's transient `/var/cache/oc-fetch` buffer is deliberately in the OPFS
+  `IGNORE` list (its in-memory index is rebuilt per session, so persisting those
+  bodies is dead weight — npm's cache is the durable copy). Keep this when editing
+  `openTerminal` env / `fs-worker` IGNORE.
 - The delivery asset is gzip-compressed but named `npm-pack.bin`, NOT `.gz`, on
   purpose: static servers (Vite's sirv, CDNs) serve a `.gz` file with
   `Content-Encoding: gzip`, so the browser auto-decompresses it and our own
@@ -658,8 +679,15 @@ The runtime runs headless under Node `worker_threads`, so validate without a
 browser first.
 
 - `npm run verify` — `scripts/verify-node.mjs`, headless end-to-end (fs, process,
-  shell, http, timers, watch). **Run this after any runtime/protocol change.** No
-  network needed.
+  shell, http, timers, watch, worker_threads incl. `receiveMessageOnPort`). **Run
+  this after any runtime/protocol change.** No network needed.
+- `npm run spikes` (`scripts/run-spikes.mjs`) — the CI runner over the per-template/
+  subsystem spikes. Tiers: `npm run spikes:offline` (Wasm-free, seconds — e.g. the
+  `spike-toolchain.mjs` subsystem guard), `npm run spikes:net` (installs real
+  templates from the registry; auto-vendors npm to `/tmp/oc-vendor`). Wired into
+  `.gitlab-ci.yml`. **A template must have a green spike before it graduates out of
+  `experimental`** — add `spike-<name>.mjs` (use `lib/spike-harness.mjs`) and list it
+  in `run-spikes.mjs`.
 - `node scripts/verify-express.mjs` — installs + runs real Express, esbuild-wasm,
   a Vite build, Vite dev+HMR, and a real `ws` server. **Needs network** (npm).
 - `node scripts/probe-realdev.mjs [vite|nest]` — the demo's exact flow headless:

@@ -194,6 +194,14 @@ never parks and many downloads can overlap (§6).
   by `opfs-persistence.js` (write-behind). OPFS sync access handles only exist in a
   Worker — hence this lives in the FS worker. On boot it restores the manifest into
   the VFS **before** serving any syscall. Use `?reset` on the demo URL to wipe it.
+  Volatile/re-seeded paths are excluded (`fs-worker.js` `IGNORE`: `/bin /tmp /proc
+  /dev /etc /usr /var/cache`). The package-manager caches deliberately live in a
+  PERSISTED location (`/home/user/.cache` for npm/yarn/corepack, `/home/user/.local/
+  share/pnpm/store` for pnpm), so npm's own content-addressed cache doubles as the
+  durable, cross-project "package cache in OPFS" — a dependency downloaded once is
+  reused by later projects and after a reload. The kernel's transient outbound-fetch
+  buffer (`/var/cache/oc-fetch`) is excluded because its index is rebuilt per session
+  and never read back, so npm's cache is the single durable copy.
 - **File watching** (`fs.watch`): `OP_WATCH` registers interest; the FS worker
   **pushes** change events back over the fs doorbell `MessagePort` (never the SAB —
   the process isn't parked on it). Events are bucketed by top-level tree to bound
@@ -501,7 +509,11 @@ as an optional dependency (rolldown, `@node-rs/*`). Two toolchain packages don't
 fit that mould — **esbuild** and **rollup** ship their WASM builds under a
 *different package name* (`esbuild-wasm`, `@rollup/wasm-node`), which npm's
 platform gating can't reach. The runtime bridges the gap so projects stay vanilla
-(no `package.json` "overrides", no per-project launcher):
+(no `package.json` "overrides", no per-project launcher). The native→wasm mapping
+is a single source of truth in `packages/runtime/toolchain-shims.js`
+(`NATIVE_WASM_ALIASES`), imported by the Fetcher Worker and guarded by
+`scripts/spike-toolchain.mjs`. Adding a drop-in = one entry there (source+target
+must be published in lockstep and the target must be pure-JS/wasm).
 
 - **Registry aliasing** (`packages/demo/fetcher-worker.js`): when npm requests the
   packument for `esbuild`/`rollup`, the Fetcher Worker serves the drop-in's
@@ -513,10 +525,15 @@ platform gating can't reach. The runtime bridges the gap so projects stay vanill
   `module.js` at compile time): esbuild-wasm's Node build spawns a child service
   whose stdio pipe deadlocks the single-threaded kernel against a Piscina/tinypool
   loop. The loader rewrites `lib/main.js` to run the Go service in-thread (fd 0/1/2
-  multiplexed onto the protocol). Idempotent; a strict no-op for native esbuild.
+  multiplexed onto the protocol). The match is **version-agnostic** (the version
+  literal in the spawn block is templated), so a point/minor esbuild-wasm bump keeps
+  patching; on a block-shape change it warns loudly rather than silently regressing
+  to a deadlock. Idempotent; a strict no-op for native esbuild.
 - **Worker-pool default** (`packages/runtime/builtins/process.js`):
-  `PISCINA_DISABLE_ATOMICS=1` by default, so pools use async message passing (our
-  cooperative worker_threads don't serve the Atomics fast-path).
+  `PISCINA_DISABLE_ATOMICS=1` by default, so pools use async message passing — a
+  browser `MessagePort` can't be drained synchronously across a worker boundary, so
+  the Atomics fast-path can't work. `worker_threads.receiveMessageOnPort` is still
+  implemented (a lazy per-port inbox) for code that polls it directly in manual mode.
 
 Together these let Angular's stock `@angular/build` (esbuild + Vite) run from an
 unmodified `ng new` project, and benefit any esbuild/worker-pool tool (Vitest,
