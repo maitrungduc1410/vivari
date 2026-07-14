@@ -170,60 +170,82 @@ export default function (exports, require, module, process, internalBinding, pri
       process.nextTick(() => {
         if (this.aborted) return;
         const body = this._chunks.length ? Buffer.concat(this._chunks) : null;
-        let meta;
-        try {
-          meta = globalThis.__ocfetch(this._url, {
-            method: this.method,
-            headers: this._headers,
-            bodyB64: body && body.length ? toB64(body) : null,
-          });
-        } catch (e) {
+        const init = {
+          method: this.method,
+          headers: this._headers,
+          bodyB64: body && body.length ? toB64(body) : null,
+        };
+        const onError = (e) => {
+          if (this.aborted) return;
           const err = new Error("request to " + this._url + " failed: " + ((e && e.message) || e));
           err.code = (e && e.code) || "ECONNREFUSED";
           this.emit("error", err);
-          return;
-        }
-        if (this.aborted) return;
-
-        const res = new Readable({ read() {} });
-        res.statusCode = meta.status | 0;
-        res.statusMessage = meta.statusText || statusText(res.statusCode);
-        res.headers = meta.headers || {};
-        res.rawHeaders = rawHeaders(res.headers);
-        res.trailers = {};
-        res.rawTrailers = [];
-        res.httpVersion = "1.1";
-        res.httpVersionMajor = 1;
-        res.httpVersionMinor = 1;
-        res.complete = false;
-        res.url = this._url;
-        res.method = this.method;
-        res.req = this;
-        res.socket = res.connection = this._socket;
-        res.setTimeout = (_ms, fn) => {
-          if (typeof fn === "function") res.once("timeout", fn);
-          return res;
         };
-
-        this.emit("response", res);
-
-        // Push the body a tick later so the consumer's 'data' listeners (attached
-        // synchronously inside the 'response' handler) are in place.
-        process.nextTick(() => {
-          if (this.aborted) {
-            res.destroy();
+        // Prefer the non-blocking async egress so a single process (e.g. npm) can
+        // keep many registry requests in flight at once — the blocking __ocfetch
+        // path would park the whole worker on each request, serializing all
+        // downloads. Fall back to the blocking primitive if the async global is
+        // unavailable (older/host runtimes), preserving the previous behavior.
+        const asyncFetch = globalThis.__ocfetchAsync;
+        if (typeof asyncFetch === "function") {
+          asyncFetch(this._url, init).then((meta) => this._deliver(meta), onError);
+        } else {
+          let meta;
+          try {
+            meta = globalThis.__ocfetch(this._url, init);
+          } catch (e) {
+            onError(e);
             return;
           }
-          let bytes = null;
-          try {
-            bytes = fs.readFileSync(meta.path);
-          } catch {
-            /* empty body */
-          }
-          if (bytes && bytes.length) res.push(Buffer.from(bytes));
-          res.complete = true;
-          res.push(null);
-        });
+          this._deliver(meta);
+        }
+      });
+    }
+
+    // Build the http.IncomingMessage from the fetch metadata and stream the body
+    // (materialized by the kernel in the VFS at meta.path) into it. Shared by the
+    // async and blocking dispatch paths above.
+    _deliver(meta) {
+      if (this.aborted) return;
+
+      const res = new Readable({ read() {} });
+      res.statusCode = meta.status | 0;
+      res.statusMessage = meta.statusText || statusText(res.statusCode);
+      res.headers = meta.headers || {};
+      res.rawHeaders = rawHeaders(res.headers);
+      res.trailers = {};
+      res.rawTrailers = [];
+      res.httpVersion = "1.1";
+      res.httpVersionMajor = 1;
+      res.httpVersionMinor = 1;
+      res.complete = false;
+      res.url = this._url;
+      res.method = this.method;
+      res.req = this;
+      res.socket = res.connection = this._socket;
+      res.setTimeout = (_ms, fn) => {
+        if (typeof fn === "function") res.once("timeout", fn);
+        return res;
+      };
+
+      this.emit("response", res);
+
+      // Push the body a tick later so the consumer's 'data' listeners (attached
+      // synchronously inside the 'response' handler) are in place.
+      process.nextTick(() => {
+        if (this.aborted) {
+          res.destroy();
+          return;
+        }
+        let bytes = null;
+        try {
+          bytes = fs.readFileSync(meta.path);
+        } catch {
+          /* empty body */
+        }
+        if (bytes && bytes.length) res.push(Buffer.from(bytes));
+        res.complete = true;
+        res.push(null);
       });
     }
   }

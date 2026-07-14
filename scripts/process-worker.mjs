@@ -88,4 +88,6 @@ parentPort.on("message", (msg) => {
     control && control.dispatchWs(msg);
   // An interactive stdin chunk for this process (host terminal / parent -> child).
   else if (msg.type === "stdin") control && control.dispatchStdin(msg);
+  // An async fetch result relayed by the kernel (parallel downloads).
+  else if (msg.type === "fetch-done") control && control.dispatchFetch(msg);
 });

@@ -947,6 +947,51 @@ export function createRuntime({
   // the npm client (#10) will build on; it'll get a proper wrapper then.
   globalThis.__ocfetch = (url, opts) => syscalls.fetch(String(url), opts);
 
+  // Async, non-blocking outbound fetch (parallel downloads). Unlike __ocfetch —
+  // which parks the whole worker on Atomics.wait, forcing a single process's
+  // registry requests to run one-at-a-time — this hands the request to the kernel
+  // and returns a Promise that resolves when the kernel posts the result back
+  // ({type:'fetch-done'} -> dispatchFetch). The npm/yarn/pnpm http client
+  // (lib/https.js) uses this so many packuments/tarballs download concurrently.
+  // Each in-flight request refs the loop (like a libuv handle) so the process
+  // stays alive until it settles. Resolves with the same metadata __ocfetch
+  // returns ({ status, ok, headers, contentType, size, path, cached }).
+  let fetchSeq = 1;
+  const pendingFetches = new Map(); // fetchId -> { resolve, reject }
+  globalThis.__ocfetchAsync = (url, opts) =>
+    new Promise((resolve, reject) => {
+      const fetchId = fetchSeq++;
+      pendingFetches.set(fetchId, { resolve, reject });
+      hostLiveness.active++;
+      try {
+        syscalls.fetchAsync(fetchId, String(url), opts);
+      } catch (e) {
+        pendingFetches.delete(fetchId);
+        if (hostLiveness.active > 0) hostLiveness.active--;
+        reject(e);
+      }
+    });
+  // External delivery from the kernel: a { type:'fetch-done', fetchId, ... }
+  // reply. Settle the matching pending promise inside a loop turn (nextTick), so
+  // a process.exit() from the continuation is honoured and microtasks flush in a
+  // controlled order — the same discipline the fork IPC / stdin deliveries use.
+  const dispatchFetch = (msg) => {
+    const p = msg && msg.fetchId != null ? pendingFetches.get(msg.fetchId) : undefined;
+    if (!p) return;
+    pendingFetches.delete(msg.fetchId);
+    if (hostLiveness.active > 0) hostLiveness.active--;
+    loop.nextTick(() => {
+      if (msg.ok) {
+        p.resolve(msg.meta);
+      } else {
+        const err = new Error(msg.error || "EFETCH");
+        err.code = msg.error || "EFETCH";
+        p.reject(err);
+      }
+    });
+    loop.wakeNet();
+  };
+
   const builtins = {
     fs,
     path,
@@ -1081,6 +1126,9 @@ export function createRuntime({
     /** External delivery from the kernel: a browser preview ws tunnel message
      * ({type:'ws-open'|'ws-in'|'ws-close', connId, ...}). roadmap #19 stage C. */
     dispatchWs: (msg) => dispatchWs(msg),
+    /** External delivery from the kernel: an async fetch result
+     * ({type:'fetch-done', fetchId, ok, meta|error}). Parallel downloads. */
+    dispatchFetch: (msg) => dispatchFetch(msg),
     /** External delivery from the kernel: an interactive stdin chunk for THIS
      * process ({type:'stdin', chunk} — chunk null = EOF). Feeds process.stdin. */
     dispatchStdin: (msg) => dispatchStdin(msg),

@@ -41,6 +41,7 @@ import {
   OP_RESPOND,
   OP_CLOSE_SERVER,
   OP_FETCH,
+  OP_FETCH_ASYNC,
 } from "../protocol/syscall.js";
 import { COREUTILS } from "./coreutils.js";
 
@@ -88,6 +89,18 @@ export class Kernel {
     // fetch (npm re-resolving the same package) skips the network entirely.
     this.fetchCache = new Map();
     this.onFetch = null; // optional observer (url, {cached,size,pid}) — e.g. a UI log / per-terminal progress
+
+    // ---- async fetch: parallel downloads (OP_FETCH_ASYNC) ----
+    // The real npm/yarn/pnpm issue many registry requests at once, but its Agent
+    // reports maxSockets=Infinity, so without a bound it would fire hundreds
+    // simultaneously and hit the browser's per-origin connection limit (and burn
+    // memory buffering tarballs). Cap concurrent outbound requests, queue the
+    // rest, and de-dupe identical in-flight cacheable GETs so a burst for the same
+    // packument only hits the network once.
+    this.fetchConcurrency = 10;
+    this._fetchActive = 0;
+    this._fetchQueue = [];
+    this._fetchInflight = new Map(); // cacheKey -> Promise<meta> (network in flight)
   }
 
   // ---- VFS helpers ----------------------------------------------------------
@@ -412,6 +425,10 @@ export class Kernel {
       this.handleFetch(proc, JSON.parse(decodeBytes(fields[0])));
       return; // deferred until the network fetch resolves
     }
+    if (opcode === OP_FETCH_ASYNC) {
+      this.handleFetchAsync(proc, JSON.parse(decodeBytes(fields[0])));
+      return; // acks immediately; the result streams back via postMessage
+    }
     // Since #14, fs opcodes are serviced by the File System Worker directly over
     // the process's SAB — they never reach the kernel. Anything else here is a bug.
     this.respondErr(proc, "ENOSYS");
@@ -707,70 +724,149 @@ export class Kernel {
     return method + " " + url + (accept ? " " + accept : "");
   }
 
+  // Run at most `fetchConcurrency` outbound requests at once; queue the rest.
+  // `task` is a () => Promise thunk that does one network fetch; the returned
+  // promise settles with the task's result once a slot frees up and it runs.
+  _scheduleFetch(task) {
+    return new Promise((resolve, reject) => {
+      this._fetchQueue.push({ task, resolve, reject });
+      this._drainFetchQueue();
+    });
+  }
+  _drainFetchQueue() {
+    while (this._fetchActive < this.fetchConcurrency && this._fetchQueue.length) {
+      const { task, resolve, reject } = this._fetchQueue.shift();
+      this._fetchActive++;
+      const done = () => {
+        this._fetchActive--;
+        this._drainFetchQueue();
+      };
+      task().then(
+        (v) => { done(); resolve(v); },
+        (e) => { done(); reject(e); },
+      );
+    }
+  }
+
+  // Resolve a request to a body materialized in the VFS, returning small JSON
+  // metadata { status, ok, headers, contentType, size, path, cached }. Shared by
+  // the blocking (OP_FETCH) and async (OP_FETCH_ASYNC) paths. Handles the content
+  // cache, in-flight de-dupe of identical cacheable GETs, and the concurrency cap.
+  async _fetchIntoVfs(pid, { url, method = "GET", headers = null, bodyB64 = null }) {
+    method = String(method || "GET").toUpperCase();
+    // Only idempotent bodyless GETs are cached (npm re-resolving the same
+    // packument). Anything with a body / non-GET always hits the network.
+    const cacheable = method === "GET" && !bodyB64;
+    const cacheKey = this._fetchCacheKey(method, url, headers);
+    const cached = cacheable ? this.fetchCache.get(cacheKey) : null;
+    if (cached) {
+      if (this.onFetch) this.onFetch(url, { cached: true, size: cached.size, pid });
+      return { ...cached, cached: true };
+    }
+    if (!this.fetcher) {
+      const err = new Error("ENETUNREACH");
+      err.code = "ENETUNREACH";
+      throw err;
+    }
+    // A burst of concurrent requests for the same packument (npm resolving the
+    // same dep from several branches at once) shares ONE network op + one write.
+    if (cacheable && this._fetchInflight.has(cacheKey)) {
+      const meta = await this._fetchInflight.get(cacheKey);
+      if (this.onFetch) this.onFetch(url, { cached: true, size: meta.size, pid });
+      return { ...meta, cached: true };
+    }
+    const work = this._scheduleFetch(() =>
+      this._doNetworkFetch({ url, method, headers, bodyB64, cacheKey, cacheable, pid }),
+    );
+    if (cacheable) {
+      this._fetchInflight.set(cacheKey, work);
+      const clear = () => { if (this._fetchInflight.get(cacheKey) === work) this._fetchInflight.delete(cacheKey); };
+      work.then(clear, clear);
+    }
+    const meta = await work;
+    return { ...meta, cached: false };
+  }
+
+  // The actual network round-trip: fetch (off-thread, in the Fetcher Worker) and
+  // stream the body into the VFS. `method`/`headers`/`bodyB64` (from the http/
+  // https client shim, lib/https.js) let a real ClientRequest egress; a bare
+  // `{url}` still works (GET).
+  async _doNetworkFetch({ url, method, headers, bodyB64, cacheKey, cacheable, pid }) {
+    const init = { method, headers: headers || undefined };
+    if (bodyB64) init.body = b64ToBytes(bodyB64);
+    const res = await this.fetcher(url, init);
+    const body = res.body instanceof Uint8Array ? res.body : new Uint8Array(res.body || 0);
+    const path = this._fetchCachePath(cacheKey);
+    this.mkdirp("/var/cache/oc-fetch");
+    // Normalize response headers to a lowercased plain object and drop the
+    // content-* encoding hints: the Fetcher Worker's fetch() already returns a
+    // DECODED body (gzip/br transfer-encoding stripped), so leaving these would
+    // make the client (npm) try to gunzip an already-plain body or mismatch the
+    // length. The body's own format (e.g. a .tgz) is untouched.
+    const headersOut = {};
+    const raw = res.headers || {};
+    const put = (k, v) => {
+      const lk = String(k).toLowerCase();
+      if (lk === "content-encoding" || lk === "content-length") return;
+      headersOut[lk] = v;
+    };
+    if (typeof raw.forEach === "function" && !Array.isArray(raw)) raw.forEach((v, k) => put(k, v));
+    else for (const k of Object.keys(raw)) put(k, raw[k]);
+    // Capture size before writeLarge: it transfers (detaches) body.buffer, after
+    // which body.byteLength reads 0.
+    const meta = {
+      status: res.status | 0,
+      statusText: res.statusText || "",
+      ok: !!res.ok,
+      headers: headersOut,
+      contentType: headersOut["content-type"] || "",
+      size: body.byteLength,
+      path,
+    };
+    // Large body bypasses the 1 MiB SAB: hand it to the FS Worker over a
+    // transferable buffer, then the process reads it back with normal fs (#14).
+    await this.fs.writeLarge(path, body);
+    if (cacheable) this.fetchCache.set(cacheKey, meta);
+    if (this.onFetch) this.onFetch(url, { cached: false, size: meta.size, pid });
+    return meta;
+  }
+
   // Deferred like handleSpawn: the caller stays parked on Atomics.wait while we
-  // fetch (off-thread, in the Fetcher Worker) and stream the body into the VFS.
-  // `method`/`headers`/`bodyB64` (from the http/https client shim, lib/https.js)
-  // let a real ClientRequest egress; a bare `{url}` still works (GET).
-  async handleFetch(proc, { url, method = "GET", headers = null, bodyB64 = null }) {
+  // fetch and stream the body into the VFS, then wakes with the JSON metadata.
+  async handleFetch(proc, req) {
     try {
-      method = String(method || "GET").toUpperCase();
-      // Only idempotent bodyless GETs are cached (npm re-resolving the same
-      // packument). Anything with a body / non-GET always hits the network.
-      const cacheable = method === "GET" && !bodyB64;
-      const cacheKey = this._fetchCacheKey(method, url, headers);
-      const cached = cacheable ? this.fetchCache.get(cacheKey) : null;
-      if (cached) {
-        if (this.onFetch) this.onFetch(url, { cached: true, size: cached.size, pid: proc.pid });
-        this.respondOk(proc, encodeString(JSON.stringify({ ...cached, cached: true })));
-        return;
-      }
-      if (!this.fetcher) {
-        this.respondErr(proc, "ENETUNREACH");
-        return;
-      }
-      const init = { method, headers: headers || undefined };
-      if (bodyB64) init.body = b64ToBytes(bodyB64);
-      const res = await this.fetcher(url, init);
+      const meta = await this._fetchIntoVfs(proc.pid, req);
       // Process may have exited while the fetch was in flight.
       if (!this.procs.has(proc.pid)) return;
-      const body = res.body instanceof Uint8Array ? res.body : new Uint8Array(res.body || 0);
-      const path = this._fetchCachePath(cacheKey);
-      this.mkdirp("/var/cache/oc-fetch");
-      // Normalize response headers to a lowercased plain object and drop the
-      // content-* encoding hints: the Fetcher Worker's fetch() already returns a
-      // DECODED body (gzip/br transfer-encoding stripped), so leaving these would
-      // make the client (npm) try to gunzip an already-plain body or mismatch the
-      // length. The body's own format (e.g. a .tgz) is untouched.
-      const headersOut = {};
-      const raw = res.headers || {};
-      const put = (k, v) => {
-        const lk = String(k).toLowerCase();
-        if (lk === "content-encoding" || lk === "content-length") return;
-        headersOut[lk] = v;
-      };
-      if (typeof raw.forEach === "function" && !Array.isArray(raw)) raw.forEach((v, k) => put(k, v));
-      else for (const k of Object.keys(raw)) put(k, raw[k]);
-      // Capture size before writeLarge: it transfers (detaches) body.buffer, after
-      // which body.byteLength reads 0.
-      const meta = {
-        status: res.status | 0,
-        statusText: res.statusText || "",
-        ok: !!res.ok,
-        headers: headersOut,
-        contentType: headersOut["content-type"] || "",
-        size: body.byteLength,
-        path,
-      };
-      // Large body bypasses the 1 MiB SAB: hand it to the FS Worker over a
-      // transferable buffer, then the process reads it back with normal fs (#14).
-      await this.fs.writeLarge(path, body);
-      if (cacheable) this.fetchCache.set(cacheKey, meta);
-      if (this.onFetch) this.onFetch(url, { cached: false, size: meta.size, pid: proc.pid });
-      this.respondOk(proc, encodeString(JSON.stringify({ ...meta, cached: false })));
+      this.respondOk(proc, encodeString(JSON.stringify(meta)));
     } catch (err) {
       if (!this.procs.has(proc.pid)) return;
       this.respondErr(proc, typeof err === "string" ? err : String(err?.message || "EFETCH"));
     }
+  }
+
+  // Async fetch (parallel downloads): the caller does NOT park — it gets an empty
+  // ack now and keeps running its event loop, issuing more fetches. When this one
+  // settles we post the outcome to the caller's worker (never over the SAB), so
+  // many downloads proceed at once (bounded by fetchConcurrency). See OP_FETCH_ASYNC.
+  handleFetchAsync(proc, req) {
+    const pid = proc.pid;
+    const fetchId = req.fetchId | 0;
+    // Acknowledge receipt immediately so the caller's loop keeps going.
+    this.respondOk(proc, EMPTY);
+    this._fetchIntoVfs(pid, req).then(
+      (meta) => {
+        this.postToProc(pid, { type: "fetch-done", fetchId, ok: true, meta });
+      },
+      (err) => {
+        this.postToProc(pid, {
+          type: "fetch-done",
+          fetchId,
+          ok: false,
+          error: typeof err === "string" ? err : String(err?.message || "EFETCH"),
+        });
+      },
+    );
   }
 
 }
