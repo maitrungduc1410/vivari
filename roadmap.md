@@ -1796,7 +1796,36 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
 - ✅ **Phase 3 (`[SPIKE]` — shipped `experimental`)** — Frontend variants: Preact, Lit, Solid,
   Qwik. Backends: Fastify, Nitro, GraphQL (Yoga), Feathers. Showcases: Socket.IO, tRPC, pnpm
   monorepo, SQLite (sql.js WASM).
-- ⏳ **Phase 4 — Angular spiked, blocked on the esbuild-service hard path (`scripts/spike-angular.mjs`).**
+- ✅ **Phase 4 (cont.) — standalone Webpack + Docusaurus proven headless AND shipped.** Two
+  new templates, each gated by a green spike (validated alongside the Next.js spike, which still
+  PASSes incl. the RSC-refresh gate):
+  - **Webpack** (`scripts/spike-webpack.mjs`, `Tooling`, non-experimental) — webpack 5 +
+    `webpack-dev-server` (connect + `ws` HMR + chokidar) + `html-webpack-plugin` + css/style
+    loaders. Binds `:8080`, serves the app, HMR live.
+  - **Docusaurus** (`scripts/spike-docusaurus.mjs`, `Docs`, `experimental` — heavy 100s+ install)
+    — Docusaurus 3 (webpack + MDX + React). Binds `:3000`, serves `/` (200, real Docusaurus HTML).
+
+  Standalone webpack (not Next's private copy) needed **three real runtime fixes** — all general
+  improvements, kept regardless of the templates:
+  1. **`require.extensions` populated (`module.js`).** `Module._extensions` was an empty
+     null-proto object; `webpack-cli`'s config loader (`rechoir`) does
+     `Object.keys(require.extensions).includes('.js')` and threw `No module loader found for '.js'`.
+     Now `.js`/`.json`/`.node` handlers are registered (the `.js` one delegates to our compiler),
+     so tools that both *read* and *patch* `require.extensions` (ts-node/tsx too) work.
+  2. **`vm.runInContext` completion value (`node/lib/vm.js`).** A multi-statement script's
+     completion value (a trailing bare expression) was lost — `html-webpack-plugin` evaluates a
+     child-compilation bundle that ends in a bare `HTML_WEBPACK_PLUGIN_RESULT` and reads it back,
+     so it errored `the loader didn't return html`. `runWithSandbox` now uses a *direct* `eval`
+     inside the `with(sandbox)` block, which both resolves free identifiers against the sandbox
+     proxy and returns the completion value.
+  3. **Benign `tls.TLSSocket` + the http2-wrapper hack (`node/lib/tls.js`).** There is no TLS
+     backend, but real deps *construct* a `TLSSocket` at module-load time for feature detection.
+     Construction is now benign (extends `net.Socket`, no I/O; only a real handshake throws), and
+     the socket carries a synthetic `_handle._parentWrap` whose `.constructor` is a harmless class
+     — `http2-wrapper` (a transitive dep of `got`, pulled by Docusaurus) reads exactly that at load
+     time (`new tls.TLSSocket(new PassThrough())._handle._parentWrap.constructor`) and would
+     otherwise crash on `null`. http/2-over-TLS is unused, so the harmless class is fine.
+- ⏳ **Phase 4 (cont.) — Angular spiked, blocked on the esbuild-service hard path (`scripts/spike-angular.mjs`).**
   The spike got Angular 21 (`@angular/build:dev-server`) from "the CLI won't even start" all the way
   to "`ng serve` binds its port, Vite + Rollup load, the esbuild Go/wasm actually runs, and the build
   begins" — fixing **five real runtime bugs** along the way (all validated against the Next.js spike,
@@ -1832,8 +1861,6 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   use the `process.stdin` stream). Both are the roadmap's heavy-toolchain "hard path"; until they land
   the spike ends `The service was stopped`. (`esbuild`→`esbuild-wasm` and `rollup`→`@rollup/wasm-node`
   are handled cleanly via npm `overrides` aliases — no file patching.)
-  - **Standalone Webpack** / **Docusaurus** — only Next's `webpack` path is proven; standalone
-    `webpack` + `webpack-dev-server` is unspiked. Docusaurus rides on it.
   - **Rust → WebAssembly** starter — needs a Rust toolchain (rustc/wasm-pack) in-VM that we haven't
     proven; consider an **AssemblyScript → WASM** substitute (pure-JS `asc` compiler) as the
     "compile & run WASM in a tab" showcase.

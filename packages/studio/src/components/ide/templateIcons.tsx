@@ -15,6 +15,8 @@ import NodeIcon from "~icons/vscode-icons/file-type-node";
 import PnpmIcon from "~icons/vscode-icons/file-type-pnpm";
 import SqliteIcon from "~icons/vscode-icons/file-type-sqlite";
 import NextjsIcon from "~icons/vscode-icons/file-type-next";
+import WebpackIcon from "~icons/vscode-icons/file-type-webpack";
+import DocusaurusIcon from "~icons/vscode-icons/file-type-docusaurus";
 
 type IconProps = { className?: string };
 
@@ -109,6 +111,7 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   three: Badge({ text: "3", bg: "#000" }),
   gsap: Badge({ text: "GS", bg: "#0ae448", fg: "#0e100f" }),
   node: (p) => <NodeIcon className={p.className} />,
+  webpack: (p) => <WebpackIcon className={p.className} />,
   sse: Badge({ text: "SSE", bg: "#16a34a" }),
   ws: Badge({ text: "WS", bg: "#646cff" }),
   fullstack: Badge({ text: "FS", bg: "#646cff" }),
@@ -119,6 +122,7 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   astro: (p) => <AstroIcon className={p.className} />,
   vitepress: Badge({ text: "VP", bg: "#3451b2" }),
   slidev: Badge({ text: "Sl", bg: "#0e9aa5" }),
+  docusaurus: (p) => <DocusaurusIcon className={p.className} />,
   // Phase 3 — frontend variants
   preact: (p) => <PreactIcon className={p.className} />,
   lit: Badge({ text: "Lit", bg: "#324fff" }),

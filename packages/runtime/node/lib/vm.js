@@ -54,14 +54,17 @@ export default function (exports, require, module) {
     });
     const src = String(code);
     const filename = filenameOf(options);
-    let fn;
-    try {
-      // eslint-disable-next-line no-new-func
-      fn = new Function("__oc_ctx__", `with(__oc_ctx__){ return (\n${src}\n); }\n//# sourceURL=${filename}`);
-    } catch {
-      // eslint-disable-next-line no-new-func
-      fn = new Function("__oc_ctx__", `with(__oc_ctx__){ ${src}\n }\n//# sourceURL=${filename}`);
-    }
+    // Real vm returns the script's *completion value* (the value of a trailing
+    // expression statement), which a `new Function` body can't yield for a
+    // multi-statement program — wrapping it as `return (…)` is a SyntaxError, and
+    // a bare `with(ctx){ … }` returns undefined. A *direct* eval inside the
+    // `with` block gives us both: free identifiers still resolve against the
+    // sandbox (through the proxy), and eval returns the completion value.
+    // html-webpack-plugin depends on this — its child-compilation template bundle
+    // ends in a bare `HTML_WEBPACK_PLUGIN_RESULT` expression it reads back.
+    const evalArg = JSON.stringify(`${src}\n//# sourceURL=${filename}`);
+    // eslint-disable-next-line no-new-func
+    const fn = new Function("__oc_ctx__", `with(__oc_ctx__){ return eval(${evalArg}); }`);
     return fn.call(proxyRef, proxyRef);
   }
 
