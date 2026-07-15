@@ -8,11 +8,186 @@
 //! Errors are surfaced to JS as `errno`-style string codes ("ENOENT", ...) which
 //! the JS `fs` facade turns into Node-compatible errors (`err.code`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use wasm_bindgen::prelude::*;
 
 const ROOT_ID: u64 = 1;
 const SYMLINK_MAX_DEPTH: usize = 40;
+
+// --- Whole-file lazy compression tuning -----------------------------------
+// Files smaller than this are never worth compressing (zlib framing overhead +
+// the CPU cost dwarfs the win). node_modules is dominated by small JS files,
+// but the big wins come from the handful of large bundles/maps.
+const MIN_COMPRESS_BYTES: usize = 4096;
+// If zlib can't beat this fraction of the original size, keep the file Raw so we
+// never pay decompression cost for a negligible saving (e.g. already-compressed
+// assets like .png/.woff2 inside node_modules).
+const MIN_COMPRESS_RATIO: f64 = 0.95;
+// Bound on the transient decompressed-bytes cache used to serve chunked reads of
+// cold (compressed) files without re-inflating on every fd_read call.
+const HOT_CACHE_MAX_BYTES: usize = 48 * 1024 * 1024;
+
+/// zlib-compress a whole file body. Never panics; on encoder error returns an
+/// empty vec (caller treats a poor ratio as "keep Raw", so this stays correct).
+fn zlib_compress(raw: &[u8]) -> Vec<u8> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut enc = ZlibEncoder::new(
+        Vec::with_capacity(raw.len() / 3 + 64),
+        Compression::new(6),
+    );
+    if enc.write_all(raw).is_err() {
+        return Vec::new();
+    }
+    enc.finish().unwrap_or_default()
+}
+
+/// Inflate bytes produced by `zlib_compress`. `len` is the known logical length,
+/// used to pre-size the output buffer so there's a single allocation.
+fn zlib_decompress(data: &[u8], len: usize) -> Vec<u8> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+    let mut dec = ZlibDecoder::new(data);
+    let mut out = Vec::with_capacity(len);
+    dec.read_to_end(&mut out).ok();
+    out
+}
+
+/// Slice `[start, start+len)` out of a byte buffer, clamped to its bounds.
+fn read_range(buf: &[u8], start: usize, len: usize) -> Vec<u8> {
+    if start >= buf.len() {
+        return Vec::new();
+    }
+    let end = (start + len).min(buf.len());
+    buf[start..end].to_vec()
+}
+
+/// A regular file's contents: either plain bytes (hot / being written) or a
+/// zlib blob plus the known uncompressed length (cold). Reads transparently
+/// inflate; the first write inflates in place (see `raw_mut`) and the file is
+/// (re)compressed when its last writable fd closes.
+enum FileBody {
+    Raw(Vec<u8>),
+    Zip { data: Vec<u8>, len: usize },
+}
+
+impl FileBody {
+    fn raw(v: Vec<u8>) -> Self {
+        FileBody::Raw(v)
+    }
+
+    /// Uncompressed length — what `stat().size` and offsets are measured in.
+    fn logical_len(&self) -> usize {
+        match self {
+            FileBody::Raw(b) => b.len(),
+            FileBody::Zip { len, .. } => *len,
+        }
+    }
+
+    /// Bytes actually held in RAM (compressed size for Zip). Drives mem_bytes.
+    fn physical_len(&self) -> usize {
+        match self {
+            FileBody::Raw(b) => b.len(),
+            FileBody::Zip { data, .. } => data.len(),
+        }
+    }
+
+    fn is_zip(&self) -> bool {
+        matches!(self, FileBody::Zip { .. })
+    }
+
+    /// Borrow the raw bytes. Only valid for Raw bodies; callers use this on the
+    /// non-compressed fast path (Zip reads go through the hot cache instead).
+    fn raw_ref(&self) -> &[u8] {
+        match self {
+            FileBody::Raw(b) => b.as_slice(),
+            FileBody::Zip { .. } => &[],
+        }
+    }
+
+    /// Materialize a full owned copy of the logical bytes (inflating if needed).
+    fn to_vec(&self) -> Vec<u8> {
+        match self {
+            FileBody::Raw(b) => b.clone(),
+            FileBody::Zip { data, len } => zlib_decompress(data, *len),
+        }
+    }
+
+    /// Get a mutable handle to the raw bytes, inflating a Zip body in place. Any
+    /// mutation makes the file Raw until it is re-compressed on close.
+    fn raw_mut(&mut self) -> &mut Vec<u8> {
+        if let FileBody::Zip { data, len } = self {
+            let raw = zlib_decompress(data, *len);
+            *self = FileBody::Raw(raw);
+        }
+        match self {
+            FileBody::Raw(b) => b,
+            FileBody::Zip { .. } => unreachable!("just converted to Raw"),
+        }
+    }
+
+    /// Reset to an empty Raw body (O_TRUNC / truncate to 0).
+    fn clear(&mut self) {
+        *self = FileBody::Raw(Vec::new());
+    }
+}
+
+/// Bounded FIFO cache of decompressed bytes for cold files. Keyed by inode so a
+/// chunked read loop (fd_read called repeatedly) inflates once. Invalidated when
+/// the file is written or recompressed.
+struct HotCache {
+    map: HashMap<u64, Vec<u8>>,
+    order: VecDeque<u64>,
+    bytes: usize,
+    cap: usize,
+}
+
+impl HotCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            cap,
+        }
+    }
+
+    fn contains(&self, inode: u64) -> bool {
+        self.map.contains_key(&inode)
+    }
+
+    fn get(&self, inode: u64) -> Option<&Vec<u8>> {
+        self.map.get(&inode)
+    }
+
+    fn insert(&mut self, inode: u64, buf: Vec<u8>) {
+        self.invalidate(inode);
+        self.bytes += buf.len();
+        self.map.insert(inode, buf);
+        self.order.push_back(inode);
+        while self.bytes > self.cap && self.order.len() > 1 {
+            if let Some(old) = self.order.pop_front() {
+                if let Some(v) = self.map.remove(&old) {
+                    self.bytes -= v.len();
+                }
+            }
+        }
+    }
+
+    fn invalidate(&mut self, inode: u64) {
+        if let Some(v) = self.map.remove(&inode) {
+            self.bytes -= v.len();
+            self.order.retain(|&x| x != inode);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+}
 
 /// errno-style errors. `code()` is what crosses the Wasm boundary into JS.
 #[derive(Clone, Copy)]
@@ -65,7 +240,7 @@ struct OpenFile {
 type VfsResult<T> = Result<T, VfsError>;
 
 enum NodeData {
-    File(Vec<u8>),
+    File(FileBody),
     Dir(BTreeMap<String, u64>), // BTreeMap => readdir is naturally sorted
     Symlink(String),
 }
@@ -78,6 +253,10 @@ struct Inode {
     // links (VFS.link) share one inode across several names; the inode is only
     // freed when the last link is removed. Regular files/dirs have exactly 1.
     nlink: u32,
+    // Number of currently-open writable fds. A file is only (re)compressed once
+    // this drops back to 0, so an in-progress write is never fighting the
+    // compressor. Non-files stay at 0.
+    wopen: u32,
 }
 
 #[wasm_bindgen]
@@ -87,6 +266,11 @@ pub struct VirtualFileSystem {
     open_files: HashMap<u64, OpenFile>,
     // Descriptors start at 3, leaving 0/1/2 for the stdio the runtime owns.
     next_fd: u64,
+    // Whole-file lazy compression gate. Off by default; the FS worker flips it on
+    // via `set_compression` (URL ?compress=1) so it can be A/B benchmarked.
+    compression: bool,
+    // Transient decompressed bytes for cold-file reads (not part of the FS state).
+    hot: HotCache,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +291,7 @@ impl VirtualFileSystem {
                 mode,
                 mtime: Self::now(),
                 nlink: 0, // linked (nlink -> 1) when attached to a parent dir
+                wopen: 0,
             },
         );
         id
@@ -204,6 +389,59 @@ impl VirtualFileSystem {
             _ => None,
         }
     }
+
+    /// Ensure the decompressed bytes for a cold file are present in the hot cache.
+    /// No-op for Raw files (they're read directly) and for cache hits.
+    fn ensure_hot(&mut self, inode: u64) {
+        if self.hot.contains(inode) {
+            return;
+        }
+        let raw = match self.inodes.get(&inode).map(|n| &n.data) {
+            Some(NodeData::File(FileBody::Zip { data, len })) => zlib_decompress(data, *len),
+            _ => return,
+        };
+        self.hot.insert(inode, raw);
+    }
+
+    /// Compress a file body if it's Raw, eligible (large enough, no writable fd
+    /// open, gate enabled) and zlib actually beats MIN_COMPRESS_RATIO. Otherwise
+    /// leaves it untouched. Called on the last writable close and after write_file.
+    fn maybe_compress(&mut self, inode: u64) {
+        if !self.compression {
+            return;
+        }
+        // Phase 1: decide + produce the compressed bytes while only borrowing
+        // immutably, so we can swap the body in afterwards without borrow clashes.
+        let produced = {
+            let node = match self.inodes.get(&inode) {
+                Some(n) => n,
+                None => return,
+            };
+            if node.wopen > 0 {
+                return;
+            }
+            match &node.data {
+                NodeData::File(FileBody::Raw(raw)) => {
+                    if raw.len() < MIN_COMPRESS_BYTES {
+                        return;
+                    }
+                    let compressed = zlib_compress(raw);
+                    if compressed.is_empty()
+                        || compressed.len() as f64 >= raw.len() as f64 * MIN_COMPRESS_RATIO
+                    {
+                        return;
+                    }
+                    (compressed, raw.len())
+                }
+                _ => return,
+            }
+        };
+        let (data, len) = produced;
+        if let Some(node) = self.inodes.get_mut(&inode) {
+            node.data = NodeData::File(FileBody::Zip { data, len });
+        }
+        self.hot.invalidate(inode);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +457,8 @@ impl VirtualFileSystem {
             next_id: ROOT_ID,
             open_files: HashMap::new(),
             next_fd: 3,
+            compression: false,
+            hot: HotCache::new(HOT_CACHE_MAX_BYTES),
         };
         fs.alloc(NodeData::Dir(BTreeMap::new()), 0o755); // root (== ROOT_ID)
 
@@ -248,7 +488,7 @@ impl VirtualFileSystem {
         (|| {
             let id = self.resolve(&path, true)?;
             match &self.inodes.get(&id).unwrap().data {
-                NodeData::File(b) => Ok(b.clone()),
+                NodeData::File(fb) => Ok(fb.to_vec()),
                 NodeData::Dir(_) => Err(VfsError::IsDir),
                 NodeData::Symlink(_) => Err(VfsError::Inval),
             }
@@ -260,22 +500,26 @@ impl VirtualFileSystem {
     pub fn write_file(&mut self, path: String, content: Vec<u8>) -> Result<(), String> {
         (|| {
             let (parent, name) = self.resolve_parent(&path)?;
-            match self.child_id(parent, &name) {
-                Some(cid) => match &mut self.inodes.get_mut(&cid).unwrap().data {
-                    NodeData::File(buf) => {
-                        *buf = content;
-                        self.inodes.get_mut(&cid).unwrap().mtime = Self::now();
-                        Ok(())
+            let id = match self.child_id(parent, &name) {
+                Some(cid) => {
+                    match &mut self.inodes.get_mut(&cid).unwrap().data {
+                        NodeData::File(fb) => *fb = FileBody::raw(content),
+                        NodeData::Dir(_) => return Err(VfsError::IsDir),
+                        NodeData::Symlink(_) => return Err(VfsError::Inval),
                     }
-                    NodeData::Dir(_) => Err(VfsError::IsDir),
-                    NodeData::Symlink(_) => Err(VfsError::Inval),
-                },
-                None => {
-                    let id = self.alloc(NodeData::File(content), 0o644);
-                    self.link_child(parent, &name, id);
-                    Ok(())
+                    self.inodes.get_mut(&cid).unwrap().mtime = Self::now();
+                    cid
                 }
-            }
+                None => {
+                    let id = self.alloc(NodeData::File(FileBody::raw(content)), 0o644);
+                    self.link_child(parent, &name, id);
+                    id
+                }
+            };
+            // Content changed: drop any cached inflate, then (maybe) recompress.
+            self.hot.invalidate(id);
+            self.maybe_compress(id);
+            Ok(())
         })()
         .map_err(VfsError::code)
     }
@@ -475,12 +719,13 @@ impl VirtualFileSystem {
                         }
                         NodeData::File(_) => {
                             if flags & O_TRUNC != 0 && writable {
-                                if let NodeData::File(buf) =
+                                if let NodeData::File(fb) =
                                     &mut self.inodes.get_mut(&id).unwrap().data
                                 {
-                                    buf.clear();
+                                    fb.clear();
                                 }
                                 self.inodes.get_mut(&id).unwrap().mtime = Self::now();
+                                self.hot.invalidate(id);
                             }
                         }
                         NodeData::Symlink(_) => {}
@@ -489,7 +734,7 @@ impl VirtualFileSystem {
                 }
                 Err(VfsError::NoEnt) if flags & O_CREAT != 0 => {
                     let (parent, name) = self.resolve_parent(&path)?;
-                    let id = self.alloc(NodeData::File(Vec::new()), mode & 0o777);
+                    let id = self.alloc(NodeData::File(FileBody::raw(Vec::new())), mode & 0o777);
                     self.link_child(parent, &name, id);
                     id
                 }
@@ -498,12 +743,18 @@ impl VirtualFileSystem {
 
             let pos = if flags & O_APPEND != 0 {
                 match &self.inodes.get(&inode).unwrap().data {
-                    NodeData::File(b) => b.len(),
+                    NodeData::File(fb) => fb.logical_len(),
                     _ => 0,
                 }
             } else {
                 0
             };
+            // Track writable opens so we only compress once the file is quiescent.
+            if writable {
+                if let Some(node) = self.inodes.get_mut(&inode) {
+                    node.wopen = node.wopen.saturating_add(1);
+                }
+            }
             let fd = self.next_fd;
             self.next_fd += 1;
             self.open_files.insert(
@@ -521,13 +772,22 @@ impl VirtualFileSystem {
         .map_err(VfsError::code)
     }
 
-    /// close(2). Idempotent-ish: an unknown fd is EBADF.
+    /// close(2). Idempotent-ish: an unknown fd is EBADF. Closing the last
+    /// writable fd on a file is the trigger to (re)compress it.
     pub fn close(&mut self, fd: u32) -> Result<(), String> {
-        self.open_files
-            .remove(&(fd as u64))
-            .map(|_| ())
-            .ok_or(VfsError::Badf)
-            .map_err(VfsError::code)
+        match self.open_files.remove(&(fd as u64)) {
+            Some(of) => {
+                if of.writable {
+                    if let Some(node) = self.inodes.get_mut(&of.inode) {
+                        node.wopen = node.wopen.saturating_sub(1);
+                    }
+                    self.maybe_compress(of.inode);
+                }
+                Ok(())
+            }
+            None => Err(VfsError::Badf),
+        }
+        .map_err(VfsError::code)
     }
 
     /// pread/read: read up to `len` bytes. `pos < 0` reads at (and advances) the
@@ -541,17 +801,25 @@ impl VirtualFileSystem {
             let inode = of.inode;
             let cursor = of.pos;
             let start = if pos >= 0.0 { pos as usize } else { cursor };
-            let out = match &self.inodes.get(&inode).ok_or(VfsError::Badf)?.data {
-                NodeData::File(b) => {
-                    if start >= b.len() {
-                        Vec::new()
-                    } else {
-                        let end = (start + len as usize).min(b.len());
-                        b[start..end].to_vec()
-                    }
+            // Cold (compressed) files are inflated once into the bounded hot cache
+            // so a chunked read loop doesn't re-inflate on every call; the file
+            // itself stays compressed. Raw files are read directly.
+            let is_zip = matches!(
+                self.inodes.get(&inode).ok_or(VfsError::Badf)?.data,
+                NodeData::File(FileBody::Zip { .. })
+            );
+            let out = if is_zip {
+                self.ensure_hot(inode);
+                match self.hot.get(inode) {
+                    Some(buf) => read_range(buf, start, len as usize),
+                    None => Vec::new(),
                 }
-                NodeData::Dir(_) => return Err(VfsError::IsDir),
-                NodeData::Symlink(_) => return Err(VfsError::Inval),
+            } else {
+                match &self.inodes.get(&inode).ok_or(VfsError::Badf)?.data {
+                    NodeData::File(fb) => read_range(fb.raw_ref(), start, len as usize),
+                    NodeData::Dir(_) => return Err(VfsError::IsDir),
+                    NodeData::Symlink(_) => return Err(VfsError::Inval),
+                }
             };
             if pos < 0.0 {
                 self.open_files.get_mut(&(fd as u64)).unwrap().pos = start + out.len();
@@ -573,9 +841,12 @@ impl VirtualFileSystem {
             let inode = of.inode;
             let cursor = of.pos;
             let append = of.append;
+            // Writing invalidates any cached inflate and (via raw_mut) inflates a
+            // compressed body in place; it recompresses when the last fd closes.
+            self.hot.invalidate(inode);
             let node = self.inodes.get_mut(&inode).ok_or(VfsError::Badf)?;
             let buf = match &mut node.data {
-                NodeData::File(b) => b,
+                NodeData::File(fb) => fb.raw_mut(),
                 NodeData::Dir(_) => return Err(VfsError::IsDir),
                 NodeData::Symlink(_) => return Err(VfsError::Inval),
             };
@@ -621,14 +892,40 @@ impl VirtualFileSystem {
         let mut total: usize = 0;
         for node in self.inodes.values() {
             total += match &node.data {
-                NodeData::File(b) => b.len(),
+                // Physical footprint: compressed size for cold files.
+                NodeData::File(fb) => fb.physical_len(),
                 NodeData::Symlink(t) => t.len(),
                 // Directory storage is the sum of its entry names + a per-entry map
                 // overhead (name String + u64 id ~ 8 bytes); a rough estimate.
                 NodeData::Dir(m) => m.keys().map(|k| k.len() + 8).sum::<usize>(),
             };
         }
+        // The hot-read cache is genuinely resident RAM too, so count it.
+        (total + self.hot.bytes) as f64
+    }
+
+    /// Diagnostic companion to `mem_bytes`: the uncompressed footprint the VFS
+    /// would occupy with compression off. Dividing mem_bytes by this gives the
+    /// realized compression ratio for the Measure Memory readout.
+    pub fn logical_mem_bytes(&self) -> f64 {
+        let mut total: usize = 0;
+        for node in self.inodes.values() {
+            total += match &node.data {
+                NodeData::File(fb) => fb.logical_len(),
+                NodeData::Symlink(t) => t.len(),
+                NodeData::Dir(m) => m.keys().map(|k| k.len() + 8).sum::<usize>(),
+            };
+        }
         total as f64
+    }
+
+    /// Enable/disable whole-file lazy compression at runtime. Turning it off does
+    /// not eagerly inflate existing Zip bodies; they inflate lazily on read/write.
+    pub fn set_compression(&mut self, on: bool) {
+        self.compression = on;
+        if !on {
+            self.hot.clear();
+        }
     }
 
     /// Diagnostic companion to `mem_bytes`: how many regular files the VFS holds.
@@ -647,9 +944,10 @@ impl VirtualFileSystem {
                 return Err(VfsError::Badf);
             }
             let inode = of.inode;
+            self.hot.invalidate(inode);
             let node = self.inodes.get_mut(&inode).ok_or(VfsError::Badf)?;
             match &mut node.data {
-                NodeData::File(b) => b.resize(len as usize, 0),
+                NodeData::File(fb) => fb.raw_mut().resize(len as usize, 0),
                 NodeData::Dir(_) => return Err(VfsError::IsDir),
                 NodeData::Symlink(_) => return Err(VfsError::Inval),
             }
@@ -694,7 +992,7 @@ impl VirtualFileSystem {
     fn stat_node_json(&self, id: u64) -> String {
         let node = self.inodes.get(&id).unwrap();
         let (kind, size) = match &node.data {
-            NodeData::File(b) => ("file", b.len()),
+            NodeData::File(fb) => ("file", fb.logical_len()),
             NodeData::Dir(m) => ("dir", m.len()),
             NodeData::Symlink(t) => ("symlink", t.len()),
         };

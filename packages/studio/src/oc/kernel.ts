@@ -147,7 +147,10 @@ export class KernelBridge {
 
   /** Start the kernel (spawns fs/fetcher workers + VFS, then posts `ready`). */
   boot() {
-    this.worker.postMessage({ type: "init" });
+    // `?compress=1` turns on the VFS's whole-file lazy compression so its memory
+    // footprint can be A/B benchmarked against the default (uncompressed) build.
+    const compress = new URLSearchParams(location.search).has("compress");
+    this.worker.postMessage({ type: "init", compress });
   }
 }
 

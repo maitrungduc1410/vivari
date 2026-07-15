@@ -21,7 +21,21 @@ import { createOpfsPersistence } from "../kernel-host/opfs-persistence.js";
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
 let server = null;
+let vfsRef = null; // the live VFS, set as soon as it's constructed (pre-restore)
+let compressionOn = false; // whole-file lazy compression gate (URL ?compress=1)
 const queue = []; // messages that arrive before the VFS finishes booting
+
+// Apply the current compression gate to the VFS. Guarded so an older wasm build
+// without set_compression simply ignores the flag instead of throwing.
+function applyCompression() {
+  if (vfsRef && typeof vfsRef.set_compression === "function") {
+    try {
+      vfsRef.set_compression(compressionOn);
+    } catch {
+      /* older build — no-op */
+    }
+  }
+}
 
 function handle(msg) {
   switch (msg.type) {
@@ -60,15 +74,31 @@ function handle(msg) {
       const vfs = server && server.vfs;
       const bytes = vfs && typeof vfs.mem_bytes === "function" ? vfs.mem_bytes() : -1;
       const files = vfs && typeof vfs.file_count === "function" ? vfs.file_count() : -1;
-      post("fs-mem", { id: msg.id, bytes, files });
+      // Logical (uncompressed) footprint, so the readout can show the ratio.
+      const logical =
+        vfs && typeof vfs.logical_mem_bytes === "function" ? vfs.logical_mem_bytes() : -1;
+      post("fs-mem", { id: msg.id, bytes, files, logical });
       break;
     }
+    case "fs-set-compression":
+      compressionOn = !!msg.on;
+      applyCompression();
+      break;
   }
 }
 
 self.onmessage = (event) => {
-  if (server) handle(event.data);
-  else queue.push(event.data);
+  const d = event.data;
+  // The compression gate can arrive before the VFS finishes booting; honor it
+  // immediately (and again once the VFS exists) so it takes effect before the
+  // OPFS restore, letting restored files compress on write.
+  if (d && d.type === "fs-set-compression") {
+    compressionOn = !!d.on;
+    applyCompression();
+    return;
+  }
+  if (server) handle(d);
+  else queue.push(d);
 };
 
 // A small vfs-bound facade the OPFS adapter uses to read current state and to
@@ -161,6 +191,10 @@ const shouldPersist = (p) => {
   post("log", { line: "  [boot] initializing virtual file system…", cls: "muted" });
   await initKernel(new URL("../vfs/pkg/open_webcontainer_vfs_bg.wasm", import.meta.url));
   const vfs = new VirtualFileSystem();
+  // Honor a compression flag that may have arrived before the VFS existed, so it
+  // is in force before the OPFS restore below.
+  vfsRef = vfs;
+  applyCompression();
 
   // Best-effort OPFS persistence. If the API is missing or throws (private
   // mode, quota, older engine), we run exactly like before — purely in RAM.

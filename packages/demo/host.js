@@ -720,7 +720,10 @@ async function main() {
   });
 
   await registerServiceWorker();
-  kernelWorker.postMessage({ type: "init" });
+  // `?compress=1` enables the VFS's whole-file lazy compression (opt-in, for
+  // A/B benchmarking its memory footprint).
+  const compress = new URLSearchParams(location.search).has("compress");
+  kernelWorker.postMessage({ type: "init", compress });
 }
 
 main();
