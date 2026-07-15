@@ -281,6 +281,7 @@ export class IdeController {
   private monaco: typeof Monaco | null = null;
   private editor: Monaco.editor.IStandaloneCodeEditor | null = null;
   private editorMounting = false; // guards the async create against StrictMode double-mount
+  private editorOpener: Monaco.IDisposable | null = null; // cross-file go-to-definition hook
   private models = new Map<string, Monaco.editor.ITextModel>(); // abs -> model
   private depLibsByRoot = new Map<string, Map<string, string>>(); // root -> (extra-lib uri -> content)
   private depsSig = new Map<string, string>(); // root -> last node_modules fingerprint
@@ -620,6 +621,7 @@ export class IdeController {
     const monaco = await import("monaco-editor");
     this.monaco = monaco;
     this.configureLanguageService(monaco);
+    this.wireGoToDefinition(monaco);
     this.editor = monaco.editor.create(el, {
       model: null,
       theme: "vs-dark",
@@ -631,6 +633,18 @@ export class IdeController {
       scrollBeyondLastLine: false,
       tabSize: 2,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      // Go-to-definition should NAVIGATE, not peek. The Peek widget's preview pane
+      // can only render an existing Monaco model, but dependency types live only as
+      // extra libs (see loadDependencyTypes) — never as models — so peeking a
+      // node_modules definition shows an empty preview. Jumping straight to the
+      // first location routes through our editor opener, which reads the target
+      // from the VFS and opens it as a real tab (so .d.ts targets render fine).
+      gotoLocation: {
+        multipleDefinitions: "goto",
+        multipleTypeDefinitions: "goto",
+        multipleDeclarations: "goto",
+        multipleImplementations: "goto",
+      },
     });
     // Seed the language service with any folders indexed before the editor was
     // ready (source files as models for cross-file IntelliSense; dependency types
@@ -685,6 +699,37 @@ export class IdeController {
     ts.javascriptDefaults.setEagerModelSync(false);
     // Mirror the worker's markers into a Problems count in the status bar.
     monaco.editor.onDidChangeMarkers(() => this.recomputeProblems());
+  }
+
+  // Wire cross-file "go to definition" (⌘/Ctrl+click, F12) into our tab system.
+  // A Monaco standalone editor does NOTHING for a resource other than the model
+  // it currently has attached unless an opener is registered — so a definition in
+  // another file (or an installed package's .d.ts) silently no-ops. We intercept
+  // it and route through openFileAt, which opens/activates the React tab AND
+  // reveals the target line/column. (Same-file definitions are handled by Monaco
+  // internally and never reach this hook.)
+  private wireGoToDefinition(monaco: typeof Monaco) {
+    if (this.editorOpener) return;
+    this.editorOpener = monaco.editor.registerEditorOpener({
+      openCodeEditor: (_source, resource, selectionOrPosition) => {
+        const abs = resource.path; // Uri.file(abs).path === abs
+        let line = 1, column = 1, length = 0;
+        if (selectionOrPosition) {
+          if ("startLineNumber" in selectionOrPosition) {
+            line = selectionOrPosition.startLineNumber;
+            column = selectionOrPosition.startColumn;
+            if (selectionOrPosition.endLineNumber === selectionOrPosition.startLineNumber) {
+              length = selectionOrPosition.endColumn - selectionOrPosition.startColumn;
+            }
+          } else {
+            line = selectionOrPosition.lineNumber;
+            column = selectionOrPosition.column;
+          }
+        }
+        void this.openFileAt(abs, line, column, length);
+        return true; // handled — suppress Monaco's default no-op
+      },
+    });
   }
 
   private recomputeProblems() {
