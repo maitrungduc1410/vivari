@@ -24,17 +24,67 @@ const T_META = 3;
 
 const ID = "[A-Za-z_$][\\w$]*";
 
+// Keywords after which a `/` begins a regex literal, not division. Bundlers
+// routinely omit the space (`return/re/.test(x)`, `typeof/re/`), so a single
+// previous-char check misreads the `/` as division and then mis-lexes the
+// regex body — desyncing the whole scan and losing later top-level `export`s.
+const REGEX_PRECEDING_KEYWORDS = new Set([
+  "return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
+  "case", "do", "else", "yield", "await", "throw",
+]);
+
+// Whether the `/` at `src[i]` can start a regex literal (vs. be a division).
+// A `/` is a regex start after nothing, after most operators/punctuation, or
+// after a regex-preceding keyword; it is division after an identifier, number,
+// or a closing `)`/`]`/`}`.
+function canStartRegex(src, i) {
+  let j = i - 1;
+  while (j >= 0 && /\s/.test(src[j])) j--;
+  if (j < 0) return true; // start of input
+  const p = src[j];
+  if ("(,=:[!&|?{};+-*%<>~^".includes(p)) return true;
+  if (/[\w$]/.test(p)) {
+    // Read the identifier/keyword ending at j; a regex follows only keywords.
+    let k = j;
+    while (k >= 0 && /[\w$]/.test(src[k])) k--;
+    return REGEX_PRECEDING_KEYWORDS.has(src.slice(k + 1, j + 1));
+  }
+  return false;
+}
+
 // Per-module interop helpers + import.meta, kept on ONE leading line so user
 // code line numbers are preserved. They close over the wrapper's `require`/
 // `__filename`, so dynamic import + import.meta.resolve resolve relative to the
 // importing module.
-function helpers(fileUrl) {
+//
+// import.meta carries url + resolve AND filename/dirname: Node has exposed
+// `import.meta.filename` / `import.meta.dirname` (for file: modules) since
+// v20.11, and modern bundled ESM uses them directly instead of the older
+// `fileURLToPath(import.meta.url)` shim — e.g. unplugin 2.x:
+//   const LOADER = resolve(import.meta.dirname, "webpack/loaders/transform.mjs");
+// Without them `import.meta.dirname` is undefined and path.resolve throws
+// (`"paths[0]" argument must be of type string`).
+function helpers(fileUrl, filename) {
+  const fp = filename || "";
+  let dir;
+  const idx = fp.lastIndexOf("/");
+  if (idx < 0) dir = ".";
+  else if (idx === 0) dir = "/";
+  else dir = fp.slice(0, idx);
   return (
     "const __oc_def=function(m){return m&&m.__esModule?m.default:m;};" +
     "const __oc_ns=function(m){if(m&&m.__esModule)return m;var ns=Object.create(null);if(m)for(var k of Object.keys(m)){Object.defineProperty(ns,k,{enumerable:true,configurable:true,get:(function(k){return function(){return m[k];};})(k)});}ns.default=m;Object.defineProperty(ns,'__esModule',{value:true});return ns;};" +
-    "const __oc_star=function(e,m){if(m)for(var k of Object.keys(m)){if(k!=='default'&&!(k in e))Object.defineProperty(e,k,{enumerable:true,configurable:true,get:function(){return m[k];}});}};" +
+    // Each getter MUST close over its OWN `k` (per-iteration IIFE), not the shared
+    // loop `var k` — otherwise every re-exported name resolves to the LAST key of
+    // `m`. That desync silently collapses all of `export * from 'x'`'s names onto
+    // one value (e.g. vue's `index.mjs` re-exports everything, so `createApp`
+    // became `withScopeId` — Nuxt SSR then read `.config` off the wrong object).
+    "const __oc_star=function(e,m){if(m)for(var k of Object.keys(m)){if(k!=='default'&&!(k in e))Object.defineProperty(e,k,{enumerable:true,configurable:true,get:(function(k){return function(){return m[k];};})(k)});}};" +
     "const __oc_import=function(s){return Promise.resolve().then(function(){return __oc_require(s);});};" +
-    "const __oc_meta={url:" + JSON.stringify(fileUrl) + ",resolve:function(s){return __oc_require.resolve?__oc_require.resolve(s):s;}};"
+    "const __oc_meta={url:" + JSON.stringify(fileUrl) +
+      ",filename:" + JSON.stringify(fp) +
+      ",dirname:" + JSON.stringify(dir) +
+      ",resolve:function(s){return __oc_require.resolve?__oc_require.resolve(s):s;}};"
   );
 }
 
@@ -88,11 +138,7 @@ function skipBalanced(src, i) {
     // being misread as a string, swallowing the matching `}` and losing later
     // top-level `export`s. Same canRegex heuristic as scanExportEdits.
     if (ch === "/") {
-      let j = i - 1;
-      while (j >= 0 && /\s/.test(src[j])) j--;
-      const p = src[j];
-      const canRegex = p === undefined || "(,=:[!&|?{};+-*%<>~^".includes(p);
-      if (canRegex) {
+      if (canStartRegex(src, i)) {
         i++;
         let inClass = false;
         while (i < n) {
@@ -157,11 +203,6 @@ function scanExportEdits(src, isFrom) {
   const n = src.length;
   let i = 0;
   const isId = (c) => /[\w$]/.test(c);
-  const prevSignificant = () => {
-    let j = i - 1;
-    while (j >= 0 && /\s/.test(src[j])) j--;
-    return src[j];
-  };
   while (i < n) {
     const c = src[i];
     // skip line comment
@@ -183,9 +224,7 @@ function scanExportEdits(src, isFrom) {
     if (c === "`") { i = skipTemplate(src, i); continue; }
     // skip regex literal (best-effort: only when a '/' can start a regex)
     if (c === "/") {
-      const p = prevSignificant();
-      const canRegex = p === undefined || "(,=:[!&|?{};+-*%<>~^".includes(p);
-      if (canRegex) {
+      if (canStartRegex(src, i)) {
         i++;
         let inClass = false;
         while (i < n) {
@@ -211,6 +250,18 @@ function scanExportEdits(src, isFrom) {
       if (isFrom(i)) { i += 6; continue; }
       let r = i + 6;
       while (r < n && /\s/.test(src[r])) r++;
+      // `export` is only a keyword when a real export form follows: `default`,
+      // `{`, `*`, or a declaration (function/class/const/let/var/async/... —
+      // i.e. an identifier-start char). When the next token is `:` / `.` / `(`
+      // / `=` / `,` etc. this `export` is actually a property name or member
+      // access (`{ export: x }`, `obj.export`, `export()`), NOT a statement.
+      // Stripping it there corrupts the code (e.g. `export: name` -> `: name`,
+      // "Unexpected token ':'"). Skip it and keep scanning.
+      const follow = src[r];
+      if (follow !== "{" && follow !== "*" && !/[A-Za-z_$]/.test(follow || " ")) {
+        i += 6;
+        continue;
+      }
       if (src.startsWith("default", r) && !isId(src[r + 7] || " ")) {
         // A NAMED `export default function foo`/`class foo` is a *declaration*: it
         // binds `foo` at module scope (and, for functions, hoists it). Rewriting it
@@ -476,7 +527,7 @@ export function transpileEsm(source, filename) {
 
   const fileUrl = "file://" + (filename || "");
   const head =
-    helpers(fileUrl) +
+    helpers(fileUrl, filename) +
     "Object.defineProperty(__oc_exports,'__esModule',{value:true});" +
     // Local export getters first (live bindings visible to circular importers),
     // then import requires + import-derived bindings + re-export getters.

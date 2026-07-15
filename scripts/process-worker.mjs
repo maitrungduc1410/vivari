@@ -86,6 +86,9 @@ parentPort.on("message", (msg) => {
   // A browser preview ws tunnel message relayed by the kernel (#19 stage C).
   else if (msg.type === "ws-open" || msg.type === "ws-in" || msg.type === "ws-close")
     control && control.dispatchWs(msg);
+  // A cross-process pipe (UNIX socket) message relayed by the kernel.
+  else if (msg.type === "pipe-open" || msg.type === "pipe-data" || msg.type === "pipe-shutdown" || msg.type === "pipe-close")
+    control && control.dispatchPipe(msg);
   // An interactive stdin chunk for this process (host terminal / parent -> child).
   else if (msg.type === "stdin") control && control.dispatchStdin(msg);
   // An async fetch result relayed by the kernel (parallel downloads).

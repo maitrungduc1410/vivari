@@ -884,11 +884,18 @@ async function boot() {
           // First server of this project → primary preview (opens folder + entry).
           p.pending = true;
           announceProjectReady(pdir, port);
-        } else {
-          // A second/third server started by the SAME run (e.g. a backend API or
-          // ws server alongside the frontend) → open an ADDITIONAL preview tab.
+        } else if (p.multiPreview) {
+          // A template that INTENTIONALLY runs multiple user-facing servers (e.g.
+          // a backend API alongside the frontend) → open an ADDITIONAL preview
+          // tab per extra server. Opt-in only (manifest.multiPreview).
           announceProjectExtra(pdir, port);
         }
+        // Otherwise this is an INTERNAL port of a single dev server — Vite's HMR
+        // WebSocket (:24678, answers "Upgrade Required" to a browser), a
+        // framework's SSR/render worker (Nuxt/Nitro's ephemeral port, reached via
+        // the main server's proxy), etc. It's not a browsable app on its own, so
+        // we do NOT open a preview tab for it. It's still tracked in p.ports above
+        // so a server restart reloads the real tab and project cleanup releases it.
       }
       return;
     }
@@ -945,6 +952,12 @@ async function boot() {
   // shims; a fresh origin fetches + unpacks the ~12 MB asset once (one batched
   // VFS transfer). A missing asset simply means no `npm` on PATH, like yarn/pnpm.
   kernel.mkdirp("/home/user");
+  // os.tmpdir() is "/tmp", so it MUST exist: tools call mkdtempSync(join(tmpdir(),
+  // "x-")) at startup (e.g. Nuxt/vite-node's generateSocketPath), which mkdir's a
+  // random child of /tmp and throws ENOENT if /tmp is missing. It used to be
+  // created implicitly by the /tmp/.npm cache dirs — those moved to
+  // /home/user/.cache, so create /tmp explicitly now.
+  kernel.mkdirp("/tmp");
   // Package-manager caches live under /home/user/.cache (persisted in OPFS), so
   // downloaded tarballs/binaries are reused across projects and page reloads.
   kernel.mkdirp("/home/user/.cache/npm/_logs");

@@ -75,6 +75,15 @@ export interface TemplateManifest {
    * under the proxy path (deep-links + `location.reload()` work).
    */
   keepPreviewPrefix?: boolean;
+  /**
+   * A template whose dev run INTENTIONALLY exposes more than one user-facing
+   * server (e.g. a backend API alongside the frontend) sets this so each extra
+   * port that binds opens its own preview tab. Off by default: a single dev
+   * server's other ports — Vite's HMR WebSocket (:24678), a framework's
+   * SSR/render worker (Nuxt/Nitro's ephemeral port), etc. — are internal
+   * infrastructure, not browsable apps, so they must NOT each spawn a tab.
+   */
+  multiPreview?: boolean;
 }
 
 export interface TemplateDef {
@@ -790,6 +799,9 @@ function wsDemoTemplate(): TemplateDef {
       entry: "src/main.js",
       hmr: true,
       reload: false,
+      // Two intentional user-facing servers (backend :3001 + frontend :5173), so
+      // surface a preview tab for each — the frontend is primary, the backend extra.
+      multiPreview: true,
       install: "npm install",
       // sh has no job control (&), so a tiny CJS orchestrator starts both servers.
       dev: "node dev.js",
@@ -1844,6 +1856,8 @@ function fullstackTemplate(): TemplateDef {
       entry: "src/App.jsx",
       hmr: true,
       reload: false,
+      // Two intentional user-facing servers (API :3001 + frontend :5173) → a tab each.
+      multiPreview: true,
       install: "npm install",
       dev: "node dev.js",
     },
@@ -3070,6 +3084,8 @@ function trpcTemplate(): TemplateDef {
       entry: "src/App.tsx",
       hmr: true,
       reload: false,
+      // Two intentional user-facing servers (tRPC :3001 + frontend :5173) → a tab each.
+      multiPreview: true,
       install: "npm install",
       dev: "npm run dev",
       experimental: true,

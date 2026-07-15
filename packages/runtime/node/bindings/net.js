@@ -17,12 +17,21 @@
 // arriving via the Service Worker, or tests calling kernel.handleHttpRequest —
 // are routed to this process. The runtime's `doNet` then replays each request
 // through a real http client into this same server over the in-process loopback.
-// The loopback `connect()` never touches the kernel; kernel registration is purely
-// the "who owns this port" routing table.
+// The same-process loopback `connect()` never touches the kernel; that kernel
+// registration is purely the "who owns this port" routing table.
+//
+// Cross-PROCESS TCP loopback: when a `connect()` targets a port that ISN'T served
+// in this process, another in-VM process may own it — e.g. Nuxt/Nitro's dev
+// server on :3000 reverse-proxies to its SSR worker on an ephemeral port in a
+// DIFFERENT process. We reach it by riding the exact same kernel byte-relay the
+// Pipe class uses for cross-process UNIX sockets, keyed by a synthetic per-port
+// path (`tcpXKey`). So `listen()` also registers that key with the kernel's pipe
+// listener table, and a cross-process `connect()` resolves it to a relayed
+// connection whose bytes flow as `pipe-*` messages by connId (see dispatchPipe).
 //
 // One process === one worker, so a per-binding registry is correctly per-process.
 
-export function createNetBindings({ process, liveness, syscalls, netServers } = {}) {
+export function createNetBindings({ process, liveness, syscalls, netServers, pipeBridge } = {}) {
   const nextTick = (fn, ...args) => process.nextTick(fn, ...args);
   const buf = () => globalThis.Buffer; // real Buffer is installed before sockets run
 
@@ -115,6 +124,10 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
     } while (listeners.has(ephemeral));
     return ephemeral;
   };
+  // Synthetic pipe path a TCP port is advertised under for CROSS-PROCESS dials.
+  // The NUL prefix keeps it out of the real socket-path namespace (tools bind
+  // `/tmp/*.sock`), so it can never collide with a genuine UNIX socket.
+  const tcpXKey = (port) => "\u0000oc-tcp:" + (port >>> 0);
 
   const EOF = Symbol("EOF");
 
@@ -159,6 +172,14 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
     copy.set(bytes);
     streamBaseState[kBytesWritten] = copy.byteLength;
     streamBaseState[kLastWriteWasAsync] = 0; // loopback writes complete sync
+    // Cross-process pipe endpoint: the peer lives in another process, so relay the
+    // bytes through the kernel (postMessage) instead of the in-process inbox.
+    if (handle._xproc) {
+      if (pipeBridge && pipeBridge.postRaw && !handle._closed) {
+        pipeBridge.postRaw({ type: "pipe-data", connId: handle._connId, chunk: copy });
+      }
+      return 0;
+    }
     if (handle._peer && !handle._peer._closed) enqueueToPeer(handle._peer, copy);
     return 0;
   };
@@ -177,6 +198,9 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
       this._live = false; // becomes true once listening or connected
       this._counted = false;
       this._kernelPort = null; // port registered with the kernel (servers only)
+      this._kernelPipe = null; // synthetic pipe key for cross-process dials (servers)
+      this._xproc = false; // true once this endpoint bridges to another process
+      this._connId = 0; // kernel-assigned id of the cross-process connection
       this._localAddress = "0.0.0.0";
       this._localPort = 0;
       this._remoteAddress = "";
@@ -221,6 +245,22 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
         }
         this._kernelPort = this._localPort;
         if (netServers) netServers.count++;
+
+        // Also advertise this port for CROSS-PROCESS in-VM dials via the pipe
+        // relay (e.g. Nitro's :3000 proxying to its SSR worker's port in another
+        // process). Same-process connect() still short-circuits via `listeners`;
+        // this only matters when the dialer lives in a different worker. Best
+        // effort — if it fails, external (browser) routing is unaffected.
+        if (pipeBridge && pipeBridge.postRaw && syscalls && syscalls.pipeListen) {
+          const key = tcpXKey(this._localPort);
+          try {
+            syscalls.pipeListen(key);
+            pipeServers.set(key, this);
+            this._kernelPipe = key;
+          } catch {
+            /* another process already relays this port; keep serving locally */
+          }
+        }
       }
 
       listeners.set(this._localPort, this);
@@ -230,12 +270,37 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
     }
 
     connect(req, address, port) {
-      const server = listeners.get(port >>> 0);
+      const p = port >>> 0;
+      const server = listeners.get(p);
       this._remoteAddress = address;
-      this._remotePort = port >>> 0;
+      this._remotePort = p;
       this._localAddress = "127.0.0.1";
       this._localPort = allocPort();
       if (!server || server._closed) {
+        // Not served in THIS process — a different in-VM process may own the
+        // port. Dial it through the kernel pipe relay (same transport as UNIX
+        // sockets), keyed by the port's synthetic path; bytes then flow as
+        // relayed `pipe-*` messages by connId. Falls back to ECONNREFUSED when
+        // nobody in the VM is listening, matching libuv.
+        if (pipeBridge && pipeBridge.postRaw && syscalls && syscalls.pipeConnect) {
+          let connId = 0;
+          try {
+            connId = syscalls.pipeConnect(tcpXKey(p)).connId | 0;
+          } catch {
+            connId = 0;
+          }
+          if (connId > 0) {
+            this._xproc = true;
+            this._connId = connId;
+            xpipeConns.set(connId, this);
+            nextTick(() => {
+              this._live = true;
+              recount(this);
+              req.oncomplete(0, this, req, true, true);
+            });
+            return 0;
+          }
+        }
         nextTick(() => req.oncomplete(UV_CODES.UV_ECONNREFUSED, this, req, false, false));
         return 0;
       }
@@ -307,8 +372,12 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
     }
 
     shutdown(req) {
-      // Half-close: signal EOF to the peer's read side.
-      if (this._peer && !this._peer._closed) enqueueToPeer(this._peer, EOF);
+      // Half-close: signal EOF to the peer's read side (cross-process or local).
+      if (this._xproc) {
+        if (pipeBridge && pipeBridge.postRaw) pipeBridge.postRaw({ type: "pipe-shutdown", connId: this._connId });
+      } else if (this._peer && !this._peer._closed) {
+        enqueueToPeer(this._peer, EOF);
+      }
       nextTick(() => req.oncomplete(0));
       return 0;
     }
@@ -328,6 +397,23 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
             this._kernelPort = null;
             if (netServers) netServers.count--;
           }
+          // Tear down the cross-process advertisement for this port too.
+          if (this._kernelPipe != null) {
+            if (pipeServers.get(this._kernelPipe) === this) pipeServers.delete(this._kernelPipe);
+            if (syscalls && syscalls.pipeCloseServer) {
+              try {
+                syscalls.pipeCloseServer(this._kernelPipe);
+              } catch {
+                /* kernel gone */
+              }
+            }
+            this._kernelPipe = null;
+          }
+        }
+        // A cross-process client/accepted endpoint: tell the far side it closed.
+        if (this._xproc) {
+          if (pipeBridge && pipeBridge.postRaw) pipeBridge.postRaw({ type: "pipe-close", connId: this._connId });
+          xpipeConns.delete(this._connId);
         }
         if (this._peer && !this._peer._closed) enqueueToPeer(this._peer, EOF);
       }
@@ -374,20 +460,298 @@ export function createNetBindings({ process, liveness, syscalls, netServers } = 
 
   const tcp_wrap = { TCP, TCPConnectWrap, constants: TCPConstants };
 
-  // ---- pipe_wrap: deferred stub (unix domain sockets / IPC not implemented) --
+  // ---- pipe_wrap: in-process UNIX-domain-socket / named-pipe loopback --------
+  // Node's lib/net.js drives a pipe server as `new Pipe(SERVER); bind(path);
+  // listen(backlog)` and a client as `new Pipe(SOCKET); connect(req, path)`.
+  // We back both with the SAME StreamBase loopback the TCP handle uses, keyed by
+  // socket path instead of port. One process === one binding instance, so a
+  // server and the client that dials it (both in this process) find each other
+  // through `pipeServers`. This is exactly what Nuxt's dev server needs:
+  // @nuxt/vite-builder runs vite-node over a UNIX socket (`*.sock` / abstract
+  // `\0…`), listening and connecting within the same dev process.
+  const PipeConstants = { SOCKET: 0, SERVER: 1, IPC: 2 };
+  const pipeServers = new Map(); // path -> server Pipe handle
+  // Cross-process pipe endpoints in THIS process, keyed by the kernel's connId.
+  // Both the client (that dialed another process) and the server-side endpoint
+  // (accepted from a `pipe-open`) live here; kernel-relayed pipe messages find
+  // their endpoint by connId. See dispatchPipe below.
+  const xpipeConns = new Map(); // connId -> local Pipe endpoint
+
   class Pipe {
-    constructor() {
-      const err = new Error("OpenContainer: named pipes / IPC are not implemented yet");
-      err.code = "ERR_METHOD_NOT_IMPLEMENTED";
-      throw err;
+    constructor(type) {
+      this.type = type;
+      this.reading = false;
+      this.onread = null;
+      this.onconnection = null;
+      this._peer = null;
+      this._inbox = [];
+      this._closed = false;
+      this._pumpScheduled = false;
+      this._refed = true;
+      this._live = false;
+      this._counted = false;
+      this._pipePath = null;
+      this._remotePath = "";
+      this._kernelPipe = null; // socket path registered with the kernel (servers)
+      this._xproc = false; // true once this endpoint bridges to another process
+      this._connId = 0; // kernel-assigned id of the cross-process connection
+      this.bytesRead = 0;
+      this.writeQueueSize = 0;
+    }
+
+    bind(path) {
+      this._pipePath = String(path);
+      return 0;
+    }
+
+    listen(/* backlog */) {
+      if (this._pipePath == null) return UV_CODES.UV_EINVAL;
+      if (pipeServers.has(this._pipePath)) return UV_CODES.UV_EADDRINUSE;
+      // Also register the socket path with the kernel so a Pipe.connect() in
+      // ANOTHER process can reach this server (e.g. Nuxt/Nitro's dev worker <->
+      // the main process, or vite-node's module socket). A cross-process conflict
+      // fails like libuv with EADDRINUSE.
+      if (pipeBridge && pipeBridge.postRaw && syscalls && syscalls.pipeListen) {
+        try {
+          syscalls.pipeListen(this._pipePath);
+          this._kernelPipe = this._pipePath;
+        } catch {
+          return UV_CODES.UV_EADDRINUSE;
+        }
+      }
+      pipeServers.set(this._pipePath, this);
+      this._live = true;
+      recount(this);
+      return 0;
+    }
+
+    connect(req, path) {
+      const target = String(path);
+      this._pipePath = "";
+      this._remotePath = target;
+      const server = pipeServers.get(target);
+      if (server && !server._closed) {
+        // Same-process loopback: link a fresh server-side endpoint to this one.
+        const peer = new Pipe(PipeConstants.SOCKET);
+        peer._pipePath = target;
+        peer._remotePath = target;
+        this._peer = peer;
+        peer._peer = this;
+        nextTick(() => {
+          if (server._closed) {
+            req.oncomplete(UV_CODES.UV_ECONNREFUSED, this, req, false, false);
+            return;
+          }
+          this._live = true;
+          recount(this);
+          peer._live = true;
+          recount(peer);
+          server.onconnection(0, peer);
+          req.oncomplete(0, this, req, true, true);
+        });
+        return 0;
+      }
+      // Not in this process — try a cross-process connect through the kernel. The
+      // server (in another process) will get a `pipe-open` and accept; bytes then
+      // flow both ways as relayed `pipe-data` messages, keyed by connId.
+      if (pipeBridge && pipeBridge.postRaw && syscalls && syscalls.pipeConnect) {
+        let connId = 0;
+        try {
+          connId = syscalls.pipeConnect(target).connId | 0;
+        } catch {
+          connId = 0; // ENOENT — no process listening on that path
+        }
+        if (connId > 0) {
+          this._xproc = true;
+          this._connId = connId;
+          xpipeConns.set(connId, this);
+          nextTick(() => {
+            this._live = true;
+            recount(this);
+            req.oncomplete(0, this, req, true, true);
+          });
+          return 0;
+        }
+      }
+      // No such socket file → libuv reports ENOENT for a missing pipe.
+      nextTick(() => req.oncomplete(UV_CODES.UV_ENOENT, this, req, false, false));
+      return 0;
+    }
+
+    readStart() {
+      this.reading = true;
+      schedulePump(this);
+      return 0;
+    }
+    readStop() {
+      this.reading = false;
+      return 0;
+    }
+
+    writeBuffer(req, data) {
+      return doWrite(this, req, data);
+    }
+    writeLatin1String(req, str) {
+      return doWrite(this, req, buf().from(str, "latin1"));
+    }
+    writeUtf8String(req, str) {
+      return doWrite(this, req, buf().from(str, "utf8"));
+    }
+    writeAsciiString(req, str) {
+      return doWrite(this, req, buf().from(str, "ascii"));
+    }
+    writeUcs2String(req, str) {
+      return doWrite(this, req, buf().from(str, "ucs2"));
+    }
+    writev(req, chunks, allBuffers) {
+      const parts = [];
+      if (allBuffers) {
+        for (let i = 0; i < chunks.length; i++) parts.push(chunks[i]);
+      } else {
+        for (let i = 0; i < chunks.length; i += 2) {
+          const chunk = chunks[i];
+          const enc = chunks[i + 1];
+          parts.push(typeof chunk === "string" ? buf().from(chunk, enc) : chunk);
+        }
+      }
+      const merged = buf().concat(parts.map((p) => (buf().isBuffer(p) ? p : buf().from(p))));
+      return doWrite(this, req, merged);
+    }
+
+    shutdown(req) {
+      // Half-close: signal EOF to the peer's read side (cross-process or local).
+      if (this._xproc) {
+        if (pipeBridge && pipeBridge.postRaw) pipeBridge.postRaw({ type: "pipe-shutdown", connId: this._connId });
+      } else if (this._peer && !this._peer._closed) {
+        enqueueToPeer(this._peer, EOF);
+      }
+      nextTick(() => req.oncomplete(0));
+      return 0;
+    }
+
+    close(cb) {
+      if (!this._closed) {
+        this._closed = true;
+        recount(this);
+        if (this.type === PipeConstants.SERVER && this._pipePath != null) {
+          if (pipeServers.get(this._pipePath) === this) pipeServers.delete(this._pipePath);
+          if (this._kernelPipe != null && syscalls && syscalls.pipeCloseServer) {
+            try {
+              syscalls.pipeCloseServer(this._kernelPipe);
+            } catch {
+              /* kernel gone */
+            }
+            this._kernelPipe = null;
+          }
+        }
+        if (this._xproc) {
+          if (pipeBridge && pipeBridge.postRaw) pipeBridge.postRaw({ type: "pipe-close", connId: this._connId });
+          xpipeConns.delete(this._connId);
+        } else if (this._peer && !this._peer._closed) {
+          enqueueToPeer(this._peer, EOF);
+        }
+      }
+      if (typeof cb === "function") nextTick(cb);
+    }
+
+    // A pipe's "name" is its filesystem path; net.Server.address() surfaces it.
+    getsockname(out) {
+      out.address = this._pipePath || "";
+      return 0;
+    }
+    getpeername(out) {
+      if (!this._remotePath) return UV_CODES.UV_ENOTCONN;
+      out.address = this._remotePath;
+      return 0;
+    }
+
+    setNoDelay() {
+      return 0;
+    }
+    setKeepAlive() {
+      return 0;
+    }
+    ref() {
+      this._refed = true;
+      recount(this);
+    }
+    unref() {
+      this._refed = false;
+      recount(this);
+    }
+    hasRef() {
+      return this._refed;
+    }
+    getAsyncId() {
+      return 1;
+    }
+    fchmod() {
+      return 0;
+    }
+    setPendingInstances() {
+      return 0;
     }
   }
   class PipeConnectWrap {}
   const pipe_wrap = {
     Pipe,
     PipeConnectWrap,
-    constants: { SOCKET: 0, SERVER: 1, IPC: 2 },
+    constants: PipeConstants,
   };
+
+  // Route a kernel-relayed cross-process pipe message into the right local
+  // endpoint. `pipe-open` means a client in another process dialed a server we
+  // host: build the server-side endpoint and hand it to the listening server as a
+  // connection. `pipe-data`/`pipe-shutdown`/`pipe-close` feed the peer's bytes /
+  // EOF into the matching endpoint's read side. Wired to the loop via pipeBridge.
+  function dispatchPipe(msg) {
+    if (!msg) return;
+    const connId = msg.connId | 0;
+    if (msg.type === "pipe-open") {
+      const server = pipeServers.get(String(msg.path));
+      if (!server || server._closed) {
+        // Server vanished between listen and connect — tell the client it closed.
+        if (pipeBridge && pipeBridge.postRaw) pipeBridge.postRaw({ type: "pipe-close", connId });
+        return;
+      }
+      // Give the accepted endpoint the SAME handle type as its server, so a TCP
+      // server (a port advertised via tcpXKey) accepts a TCP socket — identical
+      // to its same-process loopback — and a Pipe server accepts a Pipe.
+      const peer =
+        server instanceof TCP ? new TCP(TCPConstants.SOCKET) : new Pipe(PipeConstants.SOCKET);
+      peer._xproc = true;
+      peer._connId = connId;
+      if (peer instanceof Pipe) peer._remotePath = String(msg.path);
+      else peer._remoteAddress = "127.0.0.1";
+      xpipeConns.set(connId, peer);
+      peer._live = true;
+      recount(peer);
+      // Accept on a fresh turn so onconnection runs in loop context (Node wraps
+      // `peer` in a net.Socket and calls readStart, draining any buffered inbox).
+      nextTick(() => {
+        if (server._closed || peer._closed) return;
+        server.onconnection(0, peer);
+      });
+      if (pipeBridge && pipeBridge.wake) pipeBridge.wake();
+      return;
+    }
+    const ep = xpipeConns.get(connId);
+    if (!ep) return;
+    if (msg.type === "pipe-data") {
+      let chunk = msg.chunk;
+      if (chunk && !(chunk instanceof Uint8Array)) chunk = new Uint8Array(chunk);
+      if (chunk && chunk.byteLength) enqueueToPeer(ep, chunk);
+    } else if (msg.type === "pipe-shutdown") {
+      ep._inbox.push(EOF);
+      schedulePump(ep);
+    } else if (msg.type === "pipe-close") {
+      ep._inbox.push(EOF);
+      schedulePump(ep);
+      xpipeConns.delete(connId);
+    }
+    if (pipeBridge && pipeBridge.wake) pipeBridge.wake();
+  }
+  if (pipeBridge) pipeBridge.dispatch = dispatchPipe;
 
   // ---- cares_wrap: DNS binding. Real name resolution is deferred (loopback
   // connects by IPv4 literal), but the address helpers below must be real:

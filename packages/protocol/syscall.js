@@ -142,6 +142,25 @@ export const OP_FETCH = 25;
 //   OP_FETCH_ASYNC  field0 = JSON {fetchId,url,method,headers,bodyB64} -> OK empty (now)
 export const OP_FETCH_ASYNC = 30;
 
+// cross-process UNIX-domain sockets / named pipes. A pipe server registers its
+// socket path with the kernel (OP_PIPE_LISTEN); a client in ANOTHER process
+// resolves that path to a live connection id (OP_PIPE_CONNECT). Once connected,
+// raw bytes flow OUT OF BAND (never this SAB — neither side is parked on it) as
+// postMessages the kernel relays between the two processes, keyed by connId:
+//   { type:'pipe-open',  connId, path }         kernel -> server (accept it)
+//   { type:'pipe-data',  connId, chunk }        peer   -> peer   (bytes)
+//   { type:'pipe-shutdown', connId }            peer   -> peer   (half-close/EOF)
+//   { type:'pipe-close', connId }               peer   -> peer   (teardown)
+// This is what lets a tool that forks a worker and talks to it over a UNIX
+// socket work in-VM — e.g. Nuxt/Nitro's dev server (its SSR worker <-> the main
+// process over `*.sock`) and vite-node's module socket.
+//   OP_PIPE_LISTEN        field0 = JSON {path} -> OK empty / ERR EADDRINUSE
+//   OP_PIPE_CONNECT       field0 = JSON {path} -> OK JSON {connId} / ERR ENOENT
+//   OP_PIPE_CLOSE_SERVER  field0 = JSON {path} -> OK empty
+export const OP_PIPE_LISTEN = 31;
+export const OP_PIPE_CONNECT = 32;
+export const OP_PIPE_CLOSE_SERVER = 33;
+
 // request flags (bitmask)
 export const FLAG_RECURSIVE = 1; // mkdir -p
 
