@@ -333,6 +333,11 @@ through host `WebAssembly`. Gotchas when touching them:
   TLA-bearing dep from a non-entry module can hang. Its ~16 MB `pglite.wasm`+`.data`
   load from `node_modules` (`__filename` → `new URL('./pglite.wasm',…)` → `fs.readFile`),
   so keep `fs` + `url` (`fileURLToPath`) working over the VFS.
+- **Its Emscripten glue does `const { createRequire } = await import('module')`.** The
+  `module` builtin's export is the `Module` *function* with statics hung off it, so
+  `__ocImport` (`runtime/index.js`) must copy own-enumerable keys for FUNCTION exports
+  too, not only objects — otherwise the named import is `undefined` and PGlite dies deep
+  in `create()` with a minified "e is not a function". Don't regress that interop.
 - **libSQL is intentionally not a template** — local `@libsql/client` is a native
   N-API addon (no wasm32) and `/web` is remote-only; neither is a self-contained in-VM DB.
 - **Gated by `scripts/spike-sqlite.mjs` + `scripts/spike-pglite.mjs`** (net tier in

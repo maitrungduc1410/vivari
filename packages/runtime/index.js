@@ -1035,7 +1035,16 @@ export function createRuntime({
       const m = ocRootRequire(String(spec));
       if (m && m.__esModule) return m;
       const ns = Object.create(null);
-      if (m && typeof m === "object") for (const k of Object.keys(m)) ns[k] = m[k];
+      // Mirror Node's CJS→ESM interop: named exports are the module.exports' own
+      // enumerable keys, PLUS a `default`. Crucially this must also apply when the
+      // export is a FUNCTION with statics hung off it — e.g. the `module` builtin
+      // is the `Module` class carrying `createRequire`/`builtinModules`/… as
+      // statics, and PGlite's Emscripten glue does
+      // `const { createRequire } = await import('module')` (was undefined here,
+      // surfacing as "e is not a function" deep in PGlite.create()).
+      if (m && (typeof m === "object" || typeof m === "function")) {
+        for (const k of Object.keys(m)) ns[k] = m[k];
+      }
       ns.default = m;
       return ns;
     });
