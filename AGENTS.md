@@ -837,9 +837,14 @@ snapshot it at call time, not at delivery time.
      (`const Fragment = Symbol.for('astro:fragment')`) is mid-cycle.
   2. The eager `const X` is only emitted when `X` is actually **referenced in the module
      body** — a name that appears solely in `import`/`export {}` statements never gets a
-     snapshot. The "is it used" check is conservative (strings/comments count as a use),
-     so it only ever *removes* a snapshot when the name is provably absent from code — it
-     can't drop one that's needed.
+     snapshot. The "is it used" check is deliberately over-inclusive: it blanks only
+     import/`export {}` ranges and counts ANY identifier-boundaried occurrence elsewhere
+     (including in strings/comments, and NOT discounting `obj.X` member access — because
+     `.X` is ambiguous with spread `...X`). Dropping a snapshot for a name used only via
+     spread (`[...SVELTE_DEDUPED_IMPORTS]`, `[...SUPPORTED_MARKDOWN_FILE_EXTENSIONS]`)
+     was the bug that made this too aggressive → "X is not defined". So it now only
+     removes a snapshot when the name is provably absent from executable code; keeping an
+     occasional truly-unused const is harmless.
   A name that IS used in code across a `const`/`class` cycle can still TDZ; that residual
   case is unchanged. Proven by `scripts/spike-esm.mjs`.
 

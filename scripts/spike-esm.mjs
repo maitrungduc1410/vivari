@@ -95,5 +95,19 @@ console.log("\n== [esm] circular re-export → lazy live binding ==");
   check("re-exported Fragment resolves to the source Symbol", result === Symbol.for("spike:fragment"));
 }
 
+// ── 3. imported name used ONLY via spread must keep its eager const ───────────
+// Regression: the "is it used in the body" check must NOT treat `...X` (spread/rest)
+// as `obj.X` member access. vite-plugin-svelte's options.js uses the constant only as
+// `[...SVELTE_DEDUPED_IMPORTS]`, astro's vite.js only as `[...SUPPORTED_MARKDOWN_FILE_
+// EXTENSIONS]` — dropping the const there → "X is not defined".
+console.log("\n== [esm] spread-only use keeps the eager const ==");
+{
+  const spreadSrc = `import { DEDUPED } from './c.js';\nexport const list = [...DEDUPED];\n`;
+  const out = transpileEsm(spreadSrc, "/opts.js");
+  check("eager `const DEDUPED = m.DEDUPED` is kept (spread is a use)", /const DEDUPED\s*=/.test(out));
+  // member access, by contrast, need not keep it — but keeping is harmless, so we only
+  // assert the spread case (the one that actually broke).
+}
+
 console.log(`\nRESULT: ${failures === 0 ? "PASS — esm.js live-binding + TLA loader guarantees hold" : `FAIL — ${failures} check(s) failed`}`);
 process.exit(failures === 0 ? 0 : 1);

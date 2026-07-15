@@ -532,8 +532,13 @@ export function transpileEsm(source, filename) {
     const maskedStr = masked.join("");
     const usedInBody = (name) => {
       const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      // preceded by a non-identifier, non-`.` char (so `obj.X` / `?.X` don't count)
-      return new RegExp("(?:^|[^.\\w$])" + esc + "(?![\\w$])").test(maskedStr);
+      // Any identifier-boundaried occurrence counts as a use. We deliberately do NOT
+      // try to discount `obj.X` member access: a `.`-preceded match is ambiguous with
+      // spread/rest `...X` (e.g. `[...SVELTE_DEDUPED_IMPORTS]`, `...SUPPORTED_MARKDOWN_
+      // FILE_EXTENSIONS`), and mis-classifying a real spread use as "unused" drops the
+      // eager `const` → "X is not defined". Keeping an occasional truly-unused const is
+      // harmless; dropping a needed one is not — so we err toward keeping.
+      return new RegExp("(?:^|[^\\w$])" + esc + "(?![\\w$])").test(maskedStr);
     };
     for (const nc of deferredNamedConsts) {
       if (usedInBody(nc.local)) {

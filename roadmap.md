@@ -2463,8 +2463,12 @@ and are gated by a new offline `scripts/spike-esm.mjs`.
   re-exported** is compiled without the eager `const X = m.X` snapshot and re-exported via
   a **lazy getter to the source module** (`() => m.X`), exactly like `export { X } from
   'm'`. The read is deferred until after the cycle resolves. Also: the eager snapshot is
-  now only emitted when the imported name is actually referenced in the module body
-  (conservative — strings/comments count as a use). Proven by executing Astro's real
+  now only emitted when the imported name is actually referenced in the module body. That
+  "is it used" check is over-inclusive on purpose — it counts any identifier-boundaried
+  occurrence (strings/comments included) and does NOT discount `obj.X`, because `.X` is
+  ambiguous with spread `...X`; discounting it dropped consts used only via spread
+  (`[...SVELTE_DEDUPED_IMPORTS]`, `[...SUPPORTED_MARKDOWN_FILE_EXTENSIONS]`) → "X is not
+  defined". Proven by executing Astro's real
   server runtime through an OC-shaped loader (`Fragment` resolves to the Symbol; the cycle
   no longer throws). `astro.config.mjs` reverted to pristine. Left `experimental` pending
   browser confirmation.
