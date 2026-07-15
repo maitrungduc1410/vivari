@@ -8,6 +8,7 @@ import Eraser from "~icons/lucide/eraser";
 import RefreshCw from "~icons/lucide/refresh-cw";
 import RotateCcw from "~icons/lucide/rotate-ccw";
 import FileCode from "~icons/lucide/file-code";
+import Gauge from "~icons/lucide/gauge";
 import {
   Command, CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList,
 } from "@/components/ui/command";
@@ -41,6 +42,7 @@ export function CommandPalette() {
       { label: "Toggle Sidebar", icon: PanelLeft, run: () => c.toggleSidebar() },
       { label: "Clear Active Terminal", icon: Eraser, run: () => c.clearActiveTerminal() },
       { label: "Reload Preview", icon: RefreshCw, run: () => c.reloadPreview() },
+      { label: "Measure Memory", icon: Gauge, run: () => void c.measureMemory() },
       { label: "Reset & Reload (wipe VFS)", icon: RotateCcw, run: () => c.resetAndReload() },
     ],
     [c],

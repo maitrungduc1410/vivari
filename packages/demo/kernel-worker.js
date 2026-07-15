@@ -23,6 +23,28 @@ import { ensureRealTsgo, applyTsgoLoadingShims } from "../kernel-host/load-real-
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
+// Diagnostic: this worker's own memory, via the cross-origin-isolation-gated
+// performance.measureUserAgentSpecificMemory(). Best-effort — returns null if the
+// API is absent or the call is rejected (it can throw if measurement is rate-
+// limited). Used by the studio's memory readout (oc-mem, below).
+async function safeMeasureMemory() {
+  try {
+    if (typeof performance !== "undefined" && performance.measureUserAgentSpecificMemory) {
+      const r = await performance.measureUserAgentSpecificMemory();
+      return r && typeof r.bytes === "number" ? r.bytes : null;
+    }
+  } catch {
+    /* not allowed / rate-limited */
+  }
+  return null;
+}
+
+// Diagnostic mem-query correlation for the File System Worker (a plain async
+// message, off the sync SAB path). The kernel asks the FS worker for the VFS's
+// in-RAM content footprint; the reply is matched back here by id.
+let memReqSeq = 1;
+const memPending = new Map();
+
 // The real-npm delivery asset (built by `npm run vendor:npm`, served from
 // packages/studio/public/vendor). Fetched once and unpacked into the VFS so the
 // shell's `npm` is the real CLI, not the Turbo-analog (North Star). Absolute
@@ -568,11 +590,15 @@ function openTerminal(terminalId, cwd, demoId, run) {
     // Real yarn likewise needs a writable cache; persisted (see npm_config_cache)
     // so yarn's tarball cache is reused across projects/reloads.
     YARN_CACHE_FOLDER: "/home/user/.cache/yarn",
-    // Real pnpm: our VFS has no hardlink/reflink CoW, so packages must be COPIED
-    // into node_modules from the store (npm_config_* is how pnpm reads config from
-    // env). The content-addressed store is persisted so it is shared across
-    // projects/reloads too.
-    npm_config_package_import_method: "copy",
+    // Real pnpm: use its default HARD-LINK import method so node_modules entries
+    // share the store's inode instead of duplicating every package's bytes in the
+    // VFS's Wasm RAM (the store + a full copy per project was the biggest single
+    // memory sink). The VFS now supports link(2) (see OP_LINK); on a wasm build
+    // that predates it, the runtime's fs.link transparently falls back to a copy,
+    // so this is safe either way. The content-addressed store is persisted so it
+    // is shared across projects/reloads too. (npm_config_* is how pnpm reads
+    // config from env.)
+    npm_config_package_import_method: "hardlink",
     npm_config_store_dir: "/home/user/.local/share/pnpm/store",
     XDG_DATA_HOME: "/home/user/.local/share",
     XDG_CACHE_HOME: "/home/user/.cache",
@@ -599,6 +625,10 @@ function openTerminal(terminalId, cwd, demoId, run) {
     const install = p && p.install ? p.install : "npm install";
     const devCmd = run;
     env.OC_RUN = kernel.exists(dir + "/node_modules") ? devCmd : `${install} && ${devCmd}`;
+    // Merge any template-declared environment (memory/telemetry levers the
+    // framework honors — e.g. NUXT_TELEMETRY_DISABLED). Applied last so a
+    // template can override a default if it must.
+    if (p && p.env && typeof p.env === "object") Object.assign(env, p.env);
     projectDirByTerm.set(terminalId, dir);
   }
   const pid = kernel.launch("sh", [], { cwd: dir, env });
@@ -680,6 +710,22 @@ async function warmDevServer(port, timeoutMs = 180000) {
   }
 }
 
+// Ask the File System Worker for the VFS's in-RAM content size (bytes + file
+// count). Resolves { bytes, files } (or a -1 sentinel if the wasm build predates
+// the mem_bytes diagnostic), or null if the FS worker isn't up yet.
+function queryVfsMem(timeoutMs = 2000) {
+  if (!fsWorkerRef) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const id = memReqSeq++;
+    const done = (data) => resolve(data ? { bytes: data.bytes, files: data.files } : null);
+    memPending.set(id, done);
+    setTimeout(() => {
+      if (memPending.delete(id)) resolve(null);
+    }, timeoutMs);
+    fsWorkerRef.postMessage({ type: "fs-mem", id });
+  });
+}
+
 async function boot() {
   // The Rust/Wasm VFS now lives in its own nested File System Worker (#14). We
   // wait for it to boot, then talk to it: the kernel over its own sync SAB
@@ -712,7 +758,14 @@ async function boot() {
       if (event.data.type === "ready") resolve();
       // The FS worker logs OPFS restore status; relay it to the host UI.
       else if (event.data.type === "log") post("log", event.data);
-      else onKernelFsMessage(event.data);
+      // Diagnostic VFS-memory reply (off the sync SAB path) — resolve its waiter.
+      else if (event.data.type === "fs-mem") {
+        const p = memPending.get(event.data.id);
+        if (p) {
+          memPending.delete(event.data.id);
+          p(event.data);
+        }
+      } else onKernelFsMessage(event.data);
     };
   });
 
@@ -1011,7 +1064,8 @@ async function boot() {
   }
 
   // Same delivery/shim path for real pnpm. pnpm drives worker_threads and a
-  // symlinked node_modules (both supported); the shell forces copy import method.
+  // symlinked node_modules (both supported); the shell uses pnpm's default
+  // hard-link import method (VFS OP_LINK, with a copy fallback on older wasm).
   try {
     const pnpmT0 = Date.now();
     const res = await ensureRealPnpm(kernel, async () => {
@@ -1326,6 +1380,22 @@ self.onmessage = async (event) => {
   // mirror catches any writes still queued in the write-behind buffer.
   if (m.type === "fs-flush") {
     if (fsWorkerRef) fsWorkerRef.postMessage({ type: "fs-flush" });
+    return;
+  }
+
+  // Diagnostic memory readout (studio "Measure Memory"): report the kernel
+  // worker's own measured memory + the VFS's in-RAM content footprint. The main
+  // thread measures the page (which covers dedicated workers) separately and
+  // combines the two.
+  if (m.type === "oc-mem") {
+    const [kernelBytes, vfsMem] = await Promise.all([safeMeasureMemory(), queryVfsMem()]);
+    post("oc-reply", {
+      reqId: m.reqId,
+      ok: true,
+      kernelBytes,
+      vfsBytes: vfsMem ? vfsMem.bytes : -1,
+      vfsFiles: vfsMem ? vfsMem.files : -1,
+    });
     return;
   }
 

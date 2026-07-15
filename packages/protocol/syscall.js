@@ -54,6 +54,12 @@ export const OP_RMDIR = 9;
 export const OP_RENAME = 10;
 export const OP_SYMLINK = 11;
 export const OP_READLINK = 12;
+// hard link (Phase — memory). field0 = existing path, field1 = new link path.
+// Makes `newpath` an additional name for the SAME inode as `existing` (no byte
+// copy), so pnpm's store↔node_modules linking stops doubling node_modules in the
+// VFS's Wasm RAM. A build whose wasm predates VFS.link answers ENOSYS and the
+// runtime falls back to a content copy (unchanged behaviour). -> OK empty.
+export const OP_LINK = 19;
 
 // file-descriptor layer (Phase 2 #4). These back Node's real lib/fs.js, which
 // routes even readFileSync through open -> fstat -> read -> close on real fds.
@@ -154,6 +160,7 @@ export function isFsOpcode(op) {
   return (
     (op >= OP_READ_FILE && op <= OP_READLINK) ||
     (op >= OP_OPEN && op <= OP_FTRUNCATE) ||
+    op === OP_LINK ||
     op === OP_WATCH ||
     op === OP_UNWATCH
   );

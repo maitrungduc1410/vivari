@@ -41,6 +41,7 @@ import {
   OP_RENAME,
   OP_SYMLINK,
   OP_READLINK,
+  OP_LINK,
   OP_OPEN,
   OP_CLOSE,
   OP_FD_READ,
@@ -342,6 +343,21 @@ export class FsServer {
       }
       case OP_READLINK:
         return encodeString(vfs.readlink(s(0)));
+      case OP_LINK: {
+        // Guard: a wasm build predating VFS.link answers ENOSYS so the runtime's
+        // fs.link falls back to a content copy (unchanged behaviour). With link
+        // support, the new name shares the existing inode — no byte copy — which
+        // is what stops pnpm doubling node_modules in the VFS's Wasm RAM.
+        if (typeof vfs.link !== "function") throw "ENOSYS";
+        const existing = s(0);
+        const linkpath = s(1);
+        vfs.link(existing, linkpath);
+        // Persist the new name as its own on-disk entry (OPFS has no hard links);
+        // the in-RAM dedup is what we're after here.
+        if (p) p.onWrite(linkpath);
+        this.notifyWatch(linkpath, "rename");
+        return EMPTY;
+      }
       case OP_OPEN: {
         const path = s(0);
         const oflags = bytesToU32(fields[1]) | 0;

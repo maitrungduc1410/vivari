@@ -136,7 +136,9 @@ export function createFsBinding({ sys: rawSys, process }) {
     const ns = Math.round((ms - sec * 1000) * 1e6);
     const blocks = Math.ceil(st.size / 512);
     // dev,mode,nlink,uid,gid,rdev,blksize,ino,size,blocks, a/m/c/birth (s,ns)*4
-    const v = [0, type | perm, 1, 0, 0, 0, 4096, st.ino, st.size, blocks,
+    // nlink comes from the VFS when available (hard links report >1, which pnpm
+    // uses to detect already-linked store files); default 1 for older builds.
+    const v = [0, type | perm, st.nlink || 1, 0, 0, 0, 4096, st.ino, st.size, blocks,
       sec, ns, sec, ns, sec, ns, sec, ns];
     const big = arr instanceof BigInt64Array;
     for (let i = 0; i < STAT_FIELDS; i++) arr[i] = big ? BigInt(Math.trunc(v[i])) : v[i];
@@ -427,9 +429,23 @@ export function createFsBinding({ sys: rawSys, process }) {
     },
     link(existingPath, newPath, ...rest) {
       const req = findReq(rest);
-      // No hard links in the VFS; emulate by copying content.
       return dispatch(req, () => {
-        sys.writeFile(newPath, sys.readFile(existingPath));
+        // Prefer a real hard link — the new name shares the existing inode with
+        // no byte copy, which is what lets pnpm's store↔node_modules linking stop
+        // doubling node_modules in the VFS's Wasm RAM. Fall back to a content copy
+        // when the VFS build predates OP_LINK (ENOSYS) or refuses the op (EINVAL,
+        // e.g. a directory), so behaviour is unchanged there. `link` isn't in the
+        // cwd-rewrapped `sys`, so resolve both paths against cwd here.
+        if (typeof sys.link === "function") {
+          try {
+            sys.link(R(existingPath), R(newPath));
+            return;
+          } catch (e) {
+            const code = e && e.code;
+            if (code !== "ENOSYS" && code !== "EINVAL") throw e;
+          }
+        }
+        sys.writeFile(R(newPath), sys.readFile(R(existingPath)));
       });
     },
     readlink(path, encoding, ...rest) {
