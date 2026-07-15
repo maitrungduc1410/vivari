@@ -1655,8 +1655,9 @@ screen, and ten pre-authored templates that auto-install + boot their dev server
   the folder / the file's parent) and **Copy Path**, alongside New File/Folder, Rename,
   Copy/Cut/Paste, Delete, and Close Folder on roots.
 
-Deferred: full-text search (still filename-only), drag-and-drop in the tree, an "Add existing
-folder" picker (paths are typed), and hardening the `express-ts`/`nest-js` dev servers in-VM.
+Deferred: drag-and-drop in the tree, an "Add existing folder" picker (paths are typed), and
+hardening the `express-ts`/`nest-js` dev servers in-VM. (Full-text search shipped later — see
+"VS Code-style search & replace + quick-open by line" below.)
 
 ## TypeScript 7 (tsgo), cross-service WebSockets, host↔preview bridge (this change)
 
@@ -1953,6 +1954,43 @@ for the Svelte tree) and can't be turned off from user config (`ssr.optimizeDeps
 `environments.ssr.dev.optimizeDeps` with `noDiscovery` + empty `include` don't stop it). Next step is
 a runtime investigation of the SSR-environment optimize/server-restart liveness path (sibling to the
 Angular esbuild work). Reproduce with `node scripts/spike-svelte.mjs`.
+
+## VS Code-style search & replace + quick-open by line (this change)
+
+The Search pane was filename-only (a substring filter over the flat file index). This change
+makes it a real VS Code-style full-text Search & Replace across **every open workspace root**,
+and teaches quick-open to jump to a line — without ever blocking the UI.
+
+- **Search engine in the kernel worker (`demo/kernel-worker.js`).** Full-text search runs where
+  the synchronous Wasm VFS lives; doing it on the main thread would mean an `oc-read`
+  round-trip per file. New messages: `oc-search {token,roots,query,matchCase,wholeWord,regex,
+  includeGlob,excludeGlob}` walks each root (reusing the Explorer skip set), skips
+  binary/oversized files, and **streams** results as `oc-search-result` batches → final
+  `oc-search-done {matchCount,fileCount,limitHit}`. `oc-replace` recomputes matches against the
+  same options and rewrites files — scoped to a single match, one file, or all files — with
+  "preserve case" (ALLCAPS/Capitalized) and `$1`/`$&` expansion, posting `oc-fs-changed` per
+  write. `oc-search-cancel` + a monotonic `currentSearchToken` supersede an in-flight query.
+- **Non-blocking by construction.** That worker also serves preview HTTP + terminal I/O, so the
+  walk yields a macrotask every ~40 files and flushes partial batches — the results list fills
+  in progressively and the preview/terminal never stall mid-search. Results are delivered to the
+  pane via callbacks, kept OUT of the global snapshot to avoid re-render storms.
+- **Search pane rewrite (`components/ide/SearchPane.tsx`).** Search input with Match Case /
+  Whole Word / Regex; an expandable Replace row with Preserve Case + **Replace All** (disabled
+  until there's a match); a details toggle for `files to include` / `files to exclude` globs;
+  collapsible per-file results with the match highlighted and per-file/per-match replace on
+  hover; a live summary + invalid-regex inline error. Debounced; re-runs on any option change
+  and after a replace (via `treeVersion`).
+- **Editor integration (`oc/controller.ts`).** `runSearch(opts,{onBatch,onDone})` (returns a
+  cancel fn), `replace({...,files|match})`, and `openFileAt(abs,line,col,len)` which reveals +
+  selects the range in Monaco (deferred if the editor is still loading). After a replace, any
+  affected open model is re-read from disk so the buffer + dirty state don't drift.
+- **Quick-open by line (`components/ide/CommandPalette.tsx`, `AppShell.tsx`).** `⌘P` still
+  searches files by name, now accepting a trailing `:line[:col]` (e.g. `App.tsx:42`) to jump on
+  open; a bare `:line` jumps within the active editor. Added `⌘⇧F` to focus the Search pane.
+  (Also wrapped the palette in cmdk's `Command` root so filtering works.)
+
+Follow-ups: search result virtualization for very large result sets, a search-history dropdown
+(the input hints at `↑↓`), and `.gitignore`-aware excludes.
 
 ## Definition of done for T2
 

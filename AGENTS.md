@@ -95,17 +95,22 @@ packages/
                           useSyncExternalStore. Since the multi-root rewrite: workspace =
                           workspaceFolders[] + activeFolderId; EVERY tab/model/dirty flag is
                           keyed by ABSOLUTE path; project create/open/run flows + a
-                          localStorage recent-projects registry (oc-workspace-projects).
+                          localStorage recent-projects registry (oc-workspace-projects). Also
+                          drives full-text search (runSearch/replace over the worker) +
+                          openFileAt (reveal + select a match/line in Monaco).
     src/oc/templates.ts   10 project templates (React/Vue/Svelte/Express/Nest × TS/JS) —
                           manifest (install/dev/port/entry) + full source, inline.
     src/components/ide/   AppShell (+ Home overlay) · Home (Start blank / from template,
                           recents) · ActivityBar (Explorer/Search) · Explorer (VFS-backed
                           multi-root tree; context menu incl. Open in Integrated Terminal,
-                          Copy Path) · SearchPane · EditorGroup (preview/permanent tabs) ·
-                          TerminalPanel (Console/Terminal/Ports) · PreviewPanel (multi-tab
-                          mini-browser: local address bar, back/forward, reload, chii
-                          DevTools in a resizable bottom split) · StatusBar ·
-                          CommandPalette · fileIcon (vscode-icons). Icons are Iconify via
+                          Copy Path) · SearchPane (VS Code-style full-text search & replace
+                          across all roots: case/word/regex, include/exclude globs, Replace
+                          All/per-file/per-match + preserve case) · EditorGroup
+                          (preview/permanent tabs) · TerminalPanel (Console/Terminal/Ports) ·
+                          PreviewPanel (multi-tab mini-browser: local address bar,
+                          back/forward, reload, chii DevTools in a resizable bottom split) ·
+                          StatusBar · CommandPalette (⌘P quick-open by name; append :line[:col]
+                          to jump) · fileIcon (vscode-icons). Icons are Iconify via
                           unplugin-icons (`~icons/lucide/*`, `~icons/vscode-icons/*`; needs
                           @svgr/core) — do NOT reintroduce lucide-react.
 
@@ -115,8 +120,8 @@ packages/
     host.js            legacy main thread: UI, SW registration, request relay.
     kernel-worker.js   hosts the Kernel; DEMOS registry + demo shell tabs (OC_RUN); the
                        multi-root VFS protocol (oc-readdir/read/stat/mkdirp/create-project,
-                       oc-fs-changed) + dynamic project run/attribution (projectDirByTerm,
-                       project-ready/-reload). [shared]
+                       oc-fs-changed; streaming oc-search + oc-replace) + dynamic project
+                       run/attribution (projectDirByTerm, project-ready/-reload). [shared]
     fs-worker.js       hosts the File System Worker (VFS + OPFS). [shared]
     fetcher-worker.js  outbound fetch() (npm downloads). [shared]
     process-worker.js  one process = one worker (boots the runtime). [shared]
@@ -298,6 +303,18 @@ map. Rules that bite if ignored:
   legacy DEMOS still use the fixed-port `demoForPort` path; keep them separate.
 - **Templates live in `src/oc/templates.ts`** (manifest + full source, inline) — not a
   scaffolder run in-VM. Creation writes them in ONE `writeFilesBatch` via `oc-create-project`.
+
+### Full-text search runs in the kernel worker — keep it non-blocking
+The VFS is synchronous ONLY inside the kernel worker (the sole VFS holder), so full-text
+search/replace lives there (`oc-search`/`oc-replace` in `demo/kernel-worker.js`), NOT on the
+main thread — reading every file over `oc-read` round-trips would be death by a thousand
+messages. But that same worker also serves preview HTTP + terminal I/O, so the walk MUST
+stay cooperative: it `await`s a macrotask every N files and streams partial results back as
+`oc-search-result` batches (final `oc-search-done`). Don't turn it into one big synchronous
+loop or a preview/terminal will stall mid-search. A monotonic `currentSearchToken` cancels
+an in-flight search when a newer query (or `oc-search-cancel`) arrives — always check the
+token in the loop. After a replace writes files, the controller re-reads affected open
+models from disk so the Monaco buffer + dirty state don't drift.
 
 ### Real npm is the studio shell's `npm` (delivery + shims)
 The North Star is running the real npm/yarn/pnpm CLIs, not our from-scratch
