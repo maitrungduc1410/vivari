@@ -1115,6 +1115,194 @@ function copyRecursive(from, to) {
   }
 }
 
+// ── Full-text search / replace (VS Code-style) ───────────────────────────────
+// The search runs HERE, in the kernel worker, because it is the sole holder of
+// the (synchronous) Wasm VFS — doing it on the main thread would mean thousands
+// of postMessage round-trips per query. To keep the worker responsive (it also
+// serves preview HTTP + terminal I/O) the walk yields to the event loop between
+// chunks and streams results back in batches. A monotonic `currentSearchToken`
+// makes a newer query cancel any still-running older one.
+const SEARCH_SKIP_DIRS = new Set([
+  "node_modules", ".git", "dist", ".vite", ".next", "build", ".cache",
+]);
+let currentSearchToken = -1;
+
+// Convert one glob pattern into a regex source string. Supports *, **, **/, ?,
+// and {a,b} brace groups; everything else is escaped literally.
+function globPartToRegex(glob) {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        if (glob[i + 2] === "/") { re += "(?:.*/)?"; i += 2; } else { re += ".*"; i += 1; }
+      } else {
+        re += "[^/]*";
+      }
+    } else if (c === "?") {
+      re += "[^/]";
+    } else if (c === "{") {
+      let j = i + 1, body = "";
+      while (j < glob.length && glob[j] !== "}") { body += glob[j]; j++; }
+      re += "(?:" + body.split(",").map((p) => globPartToRegex(p)).join("|") + ")";
+      i = j;
+    } else if ("\\^$+.|()[]/".includes(c)) {
+      re += "\\" + c;
+    } else {
+      re += c;
+    }
+  }
+  return re;
+}
+
+// Build a matcher fn from a comma-separated glob list (VS Code "files to
+// include/exclude" semantics). Returns null when the list is empty.
+function makeGlobMatcher(list) {
+  const patterns = (list || "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (!patterns.length) return null;
+  const res = patterns.map((raw) => {
+    let p = raw;
+    if (!/[*?{}/]/.test(p)) {
+      // A bare word: a filename (has an extension) matches by basename, else it
+      // is treated as a folder name and matches everything beneath it.
+      p = /\.[^.]+$/.test(p) ? "**/" + p : "**/" + p + "/**";
+    } else if (!p.includes("/")) {
+      p = "**/" + p; // e.g. "*.ts" → any depth
+    }
+    if (p.endsWith("/")) p += "**";
+    return new RegExp("^" + globPartToRegex(p) + "$");
+  });
+  return (rel) => res.some((re) => re.test(rel));
+}
+
+// Compile the search needle into a global RegExp honouring the toggles.
+function buildSearchRegex({ query, matchCase, wholeWord, regex }) {
+  let pattern = regex ? query : query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (wholeWord) pattern = "\\b" + pattern + "\\b";
+  return new RegExp(pattern, "g" + (matchCase ? "" : "i"));
+}
+
+// Expand $1/$2/$&/$$ style refs in a replacement template against a match.
+function expandReplacement(template, matched, groups) {
+  return template.replace(/\$(\d{1,2}|[$&])/g, (_, d) => {
+    if (d === "$") return "$";
+    if (d === "&") return matched;
+    const g = groups[parseInt(d, 10) - 1];
+    return g != null ? g : "";
+  });
+}
+
+// VS Code "preserve case": ALLCAPS → upper, Capitalized → capitalized, else raw.
+function applyPreserveCase(matched, out) {
+  if (matched && matched === matched.toUpperCase() && matched !== matched.toLowerCase()) {
+    return out.toUpperCase();
+  }
+  if (matched && matched[0] === matched[0].toUpperCase() && matched.slice(1) === matched.slice(1).toLowerCase()) {
+    return out.charAt(0).toUpperCase() + out.slice(1);
+  }
+  return out;
+}
+
+function replaceInContent(content, re, template, preserveCase) {
+  re.lastIndex = 0;
+  return content.replace(re, (...args) => {
+    const matched = args[0];
+    const groups = args.slice(1, -2); // drop offset + whole-string tail args
+    let out = expandReplacement(template, matched, groups);
+    return preserveCase ? applyPreserveCase(matched, out) : out;
+  });
+}
+
+// Read + grep a single file, pushing a per-file result into the batch.
+function searchFile(abs, root, ctx) {
+  let content;
+  try { content = kernel.readFile(abs); } catch { return; }
+  if (typeof content !== "string" || content.length > ctx.maxFileBytes) return;
+  if (content.indexOf("\u0000") !== -1) return; // looks binary — skip
+  const lines = content.split("\n");
+  const matches = [];
+  for (let i = 0; i < lines.length && !ctx.limitHit; i++) {
+    const line = lines[i];
+    ctx.re.lastIndex = 0;
+    let m;
+    while ((m = ctx.re.exec(line)) !== null) {
+      matches.push({
+        line: i + 1,
+        column: m.index + 1,
+        length: m[0].length,
+        preview: line.length > 500 ? line.slice(0, 500) : line,
+      });
+      ctx.matchCount++;
+      if (m[0].length === 0) ctx.re.lastIndex++; // guard against empty-match loops
+      if (ctx.matchCount >= ctx.maxResults) { ctx.limitHit = true; break; }
+    }
+  }
+  if (matches.length) {
+    ctx.fileCount++;
+    ctx.batch.push({ file: abs, root, matches });
+  }
+}
+
+async function searchWalk(dir, root, ctx) {
+  if (ctx.token !== currentSearchToken || ctx.limitHit) return;
+  let names;
+  try { names = kernel.readdir(dir); } catch { return; }
+  names.sort();
+  for (const name of names) {
+    if (ctx.token !== currentSearchToken || ctx.limitHit) return;
+    const abs = dir + "/" + name;
+    let st;
+    try { st = kernel.stat(abs); } catch { continue; }
+    if (st.kind === "dir") {
+      if (!SEARCH_SKIP_DIRS.has(name)) await searchWalk(abs, root, ctx);
+      continue;
+    }
+    const rel = abs.startsWith(root + "/") ? abs.slice(root.length + 1) : name;
+    if (ctx.include && !ctx.include(rel)) continue;
+    if (ctx.exclude && ctx.exclude(rel)) continue;
+    searchFile(abs, root, ctx);
+    // Yield to the event loop periodically so preview/terminal messages still
+    // get serviced, flushing partial results so the UI fills in progressively.
+    if (++ctx.scanned % 40 === 0) {
+      if (ctx.batch.length) { post("oc-search-result", { token: ctx.token, files: ctx.batch }); ctx.batch = []; }
+      await new Promise((r) => setTimeout(r));
+    }
+  }
+}
+
+async function runSearch(m) {
+  const token = m.token;
+  currentSearchToken = token;
+  let re;
+  try {
+    re = buildSearchRegex(m);
+  } catch (err) {
+    post("oc-search-done", { token, error: errMsg(err) });
+    return;
+  }
+  const ctx = {
+    token, re,
+    include: makeGlobMatcher(m.includeGlob),
+    exclude: makeGlobMatcher(m.excludeGlob),
+    maxResults: m.maxResults || 2000,
+    maxFileBytes: m.maxFileBytes || 5_000_000,
+    matchCount: 0, fileCount: 0, scanned: 0, limitHit: false,
+    batch: [],
+  };
+  for (const root of m.roots || []) {
+    if (ctx.token !== currentSearchToken) break;
+    await searchWalk(root.replace(/\/+$/, ""), root.replace(/\/+$/, ""), ctx);
+  }
+  if (ctx.batch.length && ctx.token === currentSearchToken) {
+    post("oc-search-result", { token, files: ctx.batch });
+  }
+  if (ctx.token === currentSearchToken) {
+    post("oc-search-done", {
+      token, matchCount: ctx.matchCount, fileCount: ctx.fileCount, limitHit: ctx.limitHit,
+    });
+  }
+}
+
 self.onmessage = async (event) => {
   const m = event.data;
 
@@ -1250,6 +1438,66 @@ self.onmessage = async (event) => {
   if (m.type === "oc-register-project") {
     if (kernel && m.manifest) registerProject(m.dir, m.manifest, m.title);
     if (m.reqId != null) post("oc-reply", { reqId: m.reqId, ok: true });
+    return;
+  }
+
+  // ── Full-text search / replace ─────────────────────────────────────────────
+  // Kick off a streaming search (results arrive as oc-search-result batches, then
+  // a final oc-search-done). Runs async so the worker keeps servicing messages.
+  if (m.type === "oc-search") {
+    if (!kernel) { post("oc-search-done", { token: m.token, error: "kernel not ready" }); return; }
+    runSearch(m).catch((err) => post("oc-search-done", { token: m.token, error: errMsg(err) }));
+    return;
+  }
+  // Supersede any in-flight search (query cleared / pane closed).
+  if (m.type === "oc-search-cancel") {
+    currentSearchToken = -1;
+    return;
+  }
+  // Apply a replacement. Scope: a single {match}, an explicit list of {files}
+  // (Replace All / per-file), all recomputed against the same matcher options.
+  if (m.type === "oc-replace") {
+    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    try {
+      const re = buildSearchRegex(m);
+      let filesChanged = 0, replaced = 0;
+      if (m.match) {
+        const { file, line, column, length } = m.match;
+        const content = kernel.readFile(file);
+        const lines = content.split("\n");
+        const li = line - 1;
+        if (lines[li] != null) {
+          const start = column - 1;
+          const matched = lines[li].slice(start, start + length);
+          re.lastIndex = 0;
+          const mm = re.exec(matched);
+          const groups = mm ? mm.slice(1) : [];
+          let out = expandReplacement(m.replacement || "", matched, groups);
+          if (m.preserveCase) out = applyPreserveCase(matched, out);
+          lines[li] = lines[li].slice(0, start) + out + lines[li].slice(start + length);
+          kernel.writeFile(file, lines.join("\n"));
+          filesChanged = 1; replaced = 1;
+          post("oc-fs-changed", { path: file });
+        }
+      } else {
+        for (const file of m.files || []) {
+          let content;
+          try { content = kernel.readFile(file); } catch { continue; }
+          re.lastIndex = 0;
+          const count = (content.match(re) || []).length;
+          if (!count) continue;
+          const next = replaceInContent(content, re, m.replacement || "", m.preserveCase);
+          if (next !== content) {
+            kernel.writeFile(file, next);
+            filesChanged++; replaced += count;
+            post("oc-fs-changed", { path: file });
+          }
+        }
+      }
+      post("oc-reply", { reqId: m.reqId, ok: true, filesChanged, replaced });
+    } catch (err) {
+      post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+    }
     return;
   }
 

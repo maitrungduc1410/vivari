@@ -75,6 +75,33 @@ export interface PreviewTab {
   nonce: number; // per-tab reload counter (bump to force the iframe to reload)
 }
 
+// ── Full-text search (VS Code-style) ─────────────────────────────────────────
+export interface SearchOptions {
+  query: string;
+  matchCase: boolean;
+  wholeWord: boolean;
+  regex: boolean;
+  includeGlob: string;
+  excludeGlob: string;
+}
+export interface SearchMatch {
+  line: number; // 1-based
+  column: number; // 1-based
+  length: number;
+  preview: string; // the full (capped) source line, for highlighting
+}
+export interface SearchFileResult {
+  file: string; // absolute path
+  root: string; // the workspace root it was found under
+  matches: SearchMatch[];
+}
+export interface SearchDone {
+  matchCount: number;
+  fileCount: number;
+  limitHit: boolean;
+  error?: string;
+}
+
 export interface IdeSnapshot {
   booted: boolean;
   kernelReady: boolean; // kernel + VFS up (can create/open projects) — earlier than `booted`
@@ -207,6 +234,9 @@ export class IdeController {
   private devtoolsFrame: HTMLIFrameElement | null = null; // the chii DevTools frontend iframe
   private devtoolsTargetId: string | null = null; // which preview tab DevTools is attached to
   private localFiles: Record<string, string> = {}; // abs -> latest saved text (editor cache)
+  private pendingReveal: { abs: string; line: number; column: number; length: number } | null = null;
+  private searchSeq = 0;
+  private searchCbs: { token: number; onBatch: (files: SearchFileResult[]) => void; onDone: (d: SearchDone) => void } | null = null;
   private fileIndex = new Map<string, string[]>(); // rootPath -> abs files (quick-open/search)
   private folderManifests = new Map<string, TemplateManifest>(); // rootPath -> run manifest
   private runningProjects = new Map<string, { terminalId: string | null; port: number | null }>();
@@ -581,7 +611,99 @@ export class IdeController {
     if (model && this.snap.activeTab === abs) {
       this.editor.setModel(model);
       this.editor.focus();
+      if (this.pendingReveal && this.pendingReveal.abs === abs) {
+        const r = this.pendingReveal;
+        this.pendingReveal = null;
+        this.revealInEditor(r.line, r.column, r.length);
+      }
     }
+  }
+
+  // Open a file and jump to a 1-based line/column, selecting `length` chars (used
+  // by Search results + quick-open's `:line` suffix). If the editor is still
+  // loading, the reveal is remembered and applied once its model is set.
+  async openFileAt(abs: string, line: number, column = 1, length = 0) {
+    this.pendingReveal = { abs, line, column, length };
+    await this.openFile(abs);
+    if (this.pendingReveal && this.pendingReveal.abs === abs && this.editor) {
+      this.pendingReveal = null;
+      this.revealInEditor(line, column, length);
+    }
+  }
+
+  private revealInEditor(line: number, column: number, length: number) {
+    if (!this.editor || !this.monaco) return;
+    const range = new this.monaco.Range(line, column, line, column + (length || 0));
+    this.editor.setSelection(range);
+    this.editor.revealRangeInCenterIfOutsideViewport(range);
+    this.editor.focus();
+  }
+
+  // ── full-text search / replace (delegated to the kernel worker) ─────────────
+  // Stream a search across every open workspace root. Results arrive via
+  // `onBatch` (partial, progressive) then a final `onDone`. Returns a cancel fn.
+  runSearch(
+    opts: SearchOptions,
+    cb: { onBatch: (files: SearchFileResult[]) => void; onDone: (d: SearchDone) => void },
+  ): () => void {
+    const token = ++this.searchSeq;
+    this.searchCbs = { token, onBatch: cb.onBatch, onDone: cb.onDone };
+    this.bridge.post("oc-search", {
+      token,
+      roots: this.snap.workspaceFolders.map((f) => f.rootPath),
+      query: opts.query,
+      matchCase: opts.matchCase,
+      wholeWord: opts.wholeWord,
+      regex: opts.regex,
+      includeGlob: opts.includeGlob,
+      excludeGlob: opts.excludeGlob,
+    });
+    return () => {
+      if (this.searchCbs?.token === token) this.searchCbs = null;
+      this.bridge.post("oc-search-cancel", {});
+    };
+  }
+
+  // Apply a replacement. Scope is either a single `match`, or an explicit list of
+  // `files` (Replace All / per-file). Refreshes any affected open editor models
+  // from disk so the buffer + dirty state stay in sync.
+  async replace(params: {
+    query: string; matchCase: boolean; wholeWord: boolean; regex: boolean;
+    replacement: string; preserveCase: boolean;
+    files?: string[];
+    match?: { file: string; line: number; column: number; length: number };
+  }): Promise<{ ok: boolean; filesChanged: number; replaced: number; error?: string }> {
+    const res = await this.bridge.request("oc-replace", {
+      query: params.query,
+      matchCase: params.matchCase,
+      wholeWord: params.wholeWord,
+      regex: params.regex,
+      replacement: params.replacement,
+      preserveCase: params.preserveCase,
+      files: params.files,
+      match: params.match,
+    });
+    if (res.ok) {
+      const affected = params.match ? [params.match.file] : params.files ?? [];
+      for (const abs of affected) await this.refreshFileFromDisk(abs);
+    } else {
+      toast.error(`Replace failed: ${res.error ?? "unknown error"}`);
+    }
+    return {
+      ok: !!res.ok,
+      filesChanged: Number(res.filesChanged ?? 0),
+      replaced: Number(res.replaced ?? 0),
+      error: res.error as string | undefined,
+    };
+  }
+
+  // Re-sync an open model + cache with the VFS after an out-of-band write.
+  private async refreshFileFromDisk(abs: string) {
+    const text = await this.readFileText(abs);
+    this.localFiles[abs] = text;
+    const model = this.models.get(abs);
+    if (model && model.getValue() !== text) model.setValue(text);
+    if (this.snap.dirty.includes(abs)) this.set({ dirty: this.snap.dirty.filter((x) => x !== abs) });
   }
 
   // Double-clicking a preview tab (or Explorer entry) pins it permanently.
@@ -1395,7 +1517,8 @@ export class IdeController {
       const runLabel = DEMOS.find((d) => d.id === m.id)?.runLabel ?? "npm run dev";
       this.folderManifests.set(normDir(dir), {
         id: m.id as string, framework: "react", name: m.title as string, language: "JavaScript",
-        description: "", port: m.port as number, openPath: "/", entry: m.entry as string,
+        icon: "react", category: "Frontend", description: "", port: m.port as number,
+        openPath: "/", entry: m.entry as string,
         hmr: !!m.hmr, reload: !!m.reload, install: "npm install", dev: runLabel,
       });
       this.openFolder(dir, m.title as string);
@@ -1439,6 +1562,26 @@ export class IdeController {
     b.on("project-reload", (m) => {
       for (const t of this.snap.previewTabs) if (t.port === m.port) this.reloadPreviewTab(t.id);
       this.set({ status: `${m.title} restarted — preview reloaded` });
+    });
+
+    // Streaming full-text search: batches of per-file results, then a final done.
+    // Ignore stale tokens (a newer query already superseded this one).
+    b.on("oc-search-result", (m) => {
+      if (this.searchCbs && m.token === this.searchCbs.token) {
+        this.searchCbs.onBatch((m.files as SearchFileResult[]) ?? []);
+      }
+    });
+    b.on("oc-search-done", (m) => {
+      if (this.searchCbs && m.token === this.searchCbs.token) {
+        const cbs = this.searchCbs;
+        this.searchCbs = null;
+        cbs.onDone({
+          matchCount: Number(m.matchCount ?? 0),
+          fileCount: Number(m.fileCount ?? 0),
+          limitHit: !!m.limitHit,
+          error: m.error as string | undefined,
+        });
+      }
     });
 
     // The VFS changed under us (a file op, an install, a create) — refresh the
