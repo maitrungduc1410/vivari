@@ -354,10 +354,16 @@ export function rewriteCjsDynamicImport(source, filename) {
   }
   if (!edits.length) return null;
   // One leading line (preserves user line numbers). Uses the wrapper's `require`.
+  // The `(typeof m==='object'||typeof m==='function')` guard is load-bearing: Node's
+  // CJS→ESM interop makes named exports from module.exports' OWN enumerable keys — and
+  // that must include a FUNCTION export's statics. The `module` builtin export IS the
+  // `Module` class with `createRequire`/`builtinModules`/… hung off it, and PGlite's
+  // Emscripten glue does `const { createRequire } = await import('module')`; keying only
+  // objects dropped it, surfacing as a minified "e is not a function" in PGlite.create().
   const head =
     "const __oc_import=function(s){return Promise.resolve().then(function(){" +
     "var m=require(s);if(m&&m.__esModule)return m;" +
-    "var ns=Object.create(null);if(m&&typeof m==='object')for(var k of Object.keys(m))ns[k]=m[k];ns.default=m;return ns;" +
+    "var ns=Object.create(null);if(m&&(typeof m==='object'||typeof m==='function'))for(var k of Object.keys(m))ns[k]=m[k];ns.default=m;return ns;" +
     "});};";
   return head + applyEdits(source, edits);
 }

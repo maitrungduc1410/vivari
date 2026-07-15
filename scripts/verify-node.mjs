@@ -936,6 +936,33 @@ console.log('CRYPTOB_OK');
   assert(R.metaHasUrl === true, "esm: import.meta.url is available");
   assert(esm.stdout.includes("ESM_DYN:lazy-loaded"), "esm: dynamic import() resolves to a Promise of the module");
 
+  // dynamic import() in a .cjs file must expose a FUNCTION export's own statics as
+  // named exports (Node's CJS->ESM interop). Regression guard for the PGlite in-VM
+  // template: its Emscripten glue does `const { createRequire } = await import('module')`,
+  // and the `module` builtin export IS the Module *function* with createRequire hung off
+  // it — keying only objects made that undefined ("e is not a function" in create()).
+  kernel.mkdirp("/dbimp");
+  kernel.writeFile(
+    "/dbimp/fnexport.cjs",
+    "function f(){ return 1; } f.STAT = 'ok'; module.exports = f;\n",
+  );
+  kernel.writeFile(
+    "/dbimp/main.cjs",
+    "(async () => {\n" +
+      "  const assert = require('assert');\n" +
+      "  const mod = await import('module');\n" +
+      "  assert.strictEqual(typeof mod.createRequire, 'function', 'import(module).createRequire');\n" +
+      "  assert.ok(mod.default, 'import(module).default present');\n" +
+      "  const fn = await import('./fnexport.cjs');\n" +
+      "  assert.strictEqual(typeof fn.default, 'function', 'default is the function export');\n" +
+      "  assert.strictEqual(fn.STAT, 'ok', 'function export static surfaces as a named export');\n" +
+      "  console.log('CJSDYN_OK');\n" +
+      "})().catch((e) => { console.error(e); process.exit(1); });\n",
+  );
+  const cjsdyn = await kernel.start("node", ["/dbimp/main.cjs"], { cwd: "/dbimp", capture: true });
+  assert(cjsdyn.code === 0 && cjsdyn.stdout.includes("CJSDYN_OK"),
+    "esm: dynamic import() in a .cjs exposes a function export's statics as named exports (createRequire on 'module')");
+
   // === Consolidation: fill-in builtins that used to throw on require ===
   kernel.writeFile(
     "/t/compat.js",
