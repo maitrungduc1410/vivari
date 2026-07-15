@@ -282,6 +282,7 @@ OCWebSocket.prototype.send = function(data){
 };
 OCWebSocket.prototype.close = function(code, reason){
   if (this.readyState === 3 || this.readyState === 2) return; this.readyState = 2;
+  if (!this._cdpClosed){ this._cdpClosed = true; window.__ocNet.emit('Network.webSocketClosed', { requestId:this._rid, timestamp:window.__ocNet.now() }); window.__ocNet.unregister(this._rid); }
   post({ type:'oc-ws', dir:'out', sub:'close', connId:this._id, code:code, reason:reason });
 };
 OCWebSocket.prototype.addEventListener = function(t, fn){ if (this._l[t]) this._l[t].push(fn); };
