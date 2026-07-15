@@ -720,9 +720,9 @@ async function main() {
   });
 
   await registerServiceWorker();
-  // `?compress=1` enables the VFS's whole-file lazy compression (opt-in, for
-  // A/B benchmarking its memory footprint).
-  const compress = new URLSearchParams(location.search).has("compress");
+  // VFS whole-file lazy compression is ON by default; `?compress=0` disables it
+  // (A/B comparison or debugging).
+  const compress = new URLSearchParams(location.search).get("compress") !== "0";
   kernelWorker.postMessage({ type: "init", compress });
 }
 

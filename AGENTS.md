@@ -482,11 +482,13 @@ pnpm is wired like npm/yarn (`scripts/vendor-pnpm.mjs` → `pnpm-pack.bin`;
   Process-Worker model runs nested threads and the Rust VFS backs
   `symlink`/`readlink`/`lstat`. If either regresses, pnpm installs break where
   npm/yarn still pass — the canary is `scripts/spike-pnpm.mjs`.
-- No hardlink/reflink CoW in our VFS, so packages must be COPIED from the store.
-  A user types bare `pnpm add` (no room for flags), so the shell env carries the
-  config the npm way: `npm_config_package_import_method=copy` +
-  `npm_config_store_dir=/tmp/.pnpm-store` + `XDG_*` under `/home/user`
-  (see `openTerminal`). Keep these when editing the env.
+- The VFS now supports real hard links (`link(2)`, `nlink` refcount), so pnpm can
+  hard-link from its store instead of copying — several names share ONE inode's
+  bytes in RAM. A user types bare `pnpm add` (no room for flags), so the shell env
+  carries the config the npm way: `npm_config_package_import_method=hardlink` +
+  `npm_config_store_dir=/home/user/.local/share/pnpm/store` (PERSISTED, so the store
+  is shared across projects/reloads) + `XDG_*` under `/home/user` (see `openTerminal`).
+  Keep these when editing the env.
 - `vendor-pnpm.mjs` DROPS `*.node` files: pnpm ships prebuilt reflink addons only
   for darwin/win; Linux uses the JS fallback, so they're ~1.3 MB of dead weight.
 - `dist/pnpm.cjs` (~8.8 MB) exceeds the 1 MiB SAB window → loader uses writeLarge.
@@ -781,6 +783,24 @@ below it. Terminals use xterm `convertEol:true`, so guest code should emit `\n`
 The VFS mirrors to OPFS and **survives reload**. If a demo behaves as if old files
 linger, that's why — use `?reset` on the demo URL to wipe it. Restore happens
 before any syscall is served.
+
+### VFS memory: whole-file lazy compression (on by default)
+The FS worker's Wasm linear memory (all file bodies) is the largest addressable term
+in the tab. File bodies are a `FileBody { Raw | Zip{data,len} }`: cold files are stored
+zlib-compressed and inflate transparently (whole-file reads on demand; chunked `fd_read`
+once into a bounded 48 MiB hot-read cache). A file inflates in place on the first write
+and (re)compresses only when its last writable fd closes (`wopen` refcount) or after
+`write_file`, skipping files < 4 KiB or that don't beat a 95% ratio. Measured ~70% VFS
+shrink on a Nuxt `node_modules` (929 MB → 274 MB), dropping the real Chrome tab 2.9 → 2.1 GB.
+- **On by default**; `?compress=0` disables it. The flag is plumbed page (`init.compress`,
+  default true) → kernel worker (`vfsCompression`) → FS worker (`fs-set-compression`), applied
+  BEFORE the OPFS restore so restored files compress on write too.
+- Rust: `set_compression()` gate; `mem_bytes()` = physical (compressed) + hot cache;
+  `logical_mem_bytes()` = uncompressed, so "Measure Memory" prints the ratio. `flate2`
+  (miniz_oxide) keeps the wasm32 build toolchain-free.
+- With the gate off the code path is behaviorally identical, so `verify-node` is unaffected.
+  `scripts/spike-compress.mjs` estimates the win over a real `node_modules` offline. Any
+  change here needs `npm run build:vfs && npm run build:vfs:node` to rebuild the wasm.
 
 ---
 

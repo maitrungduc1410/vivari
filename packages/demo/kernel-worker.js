@@ -651,9 +651,10 @@ function defaultTermCwd() {
 // The File System Worker handle, kept module-scoped so the page-hide flush relay
 // (host -> here -> FS worker) can reach it. Set in boot().
 let fsWorkerRef = null;
-// Whole-file lazy compression gate for the VFS, sourced from the page URL
-// (?compress=1) and relayed to the File System Worker at boot. Off by default.
-let vfsCompression = false;
+// Whole-file lazy compression gate for the VFS, sourced from the page at boot
+// (init.compress) and relayed to the File System Worker. On by default; the page
+// sets it false only for ?compress=0.
+let vfsCompression = true;
 
 // A bound port isn't the same as a *serving* one: Vite 8 (rolldown) binds :port
 // a few times during startup (bind → close → rebind), so the first `listen`
@@ -1502,7 +1503,8 @@ self.onmessage = async (event) => {
   const m = event.data;
 
   if (m.type === "init") {
-    vfsCompression = !!m.compress;
+    // Default on: only an explicit `compress: false` (?compress=0) disables it.
+    vfsCompression = m.compress !== false;
     boot().catch((err) => post("log", { line: "kernel worker boot failed: " + err, stream: "stderr" }));
     return;
   }
