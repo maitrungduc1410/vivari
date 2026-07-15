@@ -2036,7 +2036,8 @@ with project-wide + dependency-aware type information.
   it's bundled into a same-origin chunk (COEP `require-corp` satisfied, no CDN). They run in Web
   Workers, so completions/hover/diagnostics never block the UI.
 - **Language service config (`configureLanguageService`).** Sensible compiler options (ESNext,
-  NodeJs resolution, `react-jsx`, `allowJs`, `esModuleInterop`, `resolveJsonModule`, `skipLibCheck`),
+  NodeJs resolution, `react-jsx`, `allowJs`, `esModuleInterop`, `resolveJsonModule`, `skipLibCheck`,
+  and `allowImportingTsExtensions`+`noEmit` so Vite templates' `import "./App.tsx"` don't error),
   semantic + syntax diagnostics ON, and `setEagerModelSync(true)` so every model we create is visible
   to the worker. `checkJs` stays OFF so plain-JS projects aren't drowned in type errors.
 - **Cross-file IntelliSense = the project's files as models (`ensureBackgroundModels`).** The worker
@@ -2049,7 +2050,9 @@ with project-wide + dependency-aware type information.
   by the worker that holds the sync Wasm VFS — one bulk reply instead of thousands of `oc-read`
   round-trips — walking `@types` first, skipping `typescript`'s own libs (Monaco ships those), and
   bounded by a file-count + byte budget. The controller registers them via `setExtraLibs`. The load is
-  debounced and re-runs on fs changes, so a fresh `npm install` lights up real types.
+  debounced and re-runs on folder open, fs changes, and **after any process exits** — since an in-VM
+  `npm install` doesn't emit `oc-fs-changed`, a finished process is the cue that `node_modules` may
+  have appeared. A cheap `node_modules` fingerprint short-circuits the file reads when nothing changed.
 - **Problems in the status bar (`StatusBar.tsx`).** `monaco.editor.onDidChangeMarkers` feeds a live
   error/warning count into the snapshot, surfaced next to the status text.
 

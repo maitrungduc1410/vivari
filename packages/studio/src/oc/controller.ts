@@ -231,7 +231,8 @@ export class IdeController {
   private editor: Monaco.editor.IStandaloneCodeEditor | null = null;
   private editorMounting = false; // guards the async create against StrictMode double-mount
   private models = new Map<string, Monaco.editor.ITextModel>(); // abs -> model
-  private depLibs = new Map<string, string>(); // extra-lib uri -> .d.ts/package.json content
+  private depLibsByRoot = new Map<string, Map<string, string>>(); // root -> (extra-lib uri -> content)
+  private depsSig = new Map<string, string>(); // root -> last node_modules fingerprint
   private dtsTimer: ReturnType<typeof setTimeout> | null = null; // debounce dependency-type loads
   private dtsSeq = 0; // supersede in-flight dependency-type refreshes
   private previewFrames = new Map<string, HTMLIFrameElement>(); // preview tab id -> iframe
@@ -602,7 +603,10 @@ export class IdeController {
       esModuleInterop: true,
       resolveJsonModule: true,
       skipLibCheck: true,
-      baseUrl: "/",
+      // Vite templates import with explicit extensions (`import App from "./App.tsx"`);
+      // allow it (requires noEmit, which the language service is anyway).
+      allowImportingTsExtensions: true,
+      noEmit: true,
       lib: ["esnext", "dom", "dom.iterable", "webworker"],
     };
     for (const d of [ts.typescriptDefaults, ts.javascriptDefaults]) {
@@ -671,19 +675,32 @@ export class IdeController {
     if (!this.monaco) return;
     const monaco = this.monaco;
     const seq = ++this.dtsSeq;
-    const next = new Map<string, string>();
-    for (const root of this.snap.workspaceFolders.map((f) => f.rootPath)) {
-      const res = await this.bridge.request("oc-collect-dts", { root });
+    const roots = new Set(this.snap.workspaceFolders.map((f) => f.rootPath));
+    let changed = false;
+    // Forget libs for roots that are no longer open.
+    for (const r of [...this.depLibsByRoot.keys()]) {
+      if (!roots.has(r)) { this.depLibsByRoot.delete(r); this.depsSig.delete(r); changed = true; }
+    }
+    // Harvest each root, passing its last node_modules fingerprint so an unchanged
+    // tree short-circuits in the worker (no file reads).
+    for (const root of roots) {
+      const res = await this.bridge.request("oc-collect-dts", { root, sig: this.depsSig.get(root) ?? "" });
       if (seq !== this.dtsSeq) return; // a newer refresh superseded us
       if (!res.ok) continue;
+      if (typeof res.sig === "string") this.depsSig.set(root, res.sig);
+      if (res.unchanged) continue;
+      const map = new Map<string, string>();
       for (const f of (res.files as { path: string; content: string }[]) ?? []) {
-        next.set(monaco.Uri.file(f.path).toString(), f.content);
+        map.set(monaco.Uri.file(f.path).toString(), f.content);
       }
+      this.depLibsByRoot.set(root, map);
+      changed = true;
     }
-    // Skip the (potentially large) setExtraLibs churn if nothing actually changed.
-    if (next.size === this.depLibs.size && [...next].every(([k, v]) => this.depLibs.get(k) === v)) return;
-    this.depLibs = next;
-    const libs = Array.from(next, ([filePath, content]) => ({ filePath, content }));
+    if (!changed) return;
+    const libs: { filePath: string; content: string }[] = [];
+    for (const map of this.depLibsByRoot.values()) {
+      for (const [filePath, content] of map) libs.push({ filePath, content });
+    }
     monaco.typescript.typescriptDefaults.setExtraLibs(libs);
     monaco.typescript.javascriptDefaults.setExtraLibs(libs);
   }
@@ -1575,6 +1592,10 @@ export class IdeController {
         if (owner === pid) { this.portMap.delete(port); changed = true; }
       }
       if (changed) this.syncPorts();
+      // A process finished — it may have been `npm/yarn/pnpm install`. In-VM writes
+      // don't emit oc-fs-changed, so re-harvest dependency types (debounced; the
+      // worker short-circuits via a node_modules fingerprint when nothing changed).
+      this.scheduleDependencyTypes();
     });
     b.on("listen", (m) => {
       this.consoleLine(`[kernel] pid ${m.pid} listening on :${m.port}`, "90");

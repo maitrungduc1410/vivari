@@ -368,8 +368,12 @@ phantom "Duplicate identifier" errors. Rule: the project's OWN source files are 
 dependency types (`node_modules/**/*.d.ts` + `package.json`) are the extra libs, harvested in bulk by
 the kernel worker (`oc-collect-dts`, sole VFS holder → one reply, not thousands of reads) and pushed
 via `setExtraLibs`. Never register a file as BOTH. The dts harvest is bounded (file-count + byte
-budget) and debounced; it re-runs on fs changes so a fresh `npm install` lights up types. `checkJs`
-stays off so plain-JS projects aren't flooded with semantic errors.
+budget) and debounced; it re-runs on folder open, fs changes, AND after any process exits — because
+in-VM writes (a `npm/yarn/pnpm install`) do NOT emit `oc-fs-changed`, so process exit is the signal
+that `node_modules` may have appeared. A cheap `node_modules` fingerprint (top-level package list) in
+`oc-collect-dts` short-circuits the file reads when nothing actually changed, so triggering on every
+process exit is nearly free. `checkJs` stays off so plain-JS projects aren't flooded with semantic
+errors.
 
 ### Real npm is the studio shell's `npm` (delivery + shims)
 The North Star is running the real npm/yarn/pnpm CLIs, not our from-scratch

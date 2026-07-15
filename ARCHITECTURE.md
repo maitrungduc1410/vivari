@@ -551,8 +551,10 @@ flowchart LR
 - **Dependency typings become extra libs.** Harvesting `node_modules/**/*.d.ts` (+ `package.json` for
   `types`/`exports` resolution) happens in the **kernel worker** (`oc-collect-dts`) — the sole VFS
   holder — as one bulk reply instead of thousands of reads; `@types` first, `typescript`'s own libs
-  skipped (Monaco ships those), bounded by file-count + byte budget. It's debounced and re-runs on fs
-  changes, so a fresh `npm install` lights up real types.
+  skipped (Monaco ships those), bounded by file-count + byte budget. It's debounced and re-runs on
+  folder open, fs changes, and after any process exits (an in-VM `npm install` doesn't emit
+  `oc-fs-changed`, so a finished process is the cue that `node_modules` may have appeared); a cheap
+  `node_modules` fingerprint short-circuits the file reads when nothing changed.
 - **Never register a file as both** a model and an extra lib, or the worker sees it twice ("Duplicate
   identifier"). `onDidChangeMarkers` feeds a live error/warning count into the status bar.
 

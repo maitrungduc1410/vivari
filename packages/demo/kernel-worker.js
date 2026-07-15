@@ -1292,12 +1292,31 @@ const DTS_MAX_BYTES = 12_000_000;
 // re-reading the same files.
 const DTS_SKIP_DIRS = new Set(["@types", "typescript", ".bin", ".cache", ".vite"]);
 
-async function collectDts(root) {
+// A cheap "did node_modules change?" fingerprint: the sorted top-level package
+// list (+ @types), no file reads. Lets a re-harvest after every process exit
+// short-circuit unless an install actually added/removed packages.
+function depsSignature(nm) {
+  let names;
+  try { names = kernel.readdir(nm); } catch { return ""; }
+  names = names.slice().sort();
+  const parts = [names.length + ":" + names.join(",")];
+  try {
+    let t = kernel.readdir(nm + "/@types");
+    t = t.slice().sort();
+    parts.push("@types=" + t.length + ":" + t.join(","));
+  } catch { /* no @types */ }
+  return parts.join("|");
+}
+
+async function collectDts(root, prevSig) {
   const out = [];
   const ctx = { bytes: 0, scanned: 0, truncated: false };
-  if (!kernel) return { files: out, truncated: false };
+  if (!kernel) return { files: out, truncated: false, sig: "", unchanged: false };
   const nm = String(root || "").replace(/\/+$/, "") + "/node_modules";
-  try { if (!kernel.exists(nm)) return { files: out, truncated: false }; } catch { return { files: out, truncated: false }; }
+  try { if (!kernel.exists(nm)) return { files: out, truncated: false, sig: "", unchanged: prevSig === "" }; } catch { return { files: out, truncated: false, sig: "", unchanged: false }; }
+  const sig = depsSignature(nm);
+  // Unchanged since the caller's last harvest — skip the (expensive) file reads.
+  if (sig && sig === prevSig) return { files: out, truncated: false, sig, unchanged: true };
 
   const collectFile = (abs, name) => {
     if (!(name.endsWith(".d.ts") || name === "package.json")) return;
@@ -1332,7 +1351,7 @@ async function collectDts(root) {
   const typesDir = nm + "/@types";
   try { if (kernel.exists(typesDir)) await walk(typesDir, 1); } catch { /* ignore */ }
   await walk(nm, 0);
-  return { files: out, truncated: ctx.truncated };
+  return { files: out, truncated: ctx.truncated, sig, unchanged: false };
 }
 
 async function runSearch(m) {
@@ -1514,8 +1533,8 @@ self.onmessage = async (event) => {
   // read round-trips. Bounded (file count + total bytes) and yields periodically.
   if (m.type === "oc-collect-dts") {
     if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
-    collectDts(m.root)
-      .then((r) => post("oc-reply", { reqId: m.reqId, ok: true, files: r.files, truncated: r.truncated }))
+    collectDts(m.root, m.sig || "")
+      .then((r) => post("oc-reply", { reqId: m.reqId, ok: true, files: r.files, truncated: r.truncated, sig: r.sig, unchanged: r.unchanged }))
       .catch((err) => post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) }));
     return;
   }
