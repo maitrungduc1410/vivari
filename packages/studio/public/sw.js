@@ -664,11 +664,23 @@ async function handlePreview(event, port, path, keepPrefix) {
     return new Response("Bad preview URL\n", { status: 400 });
   }
 
-  // Find the page that hosts the kernel (any window client that is not itself a
-  // preview frame). We include uncontrolled clients so this works on first load.
+  // Find the page that hosts the kernel: the top-level studio window. We include
+  // uncontrolled clients so this works on first load. Two nested iframes must NOT
+  // be mistaken for it: a preview frame (under /preview/) and — crucially — the
+  // DevTools frontend (/devtools-host.html). When DevTools is open that iframe is
+  // also a window client with no /preview/ marker, so the old "first non-preview
+  // client" heuristic could post the HTTP request to it; it has no kernel to
+  // answer, so the request hung until the 60s timeout (only ever with DevTools
+  // open). Prefer the top-level frame; fall back to any non-preview, non-DevTools
+  // window for the rare case frameType is unavailable.
   const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  const isPreview = (c) => c.url.includes(PREVIEW_MARKER);
+  const isDevtools = (c) => c.url.includes("/devtools-host.html") || c.url.includes("/devtools/");
   const kernelClient =
-    clients.find((c) => !c.url.includes(PREVIEW_MARKER)) || clients[0];
+    clients.find((c) => c.frameType === "top-level" && !isPreview(c) && !isDevtools(c)) ||
+    clients.find((c) => !isPreview(c) && !isDevtools(c)) ||
+    clients.find((c) => !isPreview(c)) ||
+    clients[0];
   if (!kernelClient) {
     return new Response("OpenContainer kernel is not running\n", { status: 503 });
   }
