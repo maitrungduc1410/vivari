@@ -147,7 +147,11 @@ export class KernelBridge {
 
   /** Start the kernel (spawns fs/fetcher workers + VFS, then posts `ready`). */
   boot() {
-    this.worker.postMessage({ type: "init" });
+    // VFS whole-file lazy compression is ON by default (it cuts the FS worker's
+    // memory footprint by ~70% for a big node_modules). `?compress=0` is the
+    // escape hatch to disable it for A/B comparison or debugging.
+    const compress = new URLSearchParams(location.search).get("compress") !== "0";
+    this.worker.postMessage({ type: "init", compress });
   }
 }
 

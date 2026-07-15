@@ -651,6 +651,10 @@ function defaultTermCwd() {
 // The File System Worker handle, kept module-scoped so the page-hide flush relay
 // (host -> here -> FS worker) can reach it. Set in boot().
 let fsWorkerRef = null;
+// Whole-file lazy compression gate for the VFS, sourced from the page at boot
+// (init.compress) and relayed to the File System Worker. On by default; the page
+// sets it false only for ?compress=0.
+let vfsCompression = true;
 
 // A bound port isn't the same as a *serving* one: Vite 8 (rolldown) binds :port
 // a few times during startup (bind → close → rebind), so the first `listen`
@@ -717,7 +721,8 @@ function queryVfsMem(timeoutMs = 2000) {
   if (!fsWorkerRef) return Promise.resolve(null);
   return new Promise((resolve) => {
     const id = memReqSeq++;
-    const done = (data) => resolve(data ? { bytes: data.bytes, files: data.files } : null);
+    const done = (data) =>
+      resolve(data ? { bytes: data.bytes, files: data.files, logical: data.logical } : null);
     memPending.set(id, done);
     setTimeout(() => {
       if (memPending.delete(id)) resolve(null);
@@ -752,6 +757,10 @@ async function boot() {
     name: "File System Worker",
   });
   fsWorkerRef = fsWorker;
+  // Relay the compression gate now, before the FS worker's OPFS restore runs, so
+  // it's in force as early as possible (the FS worker queues it until the VFS is
+  // constructed). No-op on wasm builds that predate set_compression.
+  fsWorker.postMessage({ type: "fs-set-compression", on: vfsCompression });
   let onKernelFsMessage = () => {};
   const fsReady = new Promise((resolve) => {
     fsWorker.onmessage = (event) => {
@@ -1497,6 +1506,8 @@ self.onmessage = async (event) => {
   const m = event.data;
 
   if (m.type === "init") {
+    // Default on: only an explicit `compress: false` (?compress=0) disables it.
+    vfsCompression = m.compress !== false;
     boot().catch((err) => post("log", { line: "kernel worker boot failed: " + err, stream: "stderr" }));
     return;
   }
@@ -1520,6 +1531,7 @@ self.onmessage = async (event) => {
       kernelBytes,
       vfsBytes: vfsMem ? vfsMem.bytes : -1,
       vfsFiles: vfsMem ? vfsMem.files : -1,
+      vfsLogicalBytes: vfsMem ? vfsMem.logical : -1,
     });
     return;
   }

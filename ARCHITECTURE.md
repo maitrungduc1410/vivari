@@ -182,7 +182,17 @@ never parks and many downloads can overlap (§6).
 - **VFS core**: `packages/vfs/` is a Rust crate compiled to Wasm (`wasm-pack`,
   `web` + `nodejs` targets; crate `open-webcontainer-vfs`). It's an inode table (`HashMap<u64, Inode>`),
   directories map names→inode via `BTreeMap` (sorted readdir for free), symlinks
-  with an `ELOOP` guard, `stat`/`lstat`, rename, errno-style errors.
+  with an `ELOOP` guard, `stat`/`lstat`, rename, errno-style errors. Hard links share
+  one inode across names (`nlink` refcount; freed on last unlink).
+- **VFS memory / compression**: file bodies are a `FileBody { Raw | Zip{data,len} }`.
+  Cold files are stored **zlib-compressed** and inflate transparently — whole-file reads
+  on demand, chunked `fd_read` once into a bounded (48 MiB) hot-read cache. The first
+  write inflates in place; a file is (re)compressed only when its last writable fd closes
+  (a `wopen` refcount) or after `write_file`, skipping files < 4 KiB or that don't beat a
+  95% ratio. This cuts the FS worker's linear-memory footprint ~70% for a big
+  `node_modules` (the largest addressable term in the tab). **On by default**; `?compress=0`
+  disables it (plumbed page → kernel worker → FS worker, applied before OPFS restore).
+  `mem_bytes()`/`logical_mem_bytes()` back the "Measure Memory" ratio readout.
 - **Servicing**: `packages/kernel-host/fs-server.js` (`FsServer`) owns the one VFS
   instance and services fs opcodes directly over each client's SAB. It runs inside
   the **File System Worker** (`packages/demo/fs-worker.js`).

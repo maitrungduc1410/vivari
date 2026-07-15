@@ -726,7 +726,10 @@ async function main() {
   });
 
   await registerServiceWorker();
-  kernelWorker.postMessage({ type: "init" });
+  // VFS whole-file lazy compression is ON by default; `?compress=0` disables it
+  // (A/B comparison or debugging).
+  const compress = new URLSearchParams(location.search).get("compress") !== "0";
+  kernelWorker.postMessage({ type: "init", compress });
 }
 
 main();

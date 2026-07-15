@@ -145,6 +145,9 @@ export interface MemInfo {
   total: number | null;
   vfsBytes: number;
   vfsFiles: number;
+  // Uncompressed VFS footprint; equals vfsBytes when compression is off. When
+  // compression is on, vfsBytes/vfsLogicalBytes is the realized ratio.
+  vfsLogicalBytes: number;
   ts: number;
 }
 
@@ -1675,12 +1678,24 @@ export class IdeController {
     // own measurement, gathered over the bridge.
     let vfsBytes = -1;
     let vfsFiles = -1;
+    let vfsLogicalBytes = -1;
     try {
       const m = await this.bridge.request("oc-mem");
       vfsBytes = Number(m.vfsBytes ?? -1);
       vfsFiles = Number(m.vfsFiles ?? -1);
+      vfsLogicalBytes = Number(m.vfsLogicalBytes ?? -1);
       if (vfsBytes >= 0) {
         this.consoleLine(`VFS content in RAM: ${fmtBytes(vfsBytes)} across ${vfsFiles} files`, "36");
+        // Show the realized compression ratio when the logical size is larger
+        // (i.e. some files are stored compressed).
+        if (vfsLogicalBytes > vfsBytes) {
+          const saved = vfsLogicalBytes - vfsBytes;
+          const ratio = (vfsBytes / vfsLogicalBytes) * 100;
+          this.consoleLine(
+            `  compressed from ${fmtBytes(vfsLogicalBytes)} (${ratio.toFixed(0)}% of logical, saved ${fmtBytes(saved)})`,
+            "90",
+          );
+        }
       } else {
         this.consoleLine("VFS content size unavailable (rebuild the VFS wasm: `npm run build:vfs`).", "90");
       }
@@ -1691,7 +1706,7 @@ export class IdeController {
       /* kernel not ready */
     }
 
-    this.set({ memInfo: { total, vfsBytes, vfsFiles, ts: Date.now() } });
+    this.set({ memInfo: { total, vfsBytes, vfsFiles, vfsLogicalBytes, ts: Date.now() } });
   }
 
   // ── kernel worker message handling (ported from host.js) ──────────────────

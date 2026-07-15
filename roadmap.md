@@ -2047,6 +2047,40 @@ and teaches quick-open to jump to a line — without ever blocking the UI.
 Follow-ups: search result virtualization for very large result sets, a search-history dropdown
 (the input hints at `↑↓`), and `.gitignore`-aware excludes.
 
+## VFS whole-file lazy compression — cut the tab's RAM (this change)
+
+The File System Worker's Wasm linear memory (every file body held as raw bytes) was the
+single largest *addressable* consumer of the tab — ~929 MB for a Nuxt project's
+`node_modules`. This stores cold file bodies zlib-compressed in the VFS, transparently, so
+that footprint drops ~70% with no change to guest behavior. **On by default**; `?compress=0`
+disables it (the flag is plumbed page → kernel worker → FS worker and applied before the OPFS
+restore). Builds on the prior memory MR (bounded fetch-cache LRU, VFS hard links, and the
+"Measure Memory" readout via `performance.measureUserAgentSpecificMemory`).
+
+- **`FileBody { Raw(Vec<u8>) | Zip { data, len } }`** in `packages/vfs/src/lib.rs` replaces the
+  bare `Vec<u8>` in `NodeData::File`. Reads inflate transparently: whole-file `read_file`
+  inflates on demand, and chunked `fd_read` inflates a cold file **once** into a bounded (48 MiB)
+  FIFO hot-read cache keyed by inode, then slices from it — the stored body stays compressed.
+- **Lazy, quiescent-only compression.** The first write inflates the body in place (`raw_mut`);
+  a file is (re)compressed only when its **last writable fd closes** (tracked with a `wopen`
+  refcount) or after `write_file`, so the write path never fights the compressor. Guards: skip
+  files < 4 KiB and keep them Raw unless zlib beats 95% of the original (already-compressed
+  assets like `.png`/`.woff2` stay Raw).
+- **Diagnostics.** `mem_bytes()` now reports the *physical* (compressed) footprint plus the hot
+  cache; new `logical_mem_bytes()` exposes the uncompressed size so "Measure Memory" prints the
+  realized ratio (`compressed from X (Y% of logical, saved Z)`). `set_compression(bool)` is the
+  runtime gate. `flate2` (miniz_oxide, pure-Rust `rust_backend`) keeps the wasm32 build
+  toolchain-free.
+- **Measured (Nuxt, Chrome).** VFS content 929.0 MB → 273.6 MB (**−71%**, 29% ratio, saved
+  655 MB); the FS worker heap fell by the same ~650 MB (the VFS *is* its linear memory); the
+  real Chrome tab dropped 2.9 GB → **2.1 GB**. Cost: a little install-time CPU (each file is
+  deflated once on close). The next-largest consumer is now the dev-server Process Worker heap
+  (~1.87 GB), which compression doesn't touch.
+- **Verification.** `scripts/spike-compress.mjs` estimates the projected saving over any real
+  `node_modules` using the same thresholds (no browser/wasm rebuild). With the gate off the code
+  path is behaviorally identical, so `verify-node` is unaffected. Requires `npm run build:vfs &&
+  npm run build:vfs:node` to rebuild the wasm.
+
 ## Real IntelliSense — Monaco's TS/JS language service, off-main-thread (this change)
 
 The editor was syntax-coloring only: Monaco's language workers were a no-op `MonacoEnvironment`, so
