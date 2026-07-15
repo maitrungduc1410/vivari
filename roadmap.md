@@ -2141,6 +2141,53 @@ host `WebAssembly` over the virtual filesystem) already runs Wasm-compiled SQL e
   `WebAssembly` primitives the runtime exposes): sql.js answers queries; PGlite boots real
   PostgreSQL 18 and answers `SELECT version()`.
 
+## Server-Sent Events over an `oc-sse` tunnel + `EventSource` polyfill (this change)
+
+The old `sse` template rendered but showed nothing: a streaming `text/event-stream` response
+can't cross the HTTP preview proxy. That path is **buffered end-to-end** — the Service Worker
+resolves ONE complete body (`handleHttpRequest` → `OP_RESPOND` waits for `total`), and
+`bridgeHttp` only replies on `cres.on('end')`, which never fires for an SSE stream — so the
+connection just 504s at the SW's 60s timeout. SSE was, in effect, unsupported.
+
+The fix mirrors the proven **WebSocket tunnel** (roadmap #19 stage C), minus the client→server
+leg (SSE is one-way):
+
+- **`EventSource` polyfill** injected into every preview page (both `packages/demo/sw.js` and
+  `packages/studio/public/sw.js`, right next to the ws shim). It replaces the iframe's
+  `EventSource` with one that tunnels each connection to the host page (`parent.postMessage`,
+  `type:'oc-sse'`, `sub:'open'|'close'`) and parses the raw event-stream bytes it gets back into
+  `message`/named events per the SSE spec (`data:`/`event:`/`id:`, dispatched on a blank line) —
+  so both `es.onmessage` and `es.addEventListener('metric', …)` work. Port routing +
+  `fallbackPort` are identical to the ws shim.
+- **Kernel routing** (`packages/kernel-host/kernel.js`): `handleSseClient` binds the `connId`
+  to the process listening on the port and forwards `sse-open`/`sse-close`; `handleSseOut`
+  relays a process's outbound chunk back out via `onSseSend`. `sseConns` are torn down on
+  process exit (the browser gets a close), same as `wsConns`.
+- **Runtime relay** (`packages/runtime/index.js`): `sseRelay` opens a genuine in-VM loopback
+  `GET` (`Accept: text/event-stream`) to `127.0.0.1:<port><path>` and forwards each incremental
+  `res.write()` chunk out as `sse-out {sub:'open'|'chunk'|'close'}`. A live relay refs the
+  event loop (`sseLiveness`) so it keeps pumping like an open socket handle.
+- **Relays**: `process-worker.js` (`sse-open`/`sse-close` → `dispatchSse`), `kernel-worker.js`
+  (`oc-sse` ↔ `onSseSend`), demo `host.js`, and studio `kernel.ts`/`controller.ts` — each gets
+  an `oc-sse` case beside its `oc-ws` one.
+
+**Richer template.** The `sse` Showcase template now multiplexes three event types onto ONE
+connection — a per-second default `message` tick (counter + live clock), a named `metric` gauge
+(a live CSS bar chart), and named `notice` log lines — with a connection-status pill and a
+Pause/Resume control (the polyfill's `close()`/reconnect). It demonstrates default AND named
+events, exactly what native `EventSource` gives you.
+
+- **Verification.** New network spike `scripts/spike-sse.mjs` (in `run-spikes.mjs`) drives the
+  exact tunnel **headlessly, no browser**: it installs + binds the server, then calls
+  `kernel.handleSseClient({sub:'open',…})` and collects `kernel.onSseSend` chunks, asserting the
+  stream opens and delivers default + `metric` + `notice` events with an advancing counter.
+  Stays `experimental` until green in CI.
+- **Feasibility proof.** The streaming + parsing core was confirmed in vanilla Node (an
+  `http.createServer` SSE endpoint consumed by `http.request` with `cres.on('data')`): chunks
+  arrive incrementally (one batch per server tick, not buffered to `end`), and the same
+  blank-line frame parser the shim/spike use correctly separates default/`metric`/`notice`
+  events with a progressing counter.
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

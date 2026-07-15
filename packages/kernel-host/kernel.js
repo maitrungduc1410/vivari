@@ -84,6 +84,15 @@ export class Kernel {
     this.wsConns = new Map(); // connId -> pid
     this.onWsSend = null;
 
+    // ---- Server-Sent Events tunnel ----
+    // Same idea as the ws tunnel but one-way: the browser preview tunnels each
+    // EventSource connection to us (a streaming text/event-stream response can't
+    // cross the buffered HTTP preview proxy). connId (chosen browser-side) -> pid
+    // that owns the port. `onSseSend(msg)` relays a process's outbound stream
+    // chunk back out to the browser via the kernel worker + preview iframe.
+    this.sseConns = new Map(); // connId -> pid
+    this.onSseSend = null;
+
     // ---- cross-process UNIX sockets / named pipes ----
     // A pipe server registers its socket path here (path -> owner pid). A client
     // in another process resolves the path to a connId; from then on raw bytes are
@@ -268,6 +277,9 @@ export class Kernel {
         // #19 stage C: this process relays a ws frame outward (in-VM ws server ->
         // browser preview) for a tunneled connection.
         "ws-out": (m) => this.handleWsOut(pid, m),
+        // A process relays an SSE stream chunk outward (in-VM server -> browser
+        // preview EventSource) for a tunneled connection.
+        "sse-out": (m) => this.handleSseOut(pid, m),
         // Cross-process pipe (UNIX socket) traffic this process produced: bytes /
         // half-close / teardown for a connection, relayed to the peer process.
         "pipe-data": (m) => this.handlePipeRelay(pid, m),
@@ -357,6 +369,13 @@ export class Kernel {
       if (owner === pid) {
         this.wsConns.delete(connId);
         if (this.onWsSend) this.onWsSend({ connId, sub: "close", code: 1006 });
+      }
+    }
+    // Tear down any SSE tunnels this process owned, telling the browser they closed.
+    for (const [connId, owner] of this.sseConns) {
+      if (owner === pid) {
+        this.sseConns.delete(connId);
+        if (this.onSseSend) this.onSseSend({ connId, sub: "close" });
       }
     }
     // Drop any pipe (UNIX socket) servers this process hosted, and tear down every
@@ -682,6 +701,50 @@ export class Kernel {
   handleWsOut(pid, m) {
     if (m.sub === "close") this.wsConns.delete(m.connId);
     if (this.onWsSend) this.onWsSend(m);
+  }
+
+  // ---- Server-Sent Events tunnel routing ------------------------------------
+  // A message from the browser preview's EventSource polyfill (relayed by the
+  // environment as {sub:'open'|'close', connId, ...}). 'open' binds the connId to
+  // the process listening on `port`; 'close' tears the relay down. Mirrors
+  // handleWsClient, minus the client->server 'send' leg (SSE is one-way).
+  handleSseClient(msg) {
+    const { sub, connId } = msg;
+    if (sub === "open") {
+      let port = msg.port | 0;
+      let pid = this.listeners.get(port);
+      // Same fallback as ws: the polyfill routes by the URL's port, which can miss
+      // (studio-origin port, or an aux port not up yet); fall back to the iframe's
+      // own preview port so the common single-port case still connects.
+      if ((pid == null || !this.procs.has(pid)) && msg.fallbackPort != null) {
+        const fp = msg.fallbackPort | 0;
+        const fpid = this.listeners.get(fp);
+        if (fpid != null && this.procs.has(fpid)) {
+          port = fp;
+          pid = fpid;
+        }
+      }
+      if (pid == null || !this.procs.has(pid)) {
+        if (this.onSseSend) this.onSseSend({ connId, sub: "close" });
+        return;
+      }
+      this.sseConns.set(connId, pid);
+      this.postToProc(pid, { type: "sse-open", connId, port, path: msg.path || "/" });
+      return;
+    }
+    const pid = this.sseConns.get(connId);
+    if (pid == null) return;
+    if (sub === "close") {
+      this.sseConns.delete(connId);
+      this.postToProc(pid, { type: "sse-close", connId });
+    }
+  }
+
+  // A process relayed an SSE stream chunk outward ({connId, sub:'open'|'chunk'|
+  // 'close', ...}).
+  handleSseOut(pid, m) {
+    if (m.sub === "close") this.sseConns.delete(m.connId);
+    if (this.onSseSend) this.onSseSend(m);
   }
 
   handleSpawn(parent, spec) {

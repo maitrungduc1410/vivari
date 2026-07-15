@@ -656,6 +656,12 @@ async function main() {
         frame.contentWindow?.postMessage({ ...m.msg, type: "oc-ws", dir: "in" }, "*");
         break;
 
+      // An SSE stream chunk the kernel routed OUT of the VM — deliver it to the
+      // preview iframe's EventSource polyfill.
+      case "oc-sse":
+        frame.contentWindow?.postMessage({ ...m.msg, type: "oc-sse", dir: "in" }, "*");
+        break;
+
       // The selected project's dev/app server is up: open its files + preview.
       case "demo-ready": {
         pointPreview(m.port);
@@ -688,8 +694,8 @@ async function main() {
   // connection events UP; relay them to the kernel worker.
   addEventListener("message", (event) => {
     const d = event.data;
-    if (!d || d.type !== "oc-ws" || d.dir !== "out") return;
-    kernelWorker.postMessage({ type: "oc-ws", msg: d });
+    if (!d || d.dir !== "out" || (d.type !== "oc-ws" && d.type !== "oc-sse")) return;
+    kernelWorker.postMessage({ type: d.type, msg: d });
   });
 
   runDemoBtn.addEventListener("click", () => {

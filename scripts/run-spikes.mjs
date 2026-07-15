@@ -48,6 +48,8 @@ const SPIKES = [
   // its install + first-boot compile need a longer budget.
   { name: "sqlite", file: "spike-sqlite.mjs", net: true },
   { name: "pglite", file: "spike-pglite.mjs", net: true, timeout: 900000 },
+  // Server-Sent Events over the oc-sse tunnel (streams past the buffered HTTP proxy).
+  { name: "sse", file: "spike-sse.mjs", net: true },
 ];
 
 const args = process.argv.slice(2);

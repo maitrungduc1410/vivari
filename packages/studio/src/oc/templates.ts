@@ -1776,7 +1776,7 @@ function sseTemplate(): TemplateDef {
       category: "Showcase",
       name: "Server-Sent Events",
       language: "JavaScript",
-      description: "Express streaming live updates to the browser via EventSource",
+      description: "Express streaming live updates to the browser via EventSource (multiplexed named events + live chart)",
       port: 3000,
       openPath: "/",
       entry: "server/index.js",
@@ -1784,6 +1784,10 @@ function sseTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "node server/index.js",
+      // Experimental until scripts/spike-sse.mjs is green in CI. SSE streams over
+      // the oc-sse tunnel + EventSource polyfill (the buffered HTTP preview proxy
+      // can't carry a never-ending text/event-stream body).
+      experimental: true,
     },
     files: {
       "package.json": `{
@@ -1801,15 +1805,44 @@ const path = require('path');
 const app = express();
 const port = Number(process.env.PORT ?? 3000);
 
+// One SSE endpoint multiplexing several named event types onto a single stream:
+//   (default) message -> a per-second tick { n, time }
+//   metric            -> a random gauge value { value } for the live chart
+//   notice            -> occasional log lines { level, text }
 app.get('/events', (req, res) => {
-  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
   res.flushHeaders();
+  // Tell EventSource clients how long to wait before reconnecting after a drop.
+  res.write('retry: 2000\\n\\n');
+
   let n = 0;
-  const id = setInterval(() => {
+  const send = (event, data) => {
+    if (event) res.write('event: ' + event + '\\n');
+    res.write('id: ' + Date.now() + '\\n');
+    res.write('data: ' + JSON.stringify(data) + '\\n\\n');
+  };
+
+  // Prime the client immediately so nothing looks idle on connect.
+  send('notice', { level: 'info', text: 'stream opened' });
+  send(null, { n: n, time: new Date().toISOString() });
+  send('metric', { value: 50 });
+
+  const tick = setInterval(() => {
     n++;
-    res.write('data: ' + JSON.stringify({ n, time: new Date().toISOString() }) + '\\n\\n');
+    send(null, { n: n, time: new Date().toISOString() });
+    send('metric', { value: Math.round(20 + Math.random() * 80) });
+    if (n % 5 === 0) send('notice', { level: 'ok', text: 'processed batch #' + n / 5 });
   }, 1000);
-  req.on('close', () => clearInterval(id));
+
+  // A comment line keeps intermediaries from idling the connection out.
+  const beat = setInterval(() => res.write(': keep-alive\\n\\n'), 15000);
+
+  req.on('close', () => { clearInterval(tick); clearInterval(beat); });
 });
 
 app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -1822,21 +1855,113 @@ app.listen(port, () => console.log('SSE demo on http://localhost:' + port));
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Server-Sent Events</title>
     <style>
-      body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0a0a0a; color: #ededed; }
-      #log { margin-top: 1rem; font-family: ui-monospace, monospace; font-size: .85rem; white-space: pre-wrap; }
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body { font-family: system-ui, sans-serif; margin: 0; padding: 2.5rem; background: #0a0a0a; color: #ededed; }
+      main { max-width: 720px; margin: 0 auto; }
+      header { display: flex; align-items: center; gap: .75rem; }
+      h1 { margin: 0; font-size: 1.5rem; }
+      .sub { color: #9ca3af; margin: .35rem 0 1.25rem; }
+      .pill { display: inline-flex; align-items: center; gap: .4rem; font-size: .75rem; padding: .25rem .6rem; border-radius: 999px; background: #1f2937; color: #9ca3af; }
+      .pill .dot { width: .5rem; height: .5rem; border-radius: 999px; background: #6b7280; }
+      .pill.live { background: #052e1a; color: #4ade80; } .pill.live .dot { background: #22c55e; }
+      .pill.off { background: #3f1d1d; color: #f87171; } .pill.off .dot { background: #ef4444; }
+      .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
+      .card { background: #111; border: 1px solid #1f2937; border-radius: 12px; padding: 1rem 1.1rem; }
+      .card .k { color: #9ca3af; font-size: .78rem; } .card .v { font-size: 1.7rem; font-weight: 600; margin-top: .2rem; }
+      .chart { display: flex; align-items: flex-end; gap: 3px; height: 90px; margin-top: .6rem; }
+      .chart .bar { flex: 1; min-width: 2px; background: linear-gradient(#60a5fa, #2563eb); border-radius: 2px 2px 0 0; transition: height .3s ease; }
+      .bar-wrap { background: #111; border: 1px solid #1f2937; border-radius: 12px; padding: 1rem 1.1rem; margin-bottom: 1rem; }
+      .controls { display: flex; gap: .5rem; margin-bottom: 1rem; }
+      button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid #333; background: #1a1a1a; color: #ededed; cursor: pointer; }
+      button:hover { border-color: #555; }
+      #log { font-family: ui-monospace, monospace; font-size: .8rem; background: #0d0d0d; border: 1px solid #1f2937; border-radius: 12px; padding: .8rem 1rem; height: 180px; overflow: auto; }
+      #log div { padding: .1rem 0; color: #cbd5e1; }
+      #log .ok { color: #4ade80; } #log .info { color: #93c5fd; }
     </style>
   </head>
   <body>
-    <h1>Server-Sent Events</h1>
-    <p>The Express server is streaming a tick every second — no polling.</p>
-    <div id="log"></div>
+    <main>
+      <header>
+        <h1>Server-Sent Events</h1>
+        <span class="pill" id="status"><span class="dot"></span><span id="statusText">connecting…</span></span>
+      </header>
+      <p class="sub">One Express endpoint streams three multiplexed event types over a single connection — no polling.</p>
+
+      <div class="cards">
+        <div class="card"><div class="k">Ticks received (default event)</div><div class="v" id="count">0</div></div>
+        <div class="card"><div class="k">Server time</div><div class="v" id="clock" style="font-size:1.15rem">—</div></div>
+      </div>
+
+      <div class="bar-wrap">
+        <div class="k" style="color:#9ca3af;font-size:.78rem">Live metric (named "metric" event)</div>
+        <div class="chart" id="chart"></div>
+      </div>
+
+      <div class="controls">
+        <button id="toggle">Pause</button>
+        <button id="clear">Clear log</button>
+      </div>
+
+      <div id="log"></div>
+    </main>
     <script>
-      const log = document.getElementById('log');
-      const es = new EventSource('/events');
-      es.onmessage = (e) => {
-        const d = JSON.parse(e.data);
-        log.textContent = 'tick #' + d.n + ' @ ' + d.time + '\\n' + log.textContent;
-      };
+      var countEl = document.getElementById('count');
+      var clockEl = document.getElementById('clock');
+      var chartEl = document.getElementById('chart');
+      var logEl = document.getElementById('log');
+      var statusEl = document.getElementById('status');
+      var statusText = document.getElementById('statusText');
+      var toggleBtn = document.getElementById('toggle');
+      var clearBtn = document.getElementById('clear');
+
+      var BARS = 40;
+      var values = [];
+      for (var i = 0; i < BARS; i++) { var b = document.createElement('div'); b.className = 'bar'; b.style.height = '0%'; chartEl.appendChild(b); values.push(0); }
+
+      function setStatus(state, text) {
+        statusEl.className = 'pill' + (state ? ' ' + state : '');
+        statusText.textContent = text;
+      }
+      function log(cls, text) {
+        var d = document.createElement('div');
+        if (cls) d.className = cls;
+        d.textContent = new Date().toLocaleTimeString() + '  ' + text;
+        logEl.insertBefore(d, logEl.firstChild);
+        while (logEl.childElementCount > 200) logEl.removeChild(logEl.lastChild);
+      }
+      function pushMetric(v) {
+        values.push(v); values.shift();
+        var bars = chartEl.children;
+        for (var i = 0; i < bars.length; i++) bars[i].style.height = values[i] + '%';
+      }
+
+      var es = null;
+      function connect() {
+        es = new EventSource('/events');
+        setStatus('', 'connecting…');
+        es.onopen = function () { setStatus('live', 'live'); };
+        es.onerror = function () { setStatus('off', 'reconnecting…'); };
+        // Default (unnamed) event → the per-second tick.
+        es.onmessage = function (e) {
+          var d = JSON.parse(e.data);
+          countEl.textContent = d.n;
+          clockEl.textContent = new Date(d.time).toLocaleTimeString();
+        };
+        // Named "metric" event → the live chart.
+        es.addEventListener('metric', function (e) { pushMetric(JSON.parse(e.data).value); });
+        // Named "notice" event → the log.
+        es.addEventListener('notice', function (e) { var d = JSON.parse(e.data); log(d.level, d.text); });
+      }
+      function disconnect() { if (es) { es.close(); es = null; } setStatus('off', 'paused'); }
+
+      toggleBtn.addEventListener('click', function () {
+        if (es) { disconnect(); toggleBtn.textContent = 'Resume'; }
+        else { connect(); toggleBtn.textContent = 'Pause'; }
+      });
+      clearBtn.addEventListener('click', function () { logEl.innerHTML = ''; });
+
+      connect();
     </script>
   </body>
 </html>

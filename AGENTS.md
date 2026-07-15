@@ -523,6 +523,22 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   untouched**. The kernel already routes ws `open` by port, so this is a shim-only change.
   Keep the two `sw.js` shims in sync. Regex lives in a template literal → backslashes are
   DOUBLED (`\\/preview\\/(\\d+)…`).
+- **SSE goes through its OWN tunnel — NOT the HTTP proxy.** A `text/event-stream` response
+  can't cross `handleHttpRequest`/`OP_RESPOND` (buffered end-to-end: the SW waits for ONE
+  complete body, so a never-ending SSE stream 504s at 60s). So an **`EventSource` polyfill**
+  (in BOTH `sw.js` shims, injected next to the ws shim — keep them in sync, same DOUBLED
+  regex escaping) tunnels each connection as `oc-sse` (`sub:'open'|'close'`); `handleSseClient`
+  binds it to the port's process, which opens an in-VM loopback GET to `/events` and relays
+  each raw chunk out as `sse-out {sub:'open'|'chunk'|'close'}` (`onSseSend`). The polyfill
+  parses the raw bytes into `message`/named events (SSE spec: `data:`/`event:`/`id:`, dispatch
+  on a blank line) — so BOTH `es.onmessage` and `es.addEventListener('name', …)` work. It's
+  one-way (no client→server `send`), otherwise it mirrors the ws tunnel exactly:
+  `packages/runtime/index.js` (`sseRelay`/`dispatchSse`/`sseLiveness`), `kernel.js`
+  (`handleSseClient`/`handleSseOut`/`sseConns`, torn down on process exit), `process-worker.js`
+  (`sse-open`/`sse-close` → `dispatchSse`), `kernel-worker.js` (`oc-sse` ↔ `onSseSend`),
+  `host.js` + studio `kernel.ts`/`controller.ts` (`oc-sse` relay both directions). Gated by
+  `scripts/spike-sse.mjs`, which drives that exact tunnel headlessly (no browser) via
+  `handleSseClient` + `onSseSend`. The `sse` template stays `experimental` until it's green.
 - **In-VM cross-process TCP/pipe (`net.js`).** `connect()` links same-process via an in-memory
   registry; when the port/path isn't served locally it falls back to the kernel byte-relay
   (`OP_PIPE_LISTEN`/`OP_PIPE_CONNECT`; bytes flow out of band as `pipe-*` postMessages keyed by

@@ -425,6 +425,22 @@ The kernel routes the `open` by port (`handleWsClient` → `listeners.get(port)`
 a shim-only change. The `ws-demo` template (Express + `ws` backend, Vite frontend, started
 together) demonstrates both directions; each server gets its own preview tab (see 8.6).
 
+**Server-Sent Events (same idea, one-way).** A streaming `text/event-stream` response
+can't cross the HTTP preview proxy — that path is buffered end-to-end (the SW resolves
+ONE complete body via `handleHttpRequest`/`OP_RESPOND`), so a never-ending SSE response
+just 504s. So SSE gets its own tunnel, mirroring the ws one minus the client→server leg:
+an **`EventSource` polyfill** injected into every preview page (next to the ws shim)
+tunnels each connection as `oc-sse` messages (`sub:'open'|'close'`); the kernel binds the
+`connId` to the port's process (`handleSseClient`), which opens a genuine **in-VM loopback
+GET** to `127.0.0.1:<port><path>` (`Accept: text/event-stream`) and relays each raw stream
+chunk back out (`sse-out {sub:'open'|'chunk'|'close'}` → `onSseSend` → iframe). The polyfill
+parses the raw bytes into `message`/named events per the SSE spec (`data:`/`event:`/`id:`,
+dispatched on a blank line), so `es.onmessage` and `es.addEventListener('foo', …)` both
+work. Port routing + the `fallbackPort` heuristic are identical to the ws shim. The `sse`
+Showcase template (Express multiplexing a per-second tick + a `metric` gauge + `notice`
+log lines onto one stream) demonstrates it. A live SSE relay refs the process event loop
+(`sseLiveness`) so it keeps pumping like an open socket handle.
+
 ### 8.5 In-browser DevTools + local address bar (studio)
 
 Each `PreviewPanel` tab is a mini-browser. The address bar is **local-only**:
