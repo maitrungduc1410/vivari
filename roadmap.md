@@ -1827,7 +1827,9 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   Node.js blank. Showcase: Vite+Express fullstack (two preview tabs), Server-Sent Events. Existing
   13 re-categorised.
 - ✅ **Phase 2 (`[SPIKE]`, meta-frameworks — shipped `experimental`)** — Fullstack: Nuxt 3,
-  SvelteKit, React Router 7 (Remix), Astro. Docs: Slidev.
+  SvelteKit, React Router 7 (Remix), Astro. Docs: Slidev. (React Router 7, Astro, and Slidev
+  have since **graduated**; SvelteKit + Nuxt stay `experimental`, blocked on the rolldown
+  Vite-8 SSR-optimize wasi/tokio panic.)
 - ✅ **Phase 3 (`[SPIKE]`)** — Frontend variants: Preact, Lit, Solid, Qwik (now proven headless by
   `scripts/spike-{preact,lit,solid,qwik}.mjs` → **graduated to non-experimental**; Qwik rides the
   merged esbuild-wasm aliasing + in-process service and runs `qwikVite({ csr: true })`). Backends:
@@ -2526,6 +2528,12 @@ and are gated by a new offline `scripts/spike-esm.mjs`.
   `__oc_require(spec)`** (cached) instead of closing over the later-declared prelude var, so
   a circular importer reading a re-exported name mid-cycle always sees a defined getter that
   returns the (hoisted) source binding. Regression-gated in `scripts/spike-esm.mjs`.
+
+  With all four loader fixes in place Astro **renders end to end** (dev server + SSR page),
+  user-confirmed in-browser → **graduated** (dropped `experimental`). Now also gated by a
+  network spike, `scripts/spike-astro.mjs`: install → `astro dev` binds :4321 → `GET /`
+  SSRs the index page. (Runs in CI's net tier; needs the built VFS wasm + vendored npm,
+  same as the other framework spikes.)
 
 Loader guarantees regression-gated by `scripts/spike-esm.mjs` (offline tier): TLA →
 async retry; circular re-export → lazy live binding (getter emitted early, re-requires the

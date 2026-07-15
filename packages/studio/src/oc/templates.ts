@@ -2356,7 +2356,8 @@ function astroTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
+      // Proven in-VM by scripts/spike-astro.mjs (dev server boots Vite + @astrojs/compiler
+      // wasm and SSRs the index page). No longer experimental.
     },
     files: {
       "package.json": `{

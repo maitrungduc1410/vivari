@@ -67,6 +67,9 @@ const SPIKES = [
   { name: "slidev", file: "spike-slidev.mjs", net: true, timeout: 600000 },
   // tRPC server — raw .ts entry through OC's loader (no `export type`), typed query.
   { name: "trpc", file: "spike-trpc.mjs", net: true },
+  // Astro dev server — Vite + @astrojs/compiler (Go/wasm) + esbuild; exercises the full
+  // loader stack (live-binding fallback, globalThis.fs pre-seat, re-export getters). Heavy.
+  { name: "astro", file: "spike-astro.mjs", net: true, timeout: 600000 },
 ];
 
 const args = process.argv.slice(2);
