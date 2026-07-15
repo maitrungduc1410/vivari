@@ -46,7 +46,7 @@ export interface PortInfo {
 
 export interface Clipboard {
   mode: "copy" | "cut";
-  abs: string; // absolute path of the copied/cut entry
+  paths: string[]; // absolute paths of the copied/cut entries (multi-select)
 }
 
 // A root folder open in the workspace (VSCode-style multi-root).
@@ -116,6 +116,7 @@ export interface IdeSnapshot {
   files: string[]; // absolute paths (flat index for quick-open + search)
   openTabs: string[]; // absolute paths
   activeTab: string | null;
+  tabKinds: Record<string, "text" | "image" | "directory">; // how each open tab renders
   previewTab: string | null; // the single "preview" (italic, single-click) tab
   dirty: string[]; // absolute paths with unsaved edits
   terminals: TerminalMeta[];
@@ -189,6 +190,43 @@ const ESC = "\x1b[";
 const REGISTRY_KEY = "oc-workspace-projects";
 
 const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
+const parentOf = (p: string) => p.slice(0, p.lastIndexOf("/")) || "/";
+
+// Drag-and-drop wire format: an internal Explorer drag carries the source's
+// absolute path under this MIME type; an OS drag carries File entries instead.
+export const OC_PATH_MIME = "application/x-oc-path";
+
+// Extract OS FileSystemEntry objects from a drop's DataTransfer. MUST be called
+// SYNCHRONOUSLY inside the drop handler — the DataTransferItemList (and thus
+// webkitGetAsEntry) is invalidated once the handler yields to an await.
+export function entriesFromDataTransfer(dt: DataTransfer): FileSystemEntry[] {
+  const out: FileSystemEntry[] = [];
+  const items = dt.items;
+  if (!items) return out;
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.kind !== "file") continue;
+    const entry = (it as DataTransferItem & { webkitGetAsEntry?: () => FileSystemEntry | null }).webkitGetAsEntry?.();
+    if (entry) out.push(entry);
+  }
+  return out;
+}
+
+// Read every child of a directory entry (createReader is paginated — keep
+// reading until a batch comes back empty).
+function readDirEntries(dir: FileSystemDirectoryEntry): Promise<FileSystemEntry[]> {
+  const reader = dir.createReader();
+  const all: FileSystemEntry[] = [];
+  return new Promise((resolve, reject) => {
+    const readBatch = () =>
+      reader.readEntries((batch) => {
+        if (!batch.length) { resolve(all); return; }
+        all.push(...batch);
+        readBatch();
+      }, reject);
+    readBatch();
+  });
+}
 // Human-readable byte size for the memory readout (MB/GB with one decimal).
 export const fmtBytes = (n: number): string => {
   if (!Number.isFinite(n) || n < 0) return "—";
@@ -204,6 +242,22 @@ const normDir = (p: string) => {
   return n === "/" ? "/" : n.replace(/\/+$/, "");
 };
 const folderIdFor = (rootPath: string) => "wf:" + rootPath;
+
+// Extensions we render in the image viewer instead of the text editor. SVG is
+// grouped here too (it's an image); flip it to text if you'd rather edit it.
+const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "avif", "svg"]);
+function isImagePath(path: string): boolean {
+  const dot = path.lastIndexOf(".");
+  return dot > 0 && IMAGE_EXTS.has(path.slice(dot + 1).toLowerCase());
+}
+// The MIME type for an image path, so the viewer's Blob renders correctly.
+function imageMime(path: string): string {
+  const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+  if (ext === "svg") return "image/svg+xml";
+  if (ext === "jpg") return "image/jpeg";
+  if (ext === "ico") return "image/x-icon";
+  return "image/" + ext;
+}
 
 function languageFor(path: string): string {
   // JS files use the `typescript` language too (the TS worker handles JS via
@@ -253,6 +307,7 @@ export class IdeController {
     files: [],
     openTabs: [],
     activeTab: null,
+    tabKinds: {},
     previewTab: null,
     dirty: [],
     terminals: [],
@@ -283,6 +338,7 @@ export class IdeController {
   private editorMounting = false; // guards the async create against StrictMode double-mount
   private editorOpener: Monaco.IDisposable | null = null; // cross-file go-to-definition hook
   private models = new Map<string, Monaco.editor.ITextModel>(); // abs -> model
+  private imageUrls = new Map<string, string>(); // abs -> object URL (image viewer)
   private depLibsByRoot = new Map<string, Map<string, string>>(); // root -> (extra-lib uri -> content)
   private depsSig = new Map<string, string>(); // root -> last node_modules fingerprint
   private dtsWarnedNoNM = new Set<string>(); // roots we've already noted lack node_modules
@@ -372,6 +428,14 @@ export class IdeController {
   async readFileText(absPath: string): Promise<string> {
     const m = await this.bridge.request("oc-read", { path: absPath });
     return m.ok ? String(m.contents ?? "") : "";
+  }
+  async readFileBytes(absPath: string): Promise<Uint8Array> {
+    const m = await this.bridge.request("oc-read-bytes", { path: absPath });
+    return m.ok && m.bytes instanceof Uint8Array ? m.bytes : new Uint8Array();
+  }
+  // The object URL for an open image tab (created lazily in openEntry).
+  imageUrlFor(abs: string): string | undefined {
+    return this.imageUrls.get(abs);
   }
   async pathInfo(absPath: string): Promise<{ exists: boolean; isDir: boolean }> {
     const m = await this.bridge.request("oc-stat", { path: absPath });
@@ -645,6 +709,9 @@ export class IdeController {
         multipleDeclarations: "goto",
         multipleImplementations: "goto",
       },
+      // We handle drops onto the editor ourselves (open the dropped entry), so
+      // turn off Monaco's built-in "drop text into the buffer" behavior.
+      dropIntoEditor: { enabled: false },
     });
     // Seed the language service with any folders indexed before the editor was
     // ready (source files as models for cross-file IntelliSense; dependency types
@@ -874,10 +941,28 @@ export class IdeController {
     return model;
   }
 
+  // Open any Explorer entry by ABSOLUTE path, choosing how it renders: a
+  // directory shows the "…is a directory" message, an image opens the image
+  // viewer, everything else opens in Monaco. Use this (not openFile) wherever a
+  // path could be a folder or an image (Explorer clicks, drag-to-editor).
+  async openEntry(abs: string, { preview = false, focus = true }: { preview?: boolean; focus?: boolean } = {}) {
+    let kind = this.snap.tabKinds[abs];
+    if (!kind) {
+      const info = await this.pathInfo(abs);
+      kind = info.isDir ? "directory" : isImagePath(abs) ? "image" : "text";
+      this.set({ tabKinds: { ...this.snap.tabKinds, [abs]: kind } });
+    }
+    if (kind === "image" && !this.imageUrls.has(abs)) {
+      const bytes = await this.readFileBytes(abs);
+      this.imageUrls.set(abs, URL.createObjectURL(new Blob([bytes as BlobPart], { type: imageMime(abs) })));
+    }
+    await this.openFile(abs, { preview, focus });
+  }
+
   // Open a file by ABSOLUTE path. `preview` (single-click from the Explorer)
   // reuses a single italic "preview" tab; a permanent open (double-click, or an
   // edit) pins it.
-  async openFile(abs: string, { preview = false }: { preview?: boolean } = {}) {
+  async openFile(abs: string, { preview = false, focus = true }: { preview?: boolean; focus?: boolean } = {}) {
     // Reconcile the tab strip + preview slot.
     const already = this.snap.openTabs.includes(abs);
     let openTabs = this.snap.openTabs;
@@ -899,10 +984,17 @@ export class IdeController {
     this.set({ openTabs, previewTab, activeTab: abs });
 
     if (!this.editor || !this.monaco) return; // editor still loading — intent remembered
+    // Image / directory tabs don't get a Monaco model — the EditorGroup renders a
+    // custom pane for them. Detach the editor's model so it doesn't show stale text.
+    const kind = this.snap.tabKinds[abs] ?? "text";
+    if (kind !== "text") {
+      if (this.snap.activeTab === abs) this.editor.setModel(null);
+      return;
+    }
     const model = await this.ensureModel(abs);
     if (model && this.snap.activeTab === abs) {
       this.editor.setModel(model);
-      this.editor.focus();
+      if (focus) this.editor.focus();
       if (this.pendingReveal && this.pendingReveal.abs === abs) {
         const r = this.pendingReveal;
         this.pendingReveal = null;
@@ -1003,18 +1095,48 @@ export class IdeController {
     if (this.snap.previewTab === abs) this.set({ previewTab: null });
   }
 
+  // Reorder the open-tabs strip (VSCode-style drag): move `fromAbs` to sit
+  // immediately before/after `toAbs`. Doesn't change which tab is active.
+  reorderTab(fromAbs: string, toAbs: string, placeAfter: boolean) {
+    if (fromAbs === toAbs) return;
+    const tabs = [...this.snap.openTabs];
+    const fromIdx = tabs.indexOf(fromAbs);
+    if (fromIdx === -1) return;
+    tabs.splice(fromIdx, 1);
+    let toIdx = tabs.indexOf(toAbs);
+    if (toIdx === -1) return;
+    if (placeAfter) toIdx += 1;
+    tabs.splice(toIdx, 0, fromAbs);
+    this.set({ openTabs: tabs });
+  }
+
+  // Revoke + forget an image tab's object URL (freeing the decoded bitmap).
+  private revokeImage(abs: string) {
+    const url = this.imageUrls.get(abs);
+    if (url) { URL.revokeObjectURL(url); this.imageUrls.delete(abs); }
+  }
+  // Drop the render-kind entry for a closed/removed tab (image URLs revoked too).
+  private forgetKind(abs: string): Record<string, "text" | "image" | "directory"> {
+    this.revokeImage(abs);
+    if (!(abs in this.snap.tabKinds)) return this.snap.tabKinds;
+    const next = { ...this.snap.tabKinds };
+    delete next[abs];
+    return next;
+  }
+
   closeTab(abs: string) {
     const i = this.snap.openTabs.indexOf(abs);
     if (i === -1) return;
     const openTabs = this.snap.openTabs.filter((x) => x !== abs);
     const previewTab = this.snap.previewTab === abs ? null : this.snap.previewTab;
+    const tabKinds = this.forgetKind(abs);
     if (this.snap.activeTab === abs) {
       const next = openTabs[i] || openTabs[i - 1] || null;
-      this.set({ openTabs, previewTab, activeTab: next });
+      this.set({ openTabs, previewTab, tabKinds, activeTab: next });
       if (next) void this.openFile(next);
       else this.editor?.setModel(null);
     } else {
-      this.set({ openTabs, previewTab });
+      this.set({ openTabs, previewTab, tabKinds });
     }
   }
 
@@ -1084,10 +1206,13 @@ export class IdeController {
     if (!folder) return;
     const root = folder.rootPath;
     // Drop the folder's open tabs/models + its file index.
+    const tabKinds = { ...this.snap.tabKinds };
     for (const abs of [...this.snap.openTabs]) {
       if (abs === root || abs.startsWith(root + "/")) {
         this.disposeModel(abs);
         delete this.localFiles[abs];
+        this.revokeImage(abs);
+        delete tabKinds[abs];
       }
     }
     const keep = (p: string) => !(p === root || p.startsWith(root + "/"));
@@ -1102,6 +1227,7 @@ export class IdeController {
       activeFolderId,
       openTabs,
       activeTab,
+      tabKinds,
       previewTab: this.snap.previewTab && keep(this.snap.previewTab) ? this.snap.previewTab : null,
       dirty: this.snap.dirty.filter(keep),
       files: this.rebuildFileIndex(),
@@ -1315,16 +1441,22 @@ export class IdeController {
   private remapOpenPaths(oldAbs: string, newAbs: string) {
     const map = (p: string) =>
       p === oldAbs ? newAbs : p.startsWith(oldAbs + "/") ? newAbs + p.slice(oldAbs.length) : p;
+    const tabKinds = { ...this.snap.tabKinds };
     for (const abs of this.snap.openTabs) {
       if (abs === oldAbs || abs.startsWith(oldAbs + "/")) {
         const dest = map(abs);
         this.disposeModel(abs);
         if (abs in this.localFiles) { this.localFiles[dest] = this.localFiles[abs]; delete this.localFiles[abs]; }
+        // Carry the render-kind + any image object URL over to the new path.
+        if (abs in tabKinds) { tabKinds[dest] = tabKinds[abs]; delete tabKinds[abs]; }
+        const url = this.imageUrls.get(abs);
+        if (url) { this.imageUrls.set(dest, url); this.imageUrls.delete(abs); }
       }
     }
     this.set({
       openTabs: this.snap.openTabs.map(map),
       activeTab: this.snap.activeTab ? map(this.snap.activeTab) : null,
+      tabKinds,
       previewTab: this.snap.previewTab ? map(this.snap.previewTab) : null,
       dirty: this.snap.dirty.map(map),
     });
@@ -1333,13 +1465,20 @@ export class IdeController {
 
   private dropOpenPaths(abs: string) {
     const affected = new Set(this.snap.openTabs.filter((p) => p === abs || p.startsWith(abs + "/")));
-    for (const p of affected) { this.disposeModel(p); delete this.localFiles[p]; }
+    const tabKinds = { ...this.snap.tabKinds };
+    for (const p of affected) {
+      this.disposeModel(p);
+      delete this.localFiles[p];
+      this.revokeImage(p);
+      delete tabKinds[p];
+    }
     const openTabs = this.snap.openTabs.filter((p) => !affected.has(p));
     let activeTab = this.snap.activeTab;
     if (activeTab && affected.has(activeTab)) activeTab = openTabs[openTabs.length - 1] ?? null;
     this.set({
       openTabs,
       activeTab,
+      tabKinds,
       previewTab: this.snap.previewTab && affected.has(this.snap.previewTab) ? null : this.snap.previewTab,
       dirty: this.snap.dirty.filter((p) => !affected.has(p)),
     });
@@ -1347,8 +1486,10 @@ export class IdeController {
     else this.editor?.setModel(null);
   }
 
-  copyEntry(abs: string) { this.set({ clipboard: { mode: "copy", abs } }); }
-  cutEntry(abs: string) { this.set({ clipboard: { mode: "cut", abs } }); }
+  copyEntry(abs: string) { this.copyEntries([abs]); }
+  cutEntry(abs: string) { this.cutEntries([abs]); }
+  copyEntries(paths: string[]) { if (paths.length) this.set({ clipboard: { mode: "copy", paths: [...paths] } }); }
+  cutEntries(paths: string[]) { if (paths.length) this.set({ clipboard: { mode: "cut", paths: [...paths] } }); }
 
   renameEntry(oldAbs: string, newName: string) {
     const name = newName.trim();
@@ -1357,44 +1498,144 @@ export class IdeController {
     const newAbs = parent + "/" + name;
     this.bridge.post("oc-rename", { from: oldAbs, to: newAbs });
     this.remapOpenPaths(oldAbs, newAbs);
-    if (this.snap.clipboard?.abs === oldAbs) this.set({ clipboard: null });
+    if (this.snap.clipboard?.paths.includes(oldAbs)) this.set({ clipboard: null });
     this.bumpTree();
   }
 
-  deleteEntry(abs: string) {
-    this.bridge.post("oc-rm", { path: abs });
-    this.dropOpenPaths(abs);
-    if (this.snap.clipboard?.abs === abs) this.set({ clipboard: null });
+  deleteEntry(abs: string) { this.deleteEntries([abs]); }
+  // Delete every entry in `paths` (batch delete from a multi-selection).
+  deleteEntries(paths: string[]) {
+    if (!paths.length) return;
+    for (const abs of paths) {
+      this.bridge.post("oc-rm", { path: abs });
+      this.dropOpenPaths(abs);
+    }
+    const cb = this.snap.clipboard;
+    if (cb) {
+      const remaining = cb.paths.filter((p) => !paths.includes(p));
+      if (remaining.length !== cb.paths.length) {
+        this.set({ clipboard: remaining.length ? { ...cb, paths: remaining } : null });
+      }
+    }
     this.bumpTree();
   }
 
-  // Paste the clipboard entry into `destDirAbs`.
+  // Paste every clipboard entry into `destDirAbs`.
   async pasteInto(destDirAbs: string) {
     const cb = this.snap.clipboard;
     if (!cb) return;
     const dest = normDir(destDirAbs);
-    const name = baseName(cb.abs);
-    // Cutting a folder into itself/descendant would be invalid — ignore.
-    if (cb.mode === "cut" && (dest === cb.abs || dest.startsWith(cb.abs + "/"))) return;
-    let target = dest + "/" + name;
-    // Avoid clobbering: append -copy, -copy-2, … until the path is free.
-    if ((await this.pathInfo(target)).exists) {
-      const dot = name.lastIndexOf(".");
-      const stem = dot > 0 ? name.slice(0, dot) : name;
-      const ext = dot > 0 ? name.slice(dot) : "";
-      for (let n = 1; ; n++) {
-        const cand = `${dest}/${stem}-copy${n > 1 ? `-${n}` : ""}${ext}`;
-        if (!(await this.pathInfo(cand)).exists) { target = cand; break; }
+    for (const src of cb.paths) {
+      // Cutting into itself/descendant/current parent is a no-op — skip.
+      if (cb.mode === "cut" && (dest === src || dest.startsWith(src + "/") || dest === parentOf(src))) continue;
+      const target = await this.uniqueChild(dest, baseName(src));
+      if (cb.mode === "copy") {
+        this.bridge.post("oc-copy", { from: src, to: target });
+      } else {
+        this.bridge.post("oc-rename", { from: src, to: target });
+        this.remapOpenPaths(src, target);
       }
     }
-    if (cb.mode === "copy") {
-      this.bridge.post("oc-copy", { from: cb.abs, to: target });
-    } else {
-      this.bridge.post("oc-rename", { from: cb.abs, to: target });
-      this.remapOpenPaths(cb.abs, target);
-      this.set({ clipboard: null });
-    }
+    if (cb.mode === "cut") this.set({ clipboard: null });
     this.bumpTree();
+  }
+
+  // ── drag & drop (Explorer reorg + OS import + open-in-editor) ──────────────
+  // Compute a non-colliding child path in `destDir` for `name`, appending
+  // -copy, -copy-2, … (matches pasteInto's clobber-avoidance).
+  private async uniqueChild(destDir: string, name: string): Promise<string> {
+    const target = destDir + "/" + name;
+    if (!(await this.pathInfo(target)).exists) return target;
+    const dot = name.lastIndexOf(".");
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : "";
+    for (let n = 1; ; n++) {
+      const cand = `${destDir}/${stem}-copy${n > 1 ? `-${n}` : ""}${ext}`;
+      if (!(await this.pathInfo(cand)).exists) return cand;
+    }
+  }
+
+  // Move an entry into `destDirAbs` (default Explorer drag). No-ops for a drop
+  // into the current parent or a folder dropped into itself/a descendant.
+  async moveEntry(fromAbs: string, destDirAbs: string) {
+    const from = fromAbs.replace(/\/+$/, "");
+    const dest = normDir(destDirAbs);
+    if (dest === parentOf(from)) return;
+    if (dest === from || dest.startsWith(from + "/")) return;
+    const target = await this.uniqueChild(dest, baseName(from));
+    this.bridge.post("oc-rename", { from, to: target });
+    this.remapOpenPaths(from, target);
+    if (this.snap.clipboard?.paths.includes(from)) this.set({ clipboard: null });
+    this.bumpTree();
+  }
+
+  // Copy an entry into `destDirAbs` (Ctrl/Cmd-drag). A folder can't be copied
+  // into itself or a descendant.
+  async copyEntryTo(fromAbs: string, destDirAbs: string) {
+    const from = fromAbs.replace(/\/+$/, "");
+    const dest = normDir(destDirAbs);
+    if (dest === from || dest.startsWith(from + "/")) return;
+    const target = await this.uniqueChild(dest, baseName(from));
+    this.bridge.post("oc-copy", { from, to: target });
+    this.bumpTree();
+  }
+
+  // Batch move/copy for a multi-selection drag. Sequential so per-item
+  // collision suffixes (-copy, -copy-2, …) resolve against prior writes.
+  async moveEntries(paths: string[], destDirAbs: string) {
+    for (const p of paths) await this.moveEntry(p, destDirAbs);
+  }
+  async copyEntriesTo(paths: string[], destDirAbs: string) {
+    for (const p of paths) await this.copyEntryTo(p, destDirAbs);
+  }
+
+  // Import OS files/folders (dragged from the desktop) into `destDirAbs`.
+  // `entries` come from entriesFromDataTransfer (extracted synchronously in the
+  // drop handler). Returns the created top-level target paths.
+  async importInto(destDirAbs: string, entries: FileSystemEntry[]): Promise<string[]> {
+    const dest = normDir(destDirAbs);
+    const targets: string[] = [];
+    let count = 0;
+    for (const entry of entries) {
+      const target = await this.uniqueChild(dest, entry.name);
+      count += await this.writeEntry(entry, target);
+      targets.push(target);
+    }
+    if (count) {
+      this.bumpTree();
+      this.set({ status: `imported ${count} file${count === 1 ? "" : "s"} into ${baseName(dest) || "/"}` });
+    }
+    return targets;
+  }
+
+  // Recursively write one OS FileSystemEntry to `targetAbs` in the VFS. Returns
+  // the number of files written.
+  private async writeEntry(entry: FileSystemEntry, targetAbs: string): Promise<number> {
+    if (entry.isFile) {
+      const file = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej));
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      await this.bridge.request("oc-write", { path: targetAbs, bytes });
+      return 1;
+    }
+    if (entry.isDirectory) {
+      await this.bridge.request("oc-mkdirp", { path: targetAbs });
+      const children = await readDirEntries(entry as FileSystemDirectoryEntry);
+      let n = 0;
+      for (const child of children) n += await this.writeEntry(child, targetAbs + "/" + child.name);
+      return n;
+    }
+    return 0;
+  }
+
+  // A drop landed on the Monaco editor. Internal entries open directly; OS
+  // files are imported into the active folder's root, then opened.
+  async dropOnEditor({ paths, entries }: { paths: string[]; entries: FileSystemEntry[] }) {
+    if (paths.length) { for (const p of paths) void this.openEntry(p); return; }
+    if (!entries.length) return;
+    const root = this.activeFolder?.rootPath;
+    if (!root) { toast.error("Open a project first to view dropped files"); return; }
+    const targets = await this.importInto(root, entries);
+    if (targets[0]) void this.openEntry(targets[0]);
   }
 
   // Create an empty file / folder (Explorer "New File" / "New Folder").

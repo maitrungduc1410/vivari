@@ -1640,7 +1640,9 @@ self.onmessage = async (event) => {
       try {
         const slash = m.path.lastIndexOf("/");
         if (slash > 0) kernel.mkdirp(m.path.slice(0, slash));
-        kernel.writeFile(m.path, m.contents ?? "");
+        // `bytes` (a Uint8Array) is used for binary imports (dropped images /
+        // files); `contents` (a string) for text edits. writeFile accepts either.
+        kernel.writeFile(m.path, m.bytes ?? m.contents ?? "");
         post("oc-fs-changed", { path: m.path });
       } catch (err) {
         post("log", { line: "[edit] write failed: " + ((err && err.message) || err), stream: "stderr" });
@@ -1671,6 +1673,18 @@ self.onmessage = async (event) => {
     if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
     try {
       post("oc-reply", { reqId: m.reqId, ok: true, path: m.path, contents: kernel.readFile(m.path) });
+    } catch (err) {
+      post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+    }
+    return;
+  }
+  // Raw bytes for binary files (images) so the editor's image viewer gets an
+  // uncorrupted buffer — readFile decodes to a JS string, which mangles binary.
+  if (m.type === "oc-read-bytes") {
+    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    try {
+      const bytes = kernel.readFileBytes(m.path);
+      post("oc-reply", { reqId: m.reqId, ok: true, path: m.path, bytes });
     } catch (err) {
       post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
     }

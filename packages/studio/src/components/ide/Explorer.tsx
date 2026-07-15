@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ChevronDown from "~icons/lucide/chevron-down";
 import ChevronRight from "~icons/lucide/chevron-right";
 import Home from "~icons/lucide/house";
@@ -18,6 +18,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils";
 import { FileIcon, FolderIcon } from "./fileIcon";
 import { useIde } from "./useIde";
+import { OC_PATH_MIME, entriesFromDataTransfer } from "@/oc/controller";
 
 interface Entry {
   name: string;
@@ -38,13 +39,66 @@ export function Explorer() {
   const { c, snap } = useIde();
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [children, setChildren] = useState<Record<string, Entry[]>>({});
-  const [selected, setSelected] = useState<{ abs: string; isDir: boolean } | null>(null);
+  // Multi-selection: the set of selected absolute paths + the range "anchor"
+  // (last plain/Cmd-clicked row) that Shift-click extends from.
+  const [selection, setSelection] = useState<Set<string>>(new Set());
+  const [anchor, setAnchor] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [creating, setCreating] = useState<Creating | null>(null);
   const [createValue, setCreateValue] = useState("");
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string[] | null>(null);
+  const [dragOver, setDragOver] = useState<string | null>(null);
   const loading = useRef<Set<string>>(new Set());
+  // The focusable tree container. Clicking a row focuses it so Explorer
+  // shortcuts (Cmd/Ctrl+A to select all, Esc to clear) work even when the
+  // editor had focus — matching VSCode (a single click doesn't focus the editor).
+  const treeRef = useRef<HTMLDivElement>(null);
+
+  // ── drag & drop ────────────────────────────────────────────────────────────
+  // Make a row a drag source. Dragging a row that's part of a multi-selection
+  // carries the whole selection (newline-joined) in the OC_PATH_MIME slot.
+  const dragProps = (abs: string) => ({
+    draggable: true,
+    onDragStart: (e: React.DragEvent) => {
+      e.stopPropagation(); // don't let an ancestor row overwrite the payload
+      const paths = selection.has(abs) && selection.size > 1 ? [...selection] : [abs];
+      const payload = paths.join("\n");
+      e.dataTransfer.setData(OC_PATH_MIME, payload);
+      e.dataTransfer.setData("text/plain", payload);
+      e.dataTransfer.effectAllowed = "copyMove";
+    },
+    onDragEnd: () => setDragOver(null),
+  });
+
+  // Make a row/area a drop target that reorganizes (internal) or imports (OS).
+  // `destDir` receives the drop; `key` drives the hover highlight.
+  const dropProps = (destDir: string | null, key: string) => ({
+    onDragOver: (e: React.DragEvent) => {
+      if (!destDir) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const internal = e.dataTransfer.types.includes(OC_PATH_MIME);
+      e.dataTransfer.dropEffect = internal ? (e.ctrlKey || e.metaKey ? "copy" : "move") : "copy";
+      if (dragOver !== key) setDragOver(key);
+    },
+    onDragLeave: () => setDragOver((cur) => (cur === key ? null : cur)),
+    onDrop: (e: React.DragEvent) => {
+      if (!destDir) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setDragOver(null);
+      const raw = e.dataTransfer.getData(OC_PATH_MIME);
+      if (raw) {
+        const paths = raw.split("\n").filter(Boolean);
+        if (e.ctrlKey || e.metaKey) void c.copyEntriesTo(paths, destDir);
+        else void c.moveEntries(paths, destDir);
+        return;
+      }
+      const entries = entriesFromDataTransfer(e.dataTransfer);
+      if (entries.length) void c.importInto(destDir, entries);
+    },
+  });
 
   // Load a directory's children from the live VFS (once, unless refreshed).
   const load = useCallback(
@@ -117,20 +171,89 @@ export function Explorer() {
     setCreating(null);
   };
 
-  const select = (abs: string, isDir: boolean, folderId: string) => {
-    setSelected({ abs, isDir });
-    c.setActiveFolder(folderId);
+  // The visible rows in render order (respecting expansion), used for Shift-range
+  // selection and Select All.
+  const flatVisible = useMemo(() => {
+    const rows: { abs: string; isDir: boolean }[] = [];
+    const walk = (dir: string) => {
+      for (const e of children[dir] ?? []) {
+        const abs = dir + "/" + e.name;
+        rows.push({ abs, isDir: e.dir });
+        if (e.dir && expanded.has(abs)) walk(abs);
+      }
+    };
+    for (const f of snap.workspaceFolders) if (expanded.has(f.rootPath)) walk(f.rootPath);
+    return rows;
+  }, [children, expanded, snap.workspaceFolders]);
+  const isDirOf = (abs: string) => flatVisible.find((r) => r.abs === abs)?.isDir ?? false;
+
+  // Apply a click to the selection: Shift extends a range from the anchor,
+  // Cmd/Ctrl toggles one row, a plain click selects just that row.
+  const applySelect = (e: React.MouseEvent, abs: string) => {
+    if (e.shiftKey && anchor) {
+      const ai = flatVisible.findIndex((r) => r.abs === anchor);
+      const bi = flatVisible.findIndex((r) => r.abs === abs);
+      if (ai !== -1 && bi !== -1) {
+        const [lo, hi] = ai <= bi ? [ai, bi] : [bi, ai];
+        setSelection(new Set(flatVisible.slice(lo, hi + 1).map((r) => r.abs)));
+        return;
+      }
+      setSelection(new Set([abs]));
+      setAnchor(abs);
+      return;
+    }
+    if (e.metaKey || e.ctrlKey) {
+      setSelection((prev) => {
+        const next = new Set(prev);
+        if (next.has(abs)) next.delete(abs);
+        else next.add(abs);
+        return next;
+      });
+      setAnchor(abs);
+      return;
+    }
+    setSelection(new Set([abs]));
+    setAnchor(abs);
   };
 
-  const pasteDestFor = (sel: { abs: string; isDir: boolean }) => (sel.isDir ? sel.abs : parentDir(sel.abs));
+  // A row was clicked: update selection, and (only for a plain click) open a
+  // file or toggle a folder. Modifier-clicks just change the selection.
+  const handleRowClick = (e: React.MouseEvent, abs: string, isDir: boolean, folderId: string) => {
+    treeRef.current?.focus({ preventScroll: true });
+    c.setActiveFolder(folderId);
+    applySelect(e, abs);
+    if (e.shiftKey || e.metaKey || e.ctrlKey) return;
+    if (isDir) toggle(abs);
+    else void c.openEntry(abs, { preview: true, focus: false }); // keep focus in the tree
+  };
+
+  // When a context menu opens on an unselected row, make it the sole selection
+  // (so menu actions target it); keep an existing multi-selection intact.
+  const selectForContext = (abs: string) => {
+    if (!selection.has(abs)) { setSelection(new Set([abs])); setAnchor(abs); }
+  };
+  // The paths a context-menu action should affect: the whole selection if the
+  // clicked row is part of it, else just that row.
+  const effective = (abs: string) => (selection.has(abs) && selection.size > 1 ? [...selection] : [abs]);
+
+  // Where a paste lands: into the anchor if it's a folder, else its parent.
+  const pasteDest = () => {
+    if (anchor) return isDirOf(anchor) ? anchor : parentDir(anchor);
+    return c.activeFolder?.rootPath ?? "/";
+  };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
-    if (renaming || creating || !selected) return;
-    if (e.key === "Enter") { e.preventDefault(); startRename(selected.abs); }
-    else if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); setConfirmDelete(selected.abs); }
-    else if (modKey(e) && e.key.toLowerCase() === "c") { e.preventDefault(); c.copyEntry(selected.abs); }
-    else if (modKey(e) && e.key.toLowerCase() === "x") { e.preventDefault(); c.cutEntry(selected.abs); }
-    else if (modKey(e) && e.key.toLowerCase() === "v") { e.preventDefault(); void c.pasteInto(pasteDestFor(selected)); }
+    if (renaming || creating) return;
+    const k = e.key.toLowerCase();
+    if (e.key === "Escape") { setSelection(new Set()); setAnchor(null); return; }
+    if (modKey(e) && k === "a") { e.preventDefault(); setSelection(new Set(flatVisible.map((r) => r.abs))); return; }
+    const sel = [...selection];
+    if (!sel.length) return;
+    if (e.key === "Enter") { e.preventDefault(); if (sel.length === 1) startRename(sel[0]); }
+    else if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); setConfirmDelete(sel); }
+    else if (modKey(e) && k === "c") { e.preventDefault(); c.copyEntries(sel); }
+    else if (modKey(e) && k === "x") { e.preventDefault(); c.cutEntries(sel); }
+    else if (modKey(e) && k === "v") { e.preventDefault(); void c.pasteInto(pasteDest()); }
   };
 
   const nameInput = (value: string, onChange: (v: string) => void, commit: () => void, cancel: () => void) => (
@@ -168,15 +291,21 @@ export function Explorer() {
     return (
       <div key={abs}>
         <RowMenu abs={abs} isDir destDir={abs} folderId={folderId} c={c} canPaste={snap.clipboard != null}
-          onOpen={() => toggle(abs)} onRename={() => startRename(abs)} onDelete={() => setConfirmDelete(abs)}
+          onContextMenuOpen={() => { c.setActiveFolder(folderId); selectForContext(abs); }}
+          onCopy={() => c.copyEntries(effective(abs))} onCut={() => c.cutEntries(effective(abs))}
+          onOpen={() => toggle(abs)} onRename={() => startRename(abs)} onDelete={() => setConfirmDelete(effective(abs))}
           onNewFile={() => startCreate(abs, "file")} onNewFolder={() => startCreate(abs, "folder")}>
           <div
+            {...dragProps(abs)}
+            {...dropProps(abs, abs)}
             className={cn(
               "flex w-full items-center gap-1 py-0.5 text-left text-sm",
-              selected?.abs === abs ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+              dragOver === abs
+                ? "bg-accent/80 text-foreground ring-1 ring-inset ring-primary"
+                : selection.has(abs) ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
             )}
             style={{ paddingLeft: 8 + depth * 12 }}
-            onClick={() => { select(abs, true, folderId); toggle(abs); }}
+            onClick={(e) => handleRowClick(e, abs, true, folderId)}
           >
             {open ? <ChevronDown className="size-3.5 shrink-0" /> : <ChevronRight className="size-3.5 shrink-0" />}
             <FolderIcon open={open} className="size-4 shrink-0" />
@@ -190,19 +319,24 @@ export function Explorer() {
 
   const renderFile = (abs: string, name: string, depth: number, folderId: string): React.ReactNode => {
     const isRenaming = renaming === abs;
-    const isSelected = selected?.abs === abs;
     return (
       <RowMenu key={abs} abs={abs} isDir={false} destDir={parentDir(abs)} folderId={folderId} c={c} canPaste={snap.clipboard != null}
-        onOpen={() => c.openFile(abs, { preview: false })} onRename={() => startRename(abs)} onDelete={() => setConfirmDelete(abs)}
+        onContextMenuOpen={() => { c.setActiveFolder(folderId); selectForContext(abs); }}
+        onCopy={() => c.copyEntries(effective(abs))} onCut={() => c.cutEntries(effective(abs))}
+        onOpen={() => c.openEntry(abs, { preview: false })} onRename={() => startRename(abs)} onDelete={() => setConfirmDelete(effective(abs))}
         onNewFile={() => startCreate(parentDir(abs), "file")} onNewFolder={() => startCreate(parentDir(abs), "folder")}>
         <div
+          {...dragProps(abs)}
+          {...dropProps(parentDir(abs), abs)}
           className={cn(
             "flex w-full items-center gap-1.5 py-0.5 text-left text-sm",
-            isSelected || snap.activeTab === abs ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50",
+            dragOver === abs
+              ? "bg-accent/80 text-foreground ring-1 ring-inset ring-primary"
+              : selection.has(abs) || snap.activeTab === abs ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50",
           )}
           style={{ paddingLeft: 8 + depth * 12 + 16 }}
-          onClick={() => { select(abs, false, folderId); void c.openFile(abs, { preview: true }); }}
-          onDoubleClick={() => void c.openFile(abs, { preview: false })}
+          onClick={(e) => handleRowClick(e, abs, false, folderId)}
+          onDoubleClick={() => void c.openEntry(abs, { preview: false })}
         >
           <FileIcon name={name} className="size-4 shrink-0" />
           {isRenaming ? nameInput(renameValue, setRenameValue, commitRename, () => setRenaming(null)) : <span className="truncate">{name}</span>}
@@ -231,7 +365,12 @@ export function Explorer() {
         </HeaderBtn>
       </div>
       <ScrollArea className="flex-1">
-        <div className="pb-4 outline-none" tabIndex={0}>
+        <div
+          ref={treeRef}
+          className={cn("min-h-full pb-4 outline-none", dragOver === "__area__" && "bg-accent/30")}
+          tabIndex={0}
+          {...dropProps(active?.rootPath ?? null, "__area__")}
+        >
           {snap.workspaceFolders.length === 0 ? (
             <div className="px-3 py-2 text-xs text-muted-foreground">
               No folder open. Go <button className="text-foreground underline" onClick={() => c.goHome()}>Home</button> to create or open a project.
@@ -242,14 +381,19 @@ export function Explorer() {
               return (
                 <div key={f.id}>
                   <RowMenu abs={f.rootPath} isDir destDir={f.rootPath} folderId={f.id} c={c} canPaste={snap.clipboard != null} isRoot
+                    onContextMenuOpen={() => c.setActiveFolder(f.id)}
+                    onCopy={() => c.copyEntry(f.rootPath)} onCut={() => c.cutEntry(f.rootPath)}
                     onOpen={() => toggle(f.rootPath)} onRename={() => { /* roots aren't renamed */ }} onDelete={() => c.closeFolder(f.id)}
                     onNewFile={() => startCreate(f.rootPath, "file")} onNewFolder={() => startCreate(f.rootPath, "folder")}>
                     <div
+                      {...dropProps(f.rootPath, f.id)}
                       className={cn(
                         "flex w-full items-center gap-1 py-1 pl-2 text-left text-[11px] font-semibold uppercase tracking-wide",
-                        snap.activeFolderId === f.id ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+                        dragOver === f.id
+                          ? "bg-accent/80 text-foreground ring-1 ring-inset ring-primary"
+                          : snap.activeFolderId === f.id ? "text-foreground" : "text-muted-foreground hover:text-foreground",
                       )}
-                      onClick={() => { c.setActiveFolder(f.id); toggle(f.rootPath); }}
+                      onClick={() => { treeRef.current?.focus({ preventScroll: true }); c.setActiveFolder(f.id); toggle(f.rootPath); }}
                     >
                       {open ? <ChevronDown className="size-3.5 shrink-0" /> : <ChevronRight className="size-3.5 shrink-0" />}
                       <span className="truncate">{f.name}</span>
@@ -268,8 +412,11 @@ export function Explorer() {
           <AlertDialogHeader>
             <AlertDialogTitle>Delete permanently?</AlertDialogTitle>
             <AlertDialogDescription>
-              <span className="font-mono text-foreground">{confirmDelete}</span> will be permanently
-              removed. This cannot be undone.
+              {confirmDelete && confirmDelete.length === 1 ? (
+                <><span className="font-mono text-foreground">{confirmDelete[0]}</span> will be permanently removed. This cannot be undone.</>
+              ) : (
+                <><span className="font-mono text-foreground">{confirmDelete?.length ?? 0} items</span> will be permanently removed. This cannot be undone.</>
+              )}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -277,7 +424,8 @@ export function Explorer() {
             <AlertDialogAction
               variant="destructive"
               onClick={() => {
-                if (confirmDelete) c.deleteEntry(confirmDelete);
+                if (confirmDelete) c.deleteEntries(confirmDelete);
+                setSelection(new Set());
                 setConfirmDelete(null);
               }}
             >
@@ -342,17 +490,18 @@ function HeaderBtn({ label, onClick, disabled, children }: {
 }
 
 function RowMenu({
-  abs, isDir, destDir, folderId, c, canPaste, isRoot, children,
-  onOpen, onRename, onDelete, onNewFile, onNewFolder,
+  abs, isDir, destDir, c, canPaste, isRoot, children,
+  onContextMenuOpen, onCopy, onCut, onOpen, onRename, onDelete, onNewFile, onNewFolder,
 }: {
   abs: string; isDir: boolean; destDir: string; folderId: string;
   c: ReturnType<typeof useIde>["c"]; canPaste: boolean; isRoot?: boolean; children: React.ReactNode;
+  onContextMenuOpen: () => void; onCopy: () => void; onCut: () => void;
   onOpen: () => void; onRename: () => void; onDelete: () => void; onNewFile: () => void; onNewFolder: () => void;
 }) {
   const termDir = isDir ? abs : destDir;
   return (
     <ContextMenu>
-      <ContextMenuTrigger className="block w-full" onContextMenu={() => c.setActiveFolder(folderId)}>
+      <ContextMenuTrigger className="block w-full" onContextMenu={onContextMenuOpen}>
         {children}
       </ContextMenuTrigger>
       <ContextMenuContent className="w-56">
@@ -372,11 +521,11 @@ function RowMenu({
             Rename<ContextMenuShortcut>↵</ContextMenuShortcut>
           </ContextMenuItem>
         )}
-        <ContextMenuItem onClick={() => c.copyEntry(abs)}>
+        <ContextMenuItem onClick={onCopy}>
           Copy<ContextMenuShortcut>⌘C</ContextMenuShortcut>
         </ContextMenuItem>
         {!isRoot && (
-          <ContextMenuItem onClick={() => c.cutEntry(abs)}>
+          <ContextMenuItem onClick={onCut}>
             Cut<ContextMenuShortcut>⌘X</ContextMenuShortcut>
           </ContextMenuItem>
         )}
