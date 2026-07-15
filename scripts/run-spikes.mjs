@@ -30,6 +30,9 @@ const SPIKES = [
   // --- offline (no live registry) --------------------------------------------
   { name: "toolchain", file: "spike-toolchain.mjs", net: false, timeout: 60000 },
   { name: "http-llhttp", file: "spike-http-llhttp.mjs", net: false, timeout: 60000 },
+  // ESM→CJS loader guarantees: top-level-await async retry + circular re-export
+  // live bindings (SvelteKit config / astro runtime). Pure parser, no kernel/wasm.
+  { name: "esm", file: "spike-esm.mjs", net: false, timeout: 60000 },
   // pnpm/cmd-shim bin unwrap — pure parser, no kernel/wasm needed.
   { name: "cmd-shim", file: "spike-cmd-shim.mjs", net: false, timeout: 60000 },
   // --- network: graduated templates gated here -------------------------------

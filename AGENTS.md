@@ -795,6 +795,18 @@ snapshot it at call time, not at delivery time.
   `require()` returns `X` directly; `export { X as default }` sets
   `exports.default`. Getting these wrong yields `TypeError: x is not a function`
   on a plugin's default export.
+- **Top-level await → compile as AsyncFunction on ANY parse failure.** Our CJS wrapper
+  is a plain (non-async) function, so an ESM module with top-level `await` fails
+  `new Function`. You can't sniff this from the error message: `await import('x')`
+  becomes `await __oc_import('x')`, and the parser reads `await` as an identifier and
+  blames the *next* token → `SyntaxError: Unexpected identifier '__oc_import'`, not the
+  tidy "await is only valid…" string. So `module.js` **retries any failed ESM compile
+  as an `AsyncFunction`** — real TLA then compiles; a genuine syntax error fails again
+  and is reported. (@sveltejs/kit's `core/sync/ts.js` — `ts = (await import('typescript'))
+  .default` — hits this when a SvelteKit `vite.config.js` loads.) A non-entry TLA module
+  still can't truly block its importer (the "only the ENTRY can block on TLA" rule
+  above), but it now at least *compiles* instead of throwing at load. Proven by
+  `scripts/spike-esm.mjs`.
 - **`esm.js` does NOT strip TypeScript types** — it only rewrites `import`/`export`.
   A raw `.ts` run through OC's loader (`node --experimental-strip-types x.ts`) is
   *not* type-stripped: `esm.js` removes the leading `export `/`import ` and leaves
@@ -807,20 +819,29 @@ snapshot it at call time, not at delivery time.
   `export type` — see the **tRPC** template (`server/index.ts` has zero type syntax;
   `src/App.tsx` derives `AppRouter` via `typeof import('../server/index').appRouter`).
   Proven by `scripts/spike-trpc.mjs`.
-- **Named imports are eager snapshots, NOT live bindings — circular `const` exports
-  can TDZ-throw.** `esm.js` compiles `import { X } from './m'` to
-  `const X = __oc_m['X']` (an eager read), while exports become lazy getters. That's
-  fine for hoisted functions (reachable early) but breaks a *circular* import of a
-  `const`/`class`: if module A's body requires B before A's `const X` initialises, and
-  B's prelude eager-reads `A.X`, the export getter throws **"Cannot access 'X' before
-  initialization"** (real ESM wouldn't — its live binding is read lazily, at use). This
-  is the documented "circular-eval ordering" casualty in `esm.js`. A full fix needs
-  scope-aware reference rewriting (every use of `X` → `__oc_m.X`); until then, the
-  workaround for frameworks that hit it is to route the offending package through
-  **Vite's** SSR pipeline (`vite.ssr.noExternal`), which models live bindings
-  correctly. The **Astro** template does exactly this (`noExternal: ['astro']`) because
-  `astro/dist/runtime/server/render/common.js` does `const Fragment = Symbol.for(
-  'astro:fragment')` inside a cycle.
+- **Named imports are eager snapshots, NOT live bindings — but re-exported names are
+  now lazy.** `esm.js` compiles a *used* `import { X } from './m'` to
+  `const X = __oc_m['X']` (an eager read). That's fine for hoisted functions (reachable
+  early) but breaks a *circular* import of a `const`/`class`: if module A's body requires
+  B before A's `const X` initialises and B eager-reads `A.X`, the getter throws
+  **"Cannot access 'X' before initialization"** (real ESM reads its live binding lazily,
+  at use). A full fix needs scope-aware reference rewriting; until then two mitigations
+  live in `transpileEsm`:
+  1. **An imported name that is only re-exported** (`import { X } from './m'; export { X }`
+     — the barrel-file shape) is compiled *without* the eager `const X` and re-exported
+     via a **lazy getter to the source module** (`get: () => __oc_m['X']`), exactly like
+     `export { X } from './m'` already was. The read is deferred until after the cycle
+     resolves. This is what unblocks the **Astro** template:
+     `astro/dist/runtime/server/render/index.js` does
+     `import { Fragment } from './common.js'; export { …Fragment… }` while `common.js`
+     (`const Fragment = Symbol.for('astro:fragment')`) is mid-cycle.
+  2. The eager `const X` is only emitted when `X` is actually **referenced in the module
+     body** — a name that appears solely in `import`/`export {}` statements never gets a
+     snapshot. The "is it used" check is conservative (strings/comments count as a use),
+     so it only ever *removes* a snapshot when the name is provably absent from code — it
+     can't drop one that's needed.
+  A name that IS used in code across a `const`/`class` cycle can still TDZ; that residual
+  case is unchanged. Proven by `scripts/spike-esm.mjs`.
 
 ### `self` is a getter in a real Worker
 Third-party bundles (Vite/rolldown workers) do `Object.assign(globalThis, {self})`,

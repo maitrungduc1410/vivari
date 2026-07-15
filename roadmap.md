@@ -2427,37 +2427,50 @@ symlink, the Vite dev server, and the live preview iframe all work. The template
 drops `experimental`; the cmd-shim unwrap it relies on is guarded by
 `scripts/spike-cmd-shim.mjs`, and real pnpm is exercised by the pnpm spikes.
 
-## SvelteKit / React Router 7 / Astro template fixes (this change)
+## SvelteKit / React Router 7 / Astro fixes (this change)
 
-Three meta-framework templates fixed after browser testing:
+Started as three template fixes; two turned out to be **ESM→CJS loader** bugs that any
+meta-framework can hit, so the fixes moved into `packages/runtime` (esm.js + module.js)
+and are gated by a new offline `scripts/spike-esm.mjs`.
 
-- **SvelteKit — `ERESOLVE`.** `npm install` failed: the template pinned `vite@^8` but
-  `@sveltejs/vite-plugin-svelte@^5` peers on `vite@^6`, so npm couldn't build the tree.
-  The plugin's vite-8 support arrived in **v7**. Bumped `@sveltejs/vite-plugin-svelte`
-  to `^7.0.0` (peers `vite ^8` + `svelte ^5.46.4`) and `svelte` to `^5.46.4`; `@sveltejs/
-  kit@2.69.3` already peers `vite ^8`. Confirmed a clean lockfile (83 pkgs: vite 8.1.4,
-  svelte 5.56.5, vite-plugin-svelte 7.2.0, kit 2.69.3 — no ERESOLVE).
+- **SvelteKit — two-stage fix.**
+  1. `ERESOLVE`: the template pinned `vite@^8` but `@sveltejs/vite-plugin-svelte@^5`
+     peers on `vite@^6`. Plugin vite-8 support landed in **v7** — bumped the plugin to
+     `^7.0.0` and `svelte` to `^5.46.4` (`@sveltejs/kit@2.8` already peers `vite ^8`).
+  2. `SyntaxError: Unexpected identifier '__oc_import'` when the config loaded:
+     `@sveltejs/kit/src/core/sync/ts.js` does `ts = (await import('typescript')).default`
+     — **top-level await**. Our CJS wrapper is a plain function, so `new Function` rejects
+     it, and after the import-rewrite the parser blames the next token (not "await is only
+     valid…"), so `module.js`'s old narrow message-match never retried as async. Fix:
+     `module.js` now retries **any** failed ESM compile as an `AsyncFunction` (real TLA
+     compiles; genuine syntax errors fail again and are reported). Left `experimental`
+     pending browser confirmation.
 
-- **React Router 7 — "not found" on first load.** RR7 framework mode is client-routed:
-  it re-matches the route against the iframe's own location (`/preview/5173/…`) during
-  hydration, so served at `/` (prefix stripped) the client router lands on NotFound even
-  though SSR rendered `/`. Fix (the same keep-prefix pattern Docusaurus uses): set
-  `manifest.keepPreviewPrefix: true` and point both `react-router.config.ts` `basename`
-  and Vite `base` at `/preview/5173/` (trailing slash required). Verified in vanilla
-  Node: `/preview/5173/` → 200 with the Home page and prefixed asset URLs, `/` → 302.
+- **React Router 7 — "not found" on first load (GRADUATED).** RR7 framework mode is
+  client-routed: it re-matches the route against the iframe's own location
+  (`/preview/5173/…`) during hydration, so served at `/` (prefix stripped) the client
+  router lands on NotFound even though SSR rendered `/`. Fix (the keep-prefix pattern
+  Docusaurus uses): `manifest.keepPreviewPrefix: true` + both `react-router.config.ts`
+  `basename` and Vite `base` at `/preview/5173/` (trailing slash required). User-confirmed
+  working in-browser → **graduated** (dropped `experimental`).
 
-- **Astro — "Cannot access 'Fragment' before initialization".** Astro's server renderer
-  (`astro/dist/runtime/server/render/common.js`) declares `const Fragment = Symbol.for(
-  'astro:fragment')` inside a circular import cycle. OC's ESM→CJS loader snapshots named
-  imports eagerly (`const Fragment = mod.Fragment`) rather than as live bindings, so the
-  cycle reads `Fragment` before its `const` initialises → TDZ throw (the documented
-  "circular-eval ordering" casualty in `esm.js`). A correct loader fix needs scope-aware
-  reference rewriting; the low-risk, template-scoped fix is `vite.ssr.noExternal:
-  ['astro']`, which routes Astro's runtime through Vite's SSR pipeline (lazy `mod.Fragment`
-  live bindings), sidestepping the eager snapshot. Confirmed valid in vanilla Node
-  (Astro dev serves `/` and SSR-renders the page body with the config applied).
+- **Astro — "Cannot access 'Fragment' before initialization" (loader fix).** Astro's
+  `runtime/server/render/index.js` does `import { Fragment } from './common.js'; export
+  { …Fragment… }`, and `common.js` declares `const Fragment = Symbol.for('astro:fragment')`
+  in a circular cycle. The earlier `vite.ssr.noExternal: ['astro']` template hack did NOT
+  work — `astro dev`'s CLI imports the render runtime through OC's loader *before* any
+  Vite SSR config applies. Real fix in `esm.js`: an imported name that is **only
+  re-exported** is compiled without the eager `const X = m.X` snapshot and re-exported via
+  a **lazy getter to the source module** (`() => m.X`), exactly like `export { X } from
+  'm'`. The read is deferred until after the cycle resolves. Also: the eager snapshot is
+  now only emitted when the imported name is actually referenced in the module body
+  (conservative — strings/comments count as a use). Proven by executing Astro's real
+  server runtime through an OC-shaped loader (`Fragment` resolves to the Symbol; the cycle
+  no longer throws). `astro.config.mjs` reverted to pristine. Left `experimental` pending
+  browser confirmation.
 
-All three left `experimental` pending browser confirmation.
+Loader guarantees regression-gated by `scripts/spike-esm.mjs` (offline tier): TLA →
+async retry, and circular re-export → lazy live binding.
 
 ## Definition of done for T2
 

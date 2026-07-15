@@ -451,18 +451,27 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
       // top-level body can await while the loop pumps. Modern CLIs (e.g. Vite's
       // bin: `await import('node:inspector')`) need this. Only ESM can hit it; CJS
       // never legally has top-level await.
-      if (isEsm && /\bawait\b.*\b(only|valid|allowed)\b/i.test(err.message)) {
+      //
+      // We can't reliably sniff TLA from the error MESSAGE: `await x` at top level
+      // parses `await` as an identifier, so the parser blames the NEXT token —
+      // `SyntaxError: Unexpected identifier 'x'` — not the tidy "await is only valid…"
+      // string. (@sveltejs/kit's core/sync/ts.js does `ts = (await import('ts')).default`
+      // → after our import-rewrite `await __oc_import('ts')` → "Unexpected identifier
+      // '__oc_import'".) So for ESM we just RETRY as an AsyncFunction on any compile
+      // error: real TLA then compiles, and a genuine syntax error fails again and is
+      // reported. The retry is error-path only, so there's no cost on the happy path.
+      if (isEsm) {
         try {
           wrapper = new AsyncFunction("__oc_exports", "__oc_require", "__oc_module", source + "\n");
           isAsync = true;
         } catch (e2) {
-          e2.message += ` (while compiling ${filename} [esm+tla])`;
+          e2.message += ` (while compiling ${filename} [esm])`;
           throw e2;
         }
       } else {
         // Compilation (parse) errors are otherwise anonymous ("<anonymous>"); name
         // the offending file + module kind so loader bugs are debuggable.
-        err.message += ` (while compiling ${filename}${isEsm ? " [esm]" : " [cjs]"})`;
+        err.message += ` (while compiling ${filename} [cjs])`;
         throw err;
       }
     }

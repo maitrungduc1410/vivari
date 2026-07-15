@@ -2255,7 +2255,6 @@ function remixTemplate(): TemplateDef {
       // though SSR rendered `/` fine. Keep the proxy prefix and set the app's
       // basename + Vite `base` to `/preview/5173/` so SSR and the client agree.
       keepPreviewPrefix: true,
-      experimental: true,
     },
     files: {
       "package.json": `{
@@ -2374,20 +2373,7 @@ function astroTemplate(): TemplateDef {
 `,
       "astro.config.mjs": `import { defineConfig } from 'astro/config'
 
-export default defineConfig({
-  vite: {
-    // Bundle Astro's own runtime through Vite's SSR pipeline instead of loading it
-    // as an external dep. Astro's server renderer (astro/dist/runtime/server/render/
-    // common.js) declares \`const Fragment = Symbol.for('astro:fragment')\` and is part
-    // of a circular import cycle. OpenContainer's ESM->CJS loader snapshots named
-    // imports eagerly (\`const Fragment = mod.Fragment\`) rather than as live bindings,
-    // so the cycle reads Fragment before its \`const\` initialises -> "Cannot access
-    // 'Fragment' before initialization". Vite's SSR transform models live bindings
-    // (lazy \`mod.Fragment\` accesses), so routing Astro through it sidesteps the
-    // loader's known circular-eval limitation.
-    ssr: { noExternal: ['astro'] },
-  },
-})
+export default defineConfig({})
 `,
       "src/pages/index.astro": `---
 const title = 'Astro on OpenContainer'

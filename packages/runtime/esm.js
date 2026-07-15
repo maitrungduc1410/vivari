@@ -421,6 +421,18 @@ export function transpileEsm(source, filename) {
   // the canonical case: command.js `import { isYargsInstance }` <-> yargs-factory.js.
   const exportGetters = [];
   const fromRanges = [];
+  // Named imports (`import { X } from 'm'`). We record each so that (a) an eager
+  // `const X = m.X` snapshot is only emitted when X is actually referenced in the
+  // module body, and (b) a re-export of X (`export { X }`) becomes a LAZY live
+  // binding to the source module instead of reading the eager snapshot. This makes
+  // barrel files that import-then-re-export a name behave like `export { X } from 'm'`
+  // (which we already treat lazily) — the fix for astro's render/index.js, which does
+  // `import { Fragment } from './common.js'; export { ...Fragment... }`. common.js is
+  // mid-cycle when render/index.js loads, so the eager `const Fragment = common.Fragment`
+  // hit common.js's still-TDZ `const Fragment` getter → "Cannot access 'Fragment'
+  // before initialization". A lazy re-export defers the read until after the cycle.
+  const namedImports = new Map(); // local -> { m, imported }
+  const deferredNamedConsts = []; // { local, m, imported } — emitted only if used in body
   let tmp = 0;
   const uniq = () => "__oc_m" + tmp++;
 
@@ -477,7 +489,11 @@ export function transpileEsm(source, filename) {
         if (c.default) prelude.push("const " + c.default + "=__oc_def(" + m + ");");
         if (c.namespace) prelude.push("const " + c.namespace + "=__oc_ns(" + m + ");");
         for (const { imported, local } of c.named) {
-          prelude.push("const " + local + "=" + m + "[" + JSON.stringify(imported) + "];");
+          // Defer: we only need the eager `const local = m.imported` snapshot if the
+          // body actually references `local`. If it's only re-exported, we skip the
+          // snapshot (avoiding a cyclic TDZ read) and wire a lazy getter below.
+          namedImports.set(local, { m, imported });
+          deferredNamedConsts.push({ local, m, imported });
         }
       }
     }
@@ -501,6 +517,31 @@ export function transpileEsm(source, filename) {
   }
   for (const e of exportEdits) edits.push(e);
 
+  // Decide which deferred named-import snapshots are actually needed. Build a "code
+  // only" view of the source with every import statement and every local `export {…}`
+  // clause blanked, so an imported name that appears ONLY in those statements reads as
+  // unused. Strings/comments are left intact and count as a use, so the check errs
+  // toward KEEPING the eager snapshot (current behaviour) — it only ever removes a
+  // snapshot when the name is provably absent from executable code.
+  const reexportGetters = []; // lazy re-exports of imported names (appended after requires)
+  if (deferredNamedConsts.length) {
+    const masked = source.split("");
+    const blank = (s, e) => { for (let k = s; k < e && k < masked.length; k++) if (masked[k] !== "\n") masked[k] = " "; };
+    for (const imp of imports) if (imp.t === T_STATIC) blank(imp.ss, imp.se);
+    for (const e of exportEdits) if (/^export\s*\{/.test(source.slice(e.start, e.end))) blank(e.start, e.end);
+    const maskedStr = masked.join("");
+    const usedInBody = (name) => {
+      const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      // preceded by a non-identifier, non-`.` char (so `obj.X` / `?.X` don't count)
+      return new RegExp("(?:^|[^.\\w$])" + esc + "(?![\\w$])").test(maskedStr);
+    };
+    for (const nc of deferredNamedConsts) {
+      if (usedInBody(nc.local)) {
+        prelude.push("const " + nc.local + "=" + nc.m + "[" + JSON.stringify(nc.imported) + "];");
+      }
+    }
+  }
+
   // local exports -> getters, with two special cases the plain getter loop misses:
   //  - `export { X as "module.exports" }`: the standard CJS-interop override
   //    (rolldown/tsdown emit it, e.g. @vitejs/plugin-react). Node makes require()
@@ -518,11 +559,30 @@ export function transpileEsm(source, filename) {
     }
     if (ex.n === "default") {
       if (!hasKeywordDefault && !keptDefault && ex.ln) {
-        exportGetters.push(
-          "Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return " +
-            ex.ln + ";}});",
-        );
+        const src = namedImports.get(ex.ln);
+        if (src) {
+          reexportGetters.push(
+            "Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return " +
+              src.m + "[" + JSON.stringify(src.imported) + "];}});",
+          );
+        } else {
+          exportGetters.push(
+            "Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return " +
+              ex.ln + ";}});",
+          );
+        }
       }
+      continue;
+    }
+    // `export { X }` where X is itself a named import → re-export as a LAZY live
+    // binding to the source module (deferred until after the import cycle resolves),
+    // not a read of X's eager snapshot (which may not exist / may be mid-TDZ).
+    const src = namedImports.get(local);
+    if (src) {
+      reexportGetters.push(
+        "Object.defineProperty(__oc_exports," + JSON.stringify(ex.n) +
+        ",{enumerable:true,configurable:true,get:function(){return " + src.m + "[" + JSON.stringify(src.imported) + "];}});",
+      );
       continue;
     }
     exportGetters.push(
@@ -530,6 +590,9 @@ export function transpileEsm(source, filename) {
       ",{enumerable:true,configurable:true,get:function(){return " + local + ";}});",
     );
   }
+  // Lazy re-export getters read the source-module var (declared in `prelude` above),
+  // so they must come AFTER the requires — append them to the end of the prelude.
+  for (const g of reexportGetters) prelude.push(g);
 
   const fileUrl = "file://" + (filename || "");
   const head =
