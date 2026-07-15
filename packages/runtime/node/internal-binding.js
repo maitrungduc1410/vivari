@@ -87,8 +87,22 @@ export function createInternalBinding({ syscalls, process, netLiveness, netServe
   // in-process loopback beneath Node's real lib/net.js. Needs process.nextTick.
   // `syscalls` lets listen() register the port with the kernel (external routing,
   // stage 2); `netServers` counts kernel-registered listeners for `doNet`;
-  // `pipeBridge` carries cross-process UNIX-socket traffic through the kernel.
+  // `pipeBridge` carries cross-process UNIX-socket AND TCP traffic through the
+  // kernel (Nitro's :3000 proxying to its SSR worker's port in another process).
   const net = createNetBindings({ process, liveness: netLiveness, syscalls, netServers, pipeBridge });
+  // http_parser (Phase 2 #8): real llhttp-in-Wasm with a pure-JS fallback. When
+  // the Wasm backend is live, advertise it via process.versions.llhttp (as real
+  // Node does), which also lets guest code / spikes confirm the backend.
+  const httpParserBinding = createHttpParserBinding();
+  if (
+    httpParserBinding.backend === "wasm" &&
+    httpParserBinding.llhttpVersion &&
+    process &&
+    process.versions &&
+    process.versions.llhttp == null
+  ) {
+    process.versions.llhttp = String(httpParserBinding.llhttpVersion);
+  }
   const bindings = {
     buffer: createBufferBinding(),
     // 'fs' needs the sync-bridge syscalls (to reach the Rust VFS) and process
@@ -99,8 +113,8 @@ export function createInternalBinding({ syscalls, process, netLiveness, netServe
     uv: net.uv,
     pipe_wrap: net.pipe_wrap,
     cares_wrap: net.cares_wrap,
-    // http_parser (Phase 2 #8): pure-JS HTTP/1.1 parser beneath real lib/http.
-    http_parser: createHttpParserBinding(),
+    // http_parser (Phase 2 #8): real llhttp (Wasm) beneath lib/http, JS fallback.
+    http_parser: httpParserBinding,
     // zlib (Phase 2 #11): Node's real lib/zlib.js over the Rust/Wasm codec.
     // crc32/constants work without the codec; the stream handle needs `codec`.
     zlib: createZlibBinding({ makeZStream: codec || null, process }),
