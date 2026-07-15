@@ -46,7 +46,7 @@ export interface PortInfo {
 
 export interface Clipboard {
   mode: "copy" | "cut";
-  abs: string; // absolute path of the copied/cut entry
+  paths: string[]; // absolute paths of the copied/cut entries (multi-select)
 }
 
 // A root folder open in the workspace (VSCode-style multi-root).
@@ -1471,8 +1471,10 @@ export class IdeController {
     else this.editor?.setModel(null);
   }
 
-  copyEntry(abs: string) { this.set({ clipboard: { mode: "copy", abs } }); }
-  cutEntry(abs: string) { this.set({ clipboard: { mode: "cut", abs } }); }
+  copyEntry(abs: string) { this.copyEntries([abs]); }
+  cutEntry(abs: string) { this.cutEntries([abs]); }
+  copyEntries(paths: string[]) { if (paths.length) this.set({ clipboard: { mode: "copy", paths: [...paths] } }); }
+  cutEntries(paths: string[]) { if (paths.length) this.set({ clipboard: { mode: "cut", paths: [...paths] } }); }
 
   renameEntry(oldAbs: string, newName: string) {
     const name = newName.trim();
@@ -1481,43 +1483,45 @@ export class IdeController {
     const newAbs = parent + "/" + name;
     this.bridge.post("oc-rename", { from: oldAbs, to: newAbs });
     this.remapOpenPaths(oldAbs, newAbs);
-    if (this.snap.clipboard?.abs === oldAbs) this.set({ clipboard: null });
+    if (this.snap.clipboard?.paths.includes(oldAbs)) this.set({ clipboard: null });
     this.bumpTree();
   }
 
-  deleteEntry(abs: string) {
-    this.bridge.post("oc-rm", { path: abs });
-    this.dropOpenPaths(abs);
-    if (this.snap.clipboard?.abs === abs) this.set({ clipboard: null });
+  deleteEntry(abs: string) { this.deleteEntries([abs]); }
+  // Delete every entry in `paths` (batch delete from a multi-selection).
+  deleteEntries(paths: string[]) {
+    if (!paths.length) return;
+    for (const abs of paths) {
+      this.bridge.post("oc-rm", { path: abs });
+      this.dropOpenPaths(abs);
+    }
+    const cb = this.snap.clipboard;
+    if (cb) {
+      const remaining = cb.paths.filter((p) => !paths.includes(p));
+      if (remaining.length !== cb.paths.length) {
+        this.set({ clipboard: remaining.length ? { ...cb, paths: remaining } : null });
+      }
+    }
     this.bumpTree();
   }
 
-  // Paste the clipboard entry into `destDirAbs`.
+  // Paste every clipboard entry into `destDirAbs`.
   async pasteInto(destDirAbs: string) {
     const cb = this.snap.clipboard;
     if (!cb) return;
     const dest = normDir(destDirAbs);
-    const name = baseName(cb.abs);
-    // Cutting a folder into itself/descendant would be invalid — ignore.
-    if (cb.mode === "cut" && (dest === cb.abs || dest.startsWith(cb.abs + "/"))) return;
-    let target = dest + "/" + name;
-    // Avoid clobbering: append -copy, -copy-2, … until the path is free.
-    if ((await this.pathInfo(target)).exists) {
-      const dot = name.lastIndexOf(".");
-      const stem = dot > 0 ? name.slice(0, dot) : name;
-      const ext = dot > 0 ? name.slice(dot) : "";
-      for (let n = 1; ; n++) {
-        const cand = `${dest}/${stem}-copy${n > 1 ? `-${n}` : ""}${ext}`;
-        if (!(await this.pathInfo(cand)).exists) { target = cand; break; }
+    for (const src of cb.paths) {
+      // Cutting into itself/descendant/current parent is a no-op — skip.
+      if (cb.mode === "cut" && (dest === src || dest.startsWith(src + "/") || dest === parentOf(src))) continue;
+      const target = await this.uniqueChild(dest, baseName(src));
+      if (cb.mode === "copy") {
+        this.bridge.post("oc-copy", { from: src, to: target });
+      } else {
+        this.bridge.post("oc-rename", { from: src, to: target });
+        this.remapOpenPaths(src, target);
       }
     }
-    if (cb.mode === "copy") {
-      this.bridge.post("oc-copy", { from: cb.abs, to: target });
-    } else {
-      this.bridge.post("oc-rename", { from: cb.abs, to: target });
-      this.remapOpenPaths(cb.abs, target);
-      this.set({ clipboard: null });
-    }
+    if (cb.mode === "cut") this.set({ clipboard: null });
     this.bumpTree();
   }
 
@@ -1546,7 +1550,7 @@ export class IdeController {
     const target = await this.uniqueChild(dest, baseName(from));
     this.bridge.post("oc-rename", { from, to: target });
     this.remapOpenPaths(from, target);
-    if (this.snap.clipboard?.abs === from) this.set({ clipboard: null });
+    if (this.snap.clipboard?.paths.includes(from)) this.set({ clipboard: null });
     this.bumpTree();
   }
 
@@ -1559,6 +1563,15 @@ export class IdeController {
     const target = await this.uniqueChild(dest, baseName(from));
     this.bridge.post("oc-copy", { from, to: target });
     this.bumpTree();
+  }
+
+  // Batch move/copy for a multi-selection drag. Sequential so per-item
+  // collision suffixes (-copy, -copy-2, …) resolve against prior writes.
+  async moveEntries(paths: string[], destDirAbs: string) {
+    for (const p of paths) await this.moveEntry(p, destDirAbs);
+  }
+  async copyEntriesTo(paths: string[], destDirAbs: string) {
+    for (const p of paths) await this.copyEntryTo(p, destDirAbs);
   }
 
   // Import OS files/folders (dragged from the desktop) into `destDirAbs`.
@@ -1599,10 +1612,10 @@ export class IdeController {
     return 0;
   }
 
-  // A drop landed on the Monaco editor. An internal entry opens directly; OS
+  // A drop landed on the Monaco editor. Internal entries open directly; OS
   // files are imported into the active folder's root, then opened.
-  async dropOnEditor({ path, entries }: { path: string | null; entries: FileSystemEntry[] }) {
-    if (path) { void this.openEntry(path); return; }
+  async dropOnEditor({ paths, entries }: { paths: string[]; entries: FileSystemEntry[] }) {
+    if (paths.length) { for (const p of paths) void this.openEntry(p); return; }
     if (!entries.length) return;
     const root = this.activeFolder?.rootPath;
     if (!root) { toast.error("Open a project first to view dropped files"); return; }

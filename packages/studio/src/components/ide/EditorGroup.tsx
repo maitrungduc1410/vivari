@@ -56,9 +56,10 @@ export function EditorGroup() {
       e.preventDefault();
       e.stopPropagation();
       setDropActive(false);
-      const path = e.dataTransfer.getData(OC_PATH_MIME) || null;
-      const entries = path ? [] : entriesFromDataTransfer(e.dataTransfer);
-      void c.dropOnEditor({ path, entries });
+      const raw = e.dataTransfer.getData(OC_PATH_MIME);
+      const paths = raw ? raw.split("\n").filter(Boolean) : [];
+      const entries = paths.length ? [] : entriesFromDataTransfer(e.dataTransfer);
+      void c.dropOnEditor({ paths, entries });
     };
     el.addEventListener("dragover", onOver, true);
     el.addEventListener("dragleave", onLeave, true);
