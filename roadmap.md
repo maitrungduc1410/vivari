@@ -2253,7 +2253,8 @@ GraphiQL) keep `/graphql`.
 - **Verification.** New network spike `scripts/spike-graphql.mjs` (in `run-spikes.mjs`) asserts
   install -> bind :4000 -> `GET /` serves the UI -> `POST /graphql` answers `hello` +
   `greet(name)` + `books` -> the `addBook` mutation grows the list by one. It uses a new
-  `httpPost` helper added to `scripts/lib/spike-harness.mjs`. Stays `experimental` until green.
+  `httpPost` helper added to `scripts/lib/spike-harness.mjs`. Proven (browser + vanilla-Node),
+  so the `graphql` template is **graduated** (no longer `experimental`).
 - **Feasibility proof.** Confirmed end-to-end in vanilla Node with real `graphql-yoga@5`: `GET /`
   serves the page, the queries and the `addBook` mutation work (books 2 -> 3), and GraphiQL is
   still served at `/graphql`.

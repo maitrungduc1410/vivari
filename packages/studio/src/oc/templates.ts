@@ -3004,8 +3004,8 @@ function graphqlTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      // Experimental until scripts/spike-graphql.mjs is green in CI.
-      experimental: true,
+      // Proven in-VM by scripts/spike-graphql.mjs (queries + the addBook mutation
+      // over the real Yoga server). No longer experimental.
     },
     files: {
       "package.json": `{
