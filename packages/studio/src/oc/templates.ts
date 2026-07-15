@@ -579,7 +579,13 @@ function backendDemoHtml(name: string): string {
         var btn = document.getElementById('call');
         var out = document.getElementById('out');
         var statusEl = document.getElementById('status');
-        var endpoint = '/api/hello';
+        // In the OpenContainer preview the page lives under /preview/<port>/. Address
+        // the in-VM server through that explicit proxy prefix so the request hits the
+        // Service Worker's deterministic preview route (the same one that served this
+        // page) instead of relying on client-port inference, which is racy right after
+        // a preview reload. Standalone (no prefix) it stays a plain /api/hello.
+        var pm = location.pathname.match(/^(\\/preview\\/\\d+)\\//);
+        var endpoint = (pm ? pm[1] : '') + '/api/hello';
         function setBusy(b) { btn.disabled = b; btn.textContent = b ? 'Calling\\u2026' : 'Call GET /api/hello'; }
         btn.addEventListener('click', function () {
           setBusy(true);
@@ -3207,7 +3213,7 @@ createServer((req, res) => {
       document.getElementById('giql').href = (pm ? pm[1] : '') + '/graphql';
 
       function gql(query, variables) {
-        return fetch('/graphql', {
+        return fetch((pm ? pm[1] : '') + '/graphql', {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'accept': 'application/json' },
           body: JSON.stringify({ query: query, variables: variables || {} })
@@ -3704,11 +3710,17 @@ function dbDemoHtml(title: string, subtitle: string): string {
       <ul id="list"></ul>
     </main>
     <script>
+      // Address the in-VM server through the explicit /preview/<port>/ proxy prefix
+      // (present when running inside OpenContainer) so requests hit the Service
+      // Worker's deterministic preview route rather than relying on client-port
+      // inference. Standalone it's just /api.
+      var pm = location.pathname.match(/^(\\/preview\\/\\d+)\\//);
+      var API = (pm ? pm[1] : '') + '/api';
       function load() {
-        fetch('/api/info').then(function (r) { return r.json(); }).then(function (info) {
+        fetch(API + '/info').then(function (r) { return r.json(); }).then(function (info) {
           document.getElementById('engine').textContent = info.engine + ' ' + info.version + ' · ' + info.driver;
         }).catch(function () {});
-        fetch('/api/todos').then(function (r) { return r.json(); }).then(function (rows) {
+        fetch(API + '/todos').then(function (r) { return r.json(); }).then(function (rows) {
           var list = document.getElementById('list');
           list.innerHTML = '';
           rows.forEach(function (row) {
@@ -3726,7 +3738,7 @@ function dbDemoHtml(title: string, subtitle: string): string {
         var input = document.getElementById('task');
         var task = input.value.trim();
         if (!task) return;
-        fetch('/api/todos', {
+        fetch(API + '/todos', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ task: task })
