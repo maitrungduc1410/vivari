@@ -2047,6 +2047,36 @@ and teaches quick-open to jump to a line — without ever blocking the UI.
 Follow-ups: search result virtualization for very large result sets, a search-history dropdown
 (the input hints at `↑↓`), and `.gitignore`-aware excludes.
 
+## Editor TS worker dedup + esbuild-heap attribution (this change)
+
+Building on the per-PID diagnostic below, a real Nuxt measurement showed two things worth acting on:
+a pair of Monaco `ts.worker` instances at ~310 MB each (~621 MB), and a 1.87 GB dev-server Process
+Worker whose esbuild slice we couldn't see. This change lands one concrete win and one measurement.
+
+- **One TS language service, not two (studio, ~300 MB+).** Monaco runs a full language service for
+  BOTH the `typescript` and `javascript` modes, and the studio was feeding each the entire ~3050-file
+  dependency `.d.ts` payload → two ~310 MB `ts.worker`s doing identical work. Now `languageFor`
+  (`packages/studio/src/oc/controller.ts`) maps `.js/.jsx/.mjs/.cjs` to the `typescript` language
+  (`allowJs` handles JS), `configureLanguageService` leaves `javascriptDefaults` inert (diagnostics
+  off, no eager sync, no extra libs) so its worker never spawns, and `loadDependencyTypes` pushes
+  extra libs / re-applies compiler options to `typescriptDefaults` only. Net: one worker, one copy of
+  the payload, no redundant restart — with strictly-better JS IntelliSense (TS-powered).
+- **esbuild Go wasm heap, quantified per-PID (diagnostic).** The in-process esbuild service's Go
+  `WebAssembly.Memory` was trapped in a closure. `esbuild-inproc-patch.js` now stashes it on
+  `globalThis.__ocEsbuildMemory` and exports `esbuildWasmBytes()` (its live `.buffer.byteLength`);
+  `runtime.memStats()` reports it, and "Measure Memory" prints `esbuild-wasm <N> MB` next to the
+  owning PID. This finally shows how much of a dev-server's 1.87 GB is the resident esbuild service
+  vs. the guest framework working set — the data needed before attempting the bigger, riskier levers.
+- **Why no dev-server-heap reduction yet.** `performance.memory` is unavailable in Chrome Workers, so
+  exact per-PID JS-heap bytes still come from the main-thread `measureUserAgentSpecificMemory()`
+  per-URL breakdown (only the dev-server worker is huge). The esbuild Go heap grows-and-stays (Go wasm
+  can't shrink; only `worker.terminate()` frees it), and the rest is guest working set. The remaining
+  "ours" lever is bounded `Module._cache` pruning — still gated on these numbers because it must
+  respect stateful singletons and cycles.
+- **Verification.** Studio-only + a read-only diagnostic: `node --check` + studio `tsc` clean;
+  `verify-node` unaffected. Browser check: "Measure Memory" shows ONE `ts.worker` and an
+  `esbuild-wasm <N> MB` figure on the dev-server PID.
+
 ## Dev-server heap: per-PID memory attribution (this change)
 
 After VFS compression, the single largest term in the tab is the **Process Worker JS heap**

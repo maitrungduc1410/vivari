@@ -12,7 +12,7 @@ import { createChildProcess } from "./builtins/child_process.js";
 import { createModuleSystem } from "./module.js";
 import { createWebSocket } from "./websocket.js";
 import { rewriteDynamicImportToGlobal } from "./esm.js";
-import { isEsbuildInprocActive } from "./esbuild-inproc-patch.js";
+import { isEsbuildInprocActive, esbuildWasmBytes } from "./esbuild-inproc-patch.js";
 
 function createConsole(process, util) {
   const toOut = (...a) => process.stdout.write(util.format(...a) + "\n");
@@ -1214,6 +1214,9 @@ export function createRuntime({
     memStats: () => ({
       modules: Object.keys(moduleSystem.cache).length,
       esbuildInproc: isEsbuildInprocActive(),
+      // Bytes of the in-process esbuild Go wasm heap (0 if esbuild isn't here) —
+      // attributes a concrete slice of this process's footprint.
+      esbuildBytes: esbuildWasmBytes(),
     }),
     /** External delivery from the kernel: an async child's stdout/stderr/exit
      * ({type:'child-stdout'|'child-stderr'|'child-exit', childPid, ...}). #15.
