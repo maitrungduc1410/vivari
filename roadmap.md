@@ -2342,6 +2342,32 @@ Two more templates drop `experimental`, each now gated by a headless spike:
   budget (`OC_BIND_TIMEOUT`) since the first Vite build is heavy, then asserts `GET /` returns
   the Slidev app shell. Confirmed in vanilla Node (dev server built + bound in ~6s, `/` served).
 
+## tRPC template — raw `.ts` server through the loader, no `export type` (this change)
+
+The **tRPC** template's server is run raw via `node --experimental-strip-types
+server/index.ts`, which routes it through OC's own module loader. That loader's
+`esm.js` only rewrites `import`/`export` — **it does not strip TypeScript types** —
+so `export type AppRouter = typeof appRouter` had its `export ` removed and left
+`type AppRouter = …`, i.e. invalid JS → `SyntaxError: Unexpected identifier
+'AppRouter'`. (Every other TS template only sees `.ts` *after* esbuild/Vite has
+stripped types; tRPC is the one that hands a raw `.ts` to the loader.)
+
+Fix keeps full end-to-end typing without any runtime type syntax in the executed
+file:
+
+- `server/index.ts` drops the `export type AppRouter` line — it now contains **zero**
+  TS type syntax, so `esm.js` transpiles it to valid CJS and it runs.
+- `src/App.tsx` derives the router type with a **type-only `typeof import()`**:
+  `type AppRouter = typeof import('../server/index').appRouter`. esbuild erases the
+  whole declaration (verified: no `../server/index` import in the transform output),
+  so there's no runtime coupling and the tRPC client stays fully typed.
+
+Guarded by `scripts/spike-trpc.mjs`, which boots the exact `.ts` server through the
+kernel (`node --experimental-strip-types server/index.ts`), binds `:3001`, and
+asserts an `httpBatchLink`-style greeting query returns the typed payload. Server
+side confirmed in vanilla Node with real `@trpc/server@11`. The template stays
+`experimental` (its React frontend still wants a browser confirmation).
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

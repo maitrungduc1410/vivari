@@ -3512,8 +3512,6 @@ export const appRouter = t.router({
     .query(({ input }) => 'Hello ' + (input?.name ?? 'world') + ' from tRPC!'),
 })
 
-export type AppRouter = typeof appRouter
-
 createHTTPServer({ router: appRouter }).listen(3001)
 console.log('[trpc] server listening on :3001')
 `,
@@ -3522,7 +3520,11 @@ console.log('[trpc] server listening on :3001')
       "src/main.tsx": reactMain(true),
       "src/App.tsx": `import { useEffect, useState } from 'react'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
-import type { AppRouter } from '../server/index'
+
+// End-to-end typing without a runtime \`export type\` in the server entry: a
+// type-only \`typeof import()\` is fully erased by the bundler, so the server
+// file (run raw via node --experimental-strip-types) stays free of type syntax.
+type AppRouter = typeof import('../server/index').appRouter
 
 // The studio's preview proxy maps /preview/<port>/ to the in-VM server, so the
 // browser reaches the tRPC server (:3001) with no CORS and no manual proxy.

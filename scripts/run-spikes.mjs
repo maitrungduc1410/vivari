@@ -60,6 +60,8 @@ const SPIKES = [
   { name: "socketio", file: "spike-socketio.mjs", net: true },
   // Slidev (Vite + Vue) CLI dev server — first build is heavy, longer budget.
   { name: "slidev", file: "spike-slidev.mjs", net: true, timeout: 600000 },
+  // tRPC server — raw .ts entry through OC's loader (no `export type`), typed query.
+  { name: "trpc", file: "spike-trpc.mjs", net: true },
 ];
 
 const args = process.argv.slice(2);

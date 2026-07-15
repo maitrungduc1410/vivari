@@ -733,6 +733,18 @@ snapshot it at call time, not at delivery time.
   `require()` returns `X` directly; `export { X as default }` sets
   `exports.default`. Getting these wrong yields `TypeError: x is not a function`
   on a plugin's default export.
+- **`esm.js` does NOT strip TypeScript types** — it only rewrites `import`/`export`.
+  A raw `.ts` run through OC's loader (`node --experimental-strip-types x.ts`) is
+  *not* type-stripped: `esm.js` removes the leading `export `/`import ` and leaves
+  the rest verbatim, so `export type Foo = …` becomes `type Foo = …` → **`SyntaxError:
+  Unexpected identifier 'Foo'`**. Everything else (Angular/Vite/Nitro/…) only ever
+  sees `.ts` *after* esbuild/Vite has stripped types, so this bites only files run
+  directly by the loader. Rule for templates: keep any raw-executed `.ts` free of
+  type syntax (no `export type`, no annotations). Share types with the bundler-
+  processed side via a type-only `typeof import('./server')` instead of a runtime
+  `export type` — see the **tRPC** template (`server/index.ts` has zero type syntax;
+  `src/App.tsx` derives `AppRouter` via `typeof import('../server/index').appRouter`).
+  Proven by `scripts/spike-trpc.mjs`.
 
 ### `self` is a getter in a real Worker
 Third-party bundles (Vite/rolldown workers) do `Object.assign(globalThis, {self})`,
