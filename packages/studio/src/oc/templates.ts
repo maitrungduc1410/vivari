@@ -2413,24 +2413,53 @@ function vitepressTemplate(): TemplateDef {
     "build": "vitepress build docs",
     "preview": "vitepress preview docs"
   },
-  "devDependencies": { "vitepress": "^1.5.0" }
+  "devDependencies": { "vitepress": "^1.5.0", "shiki": "^2.5.0" }
 }
 `,
       "docs/.vitepress/config.mjs": `import { defineConfig } from 'vitepress'
+import { createHighlighter } from 'shiki'
+import { createJavaScriptRegexEngine } from 'shiki/engine/javascript'
 
-export default defineConfig({
-  title: 'OpenContainer Docs',
-  description: 'VitePress running inside OpenContainer',
-  themeConfig: {
-    nav: [{ text: 'Home', link: '/' }, { text: 'Guide', link: '/guide' }],
-    sidebar: [
-      { text: 'Introduction', items: [
-        { text: 'Home', link: '/' },
-        { text: 'Guide', link: '/guide' },
-      ] },
-    ],
-  },
-})
+// VitePress builds its Shiki highlighter eagerly (Vite \`configResolved\`, before the
+// dev server binds). Shiki's DEFAULT engine loads the Oniguruma regex engine as
+// WebAssembly — heavy to instantiate in a browser VM and the reason \`vitepress dev\`
+// could appear to hang before printing its URL. Shiki's pure-JavaScript regex engine
+// avoids that WASM entirely while keeping the same themes/highlighting, and it's the
+// recommended engine for WASM-restricted runtimes. We wire it via \`markdown.highlight\`
+// (an async function config so there's no top-level await). Fully portable: this same
+// config runs unchanged in a plain \`npm run dev\` outside OpenContainer.
+const LIGHT = 'github-light'
+const DARK = 'github-dark'
+const LANGS = ['js', 'ts', 'jsx', 'tsx', 'json', 'bash', 'shell', 'vue', 'html', 'css', 'scss', 'md', 'yaml', 'python', 'go', 'rust', 'sql']
+
+export default async () => {
+  const highlighter = await createHighlighter({
+    themes: [LIGHT, DARK],
+    langs: LANGS,
+    engine: createJavaScriptRegexEngine(),
+  })
+  return defineConfig({
+    title: 'OpenContainer Docs',
+    description: 'VitePress running inside OpenContainer',
+    markdown: {
+      highlight: (code, lang) =>
+        highlighter.codeToHtml(code, {
+          lang: highlighter.getLoadedLanguages().includes(lang) ? lang : 'text',
+          themes: { light: LIGHT, dark: DARK },
+          defaultColor: false,
+        }),
+    },
+    themeConfig: {
+      nav: [{ text: 'Home', link: '/' }, { text: 'Guide', link: '/guide' }],
+      sidebar: [
+        { text: 'Introduction', items: [
+          { text: 'Home', link: '/' },
+          { text: 'Guide', link: '/guide' },
+        ] },
+      ],
+    },
+  })
+}
 `,
       "docs/index.md": `---
 layout: home
@@ -2451,6 +2480,18 @@ This VitePress site is running entirely inside OpenContainer.
 - Markdown with Vue components
 - Instant hot reload
 - Zero native dependencies
+
+Code blocks are highlighted with Shiki's JavaScript engine (no WebAssembly):
+
+\`\`\`ts
+interface Doc {
+  title: string
+  tags: string[]
+}
+
+const doc: Doc = { title: 'Hello', tags: ['vitepress', 'opencontainer'] }
+console.log(doc.title.toUpperCase())
+\`\`\`
 `,
     },
   };

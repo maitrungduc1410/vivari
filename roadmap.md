@@ -2310,6 +2310,23 @@ Two more Backend templates drop `experimental`, each now gated by a headless spi
 Both use the shared `scripts/lib/spike-harness.mjs` (Nitro adds `env.PORT` via `defaultEnv`; the
 new `httpPost` helper from the GraphQL change carries the Feathers `create()` assertion).
 
+## VitePress: Shiki's JavaScript engine instead of Oniguruma WASM (this change)
+
+`vitepress dev` could appear to hang right after Vite's "CJS build … deprecated" line — no
+banner, no URL. Traced to `createServer`: the VitePress plugin builds its Shiki highlighter
+**eagerly in `configResolved`** (before `httpServer.listen`), and Shiki's DEFAULT engine
+instantiates the **Oniguruma regex engine as WebAssembly**. That eager WASM instantiate is what
+stalls before the server ever binds (ruled out: the "CJS build" warning — universal in OC since
+it transpiles ESM→CJS — and the in-process esbuild patch, which *does* apply to Vite 5's
+esbuild 0.21.5, byte-identical spawn block).
+
+The fix keeps the template vanilla and portable: switch to Shiki's **pure-JavaScript regex
+engine** (`shiki/engine/javascript`) via `markdown.highlight`, wired through an **async-function
+config** (no top-level await, so OC's ESM→CJS path is fine). Same themes + highlighting, zero
+WASM. Verified as a valid, working VitePress config in vanilla Node (server binds + prints its
+URL); the same config runs unchanged in a plain export. Still `experimental` (needs an in-VM
+spike + browser confirmation before graduating).
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server
