@@ -542,6 +542,45 @@ models from disk. **Quick-open** (`CommandPalette.tsx`, `⌘P`) filters the flat
 name and accepts a trailing `:line[:col]` suffix to jump on open; a bare `:line` jumps within
 the active editor. `⌘⇧F` focuses the Search pane.
 
+### 8.9 IntelliSense — Monaco's language service, off-main-thread (studio)
+
+The editor runs Monaco's **real** TS/JS language service (completions, hover, signature help,
+go-to-definition, diagnostics), not just syntax coloring. `mountEditor` sets `MonacoEnvironment.getWorker`
+to Monaco's own workers — the editor worker plus the `typescript` worker (a bundled TS compiler), and
+json/css/html — each a Vite `?worker` import so it's bundled **same-origin** (COEP `require-corp` is
+satisfied) and runs off the main thread. `configureLanguageService` enables semantic + syntax
+diagnostics with `setEagerModelSync(true)` (every model is visible to the worker) and `checkJs: false`
+(plain-JS projects aren't flooded with type errors).
+
+The TS worker only "sees" two file sources, so the studio keeps a strict split:
+
+```mermaid
+flowchart LR
+  subgraph Main["Main thread (IdeController)"]
+    BG["project source files\n→ Monaco models\n(ensureBackgroundModels)"]
+    DEP["node_modules **/*.d.ts + package.json\n→ setExtraLibs"]
+  end
+  KW["Kernel Worker (Wasm VFS)"] -->|"oc-collect-dts (bulk .d.ts)"| DEP
+  BG -->|"eager model sync"| TSW["TS language-service worker"]
+  DEP -->|"extra libs"| TSW
+  TSW -->|"completions / hover / defs / markers"| Editor["Monaco editor"]
+  TSW -->|"onDidChangeMarkers"| SB["StatusBar problems count"]
+```
+
+- **The project's own files become models** (`ensureBackgroundModels`, bounded, node_modules excluded),
+  so cross-file imports resolve and go-to-definition works before a file is opened; `ensureModel`
+  adopts a seeded model when the user opens that file.
+- **Dependency typings become extra libs.** Harvesting `node_modules/**/*.d.ts` (+ `package.json` for
+  `types`/`exports` resolution) happens in the **kernel worker** (`oc-collect-dts`) — the sole VFS
+  holder — as one bulk reply instead of thousands of reads; the project's declared deps (+ their
+  `@types`) are harvested first so a budget cap can't drop the packages you import, then the rest of
+  `@types`; `typescript`'s own libs are skipped (Monaco ships those). It's debounced and re-runs on
+  folder open, fs changes, and after any process exits (an in-VM `npm install` doesn't emit
+  `oc-fs-changed`, so a finished process is the cue that `node_modules` may have appeared); a cheap
+  `node_modules` fingerprint short-circuits the file reads when nothing changed.
+- **Never register a file as both** a model and an extra lib, or the worker sees it twice ("Duplicate
+  identifier"). `onDidChangeMarkers` feeds a live error/warning count into the status bar.
+
 ---
 
 ## 9. Native code (Wasm)
@@ -630,8 +669,9 @@ unmodified `ng new` project, benefit any esbuild/worker-pool tool (Vitest, tsup,
   workers (`new Worker(new URL('./fs-worker.js'|'./process-worker.js'|'./fetcher-worker
   .js', import.meta.url), {type:'module'})`) and every `new URL('../*/pkg/*_bg.wasm',
   import.meta.url)` asset, all emitted same-origin so COEP holds. Monaco + xterm come
-  from npm (no vendored bundle). `npm run build:studio` / `npm run preview:studio` are
-  the production build + preview.
+  from npm (no vendored bundle); Monaco's own language workers are imported the same
+  `?worker` way (also same-origin → COEP-safe) to power real IntelliSense (§8.9).
+  `npm run build:studio` / `npm run preview:studio` are the production build + preview.
 - **Dev (legacy demo)**: `npm run dev:legacy` → `server.mjs` on `:8080` with COOP/COEP.
   Open `http://localhost:8080/packages/demo/index.html`. Loads the runtime as ~120
   individual ES modules per worker (readable, debuggable, diffable against upstream Node).

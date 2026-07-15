@@ -1348,6 +1348,115 @@ async function searchWalk(dir, root, ctx) {
   }
 }
 
+// ── IntelliSense dependency-type collection ──────────────────────────────────
+// Gather a project's node_modules .d.ts + package.json for Monaco's TS language
+// service. The ORDER matters: a blind walk can blow the budget on some giant
+// package and drop the ones the project actually imports (e.g. react). So we
+// harvest the project's DECLARED dependencies (+ their @types) FIRST — those are
+// guaranteed in — then @types (ambient globals), then whatever fits. The
+// `typescript` package's own lib.*.d.ts are skipped (Monaco ships its own).
+const DTS_MAX_FILES = 12_000;
+const DTS_MAX_BYTES = 32_000_000;
+const DTS_SKIP_DIRS = new Set(["@types", "typescript", ".bin", ".cache", ".vite"]);
+
+// A cheap "did node_modules change?" fingerprint: the sorted top-level package
+// list (+ @types), no file reads. Lets a re-harvest after every process exit
+// short-circuit unless an install actually added/removed packages.
+function depsSignature(nm) {
+  let names;
+  try { names = kernel.readdir(nm); } catch { return ""; }
+  names = names.slice().sort();
+  const parts = [names.length + ":" + names.join(",")];
+  try {
+    let t = kernel.readdir(nm + "/@types");
+    t = t.slice().sort();
+    parts.push("@types=" + t.length + ":" + t.join(","));
+  } catch { /* no @types */ }
+  return parts.join("|");
+}
+
+// The declared dependency names from a project's package.json (all buckets).
+function projectDepNames(root) {
+  const names = new Set();
+  try {
+    const pkg = JSON.parse(kernel.readFile(root.replace(/\/+$/, "") + "/package.json"));
+    for (const key of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+      const bucket = pkg[key];
+      if (bucket && typeof bucket === "object") for (const n of Object.keys(bucket)) names.add(n);
+    }
+  } catch { /* no/invalid package.json */ }
+  return names;
+}
+
+// `react` → `react`; `@scope/pkg` → `scope__pkg` (the @types package naming).
+function typesPackageName(dep) {
+  return dep[0] === "@" ? dep.slice(1).replace("/", "__") : dep;
+}
+
+async function collectDts(root, prevSig) {
+  const out = [];
+  const seen = new Set();
+  const ctx = { bytes: 0, scanned: 0, truncated: false };
+  if (!kernel) return { files: out, truncated: false, sig: "", unchanged: false };
+  const rootClean = String(root || "").replace(/\/+$/, "");
+  const nm = rootClean + "/node_modules";
+  // sig === "" signals "no node_modules yet" to the caller.
+  const noNm = (unchanged) => ({ files: out, truncated: false, sig: "", unchanged });
+  try { if (!kernel.exists(nm)) return noNm(prevSig === ""); } catch { return noNm(false); }
+  const sig = depsSignature(nm);
+  // Unchanged since the caller's last harvest — skip the (expensive) file reads.
+  if (sig && sig === prevSig) return { files: out, truncated: false, sig, unchanged: true };
+
+  const collectFile = (abs, name) => {
+    if (seen.has(abs)) return;
+    if (!(name.endsWith(".d.ts") || name === "package.json")) return;
+    let content;
+    try { content = kernel.readFile(abs); } catch { return; }
+    if (typeof content !== "string") return;
+    seen.add(abs);
+    out.push({ path: abs, content });
+    ctx.bytes += content.length;
+    if (out.length >= DTS_MAX_FILES || ctx.bytes >= DTS_MAX_BYTES) ctx.truncated = true;
+  };
+
+  const walk = async (dir, depth) => {
+    if (ctx.truncated || depth > 12) return;
+    let names;
+    try { names = kernel.readdir(dir); } catch { return; }
+    for (const name of names) {
+      if (ctx.truncated) return;
+      if (depth === 0 && DTS_SKIP_DIRS.has(name)) continue;
+      const abs = dir + "/" + name;
+      let st;
+      try { st = kernel.stat(abs); } catch { continue; }
+      if (st.kind === "dir") {
+        await walk(abs, depth + 1);
+      } else {
+        collectFile(abs, name);
+      }
+      if (++ctx.scanned % 200 === 0) await new Promise((r) => setTimeout(r));
+    }
+  };
+
+  // Walk a single package dir if it exists (used for the priority pass).
+  const walkPkg = async (dir) => {
+    let st;
+    try { if (!kernel.exists(dir)) return; st = kernel.stat(dir); } catch { return; }
+    if (st.kind === "dir") await walk(dir, 1);
+  };
+
+  // 1) Declared deps + their @types FIRST, so imported packages are never dropped.
+  for (const dep of projectDepNames(root)) {
+    if (ctx.truncated) break;
+    await walkPkg(nm + "/" + dep);
+    await walkPkg(nm + "/@types/" + typesPackageName(dep));
+  }
+  // 2) All @types (ambient globals), then 3) the rest of node_modules, budget permitting.
+  try { if (kernel.exists(nm + "/@types")) await walk(nm + "/@types", 1); } catch { /* ignore */ }
+  await walk(nm, 0);
+  return { files: out, truncated: ctx.truncated, sig, unchanged: false };
+}
+
 async function runSearch(m) {
   const token = m.token;
   currentSearchToken = token;
@@ -1532,6 +1641,20 @@ self.onmessage = async (event) => {
   if (m.type === "oc-register-project") {
     if (kernel && m.manifest) registerProject(m.dir, m.manifest, m.title);
     if (m.reqId != null) post("oc-reply", { reqId: m.reqId, ok: true });
+    return;
+  }
+
+  // ── IntelliSense: bulk-collect dependency type declarations ─────────────────
+  // Harvest a project's node_modules **/*.d.ts (+ package.json, needed for
+  // "types"/"exports" resolution) so the studio can feed them to Monaco's TS
+  // language service as extra libs. Done HERE — the worker is the sole holder of
+  // the sync Wasm VFS, so this is one bulk reply instead of thousands of per-file
+  // read round-trips. Bounded (file count + total bytes) and yields periodically.
+  if (m.type === "oc-collect-dts") {
+    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    collectDts(m.root, m.sig || "")
+      .then((r) => post("oc-reply", { reqId: m.reqId, ok: true, files: r.files, truncated: r.truncated, sig: r.sig, unchanged: r.unchanged }))
+      .catch((err) => post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) }));
     return;
   }
 

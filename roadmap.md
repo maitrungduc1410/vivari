@@ -1559,8 +1559,9 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     - **Isolation plumbing** lives in `vite.config.ts` (COOP/COEP on dev + preview, a
       plugin that stamps `Service-Worker-Allowed:/` on `/sw.js`, `worker.format:'es'`,
       and `server.fs.allow` widened to the repo root). `public/sw.js` is the same preview
-      SW at root scope. Monaco/xterm come from npm (no vendored bundle); Monaco's language
-      workers stay disabled (no-op `MonacoEnvironment`), COEP-safe as before.
+      SW at root scope. Monaco/xterm come from npm (no vendored bundle). (Monaco's language
+      workers were initially left disabled here; they are now wired for real IntelliSense —
+      see "Real IntelliSense" below.)
     - **Gotchas hit**: `@vitejs/plugin-react` v6 is oxc-based (no `babel` option) — the
       React Compiler is wired via the exported `reactCompilerPreset()` + `@rolldown/plugin-
       babel`; TS 6 removed `baseUrl` (paths are tsconfig-relative); shadcn's `base-nova`
@@ -2045,6 +2046,52 @@ and teaches quick-open to jump to a line — without ever blocking the UI.
 
 Follow-ups: search result virtualization for very large result sets, a search-history dropdown
 (the input hints at `↑↓`), and `.gitignore`-aware excludes.
+
+## Real IntelliSense — Monaco's TS/JS language service, off-main-thread (this change)
+
+The editor was syntax-coloring only: Monaco's language workers were a no-op `MonacoEnvironment`, so
+there were no completions, no hover, no go-to-definition, and no diagnostics — the most visible
+quality gap vs a hosted IDE. This change wires the real language service, running off the main thread,
+with project-wide + dependency-aware type information.
+
+- **Real workers, COEP-safe (`oc/controller.ts` `mountEditor`).** `MonacoEnvironment.getWorker` now
+  returns Monaco's own workers per language label — the editor worker plus the `typescript` worker
+  (a bundled TS compiler + language service), and json/css/html. Each is a Vite `?worker` import, so
+  it's bundled into a same-origin chunk (COEP `require-corp` satisfied, no CDN). They run in Web
+  Workers, so completions/hover/diagnostics never block the UI.
+- **Language service config (`configureLanguageService`).** Sensible compiler options (ESNext,
+  NodeJs resolution, `react-jsx`, `allowJs`, `esModuleInterop`, `resolveJsonModule`, `skipLibCheck`,
+  and `allowImportingTsExtensions`+`noEmit` so Vite templates' `import "./App.tsx"` don't error),
+  semantic + syntax diagnostics ON, and `setEagerModelSync(true)` so every model we create is visible
+  to the worker. `checkJs` stays OFF so plain-JS projects aren't drowned in type errors.
+- **Cross-file IntelliSense = the project's files as models (`ensureBackgroundModels`).** The worker
+  only sees Monaco *models* and *extra libs*. So a folder's own source files (`.ts/.tsx/.js/.jsx/
+  .mjs/.cjs`, node_modules excluded) are seeded as background models (bounded, created lazily, adopted
+  by `ensureModel` when opened) — so imports between the user's files resolve and go-to-definition
+  works before a file is even opened.
+- **Dependency types = bulk `.d.ts` harvest in the kernel worker (`oc-collect-dts`).** Installed-package
+  typings (`node_modules/**/*.d.ts` + `package.json` for `types`/`exports` resolution) are collected
+  by the worker that holds the sync Wasm VFS — one bulk reply instead of thousands of `oc-read`
+  round-trips — harvesting the project's **declared deps (+ their `@types`) first** so a budget cap
+  never drops the packages you actually import, then the rest of `@types`, skipping `typescript`'s own
+  libs (Monaco ships those). The controller registers them via `setExtraLibs`, keying each file with
+  `monaco.Uri.file(path).toString(true)` (**skip-encoding**) — the default `toString()` percent-encodes
+  `@`→`%40`, but TS's resolver looks up `@types/…`/`@scope/…` with a literal `@`, so encoded keys silently
+  break every `@types`-backed import (`react`, `react-dom`, `jsx-runtime`) even after the `.d.ts` loads.
+  After `setExtraLibs` we re-apply `setCompilerOptions` to force a fresh worker (the mount-time worker
+  validated open files before the types existed). The load is
+  debounced and re-runs on folder open, fs changes, and **after any process exits** — since an in-VM
+  `npm install` doesn't emit `oc-fs-changed`, a finished process is the cue that `node_modules` may
+  have appeared. A cheap `node_modules` fingerprint short-circuits the file reads when nothing changed.
+- **Problems in the status bar (`StatusBar.tsx`).** `monaco.editor.onDidChangeMarkers` feeds a live
+  error/warning count into the snapshot, surfaced next to the status text.
+
+Verified: `tsc -b` + `oxlint` clean; kernel-worker `node --check` clean. (A full `vite build` needs the
+Rust/Wasm VFS artifacts, which aren't built in this environment.)
+
+Follow-ups: a full Problems *panel* (jump-to-marker list), quick-fixes/auto-imports UI, `jsconfig`/
+`tsconfig` awareness (honor the project's own compiler options + `paths`), and go-to-definition into
+dependency `.d.ts`.
 
 ## Toolchain generalization, install speed, worker-pool & a spike CI harness (this change)
 
