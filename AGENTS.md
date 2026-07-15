@@ -494,6 +494,22 @@ pnpm is wired like npm/yarn (`scripts/vendor-pnpm.mjs` → `pnpm-pack.bin`;
 - `dist/pnpm.cjs` (~8.8 MB) exceeds the 1 MiB SAB window → loader uses writeLarge.
 - Headless browser-shape gate: `scripts/spike-pnpm-studio.mjs` (`OC_NET=1`), which
   uses the SAME env (not CLI flags) so it verifies studio's actual config.
+- **pnpm bins are `#!/bin/sh` cmd-shims, NOT symlinks.** npm makes `node_modules/.bin/vite`
+  a POSIX symlink to the real `vite.js`; pnpm writes a `#!/bin/sh` wrapper that
+  `exec node "$basedir/../vite/bin/vite.js" "$@"`. Our loader can't run shell, so
+  `module.js` `runMain` unwraps a shell shim to the `.js` it execs
+  (`resolveCmdShim` → the pure, unit-tested `parseShellShimTarget`; guard:
+  `scripts/spike-cmd-shim.mjs`). Without it, a `pnpm`-installed bin is compiled as
+  JS → `SyntaxError: missing ) after argument list`. A real `#!/usr/bin/env node`
+  bin is left alone. No NODE_PATH shim needed: pnpm puts the real bin next to its
+  deps in the `.pnpm/<pkg>@<ver>/node_modules/` store, so the normal node_modules
+  walk resolves them.
+- **`pnpm run` does NOT eat a leading `--` like `npm run` does.** `npm run dev --
+  --flag` strips the first `--` and forwards `--flag`; `pnpm … dev -- --flag`
+  forwards the literal `--` too, and vite's cac parser then treats everything after
+  `--` as pass-through positionals (the flag is silently ignored). For pnpm, drop
+  the `--`: `pnpm --filter web dev --configLoader native`. (See the `monorepo`
+  template's dev command.)
 
 ### Real corepack is the studio's PM version manager — DOWNLOADS + runs pinned PMs
 corepack is wired like the PMs but is a *version manager*, not a package manager

@@ -30,6 +30,8 @@ const SPIKES = [
   // --- offline (no live registry) --------------------------------------------
   { name: "toolchain", file: "spike-toolchain.mjs", net: false, timeout: 60000 },
   { name: "http-llhttp", file: "spike-http-llhttp.mjs", net: false, timeout: 60000 },
+  // pnpm/cmd-shim bin unwrap — pure parser, no kernel/wasm needed.
+  { name: "cmd-shim", file: "spike-cmd-shim.mjs", net: false, timeout: 60000 },
   // --- network: graduated templates gated here -------------------------------
   { name: "koa", file: "spike-koa.mjs", net: true },
   { name: "hono", file: "spike-hono.mjs", net: true },

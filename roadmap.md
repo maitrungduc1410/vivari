@@ -2368,6 +2368,35 @@ asserts an `httpBatchLink`-style greeting query returns the typed payload. Serve
 side confirmed in vanilla Node with real `@trpc/server@11`. The template stays
 `experimental` (its React frontend still wants a browser confirmation).
 
+## pnpm monorepo — cmd-shim bin unwrap + pnpm's `--` forwarding (this change)
+
+The **pnpm monorepo** template crashed with `SyntaxError: missing ) after argument
+list` the moment `vite` started. Two pnpm-specific behaviours, both fixed:
+
+1. **pnpm bins are `#!/bin/sh` cmd-shims, not symlinks.** npm makes
+   `node_modules/.bin/vite` a POSIX symlink straight to the real `vite.js`; pnpm
+   instead writes a `#!/bin/sh` wrapper that `exec node "$basedir/../vite/bin/vite.js"
+   "$@"`. Our synchronous loader can't run shell — it neutralised the shebang and
+   compiled the shell script as JavaScript → syntax error. Fix (runtime, general):
+   `module.js` `runMain` now detects a shell cmd-shim and **unwraps it to the `.js`
+   it execs** (`resolveCmdShim` → the pure `parseShellShimTarget`), mirroring Node's
+   `argv[1]` = the resolved `.js`. A real `#!/usr/bin/env node` bin is left alone.
+   No NODE_PATH shim is needed: pnpm places the real bin next to its deps in the
+   `.pnpm/<pkg>@<ver>/node_modules/` store, so the normal node_modules walk resolves
+   them. This benefits **every** pnpm-installed bin, not just this template.
+2. **pnpm doesn't eat a leading `--` like npm.** The template ran `pnpm --filter web
+   dev -- --configLoader native`; npm would strip the first `--` and forward
+   `--configLoader native`, but pnpm forwards the literal `--` too, so vite's cac
+   parser treated `--configLoader native` as pass-through positionals and ignored
+   the flag (which then re-triggers vite's in-VM rolldown config bug the flag exists
+   to avoid). Fix: drop the `--` → `pnpm --filter web dev --configLoader native`.
+
+Guarded by `scripts/spike-cmd-shim.mjs` — a pure, offline unit test of the shim
+parser (real pnpm shim + `.cjs`/`.mjs` targets + node-bin/non-shell negatives).
+Both the shim resolution and the corrected `--`-free command were confirmed against
+real pnpm@9.15.9 in vanilla Node (vite starts, serves `/`). Template stays
+`experimental`.
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

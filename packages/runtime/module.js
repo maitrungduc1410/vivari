@@ -21,6 +21,25 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 // time, before the global is wrapped.
 const RealFunction = Function;
 
+// Pure: given a bin file's source, return the .js/.cjs/.mjs target token that a
+// shell cmd-shim `exec`s (with pnpm's `$basedir` left un-expanded), or null when
+// it isn't an unwrappable shell shim — a real `#!/usr/bin/env node` bin, a
+// non-shell shebang, or no `.js` exec target. pnpm (and npm-on-Windows) install a
+// package's bin as such a `#!/bin/sh` wrapper instead of the POSIX symlink npm
+// uses; our loader can't run shell, so runMain unwraps it to the .js it runs.
+// Exported for the offline unit test (scripts/spike-cmd-shim.mjs).
+export function parseShellShimTarget(source) {
+  if (typeof source !== "string" || !source.startsWith("#!")) return null;
+  const nl = source.indexOf("\n");
+  const shebang = source.slice(0, nl < 0 ? source.length : nl);
+  if (/\bnode\b/.test(shebang)) return null; // real node bin — compile it as JS
+  if (!/\b(sh|bash|dash)\b/.test(shebang)) return null; // only shell wrappers
+  const m =
+    source.match(/exec\s+(?:"[^"]*"|\S+)\s+"?([^"\s]+\.[cm]?js)"?/) ||
+    source.match(/"?(\$basedir\/[^"\s]+\.[cm]?js)"?/);
+  return (m && m[1]) || null;
+}
+
 export function createModuleSystem({ fs, path, builtins, process, globals, nodeModules }) {
   const cache = Object.create(null);
   // The entry module (Node's `require.main` / `process.mainModule`). Set by
@@ -492,11 +511,44 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     }
   }
 
+  // pnpm (and npm on Windows) install a package's bin as a SHELL cmd-shim — a
+  // `#!/bin/sh` wrapper that `exec node "<…>/foo.js" "$@"` — instead of the POSIX
+  // symlink-to-the-real-.js that npm uses. Our loader can't run shell, so if the
+  // program is a shim, unwrap it to the .js it execs. Cheap: only extension-less
+  // files (bins) are ever candidates, and we only read shell shebangs — a real
+  // `#!/usr/bin/env node` bin returns null and is compiled as JS as before.
+  function resolveCmdShim(file) {
+    const ext = path.extname(file);
+    // Only extension-less files (bins) are ever shims; skip obvious JS/JSON/native.
+    if (ext === ".js" || ext === ".cjs" || ext === ".mjs" || ext === ".json" || ext === ".node") return null;
+    let src;
+    try {
+      src = fs.readFileSync(file, "utf8");
+    } catch {
+      return null;
+    }
+    let target = parseShellShimTarget(src);
+    if (!target) return null;
+    // Expand pnpm's `$basedir` (= the shim's dir) and collapse `..` for the VFS.
+    target = target.replace(/\$basedir/g, path.dirname(file));
+    target = target.startsWith("/") ? path.resolve(target) : path.resolve(path.dirname(file), target);
+    return target;
+  }
+
   function runMain(entry) {
     const abs = entry.startsWith("/") ? entry : path.resolve(process.cwd(), entry);
     const dir = path.dirname(abs);
     const r = resolveFilename(abs, dir);
     if (r.builtin) return load(abs, dir); // degenerate: entry is a builtin id
+    // Unwrap a pnpm/cmd-shim bin to the real .js it wraps, then run THAT as main.
+    // Node's argv[1] for a bin is the resolved .js (not the shim), so mirror it.
+    const shimTarget = resolveCmdShim(realpath(r.id));
+    if (shimTarget && shimTarget !== realpath(r.id)) {
+      try {
+        if (Array.isArray(process.argv) && process.argv[1] === entry) process.argv[1] = shimTarget;
+      } catch {}
+      return runMain(shimTarget);
+    }
     const filename = realpath(r.id);
     let mod = cache[filename];
     if (!mod) {

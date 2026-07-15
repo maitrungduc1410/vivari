@@ -3570,7 +3570,11 @@ function monorepoTemplate(): TemplateDef {
       hmr: true,
       reload: false,
       install: "pnpm install",
-      dev: "pnpm --filter web dev -- --configLoader native",
+      // pnpm does NOT eat a leading `--` like npm does — `pnpm … dev -- --configLoader
+      // native` forwards the literal `--` too, and vite's cac parser then treats
+      // `--configLoader native` as pass-through positionals (flag ignored). Drop the
+      // `--`: pnpm forwards everything after the script name straight to vite.
+      dev: "pnpm --filter web dev --configLoader native",
       experimental: true,
     },
     files: {
