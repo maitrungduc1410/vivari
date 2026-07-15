@@ -42,6 +42,9 @@ import {
   OP_CLOSE_SERVER,
   OP_FETCH,
   OP_FETCH_ASYNC,
+  OP_PIPE_LISTEN,
+  OP_PIPE_CONNECT,
+  OP_PIPE_CLOSE_SERVER,
 } from "../protocol/syscall.js";
 import { COREUTILS } from "./coreutils.js";
 
@@ -80,6 +83,17 @@ export class Kernel {
     // browser; the environment (kernel worker) wires it to the preview iframe.
     this.wsConns = new Map(); // connId -> pid
     this.onWsSend = null;
+
+    // ---- cross-process UNIX sockets / named pipes ----
+    // A pipe server registers its socket path here (path -> owner pid). A client
+    // in another process resolves the path to a connId; from then on raw bytes are
+    // relayed between the two processes out of band (postMessage), never the SAB.
+    // This is the process<->process analogue of the port routing table above, and
+    // is what makes Nuxt/Nitro's dev worker (which talks to the main process over a
+    // `*.sock` UNIX socket) reachable in-VM. See OP_PIPE_* in protocol/syscall.js.
+    this.pipeListeners = new Map(); // socketPath -> pid of the server process
+    this.pipeConns = new Map(); // connId -> { clientPid, serverPid }
+    this.nextPipeConnId = 1;
 
     // ---- network fetch (Phase 2 #9) ----
     // Injected by the environment: (url) => Promise<{ok,status,headers,body:Uint8Array}>.
@@ -254,6 +268,11 @@ export class Kernel {
         // #19 stage C: this process relays a ws frame outward (in-VM ws server ->
         // browser preview) for a tunneled connection.
         "ws-out": (m) => this.handleWsOut(pid, m),
+        // Cross-process pipe (UNIX socket) traffic this process produced: bytes /
+        // half-close / teardown for a connection, relayed to the peer process.
+        "pipe-data": (m) => this.handlePipeRelay(pid, m),
+        "pipe-shutdown": (m) => this.handlePipeRelay(pid, m),
+        "pipe-close": (m) => this.handlePipeRelay(pid, m),
       },
     });
     return pid;
@@ -338,6 +357,19 @@ export class Kernel {
       if (owner === pid) {
         this.wsConns.delete(connId);
         if (this.onWsSend) this.onWsSend({ connId, sub: "close", code: 1006 });
+      }
+    }
+    // Drop any pipe (UNIX socket) servers this process hosted, and tear down every
+    // cross-process pipe connection it was a party to — telling the surviving peer
+    // the socket closed so its reads see EOF instead of hanging forever.
+    for (const [path, owner] of this.pipeListeners) {
+      if (owner === pid) this.pipeListeners.delete(path);
+    }
+    for (const [connId, conn] of this.pipeConns) {
+      if (conn.clientPid === pid || conn.serverPid === pid) {
+        const otherPid = conn.clientPid === pid ? conn.serverPid : conn.clientPid;
+        this.postToProc(otherPid, { type: "pipe-close", connId });
+        this.pipeConns.delete(connId);
       }
     }
     const result = {
@@ -435,6 +467,10 @@ export class Kernel {
       this.handleNet(proc, opcode, JSON.parse(decodeBytes(fields[0])));
       return;
     }
+    if (opcode === OP_PIPE_LISTEN || opcode === OP_PIPE_CONNECT || opcode === OP_PIPE_CLOSE_SERVER) {
+      this.handlePipe(proc, opcode, JSON.parse(decodeBytes(fields[0])));
+      return;
+    }
     if (opcode === OP_FETCH) {
       this.handleFetch(proc, JSON.parse(decodeBytes(fields[0])));
       return; // deferred until the network fetch resolves
@@ -466,6 +502,53 @@ export class Kernel {
     const port = msg.port | 0;
     if (this.listeners.get(port) === proc.pid) this.listeners.delete(port);
     this.respondOk(proc, EMPTY);
+  }
+
+  // ---- cross-process pipe (UNIX socket) servicing --------------------------
+  // The process<->process analogue of handleNet: a server registers a socket path
+  // (OP_PIPE_LISTEN), a client in another process resolves it to a connId
+  // (OP_PIPE_CONNECT) and the kernel tells the server to accept the connection.
+  // After that, raw bytes are relayed by handlePipeRelay (out of band), never here.
+  handlePipe(proc, opcode, msg) {
+    const path = String(msg.path);
+    if (opcode === OP_PIPE_LISTEN) {
+      const owner = this.pipeListeners.get(path);
+      if (owner != null && owner !== proc.pid && this.procs.has(owner)) {
+        this.respondErr(proc, "EADDRINUSE");
+        return;
+      }
+      this.pipeListeners.set(path, proc.pid);
+      this.respondOk(proc, EMPTY);
+      return;
+    }
+    if (opcode === OP_PIPE_CLOSE_SERVER) {
+      if (this.pipeListeners.get(path) === proc.pid) this.pipeListeners.delete(path);
+      this.respondOk(proc, EMPTY);
+      return;
+    }
+    // OP_PIPE_CONNECT: resolve the path to a live server and open a connection.
+    const serverPid = this.pipeListeners.get(path);
+    if (serverPid == null || !this.procs.has(serverPid)) {
+      this.respondErr(proc, "ENOENT");
+      return;
+    }
+    const connId = this.nextPipeConnId++;
+    this.pipeConns.set(connId, { clientPid: proc.pid, serverPid });
+    // Tell the server to build its endpoint and accept; the client learns the
+    // connId from the OK reply below and starts relaying bytes.
+    this.postToProc(serverPid, { type: "pipe-open", connId, path });
+    this.respondOk(proc, encodeString(JSON.stringify({ connId })));
+  }
+
+  // A process produced bytes / a half-close / a teardown for one of its
+  // cross-process pipe connections. Forward the message verbatim to the OTHER end
+  // (client<->server), keyed by connId. On close, drop the connection record.
+  handlePipeRelay(fromPid, m) {
+    const conn = this.pipeConns.get(m.connId);
+    if (!conn) return;
+    const otherPid = fromPid === conn.clientPid ? conn.serverPid : conn.clientPid;
+    this.postToProc(otherPid, m);
+    if (m.type === "pipe-close") this.pipeConns.delete(m.connId);
   }
 
   // OP_RESPOND: the server produced an HTTP response and unblocks whoever issued
@@ -557,7 +640,20 @@ export class Kernel {
   handleWsClient(msg) {
     const { sub, connId } = msg;
     if (sub === "open") {
-      const pid = this.listeners.get(msg.port | 0);
+      let port = msg.port | 0;
+      let pid = this.listeners.get(port);
+      // The browser ws polyfill routes by the ws URL's explicit :port, which can
+      // guess wrong (e.g. a URL that carried the studio origin's port, or an aux
+      // port that isn't up yet). If nothing is listening there, fall back to the
+      // iframe's own preview port so the common single-port case still connects.
+      if ((pid == null || !this.procs.has(pid)) && msg.fallbackPort != null) {
+        const fp = msg.fallbackPort | 0;
+        const fpid = this.listeners.get(fp);
+        if (fpid != null && this.procs.has(fpid)) {
+          port = fp;
+          pid = fpid;
+        }
+      }
       if (pid == null || !this.procs.has(pid)) {
         if (this.onWsSend) this.onWsSend({ connId, sub: "close", code: 1006 });
         return;
@@ -566,7 +662,7 @@ export class Kernel {
       this.postToProc(pid, {
         type: "ws-open",
         connId,
-        port: msg.port | 0,
+        port,
         path: msg.path || "/",
         protocols: msg.protocols || null,
       });

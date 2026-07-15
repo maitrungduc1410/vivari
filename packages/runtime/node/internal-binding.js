@@ -82,12 +82,14 @@ function getOwnNonIndexProperties(obj, filter) {
   return out;
 }
 
-export function createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks } = {}) {
+export function createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks, pipeBridge } = {}) {
   // net (Phase 2 #7/#8): tcp_wrap/stream_wrap/uv/pipe_wrap/cares_wrap for the
   // in-process loopback beneath Node's real lib/net.js. Needs process.nextTick.
   // `syscalls` lets listen() register the port with the kernel (external routing,
-  // stage 2); `netServers` counts kernel-registered listeners for `doNet`.
-  const net = createNetBindings({ process, liveness: netLiveness, syscalls, netServers });
+  // stage 2); `netServers` counts kernel-registered listeners for `doNet`;
+  // `pipeBridge` carries cross-process UNIX-socket AND TCP traffic through the
+  // kernel (Nitro's :3000 proxying to its SSR worker's port in another process).
+  const net = createNetBindings({ process, liveness: netLiveness, syscalls, netServers, pipeBridge });
   // http_parser (Phase 2 #8): real llhttp-in-Wasm with a pure-JS fallback. When
   // the Wasm backend is live, advertise it via process.versions.llhttp (as real
   // Node does), which also lets guest code / spikes confirm the backend.

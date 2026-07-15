@@ -322,6 +322,29 @@ Gotchas:
   offline `scripts/spike-http-llhttp.mjs` assert on it. Regenerating the binary =
   `node scripts/vendor-llhttp.mjs` (re-pins the undici source).
 
+### In-VM databases are Wasm SQL engines loaded over the VFS (no native addon)
+The `sqlite` (sql.js) and `pglite` (real PostgreSQL) Showcase templates run a SQL
+engine guest-side by reading its `.wasm` out of `node_modules` and instantiating it
+through host `WebAssembly`. Gotchas when touching them:
+- **sql.js** loads its binary via `initSqlJs({ locateFile: (f) => require.resolve('sql.js/dist/'+f) })`
+  — don't hand it a bare filename or it looks on a non-existent CWD path.
+- **PGlite must be required via its CJS build** (`require('@electric-sql/pglite')`).
+  Only the ENTRY module can block on top-level await in-VM, so an ESM `import` of a
+  TLA-bearing dep from a non-entry module can hang. Its ~16 MB `pglite.wasm`+`.data`
+  load from `node_modules` (`__filename` → `new URL('./pglite.wasm',…)` → `fs.readFile`),
+  so keep `fs` + `url` (`fileURLToPath`) working over the VFS.
+- **Its Emscripten glue does `const { createRequire } = await import('module')`.** The
+  `module` builtin's export is the `Module` *function* with statics hung off it, so the
+  dynamic-import→namespace interop must copy own-enumerable keys for FUNCTION exports too,
+  not only objects — otherwise the named import is `undefined` and PGlite dies deep in
+  `create()` with a minified "e is not a function". This lives in TWO helpers, keep both:
+  the CJS path (`esm.js` `rewriteCjsDynamicImport`'s injected `__oc_import`, used by `.cjs`
+  files like PGlite's bundle) and the `new Function` path (`index.js` `__ocImport`).
+- **libSQL is intentionally not a template** — local `@libsql/client` is a native
+  N-API addon (no wasm32) and `/web` is remote-only; neither is a self-contained in-VM DB.
+- **Gated by `scripts/spike-sqlite.mjs` + `scripts/spike-pglite.mjs`** (net tier in
+  `run-spikes.mjs`; PGlite gets a longer timeout). Both stay `experimental` until green.
+
 ### The studio is a multi-root workspace — absolute paths + the VFS is truth
 Since the workspace rewrite there is NO single "current project" and NO static file
 map. Rules that bite if ignored:
@@ -500,11 +523,26 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   untouched**. The kernel already routes ws `open` by port, so this is a shim-only change.
   Keep the two `sw.js` shims in sync. Regex lives in a template literal → backslashes are
   DOUBLED (`\\/preview\\/(\\d+)…`).
-- **A preview tab per server.** `kernel.onListen` (in `kernel-worker.js`) opens a preview tab
-  for each distinct port a project's run shell binds — primary → `project-ready`, extras →
-  `project-ready {extra:true}` (the controller only adds a tab for extras). Ports are cleared
-  when the run shell exits so a re-run re-announces. The `ws-demo` template exploits this: one
-  `dev.js` starts an Express+`ws` backend (:3001) and a Vite frontend (:5173).
+- **In-VM cross-process TCP/pipe (`net.js`).** `connect()` links same-process via an in-memory
+  registry; when the port/path isn't served locally it falls back to the kernel byte-relay
+  (`OP_PIPE_LISTEN`/`OP_PIPE_CONNECT`; bytes flow out of band as `pipe-*` postMessages keyed by
+  `connId`), so a process can dial a server ANOTHER process owns. This is what makes Nuxt/Nitro
+  dev work: `:3000` (one process) reverse-proxies SSR to its render worker's ephemeral port (a
+  DIFFERENT process); `vite-node`/Nitro also talk over `*.sock` UNIX sockets. TCP servers
+  advertise a synthetic per-port key so TCP and UNIX sockets share ONE relay. Keep the fallback
+  AFTER the local miss (never before) so single-process loopback + external (SW) routing stay
+  untouched. Probes: `scripts/probe-xtcp.mjs` (the Nitro shape), `scripts/probe-xpipe.mjs`.
+- **Which ports open a preview tab.** `kernel.onListen` (in `kernel-worker.js`) makes a run
+  shell's **first** listening port the primary preview (`project-ready`). A single dev server's
+  other ports are internal — Vite's HMR ws (`:24678`, answers "Upgrade Required" to a browser),
+  a framework's SSR/render worker (Nuxt/Nitro's ephemeral port, reached via the main server's
+  proxy) — and do **not** each open a tab. A template that truly runs multiple user-facing
+  servers opts in with `manifest.multiPreview`, and each extra then gets a tab
+  (`project-ready {extra:true}`; the controller only adds a tab for extras). Only `ws-demo`,
+  `fullstack`, and `trpc` set it today (Express/`ws`/tRPC backend `:3001` + Vite frontend
+  `:5173` from one `dev.js`). All bound ports are still tracked so a restart reloads the real
+  tab; the set is cleared when the run shell exits so a re-run re-announces. **Don't** revert to
+  a tab-per-port default — HMR/SSR-worker ports would spawn junk tabs.
 - **`host.opencontainer.internal`.** Maps to the studio's own hostname so in-VM code can reach a
   service on the HOST machine (only when the studio is served locally). Two egress paths both
   honor it: `http`/`https` (and npm) go through `packages/demo/fetcher-worker.js` `rewrite()`;

@@ -140,6 +140,7 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   trpc: Badge({ text: "tR", bg: "#398ccb" }),
   monorepo: (p) => <PnpmIcon className={p.className} />,
   sqlite: (p) => <SqliteIcon className={p.className} />,
+  postgres: Badge({ text: "Pg", bg: "#336791" }),
 };
 
 export function TemplateIcon({ icon, className }: { icon: string; className?: string }) {

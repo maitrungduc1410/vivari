@@ -760,10 +760,33 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     process worker (browser `initCrypto()`, headless `require`); wired into `npm run build`
     (`build:crypto`). `Hash`/`Hmac` extend `stream.Writable` (Phase 6), so idiomatic
     `stream.pipe(createHash(algo))` + `digest()` works — real Node's Hash is a Transform.
-    **Deferred (S3):** sign/verify, RSA/EC keygen, DH, scrypt, X.509 — they throw loudly; these
+    Also covers a **symmetric-only `KeyObject`** (`KeyObject` + `createSecretKey`) so key-material
+    APIs like `jsonwebtoken@9` HS\* work (see below).
+    **Deferred (S3):** asymmetric sign/verify, RSA/EC keygen, createPrivate/PublicKey, DH, scrypt,
+    X.509 — they throw loudly; these
     want a bigger codec + vendoring Node's real `lib/crypto` internals. (corepack's registry
     ECDSA signature check needs `verify`; it's skipped via corepack's `COREPACK_INTEGRITY_KEYS=0`
     escape hatch, keeping the sha512 tarball-integrity check that only needs `createHash`.)
+
+    **`jsonwebtoken` (auth0/node-jsonwebtoken) HS256/384/512 — DONE, proven by
+    `scripts/spike-jwt.mjs`.** `jsonwebtoken@9` is pure JS (jws/jwa/ms/lodash.*/semver, no native
+    binding) so support hinged purely on crypto. The blocker was **key material**, not the HMAC
+    primitive: `sign()`/`verify()` destructure `crypto.{KeyObject,createSecretKey,createPrivateKey,
+    createPublicKey}`, run `secret instanceof KeyObject`, convert raw secrets via `createSecretKey()`
+    (only after `createPrivateKey`/`createPublicKey` *throw*), require `key.type === 'secret'`, and
+    then feed the `KeyObject` to `crypto.createHmac`. jwa additionally gates KeyObject support on
+    `typeof crypto.createPublicKey === 'function'`. Fix = a **symmetric-only `KeyObject`** in
+    `lib/crypto.js`: a branded `KeyObject` class + `SecretKeyObject` (`.type === 'secret'`,
+    `.export()`, `.symmetricKeySize`), `createSecretKey(key[,enc])`, `createPrivateKey`/
+    `createPublicKey` as **callable-but-throwing** stubs (load-bearing: their throw drives
+    jsonwebtoken's fallback to `createSecretKey`, and their mere presence flips jwa's
+    `supportsKeyObjects`), `createHmac` taught to unwrap a secret `KeyObject`, and
+    `util.types.isKeyObject` wired to the brand. Zero Wasm changes — the RustCrypto HMAC codec was
+    already there. The spike round-trips HS256/384/512 sign+verify, wrong-secret + expiry rejection,
+    and a `KeyObject`-as-secret input. **Asymmetric RS256/ES256/PS256 remain unsupported** (they need
+    the S3 `createSign`/`createVerify` + RSA/EC codec work above); jsonwebtoken now fails them with a
+    clean `secretOrPrivateKey must be an asymmetric key when using RS256` rather than an `instanceof`
+    crash.
 13. **ESM (`import`/`export`)** — **DONE (S1: transpile ESM→CJS at load time).** Our
     module system is synchronous CJS, so instead of a spec ESM loader we rewrite import/
     export down to `require`/`exports` in `compile()`, exactly like a bundler's interop
@@ -1808,7 +1831,8 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   `scripts/spike-{preact,lit,solid,qwik}.mjs` → **graduated to non-experimental**; Qwik rides the
   merged esbuild-wasm aliasing + in-process service and runs `qwikVite({ csr: true })`). Backends:
   Fastify, Nitro, GraphQL (Yoga),
-  Feathers. Showcases: Socket.IO, tRPC, pnpm monorepo, SQLite (sql.js WASM).
+  Feathers. Showcases: Socket.IO, tRPC, pnpm monorepo, and **in-VM databases** — SQLite
+  (sql.js WASM) and PostgreSQL (PGlite WASM), each spiked (see "In-VM databases via Wasm").
 - ✅ **Phase 4 (cont.) — standalone Webpack + Docusaurus proven headless AND shipped.** Two
   new templates, each gated by a green spike (validated alongside the Next.js spike, which still
   PASSes incl. the RSC-refresh gate):
@@ -2084,6 +2108,38 @@ keeping it as an automatic fallback.
   Node does). The offline `scripts/spike-http-llhttp.mjs` (20 checks, wired into the CI offline gate)
   and the extended `scripts/verify-node.mjs` http case (HEAD, 204, chunked request + response,
   trailers, keep-alive) guard both the Wasm path and the JS fallback.
+
+## In-VM databases via Wasm — SQLite + Postgres, first-class (this change)
+
+"No native database" is the headline limitation every in-browser-runtime competitor lists;
+their docs only suggest workarounds. OpenContainer's architecture (real Node `fs` + `url` +
+host `WebAssembly` over the virtual filesystem) already runs Wasm-compiled SQL engines with
+**zero native addons and no external server**, so this ships them as documented, first-class
+**Showcase** templates.
+
+- ✅ **SQLite (sql.js)** — `sqlite` template. SQLite compiled to Wasm; `initSqlJs()` loads its
+  `.wasm` from `node_modules` via `locateFile: (f) => require.resolve('sql.js/dist/' + f)`.
+  Enriched into a read/write todo demo (Express `/api/info` + `/api/todos` GET/POST + UI) and a
+  `README.md`. (The template existed but was unspiked; it now has one.)
+- ✅ **PostgreSQL (PGlite)** — new `pglite` template. `@electric-sql/pglite` is real Postgres
+  (currently PostgreSQL 18) compiled to Wasm. We use its **CJS build** (`require('@electric-sql/
+  pglite')`) so there's no top-level-await dependency (only the entry module can block on TLA
+  in-VM). Its ~16 MB of `pglite.wasm` + `pglite.data` are read from `node_modules` over the
+  virtual filesystem (the CJS build resolves them from `__filename` → `new URL('./pglite.wasm',
+  …)` → `fs.readFile`); `PGlite.create()` is in-memory by default (pass a dir to persist, and
+  pgvector/extensions are available). Same Express `/api/info` + `/api/todos` demo + `README.md`.
+- **Why these two.** Both are pure Wasm and self-contained. **libSQL is intentionally not shipped
+  as an in-VM template**: `@libsql/client` local mode is a native N-API addon (no wasm32 build),
+  and `@libsql/client/web` only talks to a *remote* Turso server — neither is a self-contained
+  in-VM database. sql.js remains the local SQLite path; libSQL is a remote/native story.
+- **Verification.** Both are gated by new network spikes — `scripts/spike-sqlite.mjs` and
+  `scripts/spike-pglite.mjs` (registered in `scripts/run-spikes.mjs`; PGlite gets a longer
+  budget for its heavy install + first-boot Wasm compile). Each asserts install → bind :3000 →
+  `GET /api/info` reports the right engine + version → `GET /api/todos` returns the seeded rows.
+  Both templates stay `experimental` until their spike is green in CI.
+- **Feasibility proof.** Both engines were confirmed end-to-end in vanilla Node (same `fs`/`url`/
+  `WebAssembly` primitives the runtime exposes): sql.js answers queries; PGlite boots real
+  PostgreSQL 18 and answers `SELECT version()`.
 
 ## Definition of done for T2
 

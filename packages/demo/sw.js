@@ -133,11 +133,14 @@ function OCWebSocket(url, protocols){
     var u = new URL(this.url, location.href);
     path = u.pathname + u.search;
     // Cross-service: /preview/<port>/ ws URLs address another in-VM server; route
-    // to that port and strip the prefix. Prefix-less URLs (HMR) keep this port.
+    // to that port and strip the prefix. A prefix-less ws URL routes by its
+    // explicit :port (e.g. Vite's dedicated HMR socket :24678 in middleware mode,
+    // as Nuxt does); a port-less one keeps this iframe's preview port.
     var pm = u.pathname.match(/^\\/preview\\/(\\d+)(\\/.*)?$/);
     if (pm) { targetPort = parseInt(pm[1], 10); path = (pm[2] || '/') + u.search; }
+    else if (u.port && u.port !== location.port) targetPort = parseInt(u.port, 10);
   } catch(e){}
-  post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, path:path, protocols: protocols || null });
+  post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path, protocols: protocols || null });
 }
 OCWebSocket.CONNECTING = 0; OCWebSocket.OPEN = 1; OCWebSocket.CLOSING = 2; OCWebSocket.CLOSED = 3;
 OCWebSocket.prototype._deliver = function(d){

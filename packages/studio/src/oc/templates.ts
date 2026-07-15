@@ -84,6 +84,15 @@ export interface TemplateManifest {
    * under the proxy path (deep-links + `location.reload()` work).
    */
   keepPreviewPrefix?: boolean;
+  /**
+   * A template whose dev run INTENTIONALLY exposes more than one user-facing
+   * server (e.g. a backend API alongside the frontend) sets this so each extra
+   * port that binds opens its own preview tab. Off by default: a single dev
+   * server's other ports — Vite's HMR WebSocket (:24678), a framework's
+   * SSR/render worker (Nuxt/Nitro's ephemeral port), etc. — are internal
+   * infrastructure, not browsable apps, so they must NOT each spawn a tab.
+   */
+  multiPreview?: boolean;
 }
 
 export interface TemplateDef {
@@ -799,6 +808,9 @@ function wsDemoTemplate(): TemplateDef {
       entry: "src/main.js",
       hmr: true,
       reload: false,
+      // Two intentional user-facing servers (backend :3001 + frontend :5173), so
+      // surface a preview tab for each — the frontend is primary, the backend extra.
+      multiPreview: true,
       install: "npm install",
       // sh has no job control (&), so a tiny CJS orchestrator starts both servers.
       dev: "node dev.js",
@@ -1853,6 +1865,8 @@ function fullstackTemplate(): TemplateDef {
       entry: "src/App.jsx",
       hmr: true,
       reload: false,
+      // Two intentional user-facing servers (API :3001 + frontend :5173) → a tab each.
+      multiPreview: true,
       install: "npm install",
       dev: "node dev.js",
     },
@@ -3083,6 +3097,8 @@ function trpcTemplate(): TemplateDef {
       entry: "src/App.tsx",
       hmr: true,
       reload: false,
+      // Two intentional user-facing servers (tRPC :3001 + frontend :5173) → a tab each.
+      multiPreview: true,
       install: "npm install",
       dev: "npm run dev",
       experimental: true,
@@ -3262,6 +3278,82 @@ export default function App() {
   };
 }
 
+// ── In-VM databases (SQLite via sql.js, Postgres via PGlite) ─────────────────
+// Both ship a real SQL engine compiled to WebAssembly — no native addons, no
+// external server. They run 100% in-VM: the .wasm binaries land in node_modules
+// from npm and are read back over the virtual filesystem + instantiated in-worker.
+// Shared UI so both templates present the same read/write todo demo.
+function dbDemoHtml(title: string, subtitle: string): string {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${title}</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { font-family: system-ui, sans-serif; margin: 0; padding: 2.5rem; background: #0a0a0a; color: #ededed; }
+      main { max-width: 640px; margin: 0 auto; }
+      h1 { margin: 0 0 .25rem; font-size: 1.6rem; }
+      .sub { color: #9ca3af; margin: 0 0 .5rem; }
+      .badge { display: inline-block; font-size: .75rem; padding: .2rem .55rem; border-radius: 999px; background: #1f2937; color: #93c5fd; }
+      form { display: flex; gap: .5rem; margin: 1.5rem 0 1rem; }
+      input { flex: 1; padding: .55rem .7rem; border-radius: 8px; border: 1px solid #333; background: #111; color: #ededed; }
+      button { padding: .55rem 1rem; border-radius: 8px; border: 1px solid transparent; background: #2563eb; color: #fff; cursor: pointer; }
+      ul { list-style: none; padding: 0; }
+      li { padding: .5rem .75rem; border: 1px solid #1f2937; border-radius: 8px; margin: .4rem 0; display: flex; gap: .55rem; align-items: center; }
+      li.done span.task { text-decoration: line-through; opacity: .55; }
+      .dot { width: .5rem; height: .5rem; border-radius: 999px; background: #f59e0b; flex: none; }
+      li.done .dot { background: #22c55e; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>${title}</h1>
+      <p class="sub">${subtitle}</p>
+      <p><span class="badge" id="engine">connecting…</span></p>
+      <form id="add">
+        <input id="task" placeholder="Add a todo and press Enter" autocomplete="off" />
+        <button type="submit">Add</button>
+      </form>
+      <ul id="list"></ul>
+    </main>
+    <script>
+      function load() {
+        fetch('/api/info').then(function (r) { return r.json(); }).then(function (info) {
+          document.getElementById('engine').textContent = info.engine + ' ' + info.version + ' · ' + info.driver;
+        }).catch(function () {});
+        fetch('/api/todos').then(function (r) { return r.json(); }).then(function (rows) {
+          var list = document.getElementById('list');
+          list.innerHTML = '';
+          rows.forEach(function (row) {
+            var li = document.createElement('li');
+            li.className = row.done ? 'done' : '';
+            var dot = document.createElement('span'); dot.className = 'dot';
+            var text = document.createElement('span'); text.className = 'task'; text.textContent = row.task;
+            li.appendChild(dot); li.appendChild(text);
+            list.appendChild(li);
+          });
+        });
+      }
+      document.getElementById('add').addEventListener('submit', function (e) {
+        e.preventDefault();
+        var input = document.getElementById('task');
+        var task = input.value.trim();
+        if (!task) return;
+        fetch('/api/todos', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ task: task })
+        }).then(function () { input.value = ''; load(); });
+      });
+      load();
+    </script>
+  </body>
+</html>
+`;
+}
+
 // ── SQLite (sql.js) ──────────────────────────────────────────────────────────
 function sqliteTemplate(): TemplateDef {
   return {
@@ -3280,6 +3372,7 @@ function sqliteTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
+      // Experimental until scripts/spike-sqlite.mjs is green in CI.
       experimental: true,
     },
     files: {
@@ -3297,19 +3390,40 @@ const path = require('path');
 const initSqlJs = require('sql.js');
 
 async function main() {
+  // sql.js loads its .wasm from node_modules over the virtual filesystem.
   const SQL = await initSqlJs({ locateFile: (f) => require.resolve('sql.js/dist/' + f) });
   const db = new SQL.Database();
-  db.run('CREATE TABLE todos (id INTEGER PRIMARY KEY, task TEXT, done INTEGER);');
+  db.run('CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0);');
   db.run("INSERT INTO todos (task, done) VALUES ('Try OpenContainer', 1), ('Run SQLite in the browser', 0);");
 
   const app = express();
+  app.use(express.json());
+
+  app.get('/api/info', (_req, res) => {
+    const stmt = db.prepare('SELECT sqlite_version() AS version');
+    stmt.step();
+    const version = stmt.getAsObject().version;
+    stmt.free();
+    res.json({ engine: 'SQLite', version: version, driver: 'sql.js (WASM)' });
+  });
+
   app.get('/api/todos', (_req, res) => {
     const rows = [];
-    const stmt = db.prepare('SELECT * FROM todos');
+    const stmt = db.prepare('SELECT id, task, done FROM todos ORDER BY id');
     while (stmt.step()) rows.push(stmt.getAsObject());
     stmt.free();
     res.json(rows);
   });
+
+  app.post('/api/todos', (req, res) => {
+    const task = (req.body && req.body.task ? String(req.body.task) : '').trim();
+    if (!task) return res.status(400).json({ error: 'task is required' });
+    const stmt = db.prepare('INSERT INTO todos (task, done) VALUES (?, 0)');
+    stmt.run([task]);
+    stmt.free();
+    res.status(201).json({ ok: true });
+  });
+
   app.use(express.static(path.join(__dirname, 'public')));
 
   const port = Number(process.env.PORT ?? 3000);
@@ -3318,37 +3432,144 @@ async function main() {
 
 main().catch((err) => { console.error(err); process.exit(1); });
 `,
-      "public/index.html": `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>SQLite (sql.js)</title>
-    <style>
-      body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #0a0a0a; color: #ededed; }
-      li { margin: .25rem 0; }
-      .done { text-decoration: line-through; opacity: .6; }
-    </style>
-  </head>
-  <body>
-    <h1>SQLite in the browser</h1>
-    <p>Rows queried from an in-memory SQLite database (sql.js WASM) via Express:</p>
-    <ul id="list"></ul>
-    <script>
-      fetch('/api/todos')
-        .then(function (r) { return r.json(); })
-        .then(function (rows) {
-          var list = document.getElementById('list');
-          rows.forEach(function (row) {
-            var li = document.createElement('li');
-            li.textContent = row.task;
-            if (row.done) li.className = 'done';
-            list.appendChild(li);
-          });
-        });
-    </script>
-  </body>
-</html>
+      "public/index.html": dbDemoHtml(
+        "SQLite in the browser",
+        "A real SQLite database (sql.js compiled to WebAssembly) running entirely in-VM.",
+      ),
+      "README.md": `# SQLite in the browser (sql.js)
+
+A real SQLite database running 100% in-VM via sql.js (SQLite compiled to
+WebAssembly) — no native addons, no better-sqlite3, no build step.
+
+## Files
+- server.js — Express API. initSqlJs() loads the WASM from node_modules over the
+  virtual filesystem (locateFile -> require.resolve('sql.js/dist/...')).
+- public/index.html — a tiny UI that reads and writes the DB through the API.
+
+## Run
+- npm install
+- npm run dev   (opens http://localhost:3000)
+
+## Endpoints
+- GET  /api/info   engine + version
+- GET  /api/todos  list rows
+- POST /api/todos  body: { "task": "..." }
+
+## Persistence
+sql.js is in-memory. Export with db.export() (a Uint8Array) and write it to disk
+with fs; reload later with new SQL.Database(bytes).
+
+Learn more: https://sql.js.org
+`,
+    },
+  };
+}
+
+// ── PostgreSQL (PGlite) ──────────────────────────────────────────────────────
+function pgliteTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "pglite",
+      framework: "pglite",
+      icon: "postgres",
+      category: "Showcase",
+      name: "PostgreSQL (PGlite)",
+      language: "JavaScript",
+      description: "A real PostgreSQL server in the browser via PGlite (WASM) + Express — no Docker, no native deps",
+      port: 3000,
+      openPath: "/",
+      entry: "server.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      // Experimental until scripts/spike-pglite.mjs is green in CI. First boot
+      // compiles ~16 MB of WASM + data, so give it a few seconds in-VM.
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "pglite-demo",
+  "private": true,
+  "version": "0.0.0",
+  "type": "commonjs",
+  "scripts": { "start": "node server.js", "dev": "node server.js" },
+  "dependencies": { "express": "^4.21.0", "@electric-sql/pglite": "^0.5.4" }
+}
+`,
+      "server.js": `const express = require('express');
+const path = require('path');
+const { PGlite } = require('@electric-sql/pglite');
+
+async function main() {
+  // In-memory Postgres. Pass a directory to persist: PGlite.create('./pgdata').
+  // The ~16 MB of WASM + data are read from node_modules over the virtual FS.
+  const db = await PGlite.create();
+  await db.exec(
+    'CREATE TABLE IF NOT EXISTS todos (' +
+      'id SERIAL PRIMARY KEY, task TEXT NOT NULL, done BOOLEAN NOT NULL DEFAULT false);'
+  );
+  await db.exec(
+    "INSERT INTO todos (task, done) VALUES ('Try OpenContainer', true), ('Run Postgres in the browser', false);"
+  );
+
+  const app = express();
+  app.use(express.json());
+
+  app.get('/api/info', async (_req, res) => {
+    const r = await db.query('SELECT version() AS version');
+    res.json({ engine: 'PostgreSQL', version: r.rows[0].version.split(' ').slice(0, 2).join(' '), driver: 'PGlite (WASM)' });
+  });
+
+  app.get('/api/todos', async (_req, res) => {
+    const r = await db.query('SELECT id, task, done FROM todos ORDER BY id');
+    res.json(r.rows);
+  });
+
+  app.post('/api/todos', async (req, res) => {
+    const task = (req.body && req.body.task ? String(req.body.task) : '').trim();
+    if (!task) return res.status(400).json({ error: 'task is required' });
+    await db.query('INSERT INTO todos (task, done) VALUES ($1, false)', [task]);
+    res.status(201).json({ ok: true });
+  });
+
+  app.use(express.static(path.join(__dirname, 'public')));
+
+  const port = Number(process.env.PORT ?? 3000);
+  app.listen(port, () => console.log('Postgres (PGlite) demo on http://localhost:' + port));
+}
+
+main().catch((err) => { console.error(err); process.exit(1); });
+`,
+      "public/index.html": dbDemoHtml(
+        "PostgreSQL in the browser",
+        "A real PostgreSQL server (PGlite compiled to WebAssembly) running entirely in-VM.",
+      ),
+      "README.md": `# PostgreSQL in the browser (PGlite)
+
+A real, full PostgreSQL server running 100% in-VM via PGlite (Postgres compiled
+to WebAssembly) — no native addons, no Docker, no external server.
+
+## Files
+- server.js — Express API. PGlite.create() boots an in-memory Postgres; its
+  ~16 MB of WASM + data are loaded from node_modules over the virtual filesystem.
+- public/index.html — a tiny UI that reads and writes the DB through the API.
+
+## Run
+- npm install
+- npm run dev   (opens http://localhost:3000 — first boot compiles the WASM, so
+  give it a few seconds)
+
+## Endpoints
+- GET  /api/info   SELECT version()
+- GET  /api/todos  list rows
+- POST /api/todos  body: { "task": "..." }
+
+## Persistence & extensions
+PGlite.create() is in-memory. Pass a directory to persist
+(PGlite.create('./pgdata')). PGlite also supports pgvector and other extensions.
+
+Learn more: https://pglite.dev
 `,
     },
   };
@@ -3860,6 +4081,7 @@ export const TEMPLATES: TemplateDef[] = [
   trpcTemplate(),
   monorepoTemplate(),
   sqliteTemplate(),
+  pgliteTemplate(),
 ];
 
 export function getTemplate(id: string): TemplateDef | undefined {
