@@ -35,6 +35,7 @@ import {
   OP_RENAME,
   OP_SYMLINK,
   OP_READLINK,
+  OP_LINK,
   OP_OPEN,
   OP_CLOSE,
   OP_FD_READ,
@@ -110,6 +111,9 @@ export function createSyscalls({ ctrl, data, notify }) {
     rmdir: (p) => call(OP_RMDIR, encodeRequest([b(p)])),
     rename: (from, to) => call(OP_RENAME, encodeRequest([b(from), b(to)])),
     symlink: (target, link) => call(OP_SYMLINK, encodeRequest([b(target), b(link)])),
+    // Hard link: a second name for the SAME inode (no byte copy). Throws ENOSYS
+    // on a VFS build without link support; the fs binding falls back to a copy.
+    link: (existing, linkpath) => call(OP_LINK, encodeRequest([b(existing), b(linkpath)])),
     readlink: (p) => decodeBytes(call(OP_READLINK, encodeRequest([b(p)]))),
 
     // ---- file-descriptor layer (Phase 2 #4) ----

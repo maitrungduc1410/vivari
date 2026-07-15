@@ -53,6 +53,16 @@ function handle(msg) {
     case "fs-flush": // page is hiding — best-effort force the mirror to disk
       if (server && server.persistence) server.persistence.flush();
       break;
+    case "fs-mem": {
+      // Diagnostic: report the VFS's in-RAM content footprint (see the studio's
+      // memory readout). Guarded so an older wasm build without mem_bytes/
+      // file_count still answers (with -1) instead of throwing.
+      const vfs = server && server.vfs;
+      const bytes = vfs && typeof vfs.mem_bytes === "function" ? vfs.mem_bytes() : -1;
+      const files = vfs && typeof vfs.file_count === "function" ? vfs.file_count() : -1;
+      post("fs-mem", { id: msg.id, bytes, files });
+      break;
+    }
   }
 }
 

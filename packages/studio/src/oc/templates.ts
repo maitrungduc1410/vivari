@@ -66,6 +66,15 @@ export interface TemplateManifest {
   /** Marks templates whose in-VM dev server is not yet fully proven. */
   experimental?: boolean;
   /**
+   * Extra environment variables for this template's install/dev shell, merged on
+   * top of the shell defaults. Use for memory- and telemetry-relevant levers the
+   * framework itself honors (e.g. disabling a background telemetry reporter).
+   * NOTE: do NOT put V8 heap flags here (NODE_OPTIONS=--max-old-space-size): the
+   * in-VM runtime's process workers are browser Workers, so v8.setFlagsFromString
+   * is a no-op and a heap-size flag string has no effect.
+   */
+  env?: Record<string, string>;
+  /**
    * The preview proxy serves every app under `/preview/<port>/` and, by default,
    * strips that prefix before hitting the dev server. A *client-routed* SPA
    * (Docusaurus, VitePress, Slidev…) resolves its route from the iframe's own
@@ -1972,6 +1981,10 @@ function nuxtTemplate(): TemplateDef {
       install: "npm install",
       dev: "npm run dev",
       experimental: true,
+      // Nuxt spins up a background telemetry reporter that buffers events in the
+      // dev-server process; disabling it drops that retained state (and a bit of
+      // work) with no effect on the app.
+      env: { NUXT_TELEMETRY_DISABLED: "1" },
     },
     files: {
       "package.json": `{

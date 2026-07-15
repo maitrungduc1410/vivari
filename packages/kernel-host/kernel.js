@@ -104,6 +104,20 @@ export class Kernel {
     this.fetchCache = new Map();
     this.onFetch = null; // optional observer (url, {cached,size,pid}) — e.g. a UI log / per-terminal progress
 
+    // ---- bounded LRU over the transient fetched-body cache -------------------
+    // Every fetched packument/tarball body is materialized under /var/cache/
+    // oc-fetch and, until now, kept in the VFS's Wasm RAM for the WHOLE session —
+    // a heavy install (Docusaurus/Nuxt) left hundreds of MB of dead `.tgz` bytes
+    // resident long after the packages were extracted. Those bodies are pure
+    // scratch: the durable, reusable copy is the package manager's OWN content-
+    // addressed cache under /home/user/.cache (persisted in OPFS). So cap the
+    // total and evict the least-recently-used bodies — dropping both the
+    // fetchCache entry AND its VFS file — once we exceed the cap. Because meta and
+    // body file are evicted together, "meta present ⟺ body present" stays true, so
+    // a cache hit never points at a missing file.
+    this.fetchCacheMaxBytes = 128 * 1024 * 1024; // 128 MiB scratch ceiling
+    this._fetchCacheBytes = 0; // running total of cached body sizes
+
     // ---- async fetch: parallel downloads (OP_FETCH_ASYNC) ----
     // The real npm/yarn/pnpm issue many registry requests at once, but its Agent
     // reports maxSockets=Infinity, so without a bound it would fire hundreds
@@ -856,6 +870,10 @@ export class Kernel {
     const cacheKey = this._fetchCacheKey(method, url, headers);
     const cached = cacheable ? this.fetchCache.get(cacheKey) : null;
     if (cached) {
+      // LRU touch: re-insert so this entry becomes most-recently-used (Map keeps
+      // insertion order), protecting a just-served body from imminent eviction.
+      this.fetchCache.delete(cacheKey);
+      this.fetchCache.set(cacheKey, cached);
       if (this.onFetch) this.onFetch(url, { cached: true, size: cached.size, pid });
       return { ...cached, cached: true };
     }
@@ -922,9 +940,32 @@ export class Kernel {
     // Large body bypasses the 1 MiB SAB: hand it to the FS Worker over a
     // transferable buffer, then the process reads it back with normal fs (#14).
     await this.fs.writeLarge(path, body);
-    if (cacheable) this.fetchCache.set(cacheKey, meta);
+    if (cacheable) {
+      this.fetchCache.set(cacheKey, meta);
+      this._fetchCacheBytes += meta.size | 0;
+      this._evictFetchCacheIfNeeded(cacheKey);
+    }
     if (this.onFetch) this.onFetch(url, { cached: false, size: meta.size, pid });
     return meta;
+  }
+
+  // Evict least-recently-used fetched bodies until the cache is back under its
+  // byte cap, freeing each body's VFS file as it goes. `protectKey` (the entry we
+  // just added) is never evicted, so a fresh download is always available to the
+  // process about to read it back.
+  _evictFetchCacheIfNeeded(protectKey) {
+    if (this._fetchCacheBytes <= this.fetchCacheMaxBytes) return;
+    for (const [key, meta] of this.fetchCache) {
+      if (this._fetchCacheBytes <= this.fetchCacheMaxBytes) break;
+      if (key === protectKey) continue;
+      this.fetchCache.delete(key);
+      this._fetchCacheBytes -= meta.size | 0;
+      try {
+        this.fs.unlink(meta.path);
+      } catch {
+        /* already gone / never materialized — nothing to free */
+      }
+    }
   }
 
   // Deferred like handleSpawn: the caller stays parked on Atomics.wait while we

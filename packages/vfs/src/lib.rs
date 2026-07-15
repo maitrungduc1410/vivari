@@ -74,6 +74,10 @@ struct Inode {
     data: NodeData,
     mode: u32,
     mtime: f64,
+    // Number of directory entries pointing at this inode (POSIX st_nlink). Hard
+    // links (VFS.link) share one inode across several names; the inode is only
+    // freed when the last link is removed. Regular files/dirs have exactly 1.
+    nlink: u32,
 }
 
 #[wasm_bindgen]
@@ -102,6 +106,7 @@ impl VirtualFileSystem {
                 data,
                 mode,
                 mtime: Self::now(),
+                nlink: 0, // linked (nlink -> 1) when attached to a parent dir
             },
         );
         id
@@ -187,6 +192,9 @@ impl VirtualFileSystem {
         }) = self.inodes.get_mut(&parent)
         {
             m.insert(name.to_string(), child);
+        }
+        if let Some(node) = self.inodes.get_mut(&child) {
+            node.nlink = node.nlink.saturating_add(1);
         }
     }
 
@@ -325,8 +333,9 @@ impl VirtualFileSystem {
             if matches!(self.inodes.get(&cid).unwrap().data, NodeData::Dir(_)) {
                 return Err(VfsError::IsDir);
             }
+            // unlink_child decrements the link count and frees the inode on the
+            // last link (a hard-linked file stays until its other names go).
             self.unlink_child(parent, &name);
-            self.inodes.remove(&cid);
             Ok(())
         })()
         .map_err(VfsError::code)
@@ -345,8 +354,8 @@ impl VirtualFileSystem {
                 }
                 _ => return Err(VfsError::NotDir),
             }
+            // unlink_child decrements the dir's single link and frees its inode.
             self.unlink_child(parent, &name);
-            self.inodes.remove(&cid);
             Ok(())
         })()
         .map_err(VfsError::code)
@@ -358,8 +367,43 @@ impl VirtualFileSystem {
             let (fparent, fname) = self.resolve_parent(&from)?;
             let cid = self.child_id(fparent, &fname).ok_or(VfsError::NoEnt)?;
             let (tparent, tname) = self.resolve_parent(&to)?;
-            self.unlink_child(fparent, &fname);
+            // Renaming a name onto itself is a no-op (and must skip the steps below,
+            // which would otherwise free the inode).
+            if fparent == tparent && fname == tname {
+                return Ok(());
+            }
+            // POSIX rename atomically replaces an existing destination: drop its
+            // link first (frees the clobbered inode on its last link).
+            if self.child_id(tparent, &tname).is_some() {
+                self.unlink_child(tparent, &tname);
+            }
+            // Add the new name BEFORE removing the old one so the moved inode's
+            // link count never transiently hits 0 (which would free its data).
             self.link_child(tparent, &tname, cid);
+            self.unlink_child(fparent, &fname);
+            Ok(())
+        })()
+        .map_err(VfsError::code)
+    }
+
+    /// hard link: make `linkpath` an additional name for the SAME inode as
+    /// `existing` (link(2)), sharing its bytes with no copy. Does not follow a
+    /// trailing symlink on `existing`. Errors: ENOENT (existing missing), EEXIST
+    /// (linkpath taken), EINVAL (refuse to hard-link a directory).
+    pub fn link(&mut self, existing: String, linkpath: String) -> Result<(), String> {
+        (|| {
+            let src = self.resolve(&existing, false)?;
+            if matches!(
+                self.inodes.get(&src).ok_or(VfsError::NoEnt)?.data,
+                NodeData::Dir(_)
+            ) {
+                return Err(VfsError::Inval);
+            }
+            let (parent, name) = self.resolve_parent(&linkpath)?;
+            if self.child_id(parent, &name).is_some() {
+                return Err(VfsError::Exist);
+            }
+            self.link_child(parent, &name, src);
             Ok(())
         })()
         .map_err(VfsError::code)
@@ -568,6 +612,33 @@ impl VirtualFileSystem {
         .map_err(VfsError::code)
     }
 
+    /// Diagnostic: total bytes of content the VFS holds in RAM — file bodies +
+    /// symlink targets + a rough per-directory-entry overhead. This is the logical
+    /// footprint (what dominates the File System Worker's Wasm linear memory when a
+    /// big `node_modules` is loaded); returned as f64 so it never overflows u32 past
+    /// 4 GiB. Used by the studio's memory readout to attribute the tab's RAM.
+    pub fn mem_bytes(&self) -> f64 {
+        let mut total: usize = 0;
+        for node in self.inodes.values() {
+            total += match &node.data {
+                NodeData::File(b) => b.len(),
+                NodeData::Symlink(t) => t.len(),
+                // Directory storage is the sum of its entry names + a per-entry map
+                // overhead (name String + u64 id ~ 8 bytes); a rough estimate.
+                NodeData::Dir(m) => m.keys().map(|k| k.len() + 8).sum::<usize>(),
+            };
+        }
+        total as f64
+    }
+
+    /// Diagnostic companion to `mem_bytes`: how many regular files the VFS holds.
+    pub fn file_count(&self) -> u32 {
+        self.inodes
+            .values()
+            .filter(|n| matches!(n.data, NodeData::File(_)))
+            .count() as u32
+    }
+
     /// ftruncate(2): grow (zero-filled) or shrink the file behind an open fd.
     pub fn ftruncate(&mut self, fd: u32, len: u32) -> Result<(), String> {
         (|| {
@@ -591,14 +662,25 @@ impl VirtualFileSystem {
 
 // Non-#[wasm_bindgen] helpers that need &mut self / shared logic.
 impl VirtualFileSystem {
-    fn unlink_child(&mut self, parent: u64, name: &str) {
-        if let Some(Inode {
-            data: NodeData::Dir(m),
-            ..
-        }) = self.inodes.get_mut(&parent)
-        {
-            m.remove(name);
+    // Remove a name→inode link from `parent`, decrement the target's link count,
+    // and free the inode once its last link is gone. Returns the (former) child id
+    // when the name existed. This is the single place inodes are reclaimed, so
+    // hard-linked files survive until every name referencing them is unlinked.
+    fn unlink_child(&mut self, parent: u64, name: &str) -> Option<u64> {
+        let cid = match self.inodes.get_mut(&parent) {
+            Some(Inode {
+                data: NodeData::Dir(m),
+                ..
+            }) => m.remove(name),
+            _ => None,
+        }?;
+        if let Some(node) = self.inodes.get_mut(&cid) {
+            node.nlink = node.nlink.saturating_sub(1);
+            if node.nlink == 0 {
+                self.inodes.remove(&cid);
+            }
         }
+        Some(cid)
     }
 
     fn stat_impl(&self, path: &str, follow_last: bool) -> VfsResult<String> {
@@ -617,8 +699,13 @@ impl VirtualFileSystem {
             NodeData::Symlink(t) => ("symlink", t.len()),
         };
         format!(
-            "{{\"kind\":\"{}\",\"size\":{},\"mode\":{},\"mtimeMs\":{},\"ino\":{}}}",
-            kind, size, node.mode, node.mtime, id
+            "{{\"kind\":\"{}\",\"size\":{},\"mode\":{},\"mtimeMs\":{},\"ino\":{},\"nlink\":{}}}",
+            kind,
+            size,
+            node.mode,
+            node.mtime,
+            id,
+            node.nlink.max(1)
         )
     }
 }
