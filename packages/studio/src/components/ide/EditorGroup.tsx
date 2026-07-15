@@ -15,6 +15,10 @@ import { useIde } from "./useIde";
 
 const baseName = (rel: string) => rel.split("/").pop() ?? rel;
 
+// Drag payload for reordering tabs within the strip (kept distinct from the
+// Explorer's OC_PATH_MIME so the editor-body drop zone ignores tab drags).
+const OC_TAB_MIME = "application/x-oc-tab";
+
 export function EditorGroup() {
   const { c, snap } = useIde();
   // A queue of tabs still to close, plus the file we're currently prompting to
@@ -22,6 +26,9 @@ export function EditorGroup() {
   // straight away and each dirty one pops a Save/Don't save/Cancel dialog.
   const [queue, setQueue] = useState<string[]>([]);
   const [promptRel, setPromptRel] = useState<string | null>(null);
+  // Tab reordering: the tab being dragged + the current drop target/side.
+  const [dragTab, setDragTab] = useState<string | null>(null);
+  const [overTab, setOverTab] = useState<{ rel: string; after: boolean } | null>(null);
 
   const mountRef = useCallback(
     (el: HTMLDivElement | null) => {
@@ -94,21 +101,50 @@ export function EditorGroup() {
   return (
     <div className="flex h-full flex-col bg-[#1e1e1e]">
       {/* tab strip */}
-      <div className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b bg-[#181818]">
+      <div className="oc-tabs-scroll flex h-9 shrink-0 items-stretch overflow-x-auto border-b bg-[#181818]">
         {snap.openTabs.map((rel, i) => {
           const active = rel === snap.activeTab;
           const isDirty = snap.dirty.includes(rel);
           const isPreview = rel === snap.previewTab;
+          const dropSide = overTab?.rel === rel && dragTab && dragTab !== rel
+            ? overTab.after
+              ? "shadow-[inset_-2px_0_0_0_var(--primary)]"
+              : "shadow-[inset_2px_0_0_0_var(--primary)]"
+            : "";
           return (
             <ContextMenu key={rel}>
               <ContextMenuTrigger className="contents">
                 <div
                   title={rel}
+                  draggable
                   onClick={() => c.openFile(rel, { preview: isPreview })}
                   onDoubleClick={() => c.pinTab(rel)}
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData(OC_TAB_MIME, rel);
+                    e.dataTransfer.effectAllowed = "move";
+                    setDragTab(rel);
+                  }}
+                  onDragOver={(e) => {
+                    if (!e.dataTransfer.types.includes(OC_TAB_MIME)) return;
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    setOverTab({ rel, after: e.clientX - rect.left > rect.width / 2 });
+                  }}
+                  onDrop={(e) => {
+                    if (!e.dataTransfer.types.includes(OC_TAB_MIME)) return;
+                    e.preventDefault();
+                    const from = e.dataTransfer.getData(OC_TAB_MIME);
+                    if (from) c.reorderTab(from, rel, e.clientX - e.currentTarget.getBoundingClientRect().left > e.currentTarget.getBoundingClientRect().width / 2);
+                    setDragTab(null);
+                    setOverTab(null);
+                  }}
+                  onDragEnd={() => { setDragTab(null); setOverTab(null); }}
                   className={cn(
                     "group flex cursor-pointer items-center gap-1.5 border-r px-3 text-xs",
                     active ? "bg-[#1e1e1e] text-foreground" : "bg-[#181818] text-muted-foreground hover:text-foreground",
+                    dragTab === rel && "opacity-50",
+                    dropSide,
                   )}
                 >
                   {snap.tabKinds[rel] === "directory" ? (

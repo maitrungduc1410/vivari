@@ -134,6 +134,25 @@
   }
 }
 
+/* VS Code-style thin horizontal scrollbar for the editor tab strip. */
+.oc-tabs-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+.oc-tabs-scroll::-webkit-scrollbar {
+  height: 3px;
+}
+.oc-tabs-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.oc-tabs-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 9999px;
+}
+.oc-tabs-scroll:hover::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.3);
+}
+
 /* IDE-specific bits that don't map cleanly to utility classes. */
 .oc-term-host .xterm {
   height: 100%;

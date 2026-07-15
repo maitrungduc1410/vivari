@@ -1095,6 +1095,21 @@ export class IdeController {
     if (this.snap.previewTab === abs) this.set({ previewTab: null });
   }
 
+  // Reorder the open-tabs strip (VSCode-style drag): move `fromAbs` to sit
+  // immediately before/after `toAbs`. Doesn't change which tab is active.
+  reorderTab(fromAbs: string, toAbs: string, placeAfter: boolean) {
+    if (fromAbs === toAbs) return;
+    const tabs = [...this.snap.openTabs];
+    const fromIdx = tabs.indexOf(fromAbs);
+    if (fromIdx === -1) return;
+    tabs.splice(fromIdx, 1);
+    let toIdx = tabs.indexOf(toAbs);
+    if (toIdx === -1) return;
+    if (placeAfter) toIdx += 1;
+    tabs.splice(toIdx, 0, fromAbs);
+    this.set({ openTabs: tabs });
+  }
+
   // Revoke + forget an image tab's object URL (freeing the decoded bitmap).
   private revokeImage(abs: string) {
     const url = this.imageUrls.get(abs);
