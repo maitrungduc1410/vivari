@@ -510,6 +510,29 @@ pnpm is wired like npm/yarn (`scripts/vendor-pnpm.mjs` → `pnpm-pack.bin`;
   `--` as pass-through positionals (the flag is silently ignored). For pnpm, drop
   the `--`: `pnpm --filter web dev --configLoader native`. (See the `monorepo`
   template's dev command.)
+- **pnpm's default isolated store hides transitive deps from Vite's in-VM dep
+  optimizer.** react-dom's `scheduler` lives behind nested `.pnpm/` symlinks, and
+  rolldown externalised it → the preview crashed with `Calling require for
+  "scheduler" …`. The `monorepo` template ships an `.npmrc` with
+  `node-linker=hoisted` — a FLAT node_modules of real dirs (npm-like); the
+  `workspace:*` package stays symlinked (the showcase) but external transitives
+  become bundlable. Reach for this whenever a pnpm project's Vite preview is blank
+  with an externalised-`require` error.
+
+### Vite config bundling is broken in-VM — avoid it
+Vite loads `vite.config`/`vitest.config`/`.vitepress/config` by esbuild/rolldown-
+**bundling** the file and importing the temp bundle via a `file://` URL — a path that
+fails ("Invalid URL") or hangs in-VM (`__ocImport` doesn't resolve `file://` temp
+bundles). Workarounds, by tool:
+- **Vite 6+/8** templates: pass `--configLoader native` (skips bundling, native
+  import). This is why every Vite `dev` command carries that flag.
+- **Vitest**: no `vitest.config` — pass options as CLI flags.
+- **VitePress** (runs **Vite 5**, which has NO `--configLoader native`): ship **no
+  `.vitepress/config.*`** at all. With no config file VitePress skips
+  `loadConfigFromFile` entirely and boots on defaults; the home page is themed via
+  `docs/index.md` frontmatter. Symptom if a config file sneaks back in: `vitepress
+  dev` hangs right after the "CJS build of Vite's Node API is deprecated" line with
+  no URL. Guard: `scripts/spike-vitepress.mjs`.
 
 ### Real corepack is the studio's PM version manager — DOWNLOADS + runs pinned PMs
 corepack is wired like the PMs but is a *version manager*, not a package manager

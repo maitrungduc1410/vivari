@@ -2413,54 +2413,17 @@ function vitepressTemplate(): TemplateDef {
     "build": "vitepress build docs",
     "preview": "vitepress preview docs"
   },
-  "devDependencies": { "vitepress": "^1.5.0", "shiki": "^2.5.0" }
+  "devDependencies": { "vitepress": "^1.5.0" }
 }
 `,
-      "docs/.vitepress/config.mjs": `import { defineConfig } from 'vitepress'
-import { createHighlighter } from 'shiki'
-import { createJavaScriptRegexEngine } from 'shiki/engine/javascript'
-
-// VitePress builds its Shiki highlighter eagerly (Vite \`configResolved\`, before the
-// dev server binds). Shiki's DEFAULT engine loads the Oniguruma regex engine as
-// WebAssembly — heavy to instantiate in a browser VM and the reason \`vitepress dev\`
-// could appear to hang before printing its URL. Shiki's pure-JavaScript regex engine
-// avoids that WASM entirely while keeping the same themes/highlighting, and it's the
-// recommended engine for WASM-restricted runtimes. We wire it via \`markdown.highlight\`
-// (an async function config so there's no top-level await). Fully portable: this same
-// config runs unchanged in a plain \`npm run dev\` outside OpenContainer.
-const LIGHT = 'github-light'
-const DARK = 'github-dark'
-const LANGS = ['js', 'ts', 'jsx', 'tsx', 'json', 'bash', 'shell', 'vue', 'html', 'css', 'scss', 'md', 'yaml', 'python', 'go', 'rust', 'sql']
-
-export default async () => {
-  const highlighter = await createHighlighter({
-    themes: [LIGHT, DARK],
-    langs: LANGS,
-    engine: createJavaScriptRegexEngine(),
-  })
-  return defineConfig({
-    title: 'OpenContainer Docs',
-    description: 'VitePress running inside OpenContainer',
-    markdown: {
-      highlight: (code, lang) =>
-        highlighter.codeToHtml(code, {
-          lang: highlighter.getLoadedLanguages().includes(lang) ? lang : 'text',
-          themes: { light: LIGHT, dark: DARK },
-          defaultColor: false,
-        }),
-    },
-    themeConfig: {
-      nav: [{ text: 'Home', link: '/' }, { text: 'Guide', link: '/guide' }],
-      sidebar: [
-        { text: 'Introduction', items: [
-          { text: 'Home', link: '/' },
-          { text: 'Guide', link: '/guide' },
-        ] },
-      ],
-    },
-  })
-}
-`,
+      // NO docs/.vitepress/config.* on purpose. VitePress runs Vite 5, whose config
+      // loader ALWAYS esbuild-bundles the config file and imports the bundle via a
+      // temp `file://` URL — a path that fails/hangs in-VM (the same reason regular
+      // Vite templates pass `--configLoader native`, which VitePress 1.x can't).
+      // With no config file VitePress skips that step entirely and boots on defaults.
+      // (Same pattern as the vitest template, which also avoids a bundled config.)
+      // Config-only options like nav/sidebar are traded for a working dev server; the
+      // home page is fully themed via index.md frontmatter, and pages cross-link.
       "docs/index.md": `---
 layout: home
 hero:
@@ -2471,17 +2434,23 @@ hero:
     - theme: brand
       text: Read the guide
       link: /guide
+features:
+  - title: Markdown + Vue
+    details: Author docs in Markdown with Vue components inline.
+  - title: Instant HMR
+    details: Edits show up immediately in the live preview.
+  - title: Zero native deps
+    details: The whole toolchain runs inside the browser VM.
 ---
 `,
       "docs/guide.md": `# Guide
 
-This VitePress site is running entirely inside OpenContainer.
+This VitePress site is running entirely inside OpenContainer — no config file, just
+Markdown. Edit any \`.md\` under \`docs/\` and save to see hot reload.
 
 - Markdown with Vue components
 - Instant hot reload
 - Zero native dependencies
-
-Code blocks are highlighted with Shiki's JavaScript engine (no WebAssembly):
 
 \`\`\`ts
 interface Doc {
@@ -2492,6 +2461,8 @@ interface Doc {
 const doc: Doc = { title: 'Hello', tags: ['vitepress', 'opencontainer'] }
 console.log(doc.title.toUpperCase())
 \`\`\`
+
+[← Back home](/)
 `,
     },
   };
@@ -3431,6 +3402,8 @@ httpServer.listen(port, () => console.log('Socket.IO chat on http://localhost:' 
 }
 
 // ── tRPC (React + Node) ──────────────────────────────────────────────────────
+// Proven in-VM by scripts/spike-trpc.mjs (the raw .ts server runs through the
+// loader and answers typed queries) + browser-confirmed end to end.
 function trpcTemplate(): TemplateDef {
   return {
     manifest: {
@@ -3450,7 +3423,6 @@ function trpcTemplate(): TemplateDef {
       multiPreview: true,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
     },
     files: {
       "package.json": `{
@@ -3578,6 +3550,15 @@ function monorepoTemplate(): TemplateDef {
       experimental: true,
     },
     files: {
+      // A FLAT node_modules (pnpm's "hoisted" linker, like npm/yarn) instead of the
+      // default isolated symlink store. The `workspace:*` package (@repo/ui) is still
+      // symlinked — that's the actual showcase — but external deps (and their
+      // transitives, e.g. react-dom's `scheduler`) become real top-level dirs. Vite's
+      // in-VM rolldown dep-optimizer can then bundle those transitive CJS deps; under
+      // the isolated store it externalised `scheduler` → the preview crashed with
+      // "Calling require for scheduler in an environment that doesn't expose require".
+      ".npmrc": `node-linker=hoisted
+`,
       "package.json": `{
   "name": "monorepo",
   "private": true,

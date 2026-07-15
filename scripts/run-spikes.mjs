@@ -64,6 +64,8 @@ const SPIKES = [
   { name: "slidev", file: "spike-slidev.mjs", net: true, timeout: 600000 },
   // tRPC server — raw .ts entry through OC's loader (no `export type`), typed query.
   { name: "trpc", file: "spike-trpc.mjs", net: true },
+  // VitePress (config-less) CLI dev server — Vite 5 build, longer budget.
+  { name: "vitepress", file: "spike-vitepress.mjs", net: true, timeout: 600000 },
 ];
 
 const args = process.argv.slice(2);

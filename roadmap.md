@@ -2310,22 +2310,27 @@ Two more Backend templates drop `experimental`, each now gated by a headless spi
 Both use the shared `scripts/lib/spike-harness.mjs` (Nitro adds `env.PORT` via `defaultEnv`; the
 new `httpPost` helper from the GraphQL change carries the Feathers `create()` assertion).
 
-## VitePress: Shiki's JavaScript engine instead of Oniguruma WASM (this change)
+## VitePress: config-less so it never hits Vite 5's config bundler (this change)
 
-`vitepress dev` could appear to hang right after Vite's "CJS build … deprecated" line — no
-banner, no URL. Traced to `createServer`: the VitePress plugin builds its Shiki highlighter
-**eagerly in `configResolved`** (before `httpServer.listen`), and Shiki's DEFAULT engine
-instantiates the **Oniguruma regex engine as WebAssembly**. That eager WASM instantiate is what
-stalls before the server ever binds (ruled out: the "CJS build" warning — universal in OC since
-it transpiles ESM→CJS — and the in-process esbuild patch, which *does* apply to Vite 5's
-esbuild 0.21.5, byte-identical spawn block).
+`vitepress dev` hangs right after Vite's "CJS build … deprecated" line — no banner, no URL.
+An earlier attempt blamed Shiki's Oniguruma WASM and swapped in Shiki's JS regex engine via
+`markdown.highlight`; that made **no difference** — the hang was byte-for-byte identical with the
+simple config and the Shiki config, which proved the stall is *before* the markdown renderer, in
+**config loading itself**. VitePress 1.x runs **Vite 5**, whose config loader ALWAYS
+esbuild-bundles `.vitepress/config.*` and imports the bundle via a temp `file://` URL
+(`loadConfigFromBundledFile`). That is exactly the in-VM config-bundling path regular Vite
+templates dodge with `--configLoader native` — an option Vite 5 doesn't have and VitePress
+doesn't pass. OC's `__ocImport` doesn't resolve `file://` temp bundles, so the load never
+settles (see also the known "vite.config bundling fails with Invalid URL" note above).
 
-The fix keeps the template vanilla and portable: switch to Shiki's **pure-JavaScript regex
-engine** (`shiki/engine/javascript`) via `markdown.highlight`, wired through an **async-function
-config** (no top-level await, so OC's ESM→CJS path is fine). Same themes + highlighting, zero
-WASM. Verified as a valid, working VitePress config in vanilla Node (server binds + prints its
-URL); the same config runs unchanged in a plain export. Still `experimental` (needs an in-VM
-spike + browser confirmation before graduating).
+Fix (same pattern the vitest template already uses): **ship no `.vitepress/config.*` file.** With
+no config file VitePress skips `loadConfigFromFile` entirely (verified in its source) and boots
+on defaults — no esbuild bundle, no `file://` import, no hang. The trade-off is that config-only
+options (nav/sidebar/site title) are dropped, but the home page is still fully themed via
+`docs/index.md` frontmatter (hero + features) and pages cross-link. Also removed the now-unused
+`shiki` devDependency and the async-function config. Confirmed config-less `vitepress dev` binds
+and serves `/` in vanilla Node; guarded in-VM by `scripts/spike-vitepress.mjs`. Still
+`experimental` pending browser confirmation.
 
 ## Slidev + Socket.IO graduated (this change)
 
@@ -2365,8 +2370,9 @@ file:
 Guarded by `scripts/spike-trpc.mjs`, which boots the exact `.ts` server through the
 kernel (`node --experimental-strip-types server/index.ts`), binds `:3001`, and
 asserts an `httpBatchLink`-style greeting query returns the typed payload. Server
-side confirmed in vanilla Node with real `@trpc/server@11`. The template stays
-`experimental` (its React frontend still wants a browser confirmation).
+side confirmed in vanilla Node with real `@trpc/server@11`. **Now graduated** —
+browser-confirmed end to end (React frontend on :5173 calling the tRPC server on
+:3001).
 
 ## pnpm monorepo — cmd-shim bin unwrap + pnpm's `--` forwarding (this change)
 
@@ -2394,8 +2400,18 @@ list` the moment `vite` started. Two pnpm-specific behaviours, both fixed:
 Guarded by `scripts/spike-cmd-shim.mjs` — a pure, offline unit test of the shim
 parser (real pnpm shim + `.cjs`/`.mjs` targets + node-bin/non-shell negatives).
 Both the shim resolution and the corrected `--`-free command were confirmed against
-real pnpm@9.15.9 in vanilla Node (vite starts, serves `/`). Template stays
-`experimental`.
+real pnpm@9.15.9 in vanilla Node (vite starts, serves `/`).
+
+**Follow-up — the preview iframe was blank** (terminal fine) with `Uncaught Error:
+Calling require for "scheduler" in an environment that doesn't expose the require
+function` from rolldown's runtime. Under pnpm's default *isolated* store, react-dom's
+transitive `scheduler` lives behind nested symlinks in `.pnpm/…`, and Vite's in-VM
+rolldown dep-optimizer externalised it (a bare `require("scheduler")`) instead of
+bundling it. Fix: a project `.npmrc` with `node-linker=hoisted`, giving a FLAT
+node_modules of real dirs (npm-like) — the `workspace:*` package (@repo/ui) stays
+symlinked (the actual showcase), but external deps and their transitives become real
+top-level dirs the optimizer bundles (confirmed with real pnpm@9.15.9: `scheduler`
+bundled, `main.jsx` served). Template stays `experimental`.
 
 ## Definition of done for T2
 
