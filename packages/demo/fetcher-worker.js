@@ -12,6 +12,10 @@
 //   fetcher -> { type: 'fetch-result', id, ok, status, statusText, headers, body } (body transferred)
 //           -> { type: 'fetch-result', id, error }                       (network failure)
 
+// The native->wasm alias table is the single source of truth for the toolchain
+// subsystem (shared with the in-process esbuild patch); add drop-ins there.
+import { NATIVE_WASM_ALIASES as PACKAGE_ALIASES } from "../runtime/toolchain-shims.js";
+
 // Pluggable registry endpoint (the "direct now, proxy later" seam). The npm
 // registry sends `Access-Control-Allow-Origin: *` on both metadata and tarballs,
 // so a cross-origin-isolated page can fetch it directly — no server needed today.
@@ -63,10 +67,7 @@ function rewrite(url) {
 // so a range like "esbuild@^0.28.0" resolves against esbuild-wasm's versions.
 // Tarball requests need no interception: the rewritten packument already points
 // at the target's tarballs. Keeps project package.json / angular.json pristine.
-const PACKAGE_ALIASES = {
-  esbuild: "esbuild-wasm",
-  rollup: "@rollup/wasm-node",
-};
+// PACKAGE_ALIASES is imported at the top of this file from the toolchain subsystem.
 
 // Encode a package name for a registry path segment (scoped -> @scope%2fname).
 function encodePkgSegment(name) {

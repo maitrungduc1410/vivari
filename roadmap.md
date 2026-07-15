@@ -1805,8 +1805,8 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   - **Webpack** (`scripts/spike-webpack.mjs`, `Tooling`, non-experimental) — webpack 5 +
     `webpack-dev-server` (connect + `ws` HMR + chokidar) + `html-webpack-plugin` + css/style
     loaders. Binds `:8080`, serves the app, HMR live.
-  - **Docusaurus** (`scripts/spike-docusaurus.mjs`, `Docs`, `experimental` — heavy 100s+ install)
-    — Docusaurus 3 (webpack + MDX + React). Binds `:3000`, serves `/` (200, real Docusaurus HTML).
+  - **Docusaurus** (`scripts/spike-docusaurus.mjs`, `Docs`, now **non-experimental** — heavy 100s+
+    install) — Docusaurus 3 (webpack + MDX + React). Binds `:3000`, serves `/` (200, real Docusaurus HTML).
 
   Standalone webpack (not Next's private copy) needed **three real runtime fixes** — all general
   improvements, kept regardless of the templates:
@@ -1849,9 +1849,10 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
     gained an `OC_BASEURL` knob to exercise the base-prefixed path headlessly.
 - ✅ **Phase 4 (cont.) — Angular proven headless AND shipped (`scripts/spike-angular.mjs`, `Angular` template).**
   Angular 21 (`@angular/build`) now builds on esbuild-wasm + Vite and serves `/` with a 200 in-VM
-  (~5s dev build). `esbuild`→`esbuild-wasm` and `rollup`→`@rollup/wasm-node` are aliased via npm
-  `overrides`; the studio template's `scripts/oc-ng.mjs` applies the in-process esbuild patch (below),
-  sets `NG_BUILD_PARALLEL_TS=0` + `PISCINA_DISABLE_ATOMICS=1`, and launches the CLI. Getting here
+  (~5s dev build). NOTE: the original ship used per-project npm `overrides` + a `scripts/oc-ng.mjs`
+  launcher; both were later **generalized into the runtime** (registry aliasing + in-process esbuild +
+  `PISCINA_DISABLE_ATOMICS=1` default — see "Toolchain generalization" below), so the template is now a
+  vanilla `ng new` with plain `ng serve`/`ng build`. Getting here
   fixed **five earlier runtime bugs** (all validated against the Next.js spike, which still PASSes
   incl. the RSC-refresh gate):
   1. **ESM transpiler — named `export default function/class` (`esm.js`).** A named default
@@ -1883,13 +1884,15 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   one event loop). Rather than make child stdio byte-accurate, we **eliminate the child**: a string
   patch of `esbuild-wasm/lib/main.js` rewrites `ensureServiceIsRunning()` to instantiate the Go wasm
   **in this thread**, multiplexing fd 0/1/2 onto the protocol in memory and delegating every other fd
-  to the VFS (`scripts/oc-ng.mjs`, kept in sync with the spike). This surfaced **three general runtime
+  to the VFS (now `packages/runtime/esbuild-inproc-patch.js`, applied by the module loader for ANY
+  project — no per-project launcher). This surfaced **three general runtime
   fixes** (landed separately — see "worker-pool + async-bundler support"): the event-loop **wake** nudge
   (native MessagePort callbacks — Piscina — now re-arm a parked `waitForNext`), the **Buffer-pool
   untransferable guard** (Angular transfers a pooled Buffer's `.buffer`, which detached the whole pool),
   **dedicated `fs.promises.readFile` buffers**, and the **dynamic-import escape hatch** (piscina's
   `new Function('s','return import(s)')` now routes through our loader). `esbuild`→`esbuild-wasm` and
-  `rollup`→`@rollup/wasm-node` are aliased via npm `overrides`.
+  `rollup`→`@rollup/wasm-node` are aliased **at the registry layer** (no project `overrides`) — see
+  "Toolchain generalization" below.
   - **Rust → WebAssembly** starter — needs a Rust toolchain (rustc/wasm-pack) in-VM that we haven't
     proven; consider an **AssemblyScript → WASM** substitute (pure-JS `asc` compiler) as the
     "compile & run WASM in a tab" showcase.
@@ -2008,6 +2011,43 @@ and teaches quick-open to jump to a line — without ever blocking the UI.
 
 Follow-ups: search result virtualization for very large result sets, a search-history dropdown
 (the input hints at `↑↓`), and `.gitignore`-aware excludes.
+
+## Toolchain generalization, install speed, worker-pool & a spike CI harness (this change)
+
+Five improvements that make the architecture more portable and self-guarding. `llhttp → Wasm`
+(replace the pure-JS `http_parser`) is intentionally **deferred to its own follow-up MR** — see
+"Deferred" at #8.
+
+- **Persistent content-addressed package cache in OPFS.** The package-manager caches moved off the
+  ephemeral `/tmp` into a PERSISTED location: `/home/user/.cache/{npm,yarn,corepack}` and the pnpm
+  store at `/home/user/.local/share/pnpm/store` (`demo/kernel-worker.js`). npm's own integrity-keyed
+  `_cacache` is a content-addressed store, so persisting it *is* the "package cache in OPFS": a
+  dependency downloaded once is reused by every later project and after a reload — no re-download. To
+  avoid double-storing tarballs, the kernel's transient outbound-fetch buffer `/var/cache/oc-fetch`
+  (whose in-memory index is rebuilt per session and never read back) is now in the OPFS `IGNORE` list
+  (`demo/fs-worker.js`) — npm's cache is the single durable copy. Wipe with `?reset`.
+- **Toolchain generalization as a real subsystem.** The native→wasm alias table is now a single
+  source of truth, `packages/runtime/toolchain-shims.js` (`NATIVE_WASM_ALIASES`), imported by the
+  Fetcher Worker (registry aliasing) and documented next to the in-process esbuild patch. The esbuild
+  patch (`esbuild-inproc-patch.js`) is now **version-drift resilient**: it matches the spawn block
+  with the version literal templated (a point/minor esbuild-wasm bump keeps patching, threading the
+  captured version through), and on a block-shape change it **warns loudly** instead of silently
+  regressing to a deadlock. Guarded offline by `scripts/spike-toolchain.mjs`.
+- **`worker_threads.receiveMessageOnPort`.** Implemented Node's synchronous manual-polling drain via a
+  lazy per-port inbox (`node/lib/worker_threads.js`): a port polled with `receiveMessageOnPort` buffers
+  each delivered message and shifts it out, returning `{ message }` or `undefined`. Lazy (not eager)
+  so event-only ports never grow an undrained buffer. The Atomics worker-pool fast-path stays **off**
+  (`PISCINA_DISABLE_ATOMICS=1`) — a browser `MessagePort` can't be drained synchronously across a
+  worker boundary. Gated by a new case in `scripts/verify-node.mjs`.
+- **Graduated templates.** Next.js (`next-ts`/`next-js`) and Docusaurus (documented-green spikes), plus
+  the low-risk Node backends **Koa, Hono, H3, Fastify** (plain HTTP servers on the proven Express/Nest
+  substrate) moved out of `experimental`. Each backend gained a spike:
+  `scripts/spike-{koa,hono,h3,fastify}.mjs`. (Preact/Lit/Solid graduated earlier in the Vite-8 sweep.)
+- **Spike CI harness.** A shared `scripts/lib/spike-harness.mjs` (boot kernel → install → waitListen →
+  httpGet) removes the copy-pasted boilerplate, and `scripts/run-spikes.mjs` is a tiered runner
+  (`--offline` / `--net` / `--all`) that auto-vendors npm and fails loudly on any red. Wired into
+  `.gitlab-ci.yml` (fast offline gate on every push; verify + network spikes on MR/schedule) and
+  exposed as `npm run spikes[:offline|:net]`. A template must have a green spike before it graduates.
 
 ## Definition of done for T2
 
