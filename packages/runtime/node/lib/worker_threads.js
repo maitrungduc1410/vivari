@@ -18,8 +18,11 @@
 //
 // Scope: Worker(entry, {workerData, argv, env, cwd, eval}), postMessage/on(
 // 'message'|'online'|'exit'|'error')/terminate/ref/unref, parentPort, workerData,
-// threadId, isMainThread, MessageChannel/MessagePort (platform). Deferred:
-// transferring MessagePorts in a transferList across threads, resourceLimits.
+// threadId, isMainThread, MessageChannel/MessagePort (platform), and
+// receiveMessageOnPort (synchronous manual-polling drain). Deferred: transferring
+// MessagePorts in a transferList across threads, resourceLimits, and the Atomics
+// worker-pool fast path (kept off via PISCINA_DISABLE_ATOMICS=1 — a browser
+// MessagePort can't be drained synchronously across a worker boundary).
 
 export default function (exports, require, module, process) {
   const g = globalThis;
@@ -238,7 +241,37 @@ export default function (exports, require, module, process) {
   };
   exports.getEnvironmentData = (key) => environmentData.get(key);
 
-  exports.receiveMessageOnPort = () => undefined;
+  // ---- receiveMessageOnPort (Node's synchronous port drain) -----------------
+  // Node lets a consumer pull a queued message off a MessagePort WITHOUT going
+  // through the event loop, returning { message } or undefined when empty. Worker
+  // pools (Piscina/tinypool) use it after Atomics.wait as a fast path; our runtime
+  // defaults pools to the async message path (PISCINA_DISABLE_ATOMICS=1) because a
+  // browser MessagePort can't be drained synchronously across a worker boundary.
+  // But libraries that use receiveMessageOnPort directly (manual polling mode)
+  // still need correct semantics. We attach a lazy per-port inbox the first time a
+  // port is polled: every message the JS side receives from then on is buffered
+  // and shifted out here. Lazy (not eager on every port) so ports used purely with
+  // the event API never grow an undrained buffer — that would be a memory leak on a
+  // long-running dev server. Like Node, it returns only messages already delivered
+  // and never blocks waiting for new ones.
+  const RX_INBOX = Symbol("ocPortRxInbox");
+  function armInbox(port) {
+    let inbox = port[RX_INBOX];
+    if (inbox) return inbox;
+    inbox = port[RX_INBOX] = [];
+    try {
+      port.addEventListener("message", (e) => inbox.push(e.data));
+      port.start && port.start();
+    } catch {
+      /* not a real MessagePort — leave the (empty) inbox */
+    }
+    return inbox;
+  }
+  exports.receiveMessageOnPort = (port) => {
+    if (!port || typeof port.addEventListener !== "function") return undefined;
+    const inbox = armInbox(port);
+    return inbox.length ? { message: inbox.shift() } : undefined;
+  };
   exports.markAsUntransferable = (obj) => obj;
   exports.isMarkedAsUntransferable = () => false;
   exports.moveMessagePortToContext = () => {

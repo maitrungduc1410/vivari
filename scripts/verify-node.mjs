@@ -1605,6 +1605,40 @@ w.on('exit', (code) => {
   assert(wtr.code === 0 && wtr.stdout.includes("WT_OK"),
     "Phase 2 #16 stage 2b: worker_threads.Worker runs a real nested thread (workerData + SAB + message roundtrip + exit code)");
 
+  // === #16 stage 2b: receiveMessageOnPort (Node's synchronous port drain) ======
+  // Piscina/tinypool's Atomics fast path pulls results with receiveMessageOnPort;
+  // libraries also use it directly in manual polling mode. Prove: empty port ->
+  // undefined, and after posting, messages drain out IN ORDER, then undefined again.
+  kernel.writeFile(
+    "/t/rmop.js",
+    `
+const { MessageChannel, receiveMessageOnPort } = require('worker_threads');
+const assert = require('assert');
+const { port1, port2 } = new MessageChannel();
+assert.strictEqual(receiveMessageOnPort(port2), undefined, 'empty port -> undefined (also arms the inbox)');
+port1.postMessage({ n: 1 });
+port1.postMessage('two');
+const got = [];
+let ticks = 0;
+const timer = setInterval(() => {
+  let m;
+  while ((m = receiveMessageOnPort(port2))) got.push(m.message);
+  if (got.length >= 2 || ++ticks > 50) {
+    clearInterval(timer);
+    assert.strictEqual(got.length, 2, 'drained exactly 2 messages, got ' + got.length);
+    assert.ok(got[0] && got[0].n === 1, 'message 1 drained in order');
+    assert.strictEqual(got[1], 'two', 'message 2 drained in order');
+    assert.strictEqual(receiveMessageOnPort(port2), undefined, 'empty again after drain');
+    console.log('RMOP_OK');
+    process.exit(0);
+  }
+}, 10);
+`,
+  );
+  const rmop = await kernel.start("node", ["/t/rmop.js"], { cwd: "/t", capture: true });
+  assert(rmop.code === 0 && rmop.stdout.includes("RMOP_OK"),
+    "Phase 2 #16 stage 2b: receiveMessageOnPort drains queued port messages in order (manual polling mode)");
+
   // === brick 4: shell session with each command as its own process ===
   const sh = await kernel.start("sh", ["/root.sh"], { cwd: "/", capture: true });
   const o = sh.stdout;
