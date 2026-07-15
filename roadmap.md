@@ -1827,7 +1827,7 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   Node.js blank. Showcase: Vite+Express fullstack (two preview tabs), Server-Sent Events. Existing
   13 re-categorised.
 - ✅ **Phase 2 (`[SPIKE]`, meta-frameworks — shipped `experimental`)** — Fullstack: Nuxt 3,
-  SvelteKit, React Router 7 (Remix), Astro. Docs: VitePress, Slidev.
+  SvelteKit, React Router 7 (Remix), Astro. Docs: Slidev.
 - ✅ **Phase 3 (`[SPIKE]`)** — Frontend variants: Preact, Lit, Solid, Qwik (now proven headless by
   `scripts/spike-{preact,lit,solid,qwik}.mjs` → **graduated to non-experimental**; Qwik rides the
   merged esbuild-wasm aliasing + in-process service and runs `qwikVite({ csr: true })`). Backends:
@@ -1872,7 +1872,7 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
     sets `NO_UPDATE_NOTIFIER=1` + `npm_config_update_notifier=false` (also kills npm's own "new
     version" notice).
   - **Keep-prefix preview routing (`public/sw.js` + controller + `templates.ts`).** A *client-routed*
-    SPA (Docusaurus — also VitePress/Slidev in future) resolves its route from the iframe's own
+    SPA (Docusaurus — also Slidev in future) resolves its route from the iframe's own
     `location.pathname`, which is `/preview/<port>/…`. The preview SW normally *strips* that proxy
     prefix before hitting the dev server (so `/`-based servers like Next/Vite see clean paths), so
     Docusaurus's router landed on its NotFound page until you clicked a link. Fix: the template sets
@@ -2292,6 +2292,140 @@ GraphiQL) keep `/graphql`.
 - **Feasibility proof.** Confirmed end-to-end in vanilla Node with real `graphql-yoga@5`: `GET /`
   serves the page, the queries and the `addBook` mutation work (books 2 -> 3), and GraphiQL is
   still served at `/graphql`.
+
+## Feathers + Nitro backends graduated (this change)
+
+Two more Backend templates drop `experimental`, each now gated by a headless spike:
+
+- **Feathers** (`scripts/spike-feathers.mjs`) — installs `@feathersjs/feathers` + `@feathersjs/koa`,
+  binds `:3030`, and drives the REST transport: `GET /messages` returns the seeded message,
+  `POST /messages` creates one (id increments), and `GET /messages` then shows both. Proven
+  end-to-end in vanilla Node with real Feathers 5.
+- **Nitro** (`scripts/spike-nitro.mjs`) — the first CLI-dev-server backend spike: it runs
+  `nitro dev` (rollup build + `defineNitroConfig`/`defineEventHandler` auto-imports, bound via
+  listhen with `PORT` pinned), then asserts `GET /` serves the index route and `GET /api/hello`
+  returns the JSON handler body. Registered with a longer budget (nitro dev builds on boot).
+  Proven end-to-end in vanilla Node with real `nitropack@2` (built in ~300ms, both routes served).
+
+Both use the shared `scripts/lib/spike-harness.mjs` (Nitro adds `env.PORT` via `defaultEnv`; the
+new `httpPost` helper from the GraphQL change carries the Feathers `create()` assertion).
+
+## VitePress — dropped: synckit's blocking Atomics + cross-worker MessagePort (revisit later)
+
+VitePress was **removed from the templates** after we chased three successive blockers and hit
+a *fundamental* one. The story (kept as a signpost for a future revisit):
+
+1. **Vite 5 config bundler** — `vitepress dev` hung right after Vite's "CJS build … deprecated"
+   line. VitePress 1.x runs **Vite 5**, whose config loader ALWAYS esbuild-bundles
+   `.vitepress/config.*` and imports the bundle via a temp `file://` URL
+   (`loadConfigFromBundledFile`) — the same in-VM config-bundling path regular Vite templates
+   dodge with `--configLoader native` (an option Vite 5 lacks). OC's `__ocImport` can't resolve
+   `file://` temp bundles, so it never settled. **Fixed** by shipping *no* config file (VitePress
+   then skips `loadConfigFromFile` and boots on defaults).
+2. **`DataCloneError` on spawn** — with config-less VitePress the boot got *past* config loading
+   and then crashed spawning a worker: `A MessagePort could not be cloned because it was not
+   transferred`. VitePress's markdown highlighter (Shiki) resolves languages **synchronously** via
+   **`synckit`** — `resolveLangSync = createSyncFn(...)` runs **eagerly at module load**, spawning
+   a `worker_threads` Worker with a `MessagePort` inside `workerData`. OC's `worker_threads`
+   explicitly *defers* transferring MessagePorts across threads, so the spawn throws.
+3. **The fundamental wall** — even if we fixed (2), synckit's runtime pattern is `Atomics.wait`
+   (block the calling thread) → `receiveMessageOnPort(port)` (read the reply synchronously). In a
+   browser a **blocked worker can't receive a MessagePort message** — delivery needs the event
+   loop, which `Atomics.wait` freezes. This is the exact limitation OC already documents (it's why
+   Piscina runs with `PISCINA_DISABLE_ATOMICS=1`), and synckit has **no async fallback**. So any
+   real (highlighted) code block would deadlock/throw regardless.
+
+The best achievable would be a gated MessagePort-transfer fix **plus** stripping every
+highlighted code block — a docs SSG that can't show highlighted code, from an unverifiable change
+to core worker infra. Not worth it while **Docusaurus** (graduated, Prism-based, no synckit)
+already covers the docs-site showcase fully. **Revisit if** OC's worker model gains a synchronous
+cross-worker port drain (e.g. a SAB-backed transport), or Shiki/VitePress drops synckit.
+
+## Slidev + Socket.IO graduated (this change)
+
+Two more templates drop `experimental`, each now gated by a headless spike:
+
+- **Socket.IO** (`scripts/spike-socketio.mjs`) — Express + `socket.io`, binds `:3000`, and
+  asserts `GET /` serves the chat UI, `/socket.io/socket.io.js` serves the client script, and
+  the **engine.io polling handshake** (`/socket.io/?EIO=4&transport=polling`) returns a session
+  advertising the `websocket` upgrade. The live ws chat rides the already-proven preview ws
+  tunnel (roadmap #19 / `spike-ws`), so the spike proves the server side in-VM. Confirmed in
+  vanilla Node with real `socket.io@4`.
+- **Slidev** (`scripts/spike-slidev.mjs`) — a Vite + Vue CLI dev server (`@slidev/cli`). Like
+  Nitro it drives the real CLI (`slidev --port 3030` → `bin/slidev.mjs`), with a longer bind
+  budget (`OC_BIND_TIMEOUT`) since the first Vite build is heavy, then asserts `GET /` returns
+  the Slidev app shell. Confirmed in vanilla Node (dev server built + bound in ~6s, `/` served).
+
+## tRPC template — raw `.ts` server through the loader, no `export type` (this change)
+
+The **tRPC** template's server is run raw via `node --experimental-strip-types
+server/index.ts`, which routes it through OC's own module loader. That loader's
+`esm.js` only rewrites `import`/`export` — **it does not strip TypeScript types** —
+so `export type AppRouter = typeof appRouter` had its `export ` removed and left
+`type AppRouter = …`, i.e. invalid JS → `SyntaxError: Unexpected identifier
+'AppRouter'`. (Every other TS template only sees `.ts` *after* esbuild/Vite has
+stripped types; tRPC is the one that hands a raw `.ts` to the loader.)
+
+Fix keeps full end-to-end typing without any runtime type syntax in the executed
+file:
+
+- `server/index.ts` drops the `export type AppRouter` line — it now contains **zero**
+  TS type syntax, so `esm.js` transpiles it to valid CJS and it runs.
+- `src/App.tsx` derives the router type with a **type-only `typeof import()`**:
+  `type AppRouter = typeof import('../server/index').appRouter`. esbuild erases the
+  whole declaration (verified: no `../server/index` import in the transform output),
+  so there's no runtime coupling and the tRPC client stays fully typed.
+
+Guarded by `scripts/spike-trpc.mjs`, which boots the exact `.ts` server through the
+kernel (`node --experimental-strip-types server/index.ts`), binds `:3001`, and
+asserts an `httpBatchLink`-style greeting query returns the typed payload. Server
+side confirmed in vanilla Node with real `@trpc/server@11`. **Now graduated** —
+browser-confirmed end to end (React frontend on :5173 calling the tRPC server on
+:3001).
+
+## pnpm monorepo — cmd-shim bin unwrap + pnpm's `--` forwarding (this change)
+
+The **pnpm monorepo** template crashed with `SyntaxError: missing ) after argument
+list` the moment `vite` started. Two pnpm-specific behaviours, both fixed:
+
+1. **pnpm bins are `#!/bin/sh` cmd-shims, not symlinks.** npm makes
+   `node_modules/.bin/vite` a POSIX symlink straight to the real `vite.js`; pnpm
+   instead writes a `#!/bin/sh` wrapper that `exec node "$basedir/../vite/bin/vite.js"
+   "$@"`. Our synchronous loader can't run shell — it neutralised the shebang and
+   compiled the shell script as JavaScript → syntax error. Fix (runtime, general):
+   `module.js` `runMain` now detects a shell cmd-shim and **unwraps it to the `.js`
+   it execs** (`resolveCmdShim` → the pure `parseShellShimTarget`), mirroring Node's
+   `argv[1]` = the resolved `.js`. A real `#!/usr/bin/env node` bin is left alone.
+   No NODE_PATH shim is needed: pnpm places the real bin next to its deps in the
+   `.pnpm/<pkg>@<ver>/node_modules/` store, so the normal node_modules walk resolves
+   them. This benefits **every** pnpm-installed bin, not just this template.
+2. **pnpm doesn't eat a leading `--` like npm.** The template ran `pnpm --filter web
+   dev -- --configLoader native`; npm would strip the first `--` and forward
+   `--configLoader native`, but pnpm forwards the literal `--` too, so vite's cac
+   parser treated `--configLoader native` as pass-through positionals and ignored
+   the flag (which then re-triggers vite's in-VM rolldown config bug the flag exists
+   to avoid). Fix: drop the `--` → `pnpm --filter web dev --configLoader native`.
+
+Guarded by `scripts/spike-cmd-shim.mjs` — a pure, offline unit test of the shim
+parser (real pnpm shim + `.cjs`/`.mjs` targets + node-bin/non-shell negatives).
+Both the shim resolution and the corrected `--`-free command were confirmed against
+real pnpm@9.15.9 in vanilla Node (vite starts, serves `/`).
+
+**Follow-up — the preview iframe was blank** (terminal fine) with `Uncaught Error:
+Calling require for "scheduler" in an environment that doesn't expose the require
+function` from rolldown's runtime. Under pnpm's default *isolated* store, react-dom's
+transitive `scheduler` lives behind nested symlinks in `.pnpm/…`, and Vite's in-VM
+rolldown dep-optimizer externalised it (a bare `require("scheduler")`) instead of
+bundling it. Fix: a project `.npmrc` with `node-linker=hoisted`, giving a FLAT
+node_modules of real dirs (npm-like) — the `workspace:*` package (@repo/ui) stays
+symlinked (the actual showcase), but external deps and their transitives become real
+top-level dirs the optimizer bundles (confirmed with real pnpm@9.15.9: `scheduler`
+bundled, `main.jsx` served).
+
+**Graduated.** Browser-confirmed end to end: `pnpm install`, the `workspace:*`
+symlink, the Vite dev server, and the live preview iframe all work. The template
+drops `experimental`; the cmd-shim unwrap it relies on is guarded by
+`scripts/spike-cmd-shim.mjs`, and real pnpm is exercised by the pnpm spikes.
 
 ## Definition of done for T2
 

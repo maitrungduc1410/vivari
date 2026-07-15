@@ -14,7 +14,7 @@ const PREVIEW_MARKER = "/preview/";
 // "Keep-prefix" ports. By default the SW strips the `/preview/<port>` proxy prefix
 // before handing a request to the in-VM dev server (so a server that assumes it
 // lives at `/` — Next, Vite, Express… — sees clean paths). But a *client-routed*
-// SPA (Docusaurus, VitePress, Slidev…) resolves its route from the iframe's own
+// SPA (Docusaurus, Slidev…) resolves its route from the iframe's own
 // `location.pathname`, which IS `/preview/<port>/…`. Serving such an app at `/`
 // makes its router land on its NotFound page. The fix: configure that app's base
 // (baseUrl / Vite `base`) to `/preview/<port>/` and tell the SW to NOT strip the
@@ -185,7 +185,7 @@ function OCWebSocket(url, protocols){
     var pm = u.pathname.match(/^\\/preview\\/(\\d+)(\\/.*)?$/);
     if (pm) {
       targetPort = parseInt(pm[1], 10);
-      // A keep-prefix dev server (e.g. Docusaurus/VitePress with base
+      // A keep-prefix dev server (e.g. Docusaurus with base
       // /preview/<port>/) serves its OWN HMR socket under that prefix too — keep it
       // so the server sees its real path. Only strip when tunnelling to a DIFFERENT
       // in-VM port (a genuine cross-service socket).

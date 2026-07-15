@@ -77,7 +77,7 @@ export interface TemplateManifest {
   /**
    * The preview proxy serves every app under `/preview/<port>/` and, by default,
    * strips that prefix before hitting the dev server. A *client-routed* SPA
-   * (Docusaurus, VitePress, Slidev…) resolves its route from the iframe's own
+   * (Docusaurus, Slidev…) resolves its route from the iframe's own
    * `location.pathname`, so served at `/` its router lands on NotFound. Such a
    * template instead sets its base (baseUrl / Vite `base`) to `/preview/<port>/`
    * and flags this so the SW keeps the prefix — the app then runs consistently
@@ -2383,78 +2383,10 @@ const title = 'Astro on OpenContainer'
   };
 }
 
-// ── VitePress ────────────────────────────────────────────────────────────────
-function vitepressTemplate(): TemplateDef {
-  return {
-    manifest: {
-      id: "vitepress",
-      framework: "vitepress",
-      icon: "vitepress",
-      category: "Docs",
-      name: "VitePress",
-      language: "TypeScript",
-      description: "VitePress — Vite & Vue powered static site generator for docs",
-      port: 5173,
-      openPath: "/",
-      entry: "docs/index.md",
-      hmr: true,
-      reload: false,
-      install: "npm install",
-      dev: "npm run dev",
-      experimental: true,
-    },
-    files: {
-      "package.json": `{
-  "name": "vitepress-docs",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "vitepress dev docs",
-    "build": "vitepress build docs",
-    "preview": "vitepress preview docs"
-  },
-  "devDependencies": { "vitepress": "^1.5.0" }
-}
-`,
-      "docs/.vitepress/config.mjs": `import { defineConfig } from 'vitepress'
-
-export default defineConfig({
-  title: 'OpenContainer Docs',
-  description: 'VitePress running inside OpenContainer',
-  themeConfig: {
-    nav: [{ text: 'Home', link: '/' }, { text: 'Guide', link: '/guide' }],
-    sidebar: [
-      { text: 'Introduction', items: [
-        { text: 'Home', link: '/' },
-        { text: 'Guide', link: '/guide' },
-      ] },
-    ],
-  },
-})
-`,
-      "docs/index.md": `---
-layout: home
-hero:
-  name: OpenContainer
-  text: VitePress in the browser
-  tagline: Edit docs/index.md and save — HMR is live.
-  actions:
-    - theme: brand
-      text: Read the guide
-      link: /guide
----
-`,
-      "docs/guide.md": `# Guide
-
-This VitePress site is running entirely inside OpenContainer.
-
-- Markdown with Vue components
-- Instant hot reload
-- Zero native dependencies
-`,
-    },
-  };
-}
+// NOTE: VitePress was dropped (see roadmap: "VitePress — dropped: synckit's blocking
+// Atomics + cross-worker MessagePort is incompatible with our worker model"). The
+// Docusaurus template covers the docs-site showcase. Revisit if the worker model gains
+// a synchronous cross-worker port drain, or Shiki drops synckit.
 
 // ── Slidev ───────────────────────────────────────────────────────────────────
 function slidevTemplate(): TemplateDef {
@@ -2474,7 +2406,8 @@ function slidevTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
+      // Proven in-VM by scripts/spike-slidev.mjs (dev server builds + serves the
+      // slide deck). No longer experimental.
     },
     files: {
       "package.json": `{
@@ -2959,7 +2892,8 @@ function nitroTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
+      // Proven in-VM by scripts/spike-nitro.mjs (nitro dev builds + serves the
+      // index route and a JSON API route). No longer experimental.
     },
     files: {
       "package.json": `{
@@ -3243,7 +3177,8 @@ function feathersTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
+      // Proven in-VM by scripts/spike-feathers.mjs (find() + create() over the
+      // rest() transport). No longer experimental.
     },
     files: {
       "package.json": `{
@@ -3307,7 +3242,8 @@ function socketioTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
+      // Proven in-VM by scripts/spike-socketio.mjs (UI + client script + engine.io
+      // handshake); the ws chat rides the proven preview ws tunnel. Not experimental.
     },
     files: {
       "package.json": `{
@@ -3386,6 +3322,8 @@ httpServer.listen(port, () => console.log('Socket.IO chat on http://localhost:' 
 }
 
 // ── tRPC (React + Node) ──────────────────────────────────────────────────────
+// Proven in-VM by scripts/spike-trpc.mjs (the raw .ts server runs through the
+// loader and answers typed queries) + browser-confirmed end to end.
 function trpcTemplate(): TemplateDef {
   return {
     manifest: {
@@ -3405,7 +3343,6 @@ function trpcTemplate(): TemplateDef {
       multiPreview: true,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
     },
     files: {
       "package.json": `{
@@ -3467,8 +3404,6 @@ export const appRouter = t.router({
     .query(({ input }) => 'Hello ' + (input?.name ?? 'world') + ' from tRPC!'),
 })
 
-export type AppRouter = typeof appRouter
-
 createHTTPServer({ router: appRouter }).listen(3001)
 console.log('[trpc] server listening on :3001')
 `,
@@ -3477,7 +3412,11 @@ console.log('[trpc] server listening on :3001')
       "src/main.tsx": reactMain(true),
       "src/App.tsx": `import { useEffect, useState } from 'react'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
-import type { AppRouter } from '../server/index'
+
+// End-to-end typing without a runtime \`export type\` in the server entry: a
+// type-only \`typeof import()\` is fully erased by the bundler, so the server
+// file (run raw via node --experimental-strip-types) stays free of type syntax.
+type AppRouter = typeof import('../server/index').appRouter
 
 // The studio's preview proxy maps /preview/<port>/ to the in-VM server, so the
 // browser reaches the tRPC server (:3001) with no CORS and no manual proxy.
@@ -3523,10 +3462,25 @@ function monorepoTemplate(): TemplateDef {
       hmr: true,
       reload: false,
       install: "pnpm install",
-      dev: "pnpm --filter web dev -- --configLoader native",
-      experimental: true,
+      // pnpm does NOT eat a leading `--` like npm does — `pnpm … dev -- --configLoader
+      // native` forwards the literal `--` too, and vite's cac parser then treats
+      // `--configLoader native` as pass-through positionals (flag ignored). Drop the
+      // `--`: pnpm forwards everything after the script name straight to vite.
+      dev: "pnpm --filter web dev --configLoader native",
+      // Graduated: browser-confirmed (pnpm install + workspace symlink + Vite dev +
+      // live preview all work). The cmd-shim bin unwrap it depends on is guarded by
+      // scripts/spike-cmd-shim.mjs, and real pnpm is exercised by the pnpm spikes.
     },
     files: {
+      // A FLAT node_modules (pnpm's "hoisted" linker, like npm/yarn) instead of the
+      // default isolated symlink store. The `workspace:*` package (@repo/ui) is still
+      // symlinked — that's the actual showcase — but external deps (and their
+      // transitives, e.g. react-dom's `scheduler`) become real top-level dirs. Vite's
+      // in-VM rolldown dep-optimizer can then bundle those transitive CJS deps; under
+      // the isolated store it externalised `scheduler` → the preview crashed with
+      // "Calling require for scheduler in an environment that doesn't expose require".
+      ".npmrc": `node-linker=hoisted
+`,
       "package.json": `{
   "name": "monorepo",
   "private": true,
@@ -4368,7 +4322,6 @@ export const TEMPLATES: TemplateDef[] = [
   remixTemplate(),
   astroTemplate(),
   // Docs
-  vitepressTemplate(),
   slidevTemplate(),
   docusaurusTemplate(),
   // Creative

@@ -30,6 +30,8 @@ const SPIKES = [
   // --- offline (no live registry) --------------------------------------------
   { name: "toolchain", file: "spike-toolchain.mjs", net: false, timeout: 60000 },
   { name: "http-llhttp", file: "spike-http-llhttp.mjs", net: false, timeout: 60000 },
+  // pnpm/cmd-shim bin unwrap — pure parser, no kernel/wasm needed.
+  { name: "cmd-shim", file: "spike-cmd-shim.mjs", net: false, timeout: 60000 },
   // --- network: graduated templates gated here -------------------------------
   { name: "koa", file: "spike-koa.mjs", net: true },
   { name: "hono", file: "spike-hono.mjs", net: true },
@@ -52,6 +54,16 @@ const SPIKES = [
   { name: "sse", file: "spike-sse.mjs", net: true },
   // GraphQL Yoga API + demo UI (queries via GET/POST + a mutation).
   { name: "graphql", file: "spike-graphql.mjs", net: true },
+  // FeathersJS (Koa transport) REST service — find() + create().
+  { name: "feathers", file: "spike-feathers.mjs", net: true },
+  // Nitro (unjs) CLI dev server — rollup build + auto-imports, longer budget.
+  { name: "nitro", file: "spike-nitro.mjs", net: true, timeout: 600000 },
+  // Socket.IO showcase — UI + client script + engine.io handshake in-VM.
+  { name: "socketio", file: "spike-socketio.mjs", net: true },
+  // Slidev (Vite + Vue) CLI dev server — first build is heavy, longer budget.
+  { name: "slidev", file: "spike-slidev.mjs", net: true, timeout: 600000 },
+  // tRPC server — raw .ts entry through OC's loader (no `export type`), typed query.
+  { name: "trpc", file: "spike-trpc.mjs", net: true },
 ];
 
 const args = process.argv.slice(2);

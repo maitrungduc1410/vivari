@@ -494,6 +494,56 @@ pnpm is wired like npm/yarn (`scripts/vendor-pnpm.mjs` → `pnpm-pack.bin`;
 - `dist/pnpm.cjs` (~8.8 MB) exceeds the 1 MiB SAB window → loader uses writeLarge.
 - Headless browser-shape gate: `scripts/spike-pnpm-studio.mjs` (`OC_NET=1`), which
   uses the SAME env (not CLI flags) so it verifies studio's actual config.
+- **pnpm bins are `#!/bin/sh` cmd-shims, NOT symlinks.** npm makes `node_modules/.bin/vite`
+  a POSIX symlink to the real `vite.js`; pnpm writes a `#!/bin/sh` wrapper that
+  `exec node "$basedir/../vite/bin/vite.js" "$@"`. Our loader can't run shell, so
+  `module.js` `runMain` unwraps a shell shim to the `.js` it execs
+  (`resolveCmdShim` → the pure, unit-tested `parseShellShimTarget`; guard:
+  `scripts/spike-cmd-shim.mjs`). Without it, a `pnpm`-installed bin is compiled as
+  JS → `SyntaxError: missing ) after argument list`. A real `#!/usr/bin/env node`
+  bin is left alone. No NODE_PATH shim needed: pnpm puts the real bin next to its
+  deps in the `.pnpm/<pkg>@<ver>/node_modules/` store, so the normal node_modules
+  walk resolves them.
+- **`pnpm run` does NOT eat a leading `--` like `npm run` does.** `npm run dev --
+  --flag` strips the first `--` and forwards `--flag`; `pnpm … dev -- --flag`
+  forwards the literal `--` too, and vite's cac parser then treats everything after
+  `--` as pass-through positionals (the flag is silently ignored). For pnpm, drop
+  the `--`: `pnpm --filter web dev --configLoader native`. (See the `monorepo`
+  template's dev command.)
+- **pnpm's default isolated store hides transitive deps from Vite's in-VM dep
+  optimizer.** react-dom's `scheduler` lives behind nested `.pnpm/` symlinks, and
+  rolldown externalised it → the preview crashed with `Calling require for
+  "scheduler" …`. The `monorepo` template ships an `.npmrc` with
+  `node-linker=hoisted` — a FLAT node_modules of real dirs (npm-like); the
+  `workspace:*` package stays symlinked (the showcase) but external transitives
+  become bundlable. Reach for this whenever a pnpm project's Vite preview is blank
+  with an externalised-`require` error.
+
+### Vite config bundling is broken in-VM — avoid it
+Vite loads `vite.config`/`vitest.config`/`.vitepress/config` by esbuild/rolldown-
+**bundling** the file and importing the temp bundle via a `file://` URL — a path that
+fails ("Invalid URL") or hangs in-VM (`__ocImport` doesn't resolve `file://` temp
+bundles). Workarounds, by tool:
+- **Vite 6+/8** templates: pass `--configLoader native` (skips bundling, native
+  import). This is why every Vite `dev` command carries that flag.
+- **Vitest**: no `vitest.config` — pass options as CLI flags.
+- **VitePress** (runs **Vite 5**, which has NO `--configLoader native`): the
+  config-less trick (ship no `.vitepress/config.*`) DID get past this — but VitePress
+  was ultimately **dropped** for a deeper reason (synckit; see below). Don't re-add it
+  without solving that.
+
+### VitePress is dropped — synckit's blocking sync port drain is incompatible
+VitePress's Shiki markdown highlighter resolves languages **synchronously** via
+**`synckit`**: `resolveLangSync = createSyncFn(...)` runs **eagerly at module load** and
+spawns a `worker_threads` Worker with a `MessagePort` in `workerData`, then at call time
+does `Atomics.wait` (block the thread) → `receiveMessageOnPort(port)` (read the reply
+synchronously). Two problems in-VM: (1) our `worker_threads` doesn't transfer MessagePorts
+across threads yet → `DataCloneError` on spawn; and (2) — the fundamental one — a **blocked
+worker can't receive a MessagePort message** (delivery needs the event loop, which
+`Atomics.wait` freezes), so `receiveMessageOnPort` returns nothing. This is the same limit
+that forces `PISCINA_DISABLE_ATOMICS=1`, and synckit has no async fallback. **Docusaurus**
+covers the docs showcase instead (Prism, no synckit). Revisit if the worker model gains a
+synchronous cross-worker port drain (SAB-backed), or Shiki/VitePress drops synckit.
 
 ### Real corepack is the studio's PM version manager — DOWNLOADS + runs pinned PMs
 corepack is wired like the PMs but is a *version manager*, not a package manager
@@ -733,6 +783,18 @@ snapshot it at call time, not at delivery time.
   `require()` returns `X` directly; `export { X as default }` sets
   `exports.default`. Getting these wrong yields `TypeError: x is not a function`
   on a plugin's default export.
+- **`esm.js` does NOT strip TypeScript types** — it only rewrites `import`/`export`.
+  A raw `.ts` run through OC's loader (`node --experimental-strip-types x.ts`) is
+  *not* type-stripped: `esm.js` removes the leading `export `/`import ` and leaves
+  the rest verbatim, so `export type Foo = …` becomes `type Foo = …` → **`SyntaxError:
+  Unexpected identifier 'Foo'`**. Everything else (Angular/Vite/Nitro/…) only ever
+  sees `.ts` *after* esbuild/Vite has stripped types, so this bites only files run
+  directly by the loader. Rule for templates: keep any raw-executed `.ts` free of
+  type syntax (no `export type`, no annotations). Share types with the bundler-
+  processed side via a type-only `typeof import('./server')` instead of a runtime
+  `export type` — see the **tRPC** template (`server/index.ts` has zero type syntax;
+  `src/App.tsx` derives `AppRouter` via `typeof import('../server/index').appRouter`).
+  Proven by `scripts/spike-trpc.mjs`.
 
 ### `self` is a getter in a real Worker
 Third-party bundles (Vite/rolldown workers) do `Object.assign(globalThis, {self})`,
