@@ -728,11 +728,7 @@ export class IdeController {
       if (sig === "") {
         if (!this.dtsWarnedNoNM.has(root)) {
           this.dtsWarnedNoNM.add(root);
-          const nm = (res.nm as string) ?? root + "/node_modules";
-          const entries = (res.rootEntries as string[]) ?? [];
-          const hasNm = entries.includes("node_modules");
-          this.consoleLine(`[intellisense] ${baseName(root)}: no node_modules at ${nm} — run \`npm install\` for dependency types`, "33");
-          this.consoleLine(`[intellisense]   root ${root} contains: ${entries.length ? entries.slice(0, 40).join(", ") : "(empty/unreadable)"}${hasNm ? "  ← node_modules IS listed (path/mount mismatch!)" : ""}`, "90");
+          this.consoleLine(`[intellisense] ${baseName(root)}: no node_modules yet — run \`npm install\` for dependency types`, "33");
         }
         continue;
       }

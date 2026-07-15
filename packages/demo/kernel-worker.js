@@ -1400,13 +1400,8 @@ async function collectDts(root, prevSig) {
   if (!kernel) return { files: out, truncated: false, sig: "", unchanged: false };
   const rootClean = String(root || "").replace(/\/+$/, "");
   const nm = rootClean + "/node_modules";
-  // Debug aid: when node_modules is absent, report what the root DOES contain so
-  // we can tell "not installed" apart from a path/mount mismatch.
-  const noNm = (unchanged) => {
-    let rootEntries = [];
-    try { rootEntries = kernel.readdir(rootClean); } catch { /* root unreadable */ }
-    return { files: out, truncated: false, sig: "", unchanged, nm, rootEntries };
-  };
+  // sig === "" signals "no node_modules yet" to the caller.
+  const noNm = (unchanged) => ({ files: out, truncated: false, sig: "", unchanged });
   try { if (!kernel.exists(nm)) return noNm(prevSig === ""); } catch { return noNm(false); }
   const sig = depsSignature(nm);
   // Unchanged since the caller's last harvest — skip the (expensive) file reads.
@@ -1658,7 +1653,7 @@ self.onmessage = async (event) => {
   if (m.type === "oc-collect-dts") {
     if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
     collectDts(m.root, m.sig || "")
-      .then((r) => post("oc-reply", { reqId: m.reqId, ok: true, files: r.files, truncated: r.truncated, sig: r.sig, unchanged: r.unchanged, nm: r.nm, rootEntries: r.rootEntries }))
+      .then((r) => post("oc-reply", { reqId: m.reqId, ok: true, files: r.files, truncated: r.truncated, sig: r.sig, unchanged: r.unchanged }))
       .catch((err) => post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) }));
     return;
   }
