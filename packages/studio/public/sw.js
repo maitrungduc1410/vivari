@@ -427,6 +427,17 @@ const CDP_BOOTSTRAP = `(function(){
 if (window.__ocCdpInstalled) return; window.__ocCdpInstalled = true;
 function post(m){ parent.postMessage(m, '*'); }
 var seq = 0;
+// The ws/SSE replay must wait until BOTH (a) the frontend re-attached (an 'init'
+// from the host, sent once per DevTools (re)mount) AND (b) the frontend's Network
+// domain is actually live (its 'Network.enable' command, seen via the relay).
+// Firing on the DevTools iframe load alone races chii's Network panel startup —
+// a webSocketCreated emitted too early is dropped, so a socket opened before the
+// panel was ready (e.g. right after a preview reload) never shows. Both signals
+// fire exactly once per fresh frontend, so this also keeps it to one row.
+var seenInit = false, seenNet = false;
+function maybeAttach(){
+  if (seenInit && seenNet && window.__ocNet){ seenInit = false; seenNet = false; window.__ocNet.onAttach(); }
+}
 function setup(){
   if (!window.chobitsu) return false;
   window.chobitsu.setOnMessage(function(msg){
@@ -451,14 +462,20 @@ function init(){
   sendToChobitsu('CSS.enable');
   sendToChobitsu('Overlay.enable');
   sendToDevtools({ method:'DOM.documentUpdated' });
-  // Replay live ws/SSE connections AFTER the frameNavigated above (which resets
-  // the frontend's network log) so the replayed rows survive.
-  if (window.__ocNet) window.__ocNet.onAttach();
+  // Don't replay live ws/SSE connections yet — wait until the frontend's Network
+  // domain is enabled too (maybeAttach), so the replayed rows aren't dropped by a
+  // not-yet-ready Network panel.
+  seenInit = true; maybeAttach();
 }
 window.addEventListener('message', function(ev){
   var d = ev.data;
   if (!d || d.source !== 'oc-cdp') return;
-  if (d.dir === 'frontend') { if (window.chobitsu) window.chobitsu.sendRawMessage(d.data); }
+  if (d.dir === 'frontend') {
+    if (window.chobitsu) window.chobitsu.sendRawMessage(d.data);
+    // The frontend just enabled its Network domain → its panel is ready to render
+    // events. Trigger the deferred ws/SSE replay now (once both signals are in).
+    try { if (JSON.parse(d.data).method === 'Network.enable') { seenNet = true; maybeAttach(); } } catch(e){}
+  }
   else if (d.dir === 'init') { init(); }
 });
 function notifyNav(){ post({ source:'oc-nav', href: location.pathname + location.search + location.hash }); }
