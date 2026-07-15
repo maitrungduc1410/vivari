@@ -354,9 +354,16 @@ through host `WebAssembly`. Gotchas when touching them:
   `module` builtin's export is the `Module` *function* with statics hung off it, so the
   dynamic-import→namespace interop must copy own-enumerable keys for FUNCTION exports too,
   not only objects — otherwise the named import is `undefined` and PGlite dies deep in
-  `create()` with a minified "e is not a function". This lives in TWO helpers, keep both:
-  the CJS path (`esm.js` `rewriteCjsDynamicImport`'s injected `__oc_import`, used by `.cjs`
-  files like PGlite's bundle) and the `new Function` path (`index.js` `__ocImport`).
+  `create()` with a minified "e is not a function". Dynamic `import()` must ALWAYS resolve
+  to a module NAMESPACE (Node wraps a CJS target as `{ default: module.exports, ...ownKeys }`),
+  never the bare `require()` value. This lives in THREE helpers, keep them consistent:
+  the ESM path (`esm.js` `helpers`' `__oc_import`, which wraps via `__oc_ns`), the CJS path
+  (`esm.js` `rewriteCjsDynamicImport`'s injected `__oc_import`, used by `.cjs` files like
+  PGlite's bundle), and the `new Function` path (`index.js` `__ocImport`). The ESM path
+  originally returned the bare exports — harmless for static default imports (they go
+  through `__oc_def`) but it broke Vite's SSR module runner, which asserts `'default' in mod`
+  for externalized CJS deps (`analyzeImportedModDifference`) → "Named export 'default' not
+  found. The requested module 'cssesc' is a CommonJS module…" on astro.
 - **libSQL is intentionally not a template** — local `@libsql/client` is a native
   N-API addon (no wasm32) and `/web` is remote-only; neither is a self-contained in-VM DB.
 - **Gated by `scripts/spike-sqlite.mjs` + `scripts/spike-pglite.mjs`** (net tier in

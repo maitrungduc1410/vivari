@@ -2498,9 +2498,20 @@ and are gated by a new offline `scripts/spike-esm.mjs`.
   __ocFs` (to multiplex its stdio fds), it throws — and the lock can't even be redefined.
   Fix in `runtime/index.js`: **pre-seat `globalThis.fs`** (writable+configurable, = real
   fs) at boot, before any Go tool loads, so every tool's `globalThis.fs || …`
-  short-circuits and never locks it, while esbuild/tsgo can still reassign it. Reproduced
-  the exact conflict + verified the fix offline. Left `experimental` pending final browser
-  confirmation of a rendered page.
+  short-circuits and never locks it, while esbuild/tsgo can still reassign it.      Reproduced
+     the exact conflict + verified the fix offline.
+
+  Past dep-optimize, Astro's dev server threw `[vite] Named export 'default' not found. The
+  requested module 'cssesc' is a CommonJS module…` from Vite's SSR module runner
+  (`analyzeImportedModDifference`), which asserts `'default' in mod` for externalized CJS
+  deps. Root cause: OC's ESM-path dynamic-import helper (`esm.js` `helpers`' `__oc_import`)
+  returned the bare `require()` value instead of a module namespace, so a CJS target had no
+  `default`. (The CJS-path and `new Function`-path helpers already synthesized the namespace;
+  the ESM path was the odd one out — it slid by because static default imports go through
+  `__oc_def`.) Fix: wrap the ESM-path `__oc_import` result in `__oc_ns` (no-op for an ESM
+  target, synthesizes `{ default, ...ownKeys }` for CJS). Regression-gated in
+  `scripts/spike-esm.mjs`. Left `experimental` pending final browser confirmation of a
+  rendered page.
 
 Loader guarantees regression-gated by `scripts/spike-esm.mjs` (offline tier): TLA →
 async retry; circular re-export → lazy live binding; spread-only use keeps its const; and

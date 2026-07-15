@@ -154,5 +154,36 @@ console.log("\n== [esm] live-binding fallback recovers a circular singleton ==")
   check("the lazily-read singleton resolves to the source Symbol", result === Symbol.for("spike:live"));
 }
 
+// ── 5. dynamic import() of a CJS target yields an ESM namespace with `default` ─
+// Node wraps a CJS dynamic-import target as { default: module.exports, ...ownKeys }.
+// Returning the bare exports left it without `default`; Vite's SSR module runner
+// asserts `'default' in mod` for externalized CJS deps (analyzeImportedModDifference)
+// and threw "Named export 'default' not found … 'cssesc' is a CommonJS module" on astro.
+console.log("\n== [esm] dynamic import() of CJS builds a namespace with default ==");
+{
+  const cssesc = function cssesc() { return "x"; };
+  cssesc.version = "3.0.0"; // a function static → a named export in Node interop
+  const esmTarget = Object.create(null);
+  esmTarget.foo = 1;
+  esmTarget.default = "D";
+  Object.defineProperty(esmTarget, "__esModule", { value: true });
+  const req = (s) => (s === "cssesc" ? cssesc : s === "esm" ? esmTarget : undefined);
+  const src = `export const z=1; const a = await import("cssesc"); const b = await import("esm"); __oc_exports.__a=a; __oc_exports.__b=b;`;
+  const out = transpileEsm(src, "/dyn.js");
+  const w = new AsyncFunction("__oc_exports", "__oc_require", "__oc_module", out + "\n");
+  const mod = { exports: Object.create(null) };
+  let a, b, threw = "";
+  try {
+    await w.call(mod.exports, mod.exports, req, mod);
+    a = mod.exports.__a;
+    b = mod.exports.__b;
+  } catch (e) { threw = e.message; }
+  check("dynamic import resolves without throwing", !threw);
+  check("CJS target namespace has a `default` binding", !!a && "default" in a);
+  check("`default` is the whole module.exports (the cssesc fn)", a && a.default === cssesc);
+  check("CJS function statics surface as named exports", a && a.version === "3.0.0");
+  check("ESM target (already __esModule) is returned unchanged", b === esmTarget);
+}
+
 console.log(`\nRESULT: ${failures === 0 ? "PASS — esm.js live-binding + TLA loader guarantees hold" : `FAIL — ${failures} check(s) failed`}`);
 process.exit(failures === 0 ? 0 : 1);

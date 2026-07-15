@@ -80,7 +80,15 @@ function helpers(fileUrl, filename) {
     // one value (e.g. vue's `index.mjs` re-exports everything, so `createApp`
     // became `withScopeId` — Nuxt SSR then read `.config` off the wrong object).
     "const __oc_star=function(e,m){if(m)for(var k of Object.keys(m)){if(k!=='default'&&!(k in e))Object.defineProperty(e,k,{enumerable:true,configurable:true,get:(function(k){return function(){return m[k];};})(k)});}};" +
-    "const __oc_import=function(s){return Promise.resolve().then(function(){return __oc_require(s);});};" +
+    // Dynamic import() must resolve to a MODULE NAMESPACE, not the raw require() value:
+    // Node wraps a CJS target as { default: module.exports, ...ownKeys }. Returning the
+    // bare exports left a CJS default-import with no `default` — real code mostly reads
+    // it via __oc_def on the STATIC path so it went unnoticed, but Vite's SSR module
+    // runner asserts `'default' in mod` for externalized CJS deps
+    // (analyzeImportedModDifference) and threw "Named export 'default' not found. The
+    // requested module 'cssesc' is a CommonJS module…" on astro. __oc_ns is a no-op for
+    // an ESM target (already __esModule) and synthesizes the namespace for CJS.
+    "const __oc_import=function(s){return Promise.resolve().then(function(){return __oc_ns(__oc_require(s));});};" +
     "const __oc_meta={url:" + JSON.stringify(fileUrl) +
       ",filename:" + JSON.stringify(fp) +
       ",dirname:" + JSON.stringify(dir) +
