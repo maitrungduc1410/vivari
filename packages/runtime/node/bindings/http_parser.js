@@ -1,23 +1,60 @@
 // internalBinding('http_parser') — the HTTP/1.x message parser beneath Node's
 // real lib/_http_common.js / _http_server.js / _http_client.js (Phase 2 #8).
 //
-// In Node this is llhttp behind a C++ binding (node_http_parser.cc). Here we ship
-// a **pure-JS HTTP/1.1 parser** exposing the same JS-facing contract the vendored
+// In Node this is llhttp behind a C++ binding (node_http_parser.cc). We now ship
+// **real llhttp compiled to Wasm** (bindings/llhttp/, reusing undici's prebuilt
+// binary) as the primary parser, with a **pure-JS HTTP/1.1 parser** kept as an
+// automatic fallback. Both expose the identical JS-facing contract the vendored
 // lib/ speaks: an HTTPParser with numeric callback slots (kOnHeadersComplete,
 // kOnBody, kOnMessageComplete, …) that lib/ assigns, plus initialize()/execute().
 //
+// Selection (createHttpParserBinding):
+//   - OC_HTTP_PARSER=js   → force the pure-JS parser.
+//   - OC_HTTP_PARSER=wasm → force Wasm (throws if it can't instantiate).
+//   - unset (default)     → try Wasm, fall back to JS. Synchronous Wasm compile
+//     is only allowed in Workers (where guest processes run); on the main thread
+//     the 4KB sync-compile cap throws and we transparently use the JS parser.
+// The returned binding carries a `backend: 'wasm' | 'js'` marker for tests.
+//
 // We deliberately do NOT advertise `isStreamBase` on our TCP handle, so
 // _http_server takes the slow path — `socket.on('data') -> parser.execute(buf)` —
-// instead of the native `parser.consume(handle)` fast path. That keeps this a
-// simple, self-contained byte->event parser. Compiling llhttp to Wasm and wiring
-// consume() is a later drop-in optimization (roadmap: Rust sinks after the
-// contract stabilizes).
+// instead of the native `parser.consume(handle)` fast path. That keeps the
+// contract a simple byte->event parser for both backends.
 //
 // Scope: HTTP/1.0 + 1.1 request & response parsing, Content-Length + chunked +
-// EOF-delimited bodies, keep-alive/close detection, header pairs. Trailers and
-// upgrade are detected but WebSocket framing is out of scope for now.
+// EOF-delimited bodies, keep-alive/close detection, header pairs, trailers.
+
+import { createLlhttpBinding } from "./llhttp/llhttp-parser.js";
+
+let _warned = false;
+function warnFallback(err) {
+  if (_warned) return;
+  _warned = true;
+  try {
+    console.warn(
+      "[OpenContainer] llhttp Wasm parser unavailable — using the pure-JS HTTP " +
+        "parser (" +
+        (err && err.message ? err.message : String(err)) +
+        ")",
+    );
+  } catch {
+    /* ignore */
+  }
+}
 
 export function createHttpParserBinding() {
+  const pref = globalThis.process?.env?.OC_HTTP_PARSER;
+  if (pref === "js") return createJsHttpParserBinding();
+  try {
+    return createLlhttpBinding();
+  } catch (err) {
+    if (pref === "wasm") throw err; // caller demanded Wasm — surface the failure
+    warnFallback(err);
+    return createJsHttpParserBinding();
+  }
+}
+
+export function createJsHttpParserBinding() {
   const B = () => globalThis.Buffer;
 
   // Callback slot indices (lib/ does `parser[kOnHeadersComplete] = fn`).
@@ -438,5 +475,11 @@ export function createHttpParserBinding() {
     }
   }
 
-  return { methods: allMethods.slice(), allMethods, HTTPParser, ConnectionsList };
+  return {
+    methods: allMethods.slice(),
+    allMethods,
+    HTTPParser,
+    ConnectionsList,
+    backend: "js",
+  };
 }

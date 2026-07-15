@@ -570,10 +570,20 @@ must be published in lockstep and the target must be pure-JS/wasm).
   browser `MessagePort` can't be drained synchronously across a worker boundary, so
   the Atomics fast-path can't work. `worker_threads.receiveMessageOnPort` is still
   implemented (a lazy per-port inbox) for code that polls it directly in manual mode.
+- **HTTP parser as Wasm** (`packages/runtime/node/bindings/http_parser.js` +
+  `bindings/llhttp/`): the parser beneath Node's real `lib/http` is **llhttp
+  compiled to Wasm** — the same upstream llhttp Node ships, vendored from undici's
+  prebuilt binary (`scripts/vendor-llhttp.mjs`, base64-embedded so no fetch) rather
+  than standing up a wasi-sdk toolchain to rebuild an identical artifact. It is
+  instantiated *synchronously* in-worker; the bridge (`llhttp/llhttp-parser.js`)
+  mirrors `node_http_parser.cc`, folding llhttp's span callbacks into the numeric
+  `kOn*` contract for both requests and responses. The pure-JS parser remains as an
+  automatic fallback (main-thread sync-compile cap, or `OC_HTTP_PARSER=js`); when
+  the Wasm backend is live it advertises `process.versions.llhttp`.
 
 Together these let Angular's stock `@angular/build` (esbuild + Vite) run from an
-unmodified `ng new` project, and benefit any esbuild/worker-pool tool (Vitest,
-tsup, ...).
+unmodified `ng new` project, benefit any esbuild/worker-pool tool (Vitest, tsup,
+...), and give the whole HTTP stack a spec-grade parser.
 
 ---
 

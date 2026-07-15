@@ -1,8 +1,9 @@
 # CI for OpenContainer. Three tiers, cheapest first:
 #
-#   gate    — offline, Wasm-free spikes (currently the toolchain subsystem guard).
-#             Runs on every push/MR; seconds; catches silent regressions such as
-#             esbuild-wasm version drift or a broken native->wasm alias table.
+#   gate    — offline, Wasm-free spikes (the toolchain subsystem guard + the
+#             llhttp Wasm HTTP-parser guard). Runs on every push/MR; seconds;
+#             catches silent regressions such as esbuild-wasm version drift, a
+#             broken native->wasm alias table, or a broken llhttp Wasm bridge.
 #   verify  — the hermetic offline suite (scripts/verify-node.mjs). Needs the Wasm
 #             VFS/codec/crypto built for Node; runs on MRs + the default branch.
 #   spikes  — the network tier: boots real templates and installs from the live npm

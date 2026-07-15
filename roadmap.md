@@ -652,10 +652,19 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
      `servers` map). The pre-existing `http: server responds 200` / accept-loop /
      two-concurrent-async verify cases now exercise this full path end-to-end. verify:
      38/38 PASS.
-   - ⏳ **Deferred:** compile **llhttp → Wasm** as a drop-in `http_parser` (perf, after
-     the contract is stable), **raw byte-tunnel** streaming (true request/response
-     streaming + binary bodies across the SW seam, replacing the buffered replay), and
-     **`http2`** (needs `internalBinding('http2')`/nghttp2).
+   - ✅ **llhttp → Wasm — DONE.** `internalBinding('http_parser')` is now **real llhttp
+     compiled to Wasm** (`node/bindings/llhttp/`, reusing undici's prebuilt binary,
+     base64-embedded and instantiated synchronously in-worker; regen via
+     `scripts/vendor-llhttp.mjs`). The bridge (`llhttp/llhttp-parser.js`) mirrors Node's
+     `node_http_parser.cc` for both requests and responses; the original pure-JS parser
+     stays as an automatic fallback (main-thread sync-compile cap, or `OC_HTTP_PARSER=js`).
+     Live Wasm advertises `process.versions.llhttp`. Guarded by the offline
+     `scripts/spike-http-llhttp.mjs` and the extended `verify-node.mjs` http case (HEAD,
+     204, chunked req+res, trailers, keep-alive). Same slow-path contract (no
+     `isStreamBase`), so it's a true drop-in.
+   - ⏳ **Deferred:** **raw byte-tunnel** streaming (true request/response streaming +
+     binary bodies across the SW seam, replacing the buffered replay), and **`http2`**
+     (needs `internalBinding('http2')`/nghttp2).
 9. **Network/registry worker** [M] — *decomp.* ✅ **DONE.** A dedicated
    **`Fetcher Worker`** (`packages/demo/fetcher-worker.js`) owns all outbound
    network so downloading/decompressing large payloads never stalls syscall
@@ -1259,7 +1268,8 @@ All bricks (1–5) and Phase 2 items (#1–19) are ✅. What remains is intentio
 none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by kind:
 
 - **Perf / build:**
-  - ⏳ Compile **llhttp → Wasm** as a drop-in `http_parser` (replace the pure-JS parser; #8).
+  - ✅ Compile **llhttp → Wasm** as a drop-in `http_parser` — DONE (see #8; real llhttp
+    vendored from undici, pure-JS fallback, `node/bindings/llhttp/`).
   - ✅ Packaging Stage 2 (**SW-precache the role bundles**) — DONE. Remaining packaging
     polish (split-chunk rare modules, dev-only source maps) deferred; transport gzip/brotli
     is left to the deploy proxy, not app-level (see "Packaging & delivery").
@@ -2015,8 +2025,7 @@ Follow-ups: search result virtualization for very large result sets, a search-hi
 ## Toolchain generalization, install speed, worker-pool & a spike CI harness (this change)
 
 Five improvements that make the architecture more portable and self-guarding. `llhttp → Wasm`
-(replace the pure-JS `http_parser`) is intentionally **deferred to its own follow-up MR** — see
-"Deferred" at #8.
+(replace the pure-JS `http_parser`) followed in its own MR — see the next section.
 
 - **Persistent content-addressed package cache in OPFS.** The package-manager caches moved off the
   ephemeral `/tmp` into a PERSISTED location: `/home/user/.cache/{npm,yarn,corepack}` and the pnpm
@@ -2048,6 +2057,33 @@ Five improvements that make the architecture more portable and self-guarding. `l
   (`--offline` / `--net` / `--all`) that auto-vendors npm and fails loudly on any red. Wired into
   `.gitlab-ci.yml` (fast offline gate on every push; verify + network spikes on MR/schedule) and
   exposed as `npm run spikes[:offline|:net]`. A template must have a green spike before it graduates.
+
+## llhttp → Wasm HTTP parser (this change)
+
+`internalBinding('http_parser')` — the parser beneath Node's real `lib/http` — is now **real
+llhttp compiled to WebAssembly**, replacing the pure-JS HTTP/1.1 parser as the default while
+keeping it as an automatic fallback.
+
+- **No new toolchain.** Rather than stand up a wasi-sdk/clang build just to recompile an artifact
+  identical to what Node already ships, we **vendor undici's prebuilt `llhttp.wasm`** (same upstream
+  https://github.com/nodejs/llhttp, MIT). `scripts/vendor-llhttp.mjs` pins the undici version
+  (currently `undici@6.21.3`) and regenerates `node/bindings/llhttp/llhttp-wasm-data.js` (the binary
+  base64-embedded so there's no fetch, ~48 KB).
+- **Synchronous, in-worker instantiation.** The binding is built synchronously at process bootstrap,
+  so the Wasm is compiled with `new WebAssembly.Module()`. That's allowed in Workers (where guest
+  processes run); on the main thread the 4 KB sync-compile cap throws — which is exactly what trips
+  the pure-JS fallback. `OC_HTTP_PARSER=js|wasm` forces either side (`wasm` = fail loud).
+- **Faithful bridge.** `node/bindings/llhttp/llhttp-parser.js` mirrors Node's `node_http_parser.cc`:
+  it drives llhttp's span callbacks (`on_url`/`on_status`/`on_header_field`/`on_header_value`/
+  `on_body`/`on_headers_complete`/`on_message_complete`) and folds them onto the exact numeric
+  `kOn*` contract `lib/_http_common.js` expects — for BOTH requests (server) and responses (client),
+  including Content-Length, chunked, EOF-delimited bodies, HEAD/204 skip-body, keep-alive/pipelining,
+  trailers, and Upgrade/CONNECT hand-off. `allMethods` follows llhttp's method enum so
+  `allMethods[llhttp_get_method()]` round-trips.
+- **Observability.** When the Wasm backend is live it advertises `process.versions.llhttp` (as real
+  Node does). The offline `scripts/spike-http-llhttp.mjs` (20 checks, wired into the CI offline gate)
+  and the extended `scripts/verify-node.mjs` http case (HEAD, 204, chunked request + response,
+  trailers, keep-alive) guard both the Wasm path and the JS fallback.
 
 ## Definition of done for T2
 

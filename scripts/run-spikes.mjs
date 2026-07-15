@@ -29,6 +29,7 @@ const VENDOR_NPM = path.join(VENDOR_DIR, "node_modules/npm");
 const SPIKES = [
   // --- offline (no live registry) --------------------------------------------
   { name: "toolchain", file: "spike-toolchain.mjs", net: false, timeout: 60000 },
+  { name: "http-llhttp", file: "spike-http-llhttp.mjs", net: false, timeout: 60000 },
   // --- network: graduated templates gated here -------------------------------
   { name: "koa", file: "spike-koa.mjs", net: true },
   { name: "hono", file: "spike-hono.mjs", net: true },

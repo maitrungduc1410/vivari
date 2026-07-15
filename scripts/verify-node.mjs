@@ -1166,10 +1166,13 @@ main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
     "Path B: real Node lib/net.js runs (echo server/client, address(), 2nd conn, chunked, ECONNREFUSED)");
 
   // Path B proof (#8): require('http') is Node's REAL vendored lib/http.js +
-  // _http_* running on the pure-JS internalBinding('http_parser') over the net
-  // loopback. Proves an in-VM server + client: POST with a body, GET with no body,
-  // a chunked (no content-length) response, response headers, keep-alive socket
-  // reuse across two requests, and ECONNREFUSED.
+  // _http_* running on internalBinding('http_parser') over the net loopback. The
+  // parser is now real llhttp compiled to Wasm (process.versions.llhttp is set
+  // when the Wasm backend is live), with a pure-JS fallback. Proves an in-VM
+  // server + client: POST with a body, GET with no body, a chunked (no
+  // content-length) response, a chunked (streamed) request body, response
+  // headers, keep-alive socket reuse, HEAD (skip-body), 204 (no body), response
+  // trailers, and ECONNREFUSED.
   kernel.writeFile(
     "/t/httpb.js",
     `
@@ -1180,6 +1183,20 @@ const server = http.createServer((req, res) => {
   if (req.url === '/chunked') {
     res.writeHead(200, { 'content-type': 'text/plain' }); // no length => chunked
     res.write('chunk-a;'); res.write('chunk-b;'); res.end('chunk-c');
+    return;
+  }
+  if (req.method === 'HEAD') {
+    res.writeHead(200, { 'content-length': '1234', 'x-demo': 'head' });
+    res.end(); // HEAD: headers only, parser must skip the (absent) body
+    return;
+  }
+  if (req.url === '/nocontent') {
+    res.writeHead(204); res.end(); // 204: no body regardless of headers
+    return;
+  }
+  if (req.url === '/trailers') {
+    res.writeHead(200, { 'content-type': 'text/plain', 'Trailer': 'X-Sum' });
+    res.write('trail'); res.addTrailers({ 'X-Sum': '42' }); res.end();
     return;
   }
   let body = '';
@@ -1196,7 +1213,7 @@ function request(port, path, method, payload, agent) {
     const req = http.request({ host: '127.0.0.1', port, method, path, agent }, (res) => {
       let data = ''; res.setEncoding('utf8');
       res.on('data', (c) => data += c);
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, trailers: res.trailers, body: data }));
     });
     req.on('error', reject);
     req.end(payload);
@@ -1207,6 +1224,9 @@ async function main() {
   await new Promise((r) => server.listen(0, r)); // ephemeral port
   const port = server.address().port;
   assert.ok(port > 0, 'http server.address() returns a bound port');
+
+  // The Wasm llhttp backend advertises itself via process.versions.llhttp.
+  assert.ok(process.versions.llhttp, 'llhttp Wasm parser active: ' + process.versions.llhttp);
 
   const post = await request(port, '/hello?x=1', 'POST', 'ping');
   assert.strictEqual(post.status, 200, 'POST status 200');
@@ -1229,6 +1249,34 @@ async function main() {
   assert.strictEqual(JSON.parse(k2.body).url, '/k2', 'keep-alive req 2');
   agent.destroy();
 
+  // client streams a chunked request body (no content-length); server echoes it.
+  const creq = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/chunkreq' }, (res) => {
+      let d = ''; res.setEncoding('utf8');
+      res.on('data', (c) => d += c);
+      res.on('end', () => resolve({ status: res.statusCode, body: d }));
+    });
+    req.on('error', reject);
+    req.write('AAA'); req.write('BBB'); req.end('CCC'); // no content-length => chunked request
+  });
+  assert.strictEqual(JSON.parse(creq.body).echo, 'AAABBBCCC', 'chunked request body reassembled');
+
+  // HEAD: response has headers (incl. content-length) but the parser skips the body.
+  const head = await request(port, '/', 'HEAD');
+  assert.strictEqual(head.status, 200, 'HEAD status 200');
+  assert.strictEqual(head.headers['content-length'], '1234', 'HEAD content-length header present');
+  assert.strictEqual(head.body, '', 'HEAD delivers no body');
+
+  // 204: no body regardless of headers.
+  const nc = await request(port, '/nocontent', 'GET');
+  assert.strictEqual(nc.status, 204, '204 status');
+  assert.strictEqual(nc.body, '', '204 delivers no body');
+
+  // response trailers (chunked) surface on res.trailers.
+  const tr = await request(port, '/trailers', 'GET');
+  assert.strictEqual(tr.body, 'trail', 'trailer response body');
+  assert.strictEqual(tr.trailers['x-sum'], '42', 'response trailer parsed');
+
   // connecting to an unbound port surfaces ECONNREFUSED on the request.
   await new Promise((resolve, reject) => {
     const req = http.request({ host: '127.0.0.1', port: 65531, path: '/', agent: false });
@@ -1247,7 +1295,7 @@ main().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
   );
   const hb = await kernel.start("node", ["/t/httpb.js"], { cwd: "/t", capture: true });
   assert(hb.code === 0 && hb.stdout.includes("HTTPB_OK"),
-    "Path B: real Node lib/http.js runs (POST/GET, chunked, headers, keep-alive, ECONNREFUSED)");
+    "Path B: real Node lib/http.js on llhttp-Wasm (POST/GET, chunked req+res, HEAD, 204, trailers, keep-alive, ECONNREFUSED)");
 
   // === #9: network fetch via the Fetcher Worker (mocked offline) ===
   // A process calls the blocking __ocfetch; the kernel routes to the (mock)
