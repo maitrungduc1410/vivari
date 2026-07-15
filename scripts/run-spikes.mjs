@@ -44,6 +44,10 @@ const SPIKES = [
   { name: "webpack", file: "spike-webpack.mjs", net: true },
   { name: "vitest", file: "spike-vitest.mjs", net: true },
   { name: "angular", file: "spike-angular.mjs", net: true, timeout: 600000 },
+  // In-VM databases (WASM SQL engines). PGlite ships ~16 MB of WASM + data, so
+  // its install + first-boot compile need a longer budget.
+  { name: "sqlite", file: "spike-sqlite.mjs", net: true },
+  { name: "pglite", file: "spike-pglite.mjs", net: true, timeout: 900000 },
 ];
 
 const args = process.argv.slice(2);

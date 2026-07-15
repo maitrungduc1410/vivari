@@ -266,7 +266,12 @@ export function createRuntime({
   // internalBinding('buffer'), `fs` is Node's real lib/fs.js over
   // internalBinding('fs') (node/bindings/fs.js -> Rust VFS via the sync bridge),
   // and `events`/`util` run on our shared internal layer (util.inspect bridged).
-  const nodeModules = createNodeModules({ process, syscalls, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks });
+  // Cross-process pipe (UNIX socket) bridge. The net binding uses `postRaw` to
+  // relay socket bytes to the kernel (which forwards them to the peer process) and
+  // `wake` to nudge the loop when inbound bytes arrive; it publishes `dispatch` so
+  // kernel-delivered pipe messages route back into the binding. See bindings/net.js.
+  const pipeBridge = { postRaw, wake: loop.wakeNet, dispatch: null };
+  const nodeModules = createNodeModules({ process, syscalls, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks, pipeBridge });
   const bufferModule = nodeModules.require("buffer");
   const Buffer = bufferModule.Buffer;
   const path = nodeModules.require("path");
@@ -1035,7 +1040,16 @@ export function createRuntime({
       const m = ocRootRequire(String(spec));
       if (m && m.__esModule) return m;
       const ns = Object.create(null);
-      if (m && typeof m === "object") for (const k of Object.keys(m)) ns[k] = m[k];
+      // Mirror Node's CJS→ESM interop: named exports are the module.exports' own
+      // enumerable keys, PLUS a `default`. Crucially this must also apply when the
+      // export is a FUNCTION with statics hung off it — e.g. the `module` builtin
+      // is the `Module` class carrying `createRequire`/`builtinModules`/… as
+      // statics, and PGlite's Emscripten glue does
+      // `const { createRequire } = await import('module')` (was undefined here,
+      // surfacing as "e is not a function" deep in PGlite.create()).
+      if (m && (typeof m === "object" || typeof m === "function")) {
+        for (const k of Object.keys(m)) ns[k] = m[k];
+      }
       ns.default = m;
       return ns;
     });
@@ -1126,6 +1140,10 @@ export function createRuntime({
     /** External delivery from the kernel: a browser preview ws tunnel message
      * ({type:'ws-open'|'ws-in'|'ws-close', connId, ...}). roadmap #19 stage C. */
     dispatchWs: (msg) => dispatchWs(msg),
+    /** External delivery from the kernel: a cross-process pipe (UNIX socket)
+     * message ({type:'pipe-open'|'pipe-data'|'pipe-shutdown'|'pipe-close',
+     * connId, ...}) for a connection this process is an endpoint of. */
+    dispatchPipe: (msg) => pipeBridge.dispatch && pipeBridge.dispatch(msg),
     /** External delivery from the kernel: an async fetch result
      * ({type:'fetch-done', fetchId, ok, meta|error}). Parallel downloads. */
     dispatchFetch: (msg) => dispatchFetch(msg),

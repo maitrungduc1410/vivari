@@ -180,8 +180,8 @@ function OCWebSocket(url, protocols){
     // Cross-service: a ws URL under /preview/<port>/ addresses ANOTHER in-VM
     // server (e.g. a backend on a different port), not this iframe's own dev
     // server. Route to that port and strip the proxy prefix so the server sees
-    // its real path. URLs without the prefix (Vite HMR, same-app sockets) keep
-    // the iframe's own port — so HMR is unaffected.
+    // its real path. A prefix-less ws URL routes by its explicit :port (see the
+    // else-if below); a port-less one keeps the iframe's own preview port.
     var pm = u.pathname.match(/^\\/preview\\/(\\d+)(\\/.*)?$/);
     if (pm) {
       targetPort = parseInt(pm[1], 10);
@@ -191,9 +191,17 @@ function OCWebSocket(url, protocols){
       // in-VM port (a genuine cross-service socket).
       if (window.__ocKeepPrefix && targetPort === previewPort) path = u.pathname + u.search;
       else path = (pm[2] || '/') + u.search;
+    } else if (u.port && u.port !== location.port) {
+      // An explicit ws port that isn't the studio origin's own port addresses a
+      // specific in-VM listener — e.g. Vite's dedicated HMR socket (default :24678)
+      // when Vite runs in middleware mode, as Nuxt/Nitro does (HTTP on :3000, HMR
+      // on :24678). Without this the HMR ws tunnels to previewPort (the HTTP
+      // server), which rejects the upgrade → no HMR. Route to the real port; the
+      // kernel falls back to previewPort if nothing is listening there.
+      targetPort = parseInt(u.port, 10);
     }
   } catch(e){}
-  post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, path:path, protocols: protocols || null });
+  post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path, protocols: protocols || null });
 }
 OCWebSocket.CONNECTING = 0; OCWebSocket.OPEN = 1; OCWebSocket.CLOSING = 2; OCWebSocket.CLOSED = 3;
 OCWebSocket.prototype._deliver = function(d){

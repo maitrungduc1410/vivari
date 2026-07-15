@@ -68,7 +68,19 @@ export default function (exports, require, module, process, internalBinding, pri
     // loader relies on. Match Node: resolve, then let URL#pathname encode it.
     pathToFileURL: (p) => {
       const path = require("path");
-      const resolved = path.resolve(String(p));
+      const filepath = String(p);
+      let resolved = path.resolve(filepath);
+      // path.resolve() strips a trailing separator, but Node's pathToFileURL
+      // preserves it (lib/internal/url.js re-adds the slash resolve() dropped).
+      // This matters for directory bases: ESM/exsolve resolvers build
+      // `new URL("./node_modules/<pkg>", base)`, which only stays inside the
+      // directory when `base` keeps its trailing slash. Without it the request
+      // resolves one directory too high and installed packages (e.g. @nuxt/kit)
+      // fail to resolve ("Cannot resolve module").
+      const last = filepath.charCodeAt(filepath.length - 1);
+      if (last === 47 /* '/' */ && resolved[resolved.length - 1] !== "/") {
+        resolved += "/";
+      }
       const u = new URL("file:///");
       u.pathname = resolved;
       return u;

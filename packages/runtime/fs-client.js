@@ -35,6 +35,7 @@ import {
   OP_RENAME,
   OP_SYMLINK,
   OP_READLINK,
+  OP_LINK,
   OP_OPEN,
   OP_CLOSE,
   OP_FD_READ,
@@ -52,6 +53,9 @@ import {
   OP_FETCH_ASYNC,
   OP_WATCH,
   OP_UNWATCH,
+  OP_PIPE_LISTEN,
+  OP_PIPE_CONNECT,
+  OP_PIPE_CLOSE_SERVER,
 } from "../protocol/syscall.js";
 
 // Cap each fd read/write to keep both request and response inside the 1 MiB
@@ -107,6 +111,9 @@ export function createSyscalls({ ctrl, data, notify }) {
     rmdir: (p) => call(OP_RMDIR, encodeRequest([b(p)])),
     rename: (from, to) => call(OP_RENAME, encodeRequest([b(from), b(to)])),
     symlink: (target, link) => call(OP_SYMLINK, encodeRequest([b(target), b(link)])),
+    // Hard link: a second name for the SAME inode (no byte copy). Throws ENOSYS
+    // on a VFS build without link support; the fs binding falls back to a copy.
+    link: (existing, linkpath) => call(OP_LINK, encodeRequest([b(existing), b(linkpath)])),
     readlink: (p) => decodeBytes(call(OP_READLINK, encodeRequest([b(p)]))),
 
     // ---- file-descriptor layer (Phase 2 #4) ----
@@ -194,6 +201,18 @@ export function createSyscalls({ ctrl, data, notify }) {
       }
     },
     closeServer: (port) => call(OP_CLOSE_SERVER, encodeRequest([b(JSON.stringify({ port }))])),
+
+    // ---- cross-process UNIX sockets / named pipes ----
+    // Register a pipe server's socket path so a client in another process can find
+    // it. Throws EADDRINUSE if another live process already owns the path.
+    pipeListen: (path) => call(OP_PIPE_LISTEN, encodeRequest([b(JSON.stringify({ path }))])),
+    // Resolve `path` to a live cross-process connection. Returns { connId } on
+    // success; throws ENOENT if no process is listening on that path. Data then
+    // flows out of band (postMessage), keyed by connId — see OP_PIPE_* in syscall.js.
+    pipeConnect: (path) =>
+      JSON.parse(decodeBytes(call(OP_PIPE_CONNECT, encodeRequest([b(JSON.stringify({ path }))])))),
+    pipeCloseServer: (path) =>
+      call(OP_PIPE_CLOSE_SERVER, encodeRequest([b(JSON.stringify({ path }))])),
 
     // ---- network fetch (Phase 2 #9) ----
     // Blocking fetch: parks until the kernel (via the Fetcher Worker) has streamed

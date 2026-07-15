@@ -134,6 +134,18 @@ export interface IdeSnapshot {
   paletteOpen: boolean;
   paletteMode: "command" | "file";
   problems: { errors: number; warnings: number }; // live TS/JS diagnostics (status bar)
+  memInfo: MemInfo | null; // last "Measure Memory" result (StatusBar readout)
+}
+
+// A snapshot of the tab's memory, produced by measureMemory(). `total` is the
+// whole-page estimate (performance.measureUserAgentSpecificMemory, which covers
+// dedicated workers); `vfsBytes`/`vfsFiles` are the VFS's in-RAM content size
+// reported by the File System Worker. `measuring` gates the StatusBar spinner.
+export interface MemInfo {
+  total: number | null;
+  vfsBytes: number;
+  vfsFiles: number;
+  ts: number;
 }
 
 const TERM_THEME = {
@@ -152,6 +164,16 @@ const ESC = "\x1b[";
 const REGISTRY_KEY = "oc-workspace-projects";
 
 const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
+// Human-readable byte size for the memory readout (MB/GB with one decimal).
+export const fmtBytes = (n: number): string => {
+  if (!Number.isFinite(n) || n < 0) return "—";
+  if (n < 1024) return `${n} B`;
+  const kb = n / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  return `${(mb / 1024).toFixed(2)} GB`;
+};
 const normDir = (p: string) => {
   const n = "/" + p.split("/").filter((s) => s && s !== ".").join("/");
   return n === "/" ? "/" : n.replace(/\/+$/, "");
@@ -221,6 +243,7 @@ export class IdeController {
     paletteOpen: false,
     paletteMode: "command",
     problems: { errors: 0, warnings: 0 },
+    memInfo: null,
   };
 
   // ── imperative state (not reactive) ──
@@ -381,8 +404,11 @@ export class IdeController {
       convertEol: true,
       cursorBlink: true,
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace',
+      // Each terminal retains `scrollback` lines of parsed buffer; with several
+      // terminals (console + shells) 8000 each adds up. 2000 keeps ample history
+      // while cutting the per-terminal buffer footprint.
       fontSize: 12.5,
-      scrollback: 8000,
+      scrollback: 2000,
       theme: TERM_THEME,
     });
     const fit = new FitAddon();
@@ -571,7 +597,9 @@ export class IdeController {
       theme: "vs-dark",
       automaticLayout: true,
       fontSize: 13,
-      minimap: { enabled: true },
+      // Minimap renders (and retains) a second tokenized view of the whole file;
+      // disabling it trims per-editor memory at no real usability cost here.
+      minimap: { enabled: false },
       scrollBeyondLastLine: false,
       tabSize: 2,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
@@ -1599,6 +1627,70 @@ export class IdeController {
   }
   resetAndReload() {
     location.href = location.pathname + "?reset";
+  }
+
+  // ── memory diagnostics ─────────────────────────────────────────────────────
+  // Measure the tab's memory and log a breakdown to the Console. This is possible
+  // because the studio is cross-origin isolated (COOP/COEP for SharedArrayBuffer),
+  // which is exactly what unlocks performance.measureUserAgentSpecificMemory().
+  // The page estimate covers this window + its dedicated workers; we additionally
+  // ask the kernel/FS worker for the VFS's in-RAM content size, which is what
+  // balloons when a heavy node_modules (Docusaurus/Nuxt) is loaded.
+  async measureMemory() {
+    this.consoleLine("Measuring memory…", "90");
+    let total: number | null = null;
+    type MemResult = { bytes: number; breakdown?: { bytes: number; types?: string[]; attribution?: { url?: string }[] }[] };
+    const perf = performance as Performance & {
+      measureUserAgentSpecificMemory?: () => Promise<MemResult>;
+    };
+    try {
+      if (typeof perf.measureUserAgentSpecificMemory === "function") {
+        const r = await perf.measureUserAgentSpecificMemory();
+        total = r.bytes;
+        this.consoleLine(`Tab total (page + workers): ${fmtBytes(total)}`, "36");
+        // Largest attributed buckets first, so the dominant consumer is obvious.
+        const rows = (r.breakdown ?? [])
+          .filter((b) => b.bytes > 0)
+          .sort((a, b) => b.bytes - a.bytes)
+          .slice(0, 12);
+        for (const b of rows) {
+          const label =
+            (b.attribution ?? []).map((a) => a.url).filter(Boolean).join(", ") ||
+            (b.types ?? []).join("/") ||
+            "(unattributed)";
+          this.consoleLine(`  ${fmtBytes(b.bytes).padStart(9)}  ${label}`, "90");
+        }
+      } else {
+        this.consoleLine(
+          "performance.measureUserAgentSpecificMemory() unavailable (needs a Chromium browser + cross-origin isolation).",
+          "31",
+        );
+      }
+    } catch (err) {
+      this.consoleLine(`memory measurement failed: ${(err as Error)?.message ?? err}`, "31");
+    }
+
+    // VFS content footprint (the File System Worker's Wasm) + the kernel worker's
+    // own measurement, gathered over the bridge.
+    let vfsBytes = -1;
+    let vfsFiles = -1;
+    try {
+      const m = await this.bridge.request("oc-mem");
+      vfsBytes = Number(m.vfsBytes ?? -1);
+      vfsFiles = Number(m.vfsFiles ?? -1);
+      if (vfsBytes >= 0) {
+        this.consoleLine(`VFS content in RAM: ${fmtBytes(vfsBytes)} across ${vfsFiles} files`, "36");
+      } else {
+        this.consoleLine("VFS content size unavailable (rebuild the VFS wasm: `npm run build:vfs`).", "90");
+      }
+      if (typeof m.kernelBytes === "number") {
+        this.consoleLine(`Kernel worker: ${fmtBytes(m.kernelBytes as number)}`, "90");
+      }
+    } catch {
+      /* kernel not ready */
+    }
+
+    this.set({ memInfo: { total, vfsBytes, vfsFiles, ts: Date.now() } });
   }
 
   // ── kernel worker message handling (ported from host.js) ──────────────────
