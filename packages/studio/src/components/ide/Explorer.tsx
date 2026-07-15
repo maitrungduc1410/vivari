@@ -18,6 +18,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils";
 import { FileIcon, FolderIcon } from "./fileIcon";
 import { useIde } from "./useIde";
+import { OC_PATH_MIME, entriesFromDataTransfer } from "@/oc/controller";
 
 interface Entry {
   name: string;
@@ -44,7 +45,49 @@ export function Explorer() {
   const [creating, setCreating] = useState<Creating | null>(null);
   const [createValue, setCreateValue] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState<string | null>(null);
   const loading = useRef<Set<string>>(new Set());
+
+  // ── drag & drop ────────────────────────────────────────────────────────────
+  // Make a row a drag source (its absolute path travels in the OC_PATH_MIME slot).
+  const dragProps = (abs: string) => ({
+    draggable: true,
+    onDragStart: (e: React.DragEvent) => {
+      e.stopPropagation(); // don't let an ancestor row overwrite the payload
+      e.dataTransfer.setData(OC_PATH_MIME, abs);
+      e.dataTransfer.setData("text/plain", abs);
+      e.dataTransfer.effectAllowed = "copyMove";
+    },
+    onDragEnd: () => setDragOver(null),
+  });
+
+  // Make a row/area a drop target that reorganizes (internal) or imports (OS).
+  // `destDir` receives the drop; `key` drives the hover highlight.
+  const dropProps = (destDir: string | null, key: string) => ({
+    onDragOver: (e: React.DragEvent) => {
+      if (!destDir) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const internal = e.dataTransfer.types.includes(OC_PATH_MIME);
+      e.dataTransfer.dropEffect = internal ? (e.ctrlKey || e.metaKey ? "copy" : "move") : "copy";
+      if (dragOver !== key) setDragOver(key);
+    },
+    onDragLeave: () => setDragOver((cur) => (cur === key ? null : cur)),
+    onDrop: (e: React.DragEvent) => {
+      if (!destDir) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setDragOver(null);
+      const internal = e.dataTransfer.getData(OC_PATH_MIME);
+      if (internal) {
+        if (e.ctrlKey || e.metaKey) void c.copyEntryTo(internal, destDir);
+        else void c.moveEntry(internal, destDir);
+        return;
+      }
+      const entries = entriesFromDataTransfer(e.dataTransfer);
+      if (entries.length) void c.importInto(destDir, entries);
+    },
+  });
 
   // Load a directory's children from the live VFS (once, unless refreshed).
   const load = useCallback(
@@ -171,9 +214,13 @@ export function Explorer() {
           onOpen={() => toggle(abs)} onRename={() => startRename(abs)} onDelete={() => setConfirmDelete(abs)}
           onNewFile={() => startCreate(abs, "file")} onNewFolder={() => startCreate(abs, "folder")}>
           <div
+            {...dragProps(abs)}
+            {...dropProps(abs, abs)}
             className={cn(
               "flex w-full items-center gap-1 py-0.5 text-left text-sm",
-              selected?.abs === abs ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+              dragOver === abs
+                ? "bg-accent/80 text-foreground ring-1 ring-inset ring-primary"
+                : selected?.abs === abs ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
             )}
             style={{ paddingLeft: 8 + depth * 12 }}
             onClick={() => { select(abs, true, folderId); toggle(abs); }}
@@ -193,16 +240,20 @@ export function Explorer() {
     const isSelected = selected?.abs === abs;
     return (
       <RowMenu key={abs} abs={abs} isDir={false} destDir={parentDir(abs)} folderId={folderId} c={c} canPaste={snap.clipboard != null}
-        onOpen={() => c.openFile(abs, { preview: false })} onRename={() => startRename(abs)} onDelete={() => setConfirmDelete(abs)}
+        onOpen={() => c.openEntry(abs, { preview: false })} onRename={() => startRename(abs)} onDelete={() => setConfirmDelete(abs)}
         onNewFile={() => startCreate(parentDir(abs), "file")} onNewFolder={() => startCreate(parentDir(abs), "folder")}>
         <div
+          {...dragProps(abs)}
+          {...dropProps(parentDir(abs), abs)}
           className={cn(
             "flex w-full items-center gap-1.5 py-0.5 text-left text-sm",
-            isSelected || snap.activeTab === abs ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50",
+            dragOver === abs
+              ? "bg-accent/80 text-foreground ring-1 ring-inset ring-primary"
+              : isSelected || snap.activeTab === abs ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50",
           )}
           style={{ paddingLeft: 8 + depth * 12 + 16 }}
-          onClick={() => { select(abs, false, folderId); void c.openFile(abs, { preview: true }); }}
-          onDoubleClick={() => void c.openFile(abs, { preview: false })}
+          onClick={() => { select(abs, false, folderId); void c.openEntry(abs, { preview: true }); }}
+          onDoubleClick={() => void c.openEntry(abs, { preview: false })}
         >
           <FileIcon name={name} className="size-4 shrink-0" />
           {isRenaming ? nameInput(renameValue, setRenameValue, commitRename, () => setRenaming(null)) : <span className="truncate">{name}</span>}
@@ -231,7 +282,11 @@ export function Explorer() {
         </HeaderBtn>
       </div>
       <ScrollArea className="flex-1">
-        <div className="pb-4 outline-none" tabIndex={0}>
+        <div
+          className={cn("min-h-full pb-4 outline-none", dragOver === "__area__" && "bg-accent/30")}
+          tabIndex={0}
+          {...dropProps(active?.rootPath ?? null, "__area__")}
+        >
           {snap.workspaceFolders.length === 0 ? (
             <div className="px-3 py-2 text-xs text-muted-foreground">
               No folder open. Go <button className="text-foreground underline" onClick={() => c.goHome()}>Home</button> to create or open a project.
@@ -245,9 +300,12 @@ export function Explorer() {
                     onOpen={() => toggle(f.rootPath)} onRename={() => { /* roots aren't renamed */ }} onDelete={() => c.closeFolder(f.id)}
                     onNewFile={() => startCreate(f.rootPath, "file")} onNewFolder={() => startCreate(f.rootPath, "folder")}>
                     <div
+                      {...dropProps(f.rootPath, f.id)}
                       className={cn(
                         "flex w-full items-center gap-1 py-1 pl-2 text-left text-[11px] font-semibold uppercase tracking-wide",
-                        snap.activeFolderId === f.id ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+                        dragOver === f.id
+                          ? "bg-accent/80 text-foreground ring-1 ring-inset ring-primary"
+                          : snap.activeFolderId === f.id ? "text-foreground" : "text-muted-foreground hover:text-foreground",
                       )}
                       onClick={() => { c.setActiveFolder(f.id); toggle(f.rootPath); }}
                     >
