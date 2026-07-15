@@ -2228,7 +2228,7 @@ events, exactly what native `EventSource` gives you.
   exact tunnel **headlessly, no browser**: it installs + binds the server, then calls
   `kernel.handleSseClient({sub:'open',…})` and collects `kernel.onSseSend` chunks, asserting the
   stream opens and delivers default + `metric` + `notice` events with an advancing counter.
-  Stays `experimental` until green in CI.
+  Now green in CI, so the `sse` template is **graduated** (no longer `experimental`).
 - **Feasibility proof.** The streaming + parsing core was confirmed in vanilla Node (an
   `http.createServer` SSE endpoint consumed by `http.request` with `cres.on('data')`): chunks
   arrive incrementally (one batch per server tick, not buffered to `end`), and the same
