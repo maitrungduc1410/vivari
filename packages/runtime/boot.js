@@ -88,6 +88,7 @@ export function bootProcess({
       dispatchChild: runtime.dispatchChild,
       dispatchThread: runtime.dispatchThread,
       dispatchWs: runtime.dispatchWs,
+      dispatchSse: runtime.dispatchSse,
       dispatchPipe: runtime.dispatchPipe,
       dispatchStdin: runtime.dispatchStdin,
       dispatchFetch: runtime.dispatchFetch,
