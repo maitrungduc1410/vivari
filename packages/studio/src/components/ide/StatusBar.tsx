@@ -1,14 +1,31 @@
+import CircleX from "~icons/lucide/circle-x";
+import TriangleAlert from "~icons/lucide/triangle-alert";
 import { useIde } from "./useIde";
 import { fmtBytes } from "../../oc/controller";
 
 export function StatusBar() {
   const { c, snap } = useIde();
+  const { errors, warnings } = snap.problems;
   const mem = snap.memInfo;
   const memLabel = mem
     ? `mem ${fmtBytes(mem.total ?? -1)}${mem.vfsBytes >= 0 ? ` · vfs ${fmtBytes(mem.vfsBytes)}` : ""}`
     : "measure memory";
   return (
     <div className="flex h-6 shrink-0 items-center gap-4 bg-primary/90 px-3 text-xs text-primary-foreground">
+      {/* Live TS/JS diagnostics from the language-service worker. */}
+      <span
+        className="flex items-center gap-2 opacity-90"
+        title={`${errors} error${errors === 1 ? "" : "s"}, ${warnings} warning${warnings === 1 ? "" : "s"}`}
+      >
+        <span className="flex items-center gap-1">
+          <CircleX className="size-3.5" />
+          {errors}
+        </span>
+        <span className="flex items-center gap-1">
+          <TriangleAlert className="size-3.5" />
+          {warnings}
+        </span>
+      </span>
       <span className="truncate">{snap.status}</span>
       <span className="flex-1" />
       <button
