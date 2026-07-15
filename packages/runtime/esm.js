@@ -479,9 +479,19 @@ export function transpileEsm(source, filename) {
           if (imported === "default") {
             prelude.push("__oc_exports[" + JSON.stringify(local) + "]=__oc_def(" + m + ");");
           } else {
-            prelude.push(
+            // Emit the re-export getter EARLY (in exportGetters, before the prelude
+            // requires) and resolve the source module LAZILY via __oc_require (cached)
+            // rather than closing over `m` (declared later in the prelude). Otherwise a
+            // circular importer that reads this re-exported name mid-cycle sees `undefined`
+            // (the getter isn't defined yet) and silently snapshots it — no TDZ throw, so
+            // the live-binding fallback never fires. astro's middleware/index.js barrel
+            // re-exports `sequence` while render-context.js eagerly imports it, and
+            // render-context read `undefined` → `sequence(...)` later → "Function.prototype
+            // .apply was called on undefined". __oc_require is cached, so re-resolving in
+            // the getter returns the same (possibly mid-cycle, but hoisted) module.
+            exportGetters.push(
               "Object.defineProperty(__oc_exports," + JSON.stringify(local) +
-              ",{enumerable:true,configurable:true,get:function(){return " + m + "[" + JSON.stringify(imported) + "];}});",
+              ",{enumerable:true,configurable:true,get:function(){return __oc_require(" + JSON.stringify(spec) + ")[" + JSON.stringify(imported) + "];}});",
             );
           }
         }
@@ -500,7 +510,7 @@ export function transpileEsm(source, filename) {
           // Defer: we only need the eager `const local = m.imported` snapshot if the
           // body actually references `local`. If it's only re-exported, we skip the
           // snapshot (avoiding a cyclic TDZ read) and wire a lazy getter below.
-          namedImports.set(local, { m, imported });
+          namedImports.set(local, { m, imported, spec });
           deferredNamedConsts.push({ local, m, imported });
         }
       }
@@ -531,7 +541,6 @@ export function transpileEsm(source, filename) {
   // unused. Strings/comments are left intact and count as a use, so the check errs
   // toward KEEPING the eager snapshot (current behaviour) — it only ever removes a
   // snapshot when the name is provably absent from executable code.
-  const reexportGetters = []; // lazy re-exports of imported names (appended after requires)
   if (deferredNamedConsts.length) {
     const masked = source.split("");
     const blank = (s, e) => { for (let k = s; k < e && k < masked.length; k++) if (masked[k] !== "\n") masked[k] = " "; };
@@ -574,9 +583,9 @@ export function transpileEsm(source, filename) {
       if (!hasKeywordDefault && !keptDefault && ex.ln) {
         const src = namedImports.get(ex.ln);
         if (src) {
-          reexportGetters.push(
-            "Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return " +
-              src.m + "[" + JSON.stringify(src.imported) + "];}});",
+          exportGetters.push(
+            "Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return __oc_require(" +
+              JSON.stringify(src.spec) + ")[" + JSON.stringify(src.imported) + "];}});",
           );
         } else {
           exportGetters.push(
@@ -587,14 +596,15 @@ export function transpileEsm(source, filename) {
       }
       continue;
     }
-    // `export { X }` where X is itself a named import → re-export as a LAZY live
-    // binding to the source module (deferred until after the import cycle resolves),
-    // not a read of X's eager snapshot (which may not exist / may be mid-TDZ).
+    // `export { X }` where X is itself a named import → re-export as a LAZY live binding
+    // to the source module, emitted EARLY (before the requires) and resolved via
+    // __oc_require, so a circular importer reading it mid-cycle gets a defined getter, not
+    // undefined / a mid-TDZ eager snapshot. (See the `export … from` note above.)
     const src = namedImports.get(local);
     if (src) {
-      reexportGetters.push(
+      exportGetters.push(
         "Object.defineProperty(__oc_exports," + JSON.stringify(ex.n) +
-        ",{enumerable:true,configurable:true,get:function(){return " + src.m + "[" + JSON.stringify(src.imported) + "];}});",
+        ",{enumerable:true,configurable:true,get:function(){return __oc_require(" + JSON.stringify(src.spec) + ")[" + JSON.stringify(src.imported) + "];}});",
       );
       continue;
     }
@@ -603,16 +613,12 @@ export function transpileEsm(source, filename) {
       ",{enumerable:true,configurable:true,get:function(){return " + local + ";}});",
     );
   }
-  // Lazy re-export getters read the source-module var (declared in `prelude` above),
-  // so they must come AFTER the requires — append them to the end of the prelude.
-  for (const g of reexportGetters) prelude.push(g);
-
   const fileUrl = "file://" + (filename || "");
   const head =
     helpers(fileUrl, filename) +
     "Object.defineProperty(__oc_exports,'__esModule',{value:true});" +
-    // Local export getters first (live bindings visible to circular importers),
-    // then import requires + import-derived bindings + re-export getters.
+    // Export getters first (local live bindings + lazy re-export getters, both visible to
+    // circular importers before this module's body runs), then the import requires.
     exportGetters.join("") +
     prelude.join("");
   // The CJS-interop override runs AFTER the body (so the local binding exists) and
@@ -658,7 +664,8 @@ export function transpileEsmLive(source, filename) {
   if (!hasModuleSyntax) return null;
 
   const edits = [];
-  const prelude = []; // requires + re-export getters (reference the require var, live)
+  const prelude = []; // requires
+  const reexportEarly = []; // lazy re-export getters, emitted BEFORE the requires
   const liveDefs = []; // getters on __oc_live for each imported binding
   const localGetters = []; // export getters for local names (run INSIDE the `with`)
   const fromRanges = [];
@@ -690,7 +697,8 @@ export function transpileEsmLive(source, filename) {
       } else {
         for (const { imported, local } of namedFromBraces(clause)) {
           if (imported === "default") prelude.push("__oc_exports[" + JSON.stringify(local) + "]=__oc_def(" + m + ");");
-          else prelude.push("Object.defineProperty(__oc_exports," + JSON.stringify(local) + ",{enumerable:true,configurable:true,get:function(){return " + m + "[" + JSON.stringify(imported) + "];}});");
+          // Lazy re-require, emitted early (before requires) — see transpileEsm note.
+          else reexportEarly.push("Object.defineProperty(__oc_exports," + JSON.stringify(local) + ",{enumerable:true,configurable:true,get:function(){return __oc_require(" + JSON.stringify(spec) + ")[" + JSON.stringify(imported) + "];}});");
         }
       }
     } else {
@@ -703,7 +711,7 @@ export function transpileEsmLive(source, filename) {
         if (c.default) liveDefs.push(defLive(c.default, "__oc_def(" + m + ")"));
         if (c.namespace) liveDefs.push(defLive(c.namespace, "__oc_ns(" + m + ")"));
         for (const { imported, local } of c.named) {
-          namedImports.set(local, { m, imported });
+          namedImports.set(local, { m, imported, spec });
           liveDefs.push(defLive(local, m + "[" + JSON.stringify(imported) + "]"));
         }
       }
@@ -727,14 +735,14 @@ export function transpileEsmLive(source, filename) {
     if (ex.n === "default") {
       if (!hasKeywordDefault && !keptDefault && ex.ln) {
         const src = namedImports.get(ex.ln);
-        if (src) prelude.push("Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return " + src.m + "[" + JSON.stringify(src.imported) + "];}});");
+        if (src) reexportEarly.push("Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return __oc_require(" + JSON.stringify(src.spec) + ")[" + JSON.stringify(src.imported) + "];}});");
         else localGetters.push("Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return " + ex.ln + ";}});");
       }
       continue;
     }
     const src = namedImports.get(local);
     if (src) {
-      prelude.push("Object.defineProperty(__oc_exports," + JSON.stringify(ex.n) + ",{enumerable:true,configurable:true,get:function(){return " + src.m + "[" + JSON.stringify(src.imported) + "];}});");
+      reexportEarly.push("Object.defineProperty(__oc_exports," + JSON.stringify(ex.n) + ",{enumerable:true,configurable:true,get:function(){return __oc_require(" + JSON.stringify(src.spec) + ")[" + JSON.stringify(src.imported) + "];}});");
       continue;
     }
     localGetters.push("Object.defineProperty(__oc_exports," + JSON.stringify(ex.n) + ",{enumerable:true,configurable:true,get:function(){return " + local + ";}});");
@@ -749,6 +757,7 @@ export function transpileEsmLive(source, filename) {
     helpers(fileUrl, filename) +
     "Object.defineProperty(__oc_exports,'__esModule',{value:true});" +
     "const __oc_live=Object.create(null);" +
+    reexportEarly.join("") +
     prelude.join("") +
     liveDefs.join("");
   const tail = cjsOverride ? "\n;__oc_module.exports=" + cjsOverride + ";" : "";

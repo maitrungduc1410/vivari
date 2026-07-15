@@ -57,7 +57,10 @@ console.log("\n== [esm] circular re-export → lazy live binding ==");
   const barrelSrc = `import { Fragment } from './common.js';\nexport { Fragment };\n`;
   const barrelOut = transpileEsm(barrelSrc, "/barrel.js");
   check("no eager `const Fragment = m.Fragment` snapshot", !/const Fragment\s*=/.test(barrelOut));
-  check("Fragment exported via a lazy getter to the source module", /get:function\(\)\{return __oc_m\d+\["Fragment"\]/.test(barrelOut));
+  // The re-export getter is emitted EARLY (before the requires) and re-resolves the
+  // source module lazily via __oc_require (cached), so a circular importer reading it
+  // mid-cycle sees a defined getter, not undefined.
+  check("Fragment exported via an early lazy getter (re-require to source)", /get:function\(\)\{return __oc_require\("\.\/common\.js"\)\["Fragment"\]/.test(barrelOut));
 
   // Execute the whole cycle through a tiny OC-shaped loader (sync require + partial
   // exports on re-entry, exactly like packages/runtime/module.js). The cycle is
@@ -93,6 +96,53 @@ console.log("\n== [esm] circular re-export → lazy live binding ==");
   check("cycle loads without TDZ throw", !threw);
   if (threw) console.log("       threw: " + threw);
   check("re-exported Fragment resolves to the source Symbol", result === Symbol.for("spike:fragment"));
+}
+
+// ── 2b. barrel re-export read mid-cycle must not snapshot `undefined` ─────────
+// astro: middleware/index.js re-exports `sequence` (import-then-re-export); render-
+// context.js eagerly imports it AND spread-calls it (`sequence(...mw)`). The re-export
+// getter used to be emitted at the END of the barrel's prelude (after its requires), so
+// a circular importer reading it mid-cycle got `undefined` — no TDZ throw, so no live
+// fallback — and the later spread call `undefined(...args)` blew up with V8's
+// "Function.prototype.apply was called on undefined". Emitting the re-export getter
+// EARLY (before the requires) + resolving via __oc_require fixes it.
+console.log("\n== [esm] barrel re-export read mid-cycle resolves (no apply-on-undefined) ==");
+{
+  const fixtures = {
+    // consumer loaded FIRST; imports `seq` from the barrel and spread-calls it in a method
+    "/rc.js": `import { seq } from './barrel.js';\nexport const SYM = Symbol.for('spike:rc');\nexport class RC { static make(){ return seq('a','b'); } }\n`,
+    // barrel: pure import-then-re-export (seq not otherwise used)
+    "/barrel.js": `import { seq } from './seq.js';\nexport { seq };\n`,
+    // seq: hoisted function; imports SYM from rc (mid-cycle) → its own live fallback
+    "/seq.js": `import { SYM } from './rc.js';\nfunction seq(...h){ return SYM ? 'seq#' + h.length : 'no'; }\nexport { seq };\n`,
+  };
+  const cache = new Map();
+  const norm = (id) => "/" + id.replace(/^\.?\//, "");
+  const load = (rawId) => {
+    const id = norm(rawId);
+    if (cache.has(id)) return cache.get(id).exports;
+    const mod = { exports: Object.create(null) };
+    cache.set(id, mod);
+    const compile = (out) => {
+      try { return new Function("__oc_exports", "__oc_require", "__oc_module", out + "\n"); }
+      catch { return new AsyncFunction("__oc_exports", "__oc_require", "__oc_module", out + "\n"); }
+    };
+    try {
+      compile(transpileEsm(fixtures[id], id)).call(mod.exports, mod.exports, load, mod);
+    } catch (e) {
+      if (e instanceof ReferenceError && /before initialization|is not defined/.test(e.message)) {
+        compile(transpileEsmLive(fixtures[id], id)).call(mod.exports, mod.exports, load, mod);
+      } else throw e;
+    }
+    return mod.exports;
+  };
+  // Load seq.js first so rc.js reads barrel['seq'] while the barrel is mid-cycle.
+  load("/seq.js");
+  let out, threw = "";
+  try { out = load("/rc.js").RC.make(); } catch (e) { threw = e.message; }
+  check("spread-calling the re-exported fn does not throw", !threw);
+  if (threw) console.log("       threw: " + threw);
+  check("re-exported function resolves (returns 'seq#2')", out === "seq#2");
 }
 
 // ── 3. imported name used ONLY via spread must keep its eager const ───────────

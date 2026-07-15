@@ -2513,9 +2513,24 @@ and are gated by a new offline `scripts/spike-esm.mjs`.
   `scripts/spike-esm.mjs`. Left `experimental` pending final browser confirmation of a
   rendered page.
 
+  Once routing rendered, `RenderContext.create` threw **"Function.prototype.apply was
+  called on undefined"** — V8's error for a spread call `undefined(...args)`. The undefined
+  was `sequence`: `render-context.js` eagerly imports it (and spread-calls `sequence(...mw)`)
+  from the `middleware/index.js` **barrel**, which re-exports it (`import { sequence } from
+  './sequence.js'; export { sequence }`). The barrel's re-export getter was emitted at the
+  END of its prelude (after its own requires), so when the barrel's requires re-entered
+  `render-context.js` mid-cycle, reading `barrel['sequence']` returned `undefined` — no TDZ
+  throw, so no live-binding fallback, and the eager `const sequence` snapshotted `undefined`
+  permanently. Fix in `esm.js` (both `transpileEsm` and `transpileEsmLive`): emit re-export
+  getters **early** (before the prelude requires) and resolve the source module **lazily via
+  `__oc_require(spec)`** (cached) instead of closing over the later-declared prelude var, so
+  a circular importer reading a re-exported name mid-cycle always sees a defined getter that
+  returns the (hoisted) source binding. Regression-gated in `scripts/spike-esm.mjs`.
+
 Loader guarantees regression-gated by `scripts/spike-esm.mjs` (offline tier): TLA →
-async retry; circular re-export → lazy live binding; spread-only use keeps its const; and
-the live-binding fallback recovers a circular singleton used inside a function.
+async retry; circular re-export → lazy live binding (getter emitted early, re-requires the
+source, so a mid-cycle read never snapshots `undefined`); spread-only use keeps its const;
+and the live-binding fallback recovers a circular singleton used inside a function.
 
 ## Definition of done for T2
 

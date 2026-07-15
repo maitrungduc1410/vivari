@@ -849,12 +849,25 @@ snapshot it at call time, not at delivery time.
   live in `transpileEsm`:
   1. **An imported name that is only re-exported** (`import { X } from './m'; export { X }`
      — the barrel-file shape) is compiled *without* the eager `const X` and re-exported
-     via a **lazy getter to the source module** (`get: () => __oc_m['X']`), exactly like
-     `export { X } from './m'` already was. The read is deferred until after the cycle
-     resolves. This is what unblocks the **Astro** template:
-     `astro/dist/runtime/server/render/index.js` does
+     via a **lazy getter to the source module**, exactly like `export { X } from './m'`.
+     The read is deferred until after the cycle resolves. This is what unblocks the
+     **Astro** template: `astro/dist/runtime/server/render/index.js` does
      `import { Fragment } from './common.js'; export { …Fragment… }` while `common.js`
      (`const Fragment = Symbol.for('astro:fragment')`) is mid-cycle.
+
+     **The re-export getter must be emitted EARLY and re-resolve the source lazily.** It's
+     defined in `exportGetters` (before the prelude requires) and reads
+     `get: () => __oc_require('./m')['X']` — NOT `get: () => __oc_m['X']` closing over the
+     later-declared prelude var `m`. Reason: a circular importer can read `barrel['X']`
+     *while the barrel is mid-prelude* (its requires re-enter the importer). If the getter
+     hasn't been defined yet, that read returns **`undefined`** — and because `undefined`
+     is not a TDZ throw, the live-binding fallback below never fires and the importer
+     silently snapshots `undefined` forever. astro's `middleware/index.js` re-exports
+     `sequence` while `render-context.js` eagerly imports AND spread-calls it
+     (`sequence(...mw)`); the stale `undefined` snapshot surfaced only later as V8's
+     **"Function.prototype.apply was called on undefined"** (a spread call `undefined(...x)`
+     compiles to `.apply`). `__oc_require` is cached, so re-resolving in the getter returns
+     the same (possibly mid-cycle, but hoisted) module.
   2. The eager `const X` is only emitted when `X` is actually **referenced in the module
      body** — a name that appears solely in `import`/`export {}` statements never gets a
      snapshot. The "is it used" check is deliberately over-inclusive: it blanks only
