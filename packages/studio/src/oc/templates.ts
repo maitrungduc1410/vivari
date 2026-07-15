@@ -1784,10 +1784,9 @@ function sseTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "node server/index.js",
-      // Experimental until scripts/spike-sse.mjs is green in CI. SSE streams over
-      // the oc-sse tunnel + EventSource polyfill (the buffered HTTP preview proxy
-      // can't carry a never-ending text/event-stream body).
-      experimental: true,
+      // Proven in-VM by scripts/spike-sse.mjs (green in CI): SSE streams over the
+      // oc-sse tunnel + EventSource polyfill (the buffered HTTP preview proxy can't
+      // carry a never-ending text/event-stream body). No longer experimental.
     },
     files: {
       "package.json": `{

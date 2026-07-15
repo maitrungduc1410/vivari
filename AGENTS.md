@@ -569,7 +569,8 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   (`sse-open`/`sse-close` → `dispatchSse`), `kernel-worker.js` (`oc-sse` ↔ `onSseSend`),
   `host.js` + studio `kernel.ts`/`controller.ts` (`oc-sse` relay both directions). Gated by
   `scripts/spike-sse.mjs`, which drives that exact tunnel headlessly (no browser) via
-  `handleSseClient` + `onSseSend`. The `sse` template stays `experimental` until it's green.
+  `handleSseClient` + `onSseSend`. That spike is green, so the `sse` template is graduated
+  (no longer `experimental`); a regression there means the tunnel or forwarding broke.
 - **In-VM cross-process TCP/pipe (`net.js`).** `connect()` links same-process via an in-memory
   registry; when the port/path isn't served locally it falls back to the kernel byte-relay
   (`OP_PIPE_LISTEN`/`OP_PIPE_CONNECT`; bytes flow out of band as `pipe-*` postMessages keyed by
