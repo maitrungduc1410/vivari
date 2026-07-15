@@ -2047,6 +2047,70 @@ and teaches quick-open to jump to a line — without ever blocking the UI.
 Follow-ups: search result virtualization for very large result sets, a search-history dropdown
 (the input hints at `↑↓`), and `.gitignore`-aware excludes.
 
+## Editor TS worker dedup + esbuild-heap attribution (this change)
+
+Building on the per-PID diagnostic below, a real Nuxt measurement showed two things worth acting on:
+a pair of Monaco `ts.worker` instances at ~310 MB each (~621 MB), and a 1.87 GB dev-server Process
+Worker whose esbuild slice we couldn't see. This change lands one concrete win and one measurement.
+
+- **One TS language service, not two (studio, ~300 MB+).** Monaco runs a full language service for
+  BOTH the `typescript` and `javascript` modes, and the studio was feeding each the entire ~3050-file
+  dependency `.d.ts` payload → two ~310 MB `ts.worker`s doing identical work. Now `languageFor`
+  (`packages/studio/src/oc/controller.ts`) maps `.js/.jsx/.mjs/.cjs` to the `typescript` language
+  (`allowJs` handles JS), `configureLanguageService` leaves `javascriptDefaults` inert (diagnostics
+  off, no eager sync, no extra libs) so its worker never spawns, and `loadDependencyTypes` pushes
+  extra libs / re-applies compiler options to `typescriptDefaults` only. Net: one worker, one copy of
+  the payload, no redundant restart — with strictly-better JS IntelliSense (TS-powered).
+- **esbuild Go wasm heap, quantified per-PID (diagnostic).** The in-process esbuild service's Go
+  `WebAssembly.Memory` was trapped in a closure. `esbuild-inproc-patch.js` now stashes it on
+  `globalThis.__ocEsbuildMemory` and exports `esbuildWasmBytes()` (its live `.buffer.byteLength`);
+  `runtime.memStats()` reports it, and "Measure Memory" prints `esbuild-wasm <N> MB` next to the
+  owning PID. This finally shows how much of a dev-server's 1.87 GB is the resident esbuild service
+  vs. the guest framework working set — the data needed before attempting the bigger, riskier levers.
+- **Why no dev-server-heap reduction yet.** `performance.memory` is unavailable in Chrome Workers, so
+  exact per-PID JS-heap bytes still come from the main-thread `measureUserAgentSpecificMemory()`
+  per-URL breakdown (only the dev-server worker is huge). The esbuild Go heap grows-and-stays (Go wasm
+  can't shrink; only `worker.terminate()` frees it), and the rest is guest working set. The remaining
+  "ours" lever is bounded `Module._cache` pruning — still gated on these numbers because it must
+  respect stateful singletons and cycles.
+- **Verification.** Studio-only + a read-only diagnostic: `node --check` + studio `tsc` clean;
+  `verify-node` unaffected. Browser check: "Measure Memory" shows ONE `ts.worker` and an
+  `esbuild-wasm <N> MB` figure on the dev-server PID.
+
+### Deferred — dev-server heap (revisit later)
+
+Measured on a real Nuxt 3 project (`nuxt dev`, Chrome, after this change): tab total **3.09 GB**, down
+from 3.46 GB before the Monaco dedup. Breakdown of what's left, so a future pass doesn't re-derive it:
+
+- **PID 8 (the `nuxt dev` Process Worker): ~1.87 GB — the elephant, and mostly NOT ours.** Of that,
+  the in-process **esbuild Go heap is only 22.5 MB** (measured via the new `esbuildWasmBytes()`), so
+  isolating/tearing down esbuild would save ~nothing — that idea is **ruled out**. Our `Module._cache`
+  holds ~1404 modules (order ~150-300 MB). The remaining ~1.5 GB is the guest **Vite + Rollup + Nitro
+  + Vue** dev-server working set (module graph, transform results, sourcemaps, V8 overhead) — roughly
+  the inherent cost of in-browser Nuxt dev (comparable to WebContainer/StackBlitz). Not safely
+  shrinkable from the runtime while the server is live.
+- **FS worker (VFS): ~580 MB, of which only 273 MB is (compressed) file content.** The other ~300 MB
+  is a **wasm linear-memory high-water mark** from `npm install` plus allocator fragmentation, the
+  hot-read cache, and inode structures. wasm memory can't shrink, so reclaiming it needs a VFS
+  "compaction/reboot" (serialize → tear down the wasm instance → re-instantiate fresh → reload). Complex,
+  and the win is transient while a dev server keeps touching the VFS. Possible future project if the
+  VFS idle footprint matters.
+- **~8 small Process Workers (~175 MB total, ~20-30 MB each).** Mostly V8 isolate overhead + our
+  per-worker runtime baseline (codecs/crypto/builtins). Trimming the baseline (lazy-load) saves a few
+  MB per worker at most — marginal.
+
+Levers considered and **not** pursued (risk/yield too poor without more signal):
+1. **Bounded/prunable `Module._cache`** — risky (the cached modules are *live* for a running dev
+   server; pruning a stateful singleton or a cycle member breaks it) and low yield here.
+2. **esbuild worker isolation** — ruled out by the 22.5 MB measurement above.
+3. **Guest dev-config knobs** (disable dev sourcemaps, Vue devtools, etc.) — target the ~1.5 GB
+   directly but change DX and have unknown yield; would need per-template experimentation.
+
+Blocker for deeper attribution: `performance.memory` doesn't exist in Chrome Workers, so exact per-PID
+JS-heap bytes can't be read programmatically (the main-thread `measureUserAgentSpecificMemory()`
+per-URL figure is the only heap number). To see *what* is retained inside PID 8, the next step is a
+**manual DevTools heap snapshot** of that worker — do that before investing in any of the above.
+
 ## Dev-server heap: per-PID memory attribution (this change)
 
 After VFS compression, the single largest term in the tab is the **Process Worker JS heap**

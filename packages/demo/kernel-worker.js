@@ -758,6 +758,7 @@ function queryAllProcMem(timeoutMs = 2000) {
               heap: data.heap,
               modules: data.modules,
               esbuildInproc: !!data.esbuildInproc,
+              esbuildBytes: Number(data.esbuildBytes) || 0,
             }),
           );
           setTimeout(() => {

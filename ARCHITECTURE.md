@@ -195,10 +195,12 @@ never parks and many downloads can overlap (§6).
   `mem_bytes()`/`logical_mem_bytes()` back the "Measure Memory" ratio readout.
 - **Per-PID memory attribution**: "Measure Memory" also breaks the Process Worker heap
   down by PID. Each worker answers a `proc-mem` query with `runtime.memStats()` — its own JS
-  heap (`performance.memory`, Chrome-only), guest module-cache size, and an esbuild-wasm flag;
-  the kernel worker fans the query across a live `pid → worker` registry and relays the rows on
-  `oc-mem`. This attributes the dev-server heap (the tab's largest term post-compression) to a
-  specific process so reduction work can be targeted; the query is read-only.
+  heap (`performance.memory`, unavailable in Chrome Workers so effectively `-1`; the main-thread
+  `measureUserAgentSpecificMemory()` per-URL figure is the real heap), guest module-cache size, an
+  esbuild-wasm flag, and the **esbuild Go wasm heap byteLength** (`esbuildWasmBytes()`); the kernel
+  worker fans the query across a live `pid → worker` registry and relays the rows on `oc-mem`. This
+  attributes the dev-server heap (the tab's largest term post-compression) to a specific process,
+  and quantifies how much of it is the resident esbuild service vs. guest framework; read-only.
 - **Servicing**: `packages/kernel-host/fs-server.js` (`FsServer`) owns the one VFS
   instance and services fs opcodes directly over each client's SAB. It runs inside
   the **File System Worker** (`packages/demo/fs-worker.js`).
@@ -583,6 +585,14 @@ json/css/html — each a Vite `?worker` import so it's bundled **same-origin** (
 satisfied) and runs off the main thread. `configureLanguageService` enables semantic + syntax
 diagnostics with `setEagerModelSync(true)` (every model is visible to the worker) and `checkJs: false`
 (plain-JS projects aren't flooded with type errors).
+
+**One TS worker, not two (memory).** Monaco runs a *separate* full language service for each of the
+`typescript` and `javascript` modes; each parses the whole dependency `.d.ts` payload into ~310 MB, so
+naively you pay ~621 MB (measured) for two identical services. The studio runs a single one:
+`languageFor` maps `.js/.jsx/.mjs/.cjs` to the `typescript` language (`allowJs` lets the TS service
+handle JS), and `javascriptDefaults` is left inert (diagnostics off, no eager sync, no extra libs) so
+its worker — created lazily on first JS-model use — never spawns. Extra libs / compiler options are
+applied to `typescriptDefaults` only.
 
 The TS worker only "sees" two file sources, so the studio keeps a strict split:
 

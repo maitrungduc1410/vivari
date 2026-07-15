@@ -161,6 +161,16 @@ export interface ProcMem {
   heap: number;
   modules: number;
   esbuildInproc: boolean;
+  // Bytes of the in-process esbuild Go wasm heap (0 if not hosted in this PID).
+  esbuildBytes: number;
+}
+
+// Render the esbuild-wasm annotation for a per-PID memory row: the resident Go
+// heap size when known (grows-and-stays for the worker's life), else just a flag.
+function esbuildLabel(p: ProcMem): string {
+  if (!p.esbuildInproc) return "";
+  const bytes = Number(p.esbuildBytes);
+  return bytes > 0 ? `, esbuild-wasm ${fmtBytes(bytes)}` : ", esbuild-wasm";
 }
 
 const TERM_THEME = {
@@ -196,8 +206,11 @@ const normDir = (p: string) => {
 const folderIdFor = (rootPath: string) => "wf:" + rootPath;
 
 function languageFor(path: string): string {
-  if (/\.(jsx?|mjs|cjs)$/.test(path)) return "javascript";
-  if (/\.tsx?$/.test(path)) return "typescript";
+  // JS files use the `typescript` language too (the TS worker handles JS via
+  // allowJs). This runs ONE language service instead of a second full ~310 MB
+  // `javascript` ts.worker fed the same dependency .d.ts payload. See
+  // configureLanguageService.
+  if (/\.(tsx?|jsx?|mjs|cjs)$/.test(path)) return "typescript";
   if (/\.css$/.test(path)) return "css";
   if (/\.(html?|vue|svelte)$/.test(path)) return "html";
   if (/\.json$/.test(path)) return "json";
@@ -658,11 +671,18 @@ export class IdeController {
       // + DOM + iterable) is what actually works.
     };
     this.tsCompilerOptions = compilerOptions;
-    for (const d of [ts.typescriptDefaults, ts.javascriptDefaults]) {
-      d.setCompilerOptions(compilerOptions);
-      d.setDiagnosticsOptions({ noSemanticValidation: false, noSyntaxValidation: false, onlyVisible: false });
-      d.setEagerModelSync(true);
-    }
+    // Run a SINGLE TS language service. Every JS/TS model uses the `typescript`
+    // language (see languageFor) with allowJs, so only the `typescript` ts.worker
+    // ever spawns. Monaco otherwise runs a SECOND full language service for the
+    // `javascript` mode — a duplicate ~310 MB worker fed the same dependency
+    // .d.ts payload. Keep the `javascript` defaults inert (diagnostics off, no
+    // eager sync, no extra libs) so its WorkerManager — created lazily on first
+    // JS-model use — never starts.
+    ts.typescriptDefaults.setCompilerOptions(compilerOptions);
+    ts.typescriptDefaults.setDiagnosticsOptions({ noSemanticValidation: false, noSyntaxValidation: false, onlyVisible: false });
+    ts.typescriptDefaults.setEagerModelSync(true);
+    ts.javascriptDefaults.setDiagnosticsOptions({ noSemanticValidation: true, noSyntaxValidation: true, onlyVisible: false });
+    ts.javascriptDefaults.setEagerModelSync(false);
     // Mirror the worker's markers into a Problems count in the status bar.
     monaco.editor.onDidChangeMarkers(() => this.recomputeProblems());
   }
@@ -770,8 +790,10 @@ export class IdeController {
     for (const map of this.depLibsByRoot.values()) {
       for (const [filePath, content] of map) libs.push({ filePath, content });
     }
+    // Only the `typescript` service is live (see configureLanguageService), so
+    // feed the dependency .d.ts to it alone — no duplicate payload to a second
+    // worker.
     monaco.typescript.typescriptDefaults.setExtraLibs(libs);
-    monaco.typescript.javascriptDefaults.setExtraLibs(libs);
     // Critical: the TS worker/LanguageService was created (and validated open
     // files) BEFORE these types existed. Monaco pushes the new libs to the live
     // worker, but a worker created with an empty `node_modules` view can keep
@@ -781,7 +803,6 @@ export class IdeController {
     // born already seeing every dependency .d.ts — so imports resolve cleanly.
     if (this.tsCompilerOptions) {
       monaco.typescript.typescriptDefaults.setCompilerOptions(this.tsCompilerOptions);
-      monaco.typescript.javascriptDefaults.setCompilerOptions(this.tsCompilerOptions);
     }
   }
 
@@ -1723,9 +1744,8 @@ export class IdeController {
         this.consoleLine("Process workers (own JS heap):", "36");
         for (const p of withHeap) {
           const mods = Number(p.modules) >= 0 ? `${p.modules} modules` : "modules n/a";
-          const esb = p.esbuildInproc ? ", esbuild-wasm" : "";
           this.consoleLine(
-            `  ${fmtBytes(Number(p.heap)).padStart(9)}  ${p.name} (${mods}${esb})`,
+            `  ${fmtBytes(Number(p.heap)).padStart(9)}  ${p.name} (${mods}${esbuildLabel(p)})`,
             "90",
           );
         }
@@ -1734,7 +1754,7 @@ export class IdeController {
         this.consoleLine("Process workers (heap size unavailable):", "36");
         for (const p of procs) {
           this.consoleLine(
-            `  ${p.name}: ${Number(p.modules) >= 0 ? p.modules + " modules" : "modules n/a"}${p.esbuildInproc ? ", esbuild-wasm" : ""}`,
+            `  ${p.name}: ${Number(p.modules) >= 0 ? p.modules + " modules" : "modules n/a"}${esbuildLabel(p)}`,
             "90",
           );
         }

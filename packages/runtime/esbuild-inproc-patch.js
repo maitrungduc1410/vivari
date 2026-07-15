@@ -144,7 +144,15 @@ const ESB_INPROC_NEW = `  // [OpenContainer] in-process esbuild service (no chil
   __ocReadFromStdout = readFromStdout;
   __ocGo.exit = (code) => { afterClose(code ? new Error("esbuild service exited with code " + code) : null); };
   WebAssembly.instantiate(__ocWasmBytes, __ocGo.importObject).then(
-    (result) => { __ocGo.run(result.instance); },
+    (result) => {
+      // Diagnostic: expose the Go service's linear memory so the runtime can
+      // report its size per-PID ("Measure Memory"). Go's wasm exports it as
+      // \`mem\` (a WebAssembly.Memory, whose .buffer always tracks the live/grown
+      // buffer). It grows-and-stays for the worker's life; this is a reference,
+      // not extra retention.
+      try { globalThis.__ocEsbuildMemory = result.instance.exports.mem || result.instance.exports.memory; } catch {}
+      __ocGo.run(result.instance);
+    },
     (err) => { afterClose(err); }
   );
   let __ocRefCount = 0;
@@ -242,4 +250,18 @@ export function maybePatchEsbuildInProcess(source, filename, fs, path) {
 let _inprocActive = false;
 export function isEsbuildInprocActive() {
   return _inprocActive;
+}
+
+// Current byte size of the in-process esbuild Go service's WebAssembly linear
+// memory (its heap), or 0 if esbuild isn't hosted here. This is the slice of a
+// dev-server Process Worker's footprint attributable to esbuild — surfaced
+// per-PID by the "Measure Memory" diagnostic. Set by the patched service (see
+// ESB_INPROC_NEW) once the Go instance is running.
+export function esbuildWasmBytes() {
+  try {
+    const m = globalThis.__ocEsbuildMemory;
+    return m && m.buffer ? m.buffer.byteLength : 0;
+  } catch {
+    return 0;
+  }
 }

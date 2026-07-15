@@ -384,7 +384,13 @@ models from disk so the Monaco buffer + dirty state don't drift.
 ### IntelliSense: real Monaco workers + who-holds-which-file
 Monaco's language workers are ENABLED (they used to be a no-op `MonacoEnvironment`): `mountEditor`
 imports the `?worker` entries (Vite bundles them same-origin → COEP-safe) and `configureLanguageService`
-turns on TS/JS semantic+syntax diagnostics with `setEagerModelSync(true)`. The worker only "sees"
+turns on semantic+syntax diagnostics with `setEagerModelSync(true)`. **One TS language service, not two
+(memory):** Monaco otherwise runs a full language service for EACH of the `typescript` and `javascript`
+modes — two `ts.worker`s that each parse the entire dependency `.d.ts` payload into ~310 MB (≈621 MB
+total, measured). We run a single one: `languageFor` maps `.js/.jsx/.mjs/.cjs` to the `typescript`
+language too (the TS service handles JS via `allowJs`), and `javascriptDefaults` is kept inert
+(diagnostics off, no eager sync, no extra libs) so its worker — created lazily on first JS-model use —
+never spawns. Extra libs + compiler options go to `typescriptDefaults` only. The worker only "sees"
 two kinds of file: **Monaco models** and **extra libs** — so the split MUST stay clean or you get
 phantom "Duplicate identifier" errors. Rule: the project's OWN source files are seeded as models
 (`ensureBackgroundModels`, so cross-file completion/go-to-def works before a file is opened); installed
@@ -886,18 +892,22 @@ Post-compression, the tab's largest term is the **Process Worker JS heap** (dev 
 `performance.measureUserAgentSpecificMemory()` only attributes it to the shared
 `process-worker.js` URL — not to a PID. "Measure Memory" adds a per-process breakdown:
 - Each worker answers a `proc-mem` message with `runtime.memStats()`: its own heap
-  (`performance.memory.usedJSHeapSize`, Chrome-only/coarse, `-1` if absent), guest **module-cache**
-  entry count (`moduleSystem.cache` — the load-once/retain-forever CJS/ESM cache), and whether it
-  hosts the resident **esbuild-wasm** service (`isEsbuildInprocActive()`). Exposed via
-  `boot.js`'s `onReady` control object.
+  (`performance.memory.usedJSHeapSize` — **unavailable in Chrome Workers**, so this reads `-1` in
+  practice; the main-thread `measureUserAgentSpecificMemory()` per-URL breakdown is the real heap
+  figure), guest **module-cache** entry count (`moduleSystem.cache` — the load-once/retain-forever
+  CJS/ESM cache), whether it hosts the resident **esbuild-wasm** service (`isEsbuildInprocActive()`),
+  and the **esbuild Go wasm heap size** (`esbuildWasmBytes()` — the byteLength of the Go service's
+  `WebAssembly.Memory`, captured to `globalThis.__ocEsbuildMemory` by the in-process patch). Exposed
+  via `boot.js`'s `onReady` control object.
 - The kernel worker keeps a `pid → worker` registry (in `spawnWorker`), queries all live processes
   in parallel (2 s timeout), and relays sorted rows on the existing `oc-mem` round-trip;
   `controller.ts` prints the table. Threads/`fork` children go through `spawnWorker` too, so they
   appear. The query is **read-only** — `verify-node` is unaffected.
 - Note: the compiled CJS/ESM wrapper is not retained after evaluation (GC-eligible), so there's no
   stray "module source" to free — the reducible heap is the `Module._cache` graph (risky to prune),
-  the by-design esbuild Go heap, and the guest framework's own working set. Use this readout to
-  decide before touching any of them.
+  the by-design esbuild Go heap (now quantified per-PID, but Go wasm can't shrink — only worker
+  `terminate()` frees it), and the guest framework's own working set. Use this readout to decide
+  before touching any of them.
 
 ---
 
