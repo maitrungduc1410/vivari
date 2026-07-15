@@ -233,6 +233,7 @@ export class IdeController {
   private models = new Map<string, Monaco.editor.ITextModel>(); // abs -> model
   private depLibsByRoot = new Map<string, Map<string, string>>(); // root -> (extra-lib uri -> content)
   private depsSig = new Map<string, string>(); // root -> last node_modules fingerprint
+  private dtsWarnedNoNM = new Set<string>(); // roots we've already noted lack node_modules
   private dtsTimer: ReturnType<typeof setTimeout> | null = null; // debounce dependency-type loads
   private dtsSeq = 0; // supersede in-flight dependency-type refreshes
   private previewFrames = new Map<string, HTMLIFrameElement>(); // preview tab id -> iframe
@@ -607,7 +608,10 @@ export class IdeController {
       // allow it (requires noEmit, which the language service is anyway).
       allowImportingTsExtensions: true,
       noEmit: true,
-      lib: ["esnext", "dom", "dom.iterable", "webworker"],
+      // NB: do NOT set an explicit `lib` array — Monaco's worker then fails to load
+      // the individual lib.*.d.ts files (DOM globals, iterators… all vanish). Letting
+      // `target: ESNext` pick the default `lib.esnext.full.d.ts` (which bundles ESNext
+      // + DOM + iterable) is what actually works.
     };
     for (const d of [ts.typescriptDefaults, ts.javascriptDefaults]) {
       d.setCompilerOptions(compilerOptions);
@@ -687,7 +691,18 @@ export class IdeController {
       const res = await this.bridge.request("oc-collect-dts", { root, sig: this.depsSig.get(root) ?? "" });
       if (seq !== this.dtsSeq) return; // a newer refresh superseded us
       if (!res.ok) continue;
-      if (typeof res.sig === "string") this.depsSig.set(root, res.sig);
+      const sig = typeof res.sig === "string" ? res.sig : "";
+      this.depsSig.set(root, sig);
+      // sig === "" ⟺ no node_modules on disk yet. Nudge the user once (types come
+      // from installed packages — nothing to resolve until deps are installed).
+      if (sig === "") {
+        if (!this.dtsWarnedNoNM.has(root)) {
+          this.dtsWarnedNoNM.add(root);
+          this.consoleLine(`[intellisense] ${baseName(root)}: no node_modules yet — run \`npm install\` to get dependency types`, "33");
+        }
+        continue;
+      }
+      this.dtsWarnedNoNM.delete(root);
       if (res.unchanged) continue;
       const map = new Map<string, string>();
       for (const f of (res.files as { path: string; content: string }[]) ?? []) {
@@ -695,6 +710,10 @@ export class IdeController {
       }
       this.depLibsByRoot.set(root, map);
       changed = true;
+      this.consoleLine(
+        `[intellisense] ${baseName(root)}: loaded ${map.size} dependency type file(s)${res.truncated ? " (capped)" : ""}`,
+        "36",
+      );
     }
     if (!changed) return;
     const libs: { filePath: string; content: string }[] = [];
