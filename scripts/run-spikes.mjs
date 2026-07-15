@@ -56,6 +56,10 @@ const SPIKES = [
   { name: "feathers", file: "spike-feathers.mjs", net: true },
   // Nitro (unjs) CLI dev server — rollup build + auto-imports, longer budget.
   { name: "nitro", file: "spike-nitro.mjs", net: true, timeout: 600000 },
+  // Socket.IO showcase — UI + client script + engine.io handshake in-VM.
+  { name: "socketio", file: "spike-socketio.mjs", net: true },
+  // Slidev (Vite + Vue) CLI dev server — first build is heavy, longer budget.
+  { name: "slidev", file: "spike-slidev.mjs", net: true, timeout: 600000 },
 ];
 
 const args = process.argv.slice(2);

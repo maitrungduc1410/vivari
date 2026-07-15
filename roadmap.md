@@ -2327,6 +2327,21 @@ WASM. Verified as a valid, working VitePress config in vanilla Node (server bind
 URL); the same config runs unchanged in a plain export. Still `experimental` (needs an in-VM
 spike + browser confirmation before graduating).
 
+## Slidev + Socket.IO graduated (this change)
+
+Two more templates drop `experimental`, each now gated by a headless spike:
+
+- **Socket.IO** (`scripts/spike-socketio.mjs`) — Express + `socket.io`, binds `:3000`, and
+  asserts `GET /` serves the chat UI, `/socket.io/socket.io.js` serves the client script, and
+  the **engine.io polling handshake** (`/socket.io/?EIO=4&transport=polling`) returns a session
+  advertising the `websocket` upgrade. The live ws chat rides the already-proven preview ws
+  tunnel (roadmap #19 / `spike-ws`), so the spike proves the server side in-VM. Confirmed in
+  vanilla Node with real `socket.io@4`.
+- **Slidev** (`scripts/spike-slidev.mjs`) — a Vite + Vue CLI dev server (`@slidev/cli`). Like
+  Nitro it drives the real CLI (`slidev --port 3030` → `bin/slidev.mjs`), with a longer bind
+  budget (`OC_BIND_TIMEOUT`) since the first Vite build is heavy, then asserts `GET /` returns
+  the Slidev app shell. Confirmed in vanilla Node (dev server built + bound in ~6s, `/` served).
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

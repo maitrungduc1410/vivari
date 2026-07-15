@@ -2515,7 +2515,8 @@ function slidevTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
+      // Proven in-VM by scripts/spike-slidev.mjs (dev server builds + serves the
+      // slide deck). No longer experimental.
     },
     files: {
       "package.json": `{
@@ -3350,7 +3351,8 @@ function socketioTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
+      // Proven in-VM by scripts/spike-socketio.mjs (UI + client script + engine.io
+      // handshake); the ws chat rides the proven preview ws tunnel. Not experimental.
     },
     files: {
       "package.json": `{
