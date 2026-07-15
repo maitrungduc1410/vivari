@@ -2048,8 +2048,9 @@ with project-wide + dependency-aware type information.
 - **Dependency types = bulk `.d.ts` harvest in the kernel worker (`oc-collect-dts`).** Installed-package
   typings (`node_modules/**/*.d.ts` + `package.json` for `types`/`exports` resolution) are collected
   by the worker that holds the sync Wasm VFS — one bulk reply instead of thousands of `oc-read`
-  round-trips — walking `@types` first, skipping `typescript`'s own libs (Monaco ships those), and
-  bounded by a file-count + byte budget. The controller registers them via `setExtraLibs`. The load is
+  round-trips — harvesting the project's **declared deps (+ their `@types`) first** so a budget cap
+  never drops the packages you actually import, then the rest of `@types`, skipping `typescript`'s own
+  libs (Monaco ships those). The controller registers them via `setExtraLibs`. The load is
   debounced and re-runs on folder open, fs changes, and **after any process exits** — since an in-VM
   `npm install` doesn't emit `oc-fs-changed`, a finished process is the cue that `node_modules` may
   have appeared. A cheap `node_modules` fingerprint short-circuits the file reads when nothing changed.

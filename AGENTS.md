@@ -367,8 +367,10 @@ phantom "Duplicate identifier" errors. Rule: the project's OWN source files are 
 (`ensureBackgroundModels`, so cross-file completion/go-to-def works before a file is opened); installed
 dependency types (`node_modules/**/*.d.ts` + `package.json`) are the extra libs, harvested in bulk by
 the kernel worker (`oc-collect-dts`, sole VFS holder → one reply, not thousands of reads) and pushed
-via `setExtraLibs`. Never register a file as BOTH. The dts harvest is bounded (file-count + byte
-budget) and debounced; it re-runs on folder open, fs changes, AND after any process exits — because
+via `setExtraLibs`. Never register a file as BOTH. The dts harvest collects the project's DECLARED
+deps (+ their `@types`) FIRST so a budget cap can't drop the packages you actually import (a blind
+walk did exactly that — react types got evicted before they were read). It's bounded (file-count +
+byte budget) and debounced; it re-runs on folder open, fs changes, AND after any process exits — because
 in-VM writes (a `npm/yarn/pnpm install`) do NOT emit `oc-fs-changed`, so process exit is the signal
 that `node_modules` may have appeared. A cheap `node_modules` fingerprint (top-level package list) in
 `oc-collect-dts` short-circuits the file reads when nothing actually changed, so triggering on every

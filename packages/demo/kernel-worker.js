@@ -1282,14 +1282,14 @@ async function searchWalk(dir, root, ctx) {
 }
 
 // ── IntelliSense dependency-type collection ──────────────────────────────────
-// Walk a project's node_modules gathering .d.ts + package.json for Monaco's TS
-// language service. @types is walked first so ambient/global typings win the byte
-// budget; the `typescript` package's own lib.*.d.ts are skipped (Monaco ships its
-// own), as are non-type dirs that only bloat the scan.
-const DTS_MAX_FILES = 4000;
-const DTS_MAX_BYTES = 12_000_000;
-// "@types" is walked explicitly first, so skip it in the main pass to avoid
-// re-reading the same files.
+// Gather a project's node_modules .d.ts + package.json for Monaco's TS language
+// service. The ORDER matters: a blind walk can blow the budget on some giant
+// package and drop the ones the project actually imports (e.g. react). So we
+// harvest the project's DECLARED dependencies (+ their @types) FIRST — those are
+// guaranteed in — then @types (ambient globals), then whatever fits. The
+// `typescript` package's own lib.*.d.ts are skipped (Monaco ships its own).
+const DTS_MAX_FILES = 12_000;
+const DTS_MAX_BYTES = 32_000_000;
 const DTS_SKIP_DIRS = new Set(["@types", "typescript", ".bin", ".cache", ".vite"]);
 
 // A cheap "did node_modules change?" fingerprint: the sorted top-level package
@@ -1308,8 +1308,27 @@ function depsSignature(nm) {
   return parts.join("|");
 }
 
+// The declared dependency names from a project's package.json (all buckets).
+function projectDepNames(root) {
+  const names = new Set();
+  try {
+    const pkg = JSON.parse(kernel.readFile(root.replace(/\/+$/, "") + "/package.json"));
+    for (const key of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+      const bucket = pkg[key];
+      if (bucket && typeof bucket === "object") for (const n of Object.keys(bucket)) names.add(n);
+    }
+  } catch { /* no/invalid package.json */ }
+  return names;
+}
+
+// `react` → `react`; `@scope/pkg` → `scope__pkg` (the @types package naming).
+function typesPackageName(dep) {
+  return dep[0] === "@" ? dep.slice(1).replace("/", "__") : dep;
+}
+
 async function collectDts(root, prevSig) {
   const out = [];
+  const seen = new Set();
   const ctx = { bytes: 0, scanned: 0, truncated: false };
   if (!kernel) return { files: out, truncated: false, sig: "", unchanged: false };
   const nm = String(root || "").replace(/\/+$/, "") + "/node_modules";
@@ -1319,10 +1338,12 @@ async function collectDts(root, prevSig) {
   if (sig && sig === prevSig) return { files: out, truncated: false, sig, unchanged: true };
 
   const collectFile = (abs, name) => {
+    if (seen.has(abs)) return;
     if (!(name.endsWith(".d.ts") || name === "package.json")) return;
     let content;
     try { content = kernel.readFile(abs); } catch { return; }
     if (typeof content !== "string") return;
+    seen.add(abs);
     out.push({ path: abs, content });
     ctx.bytes += content.length;
     if (out.length >= DTS_MAX_FILES || ctx.bytes >= DTS_MAX_BYTES) ctx.truncated = true;
@@ -1347,9 +1368,21 @@ async function collectDts(root, prevSig) {
     }
   };
 
-  // @types first (ambient globals), then the rest of node_modules.
-  const typesDir = nm + "/@types";
-  try { if (kernel.exists(typesDir)) await walk(typesDir, 1); } catch { /* ignore */ }
+  // Walk a single package dir if it exists (used for the priority pass).
+  const walkPkg = async (dir) => {
+    let st;
+    try { if (!kernel.exists(dir)) return; st = kernel.stat(dir); } catch { return; }
+    if (st.kind === "dir") await walk(dir, 1);
+  };
+
+  // 1) Declared deps + their @types FIRST, so imported packages are never dropped.
+  for (const dep of projectDepNames(root)) {
+    if (ctx.truncated) break;
+    await walkPkg(nm + "/" + dep);
+    await walkPkg(nm + "/@types/" + typesPackageName(dep));
+  }
+  // 2) All @types (ambient globals), then 3) the rest of node_modules, budget permitting.
+  try { if (kernel.exists(nm + "/@types")) await walk(nm + "/@types", 1); } catch { /* ignore */ }
   await walk(nm, 0);
   return { files: out, truncated: ctx.truncated, sig, unchanged: false };
 }

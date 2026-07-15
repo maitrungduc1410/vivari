@@ -550,8 +550,9 @@ flowchart LR
   adopts a seeded model when the user opens that file.
 - **Dependency typings become extra libs.** Harvesting `node_modules/**/*.d.ts` (+ `package.json` for
   `types`/`exports` resolution) happens in the **kernel worker** (`oc-collect-dts`) — the sole VFS
-  holder — as one bulk reply instead of thousands of reads; `@types` first, `typescript`'s own libs
-  skipped (Monaco ships those), bounded by file-count + byte budget. It's debounced and re-runs on
+  holder — as one bulk reply instead of thousands of reads; the project's declared deps (+ their
+  `@types`) are harvested first so a budget cap can't drop the packages you import, then the rest of
+  `@types`; `typescript`'s own libs are skipped (Monaco ships those). It's debounced and re-runs on
   folder open, fs changes, and after any process exits (an in-VM `npm install` doesn't emit
   `oc-fs-changed`, so a finished process is the cue that `node_modules` may have appeared); a cheap
   `node_modules` fingerprint short-circuits the file reads when nothing changed.
