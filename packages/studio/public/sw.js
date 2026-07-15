@@ -148,6 +148,36 @@ async function cacheFirst(request) {
   return resp.clone();
 }
 
+// DevTools Network bridge for the shims. The ws/SSE polyfills below replace the
+// native `WebSocket`/`EventSource` globals BEFORE chobitsu loads and tunnel over
+// postMessage, so chobitsu never observes them and they never appear in the chii
+// Network panel (fetch/XHR stay native, so chobitsu already captures those). This
+// tiny helper lets the shims emit synthetic Chrome DevTools Protocol `Network.*`
+// events over the SAME channel the CDP bootstrap uses ({source:'oc-cdp',
+// dir:'target'}); the controller already relays those to the attached frontend,
+// which renders a WS Messages tab and an EventSource EventStream tab natively.
+//
+// `emit` is gated on attachment (no work while DevTools is closed). Each live
+// connection registers a `replay` fn re-emitting its creation events, invoked on
+// attach (or re-attach on tab switch) so a connection opened before the panel —
+// or before switching to this tab — still shows up (its future frames then stream
+// live; frames from before attach are dropped, matching real DevTools behaviour).
+const NET_SHIM = `(function(){
+if (window.__ocNet) return;
+var attached = false, seq = 0, live = {};
+function post(method, params){
+  try { parent.postMessage({ source:'oc-cdp', dir:'target', data: JSON.stringify({ method: method, params: params }) }, '*'); } catch(e){}
+}
+window.__ocNet = {
+  now: function(){ return performance.now() / 1000; },
+  wall: function(){ return Date.now() / 1000; },
+  emit: function(method, params){ if (attached) post(method, params); },
+  register: function(id, replay){ live[id] = replay; },
+  unregister: function(id){ delete live[id]; },
+  onAttach: function(){ attached = true; for (var k in live){ try { live[k](); } catch(e){} } }
+};
+})();`;
+
 // roadmap #19 stage C — HMR transport. A real WebSocket from the preview iframe
 // would hit the network (there is no server there) and the SW can't intercept a
 // ws upgrade. So we inject this classic (non-module, runs before Vite's deferred
@@ -162,6 +192,14 @@ var previewPort = m ? parseInt(m[1], 10) : 0;
 var tok = Math.random().toString(36).slice(2, 8);
 var nextId = 1, conns = {};
 function post(msg){ parent.postMessage(msg, '*'); }
+function _b64(x){
+  var b;
+  if (x instanceof ArrayBuffer) b = new Uint8Array(x);
+  else if (ArrayBuffer.isView(x)) b = new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
+  else return '';
+  var s = ''; for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+  try { return btoa(s); } catch(e){ return ''; }
+}
 window.addEventListener('message', function(ev){
   var d = ev.data; if (!d || d.type !== 'oc-ws' || d.dir !== 'in') return;
   var c = conns[d.connId]; if (c) c._deliver(d);
@@ -202,12 +240,25 @@ function OCWebSocket(url, protocols){
     }
   } catch(e){}
   post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path, protocols: protocols || null });
+  var self2 = this; this._rid = this._id;
+  this._wsReplay = function(){
+    window.__ocNet.emit('Network.webSocketCreated', { requestId:self2._rid, url:self2.url, initiator:{ type:'script' } });
+    window.__ocNet.emit('Network.webSocketWillSendHandshakeRequest', { requestId:self2._rid, timestamp:window.__ocNet.now(), wallTime:window.__ocNet.wall(), request:{ headers:{} } });
+    if (self2.readyState === 1) window.__ocNet.emit('Network.webSocketHandshakeResponseReceived', { requestId:self2._rid, timestamp:window.__ocNet.now(), response:{ status:101, statusText:'Switching Protocols', headers:{} } });
+  };
+  window.__ocNet.register(this._rid, this._wsReplay); this._wsReplay();
 }
 OCWebSocket.CONNECTING = 0; OCWebSocket.OPEN = 1; OCWebSocket.CLOSING = 2; OCWebSocket.CLOSED = 3;
 OCWebSocket.prototype._deliver = function(d){
-  if (d.sub === 'open'){ this.readyState = 1; this.protocol = d.protocol || ''; this._emit('open', { type:'open' }); }
-  else if (d.sub === 'msg'){ var data = d.data; if (d.binary && this.binaryType === 'blob' && !(data instanceof Blob)) data = new Blob([data]); this._emit('message', { type:'message', data:data }); }
-  else if (d.sub === 'close'){ this.readyState = 3; delete conns[this._id]; this._emit('close', { type:'close', code:d.code||1006, reason:d.reason||'', wasClean:d.code===1000 }); }
+  if (d.sub === 'open'){ this.readyState = 1; this.protocol = d.protocol || '';
+    window.__ocNet.emit('Network.webSocketHandshakeResponseReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), response:{ status:101, statusText:'Switching Protocols', headers:{} } });
+    this._emit('open', { type:'open' }); }
+  else if (d.sub === 'msg'){ var data = d.data;
+    window.__ocNet.emit('Network.webSocketFrameReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), response:{ opcode: d.binary?2:1, mask:false, payloadData: d.binary ? _b64(d.data) : String(d.data) } });
+    if (d.binary && this.binaryType === 'blob' && !(data instanceof Blob)) data = new Blob([data]); this._emit('message', { type:'message', data:data }); }
+  else if (d.sub === 'close'){ this.readyState = 3; delete conns[this._id];
+    if (!this._cdpClosed){ this._cdpClosed = true; window.__ocNet.emit('Network.webSocketClosed', { requestId:this._rid, timestamp:window.__ocNet.now() }); window.__ocNet.unregister(this._rid); }
+    this._emit('close', { type:'close', code:d.code||1006, reason:d.reason||'', wasClean:d.code===1000 }); }
 };
 OCWebSocket.prototype.send = function(data){
   if (this.readyState !== 1) throw new Error('WebSocket is not open');
@@ -217,6 +268,7 @@ OCWebSocket.prototype.send = function(data){
     else if (ArrayBuffer.isView(data)) payload = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     else { binary = false; payload = String(data); } }
   post({ type:'oc-ws', dir:'out', sub:'send', connId:this._id, data:payload, binary:binary });
+  window.__ocNet.emit('Network.webSocketFrameSent', { requestId:this._rid, timestamp:window.__ocNet.now(), response:{ opcode: binary?2:1, mask:true, payloadData: binary ? _b64(payload) : String(payload) } });
 };
 OCWebSocket.prototype.close = function(code, reason){
   if (this.readyState === 3 || this.readyState === 2) return; this.readyState = 2;
@@ -289,12 +341,26 @@ function OCEventSource(url, cfg){
     else if (u.port && u.port !== location.port) targetPort = parseInt(u.port, 10);
   } catch(e){}
   post({ type:'oc-sse', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path });
+  var self2 = this; this._rid = this._id;
+  try { this._absUrl = new URL(this.url, location.href).href; } catch(e){ this._absUrl = this.url; }
+  this._sseReplay = function(){
+    window.__ocNet.emit('Network.requestWillBeSent', { requestId:self2._rid, loaderId:'oc', documentURL:location.href, request:{ url:self2._absUrl, method:'GET', headers:{ Accept:'text/event-stream' } }, timestamp:window.__ocNet.now(), wallTime:window.__ocNet.wall(), initiator:{ type:'script' }, type:'EventSource' });
+    if (self2.readyState === 1) window.__ocNet.emit('Network.responseReceived', { requestId:self2._rid, timestamp:window.__ocNet.now(), type:'EventSource', response:{ url:self2._absUrl, status:200, statusText:'OK', mimeType:'text/event-stream', headers:{ 'content-type':'text/event-stream' } } });
+  };
+  window.__ocNet.register(this._rid, this._sseReplay); this._sseReplay();
 }
 OCEventSource.CONNECTING = 0; OCEventSource.OPEN = 1; OCEventSource.CLOSED = 2;
+OCEventSource.prototype._sseFinish = function(){
+  if (this._cdpDone) return; this._cdpDone = true;
+  window.__ocNet.emit('Network.loadingFinished', { requestId:this._rid, timestamp:window.__ocNet.now(), encodedDataLength:0 });
+  window.__ocNet.unregister(this._rid);
+};
 OCEventSource.prototype._deliver = function(d){
-  if (d.sub === 'open'){ this.readyState = 1; this._emit('open', { type:'open' }); }
+  if (d.sub === 'open'){ this.readyState = 1;
+    window.__ocNet.emit('Network.responseReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), type:'EventSource', response:{ url:this._absUrl, status:200, statusText:'OK', mimeType:'text/event-stream', headers:{ 'content-type':'text/event-stream' } } });
+    this._emit('open', { type:'open' }); }
   else if (d.sub === 'chunk'){ this._feed(String(d.data == null ? '' : d.data)); }
-  else if (d.sub === 'close'){ if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id]; this._emit('error', { type:'error' }); }
+  else if (d.sub === 'close'){ if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id]; this._sseFinish(); this._emit('error', { type:'error' }); }
 };
 OCEventSource.prototype._feed = function(text){
   this._buf = (this._buf + text).replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n');
@@ -314,10 +380,13 @@ OCEventSource.prototype._parse = function(raw){
   }
   if (id !== null) this.lastEventId = id;
   if (data.length === 0) return;
-  this._emit(event, { type:event, data:data.join('\\n'), lastEventId:this.lastEventId, origin:location.origin });
+  var payload = data.join('\\n');
+  window.__ocNet.emit('Network.eventSourceMessageReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), eventName:event, eventId:this.lastEventId || '', data:payload });
+  this._emit(event, { type:event, data:payload, lastEventId:this.lastEventId, origin:location.origin });
 };
 OCEventSource.prototype.close = function(){
   if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id];
+  this._sseFinish();
   post({ type:'oc-sse', dir:'out', sub:'close', connId:this._id });
 };
 OCEventSource.prototype.addEventListener = function(t, fn){ (this._l[t] || (this._l[t] = [])).push(fn); };
@@ -359,6 +428,7 @@ if (!setup()) { var tries = 0, iv = setInterval(function(){ if (setup() || ++tri
 function sendToChobitsu(method){ if (window.chobitsu) window.chobitsu.sendRawMessage(JSON.stringify({ id:'ocdt'+(++seq), method:method, params:{} })); }
 function sendToDevtools(msg){ post({ source:'oc-cdp', dir:'target', data: JSON.stringify(msg) }); }
 function init(){
+  if (window.__ocNet) window.__ocNet.onAttach();
   sendToDevtools({ method:'Page.frameNavigated', params:{ frame:{ id:'1', mimeType:'text/html', securityOrigin: location.origin, url: location.href }, type:'Navigation' } });
   sendToChobitsu('Network.enable');
   sendToDevtools({ method:'Runtime.executionContextsCleared' });
@@ -390,14 +460,20 @@ const DEVTOOLS_TAGS =
   '<script src="/oc-devtools/chobitsu.js"><\/script>' + "<script>" + CDP_BOOTSTRAP + "<\/script>";
 
 // Insert the shim as the first child of <head> (so it runs before any script).
-// The WS shim runs first (inline), then chobitsu (classic src → executes before
-// the app's deferred module scripts), then the CDP bootstrap.
+// The DevTools network bridge (NET_SHIM) runs first so the WS/SSE shims can use
+// it, then the WS + SSE shims (inline), then chobitsu (classic src → executes
+// before the app's deferred module scripts), then the CDP bootstrap.
 function injectWsShim(html, keepPrefix) {
   // For keep-prefix ports, tell the injected WS shim (and any app code that cares)
   // that this document lives under its real base — so its own HMR socket path is
   // left prefixed rather than stripped.
   const flag = keepPrefix ? "<script>window.__ocKeepPrefix=true;<\/script>" : "";
-  const tag = flag + "<script>" + WS_SHIM + "<\/script><script>" + SSE_SHIM + "<\/script>" + DEVTOOLS_TAGS;
+  const tag =
+    flag +
+    "<script>" + NET_SHIM + "<\/script>" +
+    "<script>" + WS_SHIM + "<\/script>" +
+    "<script>" + SSE_SHIM + "<\/script>" +
+    DEVTOOLS_TAGS;
   const headOpen = /<head[^>]*>/i.exec(html);
   if (headOpen) {
     const at = headOpen.index + headOpen[0].length;
