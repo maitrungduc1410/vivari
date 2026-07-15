@@ -50,6 +50,8 @@ const SPIKES = [
   { name: "pglite", file: "spike-pglite.mjs", net: true, timeout: 900000 },
   // Server-Sent Events over the oc-sse tunnel (streams past the buffered HTTP proxy).
   { name: "sse", file: "spike-sse.mjs", net: true },
+  // GraphQL Yoga API + demo UI (queries via GET/POST + a mutation).
+  { name: "graphql", file: "spike-graphql.mjs", net: true },
 ];
 
 const args = process.argv.slice(2);
