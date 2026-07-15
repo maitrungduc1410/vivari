@@ -120,7 +120,15 @@ const ESB_INPROC_NEW = `  // [OpenContainer] in-process esbuild service (no chil
     }
     return __ocRealFs.read(fd, buffer, offset, length, position, callback);
   };
-  globalThis.fs = __ocFs;
+  // Install our fd-multiplexing fs for the Go glue. A plain assignment is enough once
+  // globalThis.fs is pre-seated writable at boot (runtime/index.js), but stay resilient:
+  // if another Go tool locked it (Object.defineProperty without writable — e.g.
+  // @astrojs/compiler), fall back to a configurable redefine.
+  try {
+    globalThis.fs = __ocFs;
+  } catch {
+    Object.defineProperty(globalThis, "fs", { value: __ocFs, writable: true, configurable: true });
+  }
   const __ocGo = new globalThis.Go();
   __ocGo.argv = ["node", \`--service=\${"%VER%"}\`];
   __ocGo.env = Object.assign({ TMPDIR: os2.tmpdir() }, process.env);

@@ -299,6 +299,19 @@ target pure-JS/wasm, proven by a spike. It is guarded by `scripts/spike-toolchai
   patches; on block-shape drift it `console.warn`s LOUDLY (never patch-fails
   silently → a hang). Idempotent; strict no-op for a genuine native esbuild
   (guarded on the wasm assets sitting next to `main.js`).
+- **`globalThis.fs` is pre-seated writable at boot** (`runtime/index.js`, next to the
+  `process`/`Buffer` globals). Go/wasm toolchains drive their wasm through the Go glue
+  (`wasm_exec`), which installs an fs shim with `globalThis.fs || Object.defineProperty(
+  globalThis, "fs", { value: nodeFs })`. That `defineProperty` defaults to
+  `writable:false, configurable:false`, so whichever Go tool loads FIRST **locks**
+  `globalThis.fs` — and then esbuild-wasm's in-process patch can't do `globalThis.fs =
+  __ocFs` to multiplex its stdio fds ("Cannot assign to read only property 'fs'"). This
+  bit Astro: `@astrojs/compiler` (Go wasm for `.astro`) locked it before Vite's esbuild
+  dep-optimize ran. Fix = prevention: seat a writable+configurable `globalThis.fs` at
+  boot so every tool's `globalThis.fs || …` short-circuits (never locks), while
+  esbuild/tsgo can still reassign it for their own run. A non-configurable lock can NOT
+  be undone (defineProperty throws "Cannot redefine property"), so the patch's own
+  try/catch fallback is only a backstop — the boot pre-seat is the real fix.
 - **Worker-pool default** (`runtime/builtins/process.js`): `PISCINA_DISABLE_ATOMICS`
   defaults to `1` so pools use async message passing (a browser `MessagePort`
   can't be drained synchronously across a worker boundary, so the Atomics fast-path

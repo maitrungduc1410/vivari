@@ -1123,6 +1123,28 @@ export function createRuntime({
   // loader-backed dynamic import as a global, and (b) wrap the Function
   // constructor so such bodies' import() is redirected to it.
   const ocRootRequire = moduleSystem.makeRequire("/");
+
+  // Pre-seat `globalThis.fs` as a WRITABLE, CONFIGURABLE property pointing at the real
+  // fs, BEFORE any Go/wasm toolchain loads. Multiple Go tools drive their wasm through
+  // the global Go glue (`wasm_exec`), which installs an fs shim like:
+  //   globalThis.fs || Object.defineProperty(globalThis, "fs", { value: nodeFs })
+  // That defineProperty defaults to writable:false, configurable:false — so the FIRST
+  // such tool LOCKS globalThis.fs. @astrojs/compiler (Go wasm that compiles .astro
+  // files) does exactly this at import time; if it wins the race, esbuild-wasm's
+  // in-process patch (esbuild-inproc-patch.js) can no longer do `globalThis.fs = __ocFs`
+  // to multiplex its stdio fds — it throws "Cannot assign to read only property 'fs'"
+  // and Vite's dep optimize dies. Seating a writable value here makes every tool's
+  // `globalThis.fs || …` short-circuit (never locking it) while esbuild/tsgo can still
+  // reassign it for the duration of their own run. A plain assignment gives a
+  // writable+configurable own data property, which is exactly what we want.
+  try {
+    if (!Object.getOwnPropertyDescriptor(globalThis, "fs")) {
+      globalThis.fs = ocRootRequire("fs");
+    }
+  } catch {
+    /* fs unavailable this early — tools will still install their own */
+  }
+
   globalThis.__ocImport = (spec) =>
     Promise.resolve().then(() => {
       const m = ocRootRequire(String(spec));

@@ -2486,8 +2486,21 @@ and are gated by a new offline `scripts/spike-esm.mjs`.
      `apiContextRoutesSymbol` resolve to their real Symbols, `AstroConfigSchema` is a real
      zod object. Astro is on Vite 6 + the esbuild optimizer, so it does NOT hit the
      rolldown SSR-optimize panic that blocks SvelteKit — this fallback should carry it to
-     a live dev server. `astro.config.mjs` reverted to pristine. Left `experimental`
-     pending browser confirmation.
+     a live dev server. `astro.config.mjs` reverted to pristine.
+
+  With the TDZ fixed Astro **boots** (`astro vX ready`, serving on :4321) but then Vite's
+  esbuild dep-optimize crashed with `Cannot assign to read only property 'fs' of object
+  '#<DedicatedWorkerGlobalScope>'`. Root cause: `@astrojs/compiler` (the Go/wasm `.astro`
+  compiler) installs its fs shim as `globalThis.fs || Object.defineProperty(globalThis,
+  "fs", { value: nodeFs })` — a value-only `defineProperty` defaults to
+  `writable:false, configurable:false`, so it **locks** `globalThis.fs`
+  non-configurably. When esbuild-wasm's in-process patch then does `globalThis.fs =
+  __ocFs` (to multiplex its stdio fds), it throws — and the lock can't even be redefined.
+  Fix in `runtime/index.js`: **pre-seat `globalThis.fs`** (writable+configurable, = real
+  fs) at boot, before any Go tool loads, so every tool's `globalThis.fs || …`
+  short-circuits and never locks it, while esbuild/tsgo can still reassign it. Reproduced
+  the exact conflict + verified the fix offline. Left `experimental` pending final browser
+  confirmation of a rendered page.
 
 Loader guarantees regression-gated by `scripts/spike-esm.mjs` (offline tier): TLA →
 async retry; circular re-export → lazy live binding; spread-only use keeps its const; and
