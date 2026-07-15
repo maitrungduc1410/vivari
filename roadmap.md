@@ -2427,6 +2427,38 @@ symlink, the Vite dev server, and the live preview iframe all work. The template
 drops `experimental`; the cmd-shim unwrap it relies on is guarded by
 `scripts/spike-cmd-shim.mjs`, and real pnpm is exercised by the pnpm spikes.
 
+## SvelteKit / React Router 7 / Astro template fixes (this change)
+
+Three meta-framework templates fixed after browser testing:
+
+- **SvelteKit — `ERESOLVE`.** `npm install` failed: the template pinned `vite@^8` but
+  `@sveltejs/vite-plugin-svelte@^5` peers on `vite@^6`, so npm couldn't build the tree.
+  The plugin's vite-8 support arrived in **v7**. Bumped `@sveltejs/vite-plugin-svelte`
+  to `^7.0.0` (peers `vite ^8` + `svelte ^5.46.4`) and `svelte` to `^5.46.4`; `@sveltejs/
+  kit@2.69.3` already peers `vite ^8`. Confirmed a clean lockfile (83 pkgs: vite 8.1.4,
+  svelte 5.56.5, vite-plugin-svelte 7.2.0, kit 2.69.3 — no ERESOLVE).
+
+- **React Router 7 — "not found" on first load.** RR7 framework mode is client-routed:
+  it re-matches the route against the iframe's own location (`/preview/5173/…`) during
+  hydration, so served at `/` (prefix stripped) the client router lands on NotFound even
+  though SSR rendered `/`. Fix (the same keep-prefix pattern Docusaurus uses): set
+  `manifest.keepPreviewPrefix: true` and point both `react-router.config.ts` `basename`
+  and Vite `base` at `/preview/5173/` (trailing slash required). Verified in vanilla
+  Node: `/preview/5173/` → 200 with the Home page and prefixed asset URLs, `/` → 302.
+
+- **Astro — "Cannot access 'Fragment' before initialization".** Astro's server renderer
+  (`astro/dist/runtime/server/render/common.js`) declares `const Fragment = Symbol.for(
+  'astro:fragment')` inside a circular import cycle. OC's ESM→CJS loader snapshots named
+  imports eagerly (`const Fragment = mod.Fragment`) rather than as live bindings, so the
+  cycle reads `Fragment` before its `const` initialises → TDZ throw (the documented
+  "circular-eval ordering" casualty in `esm.js`). A correct loader fix needs scope-aware
+  reference rewriting; the low-risk, template-scoped fix is `vite.ssr.noExternal:
+  ['astro']`, which routes Astro's runtime through Vite's SSR pipeline (lazy `mod.Fragment`
+  live bindings), sidestepping the eager snapshot. Confirmed valid in vanilla Node
+  (Astro dev serves `/` and SSR-renders the page body with the config applied).
+
+All three left `experimental` pending browser confirmation.
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

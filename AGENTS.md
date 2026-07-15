@@ -674,6 +674,18 @@ invariant to preserve:
   `navigator.serviceWorker.controller` is null, so control is established before
   boot/preview.
 
+### Client-routed frameworks need `keepPreviewPrefix` + a matching base
+The preview SW serves every app under `/preview/<port>/` and by default **strips**
+that prefix so `/`-based servers (Next, Vite, Express) see clean paths. But a
+framework whose **client** router re-matches routes against the iframe's own
+`location.pathname` (which IS `/preview/<port>/…`) lands on its NotFound page even
+when SSR rendered `/` fine. Fix: set `manifest.keepPreviewPrefix: true` (SW keeps the
+prefix) **and** point the app's base at `/preview/<port>/` so SSR and the hydrated
+client agree. Templates doing this: **Docusaurus** (`baseUrl`), **React Router 7**
+(`react-router.config.ts` `basename` + Vite `base`, both `/preview/5173/`, trailing
+slash required). Symptom if you forget: "not found" on first load / `No route matches
+URL "/preview/<port>/"`.
+
 ### `module` is a REAL constructor — route requires through `Module._load`
 `require('module')` returns the `Module` **constructor** (not a plain object);
 `builtins.module = Module` in `runtime/index.js`, statics/prototype wired in
@@ -795,6 +807,20 @@ snapshot it at call time, not at delivery time.
   `export type` — see the **tRPC** template (`server/index.ts` has zero type syntax;
   `src/App.tsx` derives `AppRouter` via `typeof import('../server/index').appRouter`).
   Proven by `scripts/spike-trpc.mjs`.
+- **Named imports are eager snapshots, NOT live bindings — circular `const` exports
+  can TDZ-throw.** `esm.js` compiles `import { X } from './m'` to
+  `const X = __oc_m['X']` (an eager read), while exports become lazy getters. That's
+  fine for hoisted functions (reachable early) but breaks a *circular* import of a
+  `const`/`class`: if module A's body requires B before A's `const X` initialises, and
+  B's prelude eager-reads `A.X`, the export getter throws **"Cannot access 'X' before
+  initialization"** (real ESM wouldn't — its live binding is read lazily, at use). This
+  is the documented "circular-eval ordering" casualty in `esm.js`. A full fix needs
+  scope-aware reference rewriting (every use of `X` → `__oc_m.X`); until then, the
+  workaround for frameworks that hit it is to route the offending package through
+  **Vite's** SSR pipeline (`vite.ssr.noExternal`), which models live bindings
+  correctly. The **Astro** template does exactly this (`noExternal: ['astro']`) because
+  `astro/dist/runtime/server/render/common.js` does `const Fragment = Symbol.for(
+  'astro:fragment')` inside a cycle.
 
 ### `self` is a getter in a real Worker
 Third-party bundles (Vite/rolldown workers) do `Object.assign(globalThis, {self})`,
