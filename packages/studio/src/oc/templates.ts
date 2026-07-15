@@ -2996,14 +2996,15 @@ function graphqlTemplate(): TemplateDef {
       category: "Backend",
       name: "GraphQL",
       language: "JavaScript",
-      description: "GraphQL Yoga server with GraphiQL, on Node",
+      description: "GraphQL Yoga API (queries + a mutation) with a demo UI + GraphiQL, on Node",
       port: 4000,
-      openPath: "/graphql",
+      openPath: "/",
       entry: "src/index.js",
       hmr: false,
       reload: false,
       install: "npm install",
       dev: "npm run dev",
+      // Experimental until scripts/spike-graphql.mjs is green in CI.
       experimental: true,
     },
     files: {
@@ -3017,29 +3018,208 @@ function graphqlTemplate(): TemplateDef {
 }
 `,
       "src/index.js": `const { createServer } = require('node:http');
+const { readFileSync } = require('node:fs');
+const path = require('node:path');
 const { createYoga, createSchema } = require('graphql-yoga');
 
+// In-memory data so the addBook mutation has something to change.
+let nextId = 3;
+const books = [
+  { id: '1', title: 'The Pragmatic Programmer', author: 'Hunt & Thomas' },
+  { id: '2', title: 'Refactoring', author: 'Martin Fowler' },
+];
+
 const yoga = createYoga({
+  graphqlEndpoint: '/graphql',
   schema: createSchema({
     typeDefs: \`
+      type Book { id: ID!, title: String!, author: String! }
       type Query {
         hello: String
         greet(name: String!): String
+        books: [Book!]!
+      }
+      type Mutation {
+        addBook(title: String!, author: String!): Book!
       }
     \`,
     resolvers: {
       Query: {
         hello: () => 'Hello from GraphQL Yoga!',
         greet: (_parent, args) => 'Hello ' + args.name + '!',
+        books: () => books,
+      },
+      Mutation: {
+        addBook: (_parent, args) => {
+          const book = { id: String(nextId++), title: args.title, author: args.author };
+          books.push(book);
+          return book;
+        },
       },
     },
   }),
 });
 
+// Serve a tiny demo UI at / and let GraphQL Yoga (with GraphiQL) own /graphql.
+const indexHtml = readFileSync(path.join(__dirname, '..', 'public', 'index.html'));
 const port = Number(process.env.PORT ?? 4000);
-createServer(yoga).listen(port, () => {
-  console.log('GraphQL ready at http://localhost:' + port + '/graphql');
+createServer((req, res) => {
+  const url = (req.url || '/').split('?')[0];
+  if (req.method === 'GET' && url === '/') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(indexHtml);
+    return;
+  }
+  return yoga(req, res);
+}).listen(port, () => {
+  console.log('GraphQL demo UI at http://localhost:' + port + '/  (GraphiQL at /graphql)');
 });
+`,
+      "public/index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GraphQL (Yoga) demo</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body { font-family: system-ui, sans-serif; margin: 0; padding: 2.5rem; background: #0a0a0a; color: #ededed; }
+      main { max-width: 680px; margin: 0 auto; }
+      header { display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap; }
+      h1 { margin: 0; font-size: 1.5rem; }
+      a { color: #a78bfa; }
+      .sub { color: #9ca3af; margin: .35rem 0 1.5rem; }
+      code { background: #1f2937; padding: .1rem .35rem; border-radius: 5px; }
+      .card { background: #111; border: 1px solid #1f2937; border-radius: 12px; padding: 1.1rem 1.2rem; margin-bottom: 1rem; }
+      .card h2 { margin: 0 0 .6rem; font-size: 1rem; }
+      label { display: block; color: #9ca3af; font-size: .78rem; margin: .4rem 0 .2rem; }
+      input { width: 100%; padding: .5rem .6rem; border-radius: 8px; border: 1px solid #333; background: #0d0d0d; color: #ededed; }
+      .row { display: flex; gap: .5rem; }
+      .row > div { flex: 1; }
+      button { margin-top: .7rem; padding: .5rem 1rem; border-radius: 8px; border: 1px solid transparent; background: #7c3aed; color: #fff; cursor: pointer; }
+      button.ghost { background: #1f2937; }
+      button:hover { filter: brightness(1.1); }
+      ul { list-style: none; padding: 0; margin: .5rem 0 0; }
+      li { padding: .5rem .7rem; border: 1px solid #1f2937; border-radius: 8px; margin: .35rem 0; }
+      li .by { color: #9ca3af; font-size: .8rem; }
+      .out { color: #4ade80; font-weight: 600; min-height: 1.2rem; margin: .6rem 0 0; }
+      pre { background: #0d0d0d; border: 1px solid #1f2937; border-radius: 8px; padding: .7rem; overflow: auto; font-size: .78rem; color: #cbd5e1; margin: 0; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>GraphQL (Yoga)</h1>
+        <a id="giql" href="/graphql" target="_blank" rel="noopener">Open GraphiQL &rarr;</a>
+      </header>
+      <p class="sub">Each button calls the GraphQL API at <code>/graphql</code> with <code>fetch()</code> and renders the result.</p>
+
+      <div class="card">
+        <h2>Query with an argument</h2>
+        <label for="name">name</label>
+        <input id="name" value="Duc" />
+        <button id="greetBtn">Run greet(name)</button>
+        <p class="out" id="greetOut"></p>
+      </div>
+
+      <div class="card">
+        <h2>Query a list + run a mutation</h2>
+        <div class="row">
+          <div><label for="title">title</label><input id="title" placeholder="Book title" /></div>
+          <div><label for="author">author</label><input id="author" placeholder="Author" /></div>
+        </div>
+        <button id="addBtn">Add book (mutation)</button>
+        <button id="refreshBtn" class="ghost">Refresh list</button>
+        <ul id="books"></ul>
+      </div>
+
+      <div class="card">
+        <h2>Last GraphQL response</h2>
+        <pre id="raw">Click a button above.</pre>
+      </div>
+    </main>
+    <script>
+      // In the OpenContainer preview the page lives under /preview/<port>/, so point
+      // the GraphiQL link at the same prefix; standalone it's just /graphql.
+      var pm = location.pathname.match(/^(.*\\/preview\\/\\d+)\\//);
+      document.getElementById('giql').href = (pm ? pm[1] : '') + '/graphql';
+
+      function gql(query, variables) {
+        return fetch('/graphql', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'accept': 'application/json' },
+          body: JSON.stringify({ query: query, variables: variables || {} })
+        }).then(function (r) { return r.json(); });
+      }
+      function showRaw(obj) { document.getElementById('raw').textContent = JSON.stringify(obj, null, 2); }
+
+      document.getElementById('greetBtn').addEventListener('click', function () {
+        var name = document.getElementById('name').value || 'world';
+        gql('query($name:String!){ greet(name:$name) }', { name: name }).then(function (res) {
+          showRaw(res);
+          document.getElementById('greetOut').textContent = (res.data && res.data.greet) || '';
+        });
+      });
+
+      function loadBooks() {
+        return gql('{ books { id title author } }').then(function (res) {
+          showRaw(res);
+          var list = document.getElementById('books');
+          list.innerHTML = '';
+          (res.data && res.data.books ? res.data.books : []).forEach(function (b) {
+            var li = document.createElement('li');
+            var t = document.createElement('span'); t.textContent = b.title;
+            var by = document.createElement('span'); by.className = 'by'; by.textContent = '  \u2014 ' + b.author;
+            li.appendChild(t); li.appendChild(by);
+            list.appendChild(li);
+          });
+        });
+      }
+      document.getElementById('addBtn').addEventListener('click', function () {
+        var title = document.getElementById('title').value.trim();
+        var author = document.getElementById('author').value.trim();
+        if (!title || !author) { document.getElementById('raw').textContent = 'Enter a title and author first.'; return; }
+        gql('mutation($t:String!,$a:String!){ addBook(title:$t, author:$a){ id title author } }', { t: title, a: author }).then(function (res) {
+          showRaw(res);
+          document.getElementById('title').value = '';
+          document.getElementById('author').value = '';
+          loadBooks();
+        });
+      });
+      document.getElementById('refreshBtn').addEventListener('click', loadBooks);
+
+      loadBooks();
+    </script>
+  </body>
+</html>
+`,
+      "README.md": `# GraphQL (Yoga)
+
+A GraphQL Yoga server on Node with a tiny demo UI.
+
+## Files
+- src/index.js — the Yoga server. GraphQL (and GraphiQL) live at /graphql; a small
+  static demo page is served at /.
+- public/index.html — the demo UI: buttons that call /graphql via fetch() and render
+  the result (a query with an argument, a list query, and a mutation).
+
+## Run
+- npm install
+- npm run dev   (opens http://localhost:4000)
+
+## Try it
+- Open the page and click the buttons, OR open GraphiQL at /graphql and run:
+
+  { hello }
+  query { greet(name: "Duc") }
+  { books { id title author } }
+  mutation { addBook(title: "Dune", author: "Herbert") { id title } }
+
+## API
+- POST /graphql with JSON { "query": "...", "variables": { ... } }
+
+Learn more: https://the-guild.dev/graphql/yoga-server
 `,
     },
   };

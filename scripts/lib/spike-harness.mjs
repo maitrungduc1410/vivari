@@ -193,3 +193,22 @@ export async function httpGet(kernel, port, url = "/") {
   }
   return { status: r.status, body: decode(r.body || "") };
 }
+
+/** POST a JSON body to the in-VM server (single shot — no warm-up retry loop). */
+export async function httpPost(kernel, port, url, body, headers = {}) {
+  const decode = (b) => (typeof b === "string" ? b : Buffer.from(b).toString());
+  const payload = typeof body === "string" ? body : JSON.stringify(body);
+  const r = await kernel.handleHttpRequest(port, {
+    port,
+    method: "POST",
+    url,
+    headers: {
+      host: "127.0.0.1:" + port,
+      "content-type": "application/json",
+      accept: "application/json",
+      ...headers,
+    },
+    body: payload,
+  });
+  return { status: r.status, body: decode(r.body || "") };
+}

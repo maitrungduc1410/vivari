@@ -2235,6 +2235,29 @@ events, exactly what native `EventSource` gives you.
   blank-line frame parser the shim/spike use correctly separates default/`metric`/`notice`
   events with a progressing counter.
 
+## GraphQL template — demo UI + a real mutation (this change)
+
+The `graphql` (Yoga) Backend template shipped as just the server + GraphiQL, so it wasn't
+obvious how to *call* it from an app. It's now a proper showcase: a tiny static demo UI at
+`/` whose buttons call the API with `fetch()` and render the result, while GraphQL Yoga (and
+GraphiQL) keep `/graphql`.
+
+- **Server** (`src/index.js`): one `http.createServer` serves `public/index.html` at `/` and
+  delegates everything else to Yoga (`graphqlEndpoint: '/graphql'`). Schema gains a `Book`
+  type, a `books` list query, and an `addBook` **mutation** over an in-memory array — so the
+  UI can demonstrate a query-with-args, a list query, and a write.
+- **UI** (`public/index.html`): a greet-by-name box, a book list + add-book form, and a "last
+  GraphQL response" panel showing the raw JSON. The GraphiQL link is computed from the current
+  path so it works both under the OpenContainer preview (`/preview/<port>/graphql`) and in a
+  standalone export (`/graphql`).
+- **Verification.** New network spike `scripts/spike-graphql.mjs` (in `run-spikes.mjs`) asserts
+  install -> bind :4000 -> `GET /` serves the UI -> `POST /graphql` answers `hello` +
+  `greet(name)` + `books` -> the `addBook` mutation grows the list by one. It uses a new
+  `httpPost` helper added to `scripts/lib/spike-harness.mjs`. Stays `experimental` until green.
+- **Feasibility proof.** Confirmed end-to-end in vanilla Node with real `graphql-yoga@5`: `GET /`
+  serves the page, the queries and the `addBook` mutation work (books 2 -> 3), and GraphiQL is
+  still served at `/graphql`.
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server
