@@ -66,6 +66,11 @@ packages/
       lib/         Node's REAL vendored lib/*.js (fs, net, http, stream, ...).
       internal/    Node's REAL internal/* (streams, errors, validators, ...).
       bindings/    our internalBinding shims (fs, tcp_wrap, zlib, crypto, ...).
+        http_parser.js  selects the HTTP parser: real llhttp-in-Wasm (default),
+                        pure-JS fallback. Force with OC_HTTP_PARSER=js|wasm.
+        llhttp/      llhttp compiled to Wasm (vendored from undici) + the bridge
+                     (llhttp-parser.js) folding llhttp callbacks onto Node's
+                     HTTPParser contract; regen the binary via scripts/vendor-llhttp.mjs.
       internal-binding.js / primordials.js / loader.js   glue for the above.
 
   studio/          The primary UI: a Vite + React 19 (React Compiler) + Tailwind v4
@@ -296,6 +301,26 @@ target pure-JS/wasm, proven by a spike. It is guarded by `scripts/spike-toolchai
   can't work). `worker_threads.receiveMessageOnPort` IS implemented (lazy per-port
   inbox) for libraries that poll it directly; just keep the Atomics path off. This
   is why the Angular template is now plain `ng serve`/`ng build` with no `scripts/oc-ng.mjs`.
+
+### HTTP parser is real llhttp-in-Wasm, with a pure-JS fallback
+`internalBinding('http_parser')` (`bindings/http_parser.js`) prefers **real llhttp
+compiled to Wasm** (`bindings/llhttp/`, the binary vendored from undici via
+`scripts/vendor-llhttp.mjs`) and transparently falls back to the pure-JS parser.
+Gotchas:
+- **Selection is automatic.** The Wasm module is compiled *synchronously* at
+  binding time; that's allowed in Workers (where guest processes run) but throws on
+  the main thread (4KB sync-compile cap), which is exactly what triggers the JS
+  fallback. Force either side with `OC_HTTP_PARSER=js|wasm` (wasm = fail loud).
+- **Both backends expose the identical contract** (numeric kOn* slots,
+  `initialize/execute/finish`, `kOnHeadersComplete(major,minor,headersFlat,method,
+  url,status,statusText,upgrade,shouldKeepAlive)`, `kOnBody(singleBuffer)`). The
+  bridge (`llhttp/llhttp-parser.js`) mirrors Node's `node_http_parser.cc` and
+  handles BOTH requests and responses; do NOT special-case it to responses.
+- **`allMethods` order must match llhttp's method enum** (`llhttp/constants.js`) so
+  `allMethods[llhttp_get_method()]` round-trips; don't reorder it.
+- **When Wasm is live, `process.versions.llhttp` is set** — the verify suite + the
+  offline `scripts/spike-http-llhttp.mjs` assert on it. Regenerating the binary =
+  `node scripts/vendor-llhttp.mjs` (re-pins the undici source).
 
 ### The studio is a multi-root workspace — absolute paths + the VFS is truth
 Since the workspace rewrite there is NO single "current project" and NO static file
