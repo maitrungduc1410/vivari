@@ -760,10 +760,33 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     process worker (browser `initCrypto()`, headless `require`); wired into `npm run build`
     (`build:crypto`). `Hash`/`Hmac` extend `stream.Writable` (Phase 6), so idiomatic
     `stream.pipe(createHash(algo))` + `digest()` works — real Node's Hash is a Transform.
-    **Deferred (S3):** sign/verify, RSA/EC keygen, DH, scrypt, X.509 — they throw loudly; these
+    Also covers a **symmetric-only `KeyObject`** (`KeyObject` + `createSecretKey`) so key-material
+    APIs like `jsonwebtoken@9` HS\* work (see below).
+    **Deferred (S3):** asymmetric sign/verify, RSA/EC keygen, createPrivate/PublicKey, DH, scrypt,
+    X.509 — they throw loudly; these
     want a bigger codec + vendoring Node's real `lib/crypto` internals. (corepack's registry
     ECDSA signature check needs `verify`; it's skipped via corepack's `COREPACK_INTEGRITY_KEYS=0`
     escape hatch, keeping the sha512 tarball-integrity check that only needs `createHash`.)
+
+    **`jsonwebtoken` (auth0/node-jsonwebtoken) HS256/384/512 — DONE, proven by
+    `scripts/spike-jwt.mjs`.** `jsonwebtoken@9` is pure JS (jws/jwa/ms/lodash.*/semver, no native
+    binding) so support hinged purely on crypto. The blocker was **key material**, not the HMAC
+    primitive: `sign()`/`verify()` destructure `crypto.{KeyObject,createSecretKey,createPrivateKey,
+    createPublicKey}`, run `secret instanceof KeyObject`, convert raw secrets via `createSecretKey()`
+    (only after `createPrivateKey`/`createPublicKey` *throw*), require `key.type === 'secret'`, and
+    then feed the `KeyObject` to `crypto.createHmac`. jwa additionally gates KeyObject support on
+    `typeof crypto.createPublicKey === 'function'`. Fix = a **symmetric-only `KeyObject`** in
+    `lib/crypto.js`: a branded `KeyObject` class + `SecretKeyObject` (`.type === 'secret'`,
+    `.export()`, `.symmetricKeySize`), `createSecretKey(key[,enc])`, `createPrivateKey`/
+    `createPublicKey` as **callable-but-throwing** stubs (load-bearing: their throw drives
+    jsonwebtoken's fallback to `createSecretKey`, and their mere presence flips jwa's
+    `supportsKeyObjects`), `createHmac` taught to unwrap a secret `KeyObject`, and
+    `util.types.isKeyObject` wired to the brand. Zero Wasm changes — the RustCrypto HMAC codec was
+    already there. The spike round-trips HS256/384/512 sign+verify, wrong-secret + expiry rejection,
+    and a `KeyObject`-as-secret input. **Asymmetric RS256/ES256/PS256 remain unsupported** (they need
+    the S3 `createSign`/`createVerify` + RSA/EC codec work above); jsonwebtoken now fails them with a
+    clean `secretOrPrivateKey must be an asymmetric key when using RS256` rather than an `instanceof`
+    crash.
 13. **ESM (`import`/`export`)** — **DONE (S1: transpile ESM→CJS at load time).** Our
     module system is synchronous CJS, so instead of a spec ESM loader we rewrite import/
     export down to `require`/`exports` in `compile()`, exactly like a bundler's interop
