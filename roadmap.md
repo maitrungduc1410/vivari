@@ -2047,6 +2047,36 @@ and teaches quick-open to jump to a line — without ever blocking the UI.
 Follow-ups: search result virtualization for very large result sets, a search-history dropdown
 (the input hints at `↑↓`), and `.gitignore`-aware excludes.
 
+## Dev-server heap: per-PID memory attribution (this change)
+
+After VFS compression, the single largest term in the tab is the **Process Worker JS heap**
+(~1.87 GB for Nuxt), but `performance.measureUserAgentSpecificMemory()` only attributes it to a
+URL (`process-worker.js`) — every process shares that URL, so you couldn't tell *which* process
+holds it or *what* is retained. This change adds a per-PID breakdown to "Measure Memory" so the
+next round of work can be targeted instead of guessed.
+
+- **Per-process query.** Each Process Worker answers a new `proc-mem` message with its own JS
+  heap (`performance.memory.usedJSHeapSize`, Chrome-only/coarse; `-1` when unavailable), the size
+  of its guest **module cache** (`Object.keys(moduleSystem.cache).length` — our load-once /
+  retain-forever CJS/ESM cache, the main runtime-side retainer), and whether it hosts the resident
+  **esbuild-wasm** Go service (`isEsbuildInprocActive()`). The runtime exposes this via
+  `runtime.memStats()`, surfaced through `boot.js`'s `onReady` control object.
+- **Fan-out + aggregation.** The kernel worker keeps a live `pid → worker` registry (populated /
+  pruned in `spawnWorker`), queries every process in parallel with a 2 s timeout, sorts by heap,
+  and relays the rows on the existing `oc-mem` round-trip. The studio prints a per-PID table
+  (`heap  PID N (M modules, esbuild-wasm)`), falling back to module counts when `performance.memory`
+  is off. Threads and `fork` children spawn through the same path, so nested worker-pool processes
+  show up too.
+- **Findings that shape the next step.** Reading the module loader confirms the compiled CJS/ESM
+  wrapper (and thus its source) is **not** retained after evaluation — it's GC-eligible — so there
+  is *no* dangling "source string" to free. The reducible heap is therefore (a) the unbounded
+  `Module._cache` graph (a real lever, but pruning it safely means respecting stateful singletons
+  and cycles — opt-in/measured work), (b) the by-design resident esbuild Go heap, and (c) the guest
+  framework's own working set (not ours). This diagnostic is the prerequisite for deciding between
+  those; the risky bounded-cache path stays gated on the numbers it produces.
+- **Verification.** Behavior is unchanged when nobody asks for memory; `proc-mem` is a pure
+  read-only query, so `verify-node` is unaffected (`node --check` + studio `tsc` clean).
+
 ## VFS whole-file lazy compression — cut the tab's RAM (this change)
 
 The File System Worker's Wasm linear memory (every file body held as raw bytes) was the

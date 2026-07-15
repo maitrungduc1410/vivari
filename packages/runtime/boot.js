@@ -92,6 +92,7 @@ export function bootProcess({
       dispatchPipe: runtime.dispatchPipe,
       dispatchStdin: runtime.dispatchStdin,
       dispatchFetch: runtime.dispatchFetch,
+      memStats: runtime.memStats,
     });
 
   // run() is async (it drives the event loop). Report the exit code when it

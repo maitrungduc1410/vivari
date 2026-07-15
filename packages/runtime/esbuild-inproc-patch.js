@@ -229,7 +229,17 @@ export function maybePatchEsbuildInProcess(source, filename, fs, path) {
   }
   const version = m[1];
   const replacement = ESB_INPROC_NEW.replaceAll("%VER%", version);
+  // Diagnostic: this process is about to host the resident esbuild Go wasm
+  // service (~11 MB wasm + Go heap), a notable term in the memory readout.
+  _inprocActive = true;
   // Function replacement: return the string verbatim so `$`-sequences in the
   // esbuild source (e.g. `${...}` template holes) are never treated as $-patterns.
   return source.replace(ESB_OLD_RE, () => replacement);
+}
+
+// True once this process has patched esbuild-wasm to run its Go service
+// in-process (surfaced per-PID by the "Measure Memory" diagnostic).
+let _inprocActive = false;
+export function isEsbuildInprocActive() {
+  return _inprocActive;
 }

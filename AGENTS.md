@@ -881,6 +881,24 @@ shrink on a Nuxt `node_modules` (929 MB → 274 MB), dropping the real Chrome ta
   `scripts/spike-compress.mjs` estimates the win over a real `node_modules` offline. Any
   change here needs `npm run build:vfs && npm run build:vfs:node` to rebuild the wasm.
 
+### Measure Memory: per-PID Process Worker breakdown
+Post-compression, the tab's largest term is the **Process Worker JS heap** (dev servers), but
+`performance.measureUserAgentSpecificMemory()` only attributes it to the shared
+`process-worker.js` URL — not to a PID. "Measure Memory" adds a per-process breakdown:
+- Each worker answers a `proc-mem` message with `runtime.memStats()`: its own heap
+  (`performance.memory.usedJSHeapSize`, Chrome-only/coarse, `-1` if absent), guest **module-cache**
+  entry count (`moduleSystem.cache` — the load-once/retain-forever CJS/ESM cache), and whether it
+  hosts the resident **esbuild-wasm** service (`isEsbuildInprocActive()`). Exposed via
+  `boot.js`'s `onReady` control object.
+- The kernel worker keeps a `pid → worker` registry (in `spawnWorker`), queries all live processes
+  in parallel (2 s timeout), and relays sorted rows on the existing `oc-mem` round-trip;
+  `controller.ts` prints the table. Threads/`fork` children go through `spawnWorker` too, so they
+  appear. The query is **read-only** — `verify-node` is unaffected.
+- Note: the compiled CJS/ESM wrapper is not retained after evaluation (GC-eligible), so there's no
+  stray "module source" to free — the reducible heap is the `Module._cache` graph (risky to prune),
+  the by-design esbuild Go heap, and the guest framework's own working set. Use this readout to
+  decide before touching any of them.
+
 ---
 
 ## Testing & verification

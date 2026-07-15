@@ -80,9 +80,12 @@ function buildCodecs(codecModule, cryptoModule) {
   return { makeZStream, cryptoCodec };
 }
 
+let selfPid = -1;
+
 self.onmessage = async (event) => {
   const { type, sab, spec, fsPort, threadPort, codecModule, cryptoModule } = event.data;
   if (type === "init") {
+    selfPid = (spec && spec.pid) | 0;
     const { makeZStream, cryptoCodec } = buildCodecs(codecModule, cryptoModule);
     bootProcess({
       sab,
@@ -97,6 +100,21 @@ self.onmessage = async (event) => {
       codec: makeZStream,
       cryptoCodec,
     });
+    return;
+  }
+  // Diagnostic (studio "Measure Memory"): report THIS worker's own JS heap plus
+  // its runtime retention stats (guest module-cache size, esbuild-wasm resident).
+  // `performance.memory` is Chrome-only and coarse, but enough to attribute which
+  // Process Worker holds the big heap; -1 when unavailable.
+  if (type === "proc-mem") {
+    let heap = -1;
+    try {
+      if (self.performance && performance.memory) heap = performance.memory.usedJSHeapSize;
+    } catch {
+      /* not available in this engine */
+    }
+    const stats = control && control.memStats ? control.memStats() : { modules: -1, esbuildInproc: false };
+    self.postMessage({ type: "proc-mem-reply", id: event.data.id, pid: selfPid, heap, ...stats });
     return;
   }
   // Kernel nudge: a network request is queued for us — wake the event loop.

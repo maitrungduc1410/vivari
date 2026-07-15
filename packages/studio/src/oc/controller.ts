@@ -151,6 +151,18 @@ export interface MemInfo {
   ts: number;
 }
 
+// Per-Process-Worker memory row for the "Measure Memory" breakdown. `heap` is the
+// worker's own JS heap (performance.memory, Chrome-only; -1 if unavailable),
+// `modules` the guest module-cache entry count, `esbuildInproc` whether it hosts
+// the resident esbuild Go wasm service.
+export interface ProcMem {
+  pid: number;
+  name: string;
+  heap: number;
+  modules: number;
+  esbuildInproc: boolean;
+}
+
 const TERM_THEME = {
   background: "#181818",
   foreground: "#cccccc",
@@ -1701,6 +1713,31 @@ export class IdeController {
       }
       if (typeof m.kernelBytes === "number") {
         this.consoleLine(`Kernel worker: ${fmtBytes(m.kernelBytes as number)}`, "90");
+      }
+      // Per-PID Process Worker breakdown: turns the flat "N GB on process-worker.js"
+      // figure into which process holds it (dev servers dominate), how many modules
+      // its guest cache retains, and whether it hosts the resident esbuild wasm.
+      const procs = Array.isArray(m.procs) ? (m.procs as ProcMem[]) : [];
+      const withHeap = procs.filter((p) => Number(p.heap) >= 0);
+      if (withHeap.length > 0) {
+        this.consoleLine("Process workers (own JS heap):", "36");
+        for (const p of withHeap) {
+          const mods = Number(p.modules) >= 0 ? `${p.modules} modules` : "modules n/a";
+          const esb = p.esbuildInproc ? ", esbuild-wasm" : "";
+          this.consoleLine(
+            `  ${fmtBytes(Number(p.heap)).padStart(9)}  ${p.name} (${mods}${esb})`,
+            "90",
+          );
+        }
+      } else if (procs.length > 0) {
+        // Heap sizing unavailable (performance.memory off) — still show retention.
+        this.consoleLine("Process workers (heap size unavailable):", "36");
+        for (const p of procs) {
+          this.consoleLine(
+            `  ${p.name}: ${Number(p.modules) >= 0 ? p.modules + " modules" : "modules n/a"}${p.esbuildInproc ? ", esbuild-wasm" : ""}`,
+            "90",
+          );
+        }
       }
     } catch {
       /* kernel not ready */
