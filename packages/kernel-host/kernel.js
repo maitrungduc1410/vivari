@@ -626,7 +626,20 @@ export class Kernel {
   handleWsClient(msg) {
     const { sub, connId } = msg;
     if (sub === "open") {
-      const pid = this.listeners.get(msg.port | 0);
+      let port = msg.port | 0;
+      let pid = this.listeners.get(port);
+      // The browser ws polyfill routes by the ws URL's explicit :port, which can
+      // guess wrong (e.g. a URL that carried the studio origin's port, or an aux
+      // port that isn't up yet). If nothing is listening there, fall back to the
+      // iframe's own preview port so the common single-port case still connects.
+      if ((pid == null || !this.procs.has(pid)) && msg.fallbackPort != null) {
+        const fp = msg.fallbackPort | 0;
+        const fpid = this.listeners.get(fp);
+        if (fpid != null && this.procs.has(fpid)) {
+          port = fp;
+          pid = fpid;
+        }
+      }
       if (pid == null || !this.procs.has(pid)) {
         if (this.onWsSend) this.onWsSend({ connId, sub: "close", code: 1006 });
         return;
@@ -635,7 +648,7 @@ export class Kernel {
       this.postToProc(pid, {
         type: "ws-open",
         connId,
-        port: msg.port | 0,
+        port,
         path: msg.path || "/",
         protocols: msg.protocols || null,
       });
