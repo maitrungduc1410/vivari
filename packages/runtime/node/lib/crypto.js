@@ -5,10 +5,12 @@
 //
 // Covered (S2): createHash (md5/sha1/sha224/256/384/512/512-256), createHmac,
 // pbkdf2/pbkdf2Sync, createCipheriv/createDecipheriv for AES-CBC (128/192/256)
-// and AES-GCM (128/256) incl. setAAD/getAuthTag/setAuthTag, and WebCrypto-backed
-// randomBytes/randomFill/randomInt/randomUUID.
+// and AES-GCM (128/256) incl. setAAD/getAuthTag/setAuthTag, WebCrypto-backed
+// randomBytes/randomFill/randomInt/randomUUID, and a SYMMETRIC-only KeyObject
+// (KeyObject + createSecretKey) so jsonwebtoken@9 HS256/384/512 works.
 //
-// NOT covered: sign/verify, RSA/EC keygen, DH, scrypt, X.509 — they throw.
+// NOT covered: asymmetric sign/verify, RSA/EC keygen, createPrivate/PublicKey,
+// DH, scrypt, X.509 — they throw.
 
 export default function (exports, require, module, process, internalBinding) {
   const { Buffer } = require("buffer");
@@ -37,6 +39,76 @@ export default function (exports, require, module, process, internalBinding) {
   function encodeOut(bytes, encoding) {
     if (!encoding || encoding === "buffer") return Buffer.from(bytes);
     return Buffer.from(bytes).toString(encoding);
+  }
+
+  // --- KeyObject (secret only) --------------------------------------------
+  // Minimal `crypto.KeyObject` + `createSecretKey`. This exists so libraries
+  // that route key material through Node's KeyObject API work with our
+  // HMAC-backed algorithms — chiefly jsonwebtoken@9, whose sign()/verify() do
+  // `secret instanceof KeyObject`, convert raw secrets via createSecretKey()
+  // (falling back from createPrivateKey/createPublicKey), and require
+  // `key.type === 'secret'` before HS* dispatch. jwa (jws' engine) also gates
+  // KeyObject support on `typeof crypto.createPublicKey === 'function'` and
+  // then feeds the KeyObject straight into `crypto.createHmac(...)`.
+  //
+  // Only symmetric (secret) keys are real here. createPrivateKey/createPublicKey
+  // are callable stubs that THROW — that is deliberate and load-bearing:
+  // jsonwebtoken tries them first and falls back to createSecretKey on throw, so
+  // a raw HMAC secret becomes a secret KeyObject; and an asymmetric PEM ends up
+  // as a secret key that fails the later `type === 'private'/'public'` check with
+  // a clear "must be an asymmetric key" error (RS/ES/PS stay unsupported).
+  const kKeyObjectBrand = Symbol.for("openContainer.crypto.KeyObject");
+  const kKeyMaterial = Symbol("kKeyMaterial");
+
+  class KeyObject {
+    constructor(type) {
+      if (type !== "secret" && type !== "public" && type !== "private") {
+        throw new TypeError(`Invalid KeyObject type: ${type}`);
+      }
+      this._type = type;
+      Object.defineProperty(this, kKeyObjectBrand, { value: true });
+    }
+    get type() {
+      return this._type;
+    }
+  }
+
+  class SecretKeyObject extends KeyObject {
+    constructor(bytes) {
+      super("secret");
+      this[kKeyMaterial] = bytes;
+    }
+    get symmetricKeySize() {
+      return this[kKeyMaterial].length;
+    }
+    get asymmetricKeyType() {
+      return undefined;
+    }
+    export(options) {
+      const buf = Buffer.from(this[kKeyMaterial]);
+      if (options && options.format === "jwk") {
+        return { kty: "oct", k: buf.toString("base64url") };
+      }
+      return buf;
+    }
+  }
+
+  function createSecretKey(key, encoding) {
+    const bytes =
+      typeof key === "string" ? new Uint8Array(Buffer.from(key, encoding || "utf8")) : toBytes(key);
+    return new SecretKeyObject(bytes);
+  }
+
+  // Accept a raw secret (string/Buffer/TypedArray) OR a secret KeyObject in the
+  // key position of HMAC/cipher and return its raw bytes.
+  function keyToBytes(key, inputEncoding) {
+    if (key != null && typeof key === "object" && key[kKeyObjectBrand]) {
+      if (key.type !== "secret") {
+        throw new TypeError("OpenContainer crypto: expected a secret KeyObject for symmetric operations");
+      }
+      return key[kKeyMaterial];
+    }
+    return toBytes(key, inputEncoding);
   }
 
   // --- Hash / Hmac (one-shot over the binding, buffered in JS) -------------
@@ -87,7 +159,7 @@ export default function (exports, require, module, process, internalBinding) {
       constructor(algo, key, options) {
         super(options);
         this._algo = algo;
-        this._key = toBytes(key);
+        this._key = keyToBytes(key);
         this._chunks = [];
         this._done = false;
       }
@@ -134,7 +206,7 @@ export default function (exports, require, module, process, internalBinding) {
   class Cipheriv {
     constructor(algorithm, key, iv) {
       this._mode = parseAlgo(algorithm).mode;
-      this._key = toBytes(key);
+      this._key = keyToBytes(key);
       this._iv = toBytes(iv);
       this._chunks = [];
       this._aad = null;
@@ -183,7 +255,7 @@ export default function (exports, require, module, process, internalBinding) {
   class Decipheriv {
     constructor(algorithm, key, iv) {
       this._mode = parseAlgo(algorithm).mode;
-      this._key = toBytes(key);
+      this._key = keyToBytes(key);
       this._iv = toBytes(iv);
       this._chunks = [];
       this._aad = null;
@@ -320,6 +392,14 @@ export default function (exports, require, module, process, internalBinding) {
     getCiphers: () => ["aes-128-cbc", "aes-192-cbc", "aes-256-cbc", "aes-128-gcm", "aes-256-gcm"],
     constants: {},
     webcrypto,
+    // Symmetric key material (secret only). See the KeyObject block above.
+    KeyObject,
+    createSecretKey,
+    // Callable-but-throwing on purpose: jsonwebtoken tries these first and falls
+    // back to createSecretKey, and jwa treats `typeof createPublicKey==='function'`
+    // as "KeyObjects supported". Asymmetric keys are genuinely unsupported.
+    createPrivateKey: notSupported("createPrivateKey"),
+    createPublicKey: notSupported("createPublicKey"),
     // Explicitly-unsupported surfaces fail loudly rather than silently misbehave.
     createSign: notSupported("createSign"),
     createVerify: notSupported("createVerify"),
