@@ -164,17 +164,23 @@ async function cacheFirst(request) {
 // live; frames from before attach are dropped, matching real DevTools behaviour).
 const NET_SHIM = `(function(){
 if (window.__ocNet) return;
-var attached = false, seq = 0, live = {};
+var attached = false, gen = 0, live = {};
 function post(method, params){
   try { parent.postMessage({ source:'oc-cdp', dir:'target', data: JSON.stringify({ method: method, params: params }) }, '*'); } catch(e){}
 }
+// Announce a connection's creation events at most ONCE per generation. A new
+// generation begins on each (re)attach (onAttach); the DevTools frontend clears
+// its network log on the frameNavigated that init() sends, so one announce per
+// generation = exactly one row per connection (no duplicate from the live-emit +
+// replay-on-attach paths both firing).
+function announce(id){ var o = live[id]; if (!o || o.gen === gen) return; o.gen = gen; try { o.replay(); } catch(e){} }
 window.__ocNet = {
   now: function(){ return performance.now() / 1000; },
   wall: function(){ return Date.now() / 1000; },
   emit: function(method, params){ if (attached) post(method, params); },
-  register: function(id, replay){ live[id] = replay; },
+  register: function(id, replay){ live[id] = { replay: replay, gen: -1 }; if (attached) announce(id); },
   unregister: function(id){ delete live[id]; },
-  onAttach: function(){ attached = true; for (var k in live){ try { live[k](); } catch(e){} } }
+  onAttach: function(){ attached = true; gen++; for (var k in live){ announce(k); } }
 };
 })();`;
 
@@ -240,13 +246,17 @@ function OCWebSocket(url, protocols){
     }
   } catch(e){}
   post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path, protocols: protocols || null });
+  // DevTools display URL: the real in-VM destination (localhost:<targetPort><path>),
+  // NOT the studio-origin proxy URL the app resolved against (which carries the
+  // internal /preview/<port>/ prefix and is confusing in the Network panel).
   var self2 = this; this._rid = this._id;
+  this._cdpUrl = (/^wss:/i.test(this.url) ? 'wss' : 'ws') + '://localhost:' + targetPort + path;
   this._wsReplay = function(){
-    window.__ocNet.emit('Network.webSocketCreated', { requestId:self2._rid, url:self2.url, initiator:{ type:'script' } });
+    window.__ocNet.emit('Network.webSocketCreated', { requestId:self2._rid, url:self2._cdpUrl, initiator:{ type:'script' } });
     window.__ocNet.emit('Network.webSocketWillSendHandshakeRequest', { requestId:self2._rid, timestamp:window.__ocNet.now(), wallTime:window.__ocNet.wall(), request:{ headers:{} } });
     if (self2.readyState === 1) window.__ocNet.emit('Network.webSocketHandshakeResponseReceived', { requestId:self2._rid, timestamp:window.__ocNet.now(), response:{ status:101, statusText:'Switching Protocols', headers:{} } });
   };
-  window.__ocNet.register(this._rid, this._wsReplay); this._wsReplay();
+  window.__ocNet.register(this._rid, this._wsReplay);
 }
 OCWebSocket.CONNECTING = 0; OCWebSocket.OPEN = 1; OCWebSocket.CLOSING = 2; OCWebSocket.CLOSED = 3;
 OCWebSocket.prototype._deliver = function(d){
@@ -341,13 +351,15 @@ function OCEventSource(url, cfg){
     else if (u.port && u.port !== location.port) targetPort = parseInt(u.port, 10);
   } catch(e){}
   post({ type:'oc-sse', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path });
+  // DevTools display URL: the real in-VM destination, with the internal
+  // /preview/<port>/ proxy prefix stripped (see the ws shim for rationale).
   var self2 = this; this._rid = this._id;
-  try { this._absUrl = new URL(this.url, location.href).href; } catch(e){ this._absUrl = this.url; }
+  this._cdpUrl = ((location.protocol === 'https:') ? 'https' : 'http') + '://localhost:' + targetPort + path;
   this._sseReplay = function(){
-    window.__ocNet.emit('Network.requestWillBeSent', { requestId:self2._rid, loaderId:'oc', documentURL:location.href, request:{ url:self2._absUrl, method:'GET', headers:{ Accept:'text/event-stream' } }, timestamp:window.__ocNet.now(), wallTime:window.__ocNet.wall(), initiator:{ type:'script' }, type:'EventSource' });
-    if (self2.readyState === 1) window.__ocNet.emit('Network.responseReceived', { requestId:self2._rid, timestamp:window.__ocNet.now(), type:'EventSource', response:{ url:self2._absUrl, status:200, statusText:'OK', mimeType:'text/event-stream', headers:{ 'content-type':'text/event-stream' } } });
+    window.__ocNet.emit('Network.requestWillBeSent', { requestId:self2._rid, loaderId:'oc', documentURL:location.href, request:{ url:self2._cdpUrl, method:'GET', headers:{ Accept:'text/event-stream' } }, timestamp:window.__ocNet.now(), wallTime:window.__ocNet.wall(), initiator:{ type:'script' }, type:'EventSource' });
+    if (self2.readyState === 1) window.__ocNet.emit('Network.responseReceived', { requestId:self2._rid, timestamp:window.__ocNet.now(), type:'EventSource', response:{ url:self2._cdpUrl, status:200, statusText:'OK', mimeType:'text/event-stream', headers:{ 'content-type':'text/event-stream' } } });
   };
-  window.__ocNet.register(this._rid, this._sseReplay); this._sseReplay();
+  window.__ocNet.register(this._rid, this._sseReplay);
 }
 OCEventSource.CONNECTING = 0; OCEventSource.OPEN = 1; OCEventSource.CLOSED = 2;
 OCEventSource.prototype._sseFinish = function(){
@@ -357,7 +369,7 @@ OCEventSource.prototype._sseFinish = function(){
 };
 OCEventSource.prototype._deliver = function(d){
   if (d.sub === 'open'){ this.readyState = 1;
-    window.__ocNet.emit('Network.responseReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), type:'EventSource', response:{ url:this._absUrl, status:200, statusText:'OK', mimeType:'text/event-stream', headers:{ 'content-type':'text/event-stream' } } });
+    window.__ocNet.emit('Network.responseReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), type:'EventSource', response:{ url:this._cdpUrl, status:200, statusText:'OK', mimeType:'text/event-stream', headers:{ 'content-type':'text/event-stream' } } });
     this._emit('open', { type:'open' }); }
   else if (d.sub === 'chunk'){ this._feed(String(d.data == null ? '' : d.data)); }
   else if (d.sub === 'close'){ if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id]; this._sseFinish(); this._emit('error', { type:'error' }); }
@@ -428,7 +440,6 @@ if (!setup()) { var tries = 0, iv = setInterval(function(){ if (setup() || ++tri
 function sendToChobitsu(method){ if (window.chobitsu) window.chobitsu.sendRawMessage(JSON.stringify({ id:'ocdt'+(++seq), method:method, params:{} })); }
 function sendToDevtools(msg){ post({ source:'oc-cdp', dir:'target', data: JSON.stringify(msg) }); }
 function init(){
-  if (window.__ocNet) window.__ocNet.onAttach();
   sendToDevtools({ method:'Page.frameNavigated', params:{ frame:{ id:'1', mimeType:'text/html', securityOrigin: location.origin, url: location.href }, type:'Navigation' } });
   sendToChobitsu('Network.enable');
   sendToDevtools({ method:'Runtime.executionContextsCleared' });
@@ -439,6 +450,9 @@ function init(){
   sendToChobitsu('CSS.enable');
   sendToChobitsu('Overlay.enable');
   sendToDevtools({ method:'DOM.documentUpdated' });
+  // Replay live ws/SSE connections AFTER the frameNavigated above (which resets
+  // the frontend's network log) so the replayed rows survive.
+  if (window.__ocNet) window.__ocNet.onAttach();
 }
 window.addEventListener('message', function(ev){
   var d = ev.data;

@@ -1857,6 +1857,16 @@ export class IdeController {
     target?.contentWindow?.postMessage({ source: "oc-cdp", dir: "init" }, "*");
   }
 
+  // Called when a preview iframe finishes (re)loading. A reload swaps in a fresh
+  // document with a brand-new chobitsu/CDP bootstrap that never received the attach
+  // handshake, so an open DevTools panel would go dead against the old context.
+  // Re-run init against the new document when this tab is the attached target.
+  onPreviewFrameLoad(id: string) {
+    if (!this.snap.devtoolsOpen || this.devtoolsTargetId !== id) return;
+    const frame = this.previewFrames.get(id);
+    frame?.contentWindow?.postMessage({ source: "oc-cdp", dir: "init" }, "*");
+  }
+
   private tabIdForSource(src: MessageEventSource | null): string | null {
     if (!src) return null;
     for (const [id, el] of this.previewFrames) {

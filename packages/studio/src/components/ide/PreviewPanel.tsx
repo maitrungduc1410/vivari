@@ -53,11 +53,13 @@ function PreviewFrame({
   active,
   src,
   setFrame,
+  onLoad,
 }: {
   tab: PreviewTab;
   active: boolean;
   src: string;
   setFrame: (id: string, el: HTMLIFrameElement | null) => void;
+  onLoad: (id: string) => void;
 }) {
   const ref = useRef<HTMLIFrameElement | null>(null);
   const lastSrc = useRef<string | null>(null);
@@ -75,6 +77,9 @@ function PreviewFrame({
         ref.current = el;
         setFrame(tab.id, el);
       }}
+      // Fires on every full document (re)load — re-run the DevTools attach
+      // handshake so an open panel reconnects after a preview reload/navigation.
+      onLoad={() => onLoad(tab.id)}
       title={tabTitle(tab)}
       className={cn(
         "absolute inset-0 h-full w-full border-0",
@@ -199,6 +204,7 @@ export function PreviewPanel() {
               active={t.id === snap.activePreviewId}
               src={c.previewSrc(t)}
               setFrame={(id, el) => c.setPreviewFrame(id, el)}
+              onLoad={(id) => c.onPreviewFrameLoad(id)}
             />
           ))}
           {active && active.port == null && (
