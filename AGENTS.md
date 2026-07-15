@@ -322,6 +322,22 @@ Gotchas:
   offline `scripts/spike-http-llhttp.mjs` assert on it. Regenerating the binary =
   `node scripts/vendor-llhttp.mjs` (re-pins the undici source).
 
+### In-VM databases are Wasm SQL engines loaded over the VFS (no native addon)
+The `sqlite` (sql.js) and `pglite` (real PostgreSQL) Showcase templates run a SQL
+engine guest-side by reading its `.wasm` out of `node_modules` and instantiating it
+through host `WebAssembly`. Gotchas when touching them:
+- **sql.js** loads its binary via `initSqlJs({ locateFile: (f) => require.resolve('sql.js/dist/'+f) })`
+  — don't hand it a bare filename or it looks on a non-existent CWD path.
+- **PGlite must be required via its CJS build** (`require('@electric-sql/pglite')`).
+  Only the ENTRY module can block on top-level await in-VM, so an ESM `import` of a
+  TLA-bearing dep from a non-entry module can hang. Its ~16 MB `pglite.wasm`+`.data`
+  load from `node_modules` (`__filename` → `new URL('./pglite.wasm',…)` → `fs.readFile`),
+  so keep `fs` + `url` (`fileURLToPath`) working over the VFS.
+- **libSQL is intentionally not a template** — local `@libsql/client` is a native
+  N-API addon (no wasm32) and `/web` is remote-only; neither is a self-contained in-VM DB.
+- **Gated by `scripts/spike-sqlite.mjs` + `scripts/spike-pglite.mjs`** (net tier in
+  `run-spikes.mjs`; PGlite gets a longer timeout). Both stay `experimental` until green.
+
 ### The studio is a multi-root workspace — absolute paths + the VFS is truth
 Since the workspace rewrite there is NO single "current project" and NO static file
 map. Rules that bite if ignored:

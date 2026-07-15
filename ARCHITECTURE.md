@@ -580,6 +580,17 @@ must be published in lockstep and the target must be pure-JS/wasm).
   `kOn*` contract for both requests and responses. The pure-JS parser remains as an
   automatic fallback (main-thread sync-compile cap, or `OC_HTTP_PARSER=js`); when
   the Wasm backend is live it advertises `process.versions.llhttp`.
+- **In-VM databases as Wasm** (the `sqlite` and `pglite` Showcase templates): the
+  same "Wasm binary in `node_modules`, loaded over the VFS" path lets real SQL
+  engines run guest-side with **no native addon and no external server**. sql.js
+  resolves its `.wasm` with `locateFile: (f) => require.resolve('sql.js/dist/'+f)`;
+  PGlite (real PostgreSQL) uses its **CJS** entry (`require('@electric-sql/pglite')`)
+  so it never needs top-level await (only the *entry* module can block on TLA in-VM),
+  and its ~16 MB `pglite.wasm`+`pglite.data` load from `node_modules` via
+  `__filename` → `new URL('./pglite.wasm', …)` → `fs.readFile`. Both instantiate
+  through host `WebAssembly` (kept alive by `hostLiveness` while an async compile is
+  pending). libSQL is deliberately excluded — local mode is a native N-API addon and
+  the `/web` client is remote-only, so neither is a self-contained in-VM database.
 
 Together these let Angular's stock `@angular/build` (esbuild + Vite) run from an
 unmodified `ng new` project, benefit any esbuild/worker-pool tool (Vitest, tsup,
