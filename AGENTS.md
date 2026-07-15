@@ -500,11 +500,26 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   untouched**. The kernel already routes ws `open` by port, so this is a shim-only change.
   Keep the two `sw.js` shims in sync. Regex lives in a template literal → backslashes are
   DOUBLED (`\\/preview\\/(\\d+)…`).
-- **A preview tab per server.** `kernel.onListen` (in `kernel-worker.js`) opens a preview tab
-  for each distinct port a project's run shell binds — primary → `project-ready`, extras →
-  `project-ready {extra:true}` (the controller only adds a tab for extras). Ports are cleared
-  when the run shell exits so a re-run re-announces. The `ws-demo` template exploits this: one
-  `dev.js` starts an Express+`ws` backend (:3001) and a Vite frontend (:5173).
+- **In-VM cross-process TCP/pipe (`net.js`).** `connect()` links same-process via an in-memory
+  registry; when the port/path isn't served locally it falls back to the kernel byte-relay
+  (`OP_PIPE_LISTEN`/`OP_PIPE_CONNECT`; bytes flow out of band as `pipe-*` postMessages keyed by
+  `connId`), so a process can dial a server ANOTHER process owns. This is what makes Nuxt/Nitro
+  dev work: `:3000` (one process) reverse-proxies SSR to its render worker's ephemeral port (a
+  DIFFERENT process); `vite-node`/Nitro also talk over `*.sock` UNIX sockets. TCP servers
+  advertise a synthetic per-port key so TCP and UNIX sockets share ONE relay. Keep the fallback
+  AFTER the local miss (never before) so single-process loopback + external (SW) routing stay
+  untouched. Probes: `scripts/probe-xtcp.mjs` (the Nitro shape), `scripts/probe-xpipe.mjs`.
+- **Which ports open a preview tab.** `kernel.onListen` (in `kernel-worker.js`) makes a run
+  shell's **first** listening port the primary preview (`project-ready`). A single dev server's
+  other ports are internal — Vite's HMR ws (`:24678`, answers "Upgrade Required" to a browser),
+  a framework's SSR/render worker (Nuxt/Nitro's ephemeral port, reached via the main server's
+  proxy) — and do **not** each open a tab. A template that truly runs multiple user-facing
+  servers opts in with `manifest.multiPreview`, and each extra then gets a tab
+  (`project-ready {extra:true}`; the controller only adds a tab for extras). Only `ws-demo`,
+  `fullstack`, and `trpc` set it today (Express/`ws`/tRPC backend `:3001` + Vite frontend
+  `:5173` from one `dev.js`). All bound ports are still tracked so a restart reloads the real
+  tab; the set is cleared when the run shell exits so a re-run re-announces. **Don't** revert to
+  a tab-per-port default — HMR/SSR-worker ports would spawn junk tabs.
 - **`host.opencontainer.internal`.** Maps to the studio's own hostname so in-VM code can reach a
   service on the HOST machine (only when the studio is served locally). Two egress paths both
   honor it: `http`/`https` (and npm) go through `packages/demo/fetcher-worker.js` `rewrite()`;

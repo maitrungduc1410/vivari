@@ -354,7 +354,23 @@ appear as the peer's reads. Node's unmodified `lib/net.js` / `lib/_http_*.js` ru
 end to end on top (real `ClientRequest`/`ServerResponse`/`IncomingMessage`,
 chunked bodies, keep-alive). This registry is **per-process** (one worker = one
 process). Writes never block — they queue into the peer's inbox and pump on
-`nextTick`.
+`nextTick`. The same binding backs `pipe_wrap` (UNIX-domain sockets / named
+pipes) with an identical path-keyed loopback.
+
+**Cross-process loopback (TCP + UNIX sockets).** When a `connect()` targets a
+port/path that isn't served in *this* process, another in-VM process may own it —
+e.g. Nuxt/Nitro's dev server on `:3000` reverse-proxies SSR to its render worker
+on an ephemeral port in a *different* process, and `vite-node`/Nitro talk over
+`*.sock` UNIX sockets. Both ride the same **kernel byte-relay**: `listen()` also
+registers the socket path with the kernel (`OP_PIPE_LISTEN`) — for a TCP server a
+synthetic per-port key — and a cross-process `connect()` resolves it
+(`OP_PIPE_CONNECT`) to a `connId`; raw bytes then flow **out of band** as
+`pipe-*` postMessages the kernel forwards between the two processes (never the
+syscall SAB, since neither side is parked on it). `net.js`'s `TCP`/`Pipe` handles
+fall back to this **only** when the same-process registry misses, so
+single-process loopback and external (Service Worker) routing are unchanged.
+Probes: `scripts/probe-xpipe.mjs` (UNIX sockets) and `scripts/probe-xtcp.mjs`
+(TCP, the Nitro `:3000`→worker shape), each covering both directions.
 
 ### 8.2 Cross-VM reachability (the kernel port registry)
 
@@ -458,9 +474,15 @@ one `writeFilesBatch` (`oc-create-project`) and registers a run manifest; "Run i
 opens a shell that runs `install && dev`. A dev server's `listen` is attributed to its project
 by walking the pid up to the run shell (`projectDirByTerm` / `terminalForPid`) → `project-ready`
 points the preview (the two legacy DEMOS still use the fixed-port `demoForPort` path).
-A run shell that binds **multiple ports** (e.g. a frontend + a backend) gets a preview tab per
-port — the first is the primary (`project-ready`), the rest are extras (`project-ready {extra}`);
-the port set is cleared when the run shell exits so a re-run re-announces.
+A run shell's **first** listening port is the primary preview (`project-ready` → open folder +
+entry). A single dev server's *other* ports are internal infrastructure — Vite's HMR WebSocket
+(`:24678`), a framework's SSR/render worker (Nuxt/Nitro's ephemeral port, reached via the main
+server's proxy) — and do **not** each open a tab (they'd surface a bare "Upgrade Required" or a
+non-interactive SSR page). A template that intentionally runs multiple *user-facing* servers (a
+backend API + frontend, e.g. `ws-demo`/`fullstack`/`trpc`) opts in with `manifest.multiPreview`,
+and each extra server then gets its own tab (`project-ready {extra}`). All bound ports are still
+tracked so a restart reloads the real tab; the set is cleared when the run shell exits so a re-run
+re-announces.
 
 ### 8.7 TypeScript 7 (tsgo, Go/wasm) + host↔preview bridge
 
