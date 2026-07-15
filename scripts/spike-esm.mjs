@@ -18,7 +18,7 @@
 //
 // Run:  node scripts/spike-esm.mjs
 
-import { transpileEsm } from "../packages/runtime/esm.js";
+import { transpileEsm, transpileEsmLive } from "../packages/runtime/esm.js";
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 let failures = 0;
@@ -107,6 +107,51 @@ console.log("\n== [esm] spread-only use keeps the eager const ==");
   check("eager `const DEDUPED = m.DEDUPED` is kept (spread is a use)", /const DEDUPED\s*=/.test(out));
   // member access, by contrast, need not keep it — but keeping is harmless, so we only
   // assert the spread case (the one that actually broke).
+}
+
+// ── 4. live-binding fallback: circular singleton used inside a function ───────
+// The eager `const X = m.X` snapshot TDZ-throws when a consumer imports a const/class/
+// singleton from a module that's mid-cycle (astro's apiContextRoutesSymbol / AstroConfig
+// Schema / globalContentLayer / telemetry). module.js recovers by recompiling the module
+// with transpileEsmLive (imports bound lazily via `with (__oc_live)`) and re-running.
+console.log("\n== [esm] live-binding fallback recovers a circular singleton ==");
+{
+  const fixtures = {
+    "/entry.js": `import './def.js';\nimport { getSym } from './consumer.js';\n__oc_exports.result = getSym();\n`,
+    "/def.js": `import './consumer.js';\nexport const theSymbol = Symbol.for('spike:live');\n`,
+    // uses theSymbol only inside a function → live binding read happens after the cycle
+    "/consumer.js": `import { theSymbol } from './def.js';\nexport function getSym() { return theSymbol; }\n`,
+  };
+  const cache = new Map();
+  const norm = (id) => "/" + id.replace(/^\.?\//, "");
+  const compile = (out) => {
+    try { return new Function("__oc_exports", "__oc_require", "__oc_module", out + "\n"); }
+    catch { return new AsyncFunction("__oc_exports", "__oc_require", "__oc_module", out + "\n"); }
+  };
+  let usedFallback = false;
+  const load = (rawId) => {
+    const id = norm(rawId);
+    if (cache.has(id)) return cache.get(id).exports;
+    const mod = { exports: Object.create(null) };
+    cache.set(id, mod);
+    const src = fixtures[id];
+    try {
+      compile(transpileEsm(src, id)).call(mod.exports, mod.exports, load, mod);
+    } catch (e) {
+      // mirror module.js's fallback
+      if (e instanceof ReferenceError && /before initialization|is not defined/.test(e.message)) {
+        usedFallback = true;
+        compile(transpileEsmLive(src, id)).call(mod.exports, mod.exports, load, mod);
+      } else throw e;
+    }
+    return mod.exports;
+  };
+  let result, threw = "";
+  try { result = load("/entry.js").result; } catch (e) { threw = e.message; }
+  check("eager compile hit a TDZ that triggered the fallback", usedFallback);
+  check("module recovers (no throw) via the with-live-binding variant", !threw);
+  if (threw) console.log("       threw: " + threw);
+  check("the lazily-read singleton resolves to the source Symbol", result === Symbol.for("spike:live"));
 }
 
 console.log(`\nRESULT: ${failures === 0 ? "PASS — esm.js live-binding + TLA loader guarantees hold" : `FAIL — ${failures} check(s) failed`}`);

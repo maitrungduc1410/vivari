@@ -7,7 +7,7 @@
 // directory/index/package.json "main"), and bare specifiers walked up through
 // node_modules.
 
-import { transpileEsm, rewriteCjsDynamicImport } from "./esm.js";
+import { transpileEsm, transpileEsmLive, rewriteCjsDynamicImport } from "./esm.js";
 import { maybePatchEsbuildInProcess } from "./esbuild-inproc-patch.js";
 
 // The constructor for `async function () {}` — used to (re)compile an ESM module
@@ -401,9 +401,11 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     // only if it actually uses module syntax (transpileEsm returns null for
     // plain CJS, so require/module.exports files are untouched).
     let isEsm = false;
+    let esmSource = null; // pre-transpile ESM source, kept for the live-binding fallback
     if (path.extname(filename) !== ".cjs") {
       const esm = transpileEsm(source, filename);
       if (esm != null) {
+        esmSource = source;
         source = esm;
         isEsm = true;
       }
@@ -475,6 +477,41 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
         throw err;
       }
     }
+    // Run an ESM wrapper with the live-binding fallback: a circular import of a
+    // const/class/singleton reads its source binding eagerly (`const X = m.X`), before
+    // the source finished initialising → "Cannot access 'X' before initialization" (or,
+    // for a name whose eager snapshot we dropped, "X is not defined"). Recompile THIS
+    // module so imports become live bindings read lazily via `with(__oc_live)` and
+    // re-run it ONCE. Only ESM, only when the throw looks like that, only if we still
+    // have the source. The eager attempt threw in the prelude (before the body ran), so
+    // re-running only re-defines the (configurable) export getters + re-runs cached
+    // requires — no double body side effects. astro's runtime needs this (Fragment,
+    // apiContextRoutesSymbol, AstroConfigSchema, globalContentLayer, telemetry, …).
+    const runEsm = () => {
+      try {
+        return wrapper.call(module.exports, module.exports, require, module);
+      } catch (e) {
+        if (
+          esmSource != null &&
+          e instanceof ReferenceError &&
+          /before initialization|is not defined/.test((e && e.message) || "")
+        ) {
+          const live = transpileEsmLive(esmSource, filename);
+          if (live != null) {
+            let w2;
+            try {
+              w2 = new RealFunction("__oc_exports", "__oc_require", "__oc_module", live + "\n");
+              isAsync = false;
+            } catch {
+              w2 = new AsyncFunction("__oc_exports", "__oc_require", "__oc_module", live + "\n");
+              isAsync = true;
+            }
+            return w2.call(module.exports, module.exports, require, module);
+          }
+        }
+        throw e;
+      }
+    };
     // Debug aid: name the module whose TOP-LEVEL evaluation throws. Parse errors
     // already get the filename appended above, but a runtime throw during a
     // module's body (e.g. an ESM/CJS interop mismatch → `undefined.map`) is
@@ -482,7 +519,7 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     if (process.env.OC_TRACE_MODULES) {
       try {
         if (isEsm) {
-          const ret = wrapper.call(module.exports, module.exports, require, module);
+          const ret = runEsm();
           if (isAsync) module.evaluating = ret;
         } else {
           wrapper.call(module.exports, module.exports, require, module, filename, dirname);
@@ -508,7 +545,7 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
       return;
     }
     if (isEsm) {
-      const ret = wrapper.call(module.exports, module.exports, require, module);
+      const ret = runEsm();
       // A top-level-await module evaluates to a Promise; expose it so the entry
       // (runMain) can await the top-level body. A synchronous ESM module — even one
       // compiled to an async wrapper — has already fully run by the time this

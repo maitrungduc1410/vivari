@@ -2443,8 +2443,16 @@ and are gated by a new offline `scripts/spike-esm.mjs`.
      it, and after the import-rewrite the parser blames the next token (not "await is only
      valid…"), so `module.js`'s old narrow message-match never retried as async. Fix:
      `module.js` now retries **any** failed ESM compile as an `AsyncFunction` (real TLA
-     compiles; genuine syntax errors fail again and are reported). Left `experimental`
-     pending browser confirmation.
+     compiles; genuine syntax errors fail again and are reported).
+
+  With both fixed, the SvelteKit config loads and `vite dev` starts — but then **hangs at
+  the `(ssr) [optimizer] bundling dependencies…` pass**. That's the already-documented
+  **rolldown-wasi second-bundle tokio panic** (see "Deferred / follow-up" above): a Vite-8
+  project that runs two rolldown-wasm dep-optimizes (client + the SSR optimize SvelteKit
+  forces) dies because napi's tokio runtime static is torn down after the first bundle.
+  It can't be disabled from user config. So SvelteKit stays `experimental`, blocked on the
+  same upstream rolldown bug as Nuxt — NOT on our loader. (Unlike Astro, which is on Vite 6
+  + the esbuild optimizer and so dodges this.)
 
 - **React Router 7 — "not found" on first load (GRADUATED).** RR7 framework mode is
   client-routed: it re-matches the route against the iframe's own location
@@ -2454,27 +2462,36 @@ and are gated by a new offline `scripts/spike-esm.mjs`.
   `basename` and Vite `base` at `/preview/5173/` (trailing slash required). User-confirmed
   working in-browser → **graduated** (dropped `experimental`).
 
-- **Astro — "Cannot access 'Fragment' before initialization" (loader fix).** Astro's
-  `runtime/server/render/index.js` does `import { Fragment } from './common.js'; export
-  { …Fragment… }`, and `common.js` declares `const Fragment = Symbol.for('astro:fragment')`
-  in a circular cycle. The earlier `vite.ssr.noExternal: ['astro']` template hack did NOT
-  work — `astro dev`'s CLI imports the render runtime through OC's loader *before* any
-  Vite SSR config applies. Real fix in `esm.js`: an imported name that is **only
-  re-exported** is compiled without the eager `const X = m.X` snapshot and re-exported via
-  a **lazy getter to the source module** (`() => m.X`), exactly like `export { X } from
-  'm'`. The read is deferred until after the cycle resolves. Also: the eager snapshot is
-  now only emitted when the imported name is actually referenced in the module body. That
-  "is it used" check is over-inclusive on purpose — it counts any identifier-boundaried
-  occurrence (strings/comments included) and does NOT discount `obj.X`, because `.X` is
-  ambiguous with spread `...X`; discounting it dropped consts used only via spread
-  (`[...SVELTE_DEDUPED_IMPORTS]`, `[...SUPPORTED_MARKDOWN_FILE_EXTENSIONS]`) → "X is not
-  defined". Proven by executing Astro's real
-  server runtime through an OC-shaped loader (`Fragment` resolves to the Symbol; the cycle
-  no longer throws). `astro.config.mjs` reverted to pristine. Left `experimental` pending
-  browser confirmation.
+- **Astro — cascade of circular-const TDZ, fixed with a live-binding fallback.** Astro's
+  runtime is full of module-level singletons imported across cycles and read inside
+  functions: `Fragment`, `apiContextRoutesSymbol`, `AstroConfigSchema`, `ASTRO_CONFIG_
+  DEFAULTS`, `globalContentLayer`, `globalContentConfigObserver`, `telemetry`, … (17
+  distinct cases enumerated). OC's eager `const X = m.X` import snapshot fires while the
+  source module is mid-cycle → "Cannot access 'X' before initialization". The earlier
+  `vite.ssr.noExternal: ['astro']` hack did NOT work — `astro dev`'s CLI imports these
+  through OC's loader *before* any Vite SSR config applies. Two fixes:
+  1. `esm.js`: an imported name that is **only re-exported** is compiled without the eager
+     snapshot and re-exported via a lazy getter to the source module (fixes `Fragment` in
+     `render/index.js`). The "is it used" gate that decides whether to keep the eager
+     snapshot counts any identifier-boundaried occurrence (does NOT discount `.X`, which
+     is ambiguous with spread `...X` — that discount had dropped `[...SVELTE_DEDUPED_
+     IMPORTS]` / `[...SUPPORTED_MARKDOWN_FILE_EXTENSIONS]` → "X is not defined").
+  2. **Live-binding fallback** (`transpileEsmLive` + `module.js`): the *used-in-code*
+     circular cases (singletons/schemas) can't be re-export-lazied. When eager evaluation
+     throws a TDZ/"not defined" `ReferenceError`, `module.js` recompiles that module with
+     imports bound lazily via `with (__oc_live)` and re-runs it once. Scope-correct
+     without reference rewriting; fallback-only, so normal modules keep the fast eager
+     path. Verified by executing Astro's real runtime through an OC-shaped loader that
+     mirrors the fallback: all 16 problematic modules recover, `Fragment` and
+     `apiContextRoutesSymbol` resolve to their real Symbols, `AstroConfigSchema` is a real
+     zod object. Astro is on Vite 6 + the esbuild optimizer, so it does NOT hit the
+     rolldown SSR-optimize panic that blocks SvelteKit — this fallback should carry it to
+     a live dev server. `astro.config.mjs` reverted to pristine. Left `experimental`
+     pending browser confirmation.
 
 Loader guarantees regression-gated by `scripts/spike-esm.mjs` (offline tier): TLA →
-async retry, and circular re-export → lazy live binding.
+async retry; circular re-export → lazy live binding; spread-only use keeps its const; and
+the live-binding fallback recovers a circular singleton used inside a function.
 
 ## Definition of done for T2
 

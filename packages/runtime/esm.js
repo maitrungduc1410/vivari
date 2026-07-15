@@ -614,3 +614,137 @@ export function transpileEsm(source, filename) {
   const tail = cjsOverride ? "\n;__oc_module.exports=" + cjsOverride + ";" : "";
   return head + applyEdits(source, edits) + tail;
 }
+
+/**
+ * LIVE-BINDING variant of transpileEsm — a runtime FALLBACK, not the default path.
+ *
+ * `transpileEsm` snapshots each named import eagerly (`const X = __oc_m['X']`). In a
+ * circular import of a `const`/`class`/singleton (astro's runtime is full of them —
+ * `apiContextRoutesSymbol`, `AstroConfigSchema`, `globalContentLayer`, `telemetry`, …)
+ * that eager read fires while the source module is mid-cycle → "Cannot access 'X'
+ * before initialization". Real ESM avoids this because imports are LIVE bindings: a
+ * reference reads the source binding lazily, at use — by which point the cycle has
+ * resolved (uses are typically inside functions called later, not at module top level).
+ *
+ * We model that here by binding every import onto an `__oc_live` object as a getter and
+ * running the whole module body inside `with (__oc_live) { … }`. A bare reference to an
+ * import name then resolves through the getter (lazy), while any local declaration that
+ * shadows it wins natively — so this is scope-correct WITHOUT reference rewriting (no
+ * risk of clobbering a shadowing param/const). The cost: `with` deopts and needs sloppy
+ * mode, so module.js only compiles a module this way AFTER the eager version throws a
+ * TDZ/"not defined" ReferenceError. Normal modules never pay for it.
+ *
+ * Caveats (acceptable for the fallback): assignment to an imported binding is a silent
+ * no-op (real ESM throws); a module whose import is used at TOP-LEVEL init inside a
+ * cycle still can't be satisfied (the source truly isn't ready yet — same as real ESM
+ * would deadlock/return undefined). Returns null for non-ESM (same contract as transpileEsm).
+ */
+export function transpileEsmLive(source, filename) {
+  let parsed;
+  try {
+    parsed = parse(source, filename || "module");
+  } catch {
+    return null;
+  }
+  const [imports, exports, , hasModuleSyntax] = parsed;
+  if (!hasModuleSyntax) return null;
+
+  const edits = [];
+  const prelude = []; // requires + re-export getters (reference the require var, live)
+  const liveDefs = []; // getters on __oc_live for each imported binding
+  const localGetters = []; // export getters for local names (run INSIDE the `with`)
+  const fromRanges = [];
+  const namedImports = new Map();
+  let tmp = 0;
+  const uniq = () => "__oc_m" + tmp++;
+  const defLive = (name, expr) =>
+    "Object.defineProperty(__oc_live," + JSON.stringify(name) +
+    ",{configurable:true,get:function(){return " + expr + ";}});";
+
+  for (const imp of imports) {
+    if (imp.t === T_DYNAMIC) { edits.push({ start: imp.ss, end: imp.d, text: "__oc_import" }); continue; }
+    if (imp.t === T_META) { edits.push({ start: imp.ss, end: imp.se, text: "__oc_meta" }); continue; }
+    if (imp.t !== T_STATIC) continue;
+    const stmt = source.slice(imp.ss, imp.se);
+    const spec = imp.n;
+    edits.push({ start: imp.ss, end: imp.se, text: "" });
+    if (spec == null) continue;
+    if (stmt.startsWith("export")) {
+      fromRanges.push([imp.ss, imp.se]);
+      const clause = stmt.slice(6).trimStart();
+      const m = uniq();
+      prelude.push("const " + m + "=__oc_require(" + JSON.stringify(spec) + ");");
+      if (clause.startsWith("*")) {
+        const rest = clause.slice(1).trimStart();
+        const asMatch = rest.match(new RegExp("^as\\s+(" + ID + ")"));
+        if (asMatch) prelude.push("__oc_exports[" + JSON.stringify(asMatch[1]) + "]=__oc_ns(" + m + ");");
+        else prelude.push("__oc_star(__oc_exports," + m + ");");
+      } else {
+        for (const { imported, local } of namedFromBraces(clause)) {
+          if (imported === "default") prelude.push("__oc_exports[" + JSON.stringify(local) + "]=__oc_def(" + m + ");");
+          else prelude.push("Object.defineProperty(__oc_exports," + JSON.stringify(local) + ",{enumerable:true,configurable:true,get:function(){return " + m + "[" + JSON.stringify(imported) + "];}});");
+        }
+      }
+    } else {
+      const clause = stmt.slice(6).trimStart();
+      const c = parseImportClause(clause);
+      if (c.sideEffect) { prelude.push("__oc_require(" + JSON.stringify(spec) + ");"); }
+      else {
+        const m = uniq();
+        prelude.push("const " + m + "=__oc_require(" + JSON.stringify(spec) + ");");
+        if (c.default) liveDefs.push(defLive(c.default, "__oc_def(" + m + ")"));
+        if (c.namespace) liveDefs.push(defLive(c.namespace, "__oc_ns(" + m + ")"));
+        for (const { imported, local } of c.named) {
+          namedImports.set(local, { m, imported });
+          liveDefs.push(defLive(local, m + "[" + JSON.stringify(imported) + "]"));
+        }
+      }
+    }
+  }
+
+  const inFrom = (pos) => fromRanges.some(([s, e]) => pos >= s && pos < e);
+  const exportEdits = scanExportEdits(source, inFrom);
+  const hasKeywordDefault = exportEdits.some((e) => e.text === "__oc_exports.default =");
+  const keptDefault = exportEdits.find((e) => e.defaultLocal)?.defaultLocal;
+  if (keptDefault) {
+    localGetters.push("Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return " + keptDefault + ";}});");
+  }
+  for (const e of exportEdits) edits.push(e);
+
+  let cjsOverride = null;
+  for (const ex of exports) {
+    if (inFrom(ex.s)) continue;
+    const local = ex.ln || ex.n;
+    if (ex.n === "module.exports") { if (ex.ln) cjsOverride = ex.ln; continue; }
+    if (ex.n === "default") {
+      if (!hasKeywordDefault && !keptDefault && ex.ln) {
+        const src = namedImports.get(ex.ln);
+        if (src) prelude.push("Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return " + src.m + "[" + JSON.stringify(src.imported) + "];}});");
+        else localGetters.push("Object.defineProperty(__oc_exports,'default',{enumerable:true,configurable:true,get:function(){return " + ex.ln + ";}});");
+      }
+      continue;
+    }
+    const src = namedImports.get(local);
+    if (src) {
+      prelude.push("Object.defineProperty(__oc_exports," + JSON.stringify(ex.n) + ",{enumerable:true,configurable:true,get:function(){return " + src.m + "[" + JSON.stringify(src.imported) + "];}});");
+      continue;
+    }
+    localGetters.push("Object.defineProperty(__oc_exports," + JSON.stringify(ex.n) + ",{enumerable:true,configurable:true,get:function(){return " + local + ";}});");
+  }
+
+  // A leading "use strict" directive makes `with` a SyntaxError — strip it (the module
+  // still runs under our sloppy `new Function` wrapper, same as the eager variant).
+  let body = applyEdits(source, edits).replace(/^\uFEFF?\s*(["'])use strict\1\s*;?/, "");
+
+  const fileUrl = "file://" + (filename || "");
+  const head =
+    helpers(fileUrl, filename) +
+    "Object.defineProperty(__oc_exports,'__esModule',{value:true});" +
+    "const __oc_live=Object.create(null);" +
+    prelude.join("") +
+    liveDefs.join("");
+  const tail = cjsOverride ? "\n;__oc_module.exports=" + cjsOverride + ";" : "";
+  // Local export getters go INSIDE the `with` so their closures capture the body's
+  // (block-scoped) top-level const/let bindings.
+  return head + "with(__oc_live){" + localGetters.join("") + body + "\n}" + tail;
+}

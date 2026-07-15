@@ -845,8 +845,25 @@ snapshot it at call time, not at delivery time.
      was the bug that made this too aggressive → "X is not defined". So it now only
      removes a snapshot when the name is provably absent from executable code; keeping an
      occasional truly-unused const is harmless.
-  A name that IS used in code across a `const`/`class` cycle can still TDZ; that residual
-  case is unchanged. Proven by `scripts/spike-esm.mjs`.
+  A name USED in code (not just re-exported) across a `const`/`class`/singleton cycle
+  isn't covered by those two — it's handled by a **runtime fallback**:
+- **Live-binding fallback (`transpileEsmLive` + module.js retry).** When an ESM module's
+  eager evaluation throws a `ReferenceError` matching `before initialization` / `is not
+  defined`, `module.js` recompiles THAT module with `transpileEsmLive` and re-runs it
+  once. The live variant binds every import onto an `__oc_live` object as a getter and
+  runs the whole body inside `with (__oc_live) { … }`, so a bare reference to an import
+  resolves lazily (at use), while a local that shadows it wins natively — scope-correct
+  WITHOUT reference rewriting. This is what makes **astro** boot: its runtime is full of
+  circular singletons read inside functions (`apiContextRoutesSymbol`, `AstroConfigSchema`,
+  `globalContentLayer`, `telemetry`, …) — 16 modules recover via the fallback. It's a
+  FALLBACK (not the default) because `with` deopts + needs sloppy mode: normal modules
+  keep the fast eager path and never pay for it. The eager attempt throws in the prelude
+  (before the body), so re-running only re-defines the configurable export getters + hits
+  cached requires — no double body side effects. Caveats: assigning to an imported binding
+  is a silent no-op (real ESM throws), and an import used at TOP-LEVEL init inside a cycle
+  still can't be satisfied (the source genuinely isn't ready — real ESM would deadlock).
+  A leading `"use strict"` is stripped (it would make `with` a SyntaxError). Proven by
+  `scripts/spike-esm.mjs`.
 
 ### `self` is a getter in a real Worker
 Third-party bundles (Vite/rolldown workers) do `Object.assign(globalThis, {self})`,
