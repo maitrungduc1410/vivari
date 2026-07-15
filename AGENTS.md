@@ -398,12 +398,15 @@ in-VM writes (a `npm/yarn/pnpm install`) do NOT emit `oc-fs-changed`, so process
 that `node_modules` may have appeared. A cheap `node_modules` fingerprint (top-level package list) in
 `oc-collect-dts` short-circuits the file reads when nothing actually changed, so triggering on every
 process exit is nearly free. `checkJs` stays off so plain-JS projects aren't flooded with semantic
-errors. **Gotcha (deps resolve only after a worker rebuild):** the TS worker validates open files at
-mount, BEFORE `node_modules` types exist; pushing new libs to that already-running worker via
-`setExtraLibs` alone is not reliable — it can keep serving stale `Cannot find module 'react'`. After
-`setExtraLibs`, `loadDependencyTypes` re-applies `setCompilerOptions(...)` to fire Monaco's
-`onDidChange`, which tears the worker down so the next validation spins up a FRESH LanguageService
-born already seeing every dependency `.d.ts` (that's the state in which imports actually resolve).
+errors. **Gotcha #1 (register extra libs with `Uri.toString(TRUE)`):** Monaco's `Uri.toString()`
+percent-encodes `@` → `%40`, but TS's module resolver looks up `@types/…` / `@scope/…` with a
+LITERAL `@`. If extra-lib keys are encoded (`%40types`), the resolver's `fileExists` never matches
+and EVERY `@types`-backed import fails (`react`, `react-dom/client`, `react/jsx-runtime`) even though
+the `.d.ts` was harvested and loaded. `loadDependencyTypes` therefore keys extra libs with
+`monaco.Uri.file(f.path).toString(true)` (skip-encoding) so `@` stays literal. **Gotcha #2 (timing):**
+the worker validates open files at mount, BEFORE the types exist; after `setExtraLibs` we re-apply
+`setCompilerOptions(...)` to fire Monaco's `onDidChange`, tearing the worker down so the next
+validation spins up a fresh LanguageService that already sees every dependency `.d.ts`.
 
 ### Real npm is the studio shell's `npm` (delivery + shims)
 The North Star is running the real npm/yarn/pnpm CLIs, not our from-scratch

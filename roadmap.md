@@ -2074,7 +2074,12 @@ with project-wide + dependency-aware type information.
   by the worker that holds the sync Wasm VFS — one bulk reply instead of thousands of `oc-read`
   round-trips — harvesting the project's **declared deps (+ their `@types`) first** so a budget cap
   never drops the packages you actually import, then the rest of `@types`, skipping `typescript`'s own
-  libs (Monaco ships those). The controller registers them via `setExtraLibs`. The load is
+  libs (Monaco ships those). The controller registers them via `setExtraLibs`, keying each file with
+  `monaco.Uri.file(path).toString(true)` (**skip-encoding**) — the default `toString()` percent-encodes
+  `@`→`%40`, but TS's resolver looks up `@types/…`/`@scope/…` with a literal `@`, so encoded keys silently
+  break every `@types`-backed import (`react`, `react-dom`, `jsx-runtime`) even after the `.d.ts` loads.
+  After `setExtraLibs` we re-apply `setCompilerOptions` to force a fresh worker (the mount-time worker
+  validated open files before the types existed). The load is
   debounced and re-runs on folder open, fs changes, and **after any process exits** — since an in-VM
   `npm install` doesn't emit `oc-fs-changed`, a finished process is the cue that `node_modules` may
   have appeared. A cheap `node_modules` fingerprint short-circuits the file reads when nothing changed.

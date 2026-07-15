@@ -740,7 +740,12 @@ export class IdeController {
       if (res.unchanged) continue;
       const map = new Map<string, string>();
       for (const f of (res.files as { path: string; content: string }[]) ?? []) {
-        map.set(monaco.Uri.file(f.path).toString(), f.content);
+        // toString(TRUE) = skip encoding. Monaco's Uri.toString() percent-encodes
+        // '@' → '%40', but TS's module resolver looks up '@types/…'/'@scope/…'
+        // with a LITERAL '@'. Encoded keys never match the resolver's queries, so
+        // every @types-backed import (react, react-dom, jsx-runtime) fails. Keep
+        // '@' literal so extra-lib keys line up with what the worker asks for.
+        map.set(monaco.Uri.file(f.path).toString(true), f.content);
       }
       this.depLibsByRoot.set(root, map);
       changed = true;
