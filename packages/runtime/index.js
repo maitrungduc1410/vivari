@@ -12,6 +12,7 @@ import { createChildProcess } from "./builtins/child_process.js";
 import { createModuleSystem } from "./module.js";
 import { createWebSocket } from "./websocket.js";
 import { rewriteDynamicImportToGlobal } from "./esm.js";
+import { isEsbuildInprocActive } from "./esbuild-inproc-patch.js";
 
 function createConsole(process, util) {
   const toOut = (...a) => process.stdout.write(util.format(...a) + "\n");
@@ -1206,6 +1207,14 @@ export function createRuntime({
     require: moduleSystem.makeRequire(cwd),
     /** External nudge from the kernel: a network request is queued for us. */
     wake: loop.wakeNet,
+    /** Diagnostic: this process's own retention stats for the "Measure Memory"
+     * per-PID breakdown. `modules` is how many files the guest module cache
+     * holds (our load-once/retain-forever cache — the main runtime-side term);
+     * `esbuildInproc` flags a resident esbuild Go wasm service. */
+    memStats: () => ({
+      modules: Object.keys(moduleSystem.cache).length,
+      esbuildInproc: isEsbuildInprocActive(),
+    }),
     /** External delivery from the kernel: an async child's stdout/stderr/exit
      * ({type:'child-stdout'|'child-stderr'|'child-exit', childPid, ...}). #15.
      * Fork children (child_process.fork) stream through here too; route their

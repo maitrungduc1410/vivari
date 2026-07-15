@@ -45,6 +45,13 @@ async function safeMeasureMemory() {
 let memReqSeq = 1;
 const memPending = new Map();
 
+// Live Process Workers by PID, for the per-PID "Measure Memory" breakdown. Each
+// worker answers a `proc-mem` query with its own JS heap + module-cache stats;
+// replies are matched back by id here. Populated/pruned in spawnWorker.
+const procWorkers = new Map();
+let procMemSeq = 1;
+const procMemPending = new Map();
+
 // The real-npm delivery asset (built by `npm run vendor:npm`, served from
 // packages/studio/public/vendor). Fetched once and unpacked into the VFS so the
 // shell's `npm` is the real CLI, not the Turbo-analog (North Star). Absolute
@@ -731,6 +738,41 @@ function queryVfsMem(timeoutMs = 2000) {
   });
 }
 
+// Ask every live Process Worker for its own JS heap + retention stats, in
+// parallel. Resolves an array of { pid, heap, modules, esbuildInproc, name }
+// (a worker that doesn't answer within the timeout is simply omitted). This is
+// what turns the flat "1.87 GB on process-worker.js" figure into a per-PID
+// breakdown so we can see which process holds the dev-server heap.
+function queryAllProcMem(timeoutMs = 2000) {
+  const workers = [...procWorkers.entries()];
+  if (workers.length === 0) return Promise.resolve([]);
+  return Promise.all(
+    workers.map(
+      ([pid, w]) =>
+        new Promise((resolve) => {
+          const id = procMemSeq++;
+          procMemPending.set(id, (data) =>
+            resolve({
+              pid,
+              name: w.name || `PID ${pid}`,
+              heap: data.heap,
+              modules: data.modules,
+              esbuildInproc: !!data.esbuildInproc,
+            }),
+          );
+          setTimeout(() => {
+            if (procMemPending.delete(id)) resolve(null);
+          }, timeoutMs);
+          try {
+            w.worker.postMessage({ type: "proc-mem", id });
+          } catch {
+            if (procMemPending.delete(id)) resolve(null);
+          }
+        }),
+    ),
+  ).then((rows) => rows.filter(Boolean).sort((a, b) => (b.heap || 0) - (a.heap || 0)));
+}
+
 async function boot() {
   // The Rust/Wasm VFS now lives in its own nested File System Worker (#14). We
   // wait for it to boot, then talk to it: the kernel over its own sync SAB
@@ -837,9 +879,20 @@ async function boot() {
       name: "Process Worker PID " + info.pid,
     });
     worker.onmessage = (event) => {
+      // Diagnostic reply path (per-PID Measure Memory) — resolve its waiter
+      // instead of routing through the kernel's per-process handler table.
+      if (event.data && event.data.type === "proc-mem-reply") {
+        const p = procMemPending.get(event.data.id);
+        if (p) {
+          procMemPending.delete(event.data.id);
+          p(event.data);
+        }
+        return;
+      }
       const handler = info.on[event.data.type];
       if (handler) handler(event.data);
     };
+    procWorkers.set(info.pid, { worker, name: "PID " + info.pid });
     const { port1, port2 } = new MessageChannel();
     fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
     // #16 stage 2b: a spawned thread also receives its parentPort (a MessagePort
@@ -856,6 +909,7 @@ async function boot() {
     return {
       terminate: () => {
         worker.terminate();
+        procWorkers.delete(info.pid);
         fsWorker.postMessage({ type: "fs-unregister", client: info.pid });
       },
       postMessage: (m) => worker.postMessage(m),
@@ -1524,7 +1578,11 @@ self.onmessage = async (event) => {
   // thread measures the page (which covers dedicated workers) separately and
   // combines the two.
   if (m.type === "oc-mem") {
-    const [kernelBytes, vfsMem] = await Promise.all([safeMeasureMemory(), queryVfsMem()]);
+    const [kernelBytes, vfsMem, procs] = await Promise.all([
+      safeMeasureMemory(),
+      queryVfsMem(),
+      queryAllProcMem(),
+    ]);
     post("oc-reply", {
       reqId: m.reqId,
       ok: true,
@@ -1532,6 +1590,7 @@ self.onmessage = async (event) => {
       vfsBytes: vfsMem ? vfsMem.bytes : -1,
       vfsFiles: vfsMem ? vfsMem.files : -1,
       vfsLogicalBytes: vfsMem ? vfsMem.logical : -1,
+      procs,
     });
     return;
   }

@@ -193,6 +193,12 @@ never parks and many downloads can overlap (§6).
   `node_modules` (the largest addressable term in the tab). **On by default**; `?compress=0`
   disables it (plumbed page → kernel worker → FS worker, applied before OPFS restore).
   `mem_bytes()`/`logical_mem_bytes()` back the "Measure Memory" ratio readout.
+- **Per-PID memory attribution**: "Measure Memory" also breaks the Process Worker heap
+  down by PID. Each worker answers a `proc-mem` query with `runtime.memStats()` — its own JS
+  heap (`performance.memory`, Chrome-only), guest module-cache size, and an esbuild-wasm flag;
+  the kernel worker fans the query across a live `pid → worker` registry and relays the rows on
+  `oc-mem`. This attributes the dev-server heap (the tab's largest term post-compression) to a
+  specific process so reduction work can be targeted; the query is read-only.
 - **Servicing**: `packages/kernel-host/fs-server.js` (`FsServer`) owns the one VFS
   instance and services fs opcodes directly over each client's SAB. It runs inside
   the **File System Worker** (`packages/demo/fs-worker.js`).
