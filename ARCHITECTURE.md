@@ -476,6 +476,42 @@ own `fetch` wrapper (`rewriteHostAlias`). The reverse direction needs no alias: 
 CORS/auth bypass — the target must still allow the studio origin. It is not wired into the
 preview tab address bar (that only loads in-VM ports); test it from in-VM code.
 
+### 8.8 Full-text search & replace + quick-open (studio)
+
+The Search pane (`components/ide/SearchPane.tsx`) is a VS Code-style full-text search across
+**every open workspace root**, not a filename filter. The search itself runs in the **kernel
+worker** (`demo/kernel-worker.js`) because that worker is the sole holder of the synchronous
+Wasm VFS — grepping from the main thread would mean an `oc-read` round-trip per file. The
+worker walks each root (reusing the Explorer skip set: `node_modules`/`.git`/`dist`/…), honors
+Match Case / Whole Word / Regex and comma-separated `files to include` / `files to exclude`
+globs, skips binary/oversized files, and **streams** per-file matches back as `oc-search-result`
+batches followed by a final `oc-search-done {matchCount,fileCount,limitHit}`.
+
+```mermaid
+flowchart LR
+  Pane["SearchPane (main thread)"] -->|"oc-search {token,roots,opts}"| KW["Kernel Worker"]
+  KW -->|"walk + grep VFS, yield every N files"| VFS[("Wasm VFS")]
+  KW -->|"oc-search-result batches"| Ctrl["IdeController"]
+  KW -->|"oc-search-done"| Ctrl
+  Ctrl -->|"onBatch / onDone"| Pane
+  Pane -->|"openFileAt(abs,line,col,len)"| Ctrl
+  Ctrl -->|"setSelection + revealRange"| Monaco
+```
+
+Because that worker also serves preview HTTP + terminal I/O, the walk is **cooperative**: it
+`await`s a macrotask every ~40 files and flushes the partial batch, so the UI fills in
+progressively and nothing else stalls. A monotonic `currentSearchToken` supersedes an
+in-flight search when a newer query (or `oc-search-cancel`) arrives. Heavy result arrays are
+delivered to the pane via callbacks (kept out of the global snapshot to avoid re-render
+storms). `controller.openFileAt()` opens a hit and reveals/selects the range in Monaco (with a
+deferred reveal if the editor is still loading). **Replace** (`oc-replace`) recomputes matches
+against the same options and rewrites files — scoped to a single match, one file, or all
+files (Replace All) — with VS Code "preserve case" (ALLCAPS/Capitalized) and `$1`/`$&`
+expansion; each write posts `oc-fs-changed`, and the controller re-reads any affected open
+models from disk. **Quick-open** (`CommandPalette.tsx`, `⌘P`) filters the flat file index by
+name and accepts a trailing `:line[:col]` suffix to jump on open; a bare `:line` jumps within
+the active editor. `⌘⇧F` focuses the Search pane.
+
 ---
 
 ## 9. Native code (Wasm)

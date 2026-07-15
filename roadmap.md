@@ -1655,8 +1655,9 @@ screen, and ten pre-authored templates that auto-install + boot their dev server
   the folder / the file's parent) and **Copy Path**, alongside New File/Folder, Rename,
   Copy/Cut/Paste, Delete, and Close Folder on roots.
 
-Deferred: full-text search (still filename-only), drag-and-drop in the tree, an "Add existing
-folder" picker (paths are typed), and hardening the `express-ts`/`nest-js` dev servers in-VM.
+Deferred: drag-and-drop in the tree, an "Add existing folder" picker (paths are typed), and
+hardening the `express-ts`/`nest-js` dev servers in-VM. (Full-text search shipped later — see
+"VS Code-style search & replace + quick-open by line" below.)
 
 ## TypeScript 7 (tsgo), cross-service WebSockets, host↔preview bridge (this change)
 
@@ -1793,9 +1794,11 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   13 re-categorised.
 - ✅ **Phase 2 (`[SPIKE]`, meta-frameworks — shipped `experimental`)** — Fullstack: Nuxt 3,
   SvelteKit, React Router 7 (Remix), Astro. Docs: VitePress, Slidev.
-- ✅ **Phase 3 (`[SPIKE]` — shipped `experimental`)** — Frontend variants: Preact, Lit, Solid,
-  Qwik. Backends: Fastify, Nitro, GraphQL (Yoga), Feathers. Showcases: Socket.IO, tRPC, pnpm
-  monorepo, SQLite (sql.js WASM).
+- ✅ **Phase 3 (`[SPIKE]`)** — Frontend variants: Preact, Lit, Solid, Qwik (now proven headless by
+  `scripts/spike-{preact,lit,solid,qwik}.mjs` → **graduated to non-experimental**; Qwik rides the
+  merged esbuild-wasm aliasing + in-process service and runs `qwikVite({ csr: true })`). Backends:
+  Fastify, Nitro, GraphQL (Yoga),
+  Feathers. Showcases: Socket.IO, tRPC, pnpm monorepo, SQLite (sql.js WASM).
 - ✅ **Phase 4 (cont.) — standalone Webpack + Docusaurus proven headless AND shipped.** Two
   new templates, each gated by a green spike (validated alongside the Next.js spike, which still
   PASSes incl. the RSC-refresh gate):
@@ -1899,6 +1902,112 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
 badge) because they haven't yet passed a headless `scripts/spike-*.mjs` gate — the risk is that a
 framework's own CLI drives a Vite/esbuild path we haven't routed through rolldown. They graduate to
 non-experimental once their spike is green.
+
+**Frontend variants graduated (this change).** A shared harness `scripts/spike-vite-lib.mjs` (real
+`npm install` → boot `vite` → GET `/` 200 with the title marker + `/@vite/client` 200 + the entry
+module transforms through the framework plugin) backs
+`scripts/spike-{preact,lit,solid,qwik,vue,svelte}.mjs`. Preact, Lit, Solid, **Vue, Qwik and Svelte**
+are all green and non-experimental (Svelte via a Vite-7 pin — see below).
+
+The harness fetcher now mirrors the browser kernel's transparent wasm drop-in aliasing
+(`esbuild -> esbuild-wasm`, `rollup -> @rollup/wasm-node`; see `packages/demo/fetcher-worker.js`) so
+a headless spike installs the exact same tree the studio does — without it, Qwik's Vite-7 tree pulls
+the native esbuild the browser never sees.
+
+**Vite-8 peer-dependency sweep (this change).** All the Vite templates pin `vite ^8.0.0` (Vite 8 =
+rolldown, the only optimizer proven in-VM), but several framework plugins had not yet widened their
+peer range to Vite 8, so `npm install` ERESOLVEd. Findings + fixes, each checked against the registry
+and a headless spike:
+
+- **Vue** — `@vitejs/plugin-vue@^5.2.0` peers `vite ^5||^6`. Bumped to `^6.0.0` (v6.0.5+ peers
+  `^8.0.0`). Fixed **and proven** by `scripts/spike-vue.mjs` (GET `/` 200, `/src/App.vue` compiles).
+- **Qwik** — `@builder.io/qwik@1.x` hard-caps `peer vite ">=5 <8"` (no v2 published), so it can't use
+  Vite 8 at all; pinned the template to `vite ^7.0.0`. Vite 7's dep optimizer wants esbuild's native
+  binary (no wasm32 build), which now Just Works on top of the merged Angular support: the runtime
+  aliases `esbuild -> esbuild-wasm` at the registry layer and runs its service in-process
+  (`packages/runtime/esbuild-inproc-patch.js`). The last blocker was structural — `qwikVite()`
+  defaults to SSR mode and demanded a `src/root.tsx` server entry; switching to `qwikVite({ csr: true })`
+  makes it a plain client-rendered SPA. One extra CSR gotcha: the **qwikloader** (the global
+  event listener that lazy-loads `onXxx$` handlers) is normally inlined by SSR, so a CSR entry must
+  `import '@builder.io/qwik/qwikloader.js'` or the app renders but is dead (buttons don't respond) —
+  the template's `src/main.tsx` now does. **Proven** by `scripts/spike-qwik.mjs` → graduated to
+  non-experimental.
+- **Svelte** — pinned to **Vite 7 + `@sveltejs/vite-plugin-svelte@^6`** and **graduated**
+  (`scripts/spike-svelte.mjs` green: GET `/` 200 with marker, `/@vite/client` 200, `/src/App.svelte`
+  compiles). Vite 8 is deliberately avoided: with Vite 8 (`+ vite-plugin-svelte@^7`) `npm install`
+  succeeds, but the plugin forces a **second (ssr) dep-optimize** pass on boot that can't be turned off
+  from user config (`ssr.optimizeDeps` / `environments.ssr.dev.optimizeDeps` with `noDiscovery` + empty
+  `include` don't stop it). In-VM that second **rolldown-wasm** bundle panics —
+  `Rolldown panicked ... napi-3.10.3/src/tokio_runtime.rs: Access tokio runtime failed in spawn` —
+  which traps the wasm (`unreachable`) and crashes the whole dev server (server unbinds → 502). Root
+  cause (see follow-up below) is a known upstream rolldown-on-wasi bug, not an OpenContainer-specific
+  gap. Vite 7 sidesteps it by using the **esbuild** dep optimizer, which runs in-process via
+  `packages/runtime/esbuild-inproc-patch.js` — the same path that graduated Qwik.
+- **React** — no change needed: `@vitejs/plugin-react@^5.0.0` resolves to `5.2.0`, which already peers
+  `^8.0.0`.
+
+**Deferred / follow-up — rolldown-wasi second-bundle tokio panic (blocks Vite-8 SSR optimize).**
+Root-caused while graduating Svelte (correcting the earlier "SSR optimizer hangs / drains the loop"
+guess — it does **not** hang, it **panics**). When a Vite-8 project runs **two** rolldown-wasm dep
+optimizes in one process (e.g. the client optimize followed by the SSR optimize that
+`vite-plugin-svelte`/meta-frameworks force), the **first** bundle succeeds and the **second** panics:
+
+```
+Rolldown panicked. This is a bug in Rolldown, not your code.
+thread '<unnamed>' panicked at napi-3.10.3/src/tokio_runtime.rs:113:6:
+Access tokio runtime failed in spawn
+```
+
+`napi::tokio_runtime::RT` is a Rust `static Option<Runtime>` in the (shared) wasm linear memory; it is
+shut down after the first bundle and never re-initialized under wasi, so the second bundle's
+`tokio::spawn` unwraps `None` → panic → wasm `unreachable` → the dev-server process dies. This is a
+**known upstream rolldown-on-wasi bug that also hits StackBlitz/WebContainer** (rolldown#8747,
+rolldown#9134; napi-rs#2847/#2850, napi-rs#3028) — not something a template config can dodge (the
+second optimize can't be disabled) and not fixable in our runtime without touching rolldown's Rust
+(the runtime already keeps the loop alive via `process.__wtHost`; the shutdown is internal to the
+napi tokio static). Confirmed both bundles' pool workers boot fine, so it is not a nested-worker spawn
+deadlock. **Svelte is unblocked by pinning to Vite 7** (esbuild optimizer, no rolldown). The remaining
+consumers of this bug are the **Vite-8 SSR meta-frameworks (SvelteKit / Nuxt / Astro)** which need a
+real SSR optimize; those stay `experimental` until rolldown fixes the wasi tokio lifecycle (or we
+carry a patched `@rolldown/binding-wasm32-wasi`). Reproduce the panic with the Vite-8 variant in
+`scripts/spike-svelte.mjs` history, or any meta-framework spike.
+
+## VS Code-style search & replace + quick-open by line (this change)
+
+The Search pane was filename-only (a substring filter over the flat file index). This change
+makes it a real VS Code-style full-text Search & Replace across **every open workspace root**,
+and teaches quick-open to jump to a line — without ever blocking the UI.
+
+- **Search engine in the kernel worker (`demo/kernel-worker.js`).** Full-text search runs where
+  the synchronous Wasm VFS lives; doing it on the main thread would mean an `oc-read`
+  round-trip per file. New messages: `oc-search {token,roots,query,matchCase,wholeWord,regex,
+  includeGlob,excludeGlob}` walks each root (reusing the Explorer skip set), skips
+  binary/oversized files, and **streams** results as `oc-search-result` batches → final
+  `oc-search-done {matchCount,fileCount,limitHit}`. `oc-replace` recomputes matches against the
+  same options and rewrites files — scoped to a single match, one file, or all files — with
+  "preserve case" (ALLCAPS/Capitalized) and `$1`/`$&` expansion, posting `oc-fs-changed` per
+  write. `oc-search-cancel` + a monotonic `currentSearchToken` supersede an in-flight query.
+- **Non-blocking by construction.** That worker also serves preview HTTP + terminal I/O, so the
+  walk yields a macrotask every ~40 files and flushes partial batches — the results list fills
+  in progressively and the preview/terminal never stall mid-search. Results are delivered to the
+  pane via callbacks, kept OUT of the global snapshot to avoid re-render storms.
+- **Search pane rewrite (`components/ide/SearchPane.tsx`).** Search input with Match Case /
+  Whole Word / Regex; an expandable Replace row with Preserve Case + **Replace All** (disabled
+  until there's a match); a details toggle for `files to include` / `files to exclude` globs;
+  collapsible per-file results with the match highlighted and per-file/per-match replace on
+  hover; a live summary + invalid-regex inline error. Debounced; re-runs on any option change
+  and after a replace (via `treeVersion`).
+- **Editor integration (`oc/controller.ts`).** `runSearch(opts,{onBatch,onDone})` (returns a
+  cancel fn), `replace({...,files|match})`, and `openFileAt(abs,line,col,len)` which reveals +
+  selects the range in Monaco (deferred if the editor is still loading). After a replace, any
+  affected open model is re-read from disk so the buffer + dirty state don't drift.
+- **Quick-open by line (`components/ide/CommandPalette.tsx`, `AppShell.tsx`).** `⌘P` still
+  searches files by name, now accepting a trailing `:line[:col]` (e.g. `App.tsx:42`) to jump on
+  open; a bare `:line` jumps within the active editor. Added `⌘⇧F` to focus the Search pane.
+  (Also wrapped the palette in cmdk's `Command` root so filtering works.)
+
+Follow-ups: search result virtualization for very large result sets, a search-history dropdown
+(the input hints at `↑↓`), and `.gitignore`-aware excludes.
 
 ## Definition of done for T2
 

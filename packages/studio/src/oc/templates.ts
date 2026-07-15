@@ -259,7 +259,7 @@ const vuePkg = (ts: boolean) => `{
     "vue": "^3.5.0"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": "^5.2.0",
+    "@vitejs/plugin-vue": "^6.0.0",
     "vite": "^8.0.0"${ts ? `,
     "typescript": "^5.7.0",
     "vue-tsc": "^2.2.0"` : ""}
@@ -384,9 +384,9 @@ const sveltePkg = (ts: boolean) => `{
     "preview": "vite preview"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@sveltejs/vite-plugin-svelte": "^6.0.0",
     "svelte": "^5.0.0",
-    "vite": "^8.0.0"${ts ? `,
+    "vite": "^7.0.0"${ts ? `,
     "svelte-check": "^4.0.0",
     "typescript": "^5.7.0"` : ""}
   }
@@ -487,6 +487,17 @@ function svelteTemplate(ts: boolean): TemplateDef {
       reload: false,
       install: "npm install",
       dev: VITE_DEV,
+      // Pinned to Vite 7 + @sveltejs/vite-plugin-svelte@^6 (proven green by
+      // scripts/spike-svelte.mjs). Vite 8 is deliberately avoided here: its default
+      // dep optimizer is rolldown-wasm, and vite-plugin-svelte forces a SECOND (ssr)
+      // optimize pass on boot that can't be disabled from user config. In-VM that
+      // second rolldown bundle panics — "Access tokio runtime failed in spawn"
+      // (napi-rs tokio runtime is shut down after the first/client bundle and never
+      // re-inits under wasi) — which crashes the dev server. This is a known upstream
+      // rolldown-on-wasi bug that also hits StackBlitz/WebContainer (rolldown#8747,
+      // #9134; napi-rs#2847). Vite 7 sidesteps it entirely by using the esbuild
+      // optimizer, which runs in-process via esbuild-inproc-patch.js (same path that
+      // graduated Qwik). Revisit Vite 8 once the rolldown wasi tokio lifecycle is fixed.
     },
     files,
   };
@@ -2351,7 +2362,15 @@ Presentation slides for developers — running in the browser
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Phase 3 — frontend variants (Vite 8 / rolldown; experimental until spiked)
+// Phase 3 — frontend variants. Preact, Lit, and Solid (Vite 8 / rolldown) and now
+// Qwik are all proven in-VM by headless spikes (scripts/spike-{preact,lit,solid,qwik}.mjs)
+// and are no longer experimental. Qwik is special: @builder.io/qwik@1.x declares
+// `peer vite ">=5 <8"`, so it can't use Vite 8 and is pinned to Vite 7, whose dep
+// optimizer wants esbuild's native binary (no wasm32 build). That now Just Works
+// because the runtime aliases esbuild -> esbuild-wasm at the registry layer and runs
+// its service in-process (see packages/demo/fetcher-worker.js +
+// packages/runtime/esbuild-inproc-patch.js), and qwikVite runs in `csr: true` mode
+// so it doesn't demand an SSR src/root.tsx entry.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── Preact ───────────────────────────────────────────────────────────────────
@@ -2372,7 +2391,6 @@ function preactTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: VITE_DEV,
-      experimental: true,
     },
     files: {
       "package.json": `{
@@ -2464,7 +2482,6 @@ function litTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: VITE_DEV,
-      experimental: true,
     },
     files: {
       "package.json": `{
@@ -2553,7 +2570,6 @@ function solidTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: VITE_DEV,
-      experimental: true,
     },
     files: {
       "package.json": `{
@@ -2645,7 +2661,6 @@ function qwikTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: VITE_DEV,
-      experimental: true,
     },
     files: {
       "package.json": `{
@@ -2655,14 +2670,16 @@ function qwikTemplate(): TemplateDef {
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
   "dependencies": { "@builder.io/qwik": "^1.12.0" },
-  "devDependencies": { "typescript": "^5.7.0", "vite": "^8.0.0" }
+  "devDependencies": { "typescript": "^5.7.0", "vite": "^7.0.0" }
 }
 `,
       "vite.config.ts": `import { defineConfig } from 'vite'
 import { qwikVite } from '@builder.io/qwik/optimizer'
 
+// csr: true = client-side-rendered SPA (no SSR). Without it qwikVite runs in SSR
+// mode and demands a src/root.tsx server entry ("Qwik input src/root not found").
 export default defineConfig({
-  plugins: [qwikVite()],
+  plugins: [qwikVite({ csr: true })],
 })
 `,
       "index.html": `<!doctype html>
@@ -2678,7 +2695,11 @@ export default defineConfig({
   </body>
 </html>
 `,
-      "src/main.tsx": `import { render } from '@builder.io/qwik'
+      "src/main.tsx": `// The qwikloader is the tiny global listener that intercepts DOM events and
+// lazy-loads their onXxx$ handlers. SSR normally inlines it; a CSR app must import
+// it explicitly or nothing is interactive (buttons render but clicks do nothing).
+import '@builder.io/qwik/qwikloader.js'
+import { render } from '@builder.io/qwik'
 import { App } from './app'
 
 render(document.getElementById('app')!, <App />)
