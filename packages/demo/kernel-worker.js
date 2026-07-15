@@ -945,6 +945,12 @@ async function boot() {
   // shims; a fresh origin fetches + unpacks the ~12 MB asset once (one batched
   // VFS transfer). A missing asset simply means no `npm` on PATH, like yarn/pnpm.
   kernel.mkdirp("/home/user");
+  // os.tmpdir() is "/tmp", so it MUST exist: tools call mkdtempSync(join(tmpdir(),
+  // "x-")) at startup (e.g. Nuxt/vite-node's generateSocketPath), which mkdir's a
+  // random child of /tmp and throws ENOENT if /tmp is missing. It used to be
+  // created implicitly by the /tmp/.npm cache dirs — those moved to
+  // /home/user/.cache, so create /tmp explicitly now.
+  kernel.mkdirp("/tmp");
   // Package-manager caches live under /home/user/.cache (persisted in OPFS), so
   // downloaded tarballs/binaries are reused across projects and page reloads.
   kernel.mkdirp("/home/user/.cache/npm/_logs");
