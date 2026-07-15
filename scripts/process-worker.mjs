@@ -86,6 +86,9 @@ parentPort.on("message", (msg) => {
   // A browser preview ws tunnel message relayed by the kernel (#19 stage C).
   else if (msg.type === "ws-open" || msg.type === "ws-in" || msg.type === "ws-close")
     control && control.dispatchWs(msg);
+  // A browser preview SSE tunnel message relayed by the kernel.
+  else if (msg.type === "sse-open" || msg.type === "sse-close")
+    control && control.dispatchSse(msg);
   // A cross-process pipe (UNIX socket) message relayed by the kernel.
   else if (msg.type === "pipe-open" || msg.type === "pipe-data" || msg.type === "pipe-shutdown" || msg.type === "pipe-close")
     control && control.dispatchPipe(msg);

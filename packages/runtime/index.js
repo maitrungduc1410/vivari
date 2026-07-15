@@ -107,6 +107,10 @@ export function createRuntime({
   // browser<->in-VM ws relay connection keeps the loop turning so it can pump
   // frames (like an open socket handle).
   const wsLiveness = { active: 0 };
+  // Liveness counter for Server-Sent Events tunnels: each live browser<->in-VM SSE
+  // relay (a loopback GET holding an open text/event-stream response) keeps the loop
+  // turning so it can pump chunks, like an open socket handle.
+  const sseLiveness = { active: 0 };
   // Liveness counter for interactive stdin: while a consumer is actively reading
   // process.stdin (flowing / has a 'data' listener), it refs the loop like an
   // open TTY handle so an idle REPL/shell waits for the next keystroke instead of
@@ -147,6 +151,7 @@ export function createRuntime({
       hostLiveness.active > 0 ||
       watchLiveness.active > 0 ||
       wsLiveness.active > 0 ||
+      sseLiveness.active > 0 ||
       stdinLiveness.active > 0,
     doNet: () => {
       if (netServers.count === 0 || !bridgeHttp) return;
@@ -785,6 +790,89 @@ export function createRuntime({
     loop.wakeNet();
   };
 
+  // ---- Server-Sent Events tunnel relay --------------------------------------
+  // The browser preview can't stream a `text/event-stream` response through the
+  // buffered HTTP preview proxy (the Service Worker resolves one complete body,
+  // so a never-ending SSE response just times out). So an `EventSource` polyfill
+  // in the preview iframe tunnels each logical connection to us as messages
+  // (kernel -> this process): sse-open / sse-close. We open a genuine in-VM
+  // loopback GET to 127.0.0.1:<port><path> for each, forward the raw event-stream
+  // bytes back out (postRaw -> kernel -> host -> iframe) as sse-out
+  // {sub:'open'|'chunk'|'close'}, and the iframe polyfill parses the SSE frames.
+  // Mirrors the WebSocket tunnel above; SSE is one-way (server -> client) so
+  // there's no inbound leg.
+  const sseConns = new Map(); // connId -> ClientRequest
+  const sseOut = (connId, sub, extra) => {
+    if (postRaw) postRaw({ type: "sse-out", connId, sub, ...extra });
+  };
+  const sseDrop = (connId) => {
+    if (sseConns.delete(connId) && sseLiveness.active > 0) sseLiveness.active--;
+  };
+  const sseRelay = {
+    open(connId, port, path) {
+      if (sseConns.has(connId)) return;
+      let creq;
+      try {
+        creq = http.request(
+          {
+            host: "127.0.0.1",
+            port: port | 0,
+            method: "GET",
+            path: path || "/",
+            headers: { accept: "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" },
+          },
+          (cres) => {
+            sseOut(connId, "open", { status: cres.statusCode | 0 });
+            cres.on("data", (chunk) => {
+              const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+              sseOut(connId, "chunk", { data: text });
+            });
+            cres.on("end", () => {
+              sseDrop(connId);
+              sseOut(connId, "close", {});
+            });
+            cres.on("error", () => {
+              sseDrop(connId);
+              sseOut(connId, "close", {});
+            });
+          },
+        );
+      } catch {
+        sseOut(connId, "close", {});
+        return;
+      }
+      creq.on("error", () => {
+        sseDrop(connId);
+        sseOut(connId, "close", {});
+      });
+      sseConns.set(connId, creq);
+      sseLiveness.active++;
+      loop.wakeNet();
+      try {
+        creq.end();
+      } catch {
+        /* closing */
+      }
+    },
+    close(connId) {
+      const creq = sseConns.get(connId);
+      sseDrop(connId);
+      if (creq) {
+        try {
+          creq.destroy();
+        } catch {
+          /* already gone */
+        }
+      }
+    },
+  };
+  const dispatchSse = (msg) => {
+    if (!msg) return;
+    if (msg.type === "sse-open") sseRelay.open(msg.connId, msg.port, msg.path);
+    else if (msg.type === "sse-close") sseRelay.close(msg.connId);
+    loop.wakeNet();
+  };
+
   const consoleObj = createConsole(process, util);
 
   // Globals visible to user code (both as wrapper params and on globalThis).
@@ -1140,6 +1228,9 @@ export function createRuntime({
     /** External delivery from the kernel: a browser preview ws tunnel message
      * ({type:'ws-open'|'ws-in'|'ws-close', connId, ...}). roadmap #19 stage C. */
     dispatchWs: (msg) => dispatchWs(msg),
+    /** External delivery from the kernel: a browser preview SSE tunnel message
+     * ({type:'sse-open'|'sse-close', connId, ...}). Streams text/event-stream. */
+    dispatchSse: (msg) => dispatchSse(msg),
     /** External delivery from the kernel: a cross-process pipe (UNIX socket)
      * message ({type:'pipe-open'|'pipe-data'|'pipe-shutdown'|'pipe-close',
      * connId, ...}) for a connection this process is an endpoint of. */

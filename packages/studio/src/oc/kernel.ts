@@ -56,8 +56,8 @@ export class KernelBridge {
     // events UP to this window; relay them down to the kernel worker.
     addEventListener("message", (event: MessageEvent) => {
       const d = event.data;
-      if (!d || d.type !== "oc-ws" || d.dir !== "out") return;
-      this.worker.postMessage({ type: "oc-ws", msg: d });
+      if (!d || d.dir !== "out" || (d.type !== "oc-ws" && d.type !== "oc-sse")) return;
+      this.worker.postMessage({ type: d.type as string, msg: d });
     });
   }
 

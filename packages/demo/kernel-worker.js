@@ -996,6 +996,9 @@ async function boot() {
   // server) — forward it to the main thread, which delivers it to the preview
   // iframe's WebSocket polyfill.
   kernel.onWsSend = (msg) => post("oc-ws", { msg });
+  // An SSE stream chunk a process relayed OUT of the VM — forward it to the main
+  // thread, which delivers it to the preview iframe's EventSource polyfill.
+  kernel.onSseSend = (msg) => post("oc-sse", { msg });
 
   kernel.installCoreutils();
 
@@ -1525,6 +1528,13 @@ self.onmessage = async (event) => {
   // by the main thread). Route it to the process owning the preview port.
   if (m.type === "oc-ws") {
     if (kernel) kernel.handleWsClient(m.msg);
+    return;
+  }
+
+  // An SSE connection event from the preview iframe's EventSource polyfill
+  // (relayed by the main thread). Route it to the process owning the preview port.
+  if (m.type === "oc-sse") {
+    if (kernel) kernel.handleSseClient(m.msg);
     return;
   }
 

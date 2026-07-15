@@ -170,9 +170,86 @@ OCWebSocket.prototype._emit = function(t, e){
 window.WebSocket = OCWebSocket;
 })();`;
 
-// Insert the shim as the first child of <head> (so it runs before any script).
+// SSE transport. A streaming `text/event-stream` response can't cross the buffered
+// HTTP preview proxy (the SW resolves ONE complete body, so a never-ending SSE
+// response just 504s). So — exactly like the ws shim — we replace the iframe's
+// `EventSource` with one that tunnels each connection to the host page
+// (parent.postMessage), which relays it to the kernel -> the process owning the
+// preview port -> a genuine in-VM loopback GET to the dev server's SSE endpoint.
+// The raw event-stream bytes come back as {sub:'chunk'} and are parsed here into
+// message/named events per the SSE spec (data:/event:/id:, dispatched on a blank
+// line). SSE is one-way, so there's no send() leg.
+const SSE_SHIM = `(function(){
+if (window.__ocSseInstalled) return; window.__ocSseInstalled = true;
+var m = location.pathname.match(/\\/preview\\/(\\d+)\\//);
+var previewPort = m ? parseInt(m[1], 10) : 0;
+var tok = Math.random().toString(36).slice(2, 8);
+var nextId = 1, conns = {};
+function post(msg){ parent.postMessage(msg, '*'); }
+window.addEventListener('message', function(ev){
+  var d = ev.data; if (!d || d.type !== 'oc-sse' || d.dir !== 'in') return;
+  var c = conns[d.connId]; if (c) c._deliver(d);
+});
+window.addEventListener('pagehide', function(){
+  for (var k in conns){ try { conns[k].close(); } catch(e){} }
+});
+function OCEventSource(url, cfg){
+  this.url = String(url); this.readyState = 0; this.withCredentials = !!(cfg && cfg.withCredentials);
+  this.lastEventId = ''; this.onopen = null; this.onmessage = null; this.onerror = null;
+  this._id = tok + '-' + (nextId++); this._l = {}; this._buf = '';
+  conns[this._id] = this;
+  var path = '/'; var targetPort = previewPort;
+  try {
+    var u = new URL(this.url, location.href);
+    path = u.pathname + u.search;
+    var pm = u.pathname.match(/^\\/preview\\/(\\d+)(\\/.*)?$/);
+    if (pm) { targetPort = parseInt(pm[1], 10); path = (pm[2] || '/') + u.search; }
+    else if (u.port && u.port !== location.port) targetPort = parseInt(u.port, 10);
+  } catch(e){}
+  post({ type:'oc-sse', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path });
+}
+OCEventSource.CONNECTING = 0; OCEventSource.OPEN = 1; OCEventSource.CLOSED = 2;
+OCEventSource.prototype._deliver = function(d){
+  if (d.sub === 'open'){ this.readyState = 1; this._emit('open', { type:'open' }); }
+  else if (d.sub === 'chunk'){ this._feed(String(d.data == null ? '' : d.data)); }
+  else if (d.sub === 'close'){ if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id]; this._emit('error', { type:'error' }); }
+};
+OCEventSource.prototype._feed = function(text){
+  this._buf = (this._buf + text).replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n');
+  var idx;
+  while ((idx = this._buf.indexOf('\\n\\n')) >= 0){
+    var raw = this._buf.slice(0, idx); this._buf = this._buf.slice(idx + 2);
+    this._parse(raw);
+  }
+};
+OCEventSource.prototype._parse = function(raw){
+  var lines = raw.split('\\n'); var event = 'message', data = [], id = null;
+  for (var i=0;i<lines.length;i++){
+    var line = lines[i]; if (line === '' || line.charAt(0) === ':') continue;
+    var c = line.indexOf(':'); var field = c === -1 ? line : line.slice(0, c);
+    var value = c === -1 ? '' : line.slice(c + 1); if (value.charAt(0) === ' ') value = value.slice(1);
+    if (field === 'event') event = value; else if (field === 'data') data.push(value); else if (field === 'id') id = value;
+  }
+  if (id !== null) this.lastEventId = id;
+  if (data.length === 0) return;
+  this._emit(event, { type:event, data:data.join('\\n'), lastEventId:this.lastEventId, origin:location.origin });
+};
+OCEventSource.prototype.close = function(){
+  if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id];
+  post({ type:'oc-sse', dir:'out', sub:'close', connId:this._id });
+};
+OCEventSource.prototype.addEventListener = function(t, fn){ (this._l[t] || (this._l[t] = [])).push(fn); };
+OCEventSource.prototype.removeEventListener = function(t, fn){ var a=this._l[t]; if(a){var i=a.indexOf(fn); if(i>=0)a.splice(i,1);} };
+OCEventSource.prototype._emit = function(t, e){
+  var on = this['on'+t]; if (typeof on === 'function'){ try{ on.call(this, e); }catch(x){} }
+  var a = this._l[t]; if (a) for (var i=0;i<a.length;i++){ try{ a[i].call(this, e); }catch(x){} }
+};
+window.EventSource = OCEventSource;
+})();`;
+
+// Insert the shims as the first children of <head> (so they run before any script).
 function injectWsShim(html) {
-  const tag = "<script>" + WS_SHIM + "<\/script>";
+  const tag = "<script>" + WS_SHIM + "<\/script><script>" + SSE_SHIM + "<\/script>";
   const headOpen = /<head[^>]*>/i.exec(html);
   if (headOpen) {
     const at = headOpen.index + headOpen[0].length;

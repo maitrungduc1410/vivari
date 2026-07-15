@@ -1790,6 +1790,16 @@ export class IdeController {
       }
     });
 
+    // SSE tunnel: a text/event-stream chunk routed OUT of the VM → preview iframes.
+    // Like the ws frame it doesn't carry a port, so deliver to every bound tab; the
+    // iframe's EventSource polyfill ignores chunks for connIds it doesn't own.
+    b.on("oc-sse", (m) => {
+      const payload = { ...(m.msg as object), type: "oc-sse", dir: "in" };
+      for (const t of this.snap.previewTabs) {
+        if (t.port != null) this.previewFrames.get(t.id)?.contentWindow?.postMessage(payload, "*");
+      }
+    });
+
     // Legacy built-in demo became ready.
     b.on("demo-ready", (m) => {
       this.pointPreview(m.port as number);

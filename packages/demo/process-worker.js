@@ -110,6 +110,9 @@ self.onmessage = async (event) => {
   // A browser preview ws tunnel message relayed by the kernel (#19 stage C).
   else if (type === "ws-open" || type === "ws-in" || type === "ws-close")
     control && control.dispatchWs(event.data);
+  // A browser preview SSE tunnel message relayed by the kernel.
+  else if (type === "sse-open" || type === "sse-close")
+    control && control.dispatchSse(event.data);
   // A cross-process pipe (UNIX socket) message relayed by the kernel.
   else if (type === "pipe-open" || type === "pipe-data" || type === "pipe-shutdown" || type === "pipe-close")
     control && control.dispatchPipe(event.data);
