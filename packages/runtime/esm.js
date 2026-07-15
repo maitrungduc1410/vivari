@@ -74,7 +74,12 @@ function helpers(fileUrl, filename) {
   return (
     "const __oc_def=function(m){return m&&m.__esModule?m.default:m;};" +
     "const __oc_ns=function(m){if(m&&m.__esModule)return m;var ns=Object.create(null);if(m)for(var k of Object.keys(m)){Object.defineProperty(ns,k,{enumerable:true,configurable:true,get:(function(k){return function(){return m[k];};})(k)});}ns.default=m;Object.defineProperty(ns,'__esModule',{value:true});return ns;};" +
-    "const __oc_star=function(e,m){if(m)for(var k of Object.keys(m)){if(k!=='default'&&!(k in e))Object.defineProperty(e,k,{enumerable:true,configurable:true,get:function(){return m[k];}});}};" +
+    // Each getter MUST close over its OWN `k` (per-iteration IIFE), not the shared
+    // loop `var k` — otherwise every re-exported name resolves to the LAST key of
+    // `m`. That desync silently collapses all of `export * from 'x'`'s names onto
+    // one value (e.g. vue's `index.mjs` re-exports everything, so `createApp`
+    // became `withScopeId` — Nuxt SSR then read `.config` off the wrong object).
+    "const __oc_star=function(e,m){if(m)for(var k of Object.keys(m)){if(k!=='default'&&!(k in e))Object.defineProperty(e,k,{enumerable:true,configurable:true,get:(function(k){return function(){return m[k];};})(k)});}};" +
     "const __oc_import=function(s){return Promise.resolve().then(function(){return __oc_require(s);});};" +
     "const __oc_meta={url:" + JSON.stringify(fileUrl) +
       ",filename:" + JSON.stringify(fp) +
