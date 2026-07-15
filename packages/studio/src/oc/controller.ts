@@ -945,7 +945,7 @@ export class IdeController {
   // directory shows the "…is a directory" message, an image opens the image
   // viewer, everything else opens in Monaco. Use this (not openFile) wherever a
   // path could be a folder or an image (Explorer clicks, drag-to-editor).
-  async openEntry(abs: string, { preview = false }: { preview?: boolean } = {}) {
+  async openEntry(abs: string, { preview = false, focus = true }: { preview?: boolean; focus?: boolean } = {}) {
     let kind = this.snap.tabKinds[abs];
     if (!kind) {
       const info = await this.pathInfo(abs);
@@ -956,13 +956,13 @@ export class IdeController {
       const bytes = await this.readFileBytes(abs);
       this.imageUrls.set(abs, URL.createObjectURL(new Blob([bytes as BlobPart], { type: imageMime(abs) })));
     }
-    await this.openFile(abs, { preview });
+    await this.openFile(abs, { preview, focus });
   }
 
   // Open a file by ABSOLUTE path. `preview` (single-click from the Explorer)
   // reuses a single italic "preview" tab; a permanent open (double-click, or an
   // edit) pins it.
-  async openFile(abs: string, { preview = false }: { preview?: boolean } = {}) {
+  async openFile(abs: string, { preview = false, focus = true }: { preview?: boolean; focus?: boolean } = {}) {
     // Reconcile the tab strip + preview slot.
     const already = this.snap.openTabs.includes(abs);
     let openTabs = this.snap.openTabs;
@@ -994,7 +994,7 @@ export class IdeController {
     const model = await this.ensureModel(abs);
     if (model && this.snap.activeTab === abs) {
       this.editor.setModel(model);
-      this.editor.focus();
+      if (focus) this.editor.focus();
       if (this.pendingReveal && this.pendingReveal.abs === abs) {
         const r = this.pendingReveal;
         this.pendingReveal = null;

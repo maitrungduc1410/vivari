@@ -50,6 +50,10 @@ export function Explorer() {
   const [confirmDelete, setConfirmDelete] = useState<string[] | null>(null);
   const [dragOver, setDragOver] = useState<string | null>(null);
   const loading = useRef<Set<string>>(new Set());
+  // The focusable tree container. Clicking a row focuses it so Explorer
+  // shortcuts (Cmd/Ctrl+A to select all, Esc to clear) work even when the
+  // editor had focus — matching VSCode (a single click doesn't focus the editor).
+  const treeRef = useRef<HTMLDivElement>(null);
 
   // ── drag & drop ────────────────────────────────────────────────────────────
   // Make a row a drag source. Dragging a row that's part of a multi-selection
@@ -215,11 +219,12 @@ export function Explorer() {
   // A row was clicked: update selection, and (only for a plain click) open a
   // file or toggle a folder. Modifier-clicks just change the selection.
   const handleRowClick = (e: React.MouseEvent, abs: string, isDir: boolean, folderId: string) => {
+    treeRef.current?.focus({ preventScroll: true });
     c.setActiveFolder(folderId);
     applySelect(e, abs);
     if (e.shiftKey || e.metaKey || e.ctrlKey) return;
     if (isDir) toggle(abs);
-    else void c.openEntry(abs, { preview: true });
+    else void c.openEntry(abs, { preview: true, focus: false }); // keep focus in the tree
   };
 
   // When a context menu opens on an unselected row, make it the sole selection
@@ -240,6 +245,7 @@ export function Explorer() {
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (renaming || creating) return;
     const k = e.key.toLowerCase();
+    if (e.key === "Escape") { setSelection(new Set()); setAnchor(null); return; }
     if (modKey(e) && k === "a") { e.preventDefault(); setSelection(new Set(flatVisible.map((r) => r.abs))); return; }
     const sel = [...selection];
     if (!sel.length) return;
@@ -360,6 +366,7 @@ export function Explorer() {
       </div>
       <ScrollArea className="flex-1">
         <div
+          ref={treeRef}
           className={cn("min-h-full pb-4 outline-none", dragOver === "__area__" && "bg-accent/30")}
           tabIndex={0}
           {...dropProps(active?.rootPath ?? null, "__area__")}
@@ -386,7 +393,7 @@ export function Explorer() {
                           ? "bg-accent/80 text-foreground ring-1 ring-inset ring-primary"
                           : snap.activeFolderId === f.id ? "text-foreground" : "text-muted-foreground hover:text-foreground",
                       )}
-                      onClick={() => { c.setActiveFolder(f.id); toggle(f.rootPath); }}
+                      onClick={() => { treeRef.current?.focus({ preventScroll: true }); c.setActiveFolder(f.id); toggle(f.rootPath); }}
                     >
                       {open ? <ChevronDown className="size-3.5 shrink-0" /> : <ChevronRight className="size-3.5 shrink-0" />}
                       <span className="truncate">{f.name}</span>
