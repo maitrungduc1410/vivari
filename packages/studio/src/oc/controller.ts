@@ -234,6 +234,7 @@ export class IdeController {
   private depLibsByRoot = new Map<string, Map<string, string>>(); // root -> (extra-lib uri -> content)
   private depsSig = new Map<string, string>(); // root -> last node_modules fingerprint
   private dtsWarnedNoNM = new Set<string>(); // roots we've already noted lack node_modules
+  private tsCompilerOptions: Monaco.typescript.CompilerOptions | null = null; // re-applied to force a worker rebuild after extra libs load
   private dtsTimer: ReturnType<typeof setTimeout> | null = null; // debounce dependency-type loads
   private dtsSeq = 0; // supersede in-flight dependency-type refreshes
   private previewFrames = new Map<string, HTMLIFrameElement>(); // preview tab id -> iframe
@@ -613,6 +614,7 @@ export class IdeController {
       // `target: ESNext` pick the default `lib.esnext.full.d.ts` (which bundles ESNext
       // + DOM + iterable) is what actually works.
     };
+    this.tsCompilerOptions = compilerOptions;
     for (const d of [ts.typescriptDefaults, ts.javascriptDefaults]) {
       d.setCompilerOptions(compilerOptions);
       d.setDiagnosticsOptions({ noSemanticValidation: false, noSyntaxValidation: false, onlyVisible: false });
@@ -726,6 +728,17 @@ export class IdeController {
     }
     monaco.typescript.typescriptDefaults.setExtraLibs(libs);
     monaco.typescript.javascriptDefaults.setExtraLibs(libs);
+    // Critical: the TS worker/LanguageService was created (and validated open
+    // files) BEFORE these types existed. Monaco pushes the new libs to the live
+    // worker, but a worker created with an empty `node_modules` view can keep
+    // serving stale "Cannot find module" results. Re-applying the compiler
+    // options fires `onDidChange`, which makes Monaco's WorkerManager tear the
+    // worker down; the next validation spins up a fresh LanguageService that is
+    // born already seeing every dependency .d.ts — so imports resolve cleanly.
+    if (this.tsCompilerOptions) {
+      monaco.typescript.typescriptDefaults.setCompilerOptions(this.tsCompilerOptions);
+      monaco.typescript.javascriptDefaults.setCompilerOptions(this.tsCompilerOptions);
+    }
   }
 
   // Ensure a Monaco model exists for `abs` (loading its content from the VFS on
