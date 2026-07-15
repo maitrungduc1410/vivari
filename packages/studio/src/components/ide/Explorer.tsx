@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ChevronDown from "~icons/lucide/chevron-down";
 import ChevronRight from "~icons/lucide/chevron-right";
-import Home from "~icons/lucide/house";
+import ChevronsDownUp from "~icons/lucide/chevrons-down-up";
 import FilePlus from "~icons/lucide/file-plus";
 import FolderPlus from "~icons/lucide/folder-plus";
 import RefreshCw from "~icons/lucide/refresh-cw";
@@ -360,8 +360,12 @@ export function Explorer() {
         <HeaderBtn label="Refresh" onClick={() => setChildren({})}>
           <RefreshCw className="size-3.5" />
         </HeaderBtn>
-        <HeaderBtn label="Home" onClick={() => c.goHome()}>
-          <Home className="size-3.5" />
+        <HeaderBtn
+          label="Collapse Folders in Workspace"
+          onClick={() => setExpanded(new Set())}
+          disabled={snap.workspaceFolders.length === 0}
+        >
+          <ChevronsDownUp className="size-3.5" />
         </HeaderBtn>
       </div>
       <ScrollArea className="flex-1">
