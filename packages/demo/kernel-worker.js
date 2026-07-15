@@ -1281,6 +1281,60 @@ async function searchWalk(dir, root, ctx) {
   }
 }
 
+// ── IntelliSense dependency-type collection ──────────────────────────────────
+// Walk a project's node_modules gathering .d.ts + package.json for Monaco's TS
+// language service. @types is walked first so ambient/global typings win the byte
+// budget; the `typescript` package's own lib.*.d.ts are skipped (Monaco ships its
+// own), as are non-type dirs that only bloat the scan.
+const DTS_MAX_FILES = 4000;
+const DTS_MAX_BYTES = 12_000_000;
+// "@types" is walked explicitly first, so skip it in the main pass to avoid
+// re-reading the same files.
+const DTS_SKIP_DIRS = new Set(["@types", "typescript", ".bin", ".cache", ".vite"]);
+
+async function collectDts(root) {
+  const out = [];
+  const ctx = { bytes: 0, scanned: 0, truncated: false };
+  if (!kernel) return { files: out, truncated: false };
+  const nm = String(root || "").replace(/\/+$/, "") + "/node_modules";
+  try { if (!kernel.exists(nm)) return { files: out, truncated: false }; } catch { return { files: out, truncated: false }; }
+
+  const collectFile = (abs, name) => {
+    if (!(name.endsWith(".d.ts") || name === "package.json")) return;
+    let content;
+    try { content = kernel.readFile(abs); } catch { return; }
+    if (typeof content !== "string") return;
+    out.push({ path: abs, content });
+    ctx.bytes += content.length;
+    if (out.length >= DTS_MAX_FILES || ctx.bytes >= DTS_MAX_BYTES) ctx.truncated = true;
+  };
+
+  const walk = async (dir, depth) => {
+    if (ctx.truncated || depth > 12) return;
+    let names;
+    try { names = kernel.readdir(dir); } catch { return; }
+    for (const name of names) {
+      if (ctx.truncated) return;
+      if (depth === 0 && DTS_SKIP_DIRS.has(name)) continue;
+      const abs = dir + "/" + name;
+      let st;
+      try { st = kernel.stat(abs); } catch { continue; }
+      if (st.kind === "dir") {
+        await walk(abs, depth + 1);
+      } else {
+        collectFile(abs, name);
+      }
+      if (++ctx.scanned % 200 === 0) await new Promise((r) => setTimeout(r));
+    }
+  };
+
+  // @types first (ambient globals), then the rest of node_modules.
+  const typesDir = nm + "/@types";
+  try { if (kernel.exists(typesDir)) await walk(typesDir, 1); } catch { /* ignore */ }
+  await walk(nm, 0);
+  return { files: out, truncated: ctx.truncated };
+}
+
 async function runSearch(m) {
   const token = m.token;
   currentSearchToken = token;
@@ -1449,6 +1503,20 @@ self.onmessage = async (event) => {
   if (m.type === "oc-register-project") {
     if (kernel && m.manifest) registerProject(m.dir, m.manifest, m.title);
     if (m.reqId != null) post("oc-reply", { reqId: m.reqId, ok: true });
+    return;
+  }
+
+  // ── IntelliSense: bulk-collect dependency type declarations ─────────────────
+  // Harvest a project's node_modules **/*.d.ts (+ package.json, needed for
+  // "types"/"exports" resolution) so the studio can feed them to Monaco's TS
+  // language service as extra libs. Done HERE — the worker is the sole holder of
+  // the sync Wasm VFS, so this is one bulk reply instead of thousands of per-file
+  // read round-trips. Bounded (file count + total bytes) and yields periodically.
+  if (m.type === "oc-collect-dts") {
+    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    collectDts(m.root)
+      .then((r) => post("oc-reply", { reqId: m.reqId, ok: true, files: r.files, truncated: r.truncated }))
+      .catch((err) => post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) }));
     return;
   }
 

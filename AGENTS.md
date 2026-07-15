@@ -103,7 +103,9 @@ packages/
                           keyed by ABSOLUTE path; project create/open/run flows + a
                           localStorage recent-projects registry (oc-workspace-projects). Also
                           drives full-text search (runSearch/replace over the worker) +
-                          openFileAt (reveal + select a match/line in Monaco).
+                          openFileAt (reveal + select a match/line in Monaco). Wires Monaco's
+                          real language service (TS/JS workers, diagnostics, cross-file models +
+                          node_modules .d.ts extra libs) for IntelliSense — see gotcha below.
     src/oc/templates.ts   10 project templates (React/Vue/Svelte/Express/Nest × TS/JS) —
                           manifest (install/dev/port/entry) + full source, inline.
     src/components/ide/   AppShell (+ Home overlay) · Home (Start blank / from template,
@@ -115,7 +117,8 @@ packages/
                           (preview/permanent tabs) · TerminalPanel (Console/Terminal/Ports) ·
                           PreviewPanel (multi-tab mini-browser: local address bar,
                           back/forward, reload, chii DevTools in a resizable bottom split) ·
-                          StatusBar · CommandPalette (⌘P quick-open by name; append :line[:col]
+                          StatusBar (status + live diagnostics count) · CommandPalette (⌘P
+                          quick-open by name; append :line[:col]
                           to jump) · fileIcon (vscode-icons). Icons are Iconify via
                           unplugin-icons (`~icons/lucide/*`, `~icons/vscode-icons/*`; needs
                           @svgr/core) — do NOT reintroduce lucide-react.
@@ -126,7 +129,8 @@ packages/
     host.js            legacy main thread: UI, SW registration, request relay.
     kernel-worker.js   hosts the Kernel; DEMOS registry + demo shell tabs (OC_RUN); the
                        multi-root VFS protocol (oc-readdir/read/stat/mkdirp/create-project,
-                       oc-fs-changed; streaming oc-search + oc-replace) + dynamic project
+                       oc-fs-changed; streaming oc-search + oc-replace; oc-collect-dts bulk
+                       node_modules .d.ts harvest for IntelliSense) + dynamic project
                        run/attribution (projectDirByTerm, project-ready/-reload). [shared]
     fs-worker.js       hosts the File System Worker (VFS + OPFS). [shared]
     fetcher-worker.js  outbound fetch() (npm downloads). [shared]
@@ -353,6 +357,19 @@ loop or a preview/terminal will stall mid-search. A monotonic `currentSearchToke
 an in-flight search when a newer query (or `oc-search-cancel`) arrives — always check the
 token in the loop. After a replace writes files, the controller re-reads affected open
 models from disk so the Monaco buffer + dirty state don't drift.
+
+### IntelliSense: real Monaco workers + who-holds-which-file
+Monaco's language workers are ENABLED (they used to be a no-op `MonacoEnvironment`): `mountEditor`
+imports the `?worker` entries (Vite bundles them same-origin → COEP-safe) and `configureLanguageService`
+turns on TS/JS semantic+syntax diagnostics with `setEagerModelSync(true)`. The worker only "sees"
+two kinds of file: **Monaco models** and **extra libs** — so the split MUST stay clean or you get
+phantom "Duplicate identifier" errors. Rule: the project's OWN source files are seeded as models
+(`ensureBackgroundModels`, so cross-file completion/go-to-def works before a file is opened); installed
+dependency types (`node_modules/**/*.d.ts` + `package.json`) are the extra libs, harvested in bulk by
+the kernel worker (`oc-collect-dts`, sole VFS holder → one reply, not thousands of reads) and pushed
+via `setExtraLibs`. Never register a file as BOTH. The dts harvest is bounded (file-count + byte
+budget) and debounced; it re-runs on fs changes so a fresh `npm install` lights up types. `checkJs`
+stays off so plain-JS projects aren't flooded with semantic errors.
 
 ### Real npm is the studio shell's `npm` (delivery + shims)
 The North Star is running the real npm/yarn/pnpm CLIs, not our from-scratch

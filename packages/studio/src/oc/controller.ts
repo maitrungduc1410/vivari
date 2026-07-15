@@ -133,6 +133,7 @@ export interface IdeSnapshot {
   clipboard: Clipboard | null;
   paletteOpen: boolean;
   paletteMode: "command" | "file";
+  problems: { errors: number; warnings: number }; // live TS/JS diagnostics (status bar)
 }
 
 const TERM_THEME = {
@@ -219,6 +220,7 @@ export class IdeController {
     clipboard: null,
     paletteOpen: false,
     paletteMode: "command",
+    problems: { errors: 0, warnings: 0 },
   };
 
   // ── imperative state (not reactive) ──
@@ -229,6 +231,9 @@ export class IdeController {
   private editor: Monaco.editor.IStandaloneCodeEditor | null = null;
   private editorMounting = false; // guards the async create against StrictMode double-mount
   private models = new Map<string, Monaco.editor.ITextModel>(); // abs -> model
+  private depLibs = new Map<string, string>(); // extra-lib uri -> .d.ts/package.json content
+  private dtsTimer: ReturnType<typeof setTimeout> | null = null; // debounce dependency-type loads
+  private dtsSeq = 0; // supersede in-flight dependency-type refreshes
   private previewFrames = new Map<string, HTMLIFrameElement>(); // preview tab id -> iframe
   private previewSeq = 0;
   private devtoolsFrame: HTMLIFrameElement | null = null; // the chii DevTools frontend iframe
@@ -522,29 +527,42 @@ export class IdeController {
   async mountEditor(el: HTMLElement) {
     if (this.editor || this.editorMounting) return;
     this.editorMounting = true;
-    // Silence Monaco's language-service workers (we only need syntax coloring,
-    // which runs on the main thread) and keep it COEP-safe with a no-op worker.
+    // Real language intelligence: wire Monaco's own web workers. Vite bundles each
+    // `?worker` entry into a same-origin chunk (COEP-safe), and we run them
+    // off-main-thread so completions, hover, signature help, go-to-definition and
+    // diagnostics never block the UI. The editor worker backs cross-file services;
+    // the typescript worker hosts a full TS language service (bundled TS compiler).
+    const [editorWorker, tsWorker, jsonWorker, cssWorker, htmlWorker] = await Promise.all([
+      import("monaco-editor/esm/vs/editor/editor.worker?worker"),
+      import("monaco-editor/esm/vs/language/typescript/ts.worker?worker"),
+      import("monaco-editor/esm/vs/language/json/json.worker?worker"),
+      import("monaco-editor/esm/vs/language/css/css.worker?worker"),
+      import("monaco-editor/esm/vs/language/html/html.worker?worker"),
+    ]);
     (self as unknown as { MonacoEnvironment: unknown }).MonacoEnvironment = {
-      getWorker() {
-        return new Worker(URL.createObjectURL(new Blob([""], { type: "text/javascript" })));
+      getWorker(_workerId: string, label: string): Worker {
+        switch (label) {
+          case "typescript":
+          case "javascript":
+            return new tsWorker.default();
+          case "json":
+            return new jsonWorker.default();
+          case "css":
+          case "scss":
+          case "less":
+            return new cssWorker.default();
+          case "html":
+          case "handlebars":
+          case "razor":
+            return new htmlWorker.default();
+          default:
+            return new editorWorker.default();
+        }
       },
     };
     const monaco = await import("monaco-editor");
     this.monaco = monaco;
-    // Silence the TS/JS language services if this monaco build still ships them
-    // (we only want syntax coloring; diagnostics need workers we don't wire up).
-    try {
-      const ts = (monaco.languages as unknown as {
-        typescript?: {
-          typescriptDefaults?: { setDiagnosticsOptions: (o: object) => void; setEagerModelSync: (b: boolean) => void };
-          javascriptDefaults?: { setDiagnosticsOptions: (o: object) => void; setEagerModelSync: (b: boolean) => void };
-        };
-      }).typescript;
-      for (const d of [ts?.typescriptDefaults, ts?.javascriptDefaults]) {
-        d?.setDiagnosticsOptions({ noSemanticValidation: true, noSyntaxValidation: true });
-        d?.setEagerModelSync(false);
-      }
-    } catch { /* language pack absent — fine */ }
+    this.configureLanguageService(monaco);
     this.editor = monaco.editor.create(el, {
       model: null,
       theme: "vs-dark",
@@ -555,8 +573,119 @@ export class IdeController {
       tabSize: 2,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
     });
-    // Open whatever tab was requested before the editor finished loading.
+    // Seed the language service with any folders indexed before the editor was
+    // ready (source files as models for cross-file IntelliSense; dependency types
+    // as extra libs), then open whatever tab was requested during load.
+    for (const list of this.fileIndex.values()) this.ensureBackgroundModels(list);
+    this.scheduleDependencyTypes();
     if (this.snap.activeTab) void this.openFile(this.snap.activeTab);
+  }
+
+  // ── language service (IntelliSense) ─────────────────────────────────────────
+  // Turn on the TS/JS language service: sensible compiler options, semantic +
+  // syntax diagnostics, and eager model sync so every model we create (open tabs
+  // AND the seeded project files) is visible to the worker for cross-file
+  // completion/navigation. Installed-package types are fed in separately as extra
+  // libs (see loadDependencyTypes).
+  private configureLanguageService(monaco: typeof Monaco) {
+    const ts = monaco.typescript; // typed re-export of the TS language contribution
+    if (!ts) return;
+    const compilerOptions: Monaco.typescript.CompilerOptions = {
+      target: ts.ScriptTarget.ESNext,
+      module: ts.ModuleKind.ESNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeJs,
+      jsx: ts.JsxEmit.ReactJSX,
+      allowJs: true,
+      checkJs: false,
+      allowNonTsExtensions: true,
+      allowSyntheticDefaultImports: true,
+      esModuleInterop: true,
+      resolveJsonModule: true,
+      skipLibCheck: true,
+      baseUrl: "/",
+      lib: ["esnext", "dom", "dom.iterable", "webworker"],
+    };
+    for (const d of [ts.typescriptDefaults, ts.javascriptDefaults]) {
+      d.setCompilerOptions(compilerOptions);
+      d.setDiagnosticsOptions({ noSemanticValidation: false, noSyntaxValidation: false, onlyVisible: false });
+      d.setEagerModelSync(true);
+    }
+    // Mirror the worker's markers into a Problems count in the status bar.
+    monaco.editor.onDidChangeMarkers(() => this.recomputeProblems());
+  }
+
+  private recomputeProblems() {
+    if (!this.monaco) return;
+    const Severity = this.monaco.MarkerSeverity;
+    let errors = 0, warnings = 0;
+    for (const mk of this.monaco.editor.getModelMarkers({})) {
+      if (mk.severity === Severity.Error) errors++;
+      else if (mk.severity === Severity.Warning) warnings++;
+    }
+    if (errors !== this.snap.problems.errors || warnings !== this.snap.problems.warnings) {
+      this.set({ problems: { errors, warnings } });
+    }
+  }
+
+  // Create Monaco models for a folder's own source files so the language service
+  // can resolve cross-file imports (and power go-to-definition) even before a
+  // file is opened. Bounded, and only creates models that don't already exist —
+  // node_modules is excluded from the file index, so this is just user code.
+  private ensureBackgroundModels(files: string[]) {
+    if (!this.monaco) return;
+    const monaco = this.monaco;
+    let created = 0;
+    for (const abs of files) {
+      if (created >= 800) break;
+      if (!/\.(tsx?|jsx?|mjs|cjs)$/.test(abs)) continue;
+      if (this.models.has(abs) || monaco.editor.getModel(monaco.Uri.file(abs))) continue;
+      created++;
+      void this.seedModel(abs);
+    }
+  }
+
+  private async seedModel(abs: string) {
+    if (!this.monaco || this.models.has(abs)) return;
+    const monaco = this.monaco;
+    const uri = monaco.Uri.file(abs);
+    if (monaco.editor.getModel(uri)) return;
+    const text = await this.readFileText(abs);
+    // The file may have been opened (→ has a real model) while we awaited the read.
+    if (this.models.has(abs) || monaco.editor.getModel(uri)) return;
+    monaco.editor.createModel(text, languageFor(abs), uri);
+  }
+
+  // Debounced load of dependency type declarations (node_modules **/*.d.ts +
+  // package.json) into the language service as "extra libs" so imports of
+  // installed packages resolve with real types. The bulk VFS scan happens in the
+  // kernel worker (sole holder of the sync Wasm VFS) to avoid thousands of read
+  // round-trips; we just register the returned files. Re-runs after installs
+  // (every fs change re-indexes the folder, which reschedules this).
+  private scheduleDependencyTypes() {
+    if (!this.monaco) return;
+    if (this.dtsTimer) clearTimeout(this.dtsTimer);
+    this.dtsTimer = setTimeout(() => void this.loadDependencyTypes(), 1200);
+  }
+
+  private async loadDependencyTypes() {
+    if (!this.monaco) return;
+    const monaco = this.monaco;
+    const seq = ++this.dtsSeq;
+    const next = new Map<string, string>();
+    for (const root of this.snap.workspaceFolders.map((f) => f.rootPath)) {
+      const res = await this.bridge.request("oc-collect-dts", { root });
+      if (seq !== this.dtsSeq) return; // a newer refresh superseded us
+      if (!res.ok) continue;
+      for (const f of (res.files as { path: string; content: string }[]) ?? []) {
+        next.set(monaco.Uri.file(f.path).toString(), f.content);
+      }
+    }
+    // Skip the (potentially large) setExtraLibs churn if nothing actually changed.
+    if (next.size === this.depLibs.size && [...next].every(([k, v]) => this.depLibs.get(k) === v)) return;
+    this.depLibs = next;
+    const libs = Array.from(next, ([filePath, content]) => ({ filePath, content }));
+    monaco.typescript.typescriptDefaults.setExtraLibs(libs);
+    monaco.typescript.javascriptDefaults.setExtraLibs(libs);
   }
 
   // Ensure a Monaco model exists for `abs` (loading its content from the VFS on
@@ -845,6 +974,10 @@ export class IdeController {
     await walk(root, 0);
     this.fileIndex.set(root, out);
     this.set({ files: this.rebuildFileIndex() });
+    // Feed the language service: this folder's source files (cross-file
+    // IntelliSense) + a debounced refresh of installed-package types.
+    this.ensureBackgroundModels(out);
+    this.scheduleDependencyTypes();
   }
   private rebuildFileIndex(): string[] {
     const all: string[] = [];
