@@ -299,6 +299,19 @@ target pure-JS/wasm, proven by a spike. It is guarded by `scripts/spike-toolchai
   patches; on block-shape drift it `console.warn`s LOUDLY (never patch-fails
   silently → a hang). Idempotent; strict no-op for a genuine native esbuild
   (guarded on the wasm assets sitting next to `main.js`).
+- **`globalThis.fs` is pre-seated writable at boot** (`runtime/index.js`, next to the
+  `process`/`Buffer` globals). Go/wasm toolchains drive their wasm through the Go glue
+  (`wasm_exec`), which installs an fs shim with `globalThis.fs || Object.defineProperty(
+  globalThis, "fs", { value: nodeFs })`. That `defineProperty` defaults to
+  `writable:false, configurable:false`, so whichever Go tool loads FIRST **locks**
+  `globalThis.fs` — and then esbuild-wasm's in-process patch can't do `globalThis.fs =
+  __ocFs` to multiplex its stdio fds ("Cannot assign to read only property 'fs'"). This
+  bit Astro: `@astrojs/compiler` (Go wasm for `.astro`) locked it before Vite's esbuild
+  dep-optimize ran. Fix = prevention: seat a writable+configurable `globalThis.fs` at
+  boot so every tool's `globalThis.fs || …` short-circuits (never locks), while
+  esbuild/tsgo can still reassign it for their own run. A non-configurable lock can NOT
+  be undone (defineProperty throws "Cannot redefine property"), so the patch's own
+  try/catch fallback is only a backstop — the boot pre-seat is the real fix.
 - **Worker-pool default** (`runtime/builtins/process.js`): `PISCINA_DISABLE_ATOMICS`
   defaults to `1` so pools use async message passing (a browser `MessagePort`
   can't be drained synchronously across a worker boundary, so the Atomics fast-path
@@ -341,9 +354,16 @@ through host `WebAssembly`. Gotchas when touching them:
   `module` builtin's export is the `Module` *function* with statics hung off it, so the
   dynamic-import→namespace interop must copy own-enumerable keys for FUNCTION exports too,
   not only objects — otherwise the named import is `undefined` and PGlite dies deep in
-  `create()` with a minified "e is not a function". This lives in TWO helpers, keep both:
-  the CJS path (`esm.js` `rewriteCjsDynamicImport`'s injected `__oc_import`, used by `.cjs`
-  files like PGlite's bundle) and the `new Function` path (`index.js` `__ocImport`).
+  `create()` with a minified "e is not a function". Dynamic `import()` must ALWAYS resolve
+  to a module NAMESPACE (Node wraps a CJS target as `{ default: module.exports, ...ownKeys }`),
+  never the bare `require()` value. This lives in THREE helpers, keep them consistent:
+  the ESM path (`esm.js` `helpers`' `__oc_import`, which wraps via `__oc_ns`), the CJS path
+  (`esm.js` `rewriteCjsDynamicImport`'s injected `__oc_import`, used by `.cjs` files like
+  PGlite's bundle), and the `new Function` path (`index.js` `__ocImport`). The ESM path
+  originally returned the bare exports — harmless for static default imports (they go
+  through `__oc_def`) but it broke Vite's SSR module runner, which asserts `'default' in mod`
+  for externalized CJS deps (`analyzeImportedModDifference`) → "Named export 'default' not
+  found. The requested module 'cssesc' is a CommonJS module…" on astro.
 - **libSQL is intentionally not a template** — local `@libsql/client` is a native
   N-API addon (no wasm32) and `/web` is remote-only; neither is a self-contained in-VM DB.
 - **Gated by `scripts/spike-sqlite.mjs` + `scripts/spike-pglite.mjs`** (net tier in
@@ -680,6 +700,18 @@ invariant to preserve:
   `navigator.serviceWorker.controller` is null, so control is established before
   boot/preview.
 
+### Client-routed frameworks need `keepPreviewPrefix` + a matching base
+The preview SW serves every app under `/preview/<port>/` and by default **strips**
+that prefix so `/`-based servers (Next, Vite, Express) see clean paths. But a
+framework whose **client** router re-matches routes against the iframe's own
+`location.pathname` (which IS `/preview/<port>/…`) lands on its NotFound page even
+when SSR rendered `/` fine. Fix: set `manifest.keepPreviewPrefix: true` (SW keeps the
+prefix) **and** point the app's base at `/preview/<port>/` so SSR and the hydrated
+client agree. Templates doing this: **Docusaurus** (`baseUrl`), **React Router 7**
+(`react-router.config.ts` `basename` + Vite `base`, both `/preview/5173/`, trailing
+slash required). Symptom if you forget: "not found" on first load / `No route matches
+URL "/preview/<port>/"`.
+
 ### `module` is a REAL constructor — route requires through `Module._load`
 `require('module')` returns the `Module` **constructor** (not a plain object);
 `builtins.module = Module` in `runtime/index.js`, statics/prototype wired in
@@ -789,6 +821,18 @@ snapshot it at call time, not at delivery time.
   `require()` returns `X` directly; `export { X as default }` sets
   `exports.default`. Getting these wrong yields `TypeError: x is not a function`
   on a plugin's default export.
+- **Top-level await → compile as AsyncFunction on ANY parse failure.** Our CJS wrapper
+  is a plain (non-async) function, so an ESM module with top-level `await` fails
+  `new Function`. You can't sniff this from the error message: `await import('x')`
+  becomes `await __oc_import('x')`, and the parser reads `await` as an identifier and
+  blames the *next* token → `SyntaxError: Unexpected identifier '__oc_import'`, not the
+  tidy "await is only valid…" string. So `module.js` **retries any failed ESM compile
+  as an `AsyncFunction`** — real TLA then compiles; a genuine syntax error fails again
+  and is reported. (@sveltejs/kit's `core/sync/ts.js` — `ts = (await import('typescript'))
+  .default` — hits this when a SvelteKit `vite.config.js` loads.) A non-entry TLA module
+  still can't truly block its importer (the "only the ENTRY can block on TLA" rule
+  above), but it now at least *compiles* instead of throwing at load. Proven by
+  `scripts/spike-esm.mjs`.
 - **`esm.js` does NOT strip TypeScript types** — it only rewrites `import`/`export`.
   A raw `.ts` run through OC's loader (`node --experimental-strip-types x.ts`) is
   *not* type-stripped: `esm.js` removes the leading `export `/`import ` and leaves
@@ -801,6 +845,64 @@ snapshot it at call time, not at delivery time.
   `export type` — see the **tRPC** template (`server/index.ts` has zero type syntax;
   `src/App.tsx` derives `AppRouter` via `typeof import('../server/index').appRouter`).
   Proven by `scripts/spike-trpc.mjs`.
+- **Named imports are eager snapshots, NOT live bindings — but re-exported names are
+  now lazy.** `esm.js` compiles a *used* `import { X } from './m'` to
+  `const X = __oc_m['X']` (an eager read). That's fine for hoisted functions (reachable
+  early) but breaks a *circular* import of a `const`/`class`: if module A's body requires
+  B before A's `const X` initialises and B eager-reads `A.X`, the getter throws
+  **"Cannot access 'X' before initialization"** (real ESM reads its live binding lazily,
+  at use). A full fix needs scope-aware reference rewriting; until then two mitigations
+  live in `transpileEsm`:
+  1. **An imported name that is only re-exported** (`import { X } from './m'; export { X }`
+     — the barrel-file shape) is compiled *without* the eager `const X` and re-exported
+     via a **lazy getter to the source module**, exactly like `export { X } from './m'`.
+     The read is deferred until after the cycle resolves. This is what unblocks the
+     **Astro** template: `astro/dist/runtime/server/render/index.js` does
+     `import { Fragment } from './common.js'; export { …Fragment… }` while `common.js`
+     (`const Fragment = Symbol.for('astro:fragment')`) is mid-cycle.
+
+     **The re-export getter must be emitted EARLY and re-resolve the source lazily.** It's
+     defined in `exportGetters` (before the prelude requires) and reads
+     `get: () => __oc_require('./m')['X']` — NOT `get: () => __oc_m['X']` closing over the
+     later-declared prelude var `m`. Reason: a circular importer can read `barrel['X']`
+     *while the barrel is mid-prelude* (its requires re-enter the importer). If the getter
+     hasn't been defined yet, that read returns **`undefined`** — and because `undefined`
+     is not a TDZ throw, the live-binding fallback below never fires and the importer
+     silently snapshots `undefined` forever. astro's `middleware/index.js` re-exports
+     `sequence` while `render-context.js` eagerly imports AND spread-calls it
+     (`sequence(...mw)`); the stale `undefined` snapshot surfaced only later as V8's
+     **"Function.prototype.apply was called on undefined"** (a spread call `undefined(...x)`
+     compiles to `.apply`). `__oc_require` is cached, so re-resolving in the getter returns
+     the same (possibly mid-cycle, but hoisted) module.
+  2. The eager `const X` is only emitted when `X` is actually **referenced in the module
+     body** — a name that appears solely in `import`/`export {}` statements never gets a
+     snapshot. The "is it used" check is deliberately over-inclusive: it blanks only
+     import/`export {}` ranges and counts ANY identifier-boundaried occurrence elsewhere
+     (including in strings/comments, and NOT discounting `obj.X` member access — because
+     `.X` is ambiguous with spread `...X`). Dropping a snapshot for a name used only via
+     spread (`[...SVELTE_DEDUPED_IMPORTS]`, `[...SUPPORTED_MARKDOWN_FILE_EXTENSIONS]`)
+     was the bug that made this too aggressive → "X is not defined". So it now only
+     removes a snapshot when the name is provably absent from executable code; keeping an
+     occasional truly-unused const is harmless.
+  A name USED in code (not just re-exported) across a `const`/`class`/singleton cycle
+  isn't covered by those two — it's handled by a **runtime fallback**:
+- **Live-binding fallback (`transpileEsmLive` + module.js retry).** When an ESM module's
+  eager evaluation throws a `ReferenceError` matching `before initialization` / `is not
+  defined`, `module.js` recompiles THAT module with `transpileEsmLive` and re-runs it
+  once. The live variant binds every import onto an `__oc_live` object as a getter and
+  runs the whole body inside `with (__oc_live) { … }`, so a bare reference to an import
+  resolves lazily (at use), while a local that shadows it wins natively — scope-correct
+  WITHOUT reference rewriting. This is what makes **astro** boot: its runtime is full of
+  circular singletons read inside functions (`apiContextRoutesSymbol`, `AstroConfigSchema`,
+  `globalContentLayer`, `telemetry`, …) — 16 modules recover via the fallback. It's a
+  FALLBACK (not the default) because `with` deopts + needs sloppy mode: normal modules
+  keep the fast eager path and never pay for it. The eager attempt throws in the prelude
+  (before the body), so re-running only re-defines the configurable export getters + hits
+  cached requires — no double body side effects. Caveats: assigning to an imported binding
+  is a silent no-op (real ESM throws), and an import used at TOP-LEVEL init inside a cycle
+  still can't be satisfied (the source genuinely isn't ready — real ESM would deadlock).
+  A leading `"use strict"` is stripped (it would make `with` a SyntaxError). Proven by
+  `scripts/spike-esm.mjs`.
 
 ### `self` is a getter in a real Worker
 Third-party bundles (Vite/rolldown workers) do `Object.assign(globalThis, {self})`,

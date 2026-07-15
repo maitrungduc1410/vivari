@@ -1827,7 +1827,9 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   Node.js blank. Showcase: Vite+Express fullstack (two preview tabs), Server-Sent Events. Existing
   13 re-categorised.
 - ✅ **Phase 2 (`[SPIKE]`, meta-frameworks — shipped `experimental`)** — Fullstack: Nuxt 3,
-  SvelteKit, React Router 7 (Remix), Astro. Docs: Slidev.
+  SvelteKit, React Router 7 (Remix), Astro. Docs: Slidev. (React Router 7, Astro, and Slidev
+  have since **graduated**; SvelteKit + Nuxt stay `experimental`, blocked on the rolldown
+  Vite-8 SSR-optimize wasi/tokio panic.)
 - ✅ **Phase 3 (`[SPIKE]`)** — Frontend variants: Preact, Lit, Solid, Qwik (now proven headless by
   `scripts/spike-{preact,lit,solid,qwik}.mjs` → **graduated to non-experimental**; Qwik rides the
   merged esbuild-wasm aliasing + in-process service and runs `qwikVite({ csr: true })`). Backends:
@@ -2520,6 +2522,117 @@ bundled, `main.jsx` served).
 symlink, the Vite dev server, and the live preview iframe all work. The template
 drops `experimental`; the cmd-shim unwrap it relies on is guarded by
 `scripts/spike-cmd-shim.mjs`, and real pnpm is exercised by the pnpm spikes.
+
+## SvelteKit / React Router 7 / Astro fixes (this change)
+
+Started as three template fixes; two turned out to be **ESM→CJS loader** bugs that any
+meta-framework can hit, so the fixes moved into `packages/runtime` (esm.js + module.js)
+and are gated by a new offline `scripts/spike-esm.mjs`.
+
+- **SvelteKit — two-stage fix.**
+  1. `ERESOLVE`: the template pinned `vite@^8` but `@sveltejs/vite-plugin-svelte@^5`
+     peers on `vite@^6`. Plugin vite-8 support landed in **v7** — bumped the plugin to
+     `^7.0.0` and `svelte` to `^5.46.4` (`@sveltejs/kit@2.8` already peers `vite ^8`).
+  2. `SyntaxError: Unexpected identifier '__oc_import'` when the config loaded:
+     `@sveltejs/kit/src/core/sync/ts.js` does `ts = (await import('typescript')).default`
+     — **top-level await**. Our CJS wrapper is a plain function, so `new Function` rejects
+     it, and after the import-rewrite the parser blames the next token (not "await is only
+     valid…"), so `module.js`'s old narrow message-match never retried as async. Fix:
+     `module.js` now retries **any** failed ESM compile as an `AsyncFunction` (real TLA
+     compiles; genuine syntax errors fail again and are reported).
+
+  With both fixed, the SvelteKit config loads and `vite dev` starts — but then **hangs at
+  the `(ssr) [optimizer] bundling dependencies…` pass**. That's the already-documented
+  **rolldown-wasi second-bundle tokio panic** (see "Deferred / follow-up" above): a Vite-8
+  project that runs two rolldown-wasm dep-optimizes (client + the SSR optimize SvelteKit
+  forces) dies because napi's tokio runtime static is torn down after the first bundle.
+  It can't be disabled from user config. So SvelteKit stays `experimental`, blocked on the
+  same upstream rolldown bug as Nuxt — NOT on our loader. (Unlike Astro, which is on Vite 6
+  + the esbuild optimizer and so dodges this.)
+
+- **React Router 7 — "not found" on first load (GRADUATED).** RR7 framework mode is
+  client-routed: it re-matches the route against the iframe's own location
+  (`/preview/5173/…`) during hydration, so served at `/` (prefix stripped) the client
+  router lands on NotFound even though SSR rendered `/`. Fix (the keep-prefix pattern
+  Docusaurus uses): `manifest.keepPreviewPrefix: true` + both `react-router.config.ts`
+  `basename` and Vite `base` at `/preview/5173/` (trailing slash required). User-confirmed
+  working in-browser → **graduated** (dropped `experimental`).
+
+- **Astro — cascade of circular-const TDZ, fixed with a live-binding fallback.** Astro's
+  runtime is full of module-level singletons imported across cycles and read inside
+  functions: `Fragment`, `apiContextRoutesSymbol`, `AstroConfigSchema`, `ASTRO_CONFIG_
+  DEFAULTS`, `globalContentLayer`, `globalContentConfigObserver`, `telemetry`, … (17
+  distinct cases enumerated). OC's eager `const X = m.X` import snapshot fires while the
+  source module is mid-cycle → "Cannot access 'X' before initialization". The earlier
+  `vite.ssr.noExternal: ['astro']` hack did NOT work — `astro dev`'s CLI imports these
+  through OC's loader *before* any Vite SSR config applies. Two fixes:
+  1. `esm.js`: an imported name that is **only re-exported** is compiled without the eager
+     snapshot and re-exported via a lazy getter to the source module (fixes `Fragment` in
+     `render/index.js`). The "is it used" gate that decides whether to keep the eager
+     snapshot counts any identifier-boundaried occurrence (does NOT discount `.X`, which
+     is ambiguous with spread `...X` — that discount had dropped `[...SVELTE_DEDUPED_
+     IMPORTS]` / `[...SUPPORTED_MARKDOWN_FILE_EXTENSIONS]` → "X is not defined").
+  2. **Live-binding fallback** (`transpileEsmLive` + `module.js`): the *used-in-code*
+     circular cases (singletons/schemas) can't be re-export-lazied. When eager evaluation
+     throws a TDZ/"not defined" `ReferenceError`, `module.js` recompiles that module with
+     imports bound lazily via `with (__oc_live)` and re-runs it once. Scope-correct
+     without reference rewriting; fallback-only, so normal modules keep the fast eager
+     path. Verified by executing Astro's real runtime through an OC-shaped loader that
+     mirrors the fallback: all 16 problematic modules recover, `Fragment` and
+     `apiContextRoutesSymbol` resolve to their real Symbols, `AstroConfigSchema` is a real
+     zod object. Astro is on Vite 6 + the esbuild optimizer, so it does NOT hit the
+     rolldown SSR-optimize panic that blocks SvelteKit — this fallback should carry it to
+     a live dev server. `astro.config.mjs` reverted to pristine.
+
+  With the TDZ fixed Astro **boots** (`astro vX ready`, serving on :4321) but then Vite's
+  esbuild dep-optimize crashed with `Cannot assign to read only property 'fs' of object
+  '#<DedicatedWorkerGlobalScope>'`. Root cause: `@astrojs/compiler` (the Go/wasm `.astro`
+  compiler) installs its fs shim as `globalThis.fs || Object.defineProperty(globalThis,
+  "fs", { value: nodeFs })` — a value-only `defineProperty` defaults to
+  `writable:false, configurable:false`, so it **locks** `globalThis.fs`
+  non-configurably. When esbuild-wasm's in-process patch then does `globalThis.fs =
+  __ocFs` (to multiplex its stdio fds), it throws — and the lock can't even be redefined.
+  Fix in `runtime/index.js`: **pre-seat `globalThis.fs`** (writable+configurable, = real
+  fs) at boot, before any Go tool loads, so every tool's `globalThis.fs || …`
+  short-circuits and never locks it, while esbuild/tsgo can still reassign it.      Reproduced
+     the exact conflict + verified the fix offline.
+
+  Past dep-optimize, Astro's dev server threw `[vite] Named export 'default' not found. The
+  requested module 'cssesc' is a CommonJS module…` from Vite's SSR module runner
+  (`analyzeImportedModDifference`), which asserts `'default' in mod` for externalized CJS
+  deps. Root cause: OC's ESM-path dynamic-import helper (`esm.js` `helpers`' `__oc_import`)
+  returned the bare `require()` value instead of a module namespace, so a CJS target had no
+  `default`. (The CJS-path and `new Function`-path helpers already synthesized the namespace;
+  the ESM path was the odd one out — it slid by because static default imports go through
+  `__oc_def`.) Fix: wrap the ESM-path `__oc_import` result in `__oc_ns` (no-op for an ESM
+  target, synthesizes `{ default, ...ownKeys }` for CJS). Regression-gated in
+  `scripts/spike-esm.mjs`. Left `experimental` pending final browser confirmation of a
+  rendered page.
+
+  Once routing rendered, `RenderContext.create` threw **"Function.prototype.apply was
+  called on undefined"** — V8's error for a spread call `undefined(...args)`. The undefined
+  was `sequence`: `render-context.js` eagerly imports it (and spread-calls `sequence(...mw)`)
+  from the `middleware/index.js` **barrel**, which re-exports it (`import { sequence } from
+  './sequence.js'; export { sequence }`). The barrel's re-export getter was emitted at the
+  END of its prelude (after its own requires), so when the barrel's requires re-entered
+  `render-context.js` mid-cycle, reading `barrel['sequence']` returned `undefined` — no TDZ
+  throw, so no live-binding fallback, and the eager `const sequence` snapshotted `undefined`
+  permanently. Fix in `esm.js` (both `transpileEsm` and `transpileEsmLive`): emit re-export
+  getters **early** (before the prelude requires) and resolve the source module **lazily via
+  `__oc_require(spec)`** (cached) instead of closing over the later-declared prelude var, so
+  a circular importer reading a re-exported name mid-cycle always sees a defined getter that
+  returns the (hoisted) source binding. Regression-gated in `scripts/spike-esm.mjs`.
+
+  With all four loader fixes in place Astro **renders end to end** (dev server + SSR page),
+  user-confirmed in-browser → **graduated** (dropped `experimental`). Now also gated by a
+  network spike, `scripts/spike-astro.mjs`: install → `astro dev` binds :4321 → `GET /`
+  SSRs the index page. (Runs in CI's net tier; needs the built VFS wasm + vendored npm,
+  same as the other framework spikes.)
+
+Loader guarantees regression-gated by `scripts/spike-esm.mjs` (offline tier): TLA →
+async retry; circular re-export → lazy live binding (getter emitted early, re-requires the
+source, so a mid-cycle read never snapshots `undefined`); spread-only use keeps its const;
+and the live-binding fallback recovers a circular singleton used inside a function.
 
 ## Definition of done for T2
 

@@ -2184,8 +2184,8 @@ function svelteKitTemplate(): TemplateDef {
   "devDependencies": {
     "@sveltejs/adapter-auto": "^3.3.0",
     "@sveltejs/kit": "^2.8.0",
-    "@sveltejs/vite-plugin-svelte": "^5.0.0",
-    "svelte": "^5.1.0",
+    "@sveltejs/vite-plugin-svelte": "^7.0.0",
+    "svelte": "^5.46.4",
     "vite": "^8.0.0"
   }
 }
@@ -2249,7 +2249,12 @@ function remixTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
+      // React Router 7 (framework mode) is client-routed: it re-matches the route
+      // against the iframe's own location (`/preview/5173/…`) during hydration, so
+      // served at `/` (prefix stripped) the client router lands on NotFound even
+      // though SSR rendered `/` fine. Keep the proxy prefix and set the app's
+      // basename + Vite `base` to `/preview/5173/` so SSR and the client agree.
+      keepPreviewPrefix: true,
     },
     files: {
       "package.json": `{
@@ -2280,12 +2285,19 @@ function remixTemplate(): TemplateDef {
 
 export default {
   ssr: true,
+  // The OpenContainer preview serves this app under /preview/5173/ (keepPreviewPrefix).
+  // The basename must match Vite's \`base\` (below) and end with a slash so both the
+  // server and the hydrated client router resolve routes under the proxy prefix.
+  basename: '/preview/5173/',
 } satisfies Config
 `,
       "vite.config.ts": `import { reactRouter } from '@react-router/dev/vite'
 import { defineConfig } from 'vite'
 
 export default defineConfig({
+  // Match react-router.config.ts \`basename\`; leading AND trailing slash required so
+  // asset URLs and the router base line up under the OpenContainer preview prefix.
+  base: '/preview/5173/',
   plugins: [reactRouter()],
 })
 `,
@@ -2344,7 +2356,8 @@ function astroTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
+      // Proven in-VM by scripts/spike-astro.mjs (dev server boots Vite + @astrojs/compiler
+      // wasm and SSRs the index page). No longer experimental.
     },
     files: {
       "package.json": `{
