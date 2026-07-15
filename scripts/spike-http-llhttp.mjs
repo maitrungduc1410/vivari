@@ -33,9 +33,10 @@ const { methods, allMethods, HTTPParser, backend, llhttpVersion } = createLlhttp
 
 // --- 1. backend + 2. method table --------------------------------------------
 ok(backend === "wasm", "llhttp Wasm backend instantiated (version " + llhttpVersion + ")");
-ok(methods.length >= 46, "method table populated (" + methods.length + " methods)");
-ok(allMethods[1] === "GET" && allMethods[3] === "POST" && allMethods[0] === "DELETE",
-  "method numbers round-trip (GET=1, POST=3, DELETE=0)");
+ok(methods.length >= 47, "method table populated (" + methods.length + " methods)");
+ok(allMethods[1] === "GET" && allMethods[3] === "POST" && allMethods[0] === "DELETE"
+  && allMethods[allMethods.length - 1] === "QUERY",
+  "method numbers round-trip (GET=1, POST=3, DELETE=0, QUERY=last)");
 
 function newParser(type) {
   const p = new HTTPParser();

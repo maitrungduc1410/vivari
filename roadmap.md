@@ -2067,8 +2067,8 @@ keeping it as an automatic fallback.
 - **No new toolchain.** Rather than stand up a wasi-sdk/clang build just to recompile an artifact
   identical to what Node already ships, we **vendor undici's prebuilt `llhttp.wasm`** (same upstream
   https://github.com/nodejs/llhttp, MIT). `scripts/vendor-llhttp.mjs` pins the undici version
-  (currently `undici@6.21.3`) and regenerates `node/bindings/llhttp/llhttp-wasm-data.js` (the binary
-  base64-embedded so there's no fetch, ~48 KB).
+  (currently `undici@8.7.0`) and regenerates `node/bindings/llhttp/llhttp-wasm-data.js` (the binary
+  base64-embedded so there's no fetch, ~54 KB).
 - **Synchronous, in-worker instantiation.** The binding is built synchronously at process bootstrap,
   so the Wasm is compiled with `new WebAssembly.Module()`. That's allowed in Workers (where guest
   processes run); on the main thread the 4 KB sync-compile cap throws — which is exactly what trips

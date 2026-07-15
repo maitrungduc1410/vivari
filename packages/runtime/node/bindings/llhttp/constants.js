@@ -1,4 +1,4 @@
-// llhttp constants needed by the Wasm bridge. Mirrors undici@6.21.3's
+// llhttp constants needed by the Wasm bridge. Mirrors undici@8.7.0's
 // lib/llhttp/constants.js (which mirrors llhttp's generated C headers). Kept in
 // llhttp's own enum order so `llhttp_get_method(ptr)` round-trips through
 // METHODS[n], exactly as Node's lib/_http_common.js expects (`allMethods[method]`).
@@ -28,5 +28,5 @@ export const METHODS = [
   "CHECKOUT", "MERGE", "M-SEARCH", "NOTIFY", "SUBSCRIBE", "UNSUBSCRIBE",
   "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK", "SOURCE", "PRI",
   "DESCRIBE", "ANNOUNCE", "SETUP", "PLAY", "PAUSE", "TEARDOWN",
-  "GET_PARAMETER", "SET_PARAMETER", "REDIRECT", "RECORD", "FLUSH",
+  "GET_PARAMETER", "SET_PARAMETER", "REDIRECT", "RECORD", "FLUSH", "QUERY",
 ];

@@ -4,7 +4,7 @@
 // bootstrap, so we cannot await WebAssembly.instantiate(). Instead we do a
 // synchronous new WebAssembly.Module()/Instance(). This is allowed inside Web
 // Workers (where OpenContainer runs guest processes); on the main thread the
-// 4KB sync-compile cap makes new WebAssembly.Module() throw for a 48KB payload —
+// 4KB sync-compile cap makes new WebAssembly.Module() throw for a ~54KB payload —
 // which is exactly what we want: the caller catches and falls back to the
 // pure-JS parser.
 

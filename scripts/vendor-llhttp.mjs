@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const UNDICI_VERSION = "6.21.3";
+const UNDICI_VERSION = "8.7.0";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OUT = path.join(
   HERE,
@@ -58,9 +58,12 @@ function downloadUndici() {
 
 const src = readFromArg() || downloadUndici();
 try {
-  // undici's llhttp-wasm.js is `module.exports = Buffer.from('<base64>', 'base64')`.
+  // undici's llhttp-wasm.js embeds the base64 payload either as
+  //   module.exports = Buffer.from('<base64>', 'base64')   (undici 6.x)
+  // or
+  //   const wasmBase64 = '<base64>'                          (undici 7.x/8.x)
   const text = readFileSync(src.file, "utf8");
-  const m = text.match(/Buffer\.from\('([A-Za-z0-9+/=]+)'/);
+  const m = text.match(/(?:wasmBase64\s*=\s*|Buffer\.from\()'([A-Za-z0-9+/=]{100,})'/);
   if (!m) throw new Error(`could not find base64 payload in ${src.file}`);
   const base64 = m[1];
   const bytes = Buffer.from(base64, "base64");
