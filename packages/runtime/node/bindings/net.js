@@ -17,8 +17,17 @@
 // arriving via the Service Worker, or tests calling kernel.handleHttpRequest —
 // are routed to this process. The runtime's `doNet` then replays each request
 // through a real http client into this same server over the in-process loopback.
-// The loopback `connect()` never touches the kernel; kernel registration is purely
-// the "who owns this port" routing table.
+// The same-process loopback `connect()` never touches the kernel; that kernel
+// registration is purely the "who owns this port" routing table.
+//
+// Cross-PROCESS TCP loopback: when a `connect()` targets a port that ISN'T served
+// in this process, another in-VM process may own it — e.g. Nuxt/Nitro's dev
+// server on :3000 reverse-proxies to its SSR worker on an ephemeral port in a
+// DIFFERENT process. We reach it by riding the exact same kernel byte-relay the
+// Pipe class uses for cross-process UNIX sockets, keyed by a synthetic per-port
+// path (`tcpXKey`). So `listen()` also registers that key with the kernel's pipe
+// listener table, and a cross-process `connect()` resolves it to a relayed
+// connection whose bytes flow as `pipe-*` messages by connId (see dispatchPipe).
 //
 // One process === one worker, so a per-binding registry is correctly per-process.
 
@@ -115,6 +124,10 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
     } while (listeners.has(ephemeral));
     return ephemeral;
   };
+  // Synthetic pipe path a TCP port is advertised under for CROSS-PROCESS dials.
+  // The NUL prefix keeps it out of the real socket-path namespace (tools bind
+  // `/tmp/*.sock`), so it can never collide with a genuine UNIX socket.
+  const tcpXKey = (port) => "\u0000oc-tcp:" + (port >>> 0);
 
   const EOF = Symbol("EOF");
 
@@ -185,6 +198,9 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
       this._live = false; // becomes true once listening or connected
       this._counted = false;
       this._kernelPort = null; // port registered with the kernel (servers only)
+      this._kernelPipe = null; // synthetic pipe key for cross-process dials (servers)
+      this._xproc = false; // true once this endpoint bridges to another process
+      this._connId = 0; // kernel-assigned id of the cross-process connection
       this._localAddress = "0.0.0.0";
       this._localPort = 0;
       this._remoteAddress = "";
@@ -229,6 +245,22 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
         }
         this._kernelPort = this._localPort;
         if (netServers) netServers.count++;
+
+        // Also advertise this port for CROSS-PROCESS in-VM dials via the pipe
+        // relay (e.g. Nitro's :3000 proxying to its SSR worker's port in another
+        // process). Same-process connect() still short-circuits via `listeners`;
+        // this only matters when the dialer lives in a different worker. Best
+        // effort — if it fails, external (browser) routing is unaffected.
+        if (pipeBridge && pipeBridge.postRaw && syscalls && syscalls.pipeListen) {
+          const key = tcpXKey(this._localPort);
+          try {
+            syscalls.pipeListen(key);
+            pipeServers.set(key, this);
+            this._kernelPipe = key;
+          } catch {
+            /* another process already relays this port; keep serving locally */
+          }
+        }
       }
 
       listeners.set(this._localPort, this);
@@ -238,12 +270,37 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
     }
 
     connect(req, address, port) {
-      const server = listeners.get(port >>> 0);
+      const p = port >>> 0;
+      const server = listeners.get(p);
       this._remoteAddress = address;
-      this._remotePort = port >>> 0;
+      this._remotePort = p;
       this._localAddress = "127.0.0.1";
       this._localPort = allocPort();
       if (!server || server._closed) {
+        // Not served in THIS process — a different in-VM process may own the
+        // port. Dial it through the kernel pipe relay (same transport as UNIX
+        // sockets), keyed by the port's synthetic path; bytes then flow as
+        // relayed `pipe-*` messages by connId. Falls back to ECONNREFUSED when
+        // nobody in the VM is listening, matching libuv.
+        if (pipeBridge && pipeBridge.postRaw && syscalls && syscalls.pipeConnect) {
+          let connId = 0;
+          try {
+            connId = syscalls.pipeConnect(tcpXKey(p)).connId | 0;
+          } catch {
+            connId = 0;
+          }
+          if (connId > 0) {
+            this._xproc = true;
+            this._connId = connId;
+            xpipeConns.set(connId, this);
+            nextTick(() => {
+              this._live = true;
+              recount(this);
+              req.oncomplete(0, this, req, true, true);
+            });
+            return 0;
+          }
+        }
         nextTick(() => req.oncomplete(UV_CODES.UV_ECONNREFUSED, this, req, false, false));
         return 0;
       }
@@ -315,8 +372,12 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
     }
 
     shutdown(req) {
-      // Half-close: signal EOF to the peer's read side.
-      if (this._peer && !this._peer._closed) enqueueToPeer(this._peer, EOF);
+      // Half-close: signal EOF to the peer's read side (cross-process or local).
+      if (this._xproc) {
+        if (pipeBridge && pipeBridge.postRaw) pipeBridge.postRaw({ type: "pipe-shutdown", connId: this._connId });
+      } else if (this._peer && !this._peer._closed) {
+        enqueueToPeer(this._peer, EOF);
+      }
       nextTick(() => req.oncomplete(0));
       return 0;
     }
@@ -336,6 +397,23 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
             this._kernelPort = null;
             if (netServers) netServers.count--;
           }
+          // Tear down the cross-process advertisement for this port too.
+          if (this._kernelPipe != null) {
+            if (pipeServers.get(this._kernelPipe) === this) pipeServers.delete(this._kernelPipe);
+            if (syscalls && syscalls.pipeCloseServer) {
+              try {
+                syscalls.pipeCloseServer(this._kernelPipe);
+              } catch {
+                /* kernel gone */
+              }
+            }
+            this._kernelPipe = null;
+          }
+        }
+        // A cross-process client/accepted endpoint: tell the far side it closed.
+        if (this._xproc) {
+          if (pipeBridge && pipeBridge.postRaw) pipeBridge.postRaw({ type: "pipe-close", connId: this._connId });
+          xpipeConns.delete(this._connId);
         }
         if (this._peer && !this._peer._closed) enqueueToPeer(this._peer, EOF);
       }
@@ -636,10 +714,15 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
         if (pipeBridge && pipeBridge.postRaw) pipeBridge.postRaw({ type: "pipe-close", connId });
         return;
       }
-      const peer = new Pipe(PipeConstants.SOCKET);
+      // Give the accepted endpoint the SAME handle type as its server, so a TCP
+      // server (a port advertised via tcpXKey) accepts a TCP socket — identical
+      // to its same-process loopback — and a Pipe server accepts a Pipe.
+      const peer =
+        server instanceof TCP ? new TCP(TCPConstants.SOCKET) : new Pipe(PipeConstants.SOCKET);
       peer._xproc = true;
       peer._connId = connId;
-      peer._remotePath = String(msg.path);
+      if (peer instanceof Pipe) peer._remotePath = String(msg.path);
+      else peer._remoteAddress = "127.0.0.1";
       xpipeConns.set(connId, peer);
       peer._live = true;
       recount(peer);
