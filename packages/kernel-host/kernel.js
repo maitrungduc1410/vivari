@@ -250,6 +250,10 @@ export class Kernel {
       finalized: false,
       handle: null,
       command: spec.command,
+      // Launch cwd (absolute). Used to attribute a server's `listen()` back to the
+      // project it was started in — even for a manually run `npm start` that has no
+      // OC_RUN wiring (see kernel-worker's projectDirForPid).
+      cwd: spec.cwd,
       serverInbox: [], // queued { reqId, port, req } drained by non-blocking accept
       // #16 stage 2b: reqId -> child pid for worker_threads this process spawned.
       threads: null,

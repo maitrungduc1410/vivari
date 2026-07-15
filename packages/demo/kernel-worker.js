@@ -516,6 +516,39 @@ function demoForPort(port) {
   return null;
 }
 
+// The registered project a directory belongs to: the deepest project dir that is
+// `cwd` itself or an ancestor of it (so a server started in a nested subfolder
+// still maps to its project).
+function projectDirForCwd(cwd) {
+  if (!cwd) return undefined;
+  let best;
+  for (const dir of projects.keys()) {
+    if (cwd === dir || cwd.startsWith(dir + "/")) {
+      if (best === undefined || dir.length > best.length) best = dir;
+    }
+  }
+  return best;
+}
+
+// Attribute a listening pid to a registered project by the LAUNCH CWD of the
+// server process (or any ancestor up to its shell). This is what ties a manually
+// started server — e.g. `npm start` typed in a plain terminal, which has no
+// OC_RUN / projectDirByTerm wiring — back to its project, instead of letting it
+// fall through to a legacy DEMO that merely happens to share the same port (e.g.
+// Express and the NestJS demo both default to :3000).
+function projectDirForPid(pid) {
+  let p = pid;
+  const seen = new Set();
+  while (p != null && !seen.has(p)) {
+    const proc = kernel && kernel.procs ? kernel.procs.get(p) : null;
+    const dir = proc ? projectDirForCwd(proc.cwd) : undefined;
+    if (dir) return dir;
+    seen.add(p);
+    p = proc ? proc.parentPid : null;
+  }
+  return undefined;
+}
+
 let kernel = null;
 const listening = new Set();
 // Interactive terminals: each xterm in the UI is backed by a long-lived `sh`
@@ -986,7 +1019,10 @@ async function boot() {
     // dev server is matched to *its* run-shell regardless of the port it picked
     // (and never confused with a hard-coded DEMO that shares e.g. 5173/3000).
     const tid = terminalForPid(pid);
-    const pdir = tid !== undefined ? projectDirByTerm.get(tid) : undefined;
+    // Prefer the explicit run-shell mapping; otherwise attribute by the server's
+    // launch cwd so a *manually* started server (`npm start` with no OC_RUN) is
+    // still tied to its project rather than a same-port legacy DEMO.
+    const pdir = (tid !== undefined ? projectDirByTerm.get(tid) : undefined) ?? projectDirForPid(pid);
     if (pdir && projects.has(pdir)) {
       const p = projects.get(pdir);
       if (!p.ports) p.ports = new Set();
