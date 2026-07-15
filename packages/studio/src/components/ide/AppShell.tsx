@@ -22,7 +22,10 @@ export function AppShell() {
       const mod = e.metaKey || e.ctrlKey;
       if (!mod) return;
       const k = e.key.toLowerCase();
-      if (e.shiftKey && k === "p") {
+      if (e.shiftKey && k === "f") {
+        e.preventDefault();
+        c.setActiveView("search");
+      } else if (e.shiftKey && k === "p") {
         e.preventDefault();
         c.openPalette("command");
       } else if (k === "p") {
