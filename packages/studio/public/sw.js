@@ -427,6 +427,38 @@ const CDP_BOOTSTRAP = `(function(){
 if (window.__ocCdpInstalled) return; window.__ocCdpInstalled = true;
 function post(m){ parent.postMessage(m, '*'); }
 var seq = 0;
+// chobitsu reports fetch/XHR with the URL the app resolved against the iframe
+// origin — i.e. the internal studio-origin proxy path (…/preview/<port>/…). Rewrite
+// it to the friendly in-VM URL the user's code actually targets
+// (http://localhost:<port>/<path>), so the Network panel matches what the ws/SSE
+// shims already show. Display-only: the requestId (and thus getResponseBody) is
+// untouched.
+var _pp = location.pathname.match(/^\\/preview\\/(\\d+)\\//);
+var previewPort = _pp ? parseInt(_pp[1], 10) : 0;
+function cleanUrl(u){
+  try {
+    var url = new URL(u, location.href);
+    if (url.origin !== location.origin) return u;
+    var pm = url.pathname.match(/^\\/preview\\/(\\d+)(\\/.*)?$/);
+    if (!pm) return u;
+    var port = parseInt(pm[1], 10);
+    // A keep-prefix app (Docusaurus/Slidev) genuinely serves under /preview/<port>/,
+    // so its own-port URLs legitimately keep the prefix — mirror the ws shim.
+    var rest = (window.__ocKeepPrefix && port === previewPort) ? url.pathname : (pm[2] || '/');
+    var scheme = (location.protocol === 'https:') ? 'https' : 'http';
+    return scheme + '://localhost:' + port + rest + url.search + url.hash;
+  } catch(e){ return u; }
+}
+function scrubNet(o){
+  var p = o && o.params; if (!p) return false;
+  var changed = false;
+  function fix(obj, key){ if (obj && typeof obj[key] === 'string'){ var c = cleanUrl(obj[key]); if (c !== obj[key]){ obj[key] = c; changed = true; } } }
+  fix(p, 'documentURL');
+  fix(p.request, 'url');
+  fix(p.response, 'url');
+  fix(p.redirectResponse, 'url');
+  return changed;
+}
 // The ws/SSE replay must wait until BOTH (a) the frontend re-attached (an 'init'
 // from the host, sent once per DevTools (re)mount) AND (b) the frontend's Network
 // domain is actually live (its 'Network.enable' command, seen via the relay).
@@ -444,6 +476,10 @@ function setup(){
     // Drop responses to our own internal enable requests (ids prefixed 'ocdt');
     // pass through events and responses the frontend actually asked for.
     if (typeof msg === 'string' && msg.indexOf('"id":"ocdt') !== -1) return;
+    // Friendly-URL rewrite for fetch/XHR Network events (cheap substring gate first).
+    if (typeof msg === 'string' && msg.indexOf('/preview/') !== -1 && msg.indexOf('"Network.') !== -1) {
+      try { var o = JSON.parse(msg); if (o && typeof o.method === 'string' && o.method.indexOf('Network.') === 0 && scrubNet(o)) msg = JSON.stringify(o); } catch(e){}
+    }
     post({ source:'oc-cdp', dir:'target', data: msg });
   });
   return true;
