@@ -384,9 +384,9 @@ const sveltePkg = (ts: boolean) => `{
     "preview": "vite preview"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^7.0.0",
+    "@sveltejs/vite-plugin-svelte": "^6.0.0",
     "svelte": "^5.0.0",
-    "vite": "^8.0.0"${ts ? `,
+    "vite": "^7.0.0"${ts ? `,
     "svelte-check": "^4.0.0",
     "typescript": "^5.7.0"` : ""}
   }
@@ -487,16 +487,17 @@ function svelteTemplate(ts: boolean): TemplateDef {
       reload: false,
       install: "npm install",
       dev: VITE_DEV,
-      // @sveltejs/vite-plugin-svelte@^7 fixes the install (v5/v6 peer Vite <=7 and
-      // ERESOLVE against the pinned Vite 8). The CLIENT dep optimizer runs fine, but
-      // the plugin also forces an SSR dep-optimizer pass on boot ("(ssr) [optimizer]
-      // bundling dependencies...") that never completes in-VM — the dev server binds
-      // its port, then the SSR optimize stalls and the worker exits ("No server
-      // listening"). This is NOT the esbuild path (no esbuild tarball is even
-      // installed); it's the same in-VM SSR-optimizer gap the meta-framework
-      // templates (SvelteKit/Nuxt/Astro) hit, and it can't be turned off from user
-      // config. Flagged until that runtime path is hardened. See scripts/spike-svelte.mjs.
-      experimental: true,
+      // Pinned to Vite 7 + @sveltejs/vite-plugin-svelte@^6 (proven green by
+      // scripts/spike-svelte.mjs). Vite 8 is deliberately avoided here: its default
+      // dep optimizer is rolldown-wasm, and vite-plugin-svelte forces a SECOND (ssr)
+      // optimize pass on boot that can't be disabled from user config. In-VM that
+      // second rolldown bundle panics — "Access tokio runtime failed in spawn"
+      // (napi-rs tokio runtime is shut down after the first/client bundle and never
+      // re-inits under wasi) — which crashes the dev server. This is a known upstream
+      // rolldown-on-wasi bug that also hits StackBlitz/WebContainer (rolldown#8747,
+      // #9134; napi-rs#2847). Vite 7 sidesteps it entirely by using the esbuild
+      // optimizer, which runs in-process via esbuild-inproc-patch.js (same path that
+      // graduated Qwik). Revisit Vite 8 once the rolldown wasi tokio lifecycle is fixed.
     },
     files,
   };

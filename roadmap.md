@@ -1905,8 +1905,8 @@ non-experimental once their spike is green.
 **Frontend variants graduated (this change).** A shared harness `scripts/spike-vite-lib.mjs` (real
 `npm install` → boot `vite` → GET `/` 200 with the title marker + `/@vite/client` 200 + the entry
 module transforms through the framework plugin) backs
-`scripts/spike-{preact,lit,solid,qwik,vue,svelte}.mjs`. Preact, Lit, Solid, **Vue and Qwik** are
-green and non-experimental; **Svelte** stays experimental (SSR-optimizer gap, below).
+`scripts/spike-{preact,lit,solid,qwik,vue,svelte}.mjs`. Preact, Lit, Solid, **Vue, Qwik and Svelte**
+are all green and non-experimental (Svelte via a Vite-7 pin — see below).
 
 The harness fetcher now mirrors the browser kernel's transparent wasm drop-in aliasing
 (`esbuild -> esbuild-wasm`, `rollup -> @rollup/wasm-node`; see `packages/demo/fetcher-worker.js`) so
@@ -1931,28 +1931,45 @@ and a headless spike:
   `import '@builder.io/qwik/qwikloader.js'` or the app renders but is dead (buttons don't respond) —
   the template's `src/main.tsx` now does. **Proven** by `scripts/spike-qwik.mjs` → graduated to
   non-experimental.
-- **Svelte** — `@sveltejs/vite-plugin-svelte@^5.0.0` peers `vite ^6`; only `@sveltejs/vite-plugin-svelte@^7`
-  peers Vite 8. Bumped to `^7.0.0`, which **fixes `npm install`**. But the plugin forces an **SSR
-  dep-optimizer** pass on boot (`(ssr) [optimizer] bundling dependencies...`) that never completes
-  in-VM: the client optimizer runs, the port binds, then the SSR optimize stalls and the worker exits
-  ("No server listening"). This is **not** the esbuild path (no esbuild tarball is even installed) —
-  it's the same in-VM SSR-optimizer gap the meta-framework templates (SvelteKit/Nuxt/Astro) hit, and
-  it can't be disabled from user config (tried `ssr.optimizeDeps` / `environments.ssr.dev.optimizeDeps`
-  with `noDiscovery` + empty `include`). **Stays `experimental`** until the runtime hardens the SSR
-  optimize/server-restart path; `scripts/spike-svelte.mjs` captures the red.
+- **Svelte** — pinned to **Vite 7 + `@sveltejs/vite-plugin-svelte@^6`** and **graduated**
+  (`scripts/spike-svelte.mjs` green: GET `/` 200 with marker, `/@vite/client` 200, `/src/App.svelte`
+  compiles). Vite 8 is deliberately avoided: with Vite 8 (`+ vite-plugin-svelte@^7`) `npm install`
+  succeeds, but the plugin forces a **second (ssr) dep-optimize** pass on boot that can't be turned off
+  from user config (`ssr.optimizeDeps` / `environments.ssr.dev.optimizeDeps` with `noDiscovery` + empty
+  `include` don't stop it). In-VM that second **rolldown-wasm** bundle panics —
+  `Rolldown panicked ... napi-3.10.3/src/tokio_runtime.rs: Access tokio runtime failed in spawn` —
+  which traps the wasm (`unreachable`) and crashes the whole dev server (server unbinds → 502). Root
+  cause (see follow-up below) is a known upstream rolldown-on-wasi bug, not an OpenContainer-specific
+  gap. Vite 7 sidesteps it by using the **esbuild** dep optimizer, which runs in-process via
+  `packages/runtime/esbuild-inproc-patch.js` — the same path that graduated Qwik.
 - **React** — no change needed: `@vitejs/plugin-react@^5.0.0` resolves to `5.2.0`, which already peers
   `^8.0.0`.
 
-**Deferred / follow-up — Svelte (and the SSR meta-frameworks) SSR dep-optimizer.** The one remaining
-gap: Vite's **SSR dependency optimizer** (`(ssr) [optimizer] bundling dependencies...`) never
-completes in-VM. It's what keeps `svelte` experimental, and it's almost certainly the same wall
-behind SvelteKit / Nuxt / Astro. The client-side optimizer (rolldown-wasm) works; the SSR pass either
-stalls (browser: preview spins forever) or, headless, drains the loop so the worker exits right after
-the port binds ("No server listening"). It is NOT the esbuild path (no esbuild tarball is installed
-for the Svelte tree) and can't be turned off from user config (`ssr.optimizeDeps` /
-`environments.ssr.dev.optimizeDeps` with `noDiscovery` + empty `include` don't stop it). Next step is
-a runtime investigation of the SSR-environment optimize/server-restart liveness path (sibling to the
-Angular esbuild work). Reproduce with `node scripts/spike-svelte.mjs`.
+**Deferred / follow-up — rolldown-wasi second-bundle tokio panic (blocks Vite-8 SSR optimize).**
+Root-caused while graduating Svelte (correcting the earlier "SSR optimizer hangs / drains the loop"
+guess — it does **not** hang, it **panics**). When a Vite-8 project runs **two** rolldown-wasm dep
+optimizes in one process (e.g. the client optimize followed by the SSR optimize that
+`vite-plugin-svelte`/meta-frameworks force), the **first** bundle succeeds and the **second** panics:
+
+```
+Rolldown panicked. This is a bug in Rolldown, not your code.
+thread '<unnamed>' panicked at napi-3.10.3/src/tokio_runtime.rs:113:6:
+Access tokio runtime failed in spawn
+```
+
+`napi::tokio_runtime::RT` is a Rust `static Option<Runtime>` in the (shared) wasm linear memory; it is
+shut down after the first bundle and never re-initialized under wasi, so the second bundle's
+`tokio::spawn` unwraps `None` → panic → wasm `unreachable` → the dev-server process dies. This is a
+**known upstream rolldown-on-wasi bug that also hits StackBlitz/WebContainer** (rolldown#8747,
+rolldown#9134; napi-rs#2847/#2850, napi-rs#3028) — not something a template config can dodge (the
+second optimize can't be disabled) and not fixable in our runtime without touching rolldown's Rust
+(the runtime already keeps the loop alive via `process.__wtHost`; the shutdown is internal to the
+napi tokio static). Confirmed both bundles' pool workers boot fine, so it is not a nested-worker spawn
+deadlock. **Svelte is unblocked by pinning to Vite 7** (esbuild optimizer, no rolldown). The remaining
+consumers of this bug are the **Vite-8 SSR meta-frameworks (SvelteKit / Nuxt / Astro)** which need a
+real SSR optimize; those stay `experimental` until rolldown fixes the wasi tokio lifecycle (or we
+carry a patched `@rolldown/binding-wasm32-wasi`). Reproduce the panic with the Vite-8 variant in
+`scripts/spike-svelte.mjs` history, or any meta-framework spike.
 
 ## Definition of done for T2
 

@@ -1,7 +1,12 @@
 // Spike (NETWORK): prove the Svelte template's Vite dev server boots + serves
 // in-VM. Mirrors the shipped `svelte-ts` template in
-// packages/studio/src/oc/templates.ts, including the @sveltejs/vite-plugin-svelte@^7
-// bump (v5/v6 peer vite <=7, so they ERESOLVE against the pinned Vite 8). The entry
+// packages/studio/src/oc/templates.ts, pinned to Vite 7 + @sveltejs/vite-plugin-svelte@^6.
+// Vite 8 is avoided on purpose: its rolldown-wasm dep optimizer, combined with the
+// SSR optimize pass vite-plugin-svelte forces on boot, panics in-VM with "Access
+// tokio runtime failed in spawn" (the napi-rs tokio runtime is shut down after the
+// first/client bundle and never re-inits under wasi — a known upstream rolldown wasi
+// bug, rolldown#8747/#9134, that also hits StackBlitz). Vite 7 uses the esbuild
+// optimizer instead, which runs in-process via esbuild-inproc-patch.js. The entry
 // gate hits /src/App.svelte so the Svelte compiler runs. Run (Node 22+):
 //   node scripts/spike-svelte.mjs
 
@@ -30,9 +35,9 @@ const ok = await runViteSpike({
     "preview": "vite preview"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^7.0.0",
+    "@sveltejs/vite-plugin-svelte": "^6.0.0",
     "svelte": "^5.0.0",
-    "vite": "^8.0.0",
+    "vite": "^7.0.0",
     "svelte-check": "^4.0.0",
     "typescript": "^5.7.0"
   }

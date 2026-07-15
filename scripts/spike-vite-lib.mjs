@@ -215,6 +215,12 @@ export async function runViteSpike({ name, dir, files, entryModule, titleMarker 
     npm_config_cache: "/tmp/.npm",
     NODE_ENV: "development",
     OC_LIVE: LIVE ? "1" : "",
+    // OC_DEBUG passthrough → Vite's `debug` namespaces (e.g. OC_DEBUG=vite:deps,
+    // vite:optimize-deps) so a spike can surface what the dep optimizer is doing.
+    ...(process.env.OC_DEBUG ? { DEBUG: process.env.OC_DEBUG } : {}),
+    // OC_ENV='{"K":"V",...}' — inject arbitrary env into the in-VM process (used to
+    // probe rolldown/emnapi knobs like NAPI_RS_ASYNC_WORK_POOL_SIZE).
+    ...(process.env.OC_ENV ? JSON.parse(process.env.OC_ENV) : {}),
   };
 
   // ── gate 1: install ────────────────────────────────────────────────────────
@@ -244,11 +250,16 @@ export async function runViteSpike({ name, dir, files, entryModule, titleMarker 
   const devStart = out.length;
   // `--configLoader native` avoids the rolldown config bundler's "Invalid URL"
   // in-VM (see templates.ts VITE_DEV); --strictPort so a mispick fails loudly.
-  kernel.start(
+  const __devProc = kernel.start(
     "node",
     ["node_modules/vite/bin/vite.js", "--host", "127.0.0.1", "--port", String(PORT), "--strictPort", "--configLoader", "native"],
     { cwd: dir, env },
   );
+  if (process.env.OC_DEBUG) {
+    Promise.resolve(__devProc)
+      .then((r) => console.log(`  [dev process exited] ${JSON.stringify(r)}`))
+      .catch((e) => console.log(`  [dev process rejected] ${(e && e.stack) || e}`));
+  }
   const BIND_TIMEOUT = Number(process.env.OC_BIND_TIMEOUT || 240000);
   const tb = Date.now();
   let fatal = "";
