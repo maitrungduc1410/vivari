@@ -633,6 +633,18 @@ export class IdeController {
       scrollBeyondLastLine: false,
       tabSize: 2,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      // Go-to-definition should NAVIGATE, not peek. The Peek widget's preview pane
+      // can only render an existing Monaco model, but dependency types live only as
+      // extra libs (see loadDependencyTypes) — never as models — so peeking a
+      // node_modules definition shows an empty preview. Jumping straight to the
+      // first location routes through our editor opener, which reads the target
+      // from the VFS and opens it as a real tab (so .d.ts targets render fine).
+      gotoLocation: {
+        multipleDefinitions: "goto",
+        multipleTypeDefinitions: "goto",
+        multipleDeclarations: "goto",
+        multipleImplementations: "goto",
+      },
     });
     // Seed the language service with any folders indexed before the editor was
     // ready (source files as models for cross-file IntelliSense; dependency types
