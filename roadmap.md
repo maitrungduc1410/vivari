@@ -2293,6 +2293,23 @@ GraphiQL) keep `/graphql`.
   serves the page, the queries and the `addBook` mutation work (books 2 -> 3), and GraphiQL is
   still served at `/graphql`.
 
+## Feathers + Nitro backends graduated (this change)
+
+Two more Backend templates drop `experimental`, each now gated by a headless spike:
+
+- **Feathers** (`scripts/spike-feathers.mjs`) — installs `@feathersjs/feathers` + `@feathersjs/koa`,
+  binds `:3030`, and drives the REST transport: `GET /messages` returns the seeded message,
+  `POST /messages` creates one (id increments), and `GET /messages` then shows both. Proven
+  end-to-end in vanilla Node with real Feathers 5.
+- **Nitro** (`scripts/spike-nitro.mjs`) — the first CLI-dev-server backend spike: it runs
+  `nitro dev` (rollup build + `defineNitroConfig`/`defineEventHandler` auto-imports, bound via
+  listhen with `PORT` pinned), then asserts `GET /` serves the index route and `GET /api/hello`
+  returns the JSON handler body. Registered with a longer budget (nitro dev builds on boot).
+  Proven end-to-end in vanilla Node with real `nitropack@2` (built in ~300ms, both routes served).
+
+Both use the shared `scripts/lib/spike-harness.mjs` (Nitro adds `env.PORT` via `defaultEnv`; the
+new `httpPost` helper from the GraphQL change carries the Feathers `create()` assertion).
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

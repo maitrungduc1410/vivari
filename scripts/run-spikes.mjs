@@ -52,6 +52,10 @@ const SPIKES = [
   { name: "sse", file: "spike-sse.mjs", net: true },
   // GraphQL Yoga API + demo UI (queries via GET/POST + a mutation).
   { name: "graphql", file: "spike-graphql.mjs", net: true },
+  // FeathersJS (Koa transport) REST service — find() + create().
+  { name: "feathers", file: "spike-feathers.mjs", net: true },
+  // Nitro (unjs) CLI dev server — rollup build + auto-imports, longer budget.
+  { name: "nitro", file: "spike-nitro.mjs", net: true, timeout: 600000 },
 ];
 
 const args = process.argv.slice(2);

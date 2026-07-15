@@ -2959,7 +2959,8 @@ function nitroTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
+      // Proven in-VM by scripts/spike-nitro.mjs (nitro dev builds + serves the
+      // index route and a JSON API route). No longer experimental.
     },
     files: {
       "package.json": `{
@@ -3243,7 +3244,8 @@ function feathersTemplate(): TemplateDef {
       reload: false,
       install: "npm install",
       dev: "npm run dev",
-      experimental: true,
+      // Proven in-VM by scripts/spike-feathers.mjs (find() + create() over the
+      // rest() transport). No longer experimental.
     },
     files: {
       "package.json": `{
