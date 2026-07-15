@@ -527,12 +527,23 @@ bundles). Workarounds, by tool:
 - **Vite 6+/8** templates: pass `--configLoader native` (skips bundling, native
   import). This is why every Vite `dev` command carries that flag.
 - **Vitest**: no `vitest.config` — pass options as CLI flags.
-- **VitePress** (runs **Vite 5**, which has NO `--configLoader native`): ship **no
-  `.vitepress/config.*`** at all. With no config file VitePress skips
-  `loadConfigFromFile` entirely and boots on defaults; the home page is themed via
-  `docs/index.md` frontmatter. Symptom if a config file sneaks back in: `vitepress
-  dev` hangs right after the "CJS build of Vite's Node API is deprecated" line with
-  no URL. Guard: `scripts/spike-vitepress.mjs`.
+- **VitePress** (runs **Vite 5**, which has NO `--configLoader native`): the
+  config-less trick (ship no `.vitepress/config.*`) DID get past this — but VitePress
+  was ultimately **dropped** for a deeper reason (synckit; see below). Don't re-add it
+  without solving that.
+
+### VitePress is dropped — synckit's blocking sync port drain is incompatible
+VitePress's Shiki markdown highlighter resolves languages **synchronously** via
+**`synckit`**: `resolveLangSync = createSyncFn(...)` runs **eagerly at module load** and
+spawns a `worker_threads` Worker with a `MessagePort` in `workerData`, then at call time
+does `Atomics.wait` (block the thread) → `receiveMessageOnPort(port)` (read the reply
+synchronously). Two problems in-VM: (1) our `worker_threads` doesn't transfer MessagePorts
+across threads yet → `DataCloneError` on spawn; and (2) — the fundamental one — a **blocked
+worker can't receive a MessagePort message** (delivery needs the event loop, which
+`Atomics.wait` freezes), so `receiveMessageOnPort` returns nothing. This is the same limit
+that forces `PISCINA_DISABLE_ATOMICS=1`, and synckit has no async fallback. **Docusaurus**
+covers the docs showcase instead (Prism, no synckit). Revisit if the worker model gains a
+synchronous cross-worker port drain (SAB-backed), or Shiki/VitePress drops synckit.
 
 ### Real corepack is the studio's PM version manager — DOWNLOADS + runs pinned PMs
 corepack is wired like the PMs but is a *version manager*, not a package manager

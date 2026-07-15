@@ -1827,7 +1827,7 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   Node.js blank. Showcase: Vite+Express fullstack (two preview tabs), Server-Sent Events. Existing
   13 re-categorised.
 - ✅ **Phase 2 (`[SPIKE]`, meta-frameworks — shipped `experimental`)** — Fullstack: Nuxt 3,
-  SvelteKit, React Router 7 (Remix), Astro. Docs: VitePress, Slidev.
+  SvelteKit, React Router 7 (Remix), Astro. Docs: Slidev.
 - ✅ **Phase 3 (`[SPIKE]`)** — Frontend variants: Preact, Lit, Solid, Qwik (now proven headless by
   `scripts/spike-{preact,lit,solid,qwik}.mjs` → **graduated to non-experimental**; Qwik rides the
   merged esbuild-wasm aliasing + in-process service and runs `qwikVite({ csr: true })`). Backends:
@@ -1872,7 +1872,7 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
     sets `NO_UPDATE_NOTIFIER=1` + `npm_config_update_notifier=false` (also kills npm's own "new
     version" notice).
   - **Keep-prefix preview routing (`public/sw.js` + controller + `templates.ts`).** A *client-routed*
-    SPA (Docusaurus — also VitePress/Slidev in future) resolves its route from the iframe's own
+    SPA (Docusaurus — also Slidev in future) resolves its route from the iframe's own
     `location.pathname`, which is `/preview/<port>/…`. The preview SW normally *strips* that proxy
     prefix before hitting the dev server (so `/`-based servers like Next/Vite see clean paths), so
     Docusaurus's router landed on its NotFound page until you clicked a link. Fix: the template sets
@@ -2310,27 +2310,36 @@ Two more Backend templates drop `experimental`, each now gated by a headless spi
 Both use the shared `scripts/lib/spike-harness.mjs` (Nitro adds `env.PORT` via `defaultEnv`; the
 new `httpPost` helper from the GraphQL change carries the Feathers `create()` assertion).
 
-## VitePress: config-less so it never hits Vite 5's config bundler (this change)
+## VitePress — dropped: synckit's blocking Atomics + cross-worker MessagePort (revisit later)
 
-`vitepress dev` hangs right after Vite's "CJS build … deprecated" line — no banner, no URL.
-An earlier attempt blamed Shiki's Oniguruma WASM and swapped in Shiki's JS regex engine via
-`markdown.highlight`; that made **no difference** — the hang was byte-for-byte identical with the
-simple config and the Shiki config, which proved the stall is *before* the markdown renderer, in
-**config loading itself**. VitePress 1.x runs **Vite 5**, whose config loader ALWAYS
-esbuild-bundles `.vitepress/config.*` and imports the bundle via a temp `file://` URL
-(`loadConfigFromBundledFile`). That is exactly the in-VM config-bundling path regular Vite
-templates dodge with `--configLoader native` — an option Vite 5 doesn't have and VitePress
-doesn't pass. OC's `__ocImport` doesn't resolve `file://` temp bundles, so the load never
-settles (see also the known "vite.config bundling fails with Invalid URL" note above).
+VitePress was **removed from the templates** after we chased three successive blockers and hit
+a *fundamental* one. The story (kept as a signpost for a future revisit):
 
-Fix (same pattern the vitest template already uses): **ship no `.vitepress/config.*` file.** With
-no config file VitePress skips `loadConfigFromFile` entirely (verified in its source) and boots
-on defaults — no esbuild bundle, no `file://` import, no hang. The trade-off is that config-only
-options (nav/sidebar/site title) are dropped, but the home page is still fully themed via
-`docs/index.md` frontmatter (hero + features) and pages cross-link. Also removed the now-unused
-`shiki` devDependency and the async-function config. Confirmed config-less `vitepress dev` binds
-and serves `/` in vanilla Node; guarded in-VM by `scripts/spike-vitepress.mjs`. Still
-`experimental` pending browser confirmation.
+1. **Vite 5 config bundler** — `vitepress dev` hung right after Vite's "CJS build … deprecated"
+   line. VitePress 1.x runs **Vite 5**, whose config loader ALWAYS esbuild-bundles
+   `.vitepress/config.*` and imports the bundle via a temp `file://` URL
+   (`loadConfigFromBundledFile`) — the same in-VM config-bundling path regular Vite templates
+   dodge with `--configLoader native` (an option Vite 5 lacks). OC's `__ocImport` can't resolve
+   `file://` temp bundles, so it never settled. **Fixed** by shipping *no* config file (VitePress
+   then skips `loadConfigFromFile` and boots on defaults).
+2. **`DataCloneError` on spawn** — with config-less VitePress the boot got *past* config loading
+   and then crashed spawning a worker: `A MessagePort could not be cloned because it was not
+   transferred`. VitePress's markdown highlighter (Shiki) resolves languages **synchronously** via
+   **`synckit`** — `resolveLangSync = createSyncFn(...)` runs **eagerly at module load**, spawning
+   a `worker_threads` Worker with a `MessagePort` inside `workerData`. OC's `worker_threads`
+   explicitly *defers* transferring MessagePorts across threads, so the spawn throws.
+3. **The fundamental wall** — even if we fixed (2), synckit's runtime pattern is `Atomics.wait`
+   (block the calling thread) → `receiveMessageOnPort(port)` (read the reply synchronously). In a
+   browser a **blocked worker can't receive a MessagePort message** — delivery needs the event
+   loop, which `Atomics.wait` freezes. This is the exact limitation OC already documents (it's why
+   Piscina runs with `PISCINA_DISABLE_ATOMICS=1`), and synckit has **no async fallback**. So any
+   real (highlighted) code block would deadlock/throw regardless.
+
+The best achievable would be a gated MessagePort-transfer fix **plus** stripping every
+highlighted code block — a docs SSG that can't show highlighted code, from an unverifiable change
+to core worker infra. Not worth it while **Docusaurus** (graduated, Prism-based, no synckit)
+already covers the docs-site showcase fully. **Revisit if** OC's worker model gains a synchronous
+cross-worker port drain (e.g. a SAB-backed transport), or Shiki/VitePress drops synckit.
 
 ## Slidev + Socket.IO graduated (this change)
 
@@ -2411,7 +2420,12 @@ bundling it. Fix: a project `.npmrc` with `node-linker=hoisted`, giving a FLAT
 node_modules of real dirs (npm-like) — the `workspace:*` package (@repo/ui) stays
 symlinked (the actual showcase), but external deps and their transitives become real
 top-level dirs the optimizer bundles (confirmed with real pnpm@9.15.9: `scheduler`
-bundled, `main.jsx` served). Template stays `experimental`.
+bundled, `main.jsx` served).
+
+**Graduated.** Browser-confirmed end to end: `pnpm install`, the `workspace:*`
+symlink, the Vite dev server, and the live preview iframe all work. The template
+drops `experimental`; the cmd-shim unwrap it relies on is guarded by
+`scripts/spike-cmd-shim.mjs`, and real pnpm is exercised by the pnpm spikes.
 
 ## Definition of done for T2
 

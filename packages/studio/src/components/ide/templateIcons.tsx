@@ -122,7 +122,6 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   sveltekit: (p) => <SvelteIcon className={p.className} />,
   remix: (p) => <ReactRouterIcon className={p.className} />,
   astro: (p) => <AstroIcon className={p.className} />,
-  vitepress: Badge({ text: "VP", bg: "#3451b2" }),
   slidev: Badge({ text: "Sl", bg: "#0e9aa5" }),
   docusaurus: (p) => <DocusaurusIcon className={p.className} />,
   // Phase 3 — frontend variants

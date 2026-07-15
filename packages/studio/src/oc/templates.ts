@@ -77,7 +77,7 @@ export interface TemplateManifest {
   /**
    * The preview proxy serves every app under `/preview/<port>/` and, by default,
    * strips that prefix before hitting the dev server. A *client-routed* SPA
-   * (Docusaurus, VitePress, Slidev…) resolves its route from the iframe's own
+   * (Docusaurus, Slidev…) resolves its route from the iframe's own
    * `location.pathname`, so served at `/` its router lands on NotFound. Such a
    * template instead sets its base (baseUrl / Vite `base`) to `/preview/<port>/`
    * and flags this so the SW keeps the prefix — the app then runs consistently
@@ -2383,90 +2383,10 @@ const title = 'Astro on OpenContainer'
   };
 }
 
-// ── VitePress ────────────────────────────────────────────────────────────────
-function vitepressTemplate(): TemplateDef {
-  return {
-    manifest: {
-      id: "vitepress",
-      framework: "vitepress",
-      icon: "vitepress",
-      category: "Docs",
-      name: "VitePress",
-      language: "TypeScript",
-      description: "VitePress — Vite & Vue powered static site generator for docs",
-      port: 5173,
-      openPath: "/",
-      entry: "docs/index.md",
-      hmr: true,
-      reload: false,
-      install: "npm install",
-      dev: "npm run dev",
-      experimental: true,
-    },
-    files: {
-      "package.json": `{
-  "name": "vitepress-docs",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "vitepress dev docs",
-    "build": "vitepress build docs",
-    "preview": "vitepress preview docs"
-  },
-  "devDependencies": { "vitepress": "^1.5.0" }
-}
-`,
-      // NO docs/.vitepress/config.* on purpose. VitePress runs Vite 5, whose config
-      // loader ALWAYS esbuild-bundles the config file and imports the bundle via a
-      // temp `file://` URL — a path that fails/hangs in-VM (the same reason regular
-      // Vite templates pass `--configLoader native`, which VitePress 1.x can't).
-      // With no config file VitePress skips that step entirely and boots on defaults.
-      // (Same pattern as the vitest template, which also avoids a bundled config.)
-      // Config-only options like nav/sidebar are traded for a working dev server; the
-      // home page is fully themed via index.md frontmatter, and pages cross-link.
-      "docs/index.md": `---
-layout: home
-hero:
-  name: OpenContainer
-  text: VitePress in the browser
-  tagline: Edit docs/index.md and save — HMR is live.
-  actions:
-    - theme: brand
-      text: Read the guide
-      link: /guide
-features:
-  - title: Markdown + Vue
-    details: Author docs in Markdown with Vue components inline.
-  - title: Instant HMR
-    details: Edits show up immediately in the live preview.
-  - title: Zero native deps
-    details: The whole toolchain runs inside the browser VM.
----
-`,
-      "docs/guide.md": `# Guide
-
-This VitePress site is running entirely inside OpenContainer — no config file, just
-Markdown. Edit any \`.md\` under \`docs/\` and save to see hot reload.
-
-- Markdown with Vue components
-- Instant hot reload
-- Zero native dependencies
-
-\`\`\`ts
-interface Doc {
-  title: string
-  tags: string[]
-}
-
-const doc: Doc = { title: 'Hello', tags: ['vitepress', 'opencontainer'] }
-console.log(doc.title.toUpperCase())
-\`\`\`
-
-[← Back home](/)
-`,
-    },
-  };
-}
+// NOTE: VitePress was dropped (see roadmap: "VitePress — dropped: synckit's blocking
+// Atomics + cross-worker MessagePort is incompatible with our worker model"). The
+// Docusaurus template covers the docs-site showcase. Revisit if the worker model gains
+// a synchronous cross-worker port drain, or Shiki drops synckit.
 
 // ── Slidev ───────────────────────────────────────────────────────────────────
 function slidevTemplate(): TemplateDef {
@@ -3547,7 +3467,9 @@ function monorepoTemplate(): TemplateDef {
       // `--configLoader native` as pass-through positionals (flag ignored). Drop the
       // `--`: pnpm forwards everything after the script name straight to vite.
       dev: "pnpm --filter web dev --configLoader native",
-      experimental: true,
+      // Graduated: browser-confirmed (pnpm install + workspace symlink + Vite dev +
+      // live preview all work). The cmd-shim bin unwrap it depends on is guarded by
+      // scripts/spike-cmd-shim.mjs, and real pnpm is exercised by the pnpm spikes.
     },
     files: {
       // A FLAT node_modules (pnpm's "hoisted" linker, like npm/yarn) instead of the
@@ -4400,7 +4322,6 @@ export const TEMPLATES: TemplateDef[] = [
   remixTemplate(),
   astroTemplate(),
   // Docs
-  vitepressTemplate(),
   slidevTemplate(),
   docusaurusTemplate(),
   // Creative
