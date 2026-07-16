@@ -34,7 +34,7 @@
   "scripts": {
     "build": "vite build && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "check:workers": "node --check src/workers/kernel-worker.js && node --check src/workers/fs-worker.js && node --check src/workers/process-worker.js && node --check src/workers/fetcher-worker.js"
+    "typecheck:workers": "tsc -p tsconfig.workers.json"
   },
   "devDependencies": {
     "typescript": "~6.0.2",

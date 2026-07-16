@@ -27,7 +27,7 @@ on `/sw.js` (the preview proxy needs root scope).
 ## How it fits together
 
 - `src/vv/kernel.ts` — a thin extension of `@vivari/core`'s `KernelBridge`, which
-  spawns the kernel worker (`packages/core/src/workers/kernel-worker.js`, bundled
+  spawns the kernel worker (`packages/core/src/workers/kernel-worker.ts`, bundled
   by Vite along with its nested `fs` / `fetcher` / `process` workers and the
   `packages/{vfs,codec,crypto}/pkg` wasm), registers the preview Service Worker,
   and relays its HTTP requests into the VM. Studio adds only the `?compress=0` /

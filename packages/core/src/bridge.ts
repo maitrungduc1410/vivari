@@ -9,8 +9,8 @@
 // it directly for full control over the message vocabulary.
 //
 // A bundler (Vite/Rollup/webpack 5/esbuild) resolves the worker below plus its
-// nested `new Worker(new URL('./fs-worker.js' | './process-worker.js' |
-// './fetcher-worker.js', import.meta.url))` and every `new URL('../*/pkg/*_bg
+// nested `new Worker(new URL('./fs-worker.ts' | './process-worker.ts' |
+// './fetcher-worker.ts', import.meta.url))` and every `new URL('../*/pkg/*_bg
 // .wasm', import.meta.url)` asset, emitting them beside the package so everything
 // is served same-origin (which COEP requires).
 
@@ -29,7 +29,7 @@ export class KernelBridge {
 
   constructor(options: { workerName?: string } = {}) {
     this.worker = new Worker(
-      new URL("./workers/kernel-worker.js", import.meta.url),
+      new URL("./workers/kernel-worker.ts", import.meta.url),
       { type: "module", name: options.workerName ?? "Vivari Kernel" },
     );
     this.worker.onmessage = (event: MessageEvent<KernelMessage>) => {

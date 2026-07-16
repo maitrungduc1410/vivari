@@ -1,3 +1,7 @@
+// @ts-nocheck — authored in TS for Vite's native worker bundling, but not strictly
+// type-checked: this bridges to a large body of untyped JS (packages/kernel-host,
+// packages/runtime) + generated wasm, and uses non-standard worker globals. esbuild
+// (via Vite) is the compiler; strict typing is a separate, larger effort.
 // The kernel worker — Vivari's kernel host, off the main thread.
 //
 // Phase 2, item #1 (Kernel worker). Everything heavy lives here: the Rust/Wasm
@@ -865,7 +869,7 @@ async function boot() {
   // (outbound npm; depends on neither the VFS nor the codecs, so there's no reason
   // to create it later — overlapping its load shaves a step off cold boot).
   post("log", { line: "  [boot] starting file-system + fetcher workers…", dim: true });
-  const fsWorker = new Worker(new URL("./fs-worker.js", import.meta.url), {
+  const fsWorker = new Worker(new URL("./fs-worker.ts", import.meta.url), {
     type: "module",
     name: "File System Worker",
   });
@@ -894,7 +898,7 @@ async function boot() {
   // Fetcher Worker (Phase 2 #9): all outbound network goes through it, so
   // downloading/decompressing large npm payloads never stalls syscall servicing.
   // Created here (in parallel with the VFS); the kernel calls `fetcher(url)`.
-  const fetcherWorker = new Worker(new URL("./fetcher-worker.js", import.meta.url), {
+  const fetcherWorker = new Worker(new URL("./fetcher-worker.ts", import.meta.url), {
     type: "module",
     name: "Fetcher Worker",
   });
@@ -945,7 +949,7 @@ async function boot() {
   // We also open a MessageChannel between the process and the File System Worker
   // so its fs syscalls ring that worker's doorbell directly (never the kernel).
   const spawnWorker = (info) => {
-    const worker = new Worker(new URL("./process-worker.js", import.meta.url), {
+    const worker = new Worker(new URL("./process-worker.ts", import.meta.url), {
       type: "module",
       name: "Process Worker PID " + info.pid,
     });
