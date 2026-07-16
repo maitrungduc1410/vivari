@@ -138,6 +138,65 @@ export class Kernel {
     this._fetchActive = 0;
     this._fetchQueue = [];
     this._fetchInflight = new Map(); // cacheKey -> Promise<meta> (network in flight)
+
+    // ---- lazy (on-demand) programs -------------------------------------------
+    // Some tools are HUGE (the real TypeScript 7 `tsgo` is a ~47 MB wasm; yarn/
+    // pnpm/corepack are ~11 MB gz each) and most sessions never invoke them. So
+    // instead of fetching + unpacking them into the VFS eagerly at boot, the
+    // environment (kernel worker) registers an async loader keyed by command
+    // name; the FIRST spawn of that command awaits the loader (which materializes
+    // the real /bin/<cmd>.js shims) and only then resolves + runs. A returning
+    // visitor's tree is OPFS-restored, so the loader just re-applies shims (cheap).
+    // The Kernel stays environment-agnostic — it only holds the registry + gate;
+    // the actual fetch/unpack lives in the loaders. See registerLazyProgram +
+    // ensureCommandLoaded, hooked into the spawn paths (handleSpawn/handleSpawnAsync)
+    // and awaited by the SDK spawn path before launch().
+    this.lazyLoaders = new Map(); // command name -> async loader fn (shared per asset)
+    this.lazyInflight = new Map(); // loader fn -> Promise (dedupe concurrent first-uses)
+  }
+
+  // ---- lazy (on-demand) program registry ------------------------------------
+  /**
+   * Register an async `loader` under one or more command `names`. The loader is
+   * invoked (at most once, unless it fails) the first time any of those commands
+   * is spawned; it must materialize the program on PATH (e.g. write /bin/<cmd>.js)
+   * before resolving. Passing several names that share one asset (e.g. `tsc` +
+   * `tsgo`) makes them share the SAME loader, so loading via either satisfies both.
+   */
+  registerLazyProgram(names, loader) {
+    for (const name of Array.isArray(names) ? names : [names]) {
+      this.lazyLoaders.set(name, loader);
+    }
+  }
+
+  /**
+   * Ensure a lazily-registered `command` has been loaded before it is resolved.
+   * No-op when nothing is registered for it (so environments without lazy programs
+   * — e.g. the Node test harness — are unaffected). Concurrent first-uses share a
+   * single in-flight promise; a successful load removes the registration so later
+   * spawns are a straight no-op; a FAILED load clears the in-flight entry so a
+   * subsequent invocation can retry (rather than caching the failure forever).
+   */
+  async ensureCommandLoaded(command) {
+    const loader = this.lazyLoaders.get(command);
+    if (!loader) return; // not lazy (or already loaded) — nothing to do
+    let inflight = this.lazyInflight.get(loader);
+    if (!inflight) {
+      inflight = (async () => loader())();
+      this.lazyInflight.set(loader, inflight);
+    }
+    try {
+      await inflight;
+      // Success: drop every command name mapped to this loader so future spawns
+      // skip the gate entirely.
+      for (const [name, fn] of this.lazyLoaders) {
+        if (fn === loader) this.lazyLoaders.delete(name);
+      }
+    } catch {
+      /* loader threw — leave the registration so a later spawn can retry */
+    } finally {
+      this.lazyInflight.delete(loader);
+    }
   }
 
   // ---- VFS helpers ----------------------------------------------------------
@@ -751,8 +810,14 @@ export class Kernel {
     if (this.onSseSend) this.onSseSend(m);
   }
 
-  handleSpawn(parent, spec) {
+  async handleSpawn(parent, spec) {
     const cwd = spec.cwd || "/";
+    // On-demand: if this command is a lazily-registered heavy tool, materialize
+    // it (fetch + unpack into the VFS) before resolving. The parent stays parked
+    // on Atomics.wait meanwhile; the kernel loop keeps servicing other processes.
+    await this.ensureCommandLoaded(spec.command);
+    // The parent may have exited (killed) while the tool was loading.
+    if (!this.procs.has(parent.pid)) return;
     const programPath = this.resolveProgram(spec.command, cwd, spec.env || {});
     if (!programPath) {
       this.respondErr(parent, "ENOENT");
@@ -780,8 +845,12 @@ export class Kernel {
   // Async spawn (#15): the caller does NOT park — it gets {pid} now and keeps
   // running its event loop. The child streams stdout/stderr to the parent worker
   // (proc.stream) and, on exit, we post {type:'child-exit'} to the parent handle.
-  handleSpawnAsync(parent, spec) {
+  async handleSpawnAsync(parent, spec) {
     const cwd = spec.cwd || "/";
+    // On-demand load of heavy tools before resolving (see handleSpawn). The {pid}
+    // ack simply arrives once the tool is materialized on PATH.
+    await this.ensureCommandLoaded(spec.command);
+    if (!this.procs.has(parent.pid)) return; // parent killed while loading
     const programPath = this.resolveProgram(spec.command, cwd, spec.env || {});
     if (!programPath) {
       this.respondErr(parent, "ENOENT");

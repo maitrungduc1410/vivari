@@ -23,7 +23,7 @@ import { ensureRealNpm } from "../../../kernel-host/load-real-npm.js";
 import { ensureRealYarn } from "../../../kernel-host/load-real-yarn.js";
 import { ensureRealPnpm } from "../../../kernel-host/load-real-pnpm.js";
 import { ensureRealCorepack } from "../../../kernel-host/load-real-corepack.js";
-import { ensureRealTsgo, applyTsgoLoadingShims } from "../../../kernel-host/load-real-tsgo.js";
+import { ensureRealTsgo } from "../../../kernel-host/load-real-tsgo.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
@@ -674,7 +674,7 @@ function baseProcEnv(dir) {
 const execByPid = new Map(); // pid -> execId
 const pidByExec = new Map(); // execId -> pid
 
-function spawnProcess(execId, command, args, cwd, extraEnv) {
+async function spawnProcess(execId, command, args, cwd, extraEnv) {
   if (!kernel) {
     post("proc-exit", { execId, code: 127, error: "kernel not ready" });
     return;
@@ -682,6 +682,12 @@ function spawnProcess(execId, command, args, cwd, extraEnv) {
   const dir = cwd || defaultTermCwd();
   const env = baseProcEnv(dir);
   if (extraEnv && typeof extraEnv === "object") Object.assign(env, extraEnv);
+  // On-demand: materialize a lazily-registered heavy tool (tsc/tsgo/yarn/pnpm/
+  // corepack) before launching, so `vivari.spawn('tsc', …)` works on first use.
+  // `launch` goes straight to resolveProgram (unlike the shell's OP_SPAWN path,
+  // which the kernel gates itself), so the gate has to run here.
+  await kernel.ensureCommandLoaded(command);
+  if (!kernel) return;
   const pid = kernel.launch(command, Array.isArray(args) ? args : [], { cwd: dir, env });
   if (pid < 0) {
     post("proc-exit", { execId, code: 127, error: command + ": not found" });
@@ -1179,12 +1185,12 @@ async function boot() {
   // below, which only matter once you actually run install/dev.
   post("kernel-online", {});
 
-  // `tsc`/`tsgo` exist immediately as a "still downloading" placeholder; the real
-  // TypeScript 7 (tsgo, ~11 MB) is loaded lazily in the background after `ready`
-  // (loadTsgoInBackground), then these shims are overwritten with the real runner.
-  // (When the tree is OPFS-restored the background load re-applies the real shims
-  // almost instantly, so the placeholder window is negligible.)
-  applyTsgoLoadingShims(kernel);
+  // Register the heavy, rarely-universal toolchains as ON-DEMAND programs (see
+  // below, after the eager npm load): tsc/tsgo, yarn, pnpm, corepack are only
+  // fetched + unpacked the first time their command is actually spawned, instead
+  // of paying for them on every boot. npm stays eager (below) — nearly every
+  // session installs, and `npx` shells out to it.
+  registerLazyTools();
   try {
     const npmT0 = Date.now();
     const res = await ensureRealNpm(kernel, async () => {
@@ -1207,115 +1213,66 @@ async function boot() {
     post("log", { line: `  [boot] real npm load failed (${(e && e.message) || e}) — 'npm' not installed.`, dim: true });
   }
 
-  // Same delivery/shim path for real yarn (classic). No fallback CLI exists, so a
-  // missing asset just means `yarn` isn't on PATH (npm still is).
-  try {
-    const yarnT0 = Date.now();
-    const res = await ensureRealYarn(kernel, async () => {
-      const base = (self.location && self.location.origin) || "";
-      const r = await fetch(base + REAL_YARN_ASSET);
-      if (!r.ok) return null;
-      return new Uint8Array(await r.arrayBuffer());
-    });
-    if (res && res.restored) {
-      post("log", { line: `  [boot] real yarn ready (restored from OPFS, +${Date.now() - yarnT0}ms).`, dim: true });
-    } else if (res) {
-      post("log", {
-        line: `  [boot] real yarn ${res.version} loaded (${res.fileCount} files, +${Date.now() - yarnT0}ms).`,
-        dim: true,
-      });
-    } else {
-      post("log", { line: "  [boot] real yarn asset unavailable — `yarn` not installed.", dim: true });
-    }
-  } catch (e) {
-    post("log", { line: `  [boot] real yarn load failed (${(e && e.message) || e}).`, dim: true });
-  }
-
-  // Same delivery/shim path for real pnpm. pnpm drives worker_threads and a
-  // symlinked node_modules (both supported); the shell uses pnpm's default
-  // hard-link import method (VFS OP_LINK, with a copy fallback on older wasm).
-  try {
-    const pnpmT0 = Date.now();
-    const res = await ensureRealPnpm(kernel, async () => {
-      const base = (self.location && self.location.origin) || "";
-      const r = await fetch(base + REAL_PNPM_ASSET);
-      if (!r.ok) return null;
-      return new Uint8Array(await r.arrayBuffer());
-    });
-    if (res && res.restored) {
-      post("log", { line: `  [boot] real pnpm ready (restored from OPFS, +${Date.now() - pnpmT0}ms).`, dim: true });
-    } else if (res) {
-      post("log", {
-        line: `  [boot] real pnpm ${res.version} loaded (${res.fileCount} files, +${Date.now() - pnpmT0}ms).`,
-        dim: true,
-      });
-    } else {
-      post("log", { line: "  [boot] real pnpm asset unavailable — `pnpm` not installed.", dim: true });
-    }
-  } catch (e) {
-    post("log", { line: `  [boot] real pnpm load failed (${(e && e.message) || e}).`, dim: true });
-  }
-
-  // Same delivery/shim path for real corepack (Node's PM version manager). It only
-  // adds `/bin/corepack.js`; the direct npm/yarn/pnpm shims above stay the
-  // defaults. `corepack yarn|pnpm|npm …` (or a project `packageManager` field)
-  // downloads + runs the pinned version. A missing asset just means no `corepack`.
-  try {
-    const cpT0 = Date.now();
-    const res = await ensureRealCorepack(kernel, async () => {
-      const base = (self.location && self.location.origin) || "";
-      const r = await fetch(base + REAL_COREPACK_ASSET);
-      if (!r.ok) return null;
-      return new Uint8Array(await r.arrayBuffer());
-    });
-    if (res && res.restored) {
-      post("log", { line: `  [boot] real corepack ready (restored from OPFS, +${Date.now() - cpT0}ms).`, dim: true });
-    } else if (res) {
-      post("log", {
-        line: `  [boot] real corepack ${res.version} loaded (${res.fileCount} files, +${Date.now() - cpT0}ms).`,
-        dim: true,
-      });
-    } else {
-      post("log", { line: "  [boot] real corepack asset unavailable — `corepack` not installed.", dim: true });
-    }
-  } catch (e) {
-    post("log", { line: `  [boot] real corepack load failed (${(e && e.message) || e}).`, dim: true });
-  }
-
   post("ready", {});
   post("log", { line: `  [boot] kernel ready in ${Date.now() - t0}ms.`, dim: true });
   post("log", { line: "Kernel ready — pick a project and press Run." });
-
-  // Real TypeScript 7 (tsgo, Go/wasm) is ~11 MB, and nothing at boot needs it, so
-  // load it AFTER ready without blocking — `tsc`/`tsgo` flip from the "still
-  // downloading" placeholder to the real compiler when this settles. Persists in
-  // OPFS, so only the first origin visit pays the download.
-  void loadTsgoInBackground();
 }
 
-// Lazy, non-blocking loader for the real TypeScript 7 compiler (see above).
-async function loadTsgoInBackground() {
-  try {
-    const t0 = Date.now();
-    const res = await ensureRealTsgo(kernel, async () => {
-      const base = (self.location && self.location.origin) || "";
-      const r = await fetch(base + REAL_TSGO_ASSET);
-      if (!r.ok) return null;
-      return new Uint8Array(await r.arrayBuffer());
+// Fetch a vendor asset (npm/yarn/pnpm/corepack/tsgo pack) by absolute path from
+// the app origin. Returns its bytes, or null if the asset isn't served (in which
+// case the tool simply isn't installed — same as a missing npm).
+async function fetchVendorAsset(assetPath: string): Promise<Uint8Array | null> {
+  const base = (self.location && self.location.origin) || "";
+  const r = await fetch(base + assetPath);
+  if (!r.ok) return null;
+  return new Uint8Array(await r.arrayBuffer());
+}
+
+// Register the heavy toolchains as ON-DEMAND programs: the first time one of the
+// listed commands is spawned, the kernel awaits the matching loader, which
+// fetches + unpacks the vendor asset into the VFS and writes the real /bin shims.
+// Nothing is paid at boot; a returning visitor's OPFS-restored tree makes the
+// first use near-instant (the loader just re-applies the shims). tsc + tsgo share
+// one asset (so loading via either satisfies both), as do pnpm + pnpx.
+function registerLazyTools() {
+  const lazyTool = (
+    names: string[],
+    label: string,
+    ensure: (k: typeof kernel, fetchBytes: () => Promise<Uint8Array | null>) => Promise<unknown>,
+    asset: string,
+  ) => {
+    kernel.registerLazyProgram(names, async () => {
+      const t0 = Date.now();
+      try {
+        const res = (await ensure(kernel, () => fetchVendorAsset(asset))) as
+          | { restored?: boolean; version?: string | null; fileCount?: number }
+          | null;
+        if (res && res.restored) {
+          post("log", { line: `  [${label}] ready on first use (restored from OPFS, +${Date.now() - t0}ms).`, dim: true });
+        } else if (res) {
+          post("log", {
+            line: `  [${label}] loaded on first use (${res.fileCount} files, +${Date.now() - t0}ms).`,
+            dim: true,
+          });
+        } else {
+          post("log", { line: `  [${label}] asset unavailable — \`${names[0]}\` not installed.`, dim: true });
+        }
+        return res;
+      } catch (e) {
+        post("log", { line: `  [${label}] load failed (${(e && (e as Error).message) || e}).`, dim: true });
+        throw e; // let the kernel keep the registration so a later spawn can retry
+      }
     });
-    if (res && res.restored) {
-      post("log", { line: `  [tsgo] TypeScript 7 ready (restored from OPFS, +${Date.now() - t0}ms).`, dim: true });
-    } else if (res) {
-      post("log", {
-        line: `  [tsgo] TypeScript 7 (tsgo ${res.version}) loaded (${res.fileCount} files, +${Date.now() - t0}ms) — 'tsc'/'tsgo' ready.`,
-        dim: true,
-      });
-    } else {
-      post("log", { line: "  [tsgo] TypeScript 7 asset unavailable — `tsc`/`tsgo` not installed.", dim: true });
-    }
-  } catch (e) {
-    post("log", { line: `  [tsgo] TypeScript 7 load failed (${(e && e.message) || e}) — 'tsc'/'tsgo' not installed.`, dim: true });
-  }
+  };
+
+  // Real TypeScript 7 (tsgo, Go/wasm) — ~47 MB wasm, nothing at boot needs it.
+  lazyTool(["tsc", "tsgo"], "tsgo", ensureRealTsgo, REAL_TSGO_ASSET);
+  // Real yarn (classic).
+  lazyTool(["yarn"], "yarn", ensureRealYarn, REAL_YARN_ASSET);
+  // Real pnpm (also exposes pnpx).
+  lazyTool(["pnpm", "pnpx"], "pnpm", ensureRealPnpm, REAL_PNPM_ASSET);
+  // Real corepack (Node's PM version manager).
+  lazyTool(["corepack"], "corepack", ensureRealCorepack, REAL_COREPACK_ASSET);
 }
 
 // ── File-operation helpers (host Explorer: delete / copy / cut-paste) ────────
@@ -1723,7 +1680,9 @@ self.onmessage = async (event) => {
   // Run one command directly (no wrapping shell) and stream its output/exit back
   // by `execId`. See spawnProcess + the execByPid routing in boot().
   if (m.type === "proc-spawn") {
-    spawnProcess(m.execId, m.command, m.args, m.cwd, m.env);
+    void spawnProcess(m.execId, m.command, m.args, m.cwd, m.env).catch((err) =>
+      post("proc-exit", { execId: m.execId, code: 127, error: (err && err.message) || String(err) }),
+    );
     return;
   }
   // Feed a chunk to a spawned process's stdin. `chunk == null` signals EOF.
