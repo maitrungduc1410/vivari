@@ -480,9 +480,11 @@ Yarn is wired exactly like npm, one tier up: `scripts/vendor-yarn.mjs` packs
 `yarn@1.22.22` into `packages/studio/public/vendor/yarn-pack.bin` (same archive
 format; gitignored; `npm run vendor:yarn`, auto-run by `predev`/`prebuild:studio`).
 `packages/kernel-host/load-real-yarn.js` (`ensureRealYarn`) unpacks it into
-`/usr/lib/node_modules/yarn` and writes `/bin/yarn.js` + `/bin/yarnpkg.js` shims;
-the kernel worker calls it right AFTER `ensureRealNpm()` at boot. Differences from
-npm worth knowing:
+`/usr/lib/node_modules/yarn` and writes `/bin/yarn.js` + `/bin/yarnpkg.js` shims.
+Unlike npm (loaded eagerly at boot), yarn is loaded **on demand** — the kernel
+worker registers it as a lazy program (`registerLazyTools`) and the first `yarn`
+spawn triggers the unpack (`kernel.ensureCommandLoaded`). Differences from npm
+worth knowing:
 - yarn's `lib/cli.js` is a single ~5 MB webpack bundle — far bigger than the 1 MiB
   SAB `writeFile` window, but that's a non-issue now: the loader delivers the whole
   tree via `kernel.writeFilesBatch` (one transferable `ArrayBuffer`), which carries
@@ -497,7 +499,8 @@ npm worth knowing:
 ### Real pnpm is the studio shell's `pnpm` — worker_threads + symlinked store
 pnpm is wired like npm/yarn (`scripts/vendor-pnpm.mjs` → `pnpm-pack.bin`;
 `packages/kernel-host/load-real-pnpm.js` `ensureRealPnpm` → `/bin/pnpm.js` +
-`/bin/pnpx.js`; called after `ensureRealYarn()` at boot). What makes pnpm special:
+`/bin/pnpx.js`; loaded **on demand** on the first `pnpm`/`pnpx` spawn, like yarn).
+What makes pnpm special:
 - It drives real `worker_threads` (`dist/worker.js`) and a SYMLINKED `node_modules`
   (`node_modules/<pkg>` → `.pnpm/<pkg>@<ver>/…`). Both work because the
   Process-Worker model runs nested threads and the Rust VFS backs
@@ -570,7 +573,7 @@ synchronous cross-worker port drain (SAB-backed), or Shiki/VitePress drops synck
 corepack is wired like the PMs but is a *version manager*, not a package manager
 (`scripts/vendor-corepack.mjs` → `corepack-pack.bin`;
 `packages/kernel-host/load-real-corepack.js` `ensureRealCorepack` → installs ONLY
-`/bin/corepack.js`; called after `ensureRealPnpm()`). It reads a project's
+`/bin/corepack.js`; loaded **on demand** on the first `corepack` spawn). It reads a project's
 `packageManager` field, downloads that exact yarn/pnpm/npm release (gunzip + untar +
 sha512 integrity), and execs it. What's special / must-not-regress:
 - It ONLY adds `/bin/corepack.js`; it deliberately does NOT overwrite the direct
@@ -611,9 +614,12 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   `Uint8Array` to `process.stdout.write` renders as CSV byte codes.
 - `go.env` MUST stay tiny: Go's `wasm_exec` caps argv+env at ~12 KB of linear memory, so the
   runner passes only `TMPDIR`/`HOME`/`PATH`, not the whole shell env.
-- It's ~11 MB gz, so the kernel worker loads it **lazily in the background after `ready`**
-  (`loadTsgoInBackground`), with a "still downloading" placeholder shim installed at boot; the
-  tree persists in OPFS. Don't move it into the awaited boot block.
+- It's ~11 MB gz (a ~47 MB wasm), so the kernel worker loads it **on demand — the first time
+  `tsc`/`tsgo` is actually spawned** (registered via `kernel.registerLazyProgram`; the spawn
+  paths `await kernel.ensureCommandLoaded(command)` before resolving — see `registerLazyTools`
+  in `packages/core/src/workers/kernel-worker.ts`). Boot pays nothing; the tree persists in
+  OPFS, so a returning visitor's first use just re-applies the shims. Don't move it back into
+  the awaited boot block or a boot-time background prefetch.
 - Headless proofs: `scripts/spike-tsgo.mjs` (off-disk Path B) + `scripts/spike-tsgo-studio.mjs`
   (shipped shim + shared loader). NOTE these need host **Node ≥ 22** — the vendored `fs.js`
   uses `Array.fromAsync`, which the browser's V8 has but Node 20 lacks (a headless-only quirk;

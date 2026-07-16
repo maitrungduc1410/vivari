@@ -18,8 +18,10 @@
 // process.stdout/stderr (everything else falls through to the real VFS fs).
 //
 // This is HUGE relative to npm/corepack (~11 MB gz), so the kernel worker loads it
-// LAZILY in the background after boot (project creation + npm never wait on it),
-// and the tree persists in OPFS so only the first origin visit pays the download.
+// ON DEMAND — the first time `tsc`/`tsgo` is actually spawned (registered as a lazy
+// program; see packages/core/src/workers/kernel-worker.ts + Kernel.ensureCommandLoaded).
+// Boot pays nothing, and the tree persists in OPFS so a returning visitor's first
+// use just re-applies the shims (only the very first origin visit pays the download).
 
 export const TSGO_VFS_ROOT = "/usr/lib/tsgo";
 
@@ -87,10 +89,6 @@ WebAssembly.instantiate(bytes, go.importObject)
 // `tsc` and `tsgo` are the same binary for our purposes (tsgo mirrors tsc's CLI).
 const TSC_SHIM = `require(${JSON.stringify(TSGO_VFS_ROOT + "/tsgo-run.js")});\n`;
 
-// A placeholder installed at boot so `tsc`/`tsgo` give a friendly message while
-// the (multi-MB) asset is still downloading, instead of "command not found".
-const TSGO_LOADING_SHIM = `process.stderr.write('tsc: TypeScript (tsgo) is still downloading — try again in a moment.\\n');\nprocess.exit(1);\n`;
-
 /** True once the real tsgo tree is present in the VFS (e.g. restored from OPFS).
  *  Checks the wasm itself, not just a shim, so a half-written tree isn't mistaken
  *  for a complete one. */
@@ -121,15 +119,6 @@ export async function decodeTsgoPack(packBytes) {
     bytes: raw.subarray(blobStart + f.o, blobStart + f.o + f.l),
   }));
   return { version: header.version, files };
-}
-
-/**
- * Install the placeholder `tsc`/`tsgo` shims (cheap, no wasm). Call at boot so the
- * commands exist while the real asset loads in the background.
- */
-export function applyTsgoLoadingShims(kernel) {
-  kernel.writeFile("/bin/tsc.js", TSGO_LOADING_SHIM);
-  kernel.writeFile("/bin/tsgo.js", TSGO_LOADING_SHIM);
 }
 
 /**
