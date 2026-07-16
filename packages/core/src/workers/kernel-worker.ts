@@ -1240,39 +1240,50 @@ function registerLazyTools() {
     label: string,
     ensure: (k: typeof kernel, fetchBytes: () => Promise<Uint8Array | null>) => Promise<unknown>,
     asset: string,
+    // One-line, terminal-visible notice shown the moment a first-use download
+    // starts (so the command isn't a silent multi-second frozen prompt).
+    notice: string,
   ) => {
-    kernel.registerLazyProgram(names, async () => {
-      const t0 = Date.now();
-      try {
-        const res = (await ensure(kernel, () => fetchVendorAsset(asset))) as
-          | { restored?: boolean; version?: string | null; fileCount?: number }
-          | null;
-        if (res && res.restored) {
-          post("log", { line: `  [${label}] ready on first use (restored from OPFS, +${Date.now() - t0}ms).`, dim: true });
-        } else if (res) {
-          post("log", {
-            line: `  [${label}] loaded on first use (${res.fileCount} files, +${Date.now() - t0}ms).`,
-            dim: true,
-          });
-        } else {
-          post("log", { line: `  [${label}] asset unavailable — \`${names[0]}\` not installed.`, dim: true });
+    kernel.registerLazyProgram(
+      names,
+      async () => {
+        const t0 = Date.now();
+        try {
+          const res = (await ensure(kernel, () => fetchVendorAsset(asset))) as
+            | { restored?: boolean; version?: string | null; fileCount?: number }
+            | null;
+          if (res && res.restored) {
+            post("log", { line: `  [${label}] ready on first use (restored from OPFS, +${Date.now() - t0}ms).`, dim: true });
+          } else if (res) {
+            post("log", {
+              line: `  [${label}] loaded on first use (${res.fileCount} files, +${Date.now() - t0}ms).`,
+              dim: true,
+            });
+          } else {
+            post("log", { line: `  [${label}] asset unavailable — \`${names[0]}\` not installed.`, dim: true });
+          }
+          return res;
+        } catch (e) {
+          post("log", { line: `  [${label}] load failed (${(e && (e as Error).message) || e}).`, dim: true });
+          throw e; // let the kernel keep the registration so a later spawn can retry
         }
-        return res;
-      } catch (e) {
-        post("log", { line: `  [${label}] load failed (${(e && (e as Error).message) || e}).`, dim: true });
-        throw e; // let the kernel keep the registration so a later spawn can retry
-      }
-    });
+      },
+      notice,
+    );
   };
 
   // Real TypeScript 7 (tsgo, Go/wasm) — ~47 MB wasm, nothing at boot needs it.
-  lazyTool(["tsc", "tsgo"], "tsgo", ensureRealTsgo, REAL_TSGO_ASSET);
+  lazyTool(["tsc", "tsgo"], "tsgo", ensureRealTsgo, REAL_TSGO_ASSET,
+    "Downloading TypeScript 7 (tsgo) on first use — this can take a few seconds…");
   // Real yarn (classic).
-  lazyTool(["yarn"], "yarn", ensureRealYarn, REAL_YARN_ASSET);
+  lazyTool(["yarn"], "yarn", ensureRealYarn, REAL_YARN_ASSET,
+    "Downloading yarn on first use…");
   // Real pnpm (also exposes pnpx).
-  lazyTool(["pnpm", "pnpx"], "pnpm", ensureRealPnpm, REAL_PNPM_ASSET);
+  lazyTool(["pnpm", "pnpx"], "pnpm", ensureRealPnpm, REAL_PNPM_ASSET,
+    "Downloading pnpm on first use…");
   // Real corepack (Node's PM version manager).
-  lazyTool(["corepack"], "corepack", ensureRealCorepack, REAL_COREPACK_ASSET);
+  lazyTool(["corepack"], "corepack", ensureRealCorepack, REAL_COREPACK_ASSET,
+    "Downloading corepack on first use…");
 }
 
 // ── File-operation helpers (host Explorer: delete / copy / cut-paste) ────────
