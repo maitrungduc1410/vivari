@@ -8,7 +8,7 @@ import { createRequire } from "node:module";
 import { FsServer } from "../packages/kernel-host/fs-server.js";
 
 const require = createRequire(import.meta.url);
-const wasm = require("../packages/vfs/pkg-node/open_webcontainer_vfs.js");
+const wasm = require("../packages/vfs/pkg-node/vivari_vfs.js");
 
 const server = new FsServer(new wasm.VirtualFileSystem());
 

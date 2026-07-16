@@ -818,8 +818,8 @@ async function boot() {
   // Kick off the one-time codec compile up front; it runs concurrently with the
   // workers below (we only need the Modules before the first process is spawned).
   const codecsReady = Promise.all([
-    compileWasmModule(new URL("../../../codec/pkg/open_webcontainer_codec_bg.wasm", import.meta.url)),
-    compileWasmModule(new URL("../../../crypto/pkg/open_webcontainer_crypto_bg.wasm", import.meta.url)),
+    compileWasmModule(new URL("../../../codec/pkg/vivari_codec_bg.wasm", import.meta.url)),
+    compileWasmModule(new URL("../../../crypto/pkg/vivari_crypto_bg.wasm", import.meta.url)),
   ]);
 
   // Two independent nested workers, kicked off IN PARALLEL so their scripts load +

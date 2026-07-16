@@ -14,7 +14,7 @@
 // the adapter lives here. On boot we restore the manifest into the VFS BEFORE
 // serving any syscall; afterwards FsServer forwards mutations to the adapter.
 
-import initKernel, { VirtualFileSystem } from "../../../vfs/pkg/open_webcontainer_vfs.js";
+import initKernel, { VirtualFileSystem } from "../../../vfs/pkg/vivari_vfs.js";
 import { FsServer } from "../../../kernel-host/fs-server.js";
 import { createOpfsPersistence } from "../../../kernel-host/opfs-persistence.js";
 
@@ -189,7 +189,7 @@ const shouldPersist = (p) => {
   // and 404. The sibling-dir "../../../vfs/pkg/" form is correct both in the
   // Vite dev server and in the studio build.
   post("log", { line: "  [boot] initializing virtual file system…", cls: "muted" });
-  await initKernel(new URL("../../../vfs/pkg/open_webcontainer_vfs_bg.wasm", import.meta.url));
+  await initKernel(new URL("../../../vfs/pkg/vivari_vfs_bg.wasm", import.meta.url));
   const vfs = new VirtualFileSystem();
   // Honor a compression flag that may have arrived before the VFS existed, so it
   // is in force before the OPFS restore below.

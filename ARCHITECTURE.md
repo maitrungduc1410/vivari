@@ -178,7 +178,7 @@ never parks and many downloads can overlap (§6).
 ## 5. Filesystem
 
 - **VFS core**: `packages/vfs/` is a Rust crate compiled to Wasm (`wasm-pack`,
-  `web` + `nodejs` targets; crate `open-webcontainer-vfs`). It's an inode table (`HashMap<u64, Inode>`),
+  `web` + `nodejs` targets; crate `vivari-vfs`). It's an inode table (`HashMap<u64, Inode>`),
   directories map names→inode via `BTreeMap` (sorted readdir for free), symlinks
   with an `ELOOP` guard, `stat`/`lstat`, rename, errno-style errors. Hard links share
   one inode across names (`nlink` refcount; freed on last unlink).
