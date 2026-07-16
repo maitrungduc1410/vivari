@@ -6,7 +6,7 @@
 export default function (exports, require, module, process, internalBinding, primordials) {
   "use strict";
   const notImpl = () => {
-    const err = new Error("OpenContainer: undici (fetch/WebSocket) is not implemented yet");
+    const err = new Error("Vivari: undici (fetch/WebSocket) is not implemented yet");
     err.code = "ERR_METHOD_NOT_IMPLEMENTED";
     throw err;
   };

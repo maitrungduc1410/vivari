@@ -1,5 +1,5 @@
 // Spike (NETWORK): prove the Vue template's Vite dev server boots + serves in-VM.
-// Mirrors the shipped `vue-ts` template in packages/studio/src/oc/templates.ts,
+// Mirrors the shipped `vue-ts` template in packages/studio/src/vv/templates.ts,
 // including the @vitejs/plugin-vue@^6 bump (v5 peers vite <=6, so it ERESOLVEs
 // against the pinned Vite 8). The entry gate hits /src/App.vue so the SFC compiler
 // actually runs. Run (Node 22+):  node scripts/spike-vue.mjs
@@ -78,7 +78,7 @@ const count = ref(0)
     <button type="button" @click="count++">count is {{ count }}</button>
     <p>Edit <code>src/App.vue</code> and save to test HMR</p>
   </div>
-  <p>Running inside OpenContainer — a real Vite dev server in your browser.</p>
+  <p>Running inside Vivari — a real Vite dev server in your browser.</p>
 </template>
 `,
     "tsconfig.json": `{

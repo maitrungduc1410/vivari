@@ -26,7 +26,7 @@ const __wasi = new __nodeWASI({
 
 const __emnapiContext = __emnapiGetDefaultContext()
 
-// OpenContainer: napi-rs's generated default is `initial: 4000` (≈250 MiB). That
+// Vivari: napi-rs's generated default is `initial: 4000` (≈250 MiB). That
 // is fine on a server but wasteful in a browser tab (allocating+zeroing a 250 MiB
 // SharedArrayBuffer per addon can starve the tab or blow the preview timeout).
 // crc32's own memory import minimum is well under this, so we shrink the initial

@@ -11,7 +11,7 @@
 //      shims (NOT the Turbo-analog) — the analog would print a usage line for
 //      `npm --version`, real npm prints 10.9.2.
 //
-// Offline by default (version + shim gates). Set OC_NET=1 for the install gate
+// Offline by default (version + shim gates). Set VV_NET=1 for the install gate
 // (hits registry.npmjs.org). Run: node scripts/spike-npm-studio.mjs
 //
 // Prereq: the vendor asset must exist — run `npm run vendor:npm` first.
@@ -110,11 +110,11 @@ console.log(`npx gate: ${npxOk ? "PASS" : "FAIL"}  npx --version -> ${JSON.strin
 
 // Gate D (opt-in, network): a real install through the shim on PATH.
 let installOk = true;
-if (process.env.OC_NET === "1") {
-  const PKG = process.env.OC_PKG || "is-number";
+if (process.env.VV_NET === "1") {
+  const PKG = process.env.VV_PKG || "is-number";
   console.log(`\n── npm install ${PKG} (via /bin/npm.js shim, real registry) ──`);
   kernel.writeFile("/app/package.json", JSON.stringify({ name: "app", version: "1.0.0" }, null, 2));
-  const TIMEOUT_MS = Number(process.env.OC_TIMEOUT || 90000);
+  const TIMEOUT_MS = Number(process.env.VV_TIMEOUT || 90000);
   const t1 = Date.now();
   const inst = await Promise.race([
     kernel.start("npm", ["install", PKG, "--no-audit", "--no-fund"], { cwd: "/app", env, capture: true }),
@@ -127,7 +127,7 @@ if (process.env.OC_NET === "1") {
   installOk = inst.code === 0 && installed;
   console.log(`install gate: ${installOk ? "PASS" : "FAIL"}`);
 } else {
-  console.log("\n(install gate skipped — set OC_NET=1 to run it)");
+  console.log("\n(install gate skipped — set VV_NET=1 to run it)");
 }
 
 const ok = shimOk && versionOk && npxOk && installOk;

@@ -4,7 +4,7 @@
 import { bootSpikeKernel, writeProject, npmInstall, waitListen, httpGet } from "./lib/spike-harness.mjs";
 
 const DIR = "/fastify";
-const PORT = Number(process.env.OC_PORT || 3000);
+const PORT = Number(process.env.VV_PORT || 3000);
 const h = await bootSpikeKernel();
 
 writeProject(h.kernel, DIR, {
@@ -20,7 +20,7 @@ writeProject(h.kernel, DIR, {
   "src/index.js": `const Fastify = require('fastify');
 const app = Fastify({ logger: true });
 const port = Number(process.env.PORT ?? ${PORT});
-app.get('/', async () => 'Hello from Fastify, running inside OpenContainer!');
+app.get('/', async () => 'Hello from Fastify, running inside Vivari!');
 app.get('/api/hello', async () => ({ message: 'Hello, world!' }));
 app.listen({ port, host: '0.0.0.0' }).catch((err) => {
   app.log.error(err);
@@ -31,7 +31,7 @@ app.listen({ port, host: '0.0.0.0' }).catch((err) => {
 
 const inst = await npmInstall(h, { dir: DIR });
 if (inst.code !== 0) process.exit(1);
-if (process.env.OC_INSTALL_ONLY === "1") process.exit(0);
+if (process.env.VV_INSTALL_ONLY === "1") process.exit(0);
 
 const bound = await waitListen(h, { dir: DIR, port: PORT, argv: ["src/index.js"] });
 let getOk = false;

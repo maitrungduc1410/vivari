@@ -1,6 +1,6 @@
 // Spike (NETWORK): prove the Server-Sent Events showcase template streams live
-// over the oc-sse tunnel. Mirrors the shipped `sse` template in
-// packages/studio/src/oc/templates.ts.
+// over the vv-sse tunnel. Mirrors the shipped `sse` template in
+// packages/studio/src/vv/templates.ts.
 //
 // The browser reaches SSE via an EventSource polyfill that tunnels to
 // kernel.handleSseClient(); the in-VM runtime opens a loopback GET to /events and
@@ -15,7 +15,7 @@
 import { bootSpikeKernel, writeProject, npmInstall, waitListen } from "./lib/spike-harness.mjs";
 
 const DIR = "/sse";
-const PORT = Number(process.env.OC_PORT || 3000);
+const PORT = Number(process.env.VV_PORT || 3000);
 const h = await bootSpikeKernel();
 
 writeProject(h.kernel, DIR, {
@@ -60,7 +60,7 @@ app.listen(port, () => console.log('SSE demo on http://localhost:' + port));
 
 const inst = await npmInstall(h, { dir: DIR });
 if (inst.code !== 0) process.exit(1);
-if (process.env.OC_INSTALL_ONLY === "1") process.exit(0);
+if (process.env.VV_INSTALL_ONLY === "1") process.exit(0);
 
 const bound = await waitListen(h, { dir: DIR, port: PORT, argv: ["server/index.js"] });
 
@@ -99,7 +99,7 @@ if (bound) {
   const connId = "spike-1";
   h.kernel.handleSseClient({ sub: "open", connId, port: PORT, fallbackPort: PORT, path: "/events" });
 
-  const WATCH_MS = Number(process.env.OC_SSE_WATCH || 4000);
+  const WATCH_MS = Number(process.env.VV_SSE_WATCH || 4000);
   const t0 = Date.now();
   while (Date.now() - t0 < WATCH_MS) {
     await new Promise((r) => setTimeout(r, 100));
@@ -133,7 +133,7 @@ const ok =
 console.log(
   "\nRESULT: " +
     (ok
-      ? "PASS — SSE streams default + named (metric/notice) events over the oc-sse tunnel"
+      ? "PASS — SSE streams default + named (metric/notice) events over the vv-sse tunnel"
       : "FAIL — see logs above"),
 );
 process.exit(ok ? 0 : 1);

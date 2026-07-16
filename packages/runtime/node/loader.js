@@ -320,7 +320,7 @@ export function createNodeModules({ process, syscalls, netLiveness, netServers, 
     if (existing) return existing.exports; // done, or partial during a cycle
     const factory = FACTORIES[id];
     if (!factory) {
-      throw new Error(`OpenContainer: no vendored Node builtin '${id}'`);
+      throw new Error(`Vivari: no vendored Node builtin '${id}'`);
     }
     const module = { exports: {} };
     modules.set(id, module); // register BEFORE running so cycles see the partial

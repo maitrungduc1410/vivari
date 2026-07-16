@@ -1,4 +1,4 @@
-// Bridge to the OpenContainer kernel worker.
+// Bridge to the Vivari kernel worker.
 //
 // This is the studio's single point of contact with the runtime. It boots the
 // kernel worker (which itself spawns the fs / fetcher / process workers and the
@@ -25,7 +25,7 @@ export class KernelBridge {
   private readonly handlers = new Map<string, Set<Handler>>();
   private readonly anyHandlers = new Set<Handler>();
   private swRegistered = false;
-  // Correlation table for request()/oc-reply round-trips (readdir, read, etc.).
+  // Correlation table for request()/vv-reply round-trips (readdir, read, etc.).
   private readonly pending = new Map<number, (m: KernelMessage) => void>();
   private reqSeq = 1;
 
@@ -36,7 +36,7 @@ export class KernelBridge {
     );
     this.worker.onmessage = (event: MessageEvent<KernelMessage>) => {
       const m = event.data;
-      if (m.type === "oc-reply") {
+      if (m.type === "vv-reply") {
         const resolve = this.pending.get(m.reqId as number);
         if (resolve) {
           this.pending.delete(m.reqId as number);
@@ -56,7 +56,7 @@ export class KernelBridge {
     // events UP to this window; relay them down to the kernel worker.
     addEventListener("message", (event: MessageEvent) => {
       const d = event.data;
-      if (!d || d.dir !== "out" || (d.type !== "oc-ws" && d.type !== "oc-sse")) return;
+      if (!d || d.dir !== "out" || (d.type !== "vv-ws" && d.type !== "vv-sse")) return;
       this.worker.postMessage({ type: d.type as string, msg: d });
     });
   }
@@ -88,7 +88,7 @@ export class KernelBridge {
 
   /**
    * Request/response round-trip: post `type` with a correlation id and resolve
-   * when the worker answers with `{type:"oc-reply", reqId, ...}`. Used for VFS
+   * when the worker answers with `{type:"vv-reply", reqId, ...}`. Used for VFS
    * queries (readdir/read/stat) and project creation.
    */
   request(type: string, extra?: Record<string, unknown>): Promise<KernelMessage> {
@@ -120,8 +120,8 @@ export class KernelBridge {
     // The SW posts each preview request here; forward it to the kernel worker,
     // transferring the reply port so the worker answers the SW directly.
     navigator.serviceWorker.addEventListener("message", (event) => {
-      if (event.data?.type !== "oc-http") return;
-      this.worker.postMessage({ type: "oc-http", req: event.data.req }, [
+      if (event.data?.type !== "vv-http") return;
+      this.worker.postMessage({ type: "vv-http", req: event.data.req }, [
         event.ports[0],
       ]);
     });
@@ -140,7 +140,7 @@ export class KernelBridge {
     navigator.serviceWorker.ready
       .then((reg) => {
         const sw = reg.active || navigator.serviceWorker.controller;
-        sw?.postMessage({ type: "oc-keep-prefix-ports", ports });
+        sw?.postMessage({ type: "vv-keep-prefix-ports", ports });
       })
       .catch(() => {});
   }
@@ -165,7 +165,7 @@ export async function maybeResetVfs(): Promise<boolean> {
   if (!new URLSearchParams(location.search).has("reset")) return false;
   try {
     const dir = await navigator.storage.getDirectory();
-    await dir.removeEntry("oc-vfs", { recursive: true });
+    await dir.removeEntry("vv-vfs", { recursive: true });
     return true;
   } catch {
     return false; // nothing persisted yet

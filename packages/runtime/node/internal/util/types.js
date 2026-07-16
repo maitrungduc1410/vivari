@@ -82,7 +82,7 @@ export default function (exports, require, module, process, internalBinding, pri
     isExternal: () => false,
     // Recognise our symmetric crypto KeyObject via the brand it stamps on
     // instances (see node/lib/crypto.js) without importing crypto here.
-    isKeyObject: (v) => v != null && typeof v === "object" && v[Symbol.for("openContainer.crypto.KeyObject")] === true,
+    isKeyObject: (v) => v != null && typeof v === "object" && v[Symbol.for("vivari.crypto.KeyObject")] === true,
     isCryptoKey: () => false,
   };
 }

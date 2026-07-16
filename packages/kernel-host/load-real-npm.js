@@ -21,10 +21,10 @@ export const NPM_VFS_ROOT = "/usr/lib/node_modules/npm";
 // Thin shims installed on PATH. `node /bin/npm.js <args>` just loads the real
 // CLI; npm-cli.js reads process.argv (argv[1] = /bin/npm.js, rest = its args),
 // exactly like the spike's /run-npm.js wrapper proved on Path B.
-const NPM_SHIM = `// OpenContainer: real npm shim — see packages/kernel-host/load-real-npm.js.
+const NPM_SHIM = `// Vivari: real npm shim — see packages/kernel-host/load-real-npm.js.
 require(${JSON.stringify(NPM_VFS_ROOT + "/bin/npm-cli.js")});
 `;
-const NPX_SHIM = `// OpenContainer: real npx shim — see packages/kernel-host/load-real-npm.js.
+const NPX_SHIM = `// Vivari: real npx shim — see packages/kernel-host/load-real-npm.js.
 require(${JSON.stringify(NPM_VFS_ROOT + "/bin/npx-cli.js")});
 `;
 

@@ -1,6 +1,6 @@
 // Spike (NETWORK): prove the tRPC template's server boots and answers a typed
 // query in-VM. Mirrors the shipped `trpc` template's server in
-// packages/studio/src/oc/templates.ts.
+// packages/studio/src/vv/templates.ts.
 // The server entry is a raw `.ts` run via `node --experimental-strip-types
 // server/index.ts` — this is the regression guard for the "Unexpected identifier
 // 'AppRouter'" bug: OC's loader doesn't strip TS type syntax, so the template
@@ -11,7 +11,7 @@
 import { bootSpikeKernel, writeProject, npmInstall, waitListen, httpGet } from "./lib/spike-harness.mjs";
 
 const DIR = "/trpc";
-const PORT = Number(process.env.OC_PORT || 3001);
+const PORT = Number(process.env.VV_PORT || 3001);
 const h = await bootSpikeKernel();
 
 writeProject(h.kernel, DIR, {
@@ -42,7 +42,7 @@ console.log('[trpc] server listening on :${PORT}')
 
 const inst = await npmInstall(h, { dir: DIR });
 if (inst.code !== 0) process.exit(1);
-if (process.env.OC_INSTALL_ONLY === "1") process.exit(0);
+if (process.env.VV_INSTALL_ONLY === "1") process.exit(0);
 
 // The whole point: run the raw .ts entry through OC's loader, exactly like the
 // template's `npm run server` does.

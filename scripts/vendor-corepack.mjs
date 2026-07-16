@@ -28,7 +28,7 @@ import { fileURLToPath } from "node:url";
 
 const COREPACK_VERSION = "0.35.0"; // keep in sync with scripts/spike-corepack.mjs
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
-const VENDOR_DIR = process.env.OC_VENDOR_COREPACK_DIR || "/tmp/oc-vendor-corepack";
+const VENDOR_DIR = process.env.VV_VENDOR_COREPACK_DIR || "/tmp/vv-vendor-corepack";
 const VENDOR_COREPACK = path.join(VENDOR_DIR, "node_modules", "corepack");
 const OUT_DIR = path.join(ROOT, "packages", "studio", "public", "vendor");
 // Gzip-compressed but deliberately NOT named `.gz` (static servers would set

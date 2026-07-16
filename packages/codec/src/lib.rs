@@ -1,4 +1,4 @@
-// OpenContainer compression codec — the Rust/Wasm core beneath Node's real
+// Vivari compression codec — the Rust/Wasm core beneath Node's real
 // lib/zlib.js (Phase 2 #11). Exposes a streaming, z_stream-accurate API that
 // mirrors zlib's avail_in/avail_out model so the JS `internalBinding('zlib')`
 // layer can drive it exactly like Node's C++ binding drives libz.

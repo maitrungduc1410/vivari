@@ -1,7 +1,7 @@
 // A pragmatic `fs/promises` (and `fs.promises`) implementation.
 //
 // Node's real internal/fs/promises.js is a large module built on libuv's async
-// FS ops. OpenContainer's filesystem syscalls are synchronous under the hood (a
+// FS ops. Vivari's filesystem syscalls are synchronous under the hood (a
 // blocking SAB round-trip to the File System Worker), so the honest and simplest
 // implementation is a thin promise wrapper over the vendored sync fs API: each
 // call runs the corresponding *Sync function and resolves/rejects a Promise. This

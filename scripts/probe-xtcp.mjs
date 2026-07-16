@@ -61,7 +61,7 @@ const spawnWorker = (info) => {
 const out = [];
 const cap = (s) => {
   out.push(s);
-  if (process.env.OC_LIVE === "1") process.stderr.write(s);
+  if (process.env.VV_LIVE === "1") process.stderr.write(s);
 };
 const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, stdout: cap, stderr: cap });
 kernel.installCoreutils();

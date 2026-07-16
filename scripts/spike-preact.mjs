@@ -1,5 +1,5 @@
 // Spike (NETWORK): prove the Preact template's Vite dev server boots + serves
-// in-VM. Mirrors the shipped `preact` template in packages/studio/src/oc/templates.ts.
+// in-VM. Mirrors the shipped `preact` template in packages/studio/src/vv/templates.ts.
 // Run (Node 22+):  node scripts/spike-preact.mjs   (see spike-vite-lib.mjs for setup)
 
 import { runViteSpike } from "./spike-vite-lib.mjs";
@@ -63,7 +63,7 @@ export function App() {
       <div class="card">
         <button onClick={() => setCount((c) => c + 1)}>count is {count}</button>
       </div>
-      <p>Running inside OpenContainer.</p>
+      <p>Running inside Vivari.</p>
     </>
   )
 }

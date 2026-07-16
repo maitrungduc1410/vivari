@@ -34,7 +34,7 @@ export const COREPACK_VFS_ROOT = "/usr/lib/node_modules/corepack";
 // Thin shim on PATH. `node /bin/corepack.js <args>` loads the real entry
 // (dist/corepack.js), which reads process.argv exactly like the spike wrapper
 // proved.
-const COREPACK_SHIM = `// OpenContainer: real corepack shim — see packages/kernel-host/load-real-corepack.js.
+const COREPACK_SHIM = `// Vivari: real corepack shim — see packages/kernel-host/load-real-corepack.js.
 require(${JSON.stringify(COREPACK_VFS_ROOT + "/dist/corepack.js")});
 `;
 

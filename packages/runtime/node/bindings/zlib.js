@@ -134,7 +134,7 @@ export function createZlibBinding({ makeZStream, process }) {
 
     init(windowBits, level, _memLevel, _strategy, writeState, processCallback, _dictionary) {
       if (!makeZStream) {
-        throw new Error("OpenContainer: zlib wasm codec is not available in this process");
+        throw new Error("Vivari: zlib wasm codec is not available in this process");
       }
       this.windowBits = windowBits;
       this.level = level;

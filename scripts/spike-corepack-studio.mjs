@@ -12,7 +12,7 @@
 //
 // Crucially it uses the SAME env studio sets (COREPACK_HOME +
 // COREPACK_INTEGRITY_KEYS=0 + COREPACK_ENABLE_DOWNLOAD_PROMPT=0), NOT CLI flags —
-// so it verifies the studio config. Offline by default; set OC_NET=1 for the
+// so it verifies the studio config. Offline by default; set VV_NET=1 for the
 // download+run gate.
 //
 // Prereq: run `npm run vendor:corepack` first.
@@ -28,7 +28,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
 const ASSET = path.join(ROOT, "packages", "studio", "public", "vendor", "corepack-pack.bin");
 const COREPACK_VERSION = "0.35.0";
-const PM = process.env.OC_PM || "yarn@1.22.22";
+const PM = process.env.VV_PM || "yarn@1.22.22";
 const PM_BIN = PM.split("@")[0];
 const PM_EXPECT = PM.split("@")[1];
 
@@ -117,10 +117,10 @@ if (!versionOk && v.stderr) console.log("stderr:\n" + v.stderr.trim());
 // Gate C (opt-in, network): corepack DOWNLOADS + runs a project-pinned PM using
 // ONLY the env config (integrity escape hatch + home) — no CLI flags.
 let manageOk = true;
-if (process.env.OC_NET === "1") {
+if (process.env.VV_NET === "1") {
   console.log(`\n── corepack ${PM_BIN} --version with packageManager="${PM}" (via /bin/corepack.js shim, env config only) ──`);
   kernel.writeFile("/app/package.json", JSON.stringify({ name: "app", version: "1.0.0", private: true, packageManager: PM }, null, 2));
-  const TIMEOUT_MS = Number(process.env.OC_TIMEOUT || 180000);
+  const TIMEOUT_MS = Number(process.env.VV_TIMEOUT || 180000);
   const t1 = Date.now();
   const run = await Promise.race([
     kernel.start("corepack", [PM_BIN, "--version"], { cwd: "/app", env, capture: true }),
@@ -134,7 +134,7 @@ if (process.env.OC_NET === "1") {
   manageOk = run.code === 0 && printedVersion;
   console.log(`manage gate: ${manageOk ? "PASS" : "FAIL"}`);
 } else {
-  console.log("\n(manage gate skipped — set OC_NET=1 to run it)");
+  console.log("\n(manage gate skipped — set VV_NET=1 to run it)");
 }
 
 const ok = shimOk && versionOk && manageOk;

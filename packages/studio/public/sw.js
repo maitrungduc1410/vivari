@@ -22,7 +22,7 @@ const PREVIEW_MARKER = "/preview/";
 // deep-links resolve, and (crucially) `location.reload()` still targets a real
 // preview URL. The controller pushes the current set here; we also persist it so a
 // terminated-then-revived SW (which loses in-memory state) still routes correctly.
-const KEEP_PREFIX_CACHE = "oc-config";
+const KEEP_PREFIX_CACHE = "vv-config";
 const KEEP_PREFIX_KEY = "https://oc.config/keep-prefix-ports";
 let keepPrefixPorts = null; // Set<number> once loaded (null = not yet loaded)
 
@@ -42,7 +42,7 @@ async function loadKeepPrefixPorts() {
 
 self.addEventListener("message", (event) => {
   const d = event.data;
-  if (!d || d.type !== "oc-keep-prefix-ports" || !Array.isArray(d.ports)) return;
+  if (!d || d.type !== "vv-keep-prefix-ports" || !Array.isArray(d.ports)) return;
   keepPrefixPorts = new Set(d.ports.map((p) => p | 0));
   event.waitUntil(
     (async () => {
@@ -68,7 +68,7 @@ self.addEventListener("message", (event) => {
 // yields "undefined", so this is safe to reference in the un-built file.
 const BUILD_ID = typeof __OC_BUILD_ID__ !== "undefined" ? __OC_BUILD_ID__ : null;
 const CACHE_ON = BUILD_ID !== null;
-const CACHE_PREFIX = "oc-precache-";
+const CACHE_PREFIX = "vv-precache-";
 const CACHE_NAME = CACHE_PREFIX + BUILD_ID;
 
 // Directory this SW was served from — e.g. "/packages/demo-dist/" for the build,
@@ -125,10 +125,10 @@ async function cacheFirst(request) {
           try {
             await cache.put(request, resp.clone());
           } catch (err) {
-            console.warn("[oc-sw] cache.put failed for", key, "-", err && err.message);
+            console.warn("[vv-sw] cache.put failed for", key, "-", err && err.message);
           }
         } else {
-          console.warn("[oc-sw] not caching", key, "- status", resp && resp.status, "type", resp && resp.type);
+          console.warn("[vv-sw] not caching", key, "- status", resp && resp.status, "type", resp && resp.type);
         }
         return resp;
       })
@@ -153,7 +153,7 @@ async function cacheFirst(request) {
 // postMessage, so chobitsu never observes them and they never appear in the chii
 // Network panel (fetch/XHR stay native, so chobitsu already captures those). This
 // tiny helper lets the shims emit synthetic Chrome DevTools Protocol `Network.*`
-// events over the SAME channel the CDP bootstrap uses ({source:'oc-cdp',
+// events over the SAME channel the CDP bootstrap uses ({source:'vv-cdp',
 // dir:'target'}); the controller already relays those to the attached frontend,
 // which renders a WS Messages tab and an EventSource EventStream tab natively.
 //
@@ -166,7 +166,7 @@ const NET_SHIM = `(function(){
 if (window.__ocNet) return;
 var attached = false, gen = 0, live = {};
 function post(method, params){
-  try { parent.postMessage({ source:'oc-cdp', dir:'target', data: JSON.stringify({ method: method, params: params }) }, '*'); } catch(e){}
+  try { parent.postMessage({ source:'vv-cdp', dir:'target', data: JSON.stringify({ method: method, params: params }) }, '*'); } catch(e){}
 }
 // Announce a connection's creation events at most ONCE per generation. A new
 // generation begins on each (re)attach (onAttach); the DevTools frontend clears
@@ -207,7 +207,7 @@ function _b64(x){
   try { return btoa(s); } catch(e){ return ''; }
 }
 window.addEventListener('message', function(ev){
-  var d = ev.data; if (!d || d.type !== 'oc-ws' || d.dir !== 'in') return;
+  var d = ev.data; if (!d || d.type !== 'vv-ws' || d.dir !== 'in') return;
   var c = conns[d.connId]; if (c) c._deliver(d);
 });
 window.addEventListener('pagehide', function(){
@@ -245,7 +245,7 @@ function OCWebSocket(url, protocols){
       targetPort = parseInt(u.port, 10);
     }
   } catch(e){}
-  post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path, protocols: protocols || null });
+  post({ type:'vv-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path, protocols: protocols || null });
   // DevTools display URL: the real in-VM destination (localhost:<targetPort><path>),
   // NOT the studio-origin proxy URL the app resolved against (which carries the
   // internal /preview/<port>/ prefix and is confusing in the Network panel).
@@ -277,13 +277,13 @@ OCWebSocket.prototype.send = function(data){
     if (data instanceof ArrayBuffer) payload = data;
     else if (ArrayBuffer.isView(data)) payload = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     else { binary = false; payload = String(data); } }
-  post({ type:'oc-ws', dir:'out', sub:'send', connId:this._id, data:payload, binary:binary });
+  post({ type:'vv-ws', dir:'out', sub:'send', connId:this._id, data:payload, binary:binary });
   window.__ocNet.emit('Network.webSocketFrameSent', { requestId:this._rid, timestamp:window.__ocNet.now(), response:{ opcode: binary?2:1, mask:true, payloadData: binary ? _b64(payload) : String(payload) } });
 };
 OCWebSocket.prototype.close = function(code, reason){
   if (this.readyState === 3 || this.readyState === 2) return; this.readyState = 2;
   if (!this._cdpClosed){ this._cdpClosed = true; window.__ocNet.emit('Network.webSocketClosed', { requestId:this._rid, timestamp:window.__ocNet.now() }); window.__ocNet.unregister(this._rid); }
-  post({ type:'oc-ws', dir:'out', sub:'close', connId:this._id, code:code, reason:reason });
+  post({ type:'vv-ws', dir:'out', sub:'close', connId:this._id, code:code, reason:reason });
 };
 OCWebSocket.prototype.addEventListener = function(t, fn){ if (this._l[t]) this._l[t].push(fn); };
 OCWebSocket.prototype.removeEventListener = function(t, fn){ var a=this._l[t]; if(a){var i=a.indexOf(fn); if(i>=0)a.splice(i,1);} };
@@ -332,7 +332,7 @@ var tok = Math.random().toString(36).slice(2, 8);
 var nextId = 1, conns = {};
 function post(msg){ parent.postMessage(msg, '*'); }
 window.addEventListener('message', function(ev){
-  var d = ev.data; if (!d || d.type !== 'oc-sse' || d.dir !== 'in') return;
+  var d = ev.data; if (!d || d.type !== 'vv-sse' || d.dir !== 'in') return;
   var c = conns[d.connId]; if (c) c._deliver(d);
 });
 window.addEventListener('pagehide', function(){
@@ -351,7 +351,7 @@ function OCEventSource(url, cfg){
     if (pm) { targetPort = parseInt(pm[1], 10); path = (pm[2] || '/') + u.search; }
     else if (u.port && u.port !== location.port) targetPort = parseInt(u.port, 10);
   } catch(e){}
-  post({ type:'oc-sse', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path });
+  post({ type:'vv-sse', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path });
   // DevTools display URL: the real in-VM destination, with the internal
   // /preview/<port>/ proxy prefix stripped (see the ws shim for rationale).
   var self2 = this; this._rid = this._id;
@@ -400,7 +400,7 @@ OCEventSource.prototype._parse = function(raw){
 OCEventSource.prototype.close = function(){
   if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id];
   this._sseFinish();
-  post({ type:'oc-sse', dir:'out', sub:'close', connId:this._id });
+  post({ type:'vv-sse', dir:'out', sub:'close', connId:this._id });
 };
 OCEventSource.prototype.addEventListener = function(t, fn){ (this._l[t] || (this._l[t] = [])).push(fn); };
 OCEventSource.prototype.removeEventListener = function(t, fn){ var a=this._l[t]; if(a){var i=a.indexOf(fn); if(i>=0)a.splice(i,1);} };
@@ -419,10 +419,10 @@ window.EventSource = OCEventSource;
 // SPA/MPA navigation up to the host so the preview address bar stays in sync.
 //
 // Protocol on the host page:
-//   preview → host : { source:'oc-cdp', dir:'target',   data:<cdp json string> }
-//                     { source:'oc-nav', href:<path>                          }
-//   host  → preview: { source:'oc-cdp', dir:'frontend', data:<cdp json string> }  (forward to chobitsu)
-//                     { source:'oc-cdp', dir:'init'                            }  (run the attach handshake)
+//   preview → host : { source:'vv-cdp', dir:'target',   data:<cdp json string> }
+//                     { source:'vv-nav', href:<path>                          }
+//   host  → preview: { source:'vv-cdp', dir:'frontend', data:<cdp json string> }  (forward to chobitsu)
+//                     { source:'vv-cdp', dir:'init'                            }  (run the attach handshake)
 const CDP_BOOTSTRAP = `(function(){
 if (window.__ocCdpInstalled) return; window.__ocCdpInstalled = true;
 function post(m){ parent.postMessage(m, '*'); }
@@ -480,13 +480,13 @@ function setup(){
     if (typeof msg === 'string' && msg.indexOf('/preview/') !== -1 && msg.indexOf('"Network.') !== -1) {
       try { var o = JSON.parse(msg); if (o && typeof o.method === 'string' && o.method.indexOf('Network.') === 0 && scrubNet(o)) msg = JSON.stringify(o); } catch(e){}
     }
-    post({ source:'oc-cdp', dir:'target', data: msg });
+    post({ source:'vv-cdp', dir:'target', data: msg });
   });
   return true;
 }
 if (!setup()) { var tries = 0, iv = setInterval(function(){ if (setup() || ++tries > 100) clearInterval(iv); }, 20); }
 function sendToChobitsu(method){ if (window.chobitsu) window.chobitsu.sendRawMessage(JSON.stringify({ id:'ocdt'+(++seq), method:method, params:{} })); }
-function sendToDevtools(msg){ post({ source:'oc-cdp', dir:'target', data: JSON.stringify(msg) }); }
+function sendToDevtools(msg){ post({ source:'vv-cdp', dir:'target', data: JSON.stringify(msg) }); }
 function init(){
   sendToDevtools({ method:'Page.frameNavigated', params:{ frame:{ id:'1', mimeType:'text/html', securityOrigin: location.origin, url: location.href }, type:'Navigation' } });
   sendToChobitsu('Network.enable');
@@ -505,7 +505,7 @@ function init(){
 }
 window.addEventListener('message', function(ev){
   var d = ev.data;
-  if (!d || d.source !== 'oc-cdp') return;
+  if (!d || d.source !== 'vv-cdp') return;
   if (d.dir === 'frontend') {
     if (window.chobitsu) window.chobitsu.sendRawMessage(d.data);
     // The frontend just enabled its Network domain → its panel is ready to render
@@ -514,7 +514,7 @@ window.addEventListener('message', function(ev){
   }
   else if (d.dir === 'init') { init(); }
 });
-function notifyNav(){ post({ source:'oc-nav', href: location.pathname + location.search + location.hash }); }
+function notifyNav(){ post({ source:'vv-nav', href: location.pathname + location.search + location.hash }); }
 var _ps = history.pushState, _rs = history.replaceState;
 history.pushState = function(){ var r = _ps.apply(this, arguments); notifyNav(); return r; };
 history.replaceState = function(){ var r = _rs.apply(this, arguments); notifyNav(); return r; };
@@ -525,7 +525,7 @@ notifyNav();
 })();`;
 
 const DEVTOOLS_TAGS =
-  '<script src="/oc-devtools/chobitsu.js"><\/script>' + "<script>" + CDP_BOOTSTRAP + "<\/script>";
+  '<script src="/vv-devtools/chobitsu.js"><\/script>' + "<script>" + CDP_BOOTSTRAP + "<\/script>";
 
 // Insert the shim as the first child of <head> (so it runs before any script).
 // The DevTools network bridge (NET_SHIM) runs first so the WS/SSE shims can use
@@ -585,12 +585,12 @@ async function precache() {
         fetched++;
       } catch (err) {
         failed++;
-        console.warn("[oc-sw] precache miss:", url, "-", err && err.message);
+        console.warn("[vv-sw] precache miss:", url, "-", err && err.message);
       }
     }),
   );
   if (fetched || failed) {
-    console.log(`[oc-sw] precache ${CACHE_NAME}: ${fetched} fetched, ${kept} cached, ${failed} failed`);
+    console.log(`[vv-sw] precache ${CACHE_NAME}: ${fetched} fetched, ${kept} cached, ${failed} failed`);
   }
 }
 
@@ -641,10 +641,10 @@ self.addEventListener("fetch", (event) => {
   }
 
   // The vendored DevTools CDP backend (chobitsu). A preview page loads it via an
-  // absolute /oc-devtools/... URL, so without this exception routeByClient would
+  // absolute /vv-devtools/... URL, so without this exception routeByClient would
   // proxy it into the VM (which has no such file). It's always OUR app asset —
   // let it hit the network (served same-origin by the serveDevtools Vite plugin).
-  if (url.pathname.startsWith("/oc-devtools/")) return;
+  if (url.pathname.startsWith("/vv-devtools/")) return;
 
   // The vendored DevTools frontend (chii): the host document itself and all of
   // its module assets. These are OUR app files (served same-origin by the
@@ -657,7 +657,7 @@ self.addEventListener("fetch", (event) => {
   // Our own vendored assets (the real-npm delivery pack, editor bundles). These
   // are same-origin OUR files and must hit the network directly — routing them
   // through routeByClient fails under cross-origin isolation (a spurious
-  // `fetch(event.request)` failure), exactly like /oc-devtools/ + /packages/.
+  // `fetch(event.request)` failure), exactly like /vv-devtools/ + /packages/.
   // The kernel worker fetches /vendor/npm-pack.bin here; without this bypass it
   // gets "Failed to fetch" and falls back to the built-in npm.
   if (url.pathname.startsWith("/vendor/")) return;
@@ -718,7 +718,7 @@ async function handlePreview(event, port, path, keepPrefix) {
     clients.find((c) => !isPreview(c)) ||
     clients[0];
   if (!kernelClient) {
-    return new Response("OpenContainer kernel is not running\n", { status: 503 });
+    return new Response("Vivari kernel is not running\n", { status: 503 });
   }
 
   let body = "";
@@ -747,7 +747,7 @@ async function handlePreview(event, port, path, keepPrefix) {
       clearTimeout(timer);
       resolve(e.data);
     };
-    kernelClient.postMessage({ type: "oc-http", req }, [mc.port2]);
+    kernelClient.postMessage({ type: "vv-http", req }, [mc.port2]);
   });
 
   const respHeaders = new Headers(resp.headers || {});

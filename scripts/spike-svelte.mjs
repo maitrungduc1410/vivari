@@ -1,6 +1,6 @@
 // Spike (NETWORK): prove the Svelte template's Vite dev server boots + serves
 // in-VM. Mirrors the shipped `svelte-ts` template in
-// packages/studio/src/oc/templates.ts, pinned to Vite 7 + @sveltejs/vite-plugin-svelte@^6.
+// packages/studio/src/vv/templates.ts, pinned to Vite 7 + @sveltejs/vite-plugin-svelte@^6.
 // Vite 8 is avoided on purpose: its rolldown-wasm dep optimizer, combined with the
 // SSR optimize pass vite-plugin-svelte forces on boot, panics in-VM with "Access
 // tokio runtime failed in spawn" (the napi-rs tokio runtime is shut down after the
@@ -87,7 +87,7 @@ export default app
   <button onclick={() => count++}>count is {count}</button>
   <p>Edit <code>src/App.svelte</code> and save to test HMR</p>
 </div>
-<p>Running inside OpenContainer — a real Vite dev server in your browser.</p>
+<p>Running inside Vivari — a real Vite dev server in your browser.</p>
 `,
     "tsconfig.json": `{
   "compilerOptions": {

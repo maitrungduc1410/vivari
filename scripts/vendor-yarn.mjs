@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 
 const YARN_VERSION = "1.22.22"; // keep in sync with scripts/spike-yarn.mjs
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
-const VENDOR_DIR = process.env.OC_VENDOR_YARN_DIR || "/tmp/oc-vendor-yarn";
+const VENDOR_DIR = process.env.VV_VENDOR_YARN_DIR || "/tmp/vv-vendor-yarn";
 const VENDOR_YARN = path.join(VENDOR_DIR, "node_modules", "yarn");
 const OUT_DIR = path.join(ROOT, "packages", "studio", "public", "vendor");
 // Gzip-compressed but deliberately NOT named `.gz` — static servers (Vite's

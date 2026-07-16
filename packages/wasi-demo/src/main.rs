@@ -1,6 +1,6 @@
 // A tiny wasm32-wasip1 CLI exercising the WASI preview1 surface a real tool
 // needs: argv, environ, a preopened directory, file read/write, and stdio. Rust
-// std maps all of these onto WASI calls, which OpenContainer's runtime services
+// std maps all of these onto WASI calls, which Vivari's runtime services
 // against its VFS (#16 stage 1). Output is deterministic so tests can assert it.
 //
 // Usage: wasi_demo <input> <output>

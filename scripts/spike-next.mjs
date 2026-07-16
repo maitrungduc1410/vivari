@@ -12,8 +12,8 @@
 // binds its port, GET / returns 200 HTML with the page content, and the compile log
 // shows the wasm build was used.
 //
-//   1) vendor npm:  rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor \
-//        && (cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
+//   1) vendor npm:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor \
+//        && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
 //   2) run (Node 22+):  node scripts/spike-next.mjs
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
@@ -23,15 +23,15 @@ import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
 
-const VENDOR_NPM = process.argv[2] || "/tmp/oc-vendor/node_modules/npm";
+const VENDOR_NPM = process.argv[2] || "/tmp/vv-vendor/node_modules/npm";
 const VFS_NPM = "/usr/lib/node_modules/npm";
 if (!fs.existsSync(path.join(VENDOR_NPM, "bin/npm-cli.js"))) {
   console.error(`No vendored npm at ${VENDOR_NPM} (expected bin/npm-cli.js).`);
-  console.error(`Vendor it:  rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor && (cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)`);
+  console.error(`Vendor it:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)`);
   process.exit(2);
 }
 
-const LIVE = process.env.OC_LIVE === "1";
+const LIVE = process.env.VV_LIVE === "1";
 const DIR = "/next";
 const PORT = 3024;
 
@@ -131,7 +131,7 @@ kernel.mkdirp("/home/user");
 kernel.mkdirp("/tmp/.npm/_logs");
 
 // ── App Router project source ────────────────────────────────────────────────
-const NEXT_VERSION = process.env.OC_NEXT_VERSION || "16";
+const NEXT_VERSION = process.env.VV_NEXT_VERSION || "16";
 kernel.mkdirp(DIR + "/app");
 kernel.writeFile(
   DIR + "/package.json",
@@ -161,7 +161,7 @@ kernel.writeFile(
 kernel.writeFile(DIR + "/next.config.mjs", "const nextConfig = {};\nexport default nextConfig;\n");
 kernel.writeFile(
   DIR + "/app/layout.js",
-  `export const metadata = { title: "Next in OpenContainer" };
+  `export const metadata = { title: "Next in Vivari" };
 export default function RootLayout({ children }) {
   return (
     <html lang="en">
@@ -176,7 +176,7 @@ kernel.writeFile(
   `export default function Home() {
   return (
     <main>
-      <h1 id="marker">Next.js App Router in OpenContainer</h1>
+      <h1 id="marker">Next.js App Router in Vivari</h1>
       <p>compiled by wasm SWC + webpack</p>
     </main>
   );
@@ -184,10 +184,10 @@ kernel.writeFile(
 `,
 );
 
-const env = { HOME: "/home/user", PATH: DIR + "/node_modules/.bin:/bin", npm_config_cache: "/tmp/.npm", NODE_ENV: "development", OC_LIVE: LIVE ? "1" : "" };
+const env = { HOME: "/home/user", PATH: DIR + "/node_modules/.bin:/bin", npm_config_cache: "/tmp/.npm", NODE_ENV: "development", VV_LIVE: LIVE ? "1" : "" };
 
 // ── fork IPC self-test (isolates child_process.fork from Next) ────────────────
-if (process.env.OC_FORKTEST === "1") {
+if (process.env.VV_FORKTEST === "1") {
   kernel.writeFile(
     "/fork-child.js",
     `console.log("CHILD start, has send=" + (typeof process.send));
@@ -212,7 +212,7 @@ child.on("error", (e) => { console.log("PARENT child error " + e.message); proce
 
 // ── gate 1: install (must pull wasm SWC, not native) ─────────────────────────
 console.log(`\n== npm install (next@${NEXT_VERSION} react react-dom @next/swc-wasm-nodejs) ==`);
-const INSTALL_TIMEOUT = Number(process.env.OC_INSTALL_TIMEOUT || 300000);
+const INSTALL_TIMEOUT = Number(process.env.VV_INSTALL_TIMEOUT || 300000);
 const t1 = Date.now();
 let installTimedOut = false;
 const inst = await Promise.race([
@@ -241,7 +241,7 @@ for (const p of ["@next/swc-darwin-arm64", "@next/swc-linux-x64-gnu"]) {
 // the installed package into that dir — no network, deterministic.
 console.log("\n== seed wasm SWC cache ==");
 kernel.writeFile(
-  DIR + "/oc-seed-swc.js",
+  DIR + "/vv-seed-swc.js",
   `const fs = require("fs");
 const path = require("path");
 const src = "${DIR}/node_modules/@next/swc-wasm-nodejs";
@@ -258,7 +258,7 @@ cp(src, dst);
 console.log("seeded " + fs.readdirSync(dst).length + " entries");
 `,
 );
-const seed = await kernel.start("node", [DIR + "/oc-seed-swc.js"], { cwd: DIR, env, capture: true });
+const seed = await kernel.start("node", [DIR + "/vv-seed-swc.js"], { cwd: DIR, env, capture: true });
 console.log("  seed exit=" + seed.code + " " + (seed.stdout || "").trim() + (seed.stderr ? " ERR:" + seed.stderr.trim() : ""));
 
 // ── gate 2: next dev --webpack binds the port ────────────────────────────────
@@ -271,7 +271,7 @@ kernel.start(
   ["node_modules/next/dist/bin/next", "dev", "--webpack", "-p", String(PORT), "-H", "127.0.0.1"],
   { cwd: DIR, env },
 );
-const BIND_TIMEOUT = Number(process.env.OC_BIND_TIMEOUT || 240000);
+const BIND_TIMEOUT = Number(process.env.VV_BIND_TIMEOUT || 240000);
 const tb = Date.now();
 let fatal = "";
 while (!listening.has(PORT) && Date.now() - tb < BIND_TIMEOUT && !fatal) {
@@ -297,7 +297,7 @@ if (bound) {
     root = await get("/");
   }
   const body = decode(root.body || "");
-  getOk = root.status === 200 && /Next\.js App Router in OpenContainer|id="marker"/.test(body);
+  getOk = root.status === 200 && /Next\.js App Router in Vivari|id="marker"/.test(body);
   console.log(`  GET / -> ${root.status}  (${body.length} bytes)`);
   console.log("  body head: " + body.slice(0, 200).replace(/\n/g, " "));
   compiledWasm = /wasm build @next\/swc-wasm-nodejs|next-swc build: wasm/.test(out.join(""));
@@ -328,7 +328,7 @@ if (bound) {
 // stream — thrown only during the App Router's RSC refresh render (the request the
 // client re-issues after `serverComponentChanges`), never on a plain document GET.
 // It only reproduces on the best-effort AsyncLocalStorage polyfill (the studio's
-// browser-worker path), so run this gate with OC_NO_HOST_ALS=1 to guard against a
+// browser-worker path), so run this gate with VV_NO_HOST_ALS=1 to guard against a
 // regression there — a streaming render returns its promise early while React
 // keeps rendering across awaits, so run() must not zero the store on settle.
 let rscOk = true;
@@ -357,10 +357,10 @@ if (bound) {
 }
 
 // ── optional: probe the HMR WebSocket exactly like the browser preview does ───
-// (OC_WSPROBE=1) Reveals what the dev server pushes over /_next/webpack-hmr:
+// (VV_WSPROBE=1) Reveals what the dev server pushes over /_next/webpack-hmr:
 // SYNC/RELOAD_PAGE/SERVER_COMPONENT_CHANGES, or connection flapping — the drivers
 // of the client's reload loop.
-if (process.env.OC_WSPROBE === "1" && bound) {
+if (process.env.VV_WSPROBE === "1" && bound) {
   console.log("\n== HMR ws probe ==");
   const frames = [];
   kernel.onWsSend = (m) => {

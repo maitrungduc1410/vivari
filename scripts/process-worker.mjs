@@ -65,9 +65,9 @@ parentPort.on("message", (msg) => {
       cryptoCodec,
       // Real AsyncLocalStorage (V8 PromiseHook) for cross-await context — Next.js
       // App Router (RSC) workStore. The browser twin has no equivalent binding and
-      // uses the runtime's best-effort polyfill instead; set OC_NO_HOST_ALS=1 to
+      // uses the runtime's best-effort polyfill instead; set VV_NO_HOST_ALS=1 to
       // force that polyfill here and exercise the browser path headlessly.
-      hostAsyncHooks: process.env.OC_NO_HOST_ALS ? null : hostAsyncHooks,
+      hostAsyncHooks: process.env.VV_NO_HOST_ALS ? null : hostAsyncHooks,
       // Real worker_threads.markAsUntransferable so the runtime's Buffer pool can be
       // marked untransferable to the *platform's* postMessage — otherwise a guest
       // transferring a pooled Buffer's .buffer would detach (corrupt) the whole pool.

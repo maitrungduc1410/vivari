@@ -13,11 +13,11 @@
 // COREPACK_INTEGRITY_KEYS=0 (skips the signature check; the sha512 tarball
 // integrity check, which uses createHash, still runs).
 //
-//   1) vendor:  rm -rf /tmp/oc-vendor-corepack && mkdir -p /tmp/oc-vendor-corepack \
-//        && (cd /tmp/oc-vendor-corepack && npm install corepack@latest --no-save --no-audit --no-fund)
+//   1) vendor:  rm -rf /tmp/vv-vendor-corepack && mkdir -p /tmp/vv-vendor-corepack \
+//        && (cd /tmp/vv-vendor-corepack && npm install corepack@latest --no-save --no-audit --no-fund)
 //   2) run:  node scripts/spike-corepack.mjs [path-to-vendored-corepack]
-//            OC_LIVE=1 streams output; OC_NONET=1 skips the download gate;
-//            OC_PM=yarn@1.22.22 (default) picks which PM corepack should fetch.
+//            VV_LIVE=1 streams output; VV_NONET=1 skips the download gate;
+//            VV_PM=yarn@1.22.22 (default) picks which PM corepack should fetch.
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
@@ -25,17 +25,17 @@ import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
 
-const VENDOR_COREPACK = process.argv[2] || "/tmp/oc-vendor-corepack/node_modules/corepack";
+const VENDOR_COREPACK = process.argv[2] || "/tmp/vv-vendor-corepack/node_modules/corepack";
 const VFS_COREPACK = "/usr/lib/node_modules/corepack";
 const COREPACK_VERSION = "0.35.0";
 const LARGE_THRESHOLD = 512 * 1024;
-const PM = process.env.OC_PM || "yarn@1.22.22";
+const PM = process.env.VV_PM || "yarn@1.22.22";
 const PM_EXPECT = PM.split("@")[1];
 const PM_BIN = PM.split("@")[0];
 
 if (!fs.existsSync(path.join(VENDOR_COREPACK, "dist/corepack.js"))) {
   console.error(`No vendored corepack at ${VENDOR_COREPACK} (expected dist/corepack.js).`);
-  console.error(`Vendor it first:  rm -rf /tmp/oc-vendor-corepack && mkdir -p /tmp/oc-vendor-corepack && (cd /tmp/oc-vendor-corepack && npm install corepack@latest --no-save --no-audit --no-fund)`);
+  console.error(`Vendor it first:  rm -rf /tmp/vv-vendor-corepack && mkdir -p /tmp/vv-vendor-corepack && (cd /tmp/vv-vendor-corepack && npm install corepack@latest --no-save --no-audit --no-fund)`);
   process.exit(2);
 }
 
@@ -82,7 +82,7 @@ const fetcher = async (url, init) => {
   return { ok: r.ok, status: r.status, statusText: r.statusText, headers, body };
 };
 
-const LIVE = process.env.OC_LIVE === "1";
+const LIVE = process.env.VV_LIVE === "1";
 const kernel = new Kernel({
   fs: kernelFs.fs,
   spawnWorker,
@@ -128,7 +128,7 @@ kernel.writeFile(
 const fs = require('fs');
 const LOG = '/corepacklog.txt';
 try { fs.writeFileSync(LOG, ''); } catch (e) {}
-const LIVE = process.env.OC_LIVE === '1';
+const LIVE = process.env.VV_LIVE === '1';
 const append = (s) => { try { fs.appendFileSync(LOG, s + '\\n'); } catch (e) {} if (LIVE) { try { process.stderr.write('[corepack] ' + s + '\\n'); } catch (e) {} } };
 process.on('uncaughtException', (e) => append('UNCAUGHT ' + ((e && e.stack) || e)));
 process.on('unhandledRejection', (e) => append('UNHANDLED ' + ((e && e.stack) || e)));
@@ -144,7 +144,7 @@ try {
 const env = {
   HOME: "/home/user",
   PATH: "/bin",
-  OC_LIVE: LIVE ? "1" : "",
+  VV_LIVE: LIVE ? "1" : "",
   COREPACK_HOME: "/tmp/.corepack",
   // We can't do the registry ECDSA signature check (no crypto.verify), so use the
   // official escape hatch. sha512 tarball integrity (createHash) still runs.
@@ -202,13 +202,13 @@ console.log("Gate B (https): " + (httpsOk ? "PASS" : "FAIL") + "\n");
 
 // ── Gate C: corepack DOWNLOADS + runs a project-pinned PM version ─────────────
 let manageOk = true;
-if (process.env.OC_NONET !== "1") {
+if (process.env.VV_NONET !== "1") {
   console.log(`── Gate C: corepack ${PM_BIN} --version with packageManager="${PM}" (download + exec) ──`);
   kernel.writeFile(
     "/app/package.json",
     JSON.stringify({ name: "app", version: "1.0.0", private: true, packageManager: PM }, null, 2),
   );
-  const TIMEOUT_MS = Number(process.env.OC_TIMEOUT || 180000);
+  const TIMEOUT_MS = Number(process.env.VV_TIMEOUT || 180000);
   const t2 = Date.now();
   let timedOut = false;
   const run = await Promise.race([
@@ -225,7 +225,7 @@ if (process.env.OC_NONET !== "1") {
   console.log(`\ncorepack ran ${PM} and it printed ${PM_EXPECT}: ${printedVersion}`);
   console.log("Gate C (manages PM): " + (manageOk ? "PASS" : "FAIL") + "\n");
 } else {
-  console.log("── Gate C skipped (OC_NONET=1) ──\n");
+  console.log("── Gate C skipped (VV_NONET=1) ──\n");
 }
 
 const ok = versionOk && httpsOk && manageOk;

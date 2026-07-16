@@ -13,8 +13,8 @@
 // tunneled connection to :3001 and asserts BOTH directions — the backend's
 // server→client tick + welcome, and a client→server→client echo.
 //
-// Prereq (host, one-time):  rm -rf /tmp/oc-vendor-wsdemo && mkdir -p /tmp/oc-vendor-wsdemo \
-//   && (cd /tmp/oc-vendor-wsdemo && npm install express@^4.21.0 ws@^8.18.0 --no-audit --no-fund)
+// Prereq (host, one-time):  rm -rf /tmp/vv-vendor-wsdemo && mkdir -p /tmp/vv-vendor-wsdemo \
+//   && (cd /tmp/vv-vendor-wsdemo && npm install express@^4.21.0 ws@^8.18.0 --no-audit --no-fund)
 // Requires Node >= 22 on the host (runtime fs.js uses Array.fromAsync).
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
@@ -23,11 +23,11 @@ import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
 
-const VENDOR = process.env.OC_WS_DEPS || "/tmp/oc-vendor-wsdemo/node_modules";
+const VENDOR = process.env.VV_WS_DEPS || "/tmp/vv-vendor-wsdemo/node_modules";
 const LARGE_THRESHOLD = 512 * 1024;
 if (!fs.existsSync(path.join(VENDOR, "express")) || !fs.existsSync(path.join(VENDOR, "ws"))) {
   console.error(`Missing express/ws at ${VENDOR}.`);
-  console.error(`Install first:  rm -rf /tmp/oc-vendor-wsdemo && mkdir -p /tmp/oc-vendor-wsdemo && (cd /tmp/oc-vendor-wsdemo && npm install express@^4.21.0 ws@^8.18.0 --no-audit --no-fund)`);
+  console.error(`Install first:  rm -rf /tmp/vv-vendor-wsdemo && mkdir -p /tmp/vv-vendor-wsdemo && (cd /tmp/vv-vendor-wsdemo && npm install express@^4.21.0 ws@^8.18.0 --no-audit --no-fund)`);
   process.exit(2);
 }
 
@@ -61,7 +61,7 @@ const spawnWorker = (info) => {
   };
 };
 
-const LIVE = process.env.OC_LIVE === "1";
+const LIVE = process.env.VV_LIVE === "1";
 const kernel = new Kernel({
   fs: kernelFs.fs,
   spawnWorker,

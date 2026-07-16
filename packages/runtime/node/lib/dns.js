@@ -1,5 +1,5 @@
 // A loopback-aware `dns` shim. There is no real resolver in the browser, and
-// OpenContainer's virtual network is in-process loopback only, so every name
+// Vivari's virtual network is in-process loopback only, so every name
 // resolves to loopback (127.0.0.1 / ::1). This is exactly what the vendored
 // lib/net.js needs: it does `require('dns')` and calls `dns.lookup(host, ...)`
 // when you connect/listen by hostname (e.g. 'localhost'), so wiring this in

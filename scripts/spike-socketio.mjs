@@ -1,6 +1,6 @@
 // Spike (NETWORK): prove the Socket.IO Showcase template boots and serves a live
 // Socket.IO endpoint in-VM. Mirrors the shipped `socketio` template in
-// packages/studio/src/oc/templates.ts.
+// packages/studio/src/vv/templates.ts.
 //
 // The real-time chat runs over WebSockets tunneled through the preview (the ws
 // tunnel is covered by ws-demo/spike-ws). Here we prove the server side in-VM:
@@ -11,7 +11,7 @@
 import { bootSpikeKernel, writeProject, npmInstall, waitListen, httpGet } from "./lib/spike-harness.mjs";
 
 const DIR = "/socketio";
-const PORT = Number(process.env.OC_PORT || 3000);
+const PORT = Number(process.env.VV_PORT || 3000);
 const h = await bootSpikeKernel();
 
 writeProject(h.kernel, DIR, {
@@ -50,7 +50,7 @@ httpServer.listen(port, () => console.log('Socket.IO chat on http://localhost:' 
 
 const inst = await npmInstall(h, { dir: DIR });
 if (inst.code !== 0) process.exit(1);
-if (process.env.OC_INSTALL_ONLY === "1") process.exit(0);
+if (process.env.VV_INSTALL_ONLY === "1") process.exit(0);
 
 const bound = await waitListen(h, { dir: DIR, port: PORT, argv: ["server.js"] });
 

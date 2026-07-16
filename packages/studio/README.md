@@ -1,11 +1,11 @@
-# OpenContainer Studio
+# Vivari Studio
 
-The primary UI for OpenContainer — a VS Code–style IDE that runs real Node
+The primary UI for Vivari — a VS Code–style IDE that runs real Node
 projects (Vite + React + HMR, NestJS `--watch`) entirely in the browser tab.
 
 Stack: **Vite 8 + React 19 (React Compiler) + Tailwind v4 + shadcn/ui + lucide**,
 scaffolded with **Bun**. Vite is the single toolchain and also bundles the
-OpenContainer runtime workers + wasm.
+Vivari runtime workers + wasm.
 
 ## Run
 
@@ -26,12 +26,12 @@ on `/sw.js` (the preview proxy needs root scope).
 
 ## How it fits together
 
-- `src/oc/kernel.ts` — `KernelBridge`: spawns the kernel worker
+- `src/vv/kernel.ts` — `KernelBridge`: spawns the kernel worker
   (`../../demo/kernel-worker.js`, bundled by Vite along with its nested `fs` /
   `fetcher` / `process` workers and the `packages/{vfs,codec,crypto}/pkg` wasm),
   registers the preview Service Worker, and relays its HTTP requests into the VM.
-- `src/oc/controller.ts` — `IdeController`: the imperative core (Monaco, xterm
-  terminals, the demo "Run" flow via `OC_RUN`, preview) exposed as an external
+- `src/vv/controller.ts` — `IdeController`: the imperative core (Monaco, xterm
+  terminals, the demo "Run" flow via `VV_RUN`, preview) exposed as an external
   store that React reads via `useSyncExternalStore`.
 - `src/components/ide/*` — the chrome: AppShell, ActivityBar, Explorer,
   EditorGroup, TerminalPanel, PreviewPanel, StatusBar, CommandPalette.

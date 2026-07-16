@@ -8,7 +8,7 @@ export default function (exports, require, module, process, internalBinding, pri
   "use strict";
 
   const notSupported = () => {
-    throw new Error("OpenContainer: transferable AbortController is not supported");
+    throw new Error("Vivari: transferable AbortController is not supported");
   };
 
   module.exports = {

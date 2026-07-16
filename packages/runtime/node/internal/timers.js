@@ -1,7 +1,7 @@
 // internal/timers — minimal shim (Phase 2 #7).
 //
 // NOT verbatim: Node's internal/timers.js (~700 lines) is a native-timer-driven
-// linked-list of timeout lists. OpenContainer already has a real event loop
+// linked-list of timeout lists. Vivari already has a real event loop
 // (packages/runtime/loop.js) exposed via globalThis timers, so we map the small
 // surface the vendored modules use (internal/stream_base_commons, net.js) onto
 // it. Socket timeouts therefore work via our loop's setTimeout.

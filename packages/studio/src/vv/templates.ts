@@ -4,7 +4,7 @@
 // bring it to life in-VM (install command, dev command, the port its dev server
 // listens on, and which file to open first). The studio reads a template, writes
 // its files into the chosen workspace directory via the kernel worker
-// (`oc-create-project`), and — if the user keeps "Run init script" checked —
+// (`vv-create-project`), and — if the user keeps "Run init script" checked —
 // runs `install && dev` inside a terminal so the dev server boots exactly like
 // local development. Nothing here is scaffolded by running `create-vite`/`nest
 // new` in-VM: the source is vendored so creation is instant, deterministic, and
@@ -199,7 +199,7 @@ function App() {
           Edit <code>src/App.${ts ? "tsx" : "jsx"}</code> and save to test HMR
         </p>
       </div>
-      <p>Running inside OpenContainer — a real Vite dev server in your browser.</p>
+      <p>Running inside Vivari — a real Vite dev server in your browser.</p>
     </>
   )
 }
@@ -327,7 +327,7 @@ const count = ref(0)
     <button type="button" @click="count++">count is {{ count }}</button>
     <p>Edit <code>src/App.vue</code> and save to test HMR</p>
   </div>
-  <p>Running inside OpenContainer — a real Vite dev server in your browser.</p>
+  <p>Running inside Vivari — a real Vite dev server in your browser.</p>
 </template>
 `;
 
@@ -459,7 +459,7 @@ const svelteApp = (ts: boolean) => `<script${ts ? ' lang="ts"' : ""}>
   <button onclick={() => count++}>count is {count}</button>
   <p>Edit <code>src/App.svelte</code> and save to test HMR</p>
 </div>
-<p>Running inside OpenContainer — a real Vite dev server in your browser.</p>
+<p>Running inside Vivari — a real Vite dev server in your browser.</p>
 `;
 
 const svelteTsconfig = `{
@@ -534,7 +534,7 @@ function backendDemoHtml(name: string): string {
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>${name} · OpenContainer</title>
+    <title>${name} · Vivari</title>
     <style>
       :root { color-scheme: dark; }
       * { box-sizing: border-box; }
@@ -563,7 +563,7 @@ function backendDemoHtml(name: string): string {
   </head>
   <body>
     <main>
-      <p class="eyebrow">OpenContainer</p>
+      <p class="eyebrow">Vivari</p>
       <h1>${name}</h1>
       <p class="sub">This backend is running fully in your browser. Click the button to call its API.</p>
       <div class="card">
@@ -579,7 +579,7 @@ function backendDemoHtml(name: string): string {
         var btn = document.getElementById('call');
         var out = document.getElementById('out');
         var statusEl = document.getElementById('status');
-        // In the OpenContainer preview the page lives under /preview/<port>/. Address
+        // In the Vivari preview the page lives under /preview/<port>/. Address
         // the in-VM server through that explicit proxy prefix so the request hits the
         // Service Worker's deterministic preview route (the same one that served this
         // page) instead of relying on client-port inference, which is racy right after
@@ -1157,7 +1157,7 @@ const nextPageBody = (ts: boolean) => `export default function Home() {
         Next.js App Router
       </h1>
       <p style={{ opacity: 0.7, margin: 0 }}>
-        Running in OpenContainer${ts ? " with TypeScript" : ""} — compiled by wasm SWC + webpack.
+        Running in Vivari${ts ? " with TypeScript" : ""} — compiled by wasm SWC + webpack.
       </p>
       <p style={{ opacity: 0.5, margin: 0, fontSize: "0.9rem" }}>
         Edit <code>app/page.${ts ? "tsx" : "js"}</code> and save to see changes.
@@ -1204,7 +1204,7 @@ function nextTemplate(ts: boolean): TemplateDef {
       ? `import type { ReactNode } from "react";
 
 export const metadata = {
-  title: "Next.js in OpenContainer",
+  title: "Next.js in Vivari",
   description: "Next.js 16 App Router (webpack + wasm SWC)",
 };
 
@@ -1217,7 +1217,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
 }
 `
       : `export const metadata = {
-  title: "Next.js in OpenContainer",
+  title: "Next.js in Vivari",
   description: "Next.js 16 App Router (webpack + wasm SWC)",
 };
 
@@ -1327,7 +1327,7 @@ let count = 0
 app.innerHTML = \`
   <h1>Vite + Vanilla${ts ? " + TS" : ""}</h1>
   <div class="card"><button id="counter" type="button"></button></div>
-  <p>Running inside OpenContainer — a real Vite dev server in your browser.</p>
+  <p>Running inside Vivari — a real Vite dev server in your browser.</p>
 \`
 const btn = document.querySelector${ts ? "<HTMLButtonElement>" : ""}('#counter')${q}
 const render = () => (btn.textContent = \`count is \${count}\`)
@@ -1435,7 +1435,7 @@ http.createServer((req, res) => {
   <body>
     <main>
       <h1>Static HTML/CSS/JS</h1>
-      <p>Served by a zero-dependency Node server inside OpenContainer.</p>
+      <p>Served by a zero-dependency Node server inside Vivari.</p>
       <button id="btn" type="button">Click me</button>
     </main>
     <script src="/main.js"></script>
@@ -1503,7 +1503,7 @@ import { Modal } from 'bootstrap'
 const app = document.querySelector<HTMLDivElement>('#app')!
 app.innerHTML = \`
   <h1 class="mb-3">Vite + Bootstrap 5</h1>
-  <p class="text-muted">Running inside OpenContainer.</p>
+  <p class="text-muted">Running inside Vivari.</p>
   <button class="btn btn-primary" id="open" type="button">Open modal</button>
   <div class="modal fade" id="demo" tabindex="-1">
     <div class="modal-dialog"><div class="modal-content">
@@ -1674,7 +1674,7 @@ export default function App() {
   return (
     <>
       <h1>GSAP + React</h1>
-      <p>GreenSock animating a React element inside OpenContainer.</p>
+      <p>GreenSock animating a React element inside Vivari.</p>
       <div ref={boxRef} style={{ width: 80, height: 80, margin: '3rem auto', background: '#646cff' }} />
     </>
   )
@@ -1898,7 +1898,7 @@ function sseTemplate(): TemplateDef {
       install: "npm install",
       dev: "node server/index.js",
       // Proven in-VM by scripts/spike-sse.mjs (green in CI): SSE streams over the
-      // oc-sse tunnel + EventSource polyfill (the buffered HTTP preview proxy can't
+      // vv-sse tunnel + EventSource polyfill (the buffered HTTP preview proxy can't
       // carry a never-ending text/event-stream body). No longer experimental.
     },
     files: {
@@ -2243,7 +2243,7 @@ function nuxtTemplate(): TemplateDef {
 `,
       "app.vue": `<template>
   <div class="page">
-    <h1>Nuxt 3 on OpenContainer</h1>
+    <h1>Nuxt 3 on Vivari</h1>
     <p>Edit <code>app.vue</code> and save — HMR is live.</p>
     <button @click="count++">count is {{ count }}</button>
   </div>
@@ -2335,7 +2335,7 @@ export default defineConfig({
 </script>
 
 <main style="font-family: system-ui, sans-serif; text-align: center; padding: 3rem">
-  <h1>SvelteKit on OpenContainer</h1>
+  <h1>SvelteKit on Vivari</h1>
   <p>Edit <code>src/routes/+page.svelte</code> and save.</p>
   <button onclick={() => count++}>count is {count}</button>
 </main>
@@ -2398,7 +2398,7 @@ function remixTemplate(): TemplateDef {
 
 export default {
   ssr: true,
-  // The OpenContainer preview serves this app under /preview/5173/ (keepPreviewPrefix).
+  // The Vivari preview serves this app under /preview/5173/ (keepPreviewPrefix).
   // The basename must match Vite's \`base\` (below) and end with a slash so both the
   // server and the hydrated client router resolve routes under the proxy prefix.
   basename: '/preview/5173/',
@@ -2409,7 +2409,7 @@ import { defineConfig } from 'vite'
 
 export default defineConfig({
   // Match react-router.config.ts \`basename\`; leading AND trailing slash required so
-  // asset URLs and the router base line up under the OpenContainer preview prefix.
+  // asset URLs and the router base line up under the Vivari preview prefix.
   base: '/preview/5173/',
   plugins: [reactRouter()],
 })
@@ -2441,7 +2441,7 @@ export default [index('routes/home.tsx')] satisfies RouteConfig
       "app/routes/home.tsx": `export default function Home() {
   return (
     <main style={{ fontFamily: 'system-ui, sans-serif', textAlign: 'center', padding: '3rem' }}>
-      <h1>React Router 7 on OpenContainer</h1>
+      <h1>React Router 7 on Vivari</h1>
       <p>Edit <code>app/routes/home.tsx</code> and save.</p>
     </main>
   )
@@ -2490,7 +2490,7 @@ function astroTemplate(): TemplateDef {
 export default defineConfig({})
 `,
       "src/pages/index.astro": `---
-const title = 'Astro on OpenContainer'
+const title = 'Astro on Vivari'
 ---
 
 <html lang="en">
@@ -2554,10 +2554,10 @@ function slidevTemplate(): TemplateDef {
 `,
       "slides.md": `---
 theme: default
-title: Slidev on OpenContainer
+title: Slidev on Vivari
 ---
 
-# Slidev on OpenContainer
+# Slidev on Vivari
 
 Presentation slides for developers — running in the browser
 
@@ -2652,7 +2652,7 @@ export function App() {
       <div class="card">
         <button onClick={() => setCount((c) => c + 1)}>count is {count}</button>
       </div>
-      <p>Running inside OpenContainer.</p>
+      <p>Running inside Vivari.</p>
     </>
   )
 }
@@ -2739,7 +2739,7 @@ export class MyElement extends LitElement {
     return html\`
       <h1>Vite + Lit</h1>
       <button @click=\${() => this.count++}>count is \${this.count}</button>
-      <p>A web component running inside OpenContainer.</p>
+      <p>A web component running inside Vivari.</p>
     \`
   }
 }
@@ -2831,7 +2831,7 @@ export default function App() {
       <div class="card">
         <button onClick={() => setCount(count() + 1)}>count is {count()}</button>
       </div>
-      <p>Running inside OpenContainer.</p>
+      <p>Running inside Vivari.</p>
     </>
   )
 }
@@ -2924,7 +2924,7 @@ export const App = component$(() => {
     <main style="font-family: system-ui, sans-serif; text-align: center; padding: 3rem">
       <h1>Vite + Qwik</h1>
       <button onClick$={() => count.value++}>count is {count.value}</button>
-      <p>Running inside OpenContainer.</p>
+      <p>Running inside Vivari.</p>
     </main>
   )
 })
@@ -3207,7 +3207,7 @@ createServer((req, res) => {
       </div>
     </main>
     <script>
-      // In the OpenContainer preview the page lives under /preview/<port>/, so point
+      // In the Vivari preview the page lives under /preview/<port>/, so point
       // the GraphiQL link at the same prefix; standalone it's just /graphql.
       var pm = location.pathname.match(/^(.*\\/preview\\/\\d+)\\//);
       document.getElementById('giql').href = (pm ? pm[1] : '') + '/graphql';
@@ -3354,7 +3354,7 @@ app.listen(port).then(() => console.log('Feathers on http://localhost:' + port +
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Phase 3 — showcases that lean into OpenContainer's strengths
+// Phase 3 — showcases that lean into Vivari's strengths
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── Socket.IO ────────────────────────────────────────────────────────────────
@@ -3561,7 +3561,7 @@ export default function App() {
   const [msg, setMsg] = useState('loading…')
   useEffect(() => {
     trpc.greeting
-      .query({ name: 'OpenContainer' })
+      .query({ name: 'Vivari' })
       .then(setMsg)
       .catch((e) => setMsg('error: ' + e))
   }, [])
@@ -3656,10 +3656,10 @@ export default function App() {
   return (
     <>
       <h1>pnpm monorepo</h1>
-      <p>{greeting('OpenContainer')}</p>
+      <p>{greeting('Vivari')}</p>
       <p>
         The <code>web</code> app imports a shared <code>@repo/ui</code> workspace package —
-        pnpm workspaces working inside OpenContainer.
+        pnpm workspaces working inside Vivari.
       </p>
     </>
   )
@@ -3711,7 +3711,7 @@ function dbDemoHtml(title: string, subtitle: string): string {
     </main>
     <script>
       // Address the in-VM server through the explicit /preview/<port>/ proxy prefix
-      // (present when running inside OpenContainer) so requests hit the Service
+      // (present when running inside Vivari) so requests hit the Service
       // Worker's deterministic preview route rather than relying on client-port
       // inference. Standalone it's just /api.
       var pm = location.pathname.match(/^(\\/preview\\/\\d+)\\//);
@@ -3791,7 +3791,7 @@ async function main() {
   const SQL = await initSqlJs({ locateFile: (f) => require.resolve('sql.js/dist/' + f) });
   const db = new SQL.Database();
   db.run('CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0);');
-  db.run("INSERT INTO todos (task, done) VALUES ('Try OpenContainer', 1), ('Run SQLite in the browser', 0);");
+  db.run("INSERT INTO todos (task, done) VALUES ('Try Vivari', 1), ('Run SQLite in the browser', 0);");
 
   const app = express();
   app.use(express.json());
@@ -3907,7 +3907,7 @@ async function main() {
       'id SERIAL PRIMARY KEY, task TEXT NOT NULL, done BOOLEAN NOT NULL DEFAULT false);'
   );
   await db.exec(
-    "INSERT INTO todos (task, done) VALUES ('Try OpenContainer', true), ('Run Postgres in the browser', false);"
+    "INSERT INTO todos (task, done) VALUES ('Try Vivari', true), ('Run Postgres in the browser', false);"
   );
 
   const app = express();
@@ -4037,10 +4037,10 @@ module.exports = {
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Webpack in OpenContainer</title>
+    <title>Webpack in Vivari</title>
   </head>
   <body>
-    <h1 id="marker">Webpack in OpenContainer</h1>
+    <h1 id="marker">Webpack in Vivari</h1>
     <p>webpack 5 + webpack-dev-server with hot module replacement</p>
     <div id="app"></div>
   </body>
@@ -4115,10 +4115,10 @@ function docusaurusTemplate(): TemplateDef {
 }
 `,
       "docusaurus.config.js": `module.exports = {
-  title: "Docusaurus in OpenContainer",
+  title: "Docusaurus in Vivari",
   tagline: "Docs run in the browser VM",
   url: "http://localhost",
-  // The OpenContainer preview serves this app under /preview/3000/ (see the
+  // The Vivari preview serves this app under /preview/3000/ (see the
   // template's keepPreviewPrefix flag). Match that base so Docusaurus's client
   // router resolves routes correctly on first load and deep-links work.
   baseUrl: "/preview/3000/",
@@ -4135,7 +4135,7 @@ function docusaurusTemplate(): TemplateDef {
     ],
   ],
   themeConfig: {
-    navbar: { title: "Docusaurus in OpenContainer", items: [] },
+    navbar: { title: "Docusaurus in Vivari", items: [] },
   },
 };
 `,
@@ -4145,12 +4145,12 @@ function docusaurusTemplate(): TemplateDef {
 `,
       "docs/intro.md": `---
 slug: /
-title: Docusaurus in OpenContainer
+title: Docusaurus in Vivari
 ---
 
-# Docusaurus in OpenContainer
+# Docusaurus in Vivari
 
-Hello from OpenContainer — a full Docusaurus dev server compiled in the browser VM.
+Hello from Vivari — a full Docusaurus dev server compiled in the browser VM.
 
 - Write docs in Markdown / MDX
 - Live hot reload as you edit
@@ -4267,7 +4267,7 @@ function angularTemplate(): TemplateDef {
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Angular in OpenContainer</title>
+    <title>Angular in Vivari</title>
     <base href="/" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
   </head>
@@ -4315,7 +4315,7 @@ export class App {
 `,
     "src/app/app.html": `<main class="app">
   <div class="badge">Angular 21</div>
-  <h1 id="marker">Angular in OpenContainer</h1>
+  <h1 id="marker">Angular in Vivari</h1>
   <p class="subtitle">
     esbuild-wasm + Vite dev server — compiled and served entirely in your browser.
   </p>

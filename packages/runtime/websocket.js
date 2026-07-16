@@ -1,6 +1,6 @@
 // A real WebSocket *client* for the in-VM runtime (roadmap #19 stage C).
 //
-// OpenContainer has no browser `WebSocket` reachable from a process worker, and
+// Vivari has no browser `WebSocket` reachable from a process worker, and
 // undici's is a throwing stub. But everything a client needs already exists
 // in-VM: Node's real lib/http.js emits an `'upgrade'` event with the raw duplex
 // socket (over our net loopback) once it sees a 101 response, so we only have to

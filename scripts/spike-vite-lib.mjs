@@ -13,13 +13,13 @@
 //      plugin or JSX-transform breakage that a plain "GET / 200" would miss).
 //
 // Usage (Node 22+, needs network for npm):
-//   1) vendor npm:  rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor \
-//        && (cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
+//   1) vendor npm:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor \
+//        && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
 //   2) a per-framework spike calls runViteSpike({...}); run e.g.
 //        node scripts/spike-preact.mjs
 //
-// Env knobs: OC_LIVE=1 (stream in-VM output), OC_PORT, OC_INSTALL_TIMEOUT,
-// OC_BIND_TIMEOUT, OC_INSTALL_ONLY=1.
+// Env knobs: VV_LIVE=1 (stream in-VM output), VV_PORT, VV_INSTALL_TIMEOUT,
+// VV_BIND_TIMEOUT, VV_INSTALL_ONLY=1.
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
@@ -40,14 +40,14 @@ const VFS_NPM = "/usr/lib/node_modules/npm";
  * @returns {Promise<boolean>} true on PASS.
  */
 export async function runViteSpike({ name, dir, files, entryModule, titleMarker }) {
-  const LIVE = process.env.OC_LIVE === "1";
-  const PORT = Number(process.env.OC_PORT || 5173);
-  const VENDOR_NPM = process.argv[2] || "/tmp/oc-vendor/node_modules/npm";
+  const LIVE = process.env.VV_LIVE === "1";
+  const PORT = Number(process.env.VV_PORT || 5173);
+  const VENDOR_NPM = process.argv[2] || "/tmp/vv-vendor/node_modules/npm";
 
   if (!fs.existsSync(path.join(VENDOR_NPM, "bin/npm-cli.js"))) {
     console.error(`No vendored npm at ${VENDOR_NPM} (expected bin/npm-cli.js).`);
     console.error(
-      `Vendor it:  rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor && (cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)`,
+      `Vendor it:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)`,
     );
     process.exit(2);
   }
@@ -214,18 +214,18 @@ export async function runViteSpike({ name, dir, files, entryModule, titleMarker 
     PATH: dir + "/node_modules/.bin:/bin",
     npm_config_cache: "/tmp/.npm",
     NODE_ENV: "development",
-    OC_LIVE: LIVE ? "1" : "",
-    // OC_DEBUG passthrough → Vite's `debug` namespaces (e.g. OC_DEBUG=vite:deps,
+    VV_LIVE: LIVE ? "1" : "",
+    // VV_DEBUG passthrough → Vite's `debug` namespaces (e.g. VV_DEBUG=vite:deps,
     // vite:optimize-deps) so a spike can surface what the dep optimizer is doing.
-    ...(process.env.OC_DEBUG ? { DEBUG: process.env.OC_DEBUG } : {}),
-    // OC_ENV='{"K":"V",...}' — inject arbitrary env into the in-VM process (used to
+    ...(process.env.VV_DEBUG ? { DEBUG: process.env.VV_DEBUG } : {}),
+    // VV_ENV='{"K":"V",...}' — inject arbitrary env into the in-VM process (used to
     // probe rolldown/emnapi knobs like NAPI_RS_ASYNC_WORK_POOL_SIZE).
-    ...(process.env.OC_ENV ? JSON.parse(process.env.OC_ENV) : {}),
+    ...(process.env.VV_ENV ? JSON.parse(process.env.VV_ENV) : {}),
   };
 
   // ── gate 1: install ────────────────────────────────────────────────────────
   console.log(`\n== [${name}] npm install ==`);
-  const INSTALL_TIMEOUT = Number(process.env.OC_INSTALL_TIMEOUT || 300000);
+  const INSTALL_TIMEOUT = Number(process.env.VV_INSTALL_TIMEOUT || 300000);
   const t1 = Date.now();
   let installTimedOut = false;
   const inst = await Promise.race([
@@ -240,7 +240,7 @@ export async function runViteSpike({ name, dir, files, entryModule, titleMarker 
   const viteBin = kernel.exists(dir + "/node_modules/vite/bin/vite.js");
   console.log("  vite bin present: " + viteBin);
 
-  if (process.env.OC_INSTALL_ONLY === "1") {
+  if (process.env.VV_INSTALL_ONLY === "1") {
     console.log(`\nOC_INSTALL_ONLY=1 — stopping after install.`);
     process.exit(inst.code === 0 && viteBin ? 0 : 1);
   }
@@ -255,12 +255,12 @@ export async function runViteSpike({ name, dir, files, entryModule, titleMarker 
     ["node_modules/vite/bin/vite.js", "--host", "127.0.0.1", "--port", String(PORT), "--strictPort", "--configLoader", "native"],
     { cwd: dir, env },
   );
-  if (process.env.OC_DEBUG) {
+  if (process.env.VV_DEBUG) {
     Promise.resolve(__devProc)
       .then((r) => console.log(`  [dev process exited] ${JSON.stringify(r)}`))
       .catch((e) => console.log(`  [dev process rejected] ${(e && e.stack) || e}`));
   }
-  const BIND_TIMEOUT = Number(process.env.OC_BIND_TIMEOUT || 240000);
+  const BIND_TIMEOUT = Number(process.env.VV_BIND_TIMEOUT || 240000);
   const tb = Date.now();
   let fatal = "";
   while (!listening.has(PORT) && Date.now() - tb < BIND_TIMEOUT && !fatal) {

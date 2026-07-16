@@ -17,7 +17,7 @@ export const YARN_VFS_ROOT = "/usr/lib/node_modules/yarn";
 // Thin shims installed on PATH. `node /bin/yarn.js <args>` just loads the real
 // entry (bin/yarn.js → lib/cli.js), which reads process.argv exactly like the
 // spike's /run-yarn.js wrapper proved on Path B. `yarnpkg` is yarn's own alias.
-const YARN_SHIM = `// OpenContainer: real yarn shim — see packages/kernel-host/load-real-yarn.js.
+const YARN_SHIM = `// Vivari: real yarn shim — see packages/kernel-host/load-real-yarn.js.
 require(${JSON.stringify(YARN_VFS_ROOT + "/bin/yarn.js")});
 `;
 

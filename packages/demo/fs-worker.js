@@ -172,7 +172,7 @@ function buildAccess(vfs) {
 // …) is mirrored.
 // /etc and /usr are re-seeded by the VFS constructor every boot (os-release, ldd),
 // so persisting them is redundant and would let a stale copy shadow a changed seed.
-// /var/cache holds the kernel's transient outbound-fetch buffer (oc-fetch): its
+// /var/cache holds the kernel's transient outbound-fetch buffer (vv-fetch): its
 // in-memory index is rebuilt per session and never read back across reloads, so
 // persisting those tarball bodies is pure dead weight — the durable, reusable copy
 // is npm/yarn/pnpm's own content-addressed cache under /home/user/.cache.

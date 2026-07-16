@@ -1,5 +1,5 @@
 // The `npm` program (Phase 2 #10, stage 1) — a real CommonJS Node program that
-// runs as an ordinary process inside OpenContainer. The kernel installs it as
+// runs as an ordinary process inside Vivari. The kernel installs it as
 // /bin/npm.js (see coreutils.js), so from the shell it is just `npm` on PATH.
 //
 // What stage 1 does:

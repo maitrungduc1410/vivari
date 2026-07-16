@@ -187,14 +187,14 @@ const TERM_THEME = {
 };
 
 const ESC = "\x1b[";
-const REGISTRY_KEY = "oc-workspace-projects";
+const REGISTRY_KEY = "vv-workspace-projects";
 
 const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
 const parentOf = (p: string) => p.slice(0, p.lastIndexOf("/")) || "/";
 
 // Drag-and-drop wire format: an internal Explorer drag carries the source's
 // absolute path under this MIME type; an OS drag carries File entries instead.
-export const OC_PATH_MIME = "application/x-oc-path";
+export const VV_PATH_MIME = "application/x-vv-path";
 
 // Extract OS FileSystemEntry objects from a drop's DataTransfer. MUST be called
 // SYNCHRONOUSLY inside the drop handler — the DataTransferItemList (and thus
@@ -279,7 +279,7 @@ interface TermEntry {
   label: string;
   demo: string | null;
   cwd: string | null;
-  run: string | null; // explicit OC_RUN (created/opened project run shells)
+  run: string | null; // explicit VV_RUN (created/opened project run shells)
   pid: number | null;
   alive: boolean;
   started: boolean;
@@ -422,15 +422,15 @@ export class IdeController {
 
   // ── VFS queries (request/response over the bridge) ─────────────────────────
   async readdir(absPath: string): Promise<{ name: string; dir: boolean }[]> {
-    const m = await this.bridge.request("oc-readdir", { path: absPath });
+    const m = await this.bridge.request("vv-readdir", { path: absPath });
     return m.ok ? ((m.entries as { name: string; dir: boolean }[]) ?? []) : [];
   }
   async readFileText(absPath: string): Promise<string> {
-    const m = await this.bridge.request("oc-read", { path: absPath });
+    const m = await this.bridge.request("vv-read", { path: absPath });
     return m.ok ? String(m.contents ?? "") : "";
   }
   async readFileBytes(absPath: string): Promise<Uint8Array> {
-    const m = await this.bridge.request("oc-read-bytes", { path: absPath });
+    const m = await this.bridge.request("vv-read-bytes", { path: absPath });
     return m.ok && m.bytes instanceof Uint8Array ? m.bytes : new Uint8Array();
   }
   // The object URL for an open image tab (created lazily in openEntry).
@@ -438,7 +438,7 @@ export class IdeController {
     return this.imageUrls.get(abs);
   }
   async pathInfo(absPath: string): Promise<{ exists: boolean; isDir: boolean }> {
-    const m = await this.bridge.request("oc-stat", { path: absPath });
+    const m = await this.bridge.request("vv-stat", { path: absPath });
     return { exists: !!m.exists, isDir: !!m.isDir };
   }
 
@@ -865,7 +865,7 @@ export class IdeController {
     // Harvest each root, passing its last node_modules fingerprint so an unchanged
     // tree short-circuits in the worker (no file reads).
     for (const root of roots) {
-      const res = await this.bridge.request("oc-collect-dts", { root, sig: this.depsSig.get(root) ?? "" });
+      const res = await this.bridge.request("vv-collect-dts", { root, sig: this.depsSig.get(root) ?? "" });
       if (seq !== this.dtsSeq) return; // a newer refresh superseded us
       if (!res.ok) continue;
       const sig = typeof res.sig === "string" ? res.sig : "";
@@ -1032,7 +1032,7 @@ export class IdeController {
   ): () => void {
     const token = ++this.searchSeq;
     this.searchCbs = { token, onBatch: cb.onBatch, onDone: cb.onDone };
-    this.bridge.post("oc-search", {
+    this.bridge.post("vv-search", {
       token,
       roots: this.snap.workspaceFolders.map((f) => f.rootPath),
       query: opts.query,
@@ -1044,7 +1044,7 @@ export class IdeController {
     });
     return () => {
       if (this.searchCbs?.token === token) this.searchCbs = null;
-      this.bridge.post("oc-search-cancel", {});
+      this.bridge.post("vv-search-cancel", {});
     };
   }
 
@@ -1057,7 +1057,7 @@ export class IdeController {
     files?: string[];
     match?: { file: string; line: number; column: number; length: number };
   }): Promise<{ ok: boolean; filesChanged: number; replaced: number; error?: string }> {
-    const res = await this.bridge.request("oc-replace", {
+    const res = await this.bridge.request("vv-replace", {
       query: params.query,
       matchCase: params.matchCase,
       wholeWord: params.wholeWord,
@@ -1146,7 +1146,7 @@ export class IdeController {
     if (!this.snap.dirty.includes(abs)) return;
     const contents = this.models.get(abs)?.getValue() ?? this.localFiles[abs] ?? "";
     this.localFiles[abs] = contents;
-    this.bridge.post("oc-write", { path: abs, contents });
+    this.bridge.post("vv-write", { path: abs, contents });
     const folder = this.folderForPath(abs);
     if (folder) this.touchProject(folder.rootPath);
     const reload = folder ? this.folderManifests.get(folder.rootPath)?.reload : false;
@@ -1309,9 +1309,9 @@ export class IdeController {
         2,
       ) + "\n",
       "index.js": `console.log("Hello from ${name}!");\n`,
-      "README.md": `# ${name}\n\nA blank project created in OpenContainer Studio.\n`,
+      "README.md": `# ${name}\n\nA blank project created in Vivari Studio.\n`,
     };
-    const res = await this.bridge.request("oc-create-project", { dir: root, files, title: name });
+    const res = await this.bridge.request("vv-create-project", { dir: root, files, title: name });
     if (!res.ok) {
       toast.error(`Couldn't create project: ${res.error ?? "unknown error"}`);
       return;
@@ -1332,7 +1332,7 @@ export class IdeController {
     }
     const root = normDir(dir);
     const title = `${t.manifest.name} · ${t.manifest.language}`;
-    const res = await this.bridge.request("oc-create-project", {
+    const res = await this.bridge.request("vv-create-project", {
       dir: root,
       files: t.files,
       manifest: t.manifest,
@@ -1366,7 +1366,7 @@ export class IdeController {
       const t = getTemplate(meta.template);
       if (t) {
         this.folderManifests.set(root, t.manifest);
-        this.bridge.post("oc-register-project", { dir: root, manifest: t.manifest, title: meta.name });
+        this.bridge.post("vv-register-project", { dir: root, manifest: t.manifest, title: meta.name });
       }
     }
     this.touchProject(root);
@@ -1496,7 +1496,7 @@ export class IdeController {
     if (!name || name === baseName(oldAbs)) return;
     const parent = oldAbs.slice(0, oldAbs.lastIndexOf("/"));
     const newAbs = parent + "/" + name;
-    this.bridge.post("oc-rename", { from: oldAbs, to: newAbs });
+    this.bridge.post("vv-rename", { from: oldAbs, to: newAbs });
     this.remapOpenPaths(oldAbs, newAbs);
     if (this.snap.clipboard?.paths.includes(oldAbs)) this.set({ clipboard: null });
     this.bumpTree();
@@ -1507,7 +1507,7 @@ export class IdeController {
   deleteEntries(paths: string[]) {
     if (!paths.length) return;
     for (const abs of paths) {
-      this.bridge.post("oc-rm", { path: abs });
+      this.bridge.post("vv-rm", { path: abs });
       this.dropOpenPaths(abs);
     }
     const cb = this.snap.clipboard;
@@ -1530,9 +1530,9 @@ export class IdeController {
       if (cb.mode === "cut" && (dest === src || dest.startsWith(src + "/") || dest === parentOf(src))) continue;
       const target = await this.uniqueChild(dest, baseName(src));
       if (cb.mode === "copy") {
-        this.bridge.post("oc-copy", { from: src, to: target });
+        this.bridge.post("vv-copy", { from: src, to: target });
       } else {
-        this.bridge.post("oc-rename", { from: src, to: target });
+        this.bridge.post("vv-rename", { from: src, to: target });
         this.remapOpenPaths(src, target);
       }
     }
@@ -1563,7 +1563,7 @@ export class IdeController {
     if (dest === parentOf(from)) return;
     if (dest === from || dest.startsWith(from + "/")) return;
     const target = await this.uniqueChild(dest, baseName(from));
-    this.bridge.post("oc-rename", { from, to: target });
+    this.bridge.post("vv-rename", { from, to: target });
     this.remapOpenPaths(from, target);
     if (this.snap.clipboard?.paths.includes(from)) this.set({ clipboard: null });
     this.bumpTree();
@@ -1576,7 +1576,7 @@ export class IdeController {
     const dest = normDir(destDirAbs);
     if (dest === from || dest.startsWith(from + "/")) return;
     const target = await this.uniqueChild(dest, baseName(from));
-    this.bridge.post("oc-copy", { from, to: target });
+    this.bridge.post("vv-copy", { from, to: target });
     this.bumpTree();
   }
 
@@ -1614,11 +1614,11 @@ export class IdeController {
     if (entry.isFile) {
       const file = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej));
       const bytes = new Uint8Array(await file.arrayBuffer());
-      await this.bridge.request("oc-write", { path: targetAbs, bytes });
+      await this.bridge.request("vv-write", { path: targetAbs, bytes });
       return 1;
     }
     if (entry.isDirectory) {
-      await this.bridge.request("oc-mkdirp", { path: targetAbs });
+      await this.bridge.request("vv-mkdirp", { path: targetAbs });
       const children = await readDirEntries(entry as FileSystemDirectoryEntry);
       let n = 0;
       for (const child of children) n += await this.writeEntry(child, targetAbs + "/" + child.name);
@@ -1644,7 +1644,7 @@ export class IdeController {
     if (!clean) return;
     const abs = normDir(destDirAbs) + "/" + clean;
     if ((await this.pathInfo(abs)).exists) { toast.error(`"${clean}" already exists`); return; }
-    await this.bridge.request("oc-write", { path: abs, contents: "" });
+    await this.bridge.request("vv-write", { path: abs, contents: "" });
     this.bumpTree();
     void this.openFile(abs);
   }
@@ -1653,7 +1653,7 @@ export class IdeController {
     if (!clean) return;
     const abs = normDir(destDirAbs) + "/" + clean;
     if ((await this.pathInfo(abs)).exists) { toast.error(`"${clean}" already exists`); return; }
-    await this.bridge.request("oc-mkdirp", { path: abs });
+    await this.bridge.request("vv-mkdirp", { path: abs });
     this.bumpTree();
   }
 
@@ -1854,7 +1854,7 @@ export class IdeController {
   onDevtoolsReady() {
     if (!this.snap.devtoolsOpen || !this.devtoolsTargetId) return;
     const target = this.previewFrames.get(this.devtoolsTargetId);
-    target?.contentWindow?.postMessage({ source: "oc-cdp", dir: "init" }, "*");
+    target?.contentWindow?.postMessage({ source: "vv-cdp", dir: "init" }, "*");
   }
 
   // Called when a preview iframe finishes (re)loading. A reload swaps in a fresh
@@ -1905,14 +1905,14 @@ export class IdeController {
       if (this.devtoolsFrame && src && src === this.devtoolsFrame.contentWindow) {
         if (typeof data !== "string") return;
         const target = this.devtoolsTargetId ? this.previewFrames.get(this.devtoolsTargetId) : null;
-        target?.contentWindow?.postMessage({ source: "oc-cdp", dir: "frontend", data }, "*");
+        target?.contentWindow?.postMessage({ source: "vv-cdp", dir: "frontend", data }, "*");
         return;
       }
 
       if (!data || typeof data !== "object") return;
 
       // Preview tab's chobitsu → frontend (only if this tab is the attached target).
-      if (data.source === "oc-cdp" && data.dir === "target") {
+      if (data.source === "vv-cdp" && data.dir === "target") {
         const tabId = this.tabIdForSource(src);
         if (tabId && tabId === this.devtoolsTargetId) {
           this.devtoolsFrame?.contentWindow?.postMessage(data.data, "*");
@@ -1921,7 +1921,7 @@ export class IdeController {
       }
 
       // Preview tab navigated (link click / SPA route) → sync the address bar.
-      if (data.source === "oc-nav") {
+      if (data.source === "vv-nav") {
         const tabId = this.tabIdForSource(src);
         if (tabId) this.syncTabLocation(tabId, String(data.href || "/"));
       }
@@ -2014,7 +2014,7 @@ export class IdeController {
     let vfsFiles = -1;
     let vfsLogicalBytes = -1;
     try {
-      const m = await this.bridge.request("oc-mem");
+      const m = await this.bridge.request("vv-mem");
       vfsBytes = Number(m.vfsBytes ?? -1);
       vfsFiles = Number(m.vfsFiles ?? -1);
       vfsLogicalBytes = Number(m.vfsLogicalBytes ?? -1);
@@ -2095,7 +2095,7 @@ export class IdeController {
       }
       if (changed) this.syncPorts();
       // A process finished — it may have been `npm/yarn/pnpm install`. In-VM writes
-      // don't emit oc-fs-changed, so re-harvest dependency types (debounced; the
+      // don't emit vv-fs-changed, so re-harvest dependency types (debounced; the
       // worker short-circuits via a node_modules fingerprint when nothing changed).
       this.scheduleDependencyTypes();
     });
@@ -2156,8 +2156,8 @@ export class IdeController {
     // HMR tunnel: ws frame routed OUT of the VM → preview iframes. The frame
     // doesn't carry a port, so deliver to every tab bound to a dev server; the
     // HMR client in each iframe ignores frames that aren't its own.
-    b.on("oc-ws", (m) => {
-      const payload = { ...(m.msg as object), type: "oc-ws", dir: "in" };
+    b.on("vv-ws", (m) => {
+      const payload = { ...(m.msg as object), type: "vv-ws", dir: "in" };
       for (const t of this.snap.previewTabs) {
         if (t.port != null) this.previewFrames.get(t.id)?.contentWindow?.postMessage(payload, "*");
       }
@@ -2166,8 +2166,8 @@ export class IdeController {
     // SSE tunnel: a text/event-stream chunk routed OUT of the VM → preview iframes.
     // Like the ws frame it doesn't carry a port, so deliver to every bound tab; the
     // iframe's EventSource polyfill ignores chunks for connIds it doesn't own.
-    b.on("oc-sse", (m) => {
-      const payload = { ...(m.msg as object), type: "oc-sse", dir: "in" };
+    b.on("vv-sse", (m) => {
+      const payload = { ...(m.msg as object), type: "vv-sse", dir: "in" };
       for (const t of this.snap.previewTabs) {
         if (t.port != null) this.previewFrames.get(t.id)?.contentWindow?.postMessage(payload, "*");
       }
@@ -2232,12 +2232,12 @@ export class IdeController {
 
     // Streaming full-text search: batches of per-file results, then a final done.
     // Ignore stale tokens (a newer query already superseded this one).
-    b.on("oc-search-result", (m) => {
+    b.on("vv-search-result", (m) => {
       if (this.searchCbs && m.token === this.searchCbs.token) {
         this.searchCbs.onBatch((m.files as SearchFileResult[]) ?? []);
       }
     });
-    b.on("oc-search-done", (m) => {
+    b.on("vv-search-done", (m) => {
       if (this.searchCbs && m.token === this.searchCbs.token) {
         const cbs = this.searchCbs;
         this.searchCbs = null;
@@ -2252,11 +2252,11 @@ export class IdeController {
 
     // The VFS changed under us (a file op, an install, a create) — refresh the
     // Explorer's live tree + re-index the active folder for quick-open/search.
-    b.on("oc-fs-changed", () => this.bumpTree());
+    b.on("vv-fs-changed", () => this.bumpTree());
 
     // Result of an Explorer file operation (rename/rm/copy). The UI already updated
     // optimistically; surface any failure so the user knows the VFS is out of sync.
-    b.on("oc-fs-result", (m) => {
+    b.on("vv-fs-result", (m) => {
       if (!m.ok) toast.error(`${m.op} failed: ${m.error ?? "unknown error"}`);
     });
   }

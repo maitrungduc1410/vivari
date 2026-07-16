@@ -86,7 +86,7 @@ export function TerminalPanel() {
       <div ref={bodyRef} className="relative flex-1 overflow-hidden">
         {/* Console */}
         <div className={cn("absolute inset-0", snap.panelTab === "console" ? "block" : "hidden")}>
-          <div className="oc-term-host absolute inset-0" ref={(el) => c.mountTerminal("console", el)} />
+          <div className="vv-term-host absolute inset-0" ref={(el) => c.mountTerminal("console", el)} />
         </div>
 
         {/* Terminal: xterm on the left, terminal list on the right (resizable) */}
@@ -109,7 +109,7 @@ export function TerminalPanel() {
                   <div
                     key={t.id}
                     className={cn(
-                      "oc-term-host absolute inset-0",
+                      "vv-term-host absolute inset-0",
                       snap.panelTab === "terminal" && t.id === snap.activeTermId ? "block" : "hidden",
                     )}
                     ref={(el) => c.mountTerminal(t.id, el)}

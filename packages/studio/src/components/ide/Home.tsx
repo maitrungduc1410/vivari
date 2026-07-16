@@ -11,10 +11,10 @@ import {
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { TEMPLATES, TEMPLATE_CATEGORIES, type TemplateCategory, type TemplateDef } from "@/oc/templates";
+import { TEMPLATES, TEMPLATE_CATEGORIES, type TemplateCategory, type TemplateDef } from "@/vv/templates";
 import { TemplateIcon } from "./templateIcons";
 import { useIde } from "./useIde";
-import type { ProjectMeta } from "@/oc/controller";
+import type { ProjectMeta } from "@/vv/controller";
 
 function relTime(ts: number): string {
   const s = Math.max(1, Math.round((Date.now() - ts) / 1000));
@@ -37,7 +37,7 @@ export function HomeView() {
       <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col px-6 py-10">
         <div className="mb-8 flex items-center gap-3">
           <span className="inline-block size-3 rounded-full bg-primary" />
-          <h1 className="text-lg font-semibold">OpenContainer Studio</h1>
+          <h1 className="text-lg font-semibold">Vivari Studio</h1>
           {snap.workspaceFolders.length > 0 && (
             <Button variant="ghost" size="sm" className="ml-auto" onClick={() => c.showWorkspace()}>
               <ArrowLeft className="size-4" /> Back to workspace

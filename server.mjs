@@ -85,6 +85,6 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`OpenContainer dev server → http://localhost:${PORT}/`);
+  console.log(`Vivari dev server → http://localhost:${PORT}/`);
   console.log(`Open →  http://localhost:${PORT}/packages/demo/index.html`);
 });

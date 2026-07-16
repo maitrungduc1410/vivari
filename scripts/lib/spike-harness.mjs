@@ -4,8 +4,8 @@
 // (and the CI runner, scripts/run-spikes.mjs) share one implementation.
 //
 // Requires a vendored real npm tree on the host (installs go to the live registry):
-//   rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor \
-//     && (cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
+//   rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor \
+//     && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
 //
 // Typical use:
 //   const h = await bootSpikeKernel();
@@ -21,17 +21,17 @@ import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
 
-export const LIVE = process.env.OC_LIVE === "1";
+export const LIVE = process.env.VV_LIVE === "1";
 export const VFS_NPM = "/usr/lib/node_modules/npm";
 
 /** Boot the kernel + FS worker and load the vendored real npm into the VFS. */
 export async function bootSpikeKernel() {
-  const VENDOR_NPM = process.env.OC_VENDOR_NPM || process.argv[2] || "/tmp/oc-vendor/node_modules/npm";
+  const VENDOR_NPM = process.env.VV_VENDOR_NPM || process.argv[2] || "/tmp/vv-vendor/node_modules/npm";
   if (!fs.existsSync(path.join(VENDOR_NPM, "bin/npm-cli.js"))) {
     console.error(`No vendored npm at ${VENDOR_NPM} (expected bin/npm-cli.js).`);
     console.error(
-      "Vendor it:  rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor && " +
-        "(cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)",
+      "Vendor it:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor && " +
+        "(cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)",
     );
     process.exit(2);
   }
@@ -137,13 +137,13 @@ export function defaultEnv(dir) {
     PATH: dir + "/node_modules/.bin:/bin",
     npm_config_cache: "/tmp/.npm",
     NODE_ENV: "development",
-    OC_LIVE: LIVE ? "1" : "",
+    VV_LIVE: LIVE ? "1" : "",
   };
 }
 
 /** Run `npm install` in `dir`. Returns the process result ({ code, ... }). */
 export async function npmInstall(h, { dir, env = defaultEnv(dir), extraArgs = [] }) {
-  const INSTALL_TIMEOUT = Number(process.env.OC_INSTALL_TIMEOUT || 300000);
+  const INSTALL_TIMEOUT = Number(process.env.VV_INSTALL_TIMEOUT || 300000);
   const t1 = Date.now();
   let timedOut = false;
   console.log(`\n== npm install (${dir}) ==`);
@@ -165,7 +165,7 @@ export async function waitListen(h, { dir, port, argv, env = defaultEnv(dir) }) 
   const devStart = h.out.length;
   console.log(`\n== start ${argv.join(" ")} ==`);
   h.kernel.start("node", argv, { cwd: dir, env });
-  const BIND_TIMEOUT = Number(process.env.OC_BIND_TIMEOUT || 120000);
+  const BIND_TIMEOUT = Number(process.env.VV_BIND_TIMEOUT || 120000);
   const tb = Date.now();
   let fatal = "";
   while (!h.listening.has(port) && Date.now() - tb < BIND_TIMEOUT && !fatal) {

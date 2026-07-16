@@ -1,6 +1,6 @@
 // Spike (NETWORK): prove the GraphQL (Yoga) Backend template boots and serves a
 // real GraphQL API + demo UI in-VM. Mirrors the shipped `graphql` template in
-// packages/studio/src/oc/templates.ts.
+// packages/studio/src/vv/templates.ts.
 // Gates: install ok, `node src/index.js` binds :4000, GET / serves the demo UI,
 // POST /graphql answers hello + greet(name) + books, and the addBook mutation
 // actually mutates (books grows by one).
@@ -8,7 +8,7 @@
 import { bootSpikeKernel, writeProject, npmInstall, waitListen, httpGet, httpPost } from "./lib/spike-harness.mjs";
 
 const DIR = "/graphql";
-const PORT = Number(process.env.OC_PORT || 4000);
+const PORT = Number(process.env.VV_PORT || 4000);
 const h = await bootSpikeKernel();
 
 writeProject(h.kernel, DIR, {
@@ -76,7 +76,7 @@ createServer((req, res) => {
 
 const inst = await npmInstall(h, { dir: DIR });
 if (inst.code !== 0) process.exit(1);
-if (process.env.OC_INSTALL_ONLY === "1") process.exit(0);
+if (process.env.VV_INSTALL_ONLY === "1") process.exit(0);
 
 const bound = await waitListen(h, { dir: DIR, port: PORT, argv: ["src/index.js"] });
 

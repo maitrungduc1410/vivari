@@ -19,10 +19,10 @@ export const PNPM_VFS_ROOT = "/usr/lib/node_modules/pnpm";
 // Thin shims on PATH. `node /bin/pnpm.js <args>` loads the real entry
 // (bin/pnpm.cjs → dist/pnpm.cjs), which reads process.argv exactly like the
 // spike's /run-pnpm.js wrapper proved. `pnpx` is pnpm's `dlx` alias.
-const PNPM_SHIM = `// OpenContainer: real pnpm shim — see packages/kernel-host/load-real-pnpm.js.
+const PNPM_SHIM = `// Vivari: real pnpm shim — see packages/kernel-host/load-real-pnpm.js.
 require(${JSON.stringify(PNPM_VFS_ROOT + "/bin/pnpm.cjs")});
 `;
-const PNPX_SHIM = `// OpenContainer: real pnpx shim — see packages/kernel-host/load-real-pnpm.js.
+const PNPX_SHIM = `// Vivari: real pnpx shim — see packages/kernel-host/load-real-pnpm.js.
 require(${JSON.stringify(PNPM_VFS_ROOT + "/bin/pnpx.cjs")});
 `;
 

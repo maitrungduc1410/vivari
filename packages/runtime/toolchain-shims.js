@@ -1,4 +1,4 @@
-// OpenContainer toolchain shims — the single source of truth for running NATIVE
+// Vivari toolchain shims — the single source of truth for running NATIVE
 // developer-toolchain packages inside the browser VM transparently, with ZERO
 // per-project configuration (no package.json "overrides", no launcher script).
 //

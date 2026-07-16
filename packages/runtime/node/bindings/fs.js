@@ -38,7 +38,7 @@ const textEncoder = new TextEncoder();
 
 const joinPath = (dir, name) => (dir.endsWith("/") ? dir + name : dir + "/" + name);
 
-function ocError(code, syscall, path) {
+function vvError(code, syscall, path) {
   const err = new Error(`${code}: ${syscall}${path ? ` '${path}'` : ""}`);
   err.code = code;
   err.syscall = syscall;
@@ -359,7 +359,7 @@ export function createFsBinding({ sys: rawSys, process }) {
     access(path, mode, ...rest) {
       const req = findReq(rest);
       return dispatch(req, () => {
-        if (!sys.exists(path)) throw ocError("ENOENT", "access", path);
+        if (!sys.exists(path)) throw vvError("ENOENT", "access", path);
       });
     },
     mkdir(path, mode, recursive, ...rest) {
@@ -461,7 +461,7 @@ export function createFsBinding({ sys: rawSys, process }) {
     copyFile(src, dest, mode, ...rest) {
       const req = findReq(rest);
       return dispatch(req, () => {
-        if (mode & COPYFILE_EXCL && sys.exists(dest)) throw ocError("EEXIST", "copyfile", dest);
+        if (mode & COPYFILE_EXCL && sys.exists(dest)) throw vvError("EEXIST", "copyfile", dest);
         sys.writeFile(dest, sys.readFile(src));
       });
     },
@@ -490,7 +490,7 @@ export function createFsBinding({ sys: rawSys, process }) {
             return dir;
           }
         }
-        throw ocError("EEXIST", "mkdtemp", prefix);
+        throw vvError("EEXIST", "mkdtemp", prefix);
       });
     },
     // require()/module loader hot path: 0 = file, 1 = dir, <0 = error.

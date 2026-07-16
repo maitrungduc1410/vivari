@@ -1,6 +1,6 @@
 // Spike (NETWORK): prove the Astro template boots its dev server and server-renders
 // a page in-VM. Mirrors the shipped `astro` template in
-// packages/studio/src/oc/templates.ts.
+// packages/studio/src/vv/templates.ts.
 //
 // Astro drives a real Vite dev server plus the Go/wasm `@astrojs/compiler` and esbuild's
 // dep-optimizer. Getting here exercised the whole loader stack: the with-based live-binding
@@ -12,11 +12,11 @@
 // Gates: install ok, `astro dev` binds :4321, and GET / server-renders the index page
 // (contains the page title).
 //   run (Node 22+):  node scripts/spike-astro.mjs   (needs vendored npm — see spike-harness)
-process.env.OC_BIND_TIMEOUT ||= "300000"; // Astro's first Vite build + wasm boot can be slow in-VM.
+process.env.VV_BIND_TIMEOUT ||= "300000"; // Astro's first Vite build + wasm boot can be slow in-VM.
 import { bootSpikeKernel, writeProject, npmInstall, waitListen, httpGet, defaultEnv } from "./lib/spike-harness.mjs";
 
 const DIR = "/astro";
-const PORT = Number(process.env.OC_PORT || 4321);
+const PORT = Number(process.env.VV_PORT || 4321);
 const h = await bootSpikeKernel();
 
 writeProject(h.kernel, DIR, {
@@ -37,7 +37,7 @@ writeProject(h.kernel, DIR, {
 export default defineConfig({})
 `,
   "src/pages/index.astro": `---
-const title = 'Astro on OpenContainer'
+const title = 'Astro on Vivari'
 ---
 
 <html lang="en">
@@ -56,7 +56,7 @@ const title = 'Astro on OpenContainer'
 
 const inst = await npmInstall(h, { dir: DIR });
 if (inst.code !== 0) process.exit(1);
-if (process.env.OC_INSTALL_ONLY === "1") process.exit(0);
+if (process.env.VV_INSTALL_ONLY === "1") process.exit(0);
 
 // astro dev reads --port; pin it to the template's :4321.
 const env = { ...defaultEnv(DIR), PORT: String(PORT) };
@@ -71,7 +71,7 @@ let rootOk = false;
 
 if (bound) {
   const root = await httpGet(h.kernel, PORT, "/");
-  rootOk = root.status === 200 && /Astro on OpenContainer/.test(root.body);
+  rootOk = root.status === 200 && /Astro on Vivari/.test(root.body);
   console.log(`  GET / -> ${root.status}  ${root.body.slice(0, 120).replace(/\n/g, " ")}`);
 }
 

@@ -9,7 +9,7 @@ what was built and *why* — search it before assuming something is missing.
 
 ## What this project is
 
-OpenContainer is an open-source **WebContainer**: it runs Node-style projects
+Vivari is an open-source **WebContainer**: it runs Node-style projects
 (Vite + HMR, React, NestJS, Express, `npm install`, `tsc`) **entirely in the
 browser tab**, with no backend doing the work. The filesystem, a Node-compatible
 runtime, a process/PID model, and TCP-style networking are all emulated across
@@ -67,7 +67,7 @@ packages/
       internal/    Node's REAL internal/* (streams, errors, validators, ...).
       bindings/    our internalBinding shims (fs, tcp_wrap, zlib, crypto, ...).
         http_parser.js  selects the HTTP parser: real llhttp-in-Wasm (default),
-                        pure-JS fallback. Force with OC_HTTP_PARSER=js|wasm.
+                        pure-JS fallback. Force with VV_HTTP_PARSER=js|wasm.
         llhttp/      llhttp compiled to Wasm (vendored from undici) + the bridge
                      (llhttp-parser.js) folding llhttp callbacks onto Node's
                      HTTPParser contract; regen the binary via scripts/vendor-llhttp.mjs.
@@ -84,29 +84,29 @@ packages/
                      (plugin-react v6 is oxc-based; the compiler is wired via
                      `reactCompilerPreset()` + `@rolldown/plugin-babel`) + `serveDevtools()`
                      (vendors the in-browser DevTools locally, no CDN → COEP-safe:
-                     `/oc-devtools/chobitsu.js` = chobitsu UMD, `/devtools/**` = the chii
+                     `/vv-devtools/chobitsu.js` = chobitsu UMD, `/devtools/**` = the chii
                      Chrome-DevTools frontend; streamed from node_modules in dev, copied
                      into dist on build).
     public/sw.js     the preview Service Worker, served at root scope (copied from demo/).
                      Injects, into every preview HTML: the WS shim (HMR) + chobitsu (CDP
-                     backend) + a CDP/nav bridge; passes /oc-devtools/* straight through.
+                     backend) + a CDP/nav bridge; passes /vv-devtools/* straight through.
     public/devtools-host.html  host page for the chii DevTools frontend iframe (loaded
                      with `#?embedded=<origin>` → chii's postMessage transport).
-    src/oc/kernel.ts      KernelBridge: spawns demo/kernel-worker.js, SW register +
-                          oc-http relay, typed pub/sub over the worker protocol, PLUS
-                          request()/oc-reply request-response (reqId-correlated) for VFS
-                          queries (oc-readdir/oc-read/oc-stat) + oc-create-project.
-    src/oc/controller.ts  IdeController: the imperative core (Monaco, xterm terminals,
+    src/vv/kernel.ts      KernelBridge: spawns demo/kernel-worker.js, SW register +
+                          vv-http relay, typed pub/sub over the worker protocol, PLUS
+                          request()/vv-reply request-response (reqId-correlated) for VFS
+                          queries (vv-readdir/vv-read/vv-stat) + vv-create-project.
+    src/vv/controller.ts  IdeController: the imperative core (Monaco, xterm terminals,
                           preview, DevTools relay) as an external store React reads via
                           useSyncExternalStore. Since the multi-root rewrite: workspace =
                           workspaceFolders[] + activeFolderId; EVERY tab/model/dirty flag is
                           keyed by ABSOLUTE path; project create/open/run flows + a
-                          localStorage recent-projects registry (oc-workspace-projects). Also
+                          localStorage recent-projects registry (vv-workspace-projects). Also
                           drives full-text search (runSearch/replace over the worker) +
                           openFileAt (reveal + select a match/line in Monaco). Wires Monaco's
                           real language service (TS/JS workers, diagnostics, cross-file models +
                           node_modules .d.ts extra libs) for IntelliSense — see gotcha below.
-    src/oc/templates.ts   10 project templates (React/Vue/Svelte/Express/Nest × TS/JS) —
+    src/vv/templates.ts   10 project templates (React/Vue/Svelte/Express/Nest × TS/JS) —
                           manifest (install/dev/port/entry) + full source, inline.
     src/components/ide/   AppShell (+ Home overlay) · Home (Start blank / from template,
                           recents) · ActivityBar (Explorer/Search) · Explorer (VFS-backed
@@ -127,9 +127,9 @@ packages/
                    server.mjs). Its WORKER files are the shared runtime host and are
                    bundled by studio — do NOT delete them:
     host.js            legacy main thread: UI, SW registration, request relay.
-    kernel-worker.js   hosts the Kernel; DEMOS registry + demo shell tabs (OC_RUN); the
-                       multi-root VFS protocol (oc-readdir/read/stat/mkdirp/create-project,
-                       oc-fs-changed; streaming oc-search + oc-replace; oc-collect-dts bulk
+    kernel-worker.js   hosts the Kernel; DEMOS registry + demo shell tabs (VV_RUN); the
+                       multi-root VFS protocol (vv-readdir/read/stat/mkdirp/create-project,
+                       vv-fs-changed; streaming vv-search + vv-replace; vv-collect-dts bulk
                        node_modules .d.ts harvest for IntelliSense) + dynamic project
                        run/attribution (projectDirByTerm, project-ready/-reload). [shared]
     fs-worker.js       hosts the File System Worker (VFS + OPFS). [shared]
@@ -317,7 +317,7 @@ target pure-JS/wasm, proven by a spike. It is guarded by `scripts/spike-toolchai
   can't be drained synchronously across a worker boundary, so the Atomics fast-path
   can't work). `worker_threads.receiveMessageOnPort` IS implemented (lazy per-port
   inbox) for libraries that poll it directly; just keep the Atomics path off. This
-  is why the Angular template is now plain `ng serve`/`ng build` with no `scripts/oc-ng.mjs`.
+  is why the Angular template is now plain `ng serve`/`ng build` with no `scripts/vv-ng.mjs`.
 
 ### HTTP parser is real llhttp-in-Wasm, with a pure-JS fallback
 `internalBinding('http_parser')` (`bindings/http_parser.js`) prefers **real llhttp
@@ -327,7 +327,7 @@ Gotchas:
 - **Selection is automatic.** The Wasm module is compiled *synchronously* at
   binding time; that's allowed in Workers (where guest processes run) but throws on
   the main thread (4KB sync-compile cap), which is exactly what triggers the JS
-  fallback. Force either side with `OC_HTTP_PARSER=js|wasm` (wasm = fail loud).
+  fallback. Force either side with `VV_HTTP_PARSER=js|wasm` (wasm = fail loud).
 - **Both backends expose the identical contract** (numeric kOn* slots,
   `initialize/execute/finish`, `kOnHeadersComplete(major,minor,headersFlat,method,
   url,status,statusText,upgrade,shouldKeepAlive)`, `kOnBody(singleBuffer)`). The
@@ -376,28 +376,28 @@ map. Rules that bite if ignored:
   `controller.openFile/saveFile/renameEntry/...` all take abs; the Explorer + quick-open
   pass abs. Don't reintroduce a `currentDemo`/rel-based path anywhere.
 - **The Explorer reads the live VFS**, it does NOT render a JS file map. It lazy-loads a
-  dir via `controller.readdir(abs)` (→ `oc-readdir` → `oc-reply`) and re-reads on a
-  `treeVersion` bump. Any code that mutates the VFS from the worker MUST `post("oc-fs-changed")`
+  dir via `controller.readdir(abs)` (→ `vv-readdir` → `vv-reply`) and re-reads on a
+  `treeVersion` bump. Any code that mutates the VFS from the worker MUST `post("vv-fs-changed")`
   so the tree/quick-open index refresh (writes, rename/rm/copy, create, installs).
-- **Request/response goes through `KernelBridge.request(type)`** (reqId → `oc-reply`), used
-  by oc-readdir/oc-read/oc-stat/oc-mkdirp/oc-create-project. Fire-and-forget `post()` stays
-  for streaming stuff (term I/O, oc-write on save).
+- **Request/response goes through `KernelBridge.request(type)`** (reqId → `vv-reply`), used
+  by vv-readdir/vv-read/vv-stat/vv-mkdirp/vv-create-project. Fire-and-forget `post()` stays
+  for streaming stuff (term I/O, vv-write on save).
 - **Created/opened projects are attributed to a dev-server port by pid chain**, not a port
   table: the run shell records `projectDirByTerm[terminalId]`, and `kernel.onListen` walks
   the listening pid up to that shell (`terminalForPid`) → project → `project-ready`. The two
   legacy DEMOS still use the fixed-port `demoForPort` path; keep them separate.
-- **Templates live in `src/oc/templates.ts`** (manifest + full source, inline) — not a
-  scaffolder run in-VM. Creation writes them in ONE `writeFilesBatch` via `oc-create-project`.
+- **Templates live in `src/vv/templates.ts`** (manifest + full source, inline) — not a
+  scaffolder run in-VM. Creation writes them in ONE `writeFilesBatch` via `vv-create-project`.
 
 ### Full-text search runs in the kernel worker — keep it non-blocking
 The VFS is synchronous ONLY inside the kernel worker (the sole VFS holder), so full-text
-search/replace lives there (`oc-search`/`oc-replace` in `demo/kernel-worker.js`), NOT on the
-main thread — reading every file over `oc-read` round-trips would be death by a thousand
+search/replace lives there (`vv-search`/`vv-replace` in `demo/kernel-worker.js`), NOT on the
+main thread — reading every file over `vv-read` round-trips would be death by a thousand
 messages. But that same worker also serves preview HTTP + terminal I/O, so the walk MUST
 stay cooperative: it `await`s a macrotask every N files and streams partial results back as
-`oc-search-result` batches (final `oc-search-done`). Don't turn it into one big synchronous
+`vv-search-result` batches (final `vv-search-done`). Don't turn it into one big synchronous
 loop or a preview/terminal will stall mid-search. A monotonic `currentSearchToken` cancels
-an in-flight search when a newer query (or `oc-search-cancel`) arrives — always check the
+an in-flight search when a newer query (or `vv-search-cancel`) arrives — always check the
 token in the loop. After a replace writes files, the controller re-reads affected open
 models from disk so the Monaco buffer + dirty state don't drift.
 
@@ -415,14 +415,14 @@ two kinds of file: **Monaco models** and **extra libs** — so the split MUST st
 phantom "Duplicate identifier" errors. Rule: the project's OWN source files are seeded as models
 (`ensureBackgroundModels`, so cross-file completion/go-to-def works before a file is opened); installed
 dependency types (`node_modules/**/*.d.ts` + `package.json`) are the extra libs, harvested in bulk by
-the kernel worker (`oc-collect-dts`, sole VFS holder → one reply, not thousands of reads) and pushed
+the kernel worker (`vv-collect-dts`, sole VFS holder → one reply, not thousands of reads) and pushed
 via `setExtraLibs`. Never register a file as BOTH. The dts harvest collects the project's DECLARED
 deps (+ their `@types`) FIRST so a budget cap can't drop the packages you actually import (a blind
 walk did exactly that — react types got evicted before they were read). It's bounded (file-count +
 byte budget) and debounced; it re-runs on folder open, fs changes, AND after any process exits — because
-in-VM writes (a `npm/yarn/pnpm install`) do NOT emit `oc-fs-changed`, so process exit is the signal
+in-VM writes (a `npm/yarn/pnpm install`) do NOT emit `vv-fs-changed`, so process exit is the signal
 that `node_modules` may have appeared. A cheap `node_modules` fingerprint (top-level package list) in
-`oc-collect-dts` short-circuits the file reads when nothing actually changed, so triggering on every
+`vv-collect-dts` short-circuits the file reads when nothing actually changed, so triggering on every
 process exit is nearly free. `checkJs` stays off so plain-JS projects aren't flooded with semantic
 errors. **Gotcha #1 (register extra libs with `Uri.toString(TRUE)`):** Monaco's `Uri.toString()`
 percent-encodes `@` → `%40`, but TS's module resolver looks up `@types/…` / `@scope/…` with a
@@ -465,7 +465,7 @@ AFTER `installCoreutils()`. The loader unpacks the tree to
   OPFS, so the content-addressed package cache PERSISTS and is shared across
   projects/reloads — install a dep once, later projects reuse the tarball with no
   re-download. Do NOT move these back under `/tmp` (excluded from persistence). The
-  kernel's transient `/var/cache/oc-fetch` buffer is deliberately in the OPFS
+  kernel's transient `/var/cache/vv-fetch` buffer is deliberately in the OPFS
   `IGNORE` list (its in-memory index is rebuilt per session, so persisting those
   bodies is dead weight — npm's cache is the durable copy). Keep this when editing
   `openTerminal` env / `fs-worker` IGNORE.
@@ -496,7 +496,7 @@ npm worth knowing:
   since the Turbo-analog is retired). The shim is just applied after unpack.
 - yarn needs a writable cache: the shell env sets `YARN_CACHE_FOLDER=/tmp/.yarn-cache`
   (created at boot), mirroring `npm_config_cache`.
-- Headless browser-shape gate: `scripts/spike-yarn-studio.mjs` (`OC_NET=1` for the
+- Headless browser-shape gate: `scripts/spike-yarn-studio.mjs` (`VV_NET=1` for the
   real `yarn add`). The off-disk Path B proof is `scripts/spike-yarn.mjs`.
 
 ### Real pnpm is the studio shell's `pnpm` — worker_threads + symlinked store
@@ -518,7 +518,7 @@ pnpm is wired like npm/yarn (`scripts/vendor-pnpm.mjs` → `pnpm-pack.bin`;
 - `vendor-pnpm.mjs` DROPS `*.node` files: pnpm ships prebuilt reflink addons only
   for darwin/win; Linux uses the JS fallback, so they're ~1.3 MB of dead weight.
 - `dist/pnpm.cjs` (~8.8 MB) exceeds the 1 MiB SAB window → loader uses writeLarge.
-- Headless browser-shape gate: `scripts/spike-pnpm-studio.mjs` (`OC_NET=1`), which
+- Headless browser-shape gate: `scripts/spike-pnpm-studio.mjs` (`VV_NET=1`), which
   uses the SAME env (not CLI flags) so it verifies studio's actual config.
 - **pnpm bins are `#!/bin/sh` cmd-shims, NOT symlinks.** npm makes `node_modules/.bin/vite`
   a POSIX symlink to the real `vite.js`; pnpm writes a `#!/bin/sh` wrapper that
@@ -598,7 +598,7 @@ sha512 integrity), and execs it. What's special / must-not-regress:
   escape hatch; the sha512 tarball-integrity check (via `createHash`) still runs.
   The env also carries `COREPACK_HOME=/tmp/.corepack` (cache) +
   `COREPACK_ENABLE_DOWNLOAD_PROMPT=0` (see `openTerminal`). Keep these.
-- Headless browser-shape gate: `scripts/spike-corepack-studio.mjs` (`OC_NET=1`
+- Headless browser-shape gate: `scripts/spike-corepack-studio.mjs` (`VV_NET=1`
   downloads+runs yarn AND pnpm), using the SAME env (not CLI flags). The off-disk
   Path B proof is `scripts/spike-corepack.mjs`.
 
@@ -636,7 +636,7 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   can't cross `handleHttpRequest`/`OP_RESPOND` (buffered end-to-end: the SW waits for ONE
   complete body, so a never-ending SSE stream 504s at 60s). So an **`EventSource` polyfill**
   (in BOTH `sw.js` shims, injected next to the ws shim — keep them in sync, same DOUBLED
-  regex escaping) tunnels each connection as `oc-sse` (`sub:'open'|'close'`); `handleSseClient`
+  regex escaping) tunnels each connection as `vv-sse` (`sub:'open'|'close'`); `handleSseClient`
   binds it to the port's process, which opens an in-VM loopback GET to `/events` and relays
   each raw chunk out as `sse-out {sub:'open'|'chunk'|'close'}` (`onSseSend`). The polyfill
   parses the raw bytes into `message`/named events (SSE spec: `data:`/`event:`/`id:`, dispatch
@@ -644,8 +644,8 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   one-way (no client→server `send`), otherwise it mirrors the ws tunnel exactly:
   `packages/runtime/index.js` (`sseRelay`/`dispatchSse`/`sseLiveness`), `kernel.js`
   (`handleSseClient`/`handleSseOut`/`sseConns`, torn down on process exit), `process-worker.js`
-  (`sse-open`/`sse-close` → `dispatchSse`), `kernel-worker.js` (`oc-sse` ↔ `onSseSend`),
-  `host.js` + studio `kernel.ts`/`controller.ts` (`oc-sse` relay both directions). Gated by
+  (`sse-open`/`sse-close` → `dispatchSse`), `kernel-worker.js` (`vv-sse` ↔ `onSseSend`),
+  `host.js` + studio `kernel.ts`/`controller.ts` (`vv-sse` relay both directions). Gated by
   `scripts/spike-sse.mjs`, which drives that exact tunnel headlessly (no browser) via
   `handleSseClient` + `onSseSend`. That spike is green, so the `sse` template is graduated
   (no longer `experimental`); a regression there means the tunnel or forwarding broke.
@@ -669,7 +669,7 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   `:5173` from one `dev.js`). All bound ports are still tracked so a restart reloads the real
   tab; the set is cleared when the run shell exits so a re-run re-announces. **Don't** revert to
   a tab-per-port default — HMR/SSR-worker ports would spawn junk tabs.
-- **`host.opencontainer.internal`.** Maps to the studio's own hostname so in-VM code can reach a
+- **`host.vivari.internal`.** Maps to the studio's own hostname so in-VM code can reach a
   service on the HOST machine (only when the studio is served locally). Two egress paths both
   honor it: `http`/`https` (and npm) go through `packages/demo/fetcher-worker.js` `rewrite()`;
   the **global `fetch()`** is the host realm's real fetch (used directly, not via the Fetcher
@@ -685,7 +685,7 @@ On a FRESH page load the studio document is fetched before the preview Service
 Worker takes control, so a brand-new iframe whose *first* navigation is a direct
 `/preview/<port>/` URL is NOT intercepted by the SW — the request escapes to the
 network and the studio's own SPA fallback serves its Home page INSIDE the frame
-(symptom: "Run React template → preview shows the OpenContainer Studio page, not
+(symptom: "Run React template → preview shows the Vivari Studio page, not
 the app"). The manual address-bar path never hit this because its iframe starts at
 `about:blank` (a client the SW already controls) and only THEN navigates. The fix
 lives on the client (the SW can't intercept a frame it doesn't control), and the
@@ -748,7 +748,7 @@ Real `vitest@4` (Vite/rolldown) runs a suite to green in-VM — gated by
 - Invoke with `--pool=threads` (we have `worker_threads`, not `fork`).
   Config-file bundling (`vitest.config.*`) still fails in rolldown-wasm
   ("Invalid URL") — pass options as CLI flags for now.
-- `OC_TRACE_MODULES=1` (propagate via the process env) names the module whose
+- `VV_TRACE_MODULES=1` (propagate via the process env) names the module whose
   top-level eval throws — the fastest way to localize a bundled-tool bring-up bug.
 
 ### fs.ReadStream / fs.WriteStream MUST stay ES5 function-constructors
@@ -929,7 +929,7 @@ addition and implement it in the matching `lib/`/binding.
 Each demo binds a port; a leftover long-lived server squatting a port causes
 `EADDRINUSE` for the next run. The kernel worker's `boot()` deliberately does
 **not** auto-run any server — a demo starts on demand when "Run" opens a shell tab
-that auto-runs its dev command (`OC_RUN`, via `openTerminal`). Closing that tab
+that auto-runs its dev command (`VV_RUN`, via `openTerminal`). Closing that tab
 kills the server subtree and frees the port. Don't reintroduce a background server
 into `boot()`, and don't route dev-server output anywhere but its shell tab.
 
@@ -1002,7 +1002,7 @@ Post-compression, the tab's largest term is the **Process Worker JS heap** (dev 
   `WebAssembly.Memory`, captured to `globalThis.__ocEsbuildMemory` by the in-process patch). Exposed
   via `boot.js`'s `onReady` control object.
 - The kernel worker keeps a `pid → worker` registry (in `spawnWorker`), queries all live processes
-  in parallel (2 s timeout), and relays sorted rows on the existing `oc-mem` round-trip;
+  in parallel (2 s timeout), and relays sorted rows on the existing `vv-mem` round-trip;
   `controller.ts` prints the table. Threads/`fork` children go through `spawnWorker` too, so they
   appear. The query is **read-only** — `verify-node` is unaffected.
 - Note: the compiled CJS/ESM wrapper is not retained after evaluation (GC-eligible), so there's no
@@ -1024,7 +1024,7 @@ browser first.
 - `npm run spikes` (`scripts/run-spikes.mjs`) — the CI runner over the per-template/
   subsystem spikes. Tiers: `npm run spikes:offline` (Wasm-free, seconds — e.g. the
   `spike-toolchain.mjs` subsystem guard), `npm run spikes:net` (installs real
-  templates from the registry; auto-vendors npm to `/tmp/oc-vendor`). Wired into
+  templates from the registry; auto-vendors npm to `/tmp/vv-vendor`). Wired into
   `.gitlab-ci.yml`. **A template must have a green spike before it graduates out of
   `experimental`** — add `spike-<name>.mjs` (use `lib/spike-harness.mjs`) and list it
   in `run-spikes.mjs`.
@@ -1061,9 +1061,9 @@ the gap can't silently regress.
   REAL project layout (`files` = relative path → contents, exactly what `npm create
   …` emits), plus `dir`, `port`, `entry`, and a `runCmd`/`runArgs` that is the
   project's own dev script (e.g. `npm run dev`). Add the option to the `DEMOS` array
-  in `studio/src/oc/controller.ts` (id + title + run label) — and, for the legacy UI,
+  in `studio/src/vv/controller.ts` (id + title + run label) — and, for the legacy UI,
   the `<select>` in `demo/index.html`. "Run" opens a dedicated shell tab whose `sh` auto-runs
-  `OC_RUN="npm install && <runCmd runArgs>"` (`scaffoldDemo()` writes the files once;
+  `VV_RUN="npm install && <runCmd runArgs>"` (`scaffoldDemo()` writes the files once;
   install is skipped once `node_modules` exists), so the **dev server lives in that
   tab** — closing it stops the server, a double-run `EADDRINUSE`s (not intercepted).
   Preview wiring is driven by `kernel.onListen` (see `announceDemoReady`): first real

@@ -1,4 +1,4 @@
-//! OpenContainer kernel — the in-RAM Virtual File System (VFS).
+//! Vivari kernel — the in-RAM Virtual File System (VFS).
 //!
 //! Brick #2: a real POSIX-ish filesystem tree (not a flat map). Files live in an
 //! inode table; directories map names -> inode ids; symlinks store a target path.

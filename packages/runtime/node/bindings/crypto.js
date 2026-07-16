@@ -184,7 +184,7 @@ const norm = (a) => String(a).toLowerCase().replace(/-/g, "");
 // codec = the wasm module namespace (packages/crypto pkg[-node]) or null.
 export function createCryptoBinding({ codec } = {}) {
   const needCodec = (what) => {
-    if (!codec) throw new Error(`OpenContainer crypto: ${what} needs the wasm crypto codec (not available in this process)`);
+    if (!codec) throw new Error(`Vivari crypto: ${what} needs the wasm crypto codec (not available in this process)`);
   };
 
   function digest(algo, bytes) {
@@ -192,14 +192,14 @@ export function createCryptoBinding({ codec } = {}) {
     if (codec) return new Uint8Array(codec.digest(n, bytes));
     const core = JS_CORES[n];
     if (core) return core(bytes);
-    throw new Error(`OpenContainer crypto: digest '${algo}' needs the wasm codec (md5/sha1/sha256 work without it)`);
+    throw new Error(`Vivari crypto: digest '${algo}' needs the wasm codec (md5/sha1/sha256 work without it)`);
   }
 
   function hmac(algo, key, bytes) {
     const n = norm(algo);
     if (codec) return new Uint8Array(codec.hmac_digest(n, key, bytes));
     const core = JS_CORES[n];
-    if (!core) throw new Error(`OpenContainer crypto: HMAC-${algo} needs the wasm codec`);
+    if (!core) throw new Error(`Vivari crypto: HMAC-${algo} needs the wasm codec`);
     return hmacJs(core, 64, key, bytes);
   }
 

@@ -1,4 +1,4 @@
-# OpenContainer
+# Vivari
 
 An open-source **WebContainer** — the goal is to run Node-style projects (Vite,
 Express, etc.) **100% inside the browser**, StackBlitz-style: a virtual filesystem,

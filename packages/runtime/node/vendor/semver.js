@@ -1,5 +1,5 @@
 // Vendored node-semver@7.8.5 (MIT) — bundled to one self-contained CJS module and
-// wrapped as an OpenContainer builtin factory. This is REAL semver (not a hand-rolled
+// wrapped as an Vivari builtin factory. This is REAL semver (not a hand-rolled
 // subset), so the npm program resolves ranges exactly like npm — including compound
 // ranges (>=1 <2), unions (1 || 2) and hyphen ranges — and it survives the eventual
 // switch to running the real npm CLI (see roadmap North Star + #10 stage 2).

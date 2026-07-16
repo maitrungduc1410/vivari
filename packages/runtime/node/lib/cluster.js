@@ -1,6 +1,6 @@
 // cluster — minimal stub (Phase 2 #7).
 //
-// OpenContainer runs a single VM per process; there is no cluster primary/worker
+// Vivari runs a single VM per process; there is no cluster primary/worker
 // split. net.js's listenInCluster only consults cluster.isWorker (false here) so
 // it always takes the primary path and binds the handle directly.
 export default function (exports, require, module, process, internalBinding, primordials) {
@@ -20,7 +20,7 @@ export default function (exports, require, module, process, internalBinding, pri
   cluster.setupPrimary = () => {};
   cluster.setupMaster = () => {};
   cluster.fork = () => {
-    throw new Error("OpenContainer: cluster.fork() is not supported");
+    throw new Error("Vivari: cluster.fork() is not supported");
   };
   cluster.disconnect = (cb) => {
     if (typeof cb === "function") process.nextTick(cb);

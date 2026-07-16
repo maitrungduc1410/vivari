@@ -1,7 +1,7 @@
 // Vendored @napi-rs/wasm-runtime@0.2.12 (MIT) — the pure-JS host half of
 // "napi-on-wasm": it bundles emnapi (@emnapi/core + @emnapi/runtime +
 // @emnapi/wasi-threads), @tybys/wasm-util and tslib into one self-contained CJS
-// module, wrapped as an OpenContainer builtin factory. This is what makes a real
+// module, wrapped as an Vivari builtin factory. This is what makes a real
 // N-API native addon compiled to wasm32-wasi (napi-rs / @node-rs / @napi-rs)
 // run in the browser: the addon imports `env` (the ~150 napi_* functions,
 // implemented here in JS over a handle table) plus `wasi_snapshot_preview1`
@@ -20,9 +20,9 @@
 //   then wrap the output in this factory (exports, require, module, process).
 /* eslint-disable */
 export default function (exports, require, module, process) {
-// OpenContainer patch (loop-liveness): emnapi's NodejsWaitingRequestCounter keeps
+// Vivari patch (loop-liveness): emnapi's NodejsWaitingRequestCounter keeps
 // Node's event loop alive by ref()/unref()-ing a MessagePort while async N-API
-// requests are outstanding. In OpenContainer a native MessagePort ref/unref is a
+// requests are outstanding. In Vivari a native MessagePort ref/unref is a
 // no-op for our cooperative loop, so an addon that unref's its worker pool (e.g.
 // rolldown's wasi-worker via `t && w.unref()`) would let the parent loop go idle
 // and exit mid-operation. We mirror the counter into our own loop liveness via

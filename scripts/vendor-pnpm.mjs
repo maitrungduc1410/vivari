@@ -30,7 +30,7 @@ import { fileURLToPath } from "node:url";
 
 const PNPM_VERSION = "9.15.9"; // keep in sync with scripts/spike-pnpm.mjs
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
-const VENDOR_DIR = process.env.OC_VENDOR_PNPM_DIR || "/tmp/oc-vendor-pnpm";
+const VENDOR_DIR = process.env.VV_VENDOR_PNPM_DIR || "/tmp/vv-vendor-pnpm";
 const VENDOR_PNPM = path.join(VENDOR_DIR, "node_modules", "pnpm");
 const OUT_DIR = path.join(ROOT, "packages", "studio", "public", "vendor");
 // Gzip-compressed but deliberately NOT named `.gz` (static servers would set

@@ -1,13 +1,13 @@
 // Spike (NETWORK): prove the SQLite (sql.js) showcase template boots + serves
 // a real WASM SQLite database in-VM. Mirrors the shipped `sqlite` template in
-// packages/studio/src/oc/templates.ts.
+// packages/studio/src/vv/templates.ts.
 // Gates: install ok, `node server.js` binds :3000, GET /api/info reports SQLite +
 // a version, GET /api/todos returns the seeded rows.
 //   run (Node 22+):  node scripts/spike-sqlite.mjs   (needs vendored npm — see spike-harness)
 import { bootSpikeKernel, writeProject, npmInstall, waitListen, httpGet } from "./lib/spike-harness.mjs";
 
 const DIR = "/sqlite";
-const PORT = Number(process.env.OC_PORT || 3000);
+const PORT = Number(process.env.VV_PORT || 3000);
 const h = await bootSpikeKernel();
 
 writeProject(h.kernel, DIR, {
@@ -27,7 +27,7 @@ async function main() {
   const SQL = await initSqlJs({ locateFile: (f) => require.resolve('sql.js/dist/' + f) });
   const db = new SQL.Database();
   db.run('CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0);');
-  db.run("INSERT INTO todos (task, done) VALUES ('Try OpenContainer', 1), ('Run SQLite in the browser', 0);");
+  db.run("INSERT INTO todos (task, done) VALUES ('Try Vivari', 1), ('Run SQLite in the browser', 0);");
 
   const app = express();
   app.get('/api/info', (_req, res) => {
@@ -55,7 +55,7 @@ main().catch((err) => { console.error(err); process.exit(1); });
 
 const inst = await npmInstall(h, { dir: DIR });
 if (inst.code !== 0) process.exit(1);
-if (process.env.OC_INSTALL_ONLY === "1") process.exit(0);
+if (process.env.VV_INSTALL_ONLY === "1") process.exit(0);
 
 const bound = await waitListen(h, { dir: DIR, port: PORT, argv: ["server.js"] });
 let infoOk = false;
@@ -68,7 +68,7 @@ if (bound) {
   const todos = await httpGet(h.kernel, PORT, "/api/todos");
   let rows = [];
   try { rows = JSON.parse(todos.body); } catch {}
-  todosOk = todos.status === 200 && Array.isArray(rows) && rows.length === 2 && /OpenContainer/.test(todos.body);
+  todosOk = todos.status === 200 && Array.isArray(rows) && rows.length === 2 && /Vivari/.test(todos.body);
   console.log(`  GET /api/todos -> ${todos.status}  rows=${Array.isArray(rows) ? rows.length : "?"}`);
 }
 

@@ -26,7 +26,7 @@ export const TSGO_VFS_ROOT = "/usr/lib/tsgo";
 // The runner that boots the Go wasm. Written into the VFS by the loader; the
 // `/bin/tsc.js` + `/bin/tsgo.js` shims just `require` it. Kept as a string so the
 // whole thing ships with the kernel host (no extra asset to fetch).
-const TSGO_RUNNER = `// OpenContainer: tsgo (TypeScript 7, Go/wasm) runner — see load-real-tsgo.js.
+const TSGO_RUNNER = `// Vivari: tsgo (TypeScript 7, Go/wasm) runner — see load-real-tsgo.js.
 const _fs = require('fs');
 const path = require('path');
 

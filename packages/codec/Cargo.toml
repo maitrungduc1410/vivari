@@ -2,7 +2,7 @@
 name = "open-webcontainer-codec"
 version = "0.1.0"
 edition = "2021"
-description = "OpenContainer compression codec (zlib/deflate/gzip + brotli) compiled to WebAssembly, running in-process beneath Node's real lib/zlib.js"
+description = "Vivari compression codec (zlib/deflate/gzip + brotli) compiled to WebAssembly, running in-process beneath Node's real lib/zlib.js"
 license = "MIT"
 
 [lib]

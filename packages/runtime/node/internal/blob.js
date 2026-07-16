@@ -7,7 +7,7 @@ export default function (exports, require, module, process, internalBinding, pri
 
   module.exports = {
     createBlobFromFilePath() {
-      throw new Error("OpenContainer: fs.openAsBlob() is not supported yet");
+      throw new Error("Vivari: fs.openAsBlob() is not supported yet");
     },
   };
 }

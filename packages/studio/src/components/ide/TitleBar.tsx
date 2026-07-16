@@ -13,7 +13,7 @@ export function TitleBar() {
         title="Home"
       >
         <span className="inline-block size-2.5 rounded-full bg-primary" />
-        OpenContainer Studio
+        Vivari Studio
       </button>
 
       <div className="flex-1 truncate text-center text-xs text-muted-foreground">

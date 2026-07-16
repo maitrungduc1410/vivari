@@ -2,7 +2,7 @@
 //
 // This is the JS half of "run a wasm32-wasi module": it implements the
 // `wasi_snapshot_preview1` import surface a command needs and bridges it to
-// OpenContainer's world — file descriptors and paths go through our real `fs`
+// Vivari's world — file descriptors and paths go through our real `fs`
 // (and thus the VFS in the File System Worker), argv/environ come from the
 // constructor, the clock from Date/performance, randomness from WebCrypto, and
 // stdout/stderr through `process`. A guest built for `wasm32-wasip1` (Rust std,

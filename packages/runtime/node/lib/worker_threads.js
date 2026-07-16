@@ -93,7 +93,7 @@ export default function (exports, require, module, process) {
       // Materialize the code string as a temp module so the child boots it like a
       // file (our runtime runs files, not eval strings, at boot).
       const fs = require("fs");
-      const id = "/tmp/.oc-worker-" + process.pid + "-" + seq + ".js";
+      const id = "/tmp/.vv-worker-" + process.pid + "-" + seq + ".js";
       try { fs.mkdirSync("/tmp", { recursive: true }); } catch { /* exists */ }
       fs.writeFileSync(id, String(filename));
       return id;
@@ -254,7 +254,7 @@ export default function (exports, require, module, process) {
   // the event API never grow an undrained buffer — that would be a memory leak on a
   // long-running dev server. Like Node, it returns only messages already delivered
   // and never blocks waiting for new ones.
-  const RX_INBOX = Symbol("ocPortRxInbox");
+  const RX_INBOX = Symbol("vvPortRxInbox");
   function armInbox(port) {
     let inbox = port[RX_INBOX];
     if (inbox) return inbox;
@@ -288,7 +288,7 @@ export default function (exports, require, module, process) {
     const proto = MessagePort && MessagePort.prototype;
     if (!proto || proto.__ocNodeEvents) return;
     proto.__ocNodeEvents = true;
-    const LISTENERS = Symbol("ocPortListeners");
+    const LISTENERS = Symbol("vvPortListeners");
     const bag = (port) => port[LISTENERS] || (port[LISTENERS] = new Map());
     const dataEvents = new Set(["message", "messageerror"]);
     proto.addListener = proto.on = function on(type, listener) {

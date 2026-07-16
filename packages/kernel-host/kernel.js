@@ -115,7 +115,7 @@ export class Kernel {
 
     // ---- bounded LRU over the transient fetched-body cache -------------------
     // Every fetched packument/tarball body is materialized under /var/cache/
-    // oc-fetch and, until now, kept in the VFS's Wasm RAM for the WHOLE session —
+    // vv-fetch and, until now, kept in the VFS's Wasm RAM for the WHOLE session —
     // a heavy install (Docusaurus/Nuxt) left hundreds of MB of dead `.tgz` bytes
     // resident long after the packages were extracted. Those bodies are pure
     // scratch: the durable, reusable copy is the package manager's OWN content-
@@ -252,7 +252,7 @@ export class Kernel {
       command: spec.command,
       // Launch cwd (absolute). Used to attribute a server's `listen()` back to the
       // project it was started in — even for a manually run `npm start` that has no
-      // OC_RUN wiring (see kernel-worker's projectDirForPid).
+      // VV_RUN wiring (see kernel-worker's projectDirForPid).
       cwd: spec.cwd,
       serverInbox: [], // queued { reqId, port, req } drained by non-blocking accept
       // #16 stage 2b: reqId -> child pid for worker_threads this process spawned.
@@ -893,7 +893,7 @@ export class Kernel {
   // accept) is encodeURIComponent'd into a single flat filename (no '/'), so
   // distinct request variants of the same URL never share a body file.
   _fetchCachePath(cacheKey) {
-    return "/var/cache/oc-fetch/" + encodeURIComponent(cacheKey);
+    return "/var/cache/vv-fetch/" + encodeURIComponent(cacheKey);
   }
 
   _fetchCacheKey(method, url, headers) {
@@ -978,7 +978,7 @@ export class Kernel {
     const res = await this.fetcher(url, init);
     const body = res.body instanceof Uint8Array ? res.body : new Uint8Array(res.body || 0);
     const path = this._fetchCachePath(cacheKey);
-    this.mkdirp("/var/cache/oc-fetch");
+    this.mkdirp("/var/cache/vv-fetch");
     // Normalize response headers to a lowercased plain object and drop the
     // content-* encoding hints: the Fetcher Worker's fetch() already returns a
     // DECODED body (gzip/br transfer-encoding stripped), so leaving these would

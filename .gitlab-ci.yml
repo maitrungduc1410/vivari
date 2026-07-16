@@ -1,4 +1,4 @@
-# CI for OpenContainer. Three tiers, cheapest first:
+# CI for Vivari. Three tiers, cheapest first:
 #
 #   gate    — offline, Wasm-free spikes (the toolchain subsystem guard + the
 #             llhttp Wasm HTTP-parser guard). Runs on every push/MR; seconds;
