@@ -7,7 +7,8 @@
   "license": "MIT",
   "workspaces": [
     "packages/core",
-    "packages/react"
+    "packages/react",
+    "examples/basic"
   ],
   "scripts": {
     "vendor:npm": "node scripts/vendor-npm.mjs",
@@ -21,6 +22,8 @@
     "build:studio": "cd packages/studio && bun run build",
     "preview:studio": "cd packages/studio && bun run preview",
     "verify": "node scripts/verify-node.mjs",
+    "smoke": "node scripts/smoke-sdk.mjs",
+    "build:example": "npm run build --workspace @vivari/example-basic",
     "spikes": "node scripts/run-spikes.mjs",
     "spikes:offline": "node scripts/run-spikes.mjs --offline",
     "spikes:net": "node scripts/run-spikes.mjs --net",

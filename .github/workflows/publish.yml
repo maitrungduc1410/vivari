@@ -91,6 +91,11 @@ jobs:
       - name: Build packages
         run: npm run build:sdk
 
+      # With dist built, the smoke test's runtime leg actually imports the bundled
+      # ESM and exercises the public API surface before we pack/publish.
+      - name: SDK smoke test
+        run: npm run smoke
+
       - name: Pack tarballs
         id: pack
         run: |

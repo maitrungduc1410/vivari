@@ -121,6 +121,10 @@ import { Vivari } from "@vivari/react";
 > `COEP: require-corp`) so `SharedArrayBuffer` is available. See the
 > [core README](packages/core/README.md) for host + asset self-hosting notes.
 
+A runnable, end-to-end example lives in [`examples/basic`](examples/basic) (boot →
+mount → run a script → preview an in-VM server). `npm run smoke` guards the SDK's
+public API + packaging offline.
+
 Releases are cut from the manual **Publish SDK** GitHub Actions workflow
 (`.github/workflows/publish.yml`).
 
