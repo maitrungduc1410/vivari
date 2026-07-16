@@ -1,0 +1,137 @@
+name: Publish SDK
+
+# Manual, deliberate releases only. Trigger from the Actions tab, pick which
+# packages to ship, the npm dist-tag, and whether it's a dry run. `dry_run: true`
+# (the default) builds, packs, and uploads the tarballs as run artifacts + a
+# GitHub Release **without** pushing to npm — so you can inspect exactly what
+# would be published before flipping it to false.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.1.0). Leave blank to publish package.json as-is."
+        required: false
+        type: string
+      publish_core:
+        description: "Publish @vivari/core"
+        required: true
+        default: true
+        type: boolean
+      publish_react:
+        description: "Publish @vivari/react"
+        required: true
+        default: true
+        type: boolean
+      npm_tag:
+        description: "npm dist-tag"
+        required: true
+        default: "latest"
+        type: string
+      dry_run:
+        description: "Dry run (build + pack + GitHub Release, but do NOT npm publish)"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write # create/update the GitHub Release + upload assets
+
+concurrency:
+  group: publish-sdk
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/*/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('packages/*/Cargo.lock') }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Optionally set version
+        if: ${{ inputs.version != '' }}
+        run: |
+          npm version "${{ inputs.version }}" --no-git-tag-version --workspace @vivari/core
+          npm version "${{ inputs.version }}" --no-git-tag-version --workspace @vivari/react
+
+      # The SDK bundles these three Wasm crates (VFS + codec + crypto) as assets.
+      - name: Build Wasm crates
+        run: |
+          npm run build:vfs
+          npm run build:codec
+          npm run build:crypto
+
+      - name: Build packages
+        run: npm run build:sdk
+
+      - name: Pack tarballs
+        id: pack
+        run: |
+          mkdir -p dist-artifacts
+          npm pack --workspace @vivari/core --pack-destination dist-artifacts
+          npm pack --workspace @vivari/react --pack-destination dist-artifacts
+          ls -la dist-artifacts
+          echo "core_version=$(node -p "require('./packages/core/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vivari-sdk-tarballs
+          path: dist-artifacts/*.tgz
+          if-no-files-found: error
+
+      - name: Publish @vivari/core to npm
+        if: ${{ inputs.dry_run == false && inputs.publish_core }}
+        run: npm publish --workspace @vivari/core --access public --tag "${{ inputs.npm_tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish @vivari/react to npm
+        if: ${{ inputs.dry_run == false && inputs.publish_react }}
+        run: npm publish --workspace @vivari/react --access public --tag "${{ inputs.npm_tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release with tarballs
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.pack.outputs.core_version }}
+          name: Vivari SDK v${{ steps.pack.outputs.core_version }}
+          generate_release_notes: true
+          prerelease: ${{ inputs.npm_tag != 'latest' }}
+          files: dist-artifacts/*.tgz
+          body: |
+            Vivari SDK **v${{ steps.pack.outputs.core_version }}** (npm tag `${{ inputs.npm_tag }}`).
+
+            - `@vivari/core` — framework-agnostic browser WebContainer SDK
+            - `@vivari/react` — React `<Vivari>` component + `useVivari()` hook
+
+            > Dry run: `${{ inputs.dry_run }}` — when `true`, the `.tgz` files below were
+            > built and attached but nothing was pushed to npm.

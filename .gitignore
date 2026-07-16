@@ -8,6 +8,10 @@
 # Node
 node_modules
 
+# Built SDK packages (rebuild with `npm run build:sdk`)
+/packages/core/dist
+/packages/react/dist
+
 # Vendored real-npm delivery asset (rebuild with `npm run vendor:npm`)
 /packages/studio/public/vendor
 

@@ -9,7 +9,10 @@
     "skipLibCheck": true,
 
     /* Bundler mode */
-    "paths": { "@/*": ["./src/*"] },
+    "paths": {
+      "@/*": ["./src/*"],
+      "@vivari/core": ["../core/src/index.ts"]
+    },
 
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,

@@ -154,7 +154,14 @@ export default defineConfig({
     serveDevtools(),
   ],
   resolve: {
-    alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+      // Consume the SDK from source in the monorepo: Vite compiles @vivari/core's
+      // TS and follows its nested `new Worker(new URL(...))` + `new URL(*.wasm)`
+      // references into packages/core/src/workers and the sibling crate pkg dirs —
+      // exactly how Studio bundled these before they moved into the core package.
+      "@vivari/core": fileURLToPath(new URL("../core/src/index.ts", import.meta.url)),
+    },
   },
   server: {
     headers: isolation,

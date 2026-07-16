@@ -75,7 +75,7 @@ quota (shared with Cache API). Design — **write-behind mirror**, not a backing
   manifest `[path,{kind,mode,target}]` that recreates dirs + symlinks (OPFS has neither).
 - Boot `restore()` replays the manifest into the VFS **before** the FS worker serves any
   syscall (calls the VFS directly, so it never re-enters the queue).
-- Only the browser wires it (`packages/studio/src/workers/fs-worker.js`); **headless injects no adapter**
+- Only the browser wires it (`packages/core/src/workers/fs-worker.js`); **headless injects no adapter**
   (`new FsServer(vfs)`), so `verify-node`/`verify-express` are unchanged and still green.
 - System/volatile dirs are skipped (`/bin` coreutils re-install each boot, `/tmp`,`/proc`,
   `/dev`). `?reset` (host.js) wipes `vv-vfs` before boot. Demo: `GET /api/persist` bumps a
@@ -666,7 +666,7 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
      binary bodies across the SW seam, replacing the buffered replay), and **`http2`**
      (needs `internalBinding('http2')`/nghttp2).
 9. **Network/registry worker** [M] — *decomp.* ✅ **DONE.** A dedicated
-   **`Fetcher Worker`** (`packages/studio/src/workers/fetcher-worker.js`) owns all outbound
+   **`Fetcher Worker`** (`packages/core/src/workers/fetcher-worker.js`) owns all outbound
    network so downloading/decompressing large payloads never stalls syscall
    servicing; it holds no SAB and transfers bodies back as `ArrayBuffer`. New
    **deferred syscall `OP_FETCH`** (like `OP_SPAWN`): a process calls the blocking
@@ -831,7 +831,7 @@ constructor" above): `_load`/`_resolveFilename`/`_nodeModulePaths`/`_cache`/`_ex
 (throw): `dgram`; `tls`/`https` remain fetch-backed shims (no real TLS sockets).
 
 14. **VFS worker split** [M] — **DONE.** The Rust/Wasm VFS now lives in its own dedicated
-    `File System Worker` (browser `packages/studio/src/workers/fs-worker.js`, headless `scripts/fs-worker.mjs`),
+    `File System Worker` (browser `packages/core/src/workers/fs-worker.js`, headless `scripts/fs-worker.mjs`),
     off the kernel's thread. **Routing (A1, direct-SAB):** a process's fs opcodes are
     serviced by that worker **directly over the process's own SAB** — the kernel is never
     on the fs path. At spawn the kernel opens a `MessageChannel` between each process and
@@ -1950,7 +1950,7 @@ module transforms through the framework plugin) backs
 are all green and non-experimental (Svelte via a Vite-7 pin — see below).
 
 The harness fetcher now mirrors the browser kernel's transparent wasm drop-in aliasing
-(`esbuild -> esbuild-wasm`, `rollup -> @rollup/wasm-node`; see `packages/studio/src/workers/fetcher-worker.js`) so
+(`esbuild -> esbuild-wasm`, `rollup -> @rollup/wasm-node`; see `packages/core/src/workers/fetcher-worker.js`) so
 a headless spike installs the exact same tree the studio does — without it, Qwik's Vite-7 tree pulls
 the native esbuild the browser never sees.
 

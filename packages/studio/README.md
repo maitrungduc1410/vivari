@@ -26,16 +26,19 @@ on `/sw.js` (the preview proxy needs root scope).
 
 ## How it fits together
 
-- `src/vv/kernel.ts` — `KernelBridge`: spawns the kernel worker
-  (`../workers/kernel-worker.js`, bundled by Vite along with its nested `fs` /
-  `fetcher` / `process` workers and the `packages/{vfs,codec,crypto}/pkg` wasm),
-  registers the preview Service Worker, and relays its HTTP requests into the VM.
+- `src/vv/kernel.ts` — a thin extension of `@vivari/core`'s `KernelBridge`, which
+  spawns the kernel worker (`packages/core/src/workers/kernel-worker.js`, bundled
+  by Vite along with its nested `fs` / `fetcher` / `process` workers and the
+  `packages/{vfs,codec,crypto}/pkg` wasm), registers the preview Service Worker,
+  and relays its HTTP requests into the VM. Studio adds only the `?compress=0` /
+  `?reset` URL toggles.
 - `src/vv/controller.ts` — `IdeController`: the imperative core (Monaco, xterm
   terminals, the demo "Run" flow via `VV_RUN`, preview) exposed as an external
   store that React reads via `useSyncExternalStore`.
 - `src/components/ide/*` — the chrome: AppShell, ActivityBar, Explorer,
   EditorGroup, TerminalPanel, PreviewPanel, StatusBar, CommandPalette.
 
-The kernel/worker files (`src/workers/*.js`) are the shared runtime host, moved
-here when the legacy raw-ESM demo UI was retired. See the repo root
-`ARCHITECTURE.md` for the full model.
+The kernel/worker files now live in the `@vivari/core` SDK
+(`packages/core/src/workers/*.js`) — studio is just their first consumer, via the
+`@vivari/core` Vite alias. See the repo root `ARCHITECTURE.md` for the full model,
+and `packages/core/README.md` for the embeddable SDK.

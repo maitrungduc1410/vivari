@@ -1,173 +1,32 @@
-// Bridge to the Vivari kernel worker.
+// Studio's bridge to the Vivari kernel worker.
 //
-// This is the studio's single point of contact with the runtime. It boots the
-// kernel worker (which itself spawns the fs / fetcher / process workers and the
-// Rust/Wasm VFS), registers the preview Service Worker and relays its HTTP
-// requests into the VM, and exposes a tiny typed pub/sub over the worker's
-// message protocol. All of the message shapes below mirror the studio's
-// workers/kernel-worker.js — the source of truth we bundle here via Vite.
-//
-// Vite bundles the worker + its nested `new Worker(new URL('./fs-worker.js' |
-// './process-worker.js', import.meta.url))` and every `new URL('../*/pkg/*_bg
-// .wasm', import.meta.url)` asset, all served same-origin so COEP is satisfied.
+// The transport, the worker (and its nested fs/fetcher/process workers), the
+// Rust/Wasm VFS, and the preview Service Worker relay all live in `@vivari/core`
+// now — Studio is just the first (and richest) consumer of that SDK. This file is
+// a thin extension: it re-exports the core bridge and layers on the two
+// studio-specific URL conventions (`?compress=0` and `?reset`).
 
-// Messages the kernel worker posts back to us. Loosely typed on purpose — the
-// consumer switches on `type`; extra fields ride along per message.
-export interface KernelMessage {
-  type: string;
-  [key: string]: unknown;
-}
+import {
+  KernelBridge as CoreKernelBridge,
+  isCrossOriginIsolated,
+  resetVfs,
+} from "@vivari/core";
 
-type Handler = (m: KernelMessage) => void;
+export { isCrossOriginIsolated };
+export type { KernelMessage } from "@vivari/core";
 
-export class KernelBridge {
-  readonly worker: Worker;
-  private readonly handlers = new Map<string, Set<Handler>>();
-  private readonly anyHandlers = new Set<Handler>();
-  private swRegistered = false;
-  // Correlation table for request()/vv-reply round-trips (readdir, read, etc.).
-  private readonly pending = new Map<number, (m: KernelMessage) => void>();
-  private reqSeq = 1;
-
-  constructor() {
-    this.worker = new Worker(
-      new URL("../workers/kernel-worker.js", import.meta.url),
-      { type: "module", name: "Kernel Worker" },
-    );
-    this.worker.onmessage = (event: MessageEvent<KernelMessage>) => {
-      const m = event.data;
-      if (m.type === "vv-reply") {
-        const resolve = this.pending.get(m.reqId as number);
-        if (resolve) {
-          this.pending.delete(m.reqId as number);
-          resolve(m);
-        }
-        return;
-      }
-      this.emit(m);
-    };
-
-    // Best-effort flush of the OPFS write-behind buffer as the page goes away.
-    addEventListener("pagehide", () =>
-      this.worker.postMessage({ type: "fs-flush" }),
-    );
-
-    // Reverse HMR tunnel: the preview iframe's WebSocket shim posts connection
-    // events UP to this window; relay them down to the kernel worker.
-    addEventListener("message", (event: MessageEvent) => {
-      const d = event.data;
-      if (!d || d.dir !== "out" || (d.type !== "vv-ws" && d.type !== "vv-sse")) return;
-      this.worker.postMessage({ type: d.type as string, msg: d });
-    });
-  }
-
-  /** Subscribe to one message `type`. Returns an unsubscribe fn. */
-  on(type: string, handler: Handler): () => void {
-    let set = this.handlers.get(type);
-    if (!set) this.handlers.set(type, (set = new Set()));
-    set.add(handler);
-    return () => set!.delete(handler);
-  }
-
-  /** Subscribe to every message (used for the read-only Console + debugging). */
-  onAny(handler: Handler): () => void {
-    this.anyHandlers.add(handler);
-    return () => this.anyHandlers.delete(handler);
-  }
-
-  private emit(m: KernelMessage) {
-    const set = this.handlers.get(m.type);
-    if (set) for (const h of set) h(m);
-    for (const h of this.anyHandlers) h(m);
-  }
-
-  /** Post a message to the kernel worker (optionally transferring objects). */
-  post(type: string, extra?: Record<string, unknown>, transfer?: Transferable[]) {
-    this.worker.postMessage({ type, ...extra }, transfer ?? []);
-  }
-
-  /**
-   * Request/response round-trip: post `type` with a correlation id and resolve
-   * when the worker answers with `{type:"vv-reply", reqId, ...}`. Used for VFS
-   * queries (readdir/read/stat) and project creation.
-   */
-  request(type: string, extra?: Record<string, unknown>): Promise<KernelMessage> {
-    const reqId = this.reqSeq++;
-    return new Promise((resolve) => {
-      this.pending.set(reqId, resolve);
-      this.worker.postMessage({ type, reqId, ...extra });
-    });
-  }
-
-  /** Register the preview Service Worker and wire its HTTP relay into the VM. */
-  async registerServiceWorker(): Promise<boolean> {
-    if (this.swRegistered) return true;
-    if (!("serviceWorker" in navigator)) return false;
-    await navigator.serviceWorker.register("/sw.js", { scope: "/" });
-    await navigator.serviceWorker.ready;
-    // On a fresh load the document was fetched before the SW existed, so the page
-    // isn't controlled yet even though the SW is active. Wait for `clients.claim()`
-    // to take effect (controllerchange) so that preview iframes created afterwards
-    // are actually intercepted by the SW instead of escaping to the network (which
-    // would make the studio's SPA fallback render its home page inside the frame).
-    if (!navigator.serviceWorker.controller) {
-      await new Promise<void>((resolve) => {
-        const done = () => resolve();
-        navigator.serviceWorker.addEventListener("controllerchange", done, { once: true });
-        setTimeout(done, 1000); // safety net: claim may already be in flight
-      });
-    }
-    // The SW posts each preview request here; forward it to the kernel worker,
-    // transferring the reply port so the worker answers the SW directly.
-    navigator.serviceWorker.addEventListener("message", (event) => {
-      if (event.data?.type !== "vv-http") return;
-      this.worker.postMessage({ type: "vv-http", req: event.data.req }, [
-        event.ports[0],
-      ]);
-    });
-    this.swRegistered = true;
-    return true;
-  }
-
-  /**
-   * Tell the preview Service Worker which in-VM ports serve UNDER the
-   * `/preview/<port>/` proxy prefix (keep-prefix templates like Docusaurus) so it
-   * doesn't strip the prefix for them. Safe to call before the SW is active — it
-   * resolves against the ready registration.
-   */
-  setKeepPrefixPorts(ports: number[]): void {
-    if (!("serviceWorker" in navigator)) return;
-    navigator.serviceWorker.ready
-      .then((reg) => {
-        const sw = reg.active || navigator.serviceWorker.controller;
-        sw?.postMessage({ type: "vv-keep-prefix-ports", ports });
-      })
-      .catch(() => {});
-  }
-
-  /** Start the kernel (spawns fs/fetcher workers + VFS, then posts `ready`). */
+/** The core bridge, with Studio's `?compress=0` boot toggle wired in. */
+export class KernelBridge extends CoreKernelBridge {
   boot() {
-    // VFS whole-file lazy compression is ON by default (it cuts the FS worker's
-    // memory footprint by ~70% for a big node_modules). `?compress=0` is the
+    // VFS whole-file lazy compression is ON by default; `?compress=0` is the
     // escape hatch to disable it for A/B comparison or debugging.
     const compress = new URLSearchParams(location.search).get("compress") !== "0";
-    this.worker.postMessage({ type: "init", compress });
+    super.boot(compress);
   }
-}
-
-/** Is the page cross-origin isolated (SharedArrayBuffer available)? */
-export function isCrossOriginIsolated(): boolean {
-  return typeof SharedArrayBuffer !== "undefined" && self.crossOriginIsolated;
 }
 
 /** `?reset` wipes the OPFS-mirrored VFS before boot (clean slate). */
 export async function maybeResetVfs(): Promise<boolean> {
   if (!new URLSearchParams(location.search).has("reset")) return false;
-  try {
-    const dir = await navigator.storage.getDirectory();
-    await dir.removeEntry("vv-vfs", { recursive: true });
-    return true;
-  } catch {
-    return false; // nothing persisted yet
-  }
+  return resetVfs();
 }
