@@ -40,20 +40,60 @@ async function loadKeepPrefixPorts() {
   return set;
 }
 
+// Whether to inject Vivari's in-preview DevTools backend (chobitsu + the CDP
+// bootstrap; see DEVTOOLS_TAGS) into every preview page. Default ON so the studio
+// — which never sends the toggle — behaves exactly as before. The @vivari/core SDK
+// ships this same sw.js and calls `setDevtoolsEnabled(false)` (via Vivari.boot) so
+// standalone embedders who don't host `/vv-devtools/chobitsu.js` get clean previews
+// with no 404. Persisted (like keep-prefix) so a revived SW keeps the setting.
+const DEVTOOLS_KEY = "https://vv.config/devtools";
+let devtoolsEnabled = null; // boolean once loaded (null = not yet loaded)
+
+async function loadDevtoolsEnabled() {
+  if (devtoolsEnabled !== null) return devtoolsEnabled;
+  let enabled = true; // default ON when nothing has been persisted
+  try {
+    const cache = await caches.open(KEEP_PREFIX_CACHE);
+    const hit = await cache.match(DEVTOOLS_KEY);
+    if (hit) enabled = !!(await hit.json());
+  } catch (_) {
+    /* no persisted config yet */
+  }
+  devtoolsEnabled = enabled;
+  return enabled;
+}
+
 self.addEventListener("message", (event) => {
   const d = event.data;
-  if (!d || d.type !== "vv-keep-prefix-ports" || !Array.isArray(d.ports)) return;
-  keepPrefixPorts = new Set(d.ports.map((p) => p | 0));
-  event.waitUntil(
-    (async () => {
-      try {
-        const cache = await caches.open(KEEP_PREFIX_CACHE);
-        await cache.put(KEEP_PREFIX_KEY, new Response(JSON.stringify([...keepPrefixPorts])));
-      } catch (_) {
-        /* best-effort persistence */
-      }
-    })(),
-  );
+  if (d && d.type === "vv-keep-prefix-ports" && Array.isArray(d.ports)) {
+    keepPrefixPorts = new Set(d.ports.map((p) => p | 0));
+    event.waitUntil(
+      (async () => {
+        try {
+          const cache = await caches.open(KEEP_PREFIX_CACHE);
+          await cache.put(KEEP_PREFIX_KEY, new Response(JSON.stringify([...keepPrefixPorts])));
+        } catch (_) {
+          /* best-effort persistence */
+        }
+      })(),
+    );
+    return;
+  }
+  // Toggle the in-preview DevTools backend injection (see loadDevtoolsEnabled).
+  if (d && d.type === "vv-devtools" && typeof d.enabled === "boolean") {
+    devtoolsEnabled = d.enabled;
+    event.waitUntil(
+      (async () => {
+        try {
+          const cache = await caches.open(KEEP_PREFIX_CACHE);
+          await cache.put(DEVTOOLS_KEY, new Response(JSON.stringify(devtoolsEnabled)));
+        } catch (_) {
+          /* best-effort persistence */
+        }
+      })(),
+    );
+    return;
+  }
 });
 
 // roadmap: Packaging Stage 2 — precache the role bundles. Every Process Worker
@@ -527,17 +567,20 @@ const DEVTOOLS_TAGS =
 // The DevTools network bridge (NET_SHIM) runs first so the WS/SSE shims can use
 // it, then the WS + SSE shims (inline), then chobitsu (classic src → executes
 // before the app's deferred module scripts), then the CDP bootstrap.
-function injectWsShim(html, keepPrefix) {
+function injectWsShim(html, keepPrefix, devtools) {
   // For keep-prefix ports, tell the injected WS shim (and any app code that cares)
   // that this document lives under its real base — so its own HMR socket path is
   // left prefixed rather than stripped.
   const flag = keepPrefix ? "<script>window.__ocKeepPrefix=true;<\/script>" : "";
+  // The net/WS/SSE shims are always required (HMR + virtual networking); the
+  // DevTools backend (chobitsu + CDP) is opt-out so a standalone SDK embedder that
+  // doesn't host /vv-devtools/chobitsu.js gets clean previews (no per-page 404).
   const tag =
     flag +
     "<script>" + NET_SHIM + "<\/script>" +
     "<script>" + WS_SHIM + "<\/script>" +
     "<script>" + SSE_SHIM + "<\/script>" +
-    DEVTOOLS_TAGS;
+    (devtools ? DEVTOOLS_TAGS : "");
   const headOpen = /<head[^>]*>/i.exec(html);
   if (headOpen) {
     const at = headOpen.index + headOpen[0].length;
@@ -763,7 +806,8 @@ async function handlePreview(event, port, path, keepPrefix) {
     outBody = bytes;
   } else if (typeof outBody === "string" && (respHeaders.get("content-type") || "").includes("text/html")) {
     // roadmap #19 stage C: install the ws tunnel polyfill before /@vite/client.
-    outBody = injectWsShim(outBody, keepPrefix);
+    // DevTools backend injection is opt-out (loadDevtoolsEnabled; default on).
+    outBody = injectWsShim(outBody, keepPrefix, await loadDevtoolsEnabled());
     respHeaders.delete("content-length"); // body grew; let the browser recompute
   }
 

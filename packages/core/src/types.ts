@@ -23,6 +23,12 @@ export interface BootOptions {
   serviceWorkerUrl?: string | false;
   /** Name shown for the kernel Worker in DevTools. Default: `"Vivari Kernel"`. */
   workerName?: string;
+  /**
+   * Inject Vivari's in-preview DevTools backend (chobitsu + CDP) into preview
+   * pages. Off by default — enable only if you self-host `/vv-devtools/chobitsu.js`
+   * same-origin, otherwise every preview would 404 on that script.
+   */
+  devtools?: boolean;
 }
 
 /** A recursive description of files/directories to write into the VFS. */

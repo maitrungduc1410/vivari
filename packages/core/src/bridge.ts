@@ -143,6 +143,22 @@ export class KernelBridge {
       .catch(() => {});
   }
 
+  /**
+   * Toggle whether the preview Service Worker injects Vivari's in-preview DevTools
+   * backend (chobitsu + CDP) into preview pages. Off is the right default for
+   * embedders that don't self-host `/vv-devtools/chobitsu.js` (avoids a per-preview
+   * 404); the studio IDE leaves it on. Safe to call before the SW is active.
+   */
+  setDevtoolsEnabled(enabled: boolean): void {
+    if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.ready
+      .then((reg) => {
+        const sw = reg.active || navigator.serviceWorker.controller;
+        sw?.postMessage({ type: "vv-devtools", enabled });
+      })
+      .catch(() => {});
+  }
+
   /** Start the kernel (spawns fs/fetcher workers + VFS, then posts `ready`). */
   boot(compress = true) {
     this.worker.postMessage({ type: "init", compress });

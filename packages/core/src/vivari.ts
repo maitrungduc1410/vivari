@@ -75,6 +75,10 @@ export class Vivari {
       await bridge.registerServiceWorker(
         typeof options.serviceWorkerUrl === "string" ? options.serviceWorkerUrl : undefined,
       );
+      // Preview DevTools backend is opt-in for SDK embedders (see BootOptions.devtools):
+      // it needs a same-origin /vv-devtools/chobitsu.js, which the studio hosts but a
+      // bare embedder won't. The SW defaults it on (for the studio), so opt out here.
+      bridge.setDevtoolsEnabled(options.devtools ?? false);
     }
 
     const ready = new Promise<void>((resolve) => {

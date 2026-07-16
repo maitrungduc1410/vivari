@@ -66,6 +66,13 @@ Service Worker.
 | `compress`         | `boolean`           | `true`         | VFS whole-file compression (~70 % less RAM for a big node_modules) |
 | `serviceWorkerUrl` | `string \| false`   | `"/sw.js"`     | where you host the SDK's `sw.js`; `false` disables previews        |
 | `workerName`       | `string`            | `"Vivari Kernel"` | DevTools label for the kernel Worker                            |
+| `devtools`         | `boolean`           | `false`        | inject Vivari's in-preview DevTools backend (see below)            |
+
+> **Preview DevTools.** By default the SDK does **not** inject Vivari's in-preview
+> DevTools backend into your preview pages. That backend needs a same-origin
+> `/vv-devtools/chobitsu.js`, so enabling it without hosting that file would make
+> every preview 404 on it. Pass `devtools: true` **and** serve `chobitsu.js` from
+> your origin to turn it on.
 
 ### `vivari.mount(tree, { mountPoint? })`
 
