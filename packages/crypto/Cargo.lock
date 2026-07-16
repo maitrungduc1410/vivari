@@ -193,22 +193,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
-name = "vivari-crypto"
-version = "0.1.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "cbc",
- "cipher",
- "hmac",
- "md-5",
- "pbkdf2",
- "sha1",
- "sha2",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "pbkdf2"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -320,6 +304,22 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vivari-crypto"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "cbc",
+ "cipher",
+ "hmac",
+ "md-5",
+ "pbkdf2",
+ "sha1",
+ "sha2",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "wasm-bindgen"

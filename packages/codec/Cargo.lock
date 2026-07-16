@@ -56,14 +56,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "vivari-codec"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -109,6 +101,14 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "vivari-codec"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "wasm-bindgen"
