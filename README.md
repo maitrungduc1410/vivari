@@ -54,9 +54,13 @@ packages/
     boot.js          process bootstrap used by both env worker entries
     builtins/        fs, path, process, os, events, util, buffer, assert,
                      child_process, http
-  studio/            the React IDE (the app) — Vite + React + Tailwind
+  core/              @vivari/core — the embeddable SDK (framework-agnostic)
     src/workers/     browser worker entries: kernel / fs / fetcher / process
-    src/vv/          KernelBridge + IdeController + built-in templates
+    src/              Vivari (boot/mount/spawn), fs facade, process streams,
+                     preview + the low-level KernelBridge transport
+  react/             @vivari/react — <Vivari> component + useVivari() hook
+  studio/            the React IDE (the app) — Vite + React + Tailwind
+    src/vv/          IdeController + built-in templates (consumes @vivari/core)
     public/sw.js     preview Service Worker (fetch → kernel → virtual server)
 scripts/
   process-worker.mjs Node worker entry for one process
@@ -80,6 +84,49 @@ kernel over a shared Rust VFS. A `node` process even spawns its own child via
 `execSync` — the parent blocks on the child through the same Atomics bridge. Then
 a `node /srv/server.js` process starts an HTTP server that stays alive, and the
 right-hand pane previews it live through the Service Worker.
+
+## Embed it (SDK)
+
+The same runtime that powers the studio is published as an embeddable SDK:
+
+- **`@vivari/core`** — a clean, framework-agnostic API ([docs](packages/core/README.md)).
+- **`@vivari/react`** — a `<Vivari>` component + `useVivari()` hook ([docs](packages/react/README.md)).
+
+```ts
+import { Vivari } from "@vivari/core";
+
+const vivari = await Vivari.boot();
+await vivari.mount({
+  "package.json": { file: { contents: '{ "type": "module" }' } },
+  "index.js": { file: { contents: "console.log('hello from the browser')" } },
+});
+
+const proc = await vivari.spawn("node", ["index.js"]);
+proc.output.pipeTo(new WritableStream({ write: (c) => console.log(c) }));
+await proc.exit;
+
+// Run a dev server and preview it in an <iframe>:
+vivari.on("server-ready", (port, url) => (iframe.src = url));
+await vivari.spawn("npm", ["install"]);
+await vivari.spawn("npm", ["run", "dev"]);
+```
+
+```tsx
+import { Vivari } from "@vivari/react";
+
+<Vivari files={tree} run="npm run dev" style={{ width: "100%", height: 480 }} />;
+```
+
+> Vivari needs a **cross-origin isolated** page (`COOP: same-origin` +
+> `COEP: require-corp`) so `SharedArrayBuffer` is available. See the
+> [core README](packages/core/README.md) for host + asset self-hosting notes.
+
+A runnable, end-to-end example lives in [`examples/basic`](examples/basic) (boot →
+mount → run a script → preview an in-VM server). `npm run smoke` guards the SDK's
+public API + packaging offline.
+
+Releases are cut from the manual **Publish SDK** GitHub Actions workflow
+(`.github/workflows/publish.yml`).
 
 ## Roadmap
 

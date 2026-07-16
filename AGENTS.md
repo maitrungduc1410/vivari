@@ -92,10 +92,10 @@ packages/
                      backend) + a CDP/nav bridge; passes /vv-devtools/* straight through.
     public/devtools-host.html  host page for the chii DevTools frontend iframe (loaded
                      with `#?embedded=<origin>` → chii's postMessage transport).
-    src/vv/kernel.ts      KernelBridge: spawns src/workers/kernel-worker.js, SW register +
-                          vv-http relay, typed pub/sub over the worker protocol, PLUS
-                          request()/vv-reply request-response (reqId-correlated) for VFS
-                          queries (vv-readdir/vv-read/vv-stat) + vv-create-project.
+    src/vv/kernel.ts      thin studio extension of @vivari/core's KernelBridge (which spawns
+                          packages/core/src/workers/kernel-worker.ts, does SW register +
+                          vv-http relay, typed pub/sub, and request()/vv-reply reqId round-trips
+                          for VFS queries). Adds only the studio `?compress=0` / `?reset` toggles.
     src/vv/controller.ts  IdeController: the imperative core (Monaco, xterm terminals,
                           preview, DevTools relay) as an external store React reads via
                           useSyncExternalStore. Since the multi-root rewrite: workspace =
@@ -108,16 +108,20 @@ packages/
                           node_modules .d.ts extra libs) for IntelliSense — see gotcha below.
     src/vv/templates.ts   10 project templates (React/Vue/Svelte/Express/Nest × TS/JS) —
                           manifest (install/dev/port/entry) + full source, inline.
-    src/workers/          the shared runtime host (browser worker entries; bundled by Vite
-                          via kernel.ts). Moved here when the legacy demo UI was retired:
-      kernel-worker.js    hosts the Kernel; DEMOS registry + demo shell tabs (VV_RUN); the
+  (../core/src/workers/)  the shared runtime host now lives in the @vivari/core SDK
+                          (packages/core/src/workers/); studio bundles it via the
+                          @vivari/core alias. Browser worker entries:
+      kernel-worker.ts    hosts the Kernel; DEMOS registry + demo shell tabs (VV_RUN); the
                           multi-root VFS protocol (vv-readdir/read/stat/mkdirp/create-project,
                           vv-fs-changed; streaming vv-search + vv-replace; vv-collect-dts bulk
                           node_modules .d.ts harvest for IntelliSense) + dynamic project
-                          run/attribution (projectDirByTerm, project-ready/-reload).
-      fs-worker.js        hosts the File System Worker (VFS + OPFS).
-      fetcher-worker.js   outbound fetch() (npm downloads).
-      process-worker.js   one process = one worker (boots the runtime).
+                          run/attribution (projectDirByTerm, project-ready/-reload). Also the
+                          generic SDK spawn protocol (proc-spawn/-input/-kill → proc-out/-exit).
+      fs-worker.ts        hosts the File System Worker (VFS + OPFS).
+      fetcher-worker.ts   outbound fetch() (npm downloads).
+      process-worker.ts   one process = one worker (boots the runtime).
+      (TS + `// @ts-nocheck`; bundled by Vite/esbuild, not the strict API build —
+       see packages/core/tsconfig.workers.json.)
     src/components/ide/   AppShell (+ Home overlay) · Home (Start blank / from template,
                           recents) · ActivityBar (Explorer/Search) · Explorer (VFS-backed
                           multi-root tree; context menu incl. Open in Integrated Terminal,
@@ -203,7 +207,7 @@ throw that gets swallowed. Rules:
 - If you add a syscall that can carry big data, chunk it from day one.
 
 ### The Fetcher strips non-CORS-safelisted request headers (browser only)
-`packages/studio/src/workers/fetcher-worker.js` (`corsSafeHeaders`) keeps ONLY the CORS-safelisted
+`packages/core/src/workers/fetcher-worker.ts` (`corsSafeHeaders`) keeps ONLY the CORS-safelisted
 request headers (`accept`, `accept-language`, `content-language`, a simple
 `content-type`) before calling the browser `fetch()`. Real npm/pacote attach
 custom headers (`npm-command`, `npm-session`, `npm-auth-type`, `pacote-*`,
@@ -230,7 +234,7 @@ downloads in flight at once. The wiring, keep every link intact:
   per-process unique so the reply matches its request.
 - `runtime/index.js` exposes `globalThis.__ocfetchAsync(url, opts)` (a Promise)
   and `dispatchFetch(msg)` which settles the pending promise on `fetch-done`.
-  **Both** process-worker entries — `packages/studio/src/workers/process-worker.js` (browser)
+  **Both** process-worker entries — `packages/core/src/workers/process-worker.ts` (browser)
   and `scripts/process-worker.mjs` (headless) — MUST route `fetch-done` →
   `control.dispatchFetch`, or downloads hang.
 - `node/lib/https.js` `_dispatch()` prefers `__ocfetchAsync` and falls back to the
@@ -277,7 +281,7 @@ The native->wasm alias table is the single source of truth in
 `runtime/toolchain-shims.js` (`NATIVE_WASM_ALIASES`) — add drop-ins THERE, not in
 the fetcher. Requirements for a new entry: source+target published in lockstep,
 target pure-JS/wasm, proven by a spike. It is guarded by `scripts/spike-toolchain.mjs`.
-- **Registry aliasing** (`packages/studio/src/workers/fetcher-worker.js` imports `NATIVE_WASM_ALIASES`): a
+- **Registry aliasing** (`packages/core/src/workers/fetcher-worker.ts` imports `NATIVE_WASM_ALIASES`): a
   packument request for `esbuild`/`rollup` is served the drop-in's packument
   rewritten under the source name; npm then downloads the drop-in's real tarball
   into `node_modules/<source>` (versions are published in lockstep). Falls back to
@@ -382,7 +386,7 @@ map. Rules that bite if ignored:
 
 ### Full-text search runs in the kernel worker — keep it non-blocking
 The VFS is synchronous ONLY inside the kernel worker (the sole VFS holder), so full-text
-search/replace lives there (`vv-search`/`vv-replace` in `packages/studio/src/workers/kernel-worker.js`), NOT on the
+search/replace lives there (`vv-search`/`vv-replace` in `packages/core/src/workers/kernel-worker.ts`), NOT on the
 main thread — reading every file over `vv-read` round-trips would be death by a thousand
 messages. But that same worker also serves preview HTTP + terminal I/O, so the walk MUST
 stay cooperative: it `await`s a macrotask every N files and streams partial results back as
@@ -662,7 +666,7 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   a tab-per-port default — HMR/SSR-worker ports would spawn junk tabs.
 - **`host.vivari.internal`.** Maps to the studio's own hostname so in-VM code can reach a
   service on the HOST machine (only when the studio is served locally). Two egress paths both
-  honor it: `http`/`https` (and npm) go through `packages/studio/src/workers/fetcher-worker.js` `rewrite()`;
+  honor it: `http`/`https` (and npm) go through `packages/core/src/workers/fetcher-worker.ts` `rewrite()`;
   the **global `fetch()`** is the host realm's real fetch (used directly, not via the Fetcher
   Worker), so `packages/runtime/index.js` rewrites the alias in its own `fetch` wrapper
   (`rewriteHostAlias`). Reverse direction: the host hits `<studio-origin>/preview/<port>/…`.
@@ -1046,7 +1050,7 @@ the gap can't silently regress.
 - **Fix a framework crash**: reproduce headless with a `probe-*.mjs` (copy an
   existing one), read the minified stack to the offending `lib/`/binding, implement
   the missing piece in `runtime/node/`, re-run the probe + `npm run verify`.
-- **Add a demo**: extend the `DEMOS` registry in `packages/studio/src/workers/kernel-worker.js` with a
+- **Add a demo**: extend the `DEMOS` registry in `packages/core/src/workers/kernel-worker.ts` with a
   REAL project layout (`files` = relative path → contents, exactly what `npm create
   …` emits), plus `dir`, `port`, `entry`, and a `runCmd`/`runArgs` that is the
   project's own dev script (e.g. `npm run dev`). Add the option to the `DEMOS` array

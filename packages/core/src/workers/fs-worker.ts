@@ -1,3 +1,6 @@
+// @ts-nocheck — authored in TS for Vite's native worker bundling, but not strictly
+// type-checked: it imports the generated wasm VFS + untyped kernel-host JS. esbuild
+// (via Vite) is the compiler; strict typing is a separate, larger effort.
 // The File System Worker (Phase 2 #14), browser side.
 //
 // It owns the single Rust/Wasm VirtualFileSystem and nothing else. The kernel

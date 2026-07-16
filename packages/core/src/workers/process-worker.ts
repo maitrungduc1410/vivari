@@ -1,3 +1,6 @@
+// @ts-nocheck — authored in TS for Vite's native worker bundling, but not strictly
+// type-checked: it boots the untyped Node runtime (packages/runtime) + generated wasm
+// codecs. esbuild (via Vite) is the compiler; strict typing is a separate effort.
 // Browser worker entry for a single process. Waits for the kernel's `init`
 // message, then boots the runtime and runs the program. Later `net` messages
 // from the kernel nudge the process event loop when a request is queued.

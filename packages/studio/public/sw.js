@@ -23,7 +23,7 @@ const PREVIEW_MARKER = "/preview/";
 // preview URL. The controller pushes the current set here; we also persist it so a
 // terminated-then-revived SW (which loses in-memory state) still routes correctly.
 const KEEP_PREFIX_CACHE = "vv-config";
-const KEEP_PREFIX_KEY = "https://oc.config/keep-prefix-ports";
+const KEEP_PREFIX_KEY = "https://vv.config/keep-prefix-ports";
 let keepPrefixPorts = null; // Set<number> once loaded (null = not yet loaded)
 
 async function loadKeepPrefixPorts() {
@@ -40,20 +40,60 @@ async function loadKeepPrefixPorts() {
   return set;
 }
 
+// Whether to inject Vivari's in-preview DevTools backend (chobitsu + the CDP
+// bootstrap; see DEVTOOLS_TAGS) into every preview page. Default ON so the studio
+// — which never sends the toggle — behaves exactly as before. The @vivari/core SDK
+// ships this same sw.js and calls `setDevtoolsEnabled(false)` (via Vivari.boot) so
+// standalone embedders who don't host `/vv-devtools/chobitsu.js` get clean previews
+// with no 404. Persisted (like keep-prefix) so a revived SW keeps the setting.
+const DEVTOOLS_KEY = "https://vv.config/devtools";
+let devtoolsEnabled = null; // boolean once loaded (null = not yet loaded)
+
+async function loadDevtoolsEnabled() {
+  if (devtoolsEnabled !== null) return devtoolsEnabled;
+  let enabled = true; // default ON when nothing has been persisted
+  try {
+    const cache = await caches.open(KEEP_PREFIX_CACHE);
+    const hit = await cache.match(DEVTOOLS_KEY);
+    if (hit) enabled = !!(await hit.json());
+  } catch (_) {
+    /* no persisted config yet */
+  }
+  devtoolsEnabled = enabled;
+  return enabled;
+}
+
 self.addEventListener("message", (event) => {
   const d = event.data;
-  if (!d || d.type !== "vv-keep-prefix-ports" || !Array.isArray(d.ports)) return;
-  keepPrefixPorts = new Set(d.ports.map((p) => p | 0));
-  event.waitUntil(
-    (async () => {
-      try {
-        const cache = await caches.open(KEEP_PREFIX_CACHE);
-        await cache.put(KEEP_PREFIX_KEY, new Response(JSON.stringify([...keepPrefixPorts])));
-      } catch (_) {
-        /* best-effort persistence */
-      }
-    })(),
-  );
+  if (d && d.type === "vv-keep-prefix-ports" && Array.isArray(d.ports)) {
+    keepPrefixPorts = new Set(d.ports.map((p) => p | 0));
+    event.waitUntil(
+      (async () => {
+        try {
+          const cache = await caches.open(KEEP_PREFIX_CACHE);
+          await cache.put(KEEP_PREFIX_KEY, new Response(JSON.stringify([...keepPrefixPorts])));
+        } catch (_) {
+          /* best-effort persistence */
+        }
+      })(),
+    );
+    return;
+  }
+  // Toggle the in-preview DevTools backend injection (see loadDevtoolsEnabled).
+  if (d && d.type === "vv-devtools" && typeof d.enabled === "boolean") {
+    devtoolsEnabled = d.enabled;
+    event.waitUntil(
+      (async () => {
+        try {
+          const cache = await caches.open(KEEP_PREFIX_CACHE);
+          await cache.put(DEVTOOLS_KEY, new Response(JSON.stringify(devtoolsEnabled)));
+        } catch (_) {
+          /* best-effort persistence */
+        }
+      })(),
+    );
+    return;
+  }
 });
 
 // roadmap: Packaging Stage 2 — precache the role bundles. Every Process Worker
@@ -61,12 +101,12 @@ self.addEventListener("message", (event) => {
 // alone is ~900 KB. With the bundles in the Cache Storage the browser serves
 // them from disk: spawns are instant and the app works offline.
 //
-// This is gated on a build id (`__OC_BUILD_ID__`, a build-time `define`). It is
+// This is gated on a build id (`__VV_BUILD_ID__`, a build-time `define`). It is
 // currently never defined in the studio build, so BUILD_ID is null and ALL
 // caching is skipped — edits keep hot-
 // reloading exactly as before. `typeof` on an undeclared name is legal and
 // yields "undefined", so this is safe to reference in the un-built file.
-const BUILD_ID = typeof __OC_BUILD_ID__ !== "undefined" ? __OC_BUILD_ID__ : null;
+const BUILD_ID = typeof __VV_BUILD_ID__ !== "undefined" ? __VV_BUILD_ID__ : null;
 const CACHE_ON = BUILD_ID !== null;
 const CACHE_PREFIX = "vv-precache-";
 const CACHE_NAME = CACHE_PREFIX + BUILD_ID;
@@ -159,7 +199,7 @@ async function cacheFirst(request) {
 // or before switching to this tab — still shows up (its future frames then stream
 // live; frames from before attach are dropped, matching real DevTools behaviour).
 const NET_SHIM = `(function(){
-if (window.__ocNet) return;
+if (window.__vvNet) return;
 var attached = false, gen = 0, live = {};
 function post(method, params){
   try { parent.postMessage({ source:'vv-cdp', dir:'target', data: JSON.stringify({ method: method, params: params }) }, '*'); } catch(e){}
@@ -170,7 +210,7 @@ function post(method, params){
 // generation = exactly one row per connection (no duplicate from the live-emit +
 // replay-on-attach paths both firing).
 function announce(id){ var o = live[id]; if (!o || o.gen === gen) return; o.gen = gen; try { o.replay(); } catch(e){} }
-window.__ocNet = {
+window.__vvNet = {
   now: function(){ return performance.now() / 1000; },
   wall: function(){ return Date.now() / 1000; },
   emit: function(method, params){ if (attached) post(method, params); },
@@ -188,7 +228,7 @@ window.__ocNet = {
 // (parent.postMessage), which relays it to the kernel -> the process owning the
 // preview port -> a genuine in-VM WebSocket to the dev server's HMR socket.
 const WS_SHIM = `(function(){
-if (window.__ocWsInstalled) return; window.__ocWsInstalled = true;
+if (window.__vvWsInstalled) return; window.__vvWsInstalled = true;
 var m = location.pathname.match(/\\/preview\\/(\\d+)\\//);
 var previewPort = m ? parseInt(m[1], 10) : 0;
 var tok = Math.random().toString(36).slice(2, 8);
@@ -209,7 +249,7 @@ window.addEventListener('message', function(ev){
 window.addEventListener('pagehide', function(){
   for (var k in conns){ try { conns[k].close(1001, 'unload'); } catch(e){} }
 });
-function OCWebSocket(url, protocols){
+function VVWebSocket(url, protocols){
   this.url = String(url); this.readyState = 0; this.protocol = ''; this.binaryType = 'blob';
   this._id = tok + '-' + (nextId++); this._l = { open:[], message:[], close:[], error:[] };
   conns[this._id] = this;
@@ -229,7 +269,7 @@ function OCWebSocket(url, protocols){
       // /preview/<port>/) serves its OWN HMR socket under that prefix too — keep it
       // so the server sees its real path. Only strip when tunnelling to a DIFFERENT
       // in-VM port (a genuine cross-service socket).
-      if (window.__ocKeepPrefix && targetPort === previewPort) path = u.pathname + u.search;
+      if (window.__vvKeepPrefix && targetPort === previewPort) path = u.pathname + u.search;
       else path = (pm[2] || '/') + u.search;
     } else if (u.port && u.port !== location.port) {
       // An explicit ws port that isn't the studio origin's own port addresses a
@@ -248,25 +288,25 @@ function OCWebSocket(url, protocols){
   var self2 = this; this._rid = this._id;
   this._cdpUrl = (/^wss:/i.test(this.url) ? 'wss' : 'ws') + '://localhost:' + targetPort + path;
   this._wsReplay = function(){
-    window.__ocNet.emit('Network.webSocketCreated', { requestId:self2._rid, url:self2._cdpUrl, initiator:{ type:'script' } });
-    window.__ocNet.emit('Network.webSocketWillSendHandshakeRequest', { requestId:self2._rid, timestamp:window.__ocNet.now(), wallTime:window.__ocNet.wall(), request:{ headers:{} } });
-    if (self2.readyState === 1) window.__ocNet.emit('Network.webSocketHandshakeResponseReceived', { requestId:self2._rid, timestamp:window.__ocNet.now(), response:{ status:101, statusText:'Switching Protocols', headers:{} } });
+    window.__vvNet.emit('Network.webSocketCreated', { requestId:self2._rid, url:self2._cdpUrl, initiator:{ type:'script' } });
+    window.__vvNet.emit('Network.webSocketWillSendHandshakeRequest', { requestId:self2._rid, timestamp:window.__vvNet.now(), wallTime:window.__vvNet.wall(), request:{ headers:{} } });
+    if (self2.readyState === 1) window.__vvNet.emit('Network.webSocketHandshakeResponseReceived', { requestId:self2._rid, timestamp:window.__vvNet.now(), response:{ status:101, statusText:'Switching Protocols', headers:{} } });
   };
-  window.__ocNet.register(this._rid, this._wsReplay);
+  window.__vvNet.register(this._rid, this._wsReplay);
 }
-OCWebSocket.CONNECTING = 0; OCWebSocket.OPEN = 1; OCWebSocket.CLOSING = 2; OCWebSocket.CLOSED = 3;
-OCWebSocket.prototype._deliver = function(d){
+VVWebSocket.CONNECTING = 0; VVWebSocket.OPEN = 1; VVWebSocket.CLOSING = 2; VVWebSocket.CLOSED = 3;
+VVWebSocket.prototype._deliver = function(d){
   if (d.sub === 'open'){ this.readyState = 1; this.protocol = d.protocol || '';
-    window.__ocNet.emit('Network.webSocketHandshakeResponseReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), response:{ status:101, statusText:'Switching Protocols', headers:{} } });
+    window.__vvNet.emit('Network.webSocketHandshakeResponseReceived', { requestId:this._rid, timestamp:window.__vvNet.now(), response:{ status:101, statusText:'Switching Protocols', headers:{} } });
     this._emit('open', { type:'open' }); }
   else if (d.sub === 'msg'){ var data = d.data;
-    window.__ocNet.emit('Network.webSocketFrameReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), response:{ opcode: d.binary?2:1, mask:false, payloadData: d.binary ? _b64(d.data) : String(d.data) } });
+    window.__vvNet.emit('Network.webSocketFrameReceived', { requestId:this._rid, timestamp:window.__vvNet.now(), response:{ opcode: d.binary?2:1, mask:false, payloadData: d.binary ? _b64(d.data) : String(d.data) } });
     if (d.binary && this.binaryType === 'blob' && !(data instanceof Blob)) data = new Blob([data]); this._emit('message', { type:'message', data:data }); }
   else if (d.sub === 'close'){ this.readyState = 3; delete conns[this._id];
-    if (!this._cdpClosed){ this._cdpClosed = true; window.__ocNet.emit('Network.webSocketClosed', { requestId:this._rid, timestamp:window.__ocNet.now() }); window.__ocNet.unregister(this._rid); }
+    if (!this._cdpClosed){ this._cdpClosed = true; window.__vvNet.emit('Network.webSocketClosed', { requestId:this._rid, timestamp:window.__vvNet.now() }); window.__vvNet.unregister(this._rid); }
     this._emit('close', { type:'close', code:d.code||1006, reason:d.reason||'', wasClean:d.code===1000 }); }
 };
-OCWebSocket.prototype.send = function(data){
+VVWebSocket.prototype.send = function(data){
   if (this.readyState !== 1) throw new Error('WebSocket is not open');
   var payload = data, binary = false;
   if (typeof data !== 'string'){ binary = true;
@@ -274,20 +314,20 @@ OCWebSocket.prototype.send = function(data){
     else if (ArrayBuffer.isView(data)) payload = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     else { binary = false; payload = String(data); } }
   post({ type:'vv-ws', dir:'out', sub:'send', connId:this._id, data:payload, binary:binary });
-  window.__ocNet.emit('Network.webSocketFrameSent', { requestId:this._rid, timestamp:window.__ocNet.now(), response:{ opcode: binary?2:1, mask:true, payloadData: binary ? _b64(payload) : String(payload) } });
+  window.__vvNet.emit('Network.webSocketFrameSent', { requestId:this._rid, timestamp:window.__vvNet.now(), response:{ opcode: binary?2:1, mask:true, payloadData: binary ? _b64(payload) : String(payload) } });
 };
-OCWebSocket.prototype.close = function(code, reason){
+VVWebSocket.prototype.close = function(code, reason){
   if (this.readyState === 3 || this.readyState === 2) return; this.readyState = 2;
-  if (!this._cdpClosed){ this._cdpClosed = true; window.__ocNet.emit('Network.webSocketClosed', { requestId:this._rid, timestamp:window.__ocNet.now() }); window.__ocNet.unregister(this._rid); }
+  if (!this._cdpClosed){ this._cdpClosed = true; window.__vvNet.emit('Network.webSocketClosed', { requestId:this._rid, timestamp:window.__vvNet.now() }); window.__vvNet.unregister(this._rid); }
   post({ type:'vv-ws', dir:'out', sub:'close', connId:this._id, code:code, reason:reason });
 };
-OCWebSocket.prototype.addEventListener = function(t, fn){ if (this._l[t]) this._l[t].push(fn); };
-OCWebSocket.prototype.removeEventListener = function(t, fn){ var a=this._l[t]; if(a){var i=a.indexOf(fn); if(i>=0)a.splice(i,1);} };
-OCWebSocket.prototype._emit = function(t, e){
+VVWebSocket.prototype.addEventListener = function(t, fn){ if (this._l[t]) this._l[t].push(fn); };
+VVWebSocket.prototype.removeEventListener = function(t, fn){ var a=this._l[t]; if(a){var i=a.indexOf(fn); if(i>=0)a.splice(i,1);} };
+VVWebSocket.prototype._emit = function(t, e){
   var on = this['on'+t]; if (typeof on === 'function'){ try{ on.call(this, e); }catch(x){} }
   var a = this._l[t]; if (a) for (var i=0;i<a.length;i++){ try{ a[i].call(this, e); }catch(x){} }
 };
-window.WebSocket = OCWebSocket;
+window.WebSocket = VVWebSocket;
 // Next.js 16's dev "debug channel" treats a navigation whose
 // PerformanceNavigationTiming reports transferSize===0 as a bfcache/HTTP-cache
 // restore (wasServedFromCache). Our Service Worker proxy synthesizes every
@@ -321,7 +361,7 @@ try {
 // The raw event-stream bytes come back as {sub:'chunk'} and are parsed here into
 // message/named events per the SSE spec. SSE is one-way, so there's no send() leg.
 const SSE_SHIM = `(function(){
-if (window.__ocSseInstalled) return; window.__ocSseInstalled = true;
+if (window.__vvSseInstalled) return; window.__vvSseInstalled = true;
 var m = location.pathname.match(/\\/preview\\/(\\d+)\\//);
 var previewPort = m ? parseInt(m[1], 10) : 0;
 var tok = Math.random().toString(36).slice(2, 8);
@@ -334,7 +374,7 @@ window.addEventListener('message', function(ev){
 window.addEventListener('pagehide', function(){
   for (var k in conns){ try { conns[k].close(); } catch(e){} }
 });
-function OCEventSource(url, cfg){
+function VVEventSource(url, cfg){
   this.url = String(url); this.readyState = 0; this.withCredentials = !!(cfg && cfg.withCredentials);
   this.lastEventId = ''; this.onopen = null; this.onmessage = null; this.onerror = null;
   this._id = tok + '-' + (nextId++); this._l = {}; this._buf = '';
@@ -353,25 +393,25 @@ function OCEventSource(url, cfg){
   var self2 = this; this._rid = this._id;
   this._cdpUrl = ((location.protocol === 'https:') ? 'https' : 'http') + '://localhost:' + targetPort + path;
   this._sseReplay = function(){
-    window.__ocNet.emit('Network.requestWillBeSent', { requestId:self2._rid, loaderId:'oc', documentURL:location.href, request:{ url:self2._cdpUrl, method:'GET', headers:{ Accept:'text/event-stream' } }, timestamp:window.__ocNet.now(), wallTime:window.__ocNet.wall(), initiator:{ type:'script' }, type:'EventSource' });
-    if (self2.readyState === 1) window.__ocNet.emit('Network.responseReceived', { requestId:self2._rid, timestamp:window.__ocNet.now(), type:'EventSource', response:{ url:self2._cdpUrl, status:200, statusText:'OK', mimeType:'text/event-stream', headers:{ 'content-type':'text/event-stream' } } });
+    window.__vvNet.emit('Network.requestWillBeSent', { requestId:self2._rid, loaderId:'vv', documentURL:location.href, request:{ url:self2._cdpUrl, method:'GET', headers:{ Accept:'text/event-stream' } }, timestamp:window.__vvNet.now(), wallTime:window.__vvNet.wall(), initiator:{ type:'script' }, type:'EventSource' });
+    if (self2.readyState === 1) window.__vvNet.emit('Network.responseReceived', { requestId:self2._rid, timestamp:window.__vvNet.now(), type:'EventSource', response:{ url:self2._cdpUrl, status:200, statusText:'OK', mimeType:'text/event-stream', headers:{ 'content-type':'text/event-stream' } } });
   };
-  window.__ocNet.register(this._rid, this._sseReplay);
+  window.__vvNet.register(this._rid, this._sseReplay);
 }
-OCEventSource.CONNECTING = 0; OCEventSource.OPEN = 1; OCEventSource.CLOSED = 2;
-OCEventSource.prototype._sseFinish = function(){
+VVEventSource.CONNECTING = 0; VVEventSource.OPEN = 1; VVEventSource.CLOSED = 2;
+VVEventSource.prototype._sseFinish = function(){
   if (this._cdpDone) return; this._cdpDone = true;
-  window.__ocNet.emit('Network.loadingFinished', { requestId:this._rid, timestamp:window.__ocNet.now(), encodedDataLength:0 });
-  window.__ocNet.unregister(this._rid);
+  window.__vvNet.emit('Network.loadingFinished', { requestId:this._rid, timestamp:window.__vvNet.now(), encodedDataLength:0 });
+  window.__vvNet.unregister(this._rid);
 };
-OCEventSource.prototype._deliver = function(d){
+VVEventSource.prototype._deliver = function(d){
   if (d.sub === 'open'){ this.readyState = 1;
-    window.__ocNet.emit('Network.responseReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), type:'EventSource', response:{ url:this._cdpUrl, status:200, statusText:'OK', mimeType:'text/event-stream', headers:{ 'content-type':'text/event-stream' } } });
+    window.__vvNet.emit('Network.responseReceived', { requestId:this._rid, timestamp:window.__vvNet.now(), type:'EventSource', response:{ url:this._cdpUrl, status:200, statusText:'OK', mimeType:'text/event-stream', headers:{ 'content-type':'text/event-stream' } } });
     this._emit('open', { type:'open' }); }
   else if (d.sub === 'chunk'){ this._feed(String(d.data == null ? '' : d.data)); }
   else if (d.sub === 'close'){ if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id]; this._sseFinish(); this._emit('error', { type:'error' }); }
 };
-OCEventSource.prototype._feed = function(text){
+VVEventSource.prototype._feed = function(text){
   this._buf = (this._buf + text).replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n');
   var idx;
   while ((idx = this._buf.indexOf('\\n\\n')) >= 0){
@@ -379,7 +419,7 @@ OCEventSource.prototype._feed = function(text){
     this._parse(raw);
   }
 };
-OCEventSource.prototype._parse = function(raw){
+VVEventSource.prototype._parse = function(raw){
   var lines = raw.split('\\n'); var event = 'message', data = [], id = null;
   for (var i=0;i<lines.length;i++){
     var line = lines[i]; if (line === '' || line.charAt(0) === ':') continue;
@@ -390,21 +430,21 @@ OCEventSource.prototype._parse = function(raw){
   if (id !== null) this.lastEventId = id;
   if (data.length === 0) return;
   var payload = data.join('\\n');
-  window.__ocNet.emit('Network.eventSourceMessageReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), eventName:event, eventId:this.lastEventId || '', data:payload });
+  window.__vvNet.emit('Network.eventSourceMessageReceived', { requestId:this._rid, timestamp:window.__vvNet.now(), eventName:event, eventId:this.lastEventId || '', data:payload });
   this._emit(event, { type:event, data:payload, lastEventId:this.lastEventId, origin:location.origin });
 };
-OCEventSource.prototype.close = function(){
+VVEventSource.prototype.close = function(){
   if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id];
   this._sseFinish();
   post({ type:'vv-sse', dir:'out', sub:'close', connId:this._id });
 };
-OCEventSource.prototype.addEventListener = function(t, fn){ (this._l[t] || (this._l[t] = [])).push(fn); };
-OCEventSource.prototype.removeEventListener = function(t, fn){ var a=this._l[t]; if(a){var i=a.indexOf(fn); if(i>=0)a.splice(i,1);} };
-OCEventSource.prototype._emit = function(t, e){
+VVEventSource.prototype.addEventListener = function(t, fn){ (this._l[t] || (this._l[t] = [])).push(fn); };
+VVEventSource.prototype.removeEventListener = function(t, fn){ var a=this._l[t]; if(a){var i=a.indexOf(fn); if(i>=0)a.splice(i,1);} };
+VVEventSource.prototype._emit = function(t, e){
   var on = this['on'+t]; if (typeof on === 'function'){ try{ on.call(this, e); }catch(x){} }
   var a = this._l[t]; if (a) for (var i=0;i<a.length;i++){ try{ a[i].call(this, e); }catch(x){} }
 };
-window.EventSource = OCEventSource;
+window.EventSource = VVEventSource;
 })();`;
 
 // In-browser DevTools bridge. Injected into every preview page next to the WS
@@ -420,7 +460,7 @@ window.EventSource = OCEventSource;
 //   host  → preview: { source:'vv-cdp', dir:'frontend', data:<cdp json string> }  (forward to chobitsu)
 //                     { source:'vv-cdp', dir:'init'                            }  (run the attach handshake)
 const CDP_BOOTSTRAP = `(function(){
-if (window.__ocCdpInstalled) return; window.__ocCdpInstalled = true;
+if (window.__vvCdpInstalled) return; window.__vvCdpInstalled = true;
 function post(m){ parent.postMessage(m, '*'); }
 var seq = 0;
 // chobitsu reports fetch/XHR with the URL the app resolved against the iframe
@@ -440,7 +480,7 @@ function cleanUrl(u){
     var port = parseInt(pm[1], 10);
     // A keep-prefix app (Docusaurus/Slidev) genuinely serves under /preview/<port>/,
     // so its own-port URLs legitimately keep the prefix — mirror the ws shim.
-    var rest = (window.__ocKeepPrefix && port === previewPort) ? url.pathname : (pm[2] || '/');
+    var rest = (window.__vvKeepPrefix && port === previewPort) ? url.pathname : (pm[2] || '/');
     var scheme = (location.protocol === 'https:') ? 'https' : 'http';
     return scheme + '://localhost:' + port + rest + url.search + url.hash;
   } catch(e){ return u; }
@@ -464,14 +504,14 @@ function scrubNet(o){
 // fire exactly once per fresh frontend, so this also keeps it to one row.
 var seenInit = false, seenNet = false;
 function maybeAttach(){
-  if (seenInit && seenNet && window.__ocNet){ seenInit = false; seenNet = false; window.__ocNet.onAttach(); }
+  if (seenInit && seenNet && window.__vvNet){ seenInit = false; seenNet = false; window.__vvNet.onAttach(); }
 }
 function setup(){
   if (!window.chobitsu) return false;
   window.chobitsu.setOnMessage(function(msg){
-    // Drop responses to our own internal enable requests (ids prefixed 'ocdt');
+    // Drop responses to our own internal enable requests (ids prefixed 'vvdt');
     // pass through events and responses the frontend actually asked for.
-    if (typeof msg === 'string' && msg.indexOf('"id":"ocdt') !== -1) return;
+    if (typeof msg === 'string' && msg.indexOf('"id":"vvdt') !== -1) return;
     // Friendly-URL rewrite for fetch/XHR Network events (cheap substring gate first).
     if (typeof msg === 'string' && msg.indexOf('/preview/') !== -1 && msg.indexOf('"Network.') !== -1) {
       try { var o = JSON.parse(msg); if (o && typeof o.method === 'string' && o.method.indexOf('Network.') === 0 && scrubNet(o)) msg = JSON.stringify(o); } catch(e){}
@@ -481,7 +521,7 @@ function setup(){
   return true;
 }
 if (!setup()) { var tries = 0, iv = setInterval(function(){ if (setup() || ++tries > 100) clearInterval(iv); }, 20); }
-function sendToChobitsu(method){ if (window.chobitsu) window.chobitsu.sendRawMessage(JSON.stringify({ id:'ocdt'+(++seq), method:method, params:{} })); }
+function sendToChobitsu(method){ if (window.chobitsu) window.chobitsu.sendRawMessage(JSON.stringify({ id:'vvdt'+(++seq), method:method, params:{} })); }
 function sendToDevtools(msg){ post({ source:'vv-cdp', dir:'target', data: JSON.stringify(msg) }); }
 function init(){
   sendToDevtools({ method:'Page.frameNavigated', params:{ frame:{ id:'1', mimeType:'text/html', securityOrigin: location.origin, url: location.href }, type:'Navigation' } });
@@ -527,17 +567,20 @@ const DEVTOOLS_TAGS =
 // The DevTools network bridge (NET_SHIM) runs first so the WS/SSE shims can use
 // it, then the WS + SSE shims (inline), then chobitsu (classic src → executes
 // before the app's deferred module scripts), then the CDP bootstrap.
-function injectWsShim(html, keepPrefix) {
+function injectWsShim(html, keepPrefix, devtools) {
   // For keep-prefix ports, tell the injected WS shim (and any app code that cares)
   // that this document lives under its real base — so its own HMR socket path is
   // left prefixed rather than stripped.
-  const flag = keepPrefix ? "<script>window.__ocKeepPrefix=true;<\/script>" : "";
+  const flag = keepPrefix ? "<script>window.__vvKeepPrefix=true;<\/script>" : "";
+  // The net/WS/SSE shims are always required (HMR + virtual networking); the
+  // DevTools backend (chobitsu + CDP) is opt-out so a standalone SDK embedder that
+  // doesn't host /vv-devtools/chobitsu.js gets clean previews (no per-page 404).
   const tag =
     flag +
     "<script>" + NET_SHIM + "<\/script>" +
     "<script>" + WS_SHIM + "<\/script>" +
     "<script>" + SSE_SHIM + "<\/script>" +
-    DEVTOOLS_TAGS;
+    (devtools ? DEVTOOLS_TAGS : "");
   const headOpen = /<head[^>]*>/i.exec(html);
   if (headOpen) {
     const at = headOpen.index + headOpen[0].length;
@@ -763,7 +806,8 @@ async function handlePreview(event, port, path, keepPrefix) {
     outBody = bytes;
   } else if (typeof outBody === "string" && (respHeaders.get("content-type") || "").includes("text/html")) {
     // roadmap #19 stage C: install the ws tunnel polyfill before /@vite/client.
-    outBody = injectWsShim(outBody, keepPrefix);
+    // DevTools backend injection is opt-out (loadDevtoolsEnabled; default on).
+    outBody = injectWsShim(outBody, keepPrefix, await loadDevtoolsEnabled());
     respHeaders.delete("content-length"); // body grew; let the browser recompute
   }
 

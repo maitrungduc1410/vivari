@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vivari — @vivari/core basic example</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        margin: 0;
+        padding: 1.5rem;
+        max-width: 960px;
+        margin-inline: auto;
+        line-height: 1.5;
+      }
+      h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+      p.sub { margin: 0 0 1.5rem; opacity: 0.7; }
+      section { margin-bottom: 2rem; }
+      h2 { font-size: 1.05rem; margin: 0 0 0.5rem; }
+      pre {
+        background: #1e1e2e;
+        color: #cdd6f4;
+        padding: 0.75rem 1rem;
+        border-radius: 8px;
+        overflow: auto;
+        min-height: 3rem;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 0.85rem;
+      }
+      iframe { width: 100%; height: 420px; border: 1px solid #8883; border-radius: 8px; }
+      .status { font-size: 0.85rem; opacity: 0.7; }
+    </style>
+  </head>
+  <body>
+    <h1>Vivari — <code>@vivari/core</code> basic example</h1>
+    <p class="sub">A full Node.js runtime, client-side in the browser. No server, no VM.</p>
+
+    <section>
+      <h2>1. Run a script</h2>
+      <p class="status" id="run-status">booting…</p>
+      <pre id="run-output"></pre>
+    </section>
+
+    <section>
+      <h2>2. Preview an in-VM HTTP server</h2>
+      <p class="status" id="preview-status">waiting for the script demo…</p>
+      <iframe id="preview" title="Vivari preview" hidden></iframe>
+    </section>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,46 @@
+{
+  "name": "@vivari/core",
+  "version": "0.0.1",
+  "description": "Run Node.js projects fully client-side in the browser. The framework-agnostic Vivari WebContainer SDK.",
+  "keywords": [
+    "webcontainer",
+    "vivari",
+    "browser",
+    "nodejs",
+    "wasm",
+    "sandbox",
+    "runtime"
+  ],
+  "license": "MIT",
+  "author": "Duc Trung Mai <maitrungduc1410@gmail.com>",
+  "type": "module",
+  "sideEffects": [
+    "**/*.wasm"
+  ],
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "vite build && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:workers": "tsc -p tsconfig.workers.json"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.2",
+    "vite": "^8.1.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@vivari/example-basic",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal @vivari/core example: boot a browser Node.js VM, run a script, and preview an in-VM HTTP server.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vivari/core": "^0.0.1"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.2",
+    "vite": "^8.1.1"
+  }
+}

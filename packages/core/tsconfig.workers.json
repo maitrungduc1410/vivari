@@ -1,0 +1,30 @@
+{
+  // Relaxed config for the browser workers. They are authored in TypeScript and
+  // bundled by Vite (esbuild transpile — no type errors block the build), so this
+  // exists mainly for editor/IDE support and an optional best-effort check.
+  //
+  // The workers import a very large body of untyped JavaScript (all of
+  // packages/kernel-host and packages/runtime — a full Node lib/ port) plus the
+  // generated wasm `pkg/*.js`. Each worker currently carries a `// @ts-nocheck`
+  // header, so this task is effectively a TS parse/syntax check (the successor to
+  // the old `node --check`) and does NOT require the wasm crates to be built. The
+  // `allowJs`/`checkJs: false`/loose-strict knobs below are here so the check keeps
+  // working as workers are incrementally typed (dropping `@ts-nocheck` file by file,
+  // after a `npm run build:vfs|codec|crypto` makes the wasm `pkg/*.js` resolve).
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["ESNext", "WebWorker"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": [],
+    "allowJs": true,
+    "checkJs": false,
+    "strict": false,
+    "noImplicitAny": false,
+    "verbatimModuleSyntax": false,
+    "moduleDetection": "force",
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src/workers/**/*.ts"]
+}

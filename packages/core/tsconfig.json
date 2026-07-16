@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": [],
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "erasableSyntaxOnly": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts"],
+  // The workers are authored in TS but bundled by Vite/esbuild, not this strict
+  // API build. They import a large body of untyped JS (kernel-host / runtime) plus
+  // generated wasm pkg, so they use their own relaxed tsconfig.workers.json and are
+  // excluded here — from both type-checking and the .d.ts build that extends this.
+  "exclude": ["src/workers"]
+}

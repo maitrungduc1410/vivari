@@ -81,7 +81,7 @@ bundles each** (nested module workers + wasm).
                 │ postMessage (spawn worker, init, net nudges, ws relay)
                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│ Kernel Worker — packages/studio/src/workers/kernel-worker.js                         │
+│ Kernel Worker — packages/core/src/workers/kernel-worker.ts                         │
 │   • hosts the Kernel (packages/kernel-host/kernel.js)                  │
 │   • PID table, process supervision, spawn/kill/waitpid                 │
 │   • virtual network port registry (port → pid) + HTTP request routing  │
@@ -91,7 +91,7 @@ bundles each** (nested module workers + wasm).
     ▼                    ▼                        ▼
 ┌─────────────┐   ┌───────────────┐   ┌────────────────────────────────┐
 │ Fetcher     │   │ File System   │   │ Process Worker  (one per PID)   │
-│ Worker      │   │ Worker        │   │  packages/studio/src/workers/process-worker.js│
+│ Worker      │   │ Worker        │   │  packages/core/src/workers/process-worker.ts│
 │ outbound    │   │ owns the Rust │   │  • runs the vendored Node       │
 │ fetch()     │   │ /Wasm VFS     │   │    runtime + the user program   │
 │ (npm, etc.) │   │ + OPFS mirror │   │  • its own SAB + event loop     │
@@ -201,7 +201,7 @@ never parks and many downloads can overlap (§6).
   and quantifies how much of it is the resident esbuild service vs. guest framework; read-only.
 - **Servicing**: `packages/kernel-host/fs-server.js` (`FsServer`) owns the one VFS
   instance and services fs opcodes directly over each client's SAB. It runs inside
-  the **File System Worker** (`packages/studio/src/workers/fs-worker.js`).
+  the **File System Worker** (`packages/core/src/workers/fs-worker.ts`).
 - **Node contract**: `packages/runtime/node/bindings/fs.js` maps Node's native fs
   binding contract onto the sync bridge (`stat` fills the shared `statValues`
   Float64Array in place; fd layer via `open`→`fstat`→`read`→`close`), so Node's
@@ -478,7 +478,7 @@ dev by the `serveDevtools()` Vite plugin and copied into `dist` on build.
 
 **Network panel** shows all three transports coherently. `fetch`/XHR are captured natively
 by chobitsu; `WebSocket`/`EventSource` are our postMessage-tunneled polyfills that chobitsu
-can't see, so a `NET_SHIM` (`window.__ocNet`) injected next to them **emits synthetic
+can't see, so a `NET_SHIM` (`window.__vvNet`) injected next to them **emits synthetic
 `Network.*` CDP events** over the same `vv-cdp` bridge — the full ws lifecycle
 (`webSocketCreated`/`…FrameSent`/`…FrameReceived`/`…Closed`) and SSE as a long-lived request
 with `eventSourceMessageReceived` events. It **registers live connections and replays them**
@@ -555,7 +555,7 @@ preview tab address bar (that only loads in-VM ports); test it from in-VM code.
 
 The Search pane (`components/ide/SearchPane.tsx`) is a VS Code-style full-text search across
 **every open workspace root**, not a filename filter. The search itself runs in the **kernel
-worker** (`packages/studio/src/workers/kernel-worker.js`) because that worker is the sole holder of the synchronous
+worker** (`packages/core/src/workers/kernel-worker.ts`) because that worker is the sole holder of the synchronous
 Wasm VFS — grepping from the main thread would mean an `vv-read` round-trip per file. The
 worker walks each root (reusing the Explorer skip set: `node_modules`/`.git`/`dist`/…), honors
 Match Case / Whole Word / Regex and comma-separated `files to include` / `files to exclude`
@@ -665,7 +665,7 @@ is a single source of truth in `packages/runtime/toolchain-shims.js`
 `scripts/spike-toolchain.mjs`. Adding a drop-in = one entry there (source+target
 must be published in lockstep and the target must be pure-JS/wasm).
 
-- **Registry aliasing** (`packages/studio/src/workers/fetcher-worker.js`): when npm requests the
+- **Registry aliasing** (`packages/core/src/workers/fetcher-worker.ts`): when npm requests the
   packument for `esbuild`/`rollup`, the Fetcher Worker serves the drop-in's
   packument rewritten under the source name; npm resolves a lockstep version and
   downloads the drop-in's real tarball (its own `dist`/integrity) straight into
@@ -719,8 +719,8 @@ unmodified `ng new` project, benefit any esbuild/worker-pool tool (Vitest, tsup,
   servers, stamps `Service-Worker-Allowed: /` on `/sw.js`, sets `worker.format:'es'`,
   and widens `server.fs.allow` to the repo root so it can read the sibling worker/wasm
   sources. Vite bundles the kernel worker AND — recursively — its nested module
-  workers (`new Worker(new URL('./fs-worker.js'|'./process-worker.js'|'./fetcher-worker
-  .js', import.meta.url), {type:'module'})`) and every `new URL('../*/pkg/*_bg.wasm',
+  workers (`new Worker(new URL('./fs-worker.ts'|'./process-worker.ts'|'./fetcher-worker
+  .ts', import.meta.url), {type:'module'})`) and every `new URL('../*/pkg/*_bg.wasm',
   import.meta.url)` asset, all emitted same-origin so COEP holds. Monaco + xterm come
   from npm (no vendored bundle); Monaco's own language workers are imported the same
   `?worker` way (also same-origin → COEP-safe) to power real IntelliSense (§8.9).

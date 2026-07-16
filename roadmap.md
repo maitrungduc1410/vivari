@@ -75,7 +75,7 @@ quota (shared with Cache API). Design — **write-behind mirror**, not a backing
   manifest `[path,{kind,mode,target}]` that recreates dirs + symlinks (OPFS has neither).
 - Boot `restore()` replays the manifest into the VFS **before** the FS worker serves any
   syscall (calls the VFS directly, so it never re-enters the queue).
-- Only the browser wires it (`packages/studio/src/workers/fs-worker.js`); **headless injects no adapter**
+- Only the browser wires it (`packages/core/src/workers/fs-worker.ts`); **headless injects no adapter**
   (`new FsServer(vfs)`), so `verify-node`/`verify-express` are unchanged and still green.
 - System/volatile dirs are skipped (`/bin` coreutils re-install each boot, `/tmp`,`/proc`,
   `/dev`). `?reset` (host.js) wipes `vv-vfs` before boot. Demo: `GET /api/persist` bumps a
@@ -666,7 +666,7 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
      binary bodies across the SW seam, replacing the buffered replay), and **`http2`**
      (needs `internalBinding('http2')`/nghttp2).
 9. **Network/registry worker** [M] — *decomp.* ✅ **DONE.** A dedicated
-   **`Fetcher Worker`** (`packages/studio/src/workers/fetcher-worker.js`) owns all outbound
+   **`Fetcher Worker`** (`packages/core/src/workers/fetcher-worker.ts`) owns all outbound
    network so downloading/decompressing large payloads never stalls syscall
    servicing; it holds no SAB and transfers bodies back as `ArrayBuffer`. New
    **deferred syscall `OP_FETCH`** (like `OP_SPAWN`): a process calls the blocking
@@ -831,7 +831,7 @@ constructor" above): `_load`/`_resolveFilename`/`_nodeModulePaths`/`_cache`/`_ex
 (throw): `dgram`; `tls`/`https` remain fetch-backed shims (no real TLS sockets).
 
 14. **VFS worker split** [M] — **DONE.** The Rust/Wasm VFS now lives in its own dedicated
-    `File System Worker` (browser `packages/studio/src/workers/fs-worker.js`, headless `scripts/fs-worker.mjs`),
+    `File System Worker` (browser `packages/core/src/workers/fs-worker.ts`, headless `scripts/fs-worker.mjs`),
     off the kernel's thread. **Routing (A1, direct-SAB):** a process's fs opcodes are
     serviced by that worker **directly over the process's own SAB** — the kernel is never
     on the fs path. At spawn the kernel opens a `MessageChannel` between each process and
@@ -1231,7 +1231,7 @@ diffable against upstream. The shipping shape is produced by a build step instea
   Storage. So every **Process Worker spawn** (which re-fetches `process-worker.js`, ~900 KB)
   and every reload is served from disk — instant, and the app works **offline**. Cache
   correctness across redeploys: `scripts/build-demo.mjs` stamps a per-build id into `sw.js`
-  (esbuild `define: { __OC_BUILD_ID__ }`) that names the cache (`vv-precache-<id>`); a new
+  (esbuild `define: { __VV_BUILD_ID__ }`) that names the cache (`vv-precache-<id>`); a new
   build changes `sw.js` → the browser installs the new SW, whose `activate` deletes every
   older `vv-precache-*`. All of this is **gated on that build id**, so dev (`packages/demo/`,
   loaded unbundled) never caches — edits keep hot-reloading unchanged.
@@ -1950,7 +1950,7 @@ module transforms through the framework plugin) backs
 are all green and non-experimental (Svelte via a Vite-7 pin — see below).
 
 The harness fetcher now mirrors the browser kernel's transparent wasm drop-in aliasing
-(`esbuild -> esbuild-wasm`, `rollup -> @rollup/wasm-node`; see `packages/studio/src/workers/fetcher-worker.js`) so
+(`esbuild -> esbuild-wasm`, `rollup -> @rollup/wasm-node`; see `packages/core/src/workers/fetcher-worker.ts`) so
 a headless spike installs the exact same tree the studio does — without it, Qwik's Vite-7 tree pulls
 the native esbuild the browser never sees.
 
@@ -2648,7 +2648,7 @@ app was doing.
 The fix injects a small **synthetic-CDP bridge** into every preview page and feeds the same
 `vv-cdp` channel chobitsu already uses, so ws/SSE/fetch all land in one coherent panel:
 
-- **`NET_SHIM` (`window.__ocNet`)** — a synthetic `Network.*` emitter injected into
+- **`NET_SHIM` (`window.__vvNet`)** — a synthetic `Network.*` emitter injected into
   `packages/studio/public/sw.js` (ahead of the ws/SSE shims and chobitsu). It hands out CDP
   request/loader ids, `emit()`s `Network.*` events over the bridge, and **registers each live
   connection** so it can **replay** them when a fresh DevTools frontend attaches. A `gen`
@@ -2674,7 +2674,7 @@ The fix injects a small **synthetic-CDP bridge** into every preview page and fee
   exclude the preview and DevTools iframes.
 - **Friendly URLs** — `cleanUrl`/`scrubNet` in the CDP bootstrap rewrite chobitsu's outgoing
   `Network.*` URLs from the proxy form (`/preview/<port>/…`) to the real in-VM address
-  (`http://localhost:<port>/…`), honoring `__ocKeepPrefix`. Now fetch/XHR read exactly like the
+  (`http://localhost:<port>/…`), honoring `__vvKeepPrefix`. Now fetch/XHR read exactly like the
   already-friendly ws/SSE rows (`http://localhost:3000/api/hello`, `ws://localhost:3001/ws`,
   `http://localhost:3000/events`).
 - **Backend demo buttons** — `backendDemoHtml` in `packages/studio/src/vv/templates.ts` gives
@@ -2686,7 +2686,7 @@ The fix injects a small **synthetic-CDP bridge** into every preview page and fee
 frames, an SSE stream + its events, and a fetch/XHR all appear with friendly in-VM URLs, survive
 a preview refresh, and no longer hang). The CDP visualization is inherently browser-only (not
 spike-able headlessly); the friendly-URL rewrite was validated with a Node harness over same-port,
-cross-service, and `__ocKeepPrefix` cases.
+cross-service, and `__vvKeepPrefix` cases.
 
 ## Definition of done for T2
 

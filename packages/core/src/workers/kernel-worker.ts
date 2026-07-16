@@ -1,3 +1,7 @@
+// @ts-nocheck — authored in TS for Vite's native worker bundling, but not strictly
+// type-checked: this bridges to a large body of untyped JS (packages/kernel-host,
+// packages/runtime) + generated wasm, and uses non-standard worker globals. esbuild
+// (via Vite) is the compiler; strict typing is a separate, larger effort.
 // The kernel worker — Vivari's kernel host, off the main thread.
 //
 // Phase 2, item #1 (Kernel worker). Everything heavy lives here: the Rust/Wasm
@@ -595,12 +599,14 @@ function clearProgress(tid) {
 // VV_RUN, so the dev server lives *inside this tab* (closing it kills the server,
 // running it twice EADDRINUSEs — exactly like local dev). PATH includes the
 // project's node_modules/.bin so `vite`, `nest`, etc. resolve like a real shell.
-function openTerminal(terminalId, cwd, demoId, run) {
-  if (!kernel) return;
-  const d = demoId ? DEMOS[demoId] : null;
-  if (d) scaffoldDemo(demoId);
-  const dir = (d ? d.dir : cwd) || defaultTermCwd();
-  const env = {
+// The environment a fresh process/shell starts with. Package managers need
+// writable, PERSISTED caches (see the per-key notes) and a PATH that includes the
+// project's node_modules/.bin so `vite`, `nest`, `tsc`, etc. resolve like a real
+// shell. Shared by interactive terminals (openTerminal) and the generic SDK
+// `spawn` path (proc-spawn) so `vivari.spawn('npm', ['install'])` behaves exactly
+// like typing it in a studio terminal.
+function baseProcEnv(dir) {
+  return {
     PATH: dir + "/node_modules/.bin:/bin",
     HOME: "/",
     // Real npm needs a writable cache (+ _logs) dir; created at boot. Without
@@ -657,6 +663,41 @@ function openTerminal(terminalId, cwd, demoId, run) {
     FORCE_COLOR: "3",
     PWD: dir,
   };
+}
+
+// ── Generic process spawn (SDK `vivari.spawn`) ──────────────────────────────
+// A clean, framework-agnostic counterpart to the interactive terminal path: run
+// ONE command directly (no wrapping shell), streaming its stdout/stderr and exit
+// code back over a per-process `execId`. stdin + kill are relayed the same way.
+// Output/exit routing keys off execByPid in the kernel's stdout/stderr/onProcExit
+// hooks (below), so this coexists with the terminal (termByPid) routing.
+const execByPid = new Map(); // pid -> execId
+const pidByExec = new Map(); // execId -> pid
+
+function spawnProcess(execId, command, args, cwd, extraEnv) {
+  if (!kernel) {
+    post("proc-exit", { execId, code: 127, error: "kernel not ready" });
+    return;
+  }
+  const dir = cwd || defaultTermCwd();
+  const env = baseProcEnv(dir);
+  if (extraEnv && typeof extraEnv === "object") Object.assign(env, extraEnv);
+  const pid = kernel.launch(command, Array.isArray(args) ? args : [], { cwd: dir, env });
+  if (pid < 0) {
+    post("proc-exit", { execId, code: 127, error: command + ": not found" });
+    return;
+  }
+  execByPid.set(pid, execId);
+  pidByExec.set(execId, pid);
+  post("proc-started", { execId, pid });
+}
+
+function openTerminal(terminalId, cwd, demoId, run) {
+  if (!kernel) return;
+  const d = demoId ? DEMOS[demoId] : null;
+  if (d) scaffoldDemo(demoId);
+  const dir = (d ? d.dir : cwd) || defaultTermCwd();
+  const env = baseProcEnv(dir);
   if (d) env.VV_RUN = demoRunCommand(d);
   // A created/opened project's "Run" (or auto-run after create) hands us an
   // explicit command; install is skipped automatically once node_modules exists.
@@ -828,7 +869,7 @@ async function boot() {
   // (outbound npm; depends on neither the VFS nor the codecs, so there's no reason
   // to create it later — overlapping its load shaves a step off cold boot).
   post("log", { line: "  [boot] starting file-system + fetcher workers…", dim: true });
-  const fsWorker = new Worker(new URL("./fs-worker.js", import.meta.url), {
+  const fsWorker = new Worker(new URL("./fs-worker.ts", import.meta.url), {
     type: "module",
     name: "File System Worker",
   });
@@ -857,7 +898,7 @@ async function boot() {
   // Fetcher Worker (Phase 2 #9): all outbound network goes through it, so
   // downloading/decompressing large npm payloads never stalls syscall servicing.
   // Created here (in parallel with the VFS); the kernel calls `fetcher(url)`.
-  const fetcherWorker = new Worker(new URL("./fetcher-worker.js", import.meta.url), {
+  const fetcherWorker = new Worker(new URL("./fetcher-worker.ts", import.meta.url), {
     type: "module",
     name: "Fetcher Worker",
   });
@@ -908,7 +949,7 @@ async function boot() {
   // We also open a MessageChannel between the process and the File System Worker
   // so its fs syscalls ring that worker's doorbell directly (never the kernel).
   const spawnWorker = (info) => {
-    const worker = new Worker(new URL("./process-worker.js", import.meta.url), {
+    const worker = new Worker(new URL("./process-worker.ts", import.meta.url), {
       type: "module",
       name: "Process Worker PID " + info.pid,
     });
@@ -957,6 +998,8 @@ async function boot() {
     // Route by pid: an interactive shell's output goes to its terminal; anything
     // else (npm install, dev servers) is demo/console output.
     stdout: (chunk, pid) => {
+      const eid = execByPid.get(pid);
+      if (eid !== undefined) { post("proc-out", { execId: eid, stream: "stdout", chunk }); return; }
       const tid = termByPid.get(pid);
       if (tid !== undefined) {
         clearProgress(tid); // wipe any live fetch spinner before real output lands
@@ -964,6 +1007,8 @@ async function boot() {
       } else post("stdout", { chunk });
     },
     stderr: (chunk, pid) => {
+      const eid = execByPid.get(pid);
+      if (eid !== undefined) { post("proc-out", { execId: eid, stream: "stderr", chunk }); return; }
       const tid = termByPid.get(pid);
       if (tid !== undefined) {
         clearProgress(tid);
@@ -972,6 +1017,13 @@ async function boot() {
     },
   });
   kernel.onProcExit = (pid, res) => {
+    const eid = execByPid.get(pid);
+    if (eid !== undefined) {
+      execByPid.delete(pid);
+      pidByExec.delete(eid);
+      post("proc-exit", { execId: eid, code: res.code });
+      return;
+    }
     const tid = termByPid.get(pid);
     if (tid !== undefined) {
       termByPid.delete(pid);
@@ -1667,6 +1719,26 @@ self.onmessage = async (event) => {
     return;
   }
 
+  // ── Generic process spawn (SDK `vivari.spawn`) ─────────────────────────────
+  // Run one command directly (no wrapping shell) and stream its output/exit back
+  // by `execId`. See spawnProcess + the execByPid routing in boot().
+  if (m.type === "proc-spawn") {
+    spawnProcess(m.execId, m.command, m.args, m.cwd, m.env);
+    return;
+  }
+  // Feed a chunk to a spawned process's stdin. `chunk == null` signals EOF.
+  if (m.type === "proc-input") {
+    const pid = pidByExec.get(m.execId);
+    if (pid != null && kernel) kernel.sendStdin(pid, m.chunk == null ? null : m.chunk);
+    return;
+  }
+  // Kill a spawned process (its exit is still reported via onProcExit → proc-exit).
+  if (m.type === "proc-kill") {
+    const pid = pidByExec.get(m.execId);
+    if (pid != null && kernel) kernel.stop(pid);
+    return;
+  }
+
   // The user saved an edit in the host editor — write it to the VFS. The in-VM
   // dev server's watcher does the rest: Vite pushes an HMR update over the tunnel
   // to the preview iframe; Nest --watch recompiles + restarts (its re-listen then
@@ -1857,6 +1929,7 @@ self.onmessage = async (event) => {
     const op = m.type.slice(3); // rename | rm | copy
     if (!kernel) {
       post("vv-fs-result", { op, ok: false, error: "kernel not ready", ...m });
+      if (m.reqId != null) post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" });
       return;
     }
     try {
@@ -1865,8 +1938,12 @@ self.onmessage = async (event) => {
       else copyRecursive(m.from, m.to);
       post("vv-fs-result", { op, ok: true, from: m.from, to: m.to, path: m.path });
       post("vv-fs-changed", { path: m.to || m.path });
+      // The SDK fs facade correlates by reqId; the studio Explorer keys off the
+      // vv-fs-result above. Both are emitted so neither path is disturbed.
+      if (m.reqId != null) post("vv-reply", { reqId: m.reqId, ok: true });
     } catch (err) {
       post("vv-fs-result", { op, ok: false, error: errMsg(err), from: m.from, to: m.to, path: m.path });
+      if (m.reqId != null) post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
     }
     return;
   }

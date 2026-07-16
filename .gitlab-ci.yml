@@ -29,6 +29,15 @@ toolchain-gate:
   rules:
     - if: $CI_PIPELINE_SOURCE != "schedule"
 
+# SDK packaging + public-API contract guard (offline, no Wasm, no browser). Also
+# regression-checks the shipped preview sw.js branding + the examples/basic wiring.
+sdk-smoke:
+  stage: gate
+  script:
+    - npm run smoke
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "schedule"
+
 # Shared setup for jobs that need the Rust->Wasm build (verify + net spikes).
 .needs-wasm:
   cache:

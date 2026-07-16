@@ -1,3 +1,7 @@
+// @ts-nocheck — authored in TS for Vite's native worker bundling, but not strictly
+// type-checked: it imports the untyped runtime toolchain-shims table and leans on
+// dynamic fetch shapes. esbuild (via Vite) is the compiler; strict typing is a
+// separate, larger effort.
 // The Fetcher Worker — Vivari's dedicated outbound-network worker.
 //
 // Phase 2, item #9 (Network/registry worker). The kernel worker delegates every
