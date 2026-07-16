@@ -522,7 +522,99 @@ function svelteTemplate(ts: boolean): TemplateDef {
 }
 
 // ── Express ────────────────────────────────────────────────────────────────
-const expressAppJs = `Hello from Express, running inside OpenContainer!`;
+// Shared demo page for the (otherwise headless) backend templates: a small,
+// good-looking UI whose button fires a `fetch()` at the server's JSON endpoint
+// and renders the status + response. Gives every backend a visible, interactive
+// front door — and something to watch in the preview DevTools Network panel.
+// Inlined into each server via JSON.stringify (see below) so there are no extra
+// files or static-middleware dependencies to manage per framework.
+function backendDemoHtml(name: string): string {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${name} · OpenContainer</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        background: radial-gradient(1200px 600px at 50% -10%, #1b2333, #0a0a0a); color: #e5e7eb; padding: 2rem; }
+      main { width: 100%; max-width: 560px; }
+      .eyebrow { color: #7c9cff; font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; margin: 0 0 .4rem; }
+      h1 { margin: 0 0 .3rem; font-size: 1.85rem; }
+      .sub { color: #9ca3af; margin: 0 0 1.5rem; line-height: 1.5; }
+      .card { background: #10131a; border: 1px solid #232a36; border-radius: 14px; padding: 1.25rem; }
+      .endpoint { display: flex; align-items: center; gap: .5rem; font-size: .82rem; color: #9ca3af; margin-bottom: 1rem; }
+      code { background: #1b212c; padding: .15rem .45rem; border-radius: 6px; color: #cbd5e1; }
+      button { appearance: none; border: 0; cursor: pointer; width: 100%; padding: .75rem 1rem; font-size: .95rem; font-weight: 600;
+        border-radius: 10px; color: #fff; background: linear-gradient(180deg, #4f7cff, #3b5cf0); transition: filter .15s, transform .05s; }
+      button:hover { filter: brightness(1.08); }
+      button:active { transform: translateY(1px); }
+      button:disabled { opacity: .6; cursor: progress; }
+      .status { margin: 1rem 0 .5rem; font-size: .82rem; font-weight: 600; min-height: 1.1rem; }
+      .status.ok { color: #4ade80; }
+      .status.err { color: #f87171; }
+      pre { margin: 0; background: #0b0e14; border: 1px solid #232a36; border-radius: 10px; padding: .85rem;
+        overflow: auto; font-size: .82rem; line-height: 1.5; color: #d1d5db; }
+      .hint { color: #6b7280; font-size: .76rem; margin: 1rem 0 0; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">OpenContainer</p>
+      <h1>${name}</h1>
+      <p class="sub">This backend is running fully in your browser. Click the button to call its API.</p>
+      <div class="card">
+        <div class="endpoint">Endpoint <code>GET /api/hello</code></div>
+        <button id="call">Call GET /api/hello</button>
+        <p class="status" id="status"></p>
+        <pre id="out">Response will appear here.</pre>
+        <p class="hint">Tip: open DevTools &rarr; Network to watch the request.</p>
+      </div>
+    </main>
+    <script>
+      (function () {
+        var btn = document.getElementById('call');
+        var out = document.getElementById('out');
+        var statusEl = document.getElementById('status');
+        // In the OpenContainer preview the page lives under /preview/<port>/. Address
+        // the in-VM server through that explicit proxy prefix so the request hits the
+        // Service Worker's deterministic preview route (the same one that served this
+        // page) instead of relying on client-port inference, which is racy right after
+        // a preview reload. Standalone (no prefix) it stays a plain /api/hello.
+        var pm = location.pathname.match(/^(\\/preview\\/\\d+)\\//);
+        var endpoint = (pm ? pm[1] : '') + '/api/hello';
+        function setBusy(b) { btn.disabled = b; btn.textContent = b ? 'Calling\\u2026' : 'Call GET /api/hello'; }
+        btn.addEventListener('click', function () {
+          setBusy(true);
+          statusEl.textContent = '';
+          statusEl.className = 'status';
+          var t0 = performance.now();
+          fetch(endpoint, { headers: { accept: 'application/json' } })
+            .then(function (r) { return r.text().then(function (body) { return { res: r, body: body }; }); })
+            .then(function (o) {
+              var ms = Math.round(performance.now() - t0);
+              statusEl.textContent = o.res.status + ' ' + o.res.statusText + ' \\u00b7 ' + ms + ' ms';
+              statusEl.className = 'status ' + (o.res.ok ? 'ok' : 'err');
+              var pretty = o.body;
+              try { pretty = JSON.stringify(JSON.parse(o.body), null, 2); } catch (e) {}
+              out.textContent = pretty;
+            })
+            .catch(function (err) {
+              statusEl.textContent = 'Request failed';
+              statusEl.className = 'status err';
+              out.textContent = String((err && err.message) || err);
+            })
+            .finally(function () { setBusy(false); });
+        });
+      })();
+    </script>
+  </body>
+</html>
+`;
+}
 
 function expressTemplate(ts: boolean): TemplateDef {
   if (ts) {
@@ -583,8 +675,10 @@ function expressTemplate(ts: boolean): TemplateDef {
 const app = express();
 const port = Number(process.env.PORT ?? 3000);
 
+const html = ${JSON.stringify(backendDemoHtml("Express"))};
+
 app.get('/', (_req: Request, res: Response) => {
-  res.send('${expressAppJs}');
+  res.type('html').send(html);
 });
 
 app.get('/api/hello', (_req: Request, res: Response) => {
@@ -635,8 +729,10 @@ app.listen(port, () => {
 const app = express();
 const port = Number(process.env.PORT ?? 3000);
 
+const html = ${JSON.stringify(backendDemoHtml("Express"))};
+
 app.get('/', (_req, res) => {
-  res.send('${expressAppJs}');
+  res.type('html').send(html);
 });
 
 app.get('/api/hello', (_req, res) => {
@@ -673,7 +769,7 @@ import { AppService } from './app.service';
 })
 export class AppModule {}
 `,
-  "src/app.controller.ts": `import { Controller, Get } from '@nestjs/common';
+  "src/app.controller.ts": `import { Controller, Get, Header } from '@nestjs/common';
 import { AppService } from './app.service';
 
 @Controller()
@@ -681,17 +777,25 @@ export class AppController {
   constructor(private readonly appService: AppService) {}
 
   @Get()
-  getHello(): string {
-    return this.appService.getHello();
+  @Header('Content-Type', 'text/html')
+  getHome(): string {
+    return this.appService.getHome();
+  }
+
+  @Get('api/hello')
+  getHello(): { message: string } {
+    return { message: 'Hello, world!' };
   }
 }
 `,
   "src/app.service.ts": `import { Injectable } from '@nestjs/common';
 
+const html = ${JSON.stringify(backendDemoHtml("NestJS"))};
+
 @Injectable()
 export class AppService {
-  getHello(): string {
-    return 'Hello World!';
+  getHome(): string {
+    return html;
   }
 }
 `,
@@ -1618,7 +1722,9 @@ const app = new Koa();
 const router = new Router();
 const port = Number(process.env.PORT ?? 3000);
 
-router.get('/', (ctx) => { ctx.body = 'Hello from Koa, running inside OpenContainer!'; });
+const html = ${JSON.stringify(backendDemoHtml("Koa"))};
+
+router.get('/', (ctx) => { ctx.type = 'html'; ctx.body = html; });
 router.get('/api/hello', (ctx) => { ctx.body = { message: 'Hello, world!' }; });
 
 app.use(router.routes()).use(router.allowedMethods());
@@ -1662,8 +1768,10 @@ function honoTemplate(): TemplateDef {
       "src/index.js": `import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 
+const html = ${JSON.stringify(backendDemoHtml("Hono"))}
+
 const app = new Hono()
-app.get('/', (c) => c.text('Hello from Hono, running inside OpenContainer!'))
+app.get('/', (c) => c.html(html))
 app.get('/api/hello', (c) => c.json({ message: 'Hello, world!' }))
 
 const port = Number(process.env.PORT ?? 3000)
@@ -1707,11 +1815,16 @@ function h3Template(): TemplateDef {
 }
 `,
       "src/index.js": `import { createServer } from 'node:http'
-import { createApp, createRouter, defineEventHandler, toNodeListener } from 'h3'
+import { createApp, createRouter, defineEventHandler, setResponseHeader, toNodeListener } from 'h3'
+
+const html = ${JSON.stringify(backendDemoHtml("H3"))}
 
 const app = createApp()
 const router = createRouter()
-router.get('/', defineEventHandler(() => 'Hello from H3, running inside OpenContainer!'))
+router.get('/', defineEventHandler((event) => {
+  setResponseHeader(event, 'content-type', 'text/html; charset=utf-8')
+  return html
+}))
 router.get('/api/hello', defineEventHandler(() => ({ message: 'Hello, world!' })))
 app.use(router)
 
@@ -2875,7 +2988,9 @@ function fastifyTemplate(): TemplateDef {
 const app = Fastify({ logger: true });
 const port = Number(process.env.PORT ?? 3000);
 
-app.get('/', async () => 'Hello from Fastify, running inside OpenContainer!');
+const html = ${JSON.stringify(backendDemoHtml("Fastify"))};
+
+app.get('/', (_req, reply) => reply.type('text/html').send(html));
 app.get('/api/hello', async () => ({ message: 'Hello, world!' }));
 
 app.listen({ port, host: '0.0.0.0' }).catch((err) => {
@@ -2925,7 +3040,12 @@ function nitroTemplate(): TemplateDef {
   compatibilityDate: 'latest',
 })
 `,
-      "routes/index.ts": `export default defineEventHandler(() => 'Hello from Nitro, running inside OpenContainer!')
+      "routes/index.ts": `const html = ${JSON.stringify(backendDemoHtml("Nitro"))}
+
+export default defineEventHandler((event) => {
+  setResponseHeader(event, 'content-type', 'text/html; charset=utf-8')
+  return html
+})
 `,
       "routes/api/hello.ts": `export default defineEventHandler(() => ({ message: 'Hello, world!' }))
 `,
@@ -3093,7 +3213,7 @@ createServer((req, res) => {
       document.getElementById('giql').href = (pm ? pm[1] : '') + '/graphql';
 
       function gql(query, variables) {
-        return fetch('/graphql', {
+        return fetch((pm ? pm[1] : '') + '/graphql', {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'accept': 'application/json' },
           body: JSON.stringify({ query: query, variables: variables || {} })
@@ -3590,11 +3710,17 @@ function dbDemoHtml(title: string, subtitle: string): string {
       <ul id="list"></ul>
     </main>
     <script>
+      // Address the in-VM server through the explicit /preview/<port>/ proxy prefix
+      // (present when running inside OpenContainer) so requests hit the Service
+      // Worker's deterministic preview route rather than relying on client-port
+      // inference. Standalone it's just /api.
+      var pm = location.pathname.match(/^(\\/preview\\/\\d+)\\//);
+      var API = (pm ? pm[1] : '') + '/api';
       function load() {
-        fetch('/api/info').then(function (r) { return r.json(); }).then(function (info) {
+        fetch(API + '/info').then(function (r) { return r.json(); }).then(function (info) {
           document.getElementById('engine').textContent = info.engine + ' ' + info.version + ' · ' + info.driver;
         }).catch(function () {});
-        fetch('/api/todos').then(function (r) { return r.json(); }).then(function (rows) {
+        fetch(API + '/todos').then(function (r) { return r.json(); }).then(function (rows) {
           var list = document.getElementById('list');
           list.innerHTML = '';
           rows.forEach(function (row) {
@@ -3612,7 +3738,7 @@ function dbDemoHtml(title: string, subtitle: string): string {
         var input = document.getElementById('task');
         var task = input.value.trim();
         if (!task) return;
-        fetch('/api/todos', {
+        fetch(API + '/todos', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ task: task })

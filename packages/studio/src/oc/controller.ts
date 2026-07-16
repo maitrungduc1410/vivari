@@ -1857,6 +1857,21 @@ export class IdeController {
     target?.contentWindow?.postMessage({ source: "oc-cdp", dir: "init" }, "*");
   }
 
+  // Called when a preview iframe finishes (re)loading. A reload swaps in a fresh
+  // document with a brand-new chobitsu/CDP bootstrap; the persistent chii frontend
+  // would otherwise (a) stay attached to the dead old context and (b) keep every
+  // stale row (a synthetic Page.frameNavigated does NOT reset the frontend's
+  // network log — chobitsu's own resetDevtools() has to poke the ResourceTreeModel
+  // directly). Remounting the frontend (React key = devtoolsNonce) gives a clean
+  // log and a fresh attach, exactly like the tab-switch path; onDevtoolsReady then
+  // re-runs init against the reloaded document.
+  onPreviewFrameLoad(id: string) {
+    if (!this.snap.devtoolsOpen || this.devtoolsTargetId !== id) return;
+    const tab = this.snap.previewTabs.find((t) => t.id === id);
+    if (!tab || tab.port == null) return;
+    this.set({ devtoolsNonce: this.snap.devtoolsNonce + 1 });
+  }
+
   private tabIdForSource(src: MessageEventSource | null): string | null {
     if (!src) return null;
     for (const [id, el] of this.previewFrames) {

@@ -2634,6 +2634,60 @@ async retry; circular re-export → lazy live binding (getter emitted early, re-
 source, so a mid-cycle read never snapshots `undefined`); spread-only use keeps its const;
 and the live-binding fallback recovers a circular singleton used inside a function.
 
+## Live network in the preview DevTools — WS/SSE/fetch in the Network panel (this change)
+
+The preview's in-browser chii DevTools (roadmap §"Studio — preview mini-browser") had a
+**half-empty Network panel**. `fetch`/XHR are captured natively by chobitsu, but our
+`WebSocket` and `EventSource` are **polyfills that tunnel over `postMessage`** (roadmap #19
+stage C for ws; the `oc-sse` tunnel for SSE) — chobitsu never sees a real socket, so live
+connections and their frames were invisible. And even the `fetch`/XHR rows that did show up
+displayed the **internal proxy URL** (`http://localhost:5173/preview/3000/api/hello`) rather
+than the in-VM address the app actually targets. So the panel didn't reflect what the running
+app was doing.
+
+The fix injects a small **synthetic-CDP bridge** into every preview page and feeds the same
+`oc-cdp` channel chobitsu already uses, so ws/SSE/fetch all land in one coherent panel:
+
+- **`NET_SHIM` (`window.__ocNet`)** — a synthetic `Network.*` emitter injected into
+  `packages/studio/public/sw.js` (ahead of the ws/SSE shims and chobitsu). It hands out CDP
+  request/loader ids, `emit()`s `Network.*` events over the bridge, and **registers each live
+  connection** so it can **replay** them when a fresh DevTools frontend attaches. A `gen`
+  (generation) counter guards against the duplicate/stale rows that appeared when a connection
+  was announced more than once across reloads.
+- **`OCWebSocket` emits the full ws lifecycle** — `webSocketCreated`,
+  `webSocketWillSendHandshakeRequest`, `webSocketHandshakeResponseReceived`,
+  `webSocketFrameSent`, `webSocketFrameReceived`, `webSocketClosed` — so a socket opened in guest
+  code shows up as one connection with live in/out frames.
+- **`OCEventSource` emits `requestWillBeSent` (type `EventSource`) → `responseReceived` →
+  `eventSourceMessageReceived`* → `loadingFinished`**, so an SSE stream reads as a long-lived
+  request with each event as a message.
+- **Attach timing** — replaying live connections is gated on **both** the preview's `init` and
+  the frontend's `Network.enable` (via `maybeAttach()`), because a fresh panel that isn't yet
+  listening drops early events. On a preview reload the controller **remounts** the DevTools
+  frontend (`onPreviewFrameLoad` bumps `devtoolsNonce` in
+  `packages/studio/src/oc/controller.ts`) so the network log starts clean and re-attaches — this
+  is what killed the "4 ws connections after refresh" pile-up.
+- **Fetch/XHR 504 hang when DevTools was open** — `handlePreview` in `sw.js` was picking the
+  DevTools iframe as the `kernelClient` (its URL also lacks the `/preview/` marker), so HTTP
+  requests were posted to a client with no kernel listener and 504'd at the SW timeout. Fixed by
+  refining `kernelClient` selection to prefer the **top-level studio window** and explicitly
+  exclude the preview and DevTools iframes.
+- **Friendly URLs** — `cleanUrl`/`scrubNet` in the CDP bootstrap rewrite chobitsu's outgoing
+  `Network.*` URLs from the proxy form (`/preview/<port>/…`) to the real in-VM address
+  (`http://localhost:<port>/…`), honoring `__ocKeepPrefix`. Now fetch/XHR read exactly like the
+  already-friendly ws/SSE rows (`http://localhost:3000/api/hello`, `ws://localhost:3001/ws`,
+  `http://localhost:3000/events`).
+- **Backend demo buttons** — `backendDemoHtml` in `packages/studio/src/oc/templates.ts` gives
+  every backend template (Express TS/JS, Nest, Koa, Hono, H3, Fastify, Nitro) a "Call
+  GET /api/hello" button so the panel is easy to exercise; the demo, GraphQL, and SQLite/Postgres
+  fetches all use the explicit `/preview/<port>/` prefix for deterministic routing.
+
+**Verification.** Browser-confirmed end to end for all three transports (a socket + its live
+frames, an SSE stream + its events, and a fetch/XHR all appear with friendly in-VM URLs, survive
+a preview refresh, and no longer hang). The CDP visualization is inherently browser-only (not
+spike-able headlessly); the friendly-URL rewrite was validated with a Node harness over same-port,
+cross-service, and `__ocKeepPrefix` cases.
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

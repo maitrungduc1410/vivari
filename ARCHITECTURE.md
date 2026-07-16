@@ -478,6 +478,19 @@ shared frontend attaches to the **active** tab (per-tab chobitsu backend); switc
 reloads the frontend against the new target. Assets are served from `node_modules` in
 dev by the `serveDevtools()` Vite plugin and copied into `dist` on build.
 
+**Network panel** shows all three transports coherently. `fetch`/XHR are captured natively
+by chobitsu; `WebSocket`/`EventSource` are our postMessage-tunneled polyfills that chobitsu
+can't see, so a `NET_SHIM` (`window.__ocNet`) injected next to them **emits synthetic
+`Network.*` CDP events** over the same `oc-cdp` bridge — the full ws lifecycle
+(`webSocketCreated`/`…FrameSent`/`…FrameReceived`/`…Closed`) and SSE as a long-lived request
+with `eventSourceMessageReceived` events. It **registers live connections and replays them**
+when a fresh frontend attaches (gated on the panel's `Network.enable` plus the preview's
+`init`, guarded by a generation counter to avoid duplicate rows). On a preview reload the
+controller remounts the frontend (`onPreviewFrameLoad` bumps `devtoolsNonce`) so the log starts
+clean and re-attaches. Outgoing URLs are scrubbed from the proxy form (`/preview/<port>/…`) to
+the real in-VM address (`http://localhost:<port>/…`), so ws/SSE/fetch rows all read as the app
+actually sees them.
+
 Two non-obvious constraints keep this working:
 
 - **`serveDevtools()` must send fixed-length bodies** (`fs.readFile` + `Content-Length`),

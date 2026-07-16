@@ -148,6 +148,42 @@ async function cacheFirst(request) {
   return resp.clone();
 }
 
+// DevTools Network bridge for the shims. The ws/SSE polyfills below replace the
+// native `WebSocket`/`EventSource` globals BEFORE chobitsu loads and tunnel over
+// postMessage, so chobitsu never observes them and they never appear in the chii
+// Network panel (fetch/XHR stay native, so chobitsu already captures those). This
+// tiny helper lets the shims emit synthetic Chrome DevTools Protocol `Network.*`
+// events over the SAME channel the CDP bootstrap uses ({source:'oc-cdp',
+// dir:'target'}); the controller already relays those to the attached frontend,
+// which renders a WS Messages tab and an EventSource EventStream tab natively.
+//
+// `emit` is gated on attachment (no work while DevTools is closed). Each live
+// connection registers a `replay` fn re-emitting its creation events, invoked on
+// attach (or re-attach on tab switch) so a connection opened before the panel —
+// or before switching to this tab — still shows up (its future frames then stream
+// live; frames from before attach are dropped, matching real DevTools behaviour).
+const NET_SHIM = `(function(){
+if (window.__ocNet) return;
+var attached = false, gen = 0, live = {};
+function post(method, params){
+  try { parent.postMessage({ source:'oc-cdp', dir:'target', data: JSON.stringify({ method: method, params: params }) }, '*'); } catch(e){}
+}
+// Announce a connection's creation events at most ONCE per generation. A new
+// generation begins on each (re)attach (onAttach); the DevTools frontend clears
+// its network log on the frameNavigated that init() sends, so one announce per
+// generation = exactly one row per connection (no duplicate from the live-emit +
+// replay-on-attach paths both firing).
+function announce(id){ var o = live[id]; if (!o || o.gen === gen) return; o.gen = gen; try { o.replay(); } catch(e){} }
+window.__ocNet = {
+  now: function(){ return performance.now() / 1000; },
+  wall: function(){ return Date.now() / 1000; },
+  emit: function(method, params){ if (attached) post(method, params); },
+  register: function(id, replay){ live[id] = { replay: replay, gen: -1 }; if (attached) announce(id); },
+  unregister: function(id){ delete live[id]; },
+  onAttach: function(){ attached = true; gen++; for (var k in live){ announce(k); } }
+};
+})();`;
+
 // roadmap #19 stage C — HMR transport. A real WebSocket from the preview iframe
 // would hit the network (there is no server there) and the SW can't intercept a
 // ws upgrade. So we inject this classic (non-module, runs before Vite's deferred
@@ -162,6 +198,14 @@ var previewPort = m ? parseInt(m[1], 10) : 0;
 var tok = Math.random().toString(36).slice(2, 8);
 var nextId = 1, conns = {};
 function post(msg){ parent.postMessage(msg, '*'); }
+function _b64(x){
+  var b;
+  if (x instanceof ArrayBuffer) b = new Uint8Array(x);
+  else if (ArrayBuffer.isView(x)) b = new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
+  else return '';
+  var s = ''; for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+  try { return btoa(s); } catch(e){ return ''; }
+}
 window.addEventListener('message', function(ev){
   var d = ev.data; if (!d || d.type !== 'oc-ws' || d.dir !== 'in') return;
   var c = conns[d.connId]; if (c) c._deliver(d);
@@ -202,12 +246,29 @@ function OCWebSocket(url, protocols){
     }
   } catch(e){}
   post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path, protocols: protocols || null });
+  // DevTools display URL: the real in-VM destination (localhost:<targetPort><path>),
+  // NOT the studio-origin proxy URL the app resolved against (which carries the
+  // internal /preview/<port>/ prefix and is confusing in the Network panel).
+  var self2 = this; this._rid = this._id;
+  this._cdpUrl = (/^wss:/i.test(this.url) ? 'wss' : 'ws') + '://localhost:' + targetPort + path;
+  this._wsReplay = function(){
+    window.__ocNet.emit('Network.webSocketCreated', { requestId:self2._rid, url:self2._cdpUrl, initiator:{ type:'script' } });
+    window.__ocNet.emit('Network.webSocketWillSendHandshakeRequest', { requestId:self2._rid, timestamp:window.__ocNet.now(), wallTime:window.__ocNet.wall(), request:{ headers:{} } });
+    if (self2.readyState === 1) window.__ocNet.emit('Network.webSocketHandshakeResponseReceived', { requestId:self2._rid, timestamp:window.__ocNet.now(), response:{ status:101, statusText:'Switching Protocols', headers:{} } });
+  };
+  window.__ocNet.register(this._rid, this._wsReplay);
 }
 OCWebSocket.CONNECTING = 0; OCWebSocket.OPEN = 1; OCWebSocket.CLOSING = 2; OCWebSocket.CLOSED = 3;
 OCWebSocket.prototype._deliver = function(d){
-  if (d.sub === 'open'){ this.readyState = 1; this.protocol = d.protocol || ''; this._emit('open', { type:'open' }); }
-  else if (d.sub === 'msg'){ var data = d.data; if (d.binary && this.binaryType === 'blob' && !(data instanceof Blob)) data = new Blob([data]); this._emit('message', { type:'message', data:data }); }
-  else if (d.sub === 'close'){ this.readyState = 3; delete conns[this._id]; this._emit('close', { type:'close', code:d.code||1006, reason:d.reason||'', wasClean:d.code===1000 }); }
+  if (d.sub === 'open'){ this.readyState = 1; this.protocol = d.protocol || '';
+    window.__ocNet.emit('Network.webSocketHandshakeResponseReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), response:{ status:101, statusText:'Switching Protocols', headers:{} } });
+    this._emit('open', { type:'open' }); }
+  else if (d.sub === 'msg'){ var data = d.data;
+    window.__ocNet.emit('Network.webSocketFrameReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), response:{ opcode: d.binary?2:1, mask:false, payloadData: d.binary ? _b64(d.data) : String(d.data) } });
+    if (d.binary && this.binaryType === 'blob' && !(data instanceof Blob)) data = new Blob([data]); this._emit('message', { type:'message', data:data }); }
+  else if (d.sub === 'close'){ this.readyState = 3; delete conns[this._id];
+    if (!this._cdpClosed){ this._cdpClosed = true; window.__ocNet.emit('Network.webSocketClosed', { requestId:this._rid, timestamp:window.__ocNet.now() }); window.__ocNet.unregister(this._rid); }
+    this._emit('close', { type:'close', code:d.code||1006, reason:d.reason||'', wasClean:d.code===1000 }); }
 };
 OCWebSocket.prototype.send = function(data){
   if (this.readyState !== 1) throw new Error('WebSocket is not open');
@@ -217,9 +278,11 @@ OCWebSocket.prototype.send = function(data){
     else if (ArrayBuffer.isView(data)) payload = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     else { binary = false; payload = String(data); } }
   post({ type:'oc-ws', dir:'out', sub:'send', connId:this._id, data:payload, binary:binary });
+  window.__ocNet.emit('Network.webSocketFrameSent', { requestId:this._rid, timestamp:window.__ocNet.now(), response:{ opcode: binary?2:1, mask:true, payloadData: binary ? _b64(payload) : String(payload) } });
 };
 OCWebSocket.prototype.close = function(code, reason){
   if (this.readyState === 3 || this.readyState === 2) return; this.readyState = 2;
+  if (!this._cdpClosed){ this._cdpClosed = true; window.__ocNet.emit('Network.webSocketClosed', { requestId:this._rid, timestamp:window.__ocNet.now() }); window.__ocNet.unregister(this._rid); }
   post({ type:'oc-ws', dir:'out', sub:'close', connId:this._id, code:code, reason:reason });
 };
 OCWebSocket.prototype.addEventListener = function(t, fn){ if (this._l[t]) this._l[t].push(fn); };
@@ -289,12 +352,28 @@ function OCEventSource(url, cfg){
     else if (u.port && u.port !== location.port) targetPort = parseInt(u.port, 10);
   } catch(e){}
   post({ type:'oc-sse', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path });
+  // DevTools display URL: the real in-VM destination, with the internal
+  // /preview/<port>/ proxy prefix stripped (see the ws shim for rationale).
+  var self2 = this; this._rid = this._id;
+  this._cdpUrl = ((location.protocol === 'https:') ? 'https' : 'http') + '://localhost:' + targetPort + path;
+  this._sseReplay = function(){
+    window.__ocNet.emit('Network.requestWillBeSent', { requestId:self2._rid, loaderId:'oc', documentURL:location.href, request:{ url:self2._cdpUrl, method:'GET', headers:{ Accept:'text/event-stream' } }, timestamp:window.__ocNet.now(), wallTime:window.__ocNet.wall(), initiator:{ type:'script' }, type:'EventSource' });
+    if (self2.readyState === 1) window.__ocNet.emit('Network.responseReceived', { requestId:self2._rid, timestamp:window.__ocNet.now(), type:'EventSource', response:{ url:self2._cdpUrl, status:200, statusText:'OK', mimeType:'text/event-stream', headers:{ 'content-type':'text/event-stream' } } });
+  };
+  window.__ocNet.register(this._rid, this._sseReplay);
 }
 OCEventSource.CONNECTING = 0; OCEventSource.OPEN = 1; OCEventSource.CLOSED = 2;
+OCEventSource.prototype._sseFinish = function(){
+  if (this._cdpDone) return; this._cdpDone = true;
+  window.__ocNet.emit('Network.loadingFinished', { requestId:this._rid, timestamp:window.__ocNet.now(), encodedDataLength:0 });
+  window.__ocNet.unregister(this._rid);
+};
 OCEventSource.prototype._deliver = function(d){
-  if (d.sub === 'open'){ this.readyState = 1; this._emit('open', { type:'open' }); }
+  if (d.sub === 'open'){ this.readyState = 1;
+    window.__ocNet.emit('Network.responseReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), type:'EventSource', response:{ url:this._cdpUrl, status:200, statusText:'OK', mimeType:'text/event-stream', headers:{ 'content-type':'text/event-stream' } } });
+    this._emit('open', { type:'open' }); }
   else if (d.sub === 'chunk'){ this._feed(String(d.data == null ? '' : d.data)); }
-  else if (d.sub === 'close'){ if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id]; this._emit('error', { type:'error' }); }
+  else if (d.sub === 'close'){ if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id]; this._sseFinish(); this._emit('error', { type:'error' }); }
 };
 OCEventSource.prototype._feed = function(text){
   this._buf = (this._buf + text).replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n');
@@ -314,10 +393,13 @@ OCEventSource.prototype._parse = function(raw){
   }
   if (id !== null) this.lastEventId = id;
   if (data.length === 0) return;
-  this._emit(event, { type:event, data:data.join('\\n'), lastEventId:this.lastEventId, origin:location.origin });
+  var payload = data.join('\\n');
+  window.__ocNet.emit('Network.eventSourceMessageReceived', { requestId:this._rid, timestamp:window.__ocNet.now(), eventName:event, eventId:this.lastEventId || '', data:payload });
+  this._emit(event, { type:event, data:payload, lastEventId:this.lastEventId, origin:location.origin });
 };
 OCEventSource.prototype.close = function(){
   if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id];
+  this._sseFinish();
   post({ type:'oc-sse', dir:'out', sub:'close', connId:this._id });
 };
 OCEventSource.prototype.addEventListener = function(t, fn){ (this._l[t] || (this._l[t] = [])).push(fn); };
@@ -345,12 +427,59 @@ const CDP_BOOTSTRAP = `(function(){
 if (window.__ocCdpInstalled) return; window.__ocCdpInstalled = true;
 function post(m){ parent.postMessage(m, '*'); }
 var seq = 0;
+// chobitsu reports fetch/XHR with the URL the app resolved against the iframe
+// origin — i.e. the internal studio-origin proxy path (…/preview/<port>/…). Rewrite
+// it to the friendly in-VM URL the user's code actually targets
+// (http://localhost:<port>/<path>), so the Network panel matches what the ws/SSE
+// shims already show. Display-only: the requestId (and thus getResponseBody) is
+// untouched.
+var _pp = location.pathname.match(/^\\/preview\\/(\\d+)\\//);
+var previewPort = _pp ? parseInt(_pp[1], 10) : 0;
+function cleanUrl(u){
+  try {
+    var url = new URL(u, location.href);
+    if (url.origin !== location.origin) return u;
+    var pm = url.pathname.match(/^\\/preview\\/(\\d+)(\\/.*)?$/);
+    if (!pm) return u;
+    var port = parseInt(pm[1], 10);
+    // A keep-prefix app (Docusaurus/Slidev) genuinely serves under /preview/<port>/,
+    // so its own-port URLs legitimately keep the prefix — mirror the ws shim.
+    var rest = (window.__ocKeepPrefix && port === previewPort) ? url.pathname : (pm[2] || '/');
+    var scheme = (location.protocol === 'https:') ? 'https' : 'http';
+    return scheme + '://localhost:' + port + rest + url.search + url.hash;
+  } catch(e){ return u; }
+}
+function scrubNet(o){
+  var p = o && o.params; if (!p) return false;
+  var changed = false;
+  function fix(obj, key){ if (obj && typeof obj[key] === 'string'){ var c = cleanUrl(obj[key]); if (c !== obj[key]){ obj[key] = c; changed = true; } } }
+  fix(p, 'documentURL');
+  fix(p.request, 'url');
+  fix(p.response, 'url');
+  fix(p.redirectResponse, 'url');
+  return changed;
+}
+// The ws/SSE replay must wait until BOTH (a) the frontend re-attached (an 'init'
+// from the host, sent once per DevTools (re)mount) AND (b) the frontend's Network
+// domain is actually live (its 'Network.enable' command, seen via the relay).
+// Firing on the DevTools iframe load alone races chii's Network panel startup —
+// a webSocketCreated emitted too early is dropped, so a socket opened before the
+// panel was ready (e.g. right after a preview reload) never shows. Both signals
+// fire exactly once per fresh frontend, so this also keeps it to one row.
+var seenInit = false, seenNet = false;
+function maybeAttach(){
+  if (seenInit && seenNet && window.__ocNet){ seenInit = false; seenNet = false; window.__ocNet.onAttach(); }
+}
 function setup(){
   if (!window.chobitsu) return false;
   window.chobitsu.setOnMessage(function(msg){
     // Drop responses to our own internal enable requests (ids prefixed 'ocdt');
     // pass through events and responses the frontend actually asked for.
     if (typeof msg === 'string' && msg.indexOf('"id":"ocdt') !== -1) return;
+    // Friendly-URL rewrite for fetch/XHR Network events (cheap substring gate first).
+    if (typeof msg === 'string' && msg.indexOf('/preview/') !== -1 && msg.indexOf('"Network.') !== -1) {
+      try { var o = JSON.parse(msg); if (o && typeof o.method === 'string' && o.method.indexOf('Network.') === 0 && scrubNet(o)) msg = JSON.stringify(o); } catch(e){}
+    }
     post({ source:'oc-cdp', dir:'target', data: msg });
   });
   return true;
@@ -369,11 +498,20 @@ function init(){
   sendToChobitsu('CSS.enable');
   sendToChobitsu('Overlay.enable');
   sendToDevtools({ method:'DOM.documentUpdated' });
+  // Don't replay live ws/SSE connections yet — wait until the frontend's Network
+  // domain is enabled too (maybeAttach), so the replayed rows aren't dropped by a
+  // not-yet-ready Network panel.
+  seenInit = true; maybeAttach();
 }
 window.addEventListener('message', function(ev){
   var d = ev.data;
   if (!d || d.source !== 'oc-cdp') return;
-  if (d.dir === 'frontend') { if (window.chobitsu) window.chobitsu.sendRawMessage(d.data); }
+  if (d.dir === 'frontend') {
+    if (window.chobitsu) window.chobitsu.sendRawMessage(d.data);
+    // The frontend just enabled its Network domain → its panel is ready to render
+    // events. Trigger the deferred ws/SSE replay now (once both signals are in).
+    try { if (JSON.parse(d.data).method === 'Network.enable') { seenNet = true; maybeAttach(); } } catch(e){}
+  }
   else if (d.dir === 'init') { init(); }
 });
 function notifyNav(){ post({ source:'oc-nav', href: location.pathname + location.search + location.hash }); }
@@ -390,14 +528,20 @@ const DEVTOOLS_TAGS =
   '<script src="/oc-devtools/chobitsu.js"><\/script>' + "<script>" + CDP_BOOTSTRAP + "<\/script>";
 
 // Insert the shim as the first child of <head> (so it runs before any script).
-// The WS shim runs first (inline), then chobitsu (classic src → executes before
-// the app's deferred module scripts), then the CDP bootstrap.
+// The DevTools network bridge (NET_SHIM) runs first so the WS/SSE shims can use
+// it, then the WS + SSE shims (inline), then chobitsu (classic src → executes
+// before the app's deferred module scripts), then the CDP bootstrap.
 function injectWsShim(html, keepPrefix) {
   // For keep-prefix ports, tell the injected WS shim (and any app code that cares)
   // that this document lives under its real base — so its own HMR socket path is
   // left prefixed rather than stripped.
   const flag = keepPrefix ? "<script>window.__ocKeepPrefix=true;<\/script>" : "";
-  const tag = flag + "<script>" + WS_SHIM + "<\/script><script>" + SSE_SHIM + "<\/script>" + DEVTOOLS_TAGS;
+  const tag =
+    flag +
+    "<script>" + NET_SHIM + "<\/script>" +
+    "<script>" + WS_SHIM + "<\/script>" +
+    "<script>" + SSE_SHIM + "<\/script>" +
+    DEVTOOLS_TAGS;
   const headOpen = /<head[^>]*>/i.exec(html);
   if (headOpen) {
     const at = headOpen.index + headOpen[0].length;
@@ -556,11 +700,23 @@ async function handlePreview(event, port, path, keepPrefix) {
     return new Response("Bad preview URL\n", { status: 400 });
   }
 
-  // Find the page that hosts the kernel (any window client that is not itself a
-  // preview frame). We include uncontrolled clients so this works on first load.
+  // Find the page that hosts the kernel: the top-level studio window. We include
+  // uncontrolled clients so this works on first load. Two nested iframes must NOT
+  // be mistaken for it: a preview frame (under /preview/) and — crucially — the
+  // DevTools frontend (/devtools-host.html). When DevTools is open that iframe is
+  // also a window client with no /preview/ marker, so the old "first non-preview
+  // client" heuristic could post the HTTP request to it; it has no kernel to
+  // answer, so the request hung until the 60s timeout (only ever with DevTools
+  // open). Prefer the top-level frame; fall back to any non-preview, non-DevTools
+  // window for the rare case frameType is unavailable.
   const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  const isPreview = (c) => c.url.includes(PREVIEW_MARKER);
+  const isDevtools = (c) => c.url.includes("/devtools-host.html") || c.url.includes("/devtools/");
   const kernelClient =
-    clients.find((c) => !c.url.includes(PREVIEW_MARKER)) || clients[0];
+    clients.find((c) => c.frameType === "top-level" && !isPreview(c) && !isDevtools(c)) ||
+    clients.find((c) => !isPreview(c) && !isDevtools(c)) ||
+    clients.find((c) => !isPreview(c)) ||
+    clients[0];
   if (!kernelClient) {
     return new Response("OpenContainer kernel is not running\n", { status: 503 });
   }
