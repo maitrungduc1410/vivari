@@ -1231,7 +1231,7 @@ diffable against upstream. The shipping shape is produced by a build step instea
   Storage. So every **Process Worker spawn** (which re-fetches `process-worker.js`, ~900 KB)
   and every reload is served from disk — instant, and the app works **offline**. Cache
   correctness across redeploys: `scripts/build-demo.mjs` stamps a per-build id into `sw.js`
-  (esbuild `define: { __OC_BUILD_ID__ }`) that names the cache (`vv-precache-<id>`); a new
+  (esbuild `define: { __VV_BUILD_ID__ }`) that names the cache (`vv-precache-<id>`); a new
   build changes `sw.js` → the browser installs the new SW, whose `activate` deletes every
   older `vv-precache-*`. All of this is **gated on that build id**, so dev (`packages/demo/`,
   loaded unbundled) never caches — edits keep hot-reloading unchanged.
@@ -2648,7 +2648,7 @@ app was doing.
 The fix injects a small **synthetic-CDP bridge** into every preview page and feeds the same
 `vv-cdp` channel chobitsu already uses, so ws/SSE/fetch all land in one coherent panel:
 
-- **`NET_SHIM` (`window.__ocNet`)** — a synthetic `Network.*` emitter injected into
+- **`NET_SHIM` (`window.__vvNet`)** — a synthetic `Network.*` emitter injected into
   `packages/studio/public/sw.js` (ahead of the ws/SSE shims and chobitsu). It hands out CDP
   request/loader ids, `emit()`s `Network.*` events over the bridge, and **registers each live
   connection** so it can **replay** them when a fresh DevTools frontend attaches. A `gen`
@@ -2674,7 +2674,7 @@ The fix injects a small **synthetic-CDP bridge** into every preview page and fee
   exclude the preview and DevTools iframes.
 - **Friendly URLs** — `cleanUrl`/`scrubNet` in the CDP bootstrap rewrite chobitsu's outgoing
   `Network.*` URLs from the proxy form (`/preview/<port>/…`) to the real in-VM address
-  (`http://localhost:<port>/…`), honoring `__ocKeepPrefix`. Now fetch/XHR read exactly like the
+  (`http://localhost:<port>/…`), honoring `__vvKeepPrefix`. Now fetch/XHR read exactly like the
   already-friendly ws/SSE rows (`http://localhost:3000/api/hello`, `ws://localhost:3001/ws`,
   `http://localhost:3000/events`).
 - **Backend demo buttons** — `backendDemoHtml` in `packages/studio/src/vv/templates.ts` gives
@@ -2686,7 +2686,7 @@ The fix injects a small **synthetic-CDP bridge** into every preview page and fee
 frames, an SSE stream + its events, and a fetch/XHR all appear with friendly in-VM URLs, survive
 a preview refresh, and no longer hang). The CDP visualization is inherently browser-only (not
 spike-able headlessly); the friendly-URL rewrite was validated with a Node harness over same-port,
-cross-service, and `__ocKeepPrefix` cases.
+cross-service, and `__vvKeepPrefix` cases.
 
 ## Definition of done for T2
 

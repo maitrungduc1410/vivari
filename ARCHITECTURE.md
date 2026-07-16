@@ -478,7 +478,7 @@ dev by the `serveDevtools()` Vite plugin and copied into `dist` on build.
 
 **Network panel** shows all three transports coherently. `fetch`/XHR are captured natively
 by chobitsu; `WebSocket`/`EventSource` are our postMessage-tunneled polyfills that chobitsu
-can't see, so a `NET_SHIM` (`window.__ocNet`) injected next to them **emits synthetic
+can't see, so a `NET_SHIM` (`window.__vvNet`) injected next to them **emits synthetic
 `Network.*` CDP events** over the same `vv-cdp` bridge — the full ws lifecycle
 (`webSocketCreated`/`…FrameSent`/`…FrameReceived`/`…Closed`) and SSE as a long-lived request
 with `eventSourceMessageReceived` events. It **registers live connections and replays them**

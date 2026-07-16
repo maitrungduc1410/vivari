@@ -25,7 +25,7 @@ function bundleServiceWorker(): Plugin {
 // The public entry (`src/index.ts`) only pulls in framework-agnostic TS. The
 // heavy machinery — the kernel worker and its nested fs/fetcher/process workers,
 // plus the Rust/Wasm VFS + codec + crypto artifacts — is reached exclusively
-// through `new Worker(new URL('./workers/*.js', import.meta.url))` and
+// through `new Worker(new URL('./workers/*.ts', import.meta.url))` and
 // `new URL('../../<crate>/pkg/*_bg.wasm', import.meta.url)`. Vite follows those
 // recursively, bundling each worker as its own chunk and emitting the wasm as
 // hashed assets under `dist/assets/`, with every URL rewritten to sit beside the
