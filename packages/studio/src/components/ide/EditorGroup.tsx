@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import X from "~icons/lucide/x";
 import { cn } from "@/lib/utils";
-import { OC_PATH_MIME, entriesFromDataTransfer } from "@/oc/controller";
+import { VV_PATH_MIME, entriesFromDataTransfer } from "@/vv/controller";
 import {
   ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger,
 } from "@/components/ui/context-menu";
@@ -16,8 +16,8 @@ import { useIde } from "./useIde";
 const baseName = (rel: string) => rel.split("/").pop() ?? rel;
 
 // Drag payload for reordering tabs within the strip (kept distinct from the
-// Explorer's OC_PATH_MIME so the editor-body drop zone ignores tab drags).
-const OC_TAB_MIME = "application/x-oc-tab";
+// Explorer's VV_PATH_MIME so the editor-body drop zone ignores tab drags).
+const VV_TAB_MIME = "application/x-vv-tab";
 
 export function EditorGroup() {
   const { c, snap } = useIde();
@@ -47,7 +47,7 @@ export function EditorGroup() {
     if (!el) return;
     const isDrag = (e: DragEvent) =>
       !!e.dataTransfer &&
-      (e.dataTransfer.types.includes(OC_PATH_MIME) || e.dataTransfer.types.includes("Files"));
+      (e.dataTransfer.types.includes(VV_PATH_MIME) || e.dataTransfer.types.includes("Files"));
     const onOver = (e: DragEvent) => {
       if (!isDrag(e)) return;
       e.preventDefault();
@@ -63,7 +63,7 @@ export function EditorGroup() {
       e.preventDefault();
       e.stopPropagation();
       setDropActive(false);
-      const raw = e.dataTransfer.getData(OC_PATH_MIME);
+      const raw = e.dataTransfer.getData(VV_PATH_MIME);
       const paths = raw ? raw.split("\n").filter(Boolean) : [];
       const entries = paths.length ? [] : entriesFromDataTransfer(e.dataTransfer);
       void c.dropOnEditor({ paths, entries });
@@ -101,7 +101,7 @@ export function EditorGroup() {
   return (
     <div className="flex h-full flex-col bg-[#1e1e1e]">
       {/* tab strip */}
-      <div className="oc-tabs-scroll flex h-9 shrink-0 items-stretch overflow-x-auto border-b bg-[#181818]">
+      <div className="vv-tabs-scroll flex h-9 shrink-0 items-stretch overflow-x-auto border-b bg-[#181818]">
         {snap.openTabs.map((rel, i) => {
           const active = rel === snap.activeTab;
           const isDirty = snap.dirty.includes(rel);
@@ -120,21 +120,21 @@ export function EditorGroup() {
                   onClick={() => c.openFile(rel, { preview: isPreview })}
                   onDoubleClick={() => c.pinTab(rel)}
                   onDragStart={(e) => {
-                    e.dataTransfer.setData(OC_TAB_MIME, rel);
+                    e.dataTransfer.setData(VV_TAB_MIME, rel);
                     e.dataTransfer.effectAllowed = "move";
                     setDragTab(rel);
                   }}
                   onDragOver={(e) => {
-                    if (!e.dataTransfer.types.includes(OC_TAB_MIME)) return;
+                    if (!e.dataTransfer.types.includes(VV_TAB_MIME)) return;
                     e.preventDefault();
                     e.dataTransfer.dropEffect = "move";
                     const rect = e.currentTarget.getBoundingClientRect();
                     setOverTab({ rel, after: e.clientX - rect.left > rect.width / 2 });
                   }}
                   onDrop={(e) => {
-                    if (!e.dataTransfer.types.includes(OC_TAB_MIME)) return;
+                    if (!e.dataTransfer.types.includes(VV_TAB_MIME)) return;
                     e.preventDefault();
-                    const from = e.dataTransfer.getData(OC_TAB_MIME);
+                    const from = e.dataTransfer.getData(VV_TAB_MIME);
                     if (from) c.reorderTab(from, rel, e.clientX - e.currentTarget.getBoundingClientRect().left > e.currentTarget.getBoundingClientRect().width / 2);
                     setDragTab(null);
                     setOverTab(null);
@@ -201,7 +201,7 @@ export function EditorGroup() {
       <div ref={dropZoneRef} className="relative flex-1">
         {/* Monaco stays mounted; it's hidden behind the image/directory panes so
             its models + language services survive tab switches. */}
-        <div ref={mountRef} className={cn("oc-editor-host absolute inset-0", activeKind !== "text" && "invisible")} />
+        <div ref={mountRef} className={cn("vv-editor-host absolute inset-0", activeKind !== "text" && "invisible")} />
         {activeKind === "image" && snap.activeTab && <ImageView key={snap.activeTab} abs={snap.activeTab} />}
         {activeKind === "directory" && snap.activeTab && <DirectoryView />}
         {!snap.activeTab && (

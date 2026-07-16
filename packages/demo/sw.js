@@ -23,7 +23,7 @@ const PREVIEW_MARKER = "/preview/";
 // yields "undefined", so this is safe to reference in the un-built file.
 const BUILD_ID = typeof __OC_BUILD_ID__ !== "undefined" ? __OC_BUILD_ID__ : null;
 const CACHE_ON = BUILD_ID !== null;
-const CACHE_PREFIX = "oc-precache-";
+const CACHE_PREFIX = "vv-precache-";
 const CACHE_NAME = CACHE_PREFIX + BUILD_ID;
 
 // Directory this SW was served from — e.g. "/packages/demo-dist/" for the build,
@@ -80,10 +80,10 @@ async function cacheFirst(request) {
           try {
             await cache.put(request, resp.clone());
           } catch (err) {
-            console.warn("[oc-sw] cache.put failed for", key, "-", err && err.message);
+            console.warn("[vv-sw] cache.put failed for", key, "-", err && err.message);
           }
         } else {
-          console.warn("[oc-sw] not caching", key, "- status", resp && resp.status, "type", resp && resp.type);
+          console.warn("[vv-sw] not caching", key, "- status", resp && resp.status, "type", resp && resp.type);
         }
         return resp;
       })
@@ -118,7 +118,7 @@ var tok = Math.random().toString(36).slice(2, 8);
 var nextId = 1, conns = {};
 function post(msg){ parent.postMessage(msg, '*'); }
 window.addEventListener('message', function(ev){
-  var d = ev.data; if (!d || d.type !== 'oc-ws' || d.dir !== 'in') return;
+  var d = ev.data; if (!d || d.type !== 'vv-ws' || d.dir !== 'in') return;
   var c = conns[d.connId]; if (c) c._deliver(d);
 });
 window.addEventListener('pagehide', function(){
@@ -140,7 +140,7 @@ function OCWebSocket(url, protocols){
     if (pm) { targetPort = parseInt(pm[1], 10); path = (pm[2] || '/') + u.search; }
     else if (u.port && u.port !== location.port) targetPort = parseInt(u.port, 10);
   } catch(e){}
-  post({ type:'oc-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path, protocols: protocols || null });
+  post({ type:'vv-ws', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path, protocols: protocols || null });
 }
 OCWebSocket.CONNECTING = 0; OCWebSocket.OPEN = 1; OCWebSocket.CLOSING = 2; OCWebSocket.CLOSED = 3;
 OCWebSocket.prototype._deliver = function(d){
@@ -155,11 +155,11 @@ OCWebSocket.prototype.send = function(data){
     if (data instanceof ArrayBuffer) payload = data;
     else if (ArrayBuffer.isView(data)) payload = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     else { binary = false; payload = String(data); } }
-  post({ type:'oc-ws', dir:'out', sub:'send', connId:this._id, data:payload, binary:binary });
+  post({ type:'vv-ws', dir:'out', sub:'send', connId:this._id, data:payload, binary:binary });
 };
 OCWebSocket.prototype.close = function(code, reason){
   if (this.readyState === 3 || this.readyState === 2) return; this.readyState = 2;
-  post({ type:'oc-ws', dir:'out', sub:'close', connId:this._id, code:code, reason:reason });
+  post({ type:'vv-ws', dir:'out', sub:'close', connId:this._id, code:code, reason:reason });
 };
 OCWebSocket.prototype.addEventListener = function(t, fn){ if (this._l[t]) this._l[t].push(fn); };
 OCWebSocket.prototype.removeEventListener = function(t, fn){ var a=this._l[t]; if(a){var i=a.indexOf(fn); if(i>=0)a.splice(i,1);} };
@@ -187,7 +187,7 @@ var tok = Math.random().toString(36).slice(2, 8);
 var nextId = 1, conns = {};
 function post(msg){ parent.postMessage(msg, '*'); }
 window.addEventListener('message', function(ev){
-  var d = ev.data; if (!d || d.type !== 'oc-sse' || d.dir !== 'in') return;
+  var d = ev.data; if (!d || d.type !== 'vv-sse' || d.dir !== 'in') return;
   var c = conns[d.connId]; if (c) c._deliver(d);
 });
 window.addEventListener('pagehide', function(){
@@ -206,7 +206,7 @@ function OCEventSource(url, cfg){
     if (pm) { targetPort = parseInt(pm[1], 10); path = (pm[2] || '/') + u.search; }
     else if (u.port && u.port !== location.port) targetPort = parseInt(u.port, 10);
   } catch(e){}
-  post({ type:'oc-sse', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path });
+  post({ type:'vv-sse', dir:'out', sub:'open', connId:this._id, port:targetPort, fallbackPort:previewPort, path:path });
 }
 OCEventSource.CONNECTING = 0; OCEventSource.OPEN = 1; OCEventSource.CLOSED = 2;
 OCEventSource.prototype._deliver = function(d){
@@ -236,7 +236,7 @@ OCEventSource.prototype._parse = function(raw){
 };
 OCEventSource.prototype.close = function(){
   if (this.readyState === 2) return; this.readyState = 2; delete conns[this._id];
-  post({ type:'oc-sse', dir:'out', sub:'close', connId:this._id });
+  post({ type:'vv-sse', dir:'out', sub:'close', connId:this._id });
 };
 OCEventSource.prototype.addEventListener = function(t, fn){ (this._l[t] || (this._l[t] = [])).push(fn); };
 OCEventSource.prototype.removeEventListener = function(t, fn){ var a=this._l[t]; if(a){var i=a.indexOf(fn); if(i>=0)a.splice(i,1);} };
@@ -293,12 +293,12 @@ async function precache() {
         fetched++;
       } catch (err) {
         failed++;
-        console.warn("[oc-sw] precache miss:", url, "-", err && err.message);
+        console.warn("[vv-sw] precache miss:", url, "-", err && err.message);
       }
     }),
   );
   if (fetched || failed) {
-    console.log(`[oc-sw] precache ${CACHE_NAME}: ${fetched} fetched, ${kept} cached, ${failed} failed`);
+    console.log(`[vv-sw] precache ${CACHE_NAME}: ${fetched} fetched, ${kept} cached, ${failed} failed`);
   }
 }
 
@@ -393,7 +393,7 @@ async function handlePreview(event, port, path) {
   const kernelClient =
     clients.find((c) => !c.url.includes(PREVIEW_MARKER)) || clients[0];
   if (!kernelClient) {
-    return new Response("OpenContainer kernel is not running\n", { status: 503 });
+    return new Response("Vivari kernel is not running\n", { status: 503 });
   }
 
   let body = "";
@@ -422,7 +422,7 @@ async function handlePreview(event, port, path) {
       clearTimeout(timer);
       resolve(e.data);
     };
-    kernelClient.postMessage({ type: "oc-http", req }, [mc.port2]);
+    kernelClient.postMessage({ type: "vv-http", req }, [mc.port2]);
   });
 
   const respHeaders = new Headers(resp.headers || {});

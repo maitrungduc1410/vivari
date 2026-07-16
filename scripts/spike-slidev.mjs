@@ -1,6 +1,6 @@
 // Spike (NETWORK): prove the Slidev Docs template boots its dev server and serves
 // the slide deck in-VM. Mirrors the shipped `slidev` template in
-// packages/studio/src/oc/templates.ts.
+// packages/studio/src/vv/templates.ts.
 //
 // Slidev is a Vite + Vue CLI dev server (@slidev/cli). Like Nitro, we drive the
 // real CLI: `slidev --port 3030` (node_modules/@slidev/cli/bin/slidev.mjs). The
@@ -9,11 +9,11 @@
 // Gates: install ok, the dev server binds :3030, and GET / returns the Slidev app
 // shell (contains "slidev").
 //   run (Node 22+):  node scripts/spike-slidev.mjs   (needs vendored npm — see spike-harness)
-process.env.OC_BIND_TIMEOUT ||= "300000"; // Slidev's first Vite build can be slow in-VM.
+process.env.VV_BIND_TIMEOUT ||= "300000"; // Slidev's first Vite build can be slow in-VM.
 import { bootSpikeKernel, writeProject, npmInstall, waitListen, httpGet } from "./lib/spike-harness.mjs";
 
 const DIR = "/slidev";
-const PORT = Number(process.env.OC_PORT || 3030);
+const PORT = Number(process.env.VV_PORT || 3030);
 const h = await bootSpikeKernel();
 
 writeProject(h.kernel, DIR, {
@@ -35,10 +35,10 @@ writeProject(h.kernel, DIR, {
 `,
   "slides.md": `---
 theme: default
-title: Slidev on OpenContainer
+title: Slidev on Vivari
 ---
 
-# Slidev on OpenContainer
+# Slidev on Vivari
 
 Presentation slides for developers — running in the browser
 
@@ -54,7 +54,7 @@ Presentation slides for developers — running in the browser
 
 const inst = await npmInstall(h, { dir: DIR });
 if (inst.code !== 0) process.exit(1);
-if (process.env.OC_INSTALL_ONLY === "1") process.exit(0);
+if (process.env.VV_INSTALL_ONLY === "1") process.exit(0);
 
 const bound = await waitListen(h, {
   dir: DIR,

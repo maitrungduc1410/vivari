@@ -11,10 +11,10 @@
 //
 // Throwaway harness modelled on scripts/spike-corepack.mjs.
 //
-//   1) vendor:  rm -rf /tmp/oc-vendor-tsgo && mkdir -p /tmp/oc-vendor-tsgo \
-//        && (cd /tmp/oc-vendor-tsgo && npm install tsgo-wasm --no-save --no-audit --no-fund)
+//   1) vendor:  rm -rf /tmp/vv-vendor-tsgo && mkdir -p /tmp/vv-vendor-tsgo \
+//        && (cd /tmp/vv-vendor-tsgo && npm install tsgo-wasm --no-save --no-audit --no-fund)
 //   2) run:  node scripts/spike-tsgo.mjs [path-to-vendored-tsgo-wasm]
-//            OC_LIVE=1 streams the guest's stdout/stderr live.
+//            VV_LIVE=1 streams the guest's stdout/stderr live.
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
@@ -22,14 +22,14 @@ import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
 
-const VENDOR = process.argv[2] || "/tmp/oc-vendor-tsgo/node_modules/tsgo-wasm";
+const VENDOR = process.argv[2] || "/tmp/vv-vendor-tsgo/node_modules/tsgo-wasm";
 const WASM_SRC = path.join(VENDOR, "tsgo.wasm");
 const LAUNCHER_SRC = path.join(VENDOR, "tsgo-wasm");
 const VFS_WASM = "/usr/lib/tsgo/tsgo.wasm";
 
 if (!fs.existsSync(WASM_SRC) || !fs.existsSync(LAUNCHER_SRC)) {
   console.error(`No vendored tsgo-wasm at ${VENDOR} (expected tsgo.wasm + tsgo-wasm launcher).`);
-  console.error(`Vendor it first:  rm -rf /tmp/oc-vendor-tsgo && mkdir -p /tmp/oc-vendor-tsgo && (cd /tmp/oc-vendor-tsgo && npm install tsgo-wasm --no-save --no-audit --no-fund)`);
+  console.error(`Vendor it first:  rm -rf /tmp/vv-vendor-tsgo && mkdir -p /tmp/vv-vendor-tsgo && (cd /tmp/vv-vendor-tsgo && npm install tsgo-wasm --no-save --no-audit --no-fund)`);
   process.exit(2);
 }
 
@@ -69,7 +69,7 @@ const spawnWorker = (info) => {
   };
 };
 
-const LIVE = process.env.OC_LIVE === "1";
+const LIVE = process.env.VV_LIVE === "1";
 const kernel = new Kernel({
   fs: kernelFs.fs,
   spawnWorker,

@@ -2,7 +2,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
 import { IdeProvider } from "@/components/ide/IdeProvider";
 import { AppShell } from "@/components/ide/AppShell";
-import { isCrossOriginIsolated } from "@/oc/kernel";
+import { isCrossOriginIsolated } from "@/vv/kernel";
 
 export default function App() {
   if (!isCrossOriginIsolated()) {

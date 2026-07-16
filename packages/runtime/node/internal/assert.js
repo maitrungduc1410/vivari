@@ -7,12 +7,12 @@ export default function (exports, require, module, process, internalBinding, pri
 
   function assert(value, message) {
     if (!value) {
-      throw new Error(message || "OpenContainer internal assertion failed");
+      throw new Error(message || "Vivari internal assertion failed");
     }
   }
   assert.ok = assert;
   assert.fail = (message) => {
-    throw new Error(message || "OpenContainer internal assertion failed");
+    throw new Error(message || "Vivari internal assertion failed");
   };
 
   module.exports = assert;

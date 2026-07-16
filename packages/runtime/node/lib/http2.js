@@ -6,7 +6,7 @@
 
 export default function (exports, require, module) {
   const nope = (name) => () => {
-    throw new Error("http2." + name + " is not supported in OpenContainer (use http/https)");
+    throw new Error("http2." + name + " is not supported in Vivari (use http/https)");
   };
 
   // The subset of HTTP/2 header/settings constants most code destructures.

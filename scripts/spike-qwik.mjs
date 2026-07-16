@@ -1,5 +1,5 @@
 // Spike (NETWORK): prove the Qwik template's Vite dev server boots + serves in-VM.
-// Mirrors the shipped `qwik` template in packages/studio/src/oc/templates.ts. Qwik
+// Mirrors the shipped `qwik` template in packages/studio/src/vv/templates.ts. Qwik
 // is the heaviest of the frontend variants (its optimizer plugin does more than a
 // plain JSX transform), so the entry-module gate is the meaningful one here.
 // Run (Node 22+):  node scripts/spike-qwik.mjs   (see spike-vite-lib.mjs for setup)
@@ -60,7 +60,7 @@ export const App = component$(() => {
     <main style="font-family: system-ui, sans-serif; text-align: center; padding: 3rem">
       <h1>Vite + Qwik</h1>
       <button onClick$={() => count.value++}>count is {count.value}</button>
-      <p>Running inside OpenContainer.</p>
+      <p>Running inside Vivari.</p>
     </main>
   )
 })

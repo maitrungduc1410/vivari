@@ -1,5 +1,5 @@
 import { createContext, useContext, useSyncExternalStore } from "react";
-import { IdeController, type IdeSnapshot } from "@/oc/controller";
+import { IdeController, type IdeSnapshot } from "@/vv/controller";
 
 // One kernel worker per page → one controller. A module-level singleton keeps
 // React StrictMode's double-mount from spawning a second kernel worker.

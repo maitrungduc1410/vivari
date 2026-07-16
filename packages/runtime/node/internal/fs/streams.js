@@ -1,4 +1,4 @@
-// internal/fs/streams — pragmatic fs.ReadStream / fs.WriteStream for OpenContainer.
+// internal/fs/streams — pragmatic fs.ReadStream / fs.WriteStream for Vivari.
 //
 // Node's real internal/fs/streams drives ReadStream/WriteStream through a pool of
 // libuv FSReqCallbacks with a shared read buffer. We implement the same public

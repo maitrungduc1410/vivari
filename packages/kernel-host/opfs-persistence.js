@@ -21,7 +21,7 @@
 //     worker serves any syscall.
 //
 // Layout under the origin's OPFS:
-//   oc-vfs/
+//   vv-vfs/
 //     files/…            one real OPFS file per VFS file (bytes only)
 //     manifest.json      [ [path, {k,m,t}], … ] — the index: kind, mode, and
 //                        (for symlinks) target. Dirs/symlinks have no `files/`
@@ -31,7 +31,7 @@
 // (read/walk/mkdirp/writeFile/symlink); this module never imports the wasm VFS
 // directly, so it stays environment-agnostic and headless never loads it.
 
-const ROOT_DIR = "oc-vfs";
+const ROOT_DIR = "vv-vfs";
 const FILES_DIR = "files";
 const MANIFEST = "manifest.json";
 

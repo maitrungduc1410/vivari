@@ -14,7 +14,7 @@ export default function (exports, require, module) {
   const Socket = (net && net.Socket) || class {};
 
   const notImpl = (what) => {
-    const err = new Error("OpenContainer: TLS is not implemented yet" + (what ? " (" + what + ")" : ""));
+    const err = new Error("Vivari: TLS is not implemented yet" + (what ? " (" + what + ")" : ""));
     err.code = "ERR_METHOD_NOT_IMPLEMENTED";
     throw err;
   };

@@ -2,7 +2,7 @@
 // https://github.com/guybedford/es-module-lexer
 //
 // The pure-JS (asm.js) build: `parse(source, name?)` is SYNCHRONOUS with no
-// WASM/init step, which is exactly what OpenContainer's synchronous module
+// WASM/init step, which is exactly what Vivari's synchronous module
 // system needs (Phase 2 #13). Used by ../../esm.js to locate import/export
 // statements when transpiling ESM -> CJS. The only change vs upstream is the
 // removal of the "use asm" directive (it only triggered a V8 validation warning

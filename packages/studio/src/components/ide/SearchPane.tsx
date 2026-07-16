@@ -14,7 +14,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { FileIcon } from "./fileIcon";
 import { useIde } from "./useIde";
-import type { SearchDone, SearchFileResult } from "@/oc/controller";
+import type { SearchDone, SearchFileResult } from "@/vv/controller";
 
 const baseName = (rel: string) => rel.split("/").pop() ?? rel;
 const dirName = (rel: string) => {
@@ -137,7 +137,7 @@ export function SearchPane() {
     const files = results.map((f) => f.file);
     if (!files.length) return;
     await c.replace({ ...replaceOpts, files });
-    // The oc-fs-changed bump re-runs the search via treeVersion.
+    // The vv-fs-changed bump re-runs the search via treeVersion.
   }, [c, results, replaceOpts]);
 
   const doReplaceFile = useCallback(async (file: string) => {

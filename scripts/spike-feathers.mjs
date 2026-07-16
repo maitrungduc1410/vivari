@@ -1,6 +1,6 @@
 // Spike (NETWORK): prove the FeathersJS (Koa transport) Backend template boots and
 // serves a real REST service in-VM. Mirrors the shipped `feathers` template in
-// packages/studio/src/oc/templates.ts.
+// packages/studio/src/vv/templates.ts.
 // Gates: install ok, `node src/index.js` binds :3030, GET /messages returns the
 // seeded message, POST /messages creates one (id increments), and GET /messages
 // then shows both — proving Feathers' service + rest() transport work in-VM.
@@ -8,7 +8,7 @@
 import { bootSpikeKernel, writeProject, npmInstall, waitListen, httpGet, httpPost } from "./lib/spike-harness.mjs";
 
 const DIR = "/feathers";
-const PORT = Number(process.env.OC_PORT || 3030);
+const PORT = Number(process.env.VV_PORT || 3030);
 const h = await bootSpikeKernel();
 
 writeProject(h.kernel, DIR, {
@@ -51,7 +51,7 @@ app.listen(port).then(() => console.log('Feathers on http://localhost:' + port +
 
 const inst = await npmInstall(h, { dir: DIR });
 if (inst.code !== 0) process.exit(1);
-if (process.env.OC_INSTALL_ONLY === "1") process.exit(0);
+if (process.env.VV_INSTALL_ONLY === "1") process.exit(0);
 
 const bound = await waitListen(h, { dir: DIR, port: PORT, argv: ["src/index.js"] });
 

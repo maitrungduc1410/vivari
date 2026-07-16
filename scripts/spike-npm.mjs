@@ -9,8 +9,8 @@
 // vs. need filling in before we invest in the http-over-fetcher egress (Phase 1).
 //
 //   1) vendor npm:  (already done by the agent)
-//        rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor \
-//          && (cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
+//        rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor \
+//          && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
 //   2) run:  node scripts/spike-npm.mjs [path-to-vendored-npm]
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
@@ -20,12 +20,12 @@ import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
 
-const VENDOR_NPM = process.argv[2] || "/tmp/oc-vendor/node_modules/npm";
+const VENDOR_NPM = process.argv[2] || "/tmp/vv-vendor/node_modules/npm";
 const VFS_NPM = "/usr/lib/node_modules/npm";
 
 if (!fs.existsSync(path.join(VENDOR_NPM, "bin/npm-cli.js"))) {
   console.error(`No vendored npm at ${VENDOR_NPM} (expected bin/npm-cli.js).`);
-  console.error(`Vendor it first:  rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor && (cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)`);
+  console.error(`Vendor it first:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)`);
   process.exit(2);
 }
 
@@ -72,7 +72,7 @@ const fetcher = async (url, init) => {
   return { ok: r.ok, status: r.status, statusText: r.statusText, headers, body };
 };
 
-const LIVE = process.env.OC_LIVE === "1";
+const LIVE = process.env.VV_LIVE === "1";
 const kernel = new Kernel({
   fs: kernelFs.fs,
   spawnWorker,
@@ -160,7 +160,7 @@ console.log(`(prim exit ${prim.code})\n`);
 
 // ── the gate: real npm --version ─────────────────────────────────────────────
 console.log("── npm --version (real npm-cli.js on Path B) ──");
-const env = { HOME: "/home/user", PATH: "/bin", npm_config_cache: "/tmp/.npm", OC_LIVE: LIVE ? "1" : "" };
+const env = { HOME: "/home/user", PATH: "/bin", npm_config_cache: "/tmp/.npm", VV_LIVE: LIVE ? "1" : "" };
 
 // Wrapper that taps npm's proc-log events (process.emit('log'|'output', ...)) and
 // catches a synchronous throw, so we can SEE what npm tried to say even if its
@@ -173,7 +173,7 @@ const util = require('util');
 const LOG = '/npmlog.txt';
 try { fs.writeFileSync(LOG, ''); } catch (e) {}
 const fmt = (a) => a.map((x) => (typeof x === 'string' ? x : util.inspect(x, { depth: 3 }))).join(' ');
-    const LIVE = process.env.OC_LIVE === '1';
+    const LIVE = process.env.VV_LIVE === '1';
     const append = (s) => { try { fs.appendFileSync(LOG, s + '\\n'); } catch (e) {} if (LIVE) { try { process.stderr.write('[npm] ' + s + '\\n'); } catch (e) {} } };
 process.on('output', (level, ...a) => append('OUTPUT[' + level + '] ' + fmt(a)));
 process.on('log', (level, ...a) => append('LOG[' + level + '] ' + fmt(a)));
@@ -230,13 +230,13 @@ console.log("selftest exit=" + st.code + " stdout=" + JSON.stringify((st.stdout 
 if (st.stderr && st.stderr.trim()) console.log("selftest stderr:\n" + st.stderr.trim());
 
 // ── phase 1 gate: real `npm install <pkg>` over the Fetcher Worker ────────────
-const PKG = process.env.OC_PKG || "is-number";
+const PKG = process.env.VV_PKG || "is-number";
 console.log(`\n── npm install ${PKG} (real registry via Fetcher Worker) ──`);
 kernel.mkdirp("/home/user");
 kernel.mkdirp("/tmp/.npm/_logs");
 kernel.writeFile("/app/package.json", JSON.stringify({ name: "app", version: "1.0.0" }, null, 2));
 const t2 = Date.now();
-const TIMEOUT_MS = Number(process.env.OC_TIMEOUT || 90000);
+const TIMEOUT_MS = Number(process.env.VV_TIMEOUT || 90000);
 let timedOut = false;
 const inst = await Promise.race([
   kernel.start(
@@ -293,7 +293,7 @@ if (installOk && kernel.exists("/app/package-lock.json")) {
 
 // ── phase 2 gate: lifecycle scripts + .bin + non-fatal native (node-gyp) ─────
 let lifecycleOk = true;
-const PHASE2 = process.env.OC_PHASE2 === "1";
+const PHASE2 = process.env.VV_PHASE2 === "1";
 if (PHASE2) {
   console.log("\n══ PHASE 2: lifecycle scripts + .bin + node-gyp stub ══");
   kernel.mkdirp("/app2");

@@ -6,8 +6,8 @@
 // Gates (all must pass): install ok, `docusaurus start` binds its port, GET /
 // returns 200 with the Docusaurus app shell (#__docusaurus / site title).
 //
-//   1) vendor npm:  rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor \
-//        && (cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
+//   1) vendor npm:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor \
+//        && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
 //   2) run (Node 22+):  node scripts/spike-docusaurus.mjs
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
@@ -17,23 +17,23 @@ import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
 
-const VENDOR_NPM = process.argv[2] || "/tmp/oc-vendor/node_modules/npm";
+const VENDOR_NPM = process.argv[2] || "/tmp/vv-vendor/node_modules/npm";
 const VFS_NPM = "/usr/lib/node_modules/npm";
 if (!fs.existsSync(path.join(VENDOR_NPM, "bin/npm-cli.js"))) {
   console.error(`No vendored npm at ${VENDOR_NPM} (expected bin/npm-cli.js).`);
-  console.error(`Vendor it:  rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor && (cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)`);
+  console.error(`Vendor it:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)`);
   process.exit(2);
 }
 
-const LIVE = process.env.OC_LIVE === "1";
+const LIVE = process.env.VV_LIVE === "1";
 const DIR = "/docs-site";
-const PORT = Number(process.env.OC_PORT || 3000);
+const PORT = Number(process.env.VV_PORT || 3000);
 // The shipped studio template serves Docusaurus under the preview proxy prefix
 // (baseUrl "/preview/3000/", keepPreviewPrefix) so its client router resolves the
-// first route. Set OC_BASEURL=/preview/3000/ to exercise that base-prefixed path
+// first route. Set VV_BASEURL=/preview/3000/ to exercise that base-prefixed path
 // here (GET the base, plus an asset under it, should both 200); default "/" keeps
 // the fast/plain regression run.
-const BASEURL = process.env.OC_BASEURL || "/";
+const BASEURL = process.env.VV_BASEURL || "/";
 
 // ── kernel setup (same shape as spike-webpack.mjs) ───────────────────────────
 const fsWorker = new Worker(new URL("./fs-worker.mjs", import.meta.url));
@@ -119,7 +119,7 @@ kernel.mkdirp("/home/user");
 kernel.mkdirp("/tmp/.npm/_logs");
 
 // ── minimal classic Docusaurus site ──────────────────────────────────────────
-const DOCUSAURUS_VERSION = process.env.OC_DOCUSAURUS_VERSION || "^3.6.0";
+const DOCUSAURUS_VERSION = process.env.VV_DOCUSAURUS_VERSION || "^3.6.0";
 kernel.mkdirp(DIR + "/docs");
 kernel.mkdirp(DIR + "/src/css");
 kernel.mkdirp(DIR + "/static");
@@ -151,7 +151,7 @@ kernel.writeFile(
 kernel.writeFile(
   DIR + "/docusaurus.config.js",
   `module.exports = {
-  title: "Docusaurus in OpenContainer",
+  title: "Docusaurus in Vivari",
   tagline: "Docs run in-VM",
   url: "http://localhost",
   baseUrl: "${BASEURL}",
@@ -169,7 +169,7 @@ kernel.writeFile(
     ],
   ],
   themeConfig: {
-    navbar: { title: "Docusaurus in OpenContainer", items: [] },
+    navbar: { title: "Docusaurus in Vivari", items: [] },
   },
 };
 `,
@@ -183,12 +183,12 @@ kernel.writeFile(
   DIR + "/docs/intro.md",
   `---
 slug: /
-title: Docusaurus in OpenContainer
+title: Docusaurus in Vivari
 ---
 
-# Docusaurus in OpenContainer
+# Docusaurus in Vivari
 
-Hello from OpenContainer — a full Docusaurus dev server compiled in the browser VM.
+Hello from Vivari — a full Docusaurus dev server compiled in the browser VM.
 `,
 );
 
@@ -197,13 +197,13 @@ const env = {
   PATH: DIR + "/node_modules/.bin:/bin",
   npm_config_cache: "/tmp/.npm",
   NODE_ENV: "development",
-  OC_LIVE: LIVE ? "1" : "",
-  OC_TRACE_MODULES: process.env.OC_TRACE_MODULES || "",
+  VV_LIVE: LIVE ? "1" : "",
+  VV_TRACE_MODULES: process.env.VV_TRACE_MODULES || "",
 };
 
 // ── gate 1: install (large) ──────────────────────────────────────────────────
 console.log(`\n== npm install (@docusaurus/core + preset-classic) ==`);
-const INSTALL_TIMEOUT = Number(process.env.OC_INSTALL_TIMEOUT || 600000);
+const INSTALL_TIMEOUT = Number(process.env.VV_INSTALL_TIMEOUT || 600000);
 const t1 = Date.now();
 let installTimedOut = false;
 const inst = await Promise.race([
@@ -218,13 +218,13 @@ if (inst.code !== 0) {
 const dbin = kernel.exists(DIR + "/node_modules/@docusaurus/core/bin/docusaurus.mjs");
 console.log("  docusaurus bin present: " + dbin);
 
-if (process.env.OC_INSTALL_ONLY === "1") {
+if (process.env.VV_INSTALL_ONLY === "1") {
   console.log("\nOC_INSTALL_ONLY=1 — stopping after install.");
   process.exit(inst.code === 0 && dbin ? 0 : 1);
 }
 
 // ── diagnostic: run start captured (it crashes at load → returns fast) ────────
-if (process.env.OC_STARTCAP === "1") {
+if (process.env.VV_STARTCAP === "1") {
   console.log("\n== docusaurus start (captured) ==");
   const r = await Promise.race([
     kernel.start(
@@ -246,7 +246,7 @@ kernel.start(
   ["node_modules/@docusaurus/core/bin/docusaurus.mjs", "start", "--port", String(PORT), "--host", "127.0.0.1", "--no-open"],
   { cwd: DIR, env },
 );
-const BIND_TIMEOUT = Number(process.env.OC_BIND_TIMEOUT || 360000);
+const BIND_TIMEOUT = Number(process.env.VV_BIND_TIMEOUT || 360000);
 const tb = Date.now();
 let fatal = "";
 while (!listening.has(PORT) && Date.now() - tb < BIND_TIMEOUT && !fatal) {
@@ -273,7 +273,7 @@ if (bound) {
     root = await get(home);
   }
   const body = decode(root.body || "");
-  getOk = root.status === 200 && /__docusaurus|Docusaurus in OpenContainer/.test(body);
+  getOk = root.status === 200 && /__docusaurus|Docusaurus in Vivari/.test(body);
   console.log(`  GET ${home} -> ${root.status}  (${body.length} bytes)`);
   console.log("  body head: " + body.slice(0, 220).replace(/\n/g, " "));
   // For a base-prefixed run, prove an asset also serves under the prefix — this is

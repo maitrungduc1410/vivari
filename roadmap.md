@@ -1,4 +1,4 @@
-# OpenContainer — Roadmap
+# Vivari — Roadmap
 
 Built on the principle **de-risk the hardest part first**: prove the riskiest
 primitive (synchronous cross-thread access to a shared kernel) before expanding.
@@ -71,14 +71,14 @@ quota (shared with Cache API). Design — **write-behind mirror**, not a backing
   loop (coalesced per path). Durability is eventual (~ms); `flush()` on `pagehide` forces it.
 - fd writes (`fd_write`/`ftruncate`/`close`) resolve their path via an fd→path map kept in
   `FsServer`; on drain we re-read the file's current bytes from the VFS and write one OPFS file.
-- Layout `oc-vfs/{files/…, manifest.json}`: one OPFS file per VFS file (bytes), plus a small
+- Layout `vv-vfs/{files/…, manifest.json}`: one OPFS file per VFS file (bytes), plus a small
   manifest `[path,{kind,mode,target}]` that recreates dirs + symlinks (OPFS has neither).
 - Boot `restore()` replays the manifest into the VFS **before** the FS worker serves any
   syscall (calls the VFS directly, so it never re-enters the queue).
 - Only the browser wires it (`packages/demo/fs-worker.js`); **headless injects no adapter**
   (`new FsServer(vfs)`), so `verify-node`/`verify-express` are unchanged and still green.
 - System/volatile dirs are skipped (`/bin` coreutils re-install each boot, `/tmp`,`/proc`,
-  `/dev`). `?reset` (host.js) wipes `oc-vfs` before boot. Demo: `GET /api/persist` bumps a
+  `/dev`). `?reset` (host.js) wipes `vv-vfs` before boot. Demo: `GET /api/persist` bumps a
   counter in `/data/visits.json` that keeps climbing across reloads.
 **Deferred:** exact `mode` restore (needs a VFS `chmod`; today files get the default mode on
 restore — fine for our spawn/PATH resolution which doesn't gate on the exec bit); quota-pressure
@@ -242,7 +242,7 @@ climb the hard modules (`stream` → `net`/`http` → `zlib`/`crypto`).
 
 De-risked with a throwaway harness (`scripts/spike-npm.mjs`) that loads a vendored,
 unmodified **npm@10.9.2** into the VFS and runs its real `bin/npm-cli.js` on Path B, gated
-end to end. Run it with `node scripts/spike-npm.mjs` (add `OC_PHASE2=1` for the lifecycle
+end to end. Run it with `node scripts/spike-npm.mjs` (add `VV_PHASE2=1` for the lifecycle
 gate; needs network — hits `registry.npmjs.org`).
 
 - **Phase 0 — real npm BOOTS (`baeacbf`).** `npm -v` → `10.9.2`, exit 0. Fixed three
@@ -287,7 +287,7 @@ gate; needs network — hits `registry.npmjs.org`).
   OPFS-persisted, so it only re-applies the cheap shims); it falls back to the Turbo-analog
   if the asset is missing. The **same shared loader + shim path** is gated headlessly by
   `scripts/spike-npm-studio.mjs` (`npm --version`/`npx --version` → `10.9.2` via the PATH
-  shim, `OC_NET=1` adds a real `npm install`). Fixes the reported `npm -v`/`node -v` oddity:
+  shim, `VV_NET=1` adds a real `npm install`). Fixes the reported `npm -v`/`node -v` oddity:
   `npm -v` now answers `10.9.2` (real npm), and the `node` coreutil learned `-v`/`--version`.
   (Phase-3 deferrals — `npm ci`, retiring `programs/npm.js`, and batching the first-load write
   storm — are all closed in the "PM capstone" entry below; yarn/pnpm/corepack are Phases 4-6.)
@@ -326,7 +326,7 @@ gate; needs network — hits `registry.npmjs.org`).
   worker calls `ensureRealYarn()` right after `ensureRealNpm()` at boot (OPFS-persisted, so later
   boots only re-apply the cheap shims); the shell env gains `YARN_CACHE_FOLDER=/tmp/.yarn-cache`
   (created at boot). The SAME shared loader + shim path is gated headlessly by
-  `scripts/spike-yarn-studio.mjs` (`yarn --version` → `1.22.22` via the PATH shim; `OC_NET=1` adds
+  `scripts/spike-yarn-studio.mjs` (`yarn --version` → `1.22.22` via the PATH shim; `VV_NET=1` adds
   a real `yarn add is-number` through the shim). Deferred: the cosmetic DNS-probe "no internet"
   warning.
 - **Phase 5 — pnpm proven AND wired (this change).** The riskiest PM: pnpm drives real
@@ -383,7 +383,7 @@ gate; needs network — hits `registry.npmjs.org`).
   path); the kernel worker calls it after `ensureRealPnpm()`. The shell env adds
   `COREPACK_HOME=/tmp/.corepack` + `COREPACK_INTEGRITY_KEYS=0` +
   `COREPACK_ENABLE_DOWNLOAD_PROMPT=0`. Gated headlessly by `scripts/spike-corepack-studio.mjs`
-  (`OC_NET=1` downloads+runs `yarn@1.22.22` AND `pnpm@9.15.9` via the shim, env config only).
+  (`VV_NET=1` downloads+runs `yarn@1.22.22` AND `pnpm@9.15.9` via the shim, env config only).
   This completes the package-manager North Star: npm, yarn, pnpm all run for real, and corepack
   manages their versions.
 
@@ -447,7 +447,7 @@ directly. Previously `require('module')` returned a plain object. Now `builtins.
   `process.mainModule` / `Module.main` **before** the entry body runs, so the ubiquitous
   `if (require.main === module)` guard is true inside the entry itself.
 
-Debug aid also added: `OC_TRACE_MODULES=1` names the module whose top-level evaluation throws (a
+Debug aid also added: `VV_TRACE_MODULES=1` names the module whose top-level evaluation throws (a
 runtime throw in a module body is otherwise anonymous in the stack) — invaluable for bringing up
 big bundled tools.
 
@@ -657,7 +657,7 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
      base64-embedded and instantiated synchronously in-worker; regen via
      `scripts/vendor-llhttp.mjs`). The bridge (`llhttp/llhttp-parser.js`) mirrors Node's
      `node_http_parser.cc` for both requests and responses; the original pure-JS parser
-     stays as an automatic fallback (main-thread sync-compile cap, or `OC_HTTP_PARSER=js`).
+     stays as an automatic fallback (main-thread sync-compile cap, or `VV_HTTP_PARSER=js`).
      Live Wasm advertises `process.versions.llhttp`. Guarded by the offline
      `scripts/spike-http-llhttp.mjs` and the extended `verify-node.mjs` http case (HEAD,
      204, chunked req+res, trailers, keep-alive). Same slow-path contract (no
@@ -953,7 +953,7 @@ constructor" above): `_load`/`_resolveFilename`/`_nodeModulePaths`/`_cache`/`_ex
     Depends on: stable fs/VFS contract (#14 ✓), ESM (#13 ✓).
 
 17. **Real bundler in-VM — Bundler Stage 1 (esbuild-wasm) — DONE.** A real, unmodified
-    bundler (esbuild, Go→wasm) now runs inside OpenContainer. esbuild's Node entry
+    bundler (esbuild, Go→wasm) now runs inside Vivari. esbuild's Node entry
     (`lib/main.js`) `child_process.spawn`s a helper `node bin/esbuild` and talks to the Go
     runtime over **stdin/stdout pipes** (needs a real readable stdin fd + Go's
     `wasm_exec_node.js` — the hard path we skip). Instead we load its **browser build**
@@ -1070,7 +1070,7 @@ constructor" above): `_load`/`_resolveFilename`/`_nodeModulePaths`/`_cache`/`_ex
       nested rolldown wasi `[worker N]`, `sw.js`); the rest (`typescript`, `editorWorkerService`,
       `prettier`, `engineworker.js`) are just the StackBlitz IDE (Monaco + tsserver), not runtime.
 
-    **Current state in OpenContainer:** long-lived in-VM HTTP server ✅ (`http.createServer().listen`
+    **Current state in Vivari:** long-lived in-VM HTTP server ✅ (`http.createServer().listen`
     + event loop v2 + `netLiveness`). `vite build` ✅. **`vite dev` boots + serves static + watches
     + live HMR ✅** (Stages A/B/C below, all done): the preview bridge carries binary bodies
     (base64), `fs.watch`/`fs.createReadStream` are real, the listen path handles IPv6, push-based
@@ -1162,7 +1162,7 @@ constructor" above): `_load`/`_resolveFilename`/`_nodeModulePaths`/`_cache`/`_ex
       - **Browser wiring.** The preview Service Worker injects a classic (pre-`/@vite/client`)
         `WebSocket` polyfill into every served HTML page; it tunnels each connection to the host
         page, which relays to the kernel worker and back. `host.js`/`kernel-worker.js` bridge both
-        directions (`oc-ws`).
+        directions (`vv-ws`).
       - **Demo.** A "Start real Vite dev + HMR" button `npm install vite` + boots `vite dev`
         (HMR on) in-VM on :5199, swaps the preview to it, and opens a multi-file editor. Editing
         `src/message.js` (a `import.meta.hot.accept` JS boundary) re-renders, and editing
@@ -1231,9 +1231,9 @@ diffable against upstream. The shipping shape is produced by a build step instea
   Storage. So every **Process Worker spawn** (which re-fetches `process-worker.js`, ~900 KB)
   and every reload is served from disk — instant, and the app works **offline**. Cache
   correctness across redeploys: `scripts/build-demo.mjs` stamps a per-build id into `sw.js`
-  (esbuild `define: { __OC_BUILD_ID__ }`) that names the cache (`oc-precache-<id>`); a new
+  (esbuild `define: { __OC_BUILD_ID__ }`) that names the cache (`vv-precache-<id>`); a new
   build changes `sw.js` → the browser installs the new SW, whose `activate` deletes every
-  older `oc-precache-*`. All of this is **gated on that build id**, so dev (`packages/demo/`,
+  older `vv-precache-*`. All of this is **gated on that build id**, so dev (`packages/demo/`,
   loaded unbundled) never caches — edits keep hot-reloading unchanged.
 
 Further packaging work (deferred, lower value now that request count + spawn cost are solved):
@@ -1357,7 +1357,7 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     keeps `getStore()` correct for that detached work until the next `run()` overwrites it, and (iii)
     propagates a per-hop context snapshot through the scheduling primitives React uses
     (`then`/`queueMicrotask`/`setImmediate`/`setTimeout`). Together these make the invariant
-    deterministic (not timing-dependent). Validated headlessly with `OC_NO_HOST_ALS=1` (forces the
+    deterministic (not timing-dependent). Validated headlessly with `VV_NO_HOST_ALS=1` (forces the
     polyfill): the RSC refresh render (the App Router's HMR "on save" re-render, `RSC: 1`) returns
     200 with 0 invariant errors across repeats — the same path that threw `workStore` in the studio —
     plus GET / 200, output byte-identical to the host-async_hooks path; (c) `child_process.fork`
@@ -1510,7 +1510,7 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
   - ✅ **Dev servers now run *inside a shell tab* (real local-dev lifecycle).** "Run"
     no longer orchestrates `npm install` + `launch()` behind the scenes and streams to
     the Console. Instead it opens a dedicated terminal tab whose interactive `sh`
-    auto-runs `OC_RUN` = `npm install && npm run dev …` (install skipped once
+    auto-runs `VV_RUN` = `npm install && npm run dev …` (install skipped once
     `node_modules` exists). Consequences, all intentional and matching local dev: the
     dev server is a child of that tab's shell, so **closing the tab kills the server**
     (the preview then 502s on refresh — the process is genuinely gone); **running the
@@ -1521,7 +1521,7 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     already-serving port is a Nest `--watch` restart → reload. Closing the demo shell
     clears that port's state so a later Run is a clean boot. Scaffolding writes the
     starter files **once** (`scaffolded` set) so browser edits survive a re-run.
-    Validated headlessly by `scripts/probe-term.mjs` (OC_RUN auto-runs with no stdin).
+    Validated headlessly by `scripts/probe-term.mjs` (VV_RUN auto-runs with no stdin).
   - ✅ **Cold-boot latency work (perceived startup).** The nested workers used to load
     one-after-another. Now (1) the **Fetcher Worker is created in parallel** with the
     File System Worker (it needs neither the VFS nor the codecs); (2) the demo's
@@ -1550,8 +1550,8 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     wasm + SAB under Vite) was validated first on a bare page (headless Chrome/CDP:
     `crossOriginIsolated===true`, kernel ready ~33ms), before any UI.
     - **Layout**: the imperative core of `demo/host.js` was ported verbatim into an
-      `IdeController` (`src/oc/controller.ts`) that owns Monaco, the xterm terminals
-      (read-only Console + interactive shells), the demo "Run" lifecycle (`OC_RUN`), and
+      `IdeController` (`src/vv/controller.ts`) that owns Monaco, the xterm terminals
+      (read-only Console + interactive shells), the demo "Run" lifecycle (`VV_RUN`), and
       the preview; React reads an immutable snapshot via `useSyncExternalStore` and
       renders the chrome (AppShell/ActivityBar/Explorer/EditorGroup/TerminalPanel/
       PreviewPanel/StatusBar/CommandPalette). The **kernel-worker.js protocol is
@@ -1598,8 +1598,8 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
       ⌘/Ctrl C/X/V, Delete) for Open/Rename/Copy/Cut/Paste/Delete, inline rename, and an
       `AlertDialog` delete confirmation (shadcn base `context-menu`/`alert-dialog`). Wired
       through the kernel: new sync fs verbs in `kernel-fs.js`/`kernel.js` (`readFile[Bytes]`,
-      `readdir`, `stat`, `unlink`, `rmdir`, `rename`) and `oc-rename`/`oc-rm`/`oc-copy`
-      handlers in `kernel-worker.js` (recursive rm/copy) that ack via `oc-fs-result`
+      `readdir`, `stat`, `unlink`, `rmdir`, `rename`) and `vv-rename`/`vv-rm`/`vv-copy`
+      handlers in `kernel-worker.js` (recursive rm/copy) that ack via `vv-fs-result`
       (errors surfaced with sonner). VFS mutations already `notifyWatch`, so a running dev
       server HMRs/restarts on rename/delete/paste automatically. The controller updates the
       tree, Monaco models, tabs, dirty set, and clipboard optimistically.
@@ -1620,11 +1620,11 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
       typed address (`localhost`/`127.0.0.1`/bare path/port), loads the in-VM dev server via
       the SW proxy (bump nonce → reload), and rejects external URLs with a toast. Reload now
       natively reloads the iframe (keeps the SPA route). An injected **nav notifier** (in
-      `sw.js`, next to the WS shim) posts `oc-nav` on `pushState`/`replaceState`/`popstate`/
+      `sw.js`, next to the WS shim) posts `vv-nav` on `pushState`/`replaceState`/`popstate`/
       `load`; the controller syncs the address bar display without re-driving the src.
     - **Full chii DevTools, vendored locally (no CDN → COEP-safe).** The SW injects
-      **chobitsu** (`/oc-devtools/chobitsu.js`, a JS CDP backend) into every preview page
-      plus a CDP bridge; `/oc-devtools/*` is passed straight through (never proxied into the
+      **chobitsu** (`/vv-devtools/chobitsu.js`, a JS CDP backend) into every preview page
+      plus a CDP bridge; `/vv-devtools/*` is passed straight through (never proxied into the
       VM). A new `serveDevtools()` Vite plugin streams chobitsu + the chii **Chrome DevTools
       frontend** (`/devtools/**`, from `node_modules/chii/public`) same-origin in dev and
       copies both into `dist` on build. The frontend runs in a resizable bottom split of the
@@ -1639,7 +1639,7 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
       (and a client abort could crash the dev server). Now it sends buffered bodies with an
       explicit `Content-Length`. (2) The SW routed `/devtools-host.html` + `/devtools/**`
       through `routeByClient`, whose `fetch(event.request)` on the iframe navigation could
-      fail; they're now passed straight to the network like `/oc-devtools/*`.
+      fail; they're now passed straight to the network like `/vv-devtools/*`.
 
 ## A real product shell — multi-root workspace + project templates (this change)
 
@@ -1651,26 +1651,26 @@ screen, and ten pre-authored templates that auto-install + boot their dev server
 - **Home screen (`components/ide/Home.tsx`).** On load (and via the title bar / `⌘K` →
   "Go Home") the studio shows a Home overlay: **Start from blank** and **Start from
   template** big buttons, plus a **Recent projects** list sorted by last-modified. Recents
-  persist in `localStorage` (`oc-workspace-projects`) — content itself lives in the VFS/OPFS,
+  persist in `localStorage` (`vv-workspace-projects`) — content itself lives in the VFS/OPFS,
   so the registry is just names + paths + timestamps. Home overlays the (kept-mounted) IDE
   so the Monaco editor and terminals survive a round-trip Home → workspace → Home.
-- **Multi-root workspace (`oc/controller.ts`).** The single `currentDemo` is gone. The
+- **Multi-root workspace (`vv/controller.ts`).** The single `currentDemo` is gone. The
   workspace is now `workspaceFolders: {id,name,rootPath}[]` with an `activeFolderId`, and
   **every open file / tab / model / dirty flag is keyed by its ABSOLUTE path** so files from
   different roots never collide. Opening a second project adds a root instead of wiping the
   first. `closeFolder` drops just that root's tabs/models/index.
 - **VFS-backed Explorer (`components/ide/Explorer.tsx`).** The Explorer no longer renders a
   static file map — it reads the live VFS. New worker request/response messages
-  (`oc-readdir` / `oc-read` / `oc-stat`, correlated by `reqId` → `oc-reply` via
+  (`vv-readdir` / `vv-read` / `vv-stat`, correlated by `reqId` → `vv-reply` via
   `KernelBridge.request()`) let it lazy-load a directory's children on expand and re-read on
-  a `treeVersion` bump. The kernel worker emits `oc-fs-changed` after any write / rename / rm
+  a `treeVersion` bump. The kernel worker emits `vv-fs-changed` after any write / rename / rm
   / copy / create / install, which bumps `treeVersion` — so an `npm install` or a file op
   shows up in the tree automatically. `node_modules`, `.git`, `dist`, `.vite`, `build` are
   skipped from the quick-open/search index (bounded walk).
-- **Templates (`oc/templates.ts`).** Twelve real, runnable templates — **React, Vue, Svelte,
+- **Templates (`vv/templates.ts`).** Twelve real, runnable templates — **React, Vue, Svelte,
   Express, NestJS, Next.js (App Router)**, each in **TypeScript and JavaScript**. Each carries a
   manifest (`install`, `dev`, `port`, `entry`, `hmr`/`reload`) plus its full source. Creating
-  writes the files in one batched VFS transfer (`oc-create-project` → `writeFilesBatch`) and
+  writes the files in one batched VFS transfer (`vv-create-project` → `writeFilesBatch`) and
   registers the run manifest in the worker — instant, deterministic, offline (no in-VM
   `create-vite`/`nest new`). The Vite templates run with `--configLoader native` (the
   rolldown config bundler throws "Invalid URL" in-VM); `express-ts` compiles with `tsc`
@@ -1720,14 +1720,14 @@ headless spike (`scripts/spike-*.mjs`) before wiring, per the repo's spike-first
   no kernel change was needed. To surface a multi-server project, port attribution
   (`kernel.onListen`) now opens a **preview tab per distinct port** a run shell binds (primary
   → full `project-ready`; extras → `project-ready {extra:true}`), and clears the port set when
-  the run shell exits. New **WebSocket template** (`oc/templates.ts`): an Express + `ws`
+  the run shell exits. New **WebSocket template** (`vv/templates.ts`): an Express + `ws`
   backend (:3001) and a Vite frontend (:5173) started together by a tiny CJS orchestrator
   (`dev.js`, since our `sh` has no `&`); the frontend talks to the backend over
   `/preview/3001/ws`, exercising both directions (server→client tick, client→server echo).
   Spike: `spike-ws-demo.mjs` drives the real `ws` backend through the kernel tunnel and
   asserts both directions.
 - **Host ↔ preview bridge.** In-VM code can reach a service on the **host machine** by addressing
-  `http://host.opencontainer.internal:<port>/…`, mapped to the studio's own hostname (only reaches
+  `http://host.vivari.internal:<port>/…`, mapped to the studio's own hostname (only reaches
   the host when the studio is served locally). Both egress paths honor the alias: `http`/`https`
   (and npm) via the fetcher's `rewrite()` (`fetcher-worker.js`), and the global `fetch()` — which
   is the host realm's real fetch used directly — via `rewriteHostAlias` in
@@ -1736,7 +1736,7 @@ headless spike (`scripts/spike-*.mjs`) before wiring, per the repo's spike-first
   is addressing convenience, **not** a CORS/auth bypass: the target must still allow the studio
   origin (ACAO + a COEP-satisfying CORP).
 
-  Note: `host.opencontainer.internal` is an **outbound-fetch** alias only — it is NOT wired into
+  Note: `host.vivari.internal` is an **outbound-fetch** alias only — it is NOT wired into
   the preview tab URL bar (which loads in-VM ports and rejects non-`localhost` hosts). Test it
   from in-VM code, not by typing it in a preview tab:
 
@@ -1756,7 +1756,7 @@ headless spike (`scripts/spike-*.mjs`) before wiring, per the repo's spike-first
 
      ```js
      // probe.mjs  ->  node probe.mjs
-     const res = await fetch("http://host.opencontainer.internal:3000/");
+     const res = await fetch("http://host.vivari.internal:3000/");
      console.log("status:", res.status);
      console.log("body:", await res.text());
      ```
@@ -1795,7 +1795,7 @@ wasm SWC** (no native binding on arch `wasm32`), and `GET / → 200` with the re
     primitives React uses (`Promise.prototype.then`, `queueMicrotask`, `setImmediate`, `setTimeout`).
     The primitive patches install once at boot — after the runtime's own timer globals and before any
     framework code (so React captures the wrapped primitives), polyfill path only. Result is
-    deterministic (not timing-dependent): validated with `OC_NO_HOST_ALS=1` under heavy-I/O
+    deterministic (not timing-dependent): validated with `VV_NO_HOST_ALS=1` under heavy-I/O
     perturbation — 0 invariant errors, GET / 200, output byte-identical to the host path.
   - **`child_process.fork`** — an IPC channel (`process.send`/`'message'`/`disconnect`) built on the
     worker-thread spawn path; `next dev` forks its dev server and gates boot on `process.send`. The
@@ -1810,7 +1810,7 @@ wasm SWC** (no native binding on arch `wasm32`), and `GET / → 200` with the re
   the on-demand download remains the fallback.
 - **Shipped** as the **Next.js** template (TS + JS, `experimental`) with a picker icon.
 
-## Template catalog — StackBlitz parity + OpenContainer showcases (this change)
+## Template catalog — StackBlitz parity + Vivari showcases (this change)
 
 Grew the studio's "Start from template" picker from a flat 13-template grid into a
 **category-tabbed catalog** (base-ui `Tabs`) modelled on StackBlitz's tabs. `TemplateManifest`
@@ -1883,10 +1883,10 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
     those ports the SW forwards the **un-stripped** path so the app runs consistently under the proxy
     base — first-route + deep-links resolve and `location.reload()` still targets a real preview URL.
     Default (strip) behaviour is unchanged for every other template. `scripts/spike-docusaurus.mjs`
-    gained an `OC_BASEURL` knob to exercise the base-prefixed path headlessly.
+    gained an `VV_BASEURL` knob to exercise the base-prefixed path headlessly.
 - ✅ **Phase 4 (cont.) — Angular proven headless AND shipped (`scripts/spike-angular.mjs`, `Angular` template).**
   Angular 21 (`@angular/build`) now builds on esbuild-wasm + Vite and serves `/` with a 200 in-VM
-  (~5s dev build). NOTE: the original ship used per-project npm `overrides` + a `scripts/oc-ng.mjs`
+  (~5s dev build). NOTE: the original ship used per-project npm `overrides` + a `scripts/vv-ng.mjs`
   launcher; both were later **generalized into the runtime** (registry aliasing + in-process esbuild +
   `PISCINA_DISABLE_ATOMICS=1` default — see "Toolchain generalization" below), so the template is now a
   vanilla `ng new` with plain `ng serve`/`ng build`. Getting here
@@ -1980,7 +1980,7 @@ and a headless spike:
   `include` don't stop it). In-VM that second **rolldown-wasm** bundle panics —
   `Rolldown panicked ... napi-3.10.3/src/tokio_runtime.rs: Access tokio runtime failed in spawn` —
   which traps the wasm (`unreachable`) and crashes the whole dev server (server unbinds → 502). Root
-  cause (see follow-up below) is a known upstream rolldown-on-wasi bug, not an OpenContainer-specific
+  cause (see follow-up below) is a known upstream rolldown-on-wasi bug, not an Vivari-specific
   gap. Vite 7 sidesteps it by using the **esbuild** dep optimizer, which runs in-process via
   `packages/runtime/esbuild-inproc-patch.js` — the same path that graduated Qwik.
 - **React** — no change needed: `@vitejs/plugin-react@^5.0.0` resolves to `5.2.0`, which already peers
@@ -2019,14 +2019,14 @@ makes it a real VS Code-style full-text Search & Replace across **every open wor
 and teaches quick-open to jump to a line — without ever blocking the UI.
 
 - **Search engine in the kernel worker (`demo/kernel-worker.js`).** Full-text search runs where
-  the synchronous Wasm VFS lives; doing it on the main thread would mean an `oc-read`
-  round-trip per file. New messages: `oc-search {token,roots,query,matchCase,wholeWord,regex,
+  the synchronous Wasm VFS lives; doing it on the main thread would mean an `vv-read`
+  round-trip per file. New messages: `vv-search {token,roots,query,matchCase,wholeWord,regex,
   includeGlob,excludeGlob}` walks each root (reusing the Explorer skip set), skips
-  binary/oversized files, and **streams** results as `oc-search-result` batches → final
-  `oc-search-done {matchCount,fileCount,limitHit}`. `oc-replace` recomputes matches against the
+  binary/oversized files, and **streams** results as `vv-search-result` batches → final
+  `vv-search-done {matchCount,fileCount,limitHit}`. `vv-replace` recomputes matches against the
   same options and rewrites files — scoped to a single match, one file, or all files — with
-  "preserve case" (ALLCAPS/Capitalized) and `$1`/`$&` expansion, posting `oc-fs-changed` per
-  write. `oc-search-cancel` + a monotonic `currentSearchToken` supersede an in-flight query.
+  "preserve case" (ALLCAPS/Capitalized) and `$1`/`$&` expansion, posting `vv-fs-changed` per
+  write. `vv-search-cancel` + a monotonic `currentSearchToken` supersede an in-flight query.
 - **Non-blocking by construction.** That worker also serves preview HTTP + terminal I/O, so the
   walk yields a macrotask every ~40 files and flushes partial batches — the results list fills
   in progressively and the preview/terminal never stall mid-search. Results are delivered to the
@@ -2037,7 +2037,7 @@ and teaches quick-open to jump to a line — without ever blocking the UI.
   collapsible per-file results with the match highlighted and per-file/per-match replace on
   hover; a live summary + invalid-regex inline error. Debounced; re-runs on any option change
   and after a replace (via `treeVersion`).
-- **Editor integration (`oc/controller.ts`).** `runSearch(opts,{onBatch,onDone})` (returns a
+- **Editor integration (`vv/controller.ts`).** `runSearch(opts,{onBatch,onDone})` (returns a
   cancel fn), `replace({...,files|match})`, and `openFileAt(abs,line,col,len)` which reveals +
   selects the range in Monaco (deferred if the editor is still loading). After a replace, any
   affected open model is re-read from disk so the buffer + dirty state don't drift.
@@ -2058,7 +2058,7 @@ Worker whose esbuild slice we couldn't see. This change lands one concrete win a
 - **One TS language service, not two (studio, ~300 MB+).** Monaco runs a full language service for
   BOTH the `typescript` and `javascript` modes, and the studio was feeding each the entire ~3050-file
   dependency `.d.ts` payload → two ~310 MB `ts.worker`s doing identical work. Now `languageFor`
-  (`packages/studio/src/oc/controller.ts`) maps `.js/.jsx/.mjs/.cjs` to the `typescript` language
+  (`packages/studio/src/vv/controller.ts`) maps `.js/.jsx/.mjs/.cjs` to the `typescript` language
   (`allowJs` handles JS), `configureLanguageService` leaves `javascriptDefaults` inert (diagnostics
   off, no eager sync, no extra libs) so its worker never spawns, and `loadDependencyTypes` pushes
   extra libs / re-applies compiler options to `typescriptDefaults` only. Net: one worker, one copy of
@@ -2129,7 +2129,7 @@ next round of work can be targeted instead of guessed.
   `runtime.memStats()`, surfaced through `boot.js`'s `onReady` control object.
 - **Fan-out + aggregation.** The kernel worker keeps a live `pid → worker` registry (populated /
   pruned in `spawnWorker`), queries every process in parallel with a 2 s timeout, sorts by heap,
-  and relays the rows on the existing `oc-mem` round-trip. The studio prints a per-PID table
+  and relays the rows on the existing `vv-mem` round-trip. The studio prints a per-PID table
   (`heap  PID N (M modules, esbuild-wasm)`), falling back to module counts when `performance.memory`
   is off. Threads and `fork` children spawn through the same path, so nested worker-pool processes
   show up too.
@@ -2184,7 +2184,7 @@ there were no completions, no hover, no go-to-definition, and no diagnostics —
 quality gap vs a hosted IDE. This change wires the real language service, running off the main thread,
 with project-wide + dependency-aware type information.
 
-- **Real workers, COEP-safe (`oc/controller.ts` `mountEditor`).** `MonacoEnvironment.getWorker` now
+- **Real workers, COEP-safe (`vv/controller.ts` `mountEditor`).** `MonacoEnvironment.getWorker` now
   returns Monaco's own workers per language label — the editor worker plus the `typescript` worker
   (a bundled TS compiler + language service), and json/css/html. Each is a Vite `?worker` import, so
   it's bundled into a same-origin chunk (COEP `require-corp` satisfied, no CDN). They run in Web
@@ -2199,9 +2199,9 @@ with project-wide + dependency-aware type information.
   .mjs/.cjs`, node_modules excluded) are seeded as background models (bounded, created lazily, adopted
   by `ensureModel` when opened) — so imports between the user's files resolve and go-to-definition
   works before a file is even opened.
-- **Dependency types = bulk `.d.ts` harvest in the kernel worker (`oc-collect-dts`).** Installed-package
+- **Dependency types = bulk `.d.ts` harvest in the kernel worker (`vv-collect-dts`).** Installed-package
   typings (`node_modules/**/*.d.ts` + `package.json` for `types`/`exports` resolution) are collected
-  by the worker that holds the sync Wasm VFS — one bulk reply instead of thousands of `oc-read`
+  by the worker that holds the sync Wasm VFS — one bulk reply instead of thousands of `vv-read`
   round-trips — harvesting the project's **declared deps (+ their `@types`) first** so a budget cap
   never drops the packages you actually import, then the rest of `@types`, skipping `typescript`'s own
   libs (Monaco ships those). The controller registers them via `setExtraLibs`, keying each file with
@@ -2211,7 +2211,7 @@ with project-wide + dependency-aware type information.
   After `setExtraLibs` we re-apply `setCompilerOptions` to force a fresh worker (the mount-time worker
   validated open files before the types existed). The load is
   debounced and re-runs on folder open, fs changes, and **after any process exits** — since an in-VM
-  `npm install` doesn't emit `oc-fs-changed`, a finished process is the cue that `node_modules` may
+  `npm install` doesn't emit `vv-fs-changed`, a finished process is the cue that `node_modules` may
   have appeared. A cheap `node_modules` fingerprint short-circuits the file reads when nothing changed.
 - **Problems in the status bar (`StatusBar.tsx`).** `monaco.editor.onDidChangeMarkers` feeds a live
   error/warning count into the snapshot, surfaced next to the status text.
@@ -2233,7 +2233,7 @@ Five improvements that make the architecture more portable and self-guarding. `l
   store at `/home/user/.local/share/pnpm/store` (`demo/kernel-worker.js`). npm's own integrity-keyed
   `_cacache` is a content-addressed store, so persisting it *is* the "package cache in OPFS": a
   dependency downloaded once is reused by every later project and after a reload — no re-download. To
-  avoid double-storing tarballs, the kernel's transient outbound-fetch buffer `/var/cache/oc-fetch`
+  avoid double-storing tarballs, the kernel's transient outbound-fetch buffer `/var/cache/vv-fetch`
   (whose in-memory index is rebuilt per session and never read back) is now in the OPFS `IGNORE` list
   (`demo/fs-worker.js`) — npm's cache is the single durable copy. Wipe with `?reset`.
 - **Toolchain generalization as a real subsystem.** The native→wasm alias table is now a single
@@ -2273,7 +2273,7 @@ keeping it as an automatic fallback.
 - **Synchronous, in-worker instantiation.** The binding is built synchronously at process bootstrap,
   so the Wasm is compiled with `new WebAssembly.Module()`. That's allowed in Workers (where guest
   processes run); on the main thread the 4 KB sync-compile cap throws — which is exactly what trips
-  the pure-JS fallback. `OC_HTTP_PARSER=js|wasm` forces either side (`wasm` = fail loud).
+  the pure-JS fallback. `VV_HTTP_PARSER=js|wasm` forces either side (`wasm` = fail loud).
 - **Faithful bridge.** `node/bindings/llhttp/llhttp-parser.js` mirrors Node's `node_http_parser.cc`:
   it drives llhttp's span callbacks (`on_url`/`on_status`/`on_header_field`/`on_header_value`/
   `on_body`/`on_headers_complete`/`on_message_complete`) and folds them onto the exact numeric
@@ -2289,7 +2289,7 @@ keeping it as an automatic fallback.
 ## In-VM databases via Wasm — SQLite + Postgres, first-class (this change)
 
 "No native database" is the headline limitation every in-browser-runtime competitor lists;
-their docs only suggest workarounds. OpenContainer's architecture (real Node `fs` + `url` +
+their docs only suggest workarounds. Vivari's architecture (real Node `fs` + `url` +
 host `WebAssembly` over the virtual filesystem) already runs Wasm-compiled SQL engines with
 **zero native addons and no external server**, so this ships them as documented, first-class
 **Showcase** templates.
@@ -2318,7 +2318,7 @@ host `WebAssembly` over the virtual filesystem) already runs Wasm-compiled SQL e
   `WebAssembly` primitives the runtime exposes): sql.js answers queries; PGlite boots real
   PostgreSQL 18 and answers `SELECT version()`.
 
-## Server-Sent Events over an `oc-sse` tunnel + `EventSource` polyfill (this change)
+## Server-Sent Events over an `vv-sse` tunnel + `EventSource` polyfill (this change)
 
 The old `sse` template rendered but showed nothing: a streaming `text/event-stream` response
 can't cross the HTTP preview proxy. That path is **buffered end-to-end** — the Service Worker
@@ -2332,7 +2332,7 @@ leg (SSE is one-way):
 - **`EventSource` polyfill** injected into every preview page (both `packages/demo/sw.js` and
   `packages/studio/public/sw.js`, right next to the ws shim). It replaces the iframe's
   `EventSource` with one that tunnels each connection to the host page (`parent.postMessage`,
-  `type:'oc-sse'`, `sub:'open'|'close'`) and parses the raw event-stream bytes it gets back into
+  `type:'vv-sse'`, `sub:'open'|'close'`) and parses the raw event-stream bytes it gets back into
   `message`/named events per the SSE spec (`data:`/`event:`/`id:`, dispatched on a blank line) —
   so both `es.onmessage` and `es.addEventListener('metric', …)` work. Port routing +
   `fallbackPort` are identical to the ws shim.
@@ -2345,8 +2345,8 @@ leg (SSE is one-way):
   `res.write()` chunk out as `sse-out {sub:'open'|'chunk'|'close'}`. A live relay refs the
   event loop (`sseLiveness`) so it keeps pumping like an open socket handle.
 - **Relays**: `process-worker.js` (`sse-open`/`sse-close` → `dispatchSse`), `kernel-worker.js`
-  (`oc-sse` ↔ `onSseSend`), demo `host.js`, and studio `kernel.ts`/`controller.ts` — each gets
-  an `oc-sse` case beside its `oc-ws` one.
+  (`vv-sse` ↔ `onSseSend`), demo `host.js`, and studio `kernel.ts`/`controller.ts` — each gets
+  an `vv-sse` case beside its `vv-ws` one.
 
 **Richer template.** The `sse` Showcase template now multiplexes three event types onto ONE
 connection — a per-second default `message` tick (counter + live clock), a named `metric` gauge
@@ -2378,7 +2378,7 @@ GraphiQL) keep `/graphql`.
   UI can demonstrate a query-with-args, a list query, and a write.
 - **UI** (`public/index.html`): a greet-by-name box, a book list + add-book form, and a "last
   GraphQL response" panel showing the raw JSON. The GraphiQL link is computed from the current
-  path so it works both under the OpenContainer preview (`/preview/<port>/graphql`) and in a
+  path so it works both under the Vivari preview (`/preview/<port>/graphql`) and in a
   standalone export (`/graphql`).
 - **Verification.** New network spike `scripts/spike-graphql.mjs` (in `run-spikes.mjs`) asserts
   install -> bind :4000 -> `GET /` serves the UI -> `POST /graphql` answers `hello` +
@@ -2449,7 +2449,7 @@ Two more templates drop `experimental`, each now gated by a headless spike:
   vanilla Node with real `socket.io@4`.
 - **Slidev** (`scripts/spike-slidev.mjs`) — a Vite + Vue CLI dev server (`@slidev/cli`). Like
   Nitro it drives the real CLI (`slidev --port 3030` → `bin/slidev.mjs`), with a longer bind
-  budget (`OC_BIND_TIMEOUT`) since the first Vite build is heavy, then asserts `GET /` returns
+  budget (`VV_BIND_TIMEOUT`) since the first Vite build is heavy, then asserts `GET /` returns
   the Slidev app shell. Confirmed in vanilla Node (dev server built + bound in ~6s, `/` served).
 
 ## tRPC template — raw `.ts` server through the loader, no `export type` (this change)
@@ -2639,14 +2639,14 @@ and the live-binding fallback recovers a circular singleton used inside a functi
 The preview's in-browser chii DevTools (roadmap §"Studio — preview mini-browser") had a
 **half-empty Network panel**. `fetch`/XHR are captured natively by chobitsu, but our
 `WebSocket` and `EventSource` are **polyfills that tunnel over `postMessage`** (roadmap #19
-stage C for ws; the `oc-sse` tunnel for SSE) — chobitsu never sees a real socket, so live
+stage C for ws; the `vv-sse` tunnel for SSE) — chobitsu never sees a real socket, so live
 connections and their frames were invisible. And even the `fetch`/XHR rows that did show up
 displayed the **internal proxy URL** (`http://localhost:5173/preview/3000/api/hello`) rather
 than the in-VM address the app actually targets. So the panel didn't reflect what the running
 app was doing.
 
 The fix injects a small **synthetic-CDP bridge** into every preview page and feeds the same
-`oc-cdp` channel chobitsu already uses, so ws/SSE/fetch all land in one coherent panel:
+`vv-cdp` channel chobitsu already uses, so ws/SSE/fetch all land in one coherent panel:
 
 - **`NET_SHIM` (`window.__ocNet`)** — a synthetic `Network.*` emitter injected into
   `packages/studio/public/sw.js` (ahead of the ws/SSE shims and chobitsu). It hands out CDP
@@ -2665,7 +2665,7 @@ The fix injects a small **synthetic-CDP bridge** into every preview page and fee
   the frontend's `Network.enable` (via `maybeAttach()`), because a fresh panel that isn't yet
   listening drops early events. On a preview reload the controller **remounts** the DevTools
   frontend (`onPreviewFrameLoad` bumps `devtoolsNonce` in
-  `packages/studio/src/oc/controller.ts`) so the network log starts clean and re-attaches — this
+  `packages/studio/src/vv/controller.ts`) so the network log starts clean and re-attaches — this
   is what killed the "4 ws connections after refresh" pile-up.
 - **Fetch/XHR 504 hang when DevTools was open** — `handlePreview` in `sw.js` was picking the
   DevTools iframe as the `kernelClient` (its URL also lacks the `/preview/` marker), so HTTP
@@ -2677,7 +2677,7 @@ The fix injects a small **synthetic-CDP bridge** into every preview page and fee
   (`http://localhost:<port>/…`), honoring `__ocKeepPrefix`. Now fetch/XHR read exactly like the
   already-friendly ws/SSE rows (`http://localhost:3000/api/hello`, `ws://localhost:3001/ws`,
   `http://localhost:3000/events`).
-- **Backend demo buttons** — `backendDemoHtml` in `packages/studio/src/oc/templates.ts` gives
+- **Backend demo buttons** — `backendDemoHtml` in `packages/studio/src/vv/templates.ts` gives
   every backend template (Express TS/JS, Nest, Koa, Hono, H3, Fastify, Nitro) a "Call
   GET /api/hello" button so the panel is easy to exercise; the demo, GraphQL, and SQLite/Postgres
   fetches all use the explicit `/preview/<port>/` prefix for deterministic routing.
@@ -2698,7 +2698,7 @@ previewed live in the iframe — with the Path A hand-written builtins deleted.
 
 ## 🎯 Target architecture map (StackBlitz reference)
 
-| StackBlitz (observed via DevTools) | OpenContainer |
+| StackBlitz (observed via DevTools) | Vivari |
 |---|---|
 | `Main` | Main thread — UI, orchestration |
 | `engineworker.js` | Kernel worker — `kernel-worker.js` (orchestrator) |

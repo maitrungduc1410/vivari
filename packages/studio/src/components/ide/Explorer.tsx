@@ -18,7 +18,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils";
 import { FileIcon, FolderIcon } from "./fileIcon";
 import { useIde } from "./useIde";
-import { OC_PATH_MIME, entriesFromDataTransfer } from "@/oc/controller";
+import { VV_PATH_MIME, entriesFromDataTransfer } from "@/vv/controller";
 
 interface Entry {
   name: string;
@@ -57,14 +57,14 @@ export function Explorer() {
 
   // ── drag & drop ────────────────────────────────────────────────────────────
   // Make a row a drag source. Dragging a row that's part of a multi-selection
-  // carries the whole selection (newline-joined) in the OC_PATH_MIME slot.
+  // carries the whole selection (newline-joined) in the VV_PATH_MIME slot.
   const dragProps = (abs: string) => ({
     draggable: true,
     onDragStart: (e: React.DragEvent) => {
       e.stopPropagation(); // don't let an ancestor row overwrite the payload
       const paths = selection.has(abs) && selection.size > 1 ? [...selection] : [abs];
       const payload = paths.join("\n");
-      e.dataTransfer.setData(OC_PATH_MIME, payload);
+      e.dataTransfer.setData(VV_PATH_MIME, payload);
       e.dataTransfer.setData("text/plain", payload);
       e.dataTransfer.effectAllowed = "copyMove";
     },
@@ -78,7 +78,7 @@ export function Explorer() {
       if (!destDir) return;
       e.preventDefault();
       e.stopPropagation();
-      const internal = e.dataTransfer.types.includes(OC_PATH_MIME);
+      const internal = e.dataTransfer.types.includes(VV_PATH_MIME);
       e.dataTransfer.dropEffect = internal ? (e.ctrlKey || e.metaKey ? "copy" : "move") : "copy";
       if (dragOver !== key) setDragOver(key);
     },
@@ -88,7 +88,7 @@ export function Explorer() {
       e.preventDefault();
       e.stopPropagation();
       setDragOver(null);
-      const raw = e.dataTransfer.getData(OC_PATH_MIME);
+      const raw = e.dataTransfer.getData(VV_PATH_MIME);
       if (raw) {
         const paths = raw.split("\n").filter(Boolean);
         if (e.ctrlKey || e.metaKey) void c.copyEntriesTo(paths, destDir);

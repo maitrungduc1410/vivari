@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 
 const NPM_VERSION = "10.9.2"; // keep in sync with scripts/spike-npm.mjs
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
-const VENDOR_DIR = process.env.OC_VENDOR_DIR || "/tmp/oc-vendor";
+const VENDOR_DIR = process.env.VV_VENDOR_DIR || "/tmp/vv-vendor";
 const VENDOR_NPM = path.join(VENDOR_DIR, "node_modules", "npm");
 const OUT_DIR = path.join(ROOT, "packages", "studio", "public", "vendor");
 // NOTE: the payload is gzip-compressed, but the file is deliberately NOT named

@@ -2,7 +2,7 @@
 name = "open-webcontainer-vfs"
 version = "0.1.0"
 edition = "2021"
-description = "OpenContainer VFS: in-RAM Virtual File System compiled to WebAssembly"
+description = "Vivari VFS: in-RAM Virtual File System compiled to WebAssembly"
 license = "MIT"
 
 [lib]

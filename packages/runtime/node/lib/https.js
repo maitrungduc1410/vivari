@@ -320,7 +320,7 @@ export default function (exports, require, module, process, internalBinding, pri
   const globalAgent = new Agent({ keepAlive: false });
 
   const notImpl = () => {
-    const err = new Error("OpenContainer: in-VM https servers are not supported");
+    const err = new Error("Vivari: in-VM https servers are not supported");
     err.code = "ERR_METHOD_NOT_IMPLEMENTED";
     throw err;
   };

@@ -1,6 +1,6 @@
 // Browser host (main thread) — UI + orchestration ONLY.
 //
-// A VS Code-style IDE around the OpenContainer kernel worker:
+// A VS Code-style IDE around the Vivari kernel worker:
 //   - boots the kernel worker (kernel + Rust/Wasm VFS + process workers),
 //   - registers the preview Service Worker and relays its HTTP requests in,
 //   - a Monaco editor with multiple file tabs over the running project's VFS,
@@ -157,7 +157,7 @@ function scheduleSave(abs, rel) {
   saveTimer = setTimeout(() => {
     const contents = models.get(abs)?.getValue() ?? localFiles[abs] ?? "";
     localFiles[abs] = contents;
-    kernelWorker.postMessage({ type: "oc-write", path: abs, contents });
+    kernelWorker.postMessage({ type: "vv-write", path: abs, contents });
     dirty.delete(rel);
     renderTabs();
     const short = rel;
@@ -345,7 +345,7 @@ function startShell(id) {
   if (!entry || entry.kind !== "shell" || entry.started) return;
   entry.started = true;
   entry.openedAt = performance.now(); // measure Process Worker boot (spawn → ready)
-  // A demo shell auto-runs the project's dev command in-VM (OC_RUN, kernel side).
+  // A demo shell auto-runs the project's dev command in-VM (VV_RUN, kernel side).
   kernelWorker.postMessage({ type: "term-open", terminalId: id, demo: entry.demo, cwd: currentDemo?.dir });
 }
 
@@ -568,7 +568,7 @@ async function main() {
   if (new URLSearchParams(location.search).has("reset")) {
     try {
       const dir = await navigator.storage.getDirectory();
-      await dir.removeEntry("oc-vfs", { recursive: true });
+      await dir.removeEntry("vv-vfs", { recursive: true });
       consoleLine("OPFS persistence reset — cleared the persisted VFS.", "90");
     } catch {
       /* nothing persisted yet */
@@ -652,14 +652,14 @@ async function main() {
 
       // roadmap #19 stage C: a ws frame the kernel routed OUT of the VM (Vite's
       // HMR server) — deliver it to the preview iframe's WebSocket polyfill.
-      case "oc-ws":
-        frame.contentWindow?.postMessage({ ...m.msg, type: "oc-ws", dir: "in" }, "*");
+      case "vv-ws":
+        frame.contentWindow?.postMessage({ ...m.msg, type: "vv-ws", dir: "in" }, "*");
         break;
 
       // An SSE stream chunk the kernel routed OUT of the VM — deliver it to the
       // preview iframe's EventSource polyfill.
-      case "oc-sse":
-        frame.contentWindow?.postMessage({ ...m.msg, type: "oc-sse", dir: "in" }, "*");
+      case "vv-sse":
+        frame.contentWindow?.postMessage({ ...m.msg, type: "vv-sse", dir: "in" }, "*");
         break;
 
       // The selected project's dev/app server is up: open its files + preview.
@@ -694,7 +694,7 @@ async function main() {
   // connection events UP; relay them to the kernel worker.
   addEventListener("message", (event) => {
     const d = event.data;
-    if (!d || d.dir !== "out" || (d.type !== "oc-ws" && d.type !== "oc-sse")) return;
+    if (!d || d.dir !== "out" || (d.type !== "vv-ws" && d.type !== "vv-sse")) return;
     kernelWorker.postMessage({ type: d.type, msg: d });
   });
 
@@ -721,8 +721,8 @@ async function main() {
   // The Service Worker posts preview requests here; forward to the kernel worker,
   // transferring the reply port so it answers directly.
   navigator.serviceWorker.addEventListener("message", (event) => {
-    if (event.data?.type !== "oc-http") return;
-    kernelWorker.postMessage({ type: "oc-http", req: event.data.req }, [event.ports[0]]);
+    if (event.data?.type !== "vv-http") return;
+    kernelWorker.postMessage({ type: "vv-http", req: event.data.req }, [event.ports[0]]);
   });
 
   await registerServiceWorker();

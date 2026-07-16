@@ -9,7 +9,7 @@
 // THREAD: fd 0/1/2 are multiplexed onto the protocol in memory and every other
 // fd delegates to the real fs (the VFS).
 //
-// This used to live in a per-project launcher (scripts/oc-ng.mjs). It now runs
+// This used to live in a per-project launcher (scripts/vv-ng.mjs). It now runs
 // in the module loader (see module.js) so ANY project that ends up with an
 // esbuild-wasm-backed install gets the deadlock-free service automatically, with
 // no project-level script or config. It is a string replacement of the child-
@@ -80,7 +80,7 @@ const ESB_INPROC_OLD = `  let [command, args] = esbuildCommandAndArgs();
 // (path2, fs2, os2, node_exports, createChannel, initializeWasCalled,
 // longLivedService, stopService) plus the CJS wrapper's __dirname/require, so it
 // is injected into that scope verbatim.
-const ESB_INPROC_NEW = `  // [OpenContainer] in-process esbuild service (no child spawn).
+const ESB_INPROC_NEW = `  // [Vivari] in-process esbuild service (no child spawn).
   require(path2.join(__dirname, "..", "wasm_exec.js"));
   const __ocWasmBytes = fs2.readFileSync(path2.join(__dirname, "..", "esbuild.wasm"));
   let __ocStdin = [];
@@ -181,7 +181,7 @@ const ESB_INPROC_NEW = `  // [OpenContainer] in-process esbuild service (no chil
     unref() { if (--__ocRefCount === 0 && __ocRefTimer) { clearInterval(__ocRefTimer); __ocRefTimer = null; } },
   };`;
 
-const OC_MARKER = "[OpenContainer] in-process esbuild service";
+const VV_MARKER = "[Vivari] in-process esbuild service";
 
 // A semver-ish version literal: 1-3 dotted numbers + optional prerelease/build.
 const VER_CAPTURE = "([0-9]+(?:\\.[0-9]+){0,3}(?:-[0-9A-Za-z.]+)?)";
@@ -215,7 +215,7 @@ function warnDrift(filename) {
   _driftWarned.add(filename);
   try {
     console.warn(
-      "[OpenContainer] esbuild-wasm in-process patch did NOT apply to " +
+      "[Vivari] esbuild-wasm in-process patch did NOT apply to " +
         filename +
         ": the spawn block shape changed (version drift). esbuild may deadlock " +
         "under worker pools (Angular/Vite/Vitest/tsup). Update the ESB_INPROC_OLD " +
@@ -236,7 +236,7 @@ function warnDrift(filename) {
  */
 export function maybePatchEsbuildInProcess(source, filename, fs, path) {
   if (typeof source !== "string" || source.length < 64) return null;
-  if (source.includes(OC_MARKER)) return null; // already patched
+  if (source.includes(VV_MARKER)) return null; // already patched
   if (!isEsbuildWasmMain(filename, fs, path)) return null; // native esbuild — leave it
   const m = source.match(ESB_OLD_RE);
   if (!m) {

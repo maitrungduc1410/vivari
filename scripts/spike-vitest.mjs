@@ -7,7 +7,7 @@
 // test suite to green.
 //
 // Prereq: `npm run vendor:npm` (the npm delivery asset). Network required.
-//   node scripts/spike-vitest.mjs        (OC_LIVE=1 streams output)
+//   node scripts/spike-vitest.mjs        (VV_LIVE=1 streams output)
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
@@ -67,7 +67,7 @@ const fetcher = async (url, init) => {
   return { ok: r.ok, status: r.status, statusText: r.statusText, headers, body };
 };
 
-const LIVE = process.env.OC_LIVE === "1";
+const LIVE = process.env.VV_LIVE === "1";
 const kernel = new Kernel({
   fs: kernelFs.fs,
   spawnWorker,
@@ -110,13 +110,13 @@ const env = {
   PATH: "/app/node_modules/.bin:/bin",
   npm_config_cache: "/tmp/.npm",
   CI: "1",
-  OC_LIVE: LIVE ? "1" : "",
-  OC_TRACE_MODULES: process.env.OC_TRACE_MODULES || "",
+  VV_LIVE: LIVE ? "1" : "",
+  VV_TRACE_MODULES: process.env.VV_TRACE_MODULES || "",
 };
 
 // ── install vitest (real registry via Fetcher Worker) ────────────────────────
 console.log("── npm install vitest (in-VM; pulls vite + wasm rolldown) ──");
-const TIMEOUT_INSTALL = Number(process.env.OC_INSTALL_TIMEOUT || 600000);
+const TIMEOUT_INSTALL = Number(process.env.VV_INSTALL_TIMEOUT || 600000);
 const ti = Date.now();
 let instTimedOut = false;
 const inst = await Promise.race([
@@ -134,7 +134,7 @@ if (!vitestInstalled) {
 
 // ── the gate: `vitest run` goes green on the trivial suite ───────────────────
 console.log("── vitest run ──");
-const TIMEOUT_RUN = Number(process.env.OC_RUN_TIMEOUT || 240000);
+const TIMEOUT_RUN = Number(process.env.VV_RUN_TIMEOUT || 240000);
 const tr = Date.now();
 let runTimedOut = false;
 const RUN_ARGS = [

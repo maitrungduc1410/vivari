@@ -20,7 +20,7 @@
 // plain Node program regardless of the file's original extension.
 
 export const NODE_GYP_STUB = `#!/usr/bin/env node
-// OpenContainer node-gyp stub — see packages/kernel-host/node-gyp-stub.js.
+// Vivari node-gyp stub — see packages/kernel-host/node-gyp-stub.js.
 const argv = process.argv.slice(2);
 const verb = argv.find((a) => a && a[0] !== '-') || '';
 // \`node-gyp --version\` is probed by some tooling; answer it plausibly.
@@ -29,7 +29,7 @@ if (argv.includes('-v') || argv.includes('--version')) {
   process.exit(0);
 }
 process.stderr.write(
-  'node-gyp (OpenContainer stub): skipping native build' +
+  'node-gyp (Vivari stub): skipping native build' +
     (verb ? ' \\'' + verb + '\\'' : '') +
     ' — native addons are not supported in-browser; using the package\\'s JS/wasm fallback\\n',
 );

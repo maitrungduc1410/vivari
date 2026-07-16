@@ -12,15 +12,15 @@
 // through the single-threaded in-VM kernel, that pipe deadlocks against Angular's
 // Piscina linker pool + inline AOT (all contend for the one event loop). We patch
 // ensureServiceIsRunning() to run the Go wasm IN-PROCESS — the exact patch the
-// studio template applies via scripts/oc-ng.mjs (kept in sync here). This also
+// studio template applies via scripts/vv-ng.mjs (kept in sync here). This also
 // depends on the runtime fixes in packages/runtime: the loop wake nudge, the
 // Buffer-pool untransferable guard, dedicated fs.promises.readFile buffers, and
 // the dynamic-import escape hatch that routes piscina's `new Function(...import)`
 // through our loader.
 //
-//   1) vendor npm:  rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor \
-//        && (cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
-//   2) run (Node 22+):  node scripts/spike-angular.mjs   (OC_LIVE=1 to stream)
+//   1) vendor npm:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor \
+//        && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
+//   2) run (Node 22+):  node scripts/spike-angular.mjs   (VV_LIVE=1 to stream)
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
@@ -29,16 +29,16 @@ import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
 
-const VENDOR_NPM = process.argv[2] || "/tmp/oc-vendor/node_modules/npm";
+const VENDOR_NPM = process.argv[2] || "/tmp/vv-vendor/node_modules/npm";
 const VFS_NPM = "/usr/lib/node_modules/npm";
 if (!fs.existsSync(path.join(VENDOR_NPM, "bin/npm-cli.js"))) {
   console.error(`No vendored npm at ${VENDOR_NPM} (expected bin/npm-cli.js).`);
   process.exit(2);
 }
 
-const LIVE = process.env.OC_LIVE === "1";
+const LIVE = process.env.VV_LIVE === "1";
 const DIR = "/ng";
-const PORT = Number(process.env.OC_PORT || 4210);
+const PORT = Number(process.env.VV_PORT || 4210);
 
 // ── kernel setup (same shape as spike-next.mjs) ──────────────────────────────
 const fsWorker = new Worker(new URL("./fs-worker.mjs", import.meta.url));
@@ -124,7 +124,7 @@ kernel.mkdirp("/home/user");
 kernel.mkdirp("/tmp/.npm/_logs");
 
 // ── Angular 21 project source (mirrors the studio "Angular" template) ─────────
-const NG = process.env.OC_NG_VERSION || "^21.1.0";
+const NG = process.env.VV_NG_VERSION || "^21.1.0";
 kernel.mkdirp(DIR + "/src/app");
 kernel.writeFile(
   DIR + "/package.json",
@@ -151,8 +151,8 @@ kernel.writeFile(
         typescript: "~5.9.2",
       },
       overrides: {
-        esbuild: "npm:esbuild-wasm@" + (process.env.OC_ESBUILD_WASM || "0.28.1"),
-        rollup: "npm:@rollup/wasm-node@" + (process.env.OC_ROLLUP_WASM || "^4.62.0"),
+        esbuild: "npm:esbuild-wasm@" + (process.env.VV_ESBUILD_WASM || "0.28.1"),
+        rollup: "npm:@rollup/wasm-node@" + (process.env.VV_ROLLUP_WASM || "^4.62.0"),
       },
     },
     null,
@@ -239,7 +239,7 @@ kernel.writeFile(
   DIR + "/src/index.html",
   `<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Angular in OpenContainer</title><base href="/"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<head><meta charset="utf-8"><title>Angular in Vivari</title><base href="/"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
 <body><app-root></app-root></body>
 </html>
 `,
@@ -260,7 +260,7 @@ kernel.writeFile(
 @Component({
   selector: 'app-root',
   standalone: true,
-  template: '<h1 id="marker">Angular in OpenContainer</h1><button (click)="inc()">count is {{ count() }}</button>',
+  template: '<h1 id="marker">Angular in Vivari</h1><button (click)="inc()">count is {{ count() }}</button>',
 })
 export class App {
   count = signal(0);
@@ -276,7 +276,7 @@ const env = {
   NODE_ENV: "development",
   NG_CLI_ANALYTICS: "false",
   CI: "true",
-  OC_LIVE: LIVE ? "1" : "",
+  VV_LIVE: LIVE ? "1" : "",
   // @angular/build runs the TypeScript/AOT compiler in a Node worker thread that
   // blocks on Atomics.wait then pulls results via receiveMessageOnPort — semantics
   // our cooperative worker_threads can't serve, so it deadlocks at "Building…".
@@ -289,7 +289,7 @@ const env = {
 
 // ── gate 1: install ──────────────────────────────────────────────────────────
 console.log(`\n== npm install (angular ${NG} + esbuild-wasm) ==`);
-const INSTALL_TIMEOUT = Number(process.env.OC_INSTALL_TIMEOUT || 600000);
+const INSTALL_TIMEOUT = Number(process.env.VV_INSTALL_TIMEOUT || 600000);
 const t1 = Date.now();
 let installTimedOut = false;
 // --ignore-scripts: esbuild-wasm has no native postinstall, and this also skips
@@ -315,7 +315,7 @@ console.log("  @angular/cli ng bin:   " + ngBin);
 console.log("  esbuild-wasm .wasm:    " + esbuildWasm);
 
 // ── In-process esbuild service patch (kept in sync with the studio template's
-// scripts/oc-ng.mjs). Rewrites ensureServiceIsRunning() to run the Go wasm in
+// scripts/vv-ng.mjs). Rewrites ensureServiceIsRunning() to run the Go wasm in
 // this thread instead of spawning a child that deadlocks the kernel. ──────────
 const ESB_INPROC_OLD = `  let [command, args] = esbuildCommandAndArgs();
   let child = child_process.spawn(command, args.concat(\`--service=\${"0.28.1"}\`, "--ping"), {
@@ -365,7 +365,7 @@ const ESB_INPROC_OLD = `  let [command, args] = esbuildCommandAndArgs();
     }
   };`;
 
-const ESB_INPROC_NEW = `  // [OpenContainer] in-process esbuild service (no child spawn).
+const ESB_INPROC_NEW = `  // [Vivari] in-process esbuild service (no child spawn).
   require(path2.join(__dirname, "..", "wasm_exec.js"));
   const __ocWasmBytes = fs2.readFileSync(path2.join(__dirname, "..", "esbuild.wasm"));
   let __ocStdin = [];
@@ -448,7 +448,7 @@ function patchEsbuildInProcess(pkgDir) {
   if (!kernel.exists(mainPath)) return "no main.js";
   let src;
   try { src = Buffer.from(kernel.readFile(mainPath)).toString(); } catch { return "read failed"; }
-  if (src.includes("[OpenContainer] in-process esbuild service")) return "already patched";
+  if (src.includes("[Vivari] in-process esbuild service")) return "already patched";
   if (!src.includes(ESB_INPROC_OLD)) return "PATTERN NOT FOUND";
   kernel.writeFile(mainPath, Buffer.from(src.replace(ESB_INPROC_OLD, ESB_INPROC_NEW)));
   return "patched";
@@ -467,7 +467,7 @@ kernel.start(
   ["node_modules/@angular/cli/bin/ng.js", "serve", "--port", String(PORT), "--host", "127.0.0.1"],
   { cwd: DIR, env },
 );
-const BIND_TIMEOUT = Number(process.env.OC_BIND_TIMEOUT || 300000);
+const BIND_TIMEOUT = Number(process.env.VV_BIND_TIMEOUT || 300000);
 const tb = Date.now();
 let fatal = "";
 while (!listening.has(PORT) && Date.now() - tb < BIND_TIMEOUT && !fatal) {
@@ -485,7 +485,7 @@ let getOk = false;
 if (bound) {
   const decode = (b) => (typeof b === "string" ? b : Buffer.from(b).toString());
   const get = (url) => kernel.handleHttpRequest(PORT, { port: PORT, method: "GET", url, headers: { host: "127.0.0.1:" + PORT }, body: "" });
-  const GET_RETRIES = Number(process.env.OC_GET_RETRIES || 120);
+  const GET_RETRIES = Number(process.env.VV_GET_RETRIES || 120);
   let root = await get("/");
   for (let i = 0; i < GET_RETRIES && (root.status === 502 || root.status === 404 || root.status >= 500); i++) {
     await new Promise((r) => setTimeout(r, 1000));
@@ -493,12 +493,12 @@ if (bound) {
     if (i % 15 === 0) console.log(`  …waiting for build (t+${i}s, status=${root.status}, devbytes=${out.slice(devStart).join("").length})`);
   }
   const body = decode(root.body || "");
-  getOk = root.status === 200 && /app-root|Angular in OpenContainer|<script/.test(body);
+  getOk = root.status === 200 && /app-root|Angular in Vivari|<script/.test(body);
   console.log(`  GET / -> ${root.status}  (${body.length} bytes)`);
   console.log("  body head: " + body.slice(0, 300).replace(/\n/g, " "));
 }
 if (!getOk) {
-  const tailSize = Number(process.env.OC_TAIL || 8000);
+  const tailSize = Number(process.env.VV_TAIL || 8000);
   console.log("\n---- dev output tail (last " + tailSize + " chars) ----\n" + out.slice(devStart).join("").slice(-tailSize));
 }
 

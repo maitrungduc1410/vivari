@@ -78,7 +78,7 @@ kernel.writeFile(
   DIR + "/pages/index.js",
   `
 export default function Home() {
-  return <main><h1>Next.js in OpenContainer</h1></main>;
+  return <main><h1>Next.js in Vivari</h1></main>;
 }
 `,
 );

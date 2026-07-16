@@ -28,7 +28,7 @@ function swScope(): Plugin {
     next();
   };
   return {
-    name: "oc-cross-origin-isolation",
+    name: "vv-cross-origin-isolation",
     configureServer(server) {
       server.middlewares.use(mw);
     },
@@ -40,7 +40,7 @@ function swScope(): Plugin {
 
 // Vendor the in-browser DevTools locally (no CDN → COEP-safe). We serve two
 // things same-origin:
-//   /oc-devtools/chobitsu.js  — the CDP backend injected into every preview page
+//   /vv-devtools/chobitsu.js  — the CDP backend injected into every preview page
 //                               (chobitsu ships a UMD bundle exposing `chobitsu`)
 //   /devtools/**              — the full chii (Chrome DevTools) frontend, i.e.
 //                               chii's `public/` dir (front_end/ + friends)
@@ -94,7 +94,7 @@ function serveDevtools(): Plugin {
   let outDir = "dist";
   const handler = (req: any, res: any, next: () => void) => {
     const url = (req.url || "").split("?")[0].split("#")[0];
-    if (url === "/oc-devtools/chobitsu.js") {
+    if (url === "/vv-devtools/chobitsu.js") {
       sendFile(res, CHOBITSU_FILE);
       return;
     }
@@ -118,7 +118,7 @@ function serveDevtools(): Plugin {
     next();
   };
   return {
-    name: "oc-serve-devtools",
+    name: "vv-serve-devtools",
     configResolved(cfg) {
       outDir = cfg.build.outDir;
     },
@@ -130,8 +130,8 @@ function serveDevtools(): Plugin {
     },
     closeBundle() {
       const dist = path.resolve(fileURLToPath(new URL("./", import.meta.url)), outDir);
-      fs.mkdirSync(path.join(dist, "oc-devtools"), { recursive: true });
-      fs.copyFileSync(CHOBITSU_FILE, path.join(dist, "oc-devtools", "chobitsu.js"));
+      fs.mkdirSync(path.join(dist, "vv-devtools"), { recursive: true });
+      fs.copyFileSync(CHOBITSU_FILE, path.join(dist, "vv-devtools", "chobitsu.js"));
       fs.cpSync(CHII_PUBLIC, path.join(dist, "devtools"), { recursive: true });
     },
   };

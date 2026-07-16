@@ -7,14 +7,14 @@ export function createOs() {
     platform: () => "linux",
     arch: () => "wasm32",
     type: () => "Linux",
-    release: () => "6.0.0-opencontainer",
-    version: () => "#1 OpenContainer",
-    hostname: () => "opencontainer",
+    release: () => "6.0.0-vivari",
+    version: () => "#1 Vivari",
+    hostname: () => "vivari",
     homedir: () => "/home/user",
     tmpdir: () => "/tmp",
     cpus: () => [
       {
-        model: "OpenContainer VCPU",
+        model: "Vivari VCPU",
         speed: 0,
         times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
       },

@@ -9,8 +9,8 @@
 // kOnBody, kOnMessageComplete, …) that lib/ assigns, plus initialize()/execute().
 //
 // Selection (createHttpParserBinding):
-//   - OC_HTTP_PARSER=js   → force the pure-JS parser.
-//   - OC_HTTP_PARSER=wasm → force Wasm (throws if it can't instantiate).
+//   - VV_HTTP_PARSER=js   → force the pure-JS parser.
+//   - VV_HTTP_PARSER=wasm → force Wasm (throws if it can't instantiate).
 //   - unset (default)     → try Wasm, fall back to JS. Synchronous Wasm compile
 //     is only allowed in Workers (where guest processes run); on the main thread
 //     the 4KB sync-compile cap throws and we transparently use the JS parser.
@@ -32,7 +32,7 @@ function warnFallback(err) {
   _warned = true;
   try {
     console.warn(
-      "[OpenContainer] llhttp Wasm parser unavailable — using the pure-JS HTTP " +
+      "[Vivari] llhttp Wasm parser unavailable — using the pure-JS HTTP " +
         "parser (" +
         (err && err.message ? err.message : String(err)) +
         ")",
@@ -43,7 +43,7 @@ function warnFallback(err) {
 }
 
 export function createHttpParserBinding() {
-  const pref = globalThis.process?.env?.OC_HTTP_PARSER;
+  const pref = globalThis.process?.env?.VV_HTTP_PARSER;
   if (pref === "js") return createJsHttpParserBinding();
   try {
     return createLlhttpBinding();

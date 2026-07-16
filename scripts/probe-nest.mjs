@@ -98,7 +98,7 @@ kernel.writeFile(
 import { Injectable } from '@nestjs/common';
 @Injectable()
 export class AppService {
-  hello(): string { return 'Hello from NestJS in OpenContainer'; }
+  hello(): string { return 'Hello from NestJS in Vivari'; }
 }
 `,
 );

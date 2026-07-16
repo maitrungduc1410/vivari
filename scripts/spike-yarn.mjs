@@ -9,10 +9,10 @@
 // (~5 MB webpack bundle) + lib/v8-compile-cache.js. Requiring bin/yarn.js runs
 // the CLI (it calls cli.default() when not auto-run).
 //
-//   1) vendor:  rm -rf /tmp/oc-vendor-yarn && mkdir -p /tmp/oc-vendor-yarn \
-//        && (cd /tmp/oc-vendor-yarn && npm install yarn@1.22.22 --no-save --no-audit --no-fund)
+//   1) vendor:  rm -rf /tmp/vv-vendor-yarn && mkdir -p /tmp/vv-vendor-yarn \
+//        && (cd /tmp/vv-vendor-yarn && npm install yarn@1.22.22 --no-save --no-audit --no-fund)
 //   2) run:  node scripts/spike-yarn.mjs [path-to-vendored-yarn]
-//            OC_LIVE=1 streams yarn's stdout/stderr; OC_NONET=1 skips the install gate.
+//            VV_LIVE=1 streams yarn's stdout/stderr; VV_NONET=1 skips the install gate.
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
@@ -20,13 +20,13 @@ import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
 
-const VENDOR_YARN = process.argv[2] || "/tmp/oc-vendor-yarn/node_modules/yarn";
+const VENDOR_YARN = process.argv[2] || "/tmp/vv-vendor-yarn/node_modules/yarn";
 const VFS_YARN = "/usr/lib/node_modules/yarn";
 const YARN_VERSION = "1.22.22";
 
 if (!fs.existsSync(path.join(VENDOR_YARN, "bin/yarn.js"))) {
   console.error(`No vendored yarn at ${VENDOR_YARN} (expected bin/yarn.js).`);
-  console.error(`Vendor it first:  rm -rf /tmp/oc-vendor-yarn && mkdir -p /tmp/oc-vendor-yarn && (cd /tmp/oc-vendor-yarn && npm install yarn@${YARN_VERSION} --no-save --no-audit --no-fund)`);
+  console.error(`Vendor it first:  rm -rf /tmp/vv-vendor-yarn && mkdir -p /tmp/vv-vendor-yarn && (cd /tmp/vv-vendor-yarn && npm install yarn@${YARN_VERSION} --no-save --no-audit --no-fund)`);
   process.exit(2);
 }
 
@@ -73,7 +73,7 @@ const fetcher = async (url, init) => {
   return { ok: r.ok, status: r.status, statusText: r.statusText, headers, body };
 };
 
-const LIVE = process.env.OC_LIVE === "1";
+const LIVE = process.env.VV_LIVE === "1";
 const kernel = new Kernel({
   fs: kernelFs.fs,
   spawnWorker,
@@ -125,7 +125,7 @@ kernel.writeFile(
 const fs = require('fs');
 const LOG = '/yarnlog.txt';
 try { fs.writeFileSync(LOG, ''); } catch (e) {}
-const LIVE = process.env.OC_LIVE === '1';
+const LIVE = process.env.VV_LIVE === '1';
 const append = (s) => { try { fs.appendFileSync(LOG, s + '\\n'); } catch (e) {} if (LIVE) { try { process.stderr.write('[yarn] ' + s + '\\n'); } catch (e) {} } };
 process.on('uncaughtException', (e) => append('UNCAUGHT ' + ((e && e.stack) || e)));
 process.on('unhandledRejection', (e) => append('UNHANDLED ' + ((e && e.stack) || e)));
@@ -142,7 +142,7 @@ const env = {
   HOME: "/home/user",
   PATH: "/bin",
   YARN_CACHE_FOLDER: "/tmp/.yarn-cache",
-  OC_LIVE: LIVE ? "1" : "",
+  VV_LIVE: LIVE ? "1" : "",
 };
 const YARN_FLAGS = ["--non-interactive", "--no-progress"];
 
@@ -193,11 +193,11 @@ console.log("Gate B (https): " + (httpsOk ? "PASS" : "FAIL") + "\n");
 
 // ── Gate C: real `yarn add <pkg>` over the Fetcher Worker ────────────────────
 let installOk = true;
-if (process.env.OC_NONET !== "1") {
-  const PKG = process.env.OC_PKG || "is-number";
+if (process.env.VV_NONET !== "1") {
+  const PKG = process.env.VV_PKG || "is-number";
   console.log(`── Gate C: yarn add ${PKG} (real registry via Fetcher Worker) ──`);
   kernel.writeFile("/app/package.json", JSON.stringify({ name: "app", version: "1.0.0", license: "MIT", private: true }, null, 2));
-  const TIMEOUT_MS = Number(process.env.OC_TIMEOUT || 120000);
+  const TIMEOUT_MS = Number(process.env.VV_TIMEOUT || 120000);
   const t2 = Date.now();
   let timedOut = false;
   const inst = await Promise.race([
@@ -223,7 +223,7 @@ if (process.env.OC_NONET !== "1") {
   installOk = inst.code === 0 && installed && requireOk;
   console.log("Gate C (installs): " + (installOk ? "PASS" : "FAIL") + "\n");
 } else {
-  console.log("── Gate C skipped (OC_NONET=1) ──\n");
+  console.log("── Gate C skipped (VV_NONET=1) ──\n");
 }
 
 const ok = versionOk && httpsOk && installOk;

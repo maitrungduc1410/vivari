@@ -2,7 +2,7 @@
 name = "open-webcontainer-crypto"
 version = "0.1.0"
 edition = "2021"
-description = "OpenContainer crypto core (hashes/HMAC/PBKDF2/AES) compiled to WebAssembly, running in-process beneath Node's real lib/crypto.js"
+description = "Vivari crypto core (hashes/HMAC/PBKDF2/AES) compiled to WebAssembly, running in-process beneath Node's real lib/crypto.js"
 license = "MIT"
 
 [lib]

@@ -57,7 +57,7 @@ export default function (exports, require, module, process, internalBinding) {
   // a raw HMAC secret becomes a secret KeyObject; and an asymmetric PEM ends up
   // as a secret key that fails the later `type === 'private'/'public'` check with
   // a clear "must be an asymmetric key" error (RS/ES/PS stay unsupported).
-  const kKeyObjectBrand = Symbol.for("openContainer.crypto.KeyObject");
+  const kKeyObjectBrand = Symbol.for("vivari.crypto.KeyObject");
   const kKeyMaterial = Symbol("kKeyMaterial");
 
   class KeyObject {
@@ -104,7 +104,7 @@ export default function (exports, require, module, process, internalBinding) {
   function keyToBytes(key, inputEncoding) {
     if (key != null && typeof key === "object" && key[kKeyObjectBrand]) {
       if (key.type !== "secret") {
-        throw new TypeError("OpenContainer crypto: expected a secret KeyObject for symmetric operations");
+        throw new TypeError("Vivari crypto: expected a secret KeyObject for symmetric operations");
       }
       return key[kKeyMaterial];
     }
@@ -194,11 +194,11 @@ export default function (exports, require, module, process, internalBinding) {
   function parseAlgo(algorithm) {
     const parts = String(algorithm).toLowerCase().split("-");
     if (parts[0] !== "aes" || parts.length < 3) {
-      throw new Error(`OpenContainer crypto: unsupported cipher '${algorithm}' (only aes-<128|192|256>-<cbc|gcm>)`);
+      throw new Error(`Vivari crypto: unsupported cipher '${algorithm}' (only aes-<128|192|256>-<cbc|gcm>)`);
     }
     const mode = parts[2];
     if (mode !== "cbc" && mode !== "gcm") {
-      throw new Error(`OpenContainer crypto: unsupported cipher mode '${mode}' (only cbc, gcm)`);
+      throw new Error(`Vivari crypto: unsupported cipher mode '${mode}' (only cbc, gcm)`);
     }
     return { mode };
   }
@@ -216,7 +216,7 @@ export default function (exports, require, module, process, internalBinding) {
     }
     setAutoPadding(v = true) {
       if (this._mode === "cbc" && !v) {
-        throw new Error("OpenContainer crypto: cipher.setAutoPadding(false) is not supported");
+        throw new Error("Vivari crypto: cipher.setAutoPadding(false) is not supported");
       }
       return this;
     }
@@ -264,7 +264,7 @@ export default function (exports, require, module, process, internalBinding) {
     }
     setAutoPadding(v = true) {
       if (this._mode === "cbc" && !v) {
-        throw new Error("OpenContainer crypto: decipher.setAutoPadding(false) is not supported");
+        throw new Error("Vivari crypto: decipher.setAutoPadding(false) is not supported");
       }
       return this;
     }
@@ -360,7 +360,7 @@ export default function (exports, require, module, process, internalBinding) {
   }
 
   const notSupported = (name) => () => {
-    throw new Error(`OpenContainer crypto: ${name} is not supported yet`);
+    throw new Error(`Vivari crypto: ${name} is not supported yet`);
   };
 
   module.exports = {

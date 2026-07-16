@@ -1,6 +1,6 @@
 // A pragmatic `readline` shim. Node's real lib/readline.js pulls a large
 // internal/readline/* tree (interface, keypress decoding, callbacks) built for a
-// real TTY; OpenContainer has no interactive TTY (process.stdin is a stub), so a
+// real TTY; Vivari has no interactive TTY (process.stdin is a stub), so a
 // faithful line editor would never receive input anyway. This provides the full
 // public surface, non-throwing, so libraries that merely reach for readline (CLIs
 // like Vite's) load and run — cursor/clear helpers are no-ops that still invoke

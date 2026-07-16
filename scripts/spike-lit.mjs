@@ -1,5 +1,5 @@
 // Spike (NETWORK): prove the Lit template's Vite dev server boots + serves in-VM.
-// Mirrors the shipped `lit` template in packages/studio/src/oc/templates.ts.
+// Mirrors the shipped `lit` template in packages/studio/src/vv/templates.ts.
 // Run (Node 22+):  node scripts/spike-lit.mjs   (see spike-vite-lib.mjs for setup)
 
 import { runViteSpike } from "./spike-vite-lib.mjs";
@@ -53,7 +53,7 @@ export class MyElement extends LitElement {
     return html\`
       <h1>Vite + Lit</h1>
       <button @click=\${() => this.count++}>count is \${this.count}</button>
-      <p>A web component running inside OpenContainer.</p>
+      <p>A web component running inside Vivari.</p>
     \`
   }
 }

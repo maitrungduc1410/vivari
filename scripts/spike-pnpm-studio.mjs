@@ -11,7 +11,7 @@
 //
 // Crucially it uses the SAME env studio sets (copy import-method + store-dir via
 // npm_config_*), NOT CLI flags — so it verifies the studio config, not a bespoke
-// invocation. Offline by default; set OC_NET=1 for the install gate.
+// invocation. Offline by default; set VV_NET=1 for the install gate.
 //
 // Prereq: run `npm run vendor:pnpm` first.
 
@@ -111,11 +111,11 @@ if (!versionOk && v.stderr) console.log("stderr:\n" + v.stderr.trim());
 // Gate C (opt-in, network): a real install through the shim on PATH, using ONLY
 // the env config (copy import-method + store-dir) — no CLI flags.
 let installOk = true;
-if (process.env.OC_NET === "1") {
-  const PKG = process.env.OC_PKG || "is-number";
+if (process.env.VV_NET === "1") {
+  const PKG = process.env.VV_PKG || "is-number";
   console.log(`\n── pnpm add ${PKG} (via /bin/pnpm.js shim, env config only) ──`);
   kernel.writeFile("/app/package.json", JSON.stringify({ name: "app", version: "1.0.0", license: "MIT", private: true }, null, 2));
-  const TIMEOUT_MS = Number(process.env.OC_TIMEOUT || 180000);
+  const TIMEOUT_MS = Number(process.env.VV_TIMEOUT || 180000);
   const t1 = Date.now();
   const inst = await Promise.race([
     kernel.start("pnpm", ["add", PKG], { cwd: "/app", env, capture: true }),
@@ -138,7 +138,7 @@ if (process.env.OC_NET === "1") {
   installOk = inst.code === 0 && linked && virtualStore && requireOk;
   console.log(`install gate: ${installOk ? "PASS" : "FAIL"}`);
 } else {
-  console.log("\n(install gate skipped — set OC_NET=1 to run it)");
+  console.log("\n(install gate skipped — set VV_NET=1 to run it)");
 }
 
 const ok = shimOk && versionOk && installOk;

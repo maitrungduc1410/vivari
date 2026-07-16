@@ -4,10 +4,10 @@
 // + chokidar watch — all proven primitives) binds a port and serves the app.
 //
 // Gates (all must pass): install ok, `webpack serve` binds its port, GET / -> 200
-// with the page marker. Optional HMR ws probe: OC_WSPROBE=1.
+// with the page marker. Optional HMR ws probe: VV_WSPROBE=1.
 //
-//   1) vendor npm:  rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor \
-//        && (cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
+//   1) vendor npm:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor \
+//        && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
 //   2) run (Node 22+):  node scripts/spike-webpack.mjs
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
@@ -17,17 +17,17 @@ import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
 
-const VENDOR_NPM = process.argv[2] || "/tmp/oc-vendor/node_modules/npm";
+const VENDOR_NPM = process.argv[2] || "/tmp/vv-vendor/node_modules/npm";
 const VFS_NPM = "/usr/lib/node_modules/npm";
 if (!fs.existsSync(path.join(VENDOR_NPM, "bin/npm-cli.js"))) {
   console.error(`No vendored npm at ${VENDOR_NPM} (expected bin/npm-cli.js).`);
-  console.error(`Vendor it:  rm -rf /tmp/oc-vendor && mkdir -p /tmp/oc-vendor && (cd /tmp/oc-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)`);
+  console.error(`Vendor it:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)`);
   process.exit(2);
 }
 
-const LIVE = process.env.OC_LIVE === "1";
+const LIVE = process.env.VV_LIVE === "1";
 const DIR = "/wp";
-const PORT = Number(process.env.OC_PORT || 8080);
+const PORT = Number(process.env.VV_PORT || 8080);
 
 // ── kernel setup (same shape as spike-next.mjs) ──────────────────────────────
 const fsWorker = new Worker(new URL("./fs-worker.mjs", import.meta.url));
@@ -164,9 +164,9 @@ kernel.writeFile(
   DIR + "/src/index.html",
   `<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Webpack in OpenContainer</title></head>
+<head><meta charset="utf-8"><title>Webpack in Vivari</title></head>
 <body>
-  <h1 id="marker">Webpack in OpenContainer</h1>
+  <h1 id="marker">Webpack in Vivari</h1>
   <div id="app"></div>
 </body>
 </html>
@@ -198,12 +198,12 @@ const env = {
   PATH: DIR + "/node_modules/.bin:/bin",
   npm_config_cache: "/tmp/.npm",
   NODE_ENV: "development",
-  OC_LIVE: LIVE ? "1" : "",
+  VV_LIVE: LIVE ? "1" : "",
 };
 
 // ── gate 1: install ──────────────────────────────────────────────────────────
 console.log(`\n== npm install (webpack + webpack-dev-server) ==`);
-const INSTALL_TIMEOUT = Number(process.env.OC_INSTALL_TIMEOUT || 300000);
+const INSTALL_TIMEOUT = Number(process.env.VV_INSTALL_TIMEOUT || 300000);
 const t1 = Date.now();
 let installTimedOut = false;
 const inst = await Promise.race([
@@ -220,7 +220,7 @@ const wdsBin = kernel.exists(DIR + "/node_modules/webpack-dev-server/bin/webpack
 console.log("  webpack bin present:            " + wpBin);
 console.log("  webpack-dev-server bin present: " + wdsBin);
 
-if (process.env.OC_INSTALL_ONLY === "1") {
+if (process.env.VV_INSTALL_ONLY === "1") {
   console.log("\nOC_INSTALL_ONLY=1 — stopping after install.");
   process.exit(inst.code === 0 && wpBin && wdsBin ? 0 : 1);
 }
@@ -229,7 +229,7 @@ if (process.env.OC_INSTALL_ONLY === "1") {
 console.log("\n== webpack serve ==");
 const devStart = out.length;
 kernel.start("node", ["node_modules/webpack/bin/webpack.js", "serve", "--mode", "development"], { cwd: DIR, env });
-const BIND_TIMEOUT = Number(process.env.OC_BIND_TIMEOUT || 240000);
+const BIND_TIMEOUT = Number(process.env.VV_BIND_TIMEOUT || 240000);
 const tb = Date.now();
 let fatal = "";
 while (!listening.has(PORT) && Date.now() - tb < BIND_TIMEOUT && !fatal) {
@@ -253,7 +253,7 @@ if (bound) {
     root = await get("/");
   }
   const body = decode(root.body || "");
-  getOk = root.status === 200 && /Webpack in OpenContainer|id="marker"/.test(body);
+  getOk = root.status === 200 && /Webpack in Vivari|id="marker"/.test(body);
   console.log(`  GET / -> ${root.status}  (${body.length} bytes)`);
   console.log("  body head: " + body.slice(0, 200).replace(/\n/g, " "));
   // The dev-server-injected HMR client script proves the ws bundle wired up.
@@ -263,7 +263,7 @@ if (bound) {
 }
 
 // ── optional: HMR ws probe (webpack-dev-server serves /ws) ────────────────────
-if (process.env.OC_WSPROBE === "1" && bound) {
+if (process.env.VV_WSPROBE === "1" && bound) {
   console.log("\n== HMR ws probe ==");
   const frames = [];
   kernel.onWsSend = (m) => {

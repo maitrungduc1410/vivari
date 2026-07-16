@@ -1,4 +1,4 @@
-// internal/process/permission — stub. OpenContainer has no permission model, so
+// internal/process/permission — stub. Vivari has no permission model, so
 // the Node.js Permission Model is always disabled. fs.js guards every access
 // with `permission.isEnabled()`, so returning false keeps those checks inert.
 

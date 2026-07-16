@@ -180,7 +180,7 @@ export const primordials = new Proxy(
       const value = resolve(prop);
       if (value === undefined && !["undefined", "NaN"].includes(prop)) {
         throw new Error(
-          `OpenContainer: primordials.${prop} is not resolvable — add it to node/primordials.js`,
+          `Vivari: primordials.${prop} is not resolvable — add it to node/primordials.js`,
         );
       }
       cache[prop] = value;

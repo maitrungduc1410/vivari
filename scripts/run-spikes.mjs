@@ -6,13 +6,13 @@
 //   --offline   only spikes that need NO live registry network (fast; the default
 //               gate). Still needs the Wasm VFS build for kernel-based ones.
 //   --net       only spikes that install from the live npm registry (slow; needs a
-//               vendored real npm at /tmp/oc-vendor — auto-provisioned here).
+//               vendored real npm at /tmp/vv-vendor — auto-provisioned here).
 //   --all       both tiers (default when no tier flag is given).
 //
 // Filters: any extra args are substring filters on the spike name, e.g.
 //   node scripts/run-spikes.mjs --net koa hono
 //
-// Env: OC_SPIKE_TIMEOUT (per-spike ms, default 360000), OC_LIVE=1 (stream output).
+// Env: VV_SPIKE_TIMEOUT (per-spike ms, default 360000), VV_LIVE=1 (stream output).
 // Exit code is non-zero if any selected spike fails, so CI fails loudly.
 
 import { spawn } from "node:child_process";
@@ -21,7 +21,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const VENDOR_DIR = "/tmp/oc-vendor";
+const VENDOR_DIR = "/tmp/vv-vendor";
 const VENDOR_NPM = path.join(VENDOR_DIR, "node_modules/npm");
 
 // The curated spike set. `net` marks spikes that hit the live registry.
@@ -53,7 +53,7 @@ const SPIKES = [
   // its install + first-boot compile need a longer budget.
   { name: "sqlite", file: "spike-sqlite.mjs", net: true },
   { name: "pglite", file: "spike-pglite.mjs", net: true, timeout: 900000 },
-  // Server-Sent Events over the oc-sse tunnel (streams past the buffered HTTP proxy).
+  // Server-Sent Events over the vv-sse tunnel (streams past the buffered HTTP proxy).
   { name: "sse", file: "spike-sse.mjs", net: true },
   // GraphQL Yoga API + demo UI (queries via GET/POST + a mutation).
   { name: "graphql", file: "spike-graphql.mjs", net: true },
@@ -75,7 +75,7 @@ const SPIKES = [
 const args = process.argv.slice(2);
 const tier = args.includes("--offline") ? "offline" : args.includes("--net") ? "net" : "all";
 const filters = args.filter((a) => !a.startsWith("--"));
-const DEFAULT_TIMEOUT = Number(process.env.OC_SPIKE_TIMEOUT || 360000);
+const DEFAULT_TIMEOUT = Number(process.env.VV_SPIKE_TIMEOUT || 360000);
 
 let selected = SPIKES.filter((s) => (tier === "all" ? true : tier === "net" ? s.net : !s.net));
 if (filters.length) selected = selected.filter((s) => filters.some((f) => s.name.includes(f)));
@@ -116,7 +116,7 @@ function runSpike(s) {
     const child = spawn("node", [path.join("scripts", s.file), VENDOR_NPM], {
       cwd: ROOT,
       env: { ...process.env },
-      stdio: process.env.OC_LIVE === "1" ? "inherit" : ["ignore", "pipe", "pipe"],
+      stdio: process.env.VV_LIVE === "1" ? "inherit" : ["ignore", "pipe", "pipe"],
     });
     let buf = "";
     if (child.stdout) child.stdout.on("data", (d) => (buf += d));
@@ -129,7 +129,7 @@ function runSpike(s) {
       clearTimeout(killer);
       const secs = ((Date.now() - started) / 1000).toFixed(1);
       const pass = !timedOut && code === 0;
-      if (!pass && process.env.OC_LIVE !== "1") {
+      if (!pass && process.env.VV_LIVE !== "1") {
         console.log(buf.slice(-2000));
       }
       console.log(`  ${pass ? "PASS" : "FAIL"}  ${s.name.padEnd(12)} (${secs}s${timedOut ? ", TIMED OUT" : `, exit ${code}`})`);

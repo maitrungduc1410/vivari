@@ -1,6 +1,6 @@
 // Spike (NETWORK): prove the Nitro (unjs) Backend template boots its dev server and
 // serves routes in-VM. Mirrors the shipped `nitro` template in
-// packages/studio/src/oc/templates.ts.
+// packages/studio/src/vv/templates.ts.
 //
 // Unlike the plain-node backends, this drives a real CLI dev server: `nitro dev`
 // (node_modules/nitropack/dist/cli/index.mjs dev) builds with rollup + auto-imports
@@ -13,7 +13,7 @@
 import { bootSpikeKernel, writeProject, npmInstall, waitListen, httpGet, defaultEnv } from "./lib/spike-harness.mjs";
 
 const DIR = "/nitro";
-const PORT = Number(process.env.OC_PORT || 3000);
+const PORT = Number(process.env.VV_PORT || 3000);
 const h = await bootSpikeKernel();
 
 writeProject(h.kernel, DIR, {
@@ -33,7 +33,7 @@ writeProject(h.kernel, DIR, {
   compatibilityDate: 'latest',
 })
 `,
-  "routes/index.ts": `export default defineEventHandler(() => 'Hello from Nitro, running inside OpenContainer!')
+  "routes/index.ts": `export default defineEventHandler(() => 'Hello from Nitro, running inside Vivari!')
 `,
   "routes/api/hello.ts": `export default defineEventHandler(() => ({ message: 'Hello, world!' }))
 `,
@@ -41,7 +41,7 @@ writeProject(h.kernel, DIR, {
 
 const inst = await npmInstall(h, { dir: DIR });
 if (inst.code !== 0) process.exit(1);
-if (process.env.OC_INSTALL_ONLY === "1") process.exit(0);
+if (process.env.VV_INSTALL_ONLY === "1") process.exit(0);
 
 // nitro dev reads PORT (via listhen) — pin it to the template's port.
 const env = { ...defaultEnv(DIR), PORT: String(PORT) };

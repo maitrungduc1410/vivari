@@ -1,5 +1,5 @@
 // Spike (NETWORK): prove the Solid template's Vite dev server boots + serves
-// in-VM. Mirrors the shipped `solid` template in packages/studio/src/oc/templates.ts.
+// in-VM. Mirrors the shipped `solid` template in packages/studio/src/vv/templates.ts.
 // Run (Node 22+):  node scripts/spike-solid.mjs   (see spike-vite-lib.mjs for setup)
 
 import { runViteSpike } from "./spike-vite-lib.mjs";
@@ -63,7 +63,7 @@ export default function App() {
       <div class="card">
         <button onClick={() => setCount(count() + 1)}>count is {count()}</button>
       </div>
-      <p>Running inside OpenContainer.</p>
+      <p>Running inside Vivari.</p>
     </>
   )
 }

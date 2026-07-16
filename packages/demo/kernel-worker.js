@@ -1,4 +1,4 @@
-// The kernel worker — OpenContainer's kernel host, off the main thread.
+// The kernel worker — Vivari's kernel host, off the main thread.
 //
 // Phase 2, item #1 (Kernel worker). Everything heavy lives here: the Rust/Wasm
 // VFS, the Kernel (process table + syscall servicing + virtual network), and the
@@ -26,7 +26,7 @@ const post = (type, extra) => self.postMessage({ type, ...extra });
 // Diagnostic: this worker's own memory, via the cross-origin-isolation-gated
 // performance.measureUserAgentSpecificMemory(). Best-effort — returns null if the
 // API is absent or the call is rejected (it can throw if measurement is rate-
-// limited). Used by the studio's memory readout (oc-mem, below).
+// limited). Used by the studio's memory readout (vv-mem, below).
 async function safeMeasureMemory() {
   try {
     if (typeof performance !== "undefined" && performance.measureUserAgentSpecificMemory) {
@@ -186,7 +186,7 @@ function App() {
         </p>
       </div>
       <p className="read-the-docs">
-        Running inside OpenContainer — a real Vite dev server in your browser.
+        Running inside Vivari — a real Vite dev server in your browser.
       </p>
     </>
   )
@@ -479,7 +479,7 @@ function scaffoldDemo(id) {
   scaffolded.add(id);
 }
 
-// The command a demo's shell auto-runs (OC_RUN) — exactly what you'd type locally.
+// The command a demo's shell auto-runs (VV_RUN) — exactly what you'd type locally.
 // Install only if node_modules isn't there yet, so a re-run with deps present goes
 // straight to the dev server (and EADDRINUSEs naturally if one is already bound —
 // we deliberately don't paper over that).
@@ -533,7 +533,7 @@ function projectDirForCwd(cwd) {
 // Attribute a listening pid to a registered project by the LAUNCH CWD of the
 // server process (or any ancestor up to its shell). This is what ties a manually
 // started server — e.g. `npm start` typed in a plain terminal, which has no
-// OC_RUN / projectDirByTerm wiring — back to its project, instead of letting it
+// VV_RUN / projectDirByTerm wiring — back to its project, instead of letting it
 // fall through to a legacy DEMO that merely happens to share the same port (e.g.
 // Express and the NestJS demo both default to :3000).
 function projectDirForPid(pid) {
@@ -592,7 +592,7 @@ function clearProgress(tid) {
 // Open a new interactive shell for a terminal tab. A plain shell opens in a
 // running demo's dir (or "/"). A DEMO shell (`demoId` set — the "Run" button)
 // scaffolds the project, opens in its dir, and auto-runs the dev command via
-// OC_RUN, so the dev server lives *inside this tab* (closing it kills the server,
+// VV_RUN, so the dev server lives *inside this tab* (closing it kills the server,
 // running it twice EADDRINUSEs — exactly like local dev). PATH includes the
 // project's node_modules/.bin so `vite`, `nest`, etc. resolve like a real shell.
 function openTerminal(terminalId, cwd, demoId, run) {
@@ -611,7 +611,7 @@ function openTerminal(terminalId, cwd, demoId, run) {
     // _cacache survives reloads AND is shared across projects — install a package
     // once and every later project/boot reuses the tarball with no re-download.
     // This is the durable "package cache in OPFS"; the kernel's transient
-    // /var/cache/oc-fetch buffer is intentionally NOT persisted (see fs-worker).
+    // /var/cache/vv-fetch buffer is intentionally NOT persisted (see fs-worker).
     npm_config_cache: "/home/user/.cache/npm",
     // npm's audit + funding steps POST to registry endpoints that don't send
     // Access-Control-Allow-Origin, so from the browser they fail CORS preflight
@@ -657,14 +657,14 @@ function openTerminal(terminalId, cwd, demoId, run) {
     FORCE_COLOR: "3",
     PWD: dir,
   };
-  if (d) env.OC_RUN = demoRunCommand(d);
+  if (d) env.VV_RUN = demoRunCommand(d);
   // A created/opened project's "Run" (or auto-run after create) hands us an
   // explicit command; install is skipped automatically once node_modules exists.
   else if (run) {
     const p = projects.get(dir);
     const install = p && p.install ? p.install : "npm install";
     const devCmd = run;
-    env.OC_RUN = kernel.exists(dir + "/node_modules") ? devCmd : `${install} && ${devCmd}`;
+    env.VV_RUN = kernel.exists(dir + "/node_modules") ? devCmd : `${install} && ${devCmd}`;
     // Merge any template-declared environment (memory/telemetry levers the
     // framework honors — e.g. NUXT_TELEMETRY_DISABLED). Applied last so a
     // template can override a default if it must.
@@ -813,7 +813,7 @@ async function boot() {
   // channel (createKernelFs), and each process directly over a MessagePort
   // doorbell wired at spawn.
   const t0 = Date.now();
-  post("log", { line: "Booting OpenContainer…", dim: true });
+  post("log", { line: "Booting Vivari…", dim: true });
 
   // Kick off the one-time codec compile up front; it runs concurrently with the
   // workers below (we only need the Modules before the first process is spawned).
@@ -1020,7 +1020,7 @@ async function boot() {
     // (and never confused with a hard-coded DEMO that shares e.g. 5173/3000).
     const tid = terminalForPid(pid);
     // Prefer the explicit run-shell mapping; otherwise attribute by the server's
-    // launch cwd so a *manually* started server (`npm start` with no OC_RUN) is
+    // launch cwd so a *manually* started server (`npm start` with no VV_RUN) is
     // still tied to its project rather than a same-port legacy DEMO.
     const pdir = (tid !== undefined ? projectDirByTerm.get(tid) : undefined) ?? projectDirForPid(pid);
     if (pdir && projects.has(pdir)) {
@@ -1095,10 +1095,10 @@ async function boot() {
   // roadmap #19 stage C: a ws frame a process relayed OUT of the VM (Vite's HMR
   // server) — forward it to the main thread, which delivers it to the preview
   // iframe's WebSocket polyfill.
-  kernel.onWsSend = (msg) => post("oc-ws", { msg });
+  kernel.onWsSend = (msg) => post("vv-ws", { msg });
   // An SSE stream chunk a process relayed OUT of the VM — forward it to the main
   // thread, which delivers it to the preview iframe's EventSource polyfill.
-  kernel.onSseSend = (msg) => post("oc-sse", { msg });
+  kernel.onSseSend = (msg) => post("vv-sse", { msg });
 
   kernel.installCoreutils();
 
@@ -1121,8 +1121,8 @@ async function boot() {
   kernel.mkdirp("/home/user/.local/share/pnpm/store");
   kernel.mkdirp("/home/user/.cache/corepack");
 
-  // The kernel + VFS can now service filesystem RPCs (oc-stat / oc-readdir /
-  // oc-create-project), so the studio can create/open projects immediately —
+  // The kernel + VFS can now service filesystem RPCs (vv-stat / vv-readdir /
+  // vv-create-project), so the studio can create/open projects immediately —
   // WITHOUT waiting for the (multi-second) real npm/yarn/pnpm/corepack loads
   // below, which only matter once you actually run install/dev.
   post("kernel-online", {});
@@ -1445,7 +1445,7 @@ async function searchWalk(dir, root, ctx) {
     // Yield to the event loop periodically so preview/terminal messages still
     // get serviced, flushing partial results so the UI fills in progressively.
     if (++ctx.scanned % 40 === 0) {
-      if (ctx.batch.length) { post("oc-search-result", { token: ctx.token, files: ctx.batch }); ctx.batch = []; }
+      if (ctx.batch.length) { post("vv-search-result", { token: ctx.token, files: ctx.batch }); ctx.batch = []; }
       await new Promise((r) => setTimeout(r));
     }
   }
@@ -1567,7 +1567,7 @@ async function runSearch(m) {
   try {
     re = buildSearchRegex(m);
   } catch (err) {
-    post("oc-search-done", { token, error: errMsg(err) });
+    post("vv-search-done", { token, error: errMsg(err) });
     return;
   }
   const ctx = {
@@ -1584,10 +1584,10 @@ async function runSearch(m) {
     await searchWalk(root.replace(/\/+$/, ""), root.replace(/\/+$/, ""), ctx);
   }
   if (ctx.batch.length && ctx.token === currentSearchToken) {
-    post("oc-search-result", { token, files: ctx.batch });
+    post("vv-search-result", { token, files: ctx.batch });
   }
   if (ctx.token === currentSearchToken) {
-    post("oc-search-done", {
+    post("vv-search-done", {
       token, matchCount: ctx.matchCount, fileCount: ctx.fileCount, limitHit: ctx.limitHit,
     });
   }
@@ -1614,13 +1614,13 @@ self.onmessage = async (event) => {
   // worker's own measured memory + the VFS's in-RAM content footprint. The main
   // thread measures the page (which covers dedicated workers) separately and
   // combines the two.
-  if (m.type === "oc-mem") {
+  if (m.type === "vv-mem") {
     const [kernelBytes, vfsMem, procs] = await Promise.all([
       safeMeasureMemory(),
       queryVfsMem(),
       queryAllProcMem(),
     ]);
-    post("oc-reply", {
+    post("vv-reply", {
       reqId: m.reqId,
       ok: true,
       kernelBytes,
@@ -1634,21 +1634,21 @@ self.onmessage = async (event) => {
 
   // roadmap #19 stage C: a ws connection event from the preview iframe (relayed
   // by the main thread). Route it to the process owning the preview port.
-  if (m.type === "oc-ws") {
+  if (m.type === "vv-ws") {
     if (kernel) kernel.handleWsClient(m.msg);
     return;
   }
 
   // An SSE connection event from the preview iframe's EventSource polyfill
   // (relayed by the main thread). Route it to the process owning the preview port.
-  if (m.type === "oc-sse") {
+  if (m.type === "vv-sse") {
     if (kernel) kernel.handleSseClient(m.msg);
     return;
   }
 
   // ── Interactive terminals ──────────────────────────────────────────────────
   // Open a new shell for a terminal tab. `demo` set = the "Run" button: scaffold
-  // the project and auto-run its dev command in this shell (OC_RUN), so the server
+  // the project and auto-run its dev command in this shell (VV_RUN), so the server
   // lives in this tab.
   if (m.type === "term-open") {
     openTerminal(m.terminalId, m.cwd, m.demo, m.run);
@@ -1671,7 +1671,7 @@ self.onmessage = async (event) => {
   // dev server's watcher does the rest: Vite pushes an HMR update over the tunnel
   // to the preview iframe; Nest --watch recompiles + restarts (its re-listen then
   // triggers a preview reload via kernel.onListen above). No orchestration here.
-  if (m.type === "oc-write") {
+  if (m.type === "vv-write") {
     if (kernel) {
       try {
         const slash = m.path.lastIndexOf("/");
@@ -1679,18 +1679,18 @@ self.onmessage = async (event) => {
         // `bytes` (a Uint8Array) is used for binary imports (dropped images /
         // files); `contents` (a string) for text edits. writeFile accepts either.
         kernel.writeFile(m.path, m.bytes ?? m.contents ?? "");
-        post("oc-fs-changed", { path: m.path });
+        post("vv-fs-changed", { path: m.path });
       } catch (err) {
         post("log", { line: "[edit] write failed: " + ((err && err.message) || err), stream: "stderr" });
       }
     }
-    if (m.reqId != null) post("oc-reply", { reqId: m.reqId, ok: true });
+    if (m.reqId != null) post("vv-reply", { reqId: m.reqId, ok: true });
     return;
   }
 
-  // ── VFS queries for the multi-root Explorer (request/response via oc-reply) ──
-  if (m.type === "oc-readdir") {
-    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+  // ── VFS queries for the multi-root Explorer (request/response via vv-reply) ──
+  if (m.type === "vv-readdir") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
     try {
       const base = m.path.replace(/\/+$/, "");
       const names = kernel.readdir(m.path);
@@ -1699,61 +1699,61 @@ self.onmessage = async (event) => {
         try { dir = kernel.stat(base + "/" + name).kind === "dir"; } catch { /* race: gone */ }
         return { name, dir };
       });
-      post("oc-reply", { reqId: m.reqId, ok: true, path: m.path, entries });
+      post("vv-reply", { reqId: m.reqId, ok: true, path: m.path, entries });
     } catch (err) {
-      post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
     }
     return;
   }
-  if (m.type === "oc-read") {
-    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+  if (m.type === "vv-read") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
     try {
-      post("oc-reply", { reqId: m.reqId, ok: true, path: m.path, contents: kernel.readFile(m.path) });
+      post("vv-reply", { reqId: m.reqId, ok: true, path: m.path, contents: kernel.readFile(m.path) });
     } catch (err) {
-      post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
     }
     return;
   }
   // Raw bytes for binary files (images) so the editor's image viewer gets an
   // uncorrupted buffer — readFile decodes to a JS string, which mangles binary.
-  if (m.type === "oc-read-bytes") {
-    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+  if (m.type === "vv-read-bytes") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
     try {
       const bytes = kernel.readFileBytes(m.path);
-      post("oc-reply", { reqId: m.reqId, ok: true, path: m.path, bytes });
+      post("vv-reply", { reqId: m.reqId, ok: true, path: m.path, bytes });
     } catch (err) {
-      post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
     }
     return;
   }
   // Existence + kind check used to validate a new project's target directory.
-  if (m.type === "oc-stat") {
-    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: true, exists: false, isDir: false }); return; }
+  if (m.type === "vv-stat") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: true, exists: false, isDir: false }); return; }
     try {
-      if (!kernel.exists(m.path)) { post("oc-reply", { reqId: m.reqId, ok: true, exists: false, isDir: false }); return; }
+      if (!kernel.exists(m.path)) { post("vv-reply", { reqId: m.reqId, ok: true, exists: false, isDir: false }); return; }
       const st = kernel.stat(m.path);
-      post("oc-reply", { reqId: m.reqId, ok: true, exists: true, isDir: st.kind === "dir" });
+      post("vv-reply", { reqId: m.reqId, ok: true, exists: true, isDir: st.kind === "dir" });
     } catch {
-      post("oc-reply", { reqId: m.reqId, ok: true, exists: false, isDir: false });
+      post("vv-reply", { reqId: m.reqId, ok: true, exists: false, isDir: false });
     }
     return;
   }
-  if (m.type === "oc-mkdirp") {
-    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+  if (m.type === "vv-mkdirp") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
     try {
       kernel.mkdirp(m.path);
-      post("oc-reply", { reqId: m.reqId, ok: true });
-      post("oc-fs-changed", { path: m.path });
+      post("vv-reply", { reqId: m.reqId, ok: true });
+      post("vv-fs-changed", { path: m.path });
     } catch (err) {
-      post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
     }
     return;
   }
 
   // Create a project: write its files in one batch and register its run manifest
   // so a later listen on its dev-server port points the preview at it.
-  if (m.type === "oc-create-project") {
-    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+  if (m.type === "vv-create-project") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
     try {
       const dir = m.dir;
       kernel.mkdirp(dir);
@@ -1761,18 +1761,18 @@ self.onmessage = async (event) => {
       const batch = Object.entries(files).map(([rel, contents]) => ({ path: dir + "/" + rel, contents }));
       if (batch.length) await kernel.writeFilesBatch(batch);
       if (m.manifest) registerProject(dir, m.manifest, m.title);
-      post("oc-reply", { reqId: m.reqId, ok: true });
-      post("oc-fs-changed", { path: dir });
+      post("vv-reply", { reqId: m.reqId, ok: true });
+      post("vv-fs-changed", { path: dir });
     } catch (err) {
-      post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
     }
     return;
   }
   // Re-attach a run manifest to an already-existing project dir (Open Folder /
   // "Run" on a reopened project), without rewriting its files.
-  if (m.type === "oc-register-project") {
+  if (m.type === "vv-register-project") {
     if (kernel && m.manifest) registerProject(m.dir, m.manifest, m.title);
-    if (m.reqId != null) post("oc-reply", { reqId: m.reqId, ok: true });
+    if (m.reqId != null) post("vv-reply", { reqId: m.reqId, ok: true });
     return;
   }
 
@@ -1782,31 +1782,31 @@ self.onmessage = async (event) => {
   // language service as extra libs. Done HERE — the worker is the sole holder of
   // the sync Wasm VFS, so this is one bulk reply instead of thousands of per-file
   // read round-trips. Bounded (file count + total bytes) and yields periodically.
-  if (m.type === "oc-collect-dts") {
-    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+  if (m.type === "vv-collect-dts") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
     collectDts(m.root, m.sig || "")
-      .then((r) => post("oc-reply", { reqId: m.reqId, ok: true, files: r.files, truncated: r.truncated, sig: r.sig, unchanged: r.unchanged }))
-      .catch((err) => post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) }));
+      .then((r) => post("vv-reply", { reqId: m.reqId, ok: true, files: r.files, truncated: r.truncated, sig: r.sig, unchanged: r.unchanged }))
+      .catch((err) => post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) }));
     return;
   }
 
   // ── Full-text search / replace ─────────────────────────────────────────────
-  // Kick off a streaming search (results arrive as oc-search-result batches, then
-  // a final oc-search-done). Runs async so the worker keeps servicing messages.
-  if (m.type === "oc-search") {
-    if (!kernel) { post("oc-search-done", { token: m.token, error: "kernel not ready" }); return; }
-    runSearch(m).catch((err) => post("oc-search-done", { token: m.token, error: errMsg(err) }));
+  // Kick off a streaming search (results arrive as vv-search-result batches, then
+  // a final vv-search-done). Runs async so the worker keeps servicing messages.
+  if (m.type === "vv-search") {
+    if (!kernel) { post("vv-search-done", { token: m.token, error: "kernel not ready" }); return; }
+    runSearch(m).catch((err) => post("vv-search-done", { token: m.token, error: errMsg(err) }));
     return;
   }
   // Supersede any in-flight search (query cleared / pane closed).
-  if (m.type === "oc-search-cancel") {
+  if (m.type === "vv-search-cancel") {
     currentSearchToken = -1;
     return;
   }
   // Apply a replacement. Scope: a single {match}, an explicit list of {files}
   // (Replace All / per-file), all recomputed against the same matcher options.
-  if (m.type === "oc-replace") {
-    if (!kernel) { post("oc-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+  if (m.type === "vv-replace") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
     try {
       const re = buildSearchRegex(m);
       let filesChanged = 0, replaced = 0;
@@ -1826,7 +1826,7 @@ self.onmessage = async (event) => {
           lines[li] = lines[li].slice(0, start) + out + lines[li].slice(start + length);
           kernel.writeFile(file, lines.join("\n"));
           filesChanged = 1; replaced = 1;
-          post("oc-fs-changed", { path: file });
+          post("vv-fs-changed", { path: file });
         }
       } else {
         for (const file of m.files || []) {
@@ -1839,41 +1839,41 @@ self.onmessage = async (event) => {
           if (next !== content) {
             kernel.writeFile(file, next);
             filesChanged++; replaced += count;
-            post("oc-fs-changed", { path: file });
+            post("vv-fs-changed", { path: file });
           }
         }
       }
-      post("oc-reply", { reqId: m.reqId, ok: true, filesChanged, replaced });
+      post("vv-reply", { reqId: m.reqId, ok: true, filesChanged, replaced });
     } catch (err) {
-      post("oc-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
     }
     return;
   }
 
   // Explorer file operations. The VFS ops go through the FS Worker which calls
   // notifyWatch, so a running dev server picks the changes up (HMR / restart) on
-  // its own. Each replies with `oc-fs-result` so the host can surface errors.
-  if (m.type === "oc-rename" || m.type === "oc-rm" || m.type === "oc-copy") {
+  // its own. Each replies with `vv-fs-result` so the host can surface errors.
+  if (m.type === "vv-rename" || m.type === "vv-rm" || m.type === "vv-copy") {
     const op = m.type.slice(3); // rename | rm | copy
     if (!kernel) {
-      post("oc-fs-result", { op, ok: false, error: "kernel not ready", ...m });
+      post("vv-fs-result", { op, ok: false, error: "kernel not ready", ...m });
       return;
     }
     try {
-      if (m.type === "oc-rename") kernel.rename(m.from, m.to);
-      else if (m.type === "oc-rm") rmRecursive(m.path);
+      if (m.type === "vv-rename") kernel.rename(m.from, m.to);
+      else if (m.type === "vv-rm") rmRecursive(m.path);
       else copyRecursive(m.from, m.to);
-      post("oc-fs-result", { op, ok: true, from: m.from, to: m.to, path: m.path });
-      post("oc-fs-changed", { path: m.to || m.path });
+      post("vv-fs-result", { op, ok: true, from: m.from, to: m.to, path: m.path });
+      post("vv-fs-changed", { path: m.to || m.path });
     } catch (err) {
-      post("oc-fs-result", { op, ok: false, error: errMsg(err), from: m.from, to: m.to, path: m.path });
+      post("vv-fs-result", { op, ok: false, error: errMsg(err), from: m.from, to: m.to, path: m.path });
     }
     return;
   }
 
   // A preview request relayed from the main thread. The Service Worker's reply
   // port was transferred to us, so we answer it directly.
-  if (m.type === "oc-http") {
+  if (m.type === "vv-http") {
     const port = event.ports[0];
     if (!kernel) {
       port.postMessage({ status: 503, headers: {}, body: "kernel not ready\n" });

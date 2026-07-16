@@ -32,7 +32,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
-const VENDOR_DIR = process.env.OC_VENDOR_TSGO_DIR || "/tmp/oc-vendor-tsgo";
+const VENDOR_DIR = process.env.VV_VENDOR_TSGO_DIR || "/tmp/vv-vendor-tsgo";
 const VENDOR_TSGO = path.join(VENDOR_DIR, "node_modules", "tsgo-wasm");
 const OUT_DIR = path.join(ROOT, "packages", "studio", "public", "vendor");
 // Gzip-compressed but deliberately NOT named `.gz` (static servers would set
@@ -87,7 +87,7 @@ if (startIdx === -1 || endIdx === -1) {
   process.exit(1);
 }
 const goEngine = launcher.slice(startIdx, endIdx).trim();
-const wasmExecCjs = `// OpenContainer: Go js/wasm engine extracted VERBATIM from tsgo-wasm@${VERSION}'s
+const wasmExecCjs = `// Vivari: Go js/wasm engine extracted VERBATIM from tsgo-wasm@${VERSION}'s
 // launcher and wrapped as CJS. \`fs\` is globalThis.fs — the loader installs an fs
 // whose fd 1/2 writes go to the terminal (see load-real-tsgo.js). Do not edit the
 // engine body; re-run \`npm run vendor:tsgo --force\` to refresh.

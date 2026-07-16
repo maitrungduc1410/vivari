@@ -1,7 +1,7 @@
-// internal/fs/watchers — OpenContainer fs.watch / fs.watchFile (roadmap #19 B).
+// internal/fs/watchers — Vivari fs.watch / fs.watchFile (roadmap #19 B).
 //
 // Node's real internal/fs/watchers drives libuv fs_event / stat-poll handles
-// through internalBinding. OpenContainer's VFS lives in the File System Worker,
+// through internalBinding. Vivari's VFS lives in the File System Worker,
 // which is the one place that sees *every* client's mutation (a host editor, this
 // process, or any other process). So watching is push-based: [kFSWatchStart]
 // registers the path with that worker (via process.__fsWatch -> an fs syscall),

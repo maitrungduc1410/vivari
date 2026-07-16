@@ -34,11 +34,11 @@ export default function (exports, require, module) {
     cpu_profiler_metadata_size: 0,
   });
   exports.getHeapSnapshot = () => {
-    throw new Error("v8.getHeapSnapshot is not supported in OpenContainer");
+    throw new Error("v8.getHeapSnapshot is not supported in Vivari");
   };
   exports.setFlagsFromString = () => {};
   exports.writeHeapSnapshot = () => {
-    throw new Error("v8.writeHeapSnapshot is not supported in OpenContainer");
+    throw new Error("v8.writeHeapSnapshot is not supported in Vivari");
   };
   exports.cachedDataVersionTag = () => 0;
   exports.setHeapSnapshotNearHeapLimit = () => {};

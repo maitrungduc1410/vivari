@@ -89,7 +89,7 @@ ok(NATIVE_WASM_ALIASES.rollup === "@rollup/wasm-node", "alias rollup -> @rollup/
 // --- 2. patch applies to the known block --------------------------------------
 const patched = maybePatchEsbuildInProcess(wrap(SPAWN_BLOCK("0.28.1")), MAIN, wasmPresent, path);
 ok(patched != null, "patch returns a rewritten source for esbuild-wasm@0.28.1");
-ok(patched != null && patched.includes("[OpenContainer] in-process esbuild service"), "rewrite carries the OC marker");
+ok(patched != null && patched.includes("[Vivari] in-process esbuild service"), "rewrite carries the OC marker");
 ok(patched != null && !patched.includes('child_process.spawn(command'), "child spawn removed");
 ok(patched != null && patched.includes('--service=${"0.28.1"}'), "version 0.28.1 threaded into --service");
 

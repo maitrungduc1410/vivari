@@ -926,11 +926,11 @@ export function createRuntime({
   // Host alias for the *global* fetch(). Unlike http/https (which egress via
   // __ocfetch -> the Fetcher Worker, where rewrite() already maps the alias), the
   // global fetch is the host realm's real fetch used directly, so it needs its own
-  // rewrite. Map `http://host.opencontainer.internal:<port>/…` to the studio's own
+  // rewrite. Map `http://host.vivari.internal:<port>/…` to the studio's own
   // hostname (this realm is a Worker on the studio origin, so location.hostname IS
   // the host) — reaching a service on the HOST machine when the studio is served
   // locally. Headless (no browser realm) has no location and no-ops.
-  const HOST_ALIAS = "host.opencontainer.internal";
+  const HOST_ALIAS = "host.vivari.internal";
   const rewriteHostAlias = (input) => {
     const host = globalThis.location && globalThis.location.hostname;
     if (!host) return input;
@@ -1123,7 +1123,7 @@ export function createRuntime({
   // VFS (it throws ERR_MODULE_NOT_FOUND against the host FS). We (a) expose a
   // loader-backed dynamic import as a global, and (b) wrap the Function
   // constructor so such bodies' import() is redirected to it.
-  const ocRootRequire = moduleSystem.makeRequire("/");
+  const vvRootRequire = moduleSystem.makeRequire("/");
 
   // Pre-seat `globalThis.fs` as a WRITABLE, CONFIGURABLE property pointing at the real
   // fs, BEFORE any Go/wasm toolchain loads. Multiple Go tools drive their wasm through
@@ -1140,7 +1140,7 @@ export function createRuntime({
   // writable+configurable own data property, which is exactly what we want.
   try {
     if (!Object.getOwnPropertyDescriptor(globalThis, "fs")) {
-      globalThis.fs = ocRootRequire("fs");
+      globalThis.fs = vvRootRequire("fs");
     }
   } catch {
     /* fs unavailable this early — tools will still install their own */
@@ -1148,7 +1148,7 @@ export function createRuntime({
 
   globalThis.__ocImport = (spec) =>
     Promise.resolve().then(() => {
-      const m = ocRootRequire(String(spec));
+      const m = vvRootRequire(String(spec));
       if (m && m.__esModule) return m;
       const ns = Object.create(null);
       // Mirror Node's CJS→ESM interop: named exports are the module.exports' own

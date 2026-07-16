@@ -12,7 +12,7 @@ export default function (exports, require, module, process, internalBinding, pri
 
   const notImplemented = (name) => () => {
     const err = new Error(
-      `OpenContainer: Web Streams interop (${name}) is not implemented yet`,
+      `Vivari: Web Streams interop (${name}) is not implemented yet`,
     );
     err.code = "ERR_METHOD_NOT_IMPLEMENTED";
     throw err;

@@ -1,4 +1,4 @@
-// OpenContainer crypto codec — the Rust/Wasm core beneath Node's real
+// Vivari crypto codec — the Rust/Wasm core beneath Node's real
 // lib/crypto.js (Phase 2 #12). Node's crypto API is SYNCHRONOUS
 // (createHash().digest(), pbkdf2Sync, createCipheriv().update()); the Web
 // Platform's SubtleCrypto is async-only, so — exactly like the zlib codec (#11)

@@ -1,7 +1,7 @@
 // internalBinding — the seam Node's lib/ uses to reach its C++ core.
 //
 // In real Node, `internalBinding('fs')` returns the native (C++) module. In
-// OpenContainer (Path B), THIS is where we substitute our own implementations:
+// Vivari (Path B), THIS is where we substitute our own implementations:
 // JS shims, Wasm codecs, or calls down to the Rust VFS via the sync bridge. The
 // JS layer above the binding line (Node's real lib/) stays unmodified.
 //
@@ -151,6 +151,6 @@ export function createInternalBinding({ syscalls, process, netLiveness, netServe
 
   return function internalBinding(name) {
     if (Object.prototype.hasOwnProperty.call(bindings, name)) return bindings[name];
-    throw new Error(`OpenContainer: internalBinding('${name}') is not implemented yet`);
+    throw new Error(`Vivari: internalBinding('${name}') is not implemented yet`);
   };
 }

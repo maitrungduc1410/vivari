@@ -15,7 +15,7 @@ import {
   ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { useIde } from "./useIde";
-import type { PreviewTab } from "@/oc/controller";
+import type { PreviewTab } from "@/vv/controller";
 
 function ToolButton({
   label, onClick, disabled, children,

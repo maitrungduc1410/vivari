@@ -16,7 +16,7 @@
 //   8. Malformed input returns an Error (HPE_*), never throws.
 //   9. EOF-delimited body completes on finish().
 //  10. Trailers surface on parser._headers for lib/_http_common.
-//  11. The pure-JS fallback is selectable (OC_HTTP_PARSER=js) and still parses.
+//  11. The pure-JS fallback is selectable (VV_HTTP_PARSER=js) and still parses.
 //
 //   run:  node scripts/spike-http-llhttp.mjs
 
@@ -154,10 +154,10 @@ function newParser(type) {
 
 // --- 11. fallback selection ---------------------------------------------------
 {
-  const prev = process.env.OC_HTTP_PARSER;
-  process.env.OC_HTTP_PARSER = "js";
+  const prev = process.env.VV_HTTP_PARSER;
+  process.env.VV_HTTP_PARSER = "js";
   const jsBinding = createHttpParserBinding();
-  ok(jsBinding.backend === "js", "OC_HTTP_PARSER=js selects the pure-JS parser");
+  ok(jsBinding.backend === "js", "VV_HTTP_PARSER=js selects the pure-JS parser");
   // the JS parser still parses a basic request
   const jp = new jsBinding.HTTPParser();
   jp.initialize(jsBinding.HTTPParser.REQUEST, {}, 80 * 1024, 0);
@@ -166,8 +166,8 @@ function newParser(type) {
   jp.execute(Buffer.from("GET /fallback HTTP/1.1\r\nHost: e\r\n\r\n"));
   ok(jsUrl === "/fallback", "pure-JS fallback parses a request");
 
-  if (prev === undefined) delete process.env.OC_HTTP_PARSER;
-  else process.env.OC_HTTP_PARSER = prev;
+  if (prev === undefined) delete process.env.VV_HTTP_PARSER;
+  else process.env.VV_HTTP_PARSER = prev;
   const autoBinding = createHttpParserBinding();
   ok(autoBinding.backend === "wasm", "default selection prefers the Wasm backend");
 }

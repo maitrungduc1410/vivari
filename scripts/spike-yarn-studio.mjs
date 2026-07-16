@@ -10,7 +10,7 @@
 //   2) typing `yarn` on PATH resolves to the real CLI through the /bin/yarn.js
 //      shim.
 //
-// Offline by default (version + shim gates). Set OC_NET=1 for the install gate
+// Offline by default (version + shim gates). Set VV_NET=1 for the install gate
 // (hits registry.yarnpkg.com). Run: node scripts/spike-yarn-studio.mjs
 //
 // Prereq: the vendor asset must exist — run `npm run vendor:yarn` first.
@@ -105,11 +105,11 @@ if (!versionOk && v.stderr) console.log("stderr:\n" + v.stderr.trim());
 
 // Gate C (opt-in, network): a real install through the shim on PATH.
 let installOk = true;
-if (process.env.OC_NET === "1") {
-  const PKG = process.env.OC_PKG || "is-number";
+if (process.env.VV_NET === "1") {
+  const PKG = process.env.VV_PKG || "is-number";
   console.log(`\n── yarn add ${PKG} (via /bin/yarn.js shim, real registry) ──`);
   kernel.writeFile("/app/package.json", JSON.stringify({ name: "app", version: "1.0.0", license: "MIT", private: true }, null, 2));
-  const TIMEOUT_MS = Number(process.env.OC_TIMEOUT || 120000);
+  const TIMEOUT_MS = Number(process.env.VV_TIMEOUT || 120000);
   const t1 = Date.now();
   const inst = await Promise.race([
     kernel.start("yarn", ["add", PKG, ...YARN_FLAGS], { cwd: "/app", env, capture: true }),
@@ -123,7 +123,7 @@ if (process.env.OC_NET === "1") {
   installOk = inst.code === 0 && installed && lockfile;
   console.log(`install gate: ${installOk ? "PASS" : "FAIL"}`);
 } else {
-  console.log("\n(install gate skipped — set OC_NET=1 to run it)");
+  console.log("\n(install gate skipped — set VV_NET=1 to run it)");
 }
 
 const ok = shimOk && versionOk && installOk;

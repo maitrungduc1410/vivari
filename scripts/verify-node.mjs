@@ -720,7 +720,7 @@ const zlib = require('zlib');
 const { pipeline } = require('stream');
 const { Readable, Writable } = require('stream');
 
-const data = Buffer.from('OpenContainer '.repeat(400) + 'café € zlib #11');
+const data = Buffer.from('Vivari '.repeat(400) + 'café € zlib #11');
 
 // sync round-trips
 assert.ok(zlib.gunzipSync(zlib.gzipSync(data)).equals(data), 'gzipSync/gunzipSync round-trip');
@@ -731,7 +731,7 @@ assert.ok(zlib.unzipSync(zlib.deflateSync(data)).equals(data), 'unzipSync auto-d
 
 // cross-compat: a gzip buffer made by the REAL Node zlib must decode here.
 const fromNode = Buffer.from('H4sIAAAAAAAAE/MvSM1zzs8rSczMSy1SqMrJTFJQNjRUeNQwRSE5Me3wSoVHTWsAWCDGcyQAAAA=', 'base64');
-assert.strictEqual(zlib.gunzipSync(fromNode).toString('utf8'), 'OpenContainer zlib #11 — café €', 'gunzip a Node-produced gzip');
+assert.strictEqual(zlib.gunzipSync(fromNode).toString('utf8'), 'Vivari zlib #11 — café €', 'gunzip a Node-produced gzip');
 
 // crc32 matches the real Node value.
 assert.strictEqual(zlib.crc32('hello world'), 222957957, 'crc32 matches Node');

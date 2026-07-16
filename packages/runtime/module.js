@@ -391,7 +391,7 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     // Transparent in-process esbuild service: rewrite esbuild-wasm's lib/main.js
     // so its Go service runs in this thread instead of spawning a child whose
     // stdio pipe deadlocks under a worker pool. No-op for everything else. This
-    // replaces the old per-project scripts/oc-ng.mjs patch (see
+    // replaces the old per-project scripts/vv-ng.mjs patch (see
     // esbuild-inproc-patch.js).
     const esbPatched = maybePatchEsbuildInProcess(source, filename, fs, path);
     if (esbPatched != null) source = esbPatched;
@@ -516,7 +516,7 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     // already get the filename appended above, but a runtime throw during a
     // module's body (e.g. an ESM/CJS interop mismatch → `undefined.map`) is
     // otherwise anonymous in the stack. Gated so it's zero-cost in normal runs.
-    if (process.env.OC_TRACE_MODULES) {
+    if (process.env.VV_TRACE_MODULES) {
       try {
         if (isEsm) {
           const ret = runEsm();
@@ -526,7 +526,7 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
         }
       } catch (e) {
         try {
-          process.stderr.write(`[oc-module-throw] ${filename}: ${(e && e.message) || e}\n`);
+          process.stderr.write(`[vv-module-throw] ${filename}: ${(e && e.message) || e}\n`);
         } catch {}
         // process.stderr routes through the kernel asynchronously, so it's lost if
         // the worker crashes right after. Also prepend the throwing module's path
@@ -644,7 +644,7 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
   Module._extensions[".js"] = (module, filename) => compile(module, filename);
   Module._extensions[".json"] = (module, filename) => compile(module, filename);
   Module._extensions[".node"] = () => {
-    throw new Error("Native .node addons are not supported in OpenContainer");
+    throw new Error("Native .node addons are not supported in Vivari");
   };
   Module.globalPaths = [];
   Module.wrapper = [

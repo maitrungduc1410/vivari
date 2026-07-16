@@ -1,4 +1,4 @@
-// The Fetcher Worker — OpenContainer's dedicated outbound-network worker.
+// The Fetcher Worker — Vivari's dedicated outbound-network worker.
 //
 // Phase 2, item #9 (Network/registry worker). The kernel worker delegates every
 // outbound fetch to this worker so that downloading/decompressing/parsing large
@@ -25,7 +25,7 @@ const REGISTRY_PROXY = null;
 
 // Host alias. In-VM code can reach a service running on the HOST machine (the
 // machine running the browser, e.g. a real dev server on localhost:3000) by
-// addressing it as `http://host.opencontainer.internal:<port>/…`. We map the alias
+// addressing it as `http://host.vivari.internal:<port>/…`. We map the alias
 // to the studio's OWN hostname (the fetcher runs in the browser, so
 // self.location.hostname IS the host), preserving scheme/port/path. This only
 // reaches the host when the studio is served locally (localhost).
@@ -36,7 +36,7 @@ const REGISTRY_PROXY = null;
 // cross-origin fetch. The reverse direction (host → preview) needs no alias: the
 // host reaches an in-VM server at `<studio-origin>/preview/<port>/…` (the same
 // Service Worker preview proxy the iframes use).
-const HOST_ALIAS = "host.opencontainer.internal";
+const HOST_ALIAS = "host.vivari.internal";
 
 function rewrite(url) {
   try {
