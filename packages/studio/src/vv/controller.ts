@@ -1,4 +1,4 @@
-// IDE controller — the imperative core, ported from packages/demo/host.js.
+// IDE controller — the imperative core, ported from the original raw-ESM demo UI (host.js).
 //
 // React owns the *chrome* (declarative: title bar, activity bar, explorer, tabs,
 // status bar, command palette) and subscribes to an immutable snapshot exposed

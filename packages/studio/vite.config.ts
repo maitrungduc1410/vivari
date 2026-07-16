@@ -158,8 +158,8 @@ export default defineConfig({
   },
   server: {
     headers: isolation,
-    // The kernel worker (and its nested workers) live in sibling packages
-    // (packages/demo, packages/kernel-host, packages/runtime, packages/vfs|codec|
+    // The kernel worker (in src/workers/) and its nested workers import from
+    // sibling packages (packages/kernel-host, packages/runtime, packages/vfs|codec|
     // crypto/pkg). Let Vite's dev server read + bundle them from the monorepo root.
     fs: { allow: [fileURLToPath(new URL("../../", import.meta.url))] },
   },

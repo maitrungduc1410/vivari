@@ -27,7 +27,7 @@ on `/sw.js` (the preview proxy needs root scope).
 ## How it fits together
 
 - `src/vv/kernel.ts` — `KernelBridge`: spawns the kernel worker
-  (`../../demo/kernel-worker.js`, bundled by Vite along with its nested `fs` /
+  (`../workers/kernel-worker.js`, bundled by Vite along with its nested `fs` /
   `fetcher` / `process` workers and the `packages/{vfs,codec,crypto}/pkg` wasm),
   registers the preview Service Worker, and relays its HTTP requests into the VM.
 - `src/vv/controller.ts` — `IdeController`: the imperative core (Monaco, xterm
@@ -36,5 +36,6 @@ on `/sw.js` (the preview proxy needs root scope).
 - `src/components/ide/*` — the chrome: AppShell, ActivityBar, Explorer,
   EditorGroup, TerminalPanel, PreviewPanel, StatusBar, CommandPalette.
 
-The message protocol matches the legacy `packages/demo` UI exactly, so both share
-one runtime. See the repo root `ARCHITECTURE.md` for the full model.
+The kernel/worker files (`src/workers/*.js`) are the shared runtime host, moved
+here when the legacy raw-ESM demo UI was retired. See the repo root
+`ARCHITECTURE.md` for the full model.

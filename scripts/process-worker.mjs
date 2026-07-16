@@ -1,5 +1,5 @@
 // Node worker_threads entry for a single process (used by the headless test and
-// as the Node-side twin of the browser's demo/process-worker.js).
+// as the Node-side twin of the browser's packages/studio/src/workers/process-worker.js).
 
 import { parentPort, markAsUntransferable } from "node:worker_threads";
 import { createRequire } from "node:module";

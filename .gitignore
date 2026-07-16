@@ -8,9 +8,6 @@
 # Node
 node_modules
 
-# Bundled demo (rebuild with `npm run build:demo`)
-/packages/demo-dist
-
 # Vendored real-npm delivery asset (rebuild with `npm run vendor:npm`)
 /packages/studio/public/vendor
 

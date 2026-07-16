@@ -14,7 +14,7 @@
 
 // The native->wasm alias table is the single source of truth for the toolchain
 // subsystem (shared with the in-process esbuild patch); add drop-ins there.
-import { NATIVE_WASM_ALIASES as PACKAGE_ALIASES } from "../runtime/toolchain-shims.js";
+import { NATIVE_WASM_ALIASES as PACKAGE_ALIASES } from "../../../runtime/toolchain-shims.js";
 
 // Pluggable registry endpoint (the "direct now, proxy later" seam). The npm
 // registry sends `Access-Control-Allow-Origin: *` on both metadata and tarballs,

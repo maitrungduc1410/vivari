@@ -10,7 +10,7 @@ export const COREUTILS = {
   // NOTE: there is no built-in `npm` here anymore. The Turbo-analog installer
   // (packages/kernel-host/programs/npm.js) has been RETIRED from the shipped
   // product — studio now boots the REAL npm CLI unconditionally (see
-  // load-real-npm.js + demo/kernel-worker.js). The analog survives ONLY as an
+  // load-real-npm.js + packages/studio/src/workers/kernel-worker.js). The analog survives ONLY as an
   // offline test fixture: scripts/verify-node.mjs imports NPM_PROGRAM directly
   // and installs it to /bin/npm.js, so its deterministic install/tar/hoist
   // coverage keeps running without network. See roadmap.md ("Retiring the

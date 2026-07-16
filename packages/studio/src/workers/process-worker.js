@@ -2,9 +2,9 @@
 // message, then boots the runtime and runs the program. Later `net` messages
 // from the kernel nudge the process event loop when a request is queued.
 
-import { bootProcess } from "../runtime/boot.js";
-import * as codecNs from "../codec/pkg/open_webcontainer_codec.js";
-import * as cryptoNs from "../crypto/pkg/open_webcontainer_crypto.js";
+import { bootProcess } from "../../../runtime/boot.js";
+import * as codecNs from "../../../codec/pkg/open_webcontainer_codec.js";
+import * as cryptoNs from "../../../crypto/pkg/open_webcontainer_crypto.js";
 
 // In a real Worker, `self` is a getter-only accessor on WorkerGlobalScope, so a
 // third-party global shim — e.g. `Object.assign(globalThis, { self, window,

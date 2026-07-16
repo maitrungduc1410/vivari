@@ -54,8 +54,8 @@ Cross-Origin-Opener-Policy:   same-origin
 Cross-Origin-Embedder-Policy: require-corp
 ```
 
-(`server.mjs` does this. Without it, `SharedArrayBuffer` is `undefined` and
-nothing runs — `host.js` checks and bails early.)
+(Studio's `vite.config.ts` does this. Without it, `SharedArrayBuffer` is
+`undefined` and nothing runs.)
 
 ---
 
@@ -63,13 +63,11 @@ nothing runs — `host.js` checks and bails early.)
 
 Work is split across several Web Workers so no single thread is on the critical
 path of everything. The worker roles below are ES modules; **studio's Vite build
-bundles each** (nested module workers + wasm), while the legacy demo loads them raw
-in dev and esbuild-bundles them for production (§10).
+bundles each** (nested module workers + wasm).
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │ Main thread — packages/studio (React 19 + shadcn)                      │
-│   (legacy: packages/demo/host.js — same protocol, plain-JS UI)         │
 │   • Home screen (blank / template / recents) + VS Code-style IDE:      │
 │     multi-root VFS-backed Explorer (abs-path tabs) + Search + tabbed    │
 │     Monaco (preview/permanent tabs) + bottom panel with                 │
@@ -83,7 +81,7 @@ in dev and esbuild-bundles them for production (§10).
                 │ postMessage (spawn worker, init, net nudges, ws relay)
                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│ Kernel Worker — packages/demo/kernel-worker.js                         │
+│ Kernel Worker — packages/studio/src/workers/kernel-worker.js                         │
 │   • hosts the Kernel (packages/kernel-host/kernel.js)                  │
 │   • PID table, process supervision, spawn/kill/waitpid                 │
 │   • virtual network port registry (port → pid) + HTTP request routing  │
@@ -93,7 +91,7 @@ in dev and esbuild-bundles them for production (§10).
     ▼                    ▼                        ▼
 ┌─────────────┐   ┌───────────────┐   ┌────────────────────────────────┐
 │ Fetcher     │   │ File System   │   │ Process Worker  (one per PID)   │
-│ Worker      │   │ Worker        │   │  packages/demo/process-worker.js│
+│ Worker      │   │ Worker        │   │  packages/studio/src/workers/process-worker.js│
 │ outbound    │   │ owns the Rust │   │  • runs the vendored Node       │
 │ fetch()     │   │ /Wasm VFS     │   │    runtime + the user program   │
 │ (npm, etc.) │   │ + OPFS mirror │   │  • its own SAB + event loop     │
@@ -203,7 +201,7 @@ never parks and many downloads can overlap (§6).
   and quantifies how much of it is the resident esbuild service vs. guest framework; read-only.
 - **Servicing**: `packages/kernel-host/fs-server.js` (`FsServer`) owns the one VFS
   instance and services fs opcodes directly over each client's SAB. It runs inside
-  the **File System Worker** (`packages/demo/fs-worker.js`).
+  the **File System Worker** (`packages/studio/src/workers/fs-worker.js`).
 - **Node contract**: `packages/runtime/node/bindings/fs.js` maps Node's native fs
   binding contract onto the sync bridge (`stat` fills the shared `statValues`
   Float64Array in place; fd layer via `open`→`fstat`→`read`→`close`), so Node's
@@ -408,10 +406,10 @@ UTF-8; binary (images/fonts/wasm) crosses base64 with `bodyEncoding: 'base64'`
 
 ### 8.3 Browser preview (Service Worker)
 
-`packages/demo/sw.js` is a preview proxy scoped to the whole origin (needs
+`packages/studio/public/sw.js` is a preview proxy scoped to the whole origin (needs
 `Service-Worker-Allowed: /`). It intercepts the preview iframe's `fetch`
 (`/preview/<port>/…` and root-absolute subresources like `/@vite/client`,
-`/node_modules/…`), posts each to the window (`host.js`), which forwards to the
+`/node_modules/…`), posts each to the window (the studio main thread), which forwards to the
 Kernel Worker → `handleHttpRequest` → the in-VM server. No real network is
 involved. The SW also **precaches** the worker-role bundles in production (keyed by
 a per-build id) so a redeploy can't serve stale bundles.
@@ -557,7 +555,7 @@ preview tab address bar (that only loads in-VM ports); test it from in-VM code.
 
 The Search pane (`components/ide/SearchPane.tsx`) is a VS Code-style full-text search across
 **every open workspace root**, not a filename filter. The search itself runs in the **kernel
-worker** (`demo/kernel-worker.js`) because that worker is the sole holder of the synchronous
+worker** (`packages/studio/src/workers/kernel-worker.js`) because that worker is the sole holder of the synchronous
 Wasm VFS — grepping from the main thread would mean an `vv-read` round-trip per file. The
 worker walks each root (reusing the Explorer skip set: `node_modules`/`.git`/`dist`/…), honors
 Match Case / Whole Word / Regex and comma-separated `files to include` / `files to exclude`
@@ -667,7 +665,7 @@ is a single source of truth in `packages/runtime/toolchain-shims.js`
 `scripts/spike-toolchain.mjs`. Adding a drop-in = one entry there (source+target
 must be published in lockstep and the target must be pure-JS/wasm).
 
-- **Registry aliasing** (`packages/demo/fetcher-worker.js`): when npm requests the
+- **Registry aliasing** (`packages/studio/src/workers/fetcher-worker.js`): when npm requests the
   packument for `esbuild`/`rollup`, the Fetcher Worker serves the drop-in's
   packument rewritten under the source name; npm resolves a lockstep version and
   downloads the drop-in's real tarball (its own `dist`/integrity) straight into
@@ -727,19 +725,6 @@ unmodified `ng new` project, benefit any esbuild/worker-pool tool (Vitest, tsup,
   from npm (no vendored bundle); Monaco's own language workers are imported the same
   `?worker` way (also same-origin → COEP-safe) to power real IntelliSense (§8.9).
   `npm run build:studio` / `npm run preview:studio` are the production build + preview.
-- **Dev (legacy demo)**: `npm run dev:legacy` → `server.mjs` on `:8080` with COOP/COEP.
-  Open `http://localhost:8080/packages/demo/index.html`. Loads the runtime as ~120
-  individual ES modules per worker (readable, debuggable, diffable against upstream Node).
-- **Legacy production bundle**: `npm run build:demo` → `scripts/build-demo.mjs` bundles
-  **one esbuild file per worker role** into `packages/demo-dist/` (host, kernel-worker,
-  process-worker, fs-worker, fetcher-worker, sw). `demo-dist` is a gitignored build
-  artifact and a **sibling** of `demo/` so the `new URL(x, import.meta.url)` worker/wasm
-  refs still resolve. Each build stamps a `BUILD_ID` into the SW to version its precache.
-  The editor vendor is kept **external** here and shipped as its own cache-first file.
-- **Editor vendor (legacy only)**: `scripts/build-editor-vendor.mjs` bundles Monaco +
-  xterm into a committed, same-origin `packages/demo/vendor/editor/editor.{js,css}`. It
-  must be same-origin (not a CDN) because the page is cross-origin isolated. Studio does
-  not use it (Vite bundles Monaco/xterm from npm).
 - **Wasm**: `npm run build` compiles all Rust crates (needs Rust + `wasm-pack`).
 
 ---

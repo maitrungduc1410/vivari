@@ -79,7 +79,7 @@ const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, fetcher });
 kernel.installCoreutils(); // node/sh/npx/etc — no built-in npm anymore (retired)
 
 // ── the wiring under test: the SHARED loader, fed the vendor asset ───────────
-// This is exactly what packages/demo/kernel-worker.js does at boot (there the
+// This is exactly what packages/studio/src/workers/kernel-worker.js does at boot (there the
 // bytes come from fetch('/vendor/npm-pack.bin'); here from disk).
 kernel.mkdirp("/home/user");
 kernel.mkdirp("/tmp/.npm/_logs");

@@ -16,8 +16,6 @@
     "prebuild:studio": "npm run vendor:npm && npm run vendor:yarn && npm run vendor:pnpm && npm run vendor:corepack && npm run vendor:tsgo",
     "build:studio": "cd packages/studio && bun run build",
     "preview:studio": "cd packages/studio && bun run preview",
-    "dev:legacy": "node server.mjs",
-    "build:demo": "node scripts/build-demo.mjs",
     "verify": "node scripts/verify-node.mjs",
     "spikes": "node scripts/run-spikes.mjs",
     "spikes:offline": "node scripts/run-spikes.mjs --offline",
@@ -31,10 +29,5 @@
     "build:wasi-demo": "cargo build --release --manifest-path packages/wasi-demo/Cargo.toml --target wasm32-wasip1 && cp packages/wasi-demo/target/wasm32-wasip1/release/wasi_demo.wasm packages/wasi-demo/pkg/wasi_demo.wasm",
     "build": "npm run build:vfs && npm run build:vfs:node && npm run build:codec && npm run build:codec:node && npm run build:crypto && npm run build:crypto:node && npm run build:wasi-demo"
   },
-  "devDependencies": {
-    "@xterm/addon-fit": "^0.10.0",
-    "@xterm/xterm": "^5.5.0",
-    "esbuild": "^0.28.1",
-    "monaco-editor": "^0.52.2"
-  }
+  "devDependencies": {}
 }
