@@ -85,6 +85,11 @@ kernel over a shared Rust VFS. A `node` process even spawns its own child via
 a `node /srv/server.js` process starts an HTTP server that stays alive, and the
 right-hand pane previews it live through the Service Worker.
 
+Projects persist across reloads (the VFS is mirrored to OPFS), and dependencies
+are cached: `node_modules` is snapshotted **keyed by the lockfile**, so opening a
+template you've built before (or a second project with the same deps) restores
+`node_modules` from disk instead of re-running `npm install`.
+
 ## Embed it (SDK)
 
 The same runtime that powers the studio is published as an embeddable SDK:

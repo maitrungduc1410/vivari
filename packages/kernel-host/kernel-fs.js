@@ -131,6 +131,27 @@ export function createKernelFs(fsWorker) {
     });
   }
 
+  // ---- persistent dependency cache round-trips (P1) -------------------------
+  // node_modules snapshot save/restore/has run in the FS Worker (it holds the
+  // VFS + OPFS), so they answer asynchronously over postMessage — same shape as
+  // writeLarge/writeFilesBatch. Each resolves the pending entry keyed by id.
+  function depCacheCall(type, payload) {
+    return new Promise((resolve, reject) => {
+      const id = seq++;
+      pending.set(id, { resolve, reject });
+      fsWorker.postMessage({ type, id, ...payload });
+    });
+  }
+  function depCacheHas(key) {
+    return depCacheCall("dep-cache-has", { key });
+  }
+  function depCacheSave(key, dir, aliases = []) {
+    return depCacheCall("dep-cache-save", { key, dir, aliases });
+  }
+  function depCacheRestore(key, dir) {
+    return depCacheCall("dep-cache-restore", { key, dir });
+  }
+
   function onMessage(msg) {
     if (!msg) return;
     if (msg.type === "fs-write-large-ok" || msg.type === "fs-write-batch-ok") {
@@ -145,6 +166,22 @@ export function createKernelFs(fsWorker) {
         pending.delete(msg.id);
         p.reject(new Error(msg.error || "EIO"));
       }
+    } else if (msg.type === "dep-cache-has-ok") {
+      const p = pending.get(msg.id);
+      if (p) { pending.delete(msg.id); p.resolve(!!msg.has); }
+    } else if (msg.type === "dep-cache-restore-ok") {
+      const p = pending.get(msg.id);
+      if (p) { pending.delete(msg.id); p.resolve(msg.count | 0); }
+    } else if (msg.type === "dep-cache-save-ok") {
+      const p = pending.get(msg.id);
+      if (p) { pending.delete(msg.id); p.resolve(msg.result || null); }
+    } else if (
+      msg.type === "dep-cache-has-err" ||
+      msg.type === "dep-cache-restore-err" ||
+      msg.type === "dep-cache-save-err"
+    ) {
+      const p = pending.get(msg.id);
+      if (p) { pending.delete(msg.id); p.reject(new Error(msg.error || "EIO")); }
     }
   }
 
@@ -193,6 +230,9 @@ export function createKernelFs(fsWorker) {
     },
     writeLarge,
     writeFilesBatch,
+    depCacheHas,
+    depCacheSave,
+    depCacheRestore,
   };
 
   return { fs, onMessage };

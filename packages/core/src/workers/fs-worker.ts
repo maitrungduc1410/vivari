@@ -20,11 +20,14 @@
 import initKernel, { VirtualFileSystem } from "../../../vfs/pkg/vivari_vfs.js";
 import { FsServer } from "../../../kernel-host/fs-server.js";
 import { createOpfsPersistence } from "../../../kernel-host/opfs-persistence.js";
+import { createDepCache } from "../../../kernel-host/dep-cache.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
 let server = null;
 let vfsRef = null; // the live VFS, set as soon as it's constructed (pre-restore)
+let depCache = null; // lockfile-keyed node_modules snapshot cache (P1)
+let accessRef = null; // the vfs-bound facade, shared by persistence + dep cache
 let compressionOn = false; // whole-file lazy compression gate (URL ?compress=1)
 const queue = []; // messages that arrive before the VFS finishes booting
 
@@ -86,6 +89,43 @@ function handle(msg) {
     case "fs-set-compression":
       compressionOn = !!msg.on;
       applyCompression();
+      break;
+    // ---- persistent dependency cache (P1) ---------------------------------
+    // node_modules snapshots keyed by lockfile. These run against the in-worker
+    // VFS + OPFS, so like writeLarge/writeBatch they answer over postMessage
+    // (the kernel-fs client correlates the reply by id).
+    case "dep-cache-has":
+      (async () => {
+        try {
+          post("dep-cache-has-ok", { id: msg.id, has: depCache ? await depCache.has(msg.key) : false });
+        } catch (err) {
+          post("dep-cache-has-err", { id: msg.id, error: String(err?.message || err) });
+        }
+      })();
+      break;
+    case "dep-cache-save":
+      (async () => {
+        try {
+          const res = depCache ? await depCache.save(msg.key, msg.dir, msg.aliases || []) : null;
+          post("dep-cache-save-ok", { id: msg.id, result: res });
+        } catch (err) {
+          post("dep-cache-save-err", { id: msg.id, error: String(err?.message || err) });
+        }
+      })();
+      break;
+    case "dep-cache-restore":
+      (async () => {
+        try {
+          // Mirror every restored path through the write-behind store so the
+          // cache-restored node_modules survives a reload exactly like one a real
+          // install produced (which FsServer would have mirrored per-mutation).
+          const onPath = server && server.persistence ? (p) => server.persistence.onWrite(p) : undefined;
+          const count = depCache ? await depCache.restore(msg.key, msg.dir, onPath) : 0;
+          post("dep-cache-restore-ok", { id: msg.id, count });
+        } catch (err) {
+          post("dep-cache-restore-err", { id: msg.id, error: String(err?.message || err) });
+        }
+      })();
       break;
   }
 }
@@ -185,6 +225,52 @@ const shouldPersist = (p) => {
   return true;
 };
 
+// OPFS-backed blob store for the dependency cache (P1). Snapshots live under a
+// SEPARATE origin dir (vv-depcache/) from the VFS mirror (vv-vfs/), one flat
+// file per key (the key is percent-encoded so it's a safe filename). Sync access
+// handles are available here (a Worker), the same primitive the VFS mirror uses.
+async function createOpfsDepStorage() {
+  const origin = await navigator.storage.getDirectory();
+  const base = await origin.getDirectoryHandle("vv-depcache", { create: true });
+  const nameFor = (key) => encodeURIComponent(key);
+  return {
+    async get(key) {
+      try {
+        const fh = await base.getFileHandle(nameFor(key));
+        const ah = await fh.createSyncAccessHandle();
+        try {
+          const size = ah.getSize();
+          const buf = new Uint8Array(size);
+          if (size) ah.read(buf, { at: 0 });
+          return buf;
+        } finally {
+          ah.close();
+        }
+      } catch {
+        return null; // absent
+      }
+    },
+    async put(key, bytes) {
+      const fh = await base.getFileHandle(nameFor(key), { create: true });
+      const ah = await fh.createSyncAccessHandle();
+      try {
+        ah.truncate(0);
+        if (bytes && bytes.length) ah.write(bytes, { at: 0 });
+        ah.flush();
+      } finally {
+        ah.close();
+      }
+    },
+    async delete(key) {
+      try {
+        await base.removeEntry(nameFor(key));
+      } catch {
+        /* already gone */
+      }
+    },
+  };
+}
+
 (async () => {
   // Pass the wasm URL explicitly instead of relying on the glue's default
   // `new URL('..._bg.wasm', import.meta.url)`. When this worker is bundled the
@@ -202,9 +288,10 @@ const shouldPersist = (p) => {
   // Best-effort OPFS persistence. If the API is missing or throws (private
   // mode, quota, older engine), we run exactly like before — purely in RAM.
   let persistence = null;
+  accessRef = buildAccess(vfs);
   try {
     if (typeof navigator !== "undefined" && navigator.storage && navigator.storage.getDirectory) {
-      persistence = await createOpfsPersistence({ access: buildAccess(vfs), shouldPersist });
+      persistence = await createOpfsPersistence({ access: accessRef, shouldPersist });
       // Restoring a saved project (esp. its node_modules) can take a while — the
       // VFS is re-hydrated entry-by-entry. Report progress so the user knows the
       // "stall" is real work, not a hang. Only chatter when there's a lot to do.
@@ -228,6 +315,19 @@ const shouldPersist = (p) => {
   } catch (err) {
     post("log", { line: "  [opfs] persistence unavailable: " + (err?.message || err), cls: "muted" });
     persistence = null;
+  }
+
+  // Persistent dependency cache (P1): OPFS-backed node_modules snapshots keyed by
+  // lockfile. Independent of the write-behind mirror above — if it fails to
+  // initialize we simply have no dep cache (installs run as before).
+  try {
+    if (typeof navigator !== "undefined" && navigator.storage && navigator.storage.getDirectory) {
+      const storage = await createOpfsDepStorage();
+      depCache = await createDepCache({ access: accessRef, storage });
+    }
+  } catch (err) {
+    post("log", { line: "  [depcache] unavailable: " + (err?.message || err), cls: "muted" });
+    depCache = null;
   }
 
   server = new FsServer(vfs, persistence);

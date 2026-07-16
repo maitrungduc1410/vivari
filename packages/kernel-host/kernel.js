@@ -250,6 +250,9 @@ export class Kernel {
       finalized: false,
       handle: null,
       command: spec.command,
+      // The launch args, kept so process exit can report the full invocation (e.g.
+      // detecting an `npm install` completing, to snapshot the dependency cache).
+      args: spec.args || [],
       // Launch cwd (absolute). Used to attribute a server's `listen()` back to the
       // project it was started in — even for a manually run `npm start` that has no
       // VV_RUN wiring (see kernel-worker's projectDirForPid).
@@ -401,6 +404,11 @@ export class Kernel {
       signal,
       stdout: proc.outBuf.join(""),
       stderr: proc.errBuf.join(""),
+      // The invocation, so an observer (kernel-worker's onProcExit) can tell that
+      // e.g. an `npm install` in a given cwd just finished and snapshot its deps.
+      command: proc.command,
+      args: proc.args || [],
+      cwd: proc.cwd,
     };
     if (proc.onExit) proc.onExit(result);
     if (this.onProcExit) this.onProcExit(pid, result);

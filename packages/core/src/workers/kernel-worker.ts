@@ -24,6 +24,7 @@ import { ensureRealYarn } from "../../../kernel-host/load-real-yarn.js";
 import { ensureRealPnpm } from "../../../kernel-host/load-real-pnpm.js";
 import { ensureRealCorepack } from "../../../kernel-host/load-real-corepack.js";
 import { ensureRealTsgo, applyTsgoLoadingShims } from "../../../kernel-host/load-real-tsgo.js";
+import { hashDepKey } from "../../../kernel-host/dep-cache.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
@@ -487,9 +488,13 @@ function scaffoldDemo(id) {
 // Install only if node_modules isn't there yet, so a re-run with deps present goes
 // straight to the dev server (and EADDRINUSEs naturally if one is already bound —
 // we deliberately don't paper over that).
-function demoRunCommand(d) {
+async function demoRunCommand(d) {
   const run = d.runArgs && d.runArgs.length ? `${d.runCmd} ${d.runArgs.join(" ")}` : d.runCmd;
-  return kernel.exists(d.dir + "/node_modules") ? run : `npm install && ${run}`;
+  if (kernel.exists(d.dir + "/node_modules")) return run;
+  // Deps not present yet — try the persistent cache before falling back to a real
+  // install. The demos install with npm.
+  if (await tryRestoreDeps(d.dir, "npm")) return run;
+  return `npm install && ${run}`;
 }
 
 // Drive the preview once a demo's server actually answers: wait until it serves
@@ -554,7 +559,165 @@ function projectDirForPid(pid) {
 }
 
 let kernel = null;
+// The kernel-fs client (createKernelFs return), kept module-scoped so the
+// dependency-cache round-trips (depCacheHas/Save/Restore) are reachable from the
+// project/demo run helpers and the process-exit snapshot hook. Set in boot().
+let kernelFsRef = null;
 const listening = new Set();
+
+// ── Persistent dependency cache (P1) ─────────────────────────────────────────
+// Cache the RESULT of an install (node_modules) keyed by the lockfile, so a
+// project whose deps were installed before (this project after a reset, or a
+// different project with the same lockfile) skips `npm/yarn/pnpm install` and
+// restores node_modules from an OPFS snapshot instead. The snapshot store lives
+// in the FS Worker (dep-cache.js); here we decide WHEN to restore/snapshot and
+// compute the lockfile-derived cache key.
+const LOCKFILES = {
+  npm: ["package-lock.json", "npm-shrinkwrap.json"],
+  yarn: ["yarn.lock"],
+  pnpm: ["pnpm-lock.yaml"],
+};
+
+// Map a command / install string ("npm", "npm install", "pnpm i", "yarn") to a
+// package-manager name. Defaults to npm.
+function pmName(hint) {
+  const first = String(hint || "").trim().split(/\s+/)[0] || "";
+  if (/pnpm/.test(first)) return "pnpm";
+  if (/yarn/.test(first)) return "yarn";
+  return "npm";
+}
+
+// The bytes we hash into a cache key for `dir`: the PM's lockfile if present,
+// else package.json (so a brand-new template still gets a key before its first
+// lockfile is generated). Returns { bytes, src } or null.
+function depKeyInput(dir, pm) {
+  const base = String(dir).replace(/\/+$/, "");
+  for (const lf of LOCKFILES[pm] || []) {
+    const p = base + "/" + lf;
+    try {
+      if (kernel.exists(p)) return { bytes: kernel.readFileBytes(p), src: lf };
+    } catch {
+      /* unreadable — fall through */
+    }
+  }
+  const pj = base + "/package.json";
+  try {
+    if (kernel.exists(pj)) return { bytes: kernel.readFileBytes(pj), src: "package.json" };
+  } catch {
+    /* none */
+  }
+  return null;
+}
+
+// The key used to LOOK UP a snapshot before install: lockfile if present, else
+// package.json. Returns null when there's nothing to key on.
+async function computeDepKey(dir, pm) {
+  const inp = depKeyInput(dir, pm);
+  if (!inp) return null;
+  return await hashDepKey(pm, inp.bytes, inp.src);
+}
+
+// The keys used to SAVE a snapshot after install: the primary (lockfile if it
+// now exists, else package.json) plus, when a lockfile exists, an ALIAS on the
+// package.json hash — so a future fresh project of the same template (which has
+// no lockfile yet) still hits this snapshot on its pre-install lookup.
+async function computeDepSaveKeys(dir, pm) {
+  const base = String(dir).replace(/\/+$/, "");
+  let lock = null;
+  for (const lf of LOCKFILES[pm] || []) {
+    const p = base + "/" + lf;
+    try {
+      if (kernel.exists(p)) { lock = { bytes: kernel.readFileBytes(p), src: lf }; break; }
+    } catch { /* skip */ }
+  }
+  let pj = null;
+  try {
+    const p = base + "/package.json";
+    if (kernel.exists(p)) pj = { bytes: kernel.readFileBytes(p), src: "package.json" };
+  } catch { /* none */ }
+  const primaryInput = lock || pj;
+  if (!primaryInput) return null;
+  const primary = await hashDepKey(pm, primaryInput.bytes, primaryInput.src);
+  const aliases = [];
+  if (lock && pj) {
+    const pjKey = await hashDepKey(pm, pj.bytes, "package.json");
+    if (pjKey !== primary) aliases.push(pjKey);
+  }
+  return { primary, aliases };
+}
+
+// Try to restore node_modules for `dir` from the dependency cache. Returns true
+// (and the shell can skip install) only on a real restore. Best-effort: any
+// failure just falls back to a normal install.
+async function tryRestoreDeps(dir, pmHint) {
+  try {
+    if (!kernelFsRef || !kernel) return false;
+    const pm = pmName(pmHint);
+    const key = await computeDepKey(dir, pm);
+    if (!key) return false;
+    if (!(await kernelFsRef.depCacheHas(key))) return false;
+    const t0 = Date.now();
+    const count = await kernelFsRef.depCacheRestore(key, dir);
+    if (count > 0) {
+      post("log", {
+        line: `  [depcache] restored node_modules for ${pm} (${count} entries, ${Date.now() - t0}ms) — skipping install.`,
+        dim: true,
+      });
+      return true;
+    }
+  } catch {
+    /* best effort — fall back to install */
+  }
+  return false;
+}
+
+// Dirs with an in-flight snapshot, so two install exits racing on the same
+// project don't both pack node_modules.
+const snapshotInFlight = new Set();
+
+// Snapshot node_modules for `dir` into the dependency cache after a successful
+// install. Best-effort, and a no-op if a snapshot for the current lockfile
+// already exists (an unchanged re-install), so it never re-packs needlessly.
+async function maybeSnapshotDeps(dir, pmHint) {
+  if (snapshotInFlight.has(dir)) return;
+  snapshotInFlight.add(dir);
+  try {
+    if (!kernelFsRef || !kernel) return;
+    if (!kernel.exists(dir + "/node_modules")) return;
+    const pm = pmName(pmHint);
+    const keys = await computeDepSaveKeys(dir, pm);
+    if (!keys) return;
+    if (await kernelFsRef.depCacheHas(keys.primary)) return; // already cached
+    const res = await kernelFsRef.depCacheSave(keys.primary, dir, keys.aliases);
+    if (res) {
+      post("log", {
+        line: `  [depcache] cached node_modules for ${pm} (${res.files} files, ${(res.bytes / 1048576).toFixed(1)} MB).`,
+        dim: true,
+      });
+    }
+  } catch {
+    /* best effort */
+  } finally {
+    snapshotInFlight.delete(dir);
+  }
+}
+
+// Does this invocation install dependencies (so its exit-0 should snapshot)?
+// Returns the PM name or null. Covers npm/pnpm install|ci|i|add and bare `yarn`.
+function installInvocation(command, args) {
+  const pm = pmName(command);
+  const positional = (args || []).map(String).filter((a) => !a.startsWith("-"));
+  const sub = positional[0];
+  if (pm === "yarn") {
+    // bare `yarn` (no subcommand) = install; `yarn install`/`yarn add` too.
+    if (sub === undefined || sub === "install" || sub === "add") return "yarn";
+    return null;
+  }
+  const installSubs = pm === "pnpm"
+    ? ["install", "i", "add", "update"]
+    : ["install", "i", "ci", "add", "update"];
+  return installSubs.includes(sub) ? pm : null;
+}
 // Interactive terminals: each xterm in the UI is backed by a long-lived `sh`
 // process. Map both ways so a shell's output goes to the right terminal and the
 // terminal's keystrokes go back to its pid. Demo/build output (npm, dev servers)
@@ -692,20 +855,25 @@ function spawnProcess(execId, command, args, cwd, extraEnv) {
   post("proc-started", { execId, pid });
 }
 
-function openTerminal(terminalId, cwd, demoId, run) {
+async function openTerminal(terminalId, cwd, demoId, run) {
   if (!kernel) return;
   const d = demoId ? DEMOS[demoId] : null;
   if (d) scaffoldDemo(demoId);
   const dir = (d ? d.dir : cwd) || defaultTermCwd();
   const env = baseProcEnv(dir);
-  if (d) env.VV_RUN = demoRunCommand(d);
+  if (d) env.VV_RUN = await demoRunCommand(d);
   // A created/opened project's "Run" (or auto-run after create) hands us an
-  // explicit command; install is skipped automatically once node_modules exists.
+  // explicit command; install is skipped once node_modules exists, or restored
+  // from the persistent dependency cache when a matching lockfile snapshot exists.
   else if (run) {
     const p = projects.get(dir);
     const install = p && p.install ? p.install : "npm install";
     const devCmd = run;
-    env.VV_RUN = kernel.exists(dir + "/node_modules") ? devCmd : `${install} && ${devCmd}`;
+    let vvRun;
+    if (kernel.exists(dir + "/node_modules")) vvRun = devCmd;
+    else if (await tryRestoreDeps(dir, install)) vvRun = devCmd;
+    else vvRun = `${install} && ${devCmd}`;
+    env.VV_RUN = vvRun;
     // Merge any template-declared environment (memory/telemetry levers the
     // framework honors — e.g. NUXT_TELEMETRY_DISABLED). Applied last so a
     // template can override a default if it must.
@@ -934,6 +1102,7 @@ async function boot() {
 
   await fsReady;
   const kernelFs = createKernelFs(fsWorker);
+  kernelFsRef = kernelFs;
   onKernelFsMessage = kernelFs.onMessage;
   post("log", { line: `  [boot] file system ready (+${Date.now() - t0}ms).`, dim: true });
 
@@ -1017,6 +1186,15 @@ async function boot() {
     },
   });
   kernel.onProcExit = (pid, res) => {
+    // Persistent dependency cache (P1): a package-manager install that just
+    // finished cleanly is our signal to snapshot node_modules. Keying off the
+    // process invocation covers every install path uniformly — the auto-run
+    // `install && dev` shell's npm child, a manually typed `npm install`, and the
+    // SDK `vivari.spawn('npm', ['install'])` path. Fire-and-forget; no-op if the
+    // current lockfile is already cached.
+    const installPm = res && res.code === 0 ? installInvocation(res.command, res.args) : null;
+    if (installPm && res.cwd) void maybeSnapshotDeps(res.cwd, installPm);
+
     const eid = execByPid.get(pid);
     if (eid !== undefined) {
       execByPid.delete(pid);
@@ -1703,7 +1881,7 @@ self.onmessage = async (event) => {
   // the project and auto-run its dev command in this shell (VV_RUN), so the server
   // lives in this tab.
   if (m.type === "term-open") {
-    openTerminal(m.terminalId, m.cwd, m.demo, m.run);
+    await openTerminal(m.terminalId, m.cwd, m.demo, m.run);
     return;
   }
   // Keystrokes from an xterm — feed them to that terminal's shell stdin.
