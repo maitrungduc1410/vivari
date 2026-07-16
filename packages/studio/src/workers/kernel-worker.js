@@ -13,13 +13,13 @@
 // where the real in-VM file watcher drives HMR (Vite) or a recompile+restart
 // (Nest --watch) exactly like local development.
 
-import { Kernel } from "../kernel-host/kernel.js";
-import { createKernelFs } from "../kernel-host/kernel-fs.js";
-import { ensureRealNpm } from "../kernel-host/load-real-npm.js";
-import { ensureRealYarn } from "../kernel-host/load-real-yarn.js";
-import { ensureRealPnpm } from "../kernel-host/load-real-pnpm.js";
-import { ensureRealCorepack } from "../kernel-host/load-real-corepack.js";
-import { ensureRealTsgo, applyTsgoLoadingShims } from "../kernel-host/load-real-tsgo.js";
+import { Kernel } from "../../../kernel-host/kernel.js";
+import { createKernelFs } from "../../../kernel-host/kernel-fs.js";
+import { ensureRealNpm } from "../../../kernel-host/load-real-npm.js";
+import { ensureRealYarn } from "../../../kernel-host/load-real-yarn.js";
+import { ensureRealPnpm } from "../../../kernel-host/load-real-pnpm.js";
+import { ensureRealCorepack } from "../../../kernel-host/load-real-corepack.js";
+import { ensureRealTsgo, applyTsgoLoadingShims } from "../../../kernel-host/load-real-tsgo.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
@@ -818,8 +818,8 @@ async function boot() {
   // Kick off the one-time codec compile up front; it runs concurrently with the
   // workers below (we only need the Modules before the first process is spawned).
   const codecsReady = Promise.all([
-    compileWasmModule(new URL("../codec/pkg/open_webcontainer_codec_bg.wasm", import.meta.url)),
-    compileWasmModule(new URL("../crypto/pkg/open_webcontainer_crypto_bg.wasm", import.meta.url)),
+    compileWasmModule(new URL("../../../codec/pkg/vivari_codec_bg.wasm", import.meta.url)),
+    compileWasmModule(new URL("../../../crypto/pkg/vivari_crypto_bg.wasm", import.meta.url)),
   ]);
 
   // Two independent nested workers, kicked off IN PARALLEL so their scripts load +

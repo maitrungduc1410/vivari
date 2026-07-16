@@ -2580,7 +2580,7 @@ Presentation slides for developers — running in the browser
 // `peer vite ">=5 <8"`, so it can't use Vite 8 and is pinned to Vite 7, whose dep
 // optimizer wants esbuild's native binary (no wasm32 build). That now Just Works
 // because the runtime aliases esbuild -> esbuild-wasm at the registry layer and runs
-// its service in-process (see packages/demo/fetcher-worker.js +
+// its service in-process (see packages/studio/src/workers/fetcher-worker.js +
 // packages/runtime/esbuild-inproc-patch.js), and qwikVite runs in `csr: true` mode
 // so it doesn't demand an SSR src/root.tsx entry.
 // ═══════════════════════════════════════════════════════════════════════════

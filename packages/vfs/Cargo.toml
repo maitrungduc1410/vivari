@@ -1,5 +1,5 @@
 [package]
-name = "open-webcontainer-vfs"
+name = "vivari-vfs"
 version = "0.1.0"
 edition = "2021"
 description = "Vivari VFS: in-RAM Virtual File System compiled to WebAssembly"

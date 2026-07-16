@@ -61,9 +61,9 @@ self.addEventListener("message", (event) => {
 // alone is ~900 KB. With the bundles in the Cache Storage the browser serves
 // them from disk: spawns are instant and the app works offline.
 //
-// This is gated on a build id injected by scripts/build-demo.mjs (esbuild
-// `define`). In dev (packages/demo/sw.js, loaded unbundled) the token is never
-// defined, so BUILD_ID is null and ALL caching is skipped — edits keep hot-
+// This is gated on a build id (`__OC_BUILD_ID__`, a build-time `define`). It is
+// currently never defined in the studio build, so BUILD_ID is null and ALL
+// caching is skipped — edits keep hot-
 // reloading exactly as before. `typeof` on an undeclared name is legal and
 // yields "undefined", so this is safe to reference in the un-built file.
 const BUILD_ID = typeof __OC_BUILD_ID__ !== "undefined" ? __OC_BUILD_ID__ : null;
@@ -71,10 +71,9 @@ const CACHE_ON = BUILD_ID !== null;
 const CACHE_PREFIX = "vv-precache-";
 const CACHE_NAME = CACHE_PREFIX + BUILD_ID;
 
-// Directory this SW was served from — e.g. "/packages/demo-dist/" for the build,
-// "/packages/demo/" in dev — and its parent "/packages/". The wasm binaries live
-// in sibling pkg dirs under the parent; everything else (bundles, index.html,
-// vendor) lives under the SW's own dir.
+// Directory this SW was served from (the studio origin root) — and its parent.
+// The wasm binaries live in sibling pkg dirs under the parent; everything else
+// (bundles, index.html) lives under the SW's own dir.
 const SCOPE_DIR = new URL("./", self.location.href).pathname;
 const PARENT_DIR = new URL("../", self.location.href).pathname;
 
@@ -82,13 +81,10 @@ const PARENT_DIR = new URL("../", self.location.href).pathname;
 // + the shell). Resolved against the SW location so it works wherever mounted.
 const PRECACHE = [
   "index.html",
-  "host.js",
   "kernel-worker.js",
   "process-worker.js",
   "fs-worker.js",
   "fetcher-worker.js",
-  "vendor/editor/editor.js", // Monaco + xterm (4 MB) — precache so the IDE is instant + offline
-  "vendor/editor/editor.css",
 ].map((f) => new URL(f, self.location.href).href);
 
 // A same-origin GET we own and may serve cache-first: anything under our own dir

@@ -4,8 +4,8 @@
 // kernel worker (which itself spawns the fs / fetcher / process workers and the
 // Rust/Wasm VFS), registers the preview Service Worker and relays its HTTP
 // requests into the VM, and exposes a tiny typed pub/sub over the worker's
-// message protocol. All of the message shapes below mirror packages/demo's
-// kernel-worker.js — the source of truth we bundle here via Vite.
+// message protocol. All of the message shapes below mirror the studio's
+// workers/kernel-worker.js — the source of truth we bundle here via Vite.
 //
 // Vite bundles the worker + its nested `new Worker(new URL('./fs-worker.js' |
 // './process-worker.js', import.meta.url))` and every `new URL('../*/pkg/*_bg
@@ -31,7 +31,7 @@ export class KernelBridge {
 
   constructor() {
     this.worker = new Worker(
-      new URL("../../../demo/kernel-worker.js", import.meta.url),
+      new URL("../workers/kernel-worker.js", import.meta.url),
       { type: "module", name: "Kernel Worker" },
     );
     this.worker.onmessage = (event: MessageEvent<KernelMessage>) => {

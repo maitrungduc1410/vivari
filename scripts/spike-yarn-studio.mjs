@@ -78,7 +78,7 @@ const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, fetcher });
 kernel.installCoreutils();
 
 // ── the wiring under test: the SHARED loader, fed the vendor asset ───────────
-// This is exactly what packages/demo/kernel-worker.js does at boot (there the
+// This is exactly what packages/studio/src/workers/kernel-worker.js does at boot (there the
 // bytes come from fetch('/vendor/yarn-pack.bin'); here from disk). Large files
 // (cli.js) go through kernel.fs.writeLarge, so the pump must be alive: it is,
 // via onKernelFsMessage above.

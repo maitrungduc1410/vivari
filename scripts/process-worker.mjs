@@ -1,5 +1,5 @@
 // Node worker_threads entry for a single process (used by the headless test and
-// as the Node-side twin of the browser's demo/process-worker.js).
+// as the Node-side twin of the browser's packages/studio/src/workers/process-worker.js).
 
 import { parentPort, markAsUntransferable } from "node:worker_threads";
 import { createRequire } from "node:module";
@@ -12,8 +12,8 @@ import { bootProcess } from "../packages/runtime/boot.js";
 // compresses/hashes never compiles the codec. require.resolve only resolves the
 // path (no compile), so we can still detect an unbuilt codec up front.
 const require = createRequire(import.meta.url);
-const CODEC_MOD = "../packages/codec/pkg-node/open_webcontainer_codec.js";
-const CRYPTO_MOD = "../packages/crypto/pkg-node/open_webcontainer_crypto.js";
+const CODEC_MOD = "../packages/codec/pkg-node/vivari_codec.js";
+const CRYPTO_MOD = "../packages/crypto/pkg-node/vivari_crypto.js";
 
 let makeZStream = null;
 try {

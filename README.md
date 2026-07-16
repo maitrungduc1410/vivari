@@ -54,15 +54,14 @@ packages/
     boot.js          process bootstrap used by both env worker entries
     builtins/        fs, path, process, os, events, util, buffer, assert,
                      child_process, http
-  demo/
-    process-worker.js  browser worker entry for one process
-    sw.js              preview Service Worker (fetch → kernel → virtual server)
-    host.js            boots the Wasm VFS + Kernel, runs a shell + http server
-    index.html         split terminal / preview layout
+  studio/            the React IDE (the app) — Vite + React + Tailwind
+    src/workers/     browser worker entries: kernel / fs / fetcher / process
+    src/vv/          KernelBridge + IdeController + built-in templates
+    public/sw.js     preview Service Worker (fetch → kernel → virtual server)
 scripts/
   process-worker.mjs Node worker entry for one process
   verify-node.mjs    headless end-to-end check (no browser needed)
-server.mjs           static dev server that sends the COOP/COEP headers
+  fixtures/          test fixtures (e.g. the napi-crc32 N-API addon)
 ```
 
 ## Run it
@@ -72,10 +71,10 @@ Prereqs: Rust + `wasm-pack`, and Node.
 ```bash
 npm run build      # compile the Rust VFS to Wasm (web + node targets)
 npm run verify     # headless proof the sync-bridge works end-to-end
-npm run dev        # then open http://localhost:8080/packages/demo/index.html
+npm run dev        # start the studio IDE (Vite dev server)
 ```
 
-In the browser demo you'll see a shell script run where each command (`echo`,
+In the studio you'll see a shell script run where each command (`echo`,
 `ls`, `node app.js`, ...) is its own worker/process with a PID, coordinated by the
 kernel over a shared Rust VFS. A `node` process even spawns its own child via
 `execSync` — the parent blocks on the child through the same Atomics bridge. Then

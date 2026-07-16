@@ -1,5 +1,5 @@
 [package]
-name = "open-webcontainer-codec"
+name = "vivari-codec"
 version = "0.1.0"
 edition = "2021"
 description = "Vivari compression codec (zlib/deflate/gzip + brotli) compiled to WebAssembly, running in-process beneath Node's real lib/zlib.js"

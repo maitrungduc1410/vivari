@@ -1092,7 +1092,7 @@ console.log('out=' + JSON.stringify(fs.readFileSync('/work/out.txt', 'utf8')));
   // the napi_* import surface, while the wasm's wasi_snapshot_preview1 imports
   // are satisfied by our own require('wasi'). crc32/crc32c must match the values
   // the same addon produces under host Node (907060870 / 2591144780).
-  const crc32Dir = new URL("../packages/demo/vendor/napi-crc32/", import.meta.url);
+  const crc32Dir = new URL("./fixtures/napi-crc32/", import.meta.url);
   kernel.mkdirp("/napi/node_modules/@node-rs/crc32-wasm32-wasi");
   const crcBase = "/napi/node_modules/@node-rs/crc32-wasm32-wasi/";
   kernel.writeFile(crcBase + "package.json", readFileSync(new URL("package.json", crc32Dir), "utf8"));

@@ -7,7 +7,7 @@
 //   1. Registry-level native->wasm aliasing (NATIVE_WASM_ALIASES, below).
 //      Some tools ship no wasm32 native build; their official WASM drop-in is a
 //      DIFFERENTLY-NAMED package that npm's platform auto-select can never reach.
-//      The Fetcher Worker (packages/demo/fetcher-worker.js) imports this table and
+//      The Fetcher Worker (packages/studio/src/workers/fetcher-worker.js) imports this table and
 //      serves the TARGET's packument under the SOURCE name, so `npm install esbuild`
 //      transparently downloads esbuild-wasm's tarball into node_modules/esbuild —
 //      StackBlitz-style, with the project's package.json left pristine.
@@ -26,7 +26,7 @@
 
 /**
  * Native package name -> its official, API-compatible WASM drop-in package name.
- * Consumed by packages/demo/fetcher-worker.js (registry packument aliasing).
+ * Consumed by packages/studio/src/workers/fetcher-worker.js (registry packument aliasing).
  * @type {Record<string, string>}
  */
 export const NATIVE_WASM_ALIASES = {

@@ -1,5 +1,5 @@
 // The File System Worker (Phase 2 #14), headless side — the Node worker_threads
-// twin of packages/demo/fs-worker.js. Owns the Rust/Wasm VFS (nodejs target,
+// twin of packages/studio/src/workers/fs-worker.js. Owns the Rust/Wasm VFS (nodejs target,
 // loaded synchronously) and services fs syscalls for the kernel and every
 // process over their SABs, off the kernel's thread.
 
@@ -8,7 +8,7 @@ import { createRequire } from "node:module";
 import { FsServer } from "../packages/kernel-host/fs-server.js";
 
 const require = createRequire(import.meta.url);
-const wasm = require("../packages/vfs/pkg-node/open_webcontainer_vfs.js");
+const wasm = require("../packages/vfs/pkg-node/vivari_vfs.js");
 
 const server = new FsServer(new wasm.VirtualFileSystem());
 

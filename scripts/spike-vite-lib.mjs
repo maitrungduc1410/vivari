@@ -91,7 +91,7 @@ export async function runViteSpike({ name, dir, files, entryModule, titleMarker 
     };
   };
 
-  // Transparent wasm drop-in aliasing — mirrors packages/demo/fetcher-worker.js
+  // Transparent wasm drop-in aliasing — mirrors packages/studio/src/workers/fetcher-worker.js
   // (PACKAGE_ALIASES). esbuild/rollup ship no wasm32 native build; their official
   // WASM drop-ins live under a different package name, which npm's platform
   // auto-select can't reach. Aliasing at the registry layer (serve the target's
