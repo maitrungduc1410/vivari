@@ -200,6 +200,10 @@ export const VV_PATH_MIME = "application/x-vv-path";
 // A flat, path-keyed file tree used by import/export/share.
 export type FileTree = { path: string; bytes: Uint8Array }[];
 
+// The result of reading an OS folder/drop into a project tree: the files plus a
+// flag noting whether a (skipped) node_modules was present, so import can say so.
+export type ImportTree = { name: string; files: FileTree; excludedNodeModules: boolean };
+
 // Practical cap on a shareable-URL length; beyond this the link is unwieldy.
 const MAX_SHARE_URL_LEN = 1_800_000;
 
@@ -219,37 +223,49 @@ function downloadBlob(blob: Blob, filename: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-// Never import these into a project (regenerated, huge, or VCS metadata).
+// Never import these into a project — at ANY depth (monorepos have many nested
+// node_modules), since they're regenerated, huge, or VCS metadata.
 function skipImportPath(path: string): boolean {
   return path.split("/").some((seg) => seg === "node_modules" || seg === ".git");
+}
+function hasNodeModules(path: string): boolean {
+  return path.split("/").some((seg) => seg === "node_modules");
 }
 
 // Read a <input type="file" webkitdirectory> selection into a flat file tree.
 // webkitRelativePath is "<pickedDir>/a/b.js"; strip the leading picked-dir
 // segment so the project root holds a/b.js directly. Returns a suggested name.
-export async function treeFromFileList(list: FileList): Promise<{ name: string; files: FileTree }> {
+export async function treeFromFileList(list: FileList): Promise<ImportTree> {
   let top = "";
+  let excludedNodeModules = false;
   const files: FileTree = [];
   for (const file of Array.from(list)) {
     const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
     const parts = rel.split("/").filter(Boolean);
     if (parts.length > 1 && !top) top = parts[0];
     const path = parts.length > 1 && parts[0] === top ? parts.slice(1).join("/") : rel;
-    if (!path || skipImportPath(path)) continue;
+    if (!path || skipImportPath(path)) {
+      if (path && hasNodeModules(path)) excludedNodeModules = true;
+      continue;
+    }
     files.push({ path, bytes: new Uint8Array(await file.arrayBuffer()) });
   }
-  return { name: top || "imported-project", files };
+  return { name: top || "imported-project", files, excludedNodeModules };
 }
 
 // Read an OS drop (DataTransfer entries) into a flat file tree. A single dropped
 // folder becomes the project; loose files / multiple items land at the root.
-export async function treeFromDrop(entries: FileSystemEntry[]): Promise<{ name: string; files: FileTree }> {
+export async function treeFromDrop(entries: FileSystemEntry[]): Promise<ImportTree> {
   const files: FileTree = [];
+  let excludedNodeModules = false;
   const single = entries.length === 1 && entries[0].isDirectory ? entries[0] : null;
   const roots = single ? await readDirEntries(single as FileSystemDirectoryEntry) : entries;
   const walk = async (entry: FileSystemEntry, prefix: string): Promise<void> => {
     const path = prefix ? prefix + "/" + entry.name : entry.name;
-    if (skipImportPath(path)) return;
+    if (skipImportPath(path)) {
+      if (hasNodeModules(path)) excludedNodeModules = true;
+      return;
+    }
     if (entry.isFile) {
       const file = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej));
       files.push({ path, bytes: new Uint8Array(await file.arrayBuffer()) });
@@ -259,7 +275,7 @@ export async function treeFromDrop(entries: FileSystemEntry[]): Promise<{ name: 
     }
   };
   for (const r of roots) await walk(r, "");
-  return { name: single ? single.name : "imported-project", files };
+  return { name: single ? single.name : "imported-project", files, excludedNodeModules };
 }
 
 // Extract OS FileSystemEntry objects from a drop's DataTransfer. MUST be called
@@ -1721,8 +1737,13 @@ export class IdeController {
     if (!files.length) { toast.error("Nothing to export in this project."); return; }
     try {
       const zip = await createZip(files);
-      downloadBlob(new Blob([zip as BlobPart], { type: "application/zip" }), (baseName(root) || "project") + ".zip");
-      this.set({ status: `exported ${files.length} file${files.length === 1 ? "" : "s"} → ${baseName(root) || "project"}.zip` });
+      const filename = (baseName(root) || "project") + ".zip";
+      downloadBlob(new Blob([zip as BlobPart], { type: "application/zip" }), filename);
+      const count = `${files.length} file${files.length === 1 ? "" : "s"}`;
+      this.set({ status: `exported ${count} → ${filename}` });
+      toast.success(`Exported ${filename}`, {
+        description: `${count} · node_modules excluded`,
+      });
       if (truncated) toast.warning("Project was large — the export was truncated.");
     } catch (err) {
       toast.error("Export failed: " + errText(err));
@@ -1768,7 +1789,10 @@ export class IdeController {
   }
 
   // Create a NEW project from an in-memory file tree (folder import / shared URL).
-  async importFilesAsProject({ name, dir, files }: { name: string; dir: string; files: FileTree }): Promise<boolean> {
+  async importFilesAsProject(
+    { name, dir, files, excludedNodeModules }:
+    { name: string; dir: string; files: FileTree; excludedNodeModules?: boolean },
+  ): Promise<boolean> {
     if (!this.snap.kernelReady) { toast.error("Kernel is still starting — try again in a moment."); return false; }
     if (!files.length) { toast.error("No files to import."); return false; }
     const root = normDir(dir);
@@ -1785,7 +1809,12 @@ export class IdeController {
     this.openFolder(root, name);
     const openTarget = manifest?.entry || files.find((f) => f.path === "package.json")?.path || files[0]?.path;
     if (openTarget) void this.openFile(root + "/" + openTarget);
-    this.set({ status: `imported ${files.length} file${files.length === 1 ? "" : "s"} as ${name}` });
+    const note = excludedNodeModules ? " (node_modules excluded)" : "";
+    const count = `${files.length} file${files.length === 1 ? "" : "s"}`;
+    this.set({ status: `imported ${count} as ${name}${note}` });
+    toast.success(`Imported ${name} — ${count}${note}`, {
+      description: excludedNodeModules ? "Run the project to reinstall dependencies." : undefined,
+    });
     return true;
   }
 
@@ -1801,11 +1830,16 @@ export class IdeController {
       const payload = await encodeShare({ name: baseName(root) || "project", files });
       const url = location.origin + location.pathname + "#share=" + payload;
       if (url.length > MAX_SHARE_URL_LEN) { toast.error("Project is too big to share as a link."); return null; }
+      const kb = Math.max(1, Math.round(url.length / 1024));
       try {
         await navigator.clipboard.writeText(url);
-        this.set({ status: `share link copied (${Math.round(url.length / 1024)} KB)` });
+        this.set({ status: `share link copied (${kb} KB)` });
+        toast.success("Share link copied to clipboard.", {
+          description: `Self-contained · source only · ${kb} KB`,
+        });
       } catch {
         this.set({ status: "share link ready" });
+        toast.warning("Couldn't copy to clipboard — copy the link from the address bar.");
       }
       return url;
     } catch (err) {
@@ -1837,10 +1871,10 @@ export class IdeController {
     input.onchange = async () => {
       const list = input.files;
       if (!list || !list.length) return;
-      const { name, files } = await treeFromFileList(list);
+      const { name, files, excludedNodeModules } = await treeFromFileList(list);
       if (!files.length) { toast.error("No importable files in that folder."); return; }
       const dir = await this.freeDirFor(name);
-      await this.importFilesAsProject({ name: baseName(dir) || name, dir, files });
+      await this.importFilesAsProject({ name: baseName(dir) || name, dir, files, excludedNodeModules });
     };
     input.click();
   }
@@ -1849,10 +1883,10 @@ export class IdeController {
   async importDropAsProject(entries: FileSystemEntry[]) {
     if (!this.snap.kernelReady) { toast.error("Kernel is still starting — try again in a moment."); return; }
     if (!entries.length) return;
-    const { name, files } = await treeFromDrop(entries);
+    const { name, files, excludedNodeModules } = await treeFromDrop(entries);
     if (!files.length) { toast.error("No importable files were dropped."); return; }
     const dir = await this.freeDirFor(name);
-    await this.importFilesAsProject({ name: baseName(dir) || name, dir, files });
+    await this.importFilesAsProject({ name: baseName(dir) || name, dir, files, excludedNodeModules });
   }
 
   // Command-palette convenience: export / share the active workspace folder.
