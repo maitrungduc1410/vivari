@@ -669,8 +669,9 @@ import and shared-link load. The controller (`vv/controller.ts`) exposes `export
 beyond the cap), plus an OS folder picker (`<input webkitdirectory>`) and a Home drag-drop zone. A
 boot hook (`loadSharedFromUrl`, once the kernel is ready) decodes a `#share=` payload into a new
 project and clears the hash so a reload doesn't re-import. A shared link lands straight on the
-(loading) workspace — never Home, so the user can't accidentally start a new project mid-bootstrap —
-with a Sonner loading toast that resolves to success/failure. Imported/shared projects with a runnable
+workspace — never Home, so the user can't accidentally start a new project mid-bootstrap — behind a
+full-screen blocking overlay (`ShareLoadingOverlay`, spinner + staged text) that clears once the
+project opens; a bottom-left success/error toast then fires. Imported/shared projects with a runnable
 `package.json` script get a **synthesized run manifest** so the Run button auto-installs + starts a
 dev server. Entry points: Home "Import a folder" card, the command palette (Import/Export/Share), and
 the Explorer root context-menu. Proof: `scripts/spike-zip-share.mjs` (re-decodes the ZIP with Node's
