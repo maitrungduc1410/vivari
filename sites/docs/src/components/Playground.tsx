@@ -1,4 +1,5 @@
 import React from "react";
+import useDocusaurusContext from "@docusaurus/useDocusaurusContext";
 
 // Embeds a real, running Vivari example via an <iframe> pointing at the sibling
 // /embed/ app (a cross-origin isolated page on the same origin). Because the docs
@@ -20,6 +21,7 @@ export default function Playground({
   height?: number;
   title?: string;
 }): React.JSX.Element {
+  const { siteConfig } = useDocusaurusContext();
   const label =
     title ?? (scenario === "react" ? "Live React dev server" : "Live Node terminal");
 
@@ -31,7 +33,7 @@ export default function Playground({
         <span style={{ flex: 1 }} />
         <a
           className="vv-playground__link"
-          href="/studio/"
+          href={`${siteConfig.url}/studio/`}
           target="_blank"
           rel="noreferrer"
         >

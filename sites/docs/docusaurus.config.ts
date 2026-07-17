@@ -3,6 +3,12 @@ import type { Config } from "@docusaurus/types";
 import type * as Preset from "@docusaurus/preset-classic";
 
 const GITHUB_URL = "https://github.com/maitrungduc1410/vivari";
+// The sibling apps (landing at `/`, studio at `/studio/`) live at the origin root,
+// outside the docs baseUrl (`/docs/`). Docusaurus prefixes baseUrl onto any
+// path-like link (`to`, `href`, `pathname://`) and route-checks it, so linking to
+// them requires an absolute URL, which Docusaurus treats as external (no baseUrl,
+// no broken-link check).
+const SITE_URL = "https://vivari.pages.dev";
 
 const config: Config = {
   title: "Vivari",
@@ -11,7 +17,7 @@ const config: Config = {
 
   // Deployed as part of a single Cloudflare Pages site: the landing lives at `/`,
   // the studio at `/studio/`, and these docs at `/docs/`.
-  url: "https://vivari.pages.dev",
+  url: SITE_URL,
   baseUrl: "/docs/",
 
   organizationName: "maitrungduc1410",
@@ -63,11 +69,10 @@ const config: Config = {
         src: "img/logo.svg",
       },
       items: [
-        // Root-absolute `href`s leave the docs SPA for the sibling apps at the
-        // origin root. `to`/`pathname://` would be resolved against baseUrl
-        // (`/docs/`) and wrongly land on `/docs/studio`, `/docs/`.
-        { href: "/studio/", label: "Studio", position: "left" },
-        { href: "/", label: "Home", position: "left" },
+        // Absolute URLs so they escape the docs baseUrl and reach the sibling apps
+        // at the origin root (see SITE_URL note above).
+        { href: `${SITE_URL}/studio/`, label: "Studio", position: "left" },
+        { href: `${SITE_URL}/`, label: "Home", position: "left" },
         {
           href: GITHUB_URL,
           label: "GitHub",
@@ -90,8 +95,8 @@ const config: Config = {
         {
           title: "Product",
           items: [
-            { label: "Home", href: "/" },
-            { label: "Studio", href: "/studio/" },
+            { label: "Home", href: `${SITE_URL}/` },
+            { label: "Studio", href: `${SITE_URL}/studio/` },
           ],
         },
         {

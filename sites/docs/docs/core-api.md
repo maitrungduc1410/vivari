@@ -92,4 +92,4 @@ Build the same-origin preview URL for a port, and free the workers/VFS.
 `Vivari` is a thin facade over `KernelBridge`, the raw pub/sub transport to the
 kernel worker (`on` / `onAny` / `post` / `request`, SW registration, keep-prefix
 ports). Use it directly if you need the full message vocabulary — it's what the
-[Studio](pathname:///studio/) is built on.
+[Studio](https://vivari.pages.dev/studio/) is built on.

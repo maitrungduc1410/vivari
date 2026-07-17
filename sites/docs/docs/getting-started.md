@@ -74,7 +74,7 @@ back — try importing another `node:` built-in or changing the loop.
 <Playground scenario="node" />
 
 :::tip Run real projects
-To scaffold a full project, `npm install`, and boot a dev server, [open the Studio](pathname:///studio/) or
+To scaffold a full project, `npm install`, and boot a dev server, [open the Studio](https://vivari.pages.dev/studio/) or
 embed the [`<Vivari>` component](./react) on a cross-origin isolated page.
 :::
 

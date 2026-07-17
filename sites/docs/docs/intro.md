@@ -13,13 +13,13 @@ Workers with no server doing the work.
 
 It ships in two forms:
 
-- **The [Studio](pathname:///studio/)** — a full in-browser IDE built on Vivari.
+- **The [Studio](https://vivari.pages.dev/studio/)** — a full in-browser IDE built on Vivari.
 - **The SDK** — [`@vivari/core`](./core-api) (framework-agnostic) and
   [`@vivari/react`](./react) (a `<Vivari>` component + `useVivari()` hook) that
   you can embed in your own app.
 
 :::tip Try it now
-The fastest way to understand Vivari is to [open the Studio](pathname:///studio/) and run a
+The fastest way to understand Vivari is to [open the Studio](https://vivari.pages.dev/studio/) and run a
 template — each shell command becomes its own worker/process, and an in-VM dev
 server is previewed live through a Service Worker.
 :::
