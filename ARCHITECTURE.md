@@ -663,22 +663,29 @@ lazily on first use (a process that never hashes/compresses instantiates neither
 ### 9.1 Toolchain shims (esbuild, rollup, worker pools)
 
 `wasm32-wasi` auto-select (above) covers native addons that publish a wasm build
-as an optional dependency (rolldown, `@node-rs/*`). Two toolchain packages don't
-fit that mould — **esbuild** and **rollup** ship their WASM builds under a
-*different package name* (`esbuild-wasm`, `@rollup/wasm-node`), which npm's
-platform gating can't reach. The runtime bridges the gap so projects stay vanilla
-(no `package.json` "overrides", no per-project launcher). The native→wasm mapping
-is a single source of truth in `packages/runtime/toolchain-shims.js`
-(`NATIVE_WASM_ALIASES`), imported by the Fetcher Worker and guarded by
-`scripts/spike-toolchain.mjs`. Adding a drop-in = one entry there (source+target
-must be published in lockstep and the target must be pure-JS/wasm).
+as an optional dependency (rolldown, `@node-rs/*`). Some packages don't fit that
+mould — they ship a drop-in under a *different package name* that npm's platform
+gating can't reach. The runtime bridges the gap so projects stay vanilla (no
+`package.json` "overrides", no per-project launcher) via **two** alias tables in
+`packages/runtime/toolchain-shims.js`, imported by the Fetcher Worker and guarded
+by `scripts/spike-toolchain.mjs`:
+
+- `NATIVE_WASM_ALIASES` — **lockstep** renames where source+target publish
+  identical versions (`esbuild → esbuild-wasm`, `rollup → @rollup/wasm-node`).
+- `NATIVE_DROPIN_ALIASES` — API-compatible drop-ins whose versions are **not**
+  lockstep (`bcrypt → bcryptjs`). Adding a drop-in to either table = one entry;
+  the target must be pure-JS/wasm with no native deps and be spike- + browser-proven.
 
 - **Registry aliasing** (`packages/core/src/workers/fetcher-worker.ts`): when npm requests the
-  packument for `esbuild`/`rollup`, the Fetcher Worker serves the drop-in's
-  packument rewritten under the source name; npm resolves a lockstep version and
-  downloads the drop-in's real tarball (its own `dist`/integrity) straight into
-  `node_modules/<source>`. Tarballs need no interception. This realizes the
-  `REGISTRY_PROXY`/`rewrite()` seam.
+  packument for an aliased source, the Fetcher Worker serves the drop-in's packument
+  under the source name — **verbatim** for a lockstep rename, or **version-remapped**
+  (`synthesizeRemappedPackument`) for a non-lockstep drop-in: the source's version
+  list + dist-tags are preserved so any `source@<range>` resolves, but each entry
+  points at the target's latest tarball/deps with native-install metadata
+  (scripts/optionalDependencies/cpu/os) stripped. npm then downloads the drop-in's
+  real tarball straight into `node_modules/<source>`; the remap path fetches both the
+  source and target packuments and falls back to the un-aliased fetch on error. This
+  realizes the `REGISTRY_PROXY`/`rewrite()` seam.
 - **In-process esbuild** (`packages/runtime/esbuild-inproc-patch.js`, applied by
   `module.js` at compile time): esbuild-wasm's Node build spawns a child service
   whose stdio pipe deadlocks the single-threaded kernel against a Piscina/tinypool

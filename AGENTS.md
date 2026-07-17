@@ -277,15 +277,24 @@ DIFFERENT package name (`esbuild-wasm`, `@rollup/wasm-node`) that npm's
 platform auto-select (which handles `*-wasm32-wasi` optional deps) can't reach.
 Three runtime pieces close that gap generically, so projects stay vanilla — do
 NOT re-introduce a `package.json` "overrides" block or a per-project launcher:
-The native->wasm alias table is the single source of truth in
-`runtime/toolchain-shims.js` (`NATIVE_WASM_ALIASES`) — add drop-ins THERE, not in
-the fetcher. Requirements for a new entry: source+target published in lockstep,
-target pure-JS/wasm, proven by a spike. It is guarded by `scripts/spike-toolchain.mjs`.
-- **Registry aliasing** (`packages/core/src/workers/fetcher-worker.ts` imports `NATIVE_WASM_ALIASES`): a
-  packument request for `esbuild`/`rollup` is served the drop-in's packument
-  rewritten under the source name; npm then downloads the drop-in's real tarball
-  into `node_modules/<source>` (versions are published in lockstep). Falls back to
-  the un-aliased fetch on error. This is the `REGISTRY_PROXY`/`rewrite()` seam realized.
+Two native->drop-in alias tables in `runtime/toolchain-shims.js` are the single
+source of truth — add drop-ins THERE, not in the fetcher; both are guarded by
+`scripts/spike-toolchain.mjs`:
+  - `NATIVE_WASM_ALIASES` — LOCKSTEP renames (source+target publish identical
+    versions), e.g. `esbuild -> esbuild-wasm`, `rollup -> @rollup/wasm-node`.
+    The target's packument is served verbatim under the source name.
+  - `NATIVE_DROPIN_ALIASES` — API-compatible drop-ins whose versions are NOT
+    lockstep, e.g. `bcrypt -> bcryptjs`. `synthesizeRemappedPackument()` keeps the
+    source's versions + dist-tags (so any `source@<range>` resolves) but points each
+    entry at the target's latest tarball/deps and strips native-install metadata.
+  New-entry requirements (either table): target pure-JS/wasm with no native deps,
+  API-compatible, proven by the spike AND a live browser install.
+- **Registry aliasing** (`packages/core/src/workers/fetcher-worker.ts` imports both
+  tables): a packument request for an aliased source (`esbuild`/`rollup`/`bcrypt`) is
+  served the drop-in's packument under the source name — verbatim for lockstep,
+  version-remapped for non-lockstep — so npm downloads the drop-in's real tarball
+  into `node_modules/<source>`. Falls back to the un-aliased fetch on error. This is
+  the `REGISTRY_PROXY`/`rewrite()` seam realized.
 - **In-process esbuild** (`runtime/esbuild-inproc-patch.js`, invoked from
   `module.js` compile): esbuild-wasm's Node build spawns a child service whose
   stdio pipe deadlocks under a Piscina/tinypool loop; we rewrite `lib/main.js` at

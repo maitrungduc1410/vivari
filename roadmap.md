@@ -1955,6 +1955,29 @@ The harness fetcher now mirrors the browser kernel's transparent wasm drop-in al
 a headless spike installs the exact same tree the studio does — without it, Qwik's Vite-7 tree pulls
 the native esbuild the browser never sees.
 
+**Non-lockstep drop-in aliasing — `bcrypt -> bcryptjs` — DONE.** Extended the registry aliasing
+seam with a second table `NATIVE_DROPIN_ALIASES` (`packages/runtime/toolchain-shims.js`) for
+API-compatible drop-ins whose versions are NOT published in lockstep (so the packument can't be
+served verbatim). `synthesizeRemappedPackument()` keeps the SOURCE's version list + dist-tags — so
+any `bcrypt@<range>` still `semver.maxSatisfying`-resolves — while pointing every entry at the
+TARGET's (bcryptjs) latest tarball + deps and stripping native-install metadata
+(scripts/optionalDependencies/cpu/os). The Fetcher Worker's remap branch fetches both packuments and
+falls back to the plain fetch on error. `bcryptjs` is a zero-dependency pure-JS reimplementation with
+an API-compatible surface (`hash/hashSync/compare/compareSync/genSalt/getRounds`), so `require('bcrypt')`
+Just Works — unblocking the many auth libs that pull native `bcrypt` (which has no wasm build).
+Guarded offline by `scripts/spike-toolchain.mjs` (table + synth structural assertions) and proven
+live in the browser (`npm install bcrypt`; `hashSync`/`compareSync` round-trip).
+
+- **Deferred (documented, not shipped):**
+  - **`@swc/core -> @swc/wasm`** — versions ARE lockstep, but `@swc/wasm` is a wasm-bindgen web build
+    with a *different* loader/API surface (it isn't a registry rename): it would need **sidecar
+    dependency injection** (install the wasm variant alongside and route `@swc/core`'s own fallback to
+    it), not a packument swap. Tractable next, but a distinct mechanism.
+  - **`sharp -> @img/sharp-wasm32`** — uses the Stage 2c optionalDependency/`wasm32-wasi` path, but the
+    wasm build requires **multi-threaded Wasm**, currently blocked upstream in-VM. Revisit when MT-Wasm lands.
+  - **`sqlite3`** — no API-compatible pure-JS/wasm drop-in exists (`better-sqlite3`/`sql.js`/`node:sqlite`
+    all differ in surface), so no safe rename or remap is possible. Out of scope for this mechanism.
+
 **Vite-8 peer-dependency sweep (this change).** All the Vite templates pin `vite ^8.0.0` (Vite 8 =
 rolldown, the only optimizer proven in-VM), but several framework plugins had not yet widened their
 peer range to Vite 8, so `npm install` ERESOLVEd. Findings + fixes, each checked against the registry
