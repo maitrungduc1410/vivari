@@ -109,6 +109,9 @@ export interface IdeSnapshot {
   status: string;
   cwd: string;
   view: "home" | "workspace";
+  // A shared link (#share=) is bootstrapping: show a full-screen blocking overlay.
+  shareLoading: boolean;
+  shareMessage: string;
   projectTitle: string | null;
   workspaceFolders: WorkspaceFolder[];
   activeFolderId: string | null;
@@ -388,6 +391,8 @@ export class IdeController {
     // A shared link lands straight on the (loading) workspace, never Home — so the
     // user can't accidentally start a new project while it bootstraps.
     view: hasSharePayload() ? "workspace" : "home",
+    shareLoading: hasSharePayload(),
+    shareMessage: "Booting the runtime…",
     projectTitle: null,
     workspaceFolders: [],
     activeFolderId: null,
@@ -449,8 +454,6 @@ export class IdeController {
   private portMap = new Map<number, number>(); // port -> pid (live listeners)
   private treeBump: ReturnType<typeof setTimeout> | null = null;
   private started = false;
-  // Sonner id of the "opening shared project…" loading toast (share-URL bootstrap).
-  private shareToastId: string | number | null = null;
 
   constructor() {
     this.bridge = new KernelBridge();
@@ -503,14 +506,10 @@ export class IdeController {
   async start() {
     if (this.started) return;
     this.started = true;
-    // Opened via a shared link: show a spinner immediately so the (blank) workspace
-    // doesn't look idle while the kernel boots and the project is unpacked.
+    // Opened via a shared link: show a full-screen blocking overlay immediately so
+    // the (blank) workspace doesn't look idle while the kernel boots + unpacks.
     if (hasSharePayload()) {
-      this.set({ status: "opening shared project…" });
-      this.shareToastId = toast.loading("Opening shared project…", {
-        description: "Booting the runtime and unpacking files from the link.",
-        position: "bottom-left",
-      });
+      this.set({ status: "opening shared project…", shareLoading: true, shareMessage: "Booting the runtime…" });
     }
     const ok = await this.bridge.registerServiceWorker();
     this.consoleLine(
@@ -1932,33 +1931,30 @@ export class IdeController {
     const idx = hash.indexOf(marker);
     if (idx < 0) return;
     const payload = hash.slice(idx + marker.length);
-    const toastId = this.shareToastId ?? undefined;
     if (!payload) {
-      if (toastId != null) toast.dismiss(toastId);
-      this.shareToastId = null;
+      this.set({ shareLoading: false });
       return;
     }
     history.replaceState(null, "", location.pathname + location.search);
     try {
+      this.set({ shareLoading: true, shareMessage: "Unpacking files…" });
       const { name, files } = await decodeShare(payload);
       const dir = await this.freeDirFor(name);
       const projName = baseName(dir) || this.slug(name);
       const ok = await this.importFilesAsProject({ name: projName, dir, files, silent: true });
       if (ok) {
         toast.success(`Opened shared project “${projName}”`, {
-          id: toastId,
           position: "bottom-left",
           description: `${files.length} file${files.length === 1 ? "" : "s"} · source only · Run to install deps.`,
         });
-      } else {
-        if (toastId != null) toast.dismiss(toastId);
-        if (!this.snap.workspaceFolders.length) this.goHome();
+      } else if (!this.snap.workspaceFolders.length) {
+        this.goHome();
       }
     } catch (err) {
-      toast.error("Couldn't open shared project: " + errText(err), { id: toastId, position: "bottom-left" });
+      toast.error("Couldn't open shared project: " + errText(err), { position: "bottom-left" });
       if (!this.snap.workspaceFolders.length) this.goHome();
     } finally {
-      this.shareToastId = null;
+      this.set({ shareLoading: false });
     }
   }
 
