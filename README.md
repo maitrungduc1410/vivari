@@ -1,5 +1,9 @@
 # Vivari
 
+<div align="center">
+  <img src="./icon.svg" width="128" height="128" />
+</div>
+
 **An open-source WebContainer.** Run Node-style projects (Vite, Express, and more)
 **100% inside the browser** — a virtual filesystem, a Node-compatible runtime, and
 virtual networking, with no server doing the work.
@@ -11,8 +15,7 @@ virtual networking, with no server doing the work.
   <a href="https://www.npmjs.com/package/@vivari/core">npm</a>
 </p>
 
-Vivari is **MIT-licensed** — unlike a proprietary WebContainer API, there is no
-commercial license and no usage fee: embed it, fork it, ship it.
+Vivari is **MIT-licensed** — there is no commercial license and no usage fee: embed it, fork it, ship it.
 
 ## Install
 
