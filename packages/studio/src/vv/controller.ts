@@ -18,6 +18,7 @@ import { toast } from "sonner";
 import type * as Monaco from "monaco-editor";
 import { KernelBridge } from "./kernel";
 import { getTemplate, type TemplateManifest } from "./templates";
+import { createZip, encodeShare, decodeShare } from "../../../kernel-host/archive.js";
 
 // ── Demo matrix (UI side) ────────────────────────────────────────────────────
 // The two hard-coded example projects the kernel worker still scaffolds on demand
@@ -195,6 +196,71 @@ const parentOf = (p: string) => p.slice(0, p.lastIndexOf("/")) || "/";
 // Drag-and-drop wire format: an internal Explorer drag carries the source's
 // absolute path under this MIME type; an OS drag carries File entries instead.
 export const VV_PATH_MIME = "application/x-vv-path";
+
+// A flat, path-keyed file tree used by import/export/share.
+export type FileTree = { path: string; bytes: Uint8Array }[];
+
+// Practical cap on a shareable-URL length; beyond this the link is unwieldy.
+const MAX_SHARE_URL_LEN = 1_800_000;
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+// Download an in-memory Blob to the user's disk (zip export).
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Never import these into a project (regenerated, huge, or VCS metadata).
+function skipImportPath(path: string): boolean {
+  return path.split("/").some((seg) => seg === "node_modules" || seg === ".git");
+}
+
+// Read a <input type="file" webkitdirectory> selection into a flat file tree.
+// webkitRelativePath is "<pickedDir>/a/b.js"; strip the leading picked-dir
+// segment so the project root holds a/b.js directly. Returns a suggested name.
+export async function treeFromFileList(list: FileList): Promise<{ name: string; files: FileTree }> {
+  let top = "";
+  const files: FileTree = [];
+  for (const file of Array.from(list)) {
+    const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+    const parts = rel.split("/").filter(Boolean);
+    if (parts.length > 1 && !top) top = parts[0];
+    const path = parts.length > 1 && parts[0] === top ? parts.slice(1).join("/") : rel;
+    if (!path || skipImportPath(path)) continue;
+    files.push({ path, bytes: new Uint8Array(await file.arrayBuffer()) });
+  }
+  return { name: top || "imported-project", files };
+}
+
+// Read an OS drop (DataTransfer entries) into a flat file tree. A single dropped
+// folder becomes the project; loose files / multiple items land at the root.
+export async function treeFromDrop(entries: FileSystemEntry[]): Promise<{ name: string; files: FileTree }> {
+  const files: FileTree = [];
+  const single = entries.length === 1 && entries[0].isDirectory ? entries[0] : null;
+  const roots = single ? await readDirEntries(single as FileSystemDirectoryEntry) : entries;
+  const walk = async (entry: FileSystemEntry, prefix: string): Promise<void> => {
+    const path = prefix ? prefix + "/" + entry.name : entry.name;
+    if (skipImportPath(path)) return;
+    if (entry.isFile) {
+      const file = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej));
+      files.push({ path, bytes: new Uint8Array(await file.arrayBuffer()) });
+    } else if (entry.isDirectory) {
+      const children = await readDirEntries(entry as FileSystemDirectoryEntry);
+      for (const c of children) await walk(c, path);
+    }
+  };
+  for (const r of roots) await walk(r, "");
+  return { name: single ? single.name : "imported-project", files };
+}
 
 // Extract OS FileSystemEntry objects from a drop's DataTransfer. MUST be called
 // SYNCHRONOUSLY inside the drop handler — the DataTransferItemList (and thus
@@ -1638,6 +1704,188 @@ export class IdeController {
     if (targets[0]) void this.openEntry(targets[0]);
   }
 
+  // ── import / export / share (P2) ────────────────────────────────────────────
+  // Read a project's whole source tree (node_modules/.git excluded) in one bulk
+  // reply — the basis for both zip export and the shareable-URL payload.
+  async readProjectTree(rootPath: string): Promise<{ files: FileTree; truncated: boolean }> {
+    const m = await this.bridge.request("vv-read-tree", { root: normDir(rootPath) });
+    if (!m.ok) return { files: [], truncated: false };
+    const files = ((m.files as FileTree) ?? []).filter((f) => f.bytes instanceof Uint8Array);
+    return { files, truncated: !!m.truncated };
+  }
+
+  // Export a project as a .zip downloaded to disk.
+  async exportProjectZip(rootPath: string) {
+    const root = normDir(rootPath);
+    const { files, truncated } = await this.readProjectTree(root);
+    if (!files.length) { toast.error("Nothing to export in this project."); return; }
+    try {
+      const zip = await createZip(files);
+      downloadBlob(new Blob([zip as BlobPart], { type: "application/zip" }), (baseName(root) || "project") + ".zip");
+      this.set({ status: `exported ${files.length} file${files.length === 1 ? "" : "s"} → ${baseName(root) || "project"}.zip` });
+      if (truncated) toast.warning("Project was large — the export was truncated.");
+    } catch (err) {
+      toast.error("Export failed: " + errText(err));
+    }
+  }
+
+  // Synthesize a run manifest for an imported/shared project from its package.json
+  // (so Run auto-installs + starts a dev server). Null when there's no runnable
+  // script — the project still opens; Run just drops into a shell.
+  private synthManifest(files: FileTree, name: string): TemplateManifest | null {
+    const pkgFile = files.find((f) => f.path === "package.json");
+    if (!pkgFile) return null;
+    let pkg: { scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+    try { pkg = JSON.parse(new TextDecoder().decode(pkgFile.bytes)); } catch { return null; }
+    const scripts = pkg.scripts || {};
+    const devKey = scripts.dev ? "dev" : scripts.start ? "start" : scripts.serve ? "serve" : null;
+    if (!devKey) return null;
+    const dev = devKey === "start" ? "npm start" : `npm run ${devKey}`;
+    const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    const usesVite = "vite" in allDeps || /vite/.test(scripts[devKey] || "");
+    const hasTs = files.some((f) => /\.tsx?$/.test(f.path)) || "typescript" in allDeps;
+    const entryCandidates = [
+      "src/App.tsx", "src/App.jsx", "src/main.tsx", "src/main.ts", "src/index.tsx",
+      "src/index.ts", "src/index.js", "index.ts", "index.js", "README.md",
+    ];
+    const entry = entryCandidates.find((c) => files.some((f) => f.path === c)) || files[0]?.path || "package.json";
+    return {
+      id: "imported",
+      framework: "node",
+      icon: "package",
+      category: "Frontend",
+      name,
+      language: hasTs ? "TypeScript" : "JavaScript",
+      description: "Imported project",
+      port: usesVite ? 5173 : 3000,
+      openPath: "/",
+      entry,
+      hmr: usesVite,
+      reload: !usesVite,
+      install: "npm install",
+      dev,
+    };
+  }
+
+  // Create a NEW project from an in-memory file tree (folder import / shared URL).
+  async importFilesAsProject({ name, dir, files }: { name: string; dir: string; files: FileTree }): Promise<boolean> {
+    if (!this.snap.kernelReady) { toast.error("Kernel is still starting — try again in a moment."); return false; }
+    if (!files.length) { toast.error("No files to import."); return false; }
+    const root = normDir(dir);
+    const err = await this.validateNewDir(root);
+    if (err) { toast.error(err); return false; }
+    const res = await this.bridge.request("vv-import-tree", { dir: root, files });
+    if (!res.ok) { toast.error(`Import failed: ${res.error ?? "unknown error"}`); return false; }
+    const manifest = this.synthManifest(files, name);
+    if (manifest) {
+      this.folderManifests.set(root, manifest);
+      this.bridge.post("vv-register-project", { dir: root, manifest, title: name });
+    }
+    this.upsertProjectMeta({ name, rootPath: root, template: null });
+    this.openFolder(root, name);
+    const openTarget = manifest?.entry || files.find((f) => f.path === "package.json")?.path || files[0]?.path;
+    if (openTarget) void this.openFile(root + "/" + openTarget);
+    this.set({ status: `imported ${files.length} file${files.length === 1 ? "" : "s"} as ${name}` });
+    return true;
+  }
+
+  // Build a self-contained shareable URL (compressed project source in the hash)
+  // and copy it to the clipboard. Source-only (node_modules excluded); capped so
+  // the link stays usable. Returns the URL, or null if it can't be shared.
+  async shareProject(rootPath: string): Promise<string | null> {
+    const root = normDir(rootPath);
+    const { files, truncated } = await this.readProjectTree(root);
+    if (!files.length) { toast.error("Nothing to share in this project."); return null; }
+    if (truncated) { toast.error("Project is too large to share as a link."); return null; }
+    try {
+      const payload = await encodeShare({ name: baseName(root) || "project", files });
+      const url = location.origin + location.pathname + "#share=" + payload;
+      if (url.length > MAX_SHARE_URL_LEN) { toast.error("Project is too big to share as a link."); return null; }
+      try {
+        await navigator.clipboard.writeText(url);
+        this.set({ status: `share link copied (${Math.round(url.length / 1024)} KB)` });
+      } catch {
+        this.set({ status: "share link ready" });
+      }
+      return url;
+    } catch (err) {
+      toast.error("Share failed: " + errText(err));
+      return null;
+    }
+  }
+
+  // A default project dir for `name` that doesn't collide with an open/known one.
+  private async freeDirFor(name: string): Promise<string> {
+    const base = this.slug(name);
+    let dir = this.defaultDirFor(base);
+    let n = 2;
+    while (await this.validateNewDir(dir)) {
+      dir = this.defaultDirFor(base + "-" + n++);
+      if (n > 50) break;
+    }
+    return dir;
+  }
+
+  // Open the OS folder picker and import the chosen directory as a new project.
+  importFolderViaPicker() {
+    if (!this.snap.kernelReady) { toast.error("Kernel is still starting — try again in a moment."); return; }
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    input.setAttribute("webkitdirectory", "");
+    input.setAttribute("directory", "");
+    input.onchange = async () => {
+      const list = input.files;
+      if (!list || !list.length) return;
+      const { name, files } = await treeFromFileList(list);
+      if (!files.length) { toast.error("No importable files in that folder."); return; }
+      const dir = await this.freeDirFor(name);
+      await this.importFilesAsProject({ name: baseName(dir) || name, dir, files });
+    };
+    input.click();
+  }
+
+  // Import an OS drop (folder / files) as a new project (Home dropzone).
+  async importDropAsProject(entries: FileSystemEntry[]) {
+    if (!this.snap.kernelReady) { toast.error("Kernel is still starting — try again in a moment."); return; }
+    if (!entries.length) return;
+    const { name, files } = await treeFromDrop(entries);
+    if (!files.length) { toast.error("No importable files were dropped."); return; }
+    const dir = await this.freeDirFor(name);
+    await this.importFilesAsProject({ name: baseName(dir) || name, dir, files });
+  }
+
+  // Command-palette convenience: export / share the active workspace folder.
+  exportActiveFolder() {
+    const root = this.activeFolder?.rootPath;
+    if (!root) { toast.error("Open a project first."); return; }
+    void this.exportProjectZip(root);
+  }
+  shareActiveFolder() {
+    const root = this.activeFolder?.rootPath;
+    if (!root) { toast.error("Open a project first."); return; }
+    void this.shareProject(root);
+  }
+
+  // On boot, if the URL carries a #share= payload, decode it into a new project
+  // and open it. Clears the hash afterward so a reload doesn't re-import.
+  private async loadSharedFromUrl() {
+    const marker = "#share=";
+    const hash = location.hash || "";
+    const idx = hash.indexOf(marker);
+    if (idx < 0) return;
+    const payload = hash.slice(idx + marker.length);
+    if (!payload) return;
+    history.replaceState(null, "", location.pathname + location.search);
+    try {
+      const { name, files } = await decodeShare(payload);
+      const dir = await this.freeDirFor(name);
+      await this.importFilesAsProject({ name: baseName(dir) || this.slug(name), dir, files });
+    } catch (err) {
+      toast.error("Couldn't open shared project: " + errText(err));
+    }
+  }
+
   // Create an empty file / folder (Explorer "New File" / "New Folder").
   async newFile(destDirAbs: string, name: string) {
     const clean = name.trim();
@@ -2084,6 +2332,8 @@ export class IdeController {
       this.consoleLine("Kernel ready.", "32");
       this.set({ booted: true, kernelReady: true, status: "ready — create or open a project" });
       this.newShellTerminal({ defer: true, activate: false });
+      // If the URL carries a #share= payload, import it into a new project.
+      void this.loadSharedFromUrl();
     });
     b.on("exit", (m) => {
       this.consoleLine(`[kernel] pid ${m.pid} exited with code ${m.code}`, "90");

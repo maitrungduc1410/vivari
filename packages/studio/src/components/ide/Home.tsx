@@ -4,6 +4,7 @@ import LayoutTemplate from "~icons/lucide/layout-template";
 import Clock from "~icons/lucide/clock";
 import ArrowLeft from "~icons/lucide/arrow-left";
 import Trash from "~icons/lucide/trash-2";
+import FolderInput from "~icons/lucide/folder-input";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -14,7 +15,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TEMPLATES, TEMPLATE_CATEGORIES, type TemplateCategory, type TemplateDef } from "@/vv/templates";
 import { TemplateIcon } from "./templateIcons";
 import { useIde } from "./useIde";
-import type { ProjectMeta } from "@/vv/controller";
+import { entriesFromDataTransfer, type ProjectMeta } from "@/vv/controller";
 
 function relTime(ts: number): string {
   const s = Math.max(1, Math.round((Date.now() - ts) / 1000));
@@ -31,9 +32,28 @@ export function HomeView() {
   const { c, snap } = useIde();
   const [blankOpen, setBlankOpen] = useState(false);
   const [templateOpen, setTemplateOpen] = useState(false);
+  const [dragging, setDragging] = useState(false);
+
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragging(false);
+    const entries = entriesFromDataTransfer(e.dataTransfer);
+    if (entries.length) void c.importDropAsProject(entries);
+  };
 
   return (
-    <div className="absolute inset-0 z-40 overflow-auto bg-background">
+    <div
+      className="absolute inset-0 z-40 overflow-auto bg-background"
+      onDragOver={(e) => { if (e.dataTransfer.types.includes("Files")) { e.preventDefault(); setDragging(true); } }}
+      onDragLeave={(e) => { if (e.currentTarget === e.target) setDragging(false); }}
+      onDrop={onDrop}
+    >
+      {dragging && (
+        <div className="pointer-events-none absolute inset-3 z-50 flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-primary/60 bg-primary/5 text-sm font-medium text-primary">
+          <FolderInput className="size-8" />
+          Drop a folder to import it as a new project
+        </div>
+      )}
       <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col px-6 py-10">
         <div className="mb-8 flex items-center gap-3">
           <span className="inline-block size-3 rounded-full bg-primary" />
@@ -45,7 +65,7 @@ export function HomeView() {
           )}
         </div>
 
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <button
             onClick={() => setBlankOpen(true)}
             className="group flex flex-col items-start gap-3 rounded-xl border bg-card p-5 text-left transition-colors hover:border-primary/60 hover:bg-accent/40"
@@ -68,6 +88,19 @@ export function HomeView() {
             <div>
               <div className="font-medium">Start from template</div>
               <div className="text-sm text-muted-foreground">React, Vue, Next.js, Express, Three.js, WebSocket…</div>
+            </div>
+          </button>
+          <button
+            onClick={() => c.importFolderViaPicker()}
+            disabled={!snap.kernelReady}
+            className="group flex flex-col items-start gap-3 rounded-xl border bg-card p-5 text-left transition-colors hover:border-primary/60 hover:bg-accent/40 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <div className="flex size-11 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <FolderInput className="size-6" />
+            </div>
+            <div>
+              <div className="font-medium">Import a folder</div>
+              <div className="text-sm text-muted-foreground">Open a local folder — or drop one here — as a new project.</div>
             </div>
           </button>
         </div>

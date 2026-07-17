@@ -2741,6 +2741,54 @@ the common "open a template, press Run" flow.
   `scripts/fs-worker.mjs` wires an in-memory `storage`; the pack/restore + VFS logic under test is the
   shipped code.
 
+## Import / export & share — zip export, folder import, shareable URL (this change)
+
+A playground spreads when a project can leave it and come back. This change ships the
+**pure client-side** subset of "import/export & share" — no backend, no CORS, no gist
+service — so it works entirely in the browser (and offline):
+
+- **Export as `.zip`.** Any workspace folder downloads as a real PKZIP archive
+  (Explorer root context-menu "Export as Zip…", the command palette, source-only —
+  `node_modules`/`.git` excluded).
+- **Import a folder as a new project.** The Home "Import a folder" card opens the OS
+  folder picker (`<input webkitdirectory>`); a folder can also be **drag-dropped**
+  onto Home. Both create a fresh project from the chosen tree.
+- **Shareable URL.** A workspace folder serializes to a **self-contained compressed
+  link** (`#share=…`): source gzipped + base64url'd into the URL hash, copied to the
+  clipboard. Opening such a link imports it as a new project. Source-only and
+  **size-capped** — beyond the cap you get a clear "too big to share" message rather
+  than a broken link.
+
+- **Codecs (`packages/kernel-host/archive.js`).** Environment-agnostic like
+  `dep-cache.js`: it uses only web primitives present in both a browser and modern Node
+  (`CompressionStream`/`DecompressionStream`, `DataView`, `btoa`/`atob`), so there is
+  **no npm zip/gzip dependency**. ZIP entries are DEFLATE-compressed with the platform's
+  own `CompressionStream('deflate-raw')` (STORE fallback when DEFLATE wouldn't shrink),
+  with a hand-written CRC-32 + local/central-directory/EOCD records; the share payload
+  is a gzipped JSON manifest (text files inline UTF-8, binary as base64) encoded
+  base64url. A `.d.ts` gives the studio real types.
+- **Bulk RPCs (`packages/core/src/workers/kernel-worker.ts`).** `vv-read-tree` walks a
+  project in the worker (the sole VFS holder) and returns the whole source tree in one
+  reply — `node_modules`/`.git` excluded, bounded by file count + bytes — instead of
+  thousands of per-file `vv-read-bytes` round-trips; it backs both export and share.
+  `vv-import-tree` bulk-writes an imported tree via `writeFilesBatch`; it backs both
+  folder import and shared-link load.
+- **Controller (`packages/studio/src/vv/controller.ts`).** `readProjectTree` /
+  `exportProjectZip` / `importFilesAsProject` / `shareProject`, the OS folder-picker and
+  drop entry points, and a boot hook (`loadSharedFromUrl`, run once the kernel is ready)
+  that decodes a `#share=` payload and clears the hash so a reload doesn't re-import. An
+  imported/shared project with a runnable `package.json` script gets a **synthesized run
+  manifest** so the Run button auto-installs + starts its dev server (otherwise Run drops
+  into a shell).
+- **Gate.** `scripts/spike-zip-share.mjs` (offline, in `run-spikes.mjs`) proves the ZIP
+  writer by re-decoding its output with Node's own `zlib` (bytes + CRC per entry) and
+  round-trips the share codec over a mixed text+binary tree — pure web primitives, no
+  kernel/wasm needed.
+- **Deferred (documented).** GitHub-repo and npm-package import both need network /
+  CORS (a proxy or the fetcher worker) and are left for a follow-up; the share model is
+  intentionally backend-free (no gist/paste service), trading a size cap for zero
+  infrastructure.
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

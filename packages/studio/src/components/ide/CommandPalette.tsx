@@ -9,6 +9,9 @@ import RefreshCw from "~icons/lucide/refresh-cw";
 import RotateCcw from "~icons/lucide/rotate-ccw";
 import FileCode from "~icons/lucide/file-code";
 import Gauge from "~icons/lucide/gauge";
+import FolderInput from "~icons/lucide/folder-input";
+import FileArchive from "~icons/lucide/file-archive";
+import Share2 from "~icons/lucide/share-2";
 import {
   Command, CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList,
 } from "@/components/ui/command";
@@ -38,6 +41,9 @@ export function CommandPalette() {
       { label: "Go Home / New Project", icon: Home, run: () => c.goHome() },
       { label: "New Terminal", icon: Plus, run: () => c.newShellTerminal() },
       { label: "Run Project", icon: Play, run: () => c.runActiveFolder() },
+      { label: "Import Folder as Project", icon: FolderInput, run: () => c.importFolderViaPicker() },
+      { label: "Export Project as Zip", icon: FileArchive, run: () => c.exportActiveFolder() },
+      { label: "Share Project (copy link)", icon: Share2, run: () => c.shareActiveFolder() },
       { label: "Toggle Terminal Panel", icon: TerminalIcon, run: () => c.togglePanel() },
       { label: "Toggle Sidebar", icon: PanelLeft, run: () => c.toggleSidebar() },
       { label: "Clear Active Terminal", icon: Eraser, run: () => c.clearActiveTerminal() },
