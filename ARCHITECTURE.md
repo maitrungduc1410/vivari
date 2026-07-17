@@ -657,7 +657,12 @@ flowchart LR
 - `packages/vfs/` — the Rust VFS → Wasm.
 - `packages/codec/` — Rust zlib/deflate core beneath `lib/zlib.js`
   (`internalBinding('zlib')`).
-- `packages/crypto/` — Rust crypto core beneath `lib/crypto.js`.
+- `packages/crypto/` — Rust crypto core beneath `lib/crypto.js` (RustCrypto):
+  digests/HMAC/PBKDF2/AES, plus S3 scrypt + elliptic asymmetric (ECDSA
+  P-256/P-384, Ed25519 keygen/sign/verify over PKCS#8/SPKI DER). Node's crypto is
+  synchronous, so — like zlib — the primitives live in Wasm; `lib/crypto.js` does
+  PEM<->DER and the streaming Sign/Verify shape. Keygen uses getrandom's `js`
+  backend (WebCrypto). RSA, DH/ECDH and X.509 are later phases (throw in JS).
 - `packages/wasi-demo/` — a `wasm32-wasip1` CLI used to exercise the WASI layer.
 - **WASI + napi-rs**: the runtime ships a WASI preview1 host and runs real N-API
   addons compiled to `wasm32-wasi` (e.g. `@node-rs/crc32-wasm32-wasi`) on the

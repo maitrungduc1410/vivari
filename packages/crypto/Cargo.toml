@@ -10,8 +10,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 wasm-bindgen = "0.2"
-# Pure-Rust RustCrypto primitives — all compile cleanly to wasm32-unknown-unknown
-# with no getrandom (we always pass explicit salts/ivs from JS via WebCrypto).
+# Pure-Rust RustCrypto primitives — all compile cleanly to wasm32-unknown-unknown.
+# Symmetric/KDF primitives take explicit salts/ivs from JS; the asymmetric S3
+# additions (keygen) need entropy, so getrandom's `js` backend routes to the
+# Worker's WebCrypto (browser) / node:crypto (nodejs target) at runtime.
 md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
@@ -21,6 +23,16 @@ aes = "0.8"
 cbc = { version = "0.1", default-features = false, features = ["alloc"] }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 cipher = { version = "0.4", default-features = false, features = ["block-padding", "alloc"] }
+# --- S3: scrypt + asymmetric (ECDSA P-256/P-384, Ed25519) --------------------
+scrypt = { version = "0.11", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "arithmetic"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "arithmetic"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["pkcs8", "rand_core", "alloc"] }
+ecdsa = { version = "0.16", default-features = false, features = ["der", "hazmat", "pkcs8", "alloc"] }
+pkcs8 = { version = "0.10", default-features = false, features = ["alloc"] }
+spki = { version = "0.7", default-features = false, features = ["alloc"] }
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+getrandom = { version = "0.2", features = ["js"] }
 
 [profile.release]
 opt-level = "s"
