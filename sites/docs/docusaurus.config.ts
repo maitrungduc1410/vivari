@@ -63,16 +63,11 @@ const config: Config = {
         src: "img/logo.svg",
       },
       items: [
-        {
-          type: "docSidebar",
-          sidebarId: "docsSidebar",
-          position: "left",
-          label: "Docs",
-        },
-        // `pathname://` emits a real same-origin pathname (leaving the docs SPA for
-        // the sibling apps) without Docusaurus prefixing baseUrl or route-checking it.
-        { to: "pathname:///studio/", label: "Studio", position: "left" },
-        { to: "pathname:///", label: "Home", position: "left" },
+        // Root-absolute `href`s leave the docs SPA for the sibling apps at the
+        // origin root. `to`/`pathname://` would be resolved against baseUrl
+        // (`/docs/`) and wrongly land on `/docs/studio`, `/docs/`.
+        { href: "/studio/", label: "Studio", position: "left" },
+        { href: "/", label: "Home", position: "left" },
         {
           href: GITHUB_URL,
           label: "GitHub",
@@ -95,8 +90,8 @@ const config: Config = {
         {
           title: "Product",
           items: [
-            { label: "Home", to: "pathname:///" },
-            { label: "Studio", to: "pathname:///studio/" },
+            { label: "Home", href: "/" },
+            { label: "Studio", href: "/studio/" },
           ],
         },
         {
