@@ -1,4 +1,5 @@
 import { Reveal } from "./Reveal";
+import { SyncBridge } from "./SyncBridge";
 
 const STEPS = [
   {
@@ -33,16 +34,7 @@ export function HowItWorks() {
             runtime possible in the browser.
           </p>
 
-          <pre className="glass mt-8 overflow-x-auto rounded-xl p-5 font-mono text-xs leading-relaxed text-muted">
-{`user code (Web Worker)
-   |  fs.readFileSync("/x")   <- looks synchronous
-   v
-SharedArrayBuffer  -- request -->  Host (main thread)
-   ^                                  |  Rust/Wasm VFS lookup
-   +------ Atomics.notify <-----------+
-   v
-returns bytes, still synchronous`}
-          </pre>
+          <SyncBridge />
         </Reveal>
 
         <div className="space-y-4">

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { ArrowUpRight } from "lucide-react";
 import { Reveal } from "./Reveal";
+import { highlight } from "@/lib/highlight";
 import { site } from "@/site";
 
 const SNIPPETS = {
@@ -61,7 +62,7 @@ export function Embed() {
             ))}
           </div>
           <pre className="overflow-x-auto p-5 font-mono text-[13px] leading-relaxed">
-            <code className="text-fg">{SNIPPETS[tab]}</code>
+            <code className="text-fg">{highlight(SNIPPETS[tab])}</code>
           </pre>
         </div>
 
