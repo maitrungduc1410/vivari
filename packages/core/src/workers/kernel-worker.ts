@@ -656,9 +656,9 @@ async function tryRestoreDeps(dir, pmHint) {
     const pm = pmName(pmHint);
     const key = await computeDepKey(dir, pm);
     if (!key) return false;
-    if (!(await kernelFsRef.depCacheHas(key))) return false;
+    if (!(await kernelFsRef.fs.depCacheHas(key))) return false;
     const t0 = Date.now();
-    const count = await kernelFsRef.depCacheRestore(key, dir);
+    const count = await kernelFsRef.fs.depCacheRestore(key, dir);
     if (count > 0) {
       post("log", {
         line: `  [depcache] restored node_modules for ${pm} (${count} entries, ${Date.now() - t0}ms) — skipping install.`,
@@ -682,7 +682,6 @@ const snapshotInFlight = new Set();
 async function maybeSnapshotDeps(dir, pmHint) {
   if (snapshotInFlight.has(dir)) return;
   snapshotInFlight.add(dir);
-  post("log", { line: `  [depcache] snapshot check for ${pmName(pmHint)} at ${dir}`, dim: true });
   try {
     if (!kernelFsRef || !kernel) return;
     const base = String(dir).replace(/\/+$/, "");
@@ -696,8 +695,8 @@ async function maybeSnapshotDeps(dir, pmHint) {
       post("log", { line: `  [depcache] skip snapshot: no lockfile/package.json at ${base}`, dim: true });
       return;
     }
-    if (await kernelFsRef.depCacheHas(keys.primary)) return; // already cached
-    const res = await kernelFsRef.depCacheSave(keys.primary, base, keys.aliases);
+    if (await kernelFsRef.fs.depCacheHas(keys.primary)) return; // already cached
+    const res = await kernelFsRef.fs.depCacheSave(keys.primary, base, keys.aliases);
     if (res) {
       post("log", {
         line: `  [depcache] cached node_modules for ${pm} (${res.files} files, ${(res.bytes / 1048576).toFixed(1)} MB).`,
