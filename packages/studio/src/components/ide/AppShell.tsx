@@ -13,6 +13,7 @@ import { StatusBar } from "./StatusBar";
 import { CommandPalette } from "./CommandPalette";
 import { HomeView } from "./Home";
 import { ShareLoadingOverlay } from "./ShareLoadingOverlay";
+import { ImportRemoteDialog } from "./ImportRemoteDialog";
 import { useIde } from "./useIde";
 
 export function AppShell() {
@@ -105,6 +106,7 @@ export function AppShell() {
       </div>
       <StatusBar />
       <CommandPalette />
+      <ImportRemoteDialog />
       {/* Home overlays the (kept-mounted) IDE so the editor/terminals survive a
           round-trip to Home and back. */}
       {snap.view === "home" && <HomeView />}

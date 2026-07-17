@@ -38,6 +38,7 @@ const SPIKES = [
   // Import/export/share codecs (P2): zip writer verified with Node's zlib, and
   // the shareable-URL codec round-tripped. Pure web primitives, no kernel/wasm.
   { name: "zip-share", file: "spike-zip-share.mjs", net: false, timeout: 60000 },
+  { name: "tar", file: "spike-tar.mjs", net: false, timeout: 60000 },
   // Persistent dependency cache (P1): pack node_modules → snapshot → wipe →
   // restore → require, against the real Wasm VFS. Offline + deterministic.
   { name: "dep-cache", file: "spike-dep-cache.mjs", net: false, timeout: 120000 },

@@ -19,6 +19,9 @@ import type * as Monaco from "monaco-editor";
 import { KernelBridge } from "./kernel";
 import { getTemplate, type TemplateManifest } from "./templates";
 import { createZip, encodeShare, decodeShare } from "../../../kernel-host/archive.js";
+import {
+  parseGithubSpec, fetchGithubRepo, parseNpmSpec, fetchNpmPackage, type ProgressFn,
+} from "./import-remote";
 
 // ── Demo matrix (UI side) ────────────────────────────────────────────────────
 // The two hard-coded example projects the kernel worker still scaffolds on demand
@@ -112,6 +115,8 @@ export interface IdeSnapshot {
   // A shared link (#share=) is bootstrapping: show a full-screen blocking overlay.
   shareLoading: boolean;
   shareMessage: string;
+  // The "Import from GitHub or npm" dialog is open.
+  importRemoteOpen: boolean;
   projectTitle: string | null;
   workspaceFolders: WorkspaceFolder[];
   activeFolderId: string | null;
@@ -393,6 +398,7 @@ export class IdeController {
     view: hasSharePayload() ? "workspace" : "home",
     shareLoading: hasSharePayload(),
     shareMessage: "Booting the runtime…",
+    importRemoteOpen: false,
     projectTitle: null,
     workspaceFolders: [],
     activeFolderId: null,
@@ -1909,6 +1915,48 @@ export class IdeController {
     if (!files.length) { toast.error("No importable files were dropped."); return; }
     const dir = await this.freeDirFor(name);
     await this.importFilesAsProject({ name: baseName(dir) || name, dir, files, excludedNodeModules });
+  }
+
+  // ── Import from a remote source (GitHub repo / npm package) ────────────────
+  openImportRemote() {
+    if (!this.snap.kernelReady) { toast.error("Kernel is still starting — try again in a moment."); return; }
+    this.set({ importRemoteOpen: true });
+  }
+  closeImportRemote() { this.set({ importRemoteOpen: false }); }
+
+  // Fetch a remote tree, then land it as a new project. Shared spine for the
+  // GitHub/npm importers: both just supply a fetcher. Returns true on success so
+  // the dialog can close itself. Progress flows to the dialog via onProgress.
+  private async importRemoteTree(
+    fetchTree: () => Promise<{ name: string; files: FileTree; excludedNodeModules: boolean; truncated?: boolean }>,
+  ): Promise<boolean> {
+    if (!this.snap.kernelReady) { toast.error("Kernel is still starting — try again in a moment."); return false; }
+    const { name, files, excludedNodeModules, truncated } = await fetchTree();
+    if (!files.length) { toast.error("Nothing to import."); return false; }
+    const dir = await this.freeDirFor(name);
+    const ok = await this.importFilesAsProject({
+      name: baseName(dir) || name, dir, files, excludedNodeModules,
+    });
+    if (ok && truncated) {
+      toast.warning("Project was large — some files were skipped past the import limit.", {
+        position: "bottom-left",
+      });
+    }
+    return ok;
+  }
+
+  // Import a public GitHub repo. `input` is a URL or `owner/repo[@ref]` shorthand.
+  async importGithubRepo(input: string, onProgress?: ProgressFn): Promise<boolean> {
+    const spec = parseGithubSpec(input);
+    if (!spec) { toast.error("Enter a GitHub repo, e.g. owner/repo or a github.com URL."); return false; }
+    return this.importRemoteTree(() => fetchGithubRepo(spec, onProgress));
+  }
+
+  // Import an npm package. `input` is `name`, `name@version`, or `name@tag`.
+  async importNpmPackage(input: string, onProgress?: ProgressFn): Promise<boolean> {
+    const spec = parseNpmSpec(input);
+    if (!spec) { toast.error("Enter an npm package name, e.g. left-pad or @scope/pkg@1.2.3."); return false; }
+    return this.importRemoteTree(() => fetchNpmPackage(spec, onProgress));
   }
 
   // Command-palette convenience: export / share the active workspace folder.

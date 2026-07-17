@@ -5,6 +5,7 @@ import Clock from "~icons/lucide/clock";
 import ArrowLeft from "~icons/lucide/arrow-left";
 import Trash from "~icons/lucide/trash-2";
 import FolderInput from "~icons/lucide/folder-input";
+import Github from "~icons/lucide/github";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -101,6 +102,19 @@ export function HomeView() {
             <div>
               <div className="font-medium">Import a folder</div>
               <div className="text-sm text-muted-foreground">Open a local folder — or drop one here — as a new project.</div>
+            </div>
+          </button>
+          <button
+            onClick={() => c.openImportRemote()}
+            disabled={!snap.kernelReady}
+            className="group flex flex-col items-start gap-3 rounded-xl border bg-card p-5 text-left transition-colors hover:border-primary/60 hover:bg-accent/40 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <div className="flex size-11 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <Github className="size-6" />
+            </div>
+            <div>
+              <div className="font-medium">Import from GitHub or npm</div>
+              <div className="text-sm text-muted-foreground">Fetch a public repo or an npm package as a new project.</div>
             </div>
           </button>
         </div>

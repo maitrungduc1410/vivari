@@ -675,8 +675,23 @@ project opens; a bottom-left success/error toast then fires. Imported/shared pro
 `package.json` script get a **synthesized run manifest** so the Run button auto-installs + starts a
 dev server. Entry points: Home "Import a folder" card, the command palette (Import/Export/Share), and
 the Explorer root context-menu. Proof: `scripts/spike-zip-share.mjs` (re-decodes the ZIP with Node's
-`zlib`; round-trips the share codec over a text+binary tree). GitHub-repo / npm-package import (both
-need network/CORS) are a documented follow-up.
+`zlib`; round-trips the share codec over a text+binary tree).
+
+**Remote import (GitHub repo / npm package).** The same landing path (`importFilesAsProject` →
+`vv-import-tree` → synthesized run manifest) also backs importing from a public GitHub repo or an npm
+package — still fully client-side. The studio page is cross-origin-isolated (COEP `require-corp`), and
+all the sources send `Access-Control-Allow-Origin: *`, so a plain `cors` `fetch()` from the main thread
+both reads and satisfies COEP — no backend/proxy and no Fetcher Worker. `vv/import-remote.ts` does the
+fetching: GitHub via `api.github.com` (repo info for the default branch + `git/trees?recursive=1` for
+the file list) then `raw.githubusercontent.com` per file with bounded concurrency; npm via
+`registry.npmjs.org` (packument → resolve dist-tag/version → `dist.tarball`) then gunzip + parse the
+tarball. The tar reader is `packages/kernel-host/tar.js` (env-agnostic ustar reader: `prefix` field,
+GNU `L` long names, pax `path`; `stripFirstSegment` drops the `package/` / `<repo>-<ref>/` root),
+proven by `scripts/spike-tar.mjs`. Both paths exclude `node_modules`/`.git`, are file-count + byte
+capped (surfaced as a "truncated" warning), and land through the shared spine. UI: a Home
+"Import from GitHub or npm" card and a command-palette entry open `ImportRemoteDialog` (tabbed
+GitHub/npm, snapshot-driven via `importRemoteOpen`, live progress). Public GitHub repos only (no
+auth); npm range specifiers fall back to `latest` (no semver-range resolution).
 
 ---
 
