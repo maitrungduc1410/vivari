@@ -10,12 +10,18 @@
 //      literal still patches, threading that version into --service.
 //   4. It is a strict no-op for a genuine NATIVE esbuild install (no wasm assets).
 //   5. On block-shape DRIFT it warns loudly and returns null (fail loud, not silent).
+//   6. NATIVE_DROPIN_ALIASES + synthesizeRemappedPackument version-remap a
+//      non-lockstep drop-in (bcrypt -> bcryptjs) correctly.
 //
 //   run:  node scripts/spike-toolchain.mjs
 
 import path from "node:path";
 import { maybePatchEsbuildInProcess } from "../packages/runtime/esbuild-inproc-patch.js";
-import { NATIVE_WASM_ALIASES } from "../packages/runtime/toolchain-shims.js";
+import {
+  NATIVE_WASM_ALIASES,
+  NATIVE_DROPIN_ALIASES,
+  synthesizeRemappedPackument,
+} from "../packages/runtime/toolchain-shims.js";
 
 let failures = 0;
 const ok = (cond, msg) => {
@@ -118,6 +124,68 @@ const driftResult = maybePatchEsbuildInProcess(drifted, MAIN, wasmPresent, path)
 console.warn = origWarn;
 ok(driftResult === null, "drifted block returns null (no silent patch)");
 ok(warned, "drifted block warns loudly");
+
+// --- 6. non-lockstep drop-in: version-remapped packument ----------------------
+ok(NATIVE_DROPIN_ALIASES.bcrypt === "bcryptjs", "drop-in alias bcrypt -> bcryptjs");
+
+// Mock the two real packuments: a native `bcrypt` (node-pre-gyp, native deps,
+// install scripts, cpu/os gating) and a pure-JS `bcryptjs` (zero deps).
+const bcryptPack = {
+  name: "bcrypt",
+  _id: "bcrypt",
+  "dist-tags": { latest: "6.0.0" },
+  versions: {
+    "5.1.1": {
+      name: "bcrypt",
+      version: "5.1.1",
+      dist: { tarball: "https://reg/bcrypt/-/bcrypt-5.1.1.tgz" },
+      dependencies: { "@mapbox/node-pre-gyp": "^1.0.11", "node-addon-api": "^5.0.0" },
+      optionalDependencies: {},
+      scripts: { install: "node-pre-gyp install --fallback-to-build" },
+      cpu: ["x64", "arm64"],
+      os: ["linux", "darwin", "win32"],
+    },
+    "6.0.0": {
+      name: "bcrypt",
+      version: "6.0.0",
+      dist: { tarball: "https://reg/bcrypt/-/bcrypt-6.0.0.tgz" },
+      dependencies: { "@mapbox/node-pre-gyp": "^2.0.0", "node-addon-api": "^8.3.0" },
+      scripts: { install: "node-pre-gyp install --fallback-to-build" },
+    },
+  },
+};
+const bcryptjsPack = {
+  name: "bcryptjs",
+  _id: "bcryptjs",
+  "dist-tags": { latest: "3.0.3" },
+  versions: {
+    "3.0.3": {
+      name: "bcryptjs",
+      version: "3.0.3",
+      dist: { tarball: "https://reg/bcryptjs/-/bcryptjs-3.0.3.tgz" },
+      dependencies: {},
+      main: "index.js",
+      type: "module",
+    },
+  },
+};
+
+const synth = synthesizeRemappedPackument(bcryptPack, bcryptjsPack, "bcrypt");
+ok(synth != null, "remap: synthesizes a packument");
+ok(synth != null && synth.name === "bcrypt", "remap: served under the source name (bcrypt)");
+ok(synth != null && synth["dist-tags"].latest === "6.0.0", "remap: keeps the SOURCE dist-tags");
+const vkeys = synth ? Object.keys(synth.versions) : [];
+ok(vkeys.includes("5.1.1") && vkeys.includes("6.0.0"), "remap: mirrors SOURCE versions (so any bcrypt@<range> resolves)");
+const v6 = synth && synth.versions["6.0.0"];
+ok(!!v6 && v6.dist.tarball === "https://reg/bcryptjs/-/bcryptjs-3.0.3.tgz", "remap: a source version points at the TARGET (bcryptjs) tarball");
+ok(!!v6 && JSON.stringify(v6.dependencies) === "{}", "remap: deps come from the target (no native @mapbox/node-pre-gyp)");
+ok(!!v6 && !("scripts" in v6) && !("optionalDependencies" in v6) && !("cpu" in v6) && !("os" in v6),
+  "remap: native-install metadata (scripts/optionalDependencies/cpu/os) stripped");
+ok(!!v6 && v6.main === "index.js" && v6.type === "module", "remap: carries the target's main/type");
+
+// Guard: unusable inputs yield null (fetcher then falls back to the plain fetch).
+ok(synthesizeRemappedPackument(null, bcryptjsPack, "bcrypt") === null, "remap: null source -> null");
+ok(synthesizeRemappedPackument(bcryptPack, { name: "bcryptjs" }, "bcrypt") === null, "remap: target without versions -> null");
 
 console.log("\nRESULT: " + (failures === 0 ? "PASS — toolchain subsystem intact" : `FAIL — ${failures} check(s) failed`));
 process.exit(failures === 0 ? 0 : 1);

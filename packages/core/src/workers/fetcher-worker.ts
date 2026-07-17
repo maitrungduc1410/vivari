@@ -16,9 +16,15 @@
 //   fetcher -> { type: 'fetch-result', id, ok, status, statusText, headers, body } (body transferred)
 //           -> { type: 'fetch-result', id, error }                       (network failure)
 
-// The native->wasm alias table is the single source of truth for the toolchain
+// The native->drop-in alias tables are the single source of truth for the toolchain
 // subsystem (shared with the in-process esbuild patch); add drop-ins there.
-import { NATIVE_WASM_ALIASES as PACKAGE_ALIASES } from "../../../runtime/toolchain-shims.js";
+//   - PACKAGE_ALIASES: lockstep renames (target packument served verbatim).
+//   - DROPIN_ALIASES: non-lockstep drop-ins (packument version-remapped via synth).
+import {
+  NATIVE_WASM_ALIASES as PACKAGE_ALIASES,
+  NATIVE_DROPIN_ALIASES as DROPIN_ALIASES,
+  synthesizeRemappedPackument,
+} from "../../../runtime/toolchain-shims.js";
 
 // Pluggable registry endpoint (the "direct now, proxy later" seam). The npm
 // registry sends `Access-Control-Allow-Origin: *` on both metadata and tarballs,
@@ -96,12 +102,14 @@ function matchPackumentAlias(url) {
   const looksLikeVersion = /^\d/.test(last) || last === "latest";
   if (looksLikeVersion && segs.length >= 2) nameIdx = segs.length - 2;
   const src = decodeURIComponent(segs[nameIdx]);
-  const dst = PACKAGE_ALIASES[src];
+  // Lockstep rename (verbatim) vs non-lockstep drop-in (version-remapped synth).
+  const remap = !PACKAGE_ALIASES[src] && !!DROPIN_ALIASES[src];
+  const dst = PACKAGE_ALIASES[src] || DROPIN_ALIASES[src];
   if (!dst) return null;
   const newSegs = segs.slice();
   newSegs[nameIdx] = encodePkgSegment(dst);
   u.pathname = "/" + newSegs.join("/");
-  return { targetUrl: u.toString(), src, dst };
+  return { targetUrl: u.toString(), src, dst, remap };
 }
 
 // Rewrite a fetched packument JSON so the consumer sees it under `src` while the
@@ -184,16 +192,36 @@ async function doFetch(url, init) {
     const alias = matchPackumentAlias(url);
     if (alias) {
       try {
-        const res = await fetch(rewrite(alias.targetUrl), opts);
-        if (res.ok) {
-          const json = rewritePackument(await res.json(), alias.src);
-          const body = new TextEncoder().encode(JSON.stringify(json)).buffer;
-          const headers = {};
-          for (const [k, v] of res.headers) headers[k] = v;
-          headers["content-type"] = "application/json";
-          delete headers["content-length"]; // body length changed after rewrite
-          delete headers["content-encoding"]; // we return decoded JSON bytes
-          return { ok: true, status: res.status, statusText: res.statusText, headers, body };
+        if (alias.remap) {
+          // Non-lockstep drop-in: fetch BOTH the source packument (for its version
+          // list + dist-tags) and the target packument (for the tarball + deps),
+          // then synthesize a source-named packument whose ranges resolve but whose
+          // tarballs are the target's. Requires both fetches to succeed.
+          const [srcRes, dstRes] = await Promise.all([fetch(rewrite(url), opts), fetch(rewrite(alias.targetUrl), opts)]);
+          if (srcRes.ok && dstRes.ok) {
+            const json = synthesizeRemappedPackument(await srcRes.json(), await dstRes.json(), alias.src);
+            if (json) {
+              const body = new TextEncoder().encode(JSON.stringify(json)).buffer;
+              const headers = {};
+              for (const [k, v] of dstRes.headers) headers[k] = v;
+              headers["content-type"] = "application/json";
+              delete headers["content-length"]; // synthesized body length differs
+              delete headers["content-encoding"]; // we return decoded JSON bytes
+              return { ok: true, status: 200, statusText: "OK", headers, body };
+            }
+          }
+        } else {
+          const res = await fetch(rewrite(alias.targetUrl), opts);
+          if (res.ok) {
+            const json = rewritePackument(await res.json(), alias.src);
+            const body = new TextEncoder().encode(JSON.stringify(json)).buffer;
+            const headers = {};
+            for (const [k, v] of res.headers) headers[k] = v;
+            headers["content-type"] = "application/json";
+            delete headers["content-length"]; // body length changed after rewrite
+            delete headers["content-encoding"]; // we return decoded JSON bytes
+            return { ok: true, status: res.status, statusText: res.statusText, headers, body };
+          }
         }
       } catch {
         // Network/parse failure — fall back to the un-aliased fetch below.
