@@ -12,6 +12,9 @@ node_modules
 /packages/core/dist
 /packages/react/dist
 
+# Unified Cloudflare Pages output (rebuild with `npm run build:site`)
+/dist
+
 # Vendored real-npm delivery asset (rebuild with `npm run vendor:npm`)
 /packages/studio/public/vendor
 

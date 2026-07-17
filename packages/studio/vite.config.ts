@@ -137,8 +137,16 @@ function serveDevtools(): Plugin {
   };
 }
 
+// For the unified Cloudflare Pages deploy the studio is served under `/studio/`
+// (the landing owns `/` and the docs own `/docs/`). Set `VV_BASE=/studio/` for that
+// build; local `npm run dev` keeps the default root base. The preview Service
+// Worker and its runtime asset tree (/sw.js, /preview/*, /vv-devtools/*,
+// /devtools/*) always stay at the origin root because the SW claims root scope.
+const base = process.env.VV_BASE || "/";
+
 // https://vite.dev/config/
 export default defineConfig({
+  base,
   plugins: [
     // plugin-react v6 transforms JSX with oxc; the React Compiler is a Babel
     // plugin, wired in via the exported preset + @rolldown/plugin-babel.

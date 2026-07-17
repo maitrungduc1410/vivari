@@ -1,0 +1,40 @@
+name: Feature request
+description: Suggest an idea or improvement for Vivari
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! Please check the roadmap and existing issues first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the use case or pain point, not just the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to happen? API sketches welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds or other approaches you've thought about.
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which part of Vivari?
+      options:
+        - "@vivari/core (SDK)"
+        - "@vivari/react (SDK)"
+        - Studio app
+        - Docs / landing site
+        - Runtime / builtins
+        - Other
+    validations:
+      required: true

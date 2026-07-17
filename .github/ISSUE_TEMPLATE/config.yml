@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://vivari.pages.dev/docs
+    about: Read the guides and API reference before filing an issue.
+  - name: Questions & Discussions
+    url: https://github.com/maitrungduc1410/vivari/discussions
+    about: Ask questions, share projects, and propose ideas here.
+  - name: Security vulnerability
+    url: https://github.com/maitrungduc1410/vivari/security/advisories/new
+    about: Please report security issues privately, not as public issues.

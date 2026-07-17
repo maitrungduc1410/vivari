@@ -1,0 +1,63 @@
+name: Bug report
+description: Report something that isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! Please search existing issues
+        first to avoid duplicates.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+      placeholder: When I ..., I expected ..., but instead ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: A minimal, reliable way to reproduce the problem. A shared studio link or code snippet helps a lot.
+      placeholder: |
+        1. Boot Vivari with ...
+        2. Mount ...
+        3. Spawn ...
+        4. See error
+    validations:
+      required: true
+  - type: input
+    id: package-version
+    attributes:
+      label: Vivari version
+      description: Version of @vivari/core / @vivari/react (or commit SHA).
+      placeholder: "@vivari/core 0.x.x"
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where did it happen?
+      options:
+        - "@vivari/core (SDK)"
+        - "@vivari/react (SDK)"
+        - Studio app
+        - Docs / landing site
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: Browser + version, OS. Remember Vivari needs a cross-origin isolated page.
+      placeholder: "Chrome 139 on macOS 15"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Console output / screenshots
+      description: Any relevant errors from the browser console.
+      render: shell
