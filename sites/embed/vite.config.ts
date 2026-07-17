@@ -66,6 +66,12 @@ export default defineConfig({
   base,
   plugins: [react(), crossOriginIsolation()],
   resolve: {
+    // @vivari/react is aliased to its monorepo source below, so its bare react
+    // and react-dom imports resolve from packages/react (the hoisted root copy)
+    // while this app's own imports resolve from sites/embed. Two React copies in
+    // one bundle cause an invalid hook call (the dispatcher is null, so useState
+    // throws). Dedupe collapses every react specifier to a single copy.
+    dedupe: ["react", "react-dom", "react/jsx-runtime"],
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
       // Consume the SDK from source in the monorepo, exactly like the studio does:
