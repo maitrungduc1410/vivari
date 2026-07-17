@@ -145,3 +145,9 @@ See `roadmap.md` for full status. Next up:
 
 6. Migrate builtins to Node's real `lib/` on an `internalBinding` layer (Path B),
    ESM support, and real `npm install`.
+
+## License
+
+[MIT](LICENSE) — free for any use, commercial or otherwise. Unlike StackBlitz's
+WebContainer API, there is no commercial license or usage fee: embed it, fork it,
+ship it.
