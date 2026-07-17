@@ -20,7 +20,7 @@ const STEPS = [
 
 export function HowItWorks() {
   return (
-    <section id="how" className="mx-auto max-w-6xl px-6 py-24">
+    <section id="how" className="mx-auto max-w-7xl px-6 py-24">
       <div className="grid gap-14 lg:grid-cols-[0.9fr_1.1fr] lg:items-center">
         <Reveal>
           <h2 className="text-3xl font-semibold tracking-tight md:text-4xl">

@@ -23,6 +23,7 @@
   --animate-float: float 7s ease-in-out infinite;
   --animate-marquee: marquee 32s linear infinite;
   --animate-shimmer: shimmer 2.4s linear infinite;
+  --animate-flow: flow 1.1s linear infinite;
 }
 
 @keyframes aurora {
@@ -63,6 +64,12 @@
   }
   to {
     background-position: -200% 0;
+  }
+}
+
+@keyframes flow {
+  to {
+    stroke-dashoffset: -16;
   }
 }
 

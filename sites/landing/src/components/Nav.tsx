@@ -29,7 +29,7 @@ export function Nav() {
       className="fixed inset-x-0 top-0 z-50 flex justify-center px-4 pt-4"
     >
       <nav
-        className={`flex w-full max-w-5xl items-center justify-between rounded-2xl px-4 py-2.5 transition-colors duration-300 ${
+        className={`flex w-full max-w-7xl items-center justify-between rounded-2xl px-4 py-2.5 transition-colors duration-300 ${
           scrolled ? "glass shadow-lg shadow-black/40" : "border border-transparent"
         }`}
       >

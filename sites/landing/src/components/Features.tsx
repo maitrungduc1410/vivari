@@ -43,7 +43,7 @@ const FEATURES = [
 
 export function Features() {
   return (
-    <section id="features" className="mx-auto max-w-6xl px-6 py-24">
+    <section id="features" className="mx-auto max-w-7xl px-6 py-24">
       <Reveal className="mx-auto max-w-2xl text-center">
         <h2 className="text-3xl font-semibold tracking-tight md:text-4xl">
           A whole toolchain, <span className="text-gradient">client-side</span>

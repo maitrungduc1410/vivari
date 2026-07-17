@@ -1,7 +1,7 @@
 import { motion, type Variants } from "motion/react";
 import { ArrowRight, BookOpen, Sparkles } from "lucide-react";
 import { site } from "@/site";
-import { Terminal } from "./Terminal";
+import { Workspace } from "./Workspace";
 
 const container: Variants = {
   hidden: {},
@@ -14,8 +14,8 @@ const item: Variants = {
 
 export function Hero() {
   return (
-    <section id="top" className="relative mx-auto max-w-6xl px-6 pt-36 pb-20 md:pt-44">
-      <div className="grid items-center gap-12 lg:grid-cols-[1.05fr_0.95fr]">
+    <section id="top" className="relative mx-auto max-w-7xl px-6 pt-32 pb-20 md:pt-40">
+      <div className="grid items-center gap-12 lg:grid-cols-[0.9fr_1.1fr]">
         <motion.div variants={container} initial="hidden" animate="show">
           <motion.a
             variants={item}
@@ -72,7 +72,7 @@ export function Hero() {
           transition={{ duration: 0.8, ease: "easeOut", delay: 0.2 }}
           className="animate-float"
         >
-          <Terminal />
+          <Workspace />
         </motion.div>
       </div>
     </section>

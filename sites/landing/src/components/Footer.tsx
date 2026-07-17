@@ -5,7 +5,7 @@ import { Logo } from "./Logo";
 export function Footer() {
   return (
     <footer className="border-t border-border">
-      <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-6 px-6 py-10 sm:flex-row">
+      <div className="mx-auto flex max-w-7xl flex-col items-center justify-between gap-6 px-6 py-10 sm:flex-row">
         <div className="flex items-center gap-2">
           <Logo className="h-6 w-6" />
           <span className="font-medium">{site.name}</span>
