@@ -324,6 +324,7 @@ async function createOpfsDepStorage() {
     if (typeof navigator !== "undefined" && navigator.storage && navigator.storage.getDirectory) {
       const storage = await createOpfsDepStorage();
       depCache = await createDepCache({ access: accessRef, storage });
+      post("log", { line: "  [depcache] ready", cls: "muted" });
     }
   } catch (err) {
     post("log", { line: "  [depcache] unavailable: " + (err?.message || err), cls: "muted" });

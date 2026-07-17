@@ -494,6 +494,7 @@ async function demoRunCommand(d) {
   // Deps not present yet — try the persistent cache before falling back to a real
   // install. The demos install with npm.
   if (await tryRestoreDeps(d.dir, "npm")) return run;
+  post("log", { line: "  [depcache] no snapshot for npm — installing…", dim: true });
   return `npm install && ${run}`;
 }
 
@@ -878,7 +879,10 @@ async function openTerminal(terminalId, cwd, demoId, run) {
     let vvRun;
     if (kernel.exists(dir + "/node_modules")) vvRun = devCmd;
     else if (await tryRestoreDeps(dir, install)) vvRun = devCmd;
-    else vvRun = `${install} && ${devCmd}`;
+    else {
+      post("log", { line: `  [depcache] no snapshot for ${pmName(install)} — installing…`, dim: true });
+      vvRun = `${install} && ${devCmd}`;
+    }
     env.VV_RUN = vvRun;
     // Merge any template-declared environment (memory/telemetry levers the
     // framework honors — e.g. NUXT_TELEMETRY_DISABLED). Applied last so a
