@@ -730,7 +730,8 @@ assert.ok(zlib.unzipSync(zlib.gzipSync(data)).equals(data), 'unzipSync auto-dete
 assert.ok(zlib.unzipSync(zlib.deflateSync(data)).equals(data), 'unzipSync auto-detects zlib');
 
 // cross-compat: a gzip buffer made by the REAL Node zlib must decode here.
-const fromNode = Buffer.from('H4sIAAAAAAAAE/MvSM1zzs8rSczMSy1SqMrJTFJQNjRUeNQwRSE5Me3wSoVHTWsAWCDGcyQAAAA=', 'base64');
+// (Produced by host node:zlib gzipSync of the expected string below.)
+const fromNode = Buffer.from('H4sIAAAAAAAAAwvLLEssylSoyslMUlA2NFR41DBFITkx7fBKhUdNawAosGQvHQAAAA==', 'base64');
 assert.strictEqual(zlib.gunzipSync(fromNode).toString('utf8'), 'Vivari zlib #11 — café €', 'gunzip a Node-produced gzip');
 
 // crc32 matches the real Node value.
