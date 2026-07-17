@@ -37,6 +37,9 @@ npm run build:crypto
 # --- Studio (served under /studio/) --------------------------------------------
 ( cd packages/studio && bun install && VV_BASE=/studio/ bun run build )
 
+# --- Embed playground (served under /embed/; iframed by the docs) ---------------
+( cd sites/embed && bun install && VV_BASE=/embed/ bun run build )
+
 # --- Landing (served at /) -----------------------------------------------------
 ( cd sites/landing && bun install && bun run build )
 

@@ -31,8 +31,6 @@ const config: Config = {
     },
   },
 
-  themes: ["@docusaurus/theme-live-codeblock"],
-
   presets: [
     [
       "classic",

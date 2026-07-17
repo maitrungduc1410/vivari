@@ -5,18 +5,22 @@ title: Deployment
 
 # Deploying on Cloudflare Pages
 
-This project ships three surfaces on a **single origin** so cross-links stay
+This project ships four surfaces on a **single origin** so cross-links stay
 root-relative:
 
 | Path | App | Cross-origin isolated? |
 | --- | --- | --- |
 | `/` | Landing (Vite + React) | No |
-| `/docs/` | Docs (this site — Docusaurus) | No |
+| `/docs/` | Docs (this site — Docusaurus) | **Yes** |
 | `/studio/` | Studio (the IDE) | **Yes** |
+| `/embed/` | Live doc examples (Vite + React) | **Yes** |
 
-The studio needs COOP/COEP; the landing and docs do not. Cross-origin isolation
-is scoped to just the paths that need it, so the marketing pages are free of CORP
-constraints.
+The studio and the `/embed/` playground run the Vivari runtime, so they need
+COOP/COEP. The docs are isolated too, because they host the `/embed/` playground
+in an `<iframe>` and an iframe is only cross-origin isolated when its top-level
+document is. Only the landing (`/`) stays free of COEP. Isolating the docs is safe
+because they load only same-origin assets — adding a cross-origin resource (e.g.
+Algolia DocSearch, external images) would need `credentialless` or CORP headers.
 
 ## Unified build
 
@@ -27,10 +31,11 @@ npm run build:site
 ```
 
 Under the hood it builds the Rust→Wasm crates, then the studio (with Vite
-`base: "/studio/"`), the landing, and the docs, then assembles the output. The
-preview Service Worker and its runtime asset tree stay at the origin root
-(`/sw.js`, `/preview/*`, `/vv-devtools/*`, `/devtools/*`) because the SW claims
-root scope; only the studio UI is namespaced under `/studio/`.
+`base: "/studio/"`), the `/embed/` playground (`base: "/embed/"`), the landing, and
+the docs, then assembles the output. The preview Service Worker and its runtime
+asset tree stay at the origin root (`/sw.js`, `/preview/*`, `/vv-devtools/*`,
+`/devtools/*`) because the SW claims root scope; the studio and embed UIs are
+namespaced under `/studio/` and `/embed/`.
 
 ## Cloudflare Pages settings
 
@@ -46,10 +51,18 @@ container, so no extra configuration is needed.
 ## Headers (`_headers`)
 
 The assembler emits a `dist/_headers` file that scopes cross-origin isolation to
-the studio and the Service Worker only:
+every surface that runs (or hosts) the runtime, plus the Service Worker:
 
 ```
 /studio/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/embed/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/docs/*
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
 

@@ -48,16 +48,46 @@
   mask-size: contain;
 }
 
-/* Interactive live-code playground: preview and editor side by side on wide
-   screens (falls back to stacked on narrow ones). */
-@media (min-width: 997px) {
-  div[class*="playgroundContainer"] {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    grid-template-rows: auto 1fr;
-    align-items: stretch;
-  }
-  div[class*="playgroundContainer"] > div[class*="playgroundHeader"] {
-    grid-column: 1 / -1;
-  }
+/* Live example embedded from the sibling /embed/ app (see Playground.tsx). */
+.vv-playground {
+  margin: 1.5rem 0;
+  border: 1px solid var(--ifm-toc-border-color);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--ifm-background-surface-color);
+  box-shadow: 0 10px 30px -18px rgba(0, 0, 0, 0.6);
+}
+
+.vv-playground__bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.85rem;
+  border-bottom: 1px solid var(--ifm-toc-border-color);
+  font-size: 0.8rem;
+}
+
+.vv-playground__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #34d399;
+  box-shadow: 0 0 8px 1px rgba(52, 211, 153, 0.55);
+}
+
+.vv-playground__label {
+  font-weight: 600;
+  color: var(--ifm-font-color-base);
+}
+
+.vv-playground__link {
+  font-weight: 600;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.vv-playground__frame {
+  display: block;
+  width: 100%;
+  border: 0;
 }

@@ -3,6 +3,8 @@ sidebar_position: 2
 title: Getting started
 ---
 
+import Playground from '@site/src/components/Playground';
+
 # Getting started
 
 ## Install
@@ -65,34 +67,14 @@ await vivari.spawn("npm", ["run", "dev"]); // long-running; don't await exit
 
 ## Interactive example
 
-The editor below is live — edit the code and the preview updates instantly. (This
-renders a plain React component; running a full Node runtime in-page needs a
-cross-origin isolated document, which is why the real thing lives in the
-[Studio](pathname:///studio/).)
+Edit `index.js` below and press **Run**. This boots a real Node.js runtime in your
+browser (inside a cross-origin isolated frame) and streams the actual `stdout`
+back — try importing another `node:` built-in or changing the loop.
 
-```jsx live
-function MountPreview() {
-  const [name, setName] = React.useState("app");
-  const tree = {
-    "package.json": { file: { contents: `{ "name": "${name}" }` } },
-    "index.js": { file: { contents: "console.log('hi')" } },
-  };
-  return (
-    <div style={{ fontFamily: "system-ui", display: "grid", gap: 8 }}>
-      <label>
-        project name:{" "}
-        <input value={name} onChange={(e) => setName(e.target.value)} />
-      </label>
-      <pre style={{ background: "#0e1119", color: "#eef1f8", padding: 12, borderRadius: 8 }}>
-        {JSON.stringify(tree, null, 2)}
-      </pre>
-    </div>
-  );
-}
-```
+<Playground scenario="node" />
 
 :::tip Run real projects
-To actually `npm install` and boot a dev server, [open the Studio](pathname:///studio/) or
+To scaffold a full project, `npm install`, and boot a dev server, [open the Studio](pathname:///studio/) or
 embed the [`<Vivari>` component](./react) on a cross-origin isolated page.
 :::
 

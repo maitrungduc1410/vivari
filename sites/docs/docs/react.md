@@ -3,6 +3,8 @@ sidebar_position: 4
 title: React
 ---
 
+import Playground from '@site/src/components/Playground';
+
 # `@vivari/react`
 
 React bindings for Vivari. Like all of Vivari, this needs a **cross-origin
@@ -57,6 +59,14 @@ Extends `BootOptions` (`compress`, `serviceWorkerUrl`, `workerName`), plus:
 | `className` | `string` | – |
 | `style` | `CSSProperties` | – |
 | `fallback` | `ReactNode` | `null` |
+
+## Live example
+
+The `<Vivari>` component below boots a real Vite + React dev server inside your
+browser and renders its preview. Edit `src/App.jsx` on the left and the preview
+hot-reloads — no server involved.
+
+<Playground scenario="react" />
 
 ## `useVivari()` hook
 
