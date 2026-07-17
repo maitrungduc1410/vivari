@@ -9,15 +9,17 @@
 // randomBytes/randomFill/randomInt/randomUUID, and a SYMMETRIC KeyObject
 // (KeyObject + createSecretKey) so jsonwebtoken@9 HS256/384/512 works.
 //
-// Covered (S3): scrypt/scryptSync, and the ELLIPTIC asymmetric surface —
-// createPrivateKey/createPublicKey (PKCS#8 'PRIVATE KEY' + SPKI 'PUBLIC KEY',
-// PEM or DER), asymmetric KeyObjects (ec/ed25519), createSign/createVerify +
-// one-shot sign/verify, and generateKeyPair(Sync) for 'ec' (prime256v1/secp384r1)
-// and 'ed25519'. Unlocks ES256/ES384 + EdDSA JWTs (jsonwebtoken/jose native path).
-// The Rust codec does the math; this layer handles PEM<->DER + the stream shape.
+// Covered (S3): scrypt/scryptSync, and the asymmetric surface —
+// createPrivateKey/createPublicKey (PKCS#8 'PRIVATE KEY' + SPKI 'PUBLIC KEY' +
+// PKCS#1 'RSA PRIVATE/PUBLIC KEY', PEM or DER), asymmetric KeyObjects
+// (ec/ed25519/rsa), createSign/createVerify + one-shot sign/verify, RSA
+// publicEncrypt/privateDecrypt (OAEP + PKCS1v15), and generateKeyPair(Sync) for
+// 'ec' (prime256v1/secp384r1), 'ed25519' and 'rsa'. Unlocks ES256/384 + EdDSA +
+// RS256/384/512 + PS256/384/512 JWTs (jsonwebtoken/jose native path). The Rust
+// codec does the math; this layer handles PEM<->DER + padding + the stream shape.
 //
-// NOT covered yet (throw loudly): RSA (RS/PS, publicEncrypt/privateDecrypt),
-// SEC1 'EC PRIVATE KEY' / PKCS#1, encrypted/passphrase keys, DH/ECDH, X.509, JWK.
+// NOT covered yet (throw loudly): SEC1 'EC PRIVATE KEY', encrypted/passphrase
+// keys, privateEncrypt/publicDecrypt, DH/ECDH, X.509, JWK.
 
 export default function (exports, require, module, process, internalBinding) {
   const { Buffer } = require("buffer");
@@ -211,13 +213,7 @@ export default function (exports, require, module, process, internalBinding) {
         return this;
       }
       sign(privateKey, outputEncoding) {
-        const { der, dsaEncoding } = resolveSignKey(privateKey, "private");
-        const sig = binding.asymSign(
-          der,
-          normalizeSignAlgo(this._algo),
-          concat(this._chunks),
-          dsaEncoding === "ieee-p1363",
-        );
+        const sig = doSign(resolveSignKey(privateKey, "private"), this._algo, concat(this._chunks));
         return outputEncoding ? Buffer.from(sig).toString(outputEncoding) : Buffer.from(sig);
       }
     }
@@ -241,18 +237,11 @@ export default function (exports, require, module, process, internalBinding) {
         return this;
       }
       verify(key, signature, signatureEncoding) {
-        const { der, dsaEncoding } = resolveSignKey(key, "public");
         const sig =
           typeof signature === "string"
             ? new Uint8Array(Buffer.from(signature, signatureEncoding || "hex"))
             : toBytes(signature);
-        return binding.asymVerify(
-          der,
-          normalizeSignAlgo(this._algo),
-          concat(this._chunks),
-          sig,
-          dsaEncoding === "ieee-p1363",
-        );
+        return doVerify(resolveSignKey(key, "public"), this._algo, concat(this._chunks), sig);
       }
     }
 
@@ -475,11 +464,14 @@ export default function (exports, require, module, process, internalBinding) {
       if (!parsed) throw new Error("Vivari crypto: could not parse PEM key");
       if (parsed.label === "PRIVATE KEY") return { der: parsed.der, isPrivate: true };
       if (parsed.label === "PUBLIC KEY") return { der: parsed.der, isPrivate: false };
+      // Traditional RSA PEMs (PKCS#1); normalized to PKCS#8/SPKI by createPrivate/PublicKey.
+      if (parsed.label === "RSA PRIVATE KEY") return { der: parsed.der, isPrivate: true };
+      if (parsed.label === "RSA PUBLIC KEY") return { der: parsed.der, isPrivate: false };
       if (parsed.label === "ENCRYPTED PRIVATE KEY") {
         throw new Error("Vivari crypto: encrypted PKCS#8 keys are not supported yet");
       }
       throw new Error(
-        `Vivari crypto: unsupported PEM key '${parsed.label}' (phase 1: PKCS#8 'PRIVATE KEY' / SPKI 'PUBLIC KEY'; SEC1/PKCS#1 not yet)`,
+        `Vivari crypto: unsupported PEM key '${parsed.label}' (PKCS#8 'PRIVATE KEY' / SPKI 'PUBLIC KEY' / PKCS#1 'RSA PRIVATE/PUBLIC KEY'; SEC1 'EC PRIVATE KEY' not yet)`,
       );
     }
     if (format === "der") return { der: toBytes(keyData), isPrivate: want === "private" };
@@ -490,15 +482,20 @@ export default function (exports, require, module, process, internalBinding) {
     constructor(type, der, descriptor) {
       super(type);
       this[kKeyMaterial] = der;
-      const [kt, curve] = String(descriptor).split(":");
+      // descriptor: "ed25519" | "ec:prime256v1" | "ec:secp384r1" | "rsa:<bits>"
+      const [kt, detail] = String(descriptor).split(":");
       this._asymmetricKeyType = kt;
-      this._namedCurve = curve;
+      if (kt === "rsa") {
+        this._details = detail ? { modulusLength: Number(detail) } : {};
+      } else {
+        this._details = detail ? { namedCurve: detail } : {};
+      }
     }
     get asymmetricKeyType() {
       return this._asymmetricKeyType;
     }
     get asymmetricKeyDetails() {
-      return this._namedCurve ? { namedCurve: this._namedCurve } : {};
+      return { ...this._details };
     }
     export(options = {}) {
       const format = options.format || "pem";
@@ -534,7 +531,8 @@ export default function (exports, require, module, process, internalBinding) {
     }
     const { der, isPrivate } = extractKeyDer(input, "private");
     if (!isPrivate) throw new Error("Vivari crypto: expected a private key, got a public key");
-    return new AsymmetricKeyObject("private", der, binding.inspectPrivate(der));
+    const norm = binding.normalizePrivate(der);
+    return new AsymmetricKeyObject("private", norm, binding.inspectPrivate(norm));
   }
 
   function createPublicKey(input) {
@@ -552,7 +550,34 @@ export default function (exports, require, module, process, internalBinding) {
       const spki = binding.publicFromPrivate(der);
       return new AsymmetricKeyObject("public", spki, binding.inspectPublic(spki));
     }
-    return new AsymmetricKeyObject("public", der, binding.inspectPublic(der));
+    const norm = binding.normalizePublic(der);
+    return new AsymmetricKeyObject("public", norm, binding.inspectPublic(norm));
+  }
+
+  // OpenSSL padding/salt constants (crypto.constants) — jsonwebtoken/jose read
+  // these to select RSA-PSS. Kept minimal to what our RSA surface honors.
+  const RSA_CONSTANTS = {
+    RSA_PKCS1_PADDING: 1,
+    RSA_NO_PADDING: 3,
+    RSA_PKCS1_OAEP_PADDING: 4,
+    RSA_PKCS1_PSS_PADDING: 6,
+    RSA_PSS_SALTLEN_DIGEST: -1,
+    RSA_PSS_SALTLEN_AUTO: -2,
+    RSA_PSS_SALTLEN_MAX_SIGN: -2,
+  };
+
+  // A `{ key, ... }` options object (vs a bare KeyObject / PEM / DER buffer).
+  function isKeyOptions(x) {
+    return (
+      x &&
+      typeof x === "object" &&
+      typeof x !== "string" &&
+      !x[kKeyObjectBrand] &&
+      !Buffer.isBuffer(x) &&
+      !ArrayBuffer.isView(x) &&
+      !(x instanceof ArrayBuffer) &&
+      "key" in x
+    );
   }
 
   // OpenSSL-style algorithm names ('RSA-SHA256', 'sha256', 'SHA256') -> digest.
@@ -562,32 +587,42 @@ export default function (exports, require, module, process, internalBinding) {
     return String(algo).toLowerCase().replace(/^rsa-/, "");
   }
 
-  // Resolve a key argument (KeyObject | PEM | DER | { key, dsaEncoding, ... }) to
-  // its DER + the ECDSA signature encoding preference.
+  // Resolve a key argument (KeyObject | PEM | DER | { key, dsaEncoding, padding,
+  // saltLength }) to its DER + type + the ECDSA/RSA signature preferences.
   function resolveSignKey(key, want) {
-    let dsaEncoding;
-    if (
-      key &&
-      typeof key === "object" &&
-      typeof key !== "string" &&
-      !key[kKeyObjectBrand] &&
-      !Buffer.isBuffer(key) &&
-      !ArrayBuffer.isView(key) &&
-      !(key instanceof ArrayBuffer) &&
-      "key" in key
-    ) {
+    let dsaEncoding, padding, saltLength;
+    if (isKeyOptions(key)) {
       dsaEncoding = key.dsaEncoding;
+      padding = key.padding;
+      saltLength = key.saltLength;
     }
     const ko = want === "private" ? createPrivateKey(key) : createPublicKey(key);
-    return { der: ko[kKeyMaterial], dsaEncoding };
+    return { der: ko[kKeyMaterial], keyType: ko.asymmetricKeyType, dsaEncoding, padding, saltLength };
+  }
+
+  // Route to RSA (RS*/PS*) vs EC/Ed25519 based on the key's type.
+  function doSign(resolved, algorithm, data) {
+    const { der, keyType, dsaEncoding, padding, saltLength } = resolved;
+    const digestAlgo = normalizeSignAlgo(algorithm);
+    if (keyType === "rsa") {
+      const pss = padding === RSA_CONSTANTS.RSA_PKCS1_PSS_PADDING;
+      return binding.rsaSign(der, digestAlgo, data, pss, saltLength == null ? -1 : saltLength | 0);
+    }
+    return binding.asymSign(der, digestAlgo, data, dsaEncoding === "ieee-p1363");
+  }
+  function doVerify(resolved, algorithm, data, sig) {
+    const { der, keyType, dsaEncoding, padding, saltLength } = resolved;
+    const digestAlgo = normalizeSignAlgo(algorithm);
+    if (keyType === "rsa") {
+      const pss = padding === RSA_CONSTANTS.RSA_PKCS1_PSS_PADDING;
+      return binding.rsaVerify(der, digestAlgo, data, sig, pss, saltLength == null ? -1 : saltLength | 0);
+    }
+    return binding.asymVerify(der, digestAlgo, data, sig, dsaEncoding === "ieee-p1363");
   }
 
   // --- S3: one-shot sign / verify (crypto.sign / crypto.verify) -----------
   function sign(algorithm, data, key, callback) {
-    const { der, dsaEncoding } = resolveSignKey(key, "private");
-    const sig = Buffer.from(
-      binding.asymSign(der, normalizeSignAlgo(algorithm), toBytes(data), dsaEncoding === "ieee-p1363"),
-    );
+    const sig = Buffer.from(doSign(resolveSignKey(key, "private"), algorithm, toBytes(data)));
     if (typeof callback === "function") {
       queueMicrotask(() => callback(null, sig));
       return undefined;
@@ -595,14 +630,7 @@ export default function (exports, require, module, process, internalBinding) {
     return sig;
   }
   function verify(algorithm, data, key, signature, callback) {
-    const { der, dsaEncoding } = resolveSignKey(key, "public");
-    const ok = binding.asymVerify(
-      der,
-      normalizeSignAlgo(algorithm),
-      toBytes(data),
-      toBytes(signature),
-      dsaEncoding === "ieee-p1363",
-    );
+    const ok = doVerify(resolveSignKey(key, "public"), algorithm, toBytes(data), toBytes(signature));
     if (typeof callback === "function") {
       queueMicrotask(() => callback(null, ok));
       return undefined;
@@ -665,6 +693,35 @@ export default function (exports, require, module, process, internalBinding) {
     queueMicrotask(() => (err ? callback(err) : callback(null, res.publicKey, res.privateKey)));
   }
 
+  // --- S3 phase 2: RSA encrypt/decrypt (publicEncrypt / privateDecrypt) -----
+  // Node default padding is RSA_PKCS1_OAEP_PADDING with oaepHash 'sha1'; passing
+  // RSA_PKCS1_PADDING selects RSAES-PKCS1-v1_5.
+  function rsaCipherKey(keyLike, want) {
+    let padding = RSA_CONSTANTS.RSA_PKCS1_OAEP_PADDING;
+    let oaepHash = "sha1";
+    if (isKeyOptions(keyLike)) {
+      if (keyLike.padding != null) padding = keyLike.padding;
+      if (keyLike.oaepHash) oaepHash = keyLike.oaepHash;
+      if (keyLike.oaepLabel != null) throw new Error("Vivari crypto: oaepLabel is not supported yet");
+    }
+    if (padding !== RSA_CONSTANTS.RSA_PKCS1_OAEP_PADDING && padding !== RSA_CONSTANTS.RSA_PKCS1_PADDING) {
+      throw new Error("Vivari crypto: only RSA_PKCS1_OAEP_PADDING and RSA_PKCS1_PADDING are supported");
+    }
+    const ko = want === "public" ? createPublicKey(keyLike) : createPrivateKey(keyLike);
+    if (ko.asymmetricKeyType !== "rsa") {
+      throw new Error(`Vivari crypto: publicEncrypt/privateDecrypt require an RSA key (got ${ko.asymmetricKeyType})`);
+    }
+    return { der: ko[kKeyMaterial], oaep: padding === RSA_CONSTANTS.RSA_PKCS1_OAEP_PADDING, oaepHash };
+  }
+  function publicEncrypt(keyLike, buffer) {
+    const { der, oaep, oaepHash } = rsaCipherKey(keyLike, "public");
+    return Buffer.from(binding.rsaEncrypt(der, toBytes(buffer), oaep, oaepHash));
+  }
+  function privateDecrypt(keyLike, buffer) {
+    const { der, oaep, oaepHash } = rsaCipherKey(keyLike, "private");
+    return Buffer.from(binding.rsaDecrypt(der, toBytes(buffer), oaep, oaepHash));
+  }
+
   const notSupported = (name) => () => {
     throw new Error(`Vivari crypto: ${name} is not supported yet`);
   };
@@ -696,7 +753,7 @@ export default function (exports, require, module, process, internalBinding) {
     getRandomValues: (arr) => webcrypto.getRandomValues(arr),
     getHashes: () => binding.getHashes(),
     getCiphers: () => ["aes-128-cbc", "aes-192-cbc", "aes-256-cbc", "aes-128-gcm", "aes-256-gcm"],
-    constants: {},
+    constants: { ...RSA_CONSTANTS },
     webcrypto,
     // Key material. Secret (symmetric) via createSecretKey; asymmetric (ec/
     // ed25519) via createPrivateKey/createPublicKey. Note: createPrivateKey still
@@ -715,9 +772,10 @@ export default function (exports, require, module, process, internalBinding) {
     generateKeyPairSync,
     scrypt,
     scryptSync,
-    // Still genuinely unsupported (later phases): RSA encrypt/decrypt + DH.
-    publicEncrypt: notSupported("publicEncrypt"),
-    privateDecrypt: notSupported("privateDecrypt"),
+    // S3 phase 2: RSA encryption (OAEP + PKCS1v15).
+    publicEncrypt,
+    privateDecrypt,
+    // Still genuinely unsupported (later phases): raw RSA + DH/ECDH.
     privateEncrypt: notSupported("privateEncrypt"),
     publicDecrypt: notSupported("publicDecrypt"),
     createDiffieHellman: notSupported("createDiffieHellman"),

@@ -852,7 +852,7 @@ console.log('CRYPTOB_OK');
   assert(cb2.code === 0 && cb2.stdout.includes("CRYPTOB_OK"),
     "Path B: our lib/crypto.js runs on the Rust/Wasm crypto codec (digests/HMAC/PBKDF2/AES-GCM+CBC vs node:crypto)");
 
-  // === #12b (S3): scrypt + elliptic asymmetric (ECDSA P-256/P-384, Ed25519) ===
+  // === #12b (S3): scrypt + asymmetric (ECDSA P-256/P-384, Ed25519, RSA) ===
   // Cross-validated against the host's real OpenSSL both directions: our sign is
   // verified by node:crypto, and node:crypto's signatures are verified by us.
   // Ed25519 is deterministic (RFC 8032), so its signature is compared byte-for-
@@ -862,8 +862,13 @@ console.log('CRYPTOB_OK');
   const s3ed = nodeCrypto.generateKeyPairSync("ed25519");
   const s3p256 = nodeCrypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
   const s3p384 = nodeCrypto.generateKeyPairSync("ec", { namedCurve: "P-384" });
+  const s3rsa = nodeCrypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
   const pemPriv = (k) => k.export({ type: "pkcs8", format: "pem" });
   const pemPub = (k) => k.export({ type: "spki", format: "pem" });
+  const PSS = {
+    padding: nodeCrypto.constants.RSA_PKCS1_PSS_PADDING,
+    saltLength: nodeCrypto.constants.RSA_PSS_SALTLEN_DIGEST,
+  };
   const cryptoS3Expected = {
     msgHex: S3MSG.toString("hex"),
     scrypt: nodeCrypto.scryptSync("password", "NaCl", 64, { N: 1024, r: 8, p: 16 }).toString("hex"),
@@ -876,6 +881,16 @@ console.log('CRYPTOB_OK');
     p384Priv: pemPriv(s3p384.privateKey),
     p384Pub: pemPub(s3p384.publicKey),
     p384SigHost: nodeCrypto.sign("sha384", S3MSG, s3p384.privateKey).toString("hex"),
+    // RSA (S3 phase 2): RS256 (PKCS1v15) + PS256 (PSS) signed on the host.
+    rsaPriv: pemPriv(s3rsa.privateKey),
+    rsaPub: pemPub(s3rsa.publicKey),
+    rsaPss: PSS,
+    rs256SigHost: nodeCrypto.sign("RSA-SHA256", S3MSG, s3rsa.privateKey).toString("hex"),
+    ps256SigHost: nodeCrypto
+      .sign("RSA-SHA256", S3MSG, { key: s3rsa.privateKey, ...PSS })
+      .toString("hex"),
+    // OAEP ciphertext (default sha1) the VM must decrypt with the private key.
+    oaepCtHost: nodeCrypto.publicEncrypt(s3rsa.publicKey, S3MSG).toString("hex"),
   };
   kernel.writeFile(
     "/t/cryptos3.js",
@@ -940,16 +955,43 @@ assert.ok(gEd.privateKey.includes('BEGIN PRIVATE KEY'), 'generated ed25519 expor
 assert.strictEqual(crypto.verify(null, msg, gEd.publicKey, crypto.sign(null, msg, gEd.privateKey)), true,
   'generated ed25519 key signs+verifies');
 
+// --- RSA (S3 phase 2): RS256 (PKCS1v15) + PS256 (PSS) ---
+// modulusLength is surfaced (jsonwebtoken@9 reads it during key validation):
+assert.strictEqual(crypto.createPublicKey(E.rsaPub).asymmetricKeyDetails.modulusLength, 2048,
+  'rsa: asymmetricKeyDetails.modulusLength');
+// we verify OpenSSL's RS256 signature, and our RS256 round-trips:
+assert.strictEqual(crypto.verify('RSA-SHA256', msg, E.rsaPub, Buffer.from(E.rs256SigHost, 'hex')), true,
+  'rs256: we verify OpenSSL signature');
+const rs256Sig = crypto.createSign('RSA-SHA256').update(msg).sign(E.rsaPriv);   // deterministic
+assert.strictEqual(rs256Sig.toString('hex'), E.rs256SigHost, 'rs256: our signature == OpenSSL (PKCS1v15 deterministic)');
+assert.strictEqual(crypto.verify('RSA-SHA256', Buffer.from('nope'), E.rsaPub, rs256Sig), false, 'rs256: rejects wrong message');
+// PSS is randomized -> mutual verify:
+assert.strictEqual(crypto.verify('RSA-SHA256', msg, { key: E.rsaPub, ...E.rsaPss }, Buffer.from(E.ps256SigHost, 'hex')), true,
+  'ps256: we verify OpenSSL PSS signature');
+const ps256Sig = crypto.createSign('RSA-SHA256').update(msg).sign({ key: E.rsaPriv, ...E.rsaPss });
+assert.strictEqual(crypto.verify('RSA-SHA256', msg, { key: E.rsaPub, ...E.rsaPss }, ps256Sig), true, 'ps256: our PSS round-trips');
+// RSA-OAEP: decrypt the host's ciphertext; and our own encrypt round-trips:
+assert.strictEqual(crypto.privateDecrypt(E.rsaPriv, Buffer.from(E.oaepCtHost, 'hex')).toString('hex'), E.msgHex,
+  'oaep: we decrypt OpenSSL ciphertext');
+assert.strictEqual(crypto.privateDecrypt(E.rsaPriv, crypto.publicEncrypt(E.rsaPub, msg)).toString('hex'), E.msgHex,
+  'oaep: our encrypt/decrypt round-trips');
+// generateKeyPairSync('rsa') signs+verifies:
+const gRsa = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+assert.strictEqual(crypto.verify('RSA-SHA256', msg, gRsa.publicKey, crypto.sign('RSA-SHA256', msg, gRsa.privateKey)), true,
+  'generated rsa key signs+verifies');
+
 // emit our signatures so the host can verify them with real OpenSSL:
 console.log('SIG_ED25519=' + edSig.toString('hex'));
 console.log('SIG_P256=' + p256Sig.toString('hex'));
 console.log('SIG_P384=' + p384Sig.toString('hex'));
+console.log('SIG_RS256=' + rs256Sig.toString('hex'));
+console.log('SIG_PS256=' + ps256Sig.toString('hex'));
 console.log('CRYPTOS3_OK');
 `,
   );
   const cs3 = await kernel.start("node", ["/t/cryptos3.js"], { cwd: "/t", capture: true });
   assert(cs3.code === 0 && cs3.stdout.includes("CRYPTOS3_OK"),
-    "Path B (S3): scrypt + Ed25519/ECDSA sign+verify on the Rust/Wasm codec (mutually verified vs node:crypto)");
+    "Path B (S3): scrypt + Ed25519/ECDSA/RSA sign+verify + RSA-OAEP on the Rust/Wasm codec (mutually verified vs node:crypto)");
   // Close the loop: OpenSSL must accept the signatures our Wasm codec produced.
   const grab = (re) => (cs3.stdout.match(re) || [])[1];
   assert(
@@ -961,6 +1003,12 @@ console.log('CRYPTOS3_OK');
   assert(
     nodeCrypto.verify("sha384", S3MSG, s3p384.publicKey, Buffer.from(grab(/SIG_P384=([0-9a-f]+)/), "hex")),
     "OpenSSL verifies our ECDSA P-384 signature");
+  assert(
+    nodeCrypto.verify("RSA-SHA256", S3MSG, s3rsa.publicKey, Buffer.from(grab(/SIG_RS256=([0-9a-f]+)/), "hex")),
+    "OpenSSL verifies our RSA RS256 signature");
+  assert(
+    nodeCrypto.verify("RSA-SHA256", S3MSG, { key: s3rsa.publicKey, ...PSS }, Buffer.from(grab(/SIG_PS256=([0-9a-f]+)/), "hex")),
+    "OpenSSL verifies our RSA PS256 (PSS) signature");
 
   // === #13: ESM import/export transpiled to our sync CJS (es-module-lexer) ===
   // Seed a small ESM/CJS mixed graph: named/default/namespace imports, CJS<->ESM

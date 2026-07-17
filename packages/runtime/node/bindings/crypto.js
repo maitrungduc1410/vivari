@@ -245,8 +245,12 @@ export function createCryptoBinding({ codec } = {}) {
       const curve = opts.namedCurve || opts.curve;
       if (!curve) throw new Error("Vivari crypto: generateKeyPair('ec') requires options.namedCurve");
       kp = codec.generate_ec_keypair(String(curve));
+    } else if (type === "rsa") {
+      const bits = opts.modulusLength;
+      if (!bits) throw new Error("Vivari crypto: generateKeyPair('rsa') requires options.modulusLength");
+      kp = codec.generate_rsa_keypair(bits >>> 0);
     } else {
-      throw new Error(`Vivari crypto: generateKeyPair type '${type}' is not supported yet (phase 1: 'ec', 'ed25519')`);
+      throw new Error(`Vivari crypto: generateKeyPair type '${type}' is not supported yet (phase 1: 'ec', 'ed25519'; phase 2: 'rsa')`);
     }
     const out = { privateDer: new Uint8Array(kp.privateDer), publicDer: new Uint8Array(kp.publicDer) };
     if (typeof kp.free === "function") kp.free();
@@ -277,6 +281,37 @@ export function createCryptoBinding({ codec } = {}) {
     return !!codec.asym_verify(pubDer, norm(digestAlgo || ""), data, sig, !!ieeeP1363);
   }
 
+  // --- S3 phase 2: RSA -------------------------------------------------------
+  // Canonicalize PKCS#1 keys to PKCS#8 / SPKI (no-op for EC/Ed25519).
+  function normalizePrivate(der) {
+    needCodec("createPrivateKey");
+    return new Uint8Array(codec.normalize_private_der(der));
+  }
+  function normalizePublic(der) {
+    needCodec("createPublicKey");
+    return new Uint8Array(codec.normalize_public_der(der));
+  }
+
+  // pss=false -> RSASSA-PKCS1-v1_5 (RS*); pss=true -> RSA-PSS (PS*). saltLen<0
+  // means "use the digest length" (OpenSSL/Node default for PSS).
+  function rsaSign(privDer, digestAlgo, data, pss, saltLen) {
+    needCodec("sign");
+    return new Uint8Array(codec.rsa_sign(privDer, norm(digestAlgo), data, !!pss, saltLen | 0));
+  }
+  function rsaVerify(pubDer, digestAlgo, data, sig, pss, saltLen) {
+    needCodec("verify");
+    return !!codec.rsa_verify(pubDer, norm(digestAlgo), data, sig, !!pss, saltLen | 0);
+  }
+  // oaep=true -> RSA-OAEP with oaepHash; oaep=false -> RSAES-PKCS1-v1_5.
+  function rsaEncrypt(pubDer, data, oaep, oaepHash) {
+    needCodec("publicEncrypt");
+    return new Uint8Array(codec.rsa_encrypt(pubDer, data, !!oaep, norm(oaepHash || "sha1")));
+  }
+  function rsaDecrypt(privDer, data, oaep, oaepHash) {
+    needCodec("privateDecrypt");
+    return new Uint8Array(codec.rsa_decrypt(privDer, data, !!oaep, norm(oaepHash || "sha1")));
+  }
+
   return {
     digest,
     hmac,
@@ -292,6 +327,12 @@ export function createCryptoBinding({ codec } = {}) {
     publicFromPrivate,
     asymSign,
     asymVerify,
+    normalizePrivate,
+    normalizePublic,
+    rsaSign,
+    rsaVerify,
+    rsaEncrypt,
+    rsaDecrypt,
     getHashes: () => HASHES.slice(),
     hasCodec: !!codec,
   };

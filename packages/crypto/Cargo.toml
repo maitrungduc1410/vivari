@@ -15,8 +15,10 @@ wasm-bindgen = "0.2"
 # additions (keygen) need entropy, so getrandom's `js` backend routes to the
 # Worker's WebCrypto (browser) / node:crypto (nodejs target) at runtime.
 md-5 = "0.10"
-sha1 = "0.10"
-sha2 = "0.10"
+# `oid` on sha1/sha2 provides the AssociatedOid used to build RSA PKCS#1v15
+# DigestInfo prefixes (RS256/384/512).
+sha1 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
 hmac = "0.12"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 aes = "0.8"
@@ -28,11 +30,18 @@ scrypt = { version = "0.11", default-features = false }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "arithmetic"] }
 p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "arithmetic"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["pkcs8", "rand_core", "alloc"] }
+# RSA (S3 phase 2): RS256/384/512 + PSS sign/verify, OAEP/PKCS1v15 encrypt/decrypt,
+# keygen. Pure Rust (num-bigint-dig); pkcs1/pkcs8/spki key handling built in.
+rsa = { version = "0.9", default-features = false }
 ecdsa = { version = "0.16", default-features = false, features = ["der", "hazmat", "pkcs8", "alloc"] }
 pkcs8 = { version = "0.10", default-features = false, features = ["alloc"] }
 spki = { version = "0.7", default-features = false, features = ["alloc"] }
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 getrandom = { version = "0.2", features = ["js"] }
+# Trait bounds for the generic RSA sign/verify/OAEP bodies (AssociatedOid for the
+# PKCS#1v15 DigestInfo prefix; DynDigest for OAEP's MGF).
+digest = { version = "0.10", default-features = false, features = ["alloc", "oid"] }
+const-oid = { version = "0.9", default-features = false }
 
 [profile.release]
 opt-level = "s"
