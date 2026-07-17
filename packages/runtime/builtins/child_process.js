@@ -11,7 +11,8 @@
 //     events), so a long-running child (a dev server) streams live instead of
 //     freezing the parent until it exits.
 //
-// stdin (parent -> child) is deferred: `child.stdin` exists but is a no-op sink.
+// stdin (parent -> child): `child.stdin` is a binary-safe Writable-ish sink that
+// relays bytes to the kernel, which pushes them into the child's process.stdin.
 
 export function createChildProcess({ sys, process, Buffer, EventEmitter, Readable, childLiveness, wake, postRaw }) {
   // ---- synchronous subset (unchanged) --------------------------------------
@@ -83,24 +84,55 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
     writable: true,
     readable: false,
     destroyed: false,
-    write(chunk) {
-      if (childPid >= 0 && postRaw) {
-        const s = typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    write(chunk, encoding, cb) {
+      if (typeof encoding === "function") {
+        cb = encoding;
+        encoding = undefined;
+      }
+      if (childPid >= 0 && postRaw && chunk != null) {
+        // Preserve bytes exactly: strings honor their encoding; Buffer/TypedArray
+        // pass through untouched so binary stdin (tar streams, zips, protobuf,
+        // image bytes) reaches the child intact rather than mangled through utf8.
+        let bytes;
+        if (typeof chunk === "string") bytes = Buffer.from(chunk, encoding || "utf8");
+        else if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) bytes = chunk;
+        else bytes = Buffer.from(String(chunk));
         try {
-          postRaw({ type: "child-stdin", childPid, chunk: s });
+          postRaw({ type: "child-stdin", childPid, chunk: bytes });
         } catch {
           /* kernel/child gone */
         }
       }
+      if (typeof cb === "function") {
+        try {
+          cb();
+        } catch {
+          /* listener threw */
+        }
+      }
       return true;
     },
-    end(chunk) {
-      if (chunk != null) this.write(chunk);
+    end(chunk, encoding, cb) {
+      if (typeof chunk === "function") {
+        cb = chunk;
+        chunk = undefined;
+      } else if (typeof encoding === "function") {
+        cb = encoding;
+        encoding = undefined;
+      }
+      if (chunk != null) this.write(chunk, encoding);
       if (childPid >= 0 && postRaw) {
         try {
           postRaw({ type: "child-stdin", childPid, chunk: null });
         } catch {
           /* kernel/child gone */
+        }
+      }
+      if (typeof cb === "function") {
+        try {
+          cb();
+        } catch {
+          /* listener threw */
         }
       }
       return this;

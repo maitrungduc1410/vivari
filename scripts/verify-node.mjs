@@ -1728,6 +1728,96 @@ const timer = setInterval(() => {
   assert(o.includes("nested NEST"), "process: nested execSync child works");
   assert(o.includes("note-contents"), "process: file written by app.js read back by cat");
 
+  // === brick 4b: shell pipes + redirects ===
+  // Fixtures: a producer, an uppercasing stdin filter, and an emitter that writes
+  // to BOTH stdout and stderr (lowercase) so we can prove where each byte flows.
+  kernel.writeFile("/t/produce.js", "process.stdout.write('l1 l2 l3');\n");
+  kernel.writeFile(
+    "/t/upper.js",
+    `let d = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (c) => { d += c; });
+process.stdin.on('end', () => { process.stdout.write(d.toUpperCase()); });
+`,
+  );
+  kernel.writeFile("/t/emit.js", "process.stdout.write('outline'); process.stderr.write('errline');\n");
+  kernel.writeFile(
+    "/pipe.sh",
+    `echo hello | cat
+node /t/produce.js | node /t/upper.js
+echo first > /t/red.txt
+echo second >> /t/red.txt
+cat /t/red.txt
+node /t/emit.js > /t/o.txt 2> /t/e.txt
+cat /t/o.txt
+cat /t/e.txt
+node /t/emit.js 2>&1 | node /t/upper.js
+node /t/upper.js < /t/red.txt
+echo DEVNULL_SUPPRESSED > /dev/null
+node /t/emit.js > /dev/null 2>&1
+node /t/upper.js < /dev/null
+false | true && echo LASTOK
+true | false || echo LASTFAIL
+echo SHPIPE_DONE
+`,
+  );
+  const pipe = await kernel.start("sh", ["/pipe.sh"], { cwd: "/", capture: true });
+  const po = pipe.stdout;
+  assert(pipe.code === 0 && po.includes("SHPIPE_DONE"), "shell: pipe/redirect script runs to completion");
+  assert(po.includes("hello"), "shell: basic pipe (echo hello | cat)");
+  assert(po.includes("L1 L2 L3"), "shell: multi-stage pipe streams + transforms data (node | node)");
+  assert(po.includes("first") && po.includes("second"), "shell: > truncates and >> appends (cat red.txt)");
+  assert(po.includes("outline") && po.includes("errline"), "shell: > and 2> split stdout/stderr to separate files");
+  assert(po.includes("OUTLINE") && po.includes("ERRLINE"), "shell: 2>&1 merges stderr into the pipe");
+  assert(po.includes("FIRST") && po.includes("SECOND"), "shell: < feeds a file into a command's stdin");
+  assert(!po.includes("DEVNULL_SUPPRESSED"), "shell: > /dev/null discards stdout");
+  assert(!po.includes("/dev/null"), "shell: /dev/null redirects open no real fd (no error printed)");
+  assert(po.includes("LASTOK"), "shell: pipeline exit status is the LAST stage (false | true => 0)");
+  assert(po.includes("LASTFAIL"), "shell: pipeline exit status is the LAST stage (true | false => 1)");
+
+  // === child_process: binary-safe parent -> child stdin ===
+  // The parent writes all 256 byte values (in two chunks) to child.stdin and the
+  // child echoes them back byte-for-byte, proving stdin is a real binary sink and
+  // not utf8-mangled.
+  kernel.writeFile(
+    "/t/stdin-child.js",
+    `const fs = require('fs');
+const chunks = [];
+process.stdin.on('data', (c) => chunks.push(c));
+process.stdin.on('end', () => {
+  const buf = Buffer.concat(chunks);
+  fs.writeFileSync('/t/received.bin', buf);
+  process.stdout.write('GOT ' + buf.length);
+});
+`,
+  );
+  kernel.writeFile(
+    "/t/cstdin.js",
+    `const cp = require('child_process');
+const fs = require('fs');
+const child = cp.spawn('node', ['/t/stdin-child.js'], { cwd: '/t' });
+let out = '';
+child.stdout.on('data', (d) => { out += d; });
+const payload = Buffer.alloc(256);
+for (let i = 0; i < 256; i++) payload[i] = i;
+child.stdin.write(payload.slice(0, 128));
+child.stdin.write(payload.slice(128));
+child.stdin.end();
+child.on('close', (code) => {
+  const got = fs.readFileSync('/t/received.bin');
+  let byteExact = got.length === 256;
+  for (let i = 0; byteExact && i < 256; i++) if (got[i] !== i) byteExact = false;
+  console.log('CSTDIN code=' + code + ' len=' + got.length + ' echoed=' + out.trim());
+  if (code === 0 && byteExact) console.log('CSTDIN_OK');
+});
+`,
+  );
+  const cstdin = await kernel.start("node", ["/t/cstdin.js"], { cwd: "/t", capture: true });
+  assert(
+    cstdin.code === 0 && cstdin.stdout.includes("CSTDIN_OK"),
+    "child_process: parent -> child.stdin delivers all 256 byte values intact (binary-safe write/end)",
+  );
+
   // === exit codes as separate processes ===
   assert((await kernel.start("true")).code === 0, "program 'true' exits 0");
   assert((await kernel.start("false")).code === 1, "program 'false' exits 1");

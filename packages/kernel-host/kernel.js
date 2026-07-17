@@ -893,17 +893,20 @@ export class Kernel {
     this.respondOk(parent, encodeString(JSON.stringify({ pid: childPid })));
   }
 
-  // Push an interactive stdin chunk into a running process' own process.stdin.
-  // `chunk` is a string (or null for EOF). Used by the host terminal (a live
-  // shell) and by handleChildStdin (parent -> child piping). No-op if the process
+  // Push a stdin chunk into a running process' own process.stdin. `chunk` is a
+  // string (host terminal / a live shell) OR a Uint8Array/Buffer (binary-safe
+  // parent -> child piping via handleChildStdin), or null for EOF. Bytes pass
+  // through unchanged — the runtime's drainStdin normalizes to a Buffer — so we
+  // must NOT stringify, or binary stdin would be mangled. No-op if the process
   // is gone.
   sendStdin(pid, chunk) {
-    return this.postToProc(pid | 0, { type: "stdin", chunk: chunk == null ? null : String(chunk) });
+    return this.postToProc(pid | 0, { type: "stdin", chunk: chunk == null ? null : chunk });
   }
 
   // A process wrote to one of its children's stdin (child.stdin.write): relay the
-  // bytes to that child's own process.stdin. We don't verify parentage — the pid
-  // came from a ChildProcess this parent holds — but only deliver to live procs.
+  // bytes to that child's own process.stdin, unchanged (string or Uint8Array). We
+  // don't verify parentage — the pid came from a ChildProcess this parent holds —
+  // but only deliver to live procs.
   handleChildStdin(parentPid, m) {
     const childPid = m.childPid | 0;
     if (this.procs.has(childPid)) this.sendStdin(childPid, m.chunk == null ? null : m.chunk);

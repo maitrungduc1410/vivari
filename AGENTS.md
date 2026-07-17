@@ -947,8 +947,10 @@ parents `await` their children before exiting, so on a *normal* exit there are n
 live children to cascade to — this only fires on an actual kill. Two enablers this
 relies on: `process.kill(pid, sig)` is wired in `runtime/index.js` to
 `syscalls.kill` (Node tools manage their own children by pid), and
-`child.stdin` is a full no-op stream (`pause`/`resume`/`cork`/… all chainable) —
-NestJS's watch restart calls `child.stdin.pause()` before killing.
+`child.stdin` is a real binary-safe Writable sink — `write()`/`end()` accept an
+encoding + callback and pass Buffers/Uint8Arrays through byte-for-byte — plus the
+chainable stream surface (`pause`/`resume`/`cork`/…) tools poke at (NestJS's watch
+restart calls `child.stdin.pause()` before killing).
 
 ### Interactive stdin is event-driven, delivered off the SAB
 `process.stdin` is a real flowing **TTY Readable** (isTTY, setRawMode), NOT a
@@ -961,10 +963,13 @@ push straight from the worker's `onmessage`. While a consumer is actively readin
 open TTY handle, so an idle shell waits for input instead of exiting; `resume()`/
 `pause()` toggle that ref. Parent→child piping (`child.stdin.write`) relays
 `{type:'child-stdin', childPid}` → `kernel.handleChildStdin` → the child's own
-stdin. The host terminal → shell path is `term-input` → `kernel.sendStdin(pid)`.
-The interactive line editor (echo, backspace, Ctrl+C→SIGINT the foreground child)
-lives in the `sh` coreutil, not in a TTY line discipline — there's nothing cooked
-below it. Terminals use xterm `convertEol:true`, so guest code should emit `\n`
+stdin, unchanged (`sendStdin` never stringifies, so binary bytes survive; the
+runtime's `drainStdin` normalizes strings vs bytes to a Buffer). The host terminal
+→ shell path is `term-input` → `kernel.sendStdin(pid)`.
+The interactive line editor (echo, backspace, Ctrl+C→SIGINT the whole foreground
+job — every stage of a pipeline via `currentKill`, with keystrokes forwarded to
+the pipeline's first stage) lives in the `sh` coreutil, not in a TTY line
+discipline — there's nothing cooked below it. Terminals use xterm `convertEol:true`, so guest code should emit `\n`
 (don't double it to `\r\n`).
 
 ### OPFS persistence

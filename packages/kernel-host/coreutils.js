@@ -214,45 +214,89 @@ if (evalCode != null) {
 `,
 
   // A minimal POSIX-ish shell: sequencing (;), and/or (&& ||), comments (#),
-  // builtins (cd, pwd, export, :, true, false), everything else spawned as a
-  // child process inheriting cwd/env. Quotes ("' ) are stripped by the tokenizer.
+  // pipes (|), redirects (< > >> 2> 2>> 2>&1), builtins (cd, pwd, export, :,
+  // true, false), everything else spawned as a child process inheriting cwd/env.
+  // Quotes ("' ) are stripped by the lexer. Not supported: $VAR expansion, globs,
+  // background (&), subshells.
   sh: `
 const fs = require('fs');
 const cp = require('child_process');
+const path = require('path');
 
 const argv = process.argv;
 let script = '';
 if (argv[2] === '-c') script = argv[3] || '';
 else if (argv[2]) script = fs.readFileSync(argv[2], 'utf8');
 
-function tokenize(s) {
-  const out = [];
+// Quote-aware lexer: emits word tokens (quotes stripped) and operator tokens for
+// sequencing (; && ||), pipes (|) and redirects (< > >> 2> 2>> 2>&1 1> 1>> 1>&2).
+// fd-prefixed redirects (2>, 1>) are only recognized when the digit sits directly
+// before '>' with no space (\`echo 2>f\` redirects fd2; \`echo 2 >f\` passes "2").
+function lex(s) {
+  const toks = [];
   let cur = '', q = null, has = false;
+  const flush = () => { if (has) { toks.push({ t: 'word', v: cur }); cur = ''; has = false; } };
+  const op = (v) => toks.push({ t: 'op', v: v });
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
-    if (q) {
-      if (c === q) q = null;
-      else cur += c;
-    } else if (c === '"' || c === "'") {
-      q = c; has = true;
-    } else if (/\\s/.test(c)) {
-      if (has) { out.push(cur); cur = ''; has = false; }
-    } else {
-      cur += c; has = true;
+    if (q) { if (c === q) q = null; else cur += c; continue; }
+    if (c === '"' || c === "'") { q = c; has = true; continue; }
+    if (/\\s/.test(c)) { flush(); continue; }
+    if (c === '>') {
+      const fd = (has && (cur === '1' || cur === '2')) ? cur : null;
+      if (fd) { cur = ''; has = false; }
+      if (fd === '2' && s[i + 1] === '&' && s[i + 2] === '1') { op('2>&1'); i += 2; continue; }
+      if (fd === '1' && s[i + 1] === '&' && s[i + 2] === '2') { op('1>&2'); i += 2; continue; }
+      if (!fd) flush();
+      if (s[i + 1] === '>') { op((fd || '') + '>>'); i += 1; continue; }
+      op((fd || '') + '>'); continue;
     }
+    if (c === '<') { flush(); op('<'); continue; }
+    if (c === '|') { flush(); if (s[i + 1] === '|') { op('||'); i += 1; } else op('|'); continue; }
+    if (c === '&' && s[i + 1] === '&') { flush(); op('&&'); i += 1; continue; }
+    if (c === ';') { flush(); op(';'); continue; }
+    cur += c; has = true;
   }
-  if (has) out.push(cur);
-  return out;
+  flush();
+  return toks;
+}
+
+// Parse a token stream into command-list elements. Each element is a pipeline
+// (stages separated by |) plus the operator that precedes it (; && ||). Each
+// stage is { argv, redirs:[{type,file?}] }.
+function parse(toks) {
+  const els = [];
+  let opBefore = ';';
+  let stages = [];
+  let stage = { argv: [], redirs: [] };
+  const endStage = () => { stages.push(stage); stage = { argv: [], redirs: [] }; };
+  const endPipe = () => { endStage(); els.push({ op: opBefore, stages: stages }); stages = []; };
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (t.t === 'word') { stage.argv.push(t.v); continue; }
+    const v = t.v;
+    if (v === '|') { endStage(); continue; }
+    if (v === ';' || v === '&&' || v === '||') { endPipe(); opBefore = v; continue; }
+    if (v === '2>&1' || v === '1>&2') { stage.redirs.push({ type: v }); continue; }
+    const tgt = toks[i + 1];
+    if (tgt && tgt.t === 'word') { stage.redirs.push({ type: v, file: tgt.v }); i += 1; }
+    else stage.redirs.push({ type: v, file: null });
+  }
+  endPipe();
+  return els;
 }
 
 // External commands run ASYNC and stream their output live: a long-running server
 // (e.g. \`node dist/main.js\`, spawned by \`nest start\` as \`sh -c 'node ...'\`) never
 // exits, so spawnSync would block forever AND buffer all logs until exit — the
 // Nest/Vite banner would never appear. Async spawn forwards each chunk as it lands.
-// The foreground child of an interactive shell: while set, the REPL's raw stdin
-// is piped to it (so \`cat\`, a \`node\` REPL, etc. get keystrokes) instead of being
-// line-edited by the shell itself.
+// The foreground job of an interactive shell. \`currentChild\` is where the REPL's
+// raw stdin is piped (so \`cat\`, a \`node\` REPL, the FIRST stage of a pipeline, etc.
+// get keystrokes) instead of being line-edited by the shell itself. \`currentKill\`
+// signals the WHOLE foreground job — for a pipeline that's every stage, so Ctrl+C
+// tears the entire \`a | b | c\` down, not just the last stage.
 let currentChild = null;
+let currentKill = null;
 
 function runSimple(tokens) {
   if (!tokens.length) return Promise.resolve(0);
@@ -272,27 +316,118 @@ function runSimple(tokens) {
   return new Promise((resolve) => {
     const child = cp.spawn(cmd, args, { cwd: process.cwd(), env: process.env });
     currentChild = child;
+    currentKill = (sig) => { try { child.kill(sig); } catch (e) {} };
     child.stdout.on('data', (d) => process.stdout.write(d));
     child.stderr.on('data', (d) => process.stderr.write(d));
     child.on('error', (e) => {
-      currentChild = null;
+      currentChild = null; currentKill = null;
       process.stderr.write('sh: ' + (e && e.code === 'ENOENT' ? cmd + ': not found' : ((e && e.message) || e)) + '\\n');
       resolve(127);
     });
-    child.on('close', (code) => { currentChild = null; resolve(code == null ? 0 : code); });
+    child.on('close', (code) => { currentChild = null; currentKill = null; resolve(code == null ? 0 : code); });
+  });
+}
+
+function resolvePath(f) { return path.isAbsolute(f) ? f : path.resolve(process.cwd(), f); }
+
+// /dev/null is a discard sink: the VFS has no device nodes, so instead of opening
+// a real fd (which would fail) we drop writes and read it as immediate EOF. This
+// makes the ubiquitous \`cmd > /dev/null 2>&1\` / \`cmd 2>/dev/null\` / \`< /dev/null\`
+// patterns work.
+function isDevNull(f) { return resolvePath(f) === '/dev/null'; }
+
+// Execute a pipeline of >=1 stages: wire each stage's stdout into the next
+// stage's stdin, apply per-stage redirects, and resolve with the LAST stage's
+// exit code (sh semantics; no pipefail). Builtins are NOT special-cased here —
+// every stage is spawned (bash runs pipeline/redirected builtins in a subshell).
+function runPipeline(stages) {
+  return new Promise((resolveAll) => {
+    const specs = stages.map((s) => {
+      const sp = { argv: s.argv.slice(), stdinFile: null, outFile: null, outAppend: false, errFile: null, errAppend: false, errToOut: false };
+      for (const r of s.redirs) {
+        if (r.type === '<') sp.stdinFile = r.file;
+        else if (r.type === '>' || r.type === '1>') { sp.outFile = r.file; sp.outAppend = false; }
+        else if (r.type === '>>' || r.type === '1>>') { sp.outFile = r.file; sp.outAppend = true; }
+        else if (r.type === '2>') { sp.errFile = r.file; sp.errAppend = false; }
+        else if (r.type === '2>>') { sp.errFile = r.file; sp.errAppend = true; }
+        else if (r.type === '2>&1') sp.errToOut = true;
+      }
+      return sp;
+    });
+    const n = specs.length;
+    // A stage with no command (e.g. \`> file\`) is not spawned; its redirects still
+    // apply (opening \`>\` truncates the target), then it completes with status 0.
+    const children = specs.map((sp) => (sp.argv.length ? cp.spawn(sp.argv[0], sp.argv.slice(1), { cwd: process.cwd(), env: process.env }) : null));
+    // Interactive stdin goes to the FIRST stage (it reads the terminal); Ctrl+C
+    // signals EVERY stage so the whole pipeline dies, not just one.
+    currentChild = children[0];
+    currentKill = (sig) => { for (const c of children) { if (c) { try { c.kill(sig); } catch (e) {} } } };
+    const fds = [];
+    const done = new Set();
+    let lastCode = 0, remaining = n;
+    const finish = (idx, code) => {
+      if (done.has(idx)) return;
+      done.add(idx);
+      if (idx === n - 1) lastCode = code == null ? 0 : code;
+      if (--remaining === 0) {
+        for (const fd of fds) { try { fs.closeSync(fd); } catch (e) {} }
+        currentChild = null; currentKill = null;
+        resolveAll(lastCode);
+      }
+    };
+    for (let idx = 0; idx < n; idx++) {
+      const sp = specs[idx], child = children[idx], isLast = idx === n - 1, next = children[idx + 1];
+      let outFd = null, errFd = null;
+      const outNull = sp.outFile != null && isDevNull(sp.outFile);
+      const errNull = sp.errFile != null && isDevNull(sp.errFile);
+      if (sp.outFile && !outNull) { try { outFd = fs.openSync(resolvePath(sp.outFile), sp.outAppend ? 'a' : 'w'); fds.push(outFd); } catch (e) { process.stderr.write('sh: ' + sp.outFile + ': ' + (e.code || e.message) + '\\n'); } }
+      if (sp.errFile && !errNull) { try { errFd = fs.openSync(resolvePath(sp.errFile), sp.errAppend ? 'a' : 'w'); fds.push(errFd); } catch (e) { process.stderr.write('sh: ' + sp.errFile + ': ' + (e.code || e.message) + '\\n'); } }
+      if (!child) { if (!isLast && next) { try { next.stdin.end(); } catch (_) {} } finish(idx, 0); continue; }
+      const writeOut = (buf) => {
+        if (outNull) return;
+        if (outFd != null) { try { fs.writeSync(outFd, buf); } catch (e) {} }
+        else if (!isLast && next) { try { next.stdin.write(buf); } catch (e) {} }
+        else process.stdout.write(buf);
+      };
+      const writeErr = (buf) => {
+        if (errNull) return;
+        if (errFd != null) { try { fs.writeSync(errFd, buf); } catch (e) {} }
+        else if (sp.errToOut) writeOut(buf);
+        else process.stderr.write(buf);
+      };
+      child.stdout.on('data', writeOut);
+      child.stderr.on('data', writeErr);
+      child.on('error', (e) => {
+        process.stderr.write('sh: ' + (e && e.code === 'ENOENT' ? sp.argv[0] + ': not found' : ((e && e.message) || e)) + '\\n');
+        if (!isLast && next) { try { next.stdin.end(); } catch (_) {} }
+        finish(idx, 127);
+      });
+      child.on('close', (code) => {
+        if (!isLast && next) { try { next.stdin.end(); } catch (_) {} }
+        finish(idx, code);
+      });
+      if (idx === 0 && sp.stdinFile) {
+        if (!isDevNull(sp.stdinFile)) {
+          try { child.stdin.write(fs.readFileSync(resolvePath(sp.stdinFile))); }
+          catch (e) { process.stderr.write('sh: ' + sp.stdinFile + ': ' + (e.code || e.message) + '\\n'); }
+        }
+        try { child.stdin.end(); } catch (e) {}
+      }
+    }
   });
 }
 
 async function runLine(line) {
-  const segs = line.split(/(&&|\\|\\||;)/);
-  let status = 0, op = ';';
-  for (let seg of segs) {
-    seg = seg.trim();
-    if (seg === '' || seg === ';') { op = ';'; continue; }
-    if (seg === '&&' || seg === '||') { op = seg; continue; }
-    const skip = (op === '&&' && status !== 0) || (op === '||' && status === 0);
-    if (!skip) status = await runSimple(tokenize(seg));
-    op = ';';
+  const toks = lex(line);
+  if (!toks.length) return 0;
+  let status = 0;
+  for (const el of parse(toks)) {
+    if (!el.stages.some((s) => s.argv.length || s.redirs.length)) continue;
+    const skip = (el.op === '&&' && status !== 0) || (el.op === '||' && status === 0);
+    if (skip) continue;
+    // Fast path: a single stage with no redirects runs inline (handles builtins).
+    if (el.stages.length === 1 && el.stages[0].redirs.length === 0) status = await runSimple(el.stages[0].argv);
+    else status = await runPipeline(el.stages);
   }
   return status;
 }
@@ -375,11 +510,11 @@ function runInteractive() {
 
   process.stdin.on('data', (buf) => {
     const s = typeof buf === 'string' ? buf : buf.toString('utf8');
-    // A foreground child owns stdin: Ctrl+C interrupts it (SIGINT); otherwise pass
-    // keystrokes straight through (Enter as newline), no line-edit/echo — the
-    // program drives the display.
+    // A foreground job owns stdin: Ctrl+C interrupts it (SIGINT to every stage of
+    // a pipeline); otherwise pass keystrokes straight through to the first stage
+    // (Enter as newline), no line-edit/echo — the program drives the display.
     if (currentChild) {
-      if (s.indexOf('\\x03') !== -1) { try { currentChild.kill('SIGINT'); } catch (e) {} }
+      if (s.indexOf('\\x03') !== -1) { if (currentKill) currentKill('SIGINT'); else { try { currentChild.kill('SIGINT'); } catch (e) {} } }
       else { try { currentChild.stdin.write(s.replace(/\\r/g, '\\n')); } catch (e) {} }
       return;
     }
