@@ -12,6 +12,7 @@ import Gauge from "~icons/lucide/gauge";
 import FolderInput from "~icons/lucide/folder-input";
 import FileArchive from "~icons/lucide/file-archive";
 import Share2 from "~icons/lucide/share-2";
+import Github from "~icons/lucide/github";
 import {
   Command, CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList,
 } from "@/components/ui/command";
@@ -42,6 +43,7 @@ export function CommandPalette() {
       { label: "New Terminal", icon: Plus, run: () => c.newShellTerminal() },
       { label: "Run Project", icon: Play, run: () => c.runActiveFolder() },
       { label: "Import Folder as Project", icon: FolderInput, run: () => c.importFolderViaPicker() },
+      { label: "Import from GitHub or npm", icon: Github, run: () => c.openImportRemote() },
       { label: "Export Project as Zip", icon: FileArchive, run: () => c.exportActiveFolder() },
       { label: "Share Project (copy link)", icon: Share2, run: () => c.shareActiveFolder() },
       { label: "Toggle Terminal Panel", icon: TerminalIcon, run: () => c.togglePanel() },

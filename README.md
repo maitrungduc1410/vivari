@@ -92,8 +92,9 @@ template you've built before (or a second project with the same deps) restores
 
 Projects can also leave the browser and come back — all client-side: **export** any
 project as a `.zip`, **import** a local folder as a new project (folder picker or
-drag-and-drop onto Home), and **share** a project as a self-contained compressed
-link (source is gzipped into the URL; opening it recreates the project).
+drag-and-drop onto Home), **import a public GitHub repo or an npm package** (fetched
+directly in the browser via CORS), and **share** a project as a self-contained
+compressed link (source is gzipped into the URL; opening it recreates the project).
 
 ## Embed it (SDK)
 

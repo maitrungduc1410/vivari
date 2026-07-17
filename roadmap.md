@@ -2807,10 +2807,46 @@ service — so it works entirely in the browser (and offline):
   writer by re-decoding its output with Node's own `zlib` (bytes + CRC per entry) and
   round-trips the share codec over a mixed text+binary tree — pure web primitives, no
   kernel/wasm needed.
-- **Deferred (documented).** GitHub-repo and npm-package import both need network /
-  CORS (a proxy or the fetcher worker) and are left for a follow-up; the share model is
-  intentionally backend-free (no gist/paste service), trading a size cap for zero
-  infrastructure.
+- **Follow-up (now shipped).** GitHub-repo and npm-package import (both need network /
+  CORS) land in the next section; the share model stays intentionally backend-free (no
+  gist/paste service), trading a size cap for zero infrastructure.
+
+## Import from GitHub repo / npm package (this change)
+
+The remote half of "import/export & share", still **fully client-side** — no backend, no
+proxy. The studio page is cross-origin-isolated (COEP `require-corp`), and every source
+here sends `Access-Control-Allow-Origin: *`, so a plain `cors` `fetch()` from the main
+thread both reads the bytes and satisfies COEP. The Fetcher Worker isn't involved.
+
+- **GitHub (public repos).** Paste `owner/repo`, `owner/repo@ref`, or a `github.com`
+  URL. Resolves the default branch via `api.github.com/repos/…` (unless a ref is given),
+  lists files with `git/trees/<ref>?recursive=1`, then downloads each blob from
+  `raw.githubusercontent.com` with bounded concurrency. 404 → "not found (may be
+  private)"; API rate-limit (403, `x-ratelimit-remaining: 0`) → a clear "try again
+  later". Public repos only (no token/auth in this pass).
+- **npm.** Paste `name`, `name@version`, or `name@tag` (scoped ok). Fetches the packument
+  from `registry.npmjs.org`, resolves a dist-tag/exact version (unknown/range → `latest`;
+  no semver-range resolution), downloads `dist.tarball`, gunzips + untars it. The package
+  contents become the project (its dependencies are **not** vendored — Run reinstalls).
+- **Tar reader (`packages/kernel-host/tar.js`).** Env-agnostic ustar reader (only
+  `TextDecoder` + typed arrays) handling the `prefix` field, GNU `L` long names, and pax
+  `path`; `stripFirstSegment` drops the archive's single root dir (`package/` for npm,
+  `<repo>-<ref>/` for GitHub). A `.d.ts` gives the studio types. (An equivalent in-VM
+  copy lives in `programs/npm.js`; the small duplication is intentional — it can't be
+  imported here.)
+- **Fetch logic (`packages/studio/src/vv/import-remote.ts`).** `parseGithubSpec` /
+  `fetchGithubRepo` and `parseNpmSpec` / `fetchNpmPackage` return the same `ImportTree`
+  shape the folder importer produces, so both land through the existing spine
+  (`importFilesAsProject` → `vv-import-tree` → synthesized run manifest). `node_modules` /
+  `.git` are excluded and the tree is file-count + byte capped (a "truncated" warning if
+  hit), reusing gunzip from `archive.js`.
+- **Controller + UI.** `openImportRemote` / `importGithubRepo` / `importNpmPackage` on the
+  controller; a snapshot-driven `ImportRemoteDialog` (tabbed GitHub / npm, live progress)
+  opened from a Home "Import from GitHub or npm" card and a command-palette entry.
+- **Gate.** `scripts/spike-tar.mjs` (offline, in `run-spikes.mjs`) hand-builds a real
+  ustar archive (incl. a deep path via the `prefix` field + a full-range binary blob),
+  gzips it with Node's `zlib`, then decodes it with `archive.js` gunzip + `tar.js`
+  `parseTar` and checks every entry byte-for-byte, plus `stripFirstSegment`.
 
 ## Definition of done for T2
 
