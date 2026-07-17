@@ -793,8 +793,19 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     host's ciphertext + our round-trip; generated-key round-trip; and OpenSSL verifies our
     RS256/PS256 signatures. This unlocks **RS256/384/512 + PS256/384/512 JWTs**. (Wasm is
     CI/browser-built.)
-    **Deferred (S3 later phases):** SEC1 `EC PRIVATE KEY`, encrypted/passphrase keys,
-    `privateEncrypt`/`publicDecrypt`, DH/ECDH, X.509, JWK — they throw loudly. (corepack's
+    **S3 — X.509 + SEC1 — DONE (phase 3).** `new crypto.X509Certificate(pem|der)` parses a
+    certificate via the RustCrypto `x509-cert` codec: `subject`/`issuer`, `serialNumber`,
+    `validFrom`/`validTo` (+`validFromDate`/`validToDate`), `subjectAltName`, `keyUsage`
+    (extKeyUsage OIDs), `ca`, `fingerprint`/`fingerprint256`/`fingerprint512`, `raw`,
+    `publicKey` (a real asymmetric `KeyObject`), `toString()`, plus `verify(publicKey)` and
+    `checkIssued(cert)` (signatureAlgorithm-OID dispatch to the RSA/ECDSA/Ed25519 verify math).
+    Key parsing also gained SEC1 `EC PRIVATE KEY` (normalized to PKCS#8). Verified in
+    `verify-node` against host `node:crypto`: every parsed field matches the host
+    `X509Certificate` for the same fixture, self-signed `verify`/`checkIssued` pass, a foreign
+    key is rejected, and OpenSSL verifies an ECDSA signature made by a SEC1-parsed key. This
+    unlocks **jose's `importX509`** (proven by `scripts/spike-jose.mjs`). (Wasm is CI/browser-built.)
+    **Deferred (S3 later phases):** encrypted/passphrase keys, `privateEncrypt`/`publicDecrypt`,
+    DH/ECDH, JWK — they throw loudly. (corepack's
     registry ECDSA check now *could* use `verify`, but its exact key path is un-revalidated, so
     it stays skipped via `COREPACK_INTEGRITY_KEYS=0`, keeping the sha512 tarball-integrity check
     that only needs `createHash`.)
@@ -1330,7 +1341,8 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
 - **Node API coverage (stubs/partials to fill on demand):**
   - `crypto` **S3**: ✅ scrypt + elliptic sign/verify + EC/Ed25519 keygen (phase 1, #12);
     ✅ RSA — RS/PS sign/verify + publicEncrypt/privateDecrypt (OAEP/PKCS1v15) + keygen +
-    PKCS#1 parsing (phase 2); remaining — DH/ECDH, X.509, SEC1 `EC PRIVATE KEY`, JWK.
+    PKCS#1 parsing (phase 2); ✅ X509Certificate parse/verify + SEC1 `EC PRIVATE KEY`
+    parsing (phase 3, drives jose importX509); remaining — DH/ECDH, JWK.
   - `child_process`: parent→child **stdin** pipe (#15). (`fork` is now implemented — an IPC
     channel over the worker-thread spawn path — which unblocked `next dev`.)
   - WASI: **stdin**, `poll_oneoff` (event-driven) (#16 s1).

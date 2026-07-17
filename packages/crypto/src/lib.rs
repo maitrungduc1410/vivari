@@ -11,10 +11,12 @@
 // Scope (S3, this file's second half): scrypt, and the asymmetric primitives —
 // ECDSA over P-256/P-384 and Ed25519 (phase 1), plus RSA (phase 2: RS256/384/512
 // PKCS#1v15 + PS256/384/512 PSS sign/verify, OAEP/PKCS1v15 encrypt/decrypt,
-// keygen). Keys cross as PKCS#8/SPKI DER (RSA also reads PKCS#1), kind auto-
-// detected by trial-parse. Keygen/PSS/OAEP need entropy, so getrandom's `js`
-// backend is enabled (WebCrypto in the browser Worker, node:crypto under nodejs).
-// Still out of scope (throw loudly in JS): DH/ECDH and X.509 — later phases.
+// keygen), plus X.509 certificate parsing + signature verify and SEC1 'EC PRIVATE
+// KEY' parsing (phase 3). Keys cross as PKCS#8/SPKI DER (RSA also reads PKCS#1, EC
+// also reads SEC1), kind auto-detected by trial-parse. Keygen/PSS/OAEP need
+// entropy, so getrandom's `js` backend is enabled (WebCrypto in the browser
+// Worker, node:crypto under nodejs). Still out of scope (throw loudly in JS):
+// DH/ECDH and JWK — later phases.
 
 use wasm_bindgen::prelude::*;
 
@@ -265,12 +267,19 @@ fn detect_private(der: &[u8]) -> Result<Kind, JsError> {
     if p384::SecretKey::from_pkcs8_der(der).is_ok() {
         return Ok(Kind::P384);
     }
+    // SEC1 "EC PRIVATE KEY" (traditional OpenSSL EC private keys); phase 3.
+    if p256::SecretKey::from_sec1_der(der).is_ok() {
+        return Ok(Kind::P256);
+    }
+    if p384::SecretKey::from_sec1_der(der).is_ok() {
+        return Ok(Kind::P384);
+    }
     // RSA: PKCS#8 or the traditional PKCS#1 ("RSA PRIVATE KEY").
     if load_rsa_private(der).is_ok() {
         return Ok(Kind::Rsa);
     }
     Err(JsError::new(
-        "unsupported/invalid private key (expected Ed25519 / P-256 / P-384 / RSA, PKCS#8 or PKCS#1)",
+        "unsupported/invalid private key (expected Ed25519 / P-256 / P-384 / RSA, PKCS#8 / PKCS#1 / SEC1)",
     ))
 }
 
@@ -433,7 +442,22 @@ pub fn normalize_private_der(der: &[u8]) -> Result<Vec<u8>, JsError> {
             use rsa::pkcs8::EncodePrivateKey;
             Ok(load_rsa_private(der)?.to_pkcs8_der().map_err(je)?.as_bytes().to_vec())
         }
-        _ => Ok(der.to_vec()),
+        // EC keys may arrive as SEC1 ("EC PRIVATE KEY"); re-encode to PKCS#8 so the
+        // stored/re-exported DER is uniform and asym_sign always sees PKCS#8.
+        Kind::P256 => {
+            let sk = p256::SecretKey::from_pkcs8_der(der)
+                .or_else(|_| p256::SecretKey::from_sec1_der(der))
+                .map_err(je)?;
+            Ok(sk.to_pkcs8_der().map_err(je)?.as_bytes().to_vec())
+        }
+        Kind::P384 => {
+            let sk = p384::SecretKey::from_pkcs8_der(der)
+                .or_else(|_| p384::SecretKey::from_sec1_der(der))
+                .map_err(je)?;
+            Ok(sk.to_pkcs8_der().map_err(je)?.as_bytes().to_vec())
+        }
+        // Ed25519 is already canonical PKCS#8.
+        Kind::Ed25519 => Ok(der.to_vec()),
     }
 }
 #[wasm_bindgen]
@@ -691,4 +715,230 @@ pub fn rsa_decrypt(priv_der: &[u8], data: &[u8], oaep: bool, oaep_hash: &str) ->
     } else {
         sk.decrypt(rsa::Pkcs1v15Encrypt, data).map_err(je)
     }
+}
+
+// =============================================================================
+// S3 phase 3 — X.509 certificate parsing + signature verify
+//
+// `new X509Certificate(pem|der)` in lib/crypto.js converts PEM->DER, then calls
+// x509_parse() once: the structured, text-y fields come back as JSON (safe
+// escaping of subject/SAN strings), and the SubjectPublicKeyInfo comes back as
+// raw DER so the JS layer can build `.publicKey` via the existing createPublicKey
+// path. Fingerprints are computed in JS from the raw DER (createHash). cert
+// signature verification (`cert.verify(key)`) dispatches on the signature
+// algorithm OID to the RSA / ECDSA / Ed25519 primitives already in this file.
+// =============================================================================
+
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct Rdn {
+    oid: String,
+    value: String,
+}
+
+#[derive(Serialize)]
+struct San {
+    kind: String,
+    value: String,
+}
+
+#[derive(Serialize)]
+struct X509Info {
+    subject: Vec<Rdn>,
+    issuer: Vec<Rdn>,
+    #[serde(rename = "serialNumber")]
+    serial_number: String,
+    #[serde(rename = "notBefore")]
+    not_before: i64,
+    #[serde(rename = "notAfter")]
+    not_after: i64,
+    #[serde(rename = "subjectAltName")]
+    subject_alt_name: Vec<San>,
+    #[serde(rename = "keyUsage")]
+    key_usage: Vec<String>,
+    ca: bool,
+    #[serde(rename = "sigAlgOid")]
+    sig_alg_oid: String,
+}
+
+// A parsed cert crossing to JS: `json` (the X509Info above) + the raw SPKI DER
+// (fed straight back into createPublicKey for `.publicKey`).
+#[wasm_bindgen]
+pub struct X509Parsed {
+    json: String,
+    spki_der: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl X509Parsed {
+    #[wasm_bindgen(getter)]
+    pub fn json(&self) -> String {
+        self.json.clone()
+    }
+    #[wasm_bindgen(getter, js_name = spkiDer)]
+    pub fn spki_der(&self) -> Vec<u8> {
+        self.spki_der.clone()
+    }
+}
+
+// Extract a printable string from an RDN AttributeValue (Any), trying the common
+// directory-string encodings; falls back to uppercase hex of the raw octets.
+fn atv_value_to_string(v: &x509_cert::der::Any) -> String {
+    use x509_cert::der::asn1::{Ia5StringRef, PrintableStringRef, TeletexStringRef, Utf8StringRef};
+    if let Ok(s) = v.decode_as::<Utf8StringRef>() {
+        return s.as_str().to_string();
+    }
+    if let Ok(s) = v.decode_as::<PrintableStringRef>() {
+        return s.as_str().to_string();
+    }
+    if let Ok(s) = v.decode_as::<Ia5StringRef>() {
+        return s.as_str().to_string();
+    }
+    if let Ok(s) = v.decode_as::<TeletexStringRef>() {
+        return s.as_str().to_string();
+    }
+    // Unknown/binary directory-string type: hex of the DER-encoded value.
+    use x509_cert::der::Encode;
+    v.to_der()
+        .map(|d| d.iter().map(|b| format!("{:02X}", b)).collect::<String>())
+        .unwrap_or_default()
+}
+
+fn name_to_rdns(name: &x509_cert::name::Name) -> Vec<Rdn> {
+    let mut out = Vec::new();
+    for rdn in name.0.iter() {
+        for atv in rdn.0.iter() {
+            out.push(Rdn {
+                oid: atv.oid.to_string(),
+                value: atv_value_to_string(&atv.value),
+            });
+        }
+    }
+    out
+}
+
+fn format_ip(octets: &[u8]) -> String {
+    match octets.len() {
+        4 => octets.iter().map(|b| b.to_string()).collect::<Vec<_>>().join("."),
+        16 => octets
+            .chunks(2)
+            .map(|p| format!("{:x}", ((p[0] as u16) << 8) | p[1] as u16))
+            .collect::<Vec<_>>()
+            .join(":"),
+        _ => octets.iter().map(|b| format!("{:02x}", b)).collect(),
+    }
+}
+
+#[wasm_bindgen]
+pub fn x509_parse(der: &[u8]) -> Result<X509Parsed, JsError> {
+    use x509_cert::der::{Decode, Encode};
+    use x509_cert::ext::pkix::name::GeneralName;
+    use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, SubjectAltName};
+
+    let cert = x509_cert::Certificate::from_der(der).map_err(je)?;
+    let tbs = &cert.tbs_certificate;
+
+    // Node/OpenSSL print the serial's magnitude (BN_bn2hex): drop the DER sign
+    // byte / leading zeros so a high-bit-set serial matches host node:crypto.
+    let serial_bytes = tbs.serial_number.as_bytes();
+    let start = serial_bytes
+        .iter()
+        .position(|&b| b != 0)
+        .unwrap_or(serial_bytes.len().saturating_sub(1));
+    let serial_number = serial_bytes[start..]
+        .iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<String>();
+
+    let not_before = tbs.validity.not_before.to_unix_duration().as_secs() as i64;
+    let not_after = tbs.validity.not_after.to_unix_duration().as_secs() as i64;
+
+    let mut subject_alt_name = Vec::new();
+    if let Some((_crit, san)) = tbs.get::<SubjectAltName>().ok().flatten() {
+        for gn in san.0.iter() {
+            let entry = match gn {
+                GeneralName::DnsName(s) => Some(San { kind: "DNS".into(), value: s.as_str().to_string() }),
+                GeneralName::Rfc822Name(s) => Some(San { kind: "email".into(), value: s.as_str().to_string() }),
+                GeneralName::UniformResourceIdentifier(s) => {
+                    Some(San { kind: "URI".into(), value: s.as_str().to_string() })
+                }
+                GeneralName::IpAddress(os) => Some(San { kind: "IP Address".into(), value: format_ip(os.as_bytes()) }),
+                GeneralName::DirectoryName(n) => Some(San {
+                    kind: "DirName".into(),
+                    value: name_to_rdns(n)
+                        .iter()
+                        .map(|r| format!("{}={}", r.oid, r.value))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                }),
+                _ => None,
+            };
+            if let Some(e) = entry {
+                subject_alt_name.push(e);
+            }
+        }
+    }
+
+    let mut key_usage = Vec::new();
+    if let Some((_crit, eku)) = tbs.get::<ExtendedKeyUsage>().ok().flatten() {
+        for oid in eku.0.iter() {
+            key_usage.push(oid.to_string());
+        }
+    }
+
+    let ca = tbs
+        .get::<BasicConstraints>()
+        .ok()
+        .flatten()
+        .map(|(_c, bc)| bc.ca)
+        .unwrap_or(false);
+
+    let info = X509Info {
+        subject: name_to_rdns(&tbs.subject),
+        issuer: name_to_rdns(&tbs.issuer),
+        serial_number,
+        not_before,
+        not_after,
+        subject_alt_name,
+        key_usage,
+        ca,
+        sig_alg_oid: cert.signature_algorithm.oid.to_string(),
+    };
+
+    let spki_der = tbs.subject_public_key_info.to_der().map_err(je)?;
+    let json = serde_json::to_string(&info).map_err(je)?;
+    Ok(X509Parsed { json, spki_der })
+}
+
+// Verify a certificate's signature against an issuer's SPKI (self-signed when the
+// issuer is the cert's own public key). Dispatches on the signatureAlgorithm OID.
+#[wasm_bindgen]
+pub fn x509_verify(cert_der: &[u8], issuer_spki_der: &[u8]) -> Result<bool, JsError> {
+    use x509_cert::der::{Decode, Encode};
+    let cert = x509_cert::Certificate::from_der(cert_der).map_err(je)?;
+    let tbs_der = cert.tbs_certificate.to_der().map_err(je)?;
+    let sig = cert
+        .signature
+        .as_bytes()
+        .ok_or_else(|| JsError::new("x509: signature is not octet-aligned"))?;
+    // A wrong key type (issuer key doesn't match the signature algorithm) is not
+    // an error — like Node's cert.verify(key), it just means "does not verify".
+    Ok(match cert.signature_algorithm.oid.to_string().as_str() {
+        "1.2.840.113549.1.1.5" => rsa_verify(issuer_spki_der, "sha1", &tbs_der, sig, false, -1).unwrap_or(false),
+        "1.2.840.113549.1.1.11" => rsa_verify(issuer_spki_der, "sha256", &tbs_der, sig, false, -1).unwrap_or(false),
+        "1.2.840.113549.1.1.12" => rsa_verify(issuer_spki_der, "sha384", &tbs_der, sig, false, -1).unwrap_or(false),
+        "1.2.840.113549.1.1.13" => rsa_verify(issuer_spki_der, "sha512", &tbs_der, sig, false, -1).unwrap_or(false),
+        // RSASSA-PSS: hash is carried in params; assume sha256 (salt = digest).
+        "1.2.840.113549.1.1.10" => rsa_verify(issuer_spki_der, "sha256", &tbs_der, sig, true, -1).unwrap_or(false),
+        "1.2.840.10045.4.3.2" => asym_verify(issuer_spki_der, "sha256", &tbs_der, sig, false).unwrap_or(false),
+        "1.2.840.10045.4.3.3" => asym_verify(issuer_spki_der, "sha384", &tbs_der, sig, false).unwrap_or(false),
+        "1.2.840.10045.4.3.4" => asym_verify(issuer_spki_der, "sha512", &tbs_der, sig, false).unwrap_or(false),
+        "1.3.101.112" => asym_verify(issuer_spki_der, "", &tbs_der, sig, false).unwrap_or(false),
+        other => {
+            return Err(JsError::new(&format!(
+                "x509: unsupported signature algorithm OID {other}"
+            )))
+        }
+    })
 }

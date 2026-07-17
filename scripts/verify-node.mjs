@@ -1010,6 +1010,99 @@ console.log('CRYPTOS3_OK');
     nodeCrypto.verify("RSA-SHA256", S3MSG, { key: s3rsa.publicKey, ...PSS }, Buffer.from(grab(/SIG_PS256=([0-9a-f]+)/), "hex")),
     "OpenSSL verifies our RSA PS256 (PSS) signature");
 
+  // === #12c (S3 phase 3): X.509 (new X509Certificate) + SEC1 EC private keys ===
+  // Cross-validated against the host's real node:crypto/OpenSSL: our parsed cert
+  // fields must equal what host X509Certificate produces for the same fixture,
+  // and a signature our SEC1-parsed EC key makes must verify under OpenSSL.
+  const x509Base = new URL("./fixtures/x509/", import.meta.url);
+  const readFix = (f) => readFileSync(new URL(f, x509Base), "utf8");
+  const rsaCertPem = readFix("rsa-cert.pem");
+  const ecCertPem = readFix("ec-cert.pem");
+  const ecSec1KeyPem = readFix("ec-key-sec1.pem");
+  const ecPubPem = readFix("ec-pub.pem");
+  const certExpected = (pem) => {
+    const x = new nodeCrypto.X509Certificate(pem);
+    return {
+      subject: x.subject,
+      issuer: x.issuer,
+      serialNumber: x.serialNumber,
+      validFrom: x.validFrom,
+      validTo: x.validTo,
+      subjectAltName: x.subjectAltName ?? null,
+      keyUsage: x.keyUsage ?? null,
+      ca: x.ca,
+      fingerprint256: x.fingerprint256,
+      pubType: x.publicKey.asymmetricKeyType,
+      pubSpki: x.publicKey.export({ type: "spki", format: "pem" }),
+    };
+  };
+  const cryptoX509Expected = {
+    msgHex: S3MSG.toString("hex"),
+    rsaCertPem,
+    ecCertPem,
+    ecSec1KeyPem,
+    ecPubPem,
+    rsa: certExpected(rsaCertPem),
+    ec: certExpected(ecCertPem),
+  };
+  kernel.writeFile(
+    "/t/cryptox509.js",
+    `
+const assert = require('assert');
+const crypto = require('crypto');
+const E = ${JSON.stringify(cryptoX509Expected)};
+const msg = Buffer.from(E.msgHex, 'hex');
+
+function checkCert(pem, exp, label) {
+  const x = new crypto.X509Certificate(pem);
+  assert.strictEqual(x.subject, exp.subject, label + ': subject');
+  assert.strictEqual(x.issuer, exp.issuer, label + ': issuer');
+  assert.strictEqual(x.serialNumber, exp.serialNumber, label + ': serialNumber');
+  assert.strictEqual(x.validFrom, exp.validFrom, label + ': validFrom');
+  assert.strictEqual(x.validTo, exp.validTo, label + ': validTo');
+  assert.strictEqual(x.subjectAltName ?? null, exp.subjectAltName, label + ': subjectAltName');
+  assert.strictEqual(JSON.stringify(x.keyUsage ?? null), JSON.stringify(exp.keyUsage), label + ': keyUsage');
+  assert.strictEqual(x.ca, exp.ca, label + ': ca');
+  assert.strictEqual(x.fingerprint256, exp.fingerprint256, label + ': fingerprint256');
+  assert.strictEqual(x.publicKey.asymmetricKeyType, exp.pubType, label + ': publicKey type');
+  assert.strictEqual(x.publicKey.export({ type: 'spki', format: 'pem' }), exp.pubSpki, label + ': publicKey SPKI');
+  assert.strictEqual(x.verify(x.publicKey), true, label + ': self-signed verify');
+  assert.strictEqual(x.checkIssued(x), true, label + ': checkIssued(self)');
+  return x;
+}
+
+const rsaCert = checkCert(E.rsaCertPem, E.rsa, 'rsa-cert');
+const ecCert = checkCert(E.ecCertPem, E.ec, 'ec-cert');
+
+// A cert must NOT verify under a foreign public key (and returns false, not throw).
+assert.strictEqual(rsaCert.verify(ecCert.publicKey), false, 'x509: rejects foreign key');
+assert.strictEqual(rsaCert.checkIssued(ecCert), false, 'x509: not issued by an unrelated cert');
+
+// raw is the DER; toString round-trips to a CERTIFICATE PEM that re-parses.
+assert.ok(Buffer.isBuffer(rsaCert.raw) && rsaCert.raw.length > 0, 'x509: raw DER');
+assert.strictEqual(new crypto.X509Certificate(rsaCert.toString()).serialNumber, E.rsa.serialNumber, 'x509: toString round-trips');
+
+// --- SEC1 'EC PRIVATE KEY' parsing (phase 3) ---
+const sec1 = crypto.createPrivateKey(E.ecSec1KeyPem);
+assert.strictEqual(sec1.asymmetricKeyType, 'ec', 'sec1: parsed as EC');
+const sec1Sig = crypto.sign('sha256', msg, sec1);
+assert.strictEqual(crypto.verify('sha256', msg, E.ecPubPem, sec1Sig), true, 'sec1: sign/verify round-trips');
+assert.strictEqual(crypto.verify('sha256', msg, crypto.createPublicKey(sec1), sec1Sig), true, 'sec1: createPublicKey(sec1) works');
+
+console.log('SEC1_SIG=' + sec1Sig.toString('hex'));
+console.log('CRYPTOX509_OK');
+`,
+  );
+  const cx = await kernel.start("node", ["/t/cryptox509.js"], { cwd: "/t", capture: true });
+  assert(
+    cx.code === 0 && cx.stdout.includes("CRYPTOX509_OK"),
+    "Path B (S3 phase 3): X509Certificate parse/verify + SEC1 EC keys (mutually verified vs node:crypto)");
+  // Close the loop: OpenSSL must accept the ECDSA signature our SEC1-parsed key made.
+  const grab509 = (re) => (cx.stdout.match(re) || [])[1];
+  assert(
+    nodeCrypto.verify("sha256", S3MSG, nodeCrypto.createPublicKey(ecPubPem), Buffer.from(grab509(/SEC1_SIG=([0-9a-f]+)/), "hex")),
+    "OpenSSL verifies our SEC1-key ECDSA signature");
+
   // === #13: ESM import/export transpiled to our sync CJS (es-module-lexer) ===
   // Seed a small ESM/CJS mixed graph: named/default/namespace imports, CJS<->ESM
   // interop, re-exports, an ESM-syntax .js file, a package resolved via its

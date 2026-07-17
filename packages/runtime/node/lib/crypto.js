@@ -11,15 +11,18 @@
 //
 // Covered (S3): scrypt/scryptSync, and the asymmetric surface —
 // createPrivateKey/createPublicKey (PKCS#8 'PRIVATE KEY' + SPKI 'PUBLIC KEY' +
-// PKCS#1 'RSA PRIVATE/PUBLIC KEY', PEM or DER), asymmetric KeyObjects
-// (ec/ed25519/rsa), createSign/createVerify + one-shot sign/verify, RSA
-// publicEncrypt/privateDecrypt (OAEP + PKCS1v15), and generateKeyPair(Sync) for
-// 'ec' (prime256v1/secp384r1), 'ed25519' and 'rsa'. Unlocks ES256/384 + EdDSA +
-// RS256/384/512 + PS256/384/512 JWTs (jsonwebtoken/jose native path). The Rust
-// codec does the math; this layer handles PEM<->DER + padding + the stream shape.
+// PKCS#1 'RSA PRIVATE/PUBLIC KEY' + SEC1 'EC PRIVATE KEY', PEM or DER),
+// asymmetric KeyObjects (ec/ed25519/rsa), createSign/createVerify + one-shot
+// sign/verify, RSA publicEncrypt/privateDecrypt (OAEP + PKCS1v15), and
+// generateKeyPair(Sync) for 'ec' (prime256v1/secp384r1), 'ed25519' and 'rsa'.
+// Unlocks ES256/384 + EdDSA + RS256/384/512 + PS256/384/512 JWTs (jsonwebtoken/
+// jose native path). Covered (S3 phase 3): X509Certificate (parse fields,
+// .publicKey, fingerprints, verify/checkIssued) — drives jose's importX509. The
+// Rust codec does the math; this layer handles PEM<->DER + padding + the stream
+// shape.
 //
-// NOT covered yet (throw loudly): SEC1 'EC PRIVATE KEY', encrypted/passphrase
-// keys, privateEncrypt/publicDecrypt, DH/ECDH, X.509, JWK.
+// NOT covered yet (throw loudly): encrypted/passphrase keys, privateEncrypt/
+// publicDecrypt, DH/ECDH, JWK.
 
 export default function (exports, require, module, process, internalBinding) {
   const { Buffer } = require("buffer");
@@ -467,11 +470,19 @@ export default function (exports, require, module, process, internalBinding) {
       // Traditional RSA PEMs (PKCS#1); normalized to PKCS#8/SPKI by createPrivate/PublicKey.
       if (parsed.label === "RSA PRIVATE KEY") return { der: parsed.der, isPrivate: true };
       if (parsed.label === "RSA PUBLIC KEY") return { der: parsed.der, isPrivate: false };
+      // Traditional SEC1 EC private key; normalized to PKCS#8 by createPrivateKey.
+      if (parsed.label === "EC PRIVATE KEY") return { der: parsed.der, isPrivate: true };
+      // An X.509 certificate: like Node, createPublicKey extracts its SPKI. This is
+      // how jose's importX509 obtains a public key (createPublicKey(certPem)).
+      if (parsed.label === "CERTIFICATE") {
+        if (want === "private") throw new Error("Vivari crypto: a certificate has no private key");
+        return { der: binding.x509Parse(parsed.der).spkiDer, isPrivate: false };
+      }
       if (parsed.label === "ENCRYPTED PRIVATE KEY") {
         throw new Error("Vivari crypto: encrypted PKCS#8 keys are not supported yet");
       }
       throw new Error(
-        `Vivari crypto: unsupported PEM key '${parsed.label}' (PKCS#8 'PRIVATE KEY' / SPKI 'PUBLIC KEY' / PKCS#1 'RSA PRIVATE/PUBLIC KEY'; SEC1 'EC PRIVATE KEY' not yet)`,
+        `Vivari crypto: unsupported PEM key '${parsed.label}' (PKCS#8 'PRIVATE KEY' / SPKI 'PUBLIC KEY' / PKCS#1 'RSA PRIVATE/PUBLIC KEY' / SEC1 'EC PRIVATE KEY' / X.509 'CERTIFICATE')`,
       );
     }
     if (format === "der") return { der: toBytes(keyData), isPrivate: want === "private" };
@@ -722,6 +733,143 @@ export default function (exports, require, module, process, internalBinding) {
     return Buffer.from(binding.rsaDecrypt(der, toBytes(buffer), oaep, oaepHash));
   }
 
+  // --- S3 phase 3: X.509 (new X509Certificate(...)) --------------------------
+  const kX509Der = Symbol("kX509Der");
+  const kX509Info = Symbol("kX509Info");
+  const kX509Spki = Symbol("kX509Spki");
+
+  // OID -> OpenSSL short name for RDN rendering (Node's subject/issuer strings).
+  const RDN_SHORT = {
+    "2.5.4.3": "CN",
+    "2.5.4.6": "C",
+    "2.5.4.7": "L",
+    "2.5.4.8": "ST",
+    "2.5.4.9": "street",
+    "2.5.4.10": "O",
+    "2.5.4.11": "OU",
+    "2.5.4.5": "serialNumber",
+    "2.5.4.4": "SN",
+    "2.5.4.42": "GN",
+    "1.2.840.113549.1.9.1": "emailAddress",
+    "0.9.2342.19200300.100.1.25": "DC",
+    "0.9.2342.19200300.100.1.1": "UID",
+  };
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+  const formatName = (rdns) => rdns.map((r) => `${RDN_SHORT[r.oid] || r.oid}=${r.value}`).join("\n");
+  // OpenSSL/Node validFrom/validTo format: e.g. "Sep  1 00:00:00 2024 GMT".
+  const opensslTime = (sec) => {
+    const d = new Date(sec * 1000);
+    const day = String(d.getUTCDate()).padStart(2, " ");
+    const hh = String(d.getUTCHours()).padStart(2, "0");
+    const mm = String(d.getUTCMinutes()).padStart(2, "0");
+    const ss = String(d.getUTCSeconds()).padStart(2, "0");
+    return `${MONTHS[d.getUTCMonth()]} ${day} ${hh}:${mm}:${ss} ${d.getUTCFullYear()} GMT`;
+  };
+  const shaHex = (algo, bytes) => {
+    const h = new (classes().Hash)(algo);
+    h.update(Buffer.from(bytes));
+    return h.digest("hex");
+  };
+  const fpFmt = (hex) => hex.toUpperCase().match(/../g).join(":");
+
+  class X509Certificate {
+    constructor(input) {
+      const asStr =
+        typeof input === "string"
+          ? input
+          : input && (Buffer.isBuffer(input) || ArrayBuffer.isView(input) || input instanceof ArrayBuffer)
+            ? Buffer.from(toBytes(input)).toString("latin1")
+            : null;
+      if (asStr === null) {
+        throw new Error("Vivari crypto: X509Certificate requires a PEM string or DER Buffer");
+      }
+      let der;
+      if (asStr.includes("-----BEGIN")) {
+        const parsed = pemToDer(asStr);
+        if (!parsed || parsed.label !== "CERTIFICATE") {
+          throw new Error("Vivari crypto: X509Certificate expects a 'CERTIFICATE' PEM");
+        }
+        der = parsed.der;
+      } else {
+        der = toBytes(input);
+      }
+      this[kX509Der] = der;
+      const { json, spkiDer } = binding.x509Parse(der);
+      this[kX509Info] = JSON.parse(json);
+      this[kX509Spki] = spkiDer;
+    }
+    get raw() {
+      return Buffer.from(this[kX509Der]);
+    }
+    get subject() {
+      return formatName(this[kX509Info].subject);
+    }
+    get issuer() {
+      return formatName(this[kX509Info].issuer);
+    }
+    get subjectAltName() {
+      const san = this[kX509Info].subjectAltName;
+      if (!san || san.length === 0) return undefined;
+      return san.map((e) => `${e.kind}:${e.value}`).join(", ");
+    }
+    get serialNumber() {
+      return this[kX509Info].serialNumber;
+    }
+    get validFrom() {
+      return opensslTime(this[kX509Info].notBefore);
+    }
+    get validTo() {
+      return opensslTime(this[kX509Info].notAfter);
+    }
+    get validFromDate() {
+      return new Date(this[kX509Info].notBefore * 1000);
+    }
+    get validToDate() {
+      return new Date(this[kX509Info].notAfter * 1000);
+    }
+    get keyUsage() {
+      const ku = this[kX509Info].keyUsage;
+      return ku && ku.length ? ku.slice() : undefined;
+    }
+    get ca() {
+      return !!this[kX509Info].ca;
+    }
+    get fingerprint() {
+      return fpFmt(shaHex("sha1", this[kX509Der]));
+    }
+    get fingerprint256() {
+      return fpFmt(shaHex("sha256", this[kX509Der]));
+    }
+    get fingerprint512() {
+      return fpFmt(shaHex("sha512", this[kX509Der]));
+    }
+    get publicKey() {
+      return createPublicKey({ key: Buffer.from(this[kX509Spki]), format: "der", type: "spki" });
+    }
+    toString() {
+      return derToPem(this[kX509Der], "CERTIFICATE");
+    }
+    toJSON() {
+      return this.toString();
+    }
+    // Verify this cert's signature with `publicKey` (the issuer's key; the cert's
+    // own key for a self-signed cert).
+    verify(publicKey) {
+      const pub = createPublicKey(publicKey);
+      return binding.x509Verify(this[kX509Der], pub[kKeyMaterial]);
+    }
+    // True when `other` issued this cert: issuer/subject names line up AND this
+    // cert's signature verifies under other's public key.
+    checkIssued(other) {
+      if (!(other instanceof X509Certificate)) {
+        throw new Error("Vivari crypto: checkIssued expects an X509Certificate");
+      }
+      if (this.issuer !== other.subject) return false;
+      return this.verify(other.publicKey);
+    }
+  }
+
   const notSupported = (name) => () => {
     throw new Error(`Vivari crypto: ${name} is not supported yet`);
   };
@@ -775,6 +923,8 @@ export default function (exports, require, module, process, internalBinding) {
     // S3 phase 2: RSA encryption (OAEP + PKCS1v15).
     publicEncrypt,
     privateDecrypt,
+    // S3 phase 3: X.509 certificate parsing + verify.
+    X509Certificate,
     // Still genuinely unsupported (later phases): raw RSA + DH/ECDH.
     privateEncrypt: notSupported("privateEncrypt"),
     publicDecrypt: notSupported("publicDecrypt"),
