@@ -60,10 +60,6 @@ export function Hero() {
               Read the docs
             </a>
           </motion.div>
-
-          <motion.p variants={item} className="mt-5 font-mono text-sm text-faint">
-            npm i @vivari/core
-          </motion.p>
         </motion.div>
 
         <motion.div

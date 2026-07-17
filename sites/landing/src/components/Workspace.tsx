@@ -143,7 +143,7 @@ export function Workspace() {
             <rect x="4" y="10" width="16" height="10" rx="2" />
             <path d="M8 10V7a4 4 0 0 1 8 0v3" />
           </svg>
-          my-vite-app · vivari studio
+          my-vite-app
         </div>
       </div>
 
@@ -242,7 +242,7 @@ export function Workspace() {
           >
             <span className="relative flex h-4 w-4 items-center justify-center">
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400/40" />
-              <NodeMark className="relative h-4 w-4" />
+              <NodeMark className="relative transform-[scale(1.4)]" />
             </span>
             <span className="text-[10px] font-medium text-fg">Node</span>
           </motion.div>
