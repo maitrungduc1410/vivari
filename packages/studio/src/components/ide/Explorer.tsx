@@ -519,6 +519,13 @@ function RowMenu({
         <ContextMenuSeparator />
         <ContextMenuItem onClick={() => c.openTerminalIn(termDir)}>Open in Integrated Terminal</ContextMenuItem>
         <ContextMenuItem onClick={() => c.copyPath(abs)}>Copy Path</ContextMenuItem>
+        {isRoot && (
+          <>
+            <ContextMenuSeparator />
+            <ContextMenuItem onClick={() => void c.exportProjectZip(abs)}>Export as Zip…</ContextMenuItem>
+            <ContextMenuItem onClick={() => void c.shareProject(abs)}>Share (copy link)</ContextMenuItem>
+          </>
+        )}
         <ContextMenuSeparator />
         {!isRoot && (
           <ContextMenuItem onClick={onRename}>

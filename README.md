@@ -90,6 +90,11 @@ are cached: `node_modules` is snapshotted **keyed by the lockfile**, so opening 
 template you've built before (or a second project with the same deps) restores
 `node_modules` from disk instead of re-running `npm install`.
 
+Projects can also leave the browser and come back — all client-side: **export** any
+project as a `.zip`, **import** a local folder as a new project (folder picker or
+drag-and-drop onto Home), and **share** a project as a self-contained compressed
+link (source is gzipped into the URL; opening it recreates the project).
+
 ## Embed it (SDK)
 
 The same runtime that powers the studio is published as an embeddable SDK:

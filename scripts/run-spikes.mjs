@@ -35,6 +35,9 @@ const SPIKES = [
   { name: "esm", file: "spike-esm.mjs", net: false, timeout: 60000 },
   // pnpm/cmd-shim bin unwrap — pure parser, no kernel/wasm needed.
   { name: "cmd-shim", file: "spike-cmd-shim.mjs", net: false, timeout: 60000 },
+  // Import/export/share codecs (P2): zip writer verified with Node's zlib, and
+  // the shareable-URL codec round-tripped. Pure web primitives, no kernel/wasm.
+  { name: "zip-share", file: "spike-zip-share.mjs", net: false, timeout: 60000 },
   // Persistent dependency cache (P1): pack node_modules → snapshot → wipe →
   // restore → require, against the real Wasm VFS. Offline + deterministic.
   { name: "dep-cache", file: "spike-dep-cache.mjs", net: false, timeout: 120000 },

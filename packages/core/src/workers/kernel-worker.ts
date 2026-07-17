@@ -2009,6 +2009,70 @@ self.onmessage = async (event) => {
     return;
   }
 
+  // Bulk-read a project's source tree (export as zip / shareable URL). Walks the
+  // root in-worker — one reply instead of thousands of per-file vv-read-bytes
+  // round-trips — excluding node_modules/.git and bounded by file count + bytes.
+  // Returns [{ path (relative to root), bytes }] plus a `truncated` flag.
+  if (m.type === "vv-read-tree") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    try {
+      const root = String(m.root || "").replace(/\/+$/, "");
+      const skip = new Set(["node_modules", ".git", ...(Array.isArray(m.exclude) ? m.exclude : [])]);
+      const MAX_FILES = 20000;
+      const MAX_BYTES = 64 * 1024 * 1024;
+      const files: { path: string; bytes: Uint8Array }[] = [];
+      let bytes = 0;
+      let truncated = false;
+      const walk = (dir: string, rel: string) => {
+        if (truncated) return;
+        let names: string[];
+        try { names = kernel.readdir(dir); } catch { return; }
+        for (const name of names) {
+          if (truncated) return;
+          if (skip.has(name)) continue;
+          const abs = dir + "/" + name;
+          const relPath = rel ? rel + "/" + name : name;
+          let st;
+          try { st = kernel.stat(abs); } catch { continue; }
+          if (st.kind === "dir") {
+            walk(abs, relPath);
+          } else if (st.kind === "file") {
+            let b: Uint8Array;
+            try { b = kernel.readFileBytes(abs); } catch { continue; }
+            files.push({ path: relPath, bytes: b });
+            bytes += b.byteLength;
+            if (files.length >= MAX_FILES || bytes >= MAX_BYTES) { truncated = true; return; }
+          }
+        }
+      };
+      if (kernel.exists(root)) walk(root, "");
+      post("vv-reply", { reqId: m.reqId, ok: true, files, truncated });
+    } catch (err) {
+      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+    }
+    return;
+  }
+
+  // Bulk-write an imported tree (folder import / shared-project load) into `dir`
+  // in one batch. `files` is [{ path (relative to dir), bytes }].
+  if (m.type === "vv-import-tree") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    try {
+      const dir = String(m.dir || "").replace(/\/+$/, "");
+      kernel.mkdirp(dir);
+      const incoming = Array.isArray(m.files) ? m.files : [];
+      const batch = incoming
+        .filter((f) => f && typeof f.path === "string")
+        .map((f) => ({ path: dir + "/" + String(f.path).replace(/^\/+/, ""), bytes: f.bytes ?? f.contents ?? "" }));
+      if (batch.length) await kernel.writeFilesBatch(batch);
+      post("vv-reply", { reqId: m.reqId, ok: true, count: batch.length });
+      post("vv-fs-changed", { path: dir });
+    } catch (err) {
+      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+    }
+    return;
+  }
+
   // ── IntelliSense: bulk-collect dependency type declarations ─────────────────
   // Harvest a project's node_modules **/*.d.ts (+ package.json, needed for
   // "types"/"exports" resolution) so the studio can feed them to Monaco's TS

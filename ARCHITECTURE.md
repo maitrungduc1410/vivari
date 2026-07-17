@@ -68,7 +68,7 @@ bundles each** (nested module workers + wasm).
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │ Main thread — packages/studio (React 19 + shadcn)                      │
-│   • Home screen (blank / template / recents) + VS Code-style IDE:      │
+│   • Home (blank / template / import folder / recents) + VS Code IDE:   │
 │     multi-root VFS-backed Explorer (abs-path tabs) + Search + tabbed    │
 │     Monaco (preview/permanent tabs) + bottom panel with                 │
 │     Console / Terminal (INTERACTIVE shells) / Ports + command palette   │
@@ -649,6 +649,34 @@ flowchart LR
   `node_modules` fingerprint short-circuits the file reads when nothing changed.
 - **Never register a file as both** a model and an extra lib, or the worker sees it twice ("Duplicate
   identifier"). `onDidChangeMarkers` feeds a live error/warning count into the status bar.
+
+### 8.10 Import / export & share (studio)
+
+A project can leave the playground and come back — all client-side, no backend. The codecs live in
+`packages/kernel-host/archive.js` (environment-agnostic like `dep-cache.js`: only web primitives that
+exist in both a browser and Node — `CompressionStream`/`DecompressionStream`, `DataView`,
+`btoa`/`atob` — so **no npm zip/gzip dependency**). ZIP entries are DEFLATE'd with the platform's own
+`CompressionStream('deflate-raw')` (STORE fallback when it wouldn't shrink) plus a hand-written CRC-32
++ local/central-directory/EOCD records; the shareable-URL payload is a gzipped JSON manifest (text
+inline UTF-8, binary base64) encoded base64url.
+
+Two bulk RPCs keep it off the main thread and off per-file round-trips: **`vv-read-tree`** walks a
+project in the kernel worker (sole VFS holder) and returns the whole source tree in one reply
+(`node_modules`/`.git` excluded, bounded by file count + bytes) — backing both zip export and the share
+payload; **`vv-import-tree`** bulk-writes an imported tree via `writeFilesBatch` — backing both folder
+import and shared-link load. The controller (`vv/controller.ts`) exposes `exportProjectZip`,
+`importFilesAsProject`, and `shareProject` (source-only, size-capped — a "too big to share" message
+beyond the cap), plus an OS folder picker (`<input webkitdirectory>`) and a Home drag-drop zone. A
+boot hook (`loadSharedFromUrl`, once the kernel is ready) decodes a `#share=` payload into a new
+project and clears the hash so a reload doesn't re-import. A shared link lands straight on the
+workspace — never Home, so the user can't accidentally start a new project mid-bootstrap — behind a
+full-screen blocking overlay (`ShareLoadingOverlay`, spinner + staged text) that clears once the
+project opens; a bottom-left success/error toast then fires. Imported/shared projects with a runnable
+`package.json` script get a **synthesized run manifest** so the Run button auto-installs + starts a
+dev server. Entry points: Home "Import a folder" card, the command palette (Import/Export/Share), and
+the Explorer root context-menu. Proof: `scripts/spike-zip-share.mjs` (re-decodes the ZIP with Node's
+`zlib`; round-trips the share codec over a text+binary tree). GitHub-repo / npm-package import (both
+need network/CORS) are a documented follow-up.
 
 ---
 
