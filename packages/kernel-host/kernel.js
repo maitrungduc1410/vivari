@@ -521,7 +521,7 @@ export class Kernel {
         return;
       }
       const pid = this.createProcess(
-        { programPath, args, cwd, env: opts.env || {} },
+        { command, programPath, args, cwd, env: opts.env || {} },
         { capture: !!opts.capture },
       );
       this.procs.get(pid).onExit = resolve;
@@ -850,7 +850,7 @@ export class Kernel {
       return;
     }
     const childPid = this.createProcess(
-      { programPath, args: spec.args || [], cwd, env: spec.env || {} },
+      { command: spec.command, programPath, args: spec.args || [], cwd, env: spec.env || {} },
       { parentPid: parent.pid, capture: !!spec.capture },
     );
     this.procs.get(childPid).onExit = (res) => {
@@ -885,7 +885,7 @@ export class Kernel {
     }
     const parentPid = parent.pid;
     const childPid = this.createProcess(
-      { programPath, args: spec.args || [], cwd, env: spec.env || {} },
+      { command: spec.command, programPath, args: spec.args || [], cwd, env: spec.env || {} },
       { parentPid, stream: true },
     );
     this.procs.get(childPid).onExit = (res) => {

@@ -682,22 +682,32 @@ const snapshotInFlight = new Set();
 async function maybeSnapshotDeps(dir, pmHint) {
   if (snapshotInFlight.has(dir)) return;
   snapshotInFlight.add(dir);
+  post("log", { line: `  [depcache] snapshot check for ${pmName(pmHint)} at ${dir}`, dim: true });
   try {
     if (!kernelFsRef || !kernel) return;
-    if (!kernel.exists(dir + "/node_modules")) return;
+    const base = String(dir).replace(/\/+$/, "");
+    if (!kernel.exists(base + "/node_modules")) {
+      post("log", { line: `  [depcache] skip snapshot: no node_modules at ${base}`, dim: true });
+      return;
+    }
     const pm = pmName(pmHint);
-    const keys = await computeDepSaveKeys(dir, pm);
-    if (!keys) return;
+    const keys = await computeDepSaveKeys(base, pm);
+    if (!keys) {
+      post("log", { line: `  [depcache] skip snapshot: no lockfile/package.json at ${base}`, dim: true });
+      return;
+    }
     if (await kernelFsRef.depCacheHas(keys.primary)) return; // already cached
-    const res = await kernelFsRef.depCacheSave(keys.primary, dir, keys.aliases);
+    const res = await kernelFsRef.depCacheSave(keys.primary, base, keys.aliases);
     if (res) {
       post("log", {
         line: `  [depcache] cached node_modules for ${pm} (${res.files} files, ${(res.bytes / 1048576).toFixed(1)} MB).`,
         dim: true,
       });
+    } else {
+      post("log", { line: `  [depcache] snapshot returned no result for ${base}`, dim: true });
     }
-  } catch {
-    /* best effort */
+  } catch (err) {
+    post("log", { line: `  [depcache] snapshot failed: ${(err && err.message) || err}`, dim: true });
   } finally {
     snapshotInFlight.delete(dir);
   }
