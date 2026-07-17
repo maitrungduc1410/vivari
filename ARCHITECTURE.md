@@ -254,12 +254,20 @@ never parks and many downloads can overlap (§6).
   host terminal's keystrokes → `kernel.sendStdin(pid)` → a `{type:'stdin'}`
   postMessage → the process' real flowing `process.stdin` (a TTY Readable, drained
   in a loop turn). `child.stdin.write()` relays parent→child via `{type:'child-
-  stdin'}` → `kernel.handleChildStdin` → the child's own stdin. This is what makes
-  the terminal interactive (a live `sh` REPL, `node`, etc.).
+  stdin'}` → `kernel.handleChildStdin` → the child's own stdin, **byte-for-byte**
+  (Buffers/Uint8Arrays pass through unstringified, so binary stdin survives). This
+  is what makes the terminal interactive (a live `sh` REPL, `node`, etc.).
 - **Coreutils + shell**: `packages/kernel-host/coreutils.js` provides
   `echo/cat/ls/pwd/mkdir/rm/node/npm/npx/true/false` and a small `sh`. `sh` with
   no args is an **interactive REPL** (prompt, echo, backspace, Ctrl+C→SIGINT the
-  foreground child, Ctrl+D); with `-c`/a file it runs a batch. If `$VV_RUN` is set
+  whole foreground job — every stage of a pipeline, not just the last, Ctrl+D);
+  with `-c`/a file it runs a batch. It supports
+  sequencing (`;` `&&` `||`), **pipes** (`|`) and **redirects** (`<` `>` `>>` `2>`
+  `2>>` `2>&1`) — a quote-aware lexer parses each line into pipelines of stages,
+  wiring one stage's stdout into the next's stdin and opening redirect targets as
+  fds (a pipeline's exit status is its last stage). `/dev/null` is special-cased
+  as a discard sink (there are no VFS device nodes), so `cmd > /dev/null 2>&1`
+  works. If `$VV_RUN` is set
   it auto-runs that command line at startup (echoed like you'd typed it) then stays
   interactive — used to run a demo's dev server *inside a terminal tab*. Installed
   into `/bin` by `installCoreutils()`.

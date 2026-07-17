@@ -138,16 +138,17 @@ over a shared VFS — mirroring StackBlitz's per-PID Node workers.
   against `process.cwd()`.
 - Coreutils as real Node programs installed at `/bin` (on PATH): `echo`, `cat`,
   `ls`, `pwd`, `mkdir`, `rm`, `node`, `true`, `false`, and a `sh` shell.
-- `sh`: sequencing `;`, `&&`, `||`, comments, quotes, builtins (`cd`, `pwd`,
-  `export`, `:`), everything else spawned as a child inheriting cwd/env.
+- `sh`: sequencing `;`, `&&`, `||`, pipes (`|`), redirects (`<` `>` `>>` `2>`
+  `2>>` `2>&1`, with `/dev/null` as a discard sink), comments, quotes, builtins
+  (`cd`, `pwd`, `export`, `:`), everything else spawned as a child inheriting cwd/env.
 - Generic `runtime/boot.js` process bootstrap + env worker entries
   (`demo/process-worker.js`, `scripts/process-worker.mjs`).
 - Demo runs a shell session; `scripts/verify-node.mjs`: 16/16 PASS (shell logic,
   cwd inheritance, nested execSync, exit codes 0/1/127, 15 PIDs spawned).
 
 **Deferred:** ~~async `spawn`/streaming stdio, `kill`/signals~~ (DONE in #15),
-parent→child stdin pipe, pre-warmed worker pool (StackBlitz idle ~8.1 MB),
-pipes (`|`) and redirects.
+~~parent→child stdin pipe~~ (DONE — now binary-safe), pre-warmed worker pool
+(StackBlitz idle ~8.1 MB), ~~pipes (`|`) and redirects~~ (DONE).
 
 ---
 
@@ -863,8 +864,8 @@ constructor" above): `_load`/`_resolveFilename`/`_nodeModulePaths`/`_cache`/`_ex
     buffered `spawnSync` that never returns. Verified headless (`verify-node`: live streaming
     across timers + exit code + `kill('SIGTERM')` → null code/`SIGTERM`) and in the browser
     (`/api/spawn`, plus a boot `npm run dev` that boots a real `:3200` server via async spawn).
-    **Deferred:** parent→child **stdin** pipe (`child.stdin` is a no-op sink for now), `fork`
-    (needs an IPC channel), pipes (`|`)/redirects in `sh`, `detached`/process groups.
+    **Deferred:** ~~parent→child **stdin** pipe~~ (DONE, now binary-safe), ~~`fork`~~ (DONE),
+    ~~pipes (`|`)/redirects in `sh`~~ (DONE), `detached`/process groups.
     **Extras (ongoing, unrelated):** nested `worker_threads` (our `[worker n]`, #16 2b), heavy
     toolchains (`esbuild`/`vite`/`tsserver` as Wasm), IndexedDB persistence, pre-warm worker pool.
 16. **WASI + napi-rs Wasm runtime (native→wasm packages)** [XL] — **stage 1 + 2a + 2b core + 2c DONE.**
