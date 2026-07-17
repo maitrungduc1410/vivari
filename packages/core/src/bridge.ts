@@ -181,14 +181,21 @@ export function isCrossOriginIsolated(): boolean {
 /**
  * Wipe the OPFS-mirrored VFS before boot (clean slate). Returns whether anything
  * was removed. Studio calls this when the URL has `?reset`; SDK consumers can
- * call it directly to reset persisted state.
+ * call it directly to reset persisted state. Also drops the persistent dependency
+ * cache (node_modules snapshots keyed by lockfile) so a reset is a true clean
+ * slate, not one that silently re-restores deps from a stale snapshot.
  */
 export async function resetVfs(): Promise<boolean> {
-  try {
-    const dir = await navigator.storage.getDirectory();
-    await dir.removeEntry("vv-vfs", { recursive: true });
-    return true;
-  } catch {
-    return false; // nothing persisted yet
+  let removed = false;
+  const dir = await navigator.storage.getDirectory().catch(() => null);
+  if (!dir) return false;
+  for (const name of ["vv-vfs", "vv-depcache"]) {
+    try {
+      await dir.removeEntry(name, { recursive: true });
+      removed = true;
+    } catch {
+      /* nothing persisted under this root yet */
+    }
   }
+  return removed;
 }

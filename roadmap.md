@@ -2689,6 +2689,58 @@ a preview refresh, and no longer hang). The CDP visualization is inherently brow
 spike-able headlessly); the friendly-URL rewrite was validated with a Node harness over same-port,
 cross-service, and `__vvKeepPrefix` cases.
 
+## Persistent dependency cache — node_modules keyed by lockfile (this change)
+
+The OPFS write-behind mirror already keeps a project's `node_modules` across a reload, and the
+package managers' own content-addressed caches under `/home/user/.cache` are persisted too — so a
+re-install rarely re-DOWNLOADS. But it still paid the full **CPU** cost of a real install whenever
+`node_modules` was absent: a brand-new project, a `?reset`, or a second project with the same deps
+all re-ran Arborist resolution + extracted thousands of files + ran lifecycle scripts. This change
+caches the **result** of an install (the whole `node_modules` tree) keyed by the lockfile, and
+restores it in one pass instead of re-running npm/yarn/pnpm — the biggest perceived-speed win for
+the common "open a template, press Run" flow.
+
+- **The store (`packages/kernel-host/dep-cache.js`).** A content-addressed snapshot store,
+  environment-agnostic like `opfs-persistence.js`: it takes an `access` (the same vfs-bound facade —
+  `read`/`walk`/`mkdirp`/`writeFile`/`symlink`) and a `storage` blob backend. `save(key, dir)` walks
+  `dir/node_modules` and packs it (dirs + files + **symlinks**, so pnpm's virtual store survives) into
+  one archive using the vendor-asset pack format (`[u32le headerLen][headerJSON][file bytes…]`);
+  `restore(key, dir)` unpacks it back into the VFS. A small index (persisted through `storage`) tracks
+  size + last-use per key for a **bounded LRU** (512 MiB default), so the cache can't grow without
+  limit. `hashDepKey(pm, bytes, src)` is a SHA-256 (via `crypto.subtle`) namespaced by package
+  manager + source file.
+- **Keying + aliases.** The durable key is the **lockfile** hash (`package-lock.json`/
+  `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`); when none exists yet it falls back to
+  `package.json`. A save also registers an **alias** on the `package.json` hash pointing at the same
+  snapshot, so a fresh project of the same template — which has no lockfile until its first install —
+  still hits on its pre-install lookup.
+- **Browser wiring (`packages/core/src/workers/fs-worker.ts`).** The cache lives in the File System
+  Worker (the sole holder of the VFS + OPFS sync access handles), storing snapshots under a separate
+  origin dir `vv-depcache/` (one flat file per key). New `dep-cache-{has,save,restore}` messages run
+  against the in-worker VFS and answer over `postMessage`, exposed to the kernel as
+  `depCacheHas/Save/Restore` on the kernel-fs client (`packages/kernel-host/kernel-fs.js`, same shape
+  as `writeLarge`/`writeFilesBatch`). A restore mirrors every recreated path through the existing
+  write-behind store, so cache-restored `node_modules` survives a reload exactly like a normally
+  installed one.
+- **Orchestration (`packages/core/src/workers/kernel-worker.ts`).** Before the auto-run install
+  (`demoRunCommand` / the project-run branch of `openTerminal`), if `node_modules` is absent and a
+  snapshot matches the lockfile, it is restored and the shell runs the dev command **without** the
+  `install &&` prefix. After any package-manager install exits cleanly — detected generically from the
+  process invocation in `kernel.onProcExit` (the `command`/`args`/`cwd` are now carried on the exit
+  result), covering the auto-run `install && dev` shell, a manually typed `npm install`, and the SDK
+  `vivari.spawn('npm', ['install'])` path — `node_modules` is snapshotted (skipped if the current
+  lockfile is already cached). `resetVfs()` (`?reset`) now also drops `vv-depcache`.
+- **Trade-off (documented).** This is **additive**: the write-behind mirror still persists
+  `node_modules` per project, so a restored tree is stored both in the mirror and the dep cache. A
+  cleaner, more space-efficient follow-up is to exclude `node_modules` from the mirror and let the
+  dep cache own dependency persistence outright (it changes reload semantics, so it's out of scope
+  here). Packing is also a single synchronous pass today; chunked/idle-time packing is a follow-up.
+- **Gate.** `scripts/spike-dep-cache.mjs` (offline, in `run-spikes.mjs`) fabricates a `node_modules`
+  (files + a symlink) against the real Wasm VFS, snapshots it, wipes it, restores it, and `require()`s
+  the result in-VM — plus the package.json-alias restore path. Headless has no OPFS, so
+  `scripts/fs-worker.mjs` wires an in-memory `storage`; the pack/restore + VFS logic under test is the
+  shipped code.
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

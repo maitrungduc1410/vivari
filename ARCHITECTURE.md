@@ -218,6 +218,14 @@ never parks and many downloads can overlap (§6).
   reused by later projects and after a reload. The kernel's transient outbound-fetch
   buffer (`/var/cache/vv-fetch`) is excluded because its index is rebuilt per session
   and never read back, so npm's cache is the single durable copy.
+- **Dependency cache** (`packages/kernel-host/dep-cache.js`, stored under `vv-depcache/` in OPFS):
+  layered on top of the mirror. A lockfile-keyed snapshot of a whole `node_modules` tree
+  (`dep-cache-{has,save,restore}` messages against the in-worker VFS, exposed to the kernel as
+  `kernelFs.fs.depCache{Has,Save,Restore}`). Snapshotted after a clean package-manager install
+  (detected in `kernel.onProcExit`) and restored **before** an auto-run install when the lockfile —
+  or, for a fresh template with no lockfile yet, `package.json` via an alias key — matches, so a
+  second project with the same deps skips `install` entirely. Bounded LRU (512 MiB); also dropped by
+  `?reset`. See roadmap "Persistent dependency cache".
 - **File watching** (`fs.watch`): `OP_WATCH` registers interest; the FS worker
   **pushes** change events back over the fs doorbell `MessagePort` (never the SAB —
   the process isn't parked on it). Events are bucketed by top-level tree to bound
