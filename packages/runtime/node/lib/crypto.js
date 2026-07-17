@@ -6,11 +6,18 @@
 // Covered (S2): createHash (md5/sha1/sha224/256/384/512/512-256), createHmac,
 // pbkdf2/pbkdf2Sync, createCipheriv/createDecipheriv for AES-CBC (128/192/256)
 // and AES-GCM (128/256) incl. setAAD/getAuthTag/setAuthTag, WebCrypto-backed
-// randomBytes/randomFill/randomInt/randomUUID, and a SYMMETRIC-only KeyObject
+// randomBytes/randomFill/randomInt/randomUUID, and a SYMMETRIC KeyObject
 // (KeyObject + createSecretKey) so jsonwebtoken@9 HS256/384/512 works.
 //
-// NOT covered: asymmetric sign/verify, RSA/EC keygen, createPrivate/PublicKey,
-// DH, scrypt, X.509 — they throw.
+// Covered (S3): scrypt/scryptSync, and the ELLIPTIC asymmetric surface —
+// createPrivateKey/createPublicKey (PKCS#8 'PRIVATE KEY' + SPKI 'PUBLIC KEY',
+// PEM or DER), asymmetric KeyObjects (ec/ed25519), createSign/createVerify +
+// one-shot sign/verify, and generateKeyPair(Sync) for 'ec' (prime256v1/secp384r1)
+// and 'ed25519'. Unlocks ES256/ES384 + EdDSA JWTs (jsonwebtoken/jose native path).
+// The Rust codec does the math; this layer handles PEM<->DER + the stream shape.
+//
+// NOT covered yet (throw loudly): RSA (RS/PS, publicEncrypt/privateDecrypt),
+// SEC1 'EC PRIVATE KEY' / PKCS#1, encrypted/passphrase keys, DH/ECDH, X.509, JWK.
 
 export default function (exports, require, module, process, internalBinding) {
   const { Buffer } = require("buffer");
@@ -183,7 +190,73 @@ export default function (exports, require, module, process, internalBinding) {
       }
     }
 
-    _classes = { Hash, Hmac };
+    // Sign/Verify are Writable streams too (Node's are), so `stream.pipe(sign)`
+    // then `sign.sign(key)` works. Buffered like Hash, signed one-shot in Wasm.
+    class Sign extends Writable {
+      constructor(algorithm, options) {
+        super(options);
+        this._algo = algorithm;
+        this._chunks = [];
+      }
+      _write(chunk, enc, cb) {
+        try {
+          this._chunks.push(toBytes(chunk, enc));
+          cb();
+        } catch (e) {
+          cb(e);
+        }
+      }
+      update(data, inputEncoding) {
+        this._chunks.push(toBytes(data, inputEncoding));
+        return this;
+      }
+      sign(privateKey, outputEncoding) {
+        const { der, dsaEncoding } = resolveSignKey(privateKey, "private");
+        const sig = binding.asymSign(
+          der,
+          normalizeSignAlgo(this._algo),
+          concat(this._chunks),
+          dsaEncoding === "ieee-p1363",
+        );
+        return outputEncoding ? Buffer.from(sig).toString(outputEncoding) : Buffer.from(sig);
+      }
+    }
+
+    class Verify extends Writable {
+      constructor(algorithm, options) {
+        super(options);
+        this._algo = algorithm;
+        this._chunks = [];
+      }
+      _write(chunk, enc, cb) {
+        try {
+          this._chunks.push(toBytes(chunk, enc));
+          cb();
+        } catch (e) {
+          cb(e);
+        }
+      }
+      update(data, inputEncoding) {
+        this._chunks.push(toBytes(data, inputEncoding));
+        return this;
+      }
+      verify(key, signature, signatureEncoding) {
+        const { der, dsaEncoding } = resolveSignKey(key, "public");
+        const sig =
+          typeof signature === "string"
+            ? new Uint8Array(Buffer.from(signature, signatureEncoding || "hex"))
+            : toBytes(signature);
+        return binding.asymVerify(
+          der,
+          normalizeSignAlgo(this._algo),
+          concat(this._chunks),
+          sig,
+          dsaEncoding === "ieee-p1363",
+        );
+      }
+    }
+
+    _classes = { Hash, Hmac, Sign, Verify };
     return _classes;
   }
 
@@ -359,6 +432,239 @@ export default function (exports, require, module, process, internalBinding) {
     return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
   }
 
+  // --- S3: asymmetric KeyObjects + PEM<->DER ------------------------------
+  // Keys cross into the Wasm codec as PKCS#8 DER (private) / SPKI DER (public);
+  // this layer parses/emits the PEM envelope and tracks type + curve for the
+  // Node-facing KeyObject surface (asymmetricKeyType / asymmetricKeyDetails).
+  function pemToDer(pem) {
+    const m = /-----BEGIN ([A-Z0-9 ]+?)-----([\s\S]*?)-----END \1-----/.exec(pem);
+    if (!m) return null;
+    const b64 = m[2].replace(/[^A-Za-z0-9+/=]/g, "");
+    return { label: m[1], der: new Uint8Array(Buffer.from(b64, "base64")) };
+  }
+  function derToPem(der, label) {
+    const b64 = Buffer.from(der).toString("base64");
+    const lines = b64.match(/.{1,64}/g) || [""];
+    return `-----BEGIN ${label}-----\n${lines.join("\n")}\n-----END ${label}-----\n`;
+  }
+
+  // Pull a PKCS#8/SPKI DER out of any accepted key input; `isPrivate` records
+  // which envelope it came from (PEM label wins; DER falls back to `want`).
+  function extractKeyDer(input, want) {
+    let keyData = input;
+    let format = "pem";
+    const isOpts =
+      input &&
+      typeof input === "object" &&
+      typeof input !== "string" &&
+      !Buffer.isBuffer(input) &&
+      !ArrayBuffer.isView(input) &&
+      !(input instanceof ArrayBuffer) &&
+      "key" in input;
+    if (isOpts) {
+      if (input.passphrase != null) {
+        throw new Error("Vivari crypto: encrypted/passphrase-protected keys are not supported yet");
+      }
+      keyData = input.key;
+      format = input.format || "pem";
+    }
+    if (typeof keyData === "string") format = "pem";
+    if (format === "pem") {
+      const pemStr = typeof keyData === "string" ? keyData : Buffer.from(toBytes(keyData)).toString("utf8");
+      const parsed = pemToDer(pemStr);
+      if (!parsed) throw new Error("Vivari crypto: could not parse PEM key");
+      if (parsed.label === "PRIVATE KEY") return { der: parsed.der, isPrivate: true };
+      if (parsed.label === "PUBLIC KEY") return { der: parsed.der, isPrivate: false };
+      if (parsed.label === "ENCRYPTED PRIVATE KEY") {
+        throw new Error("Vivari crypto: encrypted PKCS#8 keys are not supported yet");
+      }
+      throw new Error(
+        `Vivari crypto: unsupported PEM key '${parsed.label}' (phase 1: PKCS#8 'PRIVATE KEY' / SPKI 'PUBLIC KEY'; SEC1/PKCS#1 not yet)`,
+      );
+    }
+    if (format === "der") return { der: toBytes(keyData), isPrivate: want === "private" };
+    throw new Error(`Vivari crypto: unsupported key format '${format}'`);
+  }
+
+  class AsymmetricKeyObject extends KeyObject {
+    constructor(type, der, descriptor) {
+      super(type);
+      this[kKeyMaterial] = der;
+      const [kt, curve] = String(descriptor).split(":");
+      this._asymmetricKeyType = kt;
+      this._namedCurve = curve;
+    }
+    get asymmetricKeyType() {
+      return this._asymmetricKeyType;
+    }
+    get asymmetricKeyDetails() {
+      return this._namedCurve ? { namedCurve: this._namedCurve } : {};
+    }
+    export(options = {}) {
+      const format = options.format || "pem";
+      if (format === "jwk") throw new Error("Vivari crypto: JWK key export is not supported yet");
+      const der = this[kKeyMaterial];
+      if (format === "der") return Buffer.from(der);
+      if (options.type && options.type !== "pkcs8" && options.type !== "spki") {
+        throw new Error(`Vivari crypto: key export type '${options.type}' is not supported yet (pkcs8/spki only)`);
+      }
+      return derToPem(der, this._type === "private" ? "PRIVATE KEY" : "PUBLIC KEY");
+    }
+  }
+
+  function unwrapKeyObjectOpts(input) {
+    if (
+      input &&
+      typeof input === "object" &&
+      !input[kKeyObjectBrand] &&
+      "key" in input &&
+      input.key &&
+      input.key[kKeyObjectBrand]
+    ) {
+      return input.key;
+    }
+    return input;
+  }
+
+  function createPrivateKey(input) {
+    input = unwrapKeyObjectOpts(input);
+    if (input && typeof input === "object" && input[kKeyObjectBrand]) {
+      if (input.type === "private") return input;
+      throw new Error("Vivari crypto: createPrivateKey requires a private key");
+    }
+    const { der, isPrivate } = extractKeyDer(input, "private");
+    if (!isPrivate) throw new Error("Vivari crypto: expected a private key, got a public key");
+    return new AsymmetricKeyObject("private", der, binding.inspectPrivate(der));
+  }
+
+  function createPublicKey(input) {
+    input = unwrapKeyObjectOpts(input);
+    if (input && typeof input === "object" && input[kKeyObjectBrand]) {
+      if (input.type === "public") return input;
+      if (input.type === "private") {
+        const spki = binding.publicFromPrivate(input[kKeyMaterial]);
+        return new AsymmetricKeyObject("public", spki, binding.inspectPublic(spki));
+      }
+      throw new Error("Vivari crypto: cannot derive a public key from a secret key");
+    }
+    const { der, isPrivate } = extractKeyDer(input, "public");
+    if (isPrivate) {
+      const spki = binding.publicFromPrivate(der);
+      return new AsymmetricKeyObject("public", spki, binding.inspectPublic(spki));
+    }
+    return new AsymmetricKeyObject("public", der, binding.inspectPublic(der));
+  }
+
+  // OpenSSL-style algorithm names ('RSA-SHA256', 'sha256', 'SHA256') -> digest.
+  // Ignored for Ed25519 (algorithm is null/undefined there).
+  function normalizeSignAlgo(algo) {
+    if (!algo) return "";
+    return String(algo).toLowerCase().replace(/^rsa-/, "");
+  }
+
+  // Resolve a key argument (KeyObject | PEM | DER | { key, dsaEncoding, ... }) to
+  // its DER + the ECDSA signature encoding preference.
+  function resolveSignKey(key, want) {
+    let dsaEncoding;
+    if (
+      key &&
+      typeof key === "object" &&
+      typeof key !== "string" &&
+      !key[kKeyObjectBrand] &&
+      !Buffer.isBuffer(key) &&
+      !ArrayBuffer.isView(key) &&
+      !(key instanceof ArrayBuffer) &&
+      "key" in key
+    ) {
+      dsaEncoding = key.dsaEncoding;
+    }
+    const ko = want === "private" ? createPrivateKey(key) : createPublicKey(key);
+    return { der: ko[kKeyMaterial], dsaEncoding };
+  }
+
+  // --- S3: one-shot sign / verify (crypto.sign / crypto.verify) -----------
+  function sign(algorithm, data, key, callback) {
+    const { der, dsaEncoding } = resolveSignKey(key, "private");
+    const sig = Buffer.from(
+      binding.asymSign(der, normalizeSignAlgo(algorithm), toBytes(data), dsaEncoding === "ieee-p1363"),
+    );
+    if (typeof callback === "function") {
+      queueMicrotask(() => callback(null, sig));
+      return undefined;
+    }
+    return sig;
+  }
+  function verify(algorithm, data, key, signature, callback) {
+    const { der, dsaEncoding } = resolveSignKey(key, "public");
+    const ok = binding.asymVerify(
+      der,
+      normalizeSignAlgo(algorithm),
+      toBytes(data),
+      toBytes(signature),
+      dsaEncoding === "ieee-p1363",
+    );
+    if (typeof callback === "function") {
+      queueMicrotask(() => callback(null, ok));
+      return undefined;
+    }
+    return ok;
+  }
+
+  // --- S3: scrypt ---------------------------------------------------------
+  const SCRYPT_DEFAULTS = { N: 16384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 };
+  function scryptSync(password, salt, keylen, options = {}) {
+    const N = options.N ?? options.cost ?? SCRYPT_DEFAULTS.N;
+    const r = options.r ?? options.blockSize ?? SCRYPT_DEFAULTS.r;
+    const p = options.p ?? options.parallelization ?? SCRYPT_DEFAULTS.p;
+    const maxmem = options.maxmem ?? SCRYPT_DEFAULTS.maxmem;
+    if (128 * N * r > maxmem) {
+      throw new Error("Vivari crypto: scrypt: memory limit exceeded (raise `maxmem`)");
+    }
+    return Buffer.from(binding.scrypt(toBytes(password), toBytes(salt), N, r, p, keylen));
+  }
+  function scrypt(password, salt, keylen, options, callback) {
+    if (typeof options === "function") {
+      callback = options;
+      options = {};
+    }
+    let out = null;
+    let err = null;
+    try {
+      out = scryptSync(password, salt, keylen, options);
+    } catch (e) {
+      err = e;
+    }
+    queueMicrotask(() => (err ? callback(err) : callback(null, out)));
+  }
+
+  // --- S3: generateKeyPair (ec / ed25519) ---------------------------------
+  function encodeGeneratedKey(keyObj, encoding) {
+    return encoding ? keyObj.export(encoding) : keyObj;
+  }
+  function generateKeyPairSync(type, options = {}) {
+    const kp = binding.generateKeyPair(type, options);
+    const priv = new AsymmetricKeyObject("private", kp.privateDer, binding.inspectPrivate(kp.privateDer));
+    const pub = new AsymmetricKeyObject("public", kp.publicDer, binding.inspectPublic(kp.publicDer));
+    return {
+      publicKey: encodeGeneratedKey(pub, options.publicKeyEncoding),
+      privateKey: encodeGeneratedKey(priv, options.privateKeyEncoding),
+    };
+  }
+  function generateKeyPair(type, options, callback) {
+    if (typeof options === "function") {
+      callback = options;
+      options = {};
+    }
+    let res = null;
+    let err = null;
+    try {
+      res = generateKeyPairSync(type, options);
+    } catch (e) {
+      err = e;
+    }
+    queueMicrotask(() => (err ? callback(err) : callback(null, res.publicKey, res.privateKey)));
+  }
+
   const notSupported = (name) => () => {
     throw new Error(`Vivari crypto: ${name} is not supported yet`);
   };
@@ -392,20 +698,29 @@ export default function (exports, require, module, process, internalBinding) {
     getCiphers: () => ["aes-128-cbc", "aes-192-cbc", "aes-256-cbc", "aes-128-gcm", "aes-256-gcm"],
     constants: {},
     webcrypto,
-    // Symmetric key material (secret only). See the KeyObject block above.
+    // Key material. Secret (symmetric) via createSecretKey; asymmetric (ec/
+    // ed25519) via createPrivateKey/createPublicKey. Note: createPrivateKey still
+    // THROWS on a raw secret (it isn't parseable PEM/DER), so jsonwebtoken's HS*
+    // fallback to createSecretKey is preserved.
     KeyObject,
     createSecretKey,
-    // Callable-but-throwing on purpose: jsonwebtoken tries these first and falls
-    // back to createSecretKey, and jwa treats `typeof createPublicKey==='function'`
-    // as "KeyObjects supported". Asymmetric keys are genuinely unsupported.
-    createPrivateKey: notSupported("createPrivateKey"),
-    createPublicKey: notSupported("createPublicKey"),
-    // Explicitly-unsupported surfaces fail loudly rather than silently misbehave.
-    createSign: notSupported("createSign"),
-    createVerify: notSupported("createVerify"),
-    generateKeyPair: notSupported("generateKeyPair"),
-    generateKeyPairSync: notSupported("generateKeyPairSync"),
-    scrypt: notSupported("scrypt"),
-    scryptSync: notSupported("scryptSync"),
+    createPrivateKey,
+    createPublicKey,
+    // S3: elliptic asymmetric sign/verify + scrypt + keygen (Rust/Wasm backed).
+    createSign: (algorithm, options) => new (classes().Sign)(algorithm, options),
+    createVerify: (algorithm, options) => new (classes().Verify)(algorithm, options),
+    sign,
+    verify,
+    generateKeyPair,
+    generateKeyPairSync,
+    scrypt,
+    scryptSync,
+    // Still genuinely unsupported (later phases): RSA encrypt/decrypt + DH.
+    publicEncrypt: notSupported("publicEncrypt"),
+    privateDecrypt: notSupported("privateDecrypt"),
+    privateEncrypt: notSupported("privateEncrypt"),
+    publicDecrypt: notSupported("publicDecrypt"),
+    createDiffieHellman: notSupported("createDiffieHellman"),
+    createECDH: notSupported("createECDH"),
   };
 }

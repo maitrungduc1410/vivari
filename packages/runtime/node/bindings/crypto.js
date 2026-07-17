@@ -229,6 +229,54 @@ export function createCryptoBinding({ codec } = {}) {
     ? ["md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha512-256"]
     : ["md5", "sha1", "sha256"];
 
+  // --- S3: scrypt + elliptic asymmetric (needs the wasm codec) ---------------
+  function scrypt(pass, salt, n, r, p, keylen) {
+    needCodec("scrypt");
+    return new Uint8Array(codec.scrypt_kdf(pass, salt, n >>> 0, r >>> 0, p >>> 0, keylen >>> 0));
+  }
+
+  // Keygen returns { privateDer, publicDer } as PKCS#8 / SPKI DER (Uint8Array).
+  function generateKeyPair(type, opts = {}) {
+    needCodec("generateKeyPair");
+    let kp;
+    if (type === "ed25519") {
+      kp = codec.generate_ed25519_keypair();
+    } else if (type === "ec") {
+      const curve = opts.namedCurve || opts.curve;
+      if (!curve) throw new Error("Vivari crypto: generateKeyPair('ec') requires options.namedCurve");
+      kp = codec.generate_ec_keypair(String(curve));
+    } else {
+      throw new Error(`Vivari crypto: generateKeyPair type '${type}' is not supported yet (phase 1: 'ec', 'ed25519')`);
+    }
+    const out = { privateDer: new Uint8Array(kp.privateDer), publicDer: new Uint8Array(kp.publicDer) };
+    if (typeof kp.free === "function") kp.free();
+    return out;
+  }
+
+  // "ed25519" | "ec:prime256v1" | "ec:secp384r1"
+  function inspectPrivate(der) {
+    needCodec("createPrivateKey");
+    return codec.inspect_private_der(der);
+  }
+  function inspectPublic(der) {
+    needCodec("createPublicKey");
+    return codec.inspect_public_der(der);
+  }
+  function publicFromPrivate(der) {
+    needCodec("createPublicKey");
+    return new Uint8Array(codec.public_der_from_private_der(der));
+  }
+
+  // digestAlgo is ignored for Ed25519; ieeeP1363 selects raw r||s vs ASN.1 DER for ECDSA.
+  function asymSign(privDer, digestAlgo, data, ieeeP1363) {
+    needCodec("sign");
+    return new Uint8Array(codec.asym_sign(privDer, norm(digestAlgo || ""), data, !!ieeeP1363));
+  }
+  function asymVerify(pubDer, digestAlgo, data, sig, ieeeP1363) {
+    needCodec("verify");
+    return !!codec.asym_verify(pubDer, norm(digestAlgo || ""), data, sig, !!ieeeP1363);
+  }
+
   return {
     digest,
     hmac,
@@ -237,6 +285,13 @@ export function createCryptoBinding({ codec } = {}) {
     aesCbcDecrypt,
     aesGcmEncrypt,
     aesGcmDecrypt,
+    scrypt,
+    generateKeyPair,
+    inspectPrivate,
+    inspectPublic,
+    publicFromPrivate,
+    asymSign,
+    asymVerify,
     getHashes: () => HASHES.slice(),
     hasCodec: !!codec,
   };

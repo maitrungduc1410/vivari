@@ -597,12 +597,20 @@ sha512 integrity), and execs it. What's special / must-not-regress:
 - It execs the downloaded PM in-process via `require('module').runMain(binPath)` —
   `runMain` is exposed on the `module` builtin (`runtime/index.js`), plus no-op
   `enableCompileCache`/`flushCompileCache` (so corepack skips `v8-compile-cache`).
-- `crypto.Hash`/`Hmac` extend `stream.Writable` now (real Node's Hash is a
-  Transform), because corepack does `stream.pipe(createHash(algo))` then
-  `hash.digest()`. Don't revert them to plain objects.
-- We can't do corepack's registry ECDSA signature check (`crypto.verify` is
-  unsupported), so the shell sets `COREPACK_INTEGRITY_KEYS=0` — corepack's official
-  escape hatch; the sha512 tarball-integrity check (via `createHash`) still runs.
+- `crypto.Hash`/`Hmac`/`Sign`/`Verify` all extend `stream.Writable` (real Node's
+  are Transform/Writable), because corepack does `stream.pipe(createHash(algo))`
+  then `hash.digest()`. Don't revert them to plain objects.
+- crypto **S3** (`packages/crypto` + `lib/crypto.js`): `scrypt`/`scryptSync` and the
+  elliptic asymmetric surface — `createPrivateKey`/`createPublicKey` (PKCS#8/SPKI,
+  PEM+DER), `createSign`/`createVerify` + one-shot `sign`/`verify`, and
+  `generateKeyPair(Sync)` for `ec` (prime256v1/secp384r1) + `ed25519`. Enough for
+  ES256/ES384/EdDSA JWTs. Still unsupported (throw): RSA, SEC1/PKCS#1, encrypted
+  keys, DH/ECDH, X.509, JWK. `createPrivateKey` still THROWS on a raw secret (not
+  parseable PEM/DER), so jsonwebtoken's HS* fallback to `createSecretKey` is intact.
+- corepack's registry integrity key check uses ECDSA (now available via S3), but we
+  haven't re-validated its exact key path, so the shell still sets
+  `COREPACK_INTEGRITY_KEYS=0` — corepack's official escape hatch; the sha512
+  tarball-integrity check (via `createHash`) still runs.
   The env also carries `COREPACK_HOME=/tmp/.corepack` (cache) +
   `COREPACK_ENABLE_DOWNLOAD_PROMPT=0` (see `openTerminal`). Keep these.
 - Headless browser-shape gate: `scripts/spike-corepack-studio.mjs` (`VV_NET=1`

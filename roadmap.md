@@ -763,11 +763,26 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     `stream.pipe(createHash(algo))` + `digest()` works — real Node's Hash is a Transform.
     Also covers a **symmetric-only `KeyObject`** (`KeyObject` + `createSecretKey`) so key-material
     APIs like `jsonwebtoken@9` HS\* work (see below).
-    **Deferred (S3):** asymmetric sign/verify, RSA/EC keygen, createPrivate/PublicKey, DH, scrypt,
-    X.509 — they throw loudly; these
-    want a bigger codec + vendoring Node's real `lib/crypto` internals. (corepack's registry
-    ECDSA signature check needs `verify`; it's skipped via corepack's `COREPACK_INTEGRITY_KEYS=0`
-    escape hatch, keeping the sha512 tarball-integrity check that only needs `createHash`.)
+    **S3 — scrypt + elliptic asymmetric — DONE (phase 1).** `scrypt`/`scryptSync`, and the
+    ELLIPTIC asymmetric surface: `createPrivateKey`/`createPublicKey` (PKCS#8 `PRIVATE KEY` +
+    SPKI `PUBLIC KEY`, PEM or DER), asymmetric `KeyObject`s (`ec`/`ed25519`), `createSign`/
+    `createVerify` + one-shot `sign`/`verify`, and `generateKeyPair(Sync)` for `ec`
+    (prime256v1/secp384r1) + `ed25519`. This unlocks **ES256/ES384 + EdDSA JWTs**
+    (jsonwebtoken/jose native path). The Rust codec (`packages/crypto`) grew RustCrypto
+    `scrypt` + `p256`/`p384`/`ed25519-dalek` (keygen via getrandom's `js` backend, sign via
+    ECDSA prehash / PureEdDSA, DER or IEEE-P1363 `dsaEncoding`); keys cross the boundary as
+    PKCS#8/SPKI DER with kind+curve auto-detected by trial-parse, and `lib/crypto.js` handles
+    PEM<->DER + the streaming Sign/Verify shape. `createPrivateKey` still THROWS on a raw
+    secret (unparseable as PEM/DER), so jsonwebtoken's HS* fallback to `createSecretKey` is
+    intact. Verified in `verify-node` mutually against the host `node:crypto`: scrypt byte-
+    for-byte; Ed25519 signature byte-for-byte (RFC 8032 determinism) + our-verify-OpenSSL and
+    OpenSSL-verify-ours; ECDSA P-256/P-384 by mutual verify (DER + IEEE-P1363) + tamper-reject;
+    createSign/createVerify streaming; generateKeyPair round-trips. (Wasm is CI/browser-built.)
+    **Deferred (S3 later phases):** RSA (RS/PS, `publicEncrypt`/`privateDecrypt`), SEC1
+    `EC PRIVATE KEY` / PKCS#1, encrypted/passphrase keys, DH/ECDH, X.509, JWK — they throw
+    loudly. (corepack's registry ECDSA check now *could* use `verify`, but its exact key path
+    is un-revalidated, so it stays skipped via `COREPACK_INTEGRITY_KEYS=0`, keeping the sha512
+    tarball-integrity check that only needs `createHash`.)
 
     **`jsonwebtoken` (auth0/node-jsonwebtoken) HS256/384/512 — DONE, proven by
     `scripts/spike-jwt.mjs`.** `jsonwebtoken@9` is pure JS (jws/jwa/ms/lodash.*/semver, no native
@@ -784,10 +799,10 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     `supportsKeyObjects`), `createHmac` taught to unwrap a secret `KeyObject`, and
     `util.types.isKeyObject` wired to the brand. Zero Wasm changes — the RustCrypto HMAC codec was
     already there. The spike round-trips HS256/384/512 sign+verify, wrong-secret + expiry rejection,
-    and a `KeyObject`-as-secret input. **Asymmetric RS256/ES256/PS256 remain unsupported** (they need
-    the S3 `createSign`/`createVerify` + RSA/EC codec work above); jsonwebtoken now fails them with a
-    clean `secretOrPrivateKey must be an asymmetric key when using RS256` rather than an `instanceof`
-    crash.
+    and a `KeyObject`-as-secret input. **ES256/ES384 + EdDSA are now supported** via the S3
+    `createSign`/`createVerify` + EC/Ed25519 codec work above; **RS256/PS256 remain unsupported**
+    pending the RSA phase, and jsonwebtoken fails those with a clean
+    `secretOrPrivateKey must be an asymmetric key when using RS256` rather than an `instanceof` crash.
 13. **ESM (`import`/`export`)** — **DONE (S1: transpile ESM→CJS at load time).** Our
     module system is synchronous CJS, so instead of a spec ESM loader we rewrite import/
     export down to `require`/`exports` in `compile()`, exactly like a bundler's interop
@@ -1298,7 +1313,8 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     polish (split-chunk rare modules, dev-only source maps) deferred; transport gzip/brotli
     is left to the deploy proxy, not app-level (see "Packaging & delivery").
 - **Node API coverage (stubs/partials to fill on demand):**
-  - `crypto` **S3**: sign/verify, RSA/EC keygen, DH, scrypt, X.509 (#12).
+  - `crypto` **S3**: ✅ scrypt + elliptic sign/verify + EC/Ed25519 keygen (phase 1, #12);
+    remaining — RSA (RS/PS, publicEncrypt/privateDecrypt), DH/ECDH, X.509, SEC1/PKCS#1, JWK.
   - `child_process`: parent→child **stdin** pipe (#15). (`fork` is now implemented — an IPC
     channel over the worker-thread spawn path — which unblocked `next dev`.)
   - WASI: **stdin**, `poll_oneoff` (event-driven) (#16 s1).

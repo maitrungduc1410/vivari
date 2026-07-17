@@ -852,6 +852,116 @@ console.log('CRYPTOB_OK');
   assert(cb2.code === 0 && cb2.stdout.includes("CRYPTOB_OK"),
     "Path B: our lib/crypto.js runs on the Rust/Wasm crypto codec (digests/HMAC/PBKDF2/AES-GCM+CBC vs node:crypto)");
 
+  // === #12b (S3): scrypt + elliptic asymmetric (ECDSA P-256/P-384, Ed25519) ===
+  // Cross-validated against the host's real OpenSSL both directions: our sign is
+  // verified by node:crypto, and node:crypto's signatures are verified by us.
+  // Ed25519 is deterministic (RFC 8032), so its signature is compared byte-for-
+  // byte; ECDSA is randomized, so it's proven by mutual verify. scrypt is a
+  // deterministic KDF, so its output is byte-compared.
+  const S3MSG = Buffer.from("vivari crypto s3 — sign me, verify me", "utf8");
+  const s3ed = nodeCrypto.generateKeyPairSync("ed25519");
+  const s3p256 = nodeCrypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const s3p384 = nodeCrypto.generateKeyPairSync("ec", { namedCurve: "P-384" });
+  const pemPriv = (k) => k.export({ type: "pkcs8", format: "pem" });
+  const pemPub = (k) => k.export({ type: "spki", format: "pem" });
+  const cryptoS3Expected = {
+    msgHex: S3MSG.toString("hex"),
+    scrypt: nodeCrypto.scryptSync("password", "NaCl", 64, { N: 1024, r: 8, p: 16 }).toString("hex"),
+    edPriv: pemPriv(s3ed.privateKey),
+    edPub: pemPub(s3ed.publicKey),
+    edSigHost: nodeCrypto.sign(null, S3MSG, s3ed.privateKey).toString("hex"),
+    p256Priv: pemPriv(s3p256.privateKey),
+    p256Pub: pemPub(s3p256.publicKey),
+    p256SigHost: nodeCrypto.sign("sha256", S3MSG, s3p256.privateKey).toString("hex"),
+    p384Priv: pemPriv(s3p384.privateKey),
+    p384Pub: pemPub(s3p384.publicKey),
+    p384SigHost: nodeCrypto.sign("sha384", S3MSG, s3p384.privateKey).toString("hex"),
+  };
+  kernel.writeFile(
+    "/t/cryptos3.js",
+    `
+const assert = require('assert');
+const crypto = require('crypto');
+const E = ${JSON.stringify(cryptoS3Expected)};
+const msg = Buffer.from(E.msgHex, 'hex');
+
+// --- scrypt (deterministic KDF): byte-for-byte vs OpenSSL ---
+assert.strictEqual(
+  crypto.scryptSync('password', 'NaCl', 64, { N: 1024, r: 8, p: 16 }).toString('hex'),
+  E.scrypt, 'scryptSync matches node');
+
+// --- Ed25519 (deterministic) ---
+// our verify of OpenSSL's signature:
+assert.strictEqual(crypto.verify(null, msg, E.edPub, Buffer.from(E.edSigHost, 'hex')), true,
+  'ed25519: we verify OpenSSL signature');
+// our signature must equal OpenSSL's (RFC 8032 determinism):
+const edSig = crypto.sign(null, msg, E.edPriv);
+assert.strictEqual(edSig.toString('hex'), E.edSigHost, 'ed25519: our signature == OpenSSL (deterministic)');
+// derive the public key from the private and re-verify:
+const edPubDerived = crypto.createPublicKey(E.edPriv);
+assert.strictEqual(crypto.verify(null, msg, edPubDerived, edSig), true, 'ed25519: createPublicKey(priv) derives a working key');
+
+// --- ECDSA P-256 / ES256 (randomized -> mutual verify) ---
+assert.strictEqual(crypto.verify('sha256', msg, E.p256Pub, Buffer.from(E.p256SigHost, 'hex')), true,
+  'p256: we verify OpenSSL DER signature');
+const p256Sig = crypto.sign('sha256', msg, E.p256Priv);         // DER (Node default)
+assert.strictEqual(crypto.verify('sha256', msg, E.p256Pub, p256Sig), true, 'p256: our DER sign round-trips');
+// ieee-p1363 (JOSE) raw r||s is 64 bytes and round-trips:
+const p256Raw = crypto.sign('sha256', msg, { key: E.p256Priv, dsaEncoding: 'ieee-p1363' });
+assert.strictEqual(p256Raw.length, 64, 'p256: ieee-p1363 signature is 64 bytes (r||s)');
+assert.strictEqual(
+  crypto.verify('sha256', msg, { key: E.p256Pub, dsaEncoding: 'ieee-p1363' }, p256Raw), true,
+  'p256: ieee-p1363 round-trips');
+// a tampered message must fail verification:
+assert.strictEqual(crypto.verify('sha256', Buffer.from('other'), E.p256Pub, p256Sig), false, 'p256: rejects wrong message');
+
+// --- ECDSA P-384 / ES384 ---
+assert.strictEqual(crypto.verify('sha384', msg, E.p384Pub, Buffer.from(E.p384SigHost, 'hex')), true,
+  'p384: we verify OpenSSL signature');
+const p384Sig = crypto.sign('sha384', msg, E.p384Priv);
+assert.strictEqual(crypto.verify('sha384', msg, E.p384Pub, p384Sig), true, 'p384: our sign round-trips');
+
+// --- createSign/createVerify streaming (ES256) ---
+const streamSig = crypto.createSign('SHA256').update('foo').update('bar').sign(E.p256Priv);
+assert.strictEqual(
+  crypto.createVerify('SHA256').update('foobar').verify(E.p256Pub, streamSig), true,
+  'createSign/createVerify stream (ES256) round-trips');
+
+// --- generateKeyPairSync round-trips (ec + ed25519) ---
+const gEc = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+assert.strictEqual(gEc.publicKey.type, 'public', 'generated ec KeyObject');
+const gSig = crypto.sign('sha256', msg, gEc.privateKey);
+assert.strictEqual(crypto.verify('sha256', msg, gEc.publicKey, gSig), true, 'generated ec key signs+verifies');
+const gEd = crypto.generateKeyPairSync('ed25519', {
+  privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  publicKeyEncoding: { type: 'spki', format: 'pem' },
+});
+assert.ok(gEd.privateKey.includes('BEGIN PRIVATE KEY'), 'generated ed25519 exports PKCS#8 PEM');
+assert.strictEqual(crypto.verify(null, msg, gEd.publicKey, crypto.sign(null, msg, gEd.privateKey)), true,
+  'generated ed25519 key signs+verifies');
+
+// emit our signatures so the host can verify them with real OpenSSL:
+console.log('SIG_ED25519=' + edSig.toString('hex'));
+console.log('SIG_P256=' + p256Sig.toString('hex'));
+console.log('SIG_P384=' + p384Sig.toString('hex'));
+console.log('CRYPTOS3_OK');
+`,
+  );
+  const cs3 = await kernel.start("node", ["/t/cryptos3.js"], { cwd: "/t", capture: true });
+  assert(cs3.code === 0 && cs3.stdout.includes("CRYPTOS3_OK"),
+    "Path B (S3): scrypt + Ed25519/ECDSA sign+verify on the Rust/Wasm codec (mutually verified vs node:crypto)");
+  // Close the loop: OpenSSL must accept the signatures our Wasm codec produced.
+  const grab = (re) => (cs3.stdout.match(re) || [])[1];
+  assert(
+    nodeCrypto.verify(null, S3MSG, s3ed.publicKey, Buffer.from(grab(/SIG_ED25519=([0-9a-f]+)/), "hex")),
+    "OpenSSL verifies our Ed25519 signature");
+  assert(
+    nodeCrypto.verify("sha256", S3MSG, s3p256.publicKey, Buffer.from(grab(/SIG_P256=([0-9a-f]+)/), "hex")),
+    "OpenSSL verifies our ECDSA P-256 signature");
+  assert(
+    nodeCrypto.verify("sha384", S3MSG, s3p384.publicKey, Buffer.from(grab(/SIG_P384=([0-9a-f]+)/), "hex")),
+    "OpenSSL verifies our ECDSA P-384 signature");
+
   // === #13: ESM import/export transpiled to our sync CJS (es-module-lexer) ===
   // Seed a small ESM/CJS mixed graph: named/default/namespace imports, CJS<->ESM
   // interop, re-exports, an ESM-syntax .js file, a package resolved via its
