@@ -602,14 +602,17 @@ sha512 integrity), and execs it. What's special / must-not-regress:
   then `hash.digest()`. Don't revert them to plain objects.
 - crypto **S3** (`packages/crypto` + `lib/crypto.js`): `scrypt`/`scryptSync` and the
   asymmetric surface — `createPrivateKey`/`createPublicKey` (PKCS#8/SPKI + PKCS#1
-  `RSA PRIVATE/PUBLIC KEY`, PEM+DER), `createSign`/`createVerify` + one-shot
-  `sign`/`verify`, RSA `publicEncrypt`/`privateDecrypt` (OAEP + PKCS1v15), and
+  `RSA PRIVATE/PUBLIC KEY` + SEC1 `EC PRIVATE KEY`, PEM+DER), `createSign`/`createVerify`
+  + one-shot `sign`/`verify`, RSA `publicEncrypt`/`privateDecrypt` (OAEP + PKCS1v15), and
   `generateKeyPair(Sync)` for `ec` (prime256v1/secp384r1), `ed25519` + `rsa`.
   Enough for ES256/384 + EdDSA + RS256/384/512 + PS256/384/512 JWTs. RSA PSS uses
   `crypto.constants.RSA_PKCS1_PSS_PADDING` + `RSA_PSS_SALTLEN_DIGEST`;
   `asymmetricKeyDetails.modulusLength` is surfaced (jsonwebtoken@9 reads it).
-  Still unsupported (throw): SEC1 `EC PRIVATE KEY`, encrypted keys,
-  `privateEncrypt`/`publicDecrypt`, DH/ECDH, X.509, JWK. `createPrivateKey` still
+  **Phase 3:** `new crypto.X509Certificate(pem|der)` (parse fields + `.publicKey`
+  + fingerprints + `verify`/`checkIssued`, via `x509-cert`) — drives jose's
+  `importX509` (`scripts/spike-jose.mjs`); SEC1 EC keys normalize to PKCS#8.
+  Still unsupported (throw): encrypted keys,
+  `privateEncrypt`/`publicDecrypt`, DH/ECDH, JWK. `createPrivateKey` still
   THROWS on a raw secret (not parseable PEM/DER), so jsonwebtoken's HS* fallback
   to `createSecretKey` is intact.
 - corepack's registry integrity key check uses ECDSA (now available via S3), but we

@@ -312,6 +312,24 @@ export function createCryptoBinding({ codec } = {}) {
     return new Uint8Array(codec.rsa_decrypt(privDer, data, !!oaep, norm(oaepHash || "sha1")));
   }
 
+  // --- S3 phase 3: X.509 -----------------------------------------------------
+  // Parse a certificate (DER) once: returns { json, spkiDer } where json is the
+  // structured cert fields and spkiDer is the raw SubjectPublicKeyInfo (fed back
+  // into createPublicKey for `.publicKey`).
+  function x509Parse(der) {
+    needCodec("X509Certificate");
+    const parsed = codec.x509_parse(der);
+    const out = { json: parsed.json, spkiDer: new Uint8Array(parsed.spkiDer) };
+    if (typeof parsed.free === "function") parsed.free();
+    return out;
+  }
+  // Verify the cert's signature against an issuer SPKI DER (self-signed when the
+  // issuer is the cert's own public key).
+  function x509Verify(certDer, issuerSpkiDer) {
+    needCodec("X509Certificate.verify");
+    return !!codec.x509_verify(certDer, issuerSpkiDer);
+  }
+
   return {
     digest,
     hmac,
@@ -333,6 +351,8 @@ export function createCryptoBinding({ codec } = {}) {
     rsaVerify,
     rsaEncrypt,
     rsaDecrypt,
+    x509Parse,
+    x509Verify,
     getHashes: () => HASHES.slice(),
     hasCodec: !!codec,
   };
