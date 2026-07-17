@@ -778,11 +778,26 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     for-byte; Ed25519 signature byte-for-byte (RFC 8032 determinism) + our-verify-OpenSSL and
     OpenSSL-verify-ours; ECDSA P-256/P-384 by mutual verify (DER + IEEE-P1363) + tamper-reject;
     createSign/createVerify streaming; generateKeyPair round-trips. (Wasm is CI/browser-built.)
-    **Deferred (S3 later phases):** RSA (RS/PS, `publicEncrypt`/`privateDecrypt`), SEC1
-    `EC PRIVATE KEY` / PKCS#1, encrypted/passphrase keys, DH/ECDH, X.509, JWK — they throw
-    loudly. (corepack's registry ECDSA check now *could* use `verify`, but its exact key path
-    is un-revalidated, so it stays skipped via `COREPACK_INTEGRITY_KEYS=0`, keeping the sha512
-    tarball-integrity check that only needs `createHash`.)
+    **S3 — RSA — DONE (phase 2).** `createSign`/`createVerify` + one-shot `sign`/`verify` now
+    dispatch RSA vs EC/Ed25519 on the key's type: **RS256/384/512** (RSASSA-PKCS1-v1_5) and
+    **PS256/384/512** (RSA-PSS, salt = digest via `RSA_PKCS1_PSS_PADDING` +
+    `RSA_PSS_SALTLEN_DIGEST` on `crypto.constants`), plus **`publicEncrypt`/`privateDecrypt`**
+    (RSA-OAEP with `oaepHash`, and RSAES-PKCS1-v1_5 via `RSA_PKCS1_PADDING`) and
+    `generateKeyPair(Sync)` for `rsa` (`modulusLength`). Keys parse from PKCS#8/SPKI **and**
+    traditional PKCS#1 (`RSA PRIVATE/PUBLIC KEY`), normalized to PKCS#8/SPKI so `export()` is
+    uniform; `asymmetricKeyDetails.modulusLength` is surfaced (jsonwebtoken@9 reads it during
+    key validation). The Rust codec grew RustCrypto `rsa` (prehash sign like ECDSA;
+    `Pkcs1v15Sign`/`Pss`/`Oaep`/`Pkcs1v15Encrypt` low-level schemes; keygen via getrandom).
+    Verified in `verify-node` mutually against host `node:crypto`: RS256 signature byte-for-byte
+    (PKCS1v15 deterministic) + tamper-reject; PS256 by mutual verify; RSA-OAEP decrypt of the
+    host's ciphertext + our round-trip; generated-key round-trip; and OpenSSL verifies our
+    RS256/PS256 signatures. This unlocks **RS256/384/512 + PS256/384/512 JWTs**. (Wasm is
+    CI/browser-built.)
+    **Deferred (S3 later phases):** SEC1 `EC PRIVATE KEY`, encrypted/passphrase keys,
+    `privateEncrypt`/`publicDecrypt`, DH/ECDH, X.509, JWK — they throw loudly. (corepack's
+    registry ECDSA check now *could* use `verify`, but its exact key path is un-revalidated, so
+    it stays skipped via `COREPACK_INTEGRITY_KEYS=0`, keeping the sha512 tarball-integrity check
+    that only needs `createHash`.)
 
     **`jsonwebtoken` (auth0/node-jsonwebtoken) HS256/384/512 — DONE, proven by
     `scripts/spike-jwt.mjs`.** `jsonwebtoken@9` is pure JS (jws/jwa/ms/lodash.*/semver, no native
@@ -800,9 +815,9 @@ Effort: [S]mall · [M]edium · [L]arge. Worker names per the Target architecture
     `util.types.isKeyObject` wired to the brand. Zero Wasm changes — the RustCrypto HMAC codec was
     already there. The spike round-trips HS256/384/512 sign+verify, wrong-secret + expiry rejection,
     and a `KeyObject`-as-secret input. **ES256/ES384 + EdDSA are now supported** via the S3
-    `createSign`/`createVerify` + EC/Ed25519 codec work above; **RS256/PS256 remain unsupported**
-    pending the RSA phase, and jsonwebtoken fails those with a clean
-    `secretOrPrivateKey must be an asymmetric key when using RS256` rather than an `instanceof` crash.
+    `createSign`/`createVerify` + EC/Ed25519 codec work above; **RS256/384/512 + PS256/384/512
+    are now supported** via the S3 phase-2 RSA codec work (RSASSA-PKCS1-v1_5 + RSA-PSS, keys read
+    from PKCS#8/SPKI/PKCS#1, `modulusLength` surfaced for jsonwebtoken's key validation).
 13. **ESM (`import`/`export`)** — **DONE (S1: transpile ESM→CJS at load time).** Our
     module system is synchronous CJS, so instead of a spec ESM loader we rewrite import/
     export down to `require`/`exports` in `compile()`, exactly like a bundler's interop
@@ -1314,7 +1329,8 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     is left to the deploy proxy, not app-level (see "Packaging & delivery").
 - **Node API coverage (stubs/partials to fill on demand):**
   - `crypto` **S3**: ✅ scrypt + elliptic sign/verify + EC/Ed25519 keygen (phase 1, #12);
-    remaining — RSA (RS/PS, publicEncrypt/privateDecrypt), DH/ECDH, X.509, SEC1/PKCS#1, JWK.
+    ✅ RSA — RS/PS sign/verify + publicEncrypt/privateDecrypt (OAEP/PKCS1v15) + keygen +
+    PKCS#1 parsing (phase 2); remaining — DH/ECDH, X.509, SEC1 `EC PRIVATE KEY`, JWK.
   - `child_process`: parent→child **stdin** pipe (#15). (`fork` is now implemented — an IPC
     channel over the worker-thread spawn path — which unblocked `next dev`.)
   - WASI: **stdin**, `poll_oneoff` (event-driven) (#16 s1).

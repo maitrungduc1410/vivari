@@ -8,11 +8,13 @@
 //
 // Backend: RustCrypto (md-5/sha1/sha2/hmac/pbkdf2/aes/cbc/aes-gcm), pure Rust.
 // Scope (S2): digests, HMAC, PBKDF2, AES-CBC (128/192/256) and AES-GCM (128/256).
-// Scope (S3, this file's second half): scrypt, and the ELLIPTIC asymmetric
-// primitives — ECDSA over P-256/P-384 and Ed25519 (keygen, sign, verify, PKCS#8/
-// SPKI DER key handling). Keygen needs entropy, so getrandom's `js` backend is
-// enabled (WebCrypto in the browser Worker, node:crypto under the nodejs target).
-// Still out of scope (throw loudly in JS): RSA, DH/ECDH and X.509 — later phases.
+// Scope (S3, this file's second half): scrypt, and the asymmetric primitives —
+// ECDSA over P-256/P-384 and Ed25519 (phase 1), plus RSA (phase 2: RS256/384/512
+// PKCS#1v15 + PS256/384/512 PSS sign/verify, OAEP/PKCS1v15 encrypt/decrypt,
+// keygen). Keys cross as PKCS#8/SPKI DER (RSA also reads PKCS#1), kind auto-
+// detected by trial-parse. Keygen/PSS/OAEP need entropy, so getrandom's `js`
+// backend is enabled (WebCrypto in the browser Worker, node:crypto under nodejs).
+// Still out of scope (throw loudly in JS): DH/ECDH and X.509 — later phases.
 
 use wasm_bindgen::prelude::*;
 
@@ -227,6 +229,7 @@ enum Kind {
     Ed25519,
     P256,
     P384,
+    Rsa,
 }
 
 fn kind_str(k: Kind) -> String {
@@ -234,6 +237,7 @@ fn kind_str(k: Kind) -> String {
         Kind::Ed25519 => "ed25519".into(),
         Kind::P256 => "ec:prime256v1".into(),
         Kind::P384 => "ec:secp384r1".into(),
+        Kind::Rsa => "rsa".into(),
     }
 }
 
@@ -261,8 +265,12 @@ fn detect_private(der: &[u8]) -> Result<Kind, JsError> {
     if p384::SecretKey::from_pkcs8_der(der).is_ok() {
         return Ok(Kind::P384);
     }
+    // RSA: PKCS#8 or the traditional PKCS#1 ("RSA PRIVATE KEY").
+    if load_rsa_private(der).is_ok() {
+        return Ok(Kind::Rsa);
+    }
     Err(JsError::new(
-        "unsupported/invalid private key (expected Ed25519 / P-256 / P-384 PKCS#8)",
+        "unsupported/invalid private key (expected Ed25519 / P-256 / P-384 / RSA, PKCS#8 or PKCS#1)",
     ))
 }
 
@@ -276,9 +284,28 @@ fn detect_public(der: &[u8]) -> Result<Kind, JsError> {
     if p384::PublicKey::from_public_key_der(der).is_ok() {
         return Ok(Kind::P384);
     }
+    if load_rsa_public(der).is_ok() {
+        return Ok(Kind::Rsa);
+    }
     Err(JsError::new(
-        "unsupported/invalid public key (expected Ed25519 / P-256 / P-384 SPKI)",
+        "unsupported/invalid public key (expected Ed25519 / P-256 / P-384 / RSA, SPKI or PKCS#1)",
     ))
+}
+
+// RSA keys arrive as PKCS#8/SPKI (modern) or PKCS#1 (traditional OpenSSL); accept both.
+fn load_rsa_private(der: &[u8]) -> Result<rsa::RsaPrivateKey, JsError> {
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs8::DecodePrivateKey;
+    rsa::RsaPrivateKey::from_pkcs8_der(der)
+        .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_der(der))
+        .map_err(|_| JsError::new("invalid RSA private key (PKCS#8 or PKCS#1)"))
+}
+fn load_rsa_public(der: &[u8]) -> Result<rsa::RsaPublicKey, JsError> {
+    use rsa::pkcs1::DecodeRsaPublicKey;
+    use rsa::pkcs8::DecodePublicKey;
+    rsa::RsaPublicKey::from_public_key_der(der)
+        .or_else(|_| rsa::RsaPublicKey::from_pkcs1_der(der))
+        .map_err(|_| JsError::new("invalid RSA public key (SPKI or PKCS#1)"))
 }
 
 fn hash_for_ecdsa(algo: &str, data: &[u8]) -> Result<Vec<u8>, JsError> {
@@ -344,7 +371,7 @@ pub fn generate_ec_keypair(curve: &str) -> Result<AsymKeyPair, JsError> {
                 public_der: sk.public_key().to_public_key_der().map_err(je)?.as_bytes().to_vec(),
             })
         }
-        Kind::Ed25519 => unreachable!(),
+        Kind::Ed25519 | Kind::Rsa => unreachable!(),
     }
 }
 
@@ -352,12 +379,24 @@ pub fn generate_ec_keypair(curve: &str) -> Result<AsymKeyPair, JsError> {
 // Returns "ed25519" | "ec:prime256v1" | "ec:secp384r1" for the JS KeyObject.
 #[wasm_bindgen]
 pub fn inspect_private_der(der: &[u8]) -> Result<String, JsError> {
-    Ok(kind_str(detect_private(der)?))
+    use rsa::traits::PublicKeyParts;
+    let k = detect_private(der)?;
+    if k == Kind::Rsa {
+        let bits = load_rsa_private(der)?.n().bits();
+        return Ok(format!("rsa:{bits}"));
+    }
+    Ok(kind_str(k))
 }
 
 #[wasm_bindgen]
 pub fn inspect_public_der(der: &[u8]) -> Result<String, JsError> {
-    Ok(kind_str(detect_public(der)?))
+    use rsa::traits::PublicKeyParts;
+    let k = detect_public(der)?;
+    if k == Kind::Rsa {
+        let bits = load_rsa_public(der)?.n().bits();
+        return Ok(format!("rsa:{bits}"));
+    }
+    Ok(kind_str(k))
 }
 
 #[wasm_bindgen]
@@ -375,6 +414,36 @@ pub fn public_der_from_private_der(der: &[u8]) -> Result<Vec<u8>, JsError> {
             let sk = p384::SecretKey::from_pkcs8_der(der).map_err(je)?;
             Ok(sk.public_key().to_public_key_der().map_err(je)?.as_bytes().to_vec())
         }
+        Kind::Rsa => {
+            use rsa::pkcs8::EncodePublicKey;
+            let sk = load_rsa_private(der)?;
+            let pk = rsa::RsaPublicKey::from(&sk);
+            Ok(pk.to_public_key_der().map_err(je)?.as_bytes().to_vec())
+        }
+    }
+}
+
+// Canonicalize a key's DER to PKCS#8 (private) / SPKI (public). EC/Ed25519 inputs
+// are already canonical (returned as-is); RSA PKCS#1 is converted so the JS
+// KeyObject always stores — and re-exports — a uniform PKCS#8/SPKI encoding.
+#[wasm_bindgen]
+pub fn normalize_private_der(der: &[u8]) -> Result<Vec<u8>, JsError> {
+    match detect_private(der)? {
+        Kind::Rsa => {
+            use rsa::pkcs8::EncodePrivateKey;
+            Ok(load_rsa_private(der)?.to_pkcs8_der().map_err(je)?.as_bytes().to_vec())
+        }
+        _ => Ok(der.to_vec()),
+    }
+}
+#[wasm_bindgen]
+pub fn normalize_public_der(der: &[u8]) -> Result<Vec<u8>, JsError> {
+    match detect_public(der)? {
+        Kind::Rsa => {
+            use rsa::pkcs8::EncodePublicKey;
+            Ok(load_rsa_public(der)?.to_public_key_der().map_err(je)?.as_bytes().to_vec())
+        }
+        _ => Ok(der.to_vec()),
     }
 }
 
@@ -411,6 +480,7 @@ pub fn asym_sign(
     ieee_p1363: bool,
 ) -> Result<Vec<u8>, JsError> {
     match detect_private(priv_der)? {
+        Kind::Rsa => Err(JsError::new("internal: RSA keys use rsa_sign")),
         Kind::Ed25519 => {
             use ed25519_dalek::Signer;
             let sk = ed25519_dalek::SigningKey::from_pkcs8_der(priv_der).map_err(je)?;
@@ -450,6 +520,7 @@ pub fn asym_verify(
     ieee_p1363: bool,
 ) -> Result<bool, JsError> {
     match detect_public(pub_der)? {
+        Kind::Rsa => Err(JsError::new("internal: RSA keys use rsa_verify")),
         Kind::Ed25519 => {
             use ed25519_dalek::Verifier;
             let vk = ed25519_dalek::VerifyingKey::from_public_key_der(pub_der).map_err(je)?;
@@ -487,5 +558,137 @@ pub fn asym_verify(
                 Err(_) => Ok(false),
             }
         }
+    }
+}
+
+// =============================================================================
+// S3 phase 2 — RSA (RS256/384/512 + PSS, OAEP/PKCS1v15 encrypt, keygen)
+//
+// Node signs a message by hashing then padding, so — like ECDSA — we prehash in
+// Rust and feed the digest to RSA's low-level SignatureScheme (Pkcs1v15Sign /
+// Pss with the digest's OID). PSS + OAEP need entropy (getrandom `js`). Keys are
+// PKCS#8/SPKI (normalized from PKCS#1 by the JS layer before these are called).
+// =============================================================================
+
+// Map a digest name to a closure over the right RustCrypto Digest type. Each RSA
+// entry point matches the algo once and dispatches to the monomorphized body.
+macro_rules! rsa_dispatch {
+    ($algo:expr, $body:ident $(, $arg:expr)*) => {{
+        use sha1::Sha1;
+        use sha2::{Sha256, Sha384, Sha512};
+        match norm($algo).as_str() {
+            "sha1" => $body::<Sha1>($($arg),*),
+            "sha256" => $body::<Sha256>($($arg),*),
+            "sha384" => $body::<Sha384>($($arg),*),
+            "sha512" => $body::<Sha512>($($arg),*),
+            other => Err(JsError::new(&format!("unsupported RSA hash '{other}'"))),
+        }
+    }};
+}
+
+#[wasm_bindgen]
+pub fn generate_rsa_keypair(bits: usize) -> Result<AsymKeyPair, JsError> {
+    use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
+    if bits < 1024 || bits > 8192 {
+        return Err(JsError::new("RSA modulusLength must be between 1024 and 8192"));
+    }
+    let sk = rsa::RsaPrivateKey::new(&mut OsRng, bits).map_err(je)?;
+    let pk = rsa::RsaPublicKey::from(&sk);
+    Ok(AsymKeyPair {
+        private_der: sk.to_pkcs8_der().map_err(je)?.as_bytes().to_vec(),
+        public_der: pk.to_public_key_der().map_err(je)?.as_bytes().to_vec(),
+    })
+}
+
+fn rsa_sign_body<D>(sk: &rsa::RsaPrivateKey, hash: &[u8], pss: bool, salt_len: i32) -> Result<Vec<u8>, JsError>
+where
+    D: digest::Digest + digest::DynDigest + const_oid::AssociatedOid + Send + Sync + 'static,
+{
+    if pss {
+        let scheme = if salt_len >= 0 {
+            rsa::Pss::new_with_salt::<D>(salt_len as usize)
+        } else {
+            rsa::Pss::new::<D>()
+        };
+        sk.sign_with_rng(&mut OsRng, scheme, hash).map_err(je)
+    } else {
+        sk.sign(rsa::Pkcs1v15Sign::new::<D>(), hash).map_err(je)
+    }
+}
+
+#[wasm_bindgen]
+pub fn rsa_sign(
+    priv_der: &[u8],
+    digest_algo: &str,
+    data: &[u8],
+    pss: bool,
+    salt_len: i32,
+) -> Result<Vec<u8>, JsError> {
+    let sk = load_rsa_private(priv_der)?;
+    let hash = hash_for_ecdsa(digest_algo, data)?;
+    rsa_dispatch!(digest_algo, rsa_sign_body, &sk, &hash, pss, salt_len)
+}
+
+fn rsa_verify_body<D>(pk: &rsa::RsaPublicKey, hash: &[u8], sig: &[u8], pss: bool, salt_len: i32) -> Result<bool, JsError>
+where
+    D: digest::Digest + digest::DynDigest + const_oid::AssociatedOid + Send + Sync + 'static,
+{
+    let ok = if pss {
+        let scheme = if salt_len >= 0 {
+            rsa::Pss::new_with_salt::<D>(salt_len as usize)
+        } else {
+            rsa::Pss::new::<D>()
+        };
+        pk.verify(scheme, hash, sig).is_ok()
+    } else {
+        pk.verify(rsa::Pkcs1v15Sign::new::<D>(), hash, sig).is_ok()
+    };
+    Ok(ok)
+}
+
+#[wasm_bindgen]
+pub fn rsa_verify(
+    pub_der: &[u8],
+    digest_algo: &str,
+    data: &[u8],
+    sig: &[u8],
+    pss: bool,
+    salt_len: i32,
+) -> Result<bool, JsError> {
+    let pk = load_rsa_public(pub_der)?;
+    let hash = hash_for_ecdsa(digest_algo, data)?;
+    rsa_dispatch!(digest_algo, rsa_verify_body, &pk, &hash, sig, pss, salt_len)
+}
+
+fn rsa_encrypt_body<D>(pk: &rsa::RsaPublicKey, data: &[u8]) -> Result<Vec<u8>, JsError>
+where
+    D: digest::Digest + digest::DynDigest + Send + Sync + 'static,
+{
+    pk.encrypt(&mut OsRng, rsa::Oaep::new::<D>(), data).map_err(je)
+}
+fn rsa_decrypt_body<D>(sk: &rsa::RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>, JsError>
+where
+    D: digest::Digest + digest::DynDigest + Send + Sync + 'static,
+{
+    sk.decrypt(rsa::Oaep::new::<D>(), data).map_err(je)
+}
+
+// oaep=true -> RSA-OAEP with `oaep_hash`; oaep=false -> RSAES-PKCS1-v1_5.
+#[wasm_bindgen]
+pub fn rsa_encrypt(pub_der: &[u8], data: &[u8], oaep: bool, oaep_hash: &str) -> Result<Vec<u8>, JsError> {
+    let pk = load_rsa_public(pub_der)?;
+    if oaep {
+        rsa_dispatch!(oaep_hash, rsa_encrypt_body, &pk, data)
+    } else {
+        pk.encrypt(&mut OsRng, rsa::Pkcs1v15Encrypt, data).map_err(je)
+    }
+}
+#[wasm_bindgen]
+pub fn rsa_decrypt(priv_der: &[u8], data: &[u8], oaep: bool, oaep_hash: &str) -> Result<Vec<u8>, JsError> {
+    let sk = load_rsa_private(priv_der)?;
+    if oaep {
+        rsa_dispatch!(oaep_hash, rsa_decrypt_body, &sk, data)
+    } else {
+        sk.decrypt(rsa::Pkcs1v15Encrypt, data).map_err(je)
     }
 }

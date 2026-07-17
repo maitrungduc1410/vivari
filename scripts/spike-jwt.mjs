@@ -13,9 +13,10 @@
 //     (packages/runtime/node/lib/crypto.js) satisfies all of that. jwa also gates
 //     KeyObject support on `typeof crypto.createPublicKey === 'function'`, which our
 //     (throwing) stub satisfies.
-//   - RS256/ES256/PS256 stay unsupported: they need crypto.createSign/createVerify
-//     + RSA/EC (crypto S3). createPrivateKey/createPublicKey throw, so jsonwebtoken
-//     falls back to a secret key and fails the later asymmetric-key-type check.
+//   - RS256/384/512 + PS256/384/512 + ES256/384 + EdDSA now WORK (crypto S3):
+//     createSign/createVerify + RSA/EC/Ed25519 are Wasm-backed, and
+//     createPrivateKey/createPublicKey return real asymmetric KeyObjects, so
+//     jsonwebtoken's asymmetric path round-trips. This spike proves RS256 + PS256.
 // Run (Node 22+, with the crypto Wasm built — `npm run build:crypto:node`):
 //   node scripts/spike-jwt.mjs
 
@@ -24,10 +25,10 @@ import { bootSpikeKernel, writeProject, defaultEnv, npmInstall } from "./lib/spi
 
 const DIR = "/app";
 
-// A throwaway RSA keypair generated on the HOST (the in-VM runtime can't
-// generateKeyPair) — only used to feed jwt.sign the RS256 path so we can prove it
-// throws in-VM. Never leaves this process.
-const { privateKey } = crypto.generateKeyPairSync("rsa", {
+// A throwaway RSA keypair generated on the HOST — fed to jwt.sign/verify in-VM to
+// prove the RS256/PS256 asymmetric path round-trips (private is PKCS#1 to also
+// exercise our PKCS#1 parsing). Never leaves this process.
+const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
   modulusLength: 2048,
   publicKeyEncoding: { type: "spki", format: "pem" },
   privateKeyEncoding: { type: "pkcs1", format: "pem" },
@@ -51,6 +52,7 @@ const jwt = require('jsonwebtoken');
 const jws = require('jws');
 const assert = require('assert');
 const RSA_PRIVATE_KEY = ${JSON.stringify(privateKey)};
+const RSA_PUBLIC_KEY = ${JSON.stringify(publicKey)};
 
 const results = [];
 const check = (name, fn) => {
@@ -110,9 +112,14 @@ check('jwt-HS256-KeyObject-secret', () => {
   assert.strictEqual(decoded.sub, 'ko');
 });
 
-// RS256 (asymmetric) — expected unsupported.
+// RS256 + PS256 (asymmetric) — now supported (crypto S3 phase 2): full round-trip.
 check('jwt-RS256', () => {
-  jwt.sign({ a: 1 }, RSA_PRIVATE_KEY, { algorithm: 'RS256' });
+  const t = jwt.sign({ a: 1 }, RSA_PRIVATE_KEY, { algorithm: 'RS256' });
+  assert.strictEqual(jwt.verify(t, RSA_PUBLIC_KEY, { algorithms: ['RS256'] }).a, 1);
+});
+check('jwt-PS256', () => {
+  const t = jwt.sign({ a: 2 }, RSA_PRIVATE_KEY, { algorithm: 'PS256' });
+  assert.strictEqual(jwt.verify(t, RSA_PUBLIC_KEY, { algorithms: ['PS256'] }).a, 2);
 });
 
 console.log(results.join('\\n'));
@@ -121,10 +128,10 @@ const jwtHsOk =
   ['jwt-HS256', 'jwt-HS384', 'jwt-HS512', 'jwt-HS256-expired', 'jwt-HS256-KeyObject-secret'].every(
     (n) => results.includes('PASS ' + n),
   );
-const rsFails = !results.includes('PASS jwt-RS256');
+const rsOk = ['jwt-RS256', 'jwt-PS256'].every((n) => results.includes('PASS ' + n));
 console.log('JWS_HMAC_OK=' + jwsHsOk);
 console.log('JWT9_HS_OK=' + jwtHsOk);
-console.log('JWT_RS_FAILS=' + rsFails);
+console.log('JWT_RS_OK=' + rsOk);
 `,
 });
 
@@ -146,21 +153,20 @@ console.log(`  (exit ${run.code})`);
 
 const jwsHmacOk = /JWS_HMAC_OK=true/.test(stdout);
 const jwt9HsOk = /JWT9_HS_OK=true/.test(stdout);
-const rsFails = /JWT_RS_FAILS=true/.test(stdout);
+const rsOk = /JWT_RS_OK=true/.test(stdout);
 
-// jsonwebtoken@9 HS* must now round-trip end-to-end; the asymmetric path must
-// still fail loudly (RSA/EC deferred to crypto S3).
-const ok = installed && run.code === 0 && jwsHmacOk && jwt9HsOk && rsFails;
+// jsonwebtoken@9 HS* + the asymmetric RS256/PS256 path must now round-trip end-to-end.
+const ok = installed && run.code === 0 && jwsHmacOk && jwt9HsOk && rsOk;
 
 console.log("\n---- capability summary ----");
 console.log("  HMAC primitive (jws HS256/384/512): " + (jwsHmacOk ? "WORKS" : "BROKEN"));
 console.log("  jsonwebtoken@9 HS256/384/512 (KeyObject path): " + (jwt9HsOk ? "WORKS" : "BROKEN"));
-console.log("  Asymmetric RS256 (createSign): " + (rsFails ? "UNSUPPORTED (expected)" : "works?!"));
+console.log("  Asymmetric RS256/PS256 (createSign): " + (rsOk ? "WORKS" : "BROKEN"));
 console.log(
   "\nRESULT: " +
     (ok
-      ? "PASS — jsonwebtoken@9 HS256/384/512 sign+verify work (symmetric KeyObject shim); " +
-        "asymmetric (RS/ES/PS) still unsupported as expected"
+      ? "PASS — jsonwebtoken@9 HS256/384/512 + RS256/PS256 sign+verify work " +
+        "(symmetric KeyObject shim + crypto S3 RSA)"
       : "FAIL — see logs above"),
 );
 process.exit(ok ? 0 : 1);
