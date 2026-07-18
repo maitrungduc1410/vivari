@@ -110,11 +110,28 @@ export function Vivari(props: VivariProps): ReactNode {
   // Guards the preview against the dev server's transient boot re-binds: only the
   // first listened port drives the iframe, and only after it's really serving.
   const previewStartedRef = useRef(false);
+  // The preview <iframe>; inbound HMR/SSE frames are delivered to its shim.
+  const frameRef = useRef<HTMLIFrameElement | null>(null);
 
   useEffect(() => {
     if (!vivari || startedRef.current) return;
     startedRef.current = true;
     let disposed = false;
+
+    // Inbound half of the HMR/SSE tunnel. The preview's WS/SSE shim posts OUTbound
+    // frames to this window (the bridge forwards them to the kernel); the kernel's
+    // INbound frames arrive here as vv-ws/vv-sse and must be delivered back to the
+    // iframe's shim, or Vite HMR stays stuck at "[vite] connecting…". The frame
+    // carries no port, so we deliver to our single iframe; the shim ignores frames
+    // for connIds it doesn't own. (The studio does the same in its controller.)
+    const relay = (type: "vv-ws" | "vv-sse") =>
+      vivari.bridge.on(type, (m) => {
+        const win = frameRef.current?.contentWindow;
+        const msg = (m as { msg?: Record<string, unknown> }).msg;
+        if (win && msg) win.postMessage({ ...msg, type, dir: "in" }, "*");
+      });
+    const offWs = relay("vv-ws");
+    const offSse = relay("vv-sse");
 
     const offServer = vivari.on("server-ready", (port, url) => {
       // A dev server rebinds its port a few times during boot, firing several
@@ -156,6 +173,8 @@ export function Vivari(props: VivariProps): ReactNode {
     return () => {
       disposed = true;
       offServer();
+      offWs();
+      offSse();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vivari]);
@@ -169,6 +188,7 @@ export function Vivari(props: VivariProps): ReactNode {
   }
   return (
     <iframe
+      ref={frameRef}
       src={previewSrc}
       className={className}
       style={style}
