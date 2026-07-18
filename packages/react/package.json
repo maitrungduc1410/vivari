@@ -12,6 +12,15 @@
   ],
   "license": "MIT",
   "author": "Duc Trung Mai <maitrungduc1410@gmail.com>",
+  "homepage": "https://vivari.pages.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maitrungduc1410/vivari.git",
+    "directory": "packages/react"
+  },
+  "bugs": {
+    "url": "https://github.com/maitrungduc1410/vivari/issues"
+  },
   "type": "module",
   "sideEffects": false,
   "files": [

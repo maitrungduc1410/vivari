@@ -1,0 +1,6 @@
+node_modules
+dist
+*.local
+.DS_Store
+bun.lock
+*.tsbuildinfo

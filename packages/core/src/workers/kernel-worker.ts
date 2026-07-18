@@ -57,28 +57,46 @@ const procWorkers = new Map();
 let procMemSeq = 1;
 const procMemPending = new Map();
 
-// The real-npm delivery asset (built by `npm run vendor:npm`, served from
-// packages/studio/public/vendor). Fetched once and unpacked into the VFS so the
-// shell's `npm` is the real CLI, not the Turbo-analog (North Star). Absolute
-// path so it resolves against the app origin from inside this worker. The file
-// is gzip-compressed but NOT named `.gz` on purpose — see scripts/vendor-npm.mjs
-// (a `.gz` name makes static servers set Content-Encoding: gzip, which the
-// browser auto-decompresses, breaking our own gunzip).
-const REAL_NPM_ASSET = "/vendor/npm-pack.bin";
+// The vendored delivery assets (built by `npm run vendor:*`, served from
+// packages/studio/public/vendor → the app's `<base>vendor/`). Each is fetched
+// once and unpacked into the VFS so the shell's `npm`/`yarn`/`pnpm`/`corepack`/
+// `tsc` are the REAL CLIs (North Star), not analogs. Names are RELATIVE to the
+// app base (see vendorUrl): the studio is served under /studio/ and the docs
+// playground under /embed/, so an origin-absolute "/vendor/…" would 404 — it must
+// resolve against import.meta.env.BASE_URL. The files are gzip-compressed but NOT
+// named `.gz` on purpose — see scripts/vendor-npm.mjs (a `.gz` name makes static
+// servers set Content-Encoding: gzip, which the browser auto-decompresses,
+// breaking our own gunzip).
+const REAL_NPM_ASSET = "vendor/npm-pack.bin";
 // The real-yarn (classic) delivery asset, same shape/rationale as npm's (built by
 // `npm run vendor:yarn`). Unpacked into the VFS so `yarn` on PATH is the real CLI.
-const REAL_YARN_ASSET = "/vendor/yarn-pack.bin";
+const REAL_YARN_ASSET = "vendor/yarn-pack.bin";
 // The real-pnpm delivery asset, same shape/rationale as npm/yarn's (built by
 // `npm run vendor:pnpm`). Unpacked into the VFS so `pnpm` on PATH is the real CLI.
-const REAL_PNPM_ASSET = "/vendor/pnpm-pack.bin";
+const REAL_PNPM_ASSET = "vendor/pnpm-pack.bin";
 // The real-corepack delivery asset (built by `npm run vendor:corepack`). Unpacked
 // into the VFS so `corepack` on PATH can DOWNLOAD + run project-pinned yarn/pnpm/
 // npm versions (`packageManager` field), on top of the direct vendored defaults.
-const REAL_COREPACK_ASSET = "/vendor/corepack-pack.bin";
+const REAL_COREPACK_ASSET = "vendor/corepack-pack.bin";
 // The real-TypeScript-7 (tsgo, Go/wasm) delivery asset (built by `npm run
 // vendor:tsgo`). ~11 MB gz, so it's loaded LAZILY in the background after boot;
 // unpacked into the VFS so `tsc`/`tsgo` on PATH are the real Go compiler.
-const REAL_TSGO_ASSET = "/vendor/tsgo-pack.bin";
+const REAL_TSGO_ASSET = "vendor/tsgo-pack.bin";
+
+// Resolve a vendored asset name to a full URL against the app's configured base
+// (Vite's import.meta.env.BASE_URL — "/studio/", "/embed/", or "/"). The vendor
+// files ship inside each app's output, so they must be fetched from the base
+// path, not the origin root (which is only used by the root-scoped Service
+// Worker). Falls back to "/" when the env is absent (non-Vite consumers).
+function vendorUrl(name: string): string {
+  const origin = (self.location && self.location.origin) || "";
+  const base =
+    (typeof import.meta !== "undefined" &&
+      import.meta.env &&
+      import.meta.env.BASE_URL) ||
+    "/";
+  return origin + base + name;
+}
 
 // [optimize] Compile the Rust/Wasm codecs (zlib #11, crypto #12) EXACTLY ONCE,
 // here in the kernel worker, and hand each Process Worker the resulting
@@ -1385,8 +1403,7 @@ async function boot() {
   try {
     const npmT0 = Date.now();
     const res = await ensureRealNpm(kernel, async () => {
-      const base = (self.location && self.location.origin) || "";
-      const r = await fetch(base + REAL_NPM_ASSET);
+      const r = await fetch(vendorUrl(REAL_NPM_ASSET));
       if (!r.ok) return null;
       return new Uint8Array(await r.arrayBuffer());
     });
@@ -1409,12 +1426,12 @@ async function boot() {
   post("log", { line: "Kernel ready — pick a project and press Run." });
 }
 
-// Fetch a vendor asset (npm/yarn/pnpm/corepack/tsgo pack) by absolute path from
-// the app origin. Returns its bytes, or null if the asset isn't served (in which
-// case the tool simply isn't installed — same as a missing npm).
+// Fetch a vendor asset (npm/yarn/pnpm/corepack/tsgo pack) by base-relative name
+// (resolved against the app base via vendorUrl). Returns its bytes, or null if
+// the asset isn't served (in which case the tool simply isn't installed — same as
+// a missing npm).
 async function fetchVendorAsset(assetPath: string): Promise<Uint8Array | null> {
-  const base = (self.location && self.location.origin) || "";
-  const r = await fetch(base + assetPath);
+  const r = await fetch(vendorUrl(assetPath));
   if (!r.ok) return null;
   return new Uint8Array(await r.arrayBuffer());
 }

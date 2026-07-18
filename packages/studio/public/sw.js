@@ -11,6 +11,16 @@
 
 const PREVIEW_MARKER = "/preview/";
 
+// Client ids of pages that host a Vivari kernel (announced via `vv-kernel-host`;
+// see bridge.registerServiceWorker). handlePreview routes each preview HTTP
+// request to one of these — NOT simply the top-level window — because Vivari can
+// run inside an iframe (e.g. the docs /embed/ playground). There the top-level
+// window is the host doc, which has no kernel; posting the request to it would
+// hang. In-memory only: if the SW is revived and this is empty, handlePreview
+// falls back to the top-level heuristic (and the host re-announces on each
+// server `listen`, i.e. right before a preview loads).
+const kernelHostIds = new Set();
+
 // "Keep-prefix" ports. By default the SW strips the `/preview/<port>` proxy prefix
 // before handing a request to the in-VM dev server (so a server that assumes it
 // lives at `/` — Next, Vite, Express… — sees clean paths). But a *client-routed*
@@ -65,6 +75,12 @@ async function loadDevtoolsEnabled() {
 
 self.addEventListener("message", (event) => {
   const d = event.data;
+  // A page announcing it hosts a Vivari kernel — remember its client id so
+  // handlePreview routes preview HTTP to it even when it's a nested iframe.
+  if (d && d.type === "vv-kernel-host") {
+    if (event.source && event.source.id) kernelHostIds.add(event.source.id);
+    return;
+  }
   if (d && d.type === "vv-keep-prefix-ports" && Array.isArray(d.ports)) {
     keepPrefixPorts = new Set(d.ports.map((p) => p | 0));
     event.waitUntil(
@@ -697,9 +713,10 @@ self.addEventListener("fetch", (event) => {
   // are same-origin OUR files and must hit the network directly — routing them
   // through routeByClient fails under cross-origin isolation (a spurious
   // `fetch(event.request)` failure), exactly like /vv-devtools/ + /packages/.
-  // The kernel worker fetches /vendor/npm-pack.bin here; without this bypass it
-  // gets "Failed to fetch" and falls back to the built-in npm.
-  if (url.pathname.startsWith("/vendor/")) return;
+  // The kernel worker fetches them relative to the app base, so the path is
+  // /vendor/… (root), /studio/vendor/… or /embed/vendor/… in the unified deploy;
+  // without this bypass it gets "Failed to fetch" and no package managers load.
+  if (/(^|\/)vendor\//.test(url.pathname)) return;
 
   // Root-absolute request (e.g. Vite's /@vite/client, /src/main.js,
   // /node_modules/...). It only belongs to a preview if a preview iframe issued
@@ -751,7 +768,13 @@ async function handlePreview(event, port, path, keepPrefix) {
   const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
   const isPreview = (c) => c.url.includes(PREVIEW_MARKER);
   const isDevtools = (c) => c.url.includes("/devtools-host.html") || c.url.includes("/devtools/");
+  // Prefer a client that explicitly announced itself as a kernel host: this is
+  // what makes an EMBEDDED Vivari (the docs /embed/ iframe) work — its kernel
+  // lives in a nested frame, so the "top-level window" heuristic would wrongly
+  // pick the host document (which has no kernel). Fall back to the top-level
+  // heuristic when no announcement is known (e.g. the studio, or a revived SW).
   const kernelClient =
+    clients.find((c) => kernelHostIds.has(c.id) && !isPreview(c) && !isDevtools(c)) ||
     clients.find((c) => c.frameType === "top-level" && !isPreview(c) && !isDevtools(c)) ||
     clients.find((c) => !isPreview(c) && !isDevtools(c)) ||
     clients.find((c) => !isPreview(c)) ||

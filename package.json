@@ -5,6 +5,9 @@
   "type": "module",
   "description": "An open-source WebContainer: run Node-style projects fully client-side in the browser.",
   "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
   "workspaces": [
     "packages/core",
     "packages/react",
@@ -37,6 +40,8 @@
     "build": "npm run build:vfs && npm run build:vfs:node && npm run build:codec && npm run build:codec:node && npm run build:crypto && npm run build:crypto:node && npm run build:wasi-demo",
     "build:core": "npm run build --workspace @vivari/core",
     "build:react": "npm run build --workspace @vivari/react",
+    "build:site": "bash scripts/cloudflare-build.sh",
+    "assemble:site": "node scripts/assemble-site.mjs",
     "build:sdk": "npm run build:core && npm run build:react",
     "typecheck:sdk": "npm run typecheck --workspace @vivari/core && npm run typecheck --workspace @vivari/react"
   },

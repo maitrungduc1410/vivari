@@ -1,0 +1,122 @@
+@import "tailwindcss";
+
+/* Dark-first design system for the Vivari landing page. */
+@theme {
+  --color-bg: #05060a;
+  --color-bg-soft: #0a0c14;
+  --color-panel: #0e1119;
+  --color-border: #1c2130;
+  --color-fg: #eef1f8;
+  --color-muted: #9aa3b8;
+  --color-faint: #5b6479;
+
+  --color-brand: #7c5cff;
+  --color-brand-2: #22d3ee;
+  --color-brand-3: #f472b6;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo,
+    Consolas, monospace;
+
+  --animate-aurora: aurora 18s ease-in-out infinite;
+  --animate-float: float 7s ease-in-out infinite;
+  --animate-marquee: marquee 32s linear infinite;
+  --animate-shimmer: shimmer 2.4s linear infinite;
+  --animate-flow: flow 1.1s linear infinite;
+}
+
+@keyframes aurora {
+  0%,
+  100% {
+    transform: translate3d(-6%, -4%, 0) scale(1.05) rotate(0deg);
+  }
+  33% {
+    transform: translate3d(6%, 2%, 0) scale(1.15) rotate(8deg);
+  }
+  66% {
+    transform: translate3d(-2%, 6%, 0) scale(1.1) rotate(-6deg);
+  }
+}
+
+@keyframes float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+@keyframes marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@keyframes flow {
+  to {
+    stroke-dashoffset: -16;
+  }
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Utilities layered on top of Tailwind. */
+@utility text-gradient {
+  background-image: linear-gradient(
+    100deg,
+    var(--color-brand-2),
+    var(--color-brand),
+    var(--color-brand-3)
+  );
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+}
+
+@utility glass {
+  background: color-mix(in oklab, var(--color-panel) 70%, transparent);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--color-border);
+}
