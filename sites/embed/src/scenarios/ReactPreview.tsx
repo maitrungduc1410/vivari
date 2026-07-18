@@ -24,6 +24,14 @@ export function ReactPreview() {
     }, 250);
   }
 
+  // Cmd/Ctrl+S: write immediately (cancel the pending debounce) so the in-VM
+  // Vite watcher fires HMR right away.
+  function onSave(value: string) {
+    if (!instance.current) return;
+    clearTimeout(debounce.current);
+    instance.current.fs.writeFile(REACT_APP_PATH, value).catch(() => {});
+  }
+
   return (
     <div className="embed">
       <div className="embed__bar">
@@ -31,9 +39,12 @@ export function ReactPreview() {
       </div>
       <div className="split">
         <div className="pane">
-          <div className="pane__head">src/App.jsx</div>
+          <div className="pane__head">
+            src/App.jsx
+            <span className="pane__hint">{"\u2318S / Ctrl+S to save"}</span>
+          </div>
           <div className="pane__body">
-            <Editor initialDoc={APP_JSX} onChange={onChange} />
+            <Editor initialDoc={APP_JSX} onChange={onChange} onSave={onSave} />
           </div>
         </div>
         <div className="pane">

@@ -159,6 +159,12 @@ body {
   font-size: 11px;
 }
 
+.pane__hint {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 10.5px;
+}
+
 .pane__body {
   position: relative;
   flex: 1;

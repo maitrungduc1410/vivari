@@ -157,11 +157,18 @@ export function NodeTerminal() {
       </div>
       <div className="split">
         <div className="pane">
-          <div className="pane__head">index.js</div>
+          <div className="pane__head">
+            index.js
+            <span className="pane__hint">{"\u2318S / Ctrl+S to run"}</span>
+          </div>
           <div className="pane__body">
             <Editor
               initialDoc={INDEX_JS}
               onChange={(v) => (codeRef.current = v)}
+              onSave={(v) => {
+                codeRef.current = v;
+                void run();
+              }}
             />
           </div>
         </div>
