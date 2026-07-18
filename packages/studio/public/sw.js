@@ -214,6 +214,31 @@ async function cacheFirst(request) {
 // attach (or re-attach on tab switch) so a connection opened before the panel —
 // or before switching to this tab — still shows up (its future frames then stream
 // live; frames from before attach are dropped, matching real DevTools behaviour).
+// Report the preview document's real `document.title` up to the host page so the
+// preview tab strip can show it (with an ellipsis + hover tooltip) instead of a
+// bare "Preview (<port>)". Always injected (unlike the vv-nav address-bar sync,
+// which rides in the opt-in CDP bootstrap): the title is fetched on load and
+// re-posted whenever the app rewrites <title> (SPA routers, react-helmet, etc.).
+const TITLE_SHIM = `(function(){
+if (window.__vvTitleInstalled) return; window.__vvTitleInstalled = true;
+var last = null;
+function send(){
+  var t = document.title || "";
+  if (t === last) return;
+  last = t;
+  try { parent.postMessage({ source:'vv-title', title: t }, '*'); } catch(e){}
+}
+function observe(){
+  // <title> lives in <head>; watch it (and any added/removed title node) for
+  // changes, then push the current value.
+  try { if (document.head) new MutationObserver(send).observe(document.head, { childList:true, subtree:true, characterData:true }); } catch(e){}
+  send();
+}
+if (document.head) observe();
+else document.addEventListener('DOMContentLoaded', observe);
+window.addEventListener('load', send);
+})();`;
+
 const NET_SHIM = `(function(){
 if (window.__vvNet) return;
 var attached = false, gen = 0, live = {};
@@ -594,6 +619,7 @@ function injectWsShim(html, keepPrefix, devtools) {
   const tag =
     flag +
     "<script>" + NET_SHIM + "<\/script>" +
+    "<script>" + TITLE_SHIM + "<\/script>" +
     "<script>" + WS_SHIM + "<\/script>" +
     "<script>" + SSE_SHIM + "<\/script>" +
     (devtools ? DEVTOOLS_TAGS : "");

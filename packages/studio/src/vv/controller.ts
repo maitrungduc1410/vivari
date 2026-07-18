@@ -77,6 +77,7 @@ export interface PreviewTab {
   port: number | null; // the in-VM dev-server port this tab mirrors (null = empty tab)
   path: string; // the request path within the dev server (starts with "/")
   nonce: number; // per-tab reload counter (bump to force the iframe to reload)
+  title?: string; // the running app's real document.title (reported by the preview)
 }
 
 // ── Full-text search (VS Code-style) ─────────────────────────────────────────
@@ -2073,7 +2074,7 @@ export class IdeController {
   private pointPreview(port: number) {
     const existing = this.snap.previewTabs.find((t) => t.port === port);
     if (existing) {
-      this.setTab(existing.id, { nonce: existing.nonce + 1 });
+      this.setTab(existing.id, { nonce: existing.nonce + 1, title: "" });
       this.set({ activePreviewId: existing.id });
       return;
     }
@@ -2148,7 +2149,7 @@ export class IdeController {
     }
     if (!path.startsWith("/")) path = "/" + path;
 
-    this.setTab(id, { url: `localhost:${port}${path === "/" ? "" : path}`, port, path, nonce: tab.nonce + 1 });
+    this.setTab(id, { url: `localhost:${port}${path === "/" ? "" : path}`, port, path, nonce: tab.nonce + 1, title: "" });
   }
   reloadPreviewTab(id: string) {
     const t = this.snap.previewTabs.find((x) => x.id === id);
@@ -2308,6 +2309,13 @@ export class IdeController {
       if (data.source === "vv-nav") {
         const tabId = this.tabIdForSource(src);
         if (tabId) this.syncTabLocation(tabId, String(data.href || "/"));
+        return;
+      }
+
+      // Preview reported its document.title → show it on the tab.
+      if (data.source === "vv-title") {
+        const tabId = this.tabIdForSource(src);
+        if (tabId) this.setTab(tabId, { title: typeof data.title === "string" ? data.title.trim() : "" });
       }
     });
   }

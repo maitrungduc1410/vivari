@@ -37,6 +37,9 @@ function ToolButton({
 }
 
 function tabTitle(t: PreviewTab) {
+  // Prefer the running app's real document.title (reported by the preview shim);
+  // fall back to the port while it boots, or "New Tab" for an empty tab.
+  if (t.title) return t.title;
   return t.port != null ? `Preview (${t.port})` : "New Tab";
 }
 
