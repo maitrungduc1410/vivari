@@ -44,6 +44,12 @@ export function Hero() {
             run a dev server, and preview it live. No backend does the work.
           </motion.p>
 
+          <motion.p variants={item} className="mt-4 max-w-xl text-sm text-muted/80">
+            <span className="text-fg">Vivari</span>{" "}
+            <span className="font-mono text-xs">(vih-VAH-ree)</span> — from the
+            Latin <em>vivarium</em>, a self-contained enclosure for living things.
+          </motion.p>
+
           <motion.div variants={item} className="mt-8 flex flex-wrap items-center gap-3">
             <a
               href={site.studioUrl}

@@ -17,6 +17,8 @@ virtual networking, with no server doing the work.
 
 Vivari is **MIT-licensed** — there is no commercial license and no usage fee: embed it, fork it, ship it.
 
+> **Vivari** *(vih-VAH-ree)* takes its name from the Latin *vivarium* — a self-contained enclosure for living things. That's exactly what it is for a running Node app: a sealed, self-contained environment in the browser where a whole project lives and runs.
+
 ## Install
 
 ```bash

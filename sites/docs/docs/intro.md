@@ -11,6 +11,12 @@ Express, and more) **100% inside the browser** — a virtual filesystem, a
 Node-compatible runtime, a process model, and virtual networking, all in Web
 Workers with no server doing the work.
 
+:::info The name
+**Vivari** *(vih-VAH-ree)* comes from the Latin *vivarium* — a self-contained
+enclosure for living things. That's exactly what it is for a running Node app: a
+sealed environment in the browser where a whole project lives and runs.
+:::
+
 It ships in two forms:
 
 - **The [Studio](https://vivari.pages.dev/studio/)** — a full in-browser IDE built on Vivari.
