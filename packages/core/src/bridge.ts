@@ -124,8 +124,26 @@ export class KernelBridge {
         event.ports[0],
       ]);
     });
+    // Tell the SW this client hosts the kernel, so it routes preview HTTP here
+    // even when Vivari runs in a nested iframe (the docs /embed/ playground): the
+    // SW's "top-level window" fallback would otherwise pick the host document,
+    // which has no kernel. Re-announce on controllerchange (SW update/claim).
+    this.announceKernelHost();
+    navigator.serviceWorker.addEventListener("controllerchange", () =>
+      this.announceKernelHost(),
+    );
     this.swRegistered = true;
     return true;
+  }
+
+  /**
+   * Announce to the preview Service Worker that this page hosts the kernel, so it
+   * can route `/preview/<port>/` requests to this client. Safe to call repeatedly;
+   * a no-op when there's no controlling SW yet.
+   */
+  announceKernelHost(): void {
+    if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.controller?.postMessage({ type: "vv-kernel-host" });
   }
 
   /**

@@ -46,6 +46,11 @@ export class Vivari {
     bridge.on("listen", (m: KernelMessage) => {
       const port = m.port as number;
       const url = previewUrl(port);
+      // Re-assert kernel-host ownership with the SW right before the preview
+      // iframe loads, so an embedded (iframed) Vivari — or one whose SW was
+      // revived and lost its in-memory host set — still gets preview HTTP routed
+      // to this client instead of the top-level host document.
+      bridge.announceKernelHost();
       for (const l of this.serverReady) l(port, url);
       for (const l of this.portListeners) l(port, "open", url);
     });
