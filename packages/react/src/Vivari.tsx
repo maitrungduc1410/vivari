@@ -28,6 +28,56 @@ function toCommand(cmd: string | string[]): [string, string[]] {
   return [parts[0], parts.slice(1)];
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Wait until the in-VM dev server at `url` is actually serving, then warm it, so
+ * the preview iframe loads a working (and already-optimized) page.
+ *
+ * Why: a dev server (Vite/rolldown) binds -> closes -> rebinds its port several
+ * times during startup, so the first `listen` event is transient. Pointing the
+ * iframe there immediately races that window and the Service Worker preview proxy
+ * returns `502 No server listening on port N`. This mirrors the studio's
+ * kernel-side `waitServing` + `warmDevServer`, but over the same SW proxy the
+ * iframe uses (so it needs no extra kernel API). Best-effort throughout: any
+ * failure just falls through so the iframe still gets a chance to load.
+ */
+async function waitForPreview(url: string, timeoutMs = 60000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  // 1) Poll until the server answers with something other than the proxy's
+  //    "no listener yet" / gateway statuses (Vite rebinds during boot).
+  for (;;) {
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (res.status !== 502 && res.status !== 503 && res.status !== 504) break;
+    } catch {
+      /* not answering yet */
+    }
+    if (Date.now() > deadline) return;
+    await sleep(150);
+  }
+  // 2) Warm the dependency optimizer: fetch the entry module scripts (+ Vite's
+  //    client) so the cold optimize completes BEFORE the iframe requests them —
+  //    otherwise those subresources can race the SW's per-request timeout on a
+  //    cold `.vite` cache and 504.
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    const html = await res.text();
+    const mods = new Set<string>(["/@vite/client"]);
+    const re = /<script[^>]*type=["']module["'][^>]*src=["']([^"']+)["']/gi;
+    for (let m; (m = re.exec(html)); ) if (m[1].startsWith("/")) mods.add(m[1]);
+    const origin = new URL(url).origin;
+    const base = url.replace(origin, "").replace(/\/$/, ""); // e.g. /preview/5173
+    await Promise.all(
+      [...mods].map((p) =>
+        fetch(origin + base + p, { cache: "no-store" }).catch(() => {}),
+      ),
+    );
+  } catch {
+    /* warm is best-effort; the iframe will still load */
+  }
+}
+
 /**
  * Drop-in embed: boots Vivari, mounts `files`, runs `install` then `run`, and
  * renders the resulting dev-server preview in an <iframe>.
@@ -57,6 +107,9 @@ export function Vivari(props: VivariProps): ReactNode {
   const cbs = useRef({ onReady, onServerReady, onOutput });
   cbs.current = { onReady, onServerReady, onOutput };
   const startedRef = useRef(false);
+  // Guards the preview against the dev server's transient boot re-binds: only the
+  // first listened port drives the iframe, and only after it's really serving.
+  const previewStartedRef = useRef(false);
 
   useEffect(() => {
     if (!vivari || startedRef.current) return;
@@ -64,9 +117,16 @@ export function Vivari(props: VivariProps): ReactNode {
     let disposed = false;
 
     const offServer = vivari.on("server-ready", (port, url) => {
-      if (disposed) return;
-      setPreviewSrc(url);
-      cbs.current.onServerReady?.(port, url);
+      // A dev server rebinds its port a few times during boot, firing several
+      // `listen` events; act on the first and only after it's actually serving,
+      // so the iframe never loads into a momentarily-closed port (502).
+      if (disposed || previewStartedRef.current) return;
+      previewStartedRef.current = true;
+      void waitForPreview(url).then(() => {
+        if (disposed) return;
+        setPreviewSrc(url);
+        cbs.current.onServerReady?.(port, url);
+      });
     });
 
     const pump = (proc: { output: ReadableStream<string> }) =>
