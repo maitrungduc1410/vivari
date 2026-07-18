@@ -611,6 +611,22 @@ export class IdeController {
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
+    // Cmd+K (macOS) / Ctrl+K (Win/Linux) clears the focused terminal, mirroring
+    // VS Code's integrated terminal. Scoped to the focused xterm (not a global
+    // shortcut) so it never clobbers the editor's Cmd+K chord bindings.
+    term.attachCustomKeyEventHandler((e) => {
+      if (
+        e.type === "keydown" &&
+        (e.metaKey || e.ctrlKey) &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "k"
+      ) {
+        term.clear();
+        return false;
+      }
+      return true;
+    });
     return { term, fit };
   }
 

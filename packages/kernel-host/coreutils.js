@@ -69,6 +69,11 @@ child.on('close', (code) => process.exit(code | 0));
 
   echo: `process.stdout.write(process.argv.slice(2).join(' ') + '\\n');\n`,
 
+  // Reset the terminal: home the cursor (\\x1b[H), erase the screen (\\x1b[2J),
+  // and erase the scrollback (\\x1b[3J). xterm interprets the sequence, so the
+  // visible output and history are wiped and the next prompt starts at the top.
+  clear: `process.stdout.write('\\x1b[H\\x1b[2J\\x1b[3J');\n`,
+
   pwd: `process.stdout.write(process.cwd() + '\\n');\n`,
 
   true: `process.exit(0);\n`,
