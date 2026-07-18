@@ -697,9 +697,10 @@ self.addEventListener("fetch", (event) => {
   // are same-origin OUR files and must hit the network directly — routing them
   // through routeByClient fails under cross-origin isolation (a spurious
   // `fetch(event.request)` failure), exactly like /vv-devtools/ + /packages/.
-  // The kernel worker fetches /vendor/npm-pack.bin here; without this bypass it
-  // gets "Failed to fetch" and falls back to the built-in npm.
-  if (url.pathname.startsWith("/vendor/")) return;
+  // The kernel worker fetches them relative to the app base, so the path is
+  // /vendor/… (root), /studio/vendor/… or /embed/vendor/… in the unified deploy;
+  // without this bypass it gets "Failed to fetch" and no package managers load.
+  if (/(^|\/)vendor\//.test(url.pathname)) return;
 
   // Root-absolute request (e.g. Vite's /@vite/client, /src/main.js,
   // /node_modules/...). It only belongs to a preview if a preview iframe issued

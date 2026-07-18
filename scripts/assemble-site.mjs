@@ -68,6 +68,15 @@ fs.cpSync(EMBED, embedOut, { recursive: true });
 // The embed's standalone build emits its own /embed/sw.js; the real SW is the
 // hoisted root /sw.js, so drop the redundant copy to avoid a stale duplicate.
 fs.rmSync(path.join(embedOut, "sw.js"), { force: true });
+// The embed's React live example runs `npm run dev`, so it needs the same
+// vendored package-manager assets as the studio. They ship in the studio build
+// (packages/studio/public/vendor → /studio/vendor); the kernel worker fetches
+// them relative to the app base (/embed/vendor here), so copy the tree in.
+const studioVendor = path.join(studioOut, "vendor");
+if (fs.existsSync(studioVendor)) {
+  fs.cpSync(studioVendor, path.join(embedOut, "vendor"), { recursive: true });
+  console.log("\u2192 copied vendor assets into /embed/");
+}
 
 // 4. Headers: scope cross-origin isolation to every surface that runs the
 // runtime. The studio and the /embed/ playground need SharedArrayBuffer directly;

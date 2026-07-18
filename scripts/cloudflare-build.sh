@@ -34,6 +34,17 @@ npm run build:vfs
 npm run build:codec
 npm run build:crypto
 
+# --- Vendored package managers (real npm/yarn/pnpm/corepack + tsgo) -------------
+# The studio's own `bun run build` (below) does NOT run the root predev/
+# prebuild:studio hooks, so the gitignored delivery assets in
+# packages/studio/public/vendor/*.bin must be built explicitly here. Without them
+# the studio ships with no `npm`/`yarn`/`pnpm` on PATH. Uses host npm + network.
+npm run vendor:npm
+npm run vendor:yarn
+npm run vendor:pnpm
+npm run vendor:corepack
+npm run vendor:tsgo
+
 # --- Studio (served under /studio/) --------------------------------------------
 ( cd packages/studio && bun install && VV_BASE=/studio/ bun run build )
 
