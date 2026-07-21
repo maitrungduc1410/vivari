@@ -1,0 +1,106 @@
+name: CI
+
+# Three tiers, cheapest first (mirrors the retired GitLab CI):
+#
+#   gate    - offline, Wasm-free guards (toolchain subsystem + llhttp Wasm HTTP
+#             parser). Runs on every push/PR; seconds; catches silent regressions
+#             such as esbuild-wasm drift or a broken native->wasm alias table.
+#   verify  - the hermetic offline suite (scripts/verify-node.mjs). Needs the Wasm
+#             VFS/codec/crypto built for Node; runs on PRs + the default branch.
+#   spikes  - the network tier: boots real templates and installs from the live
+#             npm registry in-VM. Slow + registry-dependent, so it's manual/scheduled.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Nightly network spikes.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --- fast gate: offline, no Wasm, every push/PR ----------------------------
+  toolchain-gate:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/run-spikes.mjs --offline
+
+  # SDK packaging + public-API contract guard (offline, no Wasm, no browser).
+  # Also regression-checks the shipped preview sw.js branding + examples/basic.
+  sdk-smoke:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm run smoke
+
+  # --- offline hermetic suite (needs the Rust->Wasm build) -------------------
+  verify:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/*/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('packages/*/Cargo.lock') }}
+      - name: Build Wasm crates for Node
+        run: npm run build:vfs:node && npm run build:codec:node && npm run build:crypto:node
+      - run: npm run verify
+
+  # --- network tier: real template installs from the live registry -----------
+  # Manual (workflow_dispatch) or scheduled: slow and depends on
+  # registry.npmjs.org being reachable.
+  spikes-net:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/*/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('packages/*/Cargo.lock') }}
+      - name: Build Wasm crates for Node
+        run: npm run build:vfs:node && npm run build:codec:node && npm run build:crypto:node
+      - run: npm run spikes:net
