@@ -36,7 +36,7 @@
     "build:codec:node": "wasm-pack build packages/codec --target nodejs --out-dir pkg-node",
     "build:crypto": "wasm-pack build packages/crypto --target web --out-dir pkg",
     "build:crypto:node": "wasm-pack build packages/crypto --target nodejs --out-dir pkg-node",
-    "build:wasi-demo": "cargo build --release --manifest-path packages/wasi-demo/Cargo.toml --target wasm32-wasip1 && cp packages/wasi-demo/target/wasm32-wasip1/release/wasi_demo.wasm packages/wasi-demo/pkg/wasi_demo.wasm",
+    "build:wasi-demo": "mkdir -p packages/wasi-demo/pkg && cargo build --release --manifest-path packages/wasi-demo/Cargo.toml --target wasm32-wasip1 && cp packages/wasi-demo/target/wasm32-wasip1/release/wasi_demo.wasm packages/wasi-demo/pkg/wasi_demo.wasm",
     "build": "npm run build:vfs && npm run build:vfs:node && npm run build:codec && npm run build:codec:node && npm run build:crypto && npm run build:crypto:node && npm run build:wasi-demo",
     "build:core": "npm run build --workspace @vivari/core",
     "build:react": "npm run build --workspace @vivari/react",

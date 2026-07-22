@@ -41,7 +41,9 @@ const SPIKES = [
   { name: "tar", file: "spike-tar.mjs", net: false, timeout: 60000 },
   // Persistent dependency cache (P1): pack node_modules → snapshot → wipe →
   // restore → require, against the real Wasm VFS. Offline + deterministic.
-  { name: "dep-cache", file: "spike-dep-cache.mjs", net: false, timeout: 120000 },
+  // `needsWasm`: offline but requires the Node Wasm VFS build (pkg-node), so it
+  // can't run in the Wasm-free toolchain-gate — it runs in the verify job.
+  { name: "dep-cache", file: "spike-dep-cache.mjs", net: false, needsWasm: true, timeout: 120000 },
   // --- network: graduated templates gated here -------------------------------
   { name: "koa", file: "spike-koa.mjs", net: true },
   { name: "hono", file: "spike-hono.mjs", net: true },
@@ -92,6 +94,17 @@ selected = selected.filter((s) => {
   const exists = fs.existsSync(path.join(ROOT, "scripts", s.file));
   if (!exists) console.log(`  (skip ${s.name}: scripts/${s.file} not found)`);
   return exists;
+});
+// Drop spikes that need the Node Wasm VFS when it hasn't been built. Keeps the
+// Wasm-free gate (toolchain-gate) green; these run in the verify job where the
+// crates are built (see .github/workflows/ci.yml).
+const WASM_VFS = path.join(ROOT, "packages/vfs/pkg-node/vivari_vfs.js");
+selected = selected.filter((s) => {
+  if (s.needsWasm && !fs.existsSync(WASM_VFS)) {
+    console.log(`  (skip ${s.name}: Wasm VFS not built — run 'npm run build:vfs:node')`);
+    return false;
+  }
+  return true;
 });
 
 if (selected.length === 0) {

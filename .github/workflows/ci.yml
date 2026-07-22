@@ -58,7 +58,7 @@ jobs:
           node-version: 22
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown, wasm32-wasip1
       - uses: jetli/wasm-pack-action@v0.4.0
         with:
           version: latest
@@ -71,7 +71,11 @@ jobs:
             packages/*/target
           key: cargo-${{ runner.os }}-${{ hashFiles('packages/*/Cargo.lock') }}
       - name: Build Wasm crates for Node
-        run: npm run build:vfs:node && npm run build:codec:node && npm run build:crypto:node
+        run: npm run build:vfs:node && npm run build:codec:node && npm run build:crypto:node && npm run build:wasi-demo
+      # dep-cache is offline but needs the Rust/Wasm VFS, so it can't run in the
+      # Wasm-free toolchain-gate; run it here where the crates are built.
+      - name: dep-cache spike (needs Wasm VFS)
+        run: node scripts/run-spikes.mjs --offline dep-cache
       - run: npm run verify
 
   # --- network tier: real template installs from the live registry -----------
