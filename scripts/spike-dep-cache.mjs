@@ -1,13 +1,13 @@
-// Spike — persistent dependency cache (P1: node_modules keyed by lockfile).
+// Spike - persistent dependency cache (P1: node_modules keyed by lockfile).
 //
 // Proves the SHIPPED code path: the kernel-fs client's depCache* round-trips, the
 // FS Worker's dep-cache handlers, and packages/kernel-host/dep-cache.js's
 // pack/restore against the real Rust/Wasm VFS. Fully OFFLINE + deterministic (no
-// registry) — it fabricates a small node_modules (files + a symlink), snapshots
+// registry) - it fabricates a small node_modules (files + a symlink), snapshots
 // it, wipes it, restores it, and require()s the result inside the VM.
 //
 // The browser stores snapshots in OPFS; headless (no OPFS) wires an in-memory
-// store in scripts/fs-worker.mjs — the pack/restore + VFS logic under test is the
+// store in scripts/fs-worker.mjs - the pack/restore + VFS logic under test is the
 // same. Run: `node scripts/spike-dep-cache.mjs` (needs the Wasm VFS build).
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
@@ -17,7 +17,7 @@ import { Worker, MessageChannel } from "node:worker_threads";
 
 const DIR = "/app";
 
-// ── kernel setup (same shape as the other studio spikes) ─────────────────────
+// kernel setup (same shape as the other studio spikes)
 const fsWorker = new Worker(new URL("./fs-worker.mjs", import.meta.url));
 let onKernelFsMessage = () => {};
 await new Promise((resolve) => {
@@ -66,7 +66,7 @@ const runNode = (src, name) => {
 
 let ok = true;
 const gate = (label, pass, extra = "") => {
-  console.log(`${pass ? "PASS" : "FAIL"}  ${label}${extra ? "  — " + extra : ""}`);
+  console.log(`${pass ? "PASS" : "FAIL"}  ${label}${extra ? "  - " + extra : ""}`);
   if (!pass) ok = false;
 };
 
@@ -92,25 +92,25 @@ const setup = await runNode(
 );
 gate("scaffold node_modules (file + symlink)", setup.code === 0 && /SETUP_OK/.test(setup.stdout || ""), setup.stderr.trim());
 
-// ── the cache mechanics under test ───────────────────────────────────────────
+// the cache mechanics under test
 const lockBytes = kernelFs.fs.readFileBytes(`${DIR}/package-lock.json`);
 const pjBytes = kernelFs.fs.readFileBytes(`${DIR}/package.json`);
 const lockKey = await hashDepKey("npm", lockBytes, "package-lock.json");
 const pjKey = await hashDepKey("npm", pjBytes, "package.json");
 
-gate("has() miss before save", (await kernelFs.depCacheHas(lockKey)) === false);
+gate("has() miss before save", (await kernelFs.fs.depCacheHas(lockKey)) === false);
 
-const saved = await kernelFs.depCacheSave(lockKey, DIR, [pjKey]);
+const saved = await kernelFs.fs.depCacheSave(lockKey, DIR, [pjKey]);
 gate("save() packs node_modules", !!saved && saved.files >= 2, saved ? `${saved.files} files, ${saved.bytes}B` : "null");
-gate("has() hit after save (lockfile key)", (await kernelFs.depCacheHas(lockKey)) === true);
-gate("has() hit via package.json alias", (await kernelFs.depCacheHas(pjKey)) === true);
-gate("has() miss for an unknown key", (await kernelFs.depCacheHas(lockKey + "x")) === false);
+gate("has() hit after save (lockfile key)", (await kernelFs.fs.depCacheHas(lockKey)) === true);
+gate("has() hit via package.json alias", (await kernelFs.fs.depCacheHas(pjKey)) === true);
+gate("has() miss for an unknown key", (await kernelFs.fs.depCacheHas(lockKey + "x")) === false);
 
 // Wipe node_modules, then restore from the lockfile-keyed snapshot.
 await runNode(`require('fs').rmSync('${DIR}/node_modules', { recursive: true, force: true }); console.log('WIPED');`, "wipe.js");
 gate("node_modules removed before restore", kernel.exists(`${DIR}/node_modules`) === false);
 
-const restored = await kernelFs.depCacheRestore(lockKey, DIR);
+const restored = await kernelFs.fs.depCacheRestore(lockKey, DIR);
 gate("restore() rebuilds the tree", restored > 0, `${restored} entries`);
 
 const verify = await runNode(
@@ -127,9 +127,9 @@ gate("require() restored pkg + symlink intact", vOk, (verify.stdout || verify.st
 // The alias path: wipe again and restore via the package.json key (what a
 // brand-new project of the same template hits before it has a lockfile).
 await runNode(`require('fs').rmSync('${DIR}/node_modules', { recursive: true, force: true });`, "wipe2.js");
-const restoredAlias = await kernelFs.depCacheRestore(pjKey, DIR);
+const restoredAlias = await kernelFs.fs.depCacheRestore(pjKey, DIR);
 gate("restore() via package.json alias", restoredAlias > 0 && kernel.exists(`${DIR}/node_modules/leftpad/index.js`), `${restoredAlias} entries`);
 
 await fsWorker.terminate();
-console.log(`\nRESULT: ${ok ? "PASS — persistent dependency cache save/restore verified" : "FAIL — see gates above"}`);
+console.log(`\nRESULT: ${ok ? "PASS - persistent dependency cache save/restore verified" : "FAIL - see gates above"}`);
 process.exit(ok ? 0 : 1);
