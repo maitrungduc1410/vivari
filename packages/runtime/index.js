@@ -1156,7 +1156,20 @@ export function createRuntime({
 
   globalThis.__ocImport = (spec) =>
     Promise.resolve().then(() => {
-      const m = vvRootRequire(String(spec));
+      const s = String(spec);
+      // Resolve bare specifiers from the running process's cwd (the project dir),
+      // NOT '/', so an escape-hatch `import('pkg')` — built via `new Function('m',
+      // 'return import(m)')` to dodge transpilation, e.g. @preact/preset-vite's
+      // `import('zimmerframe')` in transform-hook-names — finds the project's
+      // node_modules. Absolute/relative/builtin specifiers are base-agnostic. Fall
+      // back to the '/'-rooted require on a miss to preserve the original behavior.
+      let m;
+      try {
+        m = moduleSystem.makeRequire(process.cwd() || "/")(s);
+      } catch (e) {
+        if (e && e.code === "MODULE_NOT_FOUND") m = vvRootRequire(s);
+        else throw e;
+      }
       if (m && m.__esModule) return m;
       const ns = Object.create(null);
       // Mirror Node's CJS→ESM interop: named exports are the module.exports' own
