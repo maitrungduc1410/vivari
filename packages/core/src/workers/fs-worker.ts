@@ -221,6 +221,13 @@ function buildAccess(vfs) {
 // is npm/yarn/pnpm's own content-addressed cache under /home/user/.cache.
 const IGNORE = ["/bin", "/tmp", "/proc", "/dev", "/etc", "/usr", "/var/cache"];
 const shouldPersist = (p) => {
+  // node_modules is NOT mirrored file-by-file: it's large (thousands of files),
+  // which made the per-file OPFS restore the dominant cold-reopen cost. Instead
+  // it's persisted as a single lockfile-keyed snapshot by the dependency cache
+  // (dep-cache.js) and restored in one pass on project open/run. Excluding it
+  // here also turns dep-cache.restore()'s per-path mirror callback into a no-op,
+  // so a restored node_modules isn't re-mirrored (no double storage).
+  if (p.endsWith("/node_modules") || p.includes("/node_modules/")) return false;
   for (const pre of IGNORE) if (p === pre || p.startsWith(pre + "/")) return false;
   return true;
 };

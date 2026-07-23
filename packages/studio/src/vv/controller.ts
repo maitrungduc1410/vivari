@@ -1512,6 +1512,15 @@ export class IdeController {
     this.openFolder(root, meta.name);
     const manifest = this.folderManifests.get(root);
     if (manifest) void this.openFile(root + "/" + manifest.entry);
+    // node_modules is no longer mirrored file-by-file — it's restored from the
+    // dependency-cache snapshot on demand. Bring it back now the project is open
+    // (one blob read), then refresh the Explorer + IntelliSense to reflect it.
+    void this.bridge.request("vv-ensure-deps", { dir: root }).then((res) => {
+      if ((res as { restored?: boolean }).restored) {
+        this.bumpTree();
+        this.scheduleDependencyTypes();
+      }
+    });
   }
 
   // Run a project: open a shell in its dir and auto-run install && dev. Re-uses

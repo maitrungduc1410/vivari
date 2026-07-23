@@ -606,6 +606,23 @@ function pmName(hint) {
   return "npm";
 }
 
+// Detect a project's package manager from the lockfile on disk (npm is the
+// default when only a package.json exists). Used by vv-ensure-deps to pick the
+// right snapshot key when reopening a project we didn't just install.
+function detectPm(dir) {
+  const base = String(dir).replace(/\/+$/, "");
+  for (const pm of ["pnpm", "yarn", "npm"]) {
+    for (const lf of LOCKFILES[pm] || []) {
+      try {
+        if (kernel.exists(base + "/" + lf)) return pm;
+      } catch {
+        /* unreadable — keep probing */
+      }
+    }
+  }
+  return "npm";
+}
+
 // The bytes we hash into a cache key for `dir`: the PM's lockfile if present,
 // else package.json (so a brand-new template still gets a key before its first
 // lockfile is generated). Returns { bytes, src } or null.
@@ -2035,6 +2052,27 @@ self.onmessage = async (event) => {
   if (m.type === "vv-register-project") {
     if (kernel && m.manifest) registerProject(m.dir, m.manifest, m.title);
     if (m.reqId != null) post("vv-reply", { reqId: m.reqId, ok: true });
+    return;
+  }
+  // Ensure a reopened project's node_modules is present. It's no longer mirrored
+  // file-by-file (fs-worker shouldPersist), so on reopen it's restored from the
+  // dependency-cache snapshot (one blob) instead — no re-install. No-op if deps
+  // are already on disk or there's no matching snapshot (the run flow then installs).
+  if (m.type === "vv-ensure-deps") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    (async () => {
+      const dir = String(m.dir || "").replace(/\/+$/, "");
+      try {
+        if (!dir || kernel.exists(dir + "/node_modules")) {
+          post("vv-reply", { reqId: m.reqId, ok: true, restored: false });
+          return;
+        }
+        const restored = await tryRestoreDeps(dir, detectPm(dir));
+        post("vv-reply", { reqId: m.reqId, ok: true, restored });
+      } catch (err) {
+        post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      }
+    })();
     return;
   }
 

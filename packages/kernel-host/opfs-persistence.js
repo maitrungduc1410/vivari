@@ -213,13 +213,41 @@ export async function createOpfsPersistence({ access, shouldPersist = () => true
     }
     if (!Array.isArray(arr) || arr.length === 0) return 0;
 
-    // Seed our in-memory index so future drains diff against it.
-    for (const [path, m] of arr) meta.set(path, m);
+    // Drop anything `shouldPersist` now rejects. Older builds mirrored
+    // node_modules file-by-file; replaying it here is the dominant cold-reopen
+    // cost, and it's sourced from the dependency-cache snapshot now. Seeding
+    // `meta` with kept paths only also drops the stale entries from the manifest
+    // on the next drain (writeManifest serializes `meta`).
+    const keep = [];
+    const drop = [];
+    for (const e of arr) (shouldPersist(e[0]) ? keep : drop).push(e);
+    for (const [path, m] of keep) meta.set(path, m);
+
+    // Best-effort: reclaim OPFS space from legacy node_modules blobs that are no
+    // longer referenced. Delete each distinct top-level node_modules subtree
+    // once, OFF the boot path (non-blocking) so it never delays serving syscalls.
+    const pruneRoots = new Set();
+    for (const [path] of drop) {
+      const i = path.indexOf("/node_modules");
+      if (i >= 0) pruneRoots.add(path.slice(0, i + "/node_modules".length));
+    }
+    if (pruneRoots.size) {
+      void (async () => {
+        for (const r of pruneRoots) await removePath(r);
+        manifestDirty = true;
+        try {
+          await writeManifest();
+          manifestDirty = false;
+        } catch {
+          /* a later drain will rewrite the manifest */
+        }
+      })();
+    }
 
     // Recreate in a safe order: dirs (shallow → deep), then files, then symlinks
     // (a symlink's target may live anywhere in the tree).
     const order = { dir: 0, file: 1, symlink: 2 };
-    const sorted = [...arr].sort((a, b) => {
+    const sorted = [...keep].sort((a, b) => {
       const ka = order[a[1].k] ?? 1;
       const kb = order[b[1].k] ?? 1;
       if (ka !== kb) return ka - kb;
