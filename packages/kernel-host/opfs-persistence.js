@@ -229,6 +229,12 @@ export async function createOpfsPersistence({ access, shouldPersist = () => true
     const total = sorted.length;
     let n = 0;
     if (typeof onProgress === "function") onProgress(0, total);
+    // Sequential replay. An earlier attempt to overlap the per-file OPFS reads
+    // with bounded concurrency stalled near the end of a large restore: opening
+    // many `createSyncAccessHandle`s at once runs into OPFS's exclusive-lock /
+    // handle-count limits and some acquisitions never settle, wedging boot. The
+    // durable speed-up for a big node_modules is the lockfile-keyed dependency
+    // cache (restore a single snapshot), not parallelizing this per-file loop.
     for (const [path, m] of sorted) {
       try {
         if (m.k === "dir") {
@@ -245,7 +251,7 @@ export async function createOpfsPersistence({ access, shouldPersist = () => true
         n++;
         // Report roughly every 5% (min every 200 entries) so a big node_modules
         // restore shows a moving count instead of a long silent stall.
-        if (typeof onProgress === "function" && (n % Math.max(200, Math.ceil(total / 20)) === 0))
+        if (typeof onProgress === "function" && n % Math.max(200, Math.ceil(total / 20)) === 0)
           onProgress(n, total);
       } catch {
         /* skip a corrupt entry, keep restoring the rest */

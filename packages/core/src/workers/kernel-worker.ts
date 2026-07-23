@@ -938,8 +938,9 @@ function defaultTermCwd() {
 // (host -> here -> FS worker) can reach it. Set in boot().
 let fsWorkerRef = null;
 // Whole-file lazy compression gate for the VFS, sourced from the page at boot
-// (init.compress) and relayed to the File System Worker. On by default; the page
-// sets it false only for ?compress=0.
+// (init.compress, the BootOptions.compress SDK flag) and relayed to the File
+// System Worker. On by default; a consumer sets it false only to trade memory
+// for a little less CPU.
 let vfsCompression = true;
 
 // A bound port isn't the same as a *serving* one: Vite 8 (rolldown) binds :port
@@ -969,7 +970,7 @@ async function waitServing(port, timeoutMs = 60000) {
 // the iframe's subresource fetches would race that cold optimize against the
 // Service Worker's 60 s timeout → a wall of `504 (Gateway Timeout)` on `/@vite/
 // client`, `/src/*`, and `/node_modules/.vite/deps/*` (only reproducible on a
-// cold `.vite` cache — which is exactly why `?reset` triggers it). So we prime
+// cold `.vite` cache — which is exactly why a fresh session / reset triggers it). So we prime
 // the server HERE, inside the kernel worker (no SW deadline): fetch the HTML, then
 // request its module entry, which forces the optimize to complete and `.vite/deps`
 // to be written. By the time the preview loads everything is warm and instant.
@@ -1060,6 +1061,7 @@ async function boot() {
   // doorbell wired at spawn.
   const t0 = Date.now();
   post("log", { line: "Booting Vivari…", dim: true });
+  post("boot-progress", { phase: "init" });
 
   // Kick off the one-time codec compile up front; it runs concurrently with the
   // workers below (we only need the Modules before the first process is spawned).
@@ -1089,6 +1091,13 @@ async function boot() {
       if (event.data.type === "ready") resolve();
       // The FS worker logs OPFS restore status; relay it to the host UI.
       else if (event.data.type === "log") post("log", event.data);
+      // Structured boot progress (OPFS restore done/total) — relay for the UI.
+      else if (event.data.type === "boot-progress")
+        post("boot-progress", {
+          phase: event.data.phase,
+          done: event.data.done,
+          total: event.data.total,
+        });
       // Diagnostic VFS-memory reply (off the sync SAB path) — resolve its waiter.
       else if (event.data.type === "fs-mem") {
         const p = memPending.get(event.data.id);
@@ -1142,6 +1151,9 @@ async function boot() {
   kernelFsRef = kernelFs;
   onKernelFsMessage = kernelFs.onMessage;
   post("log", { line: `  [boot] file system ready (+${Date.now() - t0}ms).`, dim: true });
+  // OPFS restore (the long pole) is done; the remaining steps before the UI
+  // unlocks (codec compile + kernel construction) are quick and indeterminate.
+  post("boot-progress", { phase: "finalize" });
 
   // [optimize] The pre-compiled codec Modules every Process Worker instantiates
   // from (compiled once above; may be null if the build/fetch failed).
@@ -1825,7 +1837,7 @@ self.onmessage = async (event) => {
   const m = event.data;
 
   if (m.type === "init") {
-    // Default on: only an explicit `compress: false` (?compress=0) disables it.
+    // Default on: only an explicit `compress: false` (BootOptions.compress) disables it.
     vfsCompression = m.compress !== false;
     boot().catch((err) => post("log", { line: "kernel worker boot failed: " + err, stream: "stderr" }));
     return;

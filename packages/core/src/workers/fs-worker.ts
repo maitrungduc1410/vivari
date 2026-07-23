@@ -298,6 +298,10 @@ async function createOpfsDepStorage() {
       const t0 = Date.now();
       let announced = false;
       const n = await persistence.restore((done, total) => {
+        // Structured progress for the host UI (relayed by the kernel worker as
+        // `boot-progress`). Always emitted — even for small projects — so a
+        // progress bar can fill and settle instead of never appearing.
+        post("boot-progress", { phase: "restore", done, total });
         if (total < 400) return; // small project: restore is instant, stay quiet
         if (!announced) {
           post("log", { line: `  [opfs] restoring saved project (${total} entries)…`, cls: "muted" });

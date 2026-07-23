@@ -197,9 +197,10 @@ export function isCrossOriginIsolated(): boolean {
 }
 
 /**
- * Wipe the OPFS-mirrored VFS before boot (clean slate). Returns whether anything
- * was removed. Studio calls this when the URL has `?reset`; SDK consumers can
- * call it directly to reset persisted state. Also drops the persistent dependency
+ * Wipe the OPFS-mirrored VFS (clean slate). Returns whether anything was
+ * removed. Studio calls this from its Home "Reset everything" button (after
+ * tearing down the worker so OPFS handles are released); SDK consumers can call
+ * it directly to reset persisted state. Also drops the persistent dependency
  * cache (node_modules snapshots keyed by lockfile) so a reset is a true clean
  * slate, not one that silently re-restores deps from a stale snapshot.
  */

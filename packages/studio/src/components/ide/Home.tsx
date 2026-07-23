@@ -6,12 +6,15 @@ import ArrowLeft from "~icons/lucide/arrow-left";
 import Trash from "~icons/lucide/trash-2";
 import FolderInput from "~icons/lucide/folder-input";
 import Github from "~icons/lucide/github";
+import Loader from "~icons/lucide/loader-circle";
+import RotateCcw from "~icons/lucide/rotate-ccw";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TEMPLATES, TEMPLATE_CATEGORIES, type TemplateCategory, type TemplateDef } from "@/vv/templates";
 import { TemplateIcon } from "./templateIcons";
@@ -33,6 +36,7 @@ export function HomeView() {
   const { c, snap } = useIde();
   const [blankOpen, setBlankOpen] = useState(false);
   const [templateOpen, setTemplateOpen] = useState(false);
+  const [resetOpen, setResetOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
 
   const onDrop = (e: React.DragEvent) => {
@@ -66,6 +70,20 @@ export function HomeView() {
           )}
         </div>
 
+        {/* Boot banner: kept mounted and collapsed smoothly (height + opacity)
+            once the kernel is ready, so the action grid glides into place instead
+            of jumping when it disappears. */}
+        <div
+          className={cn(
+            "grid transition-all duration-500 ease-out",
+            snap.kernelReady ? "mb-0 grid-rows-[0fr] opacity-0" : "mb-6 grid-rows-[1fr] opacity-100",
+          )}
+        >
+          <div className="overflow-hidden">
+            <BootStatus />
+          </div>
+        </div>
+
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <button
             onClick={() => setBlankOpen(true)}
@@ -91,38 +109,37 @@ export function HomeView() {
               <div className="text-sm text-muted-foreground">React, Vue, Next.js, Express, Three.js, WebSocket…</div>
             </div>
           </button>
-          <button
+          <ImportCard
+            icon={FolderInput}
+            title="Import a folder"
+            desc="Open a local folder — or drop one here — as a new project."
             onClick={() => c.importFolderViaPicker()}
             disabled={!snap.kernelReady}
-            className="group flex flex-col items-start gap-3 rounded-xl border bg-card p-5 text-left transition-colors hover:border-primary/60 hover:bg-accent/40 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            <div className="flex size-11 items-center justify-center rounded-lg bg-primary/10 text-primary">
-              <FolderInput className="size-6" />
-            </div>
-            <div>
-              <div className="font-medium">Import a folder</div>
-              <div className="text-sm text-muted-foreground">Open a local folder — or drop one here — as a new project.</div>
-            </div>
-          </button>
-          <button
+          />
+          <ImportCard
+            icon={Github}
+            title="Import from GitHub or npm"
+            desc="Fetch a public repo or an npm package as a new project."
             onClick={() => c.openImportRemote()}
             disabled={!snap.kernelReady}
-            className="group flex flex-col items-start gap-3 rounded-xl border bg-card p-5 text-left transition-colors hover:border-primary/60 hover:bg-accent/40 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            <div className="flex size-11 items-center justify-center rounded-lg bg-primary/10 text-primary">
-              <Github className="size-6" />
-            </div>
-            <div>
-              <div className="font-medium">Import from GitHub or npm</div>
-              <div className="text-sm text-muted-foreground">Fetch a public repo or an npm package as a new project.</div>
-            </div>
-          </button>
+          />
         </div>
 
         <div className="mt-10">
-          <div className="mb-3 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-            <Clock className="size-3.5" /> Recent projects
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              <Clock className="size-3.5" /> Recent projects
+            </div>
+            <button
+              onClick={() => setResetOpen(true)}
+              className="inline-flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-destructive"
+            >
+              <RotateCcw className="size-3.5" /> Reset everything
+            </button>
           </div>
+          <p className="mb-3 text-xs text-muted-foreground">
+            Your files and installed dependencies are saved in this browser across reloads.
+          </p>
           {snap.recentProjects.length === 0 ? (
             <div className="rounded-lg border border-dashed p-6 text-center text-sm text-muted-foreground">
               No projects yet. Create one above to get started.
@@ -139,7 +156,146 @@ export function HomeView() {
 
       <NewBlankDialog open={blankOpen} onOpenChange={setBlankOpen} />
       <NewTemplateDialog open={templateOpen} onOpenChange={setTemplateOpen} />
+      <ResetEverythingDialog open={resetOpen} onOpenChange={setResetOpen} />
     </div>
+  );
+}
+
+// An action card whose click is gated on the kernel being ready. While disabled
+// it stays hoverable (aria-disabled rather than the native `disabled` attribute,
+// which would swallow hover events) so a tooltip can explain WHY it's disabled —
+// the project is still being restored. The tooltip is only rendered while disabled.
+function ImportCard({
+  icon: Icon,
+  title,
+  desc,
+  onClick,
+  disabled,
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  title: string;
+  desc: string;
+  onClick: () => void;
+  disabled: boolean;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            onClick={() => {
+              if (!disabled) onClick();
+            }}
+            aria-disabled={disabled}
+            className={cn(
+              "group flex flex-col items-start gap-3 rounded-xl border bg-card p-5 text-left transition-colors",
+              disabled ? "cursor-not-allowed opacity-60" : "hover:border-primary/60 hover:bg-accent/40",
+            )}
+          />
+        }
+      >
+        <div className="flex size-11 items-center justify-center rounded-lg bg-primary/10 text-primary">
+          <Icon className="size-6" />
+        </div>
+        <div>
+          <div className="font-medium">{title}</div>
+          <div className="text-sm text-muted-foreground">{desc}</div>
+        </div>
+      </TooltipTrigger>
+      {disabled && (
+        <TooltipContent>Available once your saved project finishes restoring.</TooltipContent>
+      )}
+    </Tooltip>
+  );
+}
+
+// Cold-boot progress shown on Home until the kernel + VFS are ready. Restoring a
+// large saved project from OPFS can take many seconds; this replaces the silent
+// disabled-buttons state with a labeled, (for the restore phase) determinate bar.
+function bootPhaseLabel(phase: string): string {
+  switch (phase) {
+    case "restore":
+      return "Restoring your saved project";
+    case "finalize":
+      return "Finalizing runtime";
+    default:
+      return "Starting runtime";
+  }
+}
+
+function BootStatus() {
+  const { snap } = useIde();
+  const determinate = snap.bootPhase === "restore" && snap.bootTotal > 0;
+  const pct = determinate
+    ? Math.min(100, Math.round((snap.bootDone / snap.bootTotal) * 100))
+    : 0;
+  return (
+    <div className="mb-6 rounded-xl border bg-card p-4">
+      <div className="flex items-start gap-3">
+        <Loader className="mt-0.5 size-5 shrink-0 animate-spin text-primary" />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-2">
+            <span className="truncate text-sm font-medium">{bootPhaseLabel(snap.bootPhase)}…</span>
+            {determinate && (
+              <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+                {snap.bootDone.toLocaleString()} / {snap.bootTotal.toLocaleString()} ({pct}%)
+              </span>
+            )}
+          </div>
+          <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-accent">
+            {determinate ? (
+              <div
+                className="h-full rounded-full bg-primary transition-[width] duration-200"
+                style={{ width: `${pct}%` }}
+              />
+            ) : (
+              <div className="h-full w-1/3 animate-pulse rounded-full bg-primary/70" />
+            )}
+          </div>
+          <div className="mt-1.5 text-xs text-muted-foreground">
+            Setting up the in-browser runtime — import and project actions unlock in a moment.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ResetEverythingDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
+  const { c } = useIde();
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (open) setBusy(false);
+  }, [open]);
+
+  const confirmReset = async () => {
+    setBusy(true);
+    // resetEverything() tears down the worker, wipes OPFS, and reloads the page,
+    // so control does not return here on success.
+    await c.resetEverything();
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Reset everything?</DialogTitle>
+          <DialogDescription>
+            This permanently deletes all saved files and cached dependencies from this browser,
+            then reloads Studio with a clean slate. This cannot be undone.
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
+            Cancel
+          </Button>
+          <Button variant="destructive" onClick={() => void confirmReset()} disabled={busy}>
+            {busy ? "Resetting…" : "Reset everything"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

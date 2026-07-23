@@ -51,7 +51,18 @@ export function CommandPalette() {
       { label: "Clear Active Terminal", icon: Eraser, run: () => c.clearActiveTerminal() },
       { label: "Reload Preview", icon: RefreshCw, run: () => c.reloadPreview() },
       { label: "Measure Memory", icon: Gauge, run: () => void c.measureMemory() },
-      { label: "Reset & Reload (wipe VFS)", icon: RotateCcw, run: () => c.resetAndReload() },
+      {
+        label: "Reset Everything (wipe files + caches)",
+        icon: RotateCcw,
+        run: () => {
+          if (
+            confirm(
+              "Reset everything? This permanently deletes all saved files and cached dependencies, then reloads.",
+            )
+          )
+            void c.resetEverything();
+        },
+      },
     ],
     [c],
   );

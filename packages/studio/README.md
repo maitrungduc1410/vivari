@@ -26,12 +26,13 @@ on `/sw.js` (the preview proxy needs root scope).
 
 ## How it fits together
 
-- `src/vv/kernel.ts` — a thin extension of `@vivari/core`'s `KernelBridge`, which
-  spawns the kernel worker (`packages/core/src/workers/kernel-worker.ts`, bundled
+- `src/vv/kernel.ts` — a thin re-export of `@vivari/core`'s `KernelBridge` (which
+  spawns the kernel worker `packages/core/src/workers/kernel-worker.ts`, bundled
   by Vite along with its nested `fs` / `fetcher` / `process` workers and the
   `packages/{vfs,codec,crypto}/pkg` wasm), registers the preview Service Worker,
-  and relays its HTTP requests into the VM. Studio adds only the `?compress=0` /
-  `?reset` URL toggles.
+  and relays its HTTP requests into the VM) plus `resetVfs`. VFS whole-file lazy
+  compression is always on; a clean slate is available from the Home screen's
+  "Reset everything" button (wipes the OPFS-mirrored VFS + dependency cache).
 - `src/vv/controller.ts` — `IdeController`: the imperative core (Monaco, xterm
   terminals, the demo "Run" flow via `VV_RUN`, preview) exposed as an external
   store that React reads via `useSyncExternalStore`.

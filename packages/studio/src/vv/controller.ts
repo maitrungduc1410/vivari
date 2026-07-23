@@ -16,7 +16,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { toast } from "sonner";
 import type * as Monaco from "monaco-editor";
-import { KernelBridge } from "./kernel";
+import { KernelBridge, resetVfs } from "./kernel";
 import { getTemplate, type TemplateManifest } from "./templates";
 import { createZip, encodeShare, decodeShare } from "../../../kernel-host/archive.js";
 import {
@@ -110,6 +110,12 @@ export interface SearchDone {
 export interface IdeSnapshot {
   booted: boolean;
   kernelReady: boolean; // kernel + VFS up (can create/open projects) — earlier than `booted`
+  // Cold-boot progress shown on Home until `kernelReady`. `bootPhase` is one of
+  // "init" | "restore" | "finalize" (""=not started); during "restore",
+  // bootDone/bootTotal drive a determinate progress bar (OPFS re-hydration).
+  bootPhase: string;
+  bootDone: number;
+  bootTotal: number;
   status: string;
   cwd: string;
   view: "home" | "workspace";
@@ -392,6 +398,9 @@ export class IdeController {
   private snap: IdeSnapshot = {
     booted: false,
     kernelReady: false,
+    bootPhase: "init",
+    bootDone: 0,
+    bootTotal: 0,
     status: "booting…",
     cwd: "",
     // A shared link lands straight on the (loading) workspace, never Home — so the
@@ -1477,6 +1486,14 @@ export class IdeController {
 
   // Open a previously-created project from the Home recent list.
   async openProject(meta: ProjectMeta) {
+    // Until the kernel is ready the VFS hasn't finished restoring from OPFS, so
+    // the project's files legitimately aren't on disk *yet*. Don't mistake that
+    // for a deleted project (which would wrongly drop it from the recent list) —
+    // just tell the user to wait for the restore to finish.
+    if (!this.snap.kernelReady) {
+      toast.info("Still restoring your saved project — please wait until Studio finishes loading, then try again.");
+      return;
+    }
     const root = normDir(meta.rootPath);
     const info = await this.pathInfo(root);
     if (!info.exists) {
@@ -2355,8 +2372,22 @@ export class IdeController {
   closePalette() {
     this.set({ paletteOpen: false });
   }
-  resetAndReload() {
-    location.href = location.pathname + "?reset";
+  // Force a clean slate: wipe the OPFS-mirrored VFS + the dependency cache, then
+  // reload. The FS worker holds OPFS sync-access handles, so we tear the worker
+  // down FIRST (releasing them) — otherwise removeEntry() on `vv-vfs` can throw
+  // NoModificationAllowedError. Best-effort throughout; we reload regardless.
+  async resetEverything() {
+    try {
+      this.bridge.destroy();
+    } catch {
+      /* worker already gone */
+    }
+    try {
+      await resetVfs();
+    } catch {
+      /* OPFS unavailable / nothing persisted — reload into a fresh session anyway */
+    }
+    location.reload();
   }
 
   // ── memory diagnostics ─────────────────────────────────────────────────────
@@ -2469,9 +2500,18 @@ export class IdeController {
       const dim = (m.dim as boolean) || m.cls === "muted";
       this.consoleLine(m.line as string, stderr ? "31" : dim ? "90" : undefined);
     });
+    // Cold-boot progress (relayed from the FS worker's OPFS restore + kernel
+    // phase markers). Drives the Home boot indicator until `kernelReady`.
+    b.on("boot-progress", (m) => {
+      this.set({
+        bootPhase: (m.phase as string) || "",
+        bootDone: (m.done as number) ?? 0,
+        bootTotal: (m.total as number) ?? 0,
+      });
+    });
     // The kernel + VFS are up (before the PM tarballs finish loading) — the Home
     // screen can create/open projects now, so don't make the user wait for `ready`.
-    b.on("kernel-online", () => this.set({ kernelReady: true }));
+    b.on("kernel-online", () => this.set({ kernelReady: true, bootPhase: "" }));
     b.on("ready", () => {
       this.consoleLine("Kernel ready.", "32");
       this.set({ booted: true, kernelReady: true, status: "ready — create or open a project" });
