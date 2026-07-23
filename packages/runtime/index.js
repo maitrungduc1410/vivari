@@ -1,6 +1,6 @@
 // The Node runtime shim. Given a shared-memory channel to the kernel, it wires
 // up core builtins, globals, and a CommonJS module system, then runs a program
-// exactly like `node <entry>` would — synchronously, inside a worker.
+// exactly like `node <entry>` would - synchronously, inside a worker.
 
 import { createSyscalls } from "./fs-client.js";
 import { createEventLoop } from "./loop.js";
@@ -29,9 +29,9 @@ function createConsole(process, util) {
       if (!cond) toErr("Assertion failed:", ...a);
     },
     // no-op timing/grouping/counting helpers. Kept complete (matching Node's
-    // Console surface) because some libraries bind every method up front — e.g.
+    // Console surface) because some libraries bind every method up front - e.g.
     // @edge-runtime/primitives (pulled by Next.js) does
-    // `console.count.bind(console)`, `console.timeLog.bind(console)`, … at load,
+    // `console.count.bind(console)`, `console.timeLog.bind(console)`, ... at load,
     // which throws "reading 'bind' of undefined" if any method is missing.
     time() {},
     timeEnd() {},
@@ -69,12 +69,12 @@ export function createRuntime({
   // in the browser. Delegated to by internal/async_hooks for cross-await context
   // propagation (Next.js App Router / RSC). See internal-binding.js.
   hostAsyncHooks = null,
-  // Host worker_threads.markAsUntransferable (Node worker only) — used to protect the
+  // Host worker_threads.markAsUntransferable (Node worker only) - used to protect the
   // Buffer pool's ArrayBuffer from being detached by a guest transferList. Null in
   // the browser (where the buffer.js detached-pool guard is the fallback).
   hostMarkUntransferable = null,
   // Worker threads (#16 stage 2b). `postRaw(msg, transfer)` sends a message to the
-  // kernel with transferables (MessagePorts) — the shell provides it. `thread`
+  // kernel with transferables (MessagePorts) - the shell provides it. `thread`
   // carries this worker's identity when it *is* a spawned thread.
   postRaw = null,
   thread = null,
@@ -185,7 +185,7 @@ export function createRuntime({
 
   // process.kill(pid, signal): send a signal to another process via the kernel,
   // the same path child.kill() takes. Tools that manage their own children by pid
-  // rely on this — NestJS's watch mode kills the app child with process.kill()
+  // rely on this - NestJS's watch mode kills the app child with process.kill()
   // before respawning it on each recompile. signal 0 is an existence probe.
   process.kill = (targetPid, signal = "SIGTERM") => {
     syscalls.kill(targetPid | 0, signal);
@@ -334,9 +334,9 @@ export function createRuntime({
 
   // ---- fork IPC (child side): process.send / 'message' / disconnect ----------
   // A forked child (child_process.fork) runs as a normal main-thread process, but
-  // gets a dedicated IPC MessagePort to its parent. Expose Node's fork surface —
+  // gets a dedicated IPC MessagePort to its parent. Expose Node's fork surface -
   // process.send(), 'message' events, process.connected / process.channel /
-  // process.disconnect() — bridged onto that port. Next.js's `next dev` forks its
+  // process.disconnect() - bridged onto that port. Next.js's `next dev` forks its
   // dev server and gates the whole boot on `process.send` existing, then hands
   // over start options across this channel, so this is what unlocks Next dev.
   if (ipcPort) {
@@ -401,7 +401,7 @@ export function createRuntime({
   // (`Object.keys(process.binding('natives'))`), a `constants` polyfill
   // (`process.binding('constants')`), and a `util` legacy path. Delegate to the
   // same internalBinding seam the vendored Node lib uses; `natives` (source
-  // strings — we have none) becomes a name→'' map so `Object.keys` yields the
+  // strings - we have none) becomes a name→'' map so `Object.keys` yields the
   // core module list. Unknown names return {} rather than throwing.
   {
     const NATIVE_MODULE_NAMES = [
@@ -470,12 +470,20 @@ export function createRuntime({
     return stdin;
   };
   // Node's TTY exposes setRawMode(bool); we only record it (there's no cooked-mode
-  // line discipline below us — the terminal/line editor lives in guest code).
+  // line discipline below us - the terminal/line editor lives in guest code).
   stdin.setRawMode = (mode) => {
     stdin.isRaw = !!mode;
     return stdin;
   };
   process.stdin = stdin;
+  // At EOF, release stdin's loop-ref. Attaching a 'data' listener resumes the
+  // stream (setStdinRef(true)), which keeps the loop alive like an open TTY so an
+  // idle shell/REPL waits for input. But once stdin ends (Ctrl+D, a closed pipe),
+  // a process that only consumes stdin - e.g. a pipeline stage `... | node x.js`
+  // that reads to 'end' and produces its output - must be free to go quiescent and
+  // exit instead of hanging forever. Node unrefs the stdin handle at EOF; we mirror
+  // that here. Other liveness (timers, servers, children) still keeps it alive.
+  stdin.on("end", () => setStdinRef(false));
   // Queue + drain: dispatchStdin (called from the worker's onmessage, off-turn)
   // enqueues; drainStdin (a loop turn) pushes into the Readable so 'data' fires in
   // a controlled turn. A null chunk is stdin EOF (Ctrl+D / closed terminal).
@@ -512,7 +520,7 @@ export function createRuntime({
   // ChildProcess registry (fork rides the worker_threads path, not spawnAsync).
   const forkChildren = new Map(); // childPid -> { onOut(chunk), onErr(chunk) }
 
-  // child_process.fork(modulePath[, args][, options]) — a forked child is a
+  // child_process.fork(modulePath[, args][, options]) - a forked child is a
   // separate process running <modulePath> with a bidirectional IPC channel. We
   // build it on the worker_threads spawn plumbing (same kernel spawn + lifecycle
   // + MessageChannel), but boot the child in fork mode so it gets process.send /
@@ -528,7 +536,7 @@ export function createRuntime({
     child.exitCode = null;
     child.signalCode = null;
     child.killed = false;
-    // fork stdio: default (silent:false) is 'inherit' — the child's output shows on
+    // fork stdio: default (silent:false) is 'inherit' - the child's output shows on
     // OUR std streams (which bubble to the terminal). silent:true (or stdio 'pipe')
     // pipes it onto child.stdout/child.stderr Readables instead.
     const stdio = options.stdio;
@@ -606,7 +614,7 @@ export function createRuntime({
   // the kernel. This is the cross-VM seam: the kernel/SW protocol is unchanged
   // ({port,method,url,headers,body} in -> {status,headers,body} out), but Node's
   // own http parses/serves it. Bodies cross through the kernel as JSON strings, so
-  // textual responses go as utf8 and *binary* responses (images, fonts, wasm — the
+  // textual responses go as utf8 and *binary* responses (images, fonts, wasm - the
   // Vite dev server serves these) go base64-encoded with `bodyEncoding:'base64'`
   // so the Service Worker can reconstruct the exact bytes (roadmap #19 stage A).
   const HOP_BY_HOP = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"];
@@ -926,9 +934,9 @@ export function createRuntime({
   // Host alias for the *global* fetch(). Unlike http/https (which egress via
   // __ocfetch -> the Fetcher Worker, where rewrite() already maps the alias), the
   // global fetch is the host realm's real fetch used directly, so it needs its own
-  // rewrite. Map `http://host.vivari.internal:<port>/…` to the studio's own
+  // rewrite. Map `http://host.vivari.internal:<port>/...` to the studio's own
   // hostname (this realm is a Worker on the studio origin, so location.hostname IS
-  // the host) — reaching a service on the HOST machine when the studio is served
+  // the host) - reaching a service on the HOST machine when the studio is served
   // locally. Headless (no browser realm) has no location and no-ops.
   const HOST_ALIAS = "host.vivari.internal";
   const rewriteHostAlias = (input) => {
@@ -942,7 +950,7 @@ export function createRuntime({
           return u.toString();
         }
       } catch {
-        /* not an absolute URL — leave untouched */
+        /* not an absolute URL - leave untouched */
       }
       return s;
     };
@@ -974,7 +982,7 @@ export function createRuntime({
   }
   // A WHATWG ReadableStream reader's read()/cancel() promises also settle off our
   // loop. Consuming a `fetch()` response body incrementally (rather than
-  // buffering it whole via Response.arrayBuffer) drives these — e.g. corepack
+  // buffering it whole via Response.arrayBuffer) drives these - e.g. corepack
   // streams a package-manager tarball through Readable.fromWeb (see
   // internal/webstreams/adapters.js), which pumps one reader.read() per chunk.
   // Without refing the loop it would exit mid-download.
@@ -987,7 +995,7 @@ export function createRuntime({
   }
 
   // Exit-sentinel safety net. process.exit() throws a sentinel that the loop's
-  // runCallback catches — but when exit() is called from a raw Promise microtask
+  // runCallback catches - but when exit() is called from a raw Promise microtask
   // (async continuation / .then / .catch / queueMicrotask) the throw escapes the
   // loop and would crash the worker realm (Node aborts on an unhandled rejection;
   // browsers fire 'error'/'unhandledrejection'). exit() already flagged the loop
@@ -1022,7 +1030,7 @@ export function createRuntime({
   }
   // Route user-facing timers through our event loop so ordering is Node-correct
   // and callbacks fire even while a server is running (the old host timers never
-  // fired — the synchronous accept loop starved them).
+  // fired - the synchronous accept loop starved them).
   globalThis.setTimeout = loop.setTimeout;
   globalThis.clearTimeout = loop.clearTimeout;
   globalThis.setInterval = loop.setInterval;
@@ -1041,9 +1049,9 @@ export function createRuntime({
   // the npm client (#10) will build on; it'll get a proper wrapper then.
   globalThis.__ocfetch = (url, opts) => syscalls.fetch(String(url), opts);
 
-  // Async, non-blocking outbound fetch (parallel downloads). Unlike __ocfetch —
+  // Async, non-blocking outbound fetch (parallel downloads). Unlike __ocfetch -
   // which parks the whole worker on Atomics.wait, forcing a single process's
-  // registry requests to run one-at-a-time — this hands the request to the kernel
+  // registry requests to run one-at-a-time - this hands the request to the kernel
   // and returns a Promise that resolves when the kernel posts the result back
   // ({type:'fetch-done'} -> dispatchFetch). The npm/yarn/pnpm http client
   // (lib/https.js) uses this so many packuments/tarballs download concurrently.
@@ -1068,7 +1076,7 @@ export function createRuntime({
   // External delivery from the kernel: a { type:'fetch-done', fetchId, ... }
   // reply. Settle the matching pending promise inside a loop turn (nextTick), so
   // a process.exit() from the continuation is honoured and microtasks flush in a
-  // controlled order — the same discipline the fork IPC / stdin deliveries use.
+  // controlled order - the same discipline the fork IPC / stdin deliveries use.
   const dispatchFetch = (msg) => {
     const p = msg && msg.fetchId != null ? pendingFetches.get(msg.fetchId) : undefined;
     if (!p) return;
@@ -1116,7 +1124,7 @@ export function createRuntime({
   const moduleSystem = createModuleSystem({ fs, path, builtins, process, globals, nodeModules });
 
   // Dynamic-import escape hatch. Libraries that ship dual ESM/CJS sometimes build
-  // a dynamic import at runtime to dodge transpiler rewrites — piscina & tinypool
+  // a dynamic import at runtime to dodge transpiler rewrites - piscina & tinypool
   // (Angular's parallel compiler, vitest's worker pool) do
   // `new Function('s', 'return import(s)')`. The Function constructor compiles that
   // in the host realm, so the inner import() escapes the sandbox and can't see our
@@ -1129,13 +1137,13 @@ export function createRuntime({
   // fs, BEFORE any Go/wasm toolchain loads. Multiple Go tools drive their wasm through
   // the global Go glue (`wasm_exec`), which installs an fs shim like:
   //   globalThis.fs || Object.defineProperty(globalThis, "fs", { value: nodeFs })
-  // That defineProperty defaults to writable:false, configurable:false — so the FIRST
+  // That defineProperty defaults to writable:false, configurable:false - so the FIRST
   // such tool LOCKS globalThis.fs. @astrojs/compiler (Go wasm that compiles .astro
   // files) does exactly this at import time; if it wins the race, esbuild-wasm's
   // in-process patch (esbuild-inproc-patch.js) can no longer do `globalThis.fs = __ocFs`
-  // to multiplex its stdio fds — it throws "Cannot assign to read only property 'fs'"
+  // to multiplex its stdio fds - it throws "Cannot assign to read only property 'fs'"
   // and Vite's dep optimize dies. Seating a writable value here makes every tool's
-  // `globalThis.fs || …` short-circuit (never locking it) while esbuild/tsgo can still
+  // `globalThis.fs || ...` short-circuit (never locking it) while esbuild/tsgo can still
   // reassign it for the duration of their own run. A plain assignment gives a
   // writable+configurable own data property, which is exactly what we want.
   try {
@@ -1143,7 +1151,7 @@ export function createRuntime({
       globalThis.fs = vvRootRequire("fs");
     }
   } catch {
-    /* fs unavailable this early — tools will still install their own */
+    /* fs unavailable this early - tools will still install their own */
   }
 
   globalThis.__ocImport = (spec) =>
@@ -1153,8 +1161,8 @@ export function createRuntime({
       const ns = Object.create(null);
       // Mirror Node's CJS→ESM interop: named exports are the module.exports' own
       // enumerable keys, PLUS a `default`. Crucially this must also apply when the
-      // export is a FUNCTION with statics hung off it — e.g. the `module` builtin
-      // is the `Module` class carrying `createRequire`/`builtinModules`/… as
+      // export is a FUNCTION with statics hung off it - e.g. the `module` builtin
+      // is the `Module` class carrying `createRequire`/`builtinModules`/... as
       // statics, and PGlite's Emscripten glue does
       // `const { createRequire } = await import('module')` (was undefined here,
       // surfacing as "e is not a function" deep in PGlite.create()).
@@ -1169,7 +1177,7 @@ export function createRuntime({
     const OcFunction = function Function(...args) {
       if (args.length) {
         const body = args[args.length - 1];
-        // Only touch bodies that actually contain a dynamic import (cheap guard —
+        // Only touch bodies that actually contain a dynamic import (cheap guard -
         // virtually every `new Function` body doesn't), then rewrite precisely.
         if (typeof body === "string" && body.includes("import(")) {
           const rewritten = rewriteDynamicImportToGlobal(body);
@@ -1186,8 +1194,8 @@ export function createRuntime({
 
   // Node's `module` builtin default export IS the Module class, with the
   // namespace helpers hung off it as statics (createRequire, builtinModules,
-  // isBuiltin, runMain, …) and a self-reference `Module.Module`. Attaching them
-  // to the constructor — rather than returning a separate plain object — is what
+  // isBuiltin, runMain, ...) and a self-reference `Module.Module`. Attaching them
+  // to the constructor - rather than returning a separate plain object - is what
   // lets `const { Module } = require('module')`, `require('module') === Module`,
   // and monkey-patching `Module.prototype`/`_load`/`_extensions` all behave.
   const Module = moduleSystem.Module;
@@ -1206,13 +1214,13 @@ export function createRuntime({
   Module.enableCompileCache = () => ({ status: 0 });
   Module.flushCompileCache = () => {};
   Module.getCompileCacheDir = () => null;
-  // registerHooks/register (ESM loader hooks) — accept & ignore so tools that
+  // registerHooks/register (ESM loader hooks) - accept & ignore so tools that
   // call them at startup (tsx, ts-node/esm) don't crash; our loader is CJS-based.
   Module.register = () => undefined;
   Module.registerHooks = () => ({ deregister() {} });
   // Source-map lookups: no source-map registry in the sandbox. Return undefined
-  // (Node's contract for "no map found") so callers that probe error stacks — e.g.
-  // Next.js's dev overlay — get a clean miss instead of a TypeError.
+  // (Node's contract for "no map found") so callers that probe error stacks - e.g.
+  // Next.js's dev overlay - get a clean miss instead of a TypeError.
   Module.findSourceMap = () => undefined;
   Module.SourceMap = class SourceMap {
     constructor(payload) { this.payload = payload; }
@@ -1231,12 +1239,12 @@ export function createRuntime({
     wake: loop.wakeNet,
     /** Diagnostic: this process's own retention stats for the "Measure Memory"
      * per-PID breakdown. `modules` is how many files the guest module cache
-     * holds (our load-once/retain-forever cache — the main runtime-side term);
+     * holds (our load-once/retain-forever cache - the main runtime-side term);
      * `esbuildInproc` flags a resident esbuild Go wasm service. */
     memStats: () => ({
       modules: Object.keys(moduleSystem.cache).length,
       esbuildInproc: isEsbuildInprocActive(),
-      // Bytes of the in-process esbuild Go wasm heap (0 if esbuild isn't here) —
+      // Bytes of the in-process esbuild Go wasm heap (0 if esbuild isn't here) -
       // attributes a concrete slice of this process's footprint.
       esbuildBytes: esbuildWasmBytes(),
     }),
@@ -1273,7 +1281,7 @@ export function createRuntime({
      * ({type:'fetch-done', fetchId, ok, meta|error}). Parallel downloads. */
     dispatchFetch: (msg) => dispatchFetch(msg),
     /** External delivery from the kernel: an interactive stdin chunk for THIS
-     * process ({type:'stdin', chunk} — chunk null = EOF). Feeds process.stdin. */
+     * process ({type:'stdin', chunk} - chunk null = EOF). Feeds process.stdin. */
     dispatchStdin: (msg) => dispatchStdin(msg),
     /**
      * Run an entry file like `node <entry>`, then drive the event loop until it
@@ -1283,7 +1291,7 @@ export function createRuntime({
      */
     async run(entry) {
       // Node fires a single synchronous 'exit' event with the final code right
-      // before the process goes away — tools flush buffered output/logs there
+      // before the process goes away - tools flush buffered output/logs there
       // (npm's exit-handler). Emit it once across every exit path below. A
       // listener may itself call process.exit() (→ throws the sentinel); we're
       // already exiting, so swallow it.
@@ -1295,7 +1303,7 @@ export function createRuntime({
           try {
             process.emit("exit", code);
           } catch {
-            /* a listener called process.exit() — the sentinel is expected */
+            /* a listener called process.exit() - the sentinel is expected */
           }
         }
         return code;
@@ -1310,7 +1318,7 @@ export function createRuntime({
         throw err;
       }
       // A top-level-await entry evaluates to a Promise. Do NOT block on it before
-      // driving the loop — its awaits may depend on timers/microtasks the loop
+      // driving the loop - its awaits may depend on timers/microtasks the loop
       // pumps, so awaiting here would deadlock. Let it settle inside drive() and
       // just surface a process.exit() sentinel or an uncaught error from it.
       if (started && typeof started.then === "function") {

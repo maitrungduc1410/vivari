@@ -83,16 +83,34 @@ child.on('close', (code) => process.exit(code | 0));
   cat: `
 const fs = require('fs');
 const path = require('path');
+const files = process.argv.slice(2);
 let rc = 0;
-for (const a of process.argv.slice(2)) {
-  try {
-    process.stdout.write(fs.readFileSync(path.resolve(process.cwd(), a), 'utf8'));
-  } catch (e) {
-    process.stderr.write('cat: ' + a + ': ' + (e.code || e.message) + '\\n');
-    rc = 1;
-  }
+function readStdin() {
+  return new Promise((resolve) => {
+    const chunks = [];
+    process.stdin.on('data', (c) => chunks.push(typeof c === 'string' ? Buffer.from(c) : c));
+    process.stdin.on('end', () => resolve(Buffer.concat(chunks)));
+  });
 }
-process.exit(rc);
+async function main() {
+  // No file operands (or '-') => copy stdin to stdout, the standard cat behaviour
+  // a pipeline like \`echo hi | cat\` depends on.
+  if (!files.length) {
+    process.stdout.write(await readStdin());
+  } else {
+    for (const a of files) {
+      if (a === '-') { process.stdout.write(await readStdin()); continue; }
+      try {
+        process.stdout.write(fs.readFileSync(path.resolve(process.cwd(), a)));
+      } catch (e) {
+        process.stderr.write('cat: ' + a + ': ' + (e.code || e.message) + '\\n');
+        rc = 1;
+      }
+    }
+  }
+  process.exit(rc);
+}
+main();
 `,
 
   ls: `
