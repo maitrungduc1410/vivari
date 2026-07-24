@@ -43,6 +43,19 @@ export const NATIVE_WASM_ALIASES = {
   // Rollup's native binary (@rollup/rollup-<platform>, SWC-based) has no wasm32
   // build; @rollup/wasm-node is Rollup's official WASM build, released in lockstep.
   rollup: "@rollup/wasm-node",
+  // lightningcss ships a native binary (lightningcss-<platform>.node) with no
+  // wasm32 optional build, so a require('lightningcss') dies looking for the
+  // missing .node. lightningcss-wasm is Parcel's official WASM build, published
+  // in lockstep (identical version numbers). Its node+require export
+  // (wasm-node.cjs) instantiates the wasm SYNCHRONOUSLY at load
+  // (new WebAssembly.Module(fs.readFileSync('lightningcss_node.wasm')), init() is
+  // a no-op) and re-exports the full native surface (transform / bundle /
+  // Features / browserslistToTargets / composeVisitors), and module.js already
+  // picks node+require -> wasm-node.cjs, so @tailwindcss/node's synchronous
+  // require('lightningcss') works unchanged — no in-process adapter needed. This
+  // is what unblocks Tailwind v4 (and Vite's css.transformer:'lightningcss')
+  // in-VM. Gated by scripts/spike-tailwind.mjs.
+  lightningcss: "lightningcss-wasm",
 };
 
 /**

@@ -4700,6 +4700,510 @@ code {
   };
 }
 
+// ── Tailwind CSS + shadcn/ui (React) ─────────────────────────────────────────
+// React + Vite + Tailwind CSS v4 via the first-class `@tailwindcss/vite` plugin,
+// plus a shadcn/ui-style Button: the `cn()` helper (clsx + tailwind-merge) and a
+// `class-variance-authority` variant recipe. This is the flavor `npx shadcn add`
+// produces, vendored so creation is instant and offline.
+//
+// Tailwind v4 runs in-VM because the runtime aliases the two native addons it
+// reaches for: `lightningcss` -> `lightningcss-wasm` (NATIVE_WASM_ALIASES in
+// packages/runtime/toolchain-shims.js — its node/require build sync-inits the
+// wasm and exposes the native surface), and `@tailwindcss/oxide` resolves via its
+// own `@tailwindcss/oxide-wasm32-wasi` optional dep (auto-selected by the in-VM
+// npm's wasm32 platform gating). No tailwind.config / postcss.config needed: v4
+// puts theme + content in src/index.css via @import/@theme.
+function tailwindTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "tailwind",
+      framework: "tailwind",
+      icon: "tailwind",
+      category: "Frontend",
+      name: "Tailwind + shadcn/ui",
+      language: "TypeScript",
+      description: "React + Vite + Tailwind CSS v4 with shadcn/ui-style components",
+      port: 5173,
+      openPath: "/",
+      entry: "src/App.tsx",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      // vite.config.js is loaded natively like every other Vite template; the
+      // Tailwind plugin does its CSS work through lightningcss-wasm (aliased).
+      dev: VITE_DEV,
+      // Graduated: proven in-VM by scripts/spike-tailwind.mjs (lightningcss-wasm
+      // alias + @tailwindcss/oxide-wasm32-wasi CSS generation, green in CI).
+    },
+    files: {
+      "package.json": `{
+  "name": "tailwind-shadcn",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.475.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tailwind-merge": "^3.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^8.0.0"
+  }
+}
+`,
+      "vite.config.js": `import { fileURLToPath, URL } from 'node:url'
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
+
+// Tailwind v4 is a first-class Vite plugin — no postcss.config / tailwind.config
+// file needed; theme + content live in src/index.css via @import/@theme.
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+  // shadcn/ui uses the "@/..." alias; mirror the tsconfig paths for Vite.
+  resolve: {
+    alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
+  },
+})
+`,
+      "index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tailwind + shadcn/ui</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+`,
+      "src/index.css": `@import "tailwindcss";
+
+/* shadcn/ui design tokens (a trimmed slate theme). Reference them from Tailwind
+   utilities like bg-background / text-foreground / border-border. */
+@theme {
+  --color-background: #ffffff;
+  --color-foreground: #0f172a;
+  --color-primary: #0f172a;
+  --color-primary-foreground: #f8fafc;
+  --color-muted: #f1f5f9;
+  --color-muted-foreground: #64748b;
+  --color-border: #e2e8f0;
+}
+`,
+      "src/lib/utils.ts": `import { clsx, type ClassValue } from 'clsx'
+import { twMerge } from 'tailwind-merge'
+
+// The shadcn/ui class-merge helper: dedupe/override conflicting Tailwind classes.
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+`,
+      "src/components/ui/button.tsx": `import * as React from 'react'
+import { cva, type VariantProps } from 'class-variance-authority'
+import { cn } from '@/lib/utils'
+
+const buttonVariants = cva(
+  'inline-flex items-center justify-center gap-2 rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50',
+  {
+    variants: {
+      variant: {
+        default: 'bg-primary text-primary-foreground hover:opacity-90',
+        outline: 'border border-border bg-background hover:bg-muted',
+        ghost: 'hover:bg-muted',
+      },
+      size: {
+        default: 'h-10 px-4 py-2',
+        sm: 'h-9 px-3',
+        lg: 'h-11 px-8',
+      },
+    },
+    defaultVariants: { variant: 'default', size: 'default' },
+  },
+)
+
+export interface ButtonProps
+  extends React.ButtonHTMLAttributes<HTMLButtonElement>,
+    VariantProps<typeof buttonVariants> {}
+
+export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
+  ({ className, variant, size, ...props }, ref) => (
+    <button ref={ref} className={cn(buttonVariants({ variant, size, className }))} {...props} />
+  ),
+)
+Button.displayName = 'Button'
+`,
+      "src/App.tsx": `import { useState } from 'react'
+import { Rocket } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+
+export default function App() {
+  const [count, setCount] = useState(0)
+  return (
+    <main className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center gap-6 p-8">
+      <h1 className="text-3xl font-bold tracking-tight">Tailwind + shadcn/ui on Vivari</h1>
+      <p className="text-muted-foreground">Utility-first CSS with a real Vite dev server in your browser.</p>
+      <div className="flex gap-3">
+        <Button onClick={() => setCount((c) => c + 1)}>
+          <Rocket className="size-4" /> Clicked {count} times
+        </Button>
+        <Button variant="outline" onClick={() => setCount(0)}>Reset</Button>
+      </div>
+      <p className="text-sm text-muted-foreground">
+        Edit <code className="rounded bg-muted px-1 py-0.5">src/App.tsx</code> and save to test HMR.
+      </p>
+    </main>
+  )
+}
+`,
+      "src/main.tsx": `import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.tsx'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "baseUrl": ".",
+    "paths": { "@/*": ["./src/*"] }
+  },
+  "include": ["src"]
+}
+`,
+      "src/vite-env.d.ts": `/// <reference types="vite/client" />
+`,
+    },
+  };
+}
+
+// ── TanStack Router ──────────────────────────────────────────────────────────
+// TanStack Router (v1) — type-safe, file-based routing for a client-side React
+// SPA on plain Vite (the @tanstack/router-plugin code-gens routeTree.gen.ts).
+// We ship the SPA, not TanStack Start (full-stack SSR): Start's Vite plugin
+// boots a nitro server toolchain that fails to initialize in the WebContainer at
+// config-load time, whereas the Router SPA is just a Vite app and runs in-VM.
+//
+// It is client-routed, so like React Router 7 it re-matches the route against
+// the iframe's own /preview/5173/ location — keep the proxy prefix and set both
+// Vite `base` and the router `basepath` (from import.meta.env.BASE_URL) to that
+// prefix so asset URLs and route matching line up.
+function tanstackRouterTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "tanstack-router",
+      framework: "tanstack-router",
+      icon: "tanstack",
+      category: "Frontend",
+      name: "TanStack Router",
+      language: "TypeScript",
+      description: "TanStack Router — type-safe, file-based routing for a React SPA on Vite",
+      port: 5173,
+      openPath: "/",
+      entry: "src/routes/index.tsx",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: VITE_DEV,
+      keepPreviewPrefix: true,
+      // Not yet gated by a scripts/spike-tanstack-router.mjs run, so shipped experimental.
+      experimental: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "tanstack-router-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tanstack/react-router": "^1.130.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tanstack/router-plugin": "^1.130.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^7.0.0"
+  }
+}
+`,
+      "vite.config.js": `import { defineConfig } from 'vite'
+import { tanstackRouter } from '@tanstack/router-plugin/vite'
+import viteReact from '@vitejs/plugin-react'
+
+export default defineConfig({
+  // The Vivari preview serves this SPA under /preview/5173/ (keepPreviewPrefix);
+  // the router basepath below reads this same value from import.meta.env.BASE_URL.
+  base: '/preview/5173/',
+  plugins: [
+    // The router plugin MUST come before React's so routeTree.gen.ts is generated
+    // before the React transform runs.
+    tanstackRouter({ target: 'react', autoCodeSplitting: true }),
+    viteReact(),
+  ],
+})
+`,
+      "index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TanStack Router</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+`,
+      "src/main.tsx": `import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { RouterProvider, createRouter } from '@tanstack/react-router'
+import { routeTree } from './routeTree.gen'
+
+// The @tanstack/router-plugin Vite plugin generates ./routeTree.gen.ts on dev start.
+const router = createRouter({
+  routeTree,
+  // Match Vite \`base\` so client routing works under the Vivari preview prefix.
+  basepath: import.meta.env.BASE_URL,
+  defaultPreload: 'intent',
+  scrollRestoration: true,
+})
+
+declare module '@tanstack/react-router' {
+  interface Register {
+    router: typeof router
+  }
+}
+
+createRoot(document.getElementById('app')!).render(
+  <StrictMode>
+    <RouterProvider router={router} />
+  </StrictMode>,
+)
+`,
+      "src/routes/__root.tsx": `import { Link, Outlet, createRootRoute } from '@tanstack/react-router'
+
+export const Route = createRootRoute({
+  component: RootComponent,
+})
+
+function RootComponent() {
+  return (
+    <div style={{ fontFamily: 'system-ui, sans-serif' }}>
+      <nav style={{ display: 'flex', gap: '1rem', padding: '1rem' }}>
+        <Link to="/">Home</Link>
+        <Link to="/about">About</Link>
+      </nav>
+      <hr />
+      <Outlet />
+    </div>
+  )
+}
+`,
+      "src/routes/index.tsx": `import { createFileRoute } from '@tanstack/react-router'
+
+export const Route = createFileRoute('/')({
+  component: Home,
+})
+
+function Home() {
+  return (
+    <main style={{ padding: '2rem' }}>
+      <h1>TanStack Router</h1>
+      <p>Type-safe, file-based routing for React — a client-side SPA on Vite.</p>
+      <p>Edit <code>src/routes/index.tsx</code> and save, or add a file under <code>src/routes/</code>.</p>
+    </main>
+  )
+}
+`,
+      "src/routes/about.tsx": `import { createFileRoute } from '@tanstack/react-router'
+
+export const Route = createFileRoute('/about')({
+  component: About,
+})
+
+function About() {
+  return (
+    <main style={{ padding: '2rem' }}>
+      <h1>About</h1>
+      <p>This route lives in <code>src/routes/about.tsx</code>.</p>
+    </main>
+  )
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src"]
+}
+`,
+      "src/vite-env.d.ts": `/// <reference types="vite/client" />
+`,
+    },
+  };
+}
+
+// ── Vitest (with UI) ─────────────────────────────────────────────────────────
+// A testing starter that opens the @vitest/ui dashboard as its "preview": watch
+// mode re-runs on save and the browser UI (served at /__vitest__/) shows the
+// live suite. No app server — the value is the test setup itself.
+//
+// Two VM-specific knobs live in vitest.config.ts so this boots cleanly in-VM:
+//   1. open:false — `--ui` otherwise auto-opens a browser via the `open` package,
+//      which spawns xdg-open/open and dies with ENOENT in the headless VM. The
+//      preview tab points at the bound UI server (:51204) instead.
+//   2. pool:'threads' (singleThread) — Vitest's default `forks` pool ships its
+//      "collected" task tree over the fork IPC channel, which the VM mangles, so
+//      the reporter's task map comes up empty and every task-update asserts
+//      "Entity must be found for task …". The worker_threads pool uses a real
+//      MessageChannel (structured clone, so the circular task graph survives) —
+//      the path the runtime exercises for pool libraries — and one thread keeps
+//      the collected/updated events ordered.
+function vitestTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "vitest",
+      framework: "vitest",
+      icon: "vitest",
+      category: "Tooling",
+      name: "Vitest",
+      language: "TypeScript",
+      description: "Unit testing with Vitest + the @vitest/ui dashboard (watch mode)",
+      port: 51204,
+      openPath: "/__vitest__/",
+      entry: "src/sum.test.ts",
+      hmr: false,
+      // Watch mode re-runs the suite and the UI live-updates on every save.
+      reload: true,
+      install: "npm install",
+      dev: "npm run test:ui",
+      // Graduated: proven in-VM by scripts/spike-vitest.mjs (worker_threads pool
+      // runs a suite to green and flags failures, green in CI).
+    },
+    files: {
+      "package.json": `{
+  "name": "vitest-starter",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run"
+  },
+  "devDependencies": {
+    "@vitest/ui": "^3.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
+`,
+      "vitest.config.ts": `import { defineConfig } from 'vitest/config'
+
+export default defineConfig({
+  test: {
+    // Serve the @vitest/ui dashboard on a fixed port so the Vivari preview can
+    // point at it (was --api.port on the CLI).
+    api: { port: 51204 },
+    // Headless VM: never auto-open a system browser. \`vitest --ui\` otherwise
+    // shells out through the \`open\` package (xdg-open/open) and throws ENOENT.
+    open: false,
+    // Run tests on the worker_threads pool, not the default \`forks\` pool: under
+    // the VM the fork IPC channel mangles Vitest's nested "collected" task tree,
+    // so the reporter's task map comes up empty and every task update asserts
+    // "Entity must be found for task …". worker_threads uses a real MessageChannel
+    // (structured clone handles the circular task graph); one thread keeps the
+    // collected/updated events ordered.
+    pool: 'threads',
+    poolOptions: { threads: { singleThread: true } },
+  },
+})
+`,
+      "src/sum.ts": `export function sum(...values: number[]): number {
+  return values.reduce((total, n) => total + n, 0)
+}
+`,
+      "src/sum.test.ts": `import { describe, expect, it } from 'vitest'
+import { sum } from './sum'
+
+describe('sum', () => {
+  it('adds two numbers', () => {
+    expect(sum(1, 2)).toBe(3)
+  })
+
+  it('returns 0 for no arguments', () => {
+    expect(sum()).toBe(0)
+  })
+
+  it('adds a list of numbers', () => {
+    expect(sum(1, 2, 3, 4)).toBe(10)
+  })
+})
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["vitest/globals"]
+  },
+  "include": ["src"]
+}
+`,
+    },
+  };
+}
+
 // The full catalog, grouped by picker category (see TEMPLATE_CATEGORIES). The
 // picker renders one tab per category; order within a category follows this list.
 export const TEMPLATES: TemplateDef[] = [
@@ -4715,10 +5219,12 @@ export const TEMPLATES: TemplateDef[] = [
   vanillaTemplate(true),
   staticTemplate(),
   bootstrapTemplate(),
+  tailwindTemplate(),
   preactTemplate(),
   litTemplate(),
   solidTemplate(),
   qwikTemplate(),
+  tanstackRouterTemplate(),
   // Backend
   expressTemplate(false),
   expressTemplate(true),
@@ -4746,6 +5252,7 @@ export const TEMPLATES: TemplateDef[] = [
   gsapReactTemplate(),
   // Tooling
   nodeTemplate(),
+  vitestTemplate(),
   webpackTemplate(),
   rsbuildTemplate(false),
   rsbuildTemplate(true),

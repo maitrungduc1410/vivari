@@ -63,6 +63,10 @@ const SPIKES = [
   { name: "rspack", file: "spike-rspack.mjs", net: true, timeout: 600000 },
   { name: "rsbuild", file: "spike-rsbuild.mjs", net: true, timeout: 600000 },
   { name: "vitest", file: "spike-vitest.mjs", net: true },
+  // Tailwind v4: proves the lightningcss -> lightningcss-wasm alias + the
+  // @tailwindcss/oxide-wasm32-wasi selection let the v4 dev server generate CSS
+  // in-VM. Rust-core install is heavy, so use the longer budget.
+  { name: "tailwind", file: "spike-tailwind.mjs", net: true, timeout: 600000 },
   { name: "angular", file: "spike-angular.mjs", net: true, timeout: 600000 },
   // In-VM databases (WASM SQL engines). PGlite ships ~16 MB of WASM + data, so
   // its install + first-boot compile need a longer budget.

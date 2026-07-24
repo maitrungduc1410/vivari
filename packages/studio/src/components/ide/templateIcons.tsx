@@ -24,6 +24,10 @@ import AngularIcon from "~icons/vscode-icons/file-type-angular";
 // them as <img>. Vite returns a resolved URL for .svg imports (no SVGR here).
 import rsbuildLogo from "@/assets/rsbuild-logo.svg";
 import rspackLogo from "@/assets/rspack-logo.svg";
+// TanStack / Vitest ship official raster logos; bundle them as base-aware asset
+// URLs and render via <img>, same as the Rsbuild/Rspack marks above.
+import tanstackLogo from "@/assets/tanstack-logo.png";
+import vitestLogo from "@/assets/vitest-logo.jpg";
 
 type IconProps = { className?: string };
 
@@ -255,6 +259,18 @@ function ThreeIcon({ className }: IconProps) {
   );
 }
 
+// Tailwind CSS — official logo (logos:tailwindcss-icon), a single cyan wave mark.
+function TailwindIcon({ className }: IconProps) {
+  return (
+    <svg viewBox="0 0 256 154" className={className} aria-hidden>
+      <path
+        fill="#38bdf8"
+        d="M128 0C93.867 0 72.533 17.067 64 51.2C76.8 34.133 91.733 27.733 108.8 32c9.737 2.434 16.697 9.499 24.401 17.318C145.751 62.057 160.275 76.8 192 76.8c34.133 0 55.467-17.067 64-51.2c-12.8 17.067-27.733 23.467-44.8 19.2c-9.737-2.434-16.697-9.499-24.401-17.318C173.999 14.743 159.475 0 128 0M64 76.8C29.867 76.8 8.533 93.867 0 128c12.8-17.067 27.733-23.467 44.8-19.2c9.737 2.434 16.697 9.499 24.401 17.318C81.751 138.857 96.275 153.6 128 153.6c34.133 0 55.467-17.067 64-51.2c-12.8 17.067-27.733 23.467-44.8 19.2c-9.737-2.434-16.697-9.499-24.401-17.318C109.999 91.543 95.475 76.8 64 76.8"
+      />
+    </svg>
+  );
+}
+
 function GenericIcon({ className }: IconProps) {
   return (
     <svg viewBox="0 0 24 24" className={className} fill="none" aria-hidden>
@@ -312,6 +328,10 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   monorepo: (p) => <PnpmIcon className={p.className} />,
   sqlite: (p) => <SqliteIcon className={p.className} />,
   postgres: Badge({ text: "Pg", bg: "#336791" }),
+  // Top-3 additions
+  tailwind: TailwindIcon,
+  tanstack: ImgIcon(tanstackLogo, "TanStack"),
+  vitest: ImgIcon(vitestLogo, "Vitest"),
 };
 
 export function TemplateIcon({ icon, className }: { icon: string; className?: string }) {
