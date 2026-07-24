@@ -19,7 +19,21 @@ import WebpackIcon from "~icons/vscode-icons/file-type-webpack";
 import DocusaurusIcon from "~icons/vscode-icons/file-type-docusaurus";
 import AngularIcon from "~icons/vscode-icons/file-type-angular";
 
+// Rsbuild/Rspack ship no icon in any Iconify set, so bundle their official brand
+// SVGs (the mascot logos from assets.rspack.rs) as base-aware asset URLs and render
+// them as <img>. Vite returns a resolved URL for .svg imports (no SVGR here).
+import rsbuildLogo from "@/assets/rsbuild-logo.svg";
+import rspackLogo from "@/assets/rspack-logo.svg";
+
 type IconProps = { className?: string };
+
+// Renders a full-color brand SVG bundled as an asset URL. object-contain keeps the
+// mascot undistorted inside the picker's square (size-7 / size-5) icon box.
+function ImgIcon(src: string, alt: string) {
+  return function BrandImgIcon({ className }: IconProps) {
+    return <img src={src} alt={alt} aria-hidden className={className} style={{ objectFit: "contain" }} />;
+  };
+}
 
 // Simple rounded-square badge with 1-3 chars — used for stacks without a bespoke
 // mark. Keeps the picker visually consistent without pulling a brand icon set.
@@ -269,6 +283,8 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   gsap: Badge({ text: "GS", bg: "#0ae448", fg: "#0e100f" }),
   node: (p) => <NodeIcon className={p.className} />,
   webpack: (p) => <WebpackIcon className={p.className} />,
+  rsbuild: ImgIcon(rsbuildLogo, "Rsbuild"),
+  rspack: ImgIcon(rspackLogo, "Rspack"),
   sse: Badge({ text: "SSE", bg: "#16a34a" }),
   ws: Badge({ text: "WS", bg: "#646cff" }),
   fullstack: Badge({ text: "FS", bg: "#646cff" }),

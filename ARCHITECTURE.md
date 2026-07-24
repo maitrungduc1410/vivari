@@ -714,7 +714,12 @@ auth); npm range specifiers fall back to `latest` (no semver-range resolution).
 - **WASI + napi-rs**: the runtime ships a WASI preview1 host and runs real N-API
   addons compiled to `wasm32-wasi` (e.g. `@node-rs/crc32-wasm32-wasi`) on the
   vendored `@napi-rs/wasm-runtime` (emnapi). This is also why `rolldown`'s
-  `@rolldown/binding-wasm32-wasi` runs, so a real Vite build/dev server works.
+  `@rolldown/binding-wasm32-wasi` runs, so a real Vite build/dev server works —
+  and, on the same path, why **Rspack/Rsbuild** run: `@rspack/core → @rspack/binding`
+  has `@rspack/binding-wasm32-wasi` (a `wasm32-wasip1-threads` build, `cpu: wasm32`)
+  as an optionalDependency, so npm auto-selects it and the Rust bundler executes
+  in-VM (`rspack build`/`rspack serve`/`rsbuild dev` all bind + serve). Proven by
+  `scripts/spike-rspack.mjs` and `scripts/spike-rsbuild.mjs`.
 
 The codec + crypto Wasm are compiled **once** in the Kernel Worker and the
 `WebAssembly.Module`s are handed to each Process Worker, which instantiates them
@@ -785,6 +790,29 @@ Together these let Angular's stock `@angular/build` (esbuild + Vite) run from an
 unmodified `ng new` project, benefit any esbuild/worker-pool tool (Vitest, tsup,
 ...), and give the whole HTTP stack a spec-grade parser.
 
+- **`class extends Function` subclassing** (`packages/runtime/index.js`): the runtime
+  wraps the global `Function` constructor to redirect escape-hatch `new Function('s',
+  'return import(s)')` bodies to the loader-backed dynamic import. That wrapper must
+  construct via `Reflect.construct(NativeFunction, args, new.target)` (not
+  `NativeFunction.apply(this, args)`), or a `super()` from a `class X extends Function`
+  builds a bare function with `Function.prototype` instead of `X.prototype` — silently
+  dropping the whole subclass prototype chain. `@rsbuild/core`'s config chain
+  (rspack-chain) bottoms out at exactly that shape (`class extends Function` returning a
+  `Proxy`), so before the fix every chained mixin method vanished
+  (`this.extend is not a function`) and `rsbuild dev` died. The wrapper also inherits the
+  real `Function`'s statics via `Object.setPrototypeOf`.
+
+- **SAB-backed `Buffer.toString('utf8')`** (`packages/runtime/node/bindings/buffer.js`):
+  browsers reject `TextDecoder.decode()` on a view backed by a `SharedArrayBuffer`
+  ("The provided ArrayBufferView value must not be shared"); Node allows it, so this is
+  invisible headless and only bites in the real studio. Threaded wasm addons create their
+  `WebAssembly.Memory` with `shared: true`, so a `Buffer` that views that memory is
+  SAB-backed — and `@rspack/binding-wasm32-wasi` is a `wasm32-wasip1-threads` build, so
+  decoding a wasm source-map (`JsSourceMap.__from_binding` → `Buffer.toString('utf8')`) in
+  the rspack/rsbuild CSS loader threw. `utf8Slice`/`isUtf8` now copy a shared range into a
+  fresh non-shared buffer before decoding (`unshare()`); the non-shared path is passed
+  through by reference, so writes and the manual latin1/ascii/hex/ucs2 slices are untouched.
+
 ---
 
 ## 10. Build & run
@@ -816,6 +844,10 @@ No browser is needed to validate the runtime — the same runtime runs under Nod
 - `scripts/probe-*.mjs` — discovery/regression probes for React+Vite+Compiler and
   NestJS. `scripts/spike-next.mjs` proves Next.js 16 (App Router) boots on
   `next dev --webpack` + wasm SWC and serves `GET / → 200`.
+- `scripts/spike-rspack.mjs` / `scripts/spike-rsbuild.mjs` — prove the Rust bundler
+  (Rspack/Rsbuild) runs in-VM: npm auto-selects `@rspack/binding-wasm32-wasi`,
+  `rspack build` emits a bundle, and `rspack serve` / `rsbuild dev` bind + serve
+  `GET / → 200` (network-gated, like `verify-express`).
 
 See [`AGENTS.md`](./AGENTS.md) §"Testing & verification" for exactly when to run
 each and the network requirement.

@@ -11,6 +11,19 @@ const encoder = new TextEncoder();
 const utf8Decoder = new TextDecoder("utf-8"); // lossy (U+FFFD), like Node
 const utf8Strict = new TextDecoder("utf-8", { fatal: true });
 
+// Browsers reject `TextDecoder.decode()` on a view backed by a SharedArrayBuffer
+// ("The provided ArrayBufferView value must not be shared") — Node allows it, which
+// is why this only bites in-browser (and why a headless spike can't catch it).
+// Threaded wasm addons (e.g. `@rspack/binding-wasm32-wasi`, a `wasm32-wasip1-threads`
+// build) create their WebAssembly.Memory with `shared: true`, so a Buffer that views
+// that memory is SAB-backed; `Buffer.toString('utf8')` on a wasm source-map then blew
+// up inside rspack/rsbuild's CSS loader. Copy the range into a fresh, non-shared
+// buffer before decoding. Only pays a copy on the (rare) shared path; writes and the
+// manual latin1/ascii/hex/ucs2 slices index the bytes directly and are unaffected.
+const hasSAB = typeof SharedArrayBuffer !== "undefined";
+const unshare = (view) =>
+  hasSAB && view.buffer instanceof SharedArrayBuffer ? new Uint8Array(view) : view;
+
 // A Uint8Array view over whatever byte-ish thing we're handed.
 function asBytes(input) {
   if (input instanceof ArrayBuffer) return new Uint8Array(input);
@@ -75,7 +88,7 @@ function decodeBase64(str) {
 // ------------------------------------------------------------------ slices ---
 // (buf, start, end) -> string
 
-const utf8Slice = (buf, start, end) => utf8Decoder.decode(buf.subarray(start, end));
+const utf8Slice = (buf, start, end) => utf8Decoder.decode(unshare(buf.subarray(start, end)));
 
 function latin1Slice(buf, start, end) {
   let s = "";
@@ -382,7 +395,7 @@ export function createBufferBinding() {
     },
     isUtf8: (input) => {
       try {
-        utf8Strict.decode(asBytes(input));
+        utf8Strict.decode(unshare(asBytes(input)));
         return true;
       } catch {
         return false;

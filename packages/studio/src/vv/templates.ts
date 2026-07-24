@@ -4061,6 +4061,139 @@ if (module.hot) module.hot.accept();
   };
 }
 
+// ── Rsbuild (Rspack) ─────────────────────────────────────────────────────────
+// Rsbuild is the Rust-powered (Rspack) build tool. Its Rspack core is a native
+// N-API addon; on our wasm32 host in-VM npm auto-selects @rspack/binding-wasm32-
+// wasi (like Vite's rolldown), and the wasm32-wasip1-threads binding runs the
+// Rust bundler in the browser. Proven in-VM by scripts/spike-rspack.mjs (build +
+// serve) and scripts/spike-rsbuild.mjs (`rsbuild dev` binds + serves the React app
+// with a 200), both green in the CI network tier (scripts/run-spikes.mjs); HMR is
+// confirmed in the studio (rides the same ws tunnel as Vite). No longer experimental.
+function rsbuildTemplate(ts: boolean): TemplateDef {
+  const ext = ts ? "tsx" : "jsx";
+  return {
+    manifest: {
+      id: ts ? "rsbuild-ts" : "rsbuild",
+      framework: "rsbuild",
+      icon: "rsbuild",
+      category: "Tooling",
+      name: "Rsbuild (React)",
+      language: ts ? "TypeScript" : "JavaScript",
+      description: "Rspack-powered Rsbuild dev server (React) running the Rust bundler as WebAssembly",
+      port: 3000,
+      openPath: "/",
+      entry: `src/App.${ext}`,
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+    },
+    files: {
+      "package.json": `{
+  "name": "rsbuild-react${ts ? "-ts" : ""}",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "rsbuild dev",
+    "build": "rsbuild build",
+    "preview": "rsbuild preview"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@rsbuild/core": "^1.5.0",
+    "@rsbuild/plugin-react": "^1.4.0"${ts ? `,
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"` : ""}
+  }
+}
+`,
+      // A plain .mjs config works for both variants (the app source is what's TS).
+      // Rsbuild auto-detects src/index.{jsx,tsx} as the entry and injects the HTML.
+      "rsbuild.config.mjs": `import { defineConfig } from "@rsbuild/core";
+import { pluginReact } from "@rsbuild/plugin-react";
+
+export default defineConfig({
+  plugins: [pluginReact()],
+  server: { port: 3000, host: "127.0.0.1" },
+  html: { title: "Rsbuild + React" },
+});
+`,
+      [`src/index.${ext}`]: `import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { App } from "./App.${ext}";
+import "./index.css";
+
+createRoot(document.getElementById("root")${ts ? "!" : ""}).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+`,
+      [`src/App.${ext}`]: `import { useState } from "react";
+
+export function App() {
+  const [count, setCount] = useState(0);
+
+  return (
+    <main className="app">
+      <h1>Rsbuild + React${ts ? " + TS" : ""}</h1>
+      <div className="card">
+        <button onClick={() => setCount((c${ts ? ": number" : ""}) => c + 1)}>
+          count is {count}
+        </button>
+        <p>
+          Edit <code>src/App.${ext}</code> and save to test HMR
+        </p>
+      </div>
+      <p>Running inside Vivari — a real Rspack (Rust/Wasm) bundler in your browser.</p>
+    </main>
+  );
+}
+`,
+      "src/index.css": `:root {
+  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
+}
+body { margin: 0; display: flex; place-items: center; min-height: 100vh; }
+.app { max-width: 1280px; margin: 0 auto; padding: 2rem; text-align: center; }
+button {
+  border-radius: 8px; border: 1px solid transparent; padding: 0.6em 1.2em;
+  font-size: 1em; font-weight: 500; font-family: inherit;
+  background-color: #1a1a1a; color: white; cursor: pointer; transition: border-color 0.25s;
+}
+button:hover { border-color: #ff5d1b; }
+`,
+      ...(ts
+        ? {
+            "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true
+  },
+  "include": ["src"]
+}
+`,
+          }
+        : {}),
+    },
+  };
+}
+
 // ── Docusaurus (standalone webpack) ──────────────────────────────────────────
 // Docusaurus 3's dev server is webpack + webpack-dev-server + MDX/React. Proven
 // headless (scripts/spike-docusaurus.mjs) — binds :3000 and serves the site.
@@ -4614,6 +4747,8 @@ export const TEMPLATES: TemplateDef[] = [
   // Tooling
   nodeTemplate(),
   webpackTemplate(),
+  rsbuildTemplate(false),
+  rsbuildTemplate(true),
   // Showcase
   fullstackTemplate(),
   sseTemplate(),

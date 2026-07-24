@@ -57,6 +57,11 @@ const SPIKES = [
   { name: "docusaurus", file: "spike-docusaurus.mjs", net: true, timeout: 600000 },
   { name: "vitepress", file: "spike-vitepress.mjs", net: true, timeout: 600000 },
   { name: "webpack", file: "spike-webpack.mjs", net: true },
+  // Rspack/Rsbuild — the Rust bundler (@rspack/binding-wasm32-wasi, a
+  // wasm32-wasip1-threads build) runs in-VM. rspack: build + serve; rsbuild: dev
+  // server. Rust-core installs are heavy, so give them the longer budget.
+  { name: "rspack", file: "spike-rspack.mjs", net: true, timeout: 600000 },
+  { name: "rsbuild", file: "spike-rsbuild.mjs", net: true, timeout: 600000 },
   { name: "vitest", file: "spike-vitest.mjs", net: true },
   { name: "angular", file: "spike-angular.mjs", net: true, timeout: 600000 },
   // In-VM databases (WASM SQL engines). PGlite ships ~16 MB of WASM + data, so

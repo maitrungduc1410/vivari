@@ -1203,11 +1203,22 @@ export function createRuntime({
           if (rewritten != null) args = args.slice(0, -1).concat(rewritten);
         }
       }
-      return NativeFunction.apply(this, args);
+      // Build via Reflect.construct so the caller's new.target is honored. This is
+      // what keeps `class X extends Function {}` working: super() must produce a
+      // function object whose [[Prototype]] is X.prototype (not a bare
+      // Function.prototype). A plain `NativeFunction.apply(this, args)` invokes the
+      // real Function as an ORDINARY function, which ignores new.target and returns a
+      // fresh function with Function.prototype — so a subclass instance loses its
+      // whole prototype chain. @rsbuild/core's config chain (rspack-chain) bottoms
+      // out at `class extends Function` returning a Proxy; without this, every mixin
+      // method vanished ("this.extend is not a function") and `rsbuild dev` died.
+      return Reflect.construct(NativeFunction, args, new.target || OcFunction);
     };
     // Preserve prototype identity so `x instanceof Function` and the shared
-    // Function.prototype methods (call/apply/bind) keep working.
+    // Function.prototype methods (call/apply/bind) keep working. Subclassing also
+    // needs OcFunction to inherit statics from the real Function (via its proto).
     OcFunction.prototype = NativeFunction.prototype;
+    Object.setPrototypeOf(OcFunction, NativeFunction);
     globalThis.Function = OcFunction;
   }
 

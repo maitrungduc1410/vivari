@@ -1414,6 +1414,18 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     on-demand download is the fallback). Shipped as the **Next.js** template (TS + JS,
     `experimental`). The earlier `require('module')` monkeypatch gap (Next's `require-hook`) is also
     fixed — `module` is a real constructor.
+  - ✅ **Rspack + Rsbuild** — the Rust/webpack-compatible bundler **builds and serves in-VM**
+    (`scripts/spike-rspack.mjs`: `rspack build` emits a bundle + `rspack serve` → `GET / → 200`;
+    `scripts/spike-rsbuild.mjs`: `rsbuild dev` → `GET / → 200`). Same wasm32 auto-select as Vite's
+    rolldown: `@rspack/binding-wasm32-wasi` (a `wasm32-wasip1-threads` build) is the only binding
+    installed on arch `wasm32`, and it runs on our emnapi/WASI host without hitting the Stage-2b
+    async-work block. Surfaced & fixed one general runtime bug: the global `Function` wrapper broke
+    `class extends Function` subclassing (`Reflect.construct` + `new.target`), which `@rsbuild/core`'s
+    rspack-chain config depends on; and a browser-only crash where `Buffer.toString('utf8')` on a
+    SAB-backed view (the threaded wasm binding's shared memory) threw in `TextDecoder` — fixed by
+    copying the range before decoding. Shipped as the **Rsbuild (React)** template (TS + JS, `Tooling`).
+    Both spikes (`spike-rspack.mjs` + `spike-rsbuild.mjs`) are registered in the CI net tier and HMR is
+    studio-confirmed, so the template is **graduated** (no longer `experimental`).
   - The two working stacks are wired into a **VS Code-style IDE** (revamped —
     see below): a project picker (**React + Vite + React Compiler**, **NestJS**),
     an activity bar + Explorer, a Monaco editor with **multiple file tabs**, a
@@ -1881,6 +1893,35 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   Fastify, Nitro, GraphQL (Yoga),
   Feathers. Showcases: Socket.IO, tRPC, pnpm monorepo, and **in-VM databases** — SQLite
   (sql.js WASM) and PostgreSQL (PGlite WASM), each spiked (see "In-VM databases via Wasm").
+- ✅ **Phase 4 (cont.) — Rspack + Rsbuild proven headless AND shipped.** The Rust/webpack-
+  compatible bundler now runs in-VM with **zero new install plumbing**: `@rspack/core →
+  @rspack/binding` publishes `@rspack/binding-wasm32-wasi` (a `wasm32-wasip1-threads` build,
+  `cpu: wasm32`) as an optionalDependency, and because the runtime reports `process.arch ===
+  'wasm32'` real npm auto-selects it — the exact Stage-2c path that already brings in
+  `@rolldown/binding-wasm32-wasi` (Vite) and `@node-rs/*`. Crucially the `wasm32-wasip1-threads`
+  binding runs on our emnapi/`@napi-rs/wasm-runtime` + WASI host **out of the box** — it does NOT
+  hit the Stage-2b async-work (AWMT) block; the Rust bundler compiles guest code in the browser.
+  - **Rspack** (`scripts/spike-rspack.mjs`) — `npm install @rspack/core @rspack/cli` pulls the wasm
+    binding (never a native `@rspack/binding-<platform>`); `rspack build --mode production` emits
+    `dist/main.js` + `dist/index.html` (~0.6s), and `rspack serve` binds `:8081` and serves `GET /
+    → 200`.
+  - **Rsbuild** (`scripts/spike-rsbuild.mjs`, shipped as the **Rsbuild (React)** template in TS + JS,
+    `Tooling`, **graduated** — non-experimental) — `@rsbuild/core` + `@rsbuild/plugin-react` + React 19;
+    `rsbuild dev` binds `:3000`, builds in ~0.6s, and serves `GET / → 200` with the real Rsbuild HTML.
+    Both spikes are registered in the CI net tier (`scripts/run-spikes.mjs`); HMR studio-confirmed.
+
+  This needed **one general runtime fix** (kept regardless of the templates):
+  - **`class extends Function` subclassing (`packages/runtime/index.js`).** The global `Function`
+    wrapper (which redirects escape-hatch `new Function('s','return import(s)')` bodies to the
+    loader-backed dynamic import) forwarded construction with `NativeFunction.apply(this, args)`,
+    which ignores `new.target` — so a `super()` from `class X extends Function` produced a bare
+    function with `Function.prototype`, dropping the whole subclass prototype chain. `@rsbuild/core`'s
+    config chain (rspack-chain) bottoms out at exactly that shape (`class extends Function` returning
+    a `Proxy`), so every chained mixin method vanished (`this.extend is not a function`) and `rsbuild
+    dev` died. Fixed by constructing via `Reflect.construct(NativeFunction, args, new.target ||
+    OcFunction)` (+ `Object.setPrototypeOf(OcFunction, NativeFunction)` for statics). Reproduced and
+    regression-gated minimally; `verify-node` stays 100% green (no ESM/interop regression).
+
 - ✅ **Phase 4 (cont.) — standalone Webpack + Docusaurus proven headless AND shipped.** Two
   new templates, each gated by a green spike (validated alongside the Next.js spike, which still
   PASSes incl. the RSC-refresh gate):
