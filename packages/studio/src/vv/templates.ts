@@ -4104,8 +4104,8 @@ function rsbuildTemplate(ts: boolean): TemplateDef {
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@rsbuild/core": "^1.5.0",
-    "@rsbuild/plugin-react": "^1.4.0"${ts ? `,
+    "@rsbuild/core": "^2.1.0",
+    "@rsbuild/plugin-react": "^2.1.0"${ts ? `,
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "typescript": "^5.7.0"` : ""}

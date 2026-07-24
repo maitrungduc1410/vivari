@@ -616,7 +616,13 @@ export function transpileEsm(source, filename) {
   const fileUrl = "file://" + (filename || "");
   const head =
     helpers(fileUrl, filename) +
-    "Object.defineProperty(__oc_exports,'__esModule',{value:true});" +
+    // Mark the module ESM, but defensively: some CJS/ESM-hybrid bundles (e.g. rsbuild
+    // v2's dev-server middleware chunks) already carry an `__esModule` on their exports
+    // object (an accessor, or a non-configurable data prop) before our head runs, so a
+    // bare `Object.defineProperty(exports,'__esModule',{value:true})` throws
+    // "Cannot redefine property: __esModule". Define it configurable (so the module's own
+    // later re-define can't clash) and fall back to assignment if the property is locked.
+    "try{Object.defineProperty(__oc_exports,'__esModule',{value:true,configurable:true});}catch(_e){try{__oc_exports.__esModule=true;}catch(__e){}}" +
     // Export getters first (local live bindings + lazy re-export getters, both visible to
     // circular importers before this module's body runs), then the import requires.
     exportGetters.join("") +
@@ -755,7 +761,7 @@ export function transpileEsmLive(source, filename) {
   const fileUrl = "file://" + (filename || "");
   const head =
     helpers(fileUrl, filename) +
-    "Object.defineProperty(__oc_exports,'__esModule',{value:true});" +
+    "try{Object.defineProperty(__oc_exports,'__esModule',{value:true,configurable:true});}catch(_e){try{__oc_exports.__esModule=true;}catch(__e){}}" +
     "const __oc_live=Object.create(null);" +
     reexportEarly.join("") +
     prelude.join("") +

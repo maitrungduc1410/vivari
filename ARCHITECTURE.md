@@ -813,6 +813,25 @@ unmodified `ng new` project, benefit any esbuild/worker-pool tool (Vitest, tsup,
   fresh non-shared buffer before decoding (`unshare()`); the non-shared path is passed
   through by reference, so writes and the manual latin1/ascii/hex/ucs2 slices are untouched.
 
+- **Defensive `__esModule` marker** (`packages/runtime/esm.js`): every module compiled as
+  ESM gets an `__esModule` marker on its exports via the wrapper head. A bare
+  `Object.defineProperty(exports,'__esModule',{value:true})` is non-configurable, so if the
+  module's own exports object *already* carries an `__esModule` (an accessor, or a
+  non-configurable data prop) the redefine throws `Cannot redefine property: __esModule`.
+  Rsbuild v2's dev-server middleware chunks hit exactly this, killing `rsbuild dev`. The head
+  now defines the marker `configurable: true` (so the module's own later redefine can't clash)
+  and falls back to plain assignment inside a `try/catch` when the property is already locked.
+
+- **`util.styleText` color detection** (`packages/runtime/node/internal/util/colors.js`):
+  `util.styleText` decides whether to emit ANSI purely via `lazyUtilColors().shouldColorize()`,
+  and rslog v2 — the logger behind Rsbuild v2 / Rspack — routes *all* its coloring through
+  `styleText`. The old stub hard-returned `shouldColorize: () => false`, so every rslog line
+  came out plain (Rsbuild v1 used picocolors, which emits ANSI directly, so it looked colored —
+  hence "v1 highlighted, v2 all white"). `shouldColorize` now honors the standard precedence
+  (`NO_COLOR`/`TERM=dumb` off → `FORCE_COLOR` on unless `0` → else stream `isTTY`); the studio
+  kernel exports `FORCE_COLOR=3`/`TERM=xterm-256color`, so the xterm.js terminal gets color,
+  while headless kernels (no `FORCE_COLOR`, non-TTY stdout) stay plain.
+
 ---
 
 ## 10. Build & run
