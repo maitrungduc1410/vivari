@@ -552,31 +552,46 @@ What makes pnpm special:
   become bundlable. Reach for this whenever a pnpm project's Vite preview is blank
   with an externalised-`require` error.
 
-### Vite config bundling is broken in-VM — avoid it
-Vite loads `vite.config`/`vitest.config`/`.vitepress/config` by esbuild/rolldown-
-**bundling** the file and importing the temp bundle via a `file://` URL — a path that
-fails ("Invalid URL") or hangs in-VM (`__ocImport` doesn't resolve `file://` temp
-bundles). Workarounds, by tool:
+### Vite's ROLLDOWN config bundler throws "Invalid URL" — avoid it (native loader)
+Vite 6+/rolldown loads `vite.config` by bundling it and importing the temp bundle via a
+`file://` URL, and its rolldown bundler throws "Invalid URL" in-VM. Workarounds:
 - **Vite 6+/8** templates: pass `--configLoader native` (skips bundling, native
   import). This is why every Vite `dev` command carries that flag.
 - **Vitest**: no `vitest.config` — pass options as CLI flags.
-- **VitePress** (runs **Vite 5**, which has NO `--configLoader native`): the
-  config-less trick (ship no `.vitepress/config.*`) DID get past this — but VitePress
-  was ultimately **dropped** for a deeper reason (synckit; see below). Don't re-add it
-  without solving that.
 
-### VitePress is dropped — synckit's blocking sync port drain is incompatible
-VitePress's Shiki markdown highlighter resolves languages **synchronously** via
-**`synckit`**: `resolveLangSync = createSyncFn(...)` runs **eagerly at module load** and
-spawns a `worker_threads` Worker with a `MessagePort` in `workerData`, then at call time
-does `Atomics.wait` (block the thread) → `receiveMessageOnPort(port)` (read the reply
-synchronously). Two problems in-VM: (1) our `worker_threads` doesn't transfer MessagePorts
-across threads yet → `DataCloneError` on spawn; and (2) — the fundamental one — a **blocked
-worker can't receive a MessagePort message** (delivery needs the event loop, which
-`Atomics.wait` freezes), so `receiveMessageOnPort` returns nothing. This is the same limit
-that forces `PISCINA_DISABLE_ATOMICS=1`, and synckit has no async fallback. **Docusaurus**
-covers the docs showcase instead (Prism, no synckit). Revisit if the worker model gains a
-synchronous cross-worker port drain (SAB-backed), or Shiki/VitePress drops synckit.
+Note the file:// import mechanism itself works in-VM: `module.js`'s `fromFileUrl`
+resolves a `file://` specifier (including a `?t=` cache-buster) to its VFS path, so the
+NATIVE loader's config import and Vite's module-runner file:// imports resolve. It's the
+rolldown *bundling* step that fails, not the file:// import.
+
+### VitePress works in-VM (Docs template, graduated) — three in-VM gotchas
+VitePress runs **Vite 5** (esbuild config bundler, not rolldown). Getting it to boot + render
+in-VM required handling three distinct issues; all are reflected in the shipped template
+(`vitepressTemplate()` in `packages/studio/src/vv/templates.ts`) and mirrored in
+`scripts/spike-vitepress.mjs`:
+
+1. **Config must be CommonJS.** VitePress loads `.vitepress/config.*` via Vite's
+   `loadConfigFromFile`, whose loader has two branches. An **ESM** config (.mts/.mjs, or a .js in
+   a `type: module` package) is loaded with `await import(file://…temp.mjs)` — that async `file://`
+   dynamic import does NOT settle here, so boot hangs right after Vite's "CJS build … deprecated"
+   line. (A synchronous `require('file://…')` resolves fine — `module.js`'s `fromFileUrl` maps it,
+   incl. a `?t=` buster — so an offline probe of the *sync* path was misleading; the real stall is
+   the *async* `await import()`.) A **CommonJS** config (`.vitepress/config.js`, package NOT
+   `type: module`) takes Vite's synchronous branch (`require.extensions` + `module._compile`), which
+   works. Takeaway: for Vite-5 configs in-VM, prefer CJS over `.mts`/`.mjs`.
+2. **worker_threads must transfer ports embedded in workerData.** Importing VitePress does
+   `new Worker(f, { workerData: { port }, transferList: [port] })` (synckit). The runtime now
+   transfers MessagePorts found in `workerData` across both spawn hops (see
+   `packages/runtime/node/lib/worker_threads.js` `collectTransferables`, `index.js` `host.spawn`,
+   `kernel-worker.ts` `spawnWorker`). Before this it threw "A MessagePort could not be cloned…".
+3. **synckit is still used for on-demand Shiki languages — pre-load them.** `highlight.ts`
+   pre-loads only `markdown.languages`; any *other* code-block language triggers
+   `resolveLangSync = createSyncFn(...)` (Atomics.wait + `receiveMessageOnPort`), which a browser
+   worker can't drain synchronously → throws mid-render. So the template pre-loads a broad set of
+   common languages in `markdown.languages` (loaded async at `createHighlighter`, which works). A
+   language NOT in that list still throws — add it. WARNING: the spike runs under Node's real
+   `worker_threads`, where synckit works, so it canNOT catch a missing language; validate the
+   language path in a real browser.
 
 ### Real corepack is the studio's PM version manager — DOWNLOADS + runs pinned PMs
 corepack is wired like the PMs but is a *version manager*, not a package manager

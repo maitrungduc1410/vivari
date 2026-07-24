@@ -1177,6 +1177,44 @@ async function boot() {
   const [codecModule, cryptoModule] = await codecsReady;
   post("log", { line: `  [boot] codecs compiled (+${Date.now() - t0}ms).`, dim: true });
 
+  // Find MessagePort(s) embedded anywhere in a spawned thread's workerData so they
+  // can be added to the init message's transfer list (a port can't be cloned).
+  // Bounded (depth cap + visited set) against cyclic/huge graphs.
+  const collectWorkerDataPorts = (workerData) => {
+    const MP = (globalThis as { MessagePort?: unknown }).MessagePort;
+    const out = [];
+    if (!MP) return out;
+    const seen = new Set();
+    const visited = new WeakSet();
+    const scan = (v, depth) => {
+      if (!v || typeof v !== "object" || depth > 6) return;
+      if (v instanceof (MP as new () => unknown)) {
+        if (!seen.has(v)) {
+          seen.add(v);
+          out.push(v);
+        }
+        return;
+      }
+      if (visited.has(v)) return;
+      visited.add(v);
+      if (Array.isArray(v)) {
+        for (const x of v) scan(x, depth + 1);
+        return;
+      }
+      for (const k of Object.keys(v)) {
+        let child;
+        try {
+          child = v[k];
+        } catch {
+          continue;
+        }
+        scan(child, depth + 1);
+      }
+    };
+    scan(workerData, 0);
+    return out;
+  };
+
   // Spawn a process as a *nested* worker under this kernel worker. Each gets a
   // human-readable name (shown in DevTools' JS VM instance list) with its PID —
   // a Worker's name is fixed at creation, so naming it here (not from a pre-warmed
@@ -1215,6 +1253,12 @@ async function boot() {
       init.threadPort = info.threadPort;
       transfer.push(info.threadPort);
     }
+    // #16 stage 2b: a spawned thread's workerData may embed MessagePort(s) — the
+    // createSyncFn/synckit pattern. They were transferred to us on the thread-spawn
+    // message; transfer them ON to the child too, else structuredClone rejects the
+    // init message ("A MessagePort could not be cloned because it was not
+    // transferred") and Worker() startup hangs/throws.
+    for (const p of collectWorkerDataPorts(info.spec && info.spec.workerData)) transfer.push(p);
     worker.postMessage(init, transfer);
     return {
       terminate: () => {

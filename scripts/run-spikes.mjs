@@ -55,6 +55,7 @@ const SPIKES = [
   { name: "vue", file: "spike-vue.mjs", net: true },
   { name: "next", file: "spike-next.mjs", net: true, timeout: 600000 },
   { name: "docusaurus", file: "spike-docusaurus.mjs", net: true, timeout: 600000 },
+  { name: "vitepress", file: "spike-vitepress.mjs", net: true, timeout: 600000 },
   { name: "webpack", file: "spike-webpack.mjs", net: true },
   { name: "vitest", file: "spike-vitest.mjs", net: true },
   { name: "angular", file: "spike-angular.mjs", net: true, timeout: 600000 },

@@ -251,8 +251,14 @@ export function createRuntime({
     registerDispatch: (fn) => {
       dispatchThreadEvent = fn;
     },
-    spawn: (reqId, spec, port) => {
-      if (postRaw) postRaw({ type: "thread-spawn", reqId, spec, port }, [port]);
+    spawn: (reqId, spec, port, extraTransfer) => {
+      // `port` is the child's parentPort end; `extraTransfer` are MessagePorts (and
+      // other transferables) embedded in spec.workerData — both must be in the
+      // transfer list or structuredClone rejects the ports ("could not be cloned").
+      if (postRaw) {
+        const transfer = extraTransfer && extraTransfer.length ? [port, ...extraTransfer] : [port];
+        postRaw({ type: "thread-spawn", reqId, spec, port }, transfer);
+      }
     },
     terminate: (reqId) => {
       if (postRaw) postRaw({ type: "thread-terminate", reqId });

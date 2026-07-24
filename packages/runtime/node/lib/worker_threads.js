@@ -16,13 +16,16 @@
 // N-API (napi-rs async-work) addons run — that path (emnapi AWMT) is blocked
 // upstream regardless of this layer; see roadmap #16 stage 2b.
 //
-// Scope: Worker(entry, {workerData, argv, env, cwd, eval}), postMessage/on(
-// 'message'|'online'|'exit'|'error')/terminate/ref/unref, parentPort, workerData,
-// threadId, isMainThread, MessageChannel/MessagePort (platform), and
-// receiveMessageOnPort (synchronous manual-polling drain). Deferred: transferring
-// MessagePorts in a transferList across threads, resourceLimits, and the Atomics
-// worker-pool fast path (kept off via PISCINA_DISABLE_ATOMICS=1 — a browser
-// MessagePort can't be drained synchronously across a worker boundary).
+// Scope: Worker(entry, {workerData, argv, env, cwd, eval, transferList}),
+// postMessage/on('message'|'online'|'exit'|'error')/terminate/ref/unref,
+// parentPort, workerData, threadId, isMainThread, MessageChannel/MessagePort
+// (platform), and receiveMessageOnPort (synchronous manual-polling drain).
+// MessagePorts embedded in `workerData` (the `createSyncFn`/synckit pattern:
+// `new Worker(f, { workerData: { port }, transferList: [port] })`) ARE now handed
+// across to the child — see collectTransferables + host.spawn. Deferred:
+// resourceLimits and the Atomics worker-pool fast path (kept off via
+// PISCINA_DISABLE_ATOMICS=1 — a browser MessagePort can't be drained
+// synchronously across a worker boundary).
 
 export default function (exports, require, module, process) {
   const g = globalThis;
@@ -110,6 +113,54 @@ export default function (exports, require, module, process) {
     return { ...optEnv };
   }
 
+  // Gather the transferables that must ride the spawn message's transfer list so
+  // the browser's structuredClone doesn't reject them. Two sources:
+  //   - the caller's explicit `transferList` (Node's contract for `new Worker`), and
+  //   - any MessagePort *embedded* in `workerData` — the createSyncFn/synckit shape
+  //     `new Worker(f, { workerData: { port }, transferList: [port] })`. A port
+  //     cannot be cloned, so if it isn't transferred the very first postMessage of
+  //     the spawn (process-worker -> kernel) throws "A MessagePort could not be
+  //     cloned because it was not transferred", which manifested as a silent hang
+  //     (VitePress importing a synckit-backed dep).
+  // `exclude` is the parentPort end (host.spawn transfers it separately). Cyclic /
+  // deep graphs are guarded (WeakSet + depth cap).
+  function collectTransferables(workerData, transferList, exclude) {
+    const MP = g.MessagePort;
+    const out = [];
+    const seen = new Set();
+    const push = (v) => {
+      if (v && v !== exclude && !seen.has(v)) {
+        seen.add(v);
+        out.push(v);
+      }
+    };
+    if (Array.isArray(transferList)) for (const t of transferList) push(t);
+    if (MP) {
+      const visited = new WeakSet();
+      const scan = (v, depth) => {
+        if (!v || typeof v !== "object" || depth > 6) return;
+        if (v instanceof MP) return push(v);
+        if (visited.has(v)) return;
+        visited.add(v);
+        if (Array.isArray(v)) {
+          for (const x of v) scan(x, depth + 1);
+          return;
+        }
+        for (const k of Object.keys(v)) {
+          let child;
+          try {
+            child = v[k];
+          } catch {
+            continue; // a throwing getter — skip it
+          }
+          scan(child, depth + 1);
+        }
+      };
+      scan(workerData, 0);
+    }
+    return out;
+  }
+
   // A minimal, inert Readable-shaped stub for Worker.stdout/stderr. It never
   // emits data (the child's output is forwarded by the kernel), but supports the
   // pipe/unpipe/listener surface pool libraries poke at.
@@ -167,8 +218,11 @@ export default function (exports, require, module, process) {
       };
       // Hand the child's end of the channel to the kernel, which transfers it on
       // to the new worker as its parentPort. Data traffic then flows port1<->port2
-      // directly; the kernel only brokers online/exit/terminate.
-      host.spawn(reqId, spec, port2);
+      // directly; the kernel only brokers online/exit/terminate. Any MessagePort
+      // the caller stashed in workerData/transferList rides along in the transfer
+      // list (else the browser throws "could not be cloned" on the spawn message).
+      const extraTransfer = collectTransferables(options.workerData, options.transferList, port2);
+      host.spawn(reqId, spec, port2, extraTransfer);
     }
 
     postMessage(value, transferList) {

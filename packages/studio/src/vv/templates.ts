@@ -2509,11 +2509,6 @@ const title = 'Astro on Vivari'
   };
 }
 
-// NOTE: VitePress was dropped (see roadmap: "VitePress — dropped: synckit's blocking
-// Atomics + cross-worker MessagePort is incompatible with our worker model"). The
-// Docusaurus template covers the docs-site showcase. Revisit if the worker model gains
-// a synchronous cross-worker port drain, or Shiki drops synckit.
-
 // ── Slidev ───────────────────────────────────────────────────────────────────
 function slidevTemplate(): TemplateDef {
   return {
@@ -4160,6 +4155,155 @@ Hello from Vivari — a full Docusaurus dev server compiled in the browser VM.
   };
 }
 
+// ── VitePress ────────────────────────────────────────────────────────────────
+// VitePress (Vue-powered docs SSG on Vite) runs in-VM on the stock toolchain, but
+// only after three separate in-VM gotchas are handled — all reflected in the files
+// this template ships:
+//
+// 1. Config loading (CommonJS, not ESM). VitePress (Vite 5) loads
+//    `.vitepress/config.*` via Vite's `loadConfigFromFile`, which esbuild-bundles
+//    it. For an ESM config (.mts/.mjs, or a .js in a `type: module` package) Vite
+//    loads the bundle with `await import(file://…temp.mjs)` — that async dynamic
+//    import does NOT settle in-VM and hangs boot right after Vite's "CJS build
+//    deprecated" line. So we ship a **CommonJS** `.vitepress/config.js` and a
+//    package that is NOT `type: module`: Vite takes its synchronous CJS config
+//    branch (`require.extensions` override + `module._compile`) — no hang.
+//
+// 2. worker_threads transferList. Importing VitePress spins up a synckit-backed
+//    worker (`new Worker(f, { workerData: { port }, transferList: [port] })`); the
+//    runtime now transfers MessagePorts embedded in workerData (see
+//    packages/runtime/node/lib/worker_threads.js), so that no longer throws.
+//
+// 3. Shiki language pre-loading (synckit). VitePress lazily loads any not-yet-
+//    registered code-block language via synckit (Atomics.wait + a worker
+//    MessagePort) — which a browser worker can't drain synchronously, so an
+//    on-demand load throws mid-render. The config pre-loads common languages
+//    (loaded async at highlighter init, which works) so that path is never taken.
+//    NOTE: the headless spike runs under Node's real worker_threads where synckit
+//    works, so it canNOT catch a missing language — keep the config list in sync
+//    with the languages the docs actually use.
+//
+// Proven headless by scripts/spike-vitepress.mjs (dev server boots + serves); the
+// synckit language path is verified only in a real browser.
+function vitepressTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "vitepress",
+      framework: "vitepress",
+      icon: "vitepress",
+      category: "Docs",
+      name: "VitePress",
+      language: "JavaScript",
+      description: "VitePress — Vue-powered static site generator for docs (Vite + Shiki)",
+      port: 5173,
+      openPath: "/",
+      entry: "index.md",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      // VitePress is a client-routed SPA (history-mode router): served at "/" its
+      // router lands on 404, so set Vite `base` to the preview prefix and keep it.
+      keepPreviewPrefix: true,
+    },
+    files: {
+      // NOTE: intentionally NOT "type": "module" — see the header comment. A
+      // CommonJS package makes Vite load .vitepress/config.js via its synchronous
+      // CJS branch (no file:// async import), which is what boots in-VM.
+      "package.json": `{
+  "name": "vitepress-site",
+  "private": true,
+  "scripts": {
+    "dev": "vitepress dev --port 5173 --strictPort",
+    "build": "vitepress build",
+    "preview": "vitepress preview --port 5173 --strictPort"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.0",
+    "vue": "^3.5.0"
+  }
+}
+`,
+      ".vitepress/config.js": `// CommonJS config on purpose: Vite then loads it via its synchronous CJS branch
+// (require.extensions + module._compile) instead of \`await import(file://…)\`,
+// which hangs in-VM. See the template header comment in templates.ts.
+//
+// The Vivari preview serves this dev server under /preview/5173/. VitePress is a
+// history-mode SPA, so set \`base\` to that prefix (paired with the template's
+// keepPreviewPrefix flag) — otherwise the first load resolves to a 404 page.
+module.exports = {
+  base: "/preview/5173/",
+  title: "VitePress in Vivari",
+  description: "Docs that build and run entirely in the browser VM",
+  markdown: {
+    // PRE-LOAD the languages used in code blocks. VitePress lazily loads any
+    // not-yet-registered language via synckit (Atomics.wait + a worker MessagePort),
+    // which a browser worker can't drain synchronously — so an on-demand load throws
+    // mid-render ("Cannot read properties of undefined (reading 'message')"). Listing
+    // languages here loads them up front at highlighter init (async, which works in
+    // the VM), so that synckit path is never taken. Add any language your docs use.
+    languages: [
+      "js", "ts", "jsx", "tsx", "json", "jsonc", "yaml", "bash", "shell", "sh",
+      "html", "css", "scss", "vue", "python", "go", "rust", "java", "c", "cpp",
+      "sql", "diff", "dockerfile", "toml", "xml", "md",
+    ],
+  },
+  themeConfig: {
+    nav: [
+      { text: "Home", link: "/" },
+      { text: "Guide", link: "/guide/getting-started" },
+    ],
+    sidebar: [
+      {
+        text: "Guide",
+        items: [{ text: "Getting Started", link: "/guide/getting-started" }],
+      },
+    ],
+  },
+};
+`,
+      "index.md": `---
+layout: home
+hero:
+  name: VitePress in Vivari
+  text: Docs, in the browser VM
+  tagline: Vue-powered static site generator running fully client-side
+  actions:
+    - theme: brand
+      text: Get Started
+      link: /guide/getting-started
+features:
+  - title: Markdown-first
+    details: Write content in Markdown with Vue components when you need them.
+  - title: Instant HMR
+    details: Edit a page and see it update live — no native dependencies.
+  - title: Syntax highlighting
+    details: Shiki highlights code blocks, compiled entirely in-VM.
+---
+`,
+      "guide/getting-started.md": `# Getting Started
+
+Welcome to **VitePress**, running entirely inside Vivari's in-browser VM.
+
+Edit \`guide/getting-started.md\` and this page hot-reloads. Code blocks are
+highlighted by Shiki, compiled in the VM:
+
+\`\`\`ts
+export function greet(name: string): string {
+  return \`Hello, \${name}!\`;
+}
+
+console.log(greet("Vivari"));
+\`\`\`
+
+- Write docs in Markdown
+- Live hot reload as you edit
+- Zero native dependencies
+`,
+    },
+  };
+}
+
 // ── Angular ──────────────────────────────────────────────────────────────────
 // Angular 21 runs in-VM on its stock `@angular/build` toolchain (esbuild + Vite
 // dev server) from a completely vanilla project — same package.json / angular.json
@@ -4463,6 +4607,7 @@ export const TEMPLATES: TemplateDef[] = [
   // Docs
   slidevTemplate(),
   docusaurusTemplate(),
+  vitepressTemplate(),
   // Creative
   threeTemplate(),
   gsapReactTemplate(),
