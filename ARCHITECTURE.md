@@ -266,10 +266,14 @@ never parks and many downloads can overlap (§6).
   (Buffers/Uint8Arrays pass through unstringified, so binary stdin survives). This
   is what makes the terminal interactive (a live `sh` REPL, `node`, etc.).
 - **Coreutils + shell**: `packages/kernel-host/coreutils.js` provides
-  `echo/cat/ls/pwd/mkdir/rm/node/npm/npx/true/false` and a small `sh`. `sh` with
-  no args is an **interactive REPL** (prompt, echo, backspace, Ctrl+C→SIGINT the
-  whole foreground job — every stage of a pipeline, not just the last, Ctrl+D);
-  with `-c`/a file it runs a batch. It supports
+  `echo/cat/ls/pwd/mkdir/rm/node/npm/npx/bun/bunx/true/false` and a small `sh`. `sh`
+  with no args is an **interactive REPL** (prompt, echo, backspace, ↑/↓ **history**
+  recall + a `history` builtin, **Tab completion** — first token against builtins +
+  PATH, later tokens against the VFS — Ctrl+C→SIGINT the whole foreground job — every
+  stage of a pipeline, not just the last, Ctrl+D); with `-c`/a file it runs a batch.
+  `ls` colors directories bold-blue, but only under `--color=auto` (default) with an
+  interactive terminal attached — signaled by `VV_TTY=1`, which the interactive `sh`
+  sets and children inherit — so batch/CI output stays plain. It supports
   sequencing (`;` `&&` `||`), **pipes** (`|`) and **redirects** (`<` `>` `>>` `2>`
   `2>>` `2>&1`) — a quote-aware lexer parses each line into pipelines of stages,
   wiring one stage's stdout into the next's stdin and opening redirect targets as
@@ -336,7 +340,8 @@ work — it *is* Node's own module code.
 - `node/internal-binding.js`, `node/primordials.js`, `node/loader.js` — the glue
   that lets vendored `lib/` resolve `internalBinding(...)` and `primordials`.
 - `builtins/*.js` — the few remaining hand-written modules (`process`, `os`,
-  `assert`, `child_process`) that have no clean Node-lib form here.
+  `assert`, `child_process`, and `bun` — a Node-backed `Bun` global + `bun:*`
+  modules; see §9.2) that have no clean Node-lib form here.
 
 Module system:
 
@@ -348,6 +353,9 @@ Module system:
   time. Generated identifiers are namespaced (`__oc_require`, `__oc_import`,
   `__oc_exports`, `__oc_module`, …) so user code can freely declare its own
   `require`/`module`/`exports`.
+- `typescript-transform.js` — a **synchronous, dependency-free TS/JSX transform**
+  (type-strip + JSX lowering) the loader applies for zero-config `.ts`/`.tsx`
+  execution (Bun; see §9.2). Gated so plain JS is passed through untouched.
 - `index.js` — `createRuntime()`: wires builtins + globals + the HTTP bridge +
   the WebSocket client, and returns `run(entry)`.
 - `loop.js` — the **per-process event loop** (see §7.1).
@@ -522,9 +530,14 @@ Two non-obvious constraints keep this working:
 The studio is a real workspace, not a two-demo switcher. State (`controller.ts`):
 `workspaceFolders: {id,name,rootPath}[]` + `activeFolderId`; **every tab/model/dirty flag is
 keyed by ABSOLUTE path** so files from different roots can't collide. Home (`Home.tsx`) is an
-overlay over the kept-mounted IDE offering Start-from-blank, Start-from-template (12 templates
-in `vv/templates.ts`: React/Vue/Svelte/Express/Nest/Next × TS/JS), and a `localStorage` recent
-list.
+overlay over the kept-mounted IDE offering Start-from-blank, Start-from-template (~49 templates
+in `vv/templates.ts` across 8 categories — Frontend/Backend/Fullstack/Showcase/Bun/Tooling/Docs/
+Creative, spanning most JS frameworks, bundlers, and the sqlite/pglite/trpc showcases), and a
+`localStorage` recent list. ("Reset everything" also clears that recent list and locks its
+dialog while the OPFS wipe runs.) A left ActivityBar toggle switches a **light/dark/system
+theme** (next-themes; applied to Monaco and the xterm terminals via `controller.applyUiTheme`);
+the file-tree panel is labeled **"Workspace"**, and the editor shows a
+`Workspace > project > …path` breadcrumb with a VS Code-blue active-tab accent.
 
 The Explorer reads the **live VFS** rather than a static map. The bridge gained a
 request/response channel (`KernelBridge.request()` → reqId → `vv-reply`) backing
@@ -736,7 +749,9 @@ gating can't reach. The runtime bridges the gap so projects stay vanilla (no
 by `scripts/spike-toolchain.mjs`:
 
 - `NATIVE_WASM_ALIASES` — **lockstep** renames where source+target publish
-  identical versions (`esbuild → esbuild-wasm`, `rollup → @rollup/wasm-node`).
+  identical versions (`esbuild → esbuild-wasm`, `rollup → @rollup/wasm-node`,
+  `lightningcss → lightningcss-wasm` — the last is what lets **Tailwind v4** run
+  in-VM; `@tailwindcss/oxide` resolves through its own `wasm32-wasi` optional dep).
 - `NATIVE_DROPIN_ALIASES` — API-compatible drop-ins whose versions are **not**
   lockstep (`bcrypt → bcryptjs`). Adding a drop-in to either table = one entry;
   the target must be pure-JS/wasm with no native deps and be spike- + browser-proven.
@@ -831,6 +846,25 @@ unmodified `ng new` project, benefit any esbuild/worker-pool tool (Vitest, tsup,
   (`NO_COLOR`/`TERM=dumb` off → `FORCE_COLOR` on unless `0` → else stream `isTTY`); the studio
   kernel exports `FORCE_COLOR=3`/`TERM=xterm-256color`, so the xterm.js terminal gets color,
   while headless kernels (no `FORCE_COLOR`, non-TTY stdout) stay plain.
+
+### 9.2 Bun (a Node-backed shim, no native binary)
+
+Bun ships no `wasm32` build, so — unlike the real npm/yarn/pnpm/corepack/tsgo, which are
+vendored and unpacked into the VFS — Bun is **emulated on top of our Node runtime**, and its
+pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
+
+- `packages/runtime/builtins/bun.js` — a Node-backed `Bun` global: `version`/`main`/`env`,
+  `escapeHTML`/`deepEquals`, `hash`/`crc32`, `gzip`/`gunzip`, password `hash`/`verify`,
+  `CryptoHasher`, `Transpiler`, `$`, and **`Bun.serve`** (a fetch handler; `routes` with static
+  paths, `:params`, `*` wildcards and `BunRequest.params`; server-side **WebSockets** — RFC 6455
+  handshake + frame codec + `ServerWebSocket` with pub/sub topics), plus **`bun:*` modules**
+  (`bun:test` runner + `expect`).
+- `packages/kernel-host/programs/bun.js` — the `bun`/`bunx` CLI (`bun run`, `bunx` → `npx`,
+  install delegation).
+- Zero-config `.ts`/`.tsx` runs through the loader's synchronous `typescript-transform.js` (§7).
+- The install/run detector (`kernel-worker.ts` `pmFromCmd`) maps `bun`/`bunx` to the `bun` PM,
+  and the studio ships a **"Bun" template category** (serve / routes / websocket / react).
+- Proven by `scripts/spike-bun*.mjs` (the transform, route matcher, WS frame codec, Bun global API).
 
 ---
 

@@ -2942,6 +2942,87 @@ thread both reads the bytes and satisfies COEP. The Fetcher Worker isn't involve
   gzips it with Node's `zlib`, then decodes it with `archive.js` gunzip + `tar.js`
   `parseTar` and checks every entry byte-for-byte, plus `stripFirstSegment`.
 
+## Bun support — a Node-backed shim, no native binary (this change)
+
+Bun has no `wasm32` build, so instead of vendoring a real binary (npm/yarn/pnpm/corepack/tsgo
+are vendored packs unpacked into the VFS) Bun is **emulated on top of our Node runtime**. All
+of its pieces are always on PATH (in `COREUTILS`), nothing is lazily unpacked.
+
+- **Runtime shim** (`packages/runtime/builtins/bun.js`): a `Bun` global — `version`/`main`/`env`,
+  `escapeHTML`/`deepEquals`, `hash`/`crc32`, `gzip`/`gunzip`, password `hash`/`verify`,
+  `CryptoHasher`, `Transpiler`, `$` — plus **`Bun.serve`** (fetch handler; `routes` with static
+  paths, `:params`, `*` wildcards, `BunRequest.params`, static Response caching, method-specific
+  handlers; server-side **WebSockets** — RFC 6455 handshake, frame codec, `ServerWebSocket`
+  send/close/subscribe/publish/cork + pub/sub topics) and **`bun:*` modules** (`bun:test` +
+  `expect`).
+- **Zero-config `.ts`/`.tsx`** (`packages/runtime/typescript-transform.js`): a synchronous,
+  dependency-free type-strip + JSX lowering invoked by `module.js`, gated so plain JS is
+  untouched. It handles the awkward spots — return-type annotations inside object literals (the
+  `Bun.serve` shape), typed/destructured params, inline object/function type annotations.
+- **CLI** (`packages/kernel-host/programs/bun.js`): `bun run`, `bunx` (delegates to `npx`),
+  install delegation, and require/unhandled-rejection errors surfaced instead of a silent exit.
+  `kernel-worker.ts` `pmFromCmd` maps `bun`/`bunx` to the `bun` PM so a Bun template's Run
+  auto-installs with `bun`.
+- **Templates**: a new **"Bun" category** (serve / routes / websocket / react) with the official
+  Bun logo.
+- **Gate**: `scripts/spike-bun*.mjs` (offline + kernel) cover the transform, the route matcher,
+  the WebSocket frame codec, and the Bun global API.
+
+## More studio templates — Tailwind v4, TanStack Router, Vitest (this change)
+
+Three commonly-requested templates, each made to boot in the in-VM runtime (bringing the
+catalog to ~49 across 8 categories):
+
+- **Tailwind + shadcn/ui** (React + Vite + Tailwind CSS **v4**, `Frontend`, graduated). Runs v4
+  in-VM by aliasing the native lightningcss addon to its official WASM build
+  (`lightningcss → lightningcss-wasm` in `NATIVE_WASM_ALIASES`); `@tailwindcss/oxide` resolves
+  via its own `wasm32-wasi` optional dep. Gated by `scripts/spike-tailwind.mjs`.
+- **TanStack Router** (type-safe, file-based routing for a React SPA on Vite, `Frontend`,
+  experimental). Ships the SPA rather than TanStack Start, whose Nitro SSR Vite plugin fails to
+  initialize in the WebContainer at config-load time.
+- **Vitest** with the `@vitest/ui` dashboard as its preview (`Tooling`, graduated). Uses the
+  `worker_threads` pool (the default fork IPC mangles Vitest's collected task tree in-VM →
+  "Entity must be found for task") and disables the browser auto-open (ENOENT in a headless VM).
+  Gated by `scripts/spike-vitest.mjs`.
+
+## Terminal shell polish — Tab completion, history, colored `ls` (this change)
+
+The browser terminal's built-in `sh` (`packages/kernel-host/coreutils.js`) grew three
+interactive niceties:
+
+- **Tab completion**: the first token completes against builtins + PATH programs, later tokens
+  against the VFS (directories suffixed `/`). A unique match inserts + a trailing space; an
+  ambiguous one fills the longest common prefix; otherwise it lists candidates and redraws.
+- **`history`**: a new `sh` builtin printing the interactive command history (bash-style,
+  1-indexed), backed by the same module-scoped array the ↑/↓ line-editor recall uses.
+- **Colored `ls`**: directories render bold-blue (GNU `di=01;34`). Crucially it's **TTY-gated**
+  via GNU-style `--color=auto|always|never` (default `auto`): color only when an interactive
+  terminal is attached, signaled by a `VV_TTY=1` env var the interactive shell sets at startup
+  (children inherit it). Batch mode (`sh script`/`sh -c`, used by CI) never sets it, so
+  captured/piped output stays plain — this fixed a `verify-node` regression where the `ls`
+  assertion saw ANSI escapes instead of a bare `a`.
+
+Also fixed two multi-root Explorer/editor sync bugs: switching to a tab whose file sits in a
+collapsed folder now expands its ancestors + scrolls the row into view, and selecting a tab now
+makes that file the sole tree selection (no stale highlight from another project).
+
+## Studio UI polish — theme switcher, reset, status bar, breadcrumb (this change)
+
+A batch of IDE-shell improvements:
+
+- **Light/Dark/System theme switcher.** `next-themes` `ThemeProvider` at the root + a no-flash
+  inline script; a bottom-of-ActivityBar toggle (Follow system / Light / Dark). The editor
+  (Monaco `vs`/`vs-dark`) and terminals (xterm light/dark palette) follow the resolved theme via
+  a new `controller.applyUiTheme()`, driven by an `AppShell` effect; the hardcoded panel colors
+  gained light + dark variants.
+- **"Reset everything"** now also clears the recent-projects registry (`vv-workspace-projects`),
+  and its confirm dialog can no longer be dismissed (backdrop/Escape/X) while the wipe runs.
+- **Status bar** is VS Code blue (`#007acc`) with white text.
+- **Editor breadcrumb** shows the active file's path as `Workspace > <project> > …`, and the
+  active tab carries a 2px `#007acc` top accent.
+- The file-tree panel (and its ActivityBar tooltip) is renamed **"Explorer" → "Workspace"**
+  (internal view keys unchanged).
+
 ## Definition of done for T2
 
 `npm install` a real dependency, then `node`-run an Express/Vite app whose HTTP server

@@ -50,6 +50,7 @@ packages/
     load-real-npm.js     unpack the vendored real-npm asset into the VFS + shim /bin/npm.
     load-real-tsgo.js     unpack the vendored TypeScript-7 (tsgo, Go/wasm) asset + shim /bin/tsc,/bin/tsgo.
     programs/npm.js       from-scratch npm installer — LEGACY fallback (see real npm below).
+    programs/bun.js       Node-backed `bun`/`bunx` shim (always in COREUTILS; not a vendored pack).
 
   runtime/         The Node runtime that runs INSIDE each process worker.
     index.js       createRuntime(): wires builtins/globals/http-bridge/ws + run().
@@ -57,11 +58,13 @@ packages/
     toolchain-shims.js  single source of truth for native->wasm drop-ins (NATIVE_WASM_ALIASES).
     esbuild-inproc-patch.js  load-time, version-agnostic rewrite of esbuild-wasm's service to run in-process.
     esm.js         ESM→CJS transpiler (import/export → sync CJS).
+    typescript-transform.js  synchronous, dependency-free TS/JSX type-strip + JSX
+                   lowering for the loader (Bun's zero-config .ts/.tsx exec; gated so plain JS is untouched).
     loop.js        the per-process event loop (nextTick→micro→timers→immediate).
     boot.js        process bootstrap shared by browser + Node worker entries.
     fs-client.js   env-agnostic Atomics syscall client (the caller side).
     websocket.js   in-VM WebSocket client (used by the HMR tunnel).
-    builtins/      hand-written: process, os, assert, child_process.
+    builtins/      hand-written: process, os, assert, child_process, bun (Bun global + bun:* modules).
     node/
       lib/         Node's REAL vendored lib/*.js (fs, net, http, stream, ...).
       internal/    Node's REAL internal/* (streams, errors, validators, ...).
@@ -106,8 +109,15 @@ packages/
                           openFileAt (reveal + select a match/line in Monaco). Wires Monaco's
                           real language service (TS/JS workers, diagnostics, cross-file models +
                           node_modules .d.ts extra libs) for IntelliSense — see gotcha below.
-    src/vv/templates.ts   10 project templates (React/Vue/Svelte/Express/Nest × TS/JS) —
-                          manifest (install/dev/port/entry) + full source, inline.
+    src/vv/templates.ts   ~49 project templates across 8 categories (Frontend/Backend/
+                          Fullstack/Showcase/Bun/Tooling/Docs/Creative) — each a manifest
+                          (install/dev/port/entry) + full source, inline (NOT a scaffolder
+                          run in-VM). Spans React/Vue/Svelte/Solid/Qwik/Preact/Lit, Express/
+                          Nest/Fastify/Koa/Hono/h3/Nitro, Next/Nuxt/SvelteKit/Astro/React
+                          Router, Tailwind+shadcn, TanStack Router, Vitest, the Bun family
+                          (serve/routes/websocket/react), Docusaurus/VitePress/Slidev,
+                          Rsbuild/webpack/Angular, and the sqlite/pglite/trpc/monorepo showcases.
+                          The install command is inferred per PM (npm/yarn/pnpm/bun).
   (../core/src/workers/)  the shared runtime host now lives in the @vivari/core SDK
                           (packages/core/src/workers/); studio bundles it via the
                           @vivari/core alias. Browser worker entries:
@@ -123,16 +133,20 @@ packages/
       (TS + `// @ts-nocheck`; bundled by Vite/esbuild, not the strict API build —
        see packages/core/tsconfig.workers.json.)
     src/components/ide/   AppShell (+ Home overlay) · Home (Start blank / from template,
-                          recents) · ActivityBar (Explorer/Search) · Explorer (VFS-backed
-                          multi-root tree; context menu incl. Open in Integrated Terminal,
-                          Copy Path) · SearchPane (VS Code-style full-text search & replace
-                          across all roots: case/word/regex, include/exclude globs, Replace
-                          All/per-file/per-match + preserve case) · EditorGroup
-                          (preview/permanent tabs) · TerminalPanel (Console/Terminal/Ports) ·
-                          PreviewPanel (multi-tab mini-browser: local address bar,
-                          back/forward, reload, chii DevTools in a resizable bottom split) ·
-                          StatusBar (status + live diagnostics count) · CommandPalette (⌘P
-                          quick-open by name; append :line[:col]
+                          recents; "Reset everything" now also clears the recent-projects
+                          registry and locks its dialog while the wipe runs) · ActivityBar
+                          (Workspace/Search + a bottom light/dark/system theme toggle —
+                          next-themes, applied to Monaco + xterm via controller.applyUiTheme) ·
+                          Explorer (the "Workspace" panel: VFS-backed multi-root tree; context
+                          menu incl. Open in Integrated Terminal, Copy Path) · SearchPane (VS
+                          Code-style full-text search & replace across all roots: case/word/regex,
+                          include/exclude globs, Replace All/per-file/per-match + preserve case) ·
+                          EditorGroup (preview/permanent tabs; active tab has a #007acc top
+                          accent + a "Workspace > project > …path" breadcrumb) · TerminalPanel
+                          (Console/Terminal/Ports) · PreviewPanel (multi-tab mini-browser: local
+                          address bar, back/forward, reload, chii DevTools in a resizable bottom
+                          split) · StatusBar (VS Code blue #007acc; status + live diagnostics
+                          count) · CommandPalette (⌘P quick-open by name; append :line[:col]
                           to jump) · fileIcon (vscode-icons). Icons are Iconify via
                           unplugin-icons (`~icons/lucide/*`, `~icons/vscode-icons/*`; needs
                           @svgr/core) — do NOT reintroduce lucide-react.
@@ -281,7 +295,9 @@ Two native->drop-in alias tables in `runtime/toolchain-shims.js` are the single
 source of truth — add drop-ins THERE, not in the fetcher; both are guarded by
 `scripts/spike-toolchain.mjs`:
   - `NATIVE_WASM_ALIASES` — LOCKSTEP renames (source+target publish identical
-    versions), e.g. `esbuild -> esbuild-wasm`, `rollup -> @rollup/wasm-node`.
+    versions), e.g. `esbuild -> esbuild-wasm`, `rollup -> @rollup/wasm-node`,
+    `lightningcss -> lightningcss-wasm` (the last unlocks Tailwind v4 in-VM;
+    `@tailwindcss/oxide` itself resolves via its own `wasm32-wasi` optional dep).
     The target's packument is served verbatim under the source name.
   - `NATIVE_DROPIN_ALIASES` — API-compatible drop-ins whose versions are NOT
     lockstep, e.g. `bcrypt -> bcryptjs`. `synthesizeRemappedPackument()` keeps the
@@ -639,6 +655,33 @@ sha512 integrity), and execs it. What's special / must-not-regress:
 - Headless browser-shape gate: `scripts/spike-corepack-studio.mjs` (`VV_NET=1`
   downloads+runs yarn AND pnpm), using the SAME env (not CLI flags). The off-disk
   Path B proof is `scripts/spike-corepack.mjs`.
+
+### Bun is a Node-backed SHIM, not a real binary — nothing is vendored
+There is no `wasm32` build of Bun, so unlike the real npm/yarn/pnpm/corepack/tsgo
+(vendored packs unpacked into the VFS) Bun is **emulated on top of our Node
+runtime**, and its pieces are ALWAYS on PATH (in `COREUTILS`), never lazily
+unpacked:
+- **`packages/runtime/builtins/bun.js`** — a Node-backed `Bun` global (`version`,
+  `main`, `env`, `escapeHTML`, `deepEquals`, `hash`/`crc32`, `gzip`/`gunzip`,
+  password `hash`/`verify`, `CryptoHasher`, `Transpiler`, `$`) plus **`Bun.serve`**
+  (fetch handler; `routes` with static paths, `:params`, `*` wildcards,
+  `BunRequest.params`, method-specific handlers; server-side **WebSockets** — RFC
+  6455 handshake, frame codec, `ServerWebSocket` send/close/subscribe/publish/cork
+  + pub/sub topics) and **`bun:*` modules** (`bun:test` runner + `expect`).
+- **`packages/kernel-host/programs/bun.js`** — the `bun`/`bunx` CLI: `bun run`,
+  `bunx` (delegates to `npx`), install delegation, and it surfaces require/unhandled-
+  rejection errors instead of a silent exit.
+- **Zero-config `.ts`/`.tsx`** runs through `packages/runtime/typescript-transform.js`
+  (synchronous, dependency-free type-strip + JSX lowering, invoked by `module.js`;
+  gated so plain JS is untouched). It strips return-type annotations inside object
+  literals (the `Bun.serve` shape), typed/destructured params, and inline
+  object/function type annotations — do NOT route plain `.js` through it.
+- Install/run detection: `kernel-worker.ts` `pmFromCmd` maps `bun`/`bunx` to the
+  `bun` PM (see the install-command builder), so a Bun template's Run auto-installs
+  with `bun`.
+- Templates: the **"Bun" category** in `templates.ts` (serve / routes / websocket /
+  react). Gated by `scripts/spike-bun*.mjs` (offline + kernel) covering the
+  transform, the route matcher, the WS frame codec, and the Bun global API.
 
 ### Real TypeScript 7 (`tsc`/`tsgo`) is Go compiled to wasm — don't try to `require` it
 
@@ -1009,8 +1052,20 @@ runtime's `drainStdin` normalizes strings vs bytes to a Buffer). The host termin
 The interactive line editor (echo, backspace, Ctrl+C→SIGINT the whole foreground
 job — every stage of a pipeline via `currentKill`, with keystrokes forwarded to
 the pipeline's first stage) lives in the `sh` coreutil, not in a TTY line
-discipline — there's nothing cooked below it. Terminals use xterm `convertEol:true`, so guest code should emit `\n`
+discipline — there's nothing cooked below it. It also does **↑/↓ history recall**
+(a module-scoped `commandHistory` array shared with the `history` builtin, which
+lists it bash-style 1-indexed) and **Tab completion** (first token → builtins +
+PATH programs; later tokens → the VFS, dirs suffixed `/`; unique match inserts +
+a trailing space, ambiguous fills the longest common prefix, else lists
+candidates). Terminals use xterm `convertEol:true`, so guest code should emit `\n`
 (don't double it to `\r\n`).
+- **Colored `ls` is TTY-gated.** `ls` renders directories bold-blue (GNU
+  `di=01;34`), but ONLY when `--color=auto` (the default) sees an interactive
+  terminal — signaled by `VV_TTY=1`, which the interactive `sh` sets at startup and
+  children inherit. Batch mode (`sh script` / `sh -c`, used by CI) never sets it, so
+  captured/piped output stays plain (this is why `verify-node`'s `ls` assertion sees
+  a bare `a`). `--color=always` forces it; `--color=never`/`NO_COLOR` disable it.
+  Don't emit ANSI unconditionally again.
 
 ### OPFS persistence
 The VFS mirrors to OPFS and **survives reload**. If a demo behaves as if old files

@@ -1,101 +1,135 @@
-# Vivari
+# @vivari/core
 
-<div align="center">
-  <img src="./icon.svg" width="128" height="128" />
-</div>
-
-**An open-source WebContainer.** Run Node-style projects (Vite, Express, and more)
-**100% inside the browser** — a virtual filesystem, a Node-compatible runtime, and
-virtual networking, with no server doing the work.
-
-<p>
-  <a href="https://vivari.pages.dev">Website</a> ·
-  <a href="https://vivari.pages.dev/docs">Docs</a> ·
-  <a href="https://vivari.pages.dev/studio/">Studio</a> ·
-  <a href="https://www.npmjs.com/package/@vivari/core">npm</a>
-</p>
-
-Vivari is **MIT-licensed** — there is no commercial license and no usage fee: embed it, fork it, ship it.
-
-> **Vivari** *(vih-VAH-ree)* takes its name from the Latin *vivarium* — a self-contained enclosure for living things. That's exactly what it is for a running Node app: a sealed, self-contained environment in the browser where a whole project lives and runs.
-
-## Install
+Run **Node.js projects fully client-side in the browser** — a virtual filesystem,
+a Node-compatible runtime, a process model, and virtual networking, all in Web
+Workers with no server doing the work. This is the framework-agnostic Vivari
+WebContainer SDK; see [`@vivari/react`](../react) for React bindings.
 
 ```bash
-npm install @vivari/core        # framework-agnostic SDK
-npm install @vivari/react       # React <Vivari> component + useVivari()
+npm install @vivari/core
 ```
+
+## Requirements
+
+Vivari's synchronous FS/process bridge is built on `SharedArrayBuffer` +
+`Atomics.wait()`, which browsers only expose on a **cross-origin isolated** page.
+Serve your app (and the preview Service Worker) with:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+`Vivari.boot()` throws early if the page is not isolated. You can check yourself
+with the exported `isCrossOriginIsolated()`.
+
+## Quick start
 
 ```ts
 import { Vivari } from "@vivari/core";
 
 const vivari = await Vivari.boot();
+
 await vivari.mount({
-  "package.json": { file: { contents: '{ "type": "module" }' } },
-  "index.js": { file: { contents: "console.log('hello from the browser')" } },
+  "package.json": {
+    file: { contents: JSON.stringify({ name: "app", type: "module" }) },
+  },
+  "index.js": {
+    file: { contents: "console.log('hello from the browser')" },
+  },
 });
 
 const proc = await vivari.spawn("node", ["index.js"]);
 proc.output.pipeTo(new WritableStream({ write: (c) => console.log(c) }));
-await proc.exit;
+console.log("exit code:", await proc.exit);
 ```
 
-> Vivari needs a **cross-origin isolated** page (`COOP: same-origin` +
-> `COEP: require-corp`) so `SharedArrayBuffer` is available. Full guides,
-> the API reference, and interactive examples live in the
-> [documentation](https://vivari.pages.dev/docs).
+### Run a dev server and preview it
 
-## How it works (in one breath)
+```ts
+const iframe = document.querySelector("iframe")!;
+vivari.on("server-ready", (port, url) => (iframe.src = url));
 
-Node's APIs are **synchronous**. Browsers won't let you block on async work
-— *except on a Web Worker thread*, where `Atomics.wait()` can genuinely park
-execution. So `fs.readFileSync` parks the worker until the host answers over a
-`SharedArrayBuffer`; a kernel over a Rust/Wasm VFS services the syscalls, and a
-Service Worker previews an in-VM HTTP server live in an iframe. See
-[How it works](https://vivari.pages.dev/docs/how-it-works) for the full story.
-
-## Repository layout
-
-```
-packages/
-  core/      @vivari/core   — the framework-agnostic SDK
-  react/     @vivari/react  — <Vivari> component + useVivari()
-  vfs/ codec/ crypto/       — Rust crates compiled to Wasm
-  runtime/ kernel-host/ protocol/  — the Node runtime shim + kernel
-  studio/    the studio IDE (Vite + React)
-sites/
-  landing/   the marketing site (Vite + React)
-  docs/      the documentation site (Docusaurus)
-examples/
-  basic/     a minimal, runnable SDK example
-scripts/     verify / smoke / spike harnesses + the site build
+await (await vivari.spawn("npm", ["install"])).exit;
+await vivari.spawn("npm", ["run", "dev"]); // long-running; don't await exit
 ```
 
-## Develop
+## API
 
-Prereqs: **Node `>=22`** (see `.nvmrc`), plus Rust + `wasm-pack` for the Wasm crates.
+### `Vivari.boot(options?): Promise<Vivari>`
 
-```bash
-npm install
-npm run build      # compile the Rust VFS/codec/crypto to Wasm
-npm run verify     # headless proof the sync-bridge works end-to-end
-npm run dev        # start the studio IDE
-```
+Boots the kernel + workers + VFS and (unless disabled) registers the preview
+Service Worker.
 
-Build the full site (landing + docs + studio) for a static deploy:
+| option             | type                | default        | notes                                                              |
+| ------------------ | ------------------- | -------------- | ------------------------------------------------------------------ |
+| `compress`         | `boolean`           | `true`         | VFS whole-file compression (~70 % less RAM for a big node_modules) |
+| `serviceWorkerUrl` | `string \| false`   | `"/sw.js"`     | where you host the SDK's `sw.js`; `false` disables previews        |
+| `workerName`       | `string`            | `"Vivari Kernel"` | DevTools label for the kernel Worker                            |
+| `devtools`         | `boolean`           | `false`        | inject Vivari's in-preview DevTools backend (see below)            |
 
-```bash
-npm run build:site   # assembles everything into dist/ (see sites/docs deployment guide)
-```
+> **Preview DevTools.** By default the SDK does **not** inject Vivari's in-preview
+> DevTools backend into your preview pages. That backend needs a same-origin
+> `/vv-devtools/chobitsu.js`, so enabling it without hosting that file would make
+> every preview 404 on it. Pass `devtools: true` **and** serve `chobitsu.js` from
+> your origin to turn it on.
 
-## Contributing & security
+### `vivari.mount(tree, { mountPoint? })`
 
-- [Contributing guide](CONTRIBUTING.md) · [Code of Conduct](CODE_OF_CONDUCT.md)
-- Found a vulnerability? See [SECURITY.md](SECURITY.md).
+Write a declarative `FileSystemTree` (WebContainer-compatible shape) into the VFS.
 
-Releases are cut from the manual **Publish SDK** GitHub Actions workflow
-(`.github/workflows/publish.yml`).
+### `vivari.spawn(command, args?, { cwd?, env? }): Promise<VivariProcess>`
+
+Run a command. Package managers (`npm`/`yarn`/`pnpm`/`corepack`) work out of the
+box with persisted, content-addressed caches, and `bun`/`bunx` run against a
+Node-backed Bun shim (`Bun` global + `bun:*` modules, no native binary). A
+`VivariProcess` has:
+
+- `output: ReadableStream<string>` — merged stdout + stderr (ANSI intact)
+- `input: WritableStream<string>` — stdin (close the stream to send EOF)
+- `exit: Promise<number>` — the exit code
+- `kill(): void`
+
+### `vivari.fs`
+
+An async `fs/promises`-style facade: `readFile(path, "utf-8")` / `readFile(path)`
+(bytes), `writeFile`, `readdir(path, { withFileTypes? })`, `mkdir`, `rm`,
+`rename`, `exists`, `stat`.
+
+### `vivari.on(event, listener): () => void`
+
+- `"server-ready"` → `(port, url)` — a server started listening; `url` is its preview URL
+- `"port"` → `(port, "open" | "close", url)`
+- `"error"` → `({ message })`
+
+### `vivari.previewUrl(port)` · `vivari.teardown()`
+
+Build the same-origin preview URL for a port, and free the workers/VFS.
+
+## Bundlers & self-hosting assets
+
+The heavy machinery (kernel worker, its nested fs/fetcher/process workers, and the
+Rust/Wasm VFS + codec + crypto artifacts) is reached via
+`new Worker(new URL(..., import.meta.url))` and `new URL('*.wasm', import.meta.url)`.
+The published `dist/` is self-contained: modern bundlers (Vite, webpack 5, Rollup,
+esbuild) resolve those relative to the installed package and emit them same-origin.
+
+Two assets must be served **same-origin** (COEP forbids cross-origin loads):
+
+1. **The preview Service Worker.** Copy `@vivari/core/dist/assets/sw.js` to your
+   served root as `/sw.js` (or point `serviceWorkerUrl` at your chosen path). It
+   must be served with `Service-Worker-Allowed: /`.
+2. **Package-manager tarballs** (only if you use `npm`/`yarn`/`pnpm` in-VM). Vivari
+   fetches vendored PM deliveries from `/vendor/...` on your origin; host that
+   directory too, or skip installs.
+
+## Advanced: `KernelBridge`
+
+`Vivari` is a thin facade over `KernelBridge`, the raw pub/sub transport to the
+kernel worker (`on`/`onAny`/`post`/`request`, SW registration, keep-prefix ports).
+Use it directly if you need the full message vocabulary (this is what the Vivari
+studio IDE is built on).
 
 ## License
 
-[MIT](LICENSE) — free for any use, commercial or otherwise.
+MIT © Duc Trung Mai
