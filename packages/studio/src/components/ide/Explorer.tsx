@@ -54,6 +54,11 @@ export function Explorer() {
   // shortcuts (Cmd/Ctrl+A to select all, Esc to clear) work even when the
   // editor had focus — matching VSCode (a single click doesn't focus the editor).
   const treeRef = useRef<HTMLDivElement>(null);
+  // The row of the currently-active editor file, so we can scroll it into view
+  // when the active tab changes; `scrolledFor` dedupes so we only scroll once
+  // per tab (not on every unrelated tree re-render).
+  const activeRowRef = useRef<HTMLDivElement>(null);
+  const scrolledFor = useRef<string | null>(null);
 
   // ── drag & drop ────────────────────────────────────────────────────────────
   // Make a row a drag source. Dragging a row that's part of a multi-selection
@@ -127,6 +132,37 @@ export function Explorer() {
     for (const dir of expanded) if (!(dir in children)) void load(dir);
   }, [expanded, children, load]);
 
+  // Reveal the active editor file in the tree whenever the active tab changes
+  // (tab click, open, or close→next). Expands its ancestor folders so the row is
+  // rendered, and makes it the SOLE selection — clearing any stale highlight in
+  // another project (fixes two files appearing highlighted across roots).
+  useEffect(() => {
+    const abs = snap.activeTab;
+    if (!abs) { setSelection(new Set()); return; }
+    const folder = snap.workspaceFolders.find(
+      (f) => abs === f.rootPath || abs.startsWith(f.rootPath + "/"),
+    );
+    if (!folder) return;
+    // Every ancestor dir from the owning root down to the file's parent.
+    const ancestors: string[] = [];
+    for (let cur = parentDir(abs); cur.startsWith(folder.rootPath); cur = parentDir(cur)) {
+      ancestors.push(cur);
+      if (cur === folder.rootPath) break;
+    }
+    setExpanded((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const d of ancestors) if (!next.has(d)) { next.add(d); changed = true; if (!(d in children)) void load(d); }
+      return changed ? next : prev;
+    });
+    setSelection(new Set([abs]));
+    setAnchor(abs);
+    c.setActiveFolder(folder.id);
+    // Deliberately keyed only on the active tab: expanding/selecting should
+    // follow the editor, not re-run when children load or folders change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [snap.activeTab]);
+
   // A VFS change (file op / install / create) bumps treeVersion → re-read every
   // directory we currently have loaded, so the tree reflects reality.
   useEffect(() => {
@@ -186,6 +222,16 @@ export function Explorer() {
     return rows;
   }, [children, expanded, snap.workspaceFolders]);
   const isDirOf = (abs: string) => flatVisible.find((r) => r.abs === abs)?.isDir ?? false;
+
+  // Once the active file's row is mounted (after any ancestor folders finish
+  // loading and `flatVisible` updates), scroll it into view — once per tab.
+  useEffect(() => {
+    if (!snap.activeTab || scrolledFor.current === snap.activeTab) return;
+    if (activeRowRef.current) {
+      activeRowRef.current.scrollIntoView({ block: "nearest" });
+      scrolledFor.current = snap.activeTab;
+    }
+  }, [snap.activeTab, flatVisible]);
 
   // Apply a click to the selection: Shift extends a range from the anchor,
   // Cmd/Ctrl toggles one row, a plain click selects just that row.
@@ -326,6 +372,7 @@ export function Explorer() {
         onOpen={() => c.openEntry(abs, { preview: false })} onRename={() => startRename(abs)} onDelete={() => setConfirmDelete(effective(abs))}
         onNewFile={() => startCreate(parentDir(abs), "file")} onNewFolder={() => startCreate(parentDir(abs), "folder")}>
         <div
+          ref={snap.activeTab === abs ? activeRowRef : undefined}
           {...dragProps(abs)}
           {...dropProps(parentDir(abs), abs)}
           className={cn(

@@ -125,11 +125,25 @@ main();
   ls: `
 const fs = require('fs');
 const path = require('path');
-const args = process.argv.slice(2).filter((a) => !a.startsWith('-'));
+const argv = process.argv.slice(2);
+// Directories are printed bold-blue (GNU ls' di=01;34) so folders stand out
+// from files. There is no real terminal here (process.stdout.isTTY is always
+// false), so color is ON by default; \`--color=never\` or a non-empty NO_COLOR
+// env turns it off (e.g. when piping/redirecting and ANSI would be noise).
+const noColor = argv.includes('--color=never') || (process.env.NO_COLOR != null && process.env.NO_COLOR !== '');
+const args = argv.filter((a) => !a.startsWith('-'));
 const target = args[0] ? path.resolve(process.cwd(), args[0]) : process.cwd();
 try {
   const names = fs.readdirSync(target);
-  if (names.length) process.stdout.write(names.join('\\n') + '\\n');
+  if (names.length) {
+    const out = names.map((name) => {
+      if (noColor) return name;
+      let isDir = false;
+      try { isDir = fs.statSync(path.join(target, name)).isDirectory(); } catch (e) {}
+      return isDir ? '\\x1b[1;34m' + name + '\\x1b[0m' : name;
+    });
+    process.stdout.write(out.join('\\n') + '\\n');
+  }
 } catch (e) {
   process.stderr.write('ls: ' + (args[0] || '.') + ': ' + (e.code || e.message) + '\\n');
   process.exit(1);
@@ -330,6 +344,11 @@ function parse(toks) {
 let currentChild = null;
 let currentKill = null;
 
+// Interactive command history, shared between the line editor (up/down recall)
+// and the \`history\` builtin below. Populated by the REPL in interactive mode;
+// empty in batch mode (\`sh -c\`).
+const commandHistory = [];
+
 function runSimple(tokens) {
   if (!tokens.length) return Promise.resolve(0);
   const cmd = tokens[0];
@@ -345,6 +364,14 @@ function runSimple(tokens) {
   }
   if (cmd === ':' || cmd === 'true') return Promise.resolve(0);
   if (cmd === 'false') return Promise.resolve(1);
+  // \`history\` lists the interactive command history (bash-style, 1-indexed).
+  // Like cd/pwd it is a builtin, so it only works standalone — inside a pipeline
+  // it would be looked up on PATH (/bin/history.js, which doesn't exist).
+  if (cmd === 'history') {
+    const lines = commandHistory.map((h, i) => String(i + 1).padStart(4) + '  ' + h);
+    if (lines.length) process.stdout.write(lines.join('\\n') + '\\n');
+    return Promise.resolve(0);
+  }
   return new Promise((resolve) => {
     const child = cp.spawn(cmd, args, { cwd: process.cwd(), env: process.env });
     currentChild = child;
@@ -490,7 +517,7 @@ function runInteractive() {
 
   let line = '';   // current input buffer
   let pos = 0;     // cursor position within \`line\`
-  const history = [];
+  const history = commandHistory; // shared with the \`history\` builtin
   let histIdx = 0; // == history.length means "editing a fresh line"
   let busy = false;
   const queue = [];
@@ -504,6 +531,90 @@ function runInteractive() {
     if (back > 0) process.stdout.write('\\x1b[' + back + 'D');
   };
   const setLine = (s) => { line = s; pos = s.length; redraw(); };
+
+  // ---- Tab completion -------------------------------------------------------
+  const BUILTINS = ['cd', 'pwd', 'export', 'history'];
+  // Scripting no-ops: still handled by runSimple / installed on /bin (used in
+  // shell scripts and \`&&\`||\` chains), but hidden from Tab suggestions since
+  // nobody completes them interactively and they only clutter the list.
+  const HIDDEN_COMMANDS = new Set([':', 'true', 'false']);
+  // Command names for the first token: builtins + every entry on PATH, with a
+  // trailing '.js' stripped (coreutils live on disk as /bin/<name>.js).
+  const listCommands = () => {
+    const set = new Set(BUILTINS);
+    for (const d of (process.env.PATH || '/bin').split(':').filter(Boolean)) {
+      let names;
+      try { names = fs.readdirSync(d); } catch (e) { continue; }
+      for (const n of names) set.add(n.endsWith('.js') ? n.slice(0, -3) : n);
+    }
+    return Array.from(set).filter((c) => !HIDDEN_COMMANDS.has(c));
+  };
+  // Filesystem candidates for an argument token. \`frag\` may carry a directory
+  // part (e.g. "src/comp"); we readdir the directory and match the basename.
+  // Directories come back with a trailing '/'. \`base\` is the dir part of frag,
+  // kept verbatim when the caller rebuilds the token.
+  const listPaths = (frag) => {
+    const slash = frag.lastIndexOf('/');
+    const base = slash >= 0 ? frag.slice(0, slash + 1) : '';
+    const namePart = slash >= 0 ? frag.slice(slash + 1) : frag;
+    const dirAbs = base ? (path.isAbsolute(base) ? base : path.resolve(process.cwd(), base)) : process.cwd();
+    let names;
+    try { names = fs.readdirSync(dirAbs); } catch (e) { return { base: base, namePart: namePart, matches: [] }; }
+    const matches = [];
+    for (const n of names) {
+      if (!n.startsWith(namePart)) continue;
+      let isDir = false;
+      try { isDir = fs.statSync(path.join(dirAbs, n)).isDirectory(); } catch (e) {}
+      matches.push(isDir ? n + '/' : n);
+    }
+    return { base: base, namePart: namePart, matches: matches };
+  };
+  const commonPrefix = (arr) => {
+    if (!arr.length) return '';
+    let p = arr[0];
+    for (let k = 1; k < arr.length; k++) {
+      const s = arr[k]; let j = 0;
+      while (j < p.length && j < s.length && p[j] === s[j]) j++;
+      p = p.slice(0, j);
+      if (!p) break;
+    }
+    return p;
+  };
+  // Complete the whitespace-delimited token ending at the cursor. First token →
+  // command; later tokens → filesystem path. Unique match: insert it (+ a space,
+  // unless it's a directory ending in '/'). Several: fill the longest common
+  // prefix; if that adds nothing, print the candidate list and redraw.
+  const complete = () => {
+    const left = line.slice(0, pos);
+    const lastSpace = left.lastIndexOf(' ');
+    const frag = left.slice(lastSpace + 1);
+    const isCommand = left.slice(0, lastSpace + 1).trim() === '';
+    let candidates, typed;
+    if (isCommand) {
+      candidates = listCommands().filter((c) => c.startsWith(frag)).sort();
+      typed = frag;
+    } else {
+      const r = listPaths(frag);
+      candidates = r.matches.slice().sort();
+      typed = r.namePart;
+    }
+    if (!candidates.length) return;
+    if (candidates.length === 1) {
+      const completed = candidates[0];
+      const addSpace = !completed.endsWith('/');
+      const insert = completed.slice(typed.length) + (addSpace ? ' ' : '');
+      line = line.slice(0, pos) + insert + line.slice(pos); pos += insert.length; redraw();
+      return;
+    }
+    const lcp = commonPrefix(candidates);
+    if (lcp.length > typed.length) {
+      const insert = lcp.slice(typed.length);
+      line = line.slice(0, pos) + insert + line.slice(pos); pos += insert.length; redraw();
+      return;
+    }
+    process.stdout.write('\\n' + candidates.join('  ') + '\\n');
+    redraw();
+  };
 
   const drain = async () => {
     if (busy) return;
@@ -585,6 +696,7 @@ function runInteractive() {
         if (!line.length) { process.stdout.write('\\n'); process.exit(0); }
       } else if (ch === '\\x01') { pos = 0; redraw(); }          // Ctrl+A → start of line
       else if (ch === '\\x05') { pos = line.length; redraw(); }  // Ctrl+E → end of line
+      else if (ch === '\\t') { complete(); }                     // Tab → autocomplete
       else if (ch >= ' ') { // printable: insert at cursor
         line = line.slice(0, pos) + ch + line.slice(pos); pos++;
         if (pos === line.length) process.stdout.write(ch); else redraw();
