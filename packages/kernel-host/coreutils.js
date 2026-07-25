@@ -126,18 +126,22 @@ main();
 const fs = require('fs');
 const path = require('path');
 const argv = process.argv.slice(2);
-// Directories are printed bold-blue (GNU ls' di=01;34) so folders stand out
-// from files. There is no real terminal here (process.stdout.isTTY is always
-// false), so color is ON by default; \`--color=never\` or a non-empty NO_COLOR
-// env turns it off (e.g. when piping/redirecting and ANSI would be noise).
-const noColor = argv.includes('--color=never') || (process.env.NO_COLOR != null && process.env.NO_COLOR !== '');
+// Directories are printed bold-blue (GNU ls' di=01;34) so folders stand out.
+// GNU-style --color mode: 'auto' (default) colors ONLY when an interactive
+// terminal is attached (VV_TTY, set by the interactive shell) — so captured /
+// piped / scripted output (\`sh -c\`, CI) stays plain. --color[=always] forces
+// color; --color=never or a non-empty NO_COLOR disables it.
+const colorArg = argv.find((a) => a === '--color' || a.startsWith('--color='));
+const mode = colorArg == null ? 'auto' : (colorArg === '--color' ? 'always' : colorArg.slice(8));
+const noColorEnv = process.env.NO_COLOR != null && process.env.NO_COLOR !== '';
+const useColor = mode === 'never' ? false : mode === 'always' ? true : (!noColorEnv && process.env.VV_TTY === '1');
 const args = argv.filter((a) => !a.startsWith('-'));
 const target = args[0] ? path.resolve(process.cwd(), args[0]) : process.cwd();
 try {
   const names = fs.readdirSync(target);
   if (names.length) {
     const out = names.map((name) => {
-      if (noColor) return name;
+      if (!useColor) return name;
       let isDir = false;
       try { isDir = fs.statSync(path.join(target, name)).isDirectory(); } catch (e) {}
       return isDir ? '\\x1b[1;34m' + name + '\\x1b[0m' : name;
@@ -636,6 +640,12 @@ function runInteractive() {
     line = ''; pos = 0;
     drain();
   };
+
+  // Mark that an interactive terminal is attached. Child processes inherit this
+  // (spawned with env: process.env), so tools like \`ls\` can enable color only in
+  // a real terminal. Batch mode (\`sh script\` / \`sh -c\`, used by CI) never sets
+  // it, keeping captured/piped output plain.
+  process.env.VV_TTY = '1';
 
   process.stdin.setRawMode && process.stdin.setRawMode(true);
   process.stdin.resume();
