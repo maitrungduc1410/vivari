@@ -24,6 +24,7 @@
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
 import { stubNodeGyp } from "../packages/kernel-host/node-gyp-stub.js";
+import { createAliasedFetcher } from "./lib/aliased-fetcher.mjs";
 import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
@@ -91,79 +92,11 @@ export async function runViteSpike({ name, dir, files, entryModule, titleMarker 
     };
   };
 
-  // Transparent wasm drop-in aliasing — mirrors packages/studio/src/workers/fetcher-worker.js
-  // (PACKAGE_ALIASES). esbuild/rollup ship no wasm32 native build; their official
-  // WASM drop-ins live under a different package name, which npm's platform
-  // auto-select can't reach. Aliasing at the registry layer (serve the target's
-  // packument under the source name) lets a plain in-VM `npm install` pull the wasm
-  // drop-in with NO project-level "overrides". The headless spike must do this too,
-  // otherwise it installs the native esbuild the browser kernel never sees — and the
-  // module loader's in-process esbuild service (packages/runtime/esbuild-inproc-patch.js)
-  // only patches esbuild-*wasm*. Keep in sync with fetcher-worker.js.
-  const PACKAGE_ALIASES = { esbuild: "esbuild-wasm", rollup: "@rollup/wasm-node" };
-  const encPkg = (n) => (n.startsWith("@") ? "@" + encodeURIComponent(n.slice(1)) : encodeURIComponent(n));
-  const matchPackumentAlias = (url) => {
-    let u;
-    try { u = new URL(url); } catch { return null; }
-    const segs = u.pathname.split("/").filter(Boolean);
-    if (!segs.length || segs.includes("-")) return null; // empty or a tarball path
-    let i = segs.length - 1;
-    const last = decodeURIComponent(segs[i]);
-    if ((/^\d/.test(last) || last === "latest") && segs.length >= 2) i = segs.length - 2;
-    const src = decodeURIComponent(segs[i]);
-    const dst = PACKAGE_ALIASES[src];
-    if (!dst) return null;
-    const ns = segs.slice();
-    ns[i] = encPkg(dst);
-    u.pathname = "/" + ns.join("/");
-    return { targetUrl: u.toString(), src };
-  };
-  const rewritePackument = (json, src) => {
-    if (json && typeof json === "object") {
-      if ("name" in json) json.name = src;
-      if ("_id" in json) json._id = src;
-      const versions = json.versions;
-      if (versions && typeof versions === "object") {
-        for (const v of Object.keys(versions)) {
-          const m = versions[v];
-          if (m && typeof m === "object") {
-            if ("name" in m) m.name = src;
-            if ("_id" in m) m._id = src + "@" + (m.version || v);
-          }
-        }
-      }
-    }
-    return json;
-  };
-  const fetcher = async (url, init) => {
-    const method = ((init && init.method) || "GET").toUpperCase();
-    if (method === "GET") {
-      const alias = matchPackumentAlias(url);
-      if (alias) {
-        try {
-          const r = await fetch(alias.targetUrl, { redirect: "follow", ...(init || {}) });
-          if (r.ok) {
-            const json = rewritePackument(await r.json(), alias.src);
-            const body = new TextEncoder().encode(JSON.stringify(json));
-            return {
-              ok: true,
-              status: r.status,
-              statusText: r.statusText,
-              headers: { "content-type": "application/json" },
-              body,
-            };
-          }
-        } catch {
-          // fall through to the un-aliased fetch below
-        }
-      }
-    }
-    const r = await fetch(url, { redirect: "follow", ...(init || {}) });
-    const body = new Uint8Array(await r.arrayBuffer());
-    const headers = {};
-    r.headers.forEach((v, k) => (headers[k] = v));
-    return { ok: r.ok, status: r.status, statusText: r.statusText, headers, body };
-  };
+  // Transparent native->wasm packument aliasing, mirroring the browser kernel.
+  // Backed by the shared table in packages/runtime/toolchain-shims.js (via
+  // scripts/lib/aliased-fetcher.mjs), so esbuild/rollup/lightningcss and any
+  // drop-in stay in lockstep with fetcher-worker.ts and can't drift.
+  const fetcher = createAliasedFetcher();
 
   const out = [];
   const cap = (s) => {

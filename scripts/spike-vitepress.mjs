@@ -21,6 +21,7 @@
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
 import { stubNodeGyp } from "../packages/kernel-host/node-gyp-stub.js";
+import { createAliasedFetcher } from "./lib/aliased-fetcher.mjs";
 import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
@@ -80,13 +81,9 @@ const spawnWorker = (info) => {
     postMessage: (m) => w.postMessage(m),
   };
 };
-const fetcher = async (url, init) => {
-  const r = await fetch(url, { redirect: "follow", ...(init || {}) });
-  const body = new Uint8Array(await r.arrayBuffer());
-  const headers = {};
-  r.headers.forEach((v, k) => (headers[k] = v));
-  return { ok: r.ok, status: r.status, statusText: r.statusText, headers, body };
-};
+// Transparent native->wasm packument aliasing (esbuild/rollup/lightningcss),
+// mirroring the browser kernel — VitePress pulls Vite 5 + esbuild + rollup.
+const fetcher = createAliasedFetcher();
 
 const out = [];
 const cap = (s) => {

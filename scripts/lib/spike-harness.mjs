@@ -17,6 +17,8 @@
 import { Kernel } from "../../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../../packages/kernel-host/kernel-fs.js";
 import { stubNodeGyp } from "../../packages/kernel-host/node-gyp-stub.js";
+import { applyRealNpmShims } from "../../packages/kernel-host/load-real-npm.js";
+import { createAliasedFetcher } from "./aliased-fetcher.mjs";
 import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
@@ -74,13 +76,11 @@ export async function bootSpikeKernel() {
     };
   };
 
-  const fetcher = async (url, init) => {
-    const r = await fetch(url, { redirect: "follow", ...(init || {}) });
-    const body = new Uint8Array(await r.arrayBuffer());
-    const headers = {};
-    r.headers.forEach((v, k) => (headers[k] = v));
-    return { ok: r.ok, status: r.status, statusText: r.statusText, headers, body };
-  };
+  // Transparent native->wasm packument aliasing, mirroring the browser kernel
+  // (see scripts/lib/aliased-fetcher.mjs) so a plain in-VM `npm install` pulls
+  // esbuild-wasm / @rollup/wasm-node / lightningcss-wasm instead of the native
+  // binaries that die on wasm32.
+  const fetcher = createAliasedFetcher();
 
   const out = [];
   const cap = (s) => {
@@ -113,6 +113,9 @@ export async function bootSpikeKernel() {
   const t0 = Date.now();
   loadDir(VENDOR_NPM, VFS_NPM);
   stubNodeGyp(kernel, VFS_NPM);
+  // Write /bin/npm.js + /bin/npx.js on PATH (VFS_NPM === NPM_VFS_ROOT), so a bare
+  // `npm`/`npx` resolves — e.g. `bun add` delegates via cp.spawn('npm', …).
+  applyRealNpmShims(kernel);
   console.log(`Loaded real npm into VFS: ${fileCount} files (${Date.now() - t0}ms)`);
   kernel.mkdirp("/home/user");
   kernel.mkdirp("/tmp/.npm/_logs");

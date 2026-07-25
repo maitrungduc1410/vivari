@@ -91,6 +91,7 @@ const noWasm = mockFs(new Set());
 // --- 1. alias table -----------------------------------------------------------
 ok(NATIVE_WASM_ALIASES.esbuild === "esbuild-wasm", "alias esbuild -> esbuild-wasm");
 ok(NATIVE_WASM_ALIASES.rollup === "@rollup/wasm-node", "alias rollup -> @rollup/wasm-node");
+ok(NATIVE_WASM_ALIASES.lightningcss === "lightningcss-wasm", "alias lightningcss -> lightningcss-wasm");
 
 // --- 2. patch applies to the known block --------------------------------------
 const patched = maybePatchEsbuildInProcess(wrap(SPAWN_BLOCK("0.28.1")), MAIN, wasmPresent, path);
