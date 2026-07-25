@@ -6,7 +6,7 @@ export function StatusBar() {
   const { snap } = useIde();
   const { errors, warnings } = snap.problems;
   return (
-    <div className="flex h-6 shrink-0 items-center gap-4 bg-primary/90 px-3 text-xs text-primary-foreground">
+    <div className="flex h-6 shrink-0 items-center gap-4 bg-[#007acc] px-3 text-xs text-white">
       {/* Live TS/JS diagnostics from the language-service worker. */}
       <span
         className="flex items-center gap-2 opacity-90"

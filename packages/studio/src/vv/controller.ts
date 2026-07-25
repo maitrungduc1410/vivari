@@ -190,7 +190,7 @@ function esbuildLabel(p: ProcMem): string {
   return bytes > 0 ? `, esbuild-wasm ${fmtBytes(bytes)}` : ", esbuild-wasm";
 }
 
-const TERM_THEME = {
+const TERM_THEME_DARK = {
   background: "#181818",
   foreground: "#cccccc",
   cursor: "#aeafad",
@@ -201,6 +201,24 @@ const TERM_THEME = {
   brightYellow: "#f5f543", brightBlue: "#3b8eea", brightMagenta: "#d670d6",
   brightCyan: "#29b8db", brightWhite: "#ffffff",
 };
+
+// Light terminal palette mirrors VS Code's default light theme so the terminal
+// stays legible when the UI switches to light mode.
+const TERM_THEME_LIGHT = {
+  background: "#ffffff",
+  foreground: "#3b3b3b",
+  cursor: "#3b3b3b",
+  selectionBackground: "#add6ff",
+  black: "#000000", red: "#cd3131", green: "#00bc00", yellow: "#949800",
+  blue: "#0451a5", magenta: "#bc05bc", cyan: "#0598bc", white: "#555555",
+  brightBlack: "#666666", brightRed: "#cd3131", brightGreen: "#14ce14",
+  brightYellow: "#b5ba00", brightBlue: "#0451a5", brightMagenta: "#bc05bc",
+  brightCyan: "#0598bc", brightWhite: "#a5a5a5",
+};
+
+type UiTheme = "light" | "dark";
+const termThemeFor = (t: UiTheme) => (t === "light" ? TERM_THEME_LIGHT : TERM_THEME_DARK);
+const monacoThemeFor = (t: UiTheme) => (t === "light" ? "vs" : "vs-dark");
 
 const ESC = "\x1b[";
 const REGISTRY_KEY = "vv-workspace-projects";
@@ -470,6 +488,12 @@ export class IdeController {
   private portMap = new Map<number, number>(); // port -> pid (live listeners)
   private treeBump: ReturnType<typeof setTimeout> | null = null;
   private started = false;
+  // Current resolved UI theme, seeded from the pre-paint <html> class the
+  // no-flash script sets, then kept in sync with next-themes via applyUiTheme.
+  private uiTheme: UiTheme =
+    typeof document !== "undefined" && document.documentElement.classList.contains("dark")
+      ? "dark"
+      : "light";
 
   constructor() {
     this.bridge = new KernelBridge();
@@ -607,6 +631,18 @@ export class IdeController {
     this.terms.get("console")?.term.write((color ? `${ESC}${color}m${text}${ESC}0m` : text) + "\r\n");
   }
 
+  // Switch the editor + all live terminals to the given resolved theme. Called
+  // from a React effect that mirrors next-themes' resolvedTheme.
+  applyUiTheme(theme: UiTheme) {
+    if (theme === this.uiTheme) return;
+    this.uiTheme = theme;
+    this.monaco?.editor.setTheme(monacoThemeFor(theme));
+    const termTheme = termThemeFor(theme);
+    for (const { term } of this.terms.values()) {
+      term.options.theme = termTheme;
+    }
+  }
+
   private makeTerm(): { term: Terminal; fit: FitAddon } {
     const term = new Terminal({
       convertEol: true,
@@ -617,7 +653,7 @@ export class IdeController {
       // while cutting the per-terminal buffer footprint.
       fontSize: 12.5,
       scrollback: 2000,
-      theme: TERM_THEME,
+      theme: termThemeFor(this.uiTheme),
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -819,7 +855,7 @@ export class IdeController {
     this.wireGoToDefinition(monaco);
     this.editor = monaco.editor.create(el, {
       model: null,
-      theme: "vs-dark",
+      theme: monacoThemeFor(this.uiTheme),
       automaticLayout: true,
       fontSize: 13,
       // Minimap renders (and retains) a second tokenized view of the whole file;
@@ -2390,6 +2426,14 @@ export class IdeController {
       this.bridge.destroy();
     } catch {
       /* worker already gone */
+    }
+    // Wipe the recent-projects registry too, so "reset everything" truly starts
+    // from a clean slate (the Home screen's Recent list is backed by this key).
+    try {
+      localStorage.removeItem(REGISTRY_KEY);
+      this.set({ recentProjects: [] });
+    } catch {
+      /* storage disabled — nothing to clear */
     }
     try {
       await resetVfs();

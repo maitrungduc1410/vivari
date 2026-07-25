@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import X from "~icons/lucide/x";
+import ChevronRight from "~icons/lucide/chevron-right";
 import { cn } from "@/lib/utils";
-import { VV_PATH_MIME, entriesFromDataTransfer } from "@/vv/controller";
+import { VV_PATH_MIME, entriesFromDataTransfer, type WorkspaceFolder } from "@/vv/controller";
 import {
   ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger,
 } from "@/components/ui/context-menu";
@@ -99,9 +100,9 @@ export function EditorGroup() {
   const cancelClose = () => { setPromptRel(null); setQueue([]); };
 
   return (
-    <div className="flex h-full flex-col bg-[#1e1e1e]">
+    <div className="flex h-full flex-col bg-white dark:bg-[#1e1e1e]">
       {/* tab strip */}
-      <div className="vv-tabs-scroll flex h-9 shrink-0 items-stretch overflow-x-auto border-b bg-[#181818]">
+      <div className="vv-tabs-scroll flex h-9 shrink-0 items-stretch overflow-x-auto border-b bg-[#f3f3f3] dark:bg-[#181818]">
         {snap.openTabs.map((rel, i) => {
           const active = rel === snap.activeTab;
           const isDirty = snap.dirty.includes(rel);
@@ -142,7 +143,7 @@ export function EditorGroup() {
                   onDragEnd={() => { setDragTab(null); setOverTab(null); }}
                   className={cn(
                     "group flex cursor-pointer items-center gap-1.5 border-r px-3 text-xs",
-                    active ? "bg-[#1e1e1e] text-foreground" : "bg-[#181818] text-muted-foreground hover:text-foreground",
+                    active ? "bg-white text-foreground shadow-[inset_0_2px_0_0_#007acc] dark:bg-[#1e1e1e]" : "bg-[#f3f3f3] text-muted-foreground hover:text-foreground dark:bg-[#181818]",
                     dragTab === rel && "opacity-50",
                     dropSide,
                   )}
@@ -197,6 +198,9 @@ export function EditorGroup() {
         })}
       </div>
 
+      {/* breadcrumb: Workspace-relative path of the active file */}
+      {snap.activeTab && <Breadcrumb abs={snap.activeTab} folders={snap.workspaceFolders} />}
+
       {/* editor host (Monaco mounts here once) */}
       <div ref={dropZoneRef} className="relative flex-1">
         {/* Monaco stays mounted; it's hidden behind the image/directory panes so
@@ -206,7 +210,7 @@ export function EditorGroup() {
         {activeKind === "directory" && snap.activeTab && <DirectoryView />}
         {!snap.activeTab && (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
-            {snap.projectTitle ? "Open a file from the Explorer" : "Press Run to start a project"}
+            {snap.projectTitle ? "Open a file from the Workspace" : "Press Run to start a project"}
           </div>
         )}
         {dropActive && (
@@ -260,7 +264,7 @@ function ImageView({ abs }: { abs: string }) {
   const url = c.imageUrlFor(abs);
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null);
   return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 overflow-auto bg-[#1e1e1e] p-6">
+    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 overflow-auto bg-white p-6 dark:bg-[#1e1e1e]">
       <div
         className="max-h-full max-w-full"
         style={{
@@ -289,10 +293,50 @@ function ImageView({ abs }: { abs: string }) {
   );
 }
 
+// Split an active file's absolute path into breadcrumb segments, led by a
+// literal "Workspace" root and the containing project's name (e.g.
+// "Workspace > my-app > src > components > App.tsx"). Files outside any open
+// folder fall back to their full path under "Workspace".
+function crumbsFor(abs: string, folders: WorkspaceFolder[]): string[] {
+  const folder = folders.find(
+    (f) => abs === f.rootPath || abs.startsWith(f.rootPath + "/"),
+  );
+  if (folder) {
+    const rel = abs.slice(folder.rootPath.length);
+    return ["Workspace", folder.name, ...rel.split("/").filter(Boolean)];
+  }
+  return ["Workspace", ...abs.split("/").filter(Boolean)];
+}
+
+// VS Code-style breadcrumb strip above the editor body.
+function Breadcrumb({ abs, folders }: { abs: string; folders: WorkspaceFolder[] }) {
+  const crumbs = crumbsFor(abs, folders);
+  return (
+    <div className="vv-tabs-scroll flex h-6 shrink-0 items-center gap-0.5 overflow-x-auto whitespace-nowrap border-b bg-white px-3 text-xs text-muted-foreground dark:bg-[#1e1e1e]">
+      {crumbs.map((seg, i) => {
+        const isLast = i === crumbs.length - 1;
+        return (
+          <span key={i} className="flex shrink-0 items-center gap-0.5">
+            {i > 0 && <ChevronRight className="size-3 opacity-60" />}
+            {isLast && crumbs.length > 1 ? (
+              <span className="flex items-center gap-1 text-foreground">
+                <FileIcon name={seg} className="size-3.5 shrink-0" />
+                {seg}
+              </span>
+            ) : (
+              <span>{seg}</span>
+            )}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 // Shown when a directory is opened in the editor (dragged onto Monaco).
 function DirectoryView() {
   return (
-    <div className="absolute inset-0 flex items-center justify-center bg-[#1e1e1e] p-6 text-center text-sm text-muted-foreground">
+    <div className="absolute inset-0 flex items-center justify-center bg-white p-6 text-center text-sm text-muted-foreground dark:bg-[#1e1e1e]">
       The file is not displayed in the text editor because it is a directory.
     </div>
   );

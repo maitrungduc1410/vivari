@@ -397,7 +397,7 @@ export function Explorer() {
   return (
     <div className="flex h-full flex-col bg-sidebar" onKeyDown={onKeyDown}>
       <div className="flex h-8 shrink-0 items-center gap-1 pl-3 pr-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-        <span className="flex-1 truncate">Explorer</span>
+        <span className="flex-1 truncate">Workspace</span>
         <HeaderBtn label="New File" onClick={() => active && startCreate(active.rootPath, "file")} disabled={!active}>
           <FilePlus className="size-3.5" />
         </HeaderBtn>

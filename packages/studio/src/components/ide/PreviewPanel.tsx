@@ -101,7 +101,7 @@ export function PreviewPanel() {
   return (
     <div className="flex h-full flex-col bg-sidebar">
       {/* tab strip */}
-      <div className="flex h-8 shrink-0 items-stretch border-b bg-[#181818]">
+      <div className="flex h-8 shrink-0 items-stretch border-b bg-[#f3f3f3] dark:bg-[#181818]">
         <div className="flex flex-1 items-stretch overflow-x-auto">
           {tabs.map((t) => {
             const isActive = t.id === snap.activePreviewId;
@@ -113,7 +113,7 @@ export function PreviewPanel() {
                     onClick={() => c.activatePreviewTab(t.id)}
                     className={cn(
                       "group flex cursor-pointer items-center gap-1.5 border-r px-3 text-xs",
-                      isActive ? "bg-sidebar text-foreground" : "bg-[#181818] text-muted-foreground hover:text-foreground",
+                      isActive ? "bg-sidebar text-foreground" : "bg-[#f3f3f3] text-muted-foreground hover:text-foreground dark:bg-[#181818]",
                     )}
                   >
                     <Globe className="size-3.5 shrink-0 opacity-70" />
@@ -230,7 +230,7 @@ export function PreviewPanel() {
         {snap.devtoolsOpen && (
           <>
             <ResizableHandle />
-            <ResizablePanel id="preview-devtools" defaultSize="45%" minSize="15%" className="bg-[#292a2d]">
+            <ResizablePanel id="preview-devtools" defaultSize="45%" minSize="15%" className="bg-white dark:bg-[#292a2d]">
               <iframe
                 key={snap.devtoolsNonce}
                 ref={(el) => c.setDevtoolsFrame(el)}

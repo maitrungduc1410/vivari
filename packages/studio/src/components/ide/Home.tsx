@@ -277,8 +277,14 @@ function ResetEverythingDialog({ open, onOpenChange }: { open: boolean; onOpenCh
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+    // While the reset is running, lock the dialog: ignore open-state changes and
+    // disable backdrop/Escape dismissal + the X so the destructive op can't be
+    // interrupted mid-flight (the page reloads on success).
+    <Dialog
+      open={open}
+      onOpenChange={(o) => { if (!busy) onOpenChange(o); }}
+    >
+      <DialogContent className="sm:max-w-md" showCloseButton={!busy}>
         <DialogHeader>
           <DialogTitle>Reset everything?</DialogTitle>
           <DialogDescription>

@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { useTheme } from "next-themes";
 import {
   ResizableHandle, ResizablePanel, ResizablePanelGroup,
 } from "@/components/ui/resizable";
@@ -18,6 +19,15 @@ import { useIde } from "./useIde";
 
 export function AppShell() {
   const { c, snap } = useIde();
+  const { resolvedTheme } = useTheme();
+
+  // Mirror next-themes' resolved theme onto the editor + terminals, which manage
+  // their own (non-CSS) theming.
+  useEffect(() => {
+    if (resolvedTheme === "light" || resolvedTheme === "dark") {
+      c.applyUiTheme(resolvedTheme);
+    }
+  }, [c, resolvedTheme]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

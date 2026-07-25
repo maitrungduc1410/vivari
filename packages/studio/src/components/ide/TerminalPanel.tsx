@@ -37,7 +37,7 @@ export function TerminalPanel() {
   const shells = snap.terminals.filter((t) => t.kind === "shell");
 
   return (
-    <div className="flex h-full flex-col bg-[#181818]">
+    <div className="flex h-full flex-col bg-white dark:bg-[#181818]">
       {/* panel tab strip */}
       <div className="flex h-8 shrink-0 items-center border-b pr-2">
         <div className="flex flex-1 items-stretch">
