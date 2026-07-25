@@ -119,10 +119,19 @@ export class KernelBridge {
     // The SW posts each preview request here; forward it to the kernel worker,
     // transferring the reply port so the worker answers the SW directly.
     navigator.serviceWorker.addEventListener("message", (event) => {
-      if (event.data?.type !== "vv-http") return;
-      this.worker.postMessage({ type: "vv-http", req: event.data.req }, [
-        event.ports[0],
-      ]);
+      const d = event.data;
+      if (d?.type === "vv-http") {
+        this.worker.postMessage({ type: "vv-http", req: d.req }, [event.ports[0]]);
+        return;
+      }
+      // ws/SSE from a preview opened in its OWN tab (COOP severs window.opener, so
+      // it can't reach us directly): the SW relays its outbound frames here. Forward
+      // to the kernel exactly like the in-app iframe path (the `window` listener
+      // above). Inbound frames go back out via the SW in controller's vv-ws/vv-sse
+      // handlers.
+      if (d && d.dir === "out" && (d.type === "vv-ws" || d.type === "vv-sse")) {
+        this.worker.postMessage({ type: d.type as string, msg: d });
+      }
     });
     // Tell the SW this client hosts the kernel, so it routes preview HTTP here
     // even when Vivari runs in a nested iframe (the docs /embed/ playground): the

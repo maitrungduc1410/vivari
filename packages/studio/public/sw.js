@@ -110,7 +110,47 @@ self.addEventListener("message", (event) => {
     );
     return;
   }
+  // ws/SSE tunnel relay for a preview opened in its OWN top-level tab. In the studio
+  // the preview is an iframe that postMessages its parent directly; but a standalone
+  // tab ("Open in new tab") lives in a separate browsing-context group where
+  // COOP:same-origin severs window.opener, so it can't reach the studio window. The
+  // SW is shared across the origin (exactly how the HTTP preview proxy reaches the
+  // studio's kernel client cross-tab), so relay the tunnel through it:
+  //   dir:'out' (tab → kernel): forward to the studio's kernel-host client.
+  //   dir:'in'  (kernel → tabs): broadcast to every TOP-LEVEL preview client (the
+  //     in-app iframes still get theirs via parent.postMessage, so no duplicates).
+  if (d && (d.type === "vv-ws" || d.type === "vv-sse")) {
+    if (d.dir === "out") {
+      event.waitUntil(findKernelClient().then((k) => { if (k) k.postMessage(d); }));
+    } else if (d.dir === "in") {
+      event.waitUntil(
+        self.clients.matchAll({ type: "window" }).then((cs) => {
+          for (const c of cs) {
+            if (c.frameType === "top-level" && c.url.includes(PREVIEW_MARKER)) c.postMessage(d);
+          }
+        }),
+      );
+    }
+    return;
+  }
 });
+
+// The studio window that hosts the kernel — a top-level, non-preview, non-DevTools
+// client (preferring one that announced itself via vv-kernel-host so an EMBEDDED
+// Vivari, whose kernel is in a nested frame, still resolves). Used to route both
+// preview HTTP and the standalone-tab ws/SSE tunnel to the running kernel.
+async function findKernelClient() {
+  const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  const isPreview = (c) => c.url.includes(PREVIEW_MARKER);
+  const isDevtools = (c) => c.url.includes("/devtools-host.html") || c.url.includes("/devtools/");
+  return (
+    clients.find((c) => kernelHostIds.has(c.id) && !isPreview(c) && !isDevtools(c)) ||
+    clients.find((c) => c.frameType === "top-level" && !isPreview(c) && !isDevtools(c)) ||
+    clients.find((c) => !isPreview(c) && !isDevtools(c)) ||
+    clients.find((c) => !isPreview(c)) ||
+    clients[0]
+  );
+}
 
 // roadmap: Packaging Stage 2 — precache the role bundles. Every Process Worker
 // spawn (and every reload) otherwise re-fetches its bundle — process-worker.js
@@ -274,7 +314,18 @@ var m = location.pathname.match(/\\/preview\\/(\\d+)\\//);
 var previewPort = m ? parseInt(m[1], 10) : 0;
 var tok = Math.random().toString(36).slice(2, 8);
 var nextId = 1, conns = {};
-function post(msg){ parent.postMessage(msg, '*'); }
+// The preview relays connection frames to the window that talks to the kernel: our
+// parent when embedded in the studio iframe. "Open in new tab" makes this a
+// TOP-LEVEL document — and the studio's COOP:same-origin severs window.opener — so
+// there is no host window to postMessage. Fall back to the Service Worker, which is
+// shared across browsing-context groups (exactly how the HTTP preview proxy reaches
+// the studio's kernel client cross-tab); the studio relays inbound frames back the
+// same way. Listen on BOTH channels so either transport delivers.
+var vvHost = (window.parent && window.parent !== window) ? window.parent : null;
+function post(msg){
+  if (vvHost) { try { vvHost.postMessage(msg, '*'); return; } catch(e){} }
+  try { var sw = navigator.serviceWorker && navigator.serviceWorker.controller; if (sw) sw.postMessage(msg); } catch(e){}
+}
 function _b64(x){
   var b;
   if (x instanceof ArrayBuffer) b = new Uint8Array(x);
@@ -283,10 +334,12 @@ function _b64(x){
   var s = ''; for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
   try { return btoa(s); } catch(e){ return ''; }
 }
-window.addEventListener('message', function(ev){
+function _onIn(ev){
   var d = ev.data; if (!d || d.type !== 'vv-ws' || d.dir !== 'in') return;
   var c = conns[d.connId]; if (c) c._deliver(d);
-});
+}
+window.addEventListener('message', _onIn);
+if (navigator.serviceWorker) navigator.serviceWorker.addEventListener('message', _onIn);
 window.addEventListener('pagehide', function(){
   for (var k in conns){ try { conns[k].close(1001, 'unload'); } catch(e){} }
 });
@@ -407,11 +460,20 @@ var m = location.pathname.match(/\\/preview\\/(\\d+)\\//);
 var previewPort = m ? parseInt(m[1], 10) : 0;
 var tok = Math.random().toString(36).slice(2, 8);
 var nextId = 1, conns = {};
-function post(msg){ parent.postMessage(msg, '*'); }
-window.addEventListener('message', function(ev){
+// Host resolution matches the ws shim: the studio iframe's parent when embedded, or
+// — for a top-level "Open in new tab" preview, where COOP severs window.opener — the
+// shared Service Worker. Inbound frames arrive on whichever channel we sent out on.
+var vvHost = (window.parent && window.parent !== window) ? window.parent : null;
+function post(msg){
+  if (vvHost) { try { vvHost.postMessage(msg, '*'); return; } catch(e){} }
+  try { var sw = navigator.serviceWorker && navigator.serviceWorker.controller; if (sw) sw.postMessage(msg); } catch(e){}
+}
+function _onIn(ev){
   var d = ev.data; if (!d || d.type !== 'vv-sse' || d.dir !== 'in') return;
   var c = conns[d.connId]; if (c) c._deliver(d);
-});
+}
+window.addEventListener('message', _onIn);
+if (navigator.serviceWorker) navigator.serviceWorker.addEventListener('message', _onIn);
 window.addEventListener('pagehide', function(){
   for (var k in conns){ try { conns[k].close(); } catch(e){} }
 });
@@ -782,29 +844,10 @@ async function handlePreview(event, port, path, keepPrefix) {
     return new Response("Bad preview URL\n", { status: 400 });
   }
 
-  // Find the page that hosts the kernel: the top-level studio window. We include
-  // uncontrolled clients so this works on first load. Two nested iframes must NOT
-  // be mistaken for it: a preview frame (under /preview/) and — crucially — the
-  // DevTools frontend (/devtools-host.html). When DevTools is open that iframe is
-  // also a window client with no /preview/ marker, so the old "first non-preview
-  // client" heuristic could post the HTTP request to it; it has no kernel to
-  // answer, so the request hung until the 60s timeout (only ever with DevTools
-  // open). Prefer the top-level frame; fall back to any non-preview, non-DevTools
-  // window for the rare case frameType is unavailable.
-  const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-  const isPreview = (c) => c.url.includes(PREVIEW_MARKER);
-  const isDevtools = (c) => c.url.includes("/devtools-host.html") || c.url.includes("/devtools/");
-  // Prefer a client that explicitly announced itself as a kernel host: this is
-  // what makes an EMBEDDED Vivari (the docs /embed/ iframe) work — its kernel
-  // lives in a nested frame, so the "top-level window" heuristic would wrongly
-  // pick the host document (which has no kernel). Fall back to the top-level
-  // heuristic when no announcement is known (e.g. the studio, or a revived SW).
-  const kernelClient =
-    clients.find((c) => kernelHostIds.has(c.id) && !isPreview(c) && !isDevtools(c)) ||
-    clients.find((c) => c.frameType === "top-level" && !isPreview(c) && !isDevtools(c)) ||
-    clients.find((c) => !isPreview(c) && !isDevtools(c)) ||
-    clients.find((c) => !isPreview(c)) ||
-    clients[0];
+  // Find the page that hosts the kernel (the studio window). See findKernelClient:
+  // it skips preview + DevTools iframes and prefers the vv-kernel-host announcer so
+  // an embedded Vivari (kernel in a nested frame) resolves correctly.
+  const kernelClient = await findKernelClient();
   if (!kernelClient) {
     return new Response("Vivari kernel is not running\n", { status: 503 });
   }

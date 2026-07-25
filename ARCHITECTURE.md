@@ -465,6 +465,20 @@ The kernel routes the `open` by port (`handleWsClient` → `listeners.get(port)`
 a shim-only change. The `ws-demo` template (Express + `ws` backend, Vite frontend, started
 together) demonstrates both directions; each server gets its own preview tab (see 8.6).
 
+**"Open in new tab" tunnels ws/SSE through the Service Worker.** The shims relay frames by
+`postMessage` to the window that hosts the kernel — the iframe's `parent` when embedded. Opening
+a preview in a standalone tab (`window.open('/preview/<port>/')`) makes it a top-level document,
+and the studio's `COOP: same-origin` (required for `SharedArrayBuffer`) puts that tab in a
+*separate browsing-context group* with `window.opener === null` — there is no host window to
+reach. So for a top-level preview the shim falls back to `navigator.serviceWorker.controller`
+(the SW is shared across browsing-context groups, exactly how the HTTP proxy reaches the studio
+cross-tab): the SW forwards `dir:'out'` frames to the kernel-host client (`findKernelClient`,
+shared with `handlePreview`) and broadcasts `dir:'in'` frames to every top-level preview client;
+each shim keeps only its own `connId`. The studio's `bridge.ts` forwards SW-relayed `dir:'out'`
+frames to the kernel worker, and `controller` relays inbound frames back through the SW alongside
+the in-app iframes (nested clients, which the SW broadcast skips, so no duplicates). Vite HMR in
+a standalone tab now works for the same reason.
+
 **Server-Sent Events (same idea, one-way).** A streaming `text/event-stream` response
 can't cross the HTTP preview proxy — that path is buffered end-to-end (the SW resolves
 ONE complete body via `handleHttpRequest`/`OP_RESPOND`), so a never-ending SSE response

@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { useTheme } from "next-themes";
 import ArrowLeft from "~icons/lucide/arrow-left";
 import ArrowRight from "~icons/lucide/arrow-right";
 import RotateCw from "~icons/lucide/rotate-cw";
@@ -55,12 +56,14 @@ function PreviewFrame({
   tab,
   active,
   src,
+  colorScheme,
   setFrame,
   onLoad,
 }: {
   tab: PreviewTab;
   active: boolean;
   src: string;
+  colorScheme: "light" | "dark";
   setFrame: (id: string, el: HTMLIFrameElement | null) => void;
   onLoad: (id: string) => void;
 }) {
@@ -88,6 +91,13 @@ function PreviewFrame({
         "absolute inset-0 h-full w-full border-0",
         active ? "block" : "hidden",
       )}
+      // Make the preview render in the studio's theme. Without this the frame
+      // INHERITS `color-scheme` from the studio <html> (next-themes sets it), so in
+      // dark mode a template that declares `color-scheme: light dark` gets white UA
+      // text — but the frame's backdrop stayed light, so text vanished on white.
+      // Setting it on the element ties both the embedded document's used scheme AND
+      // the iframe's own default backdrop to the chosen theme, so it's always legible.
+      style={{ colorScheme }}
       sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
     />
   );
@@ -95,6 +105,8 @@ function PreviewFrame({
 
 export function PreviewPanel() {
   const { c, snap } = useIde();
+  const { resolvedTheme } = useTheme();
+  const colorScheme: "light" | "dark" = resolvedTheme === "light" ? "light" : "dark";
   const tabs = snap.previewTabs;
   const active = tabs.find((t) => t.id === snap.activePreviewId) ?? null;
 
@@ -199,13 +211,14 @@ export function PreviewPanel() {
           below when open. All preview iframes stay mounted so each tab keeps its
           state + HMR socket; the DevTools iframe remounts (key) on re-attach. */}
       <ResizablePanelGroup orientation="vertical" className="min-h-0 flex-1">
-        <ResizablePanel id="preview-body" className="relative overflow-hidden bg-white">
+        <ResizablePanel id="preview-body" className="relative overflow-hidden bg-white dark:bg-[#1e1e1e]">
           {tabs.map((t) => (
             <PreviewFrame
               key={t.id}
               tab={t}
               active={t.id === snap.activePreviewId}
               src={c.previewSrc(t)}
+              colorScheme={colorScheme}
               setFrame={(id, el) => c.setPreviewFrame(id, el)}
               onLoad={(id) => c.onPreviewFrameLoad(id)}
             />

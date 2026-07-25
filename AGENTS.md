@@ -716,6 +716,24 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   untouched**. The kernel already routes ws `open` by port, so this is a shim-only change.
   Keep the two `sw.js` shims in sync. Regex lives in a template literal → backslashes are
   DOUBLED (`\\/preview\\/(\\d+)…`).
+- **ws/SSE tunnel: iframe → `parent`, standalone tab → the Service Worker.** Both shims
+  `post()` their connection frames to the window that relays to the kernel — the iframe's
+  `parent` in the studio. But **"Open in new tab"** (`window.open('/preview/<port>/')`,
+  `controller.openExternalPreview`) makes the preview a TOP-LEVEL document, and the studio's
+  **`COOP: same-origin`** (mandatory for `SharedArrayBuffer`) puts it in a *separate
+  browsing-context group* with **`window.opener === null`** — so there is NO window to
+  postMessage. (This is why ws/SSE — and even Vite HMR — hang at `connecting…` in a new tab
+  while HTTP works: HTTP flows through the SW, ws/SSE historically didn't.) The fix routes the
+  tunnel through the **Service Worker**, which is shared across browsing-context groups (the same
+  channel the HTTP proxy already uses cross-tab): when `parent === window`, `post()` falls back to
+  `navigator.serviceWorker.controller`; the SW forwards `dir:'out'` frames to the kernel-host
+  client (`findKernelClient`) and broadcasts `dir:'in'` frames to every **top-level** preview
+  client. The shim listens on BOTH `window` and `navigator.serviceWorker` for inbound. The studio
+  side: `bridge.ts`'s SW `message` listener forwards `dir:'out'` ws/SSE to the kernel worker, and
+  `controller` relays inbound frames to the SW (`relayToExternalPreviews`) in addition to the
+  in-app iframes (nested clients, excluded from the SW broadcast → no duplicates). Frames carry a
+  per-page `connId`, so broadcasting is safe — each shim keeps only its own. (A tab opened by
+  pasting the URL works too, since it's just another top-level preview client the SW can reach.)
 - **SSE goes through its OWN tunnel — NOT the HTTP proxy.** A `text/event-stream` response
   can't cross `handleHttpRequest`/`OP_RESPOND` (buffered end-to-end: the SW waits for ONE
   complete body, so a never-ending SSE stream 504s at 60s). So an **`EventSource` polyfill**
@@ -779,6 +797,13 @@ invariant to preserve:
   `c.previewSrc(t)` imperatively in an effect (guarded by a `lastSrc` ref so
   StrictMode / re-renders don't double-navigate). Do NOT go back to
   `src={c.previewSrc(t)}` on a freshly created iframe.
+- **Preview must carry the studio theme explicitly.** `PreviewFrame` sets
+  `style={{ colorScheme }}` (from next-themes' `resolvedTheme`) and the body wrapper
+  is `bg-white dark:bg-[#1e1e1e]`. Without the explicit `color-scheme` the frame
+  *inherits* `dark` from the studio `<html>`, so a template that declares
+  `color-scheme: light dark` renders white UA text while the frame backdrop stayed
+  light → white-on-white, invisible. Setting it on the element ties both the embedded
+  doc's used scheme AND the iframe's default backdrop to the chosen theme.
 - `kernel.ts` `registerServiceWorker()` also waits for the page to actually be
   controlled (`controllerchange`, with a 1 s safety timeout) when
   `navigator.serviceWorker.controller` is null, so control is established before

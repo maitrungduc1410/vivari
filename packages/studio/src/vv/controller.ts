@@ -2240,7 +2240,29 @@ export class IdeController {
   }
   openPreviewExternal(id: string) {
     const t = this.snap.previewTabs.find((x) => x.id === id);
-    if (t?.port != null) window.open(`/preview/${t.port}/`, "_blank");
+    if (t?.port != null) this.openExternalPreview(t.port);
+  }
+
+  // Open a preview port in a standalone browser tab. Everything reaches the running
+  // kernel (which lives in THIS tab) through the Service Worker, since the studio's
+  // COOP:same-origin puts the new tab in a separate browsing-context group with no
+  // window.opener link: HTTP already routes via the SW, and the ws/SSE tunnels do
+  // too — the opened tab's shim talks to the SW, and we relay inbound frames back
+  // through the SW in the vv-ws/vv-sse handlers below.
+  openExternalPreview(port: number) {
+    window.open(`/preview/${port}/`, "_blank");
+  }
+
+  // Relay an inbound ws/SSE frame to any preview opened in its OWN tab. Those tabs
+  // can't be reached by postMessage (COOP severs the handle), so hand the frame to
+  // the SW, which broadcasts it to every top-level preview client; each shim keeps
+  // only the connIds it owns. No-op when the SW isn't controlling yet.
+  private relayToExternalPreviews(payload: object) {
+    try {
+      navigator.serviceWorker?.controller?.postMessage(payload);
+    } catch {
+      /* SW not controlling — nothing to relay to */
+    }
   }
 
   closePreviewTab(id: string) {
@@ -2648,6 +2670,7 @@ export class IdeController {
       for (const t of this.snap.previewTabs) {
         if (t.port != null) this.previewFrames.get(t.id)?.contentWindow?.postMessage(payload, "*");
       }
+      this.relayToExternalPreviews(payload);
     });
 
     // SSE tunnel: a text/event-stream chunk routed OUT of the VM → preview iframes.
@@ -2658,6 +2681,7 @@ export class IdeController {
       for (const t of this.snap.previewTabs) {
         if (t.port != null) this.previewFrames.get(t.id)?.contentWindow?.postMessage(payload, "*");
       }
+      this.relayToExternalPreviews(payload);
     });
 
     // Legacy built-in demo became ready.
