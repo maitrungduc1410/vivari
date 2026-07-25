@@ -5,8 +5,17 @@
 // Node workers.
 
 import { NODE_GYP_STUB } from "./node-gyp-stub.js";
+import { BUN_PROGRAM, BUNX_PROGRAM } from "./programs/bun.js";
 
 export const COREUTILS = {
+  // bun / bunx — the Bun runtime + package-manager analog. Unlike npm/yarn/pnpm
+  // (real vendored JS CLIs), Bun is a native binary with no pure-JS build, so this
+  // is a purpose-built shim: it runs TS/JS files with a `Bun` global installed,
+  // runs package.json scripts, and DELEGATES `bun install` to the real npm CLI.
+  // See packages/kernel-host/programs/bun.js + packages/runtime/builtins/bun.js.
+  bun: BUN_PROGRAM,
+  bunx: BUNX_PROGRAM,
+
   // NOTE: there is no built-in `npm` here anymore. The Turbo-analog installer
   // (packages/kernel-host/programs/npm.js) has been RETIRED from the shipped
   // product — studio now boots the REAL npm CLI unconditionally (see

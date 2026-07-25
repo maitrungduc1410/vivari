@@ -28,6 +28,8 @@ import rspackLogo from "@/assets/rspack-logo.svg";
 // URLs and render via <img>, same as the Rsbuild/Rspack marks above.
 import tanstackLogo from "@/assets/tanstack-logo.png";
 import vitestLogo from "@/assets/vitest-logo.jpg";
+// Bun ships an official brand SVG (bun.com/logo.svg); bundle it the same way.
+import bunLogo from "@/assets/bun-logo.svg";
 
 type IconProps = { className?: string };
 
@@ -295,6 +297,7 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   koa: Badge({ text: "Koa", bg: "#33333a" }),
   hono: Badge({ text: "h", bg: "#ff5b11" }),
   h3: Badge({ text: "H3", bg: "#eab308", fg: "#000" }),
+  bun: ImgIcon(bunLogo, "Bun"),
   three: ThreeIcon,
   gsap: Badge({ text: "GS", bg: "#0ae448", fg: "#0e100f" }),
   node: (p) => <NodeIcon className={p.className} />,

@@ -39,11 +39,19 @@ const SPIKES = [
   // the shareable-URL codec round-tripped. Pure web primitives, no kernel/wasm.
   { name: "zip-share", file: "spike-zip-share.mjs", net: false, timeout: 60000 },
   { name: "tar", file: "spike-tar.mjs", net: false, timeout: 60000 },
+  // Bun support (pure-JS tier): the synchronous TS/JSX transform, the Bun global
+  // API surface, the bun:test runner, and the /bin/bun.js CLI source — all proven
+  // with no kernel/wasm, so this runs in the Wasm-free toolchain-gate.
+  { name: "bun-offline", file: "spike-bun-offline.mjs", net: false, timeout: 60000 },
   // Persistent dependency cache (P1): pack node_modules → snapshot → wipe →
   // restore → require, against the real Wasm VFS. Offline + deterministic.
   // `needsWasm`: offline but requires the Node Wasm VFS build (pkg-node), so it
   // can't run in the Wasm-free toolchain-gate — it runs in the verify job.
   { name: "dep-cache", file: "spike-dep-cache.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // Bun runtime on the real kernel (offline): bun --version, zero-config `bun run
+  // app.ts` (TS strip + Bun global), Bun.serve preview through the http bridge,
+  // and `bun test`. Needs the Node Wasm VFS build → runs in the verify job.
+  { name: "bun", file: "spike-bun.mjs", net: false, needsWasm: true, timeout: 120000 },
   // --- network: graduated templates gated here -------------------------------
   { name: "koa", file: "spike-koa.mjs", net: true },
   { name: "hono", file: "spike-hono.mjs", net: true },
@@ -86,6 +94,9 @@ const SPIKES = [
   { name: "slidev", file: "spike-slidev.mjs", net: true, timeout: 600000 },
   // tRPC server — raw .ts entry through OC's loader (no `export type`), typed query.
   { name: "trpc", file: "spike-trpc.mjs", net: true },
+  // Bun install: `bun add <pkg>` delegates to the real npm CLI in-VM, writes a
+  // text bun.lock, then a TS entry imports the installed dep. Network + Wasm VFS.
+  { name: "bun-install", file: "spike-bun-install.mjs", net: true, needsWasm: true },
   // Astro dev server — Vite + @astrojs/compiler (Go/wasm) + esbuild; exercises the full
   // loader stack (live-binding fallback, globalThis.fs pre-seat, re-export getters). Heavy.
   { name: "astro", file: "spike-astro.mjs", net: true, timeout: 600000 },

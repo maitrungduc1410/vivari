@@ -13,6 +13,7 @@ import { createModuleSystem } from "./module.js";
 import { createWebSocket } from "./websocket.js";
 import { rewriteDynamicImportToGlobal } from "./esm.js";
 import { isEsbuildInprocActive, esbuildWasmBytes } from "./esbuild-inproc-patch.js";
+import { createBunRuntime } from "./builtins/bun.js";
 
 function createConsole(process, util) {
   const toOut = (...a) => process.stdout.write(util.format(...a) + "\n");
@@ -1260,6 +1261,21 @@ export function createRuntime({
 
   // Support both `require('fs')` and `require('node:fs')`.
   for (const name of Object.keys(builtins)) builtins["node:" + name] = builtins[name];
+
+  // ---- Bun runtime shim -----------------------------------------------------
+  // Build the `Bun` global + `bun:*` builtin modules on top of the Node runtime.
+  // The bun:* modules are registered unconditionally (only reachable via an
+  // explicit `require('bun:sqlite')` etc.), added AFTER the node: alias loop so
+  // they don't get spurious `node:bun:*` aliases. The `Bun` GLOBAL, however, is
+  // installed lazily by the /bin/bun.js launcher through __ocInstallBun — so a
+  // plain `node` process is never mistaken for Bun by libraries that branch on
+  // `typeof Bun !== 'undefined'`. See packages/runtime/builtins/bun.js.
+  const bunRuntime = createBunRuntime({ process, Buffer, require: vvRootRequire });
+  for (const [name, mod] of Object.entries(bunRuntime.modules)) builtins[name] = mod;
+  globalThis.__ocInstallBun = () => {
+    globalThis.Bun = bunRuntime.Bun;
+    return bunRuntime.Bun;
+  };
 
   return {
     fs,

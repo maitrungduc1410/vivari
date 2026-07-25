@@ -9,6 +9,7 @@
 
 import { transpileEsm, transpileEsmLive, rewriteCjsDynamicImport } from "./esm.js";
 import { maybePatchEsbuildInProcess } from "./esbuild-inproc-patch.js";
+import { maybeTranspileTypeScript } from "./typescript-transform.js";
 
 // The constructor for `async function () {}` — used to (re)compile an ESM module
 // that uses top-level await (our normal wrapper is a plain, non-async function).
@@ -73,7 +74,10 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
       return false;
     }
   };
-  const EXTS = [".js", ".mjs", ".cjs", ".json"];
+  // Resolution order: JS/JSON first (so a compiled `.js` shadows its `.ts` source
+  // when both exist — matching tsc/Node output layouts), then the TS/JSX
+  // extensions Bun resolves natively. TS files are transpiled at compile() time.
+  const EXTS = [".js", ".mjs", ".cjs", ".json", ".ts", ".tsx", ".mts", ".cts", ".jsx"];
   const tryExtensions = (p) => {
     if (isFile(p)) return p;
     for (const ext of EXTS) if (isFile(p + ext)) return p + ext;
@@ -378,6 +382,49 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     return module.exports;
   }
 
+  // JSX lowering options for a given file: honor the nearest tsconfig.json's
+  // `compilerOptions.jsxFactory` / `jsxFragmentFactory` (cached per directory),
+  // defaulting to the classic React pragma. tsconfig may be JSONC, so a failed
+  // strict parse falls back to a light comment strip.
+  const _jsxCfgCache = new Map();
+  function jsxOptionsFor(filename) {
+    let dir = path.dirname(filename);
+    for (;;) {
+      if (_jsxCfgCache.has(dir)) {
+        const cached = _jsxCfgCache.get(dir);
+        if (cached) return cached;
+      } else {
+        let opt = null;
+        const tc = path.join(dir, "tsconfig.json");
+        try {
+          if (isFile(tc)) {
+            const raw = fs.readFileSync(tc, "utf8");
+            let json;
+            try { json = JSON.parse(raw); }
+            catch { json = JSON.parse(raw.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "")); }
+            const co = (json && json.compilerOptions) || {};
+            if (co.jsxFactory || co.jsxFragmentFactory) {
+              opt = {
+                jsxPragma: co.jsxFactory || "React.createElement",
+                jsxFragment: co.jsxFragmentFactory || "React.Fragment",
+              };
+            } else {
+              opt = {};
+            }
+          }
+        } catch {
+          opt = null;
+        }
+        _jsxCfgCache.set(dir, opt);
+        if (opt && (opt.jsxPragma || opt.jsxFragment)) return opt;
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return undefined;
+  }
+
   function compile(module, filename, providedSource) {
     if (path.extname(filename) === ".json") {
       const txt = providedSource != null ? providedSource : fs.readFileSync(filename, "utf8");
@@ -395,6 +442,13 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     // esbuild-inproc-patch.js).
     const esbPatched = maybePatchEsbuildInProcess(source, filename, fs, path);
     if (esbPatched != null) source = esbPatched;
+
+    // Bun-style zero-config TypeScript/JSX: strip types + lower JSX synchronously
+    // for `.ts`/`.tsx`/`.mts`/`.cts`/`.jsx` before the ESM pass sees the source.
+    // A no-op (returns null) for plain JS and for `.ts` files that contain no
+    // type syntax, so ordinary modules are untouched. See typescript-transform.js.
+    const tsCompiled = maybeTranspileTypeScript(source, filename, jsxOptionsFor(filename));
+    if (tsCompiled != null) source = tsCompiled;
 
     // ESM support (#13): transpile import/export -> our synchronous CJS at load
     // time. `.cjs` is always CommonJS; everything else is scanned and rewritten
@@ -643,6 +697,12 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
   Module._extensions = Object.create(null);
   Module._extensions[".js"] = (module, filename) => compile(module, filename);
   Module._extensions[".json"] = (module, filename) => compile(module, filename);
+  // Bun-style native TypeScript/JSX: the same compiler handles them (compile()
+  // transpiles by extension). Registering the handlers also satisfies tools that
+  // probe `require.extensions` before loading a `.ts`/`.tsx` entry.
+  for (const e of [".ts", ".tsx", ".mts", ".cts", ".jsx"]) {
+    Module._extensions[e] = (module, filename) => compile(module, filename);
+  }
   Module._extensions[".node"] = () => {
     throw new Error("Native .node addons are not supported in Vivari");
   };

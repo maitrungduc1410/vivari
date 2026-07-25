@@ -592,15 +592,19 @@ const listening = new Set();
 // in the FS Worker (dep-cache.js); here we decide WHEN to restore/snapshot and
 // compute the lockfile-derived cache key.
 const LOCKFILES = {
+  // Bun's shim delegates installs to npm (so a package-lock.json is ALSO written),
+  // but a bun.lock/bun.lockb marks the project as Bun-managed — probed first below.
+  bun: ["bun.lock", "bun.lockb"],
   npm: ["package-lock.json", "npm-shrinkwrap.json"],
   yarn: ["yarn.lock"],
   pnpm: ["pnpm-lock.yaml"],
 };
 
-// Map a command / install string ("npm", "npm install", "pnpm i", "yarn") to a
-// package-manager name. Defaults to npm.
+// Map a command / install string ("npm", "npm install", "pnpm i", "yarn", "bun")
+// to a package-manager name. Defaults to npm.
 function pmName(hint) {
   const first = String(hint || "").trim().split(/\s+/)[0] || "";
+  if (/^bunx?$/.test(first) || /\bbun\b/.test(first)) return "bun";
   if (/pnpm/.test(first)) return "pnpm";
   if (/yarn/.test(first)) return "yarn";
   return "npm";
@@ -608,10 +612,12 @@ function pmName(hint) {
 
 // Detect a project's package manager from the lockfile on disk (npm is the
 // default when only a package.json exists). Used by vv-ensure-deps to pick the
-// right snapshot key when reopening a project we didn't just install.
+// right snapshot key when reopening a project we didn't just install. bun is
+// probed first: its lockfile coexists with npm's (installs delegate to npm), so
+// its presence is the strongest signal the project is intended to run under Bun.
 function detectPm(dir) {
   const base = String(dir).replace(/\/+$/, "");
-  for (const pm of ["pnpm", "yarn", "npm"]) {
+  for (const pm of ["bun", "pnpm", "yarn", "npm"]) {
     for (const lf of LOCKFILES[pm] || []) {
       try {
         if (kernel.exists(base + "/" + lf)) return pm;
@@ -757,6 +763,13 @@ function installInvocation(command, args) {
     // bare `yarn` (no subcommand) = install; `yarn install`/`yarn add` too.
     if (sub === undefined || sub === "install" || sub === "add") return "yarn";
     return null;
+  }
+  if (pm === "bun") {
+    // `bun install|i|add|remove|update|ci` mutate node_modules (via npm delegation);
+    // `bun run`/`bun test`/`bun x`/bare-file do not. Snapshot only the installers.
+    return ["install", "i", "add", "remove", "rm", "uninstall", "update", "upgrade", "ci"].includes(sub)
+      ? "bun"
+      : null;
   }
   const installSubs = pm === "pnpm"
     ? ["install", "i", "add", "update"]

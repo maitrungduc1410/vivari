@@ -20,6 +20,7 @@ export type Language = "TypeScript" | "JavaScript";
 export type TemplateCategory =
   | "Frontend"
   | "Backend"
+  | "Bun"
   | "Fullstack"
   | "Docs"
   | "Creative"
@@ -29,6 +30,7 @@ export type TemplateCategory =
 export const TEMPLATE_CATEGORIES: TemplateCategory[] = [
   "Frontend",
   "Backend",
+  "Bun",
   "Fullstack",
   "Docs",
   "Creative",
@@ -1832,6 +1834,572 @@ const port = Number(process.env.PORT ?? 3000)
 createServer(toNodeListener(app)).listen(port, () => {
   console.log('H3 listening on http://localhost:' + port)
 })
+`,
+    },
+  };
+}
+
+// ── Bun (Bun.serve + zero-config TypeScript) ─────────────────────────────────
+// Runs on Vivari's Bun shim (packages/runtime/builtins/bun.js + programs/bun.js):
+// the `bun` CLI runs the `.ts` entry with types stripped on the fly and the `Bun`
+// global installed, and Bun.serve is bridged onto the same Node http preview path.
+// `bun install` delegates to the real npm CLI (and writes a text bun.lock), so the
+// init script (`bun install && bun run index.ts`) works even with no dependencies.
+// Marked experimental: it is an API-compatible shim, not the native Bun binary.
+function bunTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "bun",
+      framework: "bun",
+      icon: "bun",
+      category: "Bun",
+      name: "serve",
+      language: "TypeScript",
+      description: "Bun.serve HTTP server with zero-config TypeScript (Vivari Bun shim)",
+      port: 3000,
+      openPath: "/",
+      entry: "index.ts",
+      hmr: false,
+      reload: false,
+      install: "bun install",
+      dev: "bun run index.ts",
+      experimental: true,
+      // Proven in-VM by scripts/spike-bun.mjs (bun run + Bun.serve + bun:test) and
+      // scripts/spike-bun-offline.mjs (transform + Bun API), with `bun install`
+      // delegation covered by scripts/spike-bun-install.mjs.
+    },
+    files: {
+      "package.json": `{
+  "name": "bun-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "module": "index.ts",
+  "scripts": { "start": "bun run index.ts", "dev": "bun run index.ts" },
+  "devDependencies": { "@types/bun": "latest" }
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "jsx": "react-jsx",
+    "skipLibCheck": true
+  }
+}
+`,
+      "index.ts": `// A Bun starter running on Vivari's Bun shim. \`bun run\` strips the TS types
+// on the fly and installs the \`Bun\` global; \`Bun.serve\` is previewed through the
+// same proxy as any Node server. Edit away.
+const html: string = ${JSON.stringify(backendDemoHtml("Bun"))};
+
+const port = Number(process.env.PORT ?? 3000);
+
+const server = Bun.serve({
+  port,
+  fetch(req: Request): Response {
+    const url = new URL(req.url);
+    if (url.pathname === "/api/hello") {
+      return Response.json({ message: "Hello, world!", runtime: "bun", version: Bun.version });
+    }
+    return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+  },
+});
+
+console.log("Bun listening on http://localhost:" + server.port);
+`,
+    },
+  };
+}
+
+// Shared dark-theme page chrome for the Bun routing/websocket demos.
+function bunPageStyles(): string {
+  return `:root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        background: radial-gradient(1200px 600px at 50% -10%, #1b2333, #0a0a0a); color: #e5e7eb; padding: 2rem; }
+      main { width: 100%; max-width: 620px; }
+      .eyebrow { color: #7c9cff; font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; margin: 0 0 .4rem; }
+      h1 { margin: 0 0 .3rem; font-size: 1.85rem; }
+      .sub { color: #9ca3af; margin: 0 0 1.5rem; line-height: 1.5; }
+      .card { background: #10131a; border: 1px solid #232a36; border-radius: 14px; padding: 1.1rem 1.2rem; margin-bottom: 1rem; }
+      .card h2 { margin: 0 0 .6rem; font-size: .95rem; }
+      code { background: #1b212c; padding: .15rem .45rem; border-radius: 6px; color: #cbd5e1; font-size: .82rem; }
+      label { display: block; color: #9ca3af; font-size: .78rem; margin: .5rem 0 .25rem; }
+      input { width: 100%; padding: .5rem .6rem; border-radius: 8px; border: 1px solid #333; background: #0d0d0d; color: #ededed; }
+      button { appearance: none; border: 0; cursor: pointer; margin-top: .7rem; padding: .55rem 1rem; font-size: .9rem; font-weight: 600;
+        border-radius: 9px; color: #fff; background: linear-gradient(180deg, #4f7cff, #3b5cf0); transition: filter .15s; }
+      button:hover { filter: brightness(1.08); }
+      pre { margin: .6rem 0 0; background: #0b0e14; border: 1px solid #232a36; border-radius: 10px; padding: .75rem;
+        overflow: auto; font-size: .8rem; line-height: 1.5; color: #d1d5db; max-height: 220px; }`;
+}
+
+// ── Bun (routing) ────────────────────────────────────────────────────────────
+// Bun.serve({ routes }) on the Vivari Bun shim: static Response routes, :params,
+// and * wildcards, matched by specificity; unmatched requests fall through to
+// `fetch`. See https://bun.com/docs/runtime/http/routing
+function bunRoutesTemplate(): TemplateDef {
+  const HOME = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bun routing · Vivari</title>
+    <style>${bunPageStyles()}</style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Vivari · Bun.serve routes</p>
+      <h1>Routing</h1>
+      <p class="sub">Static, <code>:param</code>, and <code>*</code> wildcard routes, matched by specificity. Try them below.</p>
+      <div class="card">
+        <h2>Static · <code>GET /api/status</code></h2>
+        <button data-get="/api/status">Call /api/status</button>
+        <pre id="out-status">Response will appear here.</pre>
+      </div>
+      <div class="card">
+        <h2>Param · <code>GET /api/users/:id</code></h2>
+        <label for="uid">User id</label>
+        <input id="uid" value="42" />
+        <button id="btn-user">Call /api/users/&lt;id&gt;</button>
+        <pre id="out-user">Response will appear here.</pre>
+      </div>
+      <div class="card">
+        <h2>Wildcard · <code>GET /files/*</code></h2>
+        <label for="fpath">File path</label>
+        <input id="fpath" value="docs/readme.txt" />
+        <button id="btn-file">Call /files/&lt;path&gt;</button>
+        <pre id="out-file">Response will appear here.</pre>
+      </div>
+    </main>
+    <script>
+      (function () {
+        // In the Vivari preview the page lives under /preview/<port>/. Prefix each
+        // request with that explicit proxy path so it hits the SW's preview route.
+        var pm = location.pathname.match(/^(\\/preview\\/\\d+)\\//);
+        var base = pm ? pm[1] : '';
+        function show(el, promise) {
+          el.textContent = 'Loading…';
+          promise
+            .then(function (r) { return r.text().then(function (b) { return { r: r, b: b }; }); })
+            .then(function (o) {
+              var pretty = o.b;
+              try { pretty = JSON.stringify(JSON.parse(o.b), null, 2); } catch (e) {}
+              el.textContent = o.r.status + ' ' + o.r.statusText + '\\n\\n' + pretty;
+            })
+            .catch(function (e) { el.textContent = 'Request failed: ' + ((e && e.message) || e); });
+        }
+        document.querySelector('[data-get="/api/status"]').addEventListener('click', function () {
+          show(document.getElementById('out-status'), fetch(base + '/api/status', { headers: { accept: 'application/json' } }));
+        });
+        document.getElementById('btn-user').addEventListener('click', function () {
+          var id = encodeURIComponent(document.getElementById('uid').value || '');
+          show(document.getElementById('out-user'), fetch(base + '/api/users/' + id, { headers: { accept: 'application/json' } }));
+        });
+        document.getElementById('btn-file').addEventListener('click', function () {
+          var p = (document.getElementById('fpath').value || '').replace(/^\\/+/, '');
+          show(document.getElementById('out-file'), fetch(base + '/files/' + p));
+        });
+      })();
+    </script>
+  </body>
+</html>
+`;
+  return {
+    manifest: {
+      id: "bun-routes",
+      framework: "bun",
+      icon: "bun",
+      category: "Bun",
+      name: "routing",
+      language: "TypeScript",
+      description: "Bun.serve routes: static, :params, and * wildcards with a fetch fallback",
+      port: 3000,
+      openPath: "/",
+      entry: "index.ts",
+      hmr: false,
+      reload: false,
+      install: "bun install",
+      dev: "bun run index.ts",
+      experimental: true,
+      // Route matching proven by scripts/spike-bun-offline.mjs (matcher unit) and
+      // scripts/spike-bun.mjs (in-VM Bun.serve routing round-trip).
+    },
+    files: {
+      "package.json": `{
+  "name": "bun-routes-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "module": "index.ts",
+  "scripts": { "start": "bun run index.ts", "dev": "bun run index.ts" },
+  "devDependencies": { "@types/bun": "latest" }
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true
+  }
+}
+`,
+      "index.ts": `// Bun.serve routing on Vivari's Bun shim. Routes are matched by specificity:
+// exact > :param > * wildcard > global /*. Anything unmatched falls through to
+// the \`fetch\` handler. Docs: https://bun.com/docs/runtime/http/routing
+const HOME: string = ${JSON.stringify(HOME)};
+
+const port = Number(process.env.PORT ?? 3000);
+
+const server = Bun.serve({
+  port,
+  routes: {
+    // A static Response (in native Bun these are optimized for zero-alloc dispatch).
+    "/api/status": Response.json({ ok: true, runtime: "bun", version: Bun.version }),
+
+    // Exact route wins over the :id param route below.
+    "/api/users/me": () => Response.json({ id: "me", name: "Ada Lovelace" }),
+
+    // Param route — req.params.id is percent-decoded for you.
+    "/api/users/:id": (req) => Response.json({ id: req.params.id, name: "User " + req.params.id }),
+
+    // Wildcard — matches /files/anything/here.
+    "/files/*": (req) => {
+      const rest = new URL(req.url).pathname.replace(/^\\/files\\//, "");
+      return new Response("You requested file: " + rest + "\\n", {
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    },
+
+    // The demo UI.
+    "/": () => new Response(HOME, { headers: { "content-type": "text/html; charset=utf-8" } }),
+  },
+  // Runs only for requests no route matched.
+  fetch(req) {
+    return new Response("404 Not Found: " + new URL(req.url).pathname + "\\n", {
+      status: 404,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  },
+});
+
+console.log("Bun routing demo on http://localhost:" + server.port);
+`,
+    },
+  };
+}
+
+// ── Bun (websocket) ──────────────────────────────────────────────────────────
+// Bun.serve({ websocket }) on the Vivari Bun shim: the fetch handler upgrades via
+// server.upgrade(req); the server does a real RFC-6455 handshake + framing over
+// the Node http `upgrade` event, and pub/sub broadcasts reach every subscriber.
+// The browser preview reaches the in-VM ws server through Vivari's WebSocket
+// tunnel. See https://bun.com/docs/runtime/http/websockets
+function bunWebSocketTemplate(): TemplateDef {
+  const HOME = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bun WebSocket · Vivari</title>
+    <style>${bunPageStyles()}
+      .log { list-style: none; padding: 0; margin: .6rem 0 0; max-height: 240px; overflow: auto; }
+      .log li { padding: .35rem .5rem; border-radius: 8px; margin: .25rem 0; font-size: .84rem; }
+      .log li.system { color: #93c5fd; background: #0b1220; }
+      .log li.chat { color: #e5e7eb; background: #0e1520; }
+      .row { display: flex; gap: .5rem; align-items: flex-end; }
+      .row input { flex: 1; }
+      .dot { display: inline-block; width: .55rem; height: .55rem; border-radius: 50%; background: #ef4444; margin-right: .4rem; }
+      .dot.on { background: #22c55e; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Vivari · Bun.serve websocket</p>
+      <h1>WebSocket chat</h1>
+      <p class="sub"><span id="dot" class="dot"></span><span id="status">connecting…</span> — messages are broadcast to every connected client via <code>server.publish</code>.</p>
+      <div class="card">
+        <div class="row">
+          <div style="flex:1">
+            <label for="msg">Message</label>
+            <input id="msg" placeholder="Type and press Enter" />
+          </div>
+          <button id="send">Send</button>
+        </div>
+        <ul id="log" class="log"></ul>
+      </div>
+    </main>
+    <script>
+      (function () {
+        var pm = location.pathname.match(/^(\\/preview\\/\\d+)\\//);
+        var base = pm ? pm[1] : '';
+        var scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+        var ws = new WebSocket(scheme + '://' + location.host + base + '/ws');
+        var log = document.getElementById('log');
+        var statusEl = document.getElementById('status');
+        var dot = document.getElementById('dot');
+        function add(kind, text) {
+          var li = document.createElement('li');
+          li.className = kind;
+          li.textContent = text;
+          log.appendChild(li);
+          log.scrollTop = log.scrollHeight;
+        }
+        ws.onopen = function () { statusEl.textContent = 'connected'; dot.className = 'dot on'; };
+        ws.onclose = function () { statusEl.textContent = 'disconnected'; dot.className = 'dot'; };
+        ws.onerror = function () { statusEl.textContent = 'error'; };
+        ws.onmessage = function (ev) {
+          var m; try { m = JSON.parse(ev.data); } catch (e) { m = { type: 'chat', text: String(ev.data) }; }
+          add(m.type === 'system' ? 'system' : 'chat', (m.type === 'chat' ? '› ' : '') + m.text);
+        };
+        function send() {
+          var input = document.getElementById('msg');
+          var v = (input.value || '').trim();
+          if (!v || ws.readyState !== WebSocket.OPEN) return;
+          ws.send(v);
+          input.value = '';
+        }
+        document.getElementById('send').addEventListener('click', send);
+        document.getElementById('msg').addEventListener('keydown', function (e) { if (e.key === 'Enter') send(); });
+      })();
+    </script>
+  </body>
+</html>
+`;
+  return {
+    manifest: {
+      id: "bun-ws",
+      framework: "bun",
+      icon: "bun",
+      category: "Bun",
+      name: "websocket",
+      language: "TypeScript",
+      description: "Bun.serve WebSocket chat with server.upgrade + pub/sub broadcast",
+      port: 3000,
+      openPath: "/",
+      entry: "index.ts",
+      hmr: false,
+      reload: false,
+      install: "bun install",
+      dev: "bun run index.ts",
+      experimental: true,
+      // Proven by scripts/spike-bun.mjs (in-VM WebSocket client vs the shim's
+      // Bun.serve ws server: open, echo, server.publish broadcast, close).
+    },
+    files: {
+      "package.json": `{
+  "name": "bun-ws-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "module": "index.ts",
+  "scripts": { "start": "bun run index.ts", "dev": "bun run index.ts" },
+  "devDependencies": { "@types/bun": "latest" }
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true
+  }
+}
+`,
+      "index.ts": `// Bun.serve WebSockets on Vivari's Bun shim. The \`fetch\` handler upgrades the
+// request via server.upgrade(req); socket lifecycle + messages are handled once
+// in the \`websocket\` object, and server.publish broadcasts to every subscriber
+// of a topic. Docs: https://bun.com/docs/runtime/http/websockets
+const HOME: string = ${JSON.stringify(HOME)};
+
+const port = Number(process.env.PORT ?? 3000);
+let online = 0;
+
+const server = Bun.serve({
+  port,
+  fetch(req, server) {
+    const url = new URL(req.url);
+    if (url.pathname === "/ws") {
+      // Upgrade to a WebSocket; on success return nothing (no Response).
+      if (server.upgrade(req)) return;
+      return new Response("WebSocket upgrade failed", { status: 400 });
+    }
+    return new Response(HOME, { headers: { "content-type": "text/html; charset=utf-8" } });
+  },
+  websocket: {
+    open(ws) {
+      online++;
+      ws.subscribe("chat");
+      ws.send(JSON.stringify({ type: "system", text: "welcome — connected to the Bun server" }));
+      server.publish("chat", JSON.stringify({ type: "system", text: "a client joined (" + online + " online)" }));
+    },
+    message(ws, message) {
+      const text = typeof message === "string" ? message : "(binary message)";
+      // Broadcast to every subscriber of "chat" (including the sender).
+      server.publish("chat", JSON.stringify({ type: "chat", text }));
+    },
+    close() {
+      online = Math.max(0, online - 1);
+      server.publish("chat", JSON.stringify({ type: "system", text: "a client left (" + online + " online)" }));
+    },
+  },
+});
+
+console.log("Bun websocket demo on http://localhost:" + server.port);
+`,
+    },
+  };
+}
+
+// ── React (Bun) ──────────────────────────────────────────────────────────────
+// A client-rendered React SPA served by Bun.serve on the Vivari Bun shim. There
+// is no client bundler in the shim, so: index.html pulls React from a CDN via an
+// importmap, and the server transpiles app.tsx on the fly (Bun.Transpiler / the
+// shim's zero-config TS+JSX transform) and serves it as an ES module at /app.js.
+// Needs internet in the preview for esm.sh (same assumption as `bun install`).
+function bunReactTemplate(): TemplateDef {
+  const INDEX_HTML = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>React + Bun · Vivari</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        background: radial-gradient(1200px 600px at 50% -10%, #1b2333, #0a0a0a); color: #e5e7eb; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "https://esm.sh/react@18.3.1",
+          "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+          "react-dom": "https://esm.sh/react-dom@18.3.1?external=react",
+          "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?external=react"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
+`;
+  return {
+    manifest: {
+      id: "bun-react",
+      framework: "bun",
+      icon: "bun",
+      category: "Bun",
+      name: "React",
+      language: "TypeScript",
+      description: "Client-rendered React + TS SPA served by Bun.serve; app.tsx transpiled on the fly",
+      port: 3000,
+      openPath: "/",
+      entry: "app.tsx",
+      hmr: false,
+      reload: false,
+      install: "bun install",
+      dev: "bun run index.ts",
+      experimental: true,
+      // app.tsx transpile + parse is covered by scripts/spike-bun-offline.mjs; the
+      // Bun.serve host path is the same one proven by scripts/spike-bun.mjs.
+    },
+    files: {
+      "package.json": `{
+  "name": "bun-react-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "module": "index.ts",
+  "scripts": { "start": "bun run index.ts", "dev": "bun run index.ts" },
+  "devDependencies": { "@types/bun": "latest", "@types/react": "^18", "@types/react-dom": "^18" }
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "jsx": "react",
+    "skipLibCheck": true
+  }
+}
+`,
+      "index.ts": `// Bun.serve host for the React SPA. The shim has no client bundler, so the server
+// transpiles app.tsx on the fly (Bun.Transpiler) and serves it as an ES module;
+// React itself is loaded in the browser from a CDN via the importmap in index.html.
+const INDEX_HTML: string = ${JSON.stringify(INDEX_HTML)};
+
+const port = Number(process.env.PORT ?? 3000);
+
+const server = Bun.serve({
+  port,
+  routes: {
+    // Transpile TSX -> JS on demand and serve as an ES module (types stripped,
+    // JSX lowered to React.createElement). Imports stay bare for the importmap.
+    "/app.js": () => {
+      const src = require("fs").readFileSync("app.tsx", "utf8");
+      const js = new Bun.Transpiler({ loader: "tsx" }).transformSync(src);
+      return new Response(js, { headers: { "content-type": "application/javascript; charset=utf-8" } });
+    },
+    "/": () => new Response(INDEX_HTML, { headers: { "content-type": "text/html; charset=utf-8" } }),
+  },
+});
+
+console.log("React + Bun on http://localhost:" + server.port);
+`,
+      "app.tsx": `import React, { useState } from "react";
+import { createRoot } from "react-dom/client";
+
+type CounterProps = { start: number };
+
+function Counter({ start }: CounterProps) {
+  const [count, setCount] = useState<number>(start);
+  return (
+    <button
+      onClick={() => setCount((c) => c + 1)}
+      style={{
+        appearance: "none",
+        border: 0,
+        cursor: "pointer",
+        padding: "0.6rem 1.2rem",
+        fontSize: "1rem",
+        fontWeight: 600,
+        borderRadius: 10,
+        color: "#fff",
+        background: "linear-gradient(180deg, #4f7cff, #3b5cf0)",
+      }}
+    >
+      count is {count}
+    </button>
+  );
+}
+
+function App() {
+  return (
+    <main style={{ textAlign: "center", padding: "2rem", maxWidth: 640 }}>
+      <h1 style={{ margin: "0 0 0.4rem", fontSize: "2rem" }}>React + Bun</h1>
+      <p style={{ color: "#9ca3af", margin: "0 0 1.5rem", lineHeight: 1.5 }}>
+        Client-rendered React written in TypeScript. Vivari's Bun shim transpiles this
+        file on the fly; React is loaded from a CDN via an importmap. Edit and reload.
+      </p>
+      <Counter start={0} />
+    </main>
+  );
+}
+
+const root = document.getElementById("root");
+if (root) createRoot(root).render(<App />);
 `,
     },
   };
@@ -5236,6 +5804,11 @@ export const TEMPLATES: TemplateDef[] = [
   nitroTemplate(),
   graphqlTemplate(),
   feathersTemplate(),
+  // Bun
+  bunTemplate(),
+  bunRoutesTemplate(),
+  bunWebSocketTemplate(),
+  bunReactTemplate(),
   // Fullstack
   nextTemplate(true),
   nextTemplate(false),
