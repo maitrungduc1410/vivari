@@ -75,11 +75,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Sets the version on @vivari/core + @vivari/react AND rewrites the internal
+      # @vivari/core range on its dependents in lockstep. `npm version --workspace`
+      # can't be used here: its post-bump reify resolves the (now unsatisfiable)
+      # @vivari/core@^0.0.1 from the registry and 404s. See the script header.
       - name: Optionally set version
         if: ${{ inputs.version != '' }}
-        run: |
-          npm version "${{ inputs.version }}" --no-git-tag-version --workspace @vivari/core
-          npm version "${{ inputs.version }}" --no-git-tag-version --workspace @vivari/react
+        run: node scripts/set-sdk-version.mjs "${{ inputs.version }}"
 
       # The SDK bundles these three Wasm crates (VFS + codec + crypto) as assets.
       - name: Build Wasm crates
