@@ -25,25 +25,25 @@ export function Comparison() {
 
       <Reveal className="mt-12">
         <div className="glass overflow-hidden rounded-2xl">
-          <div className="grid grid-cols-[1fr_auto_auto] items-center gap-4 border-b border-border px-6 py-4 text-sm font-medium">
-            <span className="text-muted">Capability</span>
-            <span className="text-gradient w-24 text-center">Vivari</span>
-            <span className="w-24 text-center text-faint">Proprietary</span>
+          <div className="grid grid-cols-[1fr_auto_auto] items-center gap-4 border-b border-border px-4 py-4 text-sm font-medium sm:px-6">
+            <span className="min-w-0 text-muted">Capability</span>
+            <span className="text-gradient w-16 text-center sm:w-24">Vivari</span>
+            <span className="w-16 text-center text-faint sm:w-24">Proprietary</span>
           </div>
           {ROWS.map((r) => (
             <div
               key={r.label}
-              className="grid grid-cols-[1fr_auto_auto] items-center gap-4 border-b border-border/60 px-6 py-3.5 text-sm last:border-0"
+              className="grid grid-cols-[1fr_auto_auto] items-center gap-4 border-b border-border/60 px-4 py-3.5 text-sm last:border-0 sm:px-6"
             >
-              <span className="text-fg">{r.label}</span>
-              <span className="flex w-24 justify-center">
+              <span className="min-w-0 text-fg">{r.label}</span>
+              <span className="flex w-16 justify-center sm:w-24">
                 {r.vivari ? (
                   <Check className="h-5 w-5 text-emerald-400" />
                 ) : (
                   <X className="h-5 w-5 text-faint" />
                 )}
               </span>
-              <span className="flex w-24 justify-center">
+              <span className="flex w-16 justify-center sm:w-24">
                 {r.other ? (
                   <Check className="h-5 w-5 text-muted" />
                 ) : (

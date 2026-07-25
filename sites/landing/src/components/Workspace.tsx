@@ -148,13 +148,13 @@ export function Workspace() {
       </div>
 
       {/* Body: editor + terminal | preview */}
-      <div className="grid h-[300px] grid-cols-[1.1fr_0.9fr] md:h-[320px]">
+      <div className="grid h-[300px] grid-cols-2 md:h-[320px]">
         {/* Left: code editor over a terminal strip */}
-        <div className="flex flex-col border-r border-border">
+        <div className="flex min-w-0 flex-col border-r border-border">
           <div className="flex items-center gap-2 border-b border-border/70 bg-white/[0.015] px-3 py-1.5">
             <span className="rounded bg-white/10 px-2 py-0.5 text-[10px] text-muted">App.jsx</span>
           </div>
-          <div className="flex-1 overflow-hidden px-3 py-2 font-mono text-[11px] leading-[1.55]">
+          <div className="flex-1 overflow-x-auto overflow-y-hidden px-3 py-2 font-mono text-[11px] leading-[1.55]">
             {CODE.slice(0, code).map((line, i) => (
               <motion.div
                 key={i}
@@ -196,7 +196,7 @@ export function Workspace() {
         </div>
 
         {/* Right: live preview */}
-        <div className="relative flex flex-col bg-gradient-to-br from-bg-soft to-panel">
+        <div className="relative flex min-w-0 flex-col bg-gradient-to-br from-bg-soft to-panel">
           <div className="flex items-center gap-2 border-b border-border/70 px-3 py-1.5 text-[10px] text-faint">
             <motion.span
               animate={ready ? { backgroundColor: "#34d399" } : { backgroundColor: "#5b6479" }}
@@ -242,7 +242,7 @@ export function Workspace() {
           >
             <span className="relative flex h-4 w-4 items-center justify-center">
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400/40" />
-              <NodeMark className="relative transform-[scale(1.4)]" />
+              <NodeMark className="relative h-4 w-4 transform-[scale(1.4)]" />
             </span>
             <span className="text-[10px] font-medium text-fg">Node</span>
           </motion.div>

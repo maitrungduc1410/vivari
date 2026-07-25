@@ -16,7 +16,7 @@ export function Hero() {
   return (
     <section id="top" className="relative mx-auto max-w-7xl px-6 pt-32 pb-20 md:pt-40">
       <div className="grid items-center gap-12 lg:grid-cols-[0.9fr_1.1fr]">
-        <motion.div variants={container} initial="hidden" animate="show">
+        <motion.div variants={container} initial="hidden" animate="show" className="min-w-0">
           <motion.a
             variants={item}
             href={site.githubUrl}
@@ -30,10 +30,10 @@ export function Hero() {
 
           <motion.h1
             variants={item}
-            className="mt-6 text-5xl font-semibold tracking-tight md:text-6xl lg:text-7xl"
+            className="mt-6 text-4xl font-semibold tracking-tight text-balance sm:text-5xl md:text-6xl lg:text-7xl"
           >
-            Run <span className="text-gradient">Node.js</span>
-            <br />
+            Run <span className="text-gradient">Node.js</span>{" "}
+            <br className="hidden md:block" />
             fully in the browser.
           </motion.h1>
 
