@@ -450,6 +450,25 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     const tsCompiled = maybeTranspileTypeScript(source, filename, jsxOptionsFor(filename));
     if (tsCompiled != null) source = tsCompiled;
 
+    // Breakpoint-debugger instrumentation. When a debug session is attached
+    // (index.js installs `globalThis.__vvDebugHook`), weave probes into the guest's
+    // OWN source (node_modules excluded) on plain, line-preserving ECMAScript —
+    // after the TS/JSX strip, before the ESM rewrite. The hook registers the script
+    // (Debugger.scriptParsed) and returns the woven code; it self-heals to the
+    // original source on any failure, so debugging never breaks a run. Zero cost
+    // when no session is attached (one global read).
+    const dh = globalThis.__vvDebugHook;
+    if (dh && dh.shouldInstrument(filename)) {
+      try {
+        const woven = dh.instrument(source, filename, {
+          isModule: /(^|[\n;])\s*(import|export)\b/.test(source),
+        });
+        if (typeof woven === "string" && woven.length) source = woven;
+      } catch {
+        /* leave source un-instrumented — that file just isn't breakpointable */
+      }
+    }
+
     // ESM support (#13): transpile import/export -> our synchronous CJS at load
     // time. `.cjs` is always CommonJS; everything else is scanned and rewritten
     // only if it actually uses module syntax (transpileEsm returns null for

@@ -1,5 +1,6 @@
 import Files from "~icons/lucide/files";
 import Search from "~icons/lucide/search";
+import Bug from "~icons/lucide/bug";
 import Sun from "~icons/lucide/sun";
 import Moon from "~icons/lucide/moon";
 import Monitor from "~icons/lucide/monitor";
@@ -40,11 +41,12 @@ export function ActivityBar() {
   const { c, snap } = useIde();
   // Clicking the active view toggles the sidebar (VS Code behaviour); otherwise
   // switch to it.
-  const select = (view: "explorer" | "search") => {
+  const select = (view: "explorer" | "search" | "debug") => {
     if (snap.activeView === view && !snap.sidebarCollapsed) c.toggleSidebar();
     else c.setActiveView(view);
   };
-  const shown = (view: "explorer" | "search") => snap.activeView === view && !snap.sidebarCollapsed;
+  const shown = (view: "explorer" | "search" | "debug") =>
+    snap.activeView === view && !snap.sidebarCollapsed;
   return (
     <div className="flex w-12 shrink-0 flex-col items-center border-r bg-sidebar py-1">
       <ActBtn label="Workspace" active={shown("explorer")} onClick={() => select("explorer")}>
@@ -52,6 +54,9 @@ export function ActivityBar() {
       </ActBtn>
       <ActBtn label="Search" active={shown("search")} onClick={() => select("search")}>
         <Search className="size-5" />
+      </ActBtn>
+      <ActBtn label="Run and Debug" active={shown("debug")} onClick={() => select("debug")}>
+        <Bug className="size-5" />
       </ActBtn>
       <ThemeToggle />
     </div>

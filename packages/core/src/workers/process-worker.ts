@@ -86,7 +86,7 @@ function buildCodecs(codecModule, cryptoModule) {
 let selfPid = -1;
 
 self.onmessage = async (event) => {
-  const { type, sab, spec, fsPort, threadPort, codecModule, cryptoModule } = event.data;
+  const { type, sab, spec, fsPort, threadPort, codecModule, cryptoModule, debugSab } = event.data;
   if (type === "init") {
     selfPid = (spec && spec.pid) | 0;
     const { makeZStream, cryptoCodec } = buildCodecs(codecModule, cryptoModule);
@@ -95,6 +95,7 @@ self.onmessage = async (event) => {
       spec,
       fsPort, // #14: fs syscalls ring the File System Worker over this port
       threadPort, // #16 stage 2b: our parentPort, if we are a spawned thread
+      debugSab, // breakpoint debugger command channel (present under a debug session)
       postRaw: (msg, transfer) => self.postMessage(msg, transfer || []),
       send: (msgType, extra) => self.postMessage({ type: msgType, ...extra }),
       onReady: (c) => {
@@ -141,4 +142,7 @@ self.onmessage = async (event) => {
   else if (type === "stdin") control && control.dispatchStdin(event.data);
   // An async fetch result relayed by the kernel (parallel downloads).
   else if (type === "fetch-done") control && control.dispatchFetch(event.data);
+  // A CDP debugger command for this process while it is RUNNING (paused commands
+  // arrive over the debug SAB instead). Feeds the in-guest Debugger backend.
+  else if (type === "dbg-cmd") control && control.dispatchDebugCommand(event.data.data);
 };

@@ -7,6 +7,7 @@ import { TitleBar } from "./TitleBar";
 import { ActivityBar } from "./ActivityBar";
 import { Explorer } from "./Explorer";
 import { SearchPane } from "./SearchPane";
+import { DebugPanel } from "./DebugPanel";
 import { EditorGroup } from "./EditorGroup";
 import { TerminalPanel } from "./TerminalPanel";
 import { PreviewPanel } from "./PreviewPanel";
@@ -88,7 +89,13 @@ export function AppShell() {
           {!snap.sidebarCollapsed && (
             <>
               <ResizablePanel id="explorer" defaultSize="16%" minSize="10%" maxSize="30%">
-                {snap.activeView === "search" ? <SearchPane /> : <Explorer />}
+                {snap.activeView === "search" ? (
+                  <SearchPane />
+                ) : snap.activeView === "debug" ? (
+                  <DebugPanel />
+                ) : (
+                  <Explorer />
+                )}
               </ResizablePanel>
               <ResizableHandle />
             </>

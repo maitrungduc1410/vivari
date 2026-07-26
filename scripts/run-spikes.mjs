@@ -33,6 +33,10 @@ const SPIKES = [
   // ESM→CJS loader guarantees: top-level-await async retry + circular re-export
   // live bindings (SvelteKit config / astro runtime). Pure parser, no kernel/wasm.
   { name: "esm", file: "spike-esm.mjs", net: false, timeout: 60000 },
+  // Breakpoint debugger: the source instrumenter + in-guest CDP Debugger backend +
+  // the debug-command SharedArrayBuffer channel (real Atomics across a worker).
+  // Pure JS + vendored acorn, no kernel/wasm.
+  { name: "debugger", file: "spike-debugger.mjs", net: false, timeout: 60000 },
   // pnpm/cmd-shim bin unwrap — pure parser, no kernel/wasm needed.
   { name: "cmd-shim", file: "spike-cmd-shim.mjs", net: false, timeout: 60000 },
   // Import/export/share codecs (P2): zip writer verified with Node's zlib, and

@@ -3374,3 +3374,64 @@ delete keep-prefix and ship **C**.
   and, in **mode C**, can give **self-hosters/embedders** the wildcard-per-port experience
   StackBlitz reserves for itself — MIT, no license fee, no lock-in. This is a concrete
   marketing + technical differentiator, not just a security fix.
+
+---
+
+## 🐞 Breakpoint debugger (chii/chobitsu CDP, extended)
+
+A source-level breakpoint debugger for guest code, speaking the **Chrome DevTools
+Protocol** (`Debugger`/`Runtime` domains) so the same backend can drive both a
+VS Code-style Monaco UI and (later) the chii Sources panel.
+
+### Phase 1–2 — Node guest processes ✅ (this change)
+
+Full **pause / step (over·into·out) / inspect / evaluate** for Node processes run
+under debug mode, implemented by **source instrumentation** (no native inspector
+in the browser). Zero cost when no session is attached.
+
+**How it works**
+- **Instrumentation** (`packages/runtime/instrument.js`) — `acorn` parses the
+  guest's own source (node_modules excluded) on plain, line-preserving ECMAScript
+  (after the TS/JSX strip, before the ESM rewrite in `packages/runtime/module.js`).
+  It weaves in probes — `__vvdbg.line/brk/push/pop` — and a per-lexical-block
+  `__vv_ev` eval closure so `evaluateOnCallFrame` and Variables see the *exact*
+  block scope (incl. TDZ correctness). Self-heals to the original source on any
+  parse failure, so debugging never breaks a run.
+- **In-guest CDP backend** (`packages/runtime/debugger.js`) — script registry,
+  breakpoint binding (`setBreakpointByUrl`, conditional), call-stack frames,
+  RemoteObject/objectId table, and a synchronous pause loop. Emits
+  `Debugger.scriptParsed/paused/resumed`.
+- **Pause channel** (`packages/protocol/debug.js`) — a `SharedArrayBuffer` ABI
+  separate from the syscall SAB. A paused worker blocks on `Atomics.wait`; the
+  kernel writes CDP commands into the SAB and `Atomics.notify`s. Running (not yet
+  paused) processes receive commands via `postMessage` instead.
+- **Kernel routing** (`packages/kernel-host/kernel.js`) — allocates the debug SAB
+  per target, announces targets (`onDebugTarget`), relays events (`onDebugEvent`),
+  and routes commands (postMessage while running, SAB while paused). The run
+  shell + package managers (`sh`/`npm`/`npx`/`yarn`/`pnpm`/…) are skipped as
+  targets so auto-attach lands on the user's actual program (the child inherits
+  `VV_DEBUG`).
+- **Studio UI** — `packages/studio/src/vv/debug-session.ts` is the CDP *client*
+  (multiplexes into Monaco); `DebugPanel.tsx` + the **Run and Debug** activity-bar
+  entry give a VS Code-style panel (Call Stack / Variables / Watch / Breakpoints)
+  with gutter-click breakpoints and a paused-line highlight (`index.css`
+  decorations). Enabling "Debug mode" sets `VV_DEBUG=1` for subsequent runs.
+
+**Verified:** `node scripts/spike-debugger.mjs` — 27 assertions covering
+instrumentation, breakpoint binding (incl. conditional), pause/step, scope +
+`evaluateOnCallFrame` (with TDZ), top-level `debugger;`, the real SAB channel, and
+an end-to-end `worker_threads` pause→evaluate→resume over the SAB. (`verify-node`
+needs the Rust/Wasm VFS build and so isn't runnable in a toolchain-less env.)
+
+### Phase 3 — preview browser JS ⏳ (planned)
+
+The preview iframe already ships a full in-browser CDP backend (chobitsu) for
+console/network/`scriptParsed`, bridged to the chii frontend by the host relay in
+`controller.ts`. What's missing is **real breakpoint pausing** of the app's own
+browser JS. Because DOM code runs on the main thread it cannot block on
+`Atomics.wait`, so this needs a **CPS / resumable transform** of the served source
+(a generator-style rewrite) plus a Debugger backend inside the preview page that
+multiplexes with chobitsu over the same `vv-cdp` channel — reusing the Phase 1–2
+CDP shapes so both UIs stay on one protocol. This is a substantial, browser-only
+piece best landed and verified with a real preview, so it is deliberately deferred
+rather than shipped unverified.

@@ -17,6 +17,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { toast } from "sonner";
 import type * as Monaco from "monaco-editor";
 import { KernelBridge, resetVfs } from "./kernel";
+import { DebugSession } from "./debug-session";
 import { getTemplate, type TemplateManifest } from "./templates";
 import { createZip, encodeShare, decodeShare } from "../../../kernel-host/archive.js";
 import {
@@ -157,7 +158,7 @@ export interface IdeSnapshot {
   devtoolsOpen: boolean; // the chii DevTools panel (bottom split of the preview)
   devtoolsNonce: number; // bump to reload the DevTools frontend (re-attach to a new target)
   selectedDemo: string;
-  activeView: "explorer" | "search";
+  activeView: "explorer" | "search" | "debug";
   sidebarCollapsed: boolean;
   panelCollapsed: boolean;
   panelTab: "console" | "terminal" | "ports";
@@ -424,6 +425,9 @@ interface TermEntry {
 
 export class IdeController {
   readonly bridge: KernelBridge;
+  // Breakpoint debugger session (CDP client for Node guest targets). Drives the
+  // Monaco gutter breakpoints, paused-line highlight, and the Debug panel.
+  readonly debug: DebugSession;
 
   // ── external store ──
   private listeners = new Set<() => void>();
@@ -519,6 +523,9 @@ export class IdeController {
     const previewOrigin = normalizePreviewOrigin(import.meta.env.VITE_PREVIEW_ORIGIN);
     this.bridge = new KernelBridge({ previewOrigin });
     this.previewBase = this.bridge.previewBase;
+    this.debug = new DebugSession(this.bridge);
+    // When execution pauses (or a frame is selected), open the file + reveal the line.
+    this.debug.onReveal = (path, line) => void this.openFileAt(path, line);
     this.snap.recentProjects = this.loadRegistry();
     this.createConsole();
     this.wireBridge();
@@ -787,7 +794,7 @@ export class IdeController {
     }
   }
 
-  setActiveView(view: "explorer" | "search") {
+  setActiveView(view: "explorer" | "search" | "debug") {
     this.set({ activeView: view, sidebarCollapsed: false });
   }
 
@@ -901,7 +908,15 @@ export class IdeController {
       // We handle drops onto the editor ourselves (open the dropped entry), so
       // turn off Monaco's built-in "drop text into the buffer" behavior.
       dropIntoEditor: { enabled: false },
+      // Breakpoint debugger: the glyph margin hosts breakpoint dots + the paused
+      // arrow, and a click there toggles a breakpoint (see DebugSession).
+      glyphMargin: true,
+      // Don't over-reserve the line-number column (Monaco defaults to 5 chars,
+      // which right-aligns single digits and leaves a big gap to their left).
+      lineNumbersMinChars: 2,
     });
+    // Breakpoint debugger: wire gutter breakpoints + paused-line decorations.
+    this.debug.attachEditor(this.editor, monaco);
     // Seed the language service with any folders indexed before the editor was
     // ready (source files as models for cross-file IntelliSense; dependency types
     // as extra libs), then open whatever tab was requested during load.

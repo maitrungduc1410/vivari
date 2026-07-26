@@ -27,6 +27,9 @@ export function bootProcess({
   // to the kernel with transferables (for Worker() -> kernel port handoff).
   threadPort = null,
   postRaw = null,
+  // Breakpoint debugger command channel (a SharedArrayBuffer) — present only when
+  // this process was spawned under a debug session. Forwarded to createRuntime.
+  debugSab = null,
 }) {
   const { ctrl, data } = makeViews(sab);
   // #14: fs opcodes ring the File System Worker's doorbell directly (a
@@ -65,6 +68,9 @@ export function bootProcess({
       workerData: spec.workerData ?? null,
       parentPort: isThread ? threadPort : null,
     },
+    // Breakpoint debugger: hand the runtime the debug SAB + an event sink. `send`
+    // posts a CDP event/response to the kernel, which relays it to the studio.
+    debug: debugSab ? { sab: debugSab, send: (json) => send("dbg-event", { data: json }) } : null,
   });
 
   // The fs doorbell port is duplex: we ring it (process -> FS worker) for every
@@ -92,6 +98,7 @@ export function bootProcess({
       dispatchPipe: runtime.dispatchPipe,
       dispatchStdin: runtime.dispatchStdin,
       dispatchFetch: runtime.dispatchFetch,
+      dispatchDebugCommand: runtime.dispatchDebugCommand,
       memStats: runtime.memStats,
     });
 

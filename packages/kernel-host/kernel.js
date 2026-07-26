@@ -46,6 +46,7 @@ import {
   OP_PIPE_CONNECT,
   OP_PIPE_CLOSE_SERVER,
 } from "../protocol/syscall.js";
+import { DBG_SAB_BYTES, makeDebugViews, writeDebugCommand } from "../protocol/debug.js";
 import { COREUTILS } from "./coreutils.js";
 
 const EMPTY = new Uint8Array(0);
@@ -112,6 +113,26 @@ export class Kernel {
     // fetch (npm re-resolving the same package) skips the network entirely.
     this.fetchCache = new Map();
     this.onFetch = null; // optional observer (url, {cached,size,pid}) — e.g. a UI log / per-terminal progress
+
+    // ---- breakpoint debugger (CDP) ----
+    // A process spawned with env VV_DEBUG=1 becomes a debug target: it gets a
+    // second SharedArrayBuffer (the debug-command channel) and the in-guest
+    // Debugger backend attaches. The kernel routes CDP between the studio and the
+    // target: events flow out via `onDebugEvent(pid, json)`; commands flow in via
+    // `debugCommand(pid, json)` — over postMessage while the target is running, or
+    // over the debug SAB while it is paused (a parked worker isn't draining
+    // postMessages). `onDebugTarget(pid, added, info)` announces targets to the UI.
+    this.debugSabs = new Map(); // pid -> SharedArrayBuffer
+    this.debugViews = new Map(); // pid -> { ctrl, data }
+    this.debugPaused = new Set(); // pids currently parked at a breakpoint
+    this.debugQueue = new Map(); // pid -> string[] of commands awaiting the SAB slot
+    this.onDebugEvent = null; // (pid, jsonString)
+    this.onDebugTarget = null; // (pid, added:boolean, info)
+    // Live "debug mode" flag, toggled from the studio. When on, every debuggable
+    // process (see skip-list in createProcess) becomes a debug target — regardless
+    // of when its terminal opened, so toggling debug mode takes effect immediately
+    // without needing to re-open the shell (whose env is fixed at launch).
+    this.debugMode = false;
 
     // ---- bounded LRU over the transient fetched-body cache -------------------
     // Every fetched packument/tarball body is materialized under /var/cache/
@@ -338,9 +359,36 @@ export class Kernel {
       threads: null,
     };
     this.procs.set(pid, proc);
+
+    // Breakpoint debugger: a process launched with VV_DEBUG=1 is a debug target.
+    // Allocate its debug-command SAB (kernel→worker) before spawning so the runtime
+    // can attach the in-guest Debugger backend at boot. The env propagates to child
+    // processes (so a dev server launched by the run shell inherits it), but the
+    // shell wrapper + package managers themselves aren't interesting to debug — skip
+    // them so auto-attach lands on the user's actual program, not `sh`/`npm`.
+    const env = spec.env || {};
+    const wantsDebug = this.debugMode || env.VV_DEBUG === "1" || env.VV_DEBUG === "true";
+    const cmd = String(spec.command || "");
+    const skipDebug = /^(sh|bash|dash|zsh|npm|npx|yarn|pnpm|corepack|node-gyp|tsc|tsgo)$/.test(cmd);
+    const debugEnabled = wantsDebug && !skipDebug;
+    let debugSab = null;
+    if (debugEnabled) {
+      debugSab = new SharedArrayBuffer(DBG_SAB_BYTES);
+      this.debugSabs.set(pid, debugSab);
+      this.debugViews.set(pid, makeDebugViews(debugSab));
+      this.debugQueue.set(pid, []);
+      // Start in SAB-routing mode: the guest blocks in an --inspect-brk-style start
+      // gate (debugger.js waitForStart) before its entry runs, and only reads inbound
+      // commands over the SAB there — so config (enable + breakpoints) must go over
+      // the SAB, not postMessage. The guest emits `Debugger.resumed` when the gate
+      // opens, which flips this back to postMessage for the running program.
+      this.debugPaused.add(pid);
+    }
+
     proc.handle = this.spawnWorker({
       pid,
       sab,
+      debugSab,
       spec: { ...spec, pid, ppid: parentPid ?? 0 },
       // #16 stage 2b: a spawned thread gets its creator's MessageChannel end as a
       // transferable, delivered to the worker as parentPort at init.
@@ -368,9 +416,59 @@ export class Kernel {
         "pipe-data": (m) => this.handlePipeRelay(pid, m),
         "pipe-shutdown": (m) => this.handlePipeRelay(pid, m),
         "pipe-close": (m) => this.handlePipeRelay(pid, m),
+        // Breakpoint debugger: a CDP event/response from the in-guest backend.
+        "dbg-event": (m) => this.handleDebugEvent(pid, m),
       },
     });
+
+    if (debugEnabled && this.onDebugTarget) {
+      this.onDebugTarget(pid, true, { command: spec.command, args: spec.args || [], cwd: spec.cwd });
+    }
     return pid;
+  }
+
+  // ── breakpoint debugger routing ─────────────────────────────────────────────
+  // A CDP event/response from a target's in-guest backend. Track paused/resumed so
+  // we know which channel to route inbound commands over, then relay to the studio.
+  handleDebugEvent(pid, m) {
+    const data = m && m.data;
+    if (typeof data === "string") {
+      if (data.indexOf('"Debugger.paused"') !== -1) this.debugPaused.add(pid);
+      else if (data.indexOf('"Debugger.resumed"') !== -1) {
+        this.debugPaused.delete(pid);
+        this._drainDebugQueue(pid); // flush any commands queued while paused
+      }
+    }
+    if (this.onDebugEvent) this.onDebugEvent(pid, data);
+  }
+
+  // Deliver a CDP command (JSON string) from the studio to a target process. While
+  // running, postMessage is fine; while paused (the worker is parked on Atomics),
+  // the command must ride the debug SAB — queued if the single slot is still full.
+  debugCommand(pid, json) {
+    if (!this.debugSabs.has(pid)) return; // not a debug target
+    if (this.debugPaused.has(pid)) {
+      const q = this.debugQueue.get(pid);
+      q.push(json);
+      this._drainDebugQueue(pid);
+    } else {
+      this.postToProc(pid, { type: "dbg-cmd", data: json });
+    }
+  }
+
+  _drainDebugQueue(pid) {
+    const q = this.debugQueue.get(pid);
+    const views = this.debugViews.get(pid);
+    if (!q || !views) return;
+    while (q.length) {
+      if (!writeDebugCommand(views, q[0])) {
+        // Slot still occupied by an unread command — retry shortly. The parked
+        // worker consumes promptly, so this is a brief, rare wait.
+        setTimeout(() => this._drainDebugQueue(pid), 0);
+        return;
+      }
+      q.shift();
+    }
   }
 
   // Post a message to a process' worker (out of band from the SAB). Used to relay
@@ -432,6 +530,15 @@ export class Kernel {
       /* ignore */
     }
     this.procs.delete(pid);
+    // Breakpoint debugger: drop the target's debug channel + state and tell the UI
+    // it went away (so the studio can detach the frontend).
+    if (this.debugSabs.has(pid)) {
+      this.debugSabs.delete(pid);
+      this.debugViews.delete(pid);
+      this.debugQueue.delete(pid);
+      this.debugPaused.delete(pid);
+      if (this.onDebugTarget) this.onDebugTarget(pid, false, {});
+    }
     // Drop any ports this process was serving and fail its in-flight requests,
     // so a fetch that was waiting on a now-dead server does not hang forever.
     for (const [port, owner] of this.listeners) {
@@ -501,7 +608,11 @@ export class Kernel {
     const programPath = this.resolveProgram(command, cwd, opts.env || {});
     if (!programPath) return -1;
     return this.createProcess(
-      { programPath, args, cwd, env: opts.env || {} },
+      // Carry `command` so downstream logic keyed on it works — notably the
+      // breakpoint debugger's skip-list (`sh`/`npm`/…): without it a debug-mode
+      // shell has command=undefined and is wrongly treated as a debug target, so
+      // auto-attach lands on the shell instead of the `node` the user runs.
+      { command, programPath, args, cwd, env: opts.env || {} },
       { capture: !!opts.capture },
     );
   }

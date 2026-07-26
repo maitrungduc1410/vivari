@@ -83,8 +83,24 @@ export function createRuntime({
   // When set, `process.send` / 'message' / connected / channel / disconnect are
   // bridged onto it (see below). Null for normal processes and worker threads.
   ipcPort = null,
+  // Breakpoint debugger channel. `{ sab, send }`: `sab` is the debug-command
+  // SharedArrayBuffer (kernel writes commands, this worker reads them while paused);
+  // `send(jsonString)` posts a CDP event/response toward the frontend. Present only
+  // when the process was spawned under a debug session (env VV_DEBUG=1). Null
+  // otherwise → the debugger + instrumentation stay completely dormant.
+  debug = null,
 }) {
   const syscalls = createSyscalls({ ctrl, data, notify });
+
+  // Breakpoint debugger (packages/runtime/debugger.js). Created lazily in run() so
+  // the parser (acorn) + backend code-split out of every non-debug process. Held
+  // here so the returned `dispatchDebugCommand` can forward running-state commands.
+  let __dbg = null;
+  // The kernel is the authority on what gets debugged: it only wires a debug SAB
+  // for a process it decided is a target (debug mode on / VV_DEBUG, minus the
+  // shell + package-manager skip-list). So attaching on the SAB's presence alone
+  // avoids depending on env propagation timing.
+  const debugEnabled = !!(debug && debug.sab);
 
   // Liveness counter for real net handles (Phase 2 #8): a listening net.Server or
   // an open socket keeps the loop alive, exactly like libuv's active handles.
@@ -1329,6 +1345,17 @@ export function createRuntime({
     /** External delivery from the kernel: an interactive stdin chunk for THIS
      * process ({type:'stdin', chunk} - chunk null = EOF). Feeds process.stdin. */
     dispatchStdin: (msg) => dispatchStdin(msg),
+    /** External delivery from the kernel: a CDP debugger command (JSON string) for
+     * THIS process, delivered while it is RUNNING (paused commands ride the debug
+     * SAB instead). No-op until a debug session is attached. */
+    dispatchDebugCommand: (json) => {
+      if (!__dbg) return;
+      try {
+        __dbg.onCommand(typeof json === "string" ? JSON.parse(json) : json);
+      } catch {
+        /* malformed command — ignore */
+      }
+    },
     /**
      * Run an entry file like `node <entry>`, then drive the event loop until it
      * is quiescent (no pending timers/immediates/nextTicks and no open servers).
@@ -1341,6 +1368,48 @@ export function createRuntime({
       // (npm's exit-handler). Emit it once across every exit path below. A
       // listener may itself call process.exit() (→ throws the sentinel); we're
       // already exiting, so swallow it.
+      // Attach the breakpoint debugger BEFORE the entry compiles (compile() reads
+      // globalThis.__vvDebugHook to weave in probes). Lazy import keeps acorn + the
+      // backend out of every ordinary process.
+      if (debugEnabled && !__dbg) {
+        try {
+          const { createDebugger } = await import("./debugger.js");
+          const { makeDebugViews, readDebugCommandBlocking } = await import("../protocol/debug.js");
+          const views = makeDebugViews(debug.sab);
+          __dbg = createDebugger({
+            send: (msg) => {
+              try {
+                debug.send(JSON.stringify(msg));
+              } catch {
+                /* transport gone */
+              }
+            },
+            // Blocks the worker thread on the debug SAB until the kernel posts a
+            // command (while paused) or `timeoutMs` elapses (the start gate).
+            waitForCommand: (timeoutMs) => {
+              try {
+                const s = readDebugCommandBlocking(views, timeoutMs);
+                return s == null ? null : JSON.parse(s);
+              } catch {
+                return null;
+              }
+            },
+          });
+          globalThis.__vvdbg = __dbg.__vvdbg;
+          globalThis.__vvDebugHook = __dbg;
+          // --inspect-brk-style gate: block until the frontend has attached and sent
+          // its breakpoints, so short synchronous entries still pause. Bounded so an
+          // unattended debug run proceeds after a short delay.
+          try {
+            __dbg.waitForStart();
+          } catch {}
+        } catch (e) {
+          try {
+            process.stderr.write("[vv-debug] failed to attach debugger: " + ((e && e.message) || e) + "\n");
+          } catch {}
+          __dbg = null;
+        }
+      }
       let exitEmitted = false;
       const finish = (code) => {
         if (!exitEmitted) {

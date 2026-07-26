@@ -437,6 +437,11 @@ const demoServing = new Set();
 const demoReadyPending = new Set();
 const termDemo = new Map(); // terminalId -> demo id
 
+// Breakpoint debugger: when on, run/demo terminals launch their process tree with
+// env VV_DEBUG=1, so the in-guest CDP Debugger backend attaches and the user's own
+// source is instrumented for breakpoints. Toggled from the studio (vv-debug-mode).
+let debugMode = false;
+
 // Dynamically created / opened projects (Home → New / Template, or Open Folder).
 // Unlike the two hard-coded DEMOS these have user-chosen dirs and are attributed
 // to a listened port by the pid chain of the run-shell that spawned the server
@@ -925,6 +930,12 @@ async function openTerminal(terminalId, cwd, demoId, run) {
   if (d) scaffoldDemo(demoId);
   const dir = (d ? d.dir : cwd) || defaultTermCwd();
   const env = baseProcEnv(dir);
+  // Breakpoint debugger: when debug mode is on, mark this process tree as a debug
+  // target. The shell passes env to its children, so any `node …` the user runs —
+  // whether via Run/demo or typed by hand in an interactive terminal — inherits
+  // VV_DEBUG and attaches the debugger. The shell + package managers themselves are
+  // skipped as targets in the kernel, so auto-attach lands on the real program.
+  if (debugMode) env.VV_DEBUG = "1";
   if (d) env.VV_RUN = await demoRunCommand(d);
   // A created/opened project's "Run" (or auto-run after create) hands us an
   // explicit command; install is skipped once node_modules exists, or restored
@@ -1261,6 +1272,10 @@ async function boot() {
     // [optimize] Hand over the pre-compiled codec Modules (cloned, not
     // transferred — a Module stays usable here and in every process).
     const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1, codecModule, cryptoModule };
+    // Breakpoint debugger: a debug target also receives its debug-command SAB. A
+    // SharedArrayBuffer is shared by reference (never transferred), so it just rides
+    // along in the init payload.
+    if (info.debugSab) init.debugSab = info.debugSab;
     const transfer = [port1];
     if (info.threadPort) {
       init.threadPort = info.threadPort;
@@ -1448,6 +1463,13 @@ async function boot() {
   // roadmap #19 stage C: a ws frame a process relayed OUT of the VM (Vite's HMR
   // server) — forward it to the main thread, which delivers it to the preview
   // iframe's WebSocket polyfill.
+  // Breakpoint debugger: relay CDP events/responses from a target's in-guest
+  // backend out to the main thread (→ studio DebugPanel / chii), and announce debug
+  // targets appearing/disappearing so the UI can attach/detach.
+  kernel.onDebugEvent = (pid, data) => post("dbg-event", { pid, data });
+  kernel.onDebugTarget = (pid, added, info) => post("dbg-target", { pid, added, info });
+  // Carry over a debug-mode toggle that arrived before the kernel booted.
+  kernel.debugMode = debugMode;
   kernel.onWsSend = (msg) => post("vv-ws", { msg });
   // An SSE stream chunk a process relayed OUT of the VM — forward it to the main
   // thread, which delivers it to the preview iframe's EventSource polyfill.
@@ -1957,6 +1979,24 @@ self.onmessage = async (event) => {
   // (relayed by the main thread). Route it to the process owning the preview port.
   if (m.type === "vv-sse") {
     if (kernel) kernel.handleSseClient(m.msg);
+    return;
+  }
+
+  // Breakpoint debugger: a CDP command (JSON string) from the studio for a target
+  // process. The kernel routes it over postMessage (running) or the debug SAB
+  // (paused).
+  if (m.type === "dbg-cmd") {
+    if (kernel) kernel.debugCommand(m.pid | 0, m.data);
+    return;
+  }
+
+  // Breakpoint debugger: toggle debug mode. The kernel flag makes every debuggable
+  // process a target immediately (even in shells opened before the toggle); the
+  // local flag still seeds VV_DEBUG into newly opened terminals' env for guests
+  // that read it.
+  if (m.type === "vv-debug-mode") {
+    debugMode = !!m.enabled;
+    if (kernel) kernel.debugMode = debugMode;
     return;
   }
 

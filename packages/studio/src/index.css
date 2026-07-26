@@ -184,3 +184,65 @@
 [data-slot="resizable-handle"][data-separator="active"] {
   background-color: #007fd4;
 }
+/*
+ * Breakpoint debugger decorations (see packages/studio/src/vv/debug-session.ts).
+ * A red dot in the glyph margin marks a breakpoint; the paused statement gets a
+ * highlighted line plus a yellow arrow in the glyph margin.
+ */
+/* All three glyphs are flex-centered inside Monaco's glyph-margin cell (which is
+ * sized to the full line height and column width), so the dot/arrow sits dead
+ * centre both vertically and horizontally — with equal space on either side. */
+.vv-bp-glyph,
+.vv-bp-hover-glyph,
+.vv-paused-glyph {
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  position: relative;
+}
+.vv-bp-glyph::before,
+.vv-bp-hover-glyph::before {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #e51400;
+}
+/* Faded dot: the "click to add a breakpoint" hover hint. */
+.vv-bp-hover-glyph::before {
+  opacity: 0.4;
+}
+.vv-paused-line {
+  background: rgba(255, 196, 0, 0.16);
+}
+/* Paused arrow: a geometric CSS triangle rather than the ▶ glyph, so it can be
+ * centred precisely inside the breakpoint dot it overlaps. A triangle's visual
+ * mass sits a third from its base, so nudge it right slightly to optically
+ * centre it within the dot. */
+.vv-paused-glyph::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 4px 0 4px 7px;
+  border-color: transparent transparent transparent #ffc400;
+  transform: translateX(1px);
+  position: relative;
+  z-index: 1;
+}
+/* Paused on a breakpoint: draw the full-size red dot behind the yellow arrow so
+ * both stay full-size (a single glyph, no split lanes). */
+.vv-paused-on-bp::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #e51400;
+  transform: translate(-50%, -50%);
+  z-index: 0;
+}
