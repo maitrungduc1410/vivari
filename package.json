@@ -41,7 +41,9 @@
     "build:core": "npm run build --workspace @vivari/core",
     "build:react": "npm run build --workspace @vivari/react",
     "build:site": "bash scripts/cloudflare-build.sh",
+    "build:preview": "bash scripts/cloudflare-build-preview.sh",
     "assemble:site": "node scripts/assemble-site.mjs",
+    "assemble:preview": "node scripts/assemble-preview.mjs",
     "build:sdk": "npm run build:core && npm run build:react",
     "typecheck:sdk": "npm run typecheck --workspace @vivari/core && npm run typecheck --workspace @vivari/react"
   },

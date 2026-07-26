@@ -21,6 +21,13 @@ const PREVIEW_MARKER = "/preview/";
 // server `listen`, i.e. right before a preview loads).
 const kernelHostIds = new Set();
 
+// Mode B (separate preview origin): a persistent MessagePort to the IDE, handed
+// to us (via the hidden __vv-bridge.html client) on `vv-connect`. When set, we
+// route preview HTTP + ws/SSE over it instead of `findKernelClient()` (which
+// only sees same-origin windows and so can't reach a cross-origin IDE). Lost
+// when the SW is evicted → re-established via a `vv-need-connect` handshake.
+let kernelPort = null;
+
 // "Keep-prefix" ports. By default the SW strips the `/preview/<port>` proxy prefix
 // before handing a request to the in-VM dev server (so a server that assumes it
 // lives at `/` — Next, Vite, Express… — sees clean paths). But a *client-routed*
@@ -73,8 +80,85 @@ async function loadDevtoolsEnabled() {
   return enabled;
 }
 
+// Persist + apply the keep-prefix port set (see setKeepPrefixPorts). `waitUntil`
+// is passed for `ExtendableEvent`-sourced calls (the global message listener);
+// MessagePort-sourced calls (mode B) fire-and-forget the persistence promise.
+function applyKeepPrefix(ports, waitUntil) {
+  keepPrefixPorts = new Set(ports.map((p) => p | 0));
+  const persist = (async () => {
+    try {
+      const cache = await caches.open(KEEP_PREFIX_CACHE);
+      await cache.put(KEEP_PREFIX_KEY, new Response(JSON.stringify([...keepPrefixPorts])));
+    } catch (_) {
+      /* best-effort persistence */
+    }
+  })();
+  if (waitUntil) waitUntil(persist);
+}
+
+// Persist + apply the DevTools-injection toggle (see loadDevtoolsEnabled).
+function applyDevtools(enabled, waitUntil) {
+  devtoolsEnabled = enabled;
+  const persist = (async () => {
+    try {
+      const cache = await caches.open(KEEP_PREFIX_CACHE);
+      await cache.put(DEVTOOLS_KEY, new Response(JSON.stringify(devtoolsEnabled)));
+    } catch (_) {
+      /* best-effort persistence */
+    }
+  })();
+  if (waitUntil) waitUntil(persist);
+}
+
+// dir:'in' (kernel → tabs): broadcast an inbound ws/SSE frame to every TOP-LEVEL
+// preview client (in-app iframes get theirs via parent.postMessage, no dupes).
+function broadcastInboundFrame(d) {
+  return self.clients.matchAll({ type: "window" }).then((cs) => {
+    for (const c of cs) {
+      if (c.frameType === "top-level" && c.url.includes(PREVIEW_MARKER)) c.postMessage(d);
+    }
+  });
+}
+
+// dir:'out' (tab → kernel): forward an outbound ws/SSE frame to the kernel — over
+// the persistent port in mode B, else to the same-origin kernel-host client.
+function forwardOutboundFrame(d) {
+  if (kernelPort) {
+    kernelPort.postMessage(d);
+    return Promise.resolve();
+  }
+  return findKernelClient().then((k) => {
+    if (k) k.postMessage(d);
+  });
+}
+
+// Messages the IDE sends us over the mode-B persistent port. Mirror of the
+// same-origin config/relay branches in the global `message` listener.
+function onKernelPortMessage(event) {
+  const d = event.data;
+  if (!d) return;
+  if (d.type === "vv-keep-prefix-ports" && Array.isArray(d.ports)) {
+    applyKeepPrefix(d.ports);
+    return;
+  }
+  if (d.type === "vv-devtools" && typeof d.enabled === "boolean") {
+    applyDevtools(d.enabled);
+    return;
+  }
+  if ((d.type === "vv-ws" || d.type === "vv-sse") && d.dir === "in") {
+    broadcastInboundFrame(d);
+  }
+}
+
 self.addEventListener("message", (event) => {
   const d = event.data;
+  // Mode B handshake: the bridge doc (on our origin) relays the IDE's port to us.
+  // Keep it and route preview HTTP + tunnel traffic over it from now on.
+  if (d && d.type === "vv-connect") {
+    kernelPort = (event.ports && event.ports[0]) || null;
+    if (kernelPort) kernelPort.onmessage = onKernelPortMessage;
+    return;
+  }
   // A page announcing it hosts a Vivari kernel — remember its client id so
   // handlePreview routes preview HTTP to it even when it's a nested iframe.
   if (d && d.type === "vv-kernel-host") {
@@ -82,32 +166,12 @@ self.addEventListener("message", (event) => {
     return;
   }
   if (d && d.type === "vv-keep-prefix-ports" && Array.isArray(d.ports)) {
-    keepPrefixPorts = new Set(d.ports.map((p) => p | 0));
-    event.waitUntil(
-      (async () => {
-        try {
-          const cache = await caches.open(KEEP_PREFIX_CACHE);
-          await cache.put(KEEP_PREFIX_KEY, new Response(JSON.stringify([...keepPrefixPorts])));
-        } catch (_) {
-          /* best-effort persistence */
-        }
-      })(),
-    );
+    applyKeepPrefix(d.ports, (p) => event.waitUntil(p));
     return;
   }
   // Toggle the in-preview DevTools backend injection (see loadDevtoolsEnabled).
   if (d && d.type === "vv-devtools" && typeof d.enabled === "boolean") {
-    devtoolsEnabled = d.enabled;
-    event.waitUntil(
-      (async () => {
-        try {
-          const cache = await caches.open(KEEP_PREFIX_CACHE);
-          await cache.put(DEVTOOLS_KEY, new Response(JSON.stringify(devtoolsEnabled)));
-        } catch (_) {
-          /* best-effort persistence */
-        }
-      })(),
-    );
+    applyDevtools(d.enabled, (p) => event.waitUntil(p));
     return;
   }
   // ws/SSE tunnel relay for a preview opened in its OWN top-level tab. In the studio
@@ -116,31 +180,45 @@ self.addEventListener("message", (event) => {
   // COOP:same-origin severs window.opener, so it can't reach the studio window. The
   // SW is shared across the origin (exactly how the HTTP preview proxy reaches the
   // studio's kernel client cross-tab), so relay the tunnel through it:
-  //   dir:'out' (tab → kernel): forward to the studio's kernel-host client.
-  //   dir:'in'  (kernel → tabs): broadcast to every TOP-LEVEL preview client (the
-  //     in-app iframes still get theirs via parent.postMessage, so no duplicates).
+  //   dir:'out' (tab → kernel): forward to the kernel (port in mode B, else client).
+  //   dir:'in'  (kernel → tabs): broadcast to every TOP-LEVEL preview client.
   if (d && (d.type === "vv-ws" || d.type === "vv-sse")) {
     if (d.dir === "out") {
-      event.waitUntil(findKernelClient().then((k) => { if (k) k.postMessage(d); }));
+      event.waitUntil(forwardOutboundFrame(d));
     } else if (d.dir === "in") {
-      event.waitUntil(
-        self.clients.matchAll({ type: "window" }).then((cs) => {
-          for (const c of cs) {
-            if (c.frameType === "top-level" && c.url.includes(PREVIEW_MARKER)) c.postMessage(d);
-          }
-        }),
-      );
+      event.waitUntil(broadcastInboundFrame(d));
     }
     return;
   }
 });
 
+// Choose how to reach the kernel for a preview request. Mode B routes over the
+// persistent port (`cross: true` → cross-origin response headers); mode A picks
+// the same-origin kernel-host window client. In mode B after an SW eviction the
+// port is gone: detect the bridge client, ask the IDE to re-hand a port, and wait
+// briefly for it before giving up. Does a single matchAll to stay cheap in mode A.
+async function resolveKernelSink() {
+  if (kernelPort) return { post: (m, t) => kernelPort.postMessage(m, t || []), cross: true };
+  const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  const bridge = clients.find((c) => c.url.includes("/__vv-bridge.html"));
+  if (bridge) {
+    // Mode B, revived SW: request a fresh port and wait up to ~2s for it.
+    bridge.postMessage({ type: "vv-need-connect" });
+    for (let i = 0; i < 40 && !kernelPort; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    if (kernelPort) return { post: (m, t) => kernelPort.postMessage(m, t || []), cross: true };
+    return null;
+  }
+  const client = pickKernelClient(clients);
+  return client ? { post: (m, t) => client.postMessage(m, t || []), cross: false } : null;
+}
+
 // The studio window that hosts the kernel — a top-level, non-preview, non-DevTools
 // client (preferring one that announced itself via vv-kernel-host so an EMBEDDED
 // Vivari, whose kernel is in a nested frame, still resolves). Used to route both
 // preview HTTP and the standalone-tab ws/SSE tunnel to the running kernel.
-async function findKernelClient() {
-  const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+function pickKernelClient(clients) {
   const isPreview = (c) => c.url.includes(PREVIEW_MARKER);
   const isDevtools = (c) => c.url.includes("/devtools-host.html") || c.url.includes("/devtools/");
   return (
@@ -150,6 +228,11 @@ async function findKernelClient() {
     clients.find((c) => !isPreview(c)) ||
     clients[0]
   );
+}
+
+async function findKernelClient() {
+  const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  return pickKernelClient(clients);
 }
 
 // roadmap: Packaging Stage 2 — precache the role bundles. Every Process Worker
@@ -844,11 +927,11 @@ async function handlePreview(event, port, path, keepPrefix) {
     return new Response("Bad preview URL\n", { status: 400 });
   }
 
-  // Find the page that hosts the kernel (the studio window). See findKernelClient:
-  // it skips preview + DevTools iframes and prefers the vv-kernel-host announcer so
-  // an embedded Vivari (kernel in a nested frame) resolves correctly.
-  const kernelClient = await findKernelClient();
-  if (!kernelClient) {
+  // Reach the kernel. Mode A: the same-origin kernel-host window client. Mode B:
+  // the persistent port to the (cross-origin) IDE, reviving it if the SW was
+  // evicted. `cross` tells us which CORP/COEP headers the response needs.
+  const sink = await resolveKernelSink();
+  if (!sink) {
     return new Response("Vivari kernel is not running\n", { status: 503 });
   }
 
@@ -878,14 +961,22 @@ async function handlePreview(event, port, path, keepPrefix) {
       clearTimeout(timer);
       resolve(e.data);
     };
-    kernelClient.postMessage({ type: "vv-http", req }, [mc.port2]);
+    sink.post({ type: "vv-http", req }, [mc.port2]);
   });
 
   const respHeaders = new Headers(resp.headers || {});
-  // Same-origin preview docs are allowed under COEP:require-corp, but be explicit
-  // so nested subresources embed cleanly in the cross-origin-isolated top page.
-  respHeaders.set("Cross-Origin-Resource-Policy", "same-origin");
-  respHeaders.set("Cross-Origin-Embedder-Policy", "require-corp");
+  if (sink.cross) {
+    // Mode B: the preview is a DIFFERENT origin from the IDE. Let its subresources
+    // be embedded cross-origin (CORP) and keep the preview cross-origin isolated
+    // without needing every response to carry CORP (COEP:credentialless).
+    respHeaders.set("Cross-Origin-Resource-Policy", "cross-origin");
+    respHeaders.set("Cross-Origin-Embedder-Policy", "credentialless");
+  } else {
+    // Same-origin preview docs are allowed under COEP:require-corp, but be explicit
+    // so nested subresources embed cleanly in the cross-origin-isolated top page.
+    respHeaders.set("Cross-Origin-Resource-Policy", "same-origin");
+    respHeaders.set("Cross-Origin-Embedder-Policy", "require-corp");
+  }
   if (!respHeaders.has("content-type")) respHeaders.set("content-type", "text/html; charset=utf-8");
 
   // Binary responses (images/fonts/wasm from the dev server) cross the kernel

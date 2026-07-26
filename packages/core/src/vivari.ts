@@ -39,13 +39,16 @@ export class Vivari {
   private readonly portListeners = new Set<PortListener>();
   private readonly errorListeners = new Set<ErrorListener>();
 
-  private constructor(bridge: KernelBridge) {
+  private readonly previewOrigin?: string;
+
+  private constructor(bridge: KernelBridge, previewOrigin?: string) {
     this.bridge = bridge;
+    this.previewOrigin = previewOrigin;
     this.fs = new FileSystemAPI(bridge);
 
     bridge.on("listen", (m: KernelMessage) => {
       const port = m.port as number;
-      const url = previewUrl(port);
+      const url = previewUrl(port, this.previewOrigin);
       // Re-assert kernel-host ownership with the SW right before the preview
       // iframe loads, so an embedded (iframed) Vivari — or one whose SW was
       // revived and lost its in-memory host set — still gets preview HTTP routed
@@ -73,8 +76,11 @@ export class Vivari {
           "and `Cross-Origin-Embedder-Policy: require-corp`.",
       );
     }
-    const bridge = new KernelBridge({ workerName: options.workerName });
-    const vivari = new Vivari(bridge);
+    const bridge = new KernelBridge({
+      workerName: options.workerName,
+      previewOrigin: options.previewOrigin,
+    });
+    const vivari = new Vivari(bridge, options.previewOrigin);
 
     if (options.serviceWorkerUrl !== false) {
       await bridge.registerServiceWorker(
@@ -107,9 +113,9 @@ export class Vivari {
     return new VivariProcess(this.bridge, this.execSeq++, command, args, options);
   }
 
-  /** Same-origin preview URL for an in-VM port (see also the `server-ready` event). */
+  /** Preview URL for an in-VM port (see also the `server-ready` event). */
   previewUrl(port: number): string {
-    return previewUrl(port);
+    return previewUrl(port, this.previewOrigin);
   }
 
   /** Subscribe to a lifecycle event. Returns an unsubscribe function. */

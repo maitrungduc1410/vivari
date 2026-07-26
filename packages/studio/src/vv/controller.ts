@@ -23,6 +23,20 @@ import {
   parseGithubSpec, fetchGithubRepo, parseNpmSpec, fetchNpmPackage, type ProgressFn,
 } from "./import-remote";
 
+// Validate + normalize the build-time VITE_PREVIEW_ORIGIN (mode B). Returns the
+// bare origin (scheme+host+port) of a same-scheme, cross-origin absolute URL, or
+// undefined for anything falsy / malformed / same-origin (→ mode A, the default).
+function normalizePreviewOrigin(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  try {
+    const origin = new URL(raw).origin;
+    if (typeof location !== "undefined" && origin === location.origin) return undefined;
+    return origin;
+  } catch {
+    return undefined;
+  }
+}
+
 // ── Demo matrix (UI side) ────────────────────────────────────────────────────
 // The two hard-coded example projects the kernel worker still scaffolds on demand
 // (the "Run" button's legacy path). New projects come from Home (blank/template).
@@ -495,8 +509,16 @@ export class IdeController {
       ? "dark"
       : "light";
 
+  // Mode B (separate preview origin): configured at build time via
+  // VITE_PREVIEW_ORIGIN. Empty in the default same-origin deploy + local dev, so
+  // preview URLs stay relative and nothing changes. When set, previews are served
+  // from that origin (see KernelBridge.previewBase) for IDE↔preview isolation.
+  private readonly previewBase: string;
+
   constructor() {
-    this.bridge = new KernelBridge();
+    const previewOrigin = normalizePreviewOrigin(import.meta.env.VITE_PREVIEW_ORIGIN);
+    this.bridge = new KernelBridge({ previewOrigin });
+    this.previewBase = this.bridge.previewBase;
     this.snap.recentProjects = this.loadRegistry();
     this.createConsole();
     this.wireBridge();
@@ -2125,7 +2147,9 @@ export class IdeController {
     if (tab.port == null) return "about:blank";
     const path = tab.path && tab.path.startsWith("/") ? tab.path : "/";
     const bust = tab.nonce > 1 ? `${path.includes("?") ? "&" : "?"}t=${tab.nonce}` : "";
-    return `/preview/${tab.port}${path}${bust}`;
+    // previewBase is "" in mode A (relative, same-origin) and the preview origin
+    // in mode B (absolute, cross-origin iframe served by the preview SW).
+    return `${this.previewBase}/preview/${tab.port}${path}${bust}`;
   }
   private setTab(id: string, patch: Partial<PreviewTab>) {
     this.set({ previewTabs: this.snap.previewTabs.map((t) => (t.id === id ? { ...t, ...patch } : t)) });
@@ -2250,18 +2274,20 @@ export class IdeController {
   // too — the opened tab's shim talks to the SW, and we relay inbound frames back
   // through the SW in the vv-ws/vv-sse handlers below.
   openExternalPreview(port: number) {
-    window.open(`/preview/${port}/`, "_blank");
+    window.open(`${this.previewBase}/preview/${port}/`, "_blank");
   }
 
   // Relay an inbound ws/SSE frame to any preview opened in its OWN tab. Those tabs
   // can't be reached by postMessage (COOP severs the handle), so hand the frame to
   // the SW, which broadcasts it to every top-level preview client; each shim keeps
-  // only the connIds it owns. No-op when the SW isn't controlling yet.
+  // only the connIds it owns. Mode B routes over the bridge port (the SW is
+  // cross-origin); mode A uses the same-origin controller. No-op when neither is
+  // ready yet.
   private relayToExternalPreviews(payload: object) {
     try {
-      navigator.serviceWorker?.controller?.postMessage(payload);
+      this.bridge.postToPreviewSW(payload);
     } catch {
-      /* SW not controlling — nothing to relay to */
+      /* SW/bridge not ready — nothing to relay to */
     }
   }
 
@@ -2366,12 +2392,21 @@ export class IdeController {
   // The host-page relay: bridges CDP between each preview tab's chobitsu and the
   // shared chii frontend, and syncs the address bar from in-app navigation.
   private wirePreviewMessages() {
+    // Preview frames are cross-origin in mode B; only trust their messages from
+    // the configured preview origin (mode A: same-origin as the studio).
+    const previewMsgOrigin = this.previewBase
+      ? new URL(this.previewBase).origin
+      : typeof location !== "undefined"
+        ? location.origin
+        : "";
     window.addEventListener("message", (event: MessageEvent) => {
       const src = event.source;
       const data = event.data;
 
-      // DevTools frontend → target tab. chii posts raw CDP JSON strings.
+      // DevTools frontend → target tab. chii posts raw CDP JSON strings. The
+      // frontend is always same-origin (served by the studio), so guard it so.
       if (this.devtoolsFrame && src && src === this.devtoolsFrame.contentWindow) {
+        if (event.origin !== location.origin) return;
         if (typeof data !== "string") return;
         const target = this.devtoolsTargetId ? this.previewFrames.get(this.devtoolsTargetId) : null;
         target?.contentWindow?.postMessage({ source: "vv-cdp", dir: "frontend", data }, "*");
@@ -2379,6 +2414,8 @@ export class IdeController {
       }
 
       if (!data || typeof data !== "object") return;
+      // Everything below originates from a preview frame — enforce its origin.
+      if (previewMsgOrigin && event.origin !== previewMsgOrigin) return;
 
       // Preview tab's chobitsu → frontend (only if this tab is the attached target).
       if (data.source === "vv-cdp" && data.dir === "target") {

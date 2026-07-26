@@ -1,0 +1,109 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="robots" content="noindex" />
+    <title>Vivari preview bridge</title>
+  </head>
+  <body>
+    <!--
+      Mode B (separate preview origin) bridge.
+
+      This hidden document is loaded (in an iframe) BY the IDE, but hosted on the
+      *preview* origin. Being same-origin to `sw.js`, it can register the preview
+      Service Worker — which the IDE, on its own origin, cannot. It then relays a
+      MessagePort from the IDE to that SW, giving the SW a persistent channel to
+      the kernel (which lives in the IDE tab). No server, no network: the SW
+      proxies each preview request to the kernel over this port.
+
+      Handshake:
+        1. IDE loads this doc with ?ide=<ide-origin>&sw=<sw-url>.
+        2. We register the SW + wait for it to control us, then postMessage
+           { type: 'vv-bridge-ready' } up to the IDE.
+        3. IDE posts { type: 'vv-connect' } + a MessagePort; we hand that port to
+           the SW via controller.postMessage(..., [port]).
+        4. If the SW is later revived (loses the in-memory port), it pings us and
+           we ask the IDE to re-hand a fresh port (vv-need-connect). We also do so
+           on controllerchange (SW update).
+    -->
+    <script>
+      (function () {
+        var params = new URLSearchParams(location.search);
+        var ide = params.get("ide") || "";
+        var swUrl = params.get("sw") || "/sw.js";
+
+        // Validate the IDE origin: it must be a real origin, and (defence in
+        // depth) the frame must actually be embedded (has a parent).
+        var ideOrigin = "";
+        try {
+          ideOrigin = new URL(ide).origin;
+        } catch (e) {
+          return;
+        }
+        if (!ideOrigin || window.parent === window) return;
+        // The sw URL must be a same-origin path (never a cross-origin script).
+        if (!/^\/[^/]/.test(swUrl)) swUrl = "/sw.js";
+
+        function toIde(msg) {
+          try {
+            window.parent.postMessage(msg, ideOrigin);
+          } catch (e) {}
+        }
+
+        // The IDE sends us the port to relay to the SW.
+        window.addEventListener("message", function (event) {
+          if (event.origin !== ideOrigin) return;
+          var d = event.data;
+          if (!d || d.type !== "vv-connect") return;
+          var port = event.ports && event.ports[0];
+          var sw = navigator.serviceWorker && navigator.serviceWorker.controller;
+          if (port && sw) sw.postMessage({ type: "vv-connect" }, [port]);
+        });
+
+        // The SW (revived, no port) asks us to trigger a fresh handshake.
+        function onSwMessage(event) {
+          var d = event.data;
+          if (d && d.type === "vv-need-connect") toIde({ type: "vv-need-connect" });
+        }
+
+        if (!("serviceWorker" in navigator)) {
+          // No SW support: nothing we can do; leave the IDE to time out.
+          return;
+        }
+
+        navigator.serviceWorker.addEventListener("message", onSwMessage);
+        // A new SW took control (first claim or an update): it holds no kernel
+        // port yet, so ask the IDE to (re)connect.
+        var announced = false;
+        navigator.serviceWorker.addEventListener("controllerchange", function () {
+          if (announced) toIde({ type: "vv-need-connect" });
+        });
+
+        navigator.serviceWorker
+          .register(swUrl, { scope: "/" })
+          .then(function () {
+            return navigator.serviceWorker.ready;
+          })
+          .then(function () {
+            // Wait until the SW actually controls this document (clients.claim),
+            // so posting to `controller` below can't be a no-op.
+            if (navigator.serviceWorker.controller) return;
+            return new Promise(function (resolve) {
+              var done = function () {
+                resolve();
+              };
+              navigator.serviceWorker.addEventListener("controllerchange", done, { once: true });
+              setTimeout(done, 1500);
+            });
+          })
+          .then(function () {
+            announced = true;
+            toIde({ type: "vv-bridge-ready" });
+          })
+          .catch(function () {
+            /* registration failed — IDE times out and falls back */
+          });
+      })();
+    </script>
+  </body>
+</html>

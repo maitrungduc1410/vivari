@@ -21,6 +21,17 @@ export interface BootOptions {
    * entirely — do this if you don't need in-browser server previews.
    */
   serviceWorkerUrl?: string | false;
+  /**
+   * Serve previews from a **separate origin** for isolation (mode B). When set to
+   * another origin (e.g. `"https://vivari-preview.pages.dev"`), the preview
+   * Service Worker + a hidden bridge document are hosted there and the kernel is
+   * reached over a persistent `MessagePort` instead of the same-origin
+   * `findKernelClient()` path. That origin must serve `sw.js` + `__vv-bridge.html`
+   * (+ `vv-devtools/chobitsu.js` if DevTools are on) with `COEP: credentialless`,
+   * `CORP: cross-origin`, and `Service-Worker-Allowed: /`. Leave unset (the
+   * default) to run previews same-origin with the IDE (mode A).
+   */
+  previewOrigin?: string;
   /** Name shown for the kernel Worker in DevTools. Default: `"Vivari Kernel"`. */
   workerName?: string;
   /**
