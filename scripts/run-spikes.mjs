@@ -94,6 +94,9 @@ const SPIKES = [
   { name: "slidev", file: "spike-slidev.mjs", net: true, timeout: 600000 },
   // tRPC server — raw .ts entry through OC's loader (no `export type`), typed query.
   { name: "trpc", file: "spike-trpc.mjs", net: true },
+  // Env ergonomics — inline `NAME=value cmd` prefix (via npm run), node --env-file,
+  // and the dotenv package all loading a .env in-VM.
+  { name: "dotenv", file: "spike-dotenv.mjs", net: true },
   // Bun install: `bun add <pkg>` delegates to the real npm CLI in-VM, writes a
   // text bun.lock, then a TS entry imports the installed dep. Network + Wasm VFS.
   { name: "bun-install", file: "spike-bun-install.mjs", net: true, needsWasm: true },

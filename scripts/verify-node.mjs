@@ -2027,6 +2027,37 @@ echo SHPIPE_DONE
   assert(po.includes("LASTOK"), "shell: pipeline exit status is the LAST stage (false | true => 0)");
   assert(po.includes("LASTFAIL"), "shell: pipeline exit status is the LAST stage (true | false => 1)");
 
+  // === brick 4c: inline env-var prefix + node --env-file ===
+  // envcheck.js prints the three env vars the script below sets three ways:
+  //   inline prefix on a simple command, inline prefix on a pipeline stage, and
+  //   `node --env-file`. A bare `NAME=value` sets the shell's own env for the rest
+  //   of the session, so a later plain `node envcheck.js` still sees it.
+  kernel.writeFile(
+    "/t/envcheck.js",
+    `process.stdout.write('ENV ' + (process.env.PORT || '-') + ' ' + (process.env.GREETING || '-') + ' ' + (process.env.FROM_FILE || '-') + '\\n');\n`,
+  );
+  kernel.writeFile("/t/app.env", "FROM_FILE=fromfile\n# comment\nGREETING=\"from file\"\n");
+  kernel.writeFile(
+    "/env.sh",
+    `PORT=3000 node /t/envcheck.js
+GREETING=hi node /t/envcheck.js | cat
+node --env-file=/t/app.env /t/envcheck.js
+FROM_FILE=inline node --env-file=/t/app.env /t/envcheck.js
+export SHELLVAR=exported
+PORT=7788
+node /t/envcheck.js
+echo ENVSH_DONE
+`,
+  );
+  const envrun = await kernel.start("sh", ["/env.sh"], { cwd: "/", capture: true });
+  const eo = envrun.stdout;
+  assert(envrun.code === 0 && eo.includes("ENVSH_DONE"), "shell: env-prefix script runs to completion");
+  assert(eo.includes("ENV 3000 - -"), "shell: inline NAME=value prefix scopes env to a simple command");
+  assert(eo.includes("ENV - hi -"), "shell: inline NAME=value prefix works on a pipeline stage");
+  assert(eo.includes("ENV - from file fromfile"), "node: --env-file loads KEY=VALUE (quotes stripped) into process.env");
+  assert(eo.includes("ENV - from file inline"), "node: existing env takes precedence over --env-file");
+  assert(eo.includes("ENV 7788 - -"), "shell: bare NAME=value sets the shell's own env for later commands");
+
   // === child_process: binary-safe parent -> child stdin ===
   // The parent writes all 256 byte values (in two chunks) to child.stdin and the
   // child echoes them back byte-for-byte, proving stdin is a real binary sink and

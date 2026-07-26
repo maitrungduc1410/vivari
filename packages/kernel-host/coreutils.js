@@ -204,10 +204,40 @@ const cli = process.argv.slice(1); // node's own args: flags, then script, then 
 // so we must skip flags to find the real entry instead of treating the first
 // flag as the script (which required('/cwd/--enable-source-maps') -> not found).
 const VALUE_FLAGS = new Set([
-  '--loader', '--experimental-loader', '--env-file', '--conditions', '-C',
+  '--loader', '--experimental-loader', '--conditions', '-C',
   '--title', '--cpu-prof-dir', '--heap-prof-dir', '--diagnostic-dir',
   '--redirect-warnings', '--disable-proto', '--report-dir', '--report-filename',
 ]);
+
+// \`--env-file[=path]\` / \`--env-file-if-exists\`: load KEY=VALUE lines into
+// process.env. A minimal .env parser (blank/#-comment lines skipped, optional
+// leading \`export \`, surrounding single/double quotes stripped). Like Node and
+// dotenv, an already-defined variable is NOT overridden. Missing file: throw for
+// --env-file, silently skip for --env-file-if-exists.
+function loadEnvFile(file, optional) {
+  const abs = file[0] === '/' ? file : path.resolve(process.cwd(), file);
+  let txt;
+  try { txt = require('fs').readFileSync(abs, 'utf8'); }
+  catch (e) {
+    if (optional) return;
+    process.stderr.write('node: --env-file ' + file + ': ' + ((e && e.code) || (e && e.message) || e) + '\\n');
+    process.exit(9);
+  }
+  for (let line of txt.split(/\\r?\\n/)) {
+    line = line.trim();
+    if (!line || line[0] === '#') continue;
+    if (line.slice(0, 7) === 'export ') line = line.slice(7).trim();
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    if (val.length >= 2 && ((val[0] === '"' && val[val.length - 1] === '"') || (val[0] === "'" && val[val.length - 1] === "'"))) {
+      val = val.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = val;
+  }
+}
+
 const preload = [];
 let evalCode = null, printResult = false, entry = null, i = 0;
 for (; i < cli.length; i++) {
@@ -224,6 +254,11 @@ for (; i < cli.length; i++) {
     if (name === '-r' || name === '--require' || name === '--import') {
       const val = eq >= 0 ? a.slice(eq + 1) : cli[++i];
       if (val) preload.push(val);
+      continue;
+    }
+    if (name === '--env-file' || name === '--env-file-if-exists') {
+      const val = eq >= 0 ? a.slice(eq + 1) : cli[++i];
+      if (val) loadEnvFile(val, name === '--env-file-if-exists');
       continue;
     }
     if (eq < 0 && VALUE_FLAGS.has(name)) i++; // consume the value token
@@ -265,9 +300,10 @@ if (evalCode != null) {
 
   // A minimal POSIX-ish shell: sequencing (;), and/or (&& ||), comments (#),
   // pipes (|), redirects (< > >> 2> 2>> 2>&1), builtins (cd, pwd, export, :,
-  // true, false), everything else spawned as a child process inheriting cwd/env.
-  // Quotes ("' ) are stripped by the lexer. Not supported: $VAR expansion, globs,
-  // background (&), subshells.
+  // true, false), a leading NAME=value assignment prefix (\`PORT=3000 node app.js\`;
+  // with no command it mutates the shell's own env), and everything else spawned
+  // as a child process inheriting cwd/env. Quotes ("' ) are stripped by the lexer.
+  // Not supported: $VAR expansion, globs, background (&), subshells.
   sh: `
 const fs = require('fs');
 const cp = require('child_process');
@@ -353,10 +389,38 @@ let currentKill = null;
 // empty in batch mode (\`sh -c\`).
 const commandHistory = [];
 
+// A POSIX assignment prefix: leading NAME=value tokens (NAME a shell identifier)
+// set env for the command that follows; with no command they mutate the shell's
+// own env, like a plain \`FOO=bar\`. Returns { assign, rest } where rest is the
+// command + args with the prefix stripped.
+const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
+function peelAssignments(tokens) {
+  let i = 0;
+  const assign = {};
+  while (i < tokens.length && ASSIGN.test(tokens[i])) {
+    const eq = tokens[i].indexOf('=');
+    assign[tokens[i].slice(0, eq)] = tokens[i].slice(eq + 1);
+    i++;
+  }
+  return { assign, rest: tokens.slice(i) };
+}
+
+// Merge an assignment overlay onto the shell env for a spawned child. When there
+// are no assignments we pass process.env by reference (unchanged behavior).
+function envWith(assign) {
+  return Object.keys(assign).length ? Object.assign({}, process.env, assign) : process.env;
+}
+
 function runSimple(tokens) {
   if (!tokens.length) return Promise.resolve(0);
-  const cmd = tokens[0];
-  const args = tokens.slice(1);
+  const { assign, rest } = peelAssignments(tokens);
+  // Bare \`NAME=value ...\` with no command: set the shell's own env (POSIX).
+  if (!rest.length) {
+    for (const k in assign) process.env[k] = assign[k];
+    return Promise.resolve(0);
+  }
+  const cmd = rest[0];
+  const args = rest.slice(1);
   if (cmd === 'cd') {
     try { process.chdir(args[0] || '/'); return Promise.resolve(0); }
     catch (e) { process.stderr.write('cd: ' + (e.code || e.message) + '\\n'); return Promise.resolve(1); }
@@ -377,7 +441,7 @@ function runSimple(tokens) {
     return Promise.resolve(0);
   }
   return new Promise((resolve) => {
-    const child = cp.spawn(cmd, args, { cwd: process.cwd(), env: process.env });
+    const child = cp.spawn(cmd, args, { cwd: process.cwd(), env: envWith(assign) });
     currentChild = child;
     currentKill = (sig) => { try { child.kill(sig); } catch (e) {} };
     child.stdout.on('data', (d) => process.stdout.write(d));
@@ -418,9 +482,15 @@ function runPipeline(stages) {
       return sp;
     });
     const n = specs.length;
-    // A stage with no command (e.g. \`> file\`) is not spawned; its redirects still
-    // apply (opening \`>\` truncates the target), then it completes with status 0.
-    const children = specs.map((sp) => (sp.argv.length ? cp.spawn(sp.argv[0], sp.argv.slice(1), { cwd: process.cwd(), env: process.env }) : null));
+    // A stage with no command (e.g. \`> file\`, or a bare \`FOO=bar\`) is not spawned;
+    // its redirects still apply (opening \`>\` truncates the target), then it
+    // completes with status 0. A leading NAME=value prefix scopes env to the stage.
+    const children = specs.map((sp) => {
+      if (!sp.argv.length) return null;
+      const { assign, rest } = peelAssignments(sp.argv);
+      if (!rest.length) return null;
+      return cp.spawn(rest[0], rest.slice(1), { cwd: process.cwd(), env: envWith(assign) });
+    });
     // Interactive stdin goes to the FIRST stage (it reads the terminal); Ctrl+C
     // signals EVERY stage so the whole pipeline dies, not just one.
     currentChild = children[0];
