@@ -31,7 +31,9 @@ fs.mkdirSync(out, { recursive: true });
 
 // The exact set of files the preview origin must serve. Everything else a preview
 // page loads is proxied by the SW into the VM; only these are real static assets.
-const FILES = ["sw.js", "__vv-bridge.html"];
+//   __vv-bridge.html      — hidden iframe the editor loads to register the SW + relay a port
+//   __vv-preview-boot.html — first-party boot page for a preview opened in its OWN tab
+const FILES = ["sw.js", "__vv-bridge.html", "__vv-preview-boot.html"];
 const DIRS = ["vv-devtools"]; // chobitsu.js (the CDP backend, absolute-pathed by the SW)
 
 for (const name of FILES) {
@@ -73,5 +75,12 @@ ${ISOLATE}
 ${ISOLATE}
 `;
 fs.writeFileSync(path.join(out, "_headers"), headers);
+
+// SPA-style fallback (200 rewrite, NOT a redirect) so a preview opened in its own
+// top-level tab isn't a hard 404 before a Service Worker controls it. When the SW
+// IS controlling it intercepts `/preview/*` first, so the embedded editor preview
+// is unaffected; this only fires for a first-party standalone tab whose SW isn't
+// visible yet (storage partitioning), where the boot page registers it and reloads.
+fs.writeFileSync(path.join(out, "_redirects"), "/preview/* /__vv-preview-boot.html 200\n");
 
 console.log(`\u2713 assembled preview origin into ${path.relative(root, out)}/`);

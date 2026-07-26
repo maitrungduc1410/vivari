@@ -1,0 +1,90 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Starting Vivari preview…</title>
+    <style>
+      html,body{height:100%;margin:0}
+      body{display:flex;align-items:center;justify-content:center;background:#0b0d10;color:#e6e8eb;
+        font:15px/1.6 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+      .card{max-width:34rem;padding:2rem;text-align:center}
+      .spin{width:26px;height:26px;margin:0 auto 1rem;border:3px solid #2a2f36;border-top-color:#6aa3ff;
+        border-radius:50%;animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}
+      h1{font-size:1.15rem;margin:.25rem 0 .5rem}p{color:#9aa4af;margin:.4rem 0}
+    </style>
+  </head>
+  <body>
+    <!--
+      Mode-B standalone preview boot page.
+
+      Cloudflare serves this (via a `_redirects` rewrite of `/preview/*`) ONLY when
+      no Service Worker is controlling the tab yet — i.e. a preview opened in its
+      OWN top-level tab on the preview origin, where the SW registered by the
+      hidden bridge iframe (a third-party context in the editor tab) isn't visible
+      due to browser storage partitioning. We register the SW *first-party* here so
+      the tab becomes controlled, then reload: the SW then serves the real preview
+      (or a friendly "connecting…" page if the kernel still isn't reachable).
+
+      When the SW already controls the tab it intercepts `/preview/*` before this
+      page is ever reached, so the embedded editor preview is unaffected.
+    -->
+    <div class="card">
+      <div class="spin" id="sp"></div>
+      <h1 id="t">Starting your Vivari preview…</h1>
+      <p id="m">Registering the preview runtime.</p>
+    </div>
+    <script>
+      (function () {
+        var t = document.getElementById("t");
+        var m = document.getElementById("m");
+        var sp = document.getElementById("sp");
+        function fail(msg) {
+          if (sp) sp.style.display = "none";
+          t.textContent = "Preview unavailable";
+          m.textContent = msg;
+        }
+        if (!("serviceWorker" in navigator)) {
+          fail("This browser has no Service Worker support, which Vivari previews require.");
+          return;
+        }
+        // Reload only once after the SW takes control, so we can't loop forever if
+        // control never happens.
+        var RELOAD_KEY = "vv-boot-reloaded:" + location.pathname;
+        navigator.serviceWorker
+          .register("/sw.js", { scope: "/" })
+          .then(function () {
+            return navigator.serviceWorker.ready;
+          })
+          .then(function () {
+            if (navigator.serviceWorker.controller) return;
+            return new Promise(function (resolve) {
+              navigator.serviceWorker.addEventListener("controllerchange", resolve, { once: true });
+              setTimeout(resolve, 2500);
+            });
+          })
+          .then(function () {
+            if (navigator.serviceWorker.controller && !sessionStorage.getItem(RELOAD_KEY)) {
+              // The SW now controls us: reload once so it intercepts /preview/* and
+              // serves the real preview (or its own "connecting…" page).
+              sessionStorage.setItem(RELOAD_KEY, "1");
+              location.reload();
+              return;
+            }
+            if (!navigator.serviceWorker.controller) {
+              fail("The preview runtime didn't take control. Keep the Vivari editor tab open and reload.");
+              return;
+            }
+            // Controlled but already reloaded — the SW should be serving the preview
+            // now; if you can read this the kernel isn't reachable from this tab.
+            if (sp) sp.style.display = "none";
+            m.textContent = "Waiting for your Vivari project tab…";
+          })
+          .catch(function () {
+            fail("Couldn't start the preview runtime. Keep the Vivari editor tab open and try again.");
+          });
+      })();
+    </script>
+  </body>
+</html>

@@ -200,7 +200,8 @@ self.addEventListener("message", (event) => {
 async function resolveKernelSink() {
   if (kernelPort) return { post: (m, t) => kernelPort.postMessage(m, t || []), cross: true };
   const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-  const bridge = clients.find((c) => c.url.includes("/__vv-bridge.html"));
+  // Match both `/__vv-bridge.html` and the Cloudflare clean-URL form `/__vv-bridge`.
+  const bridge = clients.find((c) => c.url.includes("/__vv-bridge"));
   if (bridge) {
     // Mode B, revived SW: request a fresh port and wait up to ~2s for it.
     bridge.postMessage({ type: "vv-need-connect" });
@@ -840,6 +841,21 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return; // never touch cross-origin
 
+  // Mode-B static docs on the preview origin: the hidden bridge iframe and the
+  // standalone-preview boot page. They are OUR files — always pass them straight
+  // to the network. Cloudflare Pages "clean URLs" 308-redirect `/x.html` → `/x`,
+  // so match BOTH forms; without this bypass the redirected hit falls through to
+  // routeByClient, which calls fetch() on a navigation request and throws
+  // ("Failed to fetch"), breaking the bridge handshake.
+  if (
+    url.pathname === "/__vv-bridge" ||
+    url.pathname === "/__vv-bridge.html" ||
+    url.pathname === "/__vv-preview-boot" ||
+    url.pathname === "/__vv-preview-boot.html"
+  ) {
+    return;
+  }
+
   const idx = url.pathname.indexOf(PREVIEW_MARKER);
   if (idx !== -1) {
     // Explicit preview URL: <scope>/preview/<port>/<path> — the iframe navigation
@@ -918,8 +934,50 @@ async function routeByClient(event, url) {
     if (client) clientUrl = client.url;
   }
   const m = clientUrl.match(/\/preview\/(\d+)\//);
-  if (!m) return fetch(event.request);
+  if (!m) {
+    // Defensive: a navigation Request must never be passed to fetch() inside a SW
+    // (mode:"navigate" is illegal for fetch() and throws). Re-issue a plain GET so
+    // pass-through never rejects. Real navigations already return at the top of the
+    // fetch handler; this only guards unexpected redirect artifacts.
+    if (event.request.mode === "navigate") return fetch(url.href, { credentials: "include" });
+    return fetch(event.request);
+  }
   return handlePreview(event, parseInt(m[1], 10), url.pathname + url.search);
+}
+
+// A friendly "connecting…" page for a standalone mode-B preview tab that can't
+// reach the kernel yet. It retries a few times (browser storage partitioning can
+// delay the shared SW/port becoming visible to a first-party tab), then explains
+// what to do — mirroring StackBlitz's "You're almost there" screen instead of a
+// dead 404.
+function previewConnectingHtml(port) {
+  return (
+    "<!doctype html><html><head><meta charset='utf-8'>" +
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
+    "<title>Connecting to Vivari…</title>" +
+    "<style>" +
+    "html,body{height:100%;margin:0}" +
+    "body{display:flex;align-items:center;justify-content:center;background:#0b0d10;color:#e6e8eb;" +
+    "font:15px/1.6 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}" +
+    ".card{max-width:34rem;padding:2rem;text-align:center}" +
+    ".spin{width:26px;height:26px;margin:0 auto 1rem;border:3px solid #2a2f36;border-top-color:#6aa3ff;" +
+    "border-radius:50%;animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}" +
+    "h1{font-size:1.15rem;margin:.25rem 0 .5rem}p{color:#9aa4af;margin:.4rem 0}code{color:#cbd5e1}" +
+    "</style></head><body><div class='card'>" +
+    "<div class='spin' id='sp'></div>" +
+    "<h1 id='t'>Connecting to your Vivari project…</h1>" +
+    "<p id='m'>Preview on port <code>" + port + "</code>. Keep the Vivari editor tab open.</p>" +
+    "<script>(function(){" +
+    "var k='vv-preview-tries';var n=+(sessionStorage.getItem(k)||0);" +
+    "if(n<6){sessionStorage.setItem(k,n+1);setTimeout(function(){location.reload()},1500);}" +
+    "else{sessionStorage.removeItem(k);" +
+    "document.getElementById('sp').style.display='none';" +
+    "document.getElementById('t').textContent='Can\\u2019t reach your Vivari project';" +
+    "document.getElementById('m').innerHTML='Open the preview from the <b>Vivari editor tab</b> and keep it open. "+
+    "If it still won\\u2019t load, allow third-party data for this site in your browser (previews run cross-origin for isolation).';}" +
+    "})();<\/script>" +
+    "</div></body></html>"
+  );
 }
 
 async function handlePreview(event, port, path, keepPrefix) {
@@ -932,6 +990,20 @@ async function handlePreview(event, port, path, keepPrefix) {
   // evicted. `cross` tells us which CORP/COEP headers the response needs.
   const sink = await resolveKernelSink();
   if (!sink) {
+    // A top-level preview tab (mode B "Open in new tab") whose kernel we can't
+    // reach yet — show a friendly, auto-retrying page instead of a bare 503 or a
+    // raw 404. It self-heals the moment the kernel becomes reachable (e.g. the
+    // project tab connects / the shared SW is available).
+    if (event.request.mode === "navigate") {
+      return new Response(previewConnectingHtml(port), {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "Cross-Origin-Resource-Policy": "cross-origin",
+          "Cross-Origin-Embedder-Policy": "credentialless",
+        },
+      });
+    }
     return new Response("Vivari kernel is not running\n", { status: 503 });
   }
 
