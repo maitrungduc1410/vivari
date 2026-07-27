@@ -537,18 +537,20 @@ function normalizeDomain(raw: string | undefined): string | undefined {
   return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(d) ? d : undefined;
 }
 
-// Short, unguessable, per-boot token (base36). Ties preview hostnames to this
-// session so URLs aren't enumerable and rotate each boot.
+// Short, unguessable, per-boot token (base36, ~6 chars). Ties preview hostnames to
+// this session so URLs aren't enumerable and rotate each boot. It's not a security
+// secret (previews are already session/live-tab bound), so 6 chars keeps the host
+// short while staying non-enumerable.
 function randomToken(): string {
   const g = typeof crypto !== "undefined" ? crypto : undefined;
   if (g?.getRandomValues) {
-    const a = new Uint8Array(8);
+    const a = new Uint8Array(4);
     g.getRandomValues(a);
     let s = "";
     for (const b of a) s += b.toString(36).padStart(2, "0");
-    return s.slice(0, 12);
+    return s.slice(0, 6);
   }
-  return Math.random().toString(36).slice(2, 14);
+  return Math.random().toString(36).slice(2, 8);
 }
 
 /** Is the page cross-origin isolated (SharedArrayBuffer available)? */

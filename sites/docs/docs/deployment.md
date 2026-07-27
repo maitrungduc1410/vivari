@@ -142,6 +142,21 @@ Cloudflare Pages can't attach a *wildcard* custom domain, so a small **Worker**
 3. On the **main** (IDE) project set `VITE_PREVIEW_WILDCARD_DOMAIN=jamesisme.com`
    and redeploy. Because the preview hosts are subdomains of the IDE's base domain
    they are **same-site**, so "Open in new tab" connects **gate-free**.
+4. **Enable Universal SSL** (see the next paragraph) — this is the step people miss.
+
+:::warning Turn on Universal SSL — the easy one to miss
+The wildcard preview hosts need a TLS certificate covering `*.<domain>`. Cloudflare's
+**Universal SSL is sometimes OFF** for a zone (and per-hostname certs that Pages
+creates for your *named* custom domains — e.g. `vivari.<domain>` — mask this, since
+they're separate certs). If Universal SSL is off, every preview host fails the TLS
+handshake with **`ERR_SSL_VERSION_OR_CIPHER_MISMATCH`** even though the Worker and
+route are correct.
+
+Fix: **SSL/TLS → Edge Certificates** → make sure a Universal certificate is **Active**
+and lists `*.<domain>` in its Hosts. If it's off, turn it on (or disable + re-enable
+to re-provision); issuance is usually minutes. Also check **SSL/TLS → Overview**
+isn't set to *Off*.
+:::
 
 Free Cloudflare Universal SSL covers the apex + a **single-level** wildcard
 (`*.<domain>`), which is exactly what `<token>--<port>-vv.<domain>` needs — no paid
