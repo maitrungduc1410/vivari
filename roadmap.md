@@ -3547,3 +3547,51 @@ multiplexes with chobitsu over the same `vv-cdp` channel — reusing the Phase 1
 CDP shapes so both UIs stay on one protocol. This is a substantial, browser-only
 piece best landed and verified with a real preview, so it is deliberately deferred
 rather than shipped unverified.
+
+## Python support — Pyodide (CPython→WASM), lazily loaded + Flask/FastAPI (this change)
+
+A "Native" template category and a `python`/`python3` runtime. Unlike Bun (a
+Node-backed shim), Python is **real CPython compiled to WASM (Pyodide)**, booted the
+FIRST time a python process runs — nothing is paid at studio boot, and a `node`/`bun`
+process never touches it (the plug-in shape: a `globalThis.__ocInstallPython` invoked
+only by the launcher, mirroring Bun's `__ocInstallBun`).
+
+- **Runtime** (`packages/runtime/builtins/python.js`): boots Pyodide, mirrors the
+  project dir into its FS, runs scripts / `-c` / a REPL (stdout/stderr → terminal), and
+  auto-loads prebuilt wheels the code imports (`loadPackagesFromImports`). Boot masks
+  **both** Node probes — `process.browser=true` (pyodide.mjs) and `process.type=
+  "renderer"` (Emscripten's pyodide.asm.mjs) — or Pyodide `import("node:module")` (404s
+  in a Worker); both held across the whole boot, then restored.
+- **CLI** (`packages/kernel-host/programs/python.js`) + `uvicorn`/`flask` PATH shims
+  (`coreutils.js`). `process.exit`'s control-flow throw is detected and returned quietly.
+- **Delivery** (`scripts/vendor-pyodide.mjs`): vendors the Pyodide core + selected wheels
+  (incl. fastapi and its deps — package names are normalized across `-`/`_`) into
+  `packages/studio/public/vendor/pyodide/`, and writes a **hybrid `pyodide-lock.json`**
+  (vendored packages → relative paths; the rest → absolute CDN URLs, fetched at runtime).
+  Wheel downloads are **best-effort** — a corporate-proxy TLS failure warns instead of
+  aborting `predev`. A `LOCK_FORMAT` marker forces a rebuild when the lock shape changes.
+- **Web servers (Flask / FastAPI) with a live preview.** Pyodide has no sockets, so the
+  launcher (itself a guest Node program) stands up a guest
+  `http.createServer().listen(port)` that registers the port like Express (opening a
+  preview tab), and converts each tunnelled request to a **WSGI `environ`** (Flask) or
+  **ASGI `scope`/`receive`/`send`** (FastAPI), driven through Pyodide. `python -m uvicorn`
+  / `python -m flask` are wired. Two Pyodide-specific fixes: (1) `anyio.to_thread.run_sync`
+  is patched to run inline — the single-threaded WASM VM has no OS threads, so FastAPI's
+  sync-route threadpool otherwise raises "can't start new thread"; (2) the SW forwards
+  **`X-Forwarded-Prefix: /preview/<port>`** when it strips the prefix, and the bridge maps
+  it to the ASGI `root_path` / WSGI `SCRIPT_NAME` so absolute URLs (Swagger's `openapi.json`
+  link + "Try it out" request URLs) carry the prefix and route back through the tunnel.
+  Works across preview modes A/B (prefix) and C (origin root, no prefix); verified against
+  FastAPI 0.140 / Starlette 1.3.
+- **Editor**: `.py`/`.pyi` map to Monaco's `python` mode; `.py` gets the
+  `vscode-icons:file-type-python` icon (`.txt` → `file-type-text`).
+- **Templates** (the **"Native"** category, bringing the catalog to ~55 across 9
+  categories): Python (stdout), Python data science (NumPy + pandas), Python plotting
+  (Matplotlib), FastAPI, and Flask (both with a live preview). Icons for fastapi/flask.
+- **Deployment**: `scripts/cloudflare-build.sh` now runs `npm run vendor:pyodide`
+  explicitly — the studio's `bun run build` skips the root `prebuild:studio` hook, so
+  without it the deployed studio would ship no `python`. The mode-B/C static
+  SW-only builds need nothing (the kernel — and thus Pyodide — lives on the IDE origin).
+
+See ARCHITECTURE.md §9.3 (the plug-in + HTTP bridge) and §8.3 (the `X-Forwarded-Prefix`
+seam), and the AGENTS.md "Python is Pyodide" gotcha.

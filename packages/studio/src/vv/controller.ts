@@ -2442,6 +2442,20 @@ export class IdeController {
   // log and a fresh attach, exactly like the tab-switch path; onDevtoolsReady then
   // re-runs init against the reloaded document.
   onPreviewFrameLoad(id: string) {
+    // Sync the address bar from the frame's real URL on every load. The vv-nav
+    // script only rides in HTML responses, so navigating to a non-HTML endpoint
+    // (a JSON API, a file, an image) never reports its path and the address bar
+    // would go stale. Same-origin (mode A) lets us read the location directly;
+    // cross-origin previews (mode B/C) throw here and keep relying on vv-nav for
+    // HTML pages.
+    if (this.previewMode === "same-origin") {
+      try {
+        const loc = this.previewFrames.get(id)?.contentWindow?.location;
+        if (loc) this.syncTabLocation(id, loc.pathname + loc.search);
+      } catch {
+        /* cross-origin frame — rely on the injected vv-nav script */
+      }
+    }
     if (!this.snap.devtoolsOpen || this.devtoolsTargetId !== id) return;
     const tab = this.snap.previewTabs.find((t) => t.id === id);
     if (!tab || tab.port == null) return;

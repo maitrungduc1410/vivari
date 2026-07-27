@@ -52,7 +52,10 @@ const CORE_FILES = [
 // Prebuilt package wheels to vendor for offline use. Their transitive `depends`
 // closure is resolved from the lockfile and pulled in automatically. micropip is
 // included so `python -m pip install <pure-python-pkg>` can bootstrap.
-const DEFAULT_PACKAGES = ["numpy", "pandas", "matplotlib", "micropip"];
+// fastapi (+ its closure: starlette, pydantic, pydantic-core, anyio, …) is
+// vendored so the FastAPI template serves offline. Flask is NOT in Pyodide's
+// distribution, so it installs from PyPI via micropip at runtime (needs network).
+const DEFAULT_PACKAGES = ["numpy", "pandas", "matplotlib", "fastapi", "micropip"];
 const PACKAGES = (process.env.VV_PYODIDE_PACKAGES || DEFAULT_PACKAGES.join(","))
   .split(",")
   .map((s) => s.trim())
@@ -142,11 +145,15 @@ if (!fs.existsSync(lockPath)) {
 const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
 const allPackages = lock.packages || {};
 
-// Map an lock key insensitively (lockfile keys are usually lowercased).
+// Map a lock key insensitively AND separator-insensitively: `depends` entries
+// mix hyphens/underscores (e.g. pydantic depends on "pydantic_core" while the
+// lock key is "pydantic-core"), so normalize both before comparing — otherwise
+// such deps silently drop out of the closure and only load from the CDN.
+const normName = (s) => String(s).toLowerCase().replace(/[-_.]+/g, "-");
 function findKey(name) {
   if (allPackages[name]) return name;
-  const lc = name.toLowerCase();
-  return Object.keys(allPackages).find((k) => k.toLowerCase() === lc) || null;
+  const n = normName(name);
+  return Object.keys(allPackages).find((k) => normName(k) === n) || null;
 }
 
 const closure = new Set();

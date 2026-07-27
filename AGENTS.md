@@ -54,6 +54,7 @@ packages/
     load-real-tsgo.js     unpack the vendored TypeScript-7 (tsgo, Go/wasm) asset + shim /bin/tsc,/bin/tsgo.
     programs/npm.js       from-scratch npm installer — LEGACY fallback (see real npm below).
     programs/bun.js       Node-backed `bun`/`bunx` shim (always in COREUTILS; not a vendored pack).
+    programs/python.js    `python`/`python3` CLI (lazily boots Pyodide; `-m uvicorn`/`-m flask`).
 
   runtime/         The Node runtime that runs INSIDE each process worker.
     index.js       createRuntime(): wires builtins/globals/http-bridge/ws + run().
@@ -74,7 +75,8 @@ packages/
     boot.js        process bootstrap shared by browser + Node worker entries.
     fs-client.js   env-agnostic Atomics syscall client (the caller side).
     websocket.js   in-VM WebSocket client (used by the HMR tunnel).
-    builtins/      hand-written: process, os, assert, child_process, bun (Bun global + bun:* modules).
+    builtins/      hand-written: process, os, assert, child_process, bun (Bun global + bun:* modules),
+                   python (lazy Pyodide/CPython→WASM plug-in + Flask/FastAPI HTTP bridge).
     node/
       lib/         Node's REAL vendored lib/*.js (fs, net, http, stream, ...).
       internal/    Node's REAL internal/* (streams, errors, validators, ...).
@@ -123,15 +125,16 @@ packages/
                           receives dbg-event over the kernel bridge, tracks targets/
                           frames/scopes, and drives Monaco gutter breakpoints +
                           paused-line decorations. Feeds DebugPanel.
-    src/vv/templates.ts   ~49 project templates across 8 categories (Frontend/Backend/
-                          Fullstack/Showcase/Bun/Tooling/Docs/Creative) — each a manifest
+    src/vv/templates.ts   ~55 project templates across 9 categories (Frontend/Backend/
+                          Fullstack/Showcase/Bun/Tooling/Docs/Creative/Native) — each a manifest
                           (install/dev/port/entry) + full source, inline (NOT a scaffolder
                           run in-VM). Spans React/Vue/Svelte/Solid/Qwik/Preact/Lit, Express/
                           Nest/Fastify/Koa/Hono/h3/Nitro, Next/Nuxt/SvelteKit/Astro/React
                           Router, Tailwind+shadcn, TanStack Router, Vitest, the Bun family
                           (serve/routes/websocket/react), Docusaurus/VitePress/Slidev,
-                          Rsbuild/webpack/Angular, and the sqlite/pglite/trpc/monorepo showcases.
-                          The install command is inferred per PM (npm/yarn/pnpm/bun).
+                          Rsbuild/webpack/Angular, the sqlite/pglite/trpc/monorepo showcases, and
+                          the Native family (Python / data-science / Matplotlib / FastAPI / Flask,
+                          CPython via Pyodide). The install command is inferred per PM (npm/yarn/pnpm/bun).
   (../core/src/workers/)  the shared runtime host now lives in the @vivari/core SDK
                           (packages/core/src/workers/); studio bundles it via the
                           @vivari/core alias. Browser worker entries:
@@ -701,6 +704,32 @@ unpacked:
 - Templates: the **"Bun" category** in `templates.ts` (serve / routes / websocket /
   react). Gated by `scripts/spike-bun*.mjs` (offline + kernel) covering the
   transform, the route matcher, the WS frame codec, and the Bun global API.
+
+### Python is Pyodide (CPython→WASM), lazily booted — with a Flask/FastAPI HTTP bridge
+Unlike the Node-backed Bun shim, `python`/`python3` boots **real CPython compiled to
+WASM (Pyodide)** the first time a python process runs (nothing at studio boot). Pieces:
+`packages/runtime/builtins/python.js` (boot + FS mirror + exec + `serve`),
+`packages/kernel-host/programs/python.js` (CLI + `-m uvicorn`/`-m flask`), the
+`uvicorn`/`flask` PATH shims in `coreutils.js`, and `scripts/vendor-pyodide.mjs`. Gotchas:
+- **Two Node probes must BOTH be masked** or boot dies on `import("node:module")`:
+  `process.browser = true` (pyodide.mjs) AND `process.type = "renderer"`
+  (Emscripten's pyodide.asm.mjs). Hold both across the whole boot, then restore.
+- **`vendor:pyodide` writes gitignored assets under `packages/studio/public/vendor/pyodide/`.**
+  It's in the root `prebuild:studio` hook, but the studio's own `bun run build` does NOT
+  fire that hook — so `scripts/cloudflare-build.sh` **must list `npm run vendor:pyodide`
+  explicitly** (next to vendor:npm/yarn/pnpm/tsgo) or the deployed studio ships no python.
+  The lockfile is **hybrid**: vendored packages get relative paths, the rest keep absolute
+  CDN URLs so `loadPackagesFromImports` fetches them at runtime; wheel downloads are
+  best-effort (a proxy TLS error warns, never aborts). Bump `LOCK_FORMAT` to force a rebuild.
+- **Web servers bridge through a guest Node HTTP server, not sockets.** Pyodide has no
+  sockets, so `serve()` stands up `http.createServer().listen(port)` (registers the port
+  like Express) and converts each tunnelled request to a WSGI `environ` (Flask) or ASGI
+  `scope`/`receive`/`send` (FastAPI). Two must-not-regress fixes: (1) patch
+  `anyio.to_thread.run_sync` to run inline — the WASM VM has no OS threads, so FastAPI's
+  sync-route threadpool otherwise throws "can't start new thread"; (2) map the SW's
+  `X-Forwarded-Prefix` to the ASGI `root_path` / WSGI `SCRIPT_NAME` so absolute URLs
+  (Swagger's openapi.json link + "Try it out") carry `/preview/<port>` and route back.
+  Keep the `sw.js` → bridge header contract in sync. See ARCHITECTURE.md §9.3.
 
 ### Real TypeScript 7 (`tsc`/`tsgo`) is Go compiled to wasm — don't try to `require` it
 

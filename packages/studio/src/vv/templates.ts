@@ -2645,6 +2645,159 @@ backend and saves the figure to \`plot.png\`, which you can open in the editor
   };
 }
 
+// ── Native: FastAPI (ASGI on Pyodide) ────────────────────────────────────────
+// A real Python web server running on CPython/WASM. Pyodide has no sockets, so
+// `uvicorn` here is a Vivari shim: the `python` launcher boots Pyodide, imports
+// the ASGI app, and bridges it to a guest Node http server on the port — which
+// registers with the kernel exactly like an Express app, so the preview opens.
+// See packages/runtime/builtins/python.js + packages/kernel-host/programs/python.js.
+function fastapiTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "fastapi",
+      framework: "fastapi",
+      icon: "fastapi",
+      category: "Native",
+      name: "FastAPI",
+      language: "Python",
+      description: "A FastAPI (ASGI) app on CPython/WASM (Pyodide) with a live browser preview",
+      port: 8000,
+      openPath: "/",
+      entry: "main.py",
+      hmr: false,
+      reload: false,
+      install: "python -m pip install -r requirements.txt",
+      dev: "uvicorn main:app --port 8000",
+      experimental: true,
+    },
+    files: {
+      "requirements.txt": `fastapi
+`,
+      "main.py": `# FastAPI running on CPython compiled to WebAssembly (Pyodide), served entirely
+# in your browser. Vivari bridges this ASGI app to the preview — no real server.
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+
+app = FastAPI()
+
+
+# Endpoints are async so they run directly on the event loop. Pyodide has no OS
+# threads, so a *sync* def would otherwise be dispatched to a threadpool (Vivari
+# already patches that to run inline, but async is the idiomatic choice here).
+# Links are relative so navigating stays inside the preview (/preview/<port>/…).
+@app.get("/", response_class=HTMLResponse)
+async def index() -> str:
+    return """
+    <!doctype html>
+    <html>
+      <head><title>FastAPI on Pyodide</title></head>
+      <body style="font-family: system-ui, sans-serif; padding: 2rem; line-height: 1.6;">
+        <h1>FastAPI running on Pyodide</h1>
+        <p>This ASGI app runs entirely in your browser.</p>
+        <p>Try the JSON API: <a href="api/hello?name=Vivari">/api/hello</a></p>
+        <p>Interactive docs: <a href="docs">/docs</a></p>
+      </body>
+    </html>
+    """
+
+
+@app.get("/api/hello")
+async def hello(name: str = "world"):
+    return {"message": f"Hello, {name}!", "framework": "FastAPI"}
+`,
+      "README.md": `# FastAPI starter (Pyodide)
+
+A real **FastAPI** (ASGI) app running on **CPython compiled to WebAssembly**
+(Pyodide), entirely in your browser.
+
+\`\`\`bash
+python -m pip install -r requirements.txt   # loads FastAPI (vendored/CDN wheels)
+uvicorn main:app --port 8000                # serves the app + opens the preview
+\`\`\`
+
+Pyodide has no real sockets, so \`uvicorn\` here is a Vivari shim: it boots
+Pyodide, imports \`main:app\`, and bridges each preview request through the ASGI
+protocol. Requests and responses are buffered (no streaming/WebSocket yet).
+`,
+    },
+  };
+}
+
+// ── Native: Flask (WSGI on Pyodide) ──────────────────────────────────────────
+// Like the FastAPI template, but WSGI. Flask is not in Pyodide's prebuilt wheel
+// set, so it installs from PyPI via micropip at runtime (needs network in the
+// browser). `flask run` is a Vivari shim over the same guest-http bridge.
+function flaskTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "flask",
+      framework: "flask",
+      icon: "flask",
+      category: "Native",
+      name: "Flask",
+      language: "Python",
+      description: "A Flask (WSGI) app on CPython/WASM (Pyodide) with a live browser preview",
+      port: 8000,
+      openPath: "/",
+      entry: "main.py",
+      hmr: false,
+      reload: false,
+      install: "python -m pip install -r requirements.txt",
+      dev: "flask --app main run --port 8000",
+      experimental: true,
+    },
+    files: {
+      "requirements.txt": `flask
+`,
+      "main.py": `# Flask running on CPython compiled to WebAssembly (Pyodide), served entirely in
+# your browser. Vivari bridges this WSGI app to the preview — no real server.
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+
+
+# The link is relative ("api/hello", not "/api/hello") so clicking it navigates
+# WITHIN the preview (/preview/<port>/api/hello). A root-absolute link would
+# escape the preview frame back to the studio.
+@app.get("/")
+def index() -> str:
+    return """
+    <!doctype html>
+    <html>
+      <head><title>Flask on Pyodide</title></head>
+      <body style="font-family: system-ui, sans-serif; padding: 2rem; line-height: 1.6;">
+        <h1>Flask running on Pyodide</h1>
+        <p>This WSGI app runs entirely in your browser.</p>
+        <p>Try the JSON API: <a href="api/hello?name=Vivari">/api/hello</a></p>
+      </body>
+    </html>
+    """
+
+
+@app.get("/api/hello")
+def hello():
+    name = request.args.get("name", "world")
+    return jsonify(message=f"Hello, {name}!", framework="Flask")
+`,
+      "README.md": `# Flask starter (Pyodide)
+
+A real **Flask** (WSGI) app running on **CPython compiled to WebAssembly**
+(Pyodide), entirely in your browser.
+
+\`\`\`bash
+python -m pip install -r requirements.txt   # installs Flask from PyPI (micropip)
+flask --app main run --port 8000            # serves the app + opens the preview
+\`\`\`
+
+Flask is not part of Pyodide's prebuilt wheel set, so it is installed from PyPI
+via **micropip** the first time it runs — this needs network access in the
+browser. Pyodide has no real sockets, so \`flask run\` is a Vivari shim that
+bridges each preview request through the WSGI protocol (buffered, no streaming).
+`,
+    },
+  };
+}
+
 // ── Server-Sent Events (Express) ─────────────────────────────────────────────
 function sseTemplate(): TemplateDef {
   return {
@@ -6011,6 +6164,8 @@ export const TEMPLATES: TemplateDef[] = [
   pythonTemplate(),
   pythonDataScienceTemplate(),
   pythonMatplotlibTemplate(),
+  fastapiTemplate(),
+  flaskTemplate(),
   // Fullstack
   nextTemplate(true),
   nextTemplate(false),

@@ -25,6 +25,29 @@ export const COREUTILS = {
   python: PYTHON_PROGRAM,
   python3: PYTHON_PROGRAM,
 
+  // uvicorn / flask — authentic entrypoints for the Python web-server templates.
+  // They just delegate to the `python` launcher's `-m uvicorn` / `-m flask`
+  // handling (which boots Pyodide and bridges the WSGI/ASGI app to a guest http
+  // server so the preview opens). See packages/kernel-host/programs/python.js.
+  uvicorn: `
+'use strict';
+const cp = require('child_process');
+const child = cp.spawn('python', ['-m', 'uvicorn'].concat(process.argv.slice(2)), { cwd: process.cwd(), env: process.env });
+if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
+if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
+child.on('exit', (code) => process.exit(code | 0));
+child.on('error', (e) => { process.stderr.write('uvicorn: ' + ((e && e.message) || e) + String.fromCharCode(10)); process.exit(1); });
+`,
+  flask: `
+'use strict';
+const cp = require('child_process');
+const child = cp.spawn('python', ['-m', 'flask'].concat(process.argv.slice(2)), { cwd: process.cwd(), env: process.env });
+if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
+if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
+child.on('exit', (code) => process.exit(code | 0));
+child.on('error', (e) => { process.stderr.write('flask: ' + ((e && e.message) || e) + String.fromCharCode(10)); process.exit(1); });
+`,
+
   // NOTE: there is no built-in `npm` here anymore. The Turbo-analog installer
   // (packages/kernel-host/programs/npm.js) has been RETIRED from the shipped
   // product — studio now boots the REAL npm CLI unconditionally (see

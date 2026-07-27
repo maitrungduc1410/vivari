@@ -1096,6 +1096,20 @@ async function handlePreview(event, port, path, keepPrefix) {
   const headers = {};
   for (const [k, v] of event.request.headers) headers[k] = v;
 
+  // Tell path-prefix-aware guest frameworks (FastAPI `root_path`, Flask
+  // `SCRIPT_NAME`, …) that they're mounted behind /preview/<port> so they emit
+  // correct absolute URLs — e.g. Swagger UI's openapi.json link and "Try it out"
+  // request URLs, or framework redirects. Only when we STRIPPED that prefix:
+  // keepPrefix apps already receive the full path, and a wildcard-root preview is
+  // served at the origin root with no prefix (its source URL has no /preview/).
+  if (!keepPrefix) {
+    const srcPath = new URL(event.request.url).pathname;
+    const pIdx = srcPath.indexOf(PREVIEW_MARKER);
+    if (pIdx !== -1) {
+      headers["x-forwarded-prefix"] = srcPath.slice(0, pIdx) + PREVIEW_MARKER + port;
+    }
+  }
+
   const req = { port, method, url: path, headers, body };
 
   const resp = await new Promise((resolve) => {

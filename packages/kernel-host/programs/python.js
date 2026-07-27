@@ -10,6 +10,8 @@
 //   python -c "code" [args]   run an inline program
 //   python                    start an interactive REPL
 //   python -m pip install ... install packages (vendored wheel first, else micropip)
+//   python -m uvicorn m:app   serve a FastAPI/ASGI app via a guest http bridge
+//   python -m flask run       serve a Flask/WSGI app via a guest http bridge
 //   python --version          print the interpreter version (does NOT boot Pyodide)
 //
 // The heavy Pyodide bundle is fetched from the same-origin vendored index
@@ -41,6 +43,8 @@ const HELP = [
   '  python -c "code" [args]     run an inline program',
   '  python                      start an interactive REPL',
   '  python -m pip install ...   install packages (vendored wheel, else micropip)',
+  '  python -m uvicorn main:app  serve a FastAPI/ASGI app (opens a preview)',
+  '  python -m flask run         serve a Flask/WSGI app (opens a preview)',
   '  python --version            print the interpreter version',
 ].join(NL);
 
@@ -98,6 +102,50 @@ async function doPip(rest) {
   process.exit(code | 0);
 }
 
+async function doUvicorn(rest) {
+  let app = '';
+  let host = '';
+  let port = 0;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '--host') { host = rest[i + 1] || ''; i++; }
+    else if (a.indexOf('--host=') === 0) { host = a.slice(7); }
+    else if (a === '--port' || a === '-p') { port = parseInt(rest[i + 1] || '0', 10); i++; }
+    else if (a.indexOf('--port=') === 0) { port = parseInt(a.slice(7), 10); }
+    else if (a.charAt(0) === '-') { /* ignore uvicorn-only flags (--reload, --factory, --workers, ...) */ }
+    else if (!app) { app = a; }
+  }
+  if (!app) { err('uvicorn: no app specified (expected module:attr, e.g. main:app)'); process.exit(1); return; }
+  if (!port) port = parseInt(process.env.PORT || '8000', 10);
+  const py = getPy();
+  await py.serve({ app: app, mode: 'asgi', host: host, port: port });
+  process.exit(0);
+}
+
+async function doFlask(rest) {
+  let appSpec = process.env.FLASK_APP || '';
+  let host = '';
+  let port = 0;
+  let hasRun = false;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '--app' || a === '-A') { appSpec = rest[i + 1] || appSpec; i++; }
+    else if (a.indexOf('--app=') === 0) { appSpec = a.slice(6); }
+    else if (a === 'run') { hasRun = true; }
+    else if (a === '--host') { host = rest[i + 1] || ''; i++; }
+    else if (a.indexOf('--host=') === 0) { host = a.slice(7); }
+    else if (a === '--port' || a === '-p') { port = parseInt(rest[i + 1] || '0', 10); i++; }
+    else if (a.indexOf('--port=') === 0) { port = parseInt(a.slice(7), 10); }
+    else { /* ignore --debug / --reload / etc. */ }
+  }
+  if (!hasRun) { err('flask: only the "run" command is supported in the Vivari shim.'); process.exit(1); return; }
+  if (!appSpec) appSpec = 'app';
+  if (!port) port = parseInt(process.env.PORT || '8000', 10);
+  const py = getPy();
+  await py.serve({ app: appSpec, mode: 'wsgi', host: host, port: port });
+  process.exit(0);
+}
+
 async function main() {
   const first = argv[0];
 
@@ -116,7 +164,9 @@ async function main() {
     const mod = argv[1];
     const rest = argv.slice(2);
     if (mod === 'pip') { return doPip(rest); }
-    err('python -m ' + mod + ': running arbitrary modules is not supported in the Vivari shim yet (only "pip").');
+    if (mod === 'uvicorn') { return doUvicorn(rest); }
+    if (mod === 'flask') { return doFlask(rest); }
+    err('python -m ' + mod + ': running arbitrary modules is not supported in the Vivari shim yet (only "pip", "uvicorn", "flask").');
     process.exit(1);
     return;
   }

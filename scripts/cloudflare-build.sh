@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Cloudflare Pages build for the unified Vivari site (landing + docs + blog +
-# studio).
+# Cloudflare Pages build for the unified Vivari site (landing + docs + studio).
 #
 #   Build command:            bash scripts/cloudflare-build.sh
 #   Build output directory:   dist
@@ -35,16 +34,19 @@ npm run build:vfs
 npm run build:codec
 npm run build:crypto
 
-# --- Vendored package managers (real npm/yarn/pnpm/corepack + tsgo) -------------
+# --- Vendored package managers (real npm/yarn/pnpm/corepack + tsgo) + Pyodide ---
 # The studio's own `bun run build` (below) does NOT run the root predev/
 # prebuild:studio hooks, so the gitignored delivery assets in
-# packages/studio/public/vendor/*.bin must be built explicitly here. Without them
-# the studio ships with no `npm`/`yarn`/`pnpm` on PATH. Uses host npm + network.
+# packages/studio/public/vendor/**  must be built explicitly here. Without them
+# the studio ships with no `npm`/`yarn`/`pnpm` on PATH — and, without
+# vendor:pyodide, no `python` (its CPython/WASM core + wheels live under
+# public/vendor/pyodide/, copied into dist by the Vite build). Uses host npm + network.
 npm run vendor:npm
 npm run vendor:yarn
 npm run vendor:pnpm
 npm run vendor:corepack
 npm run vendor:tsgo
+npm run vendor:pyodide
 
 # --- Studio (served under /studio/) --------------------------------------------
 ( cd packages/studio && bun install && VV_BASE=/studio/ bun run build )
@@ -57,12 +59,6 @@ npm run vendor:tsgo
 
 # --- Docs (served under /docs/) ------------------------------------------------
 ( cd sites/docs && npm install --no-audit --no-fund && npm run build )
-
-# --- Blog (served under /blog/) ------------------------------------------------
-# A second Docusaurus build rather than a route inside sites/docs: the landing
-# owns the origin root, and a Docusaurus build always emits index.html at its own
-# baseUrl root, so one build cannot serve both /docs/ and /blog/ here.
-( cd sites/blog && npm install --no-audit --no-fund && npm run build )
 
 # --- Assemble into dist/ -------------------------------------------------------
 node scripts/assemble-site.mjs

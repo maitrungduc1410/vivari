@@ -274,6 +274,35 @@ function TailwindIcon({ className }: IconProps) {
   );
 }
 
+// FastAPI — brand teal rounded square with the white lightning bolt from the
+// official mark (logos:fastapi-icon), simplified to a single glyph.
+function FastapiIcon({ className }: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} aria-hidden>
+      <rect x="1.5" y="1.5" width="21" height="21" rx="5" fill="#009688" />
+      <path d="M12.6 4.5 6.5 13h4.2l-1.3 6.5L15.5 11h-4.2z" fill="#fff" />
+    </svg>
+  );
+}
+
+// Flask — dark rounded badge with a minimal Erlenmeyer-flask glyph, echoing the
+// framework's monochrome brand mark.
+function FlaskIcon({ className }: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} aria-hidden>
+      <rect x="1.5" y="1.5" width="21" height="21" rx="5" fill="#000" />
+      <path
+        d="M10 5h4M10.5 5v5.2L6.6 17c-.5.9.1 2 1.1 2h8.6c1 0 1.6-1.1 1.1-2l-3.9-6.8V5"
+        fill="none"
+        stroke="#fff"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 function GenericIcon({ className }: IconProps) {
   return (
     <svg viewBox="0 0 24 24" className={className} fill="none" aria-hidden>
@@ -303,6 +332,8 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   gsap: Badge({ text: "GS", bg: "#0ae448", fg: "#0e100f" }),
   node: (p) => <NodeIcon className={p.className} />,
   python: (p) => <PythonIcon className={p.className} />,
+  fastapi: FastapiIcon,
+  flask: FlaskIcon,
   webpack: (p) => <WebpackIcon className={p.className} />,
   rsbuild: ImgIcon(rsbuildLogo, "Rsbuild"),
   rspack: ImgIcon(rspackLogo, "Rspack"),

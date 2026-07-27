@@ -500,6 +500,13 @@ Kernel Worker → `handleHttpRequest` → the in-VM server. No real network is
 involved. The SW also **precaches** the worker-role bundles in production (keyed by
 a per-build id) so a redeploy can't serve stale bundles.
 
+When the SW **strips** the `/preview/<port>` prefix (the default; not keep-prefix,
+not mode-C wildcard-root) it forwards an **`X-Forwarded-Prefix: /preview/<port>`**
+header, so a path-prefix-aware guest framework can advertise correct absolute URLs
+even though it sees clean `/` paths. The Python bridge maps it to the ASGI
+`root_path` / WSGI `SCRIPT_NAME` (§9.3) — that's what makes FastAPI's Swagger UI
+(`/docs`, the `openapi.json` link, "Try it out") route back through the tunnel.
+
 **Preview iframes start at about:blank, then navigate.** On a fresh page load the
 studio document is fetched before the SW takes control, so a brand-new iframe whose
 *first* navigation is a direct `/preview/<port>/` URL isn't intercepted — the
@@ -657,9 +664,10 @@ Two non-obvious constraints keep this working:
 The studio is a real workspace, not a two-demo switcher. State (`controller.ts`):
 `workspaceFolders: {id,name,rootPath}[]` + `activeFolderId`; **every tab/model/dirty flag is
 keyed by ABSOLUTE path** so files from different roots can't collide. Home (`Home.tsx`) is an
-overlay over the kept-mounted IDE offering Start-from-blank, Start-from-template (~49 templates
-in `vv/templates.ts` across 8 categories — Frontend/Backend/Fullstack/Showcase/Bun/Tooling/Docs/
-Creative, spanning most JS frameworks, bundlers, and the sqlite/pglite/trpc showcases), and a
+overlay over the kept-mounted IDE offering Start-from-blank, Start-from-template (~55 templates
+in `vv/templates.ts` across 9 categories — Frontend/Backend/Fullstack/Showcase/Bun/Tooling/Docs/
+Creative/Native — spanning most JS frameworks, bundlers, the sqlite/pglite/trpc showcases, and
+the **Native** category's Python/Flask/FastAPI (CPython via Pyodide; see §9.3)), and a
 `localStorage` recent list. ("Reset everything" also clears that recent list and locks its
 dialog while the OPFS wipe runs.) A left ActivityBar toggle switches a **light/dark/system
 theme** (next-themes; applied to Monaco and the xterm terminals via `controller.applyUiTheme`);
@@ -992,6 +1000,58 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
 - The install/run detector (`kernel-worker.ts` `pmFromCmd`) maps `bun`/`bunx` to the `bun` PM,
   and the studio ships a **"Bun" template category** (serve / routes / websocket / react).
 - Proven by `scripts/spike-bun*.mjs` (the transform, route matcher, WS frame codec, Bun global API).
+
+### 9.3 Python (Pyodide / CPython→WASM) — a lazy plug-in
+
+Python is **CPython compiled to WebAssembly** (Pyodide), booted the FIRST time a
+`python`/`python3` process runs — nothing is paid at studio boot, and a `node`/`bun`
+process never touches it. This mirrors Bun (§9.2) as a "plug-in runtime", except the
+interpreter really is WASM (like the Wasm engines above), not a Node-backed shim.
+
+- `packages/runtime/builtins/python.js` — boots Pyodide, mirrors the project dir into
+  its FS, runs scripts / `-c` / a REPL (stdout/stderr → terminal), and auto-loads wheels
+  the code imports. Exposed to the VM via a Bun-style `globalThis.__ocInstallPython`.
+- `packages/kernel-host/programs/python.js` — the `python`/`python3` CLI (arg parse,
+  `-m` module handling incl. `uvicorn`/`flask`).
+- `packages/kernel-host/coreutils.js` — `uvicorn`/`flask` PATH shims (delegate to
+  `python -m …`).
+- `scripts/vendor-pyodide.mjs` — vendors the Pyodide core + selected wheels into
+  `packages/studio/public/vendor/pyodide/` and writes a **hybrid `pyodide-lock.json`**:
+  successfully vendored packages get relative paths; the rest keep absolute CDN URLs so
+  `loadPackagesFromImports` can still fetch them at runtime. Wheel downloads are
+  best-effort (a corporate-proxy TLS failure warns, never aborts the build). **Run in CI
+  by `scripts/cloudflare-build.sh`** — the studio's `bun run build` doesn't fire the
+  root `prebuild:studio` hook, so this must be listed explicitly or the deployed studio
+  ships no `python`.
+
+**Environment masking.** Our runtime masquerades as Node, but Pyodide has two Node
+probes that would each `import("node:module")` (404 in a Worker). Both are masked across
+the whole boot: `process.browser = true` (for `pyodide.mjs`) and `process.type =
+"renderer"` (for Emscripten's `pyodide.asm.mjs`), then restored.
+
+**Web servers (Flask / FastAPI) — the HTTP bridge.** Pyodide has no real sockets, so a
+Python `uvicorn`/Werkzeug server can't bind a port. Instead the `python` launcher — itself
+a guest Node program on Vivari's Node runtime — stands up a tiny guest
+`http.createServer().listen(port)`, which registers the port with the kernel exactly like
+an Express app (opening a preview tab; §8.2/§8.3). Each request the preview tunnel replays
+is converted to a **WSGI `environ`** (Flask) or **ASGI `scope`/`receive`/`send`**
+(FastAPI), driven through Pyodide, and written back; binary crosses the JS↔Python boundary
+as base64 in a JSON string. Two Pyodide-specific fixes:
+
+- **No OS threads.** FastAPI/Starlette's sync-route threadpool
+  (`anyio.to_thread.run_sync → threading.Thread`) raises "can't start new thread" in the
+  single-threaded WASM VM, so `run_sync` is patched to run the callable inline on the
+  event loop (templates also use `async def` idiomatically).
+- **Proxy prefix → `root_path`/`SCRIPT_NAME`.** The bridge reads the SW's
+  `X-Forwarded-Prefix` (§8.3) and sets the ASGI `root_path` / WSGI `SCRIPT_NAME`, so the
+  app emits prefixed absolute URLs that route back through the tunnel. Route matching is
+  unaffected (paths are already stripped). This is what fixes FastAPI's Swagger UI, and it
+  works across preview modes A/B (prefix `/preview/<port>`) and C (served at origin root,
+  no prefix → no header). Verified against FastAPI 0.140 / Starlette 1.3.
+
+Templates: the **"Native" category** in `templates.ts` — Python (stdout), Python data
+science (NumPy + pandas), Python plotting (Matplotlib), FastAPI, and Flask (both with a
+live preview).
 
 ---
 

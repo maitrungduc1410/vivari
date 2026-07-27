@@ -23,11 +23,22 @@
 // globalThis.process undefined. Verified against the vendored Pyodide 314.0.3
 // getGlobalRuntimeEnv/calculateDerivedFlags and the asm.mjs env detection.
 //
-// Scope (v1): run scripts + `-c` + a line REPL, streaming stdout/stderr to the
+// Scope: run scripts + `-c` + a line REPL, streaming stdout/stderr to the
 // terminal, with the project directory mirrored into Pyodide's FS so file I/O and
 // sibling imports work. Prebuilt wheels (numpy/pandas/…) auto-load from the
-// vendored, same-origin package index via loadPackagesFromImports. No HTTP/preview
-// bridge (Pyodide has no real sockets).
+// vendored, same-origin package index via loadPackagesFromImports.
+//
+// WEB SERVERS (Flask / FastAPI): Pyodide has no real sockets, so a Python
+// uvicorn/Werkzeug server cannot bind a port. But the `python` launcher is itself
+// a guest Node program on Vivari's Node-compatible runtime (full `require("http")`
+// + event loop), and Pyodide runs in that same worker. So `serve()` stands up a
+// tiny guest `http.createServer().listen(port)` — which registers the port with
+// the kernel exactly like an Express app, opening a preview tab — and each request
+// the preview tunnel replays into this process is converted to a WSGI `environ`
+// (Flask) or ASGI `scope`/`receive`/`send` (FastAPI), driven through Pyodide, and
+// written back. Binary crosses the JS<->Python boundary as base64 inside a JSON
+// string to stay proxy-safe. v1: buffered request/response (no streaming/SSE/
+// WebSocket), one request at a time.
 
 // Directories we never mirror between the project and Pyodide's FS.
 const SKIP_DIRS = new Set([
@@ -371,6 +382,301 @@ export function createPythonRuntime({ process, require }) {
     });
   }
 
+  // ---- web server bridge (Flask WSGI / FastAPI ASGI) -------------------------
+  // Best-effort: make sure the named packages are importable in THIS Pyodide
+  // (each process is a fresh boot, so the project's `pip install` step — a
+  // separate process — did not load them here). Vendored/lock packages load
+  // same-origin/CDN; pure-Python PyPI packages (e.g. flask) fall back to micropip.
+  async function ensurePackages(pyodide, list) {
+    const names = (list || []).filter(Boolean);
+    if (!names.length) return;
+    try {
+      await pyodide.loadPackage(names);
+      return;
+    } catch {
+      /* not all are Pyodide-distributed — try micropip for the rest */
+    }
+    try {
+      await pyodide.loadPackage("micropip");
+      const micropip = pyodide.pyimport("micropip");
+      await micropip.install(names);
+    } catch {
+      /* a still-missing import surfaces as a Python ImportError at app import */
+    }
+  }
+
+  function readRequirements(cwd) {
+    const fs = req("fs");
+    const path = req("path");
+    try {
+      const text = fs.readFileSync(path.join(cwd, "requirements.txt"), "utf8");
+      return text
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l && l.charAt(0) !== "#");
+    } catch {
+      return [];
+    }
+  }
+
+  // Python side of the bridge. Imports the user's app once and defines a single
+  // dispatch function per protocol. Requests/responses cross as JSON strings with
+  // base64 bodies (JS strings convert to Python str cleanly; PyProxy/typed-array
+  // conversions do not need to be reasoned about). Injected: module + attr.
+  function setupSource(moduleName, attrName, mode) {
+    const mod = JSON.stringify(moduleName);
+    const attr = JSON.stringify(attrName);
+    const common = `
+import sys, json, base64, importlib, traceback
+_vv_mod = importlib.import_module(${mod})
+_vv_app = getattr(_vv_mod, ${attr})
+`;
+    if (mode === "asgi") {
+      return (
+        common +
+        `
+# Pyodide (WASM) has no OS threads, so FastAPI/Starlette's default threadpool for
+# sync endpoints (anyio.to_thread.run_sync -> threading.Thread) raises "can't
+# start new thread". Run such callables inline on the event loop instead — correct
+# for our single-threaded model (starlette reads run_sync at call time, so this
+# takes effect for every sync route/dependency).
+try:
+    import anyio.to_thread as _vv_att
+    async def _vv_run_sync(func, *args, **kwargs):
+        return func(*args)
+    _vv_att.run_sync = _vv_run_sync
+except Exception:
+    pass
+
+
+async def _vv_dispatch(req_json):
+    d = json.loads(req_json)
+    body = base64.b64decode(d["body_b64"]) if d.get("body_b64") else b""
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": d.get("http_version", "1.1"),
+        "method": d["method"],
+        "scheme": "http",
+        "path": d["path"],
+        "raw_path": d["path"].encode("utf-8"),
+        "query_string": d.get("query", "").encode("utf-8"),
+        "root_path": d.get("root_path", ""),
+        "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in d["headers"]],
+        "server": ("localhost", 80),
+        "client": ("127.0.0.1", 0),
+    }
+    _sent = {"done": False}
+    async def receive():
+        if not _sent["done"]:
+            _sent["done"] = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+    out = {"status": 200, "headers": [], "body": bytearray()}
+    async def send(message):
+        t = message["type"]
+        if t == "http.response.start":
+            out["status"] = message["status"]
+            out["headers"] = [
+                [bytes(k).decode("latin-1"), bytes(v).decode("latin-1")]
+                for k, v in message.get("headers", [])
+            ]
+        elif t == "http.response.body":
+            out["body"].extend(bytes(message.get("body", b"")))
+    await _vv_app(scope, receive, send)
+    return json.dumps({
+        "status": out["status"],
+        "headers": out["headers"],
+        "body_b64": base64.b64encode(bytes(out["body"])).decode("ascii"),
+    })
+`
+      );
+    }
+    // WSGI (Flask)
+    return (
+      common +
+      `
+import io
+def _vv_dispatch(req_json):
+    d = json.loads(req_json)
+    body = base64.b64decode(d["body_b64"]) if d.get("body_b64") else b""
+    environ = {
+        "REQUEST_METHOD": d["method"],
+        "SCRIPT_NAME": d.get("root_path", ""),
+        "PATH_INFO": d["path"],
+        "QUERY_STRING": d.get("query", ""),
+        "SERVER_NAME": "localhost",
+        "SERVER_PORT": "80",
+        "SERVER_PROTOCOL": "HTTP/" + d.get("http_version", "1.1"),
+        "wsgi.version": (1, 0),
+        "wsgi.url_scheme": "http",
+        "wsgi.input": io.BytesIO(body),
+        "wsgi.errors": sys.stderr,
+        "wsgi.multithread": False,
+        "wsgi.multiprocess": False,
+        "wsgi.run_once": False,
+    }
+    for k, v in d["headers"]:
+        key = k.upper().replace("-", "_")
+        if key in ("CONTENT_TYPE", "CONTENT_LENGTH"):
+            environ[key] = v
+        else:
+            environ["HTTP_" + key] = v
+    captured = {}
+    def start_response(status, response_headers, exc_info=None):
+        captured["status"] = status
+        captured["headers"] = response_headers
+        return lambda data: None
+    result = _vv_app(environ, start_response)
+    try:
+        chunks = b"".join(bytes(c) for c in result)
+    finally:
+        if hasattr(result, "close"):
+            result.close()
+    status = captured.get("status", "200 OK")
+    code = int(status.split(" ", 1)[0])
+    return json.dumps({
+        "status": code,
+        "headers": [[k, v] for k, v in captured.get("headers", [])],
+        "body_b64": base64.b64encode(chunks).decode("ascii"),
+    })
+`
+    );
+  }
+
+  // Long-running: boot Pyodide, import the WSGI/ASGI app, then stand up a guest
+  // Node http server on `port`. Resolves only when the server closes/errors, so
+  // the listening handle keeps the process alive (like Express's app.listen).
+  function serve(indexUrl, opts) {
+    const { app, port, cwd } = opts || {};
+    const mode = opts && opts.mode === "asgi" ? "asgi" : "wsgi";
+    const colon = String(app || "").indexOf(":");
+    const moduleName = colon === -1 ? String(app || "main") : app.slice(0, colon);
+    const attrName = colon === -1 ? "app" : app.slice(colon + 1) || "app";
+    const bindPort = port | 0;
+
+    return new Promise((resolve, reject) => {
+      bootPyodide(indexUrl).then(async (pyodide) => {
+        const workdir = cwd || process.cwd();
+        try {
+          mirrorIn(pyodide, workdir);
+          pyodide.FS.chdir(workdir);
+        } catch {
+          /* run from default home dir */
+        }
+        // Ensure the working dir is importable so `import main` resolves.
+        try {
+          pyodide.runPython(
+            `import sys\nif ${JSON.stringify(workdir)} not in sys.path: sys.path.insert(0, ${JSON.stringify(workdir)})`,
+          );
+        } catch {
+          /* non-fatal */
+        }
+        // Load the framework + declared requirements into THIS interpreter.
+        const reqs = readRequirements(workdir);
+        const wanted = reqs.length ? reqs : mode === "asgi" ? ["fastapi"] : ["flask"];
+        await ensurePackages(pyodide, wanted);
+        // Also auto-load anything the module imports that lives in the lock.
+        try {
+          const fs = req("fs");
+          const src = fs.readFileSync(req("path").join(workdir, moduleName + ".py"), "utf8");
+          await pyodide.loadPackagesFromImports(src);
+        } catch {
+          /* module may be a package or unreadable; app import will report */
+        }
+
+        let dispatch;
+        try {
+          pyodide.runPython(setupSource(moduleName, attrName, mode));
+          dispatch = pyodide.globals.get("_vv_dispatch");
+        } catch (e) {
+          reject(new Error(`failed to import ${moduleName}:${attrName}: ${(e && e.message) || e}`));
+          return;
+        }
+
+        const http = req("http");
+        const server = http.createServer((sreq, sres) => {
+          const chunks = [];
+          sreq.on("data", (c) => chunks.push(c));
+          sreq.on("end", async () => {
+            try {
+              const bodyBuf = globalThis.Buffer.concat(chunks);
+              const urlStr = sreq.url || "/";
+              const q = urlStr.indexOf("?");
+              const reqPath = q === -1 ? urlStr : urlStr.slice(0, q);
+              const query = q === -1 ? "" : urlStr.slice(q + 1);
+              const headers = [];
+              const raw = sreq.rawHeaders || [];
+              let rootPath = "";
+              for (let i = 0; i + 1 < raw.length; i += 2) {
+                headers.push([raw[i], raw[i + 1]]);
+                // The preview tunnel sets this when it strips /preview/<port> off
+                // the path; hand it to the app as ASGI root_path / WSGI SCRIPT_NAME
+                // so it generates prefixed absolute URLs that route back correctly.
+                if (raw[i].toLowerCase() === "x-forwarded-prefix") rootPath = raw[i + 1];
+              }
+              const reqJson = JSON.stringify({
+                method: sreq.method || "GET",
+                path: reqPath,
+                query,
+                headers,
+                http_version: sreq.httpVersion || "1.1",
+                root_path: rootPath,
+                body_b64: bodyBuf.length ? bodyBuf.toString("base64") : "",
+              });
+              const resultJson =
+                mode === "asgi" ? await dispatch(reqJson) : dispatch(reqJson);
+              const out = JSON.parse(resultJson);
+              const outHeaders = {};
+              for (const [k, v] of out.headers || []) outHeaders[k] = v;
+              const bodyOut = out.body_b64
+                ? globalThis.Buffer.from(out.body_b64, "base64")
+                : globalThis.Buffer.alloc(0);
+              // Let Node compute a correct content-length for the decoded body.
+              delete outHeaders["content-length"];
+              delete outHeaders["Content-Length"];
+              delete outHeaders["transfer-encoding"];
+              delete outHeaders["Transfer-Encoding"];
+              sres.writeHead(out.status || 200, outHeaders);
+              sres.end(bodyOut);
+            } catch (e) {
+              const msg = "Internal Server Error\n\n" + ((e && e.stack) || e) + "\n";
+              try {
+                sres.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+              } catch {
+                /* headers already sent */
+              }
+              sres.end(msg);
+              process.stderr.write(msg);
+            }
+          });
+          sreq.on("error", () => {
+            try {
+              sres.writeHead(400);
+              sres.end();
+            } catch {
+              /* ignore */
+            }
+          });
+        });
+        server.on("error", (e) => {
+          reject(e);
+        });
+        // listen(port, cb) — the proven form (net registers the port with the
+        // kernel regardless of host; a host arg would only risk a guest dns.lookup).
+        server.listen(bindPort, () => {
+          const kind = mode === "asgi" ? "ASGI" : "WSGI";
+          process.stdout.write(
+            `${kind} server (${moduleName}:${attrName}) running on http://localhost:${bindPort}\n`,
+          );
+        });
+        server.on("close", () => resolve(0));
+      }, (e) => {
+        reject(new Error(`failed to start Pyodide: ${(e && e.message) || e}`));
+      });
+    });
+  }
+
   return {
     // Bound to a resolved same-origin indexURL by the launcher.
     install(indexUrl) {
@@ -380,6 +686,7 @@ export function createPythonRuntime({ process, require }) {
         runCode: (source, args) => runCode(idx, source, args),
         pip: (names) => pip(idx, names),
         repl: () => repl(idx),
+        serve: (opts) => serve(idx, opts),
       };
     },
   };
