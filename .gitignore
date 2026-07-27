@@ -15,6 +15,14 @@ node_modules
 # Unified Cloudflare Pages output (rebuild with `npm run build:site`)
 /dist
 
+# Separate preview origin output — mode B (rebuild with `npm run build:preview`)
+/dist-preview
+
+# Wildcard preview Worker assets — mode C (rebuild with `npm run build:worker`)
+/worker/public
+/worker/.wrangler
+/worker/node_modules
+
 # Vendored real-npm delivery asset (rebuild with `npm run vendor:npm`)
 /packages/studio/public/vendor
 

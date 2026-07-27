@@ -18,6 +18,18 @@ import type { KernelMessage } from "./types";
 
 type Handler = (m: KernelMessage) => void;
 
+/** How previews are served. See BootOptions.previewOrigin / previewWildcardDomain. */
+export type PreviewMode = "same-origin" | "shared" | "wildcard";
+
+// One cross-origin preview bridge: the hidden iframe on a preview origin + the
+// persistent MessagePort to the SW living there. Mode B has exactly one (the
+// single shared preview origin); mode C has one per active port's origin.
+interface PreviewConn {
+  iframe?: HTMLIFrameElement;
+  port?: MessagePort;
+  ready?: Promise<boolean>;
+}
+
 export class KernelBridge {
   readonly worker: Worker;
   private readonly handlers = new Map<string, Set<Handler>>();
@@ -27,17 +39,28 @@ export class KernelBridge {
   private readonly pending = new Map<number, (m: KernelMessage) => void>();
   private reqSeq = 1;
 
+  // Where previews are served — see PreviewMode. mode A: same-origin; mode B:
+  // one shared `previewOrigin`; mode C: one origin per port under a wildcard.
+  private readonly previewMode: PreviewMode;
   // Mode B (separate preview origin): the origin that hosts the preview SW +
-  // bridge doc. Empty string / undefined = mode A (same-origin previews).
+  // bridge doc. Undefined in modes A/C.
   private readonly previewOrigin?: string;
+  // Mode C (wildcard): the base domain + hostname prefix + a random per-boot
+  // token; every port gets `<prefix><token>--<port>.<domain>`.
+  private readonly wildcardDomain?: string;
+  private readonly wildcardPrefix: string;
+  private readonly previewToken: string;
   // How "Open in new tab" behaves in mode B (see BootOptions.previewPopout).
   // "isolated" opens pop-outs on the preview origin; default "same-origin" opens
-  // them on the IDE origin. Ignored in mode A (pop-outs are always same-origin).
+  // them on the IDE origin. Ignored in mode A (pop-outs are always same-origin)
+  // and mode C (pop-outs always open on the per-port origin).
   private readonly previewPopout: "same-origin" | "isolated";
-  // The hidden bridge iframe (on the preview origin) and the persistent port to
-  // the SW living there. Only used in mode B.
-  private bridgeFrame?: HTMLIFrameElement;
-  private kernelPort?: MessagePort;
+  // Preview SW registration URL (remembered so mode C can set up per-port bridges
+  // lazily as servers start listening).
+  private swUrl = "/sw.js";
+  // Cross-origin preview bridges keyed by preview origin. Mode B has one entry;
+  // mode C has one per port's origin. Modes reach the kernel over these ports.
+  private readonly previewConns = new Map<string, PreviewConn>();
   // Latest config to (re)send to the preview SW over the port on each connect
   // (the SW loses in-memory state when revived).
   private pendingKeepPrefix?: number[];
@@ -47,14 +70,27 @@ export class KernelBridge {
     options: {
       workerName?: string;
       previewOrigin?: string;
+      previewWildcardDomain?: string;
+      previewWildcardPrefix?: string;
       previewPopout?: "same-origin" | "isolated";
     } = {},
   ) {
     // Only treat a *different* origin as mode B; an accidental same-origin value
     // stays on the simpler same-origin path.
     const here = typeof location !== "undefined" ? location.origin : "";
-    this.previewOrigin =
-      options.previewOrigin && options.previewOrigin !== here ? options.previewOrigin : undefined;
+    const wildcardDomain = normalizeDomain(options.previewWildcardDomain);
+    this.wildcardPrefix = options.previewWildcardPrefix || "vv-";
+    this.previewToken = randomToken();
+    if (wildcardDomain) {
+      // Mode C takes precedence: previews are per-port origins under the wildcard.
+      this.previewMode = "wildcard";
+      this.wildcardDomain = wildcardDomain;
+    } else if (options.previewOrigin && options.previewOrigin !== here) {
+      this.previewMode = "shared";
+      this.previewOrigin = options.previewOrigin;
+    } else {
+      this.previewMode = "same-origin";
+    }
     this.previewPopout = options.previewPopout === "isolated" ? "isolated" : "same-origin";
     this.worker = new Worker(
       new URL("./workers/kernel-worker.ts", import.meta.url),
@@ -80,11 +116,11 @@ export class KernelBridge {
       );
 
       // Reverse HMR tunnel: the preview iframe's WebSocket shim posts connection
-      // events UP to this window; relay them down to the kernel worker. In mode B
-      // the preview iframe is cross-origin, so only trust messages from the
-      // preview origin (its `parent` is still this window).
+      // events UP to this window; relay them down to the kernel worker. In modes
+      // B/C the preview iframe is cross-origin, so only trust messages from a
+      // recognised preview origin (its `parent` is still this window).
       addEventListener("message", (event: MessageEvent) => {
-        if (this.previewOrigin && event.origin !== this.previewOrigin) return;
+        if (this.previewMode !== "same-origin" && !this.isTrustedPreviewOrigin(event.origin)) return;
         const d = event.data;
         if (!d || d.dir !== "out" || (d.type !== "vv-ws" && d.type !== "vv-sse")) return;
         this.worker.postMessage({ type: d.type as string, msg: d });
@@ -130,9 +166,15 @@ export class KernelBridge {
     });
   }
 
+  /** How previews are served (same-origin / shared / wildcard). */
+  get mode(): PreviewMode {
+    return this.previewMode;
+  }
+
   /**
    * The origin prefix to build preview URLs with. Empty string in mode A (so
-   * URLs stay relative/same-origin); the preview origin in mode B.
+   * URLs stay relative/same-origin); the preview origin in mode B. Not meaningful
+   * in mode C (per-port origins) — use {@link previewUrlFor} instead.
    */
   get previewBase(): string {
     return this.previewOrigin ?? "";
@@ -140,11 +182,60 @@ export class KernelBridge {
 
   /**
    * Whether "Open in new tab" should open on the (isolated) preview origin. True
-   * only in mode B with `previewPopout: "isolated"`; otherwise pop-outs open
-   * same-origin with the IDE.
+   * in mode B with `previewPopout: "isolated"`, and always true in mode C (each
+   * pop-out opens on its per-port origin). Mode A pop-outs are same-origin.
    */
   get popoutIsolated(): boolean {
-    return !!this.previewOrigin && this.previewPopout === "isolated";
+    if (this.previewMode === "wildcard") return true;
+    return this.previewMode === "shared" && this.previewPopout === "isolated";
+  }
+
+  /**
+   * Build the preview URL for an in-VM port. Mode A: relative `/preview/<port>/`.
+   * Mode B: `<origin>/preview/<port>/`. Mode C: `<scheme>//<prefix><token>--<port>.<domain>/`.
+   * `pathAndQuery` is the in-server path (default `/`).
+   */
+  previewUrlFor(port: number, pathAndQuery = "/"): string {
+    const p = pathAndQuery.startsWith("/") ? pathAndQuery : "/" + pathAndQuery;
+    if (this.previewMode === "wildcard") {
+      const scheme = typeof location !== "undefined" ? location.protocol : "https:";
+      return `${scheme}//${this.wildcardPrefix}${this.previewToken}--${port}.${this.wildcardDomain}${p}`;
+    }
+    return `${this.previewOrigin ?? ""}/preview/${port}${p}`;
+  }
+
+  /** The origin that serves a given port's preview (undefined in mode A). */
+  private previewOriginFor(port: number): string | undefined {
+    if (this.previewMode === "wildcard") {
+      try {
+        return new URL(this.previewUrlFor(port, "/")).origin;
+      } catch {
+        return undefined;
+      }
+    }
+    return this.previewOrigin;
+  }
+
+  /**
+   * Whether `origin` is one of our preview origins — the single `previewOrigin`
+   * in mode B, or a `<prefix><token>--<port>.<domain>` host in mode C. Used to
+   * gate cross-origin postMessage from preview frames.
+   */
+  isTrustedPreviewOrigin(origin: string): boolean {
+    if (!origin) return false;
+    if (this.previewMode === "shared") return origin === this.previewOrigin;
+    if (this.previewMode === "wildcard") {
+      try {
+        const host = new URL(origin).hostname;
+        return (
+          host.startsWith(`${this.wildcardPrefix}${this.previewToken}--`) &&
+          host.endsWith(`.${this.wildcardDomain}`)
+        );
+      } catch {
+        return false;
+      }
+    }
+    return false;
   }
 
   /**
@@ -162,10 +253,14 @@ export class KernelBridge {
     } catch {
       /* same-origin SW not controlling */
     }
-    try {
-      this.kernelPort?.postMessage(payload);
-    } catch {
-      /* bridge port not connected */
+    // Mode B: the single bridge port. Mode C: every per-port bridge port (each
+    // preview-origin SW only reaches its own clients; shims keep only their connIds).
+    for (const conn of this.previewConns.values()) {
+      try {
+        conn.port?.postMessage(payload);
+      } catch {
+        /* bridge port not connected */
+      }
     }
   }
 
@@ -173,10 +268,25 @@ export class KernelBridge {
   async registerServiceWorker(url = "/sw.js"): Promise<boolean> {
     if (this.swRegistered) return true;
     if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return false;
-    if (this.previewOrigin) {
+    this.swUrl = url;
+    if (this.previewMode === "wildcard") {
+      // Mode C: each port is its OWN origin, so we can't set up a bridge until a
+      // port exists. Lazily stand one up per port as servers start listening. No
+      // same-origin SW here — every preview (embedded and pop-out) lives on a
+      // per-port origin reached over its own bridge port.
+      this.on("listen", (m) => {
+        const port = m.port as number;
+        if (!port) return;
+        const origin = this.previewOriginFor(port);
+        if (origin) void this.ensurePreviewBridge(origin);
+      });
+      this.swRegistered = true;
+      return true;
+    }
+    if (this.previewMode === "shared") {
       // Mode B: the *embedded* preview renders on a SEPARATE origin (isolation)
       // via a hidden bridge doc that registers the SW there and relays a port.
-      const bridgeOk = await this.setupPreviewBridge(url);
+      const bridgeOk = await this.ensurePreviewBridge(this.previewOrigin!);
       // …but ALSO register a same-origin SW here so "Open in new tab" pop-outs
       // work. The editor opens pop-outs on THIS origin: a standalone tab on the
       // *preview* origin can't reach the kernel (browser storage partitioning
@@ -238,24 +348,35 @@ export class KernelBridge {
     return true;
   }
 
-  // ── Mode B: separate preview origin ───────────────────────────────────────
+  // ── Modes B/C: separate preview origin(s) ─────────────────────────────────
   //
   // We can't register a cross-origin SW from here, so we load a hidden bridge
-  // document on the preview origin. It registers `sw.js` (same-origin to it) and
-  // relays a MessagePort we create back to that SW. Thereafter every preview HTTP
-  // request the SW intercepts is posted to us over the port (with a per-request
-  // reply port), and we forward it to the kernel exactly like the same-origin
-  // path — no server, no network, just a different origin.
-  private async setupPreviewBridge(swUrl: string): Promise<boolean> {
+  // document on each preview origin. Being same-origin to `sw.js` there, it can
+  // register it and relay a MessagePort we create back to that SW. Thereafter
+  // every preview HTTP request the SW intercepts is posted to us over the port
+  // (with a per-request reply port) and we forward it to the kernel exactly like
+  // the same-origin path — no server, no network, just a different origin. Mode B
+  // has one origin (all ports); mode C has one per port.
+
+  /** Ensure a bridge (iframe + port) exists for `origin`; dedupes concurrent calls. */
+  private ensurePreviewBridge(origin: string): Promise<boolean> {
+    const existing = this.previewConns.get(origin);
+    if (existing?.ready) return existing.ready;
+    const conn: PreviewConn = {};
+    this.previewConns.set(origin, conn);
+    conn.ready = this.setupPreviewBridge(origin, conn);
+    return conn.ready;
+  }
+
+  private async setupPreviewBridge(origin: string, conn: PreviewConn): Promise<boolean> {
     if (typeof document === "undefined" || typeof window === "undefined") return false;
-    const origin = this.previewOrigin!;
     const iframe = document.createElement("iframe");
     iframe.setAttribute("aria-hidden", "true");
     iframe.setAttribute("tabindex", "-1");
     iframe.style.cssText = "position:absolute;width:0;height:0;border:0;visibility:hidden;left:-9999px";
     iframe.src =
       `${origin}/__vv-bridge.html?ide=${encodeURIComponent(location.origin)}` +
-      `&sw=${encodeURIComponent(swUrl)}`;
+      `&sw=${encodeURIComponent(this.swUrl)}`;
 
     const ready = new Promise<boolean>((resolve) => {
       const onMsg = (event: MessageEvent) => {
@@ -270,15 +391,15 @@ export class KernelBridge {
       }, 15000);
     });
     document.body.appendChild(iframe);
-    this.bridgeFrame = iframe;
+    conn.iframe = iframe;
     if (!(await ready)) return false;
 
-    this.connectPort();
+    this.connectPort(origin, conn);
     // The SW is evicted when idle, losing the in-memory port. The bridge doc
     // notices (its `controllerchange` / a probe) and asks us to re-hand a port.
     window.addEventListener("message", (event: MessageEvent) => {
       if (event.origin !== origin || !event.data || event.data.type !== "vv-need-connect") return;
-      this.connectPort();
+      this.connectPort(origin, conn);
     });
     this.swRegistered = true;
     return true;
@@ -287,16 +408,19 @@ export class KernelBridge {
   // Create a fresh MessageChannel, keep one end, and ship the other to the
   // preview SW via the bridge iframe. Also (re)push the current keep-prefix +
   // DevTools config, since a revived SW starts blank.
-  private connectPort(): void {
-    const origin = this.previewOrigin;
-    const win = this.bridgeFrame?.contentWindow;
-    if (!origin || !win) return;
+  private connectPort(origin: string, conn: PreviewConn): void {
+    const win = conn.iframe?.contentWindow;
+    if (!win) return;
     const mc = new MessageChannel();
-    this.kernelPort = mc.port1;
+    conn.port = mc.port1;
     mc.port1.onmessage = (event) => this.onKernelPortMessage(event);
     win.postMessage({ type: "vv-connect" }, origin, [mc.port2]);
-    if (this.pendingKeepPrefix) mc.port1.postMessage({ type: "vv-keep-prefix-ports", ports: this.pendingKeepPrefix });
-    if (this.pendingDevtools !== undefined) mc.port1.postMessage({ type: "vv-devtools", enabled: this.pendingDevtools });
+    // keep-prefix only applies to path-multiplexed origins (mode B); mode C
+    // serves each app at `/`, so there's no prefix to keep.
+    if (this.previewMode !== "wildcard" && this.pendingKeepPrefix)
+      mc.port1.postMessage({ type: "vv-keep-prefix-ports", ports: this.pendingKeepPrefix });
+    if (this.pendingDevtools !== undefined)
+      mc.port1.postMessage({ type: "vv-devtools", enabled: this.pendingDevtools });
   }
 
   // Messages the preview SW sends us over the persistent port (mode B mirror of
@@ -331,11 +455,14 @@ export class KernelBridge {
    * doesn't strip the prefix for them. Safe to call before the SW is active.
    */
   setKeepPrefixPorts(ports: number[]): void {
+    // Mode C serves each app at `/`, so there's no proxy prefix to keep.
+    if (this.previewMode === "wildcard") return;
     // Mode B: send over the persistent port (and remember it so a revived SW is
     // reconfigured on reconnect).
-    if (this.previewOrigin) {
+    if (this.previewMode === "shared") {
       this.pendingKeepPrefix = ports;
-      this.kernelPort?.postMessage({ type: "vv-keep-prefix-ports", ports });
+      for (const conn of this.previewConns.values())
+        conn.port?.postMessage({ type: "vv-keep-prefix-ports", ports });
       return;
     }
     if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
@@ -354,9 +481,11 @@ export class KernelBridge {
    * 404); the studio IDE leaves it on. Safe to call before the SW is active.
    */
   setDevtoolsEnabled(enabled: boolean): void {
-    if (this.previewOrigin) {
+    // Modes B/C: send over every bridge port (and remember it for reconnects).
+    if (this.previewMode !== "same-origin") {
       this.pendingDevtools = enabled;
-      this.kernelPort?.postMessage({ type: "vv-devtools", enabled });
+      for (const conn of this.previewConns.values())
+        conn.port?.postMessage({ type: "vv-devtools", enabled });
       return;
     }
     if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
@@ -375,15 +504,48 @@ export class KernelBridge {
 
   /** Tear down the worker and all nested workers/VFS it owns. */
   destroy() {
-    this.kernelPort?.close();
-    this.kernelPort = undefined;
-    this.bridgeFrame?.remove();
-    this.bridgeFrame = undefined;
+    for (const conn of this.previewConns.values()) {
+      try {
+        conn.port?.close();
+      } catch {
+        /* already closed */
+      }
+      conn.iframe?.remove();
+    }
+    this.previewConns.clear();
     this.worker.terminate();
     this.handlers.clear();
     this.anyHandlers.clear();
     this.pending.clear();
   }
+}
+
+// A DNS label is 1-63 chars of [a-z0-9-]; a hostname's labels join with dots.
+// Accept a bare base domain (strip any scheme/path a caller might pass).
+function normalizeDomain(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  let d = raw.trim().toLowerCase();
+  try {
+    if (d.includes("://")) d = new URL(d).hostname;
+  } catch {
+    /* fall through to the bare-string path */
+  }
+  d = d.replace(/^\/+|\/+$/g, "").replace(/\/.*$/, "");
+  return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(d) ? d : undefined;
+}
+
+// Short, unguessable, per-boot token (base36). Ties preview hostnames to this
+// session so URLs aren't enumerable and rotate each boot.
+function randomToken(): string {
+  const g = typeof crypto !== "undefined" ? crypto : undefined;
+  if (g?.getRandomValues) {
+    const a = new Uint8Array(8);
+    g.getRandomValues(a);
+    let s = "";
+    for (const b of a) s += b.toString(36).padStart(2, "0");
+    return s.slice(0, 12);
+  }
+  return Math.random().toString(36).slice(2, 14);
 }
 
 /** Is the page cross-origin isolated (SharedArrayBuffer available)? */

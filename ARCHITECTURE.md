@@ -520,8 +520,20 @@ in the IDE tab. `KernelBridge.setupPreviewBridge()` iframes the bridge doc, whic
 cross-origin SW and hands back a persistent `MessagePort`; the SW then routes preview HTTP over that
 port instead of `findKernelClient()`. Selected at build time by `VITE_PREVIEW_ORIGIN` on the **studio
 (main) project** (the preview project needs no env). The embedded preview iframe is cross-origin, so
-its ws/SSE/CDP shims already reach the IDE via `parent.postMessage`. See `roadmap.md`
-("preview origin isolation") for the full mode A/B/C design.
+its ws/SSE/CDP shims already reach the IDE via `parent.postMessage`.
+
+**Wildcard per-port preview origins (mode C).** Instead of one shared preview origin, a deploy can
+serve **each port from its own origin** — `vv-<token>--<port>.<domain>` (random per-boot `<token>`),
+selected by `VITE_PREVIEW_WILDCARD_DOMAIN` (takes precedence over `VITE_PREVIEW_ORIGIN`). This
+isolates previews from the IDE *and* from each other, and restores real `localhost:<port>`
+web-platform semantics (own cookies/storage/CORS). The SW reads the port from
+`self.location.hostname` (`WILDCARD_MODE` in `sw.js`) and serves the app at `/` — no `/preview/`
+path, so the keep-prefix machinery is a no-op. `KernelBridge` lazily stands up **one bridge iframe +
+`MessagePort` per port** (`ensurePreviewBridge`, keyed by origin) as servers `listen`, and
+`broadcastToPreviewSWs` fans ws/SSE out across all of them. Because Cloudflare Pages can't attach a
+*wildcard* custom domain, a small Cloudflare **Worker** (`worker/`, route `vv-*.<domain>/*`) serves
+the static SW runtime and stamps the isolation headers; it needs one **proxied** wildcard DNS record
+`*.<domain>`. See `roadmap.md` ("preview origin isolation") + `sites/docs/docs/deployment.md`.
 
 ### 8.4 WebSocket tunnel (Vite HMR)
 
@@ -552,24 +564,28 @@ shared with `handlePreview`) and broadcasts `dir:'in'` frames to every top-level
 each shim keeps only its own `connId`. The studio's `bridge.ts` forwards SW-relayed `dir:'out'`
 frames to the kernel worker, and `controller` relays inbound frames back through the SW
 (`KernelBridge.broadcastToPreviewSWs`, which posts to **both** the same-origin controller and, in
-mode B, the bridge port) alongside the in-app iframes (nested clients, which the SW broadcast skips,
-so no duplicates). Vite HMR in a standalone tab now works for the same reason.
+modes B/C, every bridge port) alongside the in-app iframes (nested clients, which the SW broadcast
+skips, so no duplicates). Vite HMR in a standalone tab now works for the same reason.
 
-**Where the pop-out opens (mode B).** `openExternalPreview` opens the pop-out **same-origin by
+**Where the pop-out opens (modes B & C).** `openExternalPreview` opens the pop-out **same-origin by
 default** (`/preview/<port>/` on the IDE origin) so it lands in the kernel's storage partition and
-"just works". A standalone tab on the *preview* origin would sit in a different browser storage
-partition than the editor tab and couldn't reach the kernel without a Storage-Access grant — so the
-isolated pop-out is opt-in via `VITE_PREVIEW_POPOUT=isolated` (set on the studio project, only
-meaningful with `VITE_PREVIEW_ORIGIN`). Whether `isolated` needs that gate hinges on **same-site vs
-cross-site**: if the IDE and preview origins are subdomains of the **same registrable domain**
-(e.g. `vivari.jamesisme.com` + `vivari-preview.jamesisme.com`, IDE opened at the `jamesisme.com`
-host) they are same-site → **not** storage-partitioned → the pop-out shares the bridge Service Worker
-and connects with **no gate** (verified live), while storage stays origin-isolated. Cross-site
-deploys (two `*.pages.dev` projects — `pages.dev` is on the Public Suffix List — or StackBlitz's
-`stackblitz.com`↔`webcontainer.io`) are partitioned; the preview SW then serves a StackBlitz-style
-"connect this tab" gate (`previewConnectingHtml`), but Chrome's Storage-Access un-partitions cookies
-only (not Service Worker registrations), so on `*.pages.dev` the gate can't grant — use `same-origin`
-pop-out there. There is no isolated-*and*-frictionless standalone tab: `same-origin-allow-popups`
+"just works". A standalone tab on a *cross-site* preview origin would sit in a different browser
+storage partition than the editor tab and couldn't reach the kernel without a Storage-Access grant —
+so the mode-B isolated pop-out is opt-in via `VITE_PREVIEW_POPOUT=isolated` (set on the studio
+project, only meaningful with `VITE_PREVIEW_ORIGIN`). Whether `isolated` needs that gate hinges on
+**same-site vs cross-site**: if the IDE and preview origins are subdomains of the **same registrable
+domain** (e.g. `vivari.jamesisme.com` + `vivari-preview.jamesisme.com`, IDE opened at the
+`jamesisme.com` host) they are same-site → **not** storage-partitioned → the pop-out shares the
+bridge Service Worker and connects with **no gate** (verified live), while storage stays
+origin-isolated. **Mode C is same-site by construction** (its per-port hosts are subdomains of the
+IDE's own base domain), so its pop-out is always gate-free. Cross-site deploys (two `*.pages.dev`
+projects — `pages.dev` is on the Public Suffix List — or StackBlitz's `stackblitz.com`↔
+`webcontainer.io`) are partitioned; the preview SW then serves a StackBlitz-style "connect this tab"
+gate (`previewConnectingHtml`), but Chrome's Storage-Access un-partitions cookies only (not Service
+Worker registrations), so on `*.pages.dev` the gate can't grant — use `same-origin` pop-out there.
+(Trade-off: a same-*site* preview origin can still set/read domain-wide cookies on the IDE; use a
+*different* base domain when you need full cross-site isolation, at the cost of the gate.) There is
+no isolated-*and*-frictionless standalone tab on a cross-site origin: `same-origin-allow-popups`
 (to keep `window.opener`) forfeits `crossOriginIsolated` → no `SharedArrayBuffer`. See `roadmap.md`
 ("Pop-out behavior").
 

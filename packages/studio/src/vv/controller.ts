@@ -44,6 +44,38 @@ function normalizePreviewPopout(raw: string | undefined): "same-origin" | "isola
   return raw === "isolated" ? "isolated" : "same-origin";
 }
 
+// Build-time wildcard base domain (VITE_PREVIEW_WILDCARD_DOMAIN, mode C). Returns
+// a bare base domain (e.g. "jamesisme.com") or undefined. When set, previews are
+// served one origin per port (`vv-<token>--<port>.<domain>`); takes precedence
+// over VITE_PREVIEW_ORIGIN. Unset in the default deploy + local dev (→ mode A/B).
+function normalizePreviewWildcardDomain(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  let d = raw.trim().toLowerCase();
+  try {
+    if (d.includes("://")) d = new URL(d).hostname;
+  } catch {
+    /* fall through */
+  }
+  d = d.replace(/^\/+|\/+$/g, "").replace(/\/.*$/, "");
+  return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(d) ? d : undefined;
+}
+
+// Rewrite a keep-prefix template's framework **base** config (`base` / `basename`
+// / `baseUrl` set to `"/preview/<port>/"`) to the origin root `"/"`. Keep-prefix
+// templates (Docusaurus, VitePress, React Router 7, TanStack Router) hardcode that
+// base for the path-multiplexed modes A/B; in mode C each port is its OWN origin
+// served at `/`, so the hardcoded base would 404. We touch ONLY those config keys,
+// so legitimate cross-service URLs in app code (e.g. `'/preview/' + PORT + '/api'`,
+// which still route via the SW/shim in mode C) are left intact.
+function rewritePreviewBaseToRoot(files: Record<string, string>): Record<string, string> {
+  const re = /((?:base|basename|baseUrl)\s*:\s*)(['"`])\/preview\/\d+\/\2/g;
+  const out: Record<string, string> = {};
+  for (const [path, content] of Object.entries(files)) {
+    out[path] = content.replace(re, (_m, key: string, q: string) => `${key}${q}/${q}`);
+  }
+  return out;
+}
+
 // ── Demo matrix (UI side) ────────────────────────────────────────────────────
 // The two hard-coded example projects the kernel worker still scaffolds on demand
 // (the "Run" button's legacy path). New projects come from Home (blank/template).
@@ -522,21 +554,23 @@ export class IdeController {
       ? "dark"
       : "light";
 
-  // Mode B (separate preview origin): configured at build time via
-  // VITE_PREVIEW_ORIGIN. Empty in the default same-origin deploy + local dev, so
-  // preview URLs stay relative and nothing changes. When set, previews are served
-  // from that origin (see KernelBridge.previewBase) for IDE↔preview isolation.
-  private readonly previewBase: string;
-  // Mode B pop-out behavior. When true, "Open in new tab" opens on the isolated
-  // preview origin (behind a connect gate); otherwise it opens same-origin with
-  // the IDE. Always false in mode A. See normalizePreviewPopout / openExternalPreview.
+  // Preview origin mode (see KernelBridge.mode): "same-origin" (default / local
+  // dev), "shared" (mode B, VITE_PREVIEW_ORIGIN) or "wildcard" (mode C,
+  // VITE_PREVIEW_WILDCARD_DOMAIN — one origin per port).
+  private readonly previewMode: "same-origin" | "shared" | "wildcard";
+  // Mode B/C pop-out behavior. When true, "Open in new tab" opens on an isolated
+  // preview origin; otherwise it opens same-origin with the IDE. Always true in
+  // mode C, false in mode A. See openExternalPreview.
   private readonly popoutIsolated: boolean;
 
   constructor() {
     const previewOrigin = normalizePreviewOrigin(import.meta.env.VITE_PREVIEW_ORIGIN);
     const previewPopout = normalizePreviewPopout(import.meta.env.VITE_PREVIEW_POPOUT);
-    this.bridge = new KernelBridge({ previewOrigin, previewPopout });
-    this.previewBase = this.bridge.previewBase;
+    const previewWildcardDomain = normalizePreviewWildcardDomain(
+      import.meta.env.VITE_PREVIEW_WILDCARD_DOMAIN,
+    );
+    this.bridge = new KernelBridge({ previewOrigin, previewWildcardDomain, previewPopout });
+    this.previewMode = this.bridge.mode;
     this.popoutIsolated = this.bridge.popoutIsolated;
     this.debug = new DebugSession(this.bridge);
     // When execution pauses (or a frame is selected), open the file + reveal the line.
@@ -1551,17 +1585,24 @@ export class IdeController {
     }
     const root = normDir(dir);
     const title = `${t.manifest.name} · ${t.manifest.language}`;
+    // Mode C serves each port at its own origin root, so a keep-prefix template's
+    // hardcoded `/preview/<port>/` base (built for modes A/B) would 404. Rewrite it
+    // to "/" and drop the now-irrelevant flag so the app runs at the origin root.
+    // Modes A/B keep the template verbatim.
+    const wildcard = this.previewMode === "wildcard" && !!t.manifest.keepPreviewPrefix;
+    const files = wildcard ? rewritePreviewBaseToRoot(t.files) : t.files;
+    const manifest = wildcard ? { ...t.manifest, keepPreviewPrefix: false } : t.manifest;
     const res = await this.bridge.request("vv-create-project", {
       dir: root,
-      files: t.files,
-      manifest: t.manifest,
+      files,
+      manifest,
       title,
     });
     if (!res.ok) {
       toast.error(`Couldn't create project: ${res.error ?? "unknown error"}`);
       return;
     }
-    this.folderManifests.set(root, t.manifest);
+    this.folderManifests.set(root, manifest);
     this.upsertProjectMeta({ name, rootPath: root, template: templateId });
     this.openFolder(root, name);
     void this.openFile(root + "/" + t.manifest.entry);
@@ -2177,9 +2218,10 @@ export class IdeController {
     if (tab.port == null) return "about:blank";
     const path = tab.path && tab.path.startsWith("/") ? tab.path : "/";
     const bust = tab.nonce > 1 ? `${path.includes("?") ? "&" : "?"}t=${tab.nonce}` : "";
-    // previewBase is "" in mode A (relative, same-origin) and the preview origin
-    // in mode B (absolute, cross-origin iframe served by the preview SW).
-    return `${this.previewBase}/preview/${tab.port}${path}${bust}`;
+    // The bridge builds the right URL per mode: relative `/preview/<port>/…` in
+    // mode A, `<origin>/preview/<port>/…` in mode B, or a per-port wildcard origin
+    // `<scheme>//vv-<token>--<port>.<domain>/…` (served at root) in mode C.
+    return this.bridge.previewUrlFor(tab.port, `${path}${bust}`);
   }
   private setTab(id: string, patch: Partial<PreviewTab>) {
     this.set({ previewTabs: this.snap.previewTabs.map((t) => (t.id === id ? { ...t, ...patch } : t)) });
@@ -2306,12 +2348,18 @@ export class IdeController {
   // routes via the SW and the ws/SSE tunnels do too (the opened tab's shim talks
   // to the SW; we relay inbound frames back via relayToExternalPreviews).
   //
-  // Isolated pop-out (previewPopout: "isolated", mode B): open on the preview
-  // origin so it can't touch IDE storage/OPFS. It only auto-connects when the
-  // browser's storage is unpartitioned; otherwise the preview SW serves a
-  // "connect this tab" gate (see previewConnectingHtml in sw.js).
+  // Isolated pop-out (previewPopout: "isolated" in mode B, always in mode C): open
+  // on the preview origin so it can't touch IDE storage/OPFS. When the preview
+  // origin is same-site with the IDE (a subdomain of the same base domain — always
+  // the case in mode C) it connects gate-free; a cross-site preview origin instead
+  // shows a one-time "connect this tab" gate (see previewConnectingHtml in sw.js).
   openExternalPreview(port: number) {
-    const base = this.popoutIsolated ? this.previewBase : "";
+    // Mode C: each port has its own origin (served at root, no /preview/ path).
+    if (this.previewMode === "wildcard") {
+      window.open(this.bridge.previewUrlFor(port, "/"), "_blank");
+      return;
+    }
+    const base = this.popoutIsolated ? this.bridge.previewBase : "";
     window.open(`${base}/preview/${port}/`, "_blank");
   }
 
@@ -2425,13 +2473,12 @@ export class IdeController {
   // The host-page relay: bridges CDP between each preview tab's chobitsu and the
   // shared chii frontend, and syncs the address bar from in-app navigation.
   private wirePreviewMessages() {
-    // Preview frames are cross-origin in mode B; only trust their messages from
-    // the configured preview origin (mode A: same-origin as the studio).
-    const previewMsgOrigin = this.previewBase
-      ? new URL(this.previewBase).origin
-      : typeof location !== "undefined"
-        ? location.origin
-        : "";
+    // Preview frames are cross-origin in modes B/C; only trust their messages from
+    // a recognised preview origin (mode A: same-origin as the studio; mode B: the
+    // single preview origin; mode C: any `vv-<token>--<port>.<domain>` host).
+    const here = typeof location !== "undefined" ? location.origin : "";
+    const trustPreviewOrigin = (origin: string) =>
+      this.previewMode === "same-origin" ? origin === here : this.bridge.isTrustedPreviewOrigin(origin);
     window.addEventListener("message", (event: MessageEvent) => {
       const src = event.source;
       const data = event.data;
@@ -2448,7 +2495,7 @@ export class IdeController {
 
       if (!data || typeof data !== "object") return;
       // Everything below originates from a preview frame — enforce its origin.
-      if (previewMsgOrigin && event.origin !== previewMsgOrigin) return;
+      if (!trustPreviewOrigin(event.origin)) return;
 
       // Preview tab's chobitsu → frontend (only if this tab is the attached target).
       if (data.source === "vv-cdp" && data.dir === "target") {

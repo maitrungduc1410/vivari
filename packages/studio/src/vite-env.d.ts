@@ -15,4 +15,13 @@ interface ImportMetaEnv {
    * Storage Access gate. Unset/ignored in the default same-origin deploy.
    */
   readonly VITE_PREVIEW_POPOUT?: "same-origin" | "isolated";
+  /**
+   * Mode C (wildcard per-port preview origins). Set to a **base domain** you
+   * control (e.g. `"jamesisme.com"`); each in-VM port is served from its own
+   * origin `vv-<token>--<port>.<domain>` for full IDE↔preview and preview↔preview
+   * isolation with real `localhost:<port>` semantics. Takes precedence over
+   * VITE_PREVIEW_ORIGIN. Requires the wildcard Worker + DNS (see docs/deployment).
+   * Unset in the default deploy + local dev.
+   */
+  readonly VITE_PREVIEW_WILDCARD_DOMAIN?: string;
 }

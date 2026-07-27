@@ -75,6 +75,78 @@ every surface that runs (or hosts) the runtime, plus the Service Worker:
 Preview responses (`/preview/<port>/…`) are synthesized by the Service Worker,
 which stamps their isolation headers itself — so they don't need an entry here.
 
+## Preview isolation modes (optional)
+
+By default previews run **same-origin** with the IDE (mode A) — zero extra infra.
+Two opt-in modes move previews onto a separate origin so preview code (including
+your npm dependencies) can't touch the IDE's cookies / `localStorage` / OPFS. All
+three are the same client-side runtime; the mode is inferred from build-time env on
+the **studio (main) project** (the preview origin needs no env of its own).
+
+| | A. same-origin | B. shared origin | C. wildcard per-port |
+| --- | --- | --- | --- |
+| Preview URL | `…/preview/5173/` | `preview-origin/preview/5173/` | `vv-<token>--5173.<domain>/` |
+| Isolates IDE ↔ preview | ❌ | ✅ | ✅ |
+| Isolates preview ↔ preview | ❌ | ❌ | ✅ (own origin per port) |
+| Extra infra | none | +1 Pages project | wildcard DNS + a Worker |
+| Env (studio project) | — | `VITE_PREVIEW_ORIGIN` | `VITE_PREVIEW_WILDCARD_DOMAIN` |
+
+`VITE_PREVIEW_WILDCARD_DOMAIN` takes precedence over `VITE_PREVIEW_ORIGIN` when
+both are set.
+
+### Mode B — shared preview origin
+
+1. Create a **second** Cloudflare Pages project (e.g. `vivari-preview`) with build
+   command `bash scripts/cloudflare-build-preview.sh` and output dir `dist-preview`.
+   It serves only the static SW runtime (`sw.js`, `__vv-bridge.html`,
+   `__vv-preview-boot.html`, `vv-devtools/`) with `COEP: credentialless`,
+   `CORP: cross-origin` and `Service-Worker-Allowed: /`.
+2. On the **main** project set `VITE_PREVIEW_ORIGIN=https://vivari-preview.pages.dev`
+   and redeploy.
+3. Optional: `VITE_PREVIEW_POPOUT=isolated` opens **"Open in new tab"** on the
+   preview origin instead of same-origin. On a **cross-site** preview origin (e.g.
+   a `*.pages.dev` project, which the Public Suffix List makes a distinct site) the
+   pop-out shows a one-time "connect this tab" Storage-Access gate. To skip the gate,
+   put the IDE and preview on **subdomains of one base domain** (same-site) — see
+   mode C, which does this by construction.
+
+### Mode C — wildcard per-port preview origins
+
+Each in-VM port gets its own origin `vv-<token>--<port>.<domain>` (random per-boot
+`<token>`), which gives every preview real `localhost:<port>` semantics and isolates
+previews from each other. Cloudflare Pages can't attach a *wildcard* custom domain,
+so a small **Worker** (`worker/`) serves the SW runtime for every subdomain.
+
+1. Point a base domain (e.g. `jamesisme.com`) at Cloudflare (nameservers on
+   Cloudflare) and add **one proxied (orange-cloud) wildcard DNS record**: `A * →`
+   a placeholder IP like `192.0.2.1` (the Worker responds directly, never forwards).
+   Explicit records for your existing subdomains always win over the wildcard
+   (RFC 4592), so they're untouched.
+2. Build + deploy the Worker:
+   ```bash
+   npm run build:worker    # builds the studio + assembles worker/public/
+   npm run deploy:worker   # wrangler deploy (from worker/)
+   ```
+   In `worker/wrangler.toml` set the route to `vv-*.<domain>/*` (uncomment the
+   `[[routes]]` block with your `zone_name`, or add it under **Workers → Routes**).
+   The Worker only acts on hosts matching `vv-*` and passes every other host
+   through untouched.
+3. On the **main** (IDE) project set `VITE_PREVIEW_WILDCARD_DOMAIN=jamesisme.com`
+   and redeploy. Because the preview hosts are subdomains of the IDE's base domain
+   they are **same-site**, so "Open in new tab" connects **gate-free**.
+
+Free Cloudflare Universal SSL covers the apex + a **single-level** wildcard
+(`*.<domain>`), which is exactly what `vv-<token>--<port>.<domain>` needs — no paid
+certificate. A nested scheme like `*.preview.<domain>` would be two levels and
+require Advanced Certificate Manager.
+
+**All templates work in every mode.** Keep-prefix templates (Docusaurus, VitePress,
+React Router 7, TanStack Router) hardcode a `/preview/<port>/` base for modes A/B.
+Since mode C serves each port at its own origin root, the studio rewrites those
+templates' base to `/` at creation time — so you don't need to change anything per
+mode. Cross-service calls (a frontend hitting a backend on another port via
+`/preview/<port>/…`) keep working in mode C too.
+
 ## Local preview
 
 ```bash

@@ -3056,10 +3056,21 @@ previewed live in the iframe — with the Path A hand-written builtins deleted.
 
 ---
 
-## 🧊 PLANNED — Preview origin isolation (three configurable modes)
+## ✅ SHIPPED — Preview origin isolation (three configurable modes)
 
-Status: **planned / not started** (design agreed, deferred). Captures the current deploy
-topology + the intended change so we can pick it up later.
+Status: **all three modes shipped.** Mode A (same-origin) is the default; mode B (shared preview
+origin) is selected with `VITE_PREVIEW_ORIGIN` (+ optional `VITE_PREVIEW_POPOUT`); mode C
+(wildcard per-port origin) is selected with `VITE_PREVIEW_WILDCARD_DOMAIN`. The design essay below
+records the rationale; the boxed **"As shipped"** notes reconcile it with the final surface.
+
+> **As shipped — the mode-C surface.** Preview hostnames are `vv-<token>--<port>.<domain>`
+> (single random per-boot `<token>`, `vv-` prefix so the Worker and `sw.js` can tell Vivari
+> previews apart from other apps on the same base domain). Config is a single env
+> `VITE_PREVIEW_WILDCARD_DOMAIN=<base-domain>` (SDK: `BootOptions.previewWildcardDomain`); it takes
+> precedence over `VITE_PREVIEW_ORIGIN`. Infra is one **proxied wildcard DNS record** + a
+> **Cloudflare Worker** on route `vv-*.<domain>/*` (`worker/`, `npm run build:worker` /
+> `deploy:worker`) that serves the static SW runtime. Because the preview hosts are subdomains of
+> the IDE's own base domain they are **same-site**, so the isolated pop-out is **gate-free**.
 
 **Design decision: don't pick one topology — make it a deploy-time config knob.** All three
 options below are the *same core* (an SW that proxies preview fetches to the kernel running in
@@ -3073,11 +3084,11 @@ self-hoster picks what their infra allows:
 - **Mode B — `shared`**: a second Pages project → `vivari-preview.pages.dev/preview/<port>/`.
   Isolates **IDE ↔ preview**. No custom domain, no DNS. SW reaches the kernel via a hidden bridge
   iframe + persistent `MessagePort` (cross-origin).
-- **Mode C — `wildcard`**: one origin per (project, port) → `abc--<port>.jamesisme.com`
+- **Mode C — `wildcard`**: one origin per port → `vv-<token>--<port>.jamesisme.com`
   (StackBlitz/CodeSandbox model). Isolates **IDE ↔ preview AND preview ↔ preview**, and matches
-  real `localhost:<port>` web-platform semantics. Same bridge transport as B; port is read from
-  the **hostname**; **deletes** the keep-prefix machinery. Requires a custom domain + wildcard DNS
-  + a Cloudflare Worker route.
+  real `localhost:<port>` web-platform semantics. Same bridge transport as B (one bridge iframe +
+  `MessagePort` **per port**); port is read from the **hostname**; keep-prefix is a no-op (apps are
+  served at `/`). Requires a base domain + proxied wildcard DNS + a Cloudflare Worker route.
 
 Modes B and C share ~95% of the code (bridge + `MessagePort` + dual-mode SW). C only adds
 hostname-based routing on top of B. A already exists. So "support all three" = keep path A +
@@ -3117,7 +3128,7 @@ build the cross-origin bridge once (B & C) + a path|hostname routing switch (C).
 
 | | **A. same-origin** (default) | **B. shared** | **C. wildcard** |
 |---|---|---|---|
-| Preview URL | `vivari.pages.dev/preview/5173/` | `vivari-preview.pages.dev/preview/5173/` | `abc--5173.jamesisme.com/` |
+| Preview URL | `vivari.pages.dev/preview/5173/` | `vivari-preview.pages.dev/preview/5173/` | `vv-<token>--5173.jamesisme.com/` |
 | SW → kernel transport | `findKernelClient()` (same-origin) | bridge iframe + `MessagePort` | bridge iframe + `MessagePort` |
 | Port encoded in | **path** | **path** | **hostname** |
 | keep-prefix hack | needed | needed | **removed** |
@@ -3137,11 +3148,14 @@ A discriminated union on `BootOptions.preview`, defaulting to A (so today's beha
 unchanged):
 
 ```ts
-type PreviewConfig =
-  | { mode: 'same-origin' }                     // A — default
-  | { mode: 'shared';   origin: string }        // B — 'https://vivari-preview.pages.dev'
-  | { mode: 'wildcard'; template: string }      // C — 'https://{id}--{port}--{hash}.jamesisme.com'
-// BootOptions.preview?: PreviewConfig   // default { mode: 'same-origin' }
+// As shipped, BootOptions carries flat, optional fields (the mode is INFERRED):
+interface BootOptions {
+  previewOrigin?: string;          // B — 'https://vivari-preview.pages.dev'
+  previewWildcardDomain?: string;  // C — 'jamesisme.com' (takes precedence over previewOrigin)
+  previewWildcardPrefix?: string;  // C — default 'vv-'
+  previewPopout?: 'same-origin' | 'isolated'; // B pop-out behavior; C is always isolated
+}
+// none set → mode A (same-origin, today's behavior, byte-for-byte).
 ```
 
 Two abstractions keep the modes decoupled:
@@ -3152,15 +3166,15 @@ Two abstractions keep the modes decoupled:
   iframe is **only mounted when `mode !== 'same-origin'`**, so mode A carries **zero added cost**
   (byte-for-byte today's path).
 
-Selected at deploy time via env, e.g.:
+Selected at deploy time via env (studio reads these in `controller.ts`; the mode is inferred, no
+separate `VITE_PREVIEW_MODE`):
 ```
-VITE_PREVIEW_MODE=same-origin
-VITE_PREVIEW_MODE=shared   VITE_PREVIEW_ORIGIN=https://vivari-preview.pages.dev
-VITE_PREVIEW_MODE=wildcard VITE_PREVIEW_TEMPLATE=https://{id}--{port}--{hash}.jamesisme.com
+# A — default: set nothing
+VITE_PREVIEW_ORIGIN=https://vivari-preview.pages.dev            # B (+ optional VITE_PREVIEW_POPOUT=isolated)
+VITE_PREVIEW_WILDCARD_DOMAIN=jamesisme.com                      # C (precedence over B)
 ```
-Optional **fallback**: if C is configured but its cert/DNS isn't live, degrade to B (or A) with a
-console warning ("preview not isolated"). This is a per-deploy choice, not a per-user runtime
-toggle (simpler; a UI toggle can wrap it later without touching the core).
+This is a per-deploy choice, not a per-user runtime toggle (simpler; a UI toggle can wrap it later
+without touching the core).
 
 ### Domain options + the `*.pages.dev` constraint
 - A Pages **project** only gets `<project>.pages.dev` (preview deploys are
@@ -3418,14 +3432,18 @@ Shared plumbing (needed by B and C; inert in A):
   `import.meta.env.VITE_PREVIEW_MODE` / `VITE_PREVIEW_ORIGIN` / `VITE_PREVIEW_TEMPLATE`; pass to
   `KernelBridge`; `previewSrc()` uses the resolver; origin-guard `wirePreviewMessages`.
 
-Deploy (only for B/C):
+Deploy (only for B/C) — **as shipped**:
 - **Mode B**: a second Pages project `vivari-preview` serving `sw.js` + `__vv-bridge.html` +
-  `vv-devtools/chobitsu.js` + a `_headers` (`COEP: credentialless`, `CORP: cross-origin`,
-  `Service-Worker-Allowed: /`). New `scripts/assemble-preview.mjs` + build entry; IDE build sets
-  `VITE_PREVIEW_MODE=shared VITE_PREVIEW_ORIGIN=https://vivari-preview.pages.dev`.
-- **Mode C**: a Cloudflare **Worker** on route `*.jamesisme.com/*` (single-level wildcard, free
-  Universal SSL) serving the same static SW + bridge for every subdomain; IDE build sets
-  `VITE_PREVIEW_MODE=wildcard VITE_PREVIEW_TEMPLATE=https://{id}--{port}--{hash}.jamesisme.com`.
+  `__vv-preview-boot.html` + `vv-devtools/chobitsu.js` + a `_headers` (`COEP: credentialless`,
+  `CORP: cross-origin`, `Service-Worker-Allowed: /`). `scripts/assemble-preview.mjs` +
+  `npm run build:preview`; IDE build sets `VITE_PREVIEW_ORIGIN=https://vivari-preview.pages.dev`
+  (+ optional `VITE_PREVIEW_POPOUT=isolated`).
+- **Mode C**: a Cloudflare **Worker** (`worker/`) on route `vv-*.<domain>/*` (single-level
+  wildcard, free Universal SSL) serving the same static SW runtime for every subdomain — the
+  Worker stamps the isolation headers + serves the boot fallback itself (no `_headers`/`_redirects`).
+  Requires one **proxied** wildcard DNS record `*.<domain>`. `scripts/assemble-worker.mjs` +
+  `npm run build:worker` / `npm run deploy:worker`; IDE build sets
+  `VITE_PREVIEW_WILDCARD_DOMAIN=jamesisme.com`. See `sites/docs/docs/deployment.md`.
 
 Ship order (no wasted work — the core is shared): A exists → add the bridge + dual-transport SW
 and ship **B** (de-risks handshake/SW-revival/COEP with the least infra) → add hostname routing +
@@ -3442,10 +3460,14 @@ delete keep-prefix and ship **C**.
 ### Edge cases / limitations
 - **SW revival** loses the in-memory port → SW asks the bridge client to re-handshake; wait
   briefly before 503.
-- **Open in new tab**: works only while the editor tab is open (the kernel lives there), reached
-  via the shared per-origin SW — same as StackBlitz (see the "fundamental limitation" above). A
-  standalone tab can't reach the in-tab kernel directly (COOP severs opener), so keep it on the
-  current same-origin studio path (lesser isolation, documented) or use a popup with `opener`.
+- **Open in new tab** — **as shipped**: works only while the editor tab is open (the kernel lives
+  there), reached via the shared per-origin SW — same as StackBlitz (see the "fundamental
+  limitation" above). A standalone tab can't reach the in-tab kernel via `window.opener` (COOP
+  severs it), so it relays ws/SSE through the SW and HTTP through the bridge port. Behavior by mode:
+  mode A opens same-origin (frictionless, not isolated); mode B opens same-origin by default or on
+  the isolated preview origin with `VITE_PREVIEW_POPOUT=isolated` (a cross-site preview origin then
+  shows a one-time Storage-Access **gate** — `previewConnectingHtml` in `sw.js`); mode C always
+  opens on the per-port origin, which is **same-site** with the IDE, so it connects **gate-free**.
 - **Multi-tab IDE**: assumes one kernel; multi-tab would need a `?k=<kernelId>` client→port map.
 - **Back/forward** on a cross-origin frame needs the nav-command shim (can't touch its
   `history` from the parent); reload already falls back to a `src` cache-bust.

@@ -750,30 +750,42 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   client. The shim listens on BOTH `window` and `navigator.serviceWorker` for inbound. The studio
   side: `bridge.ts`'s SW `message` listener forwards `dir:'out'` ws/SSE to the kernel worker, and
   `controller` relays inbound frames to the SW(s) (`relayToExternalPreviews` →
-  `bridge.broadcastToPreviewSWs`, which posts to the same-origin controller AND, in mode B, the
+  `bridge.broadcastToPreviewSWs`, which posts to the same-origin controller AND, in modes B/C, every
   bridge port) in addition to the in-app iframes (nested clients, excluded from the SW broadcast →
   no duplicates). Frames carry a per-page `connId`, so broadcasting is safe — each shim keeps only
   its own. (A tab opened by pasting the URL works too, since it's just another top-level preview
   client the SW can reach.)
-- **Separate preview origin (mode B) + pop-out isolation.** Previews are same-origin by default; a
-  deploy can move them to a second origin (`VITE_PREVIEW_ORIGIN`, e.g. `vivari-preview.pages.dev`)
-  so preview code (incl. your npm deps) can't touch IDE cookies/localStorage/OPFS. It's client-side:
-  that origin is static hosting for `sw.js` + a hidden `__vv-bridge.html`; `KernelBridge`
+- **Separate preview origin (modes B & C) + pop-out isolation.** Previews are same-origin by
+  default (mode A); a deploy can move them off the IDE origin so preview code (incl. your npm deps)
+  can't touch IDE cookies/localStorage/OPFS. It's all client-side: a preview origin is static
+  hosting for `sw.js` + a hidden `__vv-bridge.html` (+ `__vv-preview-boot.html`); `KernelBridge`
   iframes the bridge, which registers the cross-origin SW and hands back a persistent `MessagePort`
-  the SW routes preview HTTP over (instead of `findKernelClient`). In mode B the studio ALSO
-  registers a same-origin SW (`registerSameOriginServiceWorker`) so **"Open in new tab"** works: it
-  opens **same-origin by default** (lands in the kernel's storage partition), or on the preview
-  origin behind a "connect this tab" Storage-Access gate (`previewConnectingHtml`) when
-  `VITE_PREVIEW_POPOUT=isolated`. Both env vars go on the **studio (main) project**, not the preview
-  project. There is NO isolated-and-frictionless standalone tab (`same-origin-allow-popups` would
-  drop `crossOriginIsolated` → no SAB). **`isolated` only works gate-free when IDE and preview are
-  *same-site*** (subdomains of one registrable domain, e.g. `vivari.jamesisme.com` +
-  `vivari-preview.jamesisme.com`, opening the IDE at the `jamesisme.com` host): same-site ⇒ not
+  the SW routes preview HTTP over (instead of `findKernelClient`). Two flavors:
+  - **Mode B — shared origin** (`VITE_PREVIEW_ORIGIN`, e.g. `vivari-preview.pages.dev`): one origin
+    for all ports, multiplexed by **path** (`/preview/<port>/`). The studio ALSO registers a
+    same-origin SW (`registerSameOriginServiceWorker`) so **"Open in new tab"** works: it opens
+    **same-origin by default** (lands in the kernel's storage partition), or on the preview origin
+    behind a one-time "connect this tab" Storage-Access gate (`previewConnectingHtml`) when
+    `VITE_PREVIEW_POPOUT=isolated`.
+  - **Mode C — wildcard per-port origin** (`VITE_PREVIEW_WILDCARD_DOMAIN`, e.g. `jamesisme.com`):
+    each port is its own origin `vv-<token>--<port>.<domain>` (random per-boot `<token>`), so the SW
+    reads the port from `self.location.hostname` (`WILDCARD_MODE` in `sw.js`) and serves the app at
+    `/` (no `/preview/` path, keep-prefix is a no-op). `KernelBridge` lazily stands up **one bridge
+    iframe + `MessagePort` per port** (`ensurePreviewBridge`, keyed by origin) as servers `listen`.
+    A Cloudflare **Worker** (`worker/`, route `vv-*.<domain>/*`) serves the static SW runtime +
+    stamps isolation headers. Pop-outs always open on the per-port origin.
+  Env vars go on the **studio (main) project**, not the preview project; `VITE_PREVIEW_WILDCARD_DOMAIN`
+  takes precedence over `VITE_PREVIEW_ORIGIN`. **`isolated` pop-outs only work gate-free when IDE and
+  preview are *same-site*** (subdomains of one registrable domain, e.g. `vivari.jamesisme.com` +
+  `vivari-preview.jamesisme.com`, or mode C's `vv-…--<port>.jamesisme.com`): same-site ⇒ not
   storage-partitioned ⇒ the pop-out shares the bridge SW and connects with **no gate** (verified
-  live), while storage stays origin-isolated. On two `*.pages.dev` projects they're **cross-site**
-  (PSL) ⇒ partitioned ⇒ Chrome's Storage-Access can't un-partition a Service Worker ⇒ the gate never
-  grants, so use `same-origin` pop-out there. Deep dive: `roadmap.md` ("preview origin isolation" +
-  "Pop-out behavior" → "same-site vs cross-site").
+  live) while storage stays origin-isolated. **Mode C is same-site by construction**, so it's
+  gate-free. On two `*.pages.dev` projects they're **cross-site** (PSL) ⇒ partitioned ⇒ Chrome's
+  Storage-Access can't un-partition a Service Worker ⇒ the gate never grants, so use `same-origin`
+  pop-out there. There is otherwise NO isolated-*and*-frictionless standalone tab on a cross-site
+  origin (`same-origin-allow-popups` would drop `crossOriginIsolated` → no SAB). Deep dive:
+  `roadmap.md` ("preview origin isolation" + "Pop-out behavior" → "same-site vs cross-site") +
+  `sites/docs/docs/deployment.md`.
 - **SSE goes through its OWN tunnel — NOT the HTTP proxy.** A `text/event-stream` response
   can't cross `handleHttpRequest`/`OP_RESPOND` (buffered end-to-end: the SW waits for ONE
   complete body, so a never-ending SSE stream 504s at 60s). So an **`EventSource` polyfill**
@@ -860,6 +872,13 @@ client agree. Templates doing this: **Docusaurus** (`baseUrl`), **React Router 7
 (`react-router.config.ts` `basename` + Vite `base`, both `/preview/5173/`, trailing
 slash required). Symptom if you forget: "not found" on first load / `No route matches
 URL "/preview/<port>/"`.
+
+**Mode C auto-adapts these.** In mode C each port is its own origin served at `/`, so
+the hardcoded `/preview/<port>/` base would 404. `createFromTemplate` calls
+`rewritePreviewBaseToRoot` when `previewMode === "wildcard"` && `keepPreviewPrefix`,
+which rewrites only the `base`/`basename`/`baseUrl` config keys to `"/"` (leaving
+legit cross-service URLs like `'/preview/'+PORT+'/api'` intact) and drops the flag —
+so every template runs correctly in every mode. Modes A/B keep the template verbatim.
 
 ### `module` is a REAL constructor — route requires through `Module._load`
 `require('module')` returns the `Module` **constructor** (not a plain object);

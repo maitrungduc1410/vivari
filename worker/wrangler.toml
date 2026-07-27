@@ -1,0 +1,30 @@
+# Cloudflare Worker for mode C — wildcard per-port preview origins.
+#
+# Deploy with:  npm run deploy:worker   (runs `wrangler deploy` in this dir)
+# Assets are assembled from the studio build into ./public by
+# scripts/assemble-worker.mjs (run `npm run build:worker` first).
+#
+# See sites/docs/docs/deployment.md → "Mode C" for the full setup (wildcard DNS +
+# route + the VITE_PREVIEW_WILDCARD_DOMAIN env on the IDE build).
+
+name = "vivari-preview"
+main = "src/index.js"
+# Pins the Workers runtime behavior to this date (any date <= today). Bump it (and
+# re-test) to opt into newer runtime defaults; it is NOT tied to the current year.
+compatibility_date = "2026-07-01"
+
+# Static SW-runtime files (sw.js, __vv-bridge.html, __vv-preview-boot.html,
+# vv-devtools/*). run_worker_first lets index.js gate on the hostname and stamp
+# isolation headers on every response instead of Cloudflare serving assets raw.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = true
+
+# Wildcard route for the per-port preview hosts. Requires a PROXIED wildcard DNS
+# record `*.<domain>` on the zone. Uncomment + set your zone, or add the route in
+# the Cloudflare dashboard (Workers Routes). `*` matches the `<token>--<port>` part.
+#
+# [[routes]]
+# pattern = "vv-*.jamesisme.com/*"
+# zone_name = "jamesisme.com"

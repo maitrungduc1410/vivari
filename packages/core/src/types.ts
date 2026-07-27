@@ -33,9 +33,33 @@ export interface BootOptions {
    */
   previewOrigin?: string;
   /**
+   * Serve **each in-VM port from its own origin** (mode C, wildcard) — e.g.
+   * `vv-<token>--5173.jamesisme.com` and `vv-<token>--3000.jamesisme.com`. Set
+   * this to the **base domain** you control (e.g. `"jamesisme.com"`); Vivari
+   * composes `<prefix><token>--<port>.<domain>` per port with a random per-boot
+   * `<token>`. This isolates IDE↔preview **and** preview↔preview and matches real
+   * `localhost:<port>` web-platform semantics. Because those hosts are subdomains
+   * of the same base domain as the IDE, the isolated pop-out is **gate-free**
+   * (same-site) — use a *different* base domain for max cross-site isolation.
+   *
+   * Requires wildcard infra: a proxied `*` DNS record and a Cloudflare Worker on
+   * `*.<domain>/*` serving `sw.js` + `__vv-bridge.html` + `__vv-preview-boot.html`
+   * (+ `vv-devtools/chobitsu.js`) with `COEP: credentialless`, `CORP:
+   * cross-origin`, `Service-Worker-Allowed: /`. Takes precedence over
+   * {@link previewOrigin} when both are set. Leave unset for mode A/B.
+   */
+  previewWildcardDomain?: string;
+  /**
+   * Hostname prefix for wildcard preview origins (mode C). Default `"vv-"`. Lets
+   * the Worker cheaply tell Vivari preview hosts apart from other apps on the same
+   * base domain, and lets `sw.js` detect it's running on a per-port origin.
+   */
+  previewWildcardPrefix?: string;
+  /**
    * How **"Open in new tab"** (a preview opened as its own top-level tab) behaves.
    * Only meaningful together with {@link previewOrigin} (mode B); with previews
-   * running same-origin (mode A) a pop-out is always same-origin regardless.
+   * running same-origin (mode A) a pop-out is always same-origin regardless. In
+   * wildcard mode (C) a pop-out always opens on the per-port origin (isolated).
    *
    * - `"same-origin"` (default): the pop-out opens on the **IDE origin** and
    *   proxies through the same-origin Service Worker. It reaches the kernel with

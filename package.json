@@ -43,8 +43,11 @@
     "build:react": "npm run build --workspace @vivari/react",
     "build:site": "bash scripts/cloudflare-build.sh",
     "build:preview": "bash scripts/cloudflare-build-preview.sh",
+    "build:worker": "bash scripts/cloudflare-build-worker.sh",
+    "deploy:worker": "cd worker && wrangler deploy",
     "assemble:site": "node scripts/assemble-site.mjs",
     "assemble:preview": "node scripts/assemble-preview.mjs",
+    "assemble:worker": "node scripts/assemble-worker.mjs",
     "build:sdk": "npm run build:core && npm run build:react",
     "typecheck:sdk": "npm run typecheck --workspace @vivari/core && npm run typecheck --workspace @vivari/react"
   },

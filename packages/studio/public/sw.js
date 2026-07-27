@@ -11,6 +11,16 @@
 
 const PREVIEW_MARKER = "/preview/";
 
+// Mode C (wildcard per-port origin): when this SW is served on a preview host
+// like `vv-<token>--<port>.<domain>` the target port is encoded in the HOSTNAME
+// (one origin per port), not in a `/preview/<port>/` PATH. Detect it once at SW
+// startup; when set, every request on this origin proxies to WILDCARD_PORT and
+// the path-based routing below is bypassed entirely. On the IDE origin (modes
+// A/B) the hostname doesn't match, so WILDCARD_MODE is false and nothing changes.
+const WILDCARD_HOST = self.location.hostname.match(/^vv-[a-z0-9]+--(\d+)\./i);
+const WILDCARD_PORT = WILDCARD_HOST ? parseInt(WILDCARD_HOST[1], 10) : 0;
+const WILDCARD_MODE = WILDCARD_PORT > 0;
+
 // Client ids of pages that host a Vivari kernel (announced via `vv-kernel-host`;
 // see bridge.registerServiceWorker). handlePreview routes each preview HTTP
 // request to one of these — NOT simply the top-level window — because Vivari can
@@ -115,7 +125,11 @@ function applyDevtools(enabled, waitUntil) {
 function broadcastInboundFrame(d) {
   return self.clients.matchAll({ type: "window" }).then((cs) => {
     for (const c of cs) {
-      if (c.frameType === "top-level" && c.url.includes(PREVIEW_MARKER)) c.postMessage(d);
+      // Mode C: this origin serves a single port, so every top-level client here
+      // IS a preview (no /preview/ marker in the URL). Mode A/B: match the marker.
+      if (c.frameType === "top-level" && (WILDCARD_MODE || c.url.includes(PREVIEW_MARKER))) {
+        c.postMessage(d);
+      }
     }
   });
 }
@@ -402,8 +416,9 @@ window.__vvNet = {
 // preview port -> a genuine in-VM WebSocket to the dev server's HMR socket.
 const WS_SHIM = `(function(){
 if (window.__vvWsInstalled) return; window.__vvWsInstalled = true;
+var hm = location.hostname.match(/^vv-[a-z0-9]+--(\\d+)\\./i);
 var m = location.pathname.match(/\\/preview\\/(\\d+)\\//);
-var previewPort = m ? parseInt(m[1], 10) : 0;
+var previewPort = hm ? parseInt(hm[1], 10) : (m ? parseInt(m[1], 10) : 0);
 var tok = Math.random().toString(36).slice(2, 8);
 var nextId = 1, conns = {};
 // The preview relays connection frames to the window that talks to the kernel: our
@@ -548,8 +563,9 @@ try {
 // message/named events per the SSE spec. SSE is one-way, so there's no send() leg.
 const SSE_SHIM = `(function(){
 if (window.__vvSseInstalled) return; window.__vvSseInstalled = true;
+var hm = location.hostname.match(/^vv-[a-z0-9]+--(\\d+)\\./i);
 var m = location.pathname.match(/\\/preview\\/(\\d+)\\//);
-var previewPort = m ? parseInt(m[1], 10) : 0;
+var previewPort = hm ? parseInt(hm[1], 10) : (m ? parseInt(m[1], 10) : 0);
 var tok = Math.random().toString(36).slice(2, 8);
 var nextId = 1, conns = {};
 // Host resolution matches the ws shim: the studio iframe's parent when embedded, or
@@ -664,12 +680,21 @@ var seq = 0;
 // (http://localhost:<port>/<path>), so the Network panel matches what the ws/SSE
 // shims already show. Display-only: the requestId (and thus getResponseBody) is
 // untouched.
+var _hp = location.hostname.match(/^vv-[a-z0-9]+--(\\d+)\\./i);
 var _pp = location.pathname.match(/^\\/preview\\/(\\d+)\\//);
-var previewPort = _pp ? parseInt(_pp[1], 10) : 0;
+var previewPort = _hp ? parseInt(_hp[1], 10) : (_pp ? parseInt(_pp[1], 10) : 0);
 function cleanUrl(u){
   try {
     var url = new URL(u, location.href);
     if (url.origin !== location.origin) return u;
+    var scheme0 = (location.protocol === 'https:') ? 'https' : 'http';
+    // Mode C: this whole origin maps to one in-VM port; show localhost:<port>.
+    // An explicit /preview/<port>/ (cross-service) still shows its real target port.
+    if (_hp) {
+      var pmc = url.pathname.match(/^\\/preview\\/(\\d+)(\\/.*)?$/);
+      if (pmc) return scheme0 + '://localhost:' + pmc[1] + (pmc[2] || '/') + url.search + url.hash;
+      return scheme0 + '://localhost:' + previewPort + url.pathname + url.search + url.hash;
+    }
     var pm = url.pathname.match(/^\\/preview\\/(\\d+)(\\/.*)?$/);
     if (!pm) return u;
     var port = parseInt(pm[1], 10);
@@ -861,6 +886,27 @@ self.addEventListener("fetch", (event) => {
     url.pathname === "/__vv-preview-boot" ||
     url.pathname === "/__vv-preview-boot.html"
   ) {
+    return;
+  }
+
+  // Mode C (wildcard per-port origin): the port is in the hostname, so a request
+  // on this origin belongs to this origin's single in-VM port — served at root
+  // (no proxy prefix to strip, no keep-prefix). Two exceptions keep parity with
+  // modes A/B: our static SW-runtime files (bridge/boot handled above; DevTools
+  // below) hit the network so the Worker can serve them; and an explicit
+  // `/preview/<port>/…` URL still addresses ANOTHER in-VM port so **cross-service
+  // HTTP** (a frontend calling a backend on a different port) keeps working
+  // exactly as before — the kernel is shared across every origin's bridge port.
+  if (WILDCARD_MODE) {
+    if (url.pathname.startsWith("/vv-devtools/")) return;
+    const cross = url.pathname.match(/^\/preview\/(\d+)(\/.*)?$/);
+    if (cross) {
+      event.respondWith(
+        handlePreview(event, parseInt(cross[1], 10), (cross[2] || "/") + url.search, false),
+      );
+    } else {
+      event.respondWith(handlePreview(event, WILDCARD_PORT, url.pathname + url.search, false));
+    }
     return;
   }
 
