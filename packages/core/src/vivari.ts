@@ -79,6 +79,7 @@ export class Vivari {
     const bridge = new KernelBridge({
       workerName: options.workerName,
       previewOrigin: options.previewOrigin,
+      previewPopout: options.previewPopout,
     });
     const vivari = new Vivari(bridge, options.previewOrigin);
 

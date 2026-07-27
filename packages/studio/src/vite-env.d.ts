@@ -8,4 +8,11 @@ interface ImportMetaEnv {
    * IDE↔preview isolation. Unset in the default same-origin deploy + local dev.
    */
   readonly VITE_PREVIEW_ORIGIN?: string;
+  /**
+   * How "Open in new tab" behaves in mode B (see BootOptions.previewPopout).
+   * `"same-origin"` (default) opens the pop-out on the IDE origin (frictionless,
+   * not isolated); `"isolated"` opens it on the preview origin behind a one-time
+   * Storage Access gate. Unset/ignored in the default same-origin deploy.
+   */
+  readonly VITE_PREVIEW_POPOUT?: "same-origin" | "isolated";
 }

@@ -737,8 +737,8 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   DOUBLED (`\\/preview\\/(\\d+)…`).
 - **ws/SSE tunnel: iframe → `parent`, standalone tab → the Service Worker.** Both shims
   `post()` their connection frames to the window that relays to the kernel — the iframe's
-  `parent` in the studio. But **"Open in new tab"** (`window.open('/preview/<port>/')`,
-  `controller.openExternalPreview`) makes the preview a TOP-LEVEL document, and the studio's
+  `parent` in the studio. But **"Open in new tab"** (`controller.openExternalPreview`) makes the
+  preview a TOP-LEVEL document, and the studio's
   **`COOP: same-origin`** (mandatory for `SharedArrayBuffer`) puts it in a *separate
   browsing-context group* with **`window.opener === null`** — so there is NO window to
   postMessage. (This is why ws/SSE — and even Vite HMR — hang at `connecting…` in a new tab
@@ -749,10 +749,25 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   client (`findKernelClient`) and broadcasts `dir:'in'` frames to every **top-level** preview
   client. The shim listens on BOTH `window` and `navigator.serviceWorker` for inbound. The studio
   side: `bridge.ts`'s SW `message` listener forwards `dir:'out'` ws/SSE to the kernel worker, and
-  `controller` relays inbound frames to the SW (`relayToExternalPreviews`) in addition to the
-  in-app iframes (nested clients, excluded from the SW broadcast → no duplicates). Frames carry a
-  per-page `connId`, so broadcasting is safe — each shim keeps only its own. (A tab opened by
-  pasting the URL works too, since it's just another top-level preview client the SW can reach.)
+  `controller` relays inbound frames to the SW(s) (`relayToExternalPreviews` →
+  `bridge.broadcastToPreviewSWs`, which posts to the same-origin controller AND, in mode B, the
+  bridge port) in addition to the in-app iframes (nested clients, excluded from the SW broadcast →
+  no duplicates). Frames carry a per-page `connId`, so broadcasting is safe — each shim keeps only
+  its own. (A tab opened by pasting the URL works too, since it's just another top-level preview
+  client the SW can reach.)
+- **Separate preview origin (mode B) + pop-out isolation.** Previews are same-origin by default; a
+  deploy can move them to a second origin (`VITE_PREVIEW_ORIGIN`, e.g. `vivari-preview.pages.dev`)
+  so preview code (incl. your npm deps) can't touch IDE cookies/localStorage/OPFS. It's client-side:
+  that origin is static hosting for `sw.js` + a hidden `__vv-bridge.html`; `KernelBridge`
+  iframes the bridge, which registers the cross-origin SW and hands back a persistent `MessagePort`
+  the SW routes preview HTTP over (instead of `findKernelClient`). In mode B the studio ALSO
+  registers a same-origin SW (`registerSameOriginServiceWorker`) so **"Open in new tab"** works: it
+  opens **same-origin by default** (lands in the kernel's storage partition), or on the preview
+  origin behind a "connect this tab" Storage-Access gate (`previewConnectingHtml`) when
+  `VITE_PREVIEW_POPOUT=isolated`. Both env vars go on the **studio (main) project**, not the preview
+  project. There is NO isolated-and-frictionless standalone tab (`same-origin-allow-popups` would
+  drop `crossOriginIsolated` → no SAB). Deep dive: `roadmap.md` ("preview origin isolation" +
+  "Pop-out behavior").
 - **SSE goes through its OWN tunnel — NOT the HTTP proxy.** A `text/event-stream` response
   can't cross `handleHttpRequest`/`OP_RESPOND` (buffered end-to-end: the SW waits for ONE
   complete body, so a never-ending SSE stream 504s at 60s). So an **`EventSource` polyfill**

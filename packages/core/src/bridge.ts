@@ -30,6 +30,10 @@ export class KernelBridge {
   // Mode B (separate preview origin): the origin that hosts the preview SW +
   // bridge doc. Empty string / undefined = mode A (same-origin previews).
   private readonly previewOrigin?: string;
+  // How "Open in new tab" behaves in mode B (see BootOptions.previewPopout).
+  // "isolated" opens pop-outs on the preview origin; default "same-origin" opens
+  // them on the IDE origin. Ignored in mode A (pop-outs are always same-origin).
+  private readonly previewPopout: "same-origin" | "isolated";
   // The hidden bridge iframe (on the preview origin) and the persistent port to
   // the SW living there. Only used in mode B.
   private bridgeFrame?: HTMLIFrameElement;
@@ -39,12 +43,19 @@ export class KernelBridge {
   private pendingKeepPrefix?: number[];
   private pendingDevtools?: boolean;
 
-  constructor(options: { workerName?: string; previewOrigin?: string } = {}) {
+  constructor(
+    options: {
+      workerName?: string;
+      previewOrigin?: string;
+      previewPopout?: "same-origin" | "isolated";
+    } = {},
+  ) {
     // Only treat a *different* origin as mode B; an accidental same-origin value
     // stays on the simpler same-origin path.
     const here = typeof location !== "undefined" ? location.origin : "";
     this.previewOrigin =
       options.previewOrigin && options.previewOrigin !== here ? options.previewOrigin : undefined;
+    this.previewPopout = options.previewPopout === "isolated" ? "isolated" : "same-origin";
     this.worker = new Worker(
       new URL("./workers/kernel-worker.ts", import.meta.url),
       { type: "module", name: options.workerName ?? "Vivari Kernel" },
@@ -127,13 +138,64 @@ export class KernelBridge {
     return this.previewOrigin ?? "";
   }
 
+  /**
+   * Whether "Open in new tab" should open on the (isolated) preview origin. True
+   * only in mode B with `previewPopout: "isolated"`; otherwise pop-outs open
+   * same-origin with the IDE.
+   */
+  get popoutIsolated(): boolean {
+    return !!this.previewOrigin && this.previewPopout === "isolated";
+  }
+
+  /**
+   * Relay an inbound ws/SSE frame to preview tabs opened in their OWN tab. A
+   * pop-out may be same-origin (served by the same-origin SW) or isolated (served
+   * by the preview-origin SW over the bridge port), so post to BOTH transports;
+   * each SW only reaches the clients it controls and each shim keeps only its own
+   * connIds. No-op for whichever transport isn't present.
+   */
+  broadcastToPreviewSWs(payload: object): void {
+    try {
+      if (typeof navigator !== "undefined" && "serviceWorker" in navigator) {
+        navigator.serviceWorker.controller?.postMessage(payload);
+      }
+    } catch {
+      /* same-origin SW not controlling */
+    }
+    try {
+      this.kernelPort?.postMessage(payload);
+    } catch {
+      /* bridge port not connected */
+    }
+  }
+
   /** Register the preview Service Worker and wire its HTTP relay into the VM. */
   async registerServiceWorker(url = "/sw.js"): Promise<boolean> {
     if (this.swRegistered) return true;
     if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return false;
-    // Mode B: the SW lives on a different origin — we can't register it here.
-    // Load a hidden bridge doc there that registers it and hands us a port.
-    if (this.previewOrigin) return this.setupPreviewBridge(url);
+    if (this.previewOrigin) {
+      // Mode B: the *embedded* preview renders on a SEPARATE origin (isolation)
+      // via a hidden bridge doc that registers the SW there and relays a port.
+      const bridgeOk = await this.setupPreviewBridge(url);
+      // …but ALSO register a same-origin SW here so "Open in new tab" pop-outs
+      // work. The editor opens pop-outs on THIS origin: a standalone tab on the
+      // *preview* origin can't reach the kernel (browser storage partitioning
+      // puts it in a different partition than the editor tab), whereas a
+      // same-origin pop-out shares the kernel's partition and proxies through this
+      // SW just like mode A. The untrusted *embedded* preview stays isolated on
+      // the preview origin.
+      try {
+        await this.registerSameOriginServiceWorker(url);
+      } catch {
+        // Pop-outs won't work, but the embedded preview (bridge) still does.
+      }
+      return bridgeOk;
+    }
+    return this.registerSameOriginServiceWorker(url);
+  }
+
+  /** The classic same-origin SW path (mode A, and mode-B pop-outs). */
+  private async registerSameOriginServiceWorker(url: string): Promise<boolean> {
     await navigator.serviceWorker.register(url, { scope: "/" });
     await navigator.serviceWorker.ready;
     // On a fresh load the document was fetched before the SW existed, so the page
@@ -252,27 +314,13 @@ export class KernelBridge {
   }
 
   /**
-   * Relay a payload to the preview Service Worker (e.g. inbound ws/SSE frames for
-   * a preview opened in its own tab). Mode B routes it over the persistent port;
-   * mode A hands it to the same-origin controlling SW.
-   */
-  postToPreviewSW(payload: object): void {
-    if (this.previewOrigin) {
-      this.kernelPort?.postMessage(payload);
-      return;
-    }
-    if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
-    navigator.serviceWorker.controller?.postMessage(payload);
-  }
-
-  /**
-   * Announce to the preview Service Worker that this page hosts the kernel, so it
-   * can route `/preview/<port>/` requests to this client. Safe to call repeatedly;
-   * a no-op when there's no controlling SW yet. In mode B the SW routes over the
-   * persistent port instead, so this is unnecessary.
+   * Announce to the same-origin Service Worker that this page hosts the kernel, so
+   * it routes `/preview/<port>/` requests here — used by mode A and by mode-B
+   * same-origin pop-outs. Safe to call repeatedly; a no-op when there's no
+   * controlling SW yet. (The mode-B *embedded* preview routes over the persistent
+   * port instead, which doesn't need this.)
    */
   announceKernelHost(): void {
-    if (this.previewOrigin) return;
     if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
     navigator.serviceWorker.controller?.postMessage({ type: "vv-kernel-host" });
   }

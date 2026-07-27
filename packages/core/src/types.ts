@@ -32,6 +32,25 @@ export interface BootOptions {
    * default) to run previews same-origin with the IDE (mode A).
    */
   previewOrigin?: string;
+  /**
+   * How **"Open in new tab"** (a preview opened as its own top-level tab) behaves.
+   * Only meaningful together with {@link previewOrigin} (mode B); with previews
+   * running same-origin (mode A) a pop-out is always same-origin regardless.
+   *
+   * - `"same-origin"` (default): the pop-out opens on the **IDE origin** and
+   *   proxies through the same-origin Service Worker. It reaches the kernel with
+   *   zero friction, at the cost of not being isolated from the IDE. Best when you
+   *   run your own trusted code.
+   * - `"isolated"`: the pop-out opens on the **preview origin** so it can't touch
+   *   IDE storage/OPFS. Because a standalone cross-site tab lives in a different
+   *   browser storage partition than the editor tab, it can only auto-connect when
+   *   storage is unpartitioned; otherwise it shows a one-time "connect this tab"
+   *   gate (Storage Access) — the same trade-off StackBlitz makes. Prefer this when
+   *   previews may run untrusted code.
+   *
+   * The **embedded** preview stays isolated on the preview origin in both cases.
+   */
+  previewPopout?: "same-origin" | "isolated";
   /** Name shown for the kernel Worker in DevTools. Default: `"Vivari Kernel"`. */
   workerName?: string;
   /**

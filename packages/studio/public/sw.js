@@ -215,19 +215,27 @@ async function resolveKernelSink() {
   return client ? { post: (m, t) => client.postMessage(m, t || []), cross: false } : null;
 }
 
-// The studio window that hosts the kernel — a top-level, non-preview, non-DevTools
-// client (preferring one that announced itself via vv-kernel-host so an EMBEDDED
+// The window that hosts the kernel — a non-preview, non-DevTools, non-bridge
+// window (preferring one that announced itself via vv-kernel-host so an EMBEDDED
 // Vivari, whose kernel is in a nested frame, still resolves). Used to route both
 // preview HTTP and the standalone-tab ws/SSE tunnel to the running kernel.
+//
+// Returns null when NO plausible kernel window exists. This is critical on a
+// mode-B *preview origin*, where every window client is itself a preview / bridge
+// / boot page and the real kernel is only reachable via the persistent port: we
+// must NOT fall back to "any client" (that would post the request to the preview
+// tab itself → nobody answers → "Preview timed out"). Returning null lets the
+// caller show the friendly "connecting…" page instead.
 function pickKernelClient(clients) {
   const isPreview = (c) => c.url.includes(PREVIEW_MARKER);
   const isDevtools = (c) => c.url.includes("/devtools-host.html") || c.url.includes("/devtools/");
+  const isBridge = (c) => c.url.includes("/__vv-bridge") || c.url.includes("/__vv-preview-boot");
+  const ok = (c) => !isPreview(c) && !isDevtools(c) && !isBridge(c);
   return (
-    clients.find((c) => kernelHostIds.has(c.id) && !isPreview(c) && !isDevtools(c)) ||
-    clients.find((c) => c.frameType === "top-level" && !isPreview(c) && !isDevtools(c)) ||
-    clients.find((c) => !isPreview(c) && !isDevtools(c)) ||
-    clients.find((c) => !isPreview(c)) ||
-    clients[0]
+    clients.find((c) => kernelHostIds.has(c.id) && ok(c)) ||
+    clients.find((c) => c.frameType === "top-level" && ok(c)) ||
+    clients.find(ok) ||
+    null
   );
 }
 
@@ -945,11 +953,14 @@ async function routeByClient(event, url) {
   return handlePreview(event, parseInt(m[1], 10), url.pathname + url.search);
 }
 
-// A friendly "connecting…" page for a standalone mode-B preview tab that can't
-// reach the kernel yet. It retries a few times (browser storage partitioning can
-// delay the shared SW/port becoming visible to a first-party tab), then explains
-// what to do — mirroring StackBlitz's "You're almost there" screen instead of a
-// dead 404.
+// A friendly "connecting…" gate for a standalone mode-B preview tab (isolated
+// pop-out, or a pasted preview-origin URL) that can't reach the kernel yet. It
+// briefly auto-retries (a just-claimed SW may not see its clients for a tick),
+// then — because a standalone cross-site tab is in a different storage partition
+// than the editor tab — reveals a "Connect this tab" gate that best-effort calls
+// the Storage Access API inside the click gesture and reloads, falling back to
+// browser-config instructions. This mirrors StackBlitz's "You're almost there"
+// screen and is inherent to any client-side kernel (no server to reach).
 function previewConnectingHtml(port) {
   return (
     "<!doctype html><html><head><meta charset='utf-8'>" +
@@ -963,18 +974,36 @@ function previewConnectingHtml(port) {
     ".spin{width:26px;height:26px;margin:0 auto 1rem;border:3px solid #2a2f36;border-top-color:#6aa3ff;" +
     "border-radius:50%;animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}" +
     "h1{font-size:1.15rem;margin:.25rem 0 .5rem}p{color:#9aa4af;margin:.4rem 0}code{color:#cbd5e1}" +
+    "button{margin-top:1rem;padding:.6rem 1.1rem;border:0;border-radius:.5rem;background:#3b82f6;" +
+    "color:#fff;font:inherit;font-weight:600;cursor:pointer}button:hover{background:#2f6fe0}" +
+    "button:disabled{opacity:.6;cursor:default}" +
     "</style></head><body><div class='card'>" +
     "<div class='spin' id='sp'></div>" +
     "<h1 id='t'>Connecting to your Vivari project…</h1>" +
     "<p id='m'>Preview on port <code>" + port + "</code>. Keep the Vivari editor tab open.</p>" +
+    "<div id='g' style='display:none'>" +
+    "<button id='b' type='button'>Connect this tab</button>" +
+    "<p id='hint' style='display:none'></p>" +
+    "</div>" +
     "<script>(function(){" +
     "var k='vv-preview-tries';var n=+(sessionStorage.getItem(k)||0);" +
-    "if(n<6){sessionStorage.setItem(k,n+1);setTimeout(function(){location.reload()},1500);}" +
-    "else{sessionStorage.removeItem(k);" +
-    "document.getElementById('sp').style.display='none';" +
-    "document.getElementById('t').textContent='Can\\u2019t reach your Vivari project';" +
-    "document.getElementById('m').innerHTML='Open the preview from the <b>Vivari editor tab</b> and keep it open. "+
-    "If it still won\\u2019t load, allow third-party data for this site in your browser (previews run cross-origin for isolation).';}" +
+    "var sp=document.getElementById('sp'),t=document.getElementById('t'),m=document.getElementById('m');" +
+    "var g=document.getElementById('g'),b=document.getElementById('b'),hint=document.getElementById('hint');" +
+    // Auto-retry a few times: self-heals when storage is already unpartitioned.
+    "if(n<3){sessionStorage.setItem(k,n+1);setTimeout(function(){location.reload()},1500);return;}" +
+    "sessionStorage.removeItem(k);sp.style.display='none';" +
+    "t.textContent='Connect this tab to your Vivari project';" +
+    "m.innerHTML='This preview runs on a separate origin for isolation. Keep the <b>Vivari editor tab</b> open, then connect this tab.';" +
+    "g.style.display='block';" +
+    "function fallback(){hint.style.display='block';" +
+    "hint.innerHTML='Still stuck? Allow third-party data / cookies for this site in your browser settings, then reload \\u2014 previews run cross-origin so the browser isolates their storage by default.';}" +
+    "b.addEventListener('click',function(){" +
+    "b.disabled=true;b.textContent='Connecting\\u2026';" +
+    // requestStorageAccess must run in a user gesture; best-effort, then reload.
+    "var req=document.requestStorageAccess?document.requestStorageAccess():Promise.reject();" +
+    "Promise.resolve(req).then(function(){location.reload();})" +
+    ".catch(function(){b.disabled=false;b.textContent='Try again';fallback();});" +
+    "});" +
     "})();<\/script>" +
     "</div></body></html>"
   );

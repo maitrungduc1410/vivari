@@ -38,6 +38,12 @@ function normalizePreviewOrigin(raw: string | undefined): string | undefined {
   }
 }
 
+// Build-time pop-out behavior (VITE_PREVIEW_POPOUT). Anything other than the
+// explicit "isolated" opt-in falls back to the frictionless same-origin default.
+function normalizePreviewPopout(raw: string | undefined): "same-origin" | "isolated" {
+  return raw === "isolated" ? "isolated" : "same-origin";
+}
+
 // ── Demo matrix (UI side) ────────────────────────────────────────────────────
 // The two hard-coded example projects the kernel worker still scaffolds on demand
 // (the "Run" button's legacy path). New projects come from Home (blank/template).
@@ -521,11 +527,17 @@ export class IdeController {
   // preview URLs stay relative and nothing changes. When set, previews are served
   // from that origin (see KernelBridge.previewBase) for IDE↔preview isolation.
   private readonly previewBase: string;
+  // Mode B pop-out behavior. When true, "Open in new tab" opens on the isolated
+  // preview origin (behind a connect gate); otherwise it opens same-origin with
+  // the IDE. Always false in mode A. See normalizePreviewPopout / openExternalPreview.
+  private readonly popoutIsolated: boolean;
 
   constructor() {
     const previewOrigin = normalizePreviewOrigin(import.meta.env.VITE_PREVIEW_ORIGIN);
-    this.bridge = new KernelBridge({ previewOrigin });
+    const previewPopout = normalizePreviewPopout(import.meta.env.VITE_PREVIEW_POPOUT);
+    this.bridge = new KernelBridge({ previewOrigin, previewPopout });
     this.previewBase = this.bridge.previewBase;
+    this.popoutIsolated = this.bridge.popoutIsolated;
     this.debug = new DebugSession(this.bridge);
     // When execution pauses (or a frame is selected), open the file + reveal the line.
     this.debug.onReveal = (path, line) => void this.openFileAt(path, line);
@@ -2285,28 +2297,31 @@ export class IdeController {
     if (t?.port != null) this.openExternalPreview(t.port);
   }
 
-  // Open a preview port in a standalone browser tab. Everything reaches the running
-  // kernel (which lives in THIS tab) through the Service Worker, since the studio's
-  // COOP:same-origin puts the new tab in a separate browsing-context group with no
-  // window.opener link: HTTP already routes via the SW, and the ws/SSE tunnels do
-  // too — the opened tab's shim talks to the SW, and we relay inbound frames back
-  // through the SW in the vv-ws/vv-sse handlers below.
+  // Open a preview port in a standalone browser tab.
+  //
+  // Default (same-origin pop-out): open on the studio's OWN origin so the tab
+  // lands in the kernel's storage partition and proxies through the same-origin
+  // SW — frictionless, but not isolated from the IDE. COOP:same-origin puts the
+  // new tab in a separate browsing-context group (no window.opener), so HTTP
+  // routes via the SW and the ws/SSE tunnels do too (the opened tab's shim talks
+  // to the SW; we relay inbound frames back via relayToExternalPreviews).
+  //
+  // Isolated pop-out (previewPopout: "isolated", mode B): open on the preview
+  // origin so it can't touch IDE storage/OPFS. It only auto-connects when the
+  // browser's storage is unpartitioned; otherwise the preview SW serves a
+  // "connect this tab" gate (see previewConnectingHtml in sw.js).
   openExternalPreview(port: number) {
-    window.open(`${this.previewBase}/preview/${port}/`, "_blank");
+    const base = this.popoutIsolated ? this.previewBase : "";
+    window.open(`${base}/preview/${port}/`, "_blank");
   }
 
   // Relay an inbound ws/SSE frame to any preview opened in its OWN tab. Those tabs
   // can't be reached by postMessage (COOP severs the handle), so hand the frame to
-  // the SW, which broadcasts it to every top-level preview client; each shim keeps
-  // only the connIds it owns. Mode B routes over the bridge port (the SW is
-  // cross-origin); mode A uses the same-origin controller. No-op when neither is
-  // ready yet.
+  // the Service Worker(s), which broadcast it to every top-level preview client;
+  // each shim keeps only the connIds it owns. A pop-out may be same-origin OR on
+  // the preview origin, so relay to both transports (bridge.broadcastToPreviewSWs).
   private relayToExternalPreviews(payload: object) {
-    try {
-      this.bridge.postToPreviewSW(payload);
-    } catch {
-      /* SW/bridge not ready — nothing to relay to */
-    }
+    this.bridge.broadcastToPreviewSWs(payload);
   }
 
   closePreviewTab(id: string) {

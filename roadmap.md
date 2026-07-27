@@ -3269,6 +3269,38 @@ not a network address. This is inherent to every client-side container (Vivari i
 persistent/shareable preview would require a server (i.e. leaving the no-server model) — position
 that as a separate, future server-backed feature, not part of this work.
 
+### Pop-out behavior: `same-origin` vs `isolated` (shipped, mode B)
+
+"Open in new tab" opens a preview as its **own top-level tab**, which is where the capability-ticket
+limitation bites: a standalone cross-site tab lives in a **different browser storage partition** than
+the editor tab, and the editor's `COOP: same-origin` (needed for `SharedArrayBuffer`) severs
+`window.opener` — so there is **no pure-code channel** from the standalone tab to the kernel. Two
+honest choices, exposed as a per-deploy axis `BootOptions.previewPopout` (env `VITE_PREVIEW_POPOUT`),
+default `same-origin`. The **embedded** preview stays isolated on the preview origin in both cases;
+only the explicit pop-out differs.
+
+| `previewPopout` | Pop-out origin | Isolated from IDE? | Friction |
+|---|---|---|---|
+| `same-origin` (default) | IDE origin (`vivari.pages.dev`) | No | None — proxies through the same-origin SW in the kernel's partition |
+| `isolated` | preview origin (`vivari-preview.pages.dev`) | Yes | One-time "connect this tab" gate when storage is partitioned |
+
+- **same-origin** trades the pop-out's isolation for zero friction. Because it runs on the IDE origin,
+  a pop-out CAN read/clear IDE storage (localStorage, the OPFS-persisted VFS, caches) — fine when you
+  run your own trusted code; not fine for untrusted code. Implemented by opening `/preview/<port>/` on
+  the studio origin and registering the same-origin SW **in addition to** the mode-B bridge (see
+  [`packages/core/src/bridge.ts`](packages/core/src/bridge.ts) `registerSameOriginServiceWorker`).
+- **isolated** keeps the pop-out off the IDE origin. It only **auto-connects when storage is
+  unpartitioned**; otherwise the preview SW serves a "connect this tab" gate
+  ([`previewConnectingHtml`](packages/studio/public/sw.js)) that best-effort calls
+  `document.requestStorageAccess()` in the click gesture and reloads, falling back to "allow
+  third-party data" instructions. This is exactly StackBlitz's "You're almost there" trade-off and is
+  browser-dependent — validate on the live preview origin.
+- Inbound ws/SSE for a pop-out is relayed to **both** SWs (same-origin controller + bridge port) via
+  `KernelBridge.broadcastToPreviewSWs`, so it works whichever pop-out kind is configured.
+- `same-origin-allow-popups` (keep `window.opener`) is **not** an option: it forfeits
+  `crossOriginIsolated` → no `SharedArrayBuffer` → the kernel breaks. So there is no "isolated AND
+  zero-friction" standalone pop-out; that's a hard browser constraint, not a missing feature.
+
 ### What actually couples the SW to the IDE origin (and why splitting is safe)
 
 A common misread is "the SW runs the editor, so we can't move it." Not so — in

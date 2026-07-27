@@ -510,6 +510,19 @@ imperatively in an effect; `registerServiceWorker()` additionally waits for
 `controllerchange` when the page isn't yet controlled. Both ensure the SW proxies
 the very first preview navigation instead of the app leaking through.
 
+**Separate preview origin (mode B) — opt-in isolation.** By default previews run
+*same-origin* with the IDE (the SW is registered on the studio origin; `findKernelClient()`
+reaches the kernel via same-origin window clients). A deploy can instead serve previews from a
+**second origin** (e.g. `vivari-preview.pages.dev`) so untrusted preview code — and, realistically,
+your own npm dependencies — can't touch the IDE's cookies/localStorage/OPFS. It's client-side only:
+that origin is **static hosting** for `sw.js` + a hidden `__vv-bridge.html`; the kernel still lives
+in the IDE tab. `KernelBridge.setupPreviewBridge()` iframes the bridge doc, which registers the
+cross-origin SW and hands back a persistent `MessagePort`; the SW then routes preview HTTP over that
+port instead of `findKernelClient()`. Selected at build time by `VITE_PREVIEW_ORIGIN` on the **studio
+(main) project** (the preview project needs no env). The embedded preview iframe is cross-origin, so
+its ws/SSE/CDP shims already reach the IDE via `parent.postMessage`. See `roadmap.md`
+("preview origin isolation") for the full mode A/B/C design.
+
 ### 8.4 WebSocket tunnel (Vite HMR)
 
 A browser `WebSocket` can't reach an in-process ws server (no TCP, and a SW can't
@@ -529,7 +542,7 @@ together) demonstrates both directions; each server gets its own preview tab (se
 
 **"Open in new tab" tunnels ws/SSE through the Service Worker.** The shims relay frames by
 `postMessage` to the window that hosts the kernel — the iframe's `parent` when embedded. Opening
-a preview in a standalone tab (`window.open('/preview/<port>/')`) makes it a top-level document,
+a preview in a standalone tab (`controller.openExternalPreview`) makes it a top-level document,
 and the studio's `COOP: same-origin` (required for `SharedArrayBuffer`) puts that tab in a
 *separate browsing-context group* with `window.opener === null` — there is no host window to
 reach. So for a top-level preview the shim falls back to `navigator.serviceWorker.controller`
@@ -537,9 +550,21 @@ reach. So for a top-level preview the shim falls back to `navigator.serviceWorke
 cross-tab): the SW forwards `dir:'out'` frames to the kernel-host client (`findKernelClient`,
 shared with `handlePreview`) and broadcasts `dir:'in'` frames to every top-level preview client;
 each shim keeps only its own `connId`. The studio's `bridge.ts` forwards SW-relayed `dir:'out'`
-frames to the kernel worker, and `controller` relays inbound frames back through the SW alongside
-the in-app iframes (nested clients, which the SW broadcast skips, so no duplicates). Vite HMR in
-a standalone tab now works for the same reason.
+frames to the kernel worker, and `controller` relays inbound frames back through the SW
+(`KernelBridge.broadcastToPreviewSWs`, which posts to **both** the same-origin controller and, in
+mode B, the bridge port) alongside the in-app iframes (nested clients, which the SW broadcast skips,
+so no duplicates). Vite HMR in a standalone tab now works for the same reason.
+
+**Where the pop-out opens (mode B).** `openExternalPreview` opens the pop-out **same-origin by
+default** (`/preview/<port>/` on the IDE origin) so it lands in the kernel's storage partition and
+"just works". A standalone tab on the *preview* origin would sit in a different browser storage
+partition than the editor tab and couldn't reach the kernel without a Storage-Access grant — so the
+isolated pop-out is opt-in via `VITE_PREVIEW_POPOUT=isolated` (set on the studio project, only
+meaningful with `VITE_PREVIEW_ORIGIN`). When isolated and the browser has partitioned storage, the
+preview SW serves a StackBlitz-style "connect this tab" gate (`previewConnectingHtml`) instead of
+timing out. There is no isolated-*and*-frictionless standalone tab: `same-origin-allow-popups`
+(to keep `window.opener`) forfeits `crossOriginIsolated` → no `SharedArrayBuffer`. See `roadmap.md`
+("Pop-out behavior").
 
 **Server-Sent Events (same idea, one-way).** A streaming `text/event-stream` response
 can't cross the HTTP preview proxy — that path is buffered end-to-end (the SW resolves
