@@ -2,6 +2,7 @@ import { Background } from "./components/Background";
 import { Nav } from "./components/Nav";
 import { Hero } from "./components/Hero";
 import { Features } from "./components/Features";
+import { Proof } from "./components/Proof";
 import { HowItWorks } from "./components/HowItWorks";
 import { Embed } from "./components/Embed";
 import { Comparison } from "./components/Comparison";
@@ -16,6 +17,7 @@ export default function App() {
       <main>
         <Hero />
         <Features />
+        <Proof />
         <HowItWorks />
         <Embed />
         <Comparison />

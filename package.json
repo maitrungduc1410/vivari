@@ -49,7 +49,11 @@
     "assemble:preview": "node scripts/assemble-preview.mjs",
     "assemble:worker": "node scripts/assemble-worker.mjs",
     "build:sdk": "npm run build:core && npm run build:react",
-    "typecheck:sdk": "npm run typecheck --workspace @vivari/core && npm run typecheck --workspace @vivari/react"
+    "typecheck:sdk": "npm run typecheck --workspace @vivari/core && npm run typecheck --workspace @vivari/react",
+    "og": "node scripts/og-cards.mjs",
+    "og:check": "node scripts/og-cards.mjs --check"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2"
+  }
 }

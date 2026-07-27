@@ -1,0 +1,168 @@
+---
+slug: nodes-real-lib-in-the-browser
+title: Running Node's real lib/ in a browser tab
+description: We spent months hand-writing Node's core modules, then took apart a 2.1 MB StackBlitz bundle and threw the approach away. Here is what we found and why we pivoted.
+tags: [teardown, runtime, nodejs]
+image: /img/og/nodes-real-lib-in-the-browser.png
+og_eyebrow: TEARDOWN 02
+---
+
+import Playground from '@site/src/components/Playground';
+
+There are two ways to give a browser a Node-compatible runtime, and for a long
+time we were confidently building the wrong one.
+
+**Path A** is the obvious one: hand-write the core modules. Implement `fs` on
+top of your virtual filesystem, implement `path` as string manipulation,
+implement `events` as a small emitter, and keep going. It feels productive
+immediately. `path` takes an afternoon. `events` takes a morning. `fs` takes a
+week and mostly works.
+
+Then you reach `stream`, and progress stops.
+
+{/* truncate */}
+
+## Where Path A dies
+
+`stream` is not a big module because Node's authors were verbose. It is big
+because backpressure is genuinely hard, and because fifteen years of packages
+have come to depend on the exact observable behaviour of that difficulty.
+
+You can write something called `Readable` in a day. Making it emit `'readable'`
+at the right moments, respect `highWaterMark`, handle a `pipe` target that
+returns `false` from `write`, unpipe cleanly on error, support both flowing and
+paused modes, implement `readableEnded` versus `readableFinished`, and behave
+correctly when a subclass calls the constructor without `new` — that is not a
+day. And when you get one of those wrong, you do not get a clean error. You get
+a dev server that hangs at 40% of a build, in a package four levels deep in
+someone's dependency tree.
+
+`http` is worse, because it is a protocol parser plus a connection agent plus a
+stream implementation. `crypto` is worse still, because it is an ABI over
+OpenSSL. `zlib` needs a compression codec.
+
+We had a runtime that could run a small Express app and could not run anything
+real, with a queue of modules ahead of us that each represented months of work
+and would still be, at the end of all that effort, an imitation.
+
+## Taking apart the competition
+
+StackBlitz's WebContainer had clearly solved this. So we did the obvious thing
+and read their bundle — a ~2.1 MB file called `builtins.2896b7f3.js`.
+
+The finding reframed the entire project:
+
+**They do not hand-write Node's core modules. They ship Node's actual `lib/`
+JavaScript.**
+
+The evidence is not subtle once you look. The bundle exports an object with
+roughly 300 keys, and those keys are not a curated public API — they are Node's
+internal module tree. Alongside `fs`, `http`, `stream`, `crypto`, `zlib`, `net`,
+`tls` and `worker_threads` sit `internal/streams/readable`, `_http_agent`,
+`internal/crypto/*`, and `internal/bootstrap/realm`. Every module is wrapped in
+a function taking `(exports, require, module, process, internalBinding,
+primordials)`.
+
+`internalBinding` and `primordials` are internal-only Node machinery. You do not
+end up with those identifiers by writing a compatibility layer. You end up with
+them by shipping Node's source.
+
+## The seam
+
+Once you see it, the architecture of real Node becomes the architecture of the
+solution.
+
+Node is two layers. On top is `lib/*.js` — tens of thousands of lines of
+JavaScript implementing streams, HTTP, crypto, the module loader, everything a
+package actually touches. Underneath is C++, reached through exactly one door:
+
+```js
+const binding = internalBinding("fs");
+```
+
+`lib/fs.js` does not know what happens inside `internalBinding('fs')`. It knows
+the shape of what comes back. That is a seam, and a seam is something you can
+cut along.
+
+So: keep Node's JavaScript layer verbatim, and replace the C++ layer underneath
+with your own implementation. When `lib/fs.js` calls `internalBinding('fs')`, it
+gets an object backed by a Rust/Wasm virtual filesystem and a
+[synchronous shared-memory bridge](/blocking-in-a-browser) instead of libuv.
+
+The economics are what make this decisive. `internal/bootstrap/realm` lists the
+bindings a running Node needs, and the list is short:
+
+```
+buffer, cares_wrap, config, constants, contextify, fs, fs_event_wrap,
+icu, inspector, js_stream, os, pipe_wrap, process_wrap, spawn_sync,
+stream_wrap, tcp_wrap, tls_wrap, tty_wrap, udp_wrap, uv, zlib
+(+ async_wrap, crypto, http_parser, signal_wrap, url, v8)
+```
+
+Roughly twenty-five bindings, against hundreds of JavaScript modules. Everything
+above the line is Node's own code, already correct, already battle-tested
+against the entire npm ecosystem. All the remaining work is below the line.
+
+That is the whole trade. Path A means writing hundreds of modules and getting
+them approximately right. Path B means writing twenty-five bindings and getting
+them *exactly* right, because Node's internal callers are unforgiving about
+shapes. Harder in a smaller place.
+
+Here is the result. Every module below is Node's own source, unmodified,
+executing in this page:
+
+<Playground scenario="real-lib" title="Node's own core modules" height={480} />
+
+## Why the foundation survived the pivot
+
+The uncomfortable question when you decide to throw away months of work is how
+much of the rest goes with it. In this case, almost none — and understanding why
+is the most useful part of the story.
+
+The realisation was that our existing `fs-client.js`, the thing user code called
+to reach the virtual filesystem, was already an `internalBinding('fs')` in
+everything but name. It took a syscall opcode and arguments, packed them into
+shared memory, parked the thread, and returned bytes or an errno. That is
+precisely the contract Node's C++ fs binding fulfils.
+
+The same held everywhere. The Rust virtual filesystem is what `internalBinding('fs')`
+needs to sit on. The PID table and process supervisor are what `process_wrap`
+and `spawn_sync` need. The virtual network is what `tcp_wrap` needs. The
+Atomics bridge is what makes any of them able to be synchronous.
+
+So Path B was a pivot in the upper layers, not a rewrite. Everything below the
+binding line — the part that had been genuinely hard to build — was the part
+worth keeping. Path A had not been wasted either: writing the hand-rolled
+builtins is how we learned what the binding contract actually needed to be.
+
+## What it costs
+
+Being honest about the other side of the ledger:
+
+**The internal ABI is undocumented and unstable.** You are writing against
+Node's private contract. Nobody upstream owes you compatibility, and pinning to
+a Node version is not optional.
+
+**Failures are opaque.** When a binding returns a subtly wrong shape, the error
+surfaces somewhere in `internal/streams/*` with a stack trace full of Node
+internals and no mention of your code. Debugging means reading Node's source,
+which is a genuine skill investment.
+
+**Delivery gets heavier.** Node's `lib/` is a lot of JavaScript to ship into a
+tab, which pushes you into lazy loading and compression decisions you would
+rather not think about.
+
+Against that: `http`, `stream` and `crypto` work, correctly, for real packages,
+today. That trade is not close.
+
+## The real test
+
+Compatibility claims are cheap. The honest test of whether you have a Node
+runtime is not whether `hello world` prints — it is whether software written by
+people who assumed a real Node install runs unmodified.
+
+The hardest such software is the package managers. npm, yarn and pnpm are large,
+old, gnarly programs that touch every corner of the runtime and were absolutely
+not written with charity toward reimplementations. Getting them to run is the
+subject of the [next post](/real-package-managers-in-the-browser) — and
+each one broke the runtime in a different, instructive way.

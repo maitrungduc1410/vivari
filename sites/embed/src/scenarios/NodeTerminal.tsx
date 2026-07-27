@@ -8,6 +8,14 @@ import { StatusDot } from "../components/ui";
 
 type Status = "booting" | "ready" | "running";
 
+export type NodeTerminalProps = {
+  /** The script mounted at `filename` and run by the Run button. */
+  source?: string;
+  filename?: string;
+  /** ESM by default; a scenario demonstrating CommonJS can override this. */
+  packageJson?: string;
+};
+
 // A real Node script the visitor can edit and run: it uses Node core modules
 // (os, crypto, process) that genuinely execute inside the browser VM.
 const INDEX_JS = `import os from "node:os";
@@ -34,9 +42,13 @@ const TERM_THEME = {
   selectionBackground: "#264f78",
 };
 
-export function NodeTerminal() {
+export function NodeTerminal({
+  source = INDEX_JS,
+  filename = "index.js",
+  packageJson = '{ "name": "demo", "type": "module" }',
+}: NodeTerminalProps = {}) {
   const [status, setStatus] = useState<Status>("booting");
-  const codeRef = useRef(INDEX_JS);
+  const codeRef = useRef(source);
   const termHost = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const vivariRef = useRef<Vivari | null>(null);
@@ -75,14 +87,14 @@ export function NodeTerminal() {
           return;
         }
         await vivari.mount({
-          "package.json": {
-            file: { contents: '{ "name": "demo", "type": "module" }' },
-          },
-          "index.js": { file: { contents: INDEX_JS } },
+          "package.json": { file: { contents: packageJson } },
+          [filename]: { file: { contents: source } },
         });
         vivariRef.current = vivari;
         setStatus("ready");
-        term.writeln("\x1b[38;5;244mReady. Edit index.js and press Run.\x1b[0m");
+        term.writeln(
+          `\x1b[38;5;244mReady. Edit ${filename} and press Run.\x1b[0m`,
+        );
       } catch (err) {
         term.writeln(
           "\x1b[38;5;203mFailed to boot: " +
@@ -99,7 +111,7 @@ export function NodeTerminal() {
       vivariRef.current?.teardown();
       term.dispose();
     };
-  }, []);
+  }, [source, filename, packageJson]);
 
   async function run() {
     const vivari = vivariRef.current;
@@ -107,11 +119,11 @@ export function NodeTerminal() {
     if (!vivari || !term || status === "running") return;
     setStatus("running");
     term.clear();
-    term.writeln("\x1b[38;5;51m$\x1b[0m node index.js");
+    term.writeln(`\x1b[38;5;51m$\x1b[0m node ${filename}`);
 
     try {
-      await vivari.fs.writeFile("/index.js", codeRef.current);
-      const proc = await vivari.spawn("node", ["index.js"]);
+      await vivari.fs.writeFile(`/${filename}`, codeRef.current);
+      const proc = await vivari.spawn("node", [filename]);
       procRef.current = proc;
 
       // Forward keystrokes to the process so interactive scripts work too.
@@ -144,7 +156,7 @@ export function NodeTerminal() {
       <div className="embed__bar">
         <span className="embed__title">
           <StatusDot state={status} />
-          {status === "booting" ? "booting runtime..." : "node - index.js"}
+          {status === "booting" ? "booting runtime..." : `node - ${filename}`}
         </span>
         <span className="embed__spacer" />
         <button
@@ -158,12 +170,12 @@ export function NodeTerminal() {
       <div className="split">
         <div className="pane">
           <div className="pane__head">
-            index.js
+            {filename}
             <span className="pane__hint">{"\u2318S / Ctrl+S to run"}</span>
           </div>
           <div className="pane__body">
             <Editor
-              initialDoc={INDEX_JS}
+              initialDoc={source}
               onChange={(v) => (codeRef.current = v)}
               onSave={(v) => {
                 codeRef.current = v;

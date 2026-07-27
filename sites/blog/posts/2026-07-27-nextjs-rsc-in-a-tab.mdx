@@ -1,0 +1,206 @@
+---
+slug: nextjs-rsc-in-a-tab
+title: Next.js 16 renders React Server Components in a browser tab — and the AsyncLocalStorage trap
+description: We had written Next.js off as a hard native wall. That verdict was wrong. Getting RSC rendering in-browser came down to one primitive the platform cannot provide.
+tags: [teardown, runtime, nodejs]
+image: /img/og/nextjs-rsc-in-a-tab.png
+og_eyebrow: TEARDOWN 04
+---
+
+For most of this project's life, our notes said Next.js was out of reach. The
+reasoning looked solid: Next compiles with SWC, SWC is native Rust, there is no
+native code in a browser tab, therefore no Next.js. A hard wall, filed away.
+
+That verdict was wrong, and it was wrong in the most ordinary way — we had
+decided something was impossible and then stopped rechecking it.
+
+`next dev --webpack` now boots inside a browser tab, compiles an App Router
+page, renders React Server Components, and answers `GET / → 200` with real HTML.
+No server. The kernel, the filesystem, the process model, the dev server and the
+React render all live in one tab.
+
+Getting there was mostly unremarkable engineering, plus one problem that has no
+correct solution.
+
+{/* truncate */}
+
+## Why the wall was not a wall
+
+Three things had to be true at once, and all three already were:
+
+**Next 16 kept the Wasm SWC fallback.** `@next/swc-wasm-nodejs` still exists,
+because Next still has to run in environments without a native binding. Next's
+own `loadBindings` prefers it when `process.versions.webcontainer` is set —
+which our runtime now reports, because that is exactly what we are.
+
+**webpack is still selectable.** Turbopack is native Rust with no Wasm build, so
+it genuinely is unavailable. But `--webpack` remains a supported flag, and
+webpack is JavaScript.
+
+**npm skips the native optional dependencies.** On arch `wasm32`, the
+`@next/swc-<platform>` optionalDeps do not install, so the Wasm build is not
+merely preferred, it is the only binding present.
+
+So the wall was three assumptions that had each expired. Worth remembering next
+time something gets filed as impossible.
+
+The rest of the work was the usual: `vm.runInNewContext` had to make the sandbox
+the *real* global, so that `globalThis.__RSC_MANIFEST = ...` assignments in
+Next's generated manifest files actually land on the context object — without
+that the client-reference manifest never loads. `child_process.fork` needed a
+genuine IPC channel, because `next dev` forks its dev server and gates startup
+on `process.send` existing. `pathToFileURL` had to resolve relative to absolute
+like Node does. A handful of modules — `dns/promises`, `stream/web`, an
+`inspector` stub, `module.findSourceMap`, and the complete `Console` method
+surface that `@edge-runtime/primitives` binds — had to exist.
+
+All generic. None of it Next-specific. Then there was the interesting one.
+
+## The trap
+
+The App Router's internals rely on `AsyncLocalStorage`. Its `workStore` and
+`workUnitAsyncStorage` carry per-request context, and React's server rendering
+reads them from deep inside component code. If `getStore()` returns `undefined`
+at the wrong moment, you get:
+
+```
+Expected workStore to be initialized
+```
+
+In real Node, `AsyncLocalStorage` works because V8 exposes a **PromiseHook**.
+The engine tells `async_hooks` when a promise is created, resolved, and
+continued, so the context can follow execution across a native `await`. Our
+runtime delegates to the host's `async_hooks` through the `internalBinding` seam
+when one exists, which is exact.
+
+A browser has no PromiseHook. There is no way to observe a native `await`. You
+cannot know that this continuation belongs to that async context, because the
+engine never tells you.
+
+This is worth sitting with, because it is a genuinely different class of problem
+from everything else in this series. Every other gap was work: read Node's
+source, implement the binding, be precise. This one is a capability the platform
+does not have and cannot be made to have.
+
+## Three rules, and why each exists
+
+What we could do was stop trying to solve the general problem. A dev preview
+handles one request at a time. That is a much weaker requirement than a
+production server, and within it the context can be tracked well enough to be
+*deterministic* — not merely usually correct.
+
+Three rules, each of which exists because a specific thing broke.
+
+**Rule 1 — a thenable-returning `run(store, cb)` holds its store until the
+promise settles, then pops only if still top, and never back to `undefined`.**
+
+The "only if still top" clause stops out-of-order settling from clobbering a
+live nested scope. The "never back to `undefined`" clause is the one that took
+real debugging. A streaming RSC render returns its promise *early* — as soon as
+the stream is created — while React carries on rendering components detached
+across native awaits. Zeroing the store when that early promise settles throws
+`Expected workStore to be initialized` in code that is still running. Restoring
+a *defined* parent store is safe and keeps nested scopes correct; restoring
+`undefined` is not.
+
+**Rule 2 — a plain, non-thenable return does not restore at all.**
+
+Next's `renderToFlightStream` returns a stream synchronously and does the actual
+rendering later, across raw awaits, with no promise for us to observe. If the
+store is popped when `run()` returns, all of that detached work runs with no
+context. Leaving the store current keeps `getStore()` correct until the next
+`run()` overwrites it.
+
+This rule is, straightforwardly, a leak. In a general-purpose implementation it
+would be wrong. Under one-request-at-a-time it is the behaviour that makes the
+detached render work, and the next `run()` cleans up after it.
+
+**Rule 3 — propagate a per-hop snapshot of every live store through the
+scheduling primitives React uses.**
+
+Specifically `Promise.prototype.then`, `queueMicrotask`, `setImmediate` and
+`setTimeout`. React's scheduler hops through these constantly, and each hop is a
+place context would otherwise be lost. Snapshotting at schedule time and
+restoring at run time recovers most of what a PromiseHook would have given us.
+
+The patches install **once at boot** — after the runtime's own timer globals are
+in place and before any framework code loads, so React captures the wrapped
+primitives rather than the originals — and only on the polyfill path. When the
+host provides real `async_hooks`, none of this is active.
+
+## Proving it, given the failure mode
+
+A context bug that only appears under specific interleavings is the worst kind
+to claim you have fixed. "It worked when I tried it" is not evidence when the
+mechanism is inherently timing-sensitive.
+
+So the polyfill is tested by *forcing* it. `VV_NO_HOST_ALS=1` disables the host
+`async_hooks` delegation even where it is available, which means the headless
+test suite exercises the browser path on a machine where the real one exists.
+That gives two things: an oracle, and the ability to run the comparison under
+load.
+
+The specific case that matters is the RSC refresh render — the App Router's
+"on save" re-render, the request with `RSC: 1` that the HMR flow issues. That is
+the path that threw `workStore` in the studio, so it is the path that has to be
+green.
+
+The results we hold it to: `GET /` returns 200; the refresh render returns 200
+with zero invariant errors across repeats; and the output is **byte-identical**
+to the host `async_hooks` path — under heavy-I/O perturbation, which is the
+whole point. Byte-identical against a known-correct implementation is a much
+stronger claim than "no errors observed", and it is the only reason we are
+comfortable describing the behaviour as deterministic rather than lucky.
+
+One more detail that is easy to get wrong: Next resolves the Wasm SWC by
+downloading it into its own cache on first compile. That is its intended
+behaviour in Wasm environments and real Node does the same thing. The template's
+`postinstall` seeds that cache from the already-installed package so the first
+compile is offline, with Next's own on-demand download left in place as the
+fallback.
+
+## What is honest to claim
+
+Next.js is shipped as an **experimental** template, in TypeScript and
+JavaScript, and the caveats are real:
+
+- **Turbopack does not work and will not.** It is native Rust with no Wasm
+  build. `--webpack` is the path.
+- **The `AsyncLocalStorage` polyfill targets a dev preview.** It is correct for
+  one request at a time. It is not a general-purpose implementation and we would
+  not present it as one.
+- **First compile is heavy.** A Wasm SWC compiling an App Router page is not
+  fast, and you will notice.
+
+What is not caveated: this is real Next.js from npm, real webpack, real SWC,
+real React Server Components, rendering real HTML, with no server involved
+anywhere. You can open the Studio and pick the Next.js template right now.
+
+## The thread running through all of this
+
+Every post in this series has landed in the same place, from a different
+direction.
+
+The [synchronous bridge](/blocking-in-a-browser) works because
+`Atomics.wait` is a real blocking primitive and we built the entire system
+around respecting it. [Node's real `lib/`](/nodes-real-lib-in-the-browser)
+works because Node already had a seam and we cut along it.
+[npm, yarn and pnpm](/real-package-managers-in-the-browser) work because
+the layers underneath implemented real specifications instead of the subset our
+demos needed.
+
+`AsyncLocalStorage` is the exception that proves the rule. There is no seam to
+cut, no specification to implement completely, no primitive to respect —
+V8's PromiseHook simply is not there. So the only honest move was to narrow the
+problem until it was solvable, be explicit about the boundary, and test against
+the real implementation rather than against our own expectations.
+
+Sometimes the interesting engineering is admitting exactly how much of the
+problem you actually solved.
+
+---
+
+Vivari is an open-source, MIT-licensed WebContainer: no commercial licence, no
+per-seat fee, self-host every asset. The code is on
+[GitHub](https://github.com/maitrungduc1410/vivari) and the
+[Studio](https://vivari.jamesisme.com/studio/) runs in your browser.

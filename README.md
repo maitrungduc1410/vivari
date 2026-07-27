@@ -11,6 +11,7 @@ virtual networking, with no server doing the work.
 <p>
   <a href="https://vivari.jamesisme.com">Website</a> ·
   <a href="https://vivari.jamesisme.com/docs">Docs</a> ·
+  <a href="https://vivari.jamesisme.com/blog/">Blog</a> ·
   <a href="https://vivari.jamesisme.com/studio/">Studio</a> ·
   <a href="https://www.npmjs.com/package/@vivari/core">npm</a>
 </p>

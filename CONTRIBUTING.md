@@ -46,7 +46,9 @@ The monorepo layout and the "why" behind each package are documented in
 | `packages/runtime`, `kernel-host`, `protocol` | the Node runtime shim + kernel |
 | `packages/studio` | the studio IDE (Vite + React) |
 | `sites/landing` | the marketing / landing site |
-| `sites/docs` | the documentation site (Docusaurus) |
+| `sites/docs` | the documentation site at `/docs/` (Docusaurus) |
+| `sites/blog` | the engineering blog at `/blog/` (a second Docusaurus site) |
+| `sites/embed` | the runnable examples the docs and blog iframe |
 | `examples/basic` | a minimal, runnable SDK example |
 | `scripts` | verify / smoke / spike harnesses |
 
@@ -63,6 +65,37 @@ npm run typecheck:sdk # type-check @vivari/core and @vivari/react
 CI runs the same checks (see `.gitlab-ci.yml`). The network-dependent spike tier
 (`npm run spikes:net`) boots real templates against the live npm registry and is
 run manually / on a schedule.
+
+## Writing a blog post
+
+Posts live in `sites/blog/posts/` as `YYYY-MM-DD-<slug>.mdx`. Two things are easy
+to forget:
+
+```bash
+npm run og                        # render the social cards, then commit the PNGs
+( cd sites/blog && npm run build ) # fails if a post has no card or no <!-- truncate -->
+```
+
+Social cards are generated at authoring time rather than during the deploy build,
+because the renderer depends on host fonts and a build machine without them would
+silently ship a blank card. The build only *checks* that each post has one.
+
+The blog is a separate Docusaurus site from the docs because the landing owns the
+origin root: a Docusaurus build always emits `index.html` at its own baseUrl root,
+so a single site covering both `/docs/` and `/blog/` would have to take `/` and
+overwrite the landing. Consequences worth knowing:
+
+- Links between posts are root-relative to the blog (`/blocking-in-a-browser`).
+  Links to the docs must be absolute (`https://vivari.jamesisme.com/docs/...`),
+  otherwise Docusaurus prefixes the blog baseUrl and the build fails the
+  broken-link check.
+- `sites/blog/src/components/Playground.tsx` is a copy of the docs' one. Two
+  separate builds cannot share a component tree; keep them in sync.
+- `/blog/*` is cross-origin isolated (see `scripts/assemble-site.mjs`), so **every
+  image must be same-origin** — a third-party image or embed without a
+  `Cross-Origin-Resource-Policy` header will be blocked. In exchange, a post can
+  embed a real running example with `<Playground scenario="..." />`; add the
+  scenario to `sites/embed/src/scenarios/registry.tsx`.
 
 ## Commit & PR conventions
 

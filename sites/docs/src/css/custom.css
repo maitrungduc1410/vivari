@@ -29,8 +29,22 @@
 }
 
 .navbar {
-  backdrop-filter: blur(10px);
   background-color: color-mix(in srgb, var(--ifm-navbar-background-color) 82%, transparent);
+}
+
+/* The frosted blur sits on a pseudo-element rather than on `.navbar` itself.
+   `backdrop-filter` makes an element the containing block for its
+   fixed-position descendants, and the mobile menu (`.navbar-sidebar`, a child of
+   `.navbar`) is `position: fixed; top: 0; bottom: 0` expecting the viewport. Put
+   the filter on `.navbar` and the sidebar collapses to the navbar's ~60px, which
+   in turn gives `.navbar-sidebar__items` — sized `calc(100% - navbar-height)` —
+   exactly zero height, so the menu opens completely empty. */
+.navbar::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  backdrop-filter: blur(10px);
 }
 
 /* GitHub navbar link with an icon (no image asset needed). */

@@ -1,10 +1,11 @@
 {
-  "name": "vivari-docs",
+  "name": "vivari-blog",
   "version": "0.0.0",
   "private": true,
   "scripts": {
     "docusaurus": "docusaurus",
     "start": "docusaurus start",
+    "prebuild": "node ../../scripts/og-cards.mjs --check",
     "build": "docusaurus build",
     "serve": "docusaurus serve",
     "clear": "docusaurus clear",

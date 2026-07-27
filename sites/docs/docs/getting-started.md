@@ -71,10 +71,10 @@ Edit `index.js` below and press **Run**. This boots a real Node.js runtime in yo
 browser (inside a cross-origin isolated frame) and streams the actual `stdout`
 back — try importing another `node:` built-in or changing the loop.
 
-<Playground scenario="node" />
+<Playground scenario="node" title="Live Node terminal" />
 
 :::tip Run real projects
-To scaffold a full project, `npm install`, and boot a dev server, [open the Studio](https://vivari.pages.dev/studio/) or
+To scaffold a full project, `npm install`, and boot a dev server, [open the Studio](https://vivari.jamesisme.com/studio/) or
 embed the [`<Vivari>` component](./react) on a cross-origin isolated page.
 :::
 

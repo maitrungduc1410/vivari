@@ -2,17 +2,19 @@ import React from "react";
 import useDocusaurusContext from "@docusaurus/useDocusaurusContext";
 
 // Embeds a real, running Vivari example via an <iframe> pointing at the sibling
-// /embed/ app (a cross-origin isolated page on the same origin). Because the docs
-// site is served cross-origin isolated too (see scripts/assemble-site.mjs), the
-// iframe inherits isolation and the runtime's SharedArrayBuffer is available.
+// /embed/ app (a cross-origin isolated page on the same origin). Because the blog
+// is served cross-origin isolated too (see scripts/assemble-site.mjs), the iframe
+// inherits isolation and the runtime's SharedArrayBuffer is available. The COEP
+// that buys us this also means every image in a post must be same-origin.
+//
+// Kept in sync with sites/docs/src/components/Playground.tsx — the two sites are
+// separate Docusaurus builds and cannot share a component tree.
 //
 // `scenario` is a free-form key resolved at runtime by the embed app's registry
 // (sites/embed/src/scenarios/registry.tsx) rather than a union checked here, so
-// that adding a demo does not require editing this component. An unknown key
-// renders a visible "unknown example" panel, not a silent fallback.
-//
-// Kept in sync with sites/blog/src/components/Playground.tsx — the blog is a
-// separate Docusaurus build and cannot share a component tree with this one.
+// that adding a demo to a blog post does not require editing this component.
+// An unknown key renders a visible "unknown example" panel, not a silent
+// fallback.
 //
 // The example only runs on the deployed site (or the assembled build served with
 // _headers). Under a plain `docusaurus start` there is no /embed/ route, so we

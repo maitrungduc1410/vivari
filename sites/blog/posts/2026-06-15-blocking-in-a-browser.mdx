@@ -1,0 +1,201 @@
+---
+slug: blocking-in-a-browser
+title: The one browser API that makes a Node runtime possible
+description: Node's API is synchronous and browsers refuse to block. Everything Vivari does rests on the single exception to that rule, and on a 1 MiB window.
+tags: [teardown, runtime, browser-platform]
+image: /img/og/blocking-in-a-browser.png
+og_eyebrow: TEARDOWN 01
+---
+
+import Playground from '@site/src/components/Playground';
+
+Every browser-based Node runtime runs into the same wall on day one, and it is
+not the filesystem, the module resolver, or the process model. It is one line of
+code:
+
+```js
+const config = fs.readFileSync("/app/package.json", "utf8");
+```
+
+That call has to return bytes. Not a promise, not a callback — bytes, on the
+next line. And reading those bytes means asking something else for them, which
+in a browser means waiting. Browsers are built on exactly one promise to the
+user: nothing blocks. So the very first thing Node requires is the one thing the
+platform refuses to do.
+
+There is precisely one exception, and this post is about building on top of it.
+
+{/* truncate */}
+
+## Why you cannot just make it async
+
+The obvious dodge is to give up on synchronous I/O: rewrite the runtime around
+`fs.promises`, tell users to `await` everything, and move on. It does not work,
+for a reason that has nothing to do with taste.
+
+Synchronous I/O is not a convenience in Node — it is load-bearing. `require()`
+is synchronous all the way down: resolving a specifier means `statSync` on a
+dozen candidate paths, then `readFileSync` on the winner, then compiling and
+executing it, before the calling module's next statement runs. `execSync` blocks
+a parent until its child exits. `zlib.gunzipSync`, `child_process.spawnSync`,
+`crypto.randomBytes` in its sync form — the whole ecosystem sits on this.
+
+You cannot make `require()` async without breaking every CommonJS package ever
+published, which is most of npm. And you certainly cannot ship the *real* npm
+CLI, which is what we actually wanted to do. So the synchronous surface is not
+negotiable. Something has to genuinely block.
+
+## The exception: `Atomics.wait` on a worker
+
+The main thread may not block. A **Web Worker** may.
+
+```js
+// Only legal off the main thread. This parks the OS thread — no spinning,
+// no event loop, nothing runs on it — until someone notifies or it times out.
+Atomics.wait(control, STATE, REQUEST);
+```
+
+`Atomics.wait` puts the calling thread to sleep on a word of shared memory. It
+is not a busy-loop and not a trick with `XMLHttpRequest`; the thread is actually
+parked, and it resumes when another thread calls `Atomics.notify` on the same
+word. Browsers allow it off the main thread precisely because a blocked worker
+cannot freeze anyone's tab.
+
+That single primitive is the whole foundation. Run user code on a worker, give
+that worker a `SharedArrayBuffer`, and a synchronous call can become: write a
+request into shared memory, park, let another thread do the async work, get
+notified, read the response out. From inside user code, `readFileSync` returned
+bytes. Nothing async leaked.
+
+```
+process code (Web Worker thread)
+   │  fs.readFileSync("/x")        ← looks synchronous to user code
+   ▼
+ write request into the SAB, Atomics.store(STATE, REQUEST), ring a doorbell
+   │
+   ▼  Atomics.wait(STATE, REQUEST) — the thread genuinely blocks
+ ...another worker services it against the Rust/Wasm VFS...
+   ▲
+   └─ writes the response into the SAB, Atomics.notify(STATE)
+   ▼
+ returns bytes — still synchronous, no async leaked to user code
+```
+
+Here it is running for real. Nothing below is awaited, and the round-trip is
+timed with `performance.now()` so you can see what a blocking syscall costs
+inside a browser tab:
+
+<Playground scenario="sync-fs" title="A synchronous syscall, for real" height={480} />
+
+## The tax: cross-origin isolation
+
+`SharedArrayBuffer` was restricted after Spectre, and getting it back requires
+the page to prove it is not sharing a browsing context group with anything it
+does not trust. Concretely, every page that hosts the runtime must be served
+with:
+
+```
+Cross-Origin-Opener-Policy:   same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+Miss either header and `SharedArrayBuffer` is simply `undefined`. There is no
+degraded mode to fall back to — the runtime does not start.
+
+This propagates further than it first appears. `require-corp` means every
+subresource on the page must opt in to being embedded, so a third-party image
+without a `Cross-Origin-Resource-Policy` header stops loading. An iframe is only
+cross-origin isolated if its embedder is too, which is why the page you are
+reading carries the headers as well: the live example above is an iframe, and it
+would not have `SharedArrayBuffer` otherwise.
+
+It is worth being blunt about this cost, because it is the part people discover
+late. Adopting a browser Node runtime is not just an npm install; it is a
+decision about your document's headers, and therefore about every third-party
+script, font, and pixel on the page.
+
+## The layout, and the invariant that bites
+
+Each client — the kernel and every process — gets one `SharedArrayBuffer`, laid
+out as a small control block followed by a data region:
+
+```
+[ control: 4 × Int32 = 16 bytes ][ data region: 1 MiB ]
+
+control[0] = STATE    (Atomics.wait / notify on this word)
+control[1] = OPCODE   (which syscall)
+control[2] = REQ_LEN  (request bytes in the data region)
+control[3] = RES_LEN  (response bytes in the data region)
+```
+
+`STATE` moves between `IDLE`, `REQUEST`, `RESPONSE_OK` and `RESPONSE_ERR`; the
+error case carries a UTF-8 errno like `ENOENT` so that Node's own error
+construction upstack behaves normally. The request frame itself is
+self-describing — `[flags:u32][fieldCount:u32]([len:u32][bytes])*` — with
+scalars packed little-endian and everything else as raw bytes.
+
+The interesting part is not the encoding. It is `DATA_BYTES = 1 << 20`.
+
+**Every request and every response must fit in one megabyte.** That single
+constant has caused more bugs than anything else in the system, because it is
+invisible until a payload crosses it, and payloads cross it constantly:
+
+- **File I/O is chunked.** Reads and writes loop at a 512 KiB chunk size, so
+  arbitrarily large files transfer in pieces. There is a separate `writeLarge`
+  path that skips the shared buffer entirely and transfers an `ArrayBuffer`
+  instead — necessary the moment you try to write something like yarn's 5 MB
+  bundled `cli.js` into the filesystem.
+- **HTTP responses are chunked.** A Vite dev server happily serves a 2.8 MB
+  pre-bundled dependency file. That body cannot cross in one message, so it is
+  split into sequential frames reassembled by request id. It also travels as a
+  raw length-prefixed field rather than inside JSON — escaping quotes and
+  newlines inflates a body unpredictably, and the failure mode is a silent
+  overflow rather than a clean error.
+- **Downloads bypass the window entirely.** A fetch streams its body straight
+  into the virtual filesystem through a dedicated worker; the caller then reads
+  it back with ordinary chunked file reads. This is why npm tarballs of any size
+  work.
+
+If there is one lesson here, it is that a fixed-size shared window is not a
+detail of the transport. It is a constraint that reaches up through every layer
+above it, and every subsystem eventually has to answer for how it handles a
+payload larger than the window.
+
+## Who is actually awake
+
+Blocking is only safe if the thread you blocked is not the one that has to
+answer you. So the work is split:
+
+- The **main thread** runs the UI and no runtime work at all. It never blocks,
+  because it never participates.
+- A **kernel worker** owns the PID table, process supervision, the virtual port
+  registry, and HTTP routing.
+- A **filesystem worker** owns the Rust/Wasm virtual filesystem. Every client
+  registers its shared buffer with it and wakes it through a `MessagePort`
+  doorbell.
+- A **fetcher worker** performs all real outbound network requests, so
+  downloading and decompressing a large tarball never stalls syscall servicing.
+- Each **process** is its own worker with its own shared buffer, and its own
+  event loop.
+
+Some syscalls are *deferred* rather than serviced immediately: `accept`,
+`spawn` and blocking `fetch` leave the caller parked until the awaited event
+actually arrives. That is not a workaround, it is the point — it is how
+blocking `accept()` and `execSync()` get their semantics. A parked worker
+costs nothing while it waits.
+
+## What this buys
+
+None of the above is exotic on its own. `Atomics.wait` is a documented API and
+`SharedArrayBuffer` has shipped for years. What is interesting is how much falls
+out of taking the one available blocking primitive seriously and building the
+entire system to respect it: real `require()`, real `execSync`, real child
+processes, and — because the synchronous surface is honest — the ability to run
+Node's own source code rather than an approximation of it.
+
+That last point is the subject of the next post: [running Node's real `lib/` in
+a browser tab](/nodes-real-lib-in-the-browser), and why hand-writing
+`stream` and `http` was never going to work.
+
+Vivari is MIT-licensed and the code is on
+[GitHub](https://github.com/maitrungduc1410/vivari).

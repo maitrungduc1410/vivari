@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Cloudflare Pages build for the unified Vivari site (landing + docs + studio).
+# Cloudflare Pages build for the unified Vivari site (landing + docs + blog +
+# studio).
 #
 #   Build command:            bash scripts/cloudflare-build.sh
 #   Build output directory:   dist
@@ -56,6 +57,12 @@ npm run vendor:tsgo
 
 # --- Docs (served under /docs/) ------------------------------------------------
 ( cd sites/docs && npm install --no-audit --no-fund && npm run build )
+
+# --- Blog (served under /blog/) ------------------------------------------------
+# A second Docusaurus build rather than a route inside sites/docs: the landing
+# owns the origin root, and a Docusaurus build always emits index.html at its own
+# baseUrl root, so one build cannot serve both /docs/ and /blog/ here.
+( cd sites/blog && npm install --no-audit --no-fund && npm run build )
 
 # --- Assemble into dist/ -------------------------------------------------------
 node scripts/assemble-site.mjs

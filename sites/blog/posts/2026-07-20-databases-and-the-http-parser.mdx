@@ -1,0 +1,135 @@
+---
+slug: databases-and-the-http-parser
+title: llhttp in Wasm, and a real Postgres in the tab
+description: Two smaller teardowns — replacing a hand-written HTTP parser with the same llhttp Node ships, and running PostgreSQL 18 with no server and no native addon.
+tags: [teardown, wasm, runtime]
+image: /img/og/databases-and-the-http-parser.png
+og_eyebrow: TEARDOWN 06
+---
+
+import Playground from '@site/src/components/Playground';
+
+Two shorter pieces this time, connected by a theme:
+[running Node's real source](/nodes-real-lib-in-the-browser) keeps paying
+out in places you did not plan for, and WebAssembly turns out to cover a lot of
+what "you need a native binary for that" used to mean.
+
+{/* truncate */}
+
+## Part one: the HTTP parser
+
+Node's `lib/http` does not parse HTTP. It delegates to
+`internalBinding('http_parser')`, which in real Node is llhttp — a C parser
+compiled into the binary.
+
+We had written a pure-JavaScript HTTP/1.1 parser to fill that binding. It
+worked, in the sense that ordinary requests went in and ordinary responses came
+out. It also had the failure profile every hand-written protocol parser has: the
+common path is fine and the edges are a long tail of things you have not thought
+about yet. Trailers. `HEAD` responses, which have `Content-Length` but no body.
+`204`, which has neither. Chunked encoding with extensions. Pipelining. Upgrade
+and `CONNECT` hand-off, where the parser has to stop parsing mid-stream and hand
+the raw socket over.
+
+The right answer is to run the same parser Node runs.
+
+**We did not build a toolchain to do it.** Standing up wasi-sdk and clang just
+to recompile llhttp would produce an artifact essentially identical to one that
+already ships publicly — undici bundles a prebuilt `llhttp.wasm` from the same
+upstream project, under the same MIT licence. So a vendoring script pins the
+undici version and regenerates a binding module with the binary base64-embedded,
+about 54 KB. No fetch at runtime, no build dependency.
+
+Two details made it interesting.
+
+**It has to compile synchronously.** The binding is constructed at process
+bootstrap, inside the
+[synchronous world](/blocking-in-a-browser) everything else lives in, so
+the module is built with `new WebAssembly.Module()` rather than the async
+`compile`. That is allowed on a worker thread, which is where guest processes
+run. On the main thread there is a 4 KB size cap on synchronous compilation, and
+a 54 KB module throws — which turns out to be a convenient way to detect the
+environment. Exceeding the cap is precisely what trips the pure-JS fallback, so
+the JS parser stays in the tree as the main-thread path rather than as dead
+code. `VV_HTTP_PARSER=js|wasm` forces either side, with `wasm` failing loudly
+instead of falling back, so tests can assert which one they exercised.
+
+**The bridge has to be numerically exact.** llhttp reports progress through span
+callbacks — `on_url`, `on_status`, `on_header_field`, `on_header_value`,
+`on_body`, `on_headers_complete`, `on_message_complete`. Node's
+`lib/_http_common.js` does not consume those; it expects a specific set of
+numeric `kOn*` slots. The binding mirrors what Node's own `node_http_parser.cc`
+does: drive llhttp's callbacks, fold them onto the exact `kOn*` contract, for
+both requests and responses. `allMethods` follows llhttp's method enum, so
+`allMethods[llhttp_get_method()]` round-trips the way callers assume.
+
+When the Wasm backend is live it advertises `process.versions.llhttp`, exactly
+as real Node does. Twenty offline checks guard it in CI, plus an extended HTTP
+case covering `HEAD`, `204`, chunked requests and responses, trailers and
+keep-alive — run against both backends, because a fallback nobody tests is a
+fallback that does not work.
+
+You can watch it parse. The server below binds a port inside this tab and then
+fetches from itself:
+
+<Playground scenario="http-parser" title="An in-VM HTTP server" height={500} />
+
+## Part two: databases
+
+"No native database" is the limitation every in-browser runtime lists, and the
+documentation usually stops at suggesting workarounds.
+
+It is worth asking why the limitation exists. The blocker is not SQL — it is
+that database clients are native addons, and there is no compiler in the tab. So
+the question becomes: what do you need in order for a Wasm-compiled engine to
+work, and do we already have it?
+
+The answer was yes, and it had nothing to do with databases. A Wasm SQL engine
+needs a real `fs` to read its data files, a working `url` module, and the host's
+`WebAssembly` — all of which exist because of decisions made for other reasons.
+So this was less a feature than a discovery.
+
+**SQLite via sql.js.** SQLite compiled to Wasm. `initSqlJs()` finds its `.wasm`
+next to itself with `locateFile: (f) => require.resolve('sql.js/dist/' + f)`,
+which resolves over the virtual filesystem like any other module path.
+
+**PostgreSQL via PGlite.** This is real PostgreSQL — currently 18 — compiled to
+Wasm. About 16 MB of `pglite.wasm` and `pglite.data`, read out of
+`node_modules` through the virtual filesystem: the package resolves them from
+`__filename`, builds a `new URL('./pglite.wasm', ...)`, and calls
+`fs.readFile`. Every step of that is ordinary Node behaviour, which is the whole
+point.
+
+One deliberate choice: we use PGlite's **CommonJS** build. The ESM build relies
+on top-level await, and in-VM only the entry module can block on TLA. Choosing
+CJS avoids the problem entirely.
+
+**And one we deliberately did not ship.** libSQL is not available as an in-VM
+template, and the reason is worth stating rather than leaving as a gap in a
+table. `@libsql/client` in local mode is a native N-API addon with no `wasm32`
+build. `@libsql/client/web` works, but only talks to a remote Turso server —
+which is a network client, not a database in the tab. Neither is
+self-contained, so neither belongs in a list of things that run with no server.
+sql.js remains the local SQLite path.
+
+Both engines were confirmed end-to-end in plain Node first, against the same
+`fs`, `url` and `WebAssembly` primitives the runtime exposes, before either was
+wired into a template. Both are then gated by network spikes in CI that install
+the dependency, bind a port, and assert that the API reports the right engine
+version and returns seeded rows — with a longer budget for PGlite, whose install
+and first-boot Wasm compile are genuinely heavy.
+
+## The pattern
+
+Both of these landed for the same reason, and it is not cleverness.
+
+The HTTP parser worked because Node had already defined the seam
+(`internalBinding('http_parser')`) and someone had already compiled the C to
+Wasm. The databases worked because the runtime implemented `fs` and `url`
+properly rather than implementing the subset our own demos needed.
+
+Neither was planned. Both fell out of building the layer underneath correctly
+and then discovering what it supported. That is a much better position to be in
+than the alternative, and it is most of the argument for
+[the architecture](https://vivari.jamesisme.com/docs/how-it-works) these posts
+keep coming back to.

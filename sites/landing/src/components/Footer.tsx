@@ -14,6 +14,7 @@ export function Footer() {
 
         <nav className="flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-sm text-muted">
           <a href={site.docsUrl} className="hover:text-fg">Docs</a>
+          <a href={site.blogUrl} className="hover:text-fg">Blog</a>
           <a href={site.studioUrl} className="hover:text-fg">Studio</a>
           <a href={site.npmCoreUrl} target="_blank" rel="noreferrer" className="hover:text-fg">npm</a>
           <a

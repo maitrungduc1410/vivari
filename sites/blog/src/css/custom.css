@@ -1,0 +1,254 @@
+/* Vivari engineering blog theme.
+ *
+ * Same brand palette as the docs and the landing (the logo gradient:
+ * cyan -> violet -> pink), but the blog leads with cyan where the docs lead with
+ * violet. Sibling sites, not clones.
+ *
+ * Everything here is plain CSS on top of the stock theme — no swizzling. That
+ * constrains the selectors: Docusaurus hashes its CSS-module class names
+ * (`title_f1Hy`, `container_mt6G`), which change between releases, so this file
+ * only targets names that are part of the public contract — the `blog-wrapper` /
+ * `blog-list-page` / `blog-post-page` wrappers and plain element structure.
+ */
+
+:root {
+  /* Cyan dark enough to clear AA against a white background. */
+  --ifm-color-primary: #0b7f96;
+  --ifm-color-primary-dark: #0a7287;
+  --ifm-color-primary-darker: #096b7f;
+  --ifm-color-primary-darkest: #075868;
+  --ifm-color-primary-light: #0c8ca5;
+  --ifm-color-primary-lighter: #0d93ad;
+  --ifm-color-primary-lightest: #0fa8c6;
+  --ifm-code-font-size: 92%;
+  --ifm-font-family-base: "Inter", system-ui, -apple-system, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.08);
+
+  /* The logo gradient, reused for every accent rule below. */
+  --vv-gradient: linear-gradient(90deg, #22d3ee 0%, #7c5cff 55%, #f472b6 100%);
+  --vv-card-radius: 14px;
+}
+
+[data-theme="dark"] {
+  --ifm-color-primary: #22d3ee;
+  --ifm-color-primary-dark: #16bcd6;
+  --ifm-color-primary-darker: #14b2ca;
+  --ifm-color-primary-darkest: #1092a6;
+  --ifm-color-primary-light: #45dbf1;
+  --ifm-color-primary-lighter: #58def3;
+  --ifm-color-primary-lightest: #8ce9f7;
+  /* Identical surfaces to the docs so the two sites read as one product. */
+  --ifm-background-color: #05060a;
+  --ifm-background-surface-color: #0e1119;
+  --docusaurus-highlighted-code-line-bg: rgba(255, 255, 255, 0.08);
+}
+
+/* --- Chrome ------------------------------------------------------------- */
+
+.navbar {
+  background-color: color-mix(in srgb, var(--ifm-navbar-background-color) 82%, transparent);
+  /* Replaced by the gradient rule below. */
+  box-shadow: none;
+  border-bottom: 1px solid var(--ifm-toc-border-color);
+}
+
+/* The frosted blur sits on a pseudo-element rather than on `.navbar` itself.
+   `backdrop-filter` makes an element the containing block for its
+   fixed-position descendants, and the mobile menu (`.navbar-sidebar`, a child of
+   `.navbar`) is `position: fixed; top: 0; bottom: 0` expecting the viewport. Put
+   the filter on `.navbar` and the sidebar collapses to the navbar's ~60px, which
+   in turn gives `.navbar-sidebar__items` — sized `calc(100% - navbar-height)` —
+   exactly zero height, so the menu opens completely empty. */
+.navbar::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  backdrop-filter: blur(10px);
+}
+
+/* Full-bleed gradient hairline pinned under the navbar — the one piece of
+   chrome that tells you at a glance you are on the blog and not the docs. */
+.navbar::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 -1px 0;
+  height: 2px;
+  background: var(--vv-gradient);
+}
+
+/* The open mobile sidebar is a positioned sibling with `z-index: auto`, so the
+   hairline — a later pseudo-element in the same layer — would paint a stripe
+   across it. The sidebar brings its own brand-row shadow. */
+.navbar.navbar-sidebar--show::after {
+  display: none;
+}
+
+/* GitHub navbar link with an icon (no image asset needed). */
+.navbar__item[href*="github.com"]::before,
+.navbar__link[href*="github.com"]::before {
+  content: "";
+  display: inline-block;
+  width: 1.25rem;
+  height: 1.25rem;
+  margin-right: 0.35rem;
+  vertical-align: text-bottom;
+  background-color: currentColor;
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 .3a12 12 0 00-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.3-1.8-1.3-1.8-1.1-.7 0-.7 0-.7 1.2 0 1.9 1.2 1.9 1.2 1 1.8 2.8 1.3 3.5 1 0-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.2.5-2.3 1.3-3.1-.2-.4-.6-1.6 0-3.2 0 0 1-.3 3.4 1.2a11.5 11.5 0 016 0c2.3-1.5 3.3-1.2 3.3-1.2.6 1.6.2 2.8.1 3.2.8.8 1.3 1.9 1.3 3.2 0 4.6-2.9 5.6-5.5 5.9.5.3.9 1 .9 2.2v3.3c0 .3.1.7.8.6A12 12 0 0012 .3z'/%3E%3C/svg%3E");
+  mask-repeat: no-repeat;
+  mask-size: contain;
+}
+
+/* --- Long-form reading -------------------------------------------------- */
+
+/* Posts are 2000+ words of prose with code; the docs' tighter defaults are
+   tuned for scanning, not reading end to end. */
+.blog-wrapper .markdown {
+  font-size: 1.0625rem;
+  line-height: 1.78;
+}
+
+.blog-wrapper .markdown > p,
+.blog-wrapper .markdown > ul,
+.blog-wrapper .markdown > ol {
+  margin-bottom: 1.35rem;
+}
+
+.blog-wrapper .markdown h2 {
+  margin-top: 3rem;
+  font-size: 1.65rem;
+  letter-spacing: -0.015em;
+}
+
+.blog-wrapper .markdown h3 {
+  margin-top: 2.25rem;
+  font-size: 1.25rem;
+}
+
+.blog-wrapper .markdown blockquote {
+  border-left: 3px solid var(--ifm-color-primary);
+  background: var(--ifm-background-surface-color);
+  border-radius: 0 var(--vv-card-radius) var(--vv-card-radius) 0;
+}
+
+/* --- Post header -------------------------------------------------------- */
+
+.blog-post-page article > header > h1 {
+  font-size: clamp(2rem, 1.35rem + 2.4vw, 3.05rem);
+  line-height: 1.12;
+  letter-spacing: -0.025em;
+  margin-bottom: 1.1rem;
+}
+
+.blog-post-page article > header > h1::after {
+  content: "";
+  display: block;
+  width: 4.5rem;
+  height: 3px;
+  margin-top: 1.35rem;
+  border-radius: 2px;
+  background: var(--vv-gradient);
+}
+
+/* The date + reading-time line is the div immediately after the title. Give it
+   its own row treatment rather than letting it read as body copy. */
+.blog-post-page article > header > h1 + div,
+.blog-list-page article > header > h2 + div {
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ifm-color-emphasis-600);
+}
+
+/* --- Post list as cards ------------------------------------------------- */
+
+.blog-list-page article {
+  padding: 1.6rem 1.75rem 1.25rem;
+  border: 1px solid var(--ifm-toc-border-color);
+  border-radius: var(--vv-card-radius);
+  background: var(--ifm-background-surface-color);
+  transition:
+    border-color 150ms ease,
+    transform 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.blog-list-page article:hover {
+  border-color: var(--ifm-color-primary);
+  transform: translateY(-2px);
+  box-shadow: 0 18px 40px -28px rgba(34, 211, 238, 0.55);
+}
+
+.blog-list-page article > header > h2 {
+  font-size: 1.45rem;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.6rem;
+}
+
+.blog-list-page article > header > h2 > a {
+  color: var(--ifm-heading-color);
+  text-decoration: none;
+}
+
+.blog-list-page article > header > h2 > a:hover {
+  color: var(--ifm-color-primary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .blog-list-page article {
+    transition: none;
+  }
+  .blog-list-page article:hover {
+    transform: none;
+  }
+}
+
+/* --- Live example ------------------------------------------------------- */
+/* Kept in sync with sites/docs/src/css/custom.css so an embed looks the same
+   whichever site it is read on (see src/components/Playground.tsx). */
+
+.vv-playground {
+  margin: 1.5rem 0;
+  border: 1px solid var(--ifm-toc-border-color);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--ifm-background-surface-color);
+  box-shadow: 0 10px 30px -18px rgba(0, 0, 0, 0.6);
+}
+
+.vv-playground__bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.85rem;
+  border-bottom: 1px solid var(--ifm-toc-border-color);
+  font-size: 0.8rem;
+}
+
+.vv-playground__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #34d399;
+  box-shadow: 0 0 8px 1px rgba(52, 211, 153, 0.55);
+}
+
+.vv-playground__label {
+  font-weight: 600;
+  color: var(--ifm-font-color-base);
+}
+
+.vv-playground__link {
+  font-weight: 600;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.vv-playground__frame {
+  display: block;
+  width: 100%;
+  border: 0;
+}

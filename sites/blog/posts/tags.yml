@@ -1,0 +1,29 @@
+runtime:
+  label: Runtime
+  permalink: /runtime
+  description: The Node-compatible runtime that executes inside the tab.
+
+teardown:
+  label: Teardown
+  permalink: /teardown
+  description: How a piece of Vivari actually works, and what it cost to build.
+
+wasm:
+  label: WebAssembly
+  permalink: /wasm
+  description: The Rust and C code compiled to Wasm underneath the runtime.
+
+nodejs:
+  label: Node.js
+  permalink: /nodejs
+  description: Compatibility with the real Node.js API surface.
+
+browser-platform:
+  label: Browser platform
+  permalink: /browser-platform
+  description: Web platform primitives the runtime is built on.
+
+deployment:
+  label: Deployment
+  permalink: /deployment
+  description: Hosting, origins, headers and the preview infrastructure.

@@ -5,6 +5,7 @@ export const site = {
   tagline: "Run Node.js in the browser.",
   studioUrl: "/studio/",
   docsUrl: "/docs/",
+  blogUrl: "/blog/",
   githubUrl: "https://github.com/maitrungduc1410/vivari",
   npmCoreUrl: "https://www.npmjs.com/package/@vivari/core",
 } as const;
