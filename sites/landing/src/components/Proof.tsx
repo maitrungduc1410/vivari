@@ -15,7 +15,7 @@ const RUNS = [
   },
   {
     title: "The real npm, yarn and pnpm",
-    body: "Not a re-implemented installer — the actual CLIs from the registry, resolving and linking a lockfile.",
+    body: "Not a re-implemented installer: the actual CLIs from the registry, resolving and linking a lockfile.",
     href: `${site.blogUrl}real-package-managers-in-the-browser`,
     hrefLabel: "how each one broke the runtime",
   },
@@ -39,7 +39,7 @@ const RUNS = [
   },
   {
     title: "Vitest, webpack, Angular, Astro",
-    body: "Test runners and heavyweight build tools that assume a real Node install — because they get one.",
+    body: "Test runners and heavyweight build tools that assume a real Node install, because they get one.",
     href: site.studioUrl,
     hrefLabel: "try a template",
   },
@@ -50,7 +50,7 @@ export function Proof() {
     <section id="proof" className="mx-auto max-w-7xl px-6 py-24">
       <Reveal className="mx-auto max-w-2xl text-center">
         <h2 className="text-3xl font-semibold tracking-tight md:text-4xl">
-          Yes — it really <span className="text-gradient">runs that</span>
+          Yes, it really <span className="text-gradient">runs that</span>
         </h2>
         <p className="mt-4 text-muted">
           A browser Node runtime is easy to demo and hard to finish. These are the

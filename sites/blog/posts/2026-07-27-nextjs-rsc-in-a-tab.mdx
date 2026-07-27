@@ -1,6 +1,6 @@
 ---
 slug: nextjs-rsc-in-a-tab
-title: Next.js 16 renders React Server Components in a browser tab — and the AsyncLocalStorage trap
+title: Next.js 16 renders React Server Components in a browser tab, and the AsyncLocalStorage trap
 description: We had written Next.js off as a hard native wall. That verdict was wrong. Getting RSC rendering in-browser came down to one primitive the platform cannot provide.
 tags: [teardown, runtime, nodejs]
 image: /img/og/nextjs-rsc-in-a-tab.png
@@ -11,7 +11,7 @@ For most of this project's life, our notes said Next.js was out of reach. The
 reasoning looked solid: Next compiles with SWC, SWC is native Rust, there is no
 native code in a browser tab, therefore no Next.js. A hard wall, filed away.
 
-That verdict was wrong, and it was wrong in the most ordinary way — we had
+That verdict was wrong, and it was wrong in the most ordinary way: we had
 decided something was impossible and then stopped rechecking it.
 
 `next dev --webpack` now boots inside a browser tab, compiles an App Router
@@ -30,7 +30,7 @@ Three things had to be true at once, and all three already were:
 
 **Next 16 kept the Wasm SWC fallback.** `@next/swc-wasm-nodejs` still exists,
 because Next still has to run in environments without a native binding. Next's
-own `loadBindings` prefers it when `process.versions.webcontainer` is set —
+own `loadBindings` prefers it when `process.versions.webcontainer` is set,
 which our runtime now reports, because that is exactly what we are.
 
 **webpack is still selectable.** Turbopack is native Rust with no Wasm build, so
@@ -46,13 +46,13 @@ time something gets filed as impossible.
 
 The rest of the work was the usual: `vm.runInNewContext` had to make the sandbox
 the *real* global, so that `globalThis.__RSC_MANIFEST = ...` assignments in
-Next's generated manifest files actually land on the context object — without
+Next's generated manifest files actually land on the context object; without
 that the client-reference manifest never loads. `child_process.fork` needed a
 genuine IPC channel, because `next dev` forks its dev server and gates startup
 on `process.send` existing. `pathToFileURL` had to resolve relative to absolute
-like Node does. A handful of modules — `dns/promises`, `stream/web`, an
-`inspector` stub, `module.findSourceMap`, and the complete `Console` method
-surface that `@edge-runtime/primitives` binds — had to exist.
+like Node does. A handful of modules had to exist: `dns/promises`, `stream/web`,
+an `inspector` stub, `module.findSourceMap`, and the complete `Console` method
+surface that `@edge-runtime/primitives` binds.
 
 All generic. None of it Next-specific. Then there was the interesting one.
 
@@ -87,23 +87,23 @@ does not have and cannot be made to have.
 What we could do was stop trying to solve the general problem. A dev preview
 handles one request at a time. That is a much weaker requirement than a
 production server, and within it the context can be tracked well enough to be
-*deterministic* — not merely usually correct.
+*deterministic*, not merely usually correct.
 
 Three rules, each of which exists because a specific thing broke.
 
-**Rule 1 — a thenable-returning `run(store, cb)` holds its store until the
+**Rule 1: a thenable-returning `run(store, cb)` holds its store until the
 promise settles, then pops only if still top, and never back to `undefined`.**
 
 The "only if still top" clause stops out-of-order settling from clobbering a
 live nested scope. The "never back to `undefined`" clause is the one that took
-real debugging. A streaming RSC render returns its promise *early* — as soon as
-the stream is created — while React carries on rendering components detached
+real debugging. A streaming RSC render returns its promise *early*, as soon as
+the stream is created, while React carries on rendering components detached
 across native awaits. Zeroing the store when that early promise settles throws
 `Expected workStore to be initialized` in code that is still running. Restoring
 a *defined* parent store is safe and keeps nested scopes correct; restoring
 `undefined` is not.
 
-**Rule 2 — a plain, non-thenable return does not restore at all.**
+**Rule 2: a plain, non-thenable return does not restore at all.**
 
 Next's `renderToFlightStream` returns a stream synchronously and does the actual
 rendering later, across raw awaits, with no promise for us to observe. If the
@@ -115,7 +115,7 @@ This rule is, straightforwardly, a leak. In a general-purpose implementation it
 would be wrong. Under one-request-at-a-time it is the behaviour that makes the
 detached render work, and the next `run()` cleans up after it.
 
-**Rule 3 — propagate a per-hop snapshot of every live store through the
+**Rule 3: propagate a per-hop snapshot of every live store through the
 scheduling primitives React uses.**
 
 Specifically `Promise.prototype.then`, `queueMicrotask`, `setImmediate` and
@@ -123,10 +123,10 @@ Specifically `Promise.prototype.then`, `queueMicrotask`, `setImmediate` and
 place context would otherwise be lost. Snapshotting at schedule time and
 restoring at run time recovers most of what a PromiseHook would have given us.
 
-The patches install **once at boot** — after the runtime's own timer globals are
-in place and before any framework code loads, so React captures the wrapped
-primitives rather than the originals — and only on the polyfill path. When the
-host provides real `async_hooks`, none of this is active.
+The patches install **once at boot**, and only on the polyfill path. The timing
+matters: after the runtime's own timer globals are in place, and before any
+framework code loads, so React captures the wrapped primitives rather than the
+originals. When the host provides real `async_hooks`, none of this is active.
 
 ## Proving it, given the failure mode
 
@@ -140,14 +140,14 @@ test suite exercises the browser path on a machine where the real one exists.
 That gives two things: an oracle, and the ability to run the comparison under
 load.
 
-The specific case that matters is the RSC refresh render — the App Router's
+The specific case that matters is the RSC refresh render: the App Router's
 "on save" re-render, the request with `RSC: 1` that the HMR flow issues. That is
 the path that threw `workStore` in the studio, so it is the path that has to be
 green.
 
 The results we hold it to: `GET /` returns 200; the refresh render returns 200
 with zero invariant errors across repeats; and the output is **byte-identical**
-to the host `async_hooks` path — under heavy-I/O perturbation, which is the
+to the host `async_hooks` path, under heavy-I/O perturbation, which is the
 whole point. Byte-identical against a known-correct implementation is a much
 stronger claim than "no errors observed", and it is the only reason we are
 comfortable describing the behaviour as deterministic rather than lucky.
@@ -190,8 +190,8 @@ the layers underneath implemented real specifications instead of the subset our
 demos needed.
 
 `AsyncLocalStorage` is the exception that proves the rule. There is no seam to
-cut, no specification to implement completely, no primitive to respect —
-V8's PromiseHook simply is not there. So the only honest move was to narrow the
+cut, no specification to implement completely, no primitive to respect. V8's
+PromiseHook simply is not there. So the only honest move was to narrow the
 problem until it was solvable, be explicit about the boundary, and test against
 the real implementation rather than against our own expectations.
 

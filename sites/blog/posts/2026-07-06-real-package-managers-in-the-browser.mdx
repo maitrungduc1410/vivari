@@ -1,174 +1,206 @@
 ---
-slug: real-package-managers-in-the-browser
-title: Real npm, yarn and pnpm in the browser — and how each one broke the runtime
-description: Not a reimplemented installer. The actual CLIs, unmodified, running in a tab. Each one exposed a different class of Node-compatibility bug.
-tags: [teardown, runtime, nodejs]
-image: /img/og/real-package-managers-in-the-browser.png
-og_eyebrow: TEARDOWN 03
+slug: three-ways-to-isolate-a-preview
+title: Three ways to isolate a preview, and the Cloudflare wildcard trick
+description: Serving a preview from the same origin as the IDE hands preview code your cookies, your storage and your OPFS. Fixing it runs into the Public Suffix List, storage partitioning and a TLS wildcard rule.
+tags: [teardown, deployment, browser-platform]
+image: /img/og/three-ways-to-isolate-a-preview.png
+og_eyebrow: TEARDOWN 05
 ---
 
-The fastest way to fake a package manager in a browser is to write one. Read a
-`package.json`, resolve the tree against the registry API, download tarballs,
-untar them into `node_modules`. A few hundred lines and it works for most
-projects. We shipped exactly that, and called it what it was: a temporary
-stand-in.
+When an in-browser IDE runs your dev server and shows you the result, the
+result has to be served from *somewhere*. The easy answer is the origin you
+already have: put the preview at `/preview/5173/` on the IDE's own domain, let
+the Service Worker route by path, ship it.
 
-StackBlitz did the same thing. Their custom client, Turbo, shipped in 2018 and
-was deprecated in April 2024 in favour of the real npm, yarn and pnpm. That arc
-is not a coincidence — it is what happens when you discover how much of the
-ecosystem depends on the actual CLI rather than the idea of one.
+That is what we did, and it is a security problem.
 
-Lockfile formats you did not implement. `overrides` and `resolutions`.
-Workspaces. Lifecycle scripts in the right order. `.npmrc` resolution.
-`peerDependenciesMeta`. Every one of those is a support request, and each one is
-a small reimplementation of behaviour that already exists in a program you could
-have just run.
+Same origin means the same cookie jar, the same `localStorage`, the same
+IndexedDB, the same OPFS, the same Cache Storage, the same Service Worker scope.
+Preview code, which includes every npm package the project installed and
+anything an AI assistant just generated, sits inside the IDE's origin. It can
+read the editor's session state, corrupt its persistence, and call its
+same-origin APIs. Previews are not isolated from the IDE, and they are not
+isolated from each other.
 
-So the goal was never a better installer. It was to run the real ones.
+Fixing this properly took three attempts, and each one ran into a different
+piece of web platform trivia.
 
 {/* truncate */}
 
-## npm: booting is the easy part
+## Mode A: same origin
 
-The first milestone was not `install`. It was `npm -v` printing `10.9.2` and
-exiting 0. That alone exposed three genuine Node-fidelity gaps:
+The default, and the one to move away from.
 
-- **`process` must be a real `EventEmitter`.** npm's logging goes through
-  `proc-log`, which attaches listeners to `process`. Our `process` was an object
-  with some properties on it. Close enough for user code, not close enough for
-  npm.
-- **`import()` inside CommonJS must route through the loader.** npm does
-  `await import('chalk')` from CJS. A dynamic import that reaches the browser's
-  native module loader instead of the runtime's resolver finds nothing.
-- **Exit semantics must be exact.** `stdout.write(cb)` firing its callback,
-  `process.exitCode` being honoured, and `'exit'` emitting exactly once. npm's
-  exit handler is picky, and a double-fired `'exit'` produces confusing
-  half-completed installs.
-
-None of these are npm-specific bugs. They are places where our runtime was
-approximately Node, and npm was the first program strict enough to notice.
-
-Real installs came next: rebuilding `lib/https.js` as a fetch-backed client so
-that npm's own `npm-registry-fetch → make-fetch-happen → minipass-fetch` stack
-runs unmodified. Then lifecycle scripts, `.bin` linking, and `npm exec`.
-
-The one genuinely unsolvable case was **native builds**. A package whose
-`install` script is `node-gyp rebuild` cannot work: there is no compiler
-toolchain in a browser tab, and there never will be. What we could fix was the
-blast radius. Previously one native dependency aborted the entire install. Now
-`node-gyp` is stubbed to a no-op that warns and exits 0, so the package's
-JavaScript or `wasm32-wasi` fallback is what loads at runtime and
-`preinstall` → `install` → `postinstall` completes.
-
-That is a deliberate trade, and worth stating plainly: we make native
-compilation a **non-fatal skip** rather than a hard failure. Packages that
-genuinely require a native addon will not work. Packages that ship a fallback —
-which is most of them now — will.
-
-## Delivery: the boring problem that ate the most time
-
-Here is a problem that does not exist on a server. The browser cannot
-`readdirSync` your machine, so before you can run npm you have to *get npm into
-the virtual filesystem*.
-
-npm is about 2,400 files. Fetching those individually is absurd, so the build
-packs the whole pinned tree into a single gzipped asset, decodes it in the
-browser with the platform's own `DecompressionStream`, and unpacks it into the
-filesystem at `/usr/lib/node_modules/npm`.
-
-The detail that cost an afternoon: the asset is named `npm-pack.bin`, not
-`npm-pack.gz`. Static hosts see a `.gz` extension and helpfully apply
-`Content-Encoding: gzip`, so the browser transparently decompresses it — and
-then our code decompresses it again, on data that is no longer compressed. The
-fix is to stop advertising the compression in the filename.
-
-After the first boot the unpacked tree is persisted to OPFS, so later boots only
-need to reapply a couple of thin shims that point `/bin/npm.js` at the real CLI.
-
-## yarn: five bugs, one of them structural
-
-yarn classic is small to deliver — essentially `bin/yarn.js` plus a ~5 MB
-webpack bundle. That 5 MB is itself informative: it does not fit through the
-[1 MiB shared-memory window](/blocking-in-a-browser), so it has to go
-through the transferred-buffer path instead.
-
-Running it filled five gaps npm had not touched:
-
-1. `process.stdout` and `process.stderr` needed the full EventEmitter and
-   Writable surface — `prependListener` and friends — that yarn attaches during
-   bootstrap.
-2. `process.memoryUsage()`, because yarn's reporter tracks peak RSS.
-3. A legacy `process.binding(name)` shim delegating to `internalBinding`, for
-   yarn's bundled `safer-buffer`, `builtin-modules` and `constants`.
-4. Two lazy `fs` internals — `internal/streams/fast-utf8-stream` and
-   `internal/fs/dir` — that yarn trips by *merely enumerating* every getter on
-   `fs`, via `thenify-all`'s `promisifyAll`. Nothing called them. Reading the
-   property was enough.
-5. The structural one.
-
-That last one is worth spelling out, because it is a perfect example of what
-"exactly right" means when you are
-[shipping Node's real source](/nodes-real-lib-in-the-browser).
-
-`internal/fs/streams` defines `ReadStream` and `WriteStream`. We had written
-them as ES6 `class` declarations, which is what any modern engineer would do.
-Real Node defines them as ES5 function constructors — callable without `new`,
-initialising via `Readable.call(this)`.
-
-`graceful-fs`, bundled by yarn and by fs-extra and by half of npm, subclasses
-them the old way:
-
-```js
-fs$WriteStream.apply(this, arguments);
+```
+https://ide.example.com/preview/5173/
 ```
 
-You cannot `.apply()` a `class`. It throws `TypeError: Class constructor cannot
-be invoked without 'new'`. The fix was to stop writing modern JavaScript and
-write what Node writes.
+The Service Worker intercepts requests under `/preview/<port>/`, strips the
+prefix, and relays them to the kernel, which it can find directly because it
+is same-origin with the tab holding it.
 
-There is one known cosmetic wart we have not chased: yarn prints "You don't
-appear to have an internet connection", because its connectivity probe is
-DNS-based and our networking is fetch-backed. The install then succeeds anyway.
+Zero extra infrastructure, and it works. But beyond the storage problem, path
+routing quietly breaks things that a real server would get right:
 
-## pnpm: the one we expected to fail
+| Keyed on origin | Breaks under shared-origin path routing |
+|---|---|
+| Cookie jar (session, CSRF, `SameSite`) | frontend and backend cookies collide at `/` |
+| localStorage / IndexedDB / OPFS / Cache | services share one store, state bleeds |
+| CORS and `fetch` credentials | cross-service calls look same-origin, wrongly |
+| Service Worker scope | the app's own SW registrations collide |
+| Absolute paths | router basename, `/asset.png` and `<base>` all break |
 
-pnpm looked like the wall. It does two things that a browser runtime has no
-business supporting.
+That last row is the one users actually report. Any app that assumes it is
+served from `/` needs a prefix hack somewhere: in the SW, in the URL rewriter,
+or in the app's own config.
 
-It uses **real worker threads** — `dist/worker.js` for fetching and extracting.
-And it builds a **symlinked** `node_modules`, where `node_modules/<pkg>` points
-into `.pnpm/<pkg>@<version>/node_modules/<pkg>`, so module resolution has to
-traverse symlinks correctly or nothing resolves at all.
+## Mode B: a second origin
 
-Both worked unmodified.
+Move previews to a different origin entirely and the browser's same-origin
+policy does the work for you. The kernel still lives in the IDE tab, so the
+preview's Service Worker reaches it through a hidden bridge iframe and a
+`MessagePort`.
 
-The worker threads work because the process model already runs each process as a
-Web Worker; nested threads are just more of the same. The symlink store works
-because the Rust virtual filesystem implements `symlink`, `readlink` and `lstat`
-properly, with an `ELOOP` guard — which was built long before anyone was
-thinking about pnpm.
+Here the hosting platform pushes back. A Cloudflare Pages project only gets
+`<project>.pages.dev`, and you cannot mint `preview.myproject.pages.dev`. A
+second origin means a second Pages project.
 
-The only gap was `util.types.isBoxedPrimitive`, a single missing function on
-pnpm's registry JSON path.
+Which sounds fine, and introduces the first real trap.
 
-This is the most encouraging result in the whole project, and the reason is
-worth naming: the components that survive contact with software you did not
-anticipate are the ones that implemented a *real specification* rather than the
-subset you happened to need. A virtual filesystem that supports symlinks because
-POSIX has symlinks handles pnpm on the first try. One that supports the
-operations your test app used would not have.
+**`pages.dev` is on the Public Suffix List.** That makes `myproject.pages.dev`
+and `myproject-preview.pages.dev` *different sites*, not merely different
+origins. As an isolation boundary that is stronger than you asked for: cookies
+cannot be shared even deliberately.
 
-## What this actually proves
+It also breaks popping a preview out into its own tab, in a way that cannot be
+worked around.
 
-Every one of these bugs was generic. `process` becoming a real EventEmitter,
-ES5 stream constructors, `process.binding`, `isBoxedPrimitive` — none of them
-are package-manager features. They are Node behaviours that our runtime had
-approximated, and the package managers were simply the first programs demanding
-enough to find them.
+Chrome storage-partitions cross-site contexts. The kernel is reached through a
+bridge iframe living in the editor tab; for a standalone preview tab to use that
+bridge's Service Worker registration and `MessagePort`, both have to be in the
+same storage partition. Cross-site, they are not. And `requestStorageAccess()`
+un-partitions **cookies**, not Service Worker registrations, so the "connect
+this tab to its project" gate can never actually bridge the two partitions. The
+gate appears, you grant it, and nothing changes.
 
-That is the argument for running real software as your test suite. A
-hand-written conformance test checks what you thought to check. npm checks what
-npm needs, which is a much better-informed list.
+**Two subdomains of one registrable domain fix it.** Serve the IDE at
+`ide.example.com` and previews at `preview.example.com`, both CNAMEd to their
+Pages projects, and the two are *same-site*: no partition wall exists, so the
+popped-out tab shares the bridge's Service Worker and reaches the kernel with no
+gate at all. Storage is still origin-scoped, so preview code still cannot touch
+IDE storage.
 
-Next: [Next.js 16 rendering React Server Components in a single tab](/nextjs-rsc-in-a-tab),
-and the `AsyncLocalStorage` problem that has no correct solution in a browser.
+| Deploy | Same-site? | Partitioned? | Pop-out |
+|---|---|---|---|
+| Two `*.pages.dev` projects | No, PSL cuts `pages.dev` | Yes | Gate appears, cannot be granted |
+| Two subdomains of one domain | Yes | No | Connects immediately, no gate |
+| StackBlitz (`stackblitz.com` / `webcontainer.io`) | No, different domains | Yes | Gate, accepted deliberately |
+
+The residual leak with same-site subdomains is domain-wide cookies: anything set
+with `Domain=example.com` is visible to both. So do not set domain-wide cookies
+on the IDE. For trusted first-party code this is the right trade. For untrusted
+code at scale you want the cross-site boundary and you accept the gate, which
+is exactly the choice StackBlitz made, and it is a reasonable one for their
+threat model, not an oversight.
+
+There is one important caveat: you have to open the editor at
+`ide.example.com`. Loading it via the raw `.pages.dev` hostname reintroduces
+cross-site and the gate comes back.
+
+## Mode C: one origin per port
+
+Mode B isolates previews from the IDE, but every preview still shares one origin
+with every other preview, and the port is still in the path. Mode C gives each
+in-VM port its own origin:
+
+```
+https://k3f9a2xh--5173-vv.example.com/
+```
+
+The port moves into the hostname, so each preview gets genuine
+`localhost:<port>` semantics, with its own cookies, its own storage and its own
+CORS behaviour, and previews are isolated from each other as well as from the
+IDE. Everything on the "breaks under path routing" list above stops being a
+problem, and the prefix hacks come out of the codebase.
+
+This is the model StackBlitz uses, and their URLs decode neatly:
+
+```
+https://vitejsvitelqrjey5b-c0kn--5173--87cf54cd.local-credentialless.webcontainer.io/
+        └────── instance / project id ────┘  └port┘ └session hash┘ └ COEP mode ┘ └base┘
+```
+
+Getting there involves three constraints that each look arbitrary until they
+bite.
+
+**Cloudflare Pages cannot do wildcard custom domains.** They are exact hostnames
+only. So the wildcard origin has to be a Worker bound to a route, serving the
+static Service Worker runtime and the bridge document. It runs no kernel and no
+IDE; it is pure static hosting for an origin that has to exist per port.
+
+**The wildcard must be a prefix, so the tag must be a suffix.** Cloudflare
+routes only allow `*` at the *start* of a hostname. `vv-*.example.com` is an
+infix wildcard and is rejected. That is why the marker is a suffix and the route
+reads `*-vv.example.com/*`, which has the pleasant side effect of being narrow:
+it matches Vivari preview hosts and nothing else on the zone. Anything else that
+reaches the Worker is passed straight through untouched.
+
+**Free TLS covers exactly one label.** Cloudflare's Universal SSL issues a
+certificate for the apex plus a single-level wildcard: `*.example.com` matches
+`abc.example.com` but *not* `abc.def.example.com`. So a scheme like
+`*.preview.example.com` is two levels deep, is not covered, and produces a TLS
+error rather than a helpful message. Paid Advanced Certificate Manager fixes it;
+staying free means keeping preview hostnames one level under the apex and
+packing the port into that single label, hence `<token>--<port>-vv`, all in one
+label.
+
+Each preview response is then stamped with `COOP: same-origin`,
+`COEP: credentialless` and `CORP: cross-origin`, so the IDE (which is
+`require-corp`) can embed the bridge iframe, and the Service Worker is allowed
+to claim root scope.
+
+## The limitation nobody can engineer away
+
+One thing worth being honest about, because it applies to every client-side
+container including this one.
+
+A preview URL is not a network address. It is a **capability ticket that only
+works inside the browser holding a kernel-connected Service Worker**. The
+Service Worker is a per-origin proxy running in *your* browser, and its live
+link to the kernel is a `MessagePort` held in its memory.
+
+The consequences are observable on StackBlitz and we inherit all of them:
+
+- Paste the URL into a new tab on the same browser and it works, because that
+  tab is claimed by the same Service Worker, which already holds the port.
+- "Open in new tab" sometimes needs a popup and a reload. That happens when the
+  Service Worker's in-memory port has lapsed because it was killed while idle,
+  and the popup provides a `window.opener` channel to re-handshake.
+- Open it on another machine and it fails, even with the project still open
+  elsewhere. The kernel lives in the first machine's tab RAM. `postMessage` does
+  not cross the network.
+- Close the editor tab and the preview dies.
+
+None of that is fixable within the no-server model, because the thing serving
+the preview genuinely is not a server. A persistent, shareable preview URL
+requires a real backend, which is a different product decision, not a bug to
+file.
+
+## Choosing
+
+| | A. same-origin | B. shared preview origin | C. wildcard per port |
+|---|---|---|---|
+| Extra infrastructure | none | one more Pages project | custom domain + wildcard DNS + Worker |
+| Port encoded in | path | path | hostname |
+| Isolates IDE from preview | no | yes | yes |
+| Isolates previews from each other | no | no | yes |
+| Real per-port semantics | no | no | yes |
+
+The modes are a deploy-time choice rather than a runtime toggle, which keeps the
+core simple. Start at A if you are running your own trusted code and want zero
+infrastructure. Move to B with same-site subdomains as soon as anyone else's
+code runs in your previews. Go to C when previews need to be isolated from each
+other, or when apps genuinely need to believe they are on their own host.
+
+The [deployment guide](https://vivari.jamesisme.com/docs/deployment) has the full
+setup for each.

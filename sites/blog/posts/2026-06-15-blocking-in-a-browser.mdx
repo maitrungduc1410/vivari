@@ -17,7 +17,7 @@ code:
 const config = fs.readFileSync("/app/package.json", "utf8");
 ```
 
-That call has to return bytes. Not a promise, not a callback — bytes, on the
+That call has to return bytes. Not a promise, not a callback: bytes, on the
 next line. And reading those bytes means asking something else for them, which
 in a browser means waiting. Browsers are built on exactly one promise to the
 user: nothing blocks. So the very first thing Node requires is the one thing the
@@ -33,12 +33,12 @@ The obvious dodge is to give up on synchronous I/O: rewrite the runtime around
 `fs.promises`, tell users to `await` everything, and move on. It does not work,
 for a reason that has nothing to do with taste.
 
-Synchronous I/O is not a convenience in Node — it is load-bearing. `require()`
+Synchronous I/O is not a convenience in Node; it is load-bearing. `require()`
 is synchronous all the way down: resolving a specifier means `statSync` on a
 dozen candidate paths, then `readFileSync` on the winner, then compiling and
 executing it, before the calling module's next statement runs. `execSync` blocks
 a parent until its child exits. `zlib.gunzipSync`, `child_process.spawnSync`,
-`crypto.randomBytes` in its sync form — the whole ecosystem sits on this.
+`crypto.randomBytes` in its sync form. The whole ecosystem sits on this.
 
 You cannot make `require()` async without breaking every CommonJS package ever
 published, which is most of npm. And you certainly cannot ship the *real* npm
@@ -50,8 +50,8 @@ negotiable. Something has to genuinely block.
 The main thread may not block. A **Web Worker** may.
 
 ```js
-// Only legal off the main thread. This parks the OS thread — no spinning,
-// no event loop, nothing runs on it — until someone notifies or it times out.
+// Only legal off the main thread. This parks the OS thread (no spinning, no
+// event loop, nothing runs on it) until someone notifies or it times out.
 Atomics.wait(control, STATE, REQUEST);
 ```
 
@@ -73,12 +73,12 @@ process code (Web Worker thread)
    ▼
  write request into the SAB, Atomics.store(STATE, REQUEST), ring a doorbell
    │
-   ▼  Atomics.wait(STATE, REQUEST) — the thread genuinely blocks
+   ▼  Atomics.wait(STATE, REQUEST)  (the thread genuinely blocks)
  ...another worker services it against the Rust/Wasm VFS...
    ▲
    └─ writes the response into the SAB, Atomics.notify(STATE)
    ▼
- returns bytes — still synchronous, no async leaked to user code
+ returns bytes (still synchronous, no async leaked to user code)
 ```
 
 Here it is running for real. Nothing below is awaited, and the round-trip is
@@ -100,7 +100,7 @@ Cross-Origin-Embedder-Policy: require-corp
 ```
 
 Miss either header and `SharedArrayBuffer` is simply `undefined`. There is no
-degraded mode to fall back to — the runtime does not start.
+degraded mode to fall back to; the runtime does not start.
 
 This propagates further than it first appears. `require-corp` means every
 subresource on the page must opt in to being embedded, so a third-party image
@@ -116,7 +116,7 @@ script, font, and pixel on the page.
 
 ## The layout, and the invariant that bites
 
-Each client — the kernel and every process — gets one `SharedArrayBuffer`, laid
+Every client (the kernel and each process) gets one `SharedArrayBuffer`, laid
 out as a small control block followed by a data region:
 
 ```
@@ -131,7 +131,7 @@ control[3] = RES_LEN  (response bytes in the data region)
 `STATE` moves between `IDLE`, `REQUEST`, `RESPONSE_OK` and `RESPONSE_ERR`; the
 error case carries a UTF-8 errno like `ENOENT` so that Node's own error
 construction upstack behaves normally. The request frame itself is
-self-describing — `[flags:u32][fieldCount:u32]([len:u32][bytes])*` — with
+self-describing (`[flags:u32][fieldCount:u32]([len:u32][bytes])*`) with
 scalars packed little-endian and everything else as raw bytes.
 
 The interesting part is not the encoding. It is `DATA_BYTES = 1 << 20`.
@@ -143,12 +143,12 @@ invisible until a payload crosses it, and payloads cross it constantly:
 - **File I/O is chunked.** Reads and writes loop at a 512 KiB chunk size, so
   arbitrarily large files transfer in pieces. There is a separate `writeLarge`
   path that skips the shared buffer entirely and transfers an `ArrayBuffer`
-  instead — necessary the moment you try to write something like yarn's 5 MB
-  bundled `cli.js` into the filesystem.
+  instead. That becomes necessary the moment you try to write something like
+  yarn's 5 MB bundled `cli.js` into the filesystem.
 - **HTTP responses are chunked.** A Vite dev server happily serves a 2.8 MB
   pre-bundled dependency file. That body cannot cross in one message, so it is
   split into sequential frames reassembled by request id. It also travels as a
-  raw length-prefixed field rather than inside JSON — escaping quotes and
+  raw length-prefixed field rather than inside JSON: escaping quotes and
   newlines inflates a body unpredictably, and the failure mode is a silent
   overflow rather than a clean error.
 - **Downloads bypass the window entirely.** A fetch streams its body straight
@@ -180,7 +180,7 @@ answer you. So the work is split:
 
 Some syscalls are *deferred* rather than serviced immediately: `accept`,
 `spawn` and blocking `fetch` leave the caller parked until the awaited event
-actually arrives. That is not a workaround, it is the point — it is how
+actually arrives. That is not a workaround, it is the point: it is how
 blocking `accept()` and `execSync()` get their semantics. A parked worker
 costs nothing while it waits.
 
@@ -190,7 +190,7 @@ None of the above is exotic on its own. `Atomics.wait` is a documented API and
 `SharedArrayBuffer` has shipped for years. What is interesting is how much falls
 out of taking the one available blocking primitive seriously and building the
 entire system to respect it: real `require()`, real `execSync`, real child
-processes, and — because the synchronous surface is honest — the ability to run
+processes, and, because the synchronous surface is honest, the ability to run
 Node's own source code rather than an approximation of it.
 
 That last point is the subject of the next post: [running Node's real `lib/` in

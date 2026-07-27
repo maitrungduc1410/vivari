@@ -32,7 +32,7 @@ You can write something called `Readable` in a day. Making it emit `'readable'`
 at the right moments, respect `highWaterMark`, handle a `pipe` target that
 returns `false` from `write`, unpipe cleanly on error, support both flowing and
 paused modes, implement `readableEnded` versus `readableFinished`, and behave
-correctly when a subclass calls the constructor without `new` — that is not a
+correctly when a subclass calls the constructor without `new`: that is not a
 day. And when you get one of those wrong, you do not get a clean error. You get
 a dev server that hangs at 40% of a build, in a package four levels deep in
 someone's dependency tree.
@@ -48,7 +48,7 @@ and would still be, at the end of all that effort, an imitation.
 ## Taking apart the competition
 
 StackBlitz's WebContainer had clearly solved this. So we did the obvious thing
-and read their bundle — a ~2.1 MB file called `builtins.2896b7f3.js`.
+and read their bundle, a ~2.1 MB file called `builtins.2896b7f3.js`.
 
 The finding reframed the entire project:
 
@@ -56,7 +56,7 @@ The finding reframed the entire project:
 JavaScript.**
 
 The evidence is not subtle once you look. The bundle exports an object with
-roughly 300 keys, and those keys are not a curated public API — they are Node's
+roughly 300 keys, and those keys are not a curated public API. They are Node's
 internal module tree. Alongside `fs`, `http`, `stream`, `crypto`, `zlib`, `net`,
 `tls` and `worker_threads` sit `internal/streams/readable`, `_http_agent`,
 `internal/crypto/*`, and `internal/bootstrap/realm`. Every module is wrapped in
@@ -72,7 +72,7 @@ them by shipping Node's source.
 Once you see it, the architecture of real Node becomes the architecture of the
 solution.
 
-Node is two layers. On top is `lib/*.js` — tens of thousands of lines of
+Node is two layers. On top is `lib/*.js`, tens of thousands of lines of
 JavaScript implementing streams, HTTP, crypto, the module loader, everything a
 package actually touches. Underneath is C++, reached through exactly one door:
 
@@ -116,7 +116,7 @@ executing in this page:
 ## Why the foundation survived the pivot
 
 The uncomfortable question when you decide to throw away months of work is how
-much of the rest goes with it. In this case, almost none — and understanding why
+much of the rest goes with it. In this case, almost none, and understanding why
 is the most useful part of the story.
 
 The realisation was that our existing `fs-client.js`, the thing user code called
@@ -131,7 +131,7 @@ and `spawn_sync` need. The virtual network is what `tcp_wrap` needs. The
 Atomics bridge is what makes any of them able to be synchronous.
 
 So Path B was a pivot in the upper layers, not a rewrite. Everything below the
-binding line — the part that had been genuinely hard to build — was the part
+binding line, the part that had been genuinely hard to build, was the part
 worth keeping. Path A had not been wasted either: writing the hand-rolled
 builtins is how we learned what the binding contract actually needed to be.
 
@@ -158,11 +158,11 @@ today. That trade is not close.
 ## The real test
 
 Compatibility claims are cheap. The honest test of whether you have a Node
-runtime is not whether `hello world` prints — it is whether software written by
+runtime is not whether `hello world` prints. It is whether software written by
 people who assumed a real Node install runs unmodified.
 
 The hardest such software is the package managers. npm, yarn and pnpm are large,
 old, gnarly programs that touch every corner of the runtime and were absolutely
 not written with charity toward reimplementations. Getting them to run is the
-subject of the [next post](/real-package-managers-in-the-browser) — and
+subject of the [next post](/real-package-managers-in-the-browser), and
 each one broke the runtime in a different, instructive way.

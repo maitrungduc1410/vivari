@@ -50,7 +50,7 @@ export function Comparison() {
         </h2>
         <p className="mt-4 text-muted">
           Vivari is not a cheaper, weaker WebContainer. It runs the same class of
-          project — and then lets you self-host it, embed it in a commercial
+          project, and then lets you self-host it, embed it in a commercial
           product, and change it, with no licence to negotiate.
         </p>
       </Reveal>
