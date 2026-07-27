@@ -2019,8 +2019,19 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   - **Rust → WebAssembly** starter — needs a Rust toolchain (rustc/wasm-pack) in-VM that we haven't
     proven; consider an **AssemblyScript → WASM** substitute (pure-JS `asc` compiler) as the
     "compile & run WASM in a tab" showcase.
+- ✅ **Python (CPython via Pyodide) — landed** as the first **Native** template tab. `python` /
+  `python3` are eager tiny launchers on PATH (`packages/kernel-host/programs/python.js`), but the
+  heavy Pyodide (CPython/WASM) bundle is fetched from a same-origin vendored index
+  (`packages/studio/public/vendor/pyodide/`, built by `npm run vendor:pyodide`) and booted **lazily**
+  the first time a `python` process runs — via `globalThis.__ocInstallPython`
+  (`packages/runtime/builtins/python.js`), exactly like the Bun shim's `__ocInstallBun`. So a plain
+  `node`/`bun` process pays nothing at boot. v1 scope is terminal-first (scripts, `-c`, a REPL,
+  `python -m pip install`); the project dir is mirrored into Pyodide's FS and prebuilt wheels
+  (NumPy/pandas) auto-load from imports. Pyodide has no real sockets, so there is no dev-server /
+  preview bridge yet (a future step could virtualize one). To pick the vendored wheel set, set
+  `VV_PYODIDE_PACKAGES` before `vendor:pyodide`.
 - ⏳ **Phase 5 — documented drops (won't build):** all **NativeScript** (Mobile & XR — need a
-  device/emulator runtime), **Python** (needs CPython/Pyodide WASM), **WordPress/PHP** (php-wasm),
+  device/emulator runtime), **WordPress/PHP** (php-wasm),
   **jq**, **Ember** (embroider = standalone webpack + native tooling), **Egg.js** (`cluster.fork`
   throws), **Nuxt 2** (webpack), **WebContainer API** (StackBlitz-proprietary).
 

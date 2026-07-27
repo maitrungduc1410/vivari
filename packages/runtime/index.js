@@ -14,10 +14,26 @@ import { createWebSocket } from "./websocket.js";
 import { rewriteDynamicImportToGlobal } from "./esm.js";
 import { isEsbuildInprocActive, esbuildWasmBytes } from "./esbuild-inproc-patch.js";
 import { createBunRuntime } from "./builtins/bun.js";
+import { createPythonRuntime } from "./builtins/python.js";
 
-function createConsole(process, util) {
-  const toOut = (...a) => process.stdout.write(util.format(...a) + "\n");
-  const toErr = (...a) => process.stderr.write(util.format(...a) + "\n");
+function createConsole(process, util, passthrough) {
+  // In dev, Vite injects @vite/client into every module worker; its HMR banners
+  // ("[vite] connecting...", "[vite] connected.", "[vite] server connection
+  // lost. …", …) reach this console (which pipes to the guest terminal) once the
+  // client's WebSocket opens after we've replaced globalThis.console. Keep that
+  // dev-only noise in the real DevTools console instead of the guest terminal.
+  // (No-op in production builds, which ship no @vite/client.)
+  const relay =
+    passthrough && typeof passthrough.debug === "function" ? passthrough : null;
+  const isViteBanner = (a) => typeof a[0] === "string" && a[0].startsWith("[vite]");
+  const toOut = (...a) => {
+    if (relay && isViteBanner(a)) return void relay.debug(...a);
+    process.stdout.write(util.format(...a) + "\n");
+  };
+  const toErr = (...a) => {
+    if (relay && isViteBanner(a)) return void relay.debug(...a);
+    process.stderr.write(util.format(...a) + "\n");
+  };
   return {
     log: toOut,
     info: toOut,
@@ -905,7 +921,9 @@ export function createRuntime({
     loop.wakeNet();
   };
 
-  const consoleObj = createConsole(process, util);
+  // Pass the still-native console (Vite's HMR client logs through it) so
+  // createConsole can relay [vite] banners there instead of the guest terminal.
+  const consoleObj = createConsole(process, util, globalThis.console);
 
   // Globals visible to user code (both as wrapper params and on globalThis).
   const globals = {
@@ -1292,6 +1310,14 @@ export function createRuntime({
     globalThis.Bun = bunRuntime.Bun;
     return bunRuntime.Bun;
   };
+
+  // ---- Python runtime shim (lazy Pyodide) -----------------------------------
+  // Like Bun, this is installed on demand — the /bin/python.js launcher calls
+  // __ocInstallPython(indexURL) to boot Pyodide (CPython/WASM) from a same-origin
+  // vendored index only when a `python` process actually runs, so a plain node
+  // process pays nothing. See packages/runtime/builtins/python.js.
+  const pythonRuntime = createPythonRuntime({ process, require: vvRootRequire });
+  globalThis.__ocInstallPython = (indexUrl) => pythonRuntime.install(indexUrl);
 
   return {
     fs,

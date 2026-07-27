@@ -18,6 +18,7 @@ import NextjsIcon from "~icons/vscode-icons/file-type-next";
 import WebpackIcon from "~icons/vscode-icons/file-type-webpack";
 import DocusaurusIcon from "~icons/vscode-icons/file-type-docusaurus";
 import AngularIcon from "~icons/vscode-icons/file-type-angular";
+import PythonIcon from "~icons/vscode-icons/file-type-python";
 
 // Rsbuild/Rspack ship no icon in any Iconify set, so bundle their official brand
 // SVGs (the mascot logos from assets.rspack.rs) as base-aware asset URLs and render
@@ -301,6 +302,7 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   three: ThreeIcon,
   gsap: Badge({ text: "GS", bg: "#0ae448", fg: "#0e100f" }),
   node: (p) => <NodeIcon className={p.className} />,
+  python: (p) => <PythonIcon className={p.className} />,
   webpack: (p) => <WebpackIcon className={p.className} />,
   rsbuild: ImgIcon(rsbuildLogo, "Rsbuild"),
   rspack: ImgIcon(rspackLogo, "Rspack"),

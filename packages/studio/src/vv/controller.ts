@@ -404,6 +404,9 @@ function languageFor(path: string): string {
   if (/\.(html?|vue|svelte)$/.test(path)) return "html";
   if (/\.json$/.test(path)) return "json";
   if (/\.md$/.test(path)) return "markdown";
+  // Python: Monaco's bundled Monarch grammar highlights on the main thread — no
+  // dedicated worker/language service (we don't ship a python.worker).
+  if (/\.pyi?$/.test(path)) return "python";
   return "plaintext";
 }
 

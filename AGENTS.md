@@ -51,6 +51,8 @@ packages/
     load-real-tsgo.js     unpack the vendored TypeScript-7 (tsgo, Go/wasm) asset + shim /bin/tsc,/bin/tsgo.
     programs/npm.js       from-scratch npm installer — LEGACY fallback (see real npm below).
     programs/bun.js       Node-backed `bun`/`bunx` shim (always in COREUTILS; not a vendored pack).
+    programs/python.js    `python`/`python3` launcher (eager in COREUTILS); boots Pyodide lazily
+                          via globalThis.__ocInstallPython on first run (see runtime/builtins/python.js).
 
   runtime/         The Node runtime that runs INSIDE each process worker.
     index.js       createRuntime(): wires builtins/globals/http-bridge/ws + run().
@@ -109,12 +111,13 @@ packages/
                           openFileAt (reveal + select a match/line in Monaco). Wires Monaco's
                           real language service (TS/JS workers, diagnostics, cross-file models +
                           node_modules .d.ts extra libs) for IntelliSense — see gotcha below.
-    src/vv/templates.ts   ~49 project templates across 8 categories (Frontend/Backend/
-                          Fullstack/Showcase/Bun/Tooling/Docs/Creative) — each a manifest
+    src/vv/templates.ts   ~51 project templates across 9 categories (Frontend/Backend/
+                          Bun/Native/Fullstack/Docs/Creative/Tooling/Showcase) — each a manifest
                           (install/dev/port/entry) + full source, inline (NOT a scaffolder
                           run in-VM). Spans React/Vue/Svelte/Solid/Qwik/Preact/Lit, Express/
                           Nest/Fastify/Koa/Hono/h3/Nitro, Next/Nuxt/SvelteKit/Astro/React
-                          Router, Tailwind+shadcn, TanStack Router, Vitest, the Bun family
+                          Router, Tailwind+shadcn, TanStack Router, Vitest, the Bun family,
+                          the Native family (Python + Data Science, on Pyodide)
                           (serve/routes/websocket/react), Docusaurus/VitePress/Slidev,
                           Rsbuild/webpack/Angular, and the sqlite/pglite/trpc/monorepo showcases.
                           The install command is inferred per PM (npm/yarn/pnpm/bun).
@@ -671,6 +674,23 @@ unpacked:
 - **`packages/kernel-host/programs/bun.js`** — the `bun`/`bunx` CLI: `bun run`,
   `bunx` (delegates to `npx`), install delegation, and it surfaces require/unhandled-
   rejection errors instead of a silent exit.
+
+**Python (CPython via Pyodide)** follows the same "install-on-demand global" pattern as Bun, but
+because Pyodide is a self-contained WASM runtime the browser loads at runtime, only the tiny
+launcher is eager:
+- **`packages/kernel-host/programs/python.js`** — the eager `python`/`python3` launcher (in
+  `COREUTILS`): `python file.py`, `python -c`, a REPL, `python -m pip install`, and a static
+  `--version` that does not boot Pyodide.
+- **`packages/runtime/builtins/python.js`** — `globalThis.__ocInstallPython(indexURL)` (the analog
+  of `__ocInstallBun`) dynamically imports the vendored `pyodide.mjs` and boots Pyodide on first
+  `python` run; mirrors the project dir into Pyodide's FS, streams stdout/stderr, and auto-loads
+  prebuilt wheels (NumPy/pandas) from imports. It transiently hides `globalThis.process` during the
+  import so Pyodide (which sniffs `process.release.name === "node"`) takes its browser/web-worker
+  fetch path instead of the Node loader.
+- **Vendored** to `packages/studio/public/vendor/pyodide/` by `npm run vendor:pyodide`
+  (`scripts/vendor-pyodide.mjs`, package set via `VV_PYODIDE_PACKAGES`); the kernel passes the
+  same-origin index to processes as `VV_PYODIDE_INDEX_URL`. Nothing Python-related loads at boot.
+  v1 is terminal-first (no dev server / preview — Pyodide has no real sockets).
 - **Zero-config `.ts`/`.tsx`** runs through `packages/runtime/typescript-transform.js`
   (synchronous, dependency-free type-strip + JSX lowering, invoked by `module.js`;
   gated so plain JS is untouched). It strips return-type annotations inside object

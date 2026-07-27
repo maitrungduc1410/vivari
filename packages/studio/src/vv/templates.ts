@@ -14,13 +14,14 @@
 // globbed via import.meta.glob) so it is bundled reliably and never dragged into
 // the studio's own tsc/eslint pass.
 
-export type Language = "TypeScript" | "JavaScript";
+export type Language = "TypeScript" | "JavaScript" | "Python";
 
 // Picker tabs, StackBlitz-style. The order here drives the tab order in the UI.
 export type TemplateCategory =
   | "Frontend"
   | "Backend"
   | "Bun"
+  | "Native"
   | "Fullstack"
   | "Docs"
   | "Creative"
@@ -31,6 +32,7 @@ export const TEMPLATE_CATEGORIES: TemplateCategory[] = [
   "Frontend",
   "Backend",
   "Bun",
+  "Native",
   "Fullstack",
   "Docs",
   "Creative",
@@ -2442,6 +2444,202 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ hello: 'world', url: req.url, node: process.version }));
 });
 server.listen(port, () => console.log('Node server on http://localhost:' + port));
+`,
+    },
+  };
+}
+
+// ── Native: Python (CPython via Pyodide) ─────────────────────────────────────
+// Python runs on CPython compiled to WebAssembly (Pyodide), booted lazily by the
+// in-VM `python` program the first time it runs — nothing Python-related loads at
+// studio boot. These are terminal-first (stdout) templates: Pyodide has no real
+// sockets, so there is no dev server / preview. See packages/runtime/builtins/python.js.
+function pythonTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "python",
+      framework: "python",
+      icon: "python",
+      category: "Native",
+      name: "Python",
+      language: "Python",
+      description: "A Python script on CPython (Pyodide) — runs in the terminal",
+      // No server: Pyodide can't listen. The port is unused (nothing binds it).
+      port: 8000,
+      openPath: "/",
+      entry: "main.py",
+      hmr: false,
+      reload: false,
+      // `python --version` is instant and does NOT boot Pyodide; the dev command
+      // boots it on first run. (No npm/pip dependencies for this starter.)
+      install: "python --version",
+      dev: "python main.py",
+    },
+    files: {
+      "main.py": `# A blank Python starter running on CPython (Pyodide) in your browser.
+# Edit away — output prints to the terminal.
+import sys
+
+
+def main() -> None:
+    print("Hello from Python!")
+    print(f"Running {sys.version.split()[0]} on {sys.platform} (Pyodide)")
+
+
+if __name__ == "__main__":
+    main()
+`,
+      "README.md": `# Python starter
+
+Runs on **CPython compiled to WebAssembly** (Pyodide), entirely in your browser.
+
+\`\`\`bash
+python main.py        # run the script
+python -c "print(1+1)"  # run an inline program
+python                # start a REPL
+\`\`\`
+
+The Pyodide runtime is loaded lazily the first time you run \`python\`, so it
+never slows down the rest of the studio.
+`,
+    },
+  };
+}
+
+// ── Native: Python data science (NumPy + pandas via Pyodide) ─────────────────
+function pythonDataScienceTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "python-data",
+      framework: "python",
+      icon: "python",
+      category: "Native",
+      name: "Data Science",
+      language: "Python",
+      description: "NumPy + pandas in the browser via Pyodide — prebuilt wheels, no server",
+      port: 8000,
+      openPath: "/",
+      entry: "main.py",
+      hmr: false,
+      reload: false,
+      // Prebuilt NumPy/pandas wheels ship with the vendored Pyodide and also
+      // auto-load from the script's imports; this makes the install step explicit.
+      install: "python -m pip install -r requirements.txt",
+      dev: "python main.py",
+      experimental: true,
+    },
+    files: {
+      "requirements.txt": `numpy
+pandas
+`,
+      "main.py": `# NumPy + pandas running on Pyodide (prebuilt WASM wheels).
+# The vendored wheels load automatically from your imports.
+import numpy as np
+import pandas as pd
+
+
+def main() -> None:
+    arr = np.arange(1, 11)
+    print("numpy array:", arr)
+    print("mean:", arr.mean(), "std:", round(float(arr.std()), 3))
+
+    df = pd.DataFrame({"x": arr, "x_squared": arr ** 2})
+    print()
+    print(df.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
+`,
+      "README.md": `# Python data science starter
+
+NumPy and pandas run on **Pyodide** (prebuilt WebAssembly wheels), entirely in
+your browser — no server, no native build.
+
+\`\`\`bash
+python -m pip install -r requirements.txt   # loads the vendored wheels
+python main.py
+\`\`\`
+
+Packages are also auto-loaded from your \`import\` statements, so \`python main.py\`
+works even without the install step.
+`,
+    },
+  };
+}
+
+// ── Native: Python plotting (Matplotlib via Pyodide) ─────────────────────────
+function pythonMatplotlibTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "python-matplotlib",
+      framework: "python",
+      icon: "python",
+      category: "Native",
+      name: "Matplotlib",
+      language: "Python",
+      description: "Matplotlib plotting via Pyodide — renders a PNG you open in the editor (no server)",
+      port: 8000,
+      openPath: "/",
+      // plot.png doesn't exist until the script runs, so open the source; the
+      // README explains opening the generated image.
+      entry: "main.py",
+      hmr: false,
+      reload: false,
+      install: "python -m pip install -r requirements.txt",
+      dev: "python main.py",
+      experimental: true,
+    },
+    files: {
+      "requirements.txt": `matplotlib
+numpy
+`,
+      "main.py": `# Matplotlib running on Pyodide (prebuilt WASM wheels).
+# The runtime is a Web Worker with no DOM, so we use the file-based "Agg"
+# backend and render the figure to a PNG — then open it in the editor.
+import matplotlib
+
+matplotlib.use("Agg")  # headless: draw to an image file, not a window
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+OUT = "plot.png"
+
+
+def main() -> None:
+    x = np.linspace(0, 2 * np.pi, 400)
+
+    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=120)
+    ax.plot(x, np.sin(x), label="sin(x)")
+    ax.plot(x, np.cos(x), label="cos(x)")
+    ax.set_title("Matplotlib on Pyodide")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    fig.savefig(OUT, bbox_inches="tight")
+    print(f"Saved {OUT} — open it in the editor to view the chart.")
+
+
+if __name__ == "__main__":
+    main()
+`,
+      "README.md": `# Python plotting starter (Matplotlib)
+
+Matplotlib runs on **Pyodide** (prebuilt WebAssembly wheels), entirely in your
+browser — no server, no native build.
+
+\`\`\`bash
+python -m pip install -r requirements.txt   # loads the vendored wheels
+python main.py                              # renders plot.png
+\`\`\`
+
+The Python process runs in a Web Worker with **no DOM**, so there is no
+interactive plot window. Instead the script uses Matplotlib's headless \`Agg\`
+backend and saves the figure to \`plot.png\`, which you can open in the editor
+(the studio renders images inline).
 `,
     },
   };
@@ -5809,6 +6007,10 @@ export const TEMPLATES: TemplateDef[] = [
   bunRoutesTemplate(),
   bunWebSocketTemplate(),
   bunReactTemplate(),
+  // Native
+  pythonTemplate(),
+  pythonDataScienceTemplate(),
+  pythonMatplotlibTemplate(),
   // Fullstack
   nextTemplate(true),
   nextTemplate(false),

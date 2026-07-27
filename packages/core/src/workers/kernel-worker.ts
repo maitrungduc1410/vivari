@@ -888,6 +888,10 @@ function baseProcEnv(dir) {
     TERM: "xterm-256color",
     FORCE_COLOR: "3",
     PWD: dir,
+    // Same-origin base URL of the vendored Pyodide distribution. Read by the
+    // /bin/python.js launcher (only when a `python` process runs) to lazily boot
+    // Pyodide — nothing here is fetched at boot. See packages/runtime/builtins/python.js.
+    VV_PYODIDE_INDEX_URL: vendorUrl("vendor/pyodide/"),
   };
 }
 

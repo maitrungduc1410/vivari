@@ -880,6 +880,31 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   and the studio ships a **"Bun" template category** (serve / routes / websocket / react).
 - Proven by `scripts/spike-bun*.mjs` (the transform, route matcher, WS frame codec, Bun global API).
 
+### 9.3 Python (CPython via Pyodide — a lazily-booted WASM runtime)
+
+Python is **CPython compiled to WebAssembly (Pyodide)**. Unlike Bun (emulated on the Node runtime)
+or the vendored JS package managers (unpacked into the VFS), Pyodide is a self-contained WASM
+runtime the **browser** loads at runtime from a same-origin index — so the wiring is split to keep
+it fully lazy:
+
+- `packages/kernel-host/programs/python.js` — the tiny `python`/`python3` CLI launcher, eager on
+  PATH (in `COREUTILS`): `python file.py`, `python -c`, a REPL, `python -m pip install`, and a
+  static `--version` that does **not** boot Pyodide.
+- `packages/runtime/builtins/python.js` — the runtime half: `globalThis.__ocInstallPython(indexURL)`
+  (the analog of `__ocInstallBun`) dynamically imports the vendored `pyodide.mjs` and boots Pyodide
+  the first time a `python` process runs. It mirrors the project dir into Pyodide's FS, streams
+  Python stdout/stderr to the process streams, and auto-loads prebuilt wheels (NumPy/pandas) from
+  the script's imports. **Env-detection caveat:** our runtime masquerades as Node
+  (`process.release.name === "node"`), which would send Pyodide down its Node loader; the loader
+  transiently hides `globalThis.process` while `pyodide.mjs` is imported so Pyodide picks its
+  browser/web-worker path (same-origin `fetch`), then restores it.
+- **Vendored assets** — `packages/studio/public/vendor/pyodide/` (core files + a curated wheel
+  closure), built by `npm run vendor:pyodide` (configurable via `VV_PYODIDE_PACKAGES`) and served
+  cross-origin-isolated. The kernel exposes the same-origin index to processes as the
+  `VV_PYODIDE_INDEX_URL` env var (`baseProcEnv` in `kernel-worker.ts`). Nothing loads at boot.
+- The studio ships a **"Native" template category** (Python, Data Science). v1 is terminal-first:
+  Pyodide has no real sockets, so these templates have no dev server / preview.
+
 ---
 
 ## 10. Build & run

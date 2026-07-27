@@ -6,6 +6,7 @@
 
 import { NODE_GYP_STUB } from "./node-gyp-stub.js";
 import { BUN_PROGRAM, BUNX_PROGRAM } from "./programs/bun.js";
+import { PYTHON_PROGRAM } from "./programs/python.js";
 
 export const COREUTILS = {
   // bun / bunx — the Bun runtime + package-manager analog. Unlike npm/yarn/pnpm
@@ -15,6 +16,14 @@ export const COREUTILS = {
   // See packages/kernel-host/programs/bun.js + packages/runtime/builtins/bun.js.
   bun: BUN_PROGRAM,
   bunx: BUNX_PROGRAM,
+
+  // python / python3 — the Python (CPython/WASM via Pyodide) runtime analog.
+  // The tiny launcher installs eagerly on PATH; the heavy Pyodide bundle is
+  // fetched from the same-origin vendored index ONLY when a `python` process runs
+  // (globalThis.__ocInstallPython), so a plain node/bun process pays nothing at
+  // boot. See packages/kernel-host/programs/python.js + packages/runtime/builtins/python.js.
+  python: PYTHON_PROGRAM,
+  python3: PYTHON_PROGRAM,
 
   // NOTE: there is no built-in `npm` here anymore. The Turbo-analog installer
   // (packages/kernel-host/programs/npm.js) has been RETIRED from the shipped

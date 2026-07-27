@@ -19,6 +19,8 @@ import Json from "~icons/vscode-icons/file-type-json";
 import Css from "~icons/vscode-icons/file-type-css";
 import Html from "~icons/vscode-icons/file-type-html";
 import Markdown from "~icons/vscode-icons/file-type-markdown";
+import Python from "~icons/vscode-icons/file-type-python";
+import Text from "~icons/vscode-icons/file-type-text";
 import Svg from "~icons/vscode-icons/file-type-svg";
 import Image from "~icons/vscode-icons/file-type-image";
 import Npm from "~icons/vscode-icons/file-type-npm";
@@ -60,6 +62,9 @@ const BY_EXT: Record<string, IconCmp> = {
   htm: Html,
   md: Markdown,
   mdx: Markdown,
+  py: Python,
+  pyi: Python,
+  txt: Text,
   svg: Svg,
   png: Image,
   jpg: Image,

@@ -425,7 +425,9 @@ function NewTemplateDialog({ open, onOpenChange }: { open: boolean; onOpenChange
 
   const pick = (t: TemplateDef) => {
     setSelected(t);
-    const suggested = `${t.manifest.framework}-${t.manifest.language === "TypeScript" ? "ts" : "js"}-app`;
+    const langSlug =
+      t.manifest.language === "TypeScript" ? "ts" : t.manifest.language === "Python" ? "py" : "js";
+    const suggested = `${t.manifest.framework}-${langSlug}-app`;
     setName(suggested);
     setDirTouched(false);
   };
