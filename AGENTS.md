@@ -768,16 +768,19 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
     behind a one-time "connect this tab" Storage-Access gate (`previewConnectingHtml`) when
     `VITE_PREVIEW_POPOUT=isolated`.
   - **Mode C — wildcard per-port origin** (`VITE_PREVIEW_WILDCARD_DOMAIN`, e.g. `jamesisme.com`):
-    each port is its own origin `vv-<token>--<port>.<domain>` (random per-boot `<token>`), so the SW
-    reads the port from `self.location.hostname` (`WILDCARD_MODE` in `sw.js`) and serves the app at
-    `/` (no `/preview/` path, keep-prefix is a no-op). `KernelBridge` lazily stands up **one bridge
-    iframe + `MessagePort` per port** (`ensurePreviewBridge`, keyed by origin) as servers `listen`.
-    A Cloudflare **Worker** (`worker/`, route `vv-*.<domain>/*`) serves the static SW runtime +
-    stamps isolation headers. Pop-outs always open on the per-port origin.
+    each port is its own origin `<token>--<port>-vv.<domain>` (random per-boot `<token>`; the `-vv`
+    tag is a **suffix** so the Cloudflare route's wildcard can lead — see below), so the SW reads the
+    port from `self.location.hostname` (`WILDCARD_MODE` in `sw.js`) and serves the app at `/` (no
+    `/preview/` path, keep-prefix is auto-rewritten to base `/` at project creation). `KernelBridge`
+    lazily stands up **one bridge iframe + `MessagePort` per port** (`ensurePreviewBridge`, keyed by
+    origin) as servers `listen`. A Cloudflare **Worker** (`worker/`, route `*-vv.<domain>/*`) serves
+    the static SW runtime + stamps isolation headers. Pop-outs always open on the per-port origin.
+    (Cloudflare routes only allow `*` at the START of the hostname, so `vv-*` — an infix wildcard — is
+    rejected; the `-vv` suffix keeps the route both valid and narrow.)
   Env vars go on the **studio (main) project**, not the preview project; `VITE_PREVIEW_WILDCARD_DOMAIN`
   takes precedence over `VITE_PREVIEW_ORIGIN`. **`isolated` pop-outs only work gate-free when IDE and
   preview are *same-site*** (subdomains of one registrable domain, e.g. `vivari.jamesisme.com` +
-  `vivari-preview.jamesisme.com`, or mode C's `vv-…--<port>.jamesisme.com`): same-site ⇒ not
+  `vivari-preview.jamesisme.com`, or mode C's `<token>--<port>-vv.jamesisme.com`): same-site ⇒ not
   storage-partitioned ⇒ the pop-out shares the bridge SW and connects with **no gate** (verified
   live) while storage stays origin-isolated. **Mode C is same-site by construction**, so it's
   gate-free. On two `*.pages.dev` projects they're **cross-site** (PSL) ⇒ partitioned ⇒ Chrome's

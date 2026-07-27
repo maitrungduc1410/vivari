@@ -12,12 +12,14 @@
 const PREVIEW_MARKER = "/preview/";
 
 // Mode C (wildcard per-port origin): when this SW is served on a preview host
-// like `vv-<token>--<port>.<domain>` the target port is encoded in the HOSTNAME
-// (one origin per port), not in a `/preview/<port>/` PATH. Detect it once at SW
-// startup; when set, every request on this origin proxies to WILDCARD_PORT and
-// the path-based routing below is bypassed entirely. On the IDE origin (modes
-// A/B) the hostname doesn't match, so WILDCARD_MODE is false and nothing changes.
-const WILDCARD_HOST = self.location.hostname.match(/^vv-[a-z0-9]+--(\d+)\./i);
+// like `<token>--<port>-vv.<domain>` the target port is encoded in the HOSTNAME
+// (one origin per port), not in a `/preview/<port>/` PATH. The `-vv` is a SUFFIX
+// (not a prefix) because Cloudflare routes only allow the `*` wildcard at the
+// START of the hostname — so the route is `*-vv.<domain>/*`. Detect the port once
+// at SW startup; when set, every request on this origin proxies to WILDCARD_PORT
+// and the path-based routing below is bypassed. On the IDE origin (modes A/B) the
+// hostname doesn't match, so WILDCARD_MODE is false and nothing changes.
+const WILDCARD_HOST = self.location.hostname.match(/^[a-z0-9]+--(\d+)-vv\./i);
 const WILDCARD_PORT = WILDCARD_HOST ? parseInt(WILDCARD_HOST[1], 10) : 0;
 const WILDCARD_MODE = WILDCARD_PORT > 0;
 
@@ -416,7 +418,7 @@ window.__vvNet = {
 // preview port -> a genuine in-VM WebSocket to the dev server's HMR socket.
 const WS_SHIM = `(function(){
 if (window.__vvWsInstalled) return; window.__vvWsInstalled = true;
-var hm = location.hostname.match(/^vv-[a-z0-9]+--(\\d+)\\./i);
+var hm = location.hostname.match(/^[a-z0-9]+--(\\d+)-vv\\./i);
 var m = location.pathname.match(/\\/preview\\/(\\d+)\\//);
 var previewPort = hm ? parseInt(hm[1], 10) : (m ? parseInt(m[1], 10) : 0);
 var tok = Math.random().toString(36).slice(2, 8);
@@ -563,7 +565,7 @@ try {
 // message/named events per the SSE spec. SSE is one-way, so there's no send() leg.
 const SSE_SHIM = `(function(){
 if (window.__vvSseInstalled) return; window.__vvSseInstalled = true;
-var hm = location.hostname.match(/^vv-[a-z0-9]+--(\\d+)\\./i);
+var hm = location.hostname.match(/^[a-z0-9]+--(\\d+)-vv\\./i);
 var m = location.pathname.match(/\\/preview\\/(\\d+)\\//);
 var previewPort = hm ? parseInt(hm[1], 10) : (m ? parseInt(m[1], 10) : 0);
 var tok = Math.random().toString(36).slice(2, 8);
@@ -680,7 +682,7 @@ var seq = 0;
 // (http://localhost:<port>/<path>), so the Network panel matches what the ws/SSE
 // shims already show. Display-only: the requestId (and thus getResponseBody) is
 // untouched.
-var _hp = location.hostname.match(/^vv-[a-z0-9]+--(\\d+)\\./i);
+var _hp = location.hostname.match(/^[a-z0-9]+--(\\d+)-vv\\./i);
 var _pp = location.pathname.match(/^\\/preview\\/(\\d+)\\//);
 var previewPort = _hp ? parseInt(_hp[1], 10) : (_pp ? parseInt(_pp[1], 10) : 0);
 function cleanUrl(u){

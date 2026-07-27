@@ -5,7 +5,7 @@
 #   npm run deploy:worker       # wrangler deploy (from worker/)
 #
 # The Worker (worker/src/index.js) is pure static hosting for the preview Service
-# Worker runtime, served on wildcard per-port hosts `vv-<token>--<port>.<domain>`.
+# Worker runtime, served on wildcard per-port hosts `<token>--<port>-vv.<domain>`.
 # It runs NO kernel and NO studio UI: the SW relays every preview request over a
 # MessagePort to the kernel in the IDE tab (which lives on the main origin). So we
 # only need the studio's `public/` assets + chobitsu.js — NOT the landing/docs/embed

@@ -22,11 +22,14 @@ binding = "ASSETS"
 run_worker_first = true
 
 # Wildcard route for the per-port preview hosts. Requires a PROXIED wildcard DNS
-# record `*.<domain>` on the zone. `*` matches the `<token>--<port>` part. Change
-# `jamesisme.com` to your own zone (and keep it in sync with the IDE build's
-# VITE_PREVIEW_WILDCARD_DOMAIN). Deploying with this route bound needs an API token
-# with "Workers Routes: Edit" on the zone; otherwise comment this out and add the
-# route manually in the dashboard (Workers → your Worker → Domains & Routes).
+# record `*.<domain>` on the zone. The `*` matches the `<token>--<port>` part and
+# the literal `-vv` suffix keeps the route narrow (only Vivari preview hosts, never
+# other apps). NOTE: Cloudflare routes only allow the wildcard at the START of the
+# hostname, so the tag MUST be a suffix (`*-vv...`), not a prefix (`vv-*...` is
+# rejected as an infix wildcard). Change `jamesisme.com` to your own zone (keep it
+# in sync with the IDE build's VITE_PREVIEW_WILDCARD_DOMAIN). Binding this route on
+# deploy needs an API token with "Workers Routes: Edit" on the zone; otherwise
+# comment this out and add the route in the dashboard (Workers → Domains & Routes).
 [[routes]]
-pattern = "vv-*.jamesisme.com/*"
+pattern = "*-vv.jamesisme.com/*"
 zone_name = "jamesisme.com"

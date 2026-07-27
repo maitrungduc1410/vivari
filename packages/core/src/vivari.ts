@@ -76,7 +76,7 @@ export class Vivari {
       workerName: options.workerName,
       previewOrigin: options.previewOrigin,
       previewWildcardDomain: options.previewWildcardDomain,
-      previewWildcardPrefix: options.previewWildcardPrefix,
+      previewWildcardTag: options.previewWildcardTag,
       previewPopout: options.previewPopout,
     });
     const vivari = new Vivari(bridge);

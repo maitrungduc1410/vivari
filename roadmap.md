@@ -3063,12 +3063,15 @@ origin) is selected with `VITE_PREVIEW_ORIGIN` (+ optional `VITE_PREVIEW_POPOUT`
 (wildcard per-port origin) is selected with `VITE_PREVIEW_WILDCARD_DOMAIN`. The design essay below
 records the rationale; the boxed **"As shipped"** notes reconcile it with the final surface.
 
-> **As shipped — the mode-C surface.** Preview hostnames are `vv-<token>--<port>.<domain>`
-> (single random per-boot `<token>`, `vv-` prefix so the Worker and `sw.js` can tell Vivari
-> previews apart from other apps on the same base domain). Config is a single env
+> **As shipped — the mode-C surface.** Preview hostnames are `<token>--<port>-vv.<domain>`
+> (single random per-boot `<token>`; `-vv` is a **suffix** tag so the Worker and `sw.js` can tell
+> Vivari previews apart from other apps on the same base domain). The tag is a suffix — not a prefix
+> — because Cloudflare routes only allow the `*` wildcard at the **start** of the hostname, so the
+> valid, narrow route is `*-vv.<domain>/*` (`vv-*.<domain>/*` is rejected as an infix wildcard, and
+> `*.<domain>/*` would be too broad). Config is a single env
 > `VITE_PREVIEW_WILDCARD_DOMAIN=<base-domain>` (SDK: `BootOptions.previewWildcardDomain`); it takes
 > precedence over `VITE_PREVIEW_ORIGIN`. Infra is one **proxied wildcard DNS record** + a
-> **Cloudflare Worker** on route `vv-*.<domain>/*` (`worker/`, `npm run build:worker` /
+> **Cloudflare Worker** on route `*-vv.<domain>/*` (`worker/`, `npm run build:worker` /
 > `deploy:worker`) that serves the static SW runtime. Because the preview hosts are subdomains of
 > the IDE's own base domain they are **same-site**, so the isolated pop-out is **gate-free**.
 
@@ -3084,11 +3087,12 @@ self-hoster picks what their infra allows:
 - **Mode B — `shared`**: a second Pages project → `vivari-preview.pages.dev/preview/<port>/`.
   Isolates **IDE ↔ preview**. No custom domain, no DNS. SW reaches the kernel via a hidden bridge
   iframe + persistent `MessagePort` (cross-origin).
-- **Mode C — `wildcard`**: one origin per port → `vv-<token>--<port>.jamesisme.com`
+- **Mode C — `wildcard`**: one origin per port → `<token>--<port>-vv.jamesisme.com`
   (StackBlitz/CodeSandbox model). Isolates **IDE ↔ preview AND preview ↔ preview**, and matches
   real `localhost:<port>` web-platform semantics. Same bridge transport as B (one bridge iframe +
-  `MessagePort` **per port**); port is read from the **hostname**; keep-prefix is a no-op (apps are
-  served at `/`). Requires a base domain + proxied wildcard DNS + a Cloudflare Worker route.
+  `MessagePort` **per port**); port is read from the **hostname**; keep-prefix templates get their
+  base auto-rewritten to `/` at creation (apps are served at the origin root). Requires a base domain
+  + proxied wildcard DNS + a Cloudflare Worker route (`*-vv.<domain>/*`).
 
 Modes B and C share ~95% of the code (bridge + `MessagePort` + dual-mode SW). C only adds
 hostname-based routing on top of B. A already exists. So "support all three" = keep path A +
@@ -3128,7 +3132,7 @@ build the cross-origin bridge once (B & C) + a path|hostname routing switch (C).
 
 | | **A. same-origin** (default) | **B. shared** | **C. wildcard** |
 |---|---|---|---|
-| Preview URL | `vivari.pages.dev/preview/5173/` | `vivari-preview.pages.dev/preview/5173/` | `vv-<token>--5173.jamesisme.com/` |
+| Preview URL | `vivari.pages.dev/preview/5173/` | `vivari-preview.pages.dev/preview/5173/` | `<token>--5173-vv.jamesisme.com/` |
 | SW → kernel transport | `findKernelClient()` (same-origin) | bridge iframe + `MessagePort` | bridge iframe + `MessagePort` |
 | Port encoded in | **path** | **path** | **hostname** |
 | keep-prefix hack | needed | needed | **removed** |
@@ -3438,7 +3442,7 @@ Deploy (only for B/C) — **as shipped**:
   `CORP: cross-origin`, `Service-Worker-Allowed: /`). `scripts/assemble-preview.mjs` +
   `npm run build:preview`; IDE build sets `VITE_PREVIEW_ORIGIN=https://vivari-preview.pages.dev`
   (+ optional `VITE_PREVIEW_POPOUT=isolated`).
-- **Mode C**: a Cloudflare **Worker** (`worker/`) on route `vv-*.<domain>/*` (single-level
+- **Mode C**: a Cloudflare **Worker** (`worker/`) on route `*-vv.<domain>/*` (single-level
   wildcard, free Universal SSL) serving the same static SW runtime for every subdomain — the
   Worker stamps the isolation headers + serves the boot fallback itself (no `_headers`/`_redirects`).
   Requires one **proxied** wildcard DNS record `*.<domain>`. `scripts/assemble-worker.mjs` +

@@ -45,10 +45,13 @@ export class KernelBridge {
   // Mode B (separate preview origin): the origin that hosts the preview SW +
   // bridge doc. Undefined in modes A/C.
   private readonly previewOrigin?: string;
-  // Mode C (wildcard): the base domain + hostname prefix + a random per-boot
-  // token; every port gets `<prefix><token>--<port>.<domain>`.
+  // Mode C (wildcard): the base domain + a random per-boot token + a hostname
+  // suffix tag; every port gets `<token>--<port>-<tag>.<domain>`. The tag is a
+  // SUFFIX (not a prefix) because Cloudflare routes only allow the `*` wildcard at
+  // the START of the hostname — so the route `*-<tag>.<domain>/*` is valid and
+  // stays narrow (matches only our per-port hosts, not other apps on the domain).
   private readonly wildcardDomain?: string;
-  private readonly wildcardPrefix: string;
+  private readonly wildcardTag: string;
   private readonly previewToken: string;
   // How "Open in new tab" behaves in mode B (see BootOptions.previewPopout).
   // "isolated" opens pop-outs on the preview origin; default "same-origin" opens
@@ -71,7 +74,7 @@ export class KernelBridge {
       workerName?: string;
       previewOrigin?: string;
       previewWildcardDomain?: string;
-      previewWildcardPrefix?: string;
+      previewWildcardTag?: string;
       previewPopout?: "same-origin" | "isolated";
     } = {},
   ) {
@@ -79,7 +82,7 @@ export class KernelBridge {
     // stays on the simpler same-origin path.
     const here = typeof location !== "undefined" ? location.origin : "";
     const wildcardDomain = normalizeDomain(options.previewWildcardDomain);
-    this.wildcardPrefix = options.previewWildcardPrefix || "vv-";
+    this.wildcardTag = options.previewWildcardTag || "vv";
     this.previewToken = randomToken();
     if (wildcardDomain) {
       // Mode C takes precedence: previews are per-port origins under the wildcard.
@@ -192,14 +195,14 @@ export class KernelBridge {
 
   /**
    * Build the preview URL for an in-VM port. Mode A: relative `/preview/<port>/`.
-   * Mode B: `<origin>/preview/<port>/`. Mode C: `<scheme>//<prefix><token>--<port>.<domain>/`.
+   * Mode B: `<origin>/preview/<port>/`. Mode C: `<scheme>//<token>--<port>-<tag>.<domain>/`.
    * `pathAndQuery` is the in-server path (default `/`).
    */
   previewUrlFor(port: number, pathAndQuery = "/"): string {
     const p = pathAndQuery.startsWith("/") ? pathAndQuery : "/" + pathAndQuery;
     if (this.previewMode === "wildcard") {
       const scheme = typeof location !== "undefined" ? location.protocol : "https:";
-      return `${scheme}//${this.wildcardPrefix}${this.previewToken}--${port}.${this.wildcardDomain}${p}`;
+      return `${scheme}//${this.previewToken}--${port}-${this.wildcardTag}.${this.wildcardDomain}${p}`;
     }
     return `${this.previewOrigin ?? ""}/preview/${port}${p}`;
   }
@@ -218,7 +221,7 @@ export class KernelBridge {
 
   /**
    * Whether `origin` is one of our preview origins — the single `previewOrigin`
-   * in mode B, or a `<prefix><token>--<port>.<domain>` host in mode C. Used to
+   * in mode B, or a `<token>--<port>-<tag>.<domain>` host in mode C. Used to
    * gate cross-origin postMessage from preview frames.
    */
   isTrustedPreviewOrigin(origin: string): boolean {
@@ -228,8 +231,8 @@ export class KernelBridge {
       try {
         const host = new URL(origin).hostname;
         return (
-          host.startsWith(`${this.wildcardPrefix}${this.previewToken}--`) &&
-          host.endsWith(`.${this.wildcardDomain}`)
+          host.startsWith(`${this.previewToken}--`) &&
+          host.endsWith(`-${this.wildcardTag}.${this.wildcardDomain}`)
         );
       } catch {
         return false;

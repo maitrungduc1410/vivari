@@ -46,7 +46,7 @@ function normalizePreviewPopout(raw: string | undefined): "same-origin" | "isola
 
 // Build-time wildcard base domain (VITE_PREVIEW_WILDCARD_DOMAIN, mode C). Returns
 // a bare base domain (e.g. "jamesisme.com") or undefined. When set, previews are
-// served one origin per port (`vv-<token>--<port>.<domain>`); takes precedence
+// served one origin per port (`<token>--<port>-vv.<domain>`); takes precedence
 // over VITE_PREVIEW_ORIGIN. Unset in the default deploy + local dev (→ mode A/B).
 function normalizePreviewWildcardDomain(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
@@ -2220,7 +2220,7 @@ export class IdeController {
     const bust = tab.nonce > 1 ? `${path.includes("?") ? "&" : "?"}t=${tab.nonce}` : "";
     // The bridge builds the right URL per mode: relative `/preview/<port>/…` in
     // mode A, `<origin>/preview/<port>/…` in mode B, or a per-port wildcard origin
-    // `<scheme>//vv-<token>--<port>.<domain>/…` (served at root) in mode C.
+    // `<scheme>//<token>--<port>-vv.<domain>/…` (served at root) in mode C.
     return this.bridge.previewUrlFor(tab.port, `${path}${bust}`);
   }
   private setTab(id: string, patch: Partial<PreviewTab>) {
@@ -2475,7 +2475,7 @@ export class IdeController {
   private wirePreviewMessages() {
     // Preview frames are cross-origin in modes B/C; only trust their messages from
     // a recognised preview origin (mode A: same-origin as the studio; mode B: the
-    // single preview origin; mode C: any `vv-<token>--<port>.<domain>` host).
+    // single preview origin; mode C: any `<token>--<port>-vv.<domain>` host).
     const here = typeof location !== "undefined" ? location.origin : "";
     const trustPreviewOrigin = (origin: string) =>
       this.previewMode === "same-origin" ? origin === here : this.bridge.isTrustedPreviewOrigin(origin);

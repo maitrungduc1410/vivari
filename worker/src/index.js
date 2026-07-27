@@ -1,12 +1,15 @@
 // Cloudflare Worker — mode C (wildcard per-port preview origins).
 //
 // In mode C every in-VM port is served from its OWN origin,
-// `vv-<token>--<port>.<domain>` (e.g. vv-k3f9a2xh--5173.jamesisme.com). That
+// `<token>--<port>-vv.<domain>` (e.g. k3f9a2xh--5173-vv.jamesisme.com). That
 // gives each preview real `localhost:<port>` web-platform semantics (its own
 // cookies/storage/CORS) and isolates previews from the IDE *and* from each other.
+// The `-vv` tag is a SUFFIX (not a prefix) because Cloudflare routes only allow
+// the `*` wildcard at the START of the hostname — so the route `*-vv.<domain>/*`
+// is valid AND narrow (it matches only our per-port hosts, never other apps).
 //
 // Cloudflare Pages can't attach a *wildcard* custom domain, so a Worker (bound to
-// a `vv-*.<domain>/*` route) plays the role the second Pages project plays in mode
+// a `*-vv.<domain>/*` route) plays the role the second Pages project plays in mode
 // B: pure static hosting for the preview Service Worker runtime. It runs NO kernel
 // and NO studio UI. The SW it serves relays every preview request over a
 // MessagePort to the kernel living in the IDE tab (see packages/studio/public/
@@ -24,9 +27,9 @@
 //   4. Stamp cross-origin isolation headers on every response so the IDE
 //      (COEP:require-corp) can embed the bridge iframe and the SW can claim `/`.
 
-// A Vivari preview host: `<prefix><token>--<port>.<rest>`. Keep this in sync with
-// the prefix in packages/core (default "vv-") and the regex in sw.js.
-const PREVIEW_HOST = /^vv-[a-z0-9]+--\d+\./i;
+// A Vivari preview host: `<token>--<port>-vv.<rest>`. Keep this in sync with the
+// tag in packages/core (default "vv" suffix) and the regex in sw.js.
+const PREVIEW_HOST = /^[a-z0-9]+--\d+-vv\./i;
 
 // Cloudflare "clean URLs" serve `/x.html` as `/x`; map both forms to the file.
 const ALIASES = {
