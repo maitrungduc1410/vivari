@@ -173,6 +173,21 @@ arrives — this is how blocking `accept()`/`execSync()`/blocking fetch work.
 posts the outcome back as a `{type:'fetch-done', fetchId}` message, so the caller
 never parks and many downloads can overlap (§6).
 
+### 4.3 Debug channel (`packages/protocol/debug.js`)
+
+The breakpoint debugger (§7.2) needs to drive a process that is **parked at a
+breakpoint** — i.e. not sitting in the syscall loop. So it uses a **second,
+independent SAB**, separate from the 1 MiB syscall SAB, allocated per debug target:
+
+```
+[ control: Int32 STATE ][ data region: JSON CDP command bytes ]
+STATE values: DBG_STATE_EMPTY=0, DBG_STATE_CMD=1
+```
+
+A paused worker blocks on `Atomics.wait(STATE, EMPTY)`; the kernel writes a CDP
+command into the data region, stores `DBG_STATE_CMD`, and `Atomics.notify`s. This is
+only wired when `VV_DEBUG` is set, so non-debug runs never allocate it.
+
 ---
 
 ## 5. Filesystem
@@ -244,6 +259,9 @@ never parks and many downloads can overlap (§6).
   child. `OP_SPAWN_ASYNC` returns `{pid}` immediately; the child's stdout/stderr/
   exit stream back to the parent worker as postMessages (the model behind
   `child_process.spawn` and a `npm run dev` that launches a long-lived server).
+- **Debug**: when `VV_DEBUG` is set (kernel-authoritative `debugMode`), the kernel
+  allocates a per-target debug SAB (§4.3), announces the target, and routes CDP
+  attach/detach + commands to it — postMessage while running, SAB while paused (§7.2).
 - **Naming**: each Process Worker is created with the name `Process Worker PID N`.
   A Worker's name is fixed at creation and can't be changed later, so naming it
   per-PID at spawn (rather than reusing a pre-warmed, PID-less pool) is what keeps
@@ -377,6 +395,50 @@ still block via `Atomics.wait`. Key ideas (`loop.js`):
   free while idle and a timer callback can run a sync fs syscall.
 - Each turn also drains queued HTTP requests, async child events, worker_threads
   events, and fs.watch events (`doNet`/`doChildren`/`doThreads`/`doWatch`).
+
+### 7.2 Breakpoint debugger (Node guests)
+
+A full pause / step / inspect / evaluate debugger for guest Node processes, speaking
+the **Chrome DevTools Protocol** (`Debugger`/`Runtime` domains). There is no V8
+inspector in the browser, so pausing is built from **source instrumentation** plus
+the debug SAB (§4.3) — the same "genuinely block the worker thread" trick that makes
+sync syscalls work.
+
+Three pieces, all lazy-loaded only when `VV_DEBUG` is set (zero cost otherwise):
+
+- **Instrument** (`packages/runtime/instrument.js`) — `acorn` parses the guest's own
+  source (on plain ES, after the TS/JSX strip, before the ESM rewrite in `module.js`,
+  so line numbers are preserved) and weaves in `__vvdbg.line/brk/push/pop` probes and
+  a per-lexical-block `__vv_ev` eval closure (so `evaluateOnCallFrame` and Variables
+  see the exact block scope). Self-heals to the original source on any parse failure.
+- **In-guest CDP backend** (`packages/runtime/debugger.js`) — script registry,
+  breakpoint binding, call-stack frames, RemoteObject table, and the synchronous pause
+  loop. Emits `Debugger.scriptParsed/paused/resumed`.
+- **Studio client** (`packages/studio/src/vv/debug-session.ts` + `DebugPanel.tsx`) —
+  the CDP client that drives Monaco gutter breakpoints, the paused-line highlight, and
+  a VS Code-style Call Stack / Variables / Watch panel, opened from the ActivityBar's
+  "Run and Debug" entry.
+
+The pause flow (kernel routing lives in `kernel.js` / `kernel-worker.ts` /
+`process-worker.ts`):
+
+```mermaid
+flowchart TD
+  probe["__vvdbg.line() probe hits a breakpoint"] --> park["worker Atomics.wait on debug SAB (thread parked)"]
+  park --> kdrive["kernel writes CDP cmd into debug SAB + notify"]
+  kdrive --> handle["backend runs cmd (step / evaluateOnCallFrame / getProperties)"]
+  handle -->|"more commands"| kdrive
+  handle -->|"resume"| run["notify + continue execution"]
+  ui["DebugPanel / Monaco (debug-session.ts)"] -->|"dbg-cmd"| kdrive
+  handle -->|"dbg-event: paused/scriptParsed"| ui
+```
+
+A **running** (not-yet-paused) process receives commands via `postMessage` instead of
+the SAB; a `--inspect-brk`-style start gate (`waitForStart` in `index.js`) keeps short
+scripts from finishing before the frontend attaches. The run shell + package managers
+are skipped as debug targets so auto-attach lands on the user's program. The CDP shape
+is shared so the same backend can later also feed the chii Sources panel — distinct
+from §8.5, which debugs preview **browser** JS via chobitsu.
 
 ---
 
@@ -879,31 +941,6 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
 - The install/run detector (`kernel-worker.ts` `pmFromCmd`) maps `bun`/`bunx` to the `bun` PM,
   and the studio ships a **"Bun" template category** (serve / routes / websocket / react).
 - Proven by `scripts/spike-bun*.mjs` (the transform, route matcher, WS frame codec, Bun global API).
-
-### 9.3 Python (CPython via Pyodide — a lazily-booted WASM runtime)
-
-Python is **CPython compiled to WebAssembly (Pyodide)**. Unlike Bun (emulated on the Node runtime)
-or the vendored JS package managers (unpacked into the VFS), Pyodide is a self-contained WASM
-runtime the **browser** loads at runtime from a same-origin index — so the wiring is split to keep
-it fully lazy:
-
-- `packages/kernel-host/programs/python.js` — the tiny `python`/`python3` CLI launcher, eager on
-  PATH (in `COREUTILS`): `python file.py`, `python -c`, a REPL, `python -m pip install`, and a
-  static `--version` that does **not** boot Pyodide.
-- `packages/runtime/builtins/python.js` — the runtime half: `globalThis.__ocInstallPython(indexURL)`
-  (the analog of `__ocInstallBun`) dynamically imports the vendored `pyodide.mjs` and boots Pyodide
-  the first time a `python` process runs. It mirrors the project dir into Pyodide's FS, streams
-  Python stdout/stderr to the process streams, and auto-loads prebuilt wheels (NumPy/pandas) from
-  the script's imports. **Env-detection caveat:** our runtime masquerades as Node
-  (`process.release.name === "node"`), which would send Pyodide down its Node loader; the loader
-  transiently hides `globalThis.process` while `pyodide.mjs` is imported so Pyodide picks its
-  browser/web-worker path (same-origin `fetch`), then restores it.
-- **Vendored assets** — `packages/studio/public/vendor/pyodide/` (core files + a curated wheel
-  closure), built by `npm run vendor:pyodide` (configurable via `VV_PYODIDE_PACKAGES`) and served
-  cross-origin-isolated. The kernel exposes the same-origin index to processes as the
-  `VV_PYODIDE_INDEX_URL` env var (`baseProcEnv` in `kernel-worker.ts`). Nothing loads at boot.
-- The studio ships a **"Native" template category** (Python, Data Science). v1 is terminal-first:
-  Pyodide has no real sockets, so these templates have no dev server / preview.
 
 ---
 

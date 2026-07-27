@@ -38,6 +38,9 @@ packages/
   protocol/
     syscall.js     THE worker↔host ABI over one SharedArrayBuffer. 1 MiB window.
                    Single source of truth for the wire format + opcodes.
+    debug.js       the SECOND SAB ABI: kernel→paused-worker debug (CDP) command
+                   channel (EMPTY/CMD state words + Atomics.wait). Only used when
+                   VV_DEBUG is set. See the breakpoint-debugger gotcha below.
 
   kernel-host/     The supervisor (environment-agnostic).
     kernel.js      PID table, spawn/kill/waitpid, net port registry,
@@ -51,8 +54,6 @@ packages/
     load-real-tsgo.js     unpack the vendored TypeScript-7 (tsgo, Go/wasm) asset + shim /bin/tsc,/bin/tsgo.
     programs/npm.js       from-scratch npm installer — LEGACY fallback (see real npm below).
     programs/bun.js       Node-backed `bun`/`bunx` shim (always in COREUTILS; not a vendored pack).
-    programs/python.js    `python`/`python3` launcher (eager in COREUTILS); boots Pyodide lazily
-                          via globalThis.__ocInstallPython on first run (see runtime/builtins/python.js).
 
   runtime/         The Node runtime that runs INSIDE each process worker.
     index.js       createRuntime(): wires builtins/globals/http-bridge/ws + run().
@@ -62,6 +63,13 @@ packages/
     esm.js         ESM→CJS transpiler (import/export → sync CJS).
     typescript-transform.js  synchronous, dependency-free TS/JSX type-strip + JSX
                    lowering for the loader (Bun's zero-config .ts/.tsx exec; gated so plain JS is untouched).
+    instrument.js  breakpoint-debugger source instrumentation: acorn parses the
+                   guest's own source and weaves in __vvdbg probes + per-block
+                   __vv_ev eval closures (only when the debug hook is set).
+    debugger.js    in-guest CDP Debugger/Runtime backend (script registry,
+                   breakpoints, call frames, pause/step, evaluateOnCallFrame).
+    vendor/acorn.mjs  vendored acorn parser used ONLY by instrument.js; ships in a
+                   lazy import() chunk so it costs nothing when debug is off.
     loop.js        the per-process event loop (nextTick→micro→timers→immediate).
     boot.js        process bootstrap shared by browser + Node worker entries.
     fs-client.js   env-agnostic Atomics syscall client (the caller side).
@@ -111,13 +119,16 @@ packages/
                           openFileAt (reveal + select a match/line in Monaco). Wires Monaco's
                           real language service (TS/JS workers, diagnostics, cross-file models +
                           node_modules .d.ts extra libs) for IntelliSense — see gotcha below.
-    src/vv/templates.ts   ~51 project templates across 9 categories (Frontend/Backend/
-                          Bun/Native/Fullstack/Docs/Creative/Tooling/Showcase) — each a manifest
+    src/vv/debug-session.ts  the breakpoint-debugger CDP *client*: sends dbg-cmd /
+                          receives dbg-event over the kernel bridge, tracks targets/
+                          frames/scopes, and drives Monaco gutter breakpoints +
+                          paused-line decorations. Feeds DebugPanel.
+    src/vv/templates.ts   ~49 project templates across 8 categories (Frontend/Backend/
+                          Fullstack/Showcase/Bun/Tooling/Docs/Creative) — each a manifest
                           (install/dev/port/entry) + full source, inline (NOT a scaffolder
                           run in-VM). Spans React/Vue/Svelte/Solid/Qwik/Preact/Lit, Express/
                           Nest/Fastify/Koa/Hono/h3/Nitro, Next/Nuxt/SvelteKit/Astro/React
-                          Router, Tailwind+shadcn, TanStack Router, Vitest, the Bun family,
-                          the Native family (Python + Data Science, on Pyodide)
+                          Router, Tailwind+shadcn, TanStack Router, Vitest, the Bun family
                           (serve/routes/websocket/react), Docusaurus/VitePress/Slidev,
                           Rsbuild/webpack/Angular, and the sqlite/pglite/trpc/monorepo showcases.
                           The install command is inferred per PM (npm/yarn/pnpm/bun).
@@ -138,14 +149,17 @@ packages/
     src/components/ide/   AppShell (+ Home overlay) · Home (Start blank / from template,
                           recents; "Reset everything" now also clears the recent-projects
                           registry and locks its dialog while the wipe runs) · ActivityBar
-                          (Workspace/Search + a bottom light/dark/system theme toggle —
+                          (Workspace/Search + a "Run and Debug" entry that opens the
+                          DebugPanel + a bottom light/dark/system theme toggle —
                           next-themes, applied to Monaco + xterm via controller.applyUiTheme) ·
                           Explorer (the "Workspace" panel: VFS-backed multi-root tree; context
                           menu incl. Open in Integrated Terminal, Copy Path) · SearchPane (VS
                           Code-style full-text search & replace across all roots: case/word/regex,
                           include/exclude globs, Replace All/per-file/per-match + preserve case) ·
                           EditorGroup (preview/permanent tabs; active tab has a #007acc top
-                          accent + a "Workspace > project > …path" breadcrumb) · TerminalPanel
+                          accent + a "Workspace > project > …path" breadcrumb) · DebugPanel
+                          (VS Code-style Call Stack / Variables / Watch / Breakpoints for the
+                          breakpoint debugger — see gotcha below) · TerminalPanel
                           (Console/Terminal/Ports) · PreviewPanel (multi-tab mini-browser: local
                           address bar, back/forward, reload, chii DevTools in a resizable bottom
                           split) · StatusBar (VS Code blue #007acc; status + live diagnostics
@@ -159,6 +173,8 @@ scripts/
   verify-express.mjs   installs+runs real Express/Vite/ws (needs network).
   probe-*.mjs          framework discovery/regression probes (react/nest/realdev).
   spike-*.mjs          per-template/subsystem "does it boot + serve in-VM" proofs.
+  spike-debugger.mjs   headless breakpoint-debugger proof (instrument + CDP backend +
+                       real SAB channel + worker_threads pause→evaluate→resume).
   lib/spike-harness.mjs   shared kernel-boot/install/waitListen/httpGet helper for spikes.
   run-spikes.mjs       CI runner over the spikes (tiers: --offline / --net / --all).
   process-worker.mjs / fs-worker.mjs   Node worker_threads entries for headless.
@@ -674,23 +690,6 @@ unpacked:
 - **`packages/kernel-host/programs/bun.js`** — the `bun`/`bunx` CLI: `bun run`,
   `bunx` (delegates to `npx`), install delegation, and it surfaces require/unhandled-
   rejection errors instead of a silent exit.
-
-**Python (CPython via Pyodide)** follows the same "install-on-demand global" pattern as Bun, but
-because Pyodide is a self-contained WASM runtime the browser loads at runtime, only the tiny
-launcher is eager:
-- **`packages/kernel-host/programs/python.js`** — the eager `python`/`python3` launcher (in
-  `COREUTILS`): `python file.py`, `python -c`, a REPL, `python -m pip install`, and a static
-  `--version` that does not boot Pyodide.
-- **`packages/runtime/builtins/python.js`** — `globalThis.__ocInstallPython(indexURL)` (the analog
-  of `__ocInstallBun`) dynamically imports the vendored `pyodide.mjs` and boots Pyodide on first
-  `python` run; mirrors the project dir into Pyodide's FS, streams stdout/stderr, and auto-loads
-  prebuilt wheels (NumPy/pandas) from imports. It transiently hides `globalThis.process` during the
-  import so Pyodide (which sniffs `process.release.name === "node"`) takes its browser/web-worker
-  fetch path instead of the Node loader.
-- **Vendored** to `packages/studio/public/vendor/pyodide/` by `npm run vendor:pyodide`
-  (`scripts/vendor-pyodide.mjs`, package set via `VV_PYODIDE_PACKAGES`); the kernel passes the
-  same-origin index to processes as `VV_PYODIDE_INDEX_URL`. Nothing Python-related loads at boot.
-  v1 is terminal-first (no dev server / preview — Pyodide has no real sockets).
 - **Zero-config `.ts`/`.tsx`** runs through `packages/runtime/typescript-transform.js`
   (synchronous, dependency-free type-strip + JSX lowering, invoked by `module.js`;
   gated so plain JS is untouched). It strips return-type annotations inside object
@@ -1157,6 +1156,41 @@ Post-compression, the tab's largest term is the **Process Worker JS heap** (dev 
   `terminate()` frees it), and the guest framework's own working set. Use this readout to decide
   before touching any of them.
 
+### Breakpoint debugger (source-instrumented, `VV_DEBUG`)
+A full pause/step/inspect debugger for **Node guest processes** — no native V8
+inspector exists in the browser, so it is built from **source instrumentation** +
+a **second SAB** the paused worker parks on. Load-bearing details:
+- **Instrument on the RIGHT layer.** `runtime/module.js` calls
+  `globalThis.__vvDebugHook.instrument()` on plain ECMAScript **after** the TS/JSX
+  strip but **before** the ESM→CJS rewrite, so line numbers survive. acorn weaves in
+  `__vvdbg.line/brk/push/pop` probes + a per-lexical-block `__vv_ev` eval closure
+  (so `evaluateOnCallFrame`/Variables see the exact block scope, TDZ included). On
+  **any parse failure it self-heals to the original source** — debugging must never
+  break a run.
+- **Pause = `Atomics.wait` on the debug SAB.** A guest runs in its own Process
+  Worker, so hitting a breakpoint genuinely parks the thread on `protocol/debug.js`'s
+  SAB. The kernel writes CDP commands into that SAB + `Atomics.notify`s; a **running**
+  (not-yet-paused) process instead receives commands via `postMessage`. Two transports,
+  one CDP shape.
+- **`--inspect-brk`-style start gate.** Short scripts would finish before the frontend
+  attaches, so `index.js` opens a start gate (`waitForStart`) that blocks until the
+  frontend sends `Runtime.runIfWaitingForDebugger`.
+- **Debug mode is kernel-authoritative.** `kernel.js` owns `debugMode`; `run()` gates
+  purely on `!!(debug && debug.sab)`. The **run shell + package managers**
+  (`sh`/`npm`/`npx`/`yarn`/`pnpm`/…) are **skipped as debug targets** so auto-attach
+  lands on the user's actual program (the child inherits `VV_DEBUG`). Set via the
+  studio "Debug mode" toggle, which sets `VV_DEBUG=1` for subsequent runs.
+- **Zero cost when off.** `debugger.js` + `instrument.js` + the vendored `acorn.mjs`
+  live in a lazy `import()` chunk (~195 KB) fetched only when a debug SAB is present.
+  Keep it that way — never add a static top-level import of them into the always-loaded
+  worker bundle.
+- **Keep all CDP sides in sync.** The backend (`runtime/debugger.js`), the SAB ABI
+  (`protocol/debug.js`, kernel + worker halves), the kernel routing (`kernel.js`,
+  `kernel-worker.ts`, `process-worker.ts`), and the client (`studio/src/vv/debug-session.ts`)
+  are one contract — change them together and re-run `scripts/spike-debugger.mjs`.
+- **Not the preview DevTools.** This debugs Node guests; the chii/chobitsu Sources
+  panel (`sw.js`, preview iframe) debugs preview **browser** JS and is a separate path.
+
 ---
 
 ## Testing & verification
@@ -1183,6 +1217,11 @@ browser first.
 - `node scripts/probe-term.mjs` — interactive terminal: launches a live `sh`, feeds
   keystrokes via `kernel.sendStdin`, asserts echo + `cd`/`pwd`/backspace. No network.
   `probe-nest-watch.mjs` validates the Nest save→recompile→restart reload.
+- `node scripts/spike-debugger.mjs` — the breakpoint debugger's spike gate:
+  instrumentation, breakpoint binding (incl. conditional), pause/step, scope +
+  `evaluateOnCallFrame` (with TDZ), top-level `debugger;`, the real SAB channel, and an
+  end-to-end `worker_threads` pause→evaluate→resume. **Run after any debugger change.**
+  No network.
 - Browser smoke test: `npm run dev` (studio, Vite — opens on `http://localhost:5173`
   by default), pick a project + Run, then check the terminal (Vite/Nest colored
   output), edit a file in Monaco (⌘S to save → HMR/restart), and the preview iframe.
@@ -1218,6 +1257,10 @@ the gap can't silently regress.
   orchestration in the worker.
 - **Change the syscall ABI**: edit `protocol/syscall.js` (+ its format comment) and
   update all three sides (`fs-client.js`, `fs-server.js`, `kernel.js`) together.
+- **Work on the debugger**: edit `runtime/instrument.js` (probes), `runtime/debugger.js`
+  (CDP backend), `protocol/debug.js` (SAB ABI), and/or `studio/src/vv/debug-session.ts`
+  (client) — they are one CDP contract, so change the relevant sides together and
+  re-run `node scripts/spike-debugger.mjs`. See the breakpoint-debugger gotcha above.
 - **Ship the studio**: `npm run build:studio` (Vite build → `packages/studio/dist/`).
 
 ---

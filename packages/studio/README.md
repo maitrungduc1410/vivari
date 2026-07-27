@@ -36,8 +36,14 @@ on `/sw.js` (the preview proxy needs root scope).
 - `src/vv/controller.ts` — `IdeController`: the imperative core (Monaco, xterm
   terminals, the demo "Run" flow via `VV_RUN`, preview) exposed as an external
   store that React reads via `useSyncExternalStore`.
+- `src/vv/debug-session.ts` — the breakpoint debugger's CDP client for Node guest
+  processes: sends/receives CDP over the kernel bridge and drives Monaco gutter
+  breakpoints + the paused-line highlight. Enable "Debug mode" (sets `VV_DEBUG` for
+  subsequent runs) and open "Run and Debug" from the ActivityBar. See the repo root
+  `ARCHITECTURE.md` §7.2 for the full model.
 - `src/components/ide/*` — the chrome: AppShell, ActivityBar, Explorer,
-  EditorGroup, TerminalPanel, PreviewPanel, StatusBar, CommandPalette.
+  EditorGroup, TerminalPanel, PreviewPanel, StatusBar, CommandPalette, DebugPanel
+  (Call Stack / Variables / Watch / Breakpoints).
 
 The kernel/worker files now live in the `@vivari/core` SDK
 (`packages/core/src/workers/*.js`) — studio is just their first consumer, via the
