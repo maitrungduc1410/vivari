@@ -122,13 +122,16 @@ so a small **Worker** (`worker/`) serves the SW runtime for every subdomain.
    a placeholder IP like `192.0.2.1` (the Worker responds directly, never forwards).
    Explicit records for your existing subdomains always win over the wildcard
    (RFC 4592), so they're untouched.
-2. Build + deploy the Worker:
+2. Build + deploy the Worker (from your machine — or wire up Git deploys, see
+   below):
    ```bash
    npm run build:worker    # builds the studio + assembles worker/public/
    npm run deploy:worker   # wrangler deploy (from worker/)
    ```
-   In `worker/wrangler.toml` set the route to `vv-*.<domain>/*` (uncomment the
-   `[[routes]]` block with your `zone_name`, or add it under **Workers → Routes**).
+   `worker/wrangler.toml` ships with the route `vv-*.jamesisme.com/*` bound — change
+   `zone_name`/`pattern` to your own zone. Binding a route on deploy needs an API
+   token with **Workers Routes: Edit** on the zone; otherwise comment the `[[routes]]`
+   block out and add the route under **Workers → your Worker → Domains & Routes**.
    The Worker only acts on hosts matching `vv-*` and passes every other host
    through untouched.
 3. On the **main** (IDE) project set `VITE_PREVIEW_WILDCARD_DOMAIN=jamesisme.com`
@@ -146,6 +149,36 @@ Since mode C serves each port at its own origin root, the studio rewrites those
 templates' base to `/` at creation time — so you don't need to change anything per
 mode. Cross-service calls (a frontend hitting a backend on another port via
 `/preview/<port>/…`) keep working in mode C too.
+
+### Deploy the Worker via Git (Workers Builds)
+
+Instead of running `build:worker` / `deploy:worker` by hand, connect the repo to
+**Cloudflare → Workers & Pages → Create → Workers → Connect to Git**. Cloudflare
+then runs the build + deploy on every push. Use these settings:
+
+| Field | Value |
+| --- | --- |
+| Project name | `vivari-preview` *(must match `name` in `worker/wrangler.toml`)* |
+| Build command | `npm run build:worker` |
+| Deploy command | `cd worker && npx wrangler deploy` |
+| Path (root directory) | `/` |
+| Non-production branch deploy command | `cd worker && npx wrangler versions upload` |
+| API token | needs **Workers Scripts: Edit** (+ **Workers Routes: Edit** to bind the route) |
+
+Why these:
+
+- **Path stays `/` (repo root).** `npm run build:worker` runs
+  `scripts/cloudflare-build-worker.sh`, which builds the studio + Wasm crates at the
+  repo root and assembles `worker/public/`. Pointing Path at `worker/` would break
+  the build (there is no `package.json` there).
+- **Deploy does `cd worker`** so `wrangler` finds `worker/wrangler.toml` (whose
+  `main`/`[assets] directory` are relative to that file).
+- The route in `[[routes]]` is bound automatically on deploy (given the token
+  permission above); no separate dashboard step needed.
+
+These are the Worker's build settings. The `VITE_PREVIEW_WILDCARD_DOMAIN` env var is a
+**build-time variable of the IDE project** (the studio/Pages project), *not* the
+Worker — set it there and redeploy the IDE.
 
 ## Local preview
 

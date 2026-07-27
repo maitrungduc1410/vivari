@@ -22,9 +22,11 @@ binding = "ASSETS"
 run_worker_first = true
 
 # Wildcard route for the per-port preview hosts. Requires a PROXIED wildcard DNS
-# record `*.<domain>` on the zone. Uncomment + set your zone, or add the route in
-# the Cloudflare dashboard (Workers Routes). `*` matches the `<token>--<port>` part.
-#
-# [[routes]]
-# pattern = "vv-*.jamesisme.com/*"
-# zone_name = "jamesisme.com"
+# record `*.<domain>` on the zone. `*` matches the `<token>--<port>` part. Change
+# `jamesisme.com` to your own zone (and keep it in sync with the IDE build's
+# VITE_PREVIEW_WILDCARD_DOMAIN). Deploying with this route bound needs an API token
+# with "Workers Routes: Edit" on the zone; otherwise comment this out and add the
+# route manually in the dashboard (Workers → your Worker → Domains & Routes).
+[[routes]]
+pattern = "vv-*.jamesisme.com/*"
+zone_name = "jamesisme.com"
