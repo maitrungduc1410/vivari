@@ -560,9 +560,16 @@ default** (`/preview/<port>/` on the IDE origin) so it lands in the kernel's sto
 "just works". A standalone tab on the *preview* origin would sit in a different browser storage
 partition than the editor tab and couldn't reach the kernel without a Storage-Access grant — so the
 isolated pop-out is opt-in via `VITE_PREVIEW_POPOUT=isolated` (set on the studio project, only
-meaningful with `VITE_PREVIEW_ORIGIN`). When isolated and the browser has partitioned storage, the
-preview SW serves a StackBlitz-style "connect this tab" gate (`previewConnectingHtml`) instead of
-timing out. There is no isolated-*and*-frictionless standalone tab: `same-origin-allow-popups`
+meaningful with `VITE_PREVIEW_ORIGIN`). Whether `isolated` needs that gate hinges on **same-site vs
+cross-site**: if the IDE and preview origins are subdomains of the **same registrable domain**
+(e.g. `vivari.jamesisme.com` + `vivari-preview.jamesisme.com`, IDE opened at the `jamesisme.com`
+host) they are same-site → **not** storage-partitioned → the pop-out shares the bridge Service Worker
+and connects with **no gate** (verified live), while storage stays origin-isolated. Cross-site
+deploys (two `*.pages.dev` projects — `pages.dev` is on the Public Suffix List — or StackBlitz's
+`stackblitz.com`↔`webcontainer.io`) are partitioned; the preview SW then serves a StackBlitz-style
+"connect this tab" gate (`previewConnectingHtml`), but Chrome's Storage-Access un-partitions cookies
+only (not Service Worker registrations), so on `*.pages.dev` the gate can't grant — use `same-origin`
+pop-out there. There is no isolated-*and*-frictionless standalone tab: `same-origin-allow-popups`
 (to keep `window.opener`) forfeits `crossOriginIsolated` → no `SharedArrayBuffer`. See `roadmap.md`
 ("Pop-out behavior").
 

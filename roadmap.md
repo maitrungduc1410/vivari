@@ -3168,15 +3168,24 @@ toggle (simpler; a UI toggle can wrap it later without touching the core).
   preview origin = a **second Pages project** → `vivari-preview.pages.dev`.
 - **Mode B: two `*.pages.dev` projects.** Zero DNS, and — because `pages.dev` is on the
   **Public Suffix List** — `vivari.pages.dev` and `vivari-preview.pages.dev` are treated as
-  **different sites (cross-site)**, i.e. a *cleaner* boundary than same-TLD subdomains (cookies
-  can't be shared even deliberately).
-- **Custom domain (optional, orthogonal — branding, not isolation).** We own `jamesisme.com`
-  (a Cloudflare zone). Mapping is per project: IDE `vivari.jamesisme.com` → CNAME
-  `vivari.pages.dev`; preview `preview.jamesisme.com` → CNAME `vivari-preview.pages.dev`, then
-  set `VITE_PREVIEW_ORIGIN` to it. Note: subdomains of the **same** TLD are **same-site** (share
-  cookies if `Domain=jamesisme.com` is set) but still **origin-isolated** for storage/OPFS/DOM —
-  fine for our threat model, just slightly weaker than two pages.dev projects. So don't set
-  domain-wide cookies on the IDE.
+  **different sites (cross-site)**, i.e. a *cleaner* isolation boundary than same-TLD subdomains
+  (cookies can't be shared even deliberately). **⚠️ But cross-site is exactly what breaks the
+  `isolated` pop-out** (see the validated note below): a standalone preview tab is storage-partitioned
+  away from the editor, and Chrome's Storage-Access gate can't un-partition a Service Worker → the
+  "connect this tab" gate never grants. So on two `*.pages.dev` projects, `isolated` pop-out does **not**
+  work; use `same-origin` pop-out, or go same-site (below), or mode C.
+- **Custom domain — same-site subdomains (RECOMMENDED for `isolated`, validated live).** We own
+  `jamesisme.com` (a Cloudflare zone). Map **both** projects to subdomains of it: IDE
+  `vivari.jamesisme.com` → CNAME `vivari.pages.dev`; preview `vivari-preview.jamesisme.com` → CNAME
+  `vivari-preview.pages.dev`, set `VITE_PREVIEW_ORIGIN=https://vivari-preview.jamesisme.com`, and
+  **open the editor at `vivari.jamesisme.com`** (not the `.pages.dev` URL). Because both are subdomains
+  of the same registrable domain they are **same-site** → browsers do **not** storage-partition them →
+  the `isolated` pop-out reaches the kernel **with no gate at all** (verified: `vivari-preview.jamesisme.com/preview/5173/`
+  opens straight into the preview). You still get full **origin isolation** (localStorage/OPFS/IndexedDB/DOM
+  are per-origin), so preview code (incl. your npm deps) can't touch IDE storage. The only residual
+  same-site leak is **domain-wide cookies** (`Domain=jamesisme.com`) — so **don't set domain-wide
+  cookies on the IDE**. This is the sweet spot for trusted-own-code; for untrusted code at scale you
+  want cross-site + gate (mode C, StackBlitz-style).
 - **Mode C requires a custom domain.** `*.pages.dev` can't do wildcard; Cloudflare **Pages custom
   domains are exact hostnames only (no `*.`)**, so wildcard needs a **Cloudflare Worker route**
   (`*.jamesisme.com/*`) serving the static SW + bridge (or Cloudflare for SaaS).
@@ -3300,6 +3309,40 @@ only the explicit pop-out differs.
 - `same-origin-allow-popups` (keep `window.opener`) is **not** an option: it forfeits
   `crossOriginIsolated` → no `SharedArrayBuffer` → the kernel breaks. So there is no "isolated AND
   zero-friction" standalone pop-out; that's a hard browser constraint, not a missing feature.
+
+#### The deciding factor for `isolated`: **same-site vs cross-site** (validated live)
+
+Whether the `isolated` pop-out shows a gate — or "just works" — is decided entirely by whether the
+IDE origin and the preview origin are the **same site** (same registrable domain) or not. Browsers
+storage-partition **only cross-site** contexts; a same-site iframe is first-party and unpartitioned.
+The kernel reaches the preview origin via a hidden bridge iframe *inside the editor tab*; for a
+standalone pop-out tab to share that bridge's Service Worker registration + `MessagePort`, both must
+land in the **same storage partition**.
+
+| Deploy | IDE site | Preview site | Same-site? | Partitioned? | `isolated` pop-out |
+|---|---|---|---|---|---|
+| Two `*.pages.dev` projects | `vivari.pages.dev` | `vivari-preview.pages.dev` | **No** (PSL cuts `pages.dev`) | Yes | ❌ gate appears, **can't grant on Chrome** |
+| Two subdomains of one domain | `jamesisme.com` | `jamesisme.com` | **Yes** | No | ✅ **no gate, connects straight** |
+| StackBlitz | `stackblitz.com` | `webcontainer.io` | **No** (different domains) | Yes | ⚠️ gate ("You're almost there") — accepted for max isolation |
+
+- **Why `*.pages.dev` fails:** `pages.dev` is on the **Public Suffix List**, so `vivari.pages.dev`
+  and `vivari-preview.pages.dev` are *different sites* → cross-site → partitioned. Chrome's
+  `requestStorageAccess()` reliably un-partitions **cookies only**, not Service Worker registrations,
+  so the "connect this tab" gate can never bridge the two partitions. Result: the gate loops.
+- **Why same-site works with no gate:** `vivari.jamesisme.com` and `vivari-preview.jamesisme.com`
+  are both under registrable domain `jamesisme.com` → **same-site** → no partition wall exists in the
+  first place → the pop-out tab shares the bridge's SW/port → reaches the kernel immediately. Storage
+  is still **origin-scoped**, so isolation holds. **Verified live** (2026-07): `isolated` pop-out to
+  `vivari-preview.jamesisme.com/preview/5173/` opens with no gate. Requires opening the editor at the
+  `jamesisme.com` host — loading it via `.pages.dev` re-introduces cross-site and the gate returns.
+- **Why StackBlitz still shows a gate:** they deliberately run *untrusted* code at scale, so they
+  chose maximum isolation — `stackblitz.com` (editor) vs `webcontainer.io` (preview) are different
+  registrable domains (cross-site, even stronger than same-TLD). The gate is the accepted cost of that
+  choice, not a bug. Vivari's `isolated`-same-site is the right trade-off for **trusted-own-code**;
+  the StackBlitz-style cross-site gate (and eventually mode C wildcard) is for **untrusted code**.
+- **Practical guidance:** for `VITE_PREVIEW_POPOUT=isolated` without friction, deploy IDE + preview as
+  **two subdomains of the same domain** and open the IDE at that domain. Two `*.pages.dev` projects
+  can't do gate-free `isolated` — use `same-origin` pop-out there instead.
 
 ### What actually couples the SW to the IDE origin (and why splitting is safe)
 

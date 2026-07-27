@@ -766,8 +766,14 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
   origin behind a "connect this tab" Storage-Access gate (`previewConnectingHtml`) when
   `VITE_PREVIEW_POPOUT=isolated`. Both env vars go on the **studio (main) project**, not the preview
   project. There is NO isolated-and-frictionless standalone tab (`same-origin-allow-popups` would
-  drop `crossOriginIsolated` → no SAB). Deep dive: `roadmap.md` ("preview origin isolation" +
-  "Pop-out behavior").
+  drop `crossOriginIsolated` → no SAB). **`isolated` only works gate-free when IDE and preview are
+  *same-site*** (subdomains of one registrable domain, e.g. `vivari.jamesisme.com` +
+  `vivari-preview.jamesisme.com`, opening the IDE at the `jamesisme.com` host): same-site ⇒ not
+  storage-partitioned ⇒ the pop-out shares the bridge SW and connects with **no gate** (verified
+  live), while storage stays origin-isolated. On two `*.pages.dev` projects they're **cross-site**
+  (PSL) ⇒ partitioned ⇒ Chrome's Storage-Access can't un-partition a Service Worker ⇒ the gate never
+  grants, so use `same-origin` pop-out there. Deep dive: `roadmap.md` ("preview origin isolation" +
+  "Pop-out behavior" → "same-site vs cross-site").
 - **SSE goes through its OWN tunnel — NOT the HTTP proxy.** A `text/event-stream` response
   can't cross `handleHttpRequest`/`OP_RESPOND` (buffered end-to-end: the SW waits for ONE
   complete body, so a never-ending SSE stream 504s at 60s). So an **`EventSource` polyfill**
