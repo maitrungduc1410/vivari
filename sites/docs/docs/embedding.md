@@ -39,7 +39,7 @@ installs.
 
 ## Headers
 
-Every HTML document that boots Vivari — and the `sw.js` script — needs:
+Every HTML document that boots Vivari (and the `sw.js` script) needs:
 
 ```
 Cross-Origin-Opener-Policy: same-origin

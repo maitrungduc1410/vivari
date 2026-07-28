@@ -8,7 +8,7 @@ title: How it works
 ## The load-bearing trick: blocking on a worker
 
 Node's APIs (`fs.readFileSync`, `require()`, …) are **synchronous**. Browsers
-don't let you block on async work — *except on a Web Worker thread*, where
+don't let you block on async work, *except on a Web Worker thread*, where
 `Atomics.wait()` can genuinely park execution. So a `readFileSync` call inside
 the VM parks the worker until the host answers over a `SharedArrayBuffer`:
 
@@ -39,7 +39,7 @@ isolation**, which is why Vivari requires the COOP/COEP headers.
    (`fs`, `path`, `process`, `os`, `http`, `child_process`, …).
 4. **Virtual networking.** A `http.createServer().listen()` runs inside a worker;
    a **Service Worker** intercepts `/preview/<port>/…` and turns each iframe
-   request into an in-VM HTTP call — no network involved.
+   request into an in-VM HTTP call, with no network involved.
 
 ## Dependency caching
 
@@ -49,7 +49,7 @@ you've built before (or a second project with the same deps) restores
 
 ## Portability
 
-Projects can leave the browser and come back — all client-side: **export** a
+Projects can leave the browser and come back, all client-side: **export** a
 project as a `.zip`, **import** a local folder, **import a public GitHub repo or
 npm package** (fetched directly via CORS), and **share** a project as a
 self-contained compressed link.

@@ -15,7 +15,7 @@ Cross-Origin-Embedder-Policy: require-corp
 ```
 
 Under `require-corp`, every **cross-origin** subresource must opt in with
-`Cross-Origin-Resource-Policy` (or CORS). Same-origin subresources are fine —
+`Cross-Origin-Resource-Policy` (or CORS). Same-origin subresources are fine,
 which is why Vivari self-hosts all of its workers and Wasm.
 
 Check at runtime:
@@ -77,6 +77,6 @@ app.use((_req, res, next) => {
 Cross-origin isolation is contagious: a page is only isolated if its top-level
 document sends the headers. If you host a marketing page and an embed on the same
 origin, you can scope the headers to just the embed's path so the rest of the
-site stays free of CORP constraints. That's exactly what this project does — see
+site stays free of CORP constraints. That's exactly what this project does; see
 [Deployment](./deployment).
 :::

@@ -47,9 +47,9 @@ await vivari.mount({
 Run a command. Package managers (`npm` / `yarn` / `pnpm` / `corepack`) work out
 of the box with persisted, content-addressed caches. A `VivariProcess` has:
 
-- `output: ReadableStream<string>` — merged stdout + stderr (ANSI intact)
-- `input: WritableStream<string>` — stdin (close the stream to send EOF)
-- `exit: Promise<number>` — the exit code
+- `output: ReadableStream<string>`, the merged stdout + stderr (ANSI intact)
+- `input: WritableStream<string>`, stdin (close the stream to send EOF)
+- `exit: Promise<number>`, the exit code
 - `kill(): void`
 
 ```ts
@@ -91,5 +91,5 @@ Build the same-origin preview URL for a port, and free the workers/VFS.
 
 `Vivari` is a thin facade over `KernelBridge`, the raw pub/sub transport to the
 kernel worker (`on` / `onAny` / `post` / `request`, SW registration, keep-prefix
-ports). Use it directly if you need the full message vocabulary — it's what the
+ports). Use it directly if you need the full message vocabulary; it's what the
 [Studio](https://vivari.jamesisme.com/studio/) is built on.

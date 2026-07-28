@@ -69,7 +69,7 @@ await vivari.spawn("npm", ["run", "dev"]); // long-running; don't await exit
 
 Edit `index.js` below and press **Run**. This boots a real Node.js runtime in your
 browser (inside a cross-origin isolated frame) and streams the actual `stdout`
-back — try importing another `node:` built-in or changing the loop.
+back. Try importing another `node:` built-in or changing the loop.
 
 <Playground scenario="node" title="Live Node terminal" />
 
@@ -80,5 +80,5 @@ embed the [`<Vivari>` component](./react) on a cross-origin isolated page.
 
 ## Next
 
-- [Core API](./core-api) — every method and option.
-- [Embedding](./embedding) — self-hosting the Service Worker and assets.
+- [Core API](./core-api): every method and option.
+- [Embedding](./embedding): self-hosting the Service Worker and assets.

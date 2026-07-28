@@ -64,7 +64,7 @@ Extends `BootOptions` (`compress`, `serviceWorkerUrl`, `workerName`), plus:
 
 The `<Vivari>` component below boots a real Vite + React dev server inside your
 browser and renders its preview. Edit `src/App.jsx` on the left and the preview
-hot-reloads — no server involved.
+hot-reloads, with no server involved.
 
 <Playground scenario="react" title="Live React dev server" height={520} />
 
@@ -92,5 +92,5 @@ function Terminal() {
 }
 ```
 
-The instance is torn down on unmount. Options are read once — change them by
+The instance is torn down on unmount. Options are read once; change them by
 remounting (e.g. with a React `key`).
