@@ -3685,7 +3685,8 @@ ready`) and none of the things you actually reach for. It now mirrors VS Code.
   `IdeSnapshot.cwd` are gone; the ~20 messages that fed `status` are now **sonner toasts**
   (transient by nature, so they never needed a permanent slot), and the pure boot-lifecycle
   ones were dropped as redundant — Home already renders `bootPhase` progress and the share
-  overlay its own `shareMessage`.
+  overlay its own `shareMessage`. (Superseded — see "Status bar — the message slot comes
+  back" below: the toasts turned out to be too noisy on save.)
 
 Two implementation notes worth keeping in mind:
 
@@ -3701,3 +3702,35 @@ Two implementation notes worth keeping in mind:
 
 See ARCHITECTURE.md §8.12, and the AGENTS.md gotchas "The status bar's git branch must NOT
 trigger a status walk" and IntelliSense gotcha #3.
+
+## Status bar — the message slot comes back (this change)
+
+Routing every status message to a sonner toast (previous entry) was wrong for one message in
+particular: `saveFile` fires on every Ctrl+S, so a toast popped over the editor on each save.
+Toasts are for things you must not miss; a save is the opposite of that.
+
+All the non-error messages move back to the status bar, into a **message slot** between the
+diagnostics and the right-hand `Ln/Col` group — VS Code's `setStatusBarMessage` position. That
+is the 14 messages the previous change converted (save, created, installing, imported, copied
+path, dev-server stopped/running/restarted, `demo-status`, service ready) plus the 5 it dropped
+as redundant (opening shared project, exported, imported-as, share link, boot ready), restored
+verbatim in their original lowercase wording. Only genuine **failures** stay toasts, alongside
+the handful of pre-existing successes that carry a second line of detail (export, import,
+share) — those need to survive longer than a glance and be dismissed deliberately.
+
+Two things are deliberately different from the pre-VS-Code status bar:
+
+- **Messages auto-hide after 4s.** The old slot left the last message sitting there forever, so
+  the bar routinely showed something that had stopped being true minutes ago. A stale readout is
+  worse than an empty one.
+- **`src/vv/status-message.ts` is its own external store**, not a field back on `IdeSnapshot`.
+  The `demo-status` bridge event carries one message per line of dev-server output, so an npm
+  install used to re-render every `useIde()` consumer in the IDE a few hundred times. Same
+  reasoning — and same `DebugSession` / `ScmSession` / `EditorStatus` pattern — as the previous
+  entry's `editor-status.ts`. The store owns a single reset-able hide timer, so a burst of build
+  output leaves one pending hide rather than hundreds.
+
+The controller writes through a private `status(text)` helper, which keeps the choice of channel
+(status bar vs. toast) a one-word decision at each call site.
+
+See ARCHITECTURE.md §8.12.

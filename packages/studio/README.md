@@ -44,6 +44,10 @@ on `/sw.js` (the preview proxy needs root scope).
 - `src/vv/editor-status.ts` — cursor / indentation / language-mode readouts for the
   status bar, fed by Monaco listeners in the controller. A store of its own (not
   `IdeSnapshot`) so a cursor move doesn't re-render the whole IDE.
+- `src/vv/status-message.ts` — the status bar's transient message slot ("saved
+  page.tsx — hot-updating…"), auto-hiding after 4s. Also its own store, so the
+  per-line `demo-status` build output doesn't re-render the whole IDE. Routine
+  feedback lands here; failures raise a sonner toast instead.
 - `src/components/ide/*` — the chrome: AppShell, ActivityBar, Explorer,
   EditorGroup, TerminalPanel, PreviewPanel, StatusBar (+ StatusBarPickers: Go to
   Line, indentation, language mode), CommandPalette, DebugPanel

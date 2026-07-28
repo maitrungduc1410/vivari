@@ -898,6 +898,7 @@ flowchart LR
   Monaco["Monaco editor + model"] -->|"cursor / selection / model / options / language"| ES["EditorStatus store"]
   ES -->|"useSyncExternalStore"| Right["Ln,Col · Spaces · Language"]
   SCM["ScmSession.refreshBranches()"] -->|"useSyncExternalStore"| Left["branch"]
+  Ctrl["IdeController.status()"] -->|"useSyncExternalStore"| Msg["message slot (auto-hides 4s)"]
   Right -->|"click"| QP["quick pick"]
   QP -->|"c.gotoLine / setIndentation / setLanguageMode"| Monaco
 ```
@@ -912,9 +913,18 @@ flowchart LR
   Control panel. `refreshScm()` picks between them.
 
 A hand-picked language mode is remembered per file (`languageOverrides`) so it survives closing and
-reopening the tab. There is **no free-form status text**: what used to live there (saved / created /
-imported / running …) is now a sonner toast, which is transient by nature and doesn't need a
-permanent slot.
+reopening the tab.
+
+Between the diagnostics and the right-hand group sits the **message slot** (`status-message.ts`),
+VS Code's `setStatusBarMessage` equivalent: the routine "saved / created / imported / running …"
+feedback the controller writes through its private `status()`. It is a third small store for the
+same reason as `editor-status.ts` — the `demo-status` bridge event fires once per line of
+dev-server output, so on `IdeSnapshot` an npm install would re-render the whole IDE a few hundred
+times. Messages **auto-hide after 4s**; a readout that has gone stale is worse than an empty slot.
+
+Choosing a channel: routine, high-frequency feedback goes to the status bar, because a save happens
+constantly and a toast per Ctrl+S is noise. Failures and anything carrying a second line of detail
+stay sonner toasts — they need to survive the 4s window and be dismissed deliberately.
 
 ---
 

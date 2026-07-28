@@ -1,12 +1,14 @@
 // VS Code-style status bar.
 //
-// Left:  the active folder's git branch (when it is a repo) + live TS/JS
-//        diagnostics from the language-service worker.
+// Left:  the active folder's git branch (when it is a repo), live TS/JS
+//        diagnostics from the language-service worker, and the transient
+//        message slot ("saved page.tsx — hot-updating…").
 // Right: the active editor's cursor position, indentation and language mode.
 //        Each opens a quick pick (see StatusBarPickers).
 //
-// The right-hand readouts come from `c.editorStatus`, a store of their own, so a
-// cursor move doesn't re-render every useIde() consumer in the IDE.
+// The readouts come from `c.editorStatus` / `c.statusMessage`, stores of their
+// own, so a cursor move or a line of dev-server output doesn't re-render every
+// useIde() consumer in the IDE.
 
 import { useState, useSyncExternalStore } from "react";
 import CircleX from "~icons/lucide/circle-x";
@@ -23,6 +25,7 @@ export function StatusBar() {
   const { errors, warnings } = snap.problems;
   const scm = useSyncExternalStore(c.scm.subscribe, c.scm.getSnapshot);
   const editor = useSyncExternalStore(c.editorStatus.subscribe, c.editorStatus.getSnapshot);
+  const message = useSyncExternalStore(c.statusMessage.subscribe, c.statusMessage.getSnapshot);
   const [picker, setPicker] = useState<StatusPicker>(null);
 
   // VS Code shows one repository at a time: the one owning the active file, else
@@ -58,6 +61,9 @@ export function StatusBar() {
           <TriangleAlert className="ml-1 size-3.5" />
           {warnings}
         </StatusItem>
+        {/* Transient feedback for routine operations (save, run, import). Auto-
+            hides; `min-w-0` keeps a long path from shoving the right side off. */}
+        {message && <span className="min-w-0 truncate px-2">{message}</span>}
 
         <span className="flex-1" />
 

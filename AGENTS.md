@@ -140,6 +140,12 @@ packages/
                           the cursor changes on every keystroke, so folding it into
                           the main snapshot would re-render every useIde() consumer
                           on each keypress.
+    src/vv/status-message.ts  the status bar's transient message slot ("saved page.tsx
+                          — hot-updating…"), written via the controller's private
+                          `status()`. Also its OWN store, for the same reason: the
+                          `demo-status` bridge event carries one message per line of
+                          dev-server output. Auto-hides after 4s. Routine feedback
+                          goes here; FAILURES still raise a sonner toast.
     src/vv/git-fs.ts      isomorphic-git fs adapter → the silent `vv-git-fs` kernel
                           RPC (main-thread git can't touch the FS-worker VFS directly).
     src/vv/git-config.ts  persisted git author identity (localStorage; per-user).
@@ -192,10 +198,10 @@ packages/
                           (Console/Terminal/Ports) · PreviewPanel (multi-tab mini-browser: local
                           address bar, back/forward, reload, chii DevTools in a resizable bottom
                           split) · StatusBar (VS Code blue #007acc; LEFT: active repo's git branch
-                          + live diagnostics count, RIGHT: "Ln x, Col y" / "Spaces: n" / language
-                          mode, each opening a quick pick — see StatusBarPickers + the gotcha
-                          below. There is deliberately no free-form status text: transient
-                          messages are sonner toasts) · StatusBarPickers (Go to Line, the
+                          + live diagnostics count + the auto-hiding message slot, RIGHT:
+                          "Ln x, Col y" / "Spaces: n" / language mode, each opening a quick
+                          pick — see StatusBarPickers + the gotcha
+                          below) · StatusBarPickers (Go to Line, the
                           two-level indentation actions, Select Language Mode — all built on the
                           CommandDialog primitives) · CommandPalette (⌘P quick-open by name;
                           append :line[:col] to jump) · fileIcon (vscode-icons). Icons are Iconify via
