@@ -714,6 +714,13 @@ WASM (Pyodide)** the first time a python process runs (nothing at studio boot). 
 - **Two Node probes must BOTH be masked** or boot dies on `import("node:module")`:
   `process.browser = true` (pyodide.mjs) AND `process.type = "renderer"`
   (Emscripten's pyodide.asm.mjs). Hold both across the whole boot, then restore.
+- **The boot promise MUST hold a host-liveness ref** (`trackHost(bootPromise)` in
+  `bootPyodide`). Pyodide's `fetch`/`WebAssembly` are liveness-tracked, but the initial
+  `import(pyodide.mjs)` (and `import(pyodide.asm.mjs)` inside `loadPyodide`) are native ES
+  imports that are NOT — on a warm dev server they resolve in one loop turn so `main()`
+  reaches the tracked fetches first, but on a **cold prod/CDN load** the import outlasts a
+  macrotask, `drive()` sees no ref'd work and exits 0 mid-boot, and every `python`/`flask`/
+  `uvicorn` command appears to **exit instantly with no output** (dev-passes/prod-fails).
 - **`vendor:pyodide` writes gitignored assets under `packages/studio/public/vendor/pyodide/`.**
   It's in the root `prebuild:studio` hook, but the studio's own `bun run build` does NOT
   fire that hook — so `scripts/cloudflare-build.sh` **must list `npm run vendor:pyodide`

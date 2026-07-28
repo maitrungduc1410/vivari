@@ -58,7 +58,7 @@ function withTrailingSlash(u) {
   return s.endsWith("/") ? s : s + "/";
 }
 
-export function createPythonRuntime({ process, require }) {
+export function createPythonRuntime({ process, require, trackHost }) {
   const req = (name) => require(name);
 
   // One Pyodide per process (a fresh process worker = a fresh boot). Cached so a
@@ -111,6 +111,18 @@ export function createPythonRuntime({ process, require }) {
         restoreEnv();
       }
     })();
+    // Keep this process's event loop alive across the whole boot. Pyodide's own
+    // fetch()/WebAssembly calls are liveness-tracked (see trackHost in
+    // packages/runtime/index.js), but the initial dynamic `import(pyodide.mjs)`
+    // — and the `import(pyodide.asm.mjs)` loadPyodide() does internally — are
+    // native ES module imports that bypass that tracking. On a warm dev server
+    // they resolve within a single loop turn, so main() reaches the tracked
+    // fetches before drive() can quiesce; on a cold production/CDN load the
+    // import takes longer than one macrotask, so drive() sees no ref'd work and
+    // exits 0 BEFORE Pyodide finishes booting. Every `python`/`flask`/`uvicorn`
+    // command then appears to exit instantly with no output. Holding a
+    // host-liveness ref until the boot promise settles closes that race.
+    if (typeof trackHost === "function") trackHost(bootPromise);
     return bootPromise;
   }
 

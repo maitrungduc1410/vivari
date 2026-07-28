@@ -3566,7 +3566,12 @@ only by the launcher, mirroring Bun's `__ocInstallBun`).
   auto-loads prebuilt wheels the code imports (`loadPackagesFromImports`). Boot masks
   **both** Node probes — `process.browser=true` (pyodide.mjs) and `process.type=
   "renderer"` (Emscripten's pyodide.asm.mjs) — or Pyodide `import("node:module")` (404s
-  in a Worker); both held across the whole boot, then restored.
+  in a Worker); both held across the whole boot, then restored. The boot promise also
+  holds a **host-liveness ref** (`trackHost(bootPromise)`): Pyodide's `fetch`/`WebAssembly`
+  are tracked, but the initial `import(pyodide.mjs)` / `import(pyodide.asm.mjs)` are native
+  ES imports that are not — without the ref, a **cold prod/CDN** import outlasts a loop
+  macrotask, `drive()` quiesces and exits 0 mid-boot, and every `python`/`flask`/`uvicorn`
+  command exits instantly with no output (a dev-passes / prod-fails race).
 - **CLI** (`packages/kernel-host/programs/python.js`) + `uvicorn`/`flask` PATH shims
   (`coreutils.js`). `process.exit`'s control-flow throw is detected and returned quietly.
 - **Delivery** (`scripts/vendor-pyodide.mjs`): vendors the Pyodide core + selected wheels

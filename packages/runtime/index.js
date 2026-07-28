@@ -1316,7 +1316,7 @@ export function createRuntime({
   // __ocInstallPython(indexURL) to boot Pyodide (CPython/WASM) from a same-origin
   // vendored index only when a `python` process actually runs, so a plain node
   // process pays nothing. See packages/runtime/builtins/python.js.
-  const pythonRuntime = createPythonRuntime({ process, require: vvRootRequire });
+  const pythonRuntime = createPythonRuntime({ process, require: vvRootRequire, trackHost });
   globalThis.__ocInstallPython = (indexUrl) => pythonRuntime.install(indexUrl);
 
   return {
