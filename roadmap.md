@@ -3652,3 +3652,52 @@ only by the launcher, mirroring Bun's `__ocInstallBun`).
 
 See ARCHITECTURE.md §9.3 (the plug-in + HTTP bridge) and §8.3 (the `X-Forwarded-Prefix`
 seam), and the AGENTS.md "Python is Pyodide" gotcha.
+## Status bar — VS Code parity (Ln/Col, indentation, language mode) (this change)
+
+The status bar carried an ad-hoc mix (a free-form status string, the shell cwd, `kernel:
+ready`) and none of the things you actually reach for. It now mirrors VS Code.
+
+- **Left**: the active repository's **git branch** + the live **error/warning** counts.
+  "Active repository" resolves like VS Code — the repo owning the active file, else the
+  focused workspace folder, else the only repo there is. Clicking the branch opens the
+  Source Control panel.
+- **Right**: **`Ln x, Col y`** (with ` (n selected)` / `n selections` for selections and
+  multi-cursor), the **indentation** (`Spaces: 2` / `Tab Size: 4`) and the **language
+  mode**. Each cell is a button that opens a quick pick, built on the same
+  `CommandDialog` primitives as ⌘P so they look and keyboard-drive identically:
+  - **Go to Line** — `line` or `line:col`, validated against the model's line count, with
+    VS Code's "Current Line: …, Character: …" hint when the input is empty.
+  - **Indentation** — the full VS Code action list, two-level: Indent Using Spaces /
+    Indent Using Tabs / Change Tab Display Size drill into a size list (1-8, current one
+    checked); Detect Indentation from Content, Convert Indentation to Spaces/Tabs and Trim
+    Trailing Whitespace run Monaco's own `editor.action.*`.
+  - **Select Language Mode** — Auto Detect plus the 20 grammars Monaco already bundles and
+    `languageFor` can auto-detect. A hand-picked mode is remembered per file so it survives
+    closing and reopening the tab. Deliberately **no JavaScript entry**: `.js` is served by
+    the `typescript` mode on purpose (one language service, not two ~310 MB `ts.worker`s),
+    so offering it would quietly double IntelliSense memory. See the AGENTS.md IntelliSense
+    gotcha #3.
+- **`languageFor` learned twelve more extensions** (scss/less, yaml, shell, sql, xml,
+  Dockerfile, go, rust, java, php, ruby, ini/toml), all Monarch highlighting only — no
+  worker, no language service.
+- **Removed**: the cwd path, `kernel: ready/booting`, and the free-form status text
+  (`"React · TypeScript running — edits hot-reload"`). `IdeSnapshot.status` and
+  `IdeSnapshot.cwd` are gone; the ~20 messages that fed `status` are now **sonner toasts**
+  (transient by nature, so they never needed a permanent slot), and the pure boot-lifecycle
+  ones were dropped as redundant — Home already renders `bootPhase` progress and the share
+  overlay its own `shareMessage`.
+
+Two implementation notes worth keeping in mind:
+
+- **`src/vv/editor-status.ts` is its own external store**, not part of `IdeSnapshot`. The
+  cursor moves on every keystroke; on the main snapshot that would notify every `useIde()`
+  consumer in the IDE per keypress. Same pattern as `DebugSession` / `ScmSession`.
+- **The branch readout must not trigger a status walk.** `ScmSession.refreshBranches()` is
+  a new branch-only path (a `.git` stat + `git.currentBranch()`); the full `statusMatrix`
+  walk stays gated to when the Source Control panel is shown, because it floods the
+  single-threaded kernel worker that also drives the terminal. Non-repo folders
+  short-circuit on the stat, so a git-less workspace still never pays the lazy ~1 MB
+  isomorphic-git import.
+
+See ARCHITECTURE.md §8.12, and the AGENTS.md gotchas "The status bar's git branch must NOT
+trigger a status walk" and IntelliSense gotcha #3.

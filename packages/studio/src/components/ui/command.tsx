@@ -38,12 +38,16 @@ function CommandDialog({
   children,
   className,
   showCloseButton = false,
+  finalFocus,
   ...props
 }: Omit<React.ComponentProps<typeof Dialog>, "children"> & {
   title?: string
   description?: string
   className?: string
   showCloseButton?: boolean
+  // Where focus lands on close. Pass `false` when the selected command focuses
+  // something itself (e.g. the editor), so the trigger doesn't steal it back.
+  finalFocus?: React.ComponentProps<typeof DialogContent>["finalFocus"]
   children: React.ReactNode
 }) {
   return (
@@ -58,6 +62,7 @@ function CommandDialog({
           className
         )}
         showCloseButton={showCloseButton}
+        finalFocus={finalFocus}
       >
         {children}
       </DialogContent>

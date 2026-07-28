@@ -797,6 +797,10 @@ flowchart LR
   `node_modules` fingerprint short-circuits the file reads when nothing changed.
 - **Never register a file as both** a model and an extra lib, or the worker sees it twice ("Duplicate
   identifier"). `onDidChangeMarkers` feeds a live error/warning count into the status bar.
+- **Only the `typescript` mode has a service.** `.js` is mapped onto it (`allowJs`) so a second
+  ~310 MB `ts.worker` never spawns — which is also why the status bar's language picker offers no
+  JavaScript entry (§8.12). Every other language in that picker is a bundled Monarch grammar:
+  highlighting only, no worker.
 
 ### 8.10 Import / export & share (studio)
 
@@ -876,6 +880,41 @@ in the File System Worker and is only reachable synchronously from the **kernel*
 Because the adapter isolates *all* fs access behind the bridge, the upgrade path (if main-thread status
 walks ever jank on a huge repo) is to move isomorphic-git behind its own worker with only the call site
 changing.
+
+### 8.12 Status bar (studio)
+
+A VS Code-parity status bar: the active repository's **git branch** and the live **error/warning**
+counts on the left; the active editor's **`Ln x, Col y`**, **indentation** (`Spaces: 2` / `Tab Size: 4`)
+and **language mode** on the right. Clicking any of the three right-hand cells opens a quick pick
+(`StatusBarPickers.tsx`, built on the same `CommandDialog` primitives as ⌘P): Go to Line, the
+two-level indentation actions (Indent Using Spaces/Tabs and Change Tab Display Size drill into a
+size list; Detect Indentation, the two conversions and Trim Trailing Whitespace run Monaco's own
+`editor.action.*`), and Select Language Mode.
+
+Two feed paths, and neither goes through `IdeSnapshot`:
+
+```mermaid
+flowchart LR
+  Monaco["Monaco editor + model"] -->|"cursor / selection / model / options / language"| ES["EditorStatus store"]
+  ES -->|"useSyncExternalStore"| Right["Ln,Col · Spaces · Language"]
+  SCM["ScmSession.refreshBranches()"] -->|"useSyncExternalStore"| Left["branch"]
+  Right -->|"click"| QP["quick pick"]
+  QP -->|"c.gotoLine / setIndentation / setLanguageMode"| Monaco
+```
+
+- **`editor-status.ts` is a store of its own** (like `DebugSession`/`ScmSession`) precisely because the
+  cursor moves on every keystroke. On `IdeSnapshot` that would notify every `useIde()` consumer in the
+  IDE per keypress; here it re-renders the status bar and nothing else. The controller's
+  `wireEditorStatus` binds the editor-level listeners once and re-binds the model-level ones on each
+  model swap.
+- **The branch readout never triggers a status walk.** `refreshBranches()` does a `.git` stat plus
+  `git.currentBranch()` and stops; the full `statusMatrix` walk (§8.11) stays gated to the Source
+  Control panel. `refreshScm()` picks between them.
+
+A hand-picked language mode is remembered per file (`languageOverrides`) so it survives closing and
+reopening the tab. There is **no free-form status text**: what used to live there (saved / created /
+imported / running …) is now a sonner toast, which is transient by nature and doesn't need a
+permanent slot.
 
 ---
 

@@ -19,6 +19,7 @@ import type * as Monaco from "monaco-editor";
 import { KernelBridge, resetVfs } from "./kernel";
 import { DebugSession } from "./debug-session";
 import { ScmSession } from "./scm-session";
+import { EditorStatus } from "./editor-status";
 import { getTemplate, type TemplateManifest } from "./templates";
 import { createZip, encodeShare, decodeShare } from "../../../kernel-host/archive.js";
 import {
@@ -170,8 +171,6 @@ export interface IdeSnapshot {
   bootPhase: string;
   bootDone: number;
   bootTotal: number;
-  status: string;
-  cwd: string;
   view: "home" | "workspace";
   // A shared link (#share=) is bootstrapping: show a full-screen blocking overlay.
   shareLoading: boolean;
@@ -448,13 +447,71 @@ function languageFor(path: string): string {
   // configureLanguageService.
   if (/\.(tsx?|jsx?|mjs|cjs)$/.test(path)) return "typescript";
   if (/\.css$/.test(path)) return "css";
+  if (/\.scss$/.test(path)) return "scss";
+  if (/\.less$/.test(path)) return "less";
   if (/\.(html?|vue|svelte)$/.test(path)) return "html";
-  if (/\.json$/.test(path)) return "json";
+  if (/\.json[5c]?$/.test(path)) return "json";
   if (/\.md$/.test(path)) return "markdown";
   // Python: Monaco's bundled Monarch grammar highlights on the main thread — no
-  // dedicated worker/language service (we don't ship a python.worker).
+  // dedicated worker/language service (we don't ship a python.worker). Same for
+  // every language below: Monarch highlighting only, no language service.
   if (/\.pyi?$/.test(path)) return "python";
+  if (/\.ya?ml$/.test(path)) return "yaml";
+  if (/\.(sh|bash|zsh|ksh)$/.test(path)) return "shell";
+  if (/\.sql$/.test(path)) return "sql";
+  if (/\.(xml|xsd|xsl|plist)$/.test(path)) return "xml";
+  if (/(^|\/)Dockerfile[^/]*$|\.dockerfile$/.test(path)) return "dockerfile";
+  if (/\.go$/.test(path)) return "go";
+  if (/\.rs$/.test(path)) return "rust";
+  if (/\.java$/.test(path)) return "java";
+  if (/\.php$/.test(path)) return "php";
+  if (/\.rb$/.test(path)) return "ruby";
+  if (/\.(ini|toml|cfg|conf|properties)$/.test(path)) return "ini";
   return "plaintext";
+}
+
+/** The language modes the "Select Language Mode" status-bar picker offers, in
+ * display order. Every id is a grammar Monaco already bundles, so listing one
+ * costs nothing beyond this entry — but the list is deliberately limited to what
+ * `languageFor` can auto-detect, so picking a mode and re-opening the file behave
+ * consistently. Anything unrecognised falls back to Plain Text.
+ *
+ * There is intentionally NO `javascript` entry: `languageFor` maps .js/.jsx/.mjs
+ * to `typescript` so the TS worker serves both (see the comment above), and
+ * selecting a real `javascript` mode would have Monaco spin up a SECOND full
+ * ~310 MB ts.worker for it. .js files therefore report "TypeScript". */
+export const LANGUAGE_MODES: { id: string; label: string }[] = [
+  { id: "typescript", label: "TypeScript" },
+  { id: "css", label: "CSS" },
+  { id: "scss", label: "SCSS" },
+  { id: "less", label: "Less" },
+  { id: "html", label: "HTML" },
+  { id: "json", label: "JSON" },
+  { id: "markdown", label: "Markdown" },
+  { id: "python", label: "Python" },
+  { id: "yaml", label: "YAML" },
+  { id: "shell", label: "Shell Script" },
+  { id: "sql", label: "SQL" },
+  { id: "xml", label: "XML" },
+  { id: "dockerfile", label: "Dockerfile" },
+  { id: "go", label: "Go" },
+  { id: "rust", label: "Rust" },
+  { id: "java", label: "Java" },
+  { id: "php", label: "PHP" },
+  { id: "ruby", label: "Ruby" },
+  { id: "ini", label: "Ini" },
+  { id: "plaintext", label: "Plain Text" },
+];
+
+/** Human label for a monaco language id (status-bar readout). */
+export function languageLabel(id: string | null): string {
+  if (!id) return "Plain Text";
+  return LANGUAGE_MODES.find((l) => l.id === id)?.label ?? id;
+}
+
+/** What a save does for a just-started project, for the "X running" toast. */
+function editHint(reload: boolean): string {
+  return reload ? "Edits recompile + restart the server." : "Edits hot-reload.";
 }
 
 interface TermEntry {
@@ -481,6 +538,9 @@ export class IdeController {
   // Source Control (git) session — local-only isomorphic-git over the VFS. Drives
   // the Source Control panel + the diff tab.
   readonly scm: ScmSession;
+  // Cursor / indentation / language readouts for the status bar. Its own store so
+  // per-keystroke cursor updates don't re-render every useIde() consumer.
+  readonly editorStatus = new EditorStatus();
 
   // ── external store ──
   private listeners = new Set<() => void>();
@@ -490,8 +550,6 @@ export class IdeController {
     bootPhase: "init",
     bootDone: 0,
     bootTotal: 0,
-    status: "booting…",
-    cwd: "",
     // A shared link lands straight on the (loading) workspace, never Home — so the
     // user can't accidentally start a new project while it bootstraps.
     view: hasSharePayload() ? "workspace" : "home",
@@ -537,6 +595,12 @@ export class IdeController {
   private editorMounting = false; // guards the async create against StrictMode double-mount
   private editorOpener: Monaco.IDisposable | null = null; // cross-file go-to-definition hook
   private models = new Map<string, Monaco.editor.ITextModel>(); // abs -> model
+  // Language modes chosen by hand from the status bar (abs -> monaco language id).
+  // Re-applied in ensureModel so the choice survives closing + reopening the tab.
+  private languageOverrides = new Map<string, string>();
+  // Per-model subscription feeding `editorStatus` (indent/language). Swapped on
+  // every model change so we only ever listen to the attached model.
+  private modelStatusSub: Monaco.IDisposable | null = null;
   private diffEditor: Monaco.editor.IStandaloneDiffEditor | null = null; // Source Control diff tab
   private diffModels: Monaco.editor.ITextModel[] = []; // throwaway [original, modified] for the diff editor
   private imageUrls = new Map<string, string>(); // abs -> object URL (image viewer)
@@ -645,7 +709,7 @@ export class IdeController {
     // Opened via a shared link: show a full-screen blocking overlay immediately so
     // the (blank) workspace doesn't look idle while the kernel boots + unpacks.
     if (hasSharePayload()) {
-      this.set({ status: "opening shared project…", shareLoading: true, shareMessage: "Booting the runtime…" });
+      this.set({ shareLoading: true, shareMessage: "Booting the runtime…" });
     }
     const ok = await this.bridge.registerServiceWorker();
     this.consoleLine(
@@ -878,6 +942,14 @@ export class IdeController {
     this.scm.setRoots(this.snap.workspaceFolders.map((f) => ({ root: f.rootPath, name: f.name })));
   }
 
+  /** Re-read git after the workspace changed. A full status walk only happens while
+   * the Source Control panel is shown; otherwise we just resolve each repo's branch,
+   * which is all the status bar needs and costs a `.git/HEAD` read. */
+  private refreshScm() {
+    if (this.snap.activeView === "scm") void this.scm.refresh();
+    else void this.scm.refreshBranches();
+  }
+
   closeTerminal(id: string) {
     const t = this.terms.get(id);
     if (!t || t.kind === "console") return;
@@ -997,12 +1069,109 @@ export class IdeController {
     });
     // Breakpoint debugger: wire gutter breakpoints + paused-line decorations.
     this.debug.attachEditor(this.editor, monaco);
+    this.wireEditorStatus(this.editor);
     // Seed the language service with any folders indexed before the editor was
     // ready (source files as models for cross-file IntelliSense; dependency types
     // as extra libs), then open whatever tab was requested during load.
     for (const list of this.fileIndex.values()) this.ensureBackgroundModels(list);
     this.scheduleDependencyTypes();
     if (this.snap.activeTab) void this.openFile(this.snap.activeTab);
+  }
+
+  // ── status-bar readouts (Ln/Col · indentation · language mode) ──────────────
+  // Mirror Monaco's cursor, indentation and language onto the EditorStatus store
+  // that the StatusBar subscribes to. Model-scoped listeners are re-bound on every
+  // model swap so we only ever watch the attached model.
+  private wireEditorStatus(editor: Monaco.editor.IStandaloneCodeEditor) {
+    const pushCursor = () => {
+      const model = editor.getModel();
+      const pos = editor.getPosition();
+      if (!model || !pos) return;
+      const selections = editor.getSelections() ?? [];
+      let selected = 0;
+      for (const s of selections) selected += model.getValueLengthInRange(s);
+      this.editorStatus.set({
+        cursor: { line: pos.lineNumber, column: pos.column, selected, selections: selections.length },
+        lineCount: model.getLineCount(),
+      });
+    };
+    const pushModelInfo = () => {
+      const model = editor.getModel();
+      if (!model) {
+        this.editorStatus.clear();
+        return;
+      }
+      const { insertSpaces, tabSize } = model.getOptions();
+      this.editorStatus.set({
+        indent: { insertSpaces, tabSize },
+        language: model.getLanguageId(),
+        lineCount: model.getLineCount(),
+      });
+    };
+    const rebindModel = () => {
+      this.modelStatusSub?.dispose();
+      this.modelStatusSub = null;
+      const model = editor.getModel();
+      pushModelInfo();
+      if (!model) return;
+      const subs = [
+        model.onDidChangeOptions(pushModelInfo),
+        model.onDidChangeLanguage(pushModelInfo),
+        // Line count feeds the Go to Line hint, so it has to track edits.
+        model.onDidChangeContent(pushCursor),
+      ];
+      this.modelStatusSub = { dispose: () => subs.forEach((s) => s.dispose()) };
+      pushCursor();
+    };
+    editor.onDidChangeModel(rebindModel);
+    editor.onDidChangeCursorPosition(pushCursor);
+    editor.onDidChangeCursorSelection(pushCursor);
+    rebindModel();
+  }
+
+  /** Jump the cursor to a 1-based line/column in the ACTIVE editor (status-bar
+   * "Ln x, Col y" → Go to Line). Clamped to the model's bounds. */
+  gotoLine(line: number, column = 1) {
+    const model = this.editor?.getModel();
+    if (!model) return;
+    const l = Math.min(Math.max(1, Math.trunc(line)), model.getLineCount());
+    const c = Math.min(Math.max(1, Math.trunc(column)), model.getLineMaxColumn(l));
+    this.revealInEditor(l, c, 0);
+  }
+
+  /** Set the active tab's language mode. `null` restores auto-detection from the
+   * file extension and forgets the override. */
+  setLanguageMode(id: string | null) {
+    const abs = this.snap.activeTab;
+    const model = this.editor?.getModel();
+    if (!abs || !model || !this.monaco) return;
+    if (id) this.languageOverrides.set(abs, id);
+    else this.languageOverrides.delete(abs);
+    this.monaco.editor.setModelLanguage(model, id ?? languageFor(abs));
+    this.editor?.focus();
+  }
+
+  /** Change the active model's indentation (status-bar "Spaces: n" picker). */
+  setIndentation(opts: { insertSpaces?: boolean; tabSize?: number }) {
+    this.editor?.getModel()?.updateOptions(opts);
+    this.editor?.focus();
+  }
+
+  /** Guess indentation from the file's own content, like VS Code's
+   * "Detect Indentation from Content". Falls back to the editor defaults. */
+  detectIndentation() {
+    const model = this.editor?.getModel();
+    if (!model) return;
+    const current = model.getOptions();
+    model.detectIndentation(current.insertSpaces, current.tabSize);
+    this.editor?.focus();
+  }
+
+  /** Run a built-in Monaco editor action by id (indentation conversion + trim
+   * trailing whitespace in the status-bar picker). */
+  runEditorAction(id: string) {
+    void this.editor?.getAction(id)?.run();
+    this.editor?.focus();
   }
 
   // ── language service (IntelliSense) ─────────────────────────────────────────
@@ -1211,9 +1380,15 @@ export class IdeController {
     if (!(abs in this.localFiles)) this.localFiles[abs] = await this.readFileText(abs);
     const monaco = this.monaco;
     const uri = monaco.Uri.file(abs);
-    const model =
-      monaco.editor.getModel(uri) ||
-      monaco.editor.createModel(this.localFiles[abs] ?? "", languageFor(abs), uri);
+    // A language mode picked by hand from the status bar wins over the extension.
+    const language = this.languageOverrides.get(abs) ?? languageFor(abs);
+    const existing = monaco.editor.getModel(uri);
+    const model = existing ?? monaco.editor.createModel(this.localFiles[abs] ?? "", language, uri);
+    // A background/seeded model already exists (created with the auto-detected
+    // language) — re-apply the override so reopening the tab keeps the choice.
+    if (existing && existing.getLanguageId() !== language) {
+      monaco.editor.setModelLanguage(existing, language);
+    }
     model.onDidChangeContent(() => {
       const changed = model.getValue() !== (this.localFiles[abs] ?? "");
       const isDirty = this.snap.dirty.includes(abs);
@@ -1442,10 +1617,8 @@ export class IdeController {
     const folder = this.folderForPath(abs);
     if (folder) this.touchProject(folder.rootPath);
     const reload = folder ? this.folderManifests.get(folder.rootPath)?.reload : false;
-    this.set({
-      dirty: this.snap.dirty.filter((x) => x !== abs),
-      status: reload ? `saved ${baseName(abs)} — recompiling…` : `saved ${baseName(abs)} — hot-updating…`,
-    });
+    this.set({ dirty: this.snap.dirty.filter((x) => x !== abs) });
+    toast.success(reload ? `Saved ${baseName(abs)} — recompiling…` : `Saved ${baseName(abs)} — hot-updating…`);
   }
 
   // ── Source Control: diff tab + working-tree reload ──
@@ -1560,7 +1733,7 @@ export class IdeController {
     });
     void this.indexFolder(root);
     this.syncScmRoots();
-    if (this.snap.activeView === "scm") void this.scm.refresh();
+    this.refreshScm();
     return folder;
   }
 
@@ -1601,7 +1774,7 @@ export class IdeController {
     else this.editor?.setModel(null);
     // A folder was removed: drop its Source Control section.
     this.syncScmRoots();
-    if (this.snap.activeView === "scm") void this.scm.refresh();
+    this.refreshScm();
   }
 
   setActiveFolder(id: string) {
@@ -1687,7 +1860,7 @@ export class IdeController {
     this.upsertProjectMeta({ name, rootPath: root, template: null });
     this.openFolder(root, name);
     void this.openFile(root + "/index.js");
-    this.set({ status: `created ${name}` });
+    toast.success(`Created ${name}`);
   }
 
   async createFromTemplate({ templateId, name, dir, runInit }: {
@@ -1724,7 +1897,9 @@ export class IdeController {
     if (runInit) {
       this.runProject(root);
     } else {
-      this.set({ status: `${name} created — run \`${t.manifest.install}\` then \`${t.manifest.dev}\`` });
+      toast.success(`${name} created`, {
+        description: `Run \`${t.manifest.install}\` then \`${t.manifest.dev}\` to start it.`,
+      });
     }
   }
 
@@ -1786,7 +1961,7 @@ export class IdeController {
     }
     const tid = this.newShellTerminal({ cwd: root, run: manifest.dev, label: manifest.dev });
     this.runningProjects.set(root, { terminalId: tid, port: null });
-    this.set({ status: "installing from npm + booting in-VM…" });
+    toast.info("Installing from npm + booting in-VM…");
   }
 
   // Run the currently-focused folder (TitleBar / command palette Run).
@@ -2000,7 +2175,7 @@ export class IdeController {
     }
     if (count) {
       this.bumpTree();
-      this.set({ status: `imported ${count} file${count === 1 ? "" : "s"} into ${baseName(dest) || "/"}` });
+      toast.success(`Imported ${count} file${count === 1 ? "" : "s"} into ${baseName(dest) || "/"}`);
     }
     return targets;
   }
@@ -2055,7 +2230,6 @@ export class IdeController {
       const filename = (baseName(root) || "project") + ".zip";
       downloadBlob(new Blob([zip as BlobPart], { type: "application/zip" }), filename);
       const count = `${files.length} file${files.length === 1 ? "" : "s"}`;
-      this.set({ status: `exported ${count} → ${filename}` });
       toast.success(`Exported ${filename}`, {
         description: `${count} · node_modules excluded`,
       });
@@ -2126,7 +2300,6 @@ export class IdeController {
     if (openTarget) void this.openFile(root + "/" + openTarget);
     const note = excludedNodeModules ? " (node_modules excluded)" : "";
     const count = `${files.length} file${files.length === 1 ? "" : "s"}`;
-    this.set({ status: `imported ${count} as ${name}${note}` });
     if (!silent) {
       toast.success(`Imported ${name} — ${count}${note}`, {
         description: excludedNodeModules ? "Run the project to reinstall dependencies." : undefined,
@@ -2150,13 +2323,11 @@ export class IdeController {
       const kb = Math.max(1, Math.round(url.length / 1024));
       try {
         await navigator.clipboard.writeText(url);
-        this.set({ status: `share link copied (${kb} KB)` });
         toast.success("Share link copied to clipboard.", {
           description: `Self-contained · source only · ${kb} KB`,
           position: "bottom-left",
         });
       } catch {
-        this.set({ status: "share link ready" });
         toast.warning("Couldn't copy to clipboard — copy the link from the address bar.", {
           position: "bottom-left",
         });
@@ -2320,7 +2491,7 @@ export class IdeController {
   copyPath(abs: string) {
     try {
       void navigator.clipboard?.writeText(abs);
-      this.set({ status: `copied path: ${abs}` });
+      toast.success("Copied path", { description: abs });
     } catch {
       toast.error("Clipboard unavailable");
     }
@@ -2671,7 +2842,7 @@ export class IdeController {
     const opt = DEMOS.find((d) => d.id === demo);
     const tid = this.newShellTerminal({ demo, label: opt?.runLabel ?? "run" });
     this.runningDemos.set(demo, { terminalId: tid, port: null });
-    this.set({ status: "installing from npm + booting in-VM…" });
+    toast.info("Installing from npm + booting in-VM…");
   }
 
   // ── UI toggles ──
@@ -2840,7 +3011,7 @@ export class IdeController {
     b.on("kernel-online", () => this.set({ kernelReady: true, bootPhase: "" }));
     b.on("ready", () => {
       this.consoleLine("Kernel ready.", "32");
-      this.set({ booted: true, kernelReady: true, status: "ready — create or open a project" });
+      this.set({ booted: true, kernelReady: true });
       this.newShellTerminal({ defer: true, activate: false });
       // If the URL carries a #share= payload, import it into a new project.
       void this.loadSharedFromUrl();
@@ -2875,7 +3046,6 @@ export class IdeController {
           t.pendingInput.length = 0;
         }
       }
-      this.set({ cwd: (m.cwd as string) || "" });
     });
     b.on("term-out", (m) => {
       const t = this.terms.get(m.terminalId as string);
@@ -2898,7 +3068,7 @@ export class IdeController {
         this.runningDemos.delete(t.demo);
         if (gone?.port != null && this.portMap.delete(gone.port)) this.syncPorts();
         if (gone?.port != null && this.snap.previewTabs.some((t) => t.port === gone.port))
-          this.set({ status: "dev server stopped — preview will 502 until you Run again" });
+          toast.warning("Dev server stopped — preview will 502 until you Run again.");
       }
       // A created/opened project's run tab ended → server gone.
       for (const [dir, r] of this.runningProjects) {
@@ -2907,7 +3077,7 @@ export class IdeController {
           if (r.port != null && this.portMap.delete(r.port)) this.syncPorts();
           this.syncKeepPrefixPorts();
           if (r.port != null && this.snap.previewTabs.some((t) => t.port === r.port))
-            this.set({ status: "dev server stopped — preview will 502 until you Run again" });
+            toast.warning("Dev server stopped — preview will 502 until you Run again.");
         }
       }
       this.syncTerminals();
@@ -2951,15 +3121,13 @@ export class IdeController {
       });
       this.openFolder(dir, m.title as string);
       if (m.entry) void this.openFile(dir + "/" + (m.entry as string));
-      this.set({
-        status: m.reload ? `${m.title} running — edits recompile + restart` : `${m.title} running — edits hot-reload`,
-      });
+      toast.success(`${m.title} running`, { description: editHint(!!m.reload) });
     });
     b.on("demo-reload", (m) => {
       for (const t of this.snap.previewTabs) if (t.port === m.port) this.reloadPreviewTab(t.id);
-      this.set({ status: `${m.title} restarted — preview reloaded` });
+      toast.info(`${m.title} restarted — preview reloaded`);
     });
-    b.on("demo-status", (m) => this.set({ status: m.line as string }));
+    b.on("demo-status", (m) => toast.info(m.line as string));
 
     // A created/opened project's dev server is up.
     b.on("project-ready", (m) => {
@@ -2969,7 +3137,7 @@ export class IdeController {
       // opened the folder + entry file.
       if (m.extra) {
         this.pointPreview(m.port as number);
-        this.set({ status: `${m.title as string}: service on :${m.port} ready` });
+        toast.success(`${m.title as string}: service on :${m.port} ready`);
         return;
       }
       const r = this.runningProjects.get(dir);
@@ -2983,13 +3151,11 @@ export class IdeController {
       if (!this.snap.workspaceFolders.some((f) => f.rootPath === dir)) this.openFolder(dir, m.title as string);
       if (m.entry) void this.openFile(dir + "/" + (m.entry as string));
       this.touchProject(dir);
-      this.set({
-        status: m.reload ? `${m.title} running — edits recompile + restart` : `${m.title} running — edits hot-reload`,
-      });
+      toast.success(`${m.title} running`, { description: editHint(!!m.reload) });
     });
     b.on("project-reload", (m) => {
       for (const t of this.snap.previewTabs) if (t.port === m.port) this.reloadPreviewTab(t.id);
-      this.set({ status: `${m.title} restarted — preview reloaded` });
+      toast.info(`${m.title} restarted — preview reloaded`);
     });
 
     // Streaming full-text search: batches of per-file results, then a final done.

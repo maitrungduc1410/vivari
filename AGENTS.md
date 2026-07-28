@@ -130,7 +130,16 @@ packages/
                           RepoState[] with one entry per open workspace folder (VS
                           Code-style), each owning its own branch/status/history +
                           staged/unstaged + commit message; ops take a `root`.
-                          LOCAL-ONLY (no remote). Feeds SourceControlPanel.
+                          LOCAL-ONLY (no remote). Feeds SourceControlPanel. Also
+                          `refreshBranches()` — a branch-only readout (no statusMatrix,
+                          no log) cheap enough to run on every workspace change for
+                          the status bar; see the gotcha below.
+    src/vv/editor-status.ts  cursor / indentation / language-mode readouts for the
+                          StatusBar, fed by Monaco listeners in controller
+                          `wireEditorStatus`. A store of its OWN (not IdeSnapshot) —
+                          the cursor changes on every keystroke, so folding it into
+                          the main snapshot would re-render every useIde() consumer
+                          on each keypress.
     src/vv/git-fs.ts      isomorphic-git fs adapter → the silent `vv-git-fs` kernel
                           RPC (main-thread git can't touch the FS-worker VFS directly).
     src/vv/git-config.ts  persisted git author identity (localStorage; per-user).
@@ -182,9 +191,14 @@ packages/
                           TerminalPanel
                           (Console/Terminal/Ports) · PreviewPanel (multi-tab mini-browser: local
                           address bar, back/forward, reload, chii DevTools in a resizable bottom
-                          split) · StatusBar (VS Code blue #007acc; status + live diagnostics
-                          count) · CommandPalette (⌘P quick-open by name; append :line[:col]
-                          to jump) · fileIcon (vscode-icons). Icons are Iconify via
+                          split) · StatusBar (VS Code blue #007acc; LEFT: active repo's git branch
+                          + live diagnostics count, RIGHT: "Ln x, Col y" / "Spaces: n" / language
+                          mode, each opening a quick pick — see StatusBarPickers + the gotcha
+                          below. There is deliberately no free-form status text: transient
+                          messages are sonner toasts) · StatusBarPickers (Go to Line, the
+                          two-level indentation actions, Select Language Mode — all built on the
+                          CommandDialog primitives) · CommandPalette (⌘P quick-open by name;
+                          append :line[:col] to jump) · fileIcon (vscode-icons). Icons are Iconify via
                           unplugin-icons (`~icons/lucide/*`, `~icons/vscode-icons/*`; needs
                           @svgr/core) — do NOT reintroduce lucide-react.
 
@@ -460,6 +474,17 @@ an in-flight search when a newer query (or `vv-search-cancel`) arrives — alway
 token in the loop. After a replace writes files, the controller re-reads affected open
 models from disk so the Monaco buffer + dirty state don't drift.
 
+### The status bar's git branch must NOT trigger a status walk
+`ScmSession.refresh()` runs a `git.statusMatrix` walk, and that walk fires a pile of synchronous
+kernel-fs ops onto the kernel worker thread that also serves the terminal + preview. That's why it
+only runs while the Source Control panel is SHOWN. The status bar needs the branch on every
+workspace change, which is far more often — so it uses `refreshBranches()` instead: a `.git` stat
+plus `git.currentBranch()` (a `.git/HEAD` read) and nothing else. The controller picks between them
+in `refreshScm()`: full walk when the SCM panel is open, branch-only otherwise. If you ever need
+more git state in the status bar, extend `refreshBranches` with something equally cheap — do NOT
+reach for `refresh()`. Non-repo folders short-circuit on the `.git` stat, so a git-less workspace
+still never pays the lazy ~1 MB isomorphic-git import.
+
 ### IntelliSense: real Monaco workers + who-holds-which-file
 Monaco's language workers are ENABLED (they used to be a no-op `MonacoEnvironment`): `mountEditor`
 imports the `?worker` entries (Vite bundles them same-origin → COEP-safe) and `configureLanguageService`
@@ -492,6 +517,13 @@ the `.d.ts` was harvested and loaded. `loadDependencyTypes` therefore keys extra
 the worker validates open files at mount, BEFORE the types exist; after `setExtraLibs` we re-apply
 `setCompilerOptions(...)` to fire Monaco's `onDidChange`, tearing the worker down so the next
 validation spins up a fresh LanguageService that already sees every dependency `.d.ts`.
+**Gotcha #3 (never offer a `javascript` language mode):** the status bar's Select Language Mode
+picker (`LANGUAGE_MODES` in `controller.ts`) has NO JavaScript entry, on purpose. Selecting it
+would put a model in the `javascript` mode and defeat the single-service rule above — Monaco would
+spawn the second ~310 MB `ts.worker` the moment that model asked for completions. `.js` files
+therefore report "TypeScript" in the status bar. Every OTHER id in that list is a Monarch grammar
+Monaco already bundles (yaml, shell, sql, xml, dockerfile, go, rust, java, php, ruby, ini, …):
+highlighting only, no worker, no language service, so listing one costs nothing.
 
 ### Real npm is the studio shell's `npm` (delivery + shims)
 The North Star is running the real npm/yarn/pnpm CLIs, not our from-scratch

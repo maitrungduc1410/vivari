@@ -201,6 +201,36 @@ export class ScmSession {
     }
   }
 
+  /** Resolve JUST the current branch of every repo — no status walk, no history.
+   * The status bar shows the active folder's branch, and it can't afford the full
+   * `refresh()` (a statusMatrix walk contends with the terminal on the kernel
+   * worker thread), so this reads `.git/HEAD` and nothing else.
+   *
+   * Non-repo folders short-circuit on the `.git` stat, so a workspace without git
+   * never pays the lazy ~1 MB isomorphic-git import. */
+  async refreshBranches(): Promise<void> {
+    for (const root of this.snap.repos.map((r) => r.root)) {
+      if (!this.repo(root)) continue;
+      const isRepo = await this.detectRepo(root);
+      if (!this.repo(root)) continue;
+      if (!isRepo) {
+        this.setRepo(root, { isRepo: false, currentBranch: null });
+        continue;
+      }
+      try {
+        const git = await this.loadGit();
+        if (!this.repo(root)) continue;
+        const branch = await git
+          .currentBranch({ fs: this.fs, dir: root, fullname: false })
+          .catch(() => null);
+        if (!this.repo(root)) continue;
+        this.setRepo(root, { isRepo: true, currentBranch: branch });
+      } catch {
+        // A branch readout is best-effort — the panel's own refresh surfaces errors.
+      }
+    }
+  }
+
   /** Recompute branch + status + history for every repo. Coalesced so status walks
    * never overlap (they'd otherwise pile synchronous kernel-fs ops onto the kernel
    * worker thread that also serves the terminal). While one runs, extra calls

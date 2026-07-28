@@ -41,8 +41,12 @@ on `/sw.js` (the preview proxy needs root scope).
   breakpoints + the paused-line highlight. Enable "Debug mode" (sets `VV_DEBUG` for
   subsequent runs) and open "Run and Debug" from the ActivityBar. See the repo root
   `ARCHITECTURE.md` §7.2 for the full model.
+- `src/vv/editor-status.ts` — cursor / indentation / language-mode readouts for the
+  status bar, fed by Monaco listeners in the controller. A store of its own (not
+  `IdeSnapshot`) so a cursor move doesn't re-render the whole IDE.
 - `src/components/ide/*` — the chrome: AppShell, ActivityBar, Explorer,
-  EditorGroup, TerminalPanel, PreviewPanel, StatusBar, CommandPalette, DebugPanel
+  EditorGroup, TerminalPanel, PreviewPanel, StatusBar (+ StatusBarPickers: Go to
+  Line, indentation, language mode), CommandPalette, DebugPanel
   (Call Stack / Variables / Watch / Breakpoints).
 
 The kernel/worker files now live in the `@vivari/core` SDK
