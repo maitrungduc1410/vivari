@@ -3520,9 +3520,14 @@ in the browser). Zero cost when no session is attached.
 - **Kernel routing** (`packages/kernel-host/kernel.js`) — allocates the debug SAB
   per target, announces targets (`onDebugTarget`), relays events (`onDebugEvent`),
   and routes commands (postMessage while running, SAB while paused). The run
-  shell + package managers (`sh`/`npm`/`npx`/`yarn`/`pnpm`/…) are skipped as
-  targets so auto-attach lands on the user's actual program (the child inherits
-  `VV_DEBUG`).
+  shell + package managers (`sh`/`npm`/`npx`/`yarn`/`pnpm`/…) — and `python`/
+  `python3` — are skipped as targets so auto-attach lands on the user's actual
+  program (the child inherits `VV_DEBUG`).
+- **Language reach** — JS/TS only. **Bun is debuggable** (`bun <file>` runs the
+  entry through the JS module loader, so its breakpoints bind like `node`).
+  **Python is not**: `python` is a Node shim that runs the real `.py` inside
+  Pyodide (CPython/Wasm), which never passes through the loader — so it is skipped
+  above rather than surfaced as a dead debug target.
 - **Studio UI** — `packages/studio/src/vv/debug-session.ts` is the CDP *client*
   (multiplexes into Monaco); `DebugPanel.tsx` + the **Run and Debug** activity-bar
   entry give a VS Code-style panel (Call Stack / Variables / Watch / Breakpoints)

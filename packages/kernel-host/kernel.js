@@ -366,10 +366,16 @@ export class Kernel {
     // processes (so a dev server launched by the run shell inherits it), but the
     // shell wrapper + package managers themselves aren't interesting to debug — skip
     // them so auto-attach lands on the user's actual program, not `sh`/`npm`.
+    // `python`/`python3` are also skipped: our `python` is a Node shim that runs the
+    // real program inside Pyodide (CPython/Wasm), so the `.py` source never passes
+    // through the JS module loader and can't be instrumented — treating it as a debug
+    // target only yields a bogus target + start-gate latency + a needlessly
+    // instrumented shim. (Bun is deliberately NOT skipped: `bun <file>` runs the entry
+    // through the JS module loader, so its breakpoints bind like `node`.)
     const env = spec.env || {};
     const wantsDebug = this.debugMode || env.VV_DEBUG === "1" || env.VV_DEBUG === "true";
     const cmd = String(spec.command || "");
-    const skipDebug = /^(sh|bash|dash|zsh|npm|npx|yarn|pnpm|corepack|node-gyp|tsc|tsgo)$/.test(cmd);
+    const skipDebug = /^(sh|bash|dash|zsh|npm|npx|yarn|pnpm|corepack|node-gyp|tsc|tsgo|python|python3)$/.test(cmd);
     const debugEnabled = wantsDebug && !skipDebug;
     let debugSab = null;
     if (debugEnabled) {

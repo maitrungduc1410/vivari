@@ -1249,9 +1249,16 @@ a **second SAB** the paused worker parks on. Load-bearing details:
   frontend sends `Runtime.runIfWaitingForDebugger`.
 - **Debug mode is kernel-authoritative.** `kernel.js` owns `debugMode`; `run()` gates
   purely on `!!(debug && debug.sab)`. The **run shell + package managers**
-  (`sh`/`npm`/`npx`/`yarn`/`pnpm`/…) are **skipped as debug targets** so auto-attach
-  lands on the user's actual program (the child inherits `VV_DEBUG`). Set via the
-  studio "Debug mode" toggle, which sets `VV_DEBUG=1` for subsequent runs.
+  (`sh`/`npm`/`npx`/`yarn`/`pnpm`/…) plus **`python`/`python3`** are **skipped as debug
+  targets** so auto-attach lands on the user's actual program (the child inherits
+  `VV_DEBUG`). Set via the studio "Debug mode" toggle, which sets `VV_DEBUG=1` for
+  subsequent runs.
+- **Language reach: JS/TS only.** Instrumentation runs on the JS module loader, so
+  **Bun IS debuggable** (`bun <file>` runs the entry through the loader → breakpoints
+  bind like `node`). **Python is not**: our `python` is a Node shim that runs the real
+  `.py` inside Pyodide (CPython/Wasm), which never passes through the loader — hence the
+  skip above (otherwise you'd get a bogus target + start-gate latency + a needlessly
+  instrumented shim, and `.py` breakpoints that never bind).
 - **Zero cost when off.** `debugger.js` + `instrument.js` + the vendored `acorn.mjs`
   live in a lazy `import()` chunk (~195 KB) fetched only when a debug SAB is present.
   Keep it that way — never add a static top-level import of them into the always-loaded
