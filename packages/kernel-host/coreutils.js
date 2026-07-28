@@ -108,14 +108,14 @@ child.on('error', (e) => { process.stderr.write('npx: ' + ((e && e.message) || e
 child.on('close', (code) => process.exit(code | 0));
 `,
 
-  echo: `process.stdout.write(process.argv.slice(2).join(' ') + '\\n');\n`,
+  echo: `process.stdout.write(process.argv.slice(2).join(' ') + '\\n');\nprocess.exit(0);\n`,
 
   // Reset the terminal: home the cursor (\\x1b[H), erase the screen (\\x1b[2J),
   // and erase the scrollback (\\x1b[3J). xterm interprets the sequence, so the
   // visible output and history are wiped and the next prompt starts at the top.
-  clear: `process.stdout.write('\\x1b[H\\x1b[2J\\x1b[3J');\n`,
+  clear: `process.stdout.write('\\x1b[H\\x1b[2J\\x1b[3J');\nprocess.exit(0);\n`,
 
-  pwd: `process.stdout.write(process.cwd() + '\\n');\n`,
+  pwd: `process.stdout.write(process.cwd() + '\\n');\nprocess.exit(0);\n`,
 
   true: `process.exit(0);\n`,
 
@@ -184,6 +184,7 @@ try {
   process.stderr.write('ls: ' + (args[0] || '.') + ': ' + (e.code || e.message) + '\\n');
   process.exit(1);
 }
+process.exit(0);
 `,
 
   mkdir: `

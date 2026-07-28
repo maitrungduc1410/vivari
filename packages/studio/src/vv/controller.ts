@@ -18,6 +18,7 @@ import { toast } from "sonner";
 import type * as Monaco from "monaco-editor";
 import { KernelBridge, resetVfs } from "./kernel";
 import { DebugSession } from "./debug-session";
+import { ScmSession } from "./scm-session";
 import { getTemplate, type TemplateManifest } from "./templates";
 import { createZip, encodeShare, decodeShare } from "../../../kernel-host/archive.js";
 import {
@@ -185,7 +186,7 @@ export interface IdeSnapshot {
   files: string[]; // absolute paths (flat index for quick-open + search)
   openTabs: string[]; // absolute paths
   activeTab: string | null;
-  tabKinds: Record<string, "text" | "image" | "directory">; // how each open tab renders
+  tabKinds: Record<string, "text" | "image" | "directory" | "diff">; // how each open tab renders
   previewTab: string | null; // the single "preview" (italic, single-click) tab
   dirty: string[]; // absolute paths with unsaved edits
   terminals: TerminalMeta[];
@@ -196,7 +197,7 @@ export interface IdeSnapshot {
   devtoolsOpen: boolean; // the chii DevTools panel (bottom split of the preview)
   devtoolsNonce: number; // bump to reload the DevTools frontend (re-attach to a new target)
   selectedDemo: string;
-  activeView: "explorer" | "search" | "debug";
+  activeView: "explorer" | "search" | "debug" | "scm";
   sidebarCollapsed: boolean;
   panelCollapsed: boolean;
   panelTab: "console" | "terminal" | "ports";
@@ -272,6 +273,14 @@ const TERM_THEME_LIGHT = {
 type UiTheme = "light" | "dark";
 const termThemeFor = (t: UiTheme) => (t === "light" ? TERM_THEME_LIGHT : TERM_THEME_DARK);
 const monacoThemeFor = (t: UiTheme) => (t === "light" ? "vs" : "vs-dark");
+
+// A diff tab is a synthetic open-tab id: `vv-diff:<abs>`. It reuses the tab strip
+// (kind "diff") but must never be treated as a real file path (no read/save). The
+// filename still renders because baseName() splits on "/".
+const DIFF_PREFIX = "vv-diff:";
+export const diffTabId = (abs: string): string => DIFF_PREFIX + abs;
+export const isDiffTabId = (id: string | null): boolean => !!id && id.startsWith(DIFF_PREFIX);
+export const diffTargetOf = (id: string): string => id.slice(DIFF_PREFIX.length);
 
 const ESC = "\x1b[";
 const REGISTRY_KEY = "vv-workspace-projects";
@@ -469,6 +478,9 @@ export class IdeController {
   // Breakpoint debugger session (CDP client for Node guest targets). Drives the
   // Monaco gutter breakpoints, paused-line highlight, and the Debug panel.
   readonly debug: DebugSession;
+  // Source Control (git) session — local-only isomorphic-git over the VFS. Drives
+  // the Source Control panel + the diff tab.
+  readonly scm: ScmSession;
 
   // ── external store ──
   private listeners = new Set<() => void>();
@@ -525,6 +537,8 @@ export class IdeController {
   private editorMounting = false; // guards the async create against StrictMode double-mount
   private editorOpener: Monaco.IDisposable | null = null; // cross-file go-to-definition hook
   private models = new Map<string, Monaco.editor.ITextModel>(); // abs -> model
+  private diffEditor: Monaco.editor.IStandaloneDiffEditor | null = null; // Source Control diff tab
+  private diffModels: Monaco.editor.ITextModel[] = []; // throwaway [original, modified] for the diff editor
   private imageUrls = new Map<string, string>(); // abs -> object URL (image viewer)
   private depLibsByRoot = new Map<string, Map<string, string>>(); // root -> (extra-lib uri -> content)
   private depsSig = new Map<string, string>(); // root -> last node_modules fingerprint
@@ -575,6 +589,10 @@ export class IdeController {
     this.debug = new DebugSession(this.bridge);
     // When execution pauses (or a frame is selected), open the file + reveal the line.
     this.debug.onReveal = (path, line) => void this.openFileAt(path, line);
+    this.scm = new ScmSession(this.bridge);
+    // A checkout/discard rewrote the working tree via the silent git RPC (no
+    // vv-fs-changed), so refresh the Explorer tree and reload any open editors.
+    this.scm.onWorkdirChanged = () => this.reloadWorkdir();
     this.snap.recentProjects = this.loadRegistry();
     this.createConsole();
     this.wireBridge();
@@ -843,8 +861,21 @@ export class IdeController {
     }
   }
 
-  setActiveView(view: "explorer" | "search" | "debug") {
+  setActiveView(view: "explorer" | "search" | "debug" | "scm") {
     this.set({ activeView: view, sidebarCollapsed: false });
+    // Opening Source Control: point it at all workspace folders and refresh NOW.
+    // Status walks only run while the panel is shown (they contend with the terminal
+    // on the kernel worker thread), so this on-demand refresh is where they happen.
+    if (view === "scm") {
+      this.syncScmRoots();
+      void this.scm.refresh();
+    }
+  }
+
+  /** Keep the Source Control panel's repo list in sync with the open workspace
+   * folders (one repo section per folder, like VS Code). */
+  private syncScmRoots() {
+    this.scm.setRoots(this.snap.workspaceFolders.map((f) => ({ root: f.rootPath, name: f.name })));
   }
 
   closeTerminal(id: string) {
@@ -1216,6 +1247,14 @@ export class IdeController {
   // reuses a single italic "preview" tab; a permanent open (double-click, or an
   // edit) pins it.
   async openFile(abs: string, { preview = false, focus = true }: { preview?: boolean; focus?: boolean } = {}) {
+    // A diff tab carries no real file — just activate it; EditorGroup mounts the
+    // Monaco diff editor. Detach the standard editor so it doesn't show stale text.
+    if (isDiffTabId(abs)) {
+      if (!this.snap.openTabs.includes(abs)) return;
+      this.set({ activeTab: abs });
+      if (this.editor) this.editor.setModel(null);
+      return;
+    }
     // Reconcile the tab strip + preview slot.
     const already = this.snap.openTabs.includes(abs);
     let openTabs = this.snap.openTabs;
@@ -1369,7 +1408,7 @@ export class IdeController {
     if (url) { URL.revokeObjectURL(url); this.imageUrls.delete(abs); }
   }
   // Drop the render-kind entry for a closed/removed tab (image URLs revoked too).
-  private forgetKind(abs: string): Record<string, "text" | "image" | "directory"> {
+  private forgetKind(abs: string): Record<string, "text" | "image" | "directory" | "diff"> {
     this.revokeImage(abs);
     if (!(abs in this.snap.tabKinds)) return this.snap.tabKinds;
     const next = { ...this.snap.tabKinds };
@@ -1407,6 +1446,75 @@ export class IdeController {
       dirty: this.snap.dirty.filter((x) => x !== abs),
       status: reload ? `saved ${baseName(abs)} — recompiling…` : `saved ${baseName(abs)} — hot-updating…`,
     });
+  }
+
+  // ── Source Control: diff tab + working-tree reload ──
+
+  /** Open a read-only diff (HEAD ↔ working tree) for a file as its own tab. */
+  openDiff(abs: string) {
+    const id = diffTabId(abs);
+    const openTabs = this.snap.openTabs.includes(id) ? this.snap.openTabs : [...this.snap.openTabs, id];
+    const tabKinds = { ...this.snap.tabKinds, [id]: "diff" as const };
+    this.set({ openTabs, tabKinds, activeTab: id, previewTab: null });
+  }
+
+  /** Mount (or re-target) the Monaco diff editor for a diff tab. Called by the
+   * EditorGroup's DiffView, which remounts per diff tab (keyed by tab id). */
+  async mountDiffEditor(el: HTMLElement, id: string) {
+    const abs = diffTargetOf(id);
+    const monaco = this.monaco ?? (await import("monaco-editor"));
+    this.monaco = monaco;
+    // One diff editor instance, rebound per mount. Dispose the previous editor +
+    // its throwaway models so we don't leak on every open.
+    this.disposeDiffEditor();
+    const diff = monaco.editor.createDiffEditor(el, {
+      readOnly: true,
+      automaticLayout: true,
+      theme: monacoThemeFor(this.uiTheme),
+      fontSize: 13,
+      minimap: { enabled: false },
+      renderSideBySide: true,
+      scrollBeyondLastLine: false,
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+    });
+    this.diffEditor = diff;
+    const [head, work] = await Promise.all([
+      this.scm.headBlobText(abs),
+      this.readFileText(abs).catch(() => ""),
+    ]);
+    // A resume/tab-switch may have torn this editor down while we awaited.
+    if (this.diffEditor !== diff) return;
+    const lang = languageFor(abs);
+    const original = monaco.editor.createModel(head, lang);
+    const modified = monaco.editor.createModel(work, lang);
+    this.diffModels = [original, modified];
+    diff.setModel({ original, modified });
+  }
+
+  private disposeDiffEditor() {
+    this.diffEditor?.dispose();
+    this.diffEditor = null;
+    for (const m of this.diffModels) m.dispose();
+    this.diffModels = [];
+  }
+
+  /** After a checkout/discard rewrote files via the silent git RPC, refresh the
+   * Explorer tree and reload any open editor models whose bytes changed on disk. */
+  private async reloadWorkdir() {
+    this.bumpTree();
+    for (const abs of this.snap.openTabs) {
+      if (isDiffTabId(abs)) continue;
+      if ((this.snap.tabKinds[abs] ?? "text") !== "text") continue;
+      const model = this.models.get(abs);
+      if (!model) continue;
+      try {
+        const text = await this.readFileText(abs);
+        this.localFiles[abs] = text;
+        if (model.getValue() !== text) model.setValue(text);
+      } catch {
+        /* the checkout may have deleted this file — leave the stale buffer */
+      }
+    }
   }
 
   saveActiveFile() {
@@ -1451,6 +1559,8 @@ export class IdeController {
       treeVersion: this.snap.treeVersion + 1,
     });
     void this.indexFolder(root);
+    this.syncScmRoots();
+    if (this.snap.activeView === "scm") void this.scm.refresh();
     return folder;
   }
 
@@ -1489,11 +1599,16 @@ export class IdeController {
     });
     if (activeTab) void this.openFile(activeTab);
     else this.editor?.setModel(null);
+    // A folder was removed: drop its Source Control section.
+    this.syncScmRoots();
+    if (this.snap.activeView === "scm") void this.scm.refresh();
   }
 
   setActiveFolder(id: string) {
     const f = this.snap.workspaceFolders.find((x) => x.id === id);
-    if (f) this.set({ activeFolderId: id, projectTitle: f.name });
+    if (f) {
+      this.set({ activeFolderId: id, projectTitle: f.name });
+    }
   }
 
   // Recursively index a folder's files (skipping heavy dirs) for quick-open +
@@ -1710,6 +1825,11 @@ export class IdeController {
       this.treeBump = null;
       const root = this.activeFolder?.rootPath;
       if (root) void this.indexFolder(root);
+      // Refresh Source Control status ONLY while its panel is open — a status walk
+      // pushes many synchronous fs ops onto the kernel worker thread, which also
+      // drives the terminal, so running it in the background would stall commands.
+      // (git's own .git writes use the silent RPC and never reach here anyway.)
+      if (this.snap.activeView === "scm") void this.scm.refresh();
       this.set({ treeVersion: this.snap.treeVersion + 1 });
     }, 60);
   }

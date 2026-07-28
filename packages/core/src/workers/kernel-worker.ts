@@ -2130,6 +2130,45 @@ self.onmessage = async (event) => {
     return;
   }
 
+  // Silent fs RPC for main-thread git (isomorphic-git via studio/src/vv/git-fs.ts).
+  // One message dispatched by `op`, mapping straight onto the kernel's sync fs
+  // (SAB → FS worker). It deliberately does NOT broadcast `vv-fs-changed`: a single
+  // commit writes hundreds of `.git/objects` entries, and storming the Explorer /
+  // watchers on each would jank the UI. The SCM session refreshes the working tree
+  // explicitly after a checkout/discard, which is the only time the workdir changes.
+  if (m.type === "vv-git-fs") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready", code: "ENOENT" }); return; }
+    const fs = kernel.fs;
+    const a = m.args || {};
+    try {
+      let result: unknown = null;
+      switch (m.op) {
+        case "readFile": result = fs.readFileBytes(a.path); break;
+        case "writeFile": {
+          const slash = a.path.lastIndexOf("/");
+          if (slash > 0) fs.mkdirp(a.path.slice(0, slash));
+          fs.writeFile(a.path, a.bytes ?? a.contents ?? "");
+          break;
+        }
+        case "unlink": fs.unlink(a.path); break;
+        case "readdir": result = fs.readdir(a.path); break;
+        case "mkdir": fs.mkdirp(a.path); break;
+        case "rmdir": fs.rmdir(a.path); break;
+        case "stat": result = fs.stat(a.path); break;
+        case "lstat": result = fs.lstat(a.path); break;
+        case "readlink": result = fs.readlink(a.path); break;
+        case "symlink": fs.symlink(a.target, a.path); break;
+        default:
+          post("vv-reply", { reqId: m.reqId, ok: false, error: "unknown git-fs op: " + m.op });
+          return;
+      }
+      post("vv-reply", { reqId: m.reqId, ok: true, result });
+    } catch (err) {
+      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err), code: (err && err.code) || "" });
+    }
+    return;
+  }
+
   // Create a project: write its files in one batch and register its run manifest
   // so a later listen on its dev-server port points the preview at it.
   if (m.type === "vv-create-project") {

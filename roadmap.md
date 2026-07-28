@@ -3553,6 +3553,58 @@ CDP shapes so both UIs stay on one protocol. This is a substantial, browser-only
 piece best landed and verified with a real preview, so it is deliberately deferred
 rather than shipped unverified.
 
+## 🔀 Git Source Control panel (isomorphic-git, local-only) — **shipped**
+
+A VS Code-style **Source Control** panel that runs [`isomorphic-git`](https://isomorphic-git.org)
+directly against the in-tab VFS. **Local-only by design**: `init`, stage/unstage,
+commit, branch/checkout/delete, per-file diff (HEAD ↔ working tree), history, and
+discard — no network, no remote, no server. (Remotes/clone/push over the git wire
+protocol need an authenticated CORS proxy and are intentionally out of scope here;
+GitHub *import* already exists via the REST API.)
+
+**How it's wired**
+
+- **`git-fs.ts`** — an isomorphic-git `fs` adapter. isomorphic-git runs on the
+  studio **main thread**, but the VFS lives in the File System Worker, so every
+  call becomes a `KernelBridge` round-trip.
+- **`vv-git-fs` RPC** (`kernel-worker.ts`) — one silent message dispatched by `op`
+  onto the kernel's synchronous fs (SAB → FS worker). **Silent** = it does *not*
+  broadcast `vv-fs-changed`; a single commit writes hundreds of `.git/objects`
+  entries and storming the Explorer/watchers on each would jank the UI. The SCM
+  session instead refreshes the working tree explicitly after checkout/discard.
+- **kernel fs surface** — `kernel-fs.js` gained sync `lstat`/`symlink`/`readlink`
+  (mirroring `runtime/fs-client.js`) so git has full POSIX metadata; the adapter
+  reconstructs `st_mode` (type | perm) from the VFS `kind` so blob filemodes
+  (100644 / 100755 / 120000 / 040000) are correct.
+- **`scm-session.ts`** — a `useSyncExternalStore` store (mirrors `DebugSession`).
+  It is **multi-repo**: it owns a `RepoState[]` with one entry per open workspace
+  folder (like VS Code), each carrying its own branch/status/history, staged/unstaged
+  lists (from `git.statusMatrix`) and commit message. Every operation targets a
+  `root`. isomorphic-git is **lazy-imported** (a ~1 MB chunk) only when a repo is
+  present or the user clicks *Initialize Repository*.
+- **`controller.ts`** — owns the `ScmSession`, keeps its repo list in sync with the
+  open workspace folders via `syncScmRoots()` (called on folder open/close), adds the
+  `scm` activity view, a `"diff"` tab kind rendered by a read-only Monaco **diff
+  editor** (`openDiff` / `mountDiffEditor`), and reloads open editors after a
+  checkout/discard rewrites files under them.
+- **UI** — `SourceControlPanel.tsx` renders **one collapsible section per repo**
+  (branch menu, commit box, staged/changes sections, history, discard confirms,
+  first-commit identity dialog — or an *Initialize Repository* button when a folder
+  isn't a repo). The activity-bar badge sums changed files across all repos, and
+  `Cmd/Ctrl+Shift+G` focuses the view.
+
+**Performance notes** — status walks hard-filter heavy dirs (`node_modules`,
+`dist`, …); refresh walks repos **sequentially**, is **coalesced** (no overlapping
+walks) and gated to when the panel is open, so it never floods the single-threaded
+kernel worker that also drives the terminal. `git init` seeds a sensible
+`.gitignore` so untracked build output never floods the list. If a very large repo
+ever makes main-thread status walks jank, the upgrade path is to move isomorphic-git
+behind a dedicated worker (the git-fs adapter already isolates all fs access behind
+the bridge, so only the call site moves).
+
+**Scope** — one repo per open workspace folder. Nested/sub-directory repos are not
+auto-discovered (VS Code does; out of scope for now).
+
 ## Python support — Pyodide (CPython→WASM), lazily loaded + Flask/FastAPI (this change)
 
 A "Native" template category and a `python`/`python3` runtime. Unlike Bun (a
@@ -3566,12 +3618,7 @@ only by the launcher, mirroring Bun's `__ocInstallBun`).
   auto-loads prebuilt wheels the code imports (`loadPackagesFromImports`). Boot masks
   **both** Node probes — `process.browser=true` (pyodide.mjs) and `process.type=
   "renderer"` (Emscripten's pyodide.asm.mjs) — or Pyodide `import("node:module")` (404s
-  in a Worker); both held across the whole boot, then restored. The boot promise also
-  holds a **host-liveness ref** (`trackHost(bootPromise)`): Pyodide's `fetch`/`WebAssembly`
-  are tracked, but the initial `import(pyodide.mjs)` / `import(pyodide.asm.mjs)` are native
-  ES imports that are not — without the ref, a **cold prod/CDN** import outlasts a loop
-  macrotask, `drive()` quiesces and exits 0 mid-boot, and every `python`/`flask`/`uvicorn`
-  command exits instantly with no output (a dev-passes / prod-fails race).
+  in a Worker); both held across the whole boot, then restored.
 - **CLI** (`packages/kernel-host/programs/python.js`) + `uvicorn`/`flask` PATH shims
   (`coreutils.js`). `process.exit`'s control-flow throw is detected and returned quietly.
 - **Delivery** (`scripts/vendor-pyodide.mjs`): vendors the Pyodide core + selected wheels

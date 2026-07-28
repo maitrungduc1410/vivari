@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import X from "~icons/lucide/x";
 import ChevronRight from "~icons/lucide/chevron-right";
 import { cn } from "@/lib/utils";
-import { VV_PATH_MIME, entriesFromDataTransfer, type WorkspaceFolder } from "@/vv/controller";
+import { VV_PATH_MIME, entriesFromDataTransfer, isDiffTabId, diffTargetOf, type WorkspaceFolder } from "@/vv/controller";
 import {
   ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger,
 } from "@/components/ui/context-menu";
@@ -112,11 +112,12 @@ export function EditorGroup() {
               ? "shadow-[inset_-2px_0_0_0_var(--primary)]"
               : "shadow-[inset_2px_0_0_0_var(--primary)]"
             : "";
+          const isDiff = isDiffTabId(rel);
           return (
             <ContextMenu key={rel}>
               <ContextMenuTrigger className="contents">
                 <div
-                  title={rel}
+                  title={isDiff ? diffTargetOf(rel) : rel}
                   draggable
                   onClick={() => c.openFile(rel, { preview: isPreview })}
                   onDoubleClick={() => c.pinTab(rel)}
@@ -153,7 +154,10 @@ export function EditorGroup() {
                   ) : (
                     <FileIcon name={baseName(rel)} className="size-3.5 shrink-0" />
                   )}
-                  <span className={cn(isPreview && "italic")}>{baseName(rel)}</span>
+                  <span className={cn(isPreview && "italic")}>
+                    {baseName(rel)}
+                    {isDiff && <span className="ml-1 opacity-60">(Working Tree)</span>}
+                  </span>
                   <button
                     className="flex size-4 items-center justify-center rounded hover:bg-accent"
                     onClick={(e) => { e.stopPropagation(); processQueue([rel]); }}
@@ -198,8 +202,13 @@ export function EditorGroup() {
         })}
       </div>
 
-      {/* breadcrumb: Workspace-relative path of the active file */}
-      {snap.activeTab && <Breadcrumb abs={snap.activeTab} folders={snap.workspaceFolders} />}
+      {/* breadcrumb: Workspace-relative path of the active file (or diff target) */}
+      {snap.activeTab && (
+        <Breadcrumb
+          abs={isDiffTabId(snap.activeTab) ? diffTargetOf(snap.activeTab) : snap.activeTab}
+          folders={snap.workspaceFolders}
+        />
+      )}
 
       {/* editor host (Monaco mounts here once) */}
       <div ref={dropZoneRef} className="relative flex-1">
@@ -208,6 +217,7 @@ export function EditorGroup() {
         <div ref={mountRef} className={cn("vv-editor-host absolute inset-0", activeKind !== "text" && "invisible")} />
         {activeKind === "image" && snap.activeTab && <ImageView key={snap.activeTab} abs={snap.activeTab} />}
         {activeKind === "directory" && snap.activeTab && <DirectoryView />}
+        {activeKind === "diff" && snap.activeTab && <DiffView key={snap.activeTab} id={snap.activeTab} />}
         {!snap.activeTab && (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
             {snap.projectTitle ? "Open a file from the Workspace" : "Press Run to start a project"}
@@ -331,6 +341,20 @@ function Breadcrumb({ abs, folders }: { abs: string; folders: WorkspaceFolder[] 
       })}
     </div>
   );
+}
+
+// Source Control diff tab: a read-only Monaco diff editor (HEAD ↔ working tree).
+// Keyed by tab id in the parent, so it remounts per diff tab and the controller
+// rebinds fresh original/modified models.
+function DiffView({ id }: { id: string }) {
+  const { c } = useIde();
+  const ref = useCallback(
+    (el: HTMLDivElement | null) => {
+      if (el) void c.mountDiffEditor(el, id);
+    },
+    [c, id],
+  );
+  return <div ref={ref} className="absolute inset-0" />;
 }
 
 // Shown when a directory is opened in the editor (dragged onto Monaco).

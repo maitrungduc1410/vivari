@@ -34,6 +34,9 @@ import {
   OP_UNLINK,
   OP_RMDIR,
   OP_RENAME,
+  OP_LSTAT,
+  OP_SYMLINK,
+  OP_READLINK,
 } from "../protocol/syscall.js";
 
 // The kernel registers as client 0; processes use their (>= 1) pid.
@@ -208,6 +211,19 @@ export function createKernelFs(fsWorker) {
     },
     stat(path) {
       return JSON.parse(decodeBytes(call(OP_STAT, encodeRequest([enc(path)]))));
+    },
+    // lstat/symlink/readlink mirror the process syscall client (runtime/fs-client.js).
+    // The kernel gained them so main-thread git (isomorphic-git via the vv-git-fs
+    // RPC) has the full POSIX metadata surface it needs — symlink-typed blobs,
+    // lstat to tell a link from a file, etc.
+    lstat(path) {
+      return JSON.parse(decodeBytes(call(OP_LSTAT, encodeRequest([enc(path)]))));
+    },
+    symlink(target, linkpath) {
+      call(OP_SYMLINK, encodeRequest([enc(target), enc(linkpath)]));
+    },
+    readlink(path) {
+      return decodeBytes(call(OP_READLINK, encodeRequest([enc(path)])));
     },
     isFile(path) {
       try {

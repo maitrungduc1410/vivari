@@ -29,6 +29,10 @@ const baseName = (abs: string) => abs.split("/").filter(Boolean).pop() ?? abs;
 const parentDir = (abs: string) => abs.slice(0, abs.lastIndexOf("/")) || "/";
 const modKey = (e: React.KeyboardEvent) => e.metaKey || e.ctrlKey;
 
+// Entries hidden from the file tree only (VS Code hides `.git` by default).
+// The terminal/VFS is unaffected, so `ls` still lists these.
+const HIDDEN_IN_TREE = new Set([".git"]);
+
 // A pending inline "new file" / "new folder" input.
 interface Creating {
   dir: string;
@@ -110,7 +114,9 @@ export function Explorer() {
     async (dir: string) => {
       if (loading.current.has(dir)) return;
       loading.current.add(dir);
-      const entries = await c.readdir(dir);
+      // Hide VCS internals from the tree (like VS Code's default files.exclude).
+      // This is display-only: `ls` in the terminal still shows .git.
+      const entries = (await c.readdir(dir)).filter((e) => !HIDDEN_IN_TREE.has(e.name));
       loading.current.delete(dir);
       entries.sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
       setChildren((prev) => ({ ...prev, [dir]: entries }));

@@ -841,6 +841,42 @@ capped (surfaced as a "truncated" warning), and land through the shared spine. U
 GitHub/npm, snapshot-driven via `importRemoteOpen`, live progress). Public GitHub repos only (no
 auth); npm range specifiers fall back to `latest` (no semver-range resolution).
 
+### 8.11 Source Control (git) panel (studio)
+
+A VS Code-style **Source Control** view backed by [`isomorphic-git`](https://isomorphic-git.org),
+running entirely in the tab against the VFS. **Local-only** by design: `init`, stage/unstage,
+commit, branch/checkout/delete, per-file diff, history, discard — no remote, no clone/push (the git
+wire protocol needs an authenticated CORS proxy; out of scope). GitHub *import* (§8.10) covers the
+"get code in" case.
+
+The twist is *where* git runs. isomorphic-git runs on the **studio main thread**, but the VFS lives
+in the File System Worker and is only reachable synchronously from the **kernel** worker. So:
+
+- `studio/src/vv/git-fs.ts` implements isomorphic-git's `fs` promise API by turning each call into a
+  `KernelBridge` request to a **silent `vv-git-fs` RPC** in `kernel-worker.ts`, which dispatches onto
+  the kernel's synchronous fs (SAB → FS worker). "Silent" = it never emits `vv-fs-changed`: one commit
+  writes hundreds of `.git/objects`, and a change event per write would storm the Explorer/watchers.
+- The kernel fs surface gained sync `lstat`/`symlink`/`readlink` (`kernel-fs.js`, mirroring
+  `runtime/fs-client.js`) so git has full POSIX metadata; the adapter rebuilds `st_mode` (type | perm)
+  from the VFS `kind` so blob filemodes (100644/100755/120000/040000) are correct.
+- `studio/src/vv/scm-session.ts` is a `useSyncExternalStore` store (like `DebugSession`). It is
+  **multi-repo**: it holds a `RepoState[]` (one entry per open workspace folder, like VS Code), each with
+  its own branch/commit-message/status/history. The controller's `syncScmRoots()` reconciles the list as
+  folders open/close; every git op takes the target `root`; `headBlobText(abs)` resolves the owning repo
+  by longest-prefix root. Status is derived from `git.statusMatrix`; isomorphic-git is **lazy-imported**
+  only when a repo exists or the user initializes one. Refresh walks the repos **sequentially**, is
+  **coalesced** (never two overlapping walks) and gated to when the panel is shown (a walk floods the
+  single-threaded kernel worker that also drives the terminal). `git init` seeds a `.gitignore`.
+- The controller adds a `"diff"` tab kind rendered by a read-only **Monaco diff editor** (HEAD ↔
+  working tree) and reloads open editors after a checkout/discard rewrites files under them. UI:
+  `SourceControlPanel.tsx` renders one collapsible section per repo (branch dropdown, commit box,
+  staged/changes/history, or an Initialize button when the folder isn't a repo), an activity-bar entry
+  whose badge sums changed files across repos, and `Cmd/Ctrl+Shift+G`.
+
+Because the adapter isolates *all* fs access behind the bridge, the upgrade path (if main-thread status
+walks ever jank on a huge repo) is to move isomorphic-git behind its own worker with only the call site
+changing.
+
 ---
 
 ## 9. Native code (Wasm)

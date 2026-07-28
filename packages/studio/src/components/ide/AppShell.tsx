@@ -8,6 +8,7 @@ import { ActivityBar } from "./ActivityBar";
 import { Explorer } from "./Explorer";
 import { SearchPane } from "./SearchPane";
 import { DebugPanel } from "./DebugPanel";
+import { SourceControlPanel } from "./SourceControlPanel";
 import { EditorGroup } from "./EditorGroup";
 import { TerminalPanel } from "./TerminalPanel";
 import { PreviewPanel } from "./PreviewPanel";
@@ -38,6 +39,9 @@ export function AppShell() {
       if (e.shiftKey && k === "f") {
         e.preventDefault();
         c.setActiveView("search");
+      } else if (e.shiftKey && k === "g") {
+        e.preventDefault();
+        c.setActiveView("scm");
       } else if (e.shiftKey && k === "p") {
         e.preventDefault();
         c.openPalette("command");
@@ -93,6 +97,8 @@ export function AppShell() {
                   <SearchPane />
                 ) : snap.activeView === "debug" ? (
                   <DebugPanel />
+                ) : snap.activeView === "scm" ? (
+                  <SourceControlPanel />
                 ) : (
                   <Explorer />
                 )}

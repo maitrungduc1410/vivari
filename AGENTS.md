@@ -125,6 +125,15 @@ packages/
                           receives dbg-event over the kernel bridge, tracks targets/
                           frames/scopes, and drives Monaco gutter breakpoints +
                           paused-line decorations. Feeds DebugPanel.
+    src/vv/scm-session.ts    Source Control (git) store: runs isomorphic-git (lazy-
+                          imported) over the VFS via git-fs.ts. MULTI-REPO: a
+                          RepoState[] with one entry per open workspace folder (VS
+                          Code-style), each owning its own branch/status/history +
+                          staged/unstaged + commit message; ops take a `root`.
+                          LOCAL-ONLY (no remote). Feeds SourceControlPanel.
+    src/vv/git-fs.ts      isomorphic-git fs adapter → the silent `vv-git-fs` kernel
+                          RPC (main-thread git can't touch the FS-worker VFS directly).
+    src/vv/git-config.ts  persisted git author identity (localStorage; per-user).
     src/vv/templates.ts   ~55 project templates across 9 categories (Frontend/Backend/
                           Fullstack/Showcase/Bun/Tooling/Docs/Creative/Native) — each a manifest
                           (install/dev/port/entry) + full source, inline (NOT a scaffolder
@@ -141,7 +150,8 @@ packages/
       kernel-worker.ts    hosts the Kernel; DEMOS registry + demo shell tabs (VV_RUN); the
                           multi-root VFS protocol (vv-readdir/read/stat/mkdirp/create-project,
                           vv-fs-changed; streaming vv-search + vv-replace; vv-collect-dts bulk
-                          node_modules .d.ts harvest for IntelliSense) + dynamic project
+                          node_modules .d.ts harvest for IntelliSense; the SILENT vv-git-fs RPC
+                          for main-thread isomorphic-git — no vv-fs-changed storm on commits) + dynamic project
                           run/attribution (projectDirByTerm, project-ready/-reload). Also the
                           generic SDK spawn protocol (proc-spawn/-input/-kill → proc-out/-exit).
       fs-worker.ts        hosts the File System Worker (VFS + OPFS).
@@ -152,8 +162,9 @@ packages/
     src/components/ide/   AppShell (+ Home overlay) · Home (Start blank / from template,
                           recents; "Reset everything" now also clears the recent-projects
                           registry and locks its dialog while the wipe runs) · ActivityBar
-                          (Workspace/Search + a "Run and Debug" entry that opens the
-                          DebugPanel + a bottom light/dark/system theme toggle —
+                          (Workspace/Search/Source Control + a "Run and Debug" entry that
+                          opens the DebugPanel; the Source Control entry carries a
+                          changed-count badge + a bottom light/dark/system theme toggle —
                           next-themes, applied to Monaco + xterm via controller.applyUiTheme) ·
                           Explorer (the "Workspace" panel: VFS-backed multi-root tree; context
                           menu incl. Open in Integrated Terminal, Copy Path) · SearchPane (VS
@@ -162,7 +173,13 @@ packages/
                           EditorGroup (preview/permanent tabs; active tab has a #007acc top
                           accent + a "Workspace > project > …path" breadcrumb) · DebugPanel
                           (VS Code-style Call Stack / Variables / Watch / Breakpoints for the
-                          breakpoint debugger — see gotcha below) · TerminalPanel
+                          breakpoint debugger — see gotcha below) · SourceControlPanel
+                          (VS Code-style git, MULTI-REPO: one collapsible section per open
+                          workspace folder, each with its own branch switch/create, commit
+                          box, Staged/Changes with stage/unstage/discard, history, per-file
+                          diff via a read-only Monaco diff tab, or an Initialize button when
+                          the folder isn't a repo — local-only isomorphic-git) ·
+                          TerminalPanel
                           (Console/Terminal/Ports) · PreviewPanel (multi-tab mini-browser: local
                           address bar, back/forward, reload, chii DevTools in a resizable bottom
                           split) · StatusBar (VS Code blue #007acc; status + live diagnostics
@@ -714,13 +731,6 @@ WASM (Pyodide)** the first time a python process runs (nothing at studio boot). 
 - **Two Node probes must BOTH be masked** or boot dies on `import("node:module")`:
   `process.browser = true` (pyodide.mjs) AND `process.type = "renderer"`
   (Emscripten's pyodide.asm.mjs). Hold both across the whole boot, then restore.
-- **The boot promise MUST hold a host-liveness ref** (`trackHost(bootPromise)` in
-  `bootPyodide`). Pyodide's `fetch`/`WebAssembly` are liveness-tracked, but the initial
-  `import(pyodide.mjs)` (and `import(pyodide.asm.mjs)` inside `loadPyodide`) are native ES
-  imports that are NOT — on a warm dev server they resolve in one loop turn so `main()`
-  reaches the tracked fetches first, but on a **cold prod/CDN load** the import outlasts a
-  macrotask, `drive()` sees no ref'd work and exits 0 mid-boot, and every `python`/`flask`/
-  `uvicorn` command appears to **exit instantly with no output** (dev-passes/prod-fails).
 - **`vendor:pyodide` writes gitignored assets under `packages/studio/public/vendor/pyodide/`.**
   It's in the root `prebuild:studio` hook, but the studio's own `bun run build` does NOT
   fire that hook — so `scripts/cloudflare-build.sh` **must list `npm run vendor:pyodide`
@@ -1347,6 +1357,13 @@ the gap can't silently regress.
   (CDP backend), `protocol/debug.js` (SAB ABI), and/or `studio/src/vv/debug-session.ts`
   (client) — they are one CDP contract, so change the relevant sides together and
   re-run `node scripts/spike-debugger.mjs`. See the breakpoint-debugger gotcha above.
+- **Work on Source Control (git)**: edit `studio/src/vv/scm-session.ts` (multi-repo
+  store — `RepoState[]`, one per workspace folder; every op takes a `root`), `git-fs.ts`
+  (isomorphic-git ⇄ VFS adapter), and `SourceControlPanel.tsx` (per-repo sections). The
+  controller keeps the repo list in sync via `syncScmRoots()` (folder open/close). All
+  fs access flows through the SILENT `vv-git-fs` RPC in `kernel-worker.ts`; if you
+  add a new fs op, wire it in `kernel-fs.js` (kernel sync fs), the RPC switch, and the
+  adapter together. It's LOCAL-ONLY (no remote/clone/push) — don't add network here.
 - **Ship the studio**: `npm run build:studio` (Vite build → `packages/studio/dist/`).
 
 ---
