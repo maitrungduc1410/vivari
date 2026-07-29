@@ -140,12 +140,6 @@ packages/
                           the cursor changes on every keystroke, so folding it into
                           the main snapshot would re-render every useIde() consumer
                           on each keypress.
-    src/vv/status-message.ts  the status bar's transient message slot ("saved page.tsx
-                          — hot-updating…"), written via the controller's private
-                          `status()`. Also its OWN store, for the same reason: the
-                          `demo-status` bridge event carries one message per line of
-                          dev-server output. Auto-hides after 4s. Routine feedback
-                          goes here; FAILURES still raise a sonner toast.
     src/vv/git-fs.ts      isomorphic-git fs adapter → the silent `vv-git-fs` kernel
                           RPC (main-thread git can't touch the FS-worker VFS directly).
     src/vv/git-config.ts  persisted git author identity (localStorage; per-user).
@@ -198,10 +192,10 @@ packages/
                           (Console/Terminal/Ports) · PreviewPanel (multi-tab mini-browser: local
                           address bar, back/forward, reload, chii DevTools in a resizable bottom
                           split) · StatusBar (VS Code blue #007acc; LEFT: active repo's git branch
-                          + live diagnostics count + the auto-hiding message slot, RIGHT:
-                          "Ln x, Col y" / "Spaces: n" / language mode, each opening a quick
-                          pick — see StatusBarPickers + the gotcha
-                          below) · StatusBarPickers (Go to Line, the
+                          + live diagnostics count, RIGHT: "Ln x, Col y" / "Spaces: n" / language
+                          mode, each opening a quick pick — see StatusBarPickers + the gotcha
+                          below. There is deliberately no free-form status text: transient
+                          messages are sonner toasts) · StatusBarPickers (Go to Line, the
                           two-level indentation actions, Select Language Mode — all built on the
                           CommandDialog primitives) · CommandPalette (⌘P quick-open by name;
                           append :line[:col] to jump) · fileIcon (vscode-icons). Icons are Iconify via
@@ -851,7 +845,7 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
     **same-origin by default** (lands in the kernel's storage partition), or on the preview origin
     behind a one-time "connect this tab" Storage-Access gate (`previewConnectingHtml`) when
     `VITE_PREVIEW_POPOUT=isolated`.
-  - **Mode C — wildcard per-port origin** (`VITE_PREVIEW_WILDCARD_DOMAIN`, e.g. `jamesisme.com`):
+  - **Mode C — wildcard per-port origin** (`VITE_PREVIEW_WILDCARD_DOMAIN`, e.g. `vivari.run`):
     each port is its own origin `<token>--<port>-vv.<domain>` (random per-boot `<token>`; the `-vv`
     tag is a **suffix** so the Cloudflare route's wildcard can lead — see below), so the SW reads the
     port from `self.location.hostname` (`WILDCARD_MODE` in `sw.js`) and serves the app at `/` (no
@@ -863,8 +857,8 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
     rejected; the `-vv` suffix keeps the route both valid and narrow.)
   Env vars go on the **studio (main) project**, not the preview project; `VITE_PREVIEW_WILDCARD_DOMAIN`
   takes precedence over `VITE_PREVIEW_ORIGIN`. **`isolated` pop-outs only work gate-free when IDE and
-  preview are *same-site*** (subdomains of one registrable domain, e.g. `vivari.jamesisme.com` +
-  `vivari-preview.jamesisme.com`, or mode C's `<token>--<port>-vv.jamesisme.com`): same-site ⇒ not
+  preview are *same-site*** (subdomains of one registrable domain, e.g. `ide.vivari.run` +
+  `preview.vivari.run`, or mode C's `<token>--<port>-vv.vivari.run`): same-site ⇒ not
   storage-partitioned ⇒ the pop-out shares the bridge SW and connects with **no gate** (verified
   live) while storage stays origin-isolated. **Mode C is same-site by construction**, so it's
   gate-free. On two `*.pages.dev` projects they're **cross-site** (PSL) ⇒ partitioned ⇒ Chrome's

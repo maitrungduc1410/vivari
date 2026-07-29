@@ -20,7 +20,6 @@ import { KernelBridge, resetVfs } from "./kernel";
 import { DebugSession } from "./debug-session";
 import { ScmSession } from "./scm-session";
 import { EditorStatus } from "./editor-status";
-import { StatusMessage } from "./status-message";
 import { getTemplate, type TemplateManifest } from "./templates";
 import { createZip, encodeShare, decodeShare } from "../../../kernel-host/archive.js";
 import {
@@ -48,7 +47,7 @@ function normalizePreviewPopout(raw: string | undefined): "same-origin" | "isola
 }
 
 // Build-time wildcard base domain (VITE_PREVIEW_WILDCARD_DOMAIN, mode C). Returns
-// a bare base domain (e.g. "jamesisme.com") or undefined. When set, previews are
+// a bare base domain (e.g. "vivari.run") or undefined. When set, previews are
 // served one origin per port (`<token>--<port>-vv.<domain>`); takes precedence
 // over VITE_PREVIEW_ORIGIN. Unset in the default deploy + local dev (→ mode A/B).
 function normalizePreviewWildcardDomain(raw: string | undefined): string | undefined {
@@ -510,6 +509,11 @@ export function languageLabel(id: string | null): string {
   return LANGUAGE_MODES.find((l) => l.id === id)?.label ?? id;
 }
 
+/** What a save does for a just-started project, for the "X running" toast. */
+function editHint(reload: boolean): string {
+  return reload ? "Edits recompile + restart the server." : "Edits hot-reload.";
+}
+
 interface TermEntry {
   term: Terminal;
   fit: FitAddon;
@@ -537,9 +541,6 @@ export class IdeController {
   // Cursor / indentation / language readouts for the status bar. Its own store so
   // per-keystroke cursor updates don't re-render every useIde() consumer.
   readonly editorStatus = new EditorStatus();
-  // The status bar's transient message slot. Also its own store: `demo-status`
-  // pushes one message per line of dev-server output.
-  readonly statusMessage = new StatusMessage();
 
   // ── external store ──
   private listeners = new Set<() => void>();
@@ -685,11 +686,6 @@ export class IdeController {
     }
     for (const l of this.listeners) l();
   }
-  /** Post a transient message to the status bar. For routine, high-frequency
-   * feedback (a save, a dev-server restart); failures still raise a toast. */
-  private status(text: string) {
-    this.statusMessage.show(text);
-  }
   private syncTerminals() {
     this.set({
       terminals: this.termOrder.map((id) => {
@@ -714,7 +710,6 @@ export class IdeController {
     // the (blank) workspace doesn't look idle while the kernel boots + unpacks.
     if (hasSharePayload()) {
       this.set({ shareLoading: true, shareMessage: "Booting the runtime…" });
-      this.status("opening shared project…");
     }
     const ok = await this.bridge.registerServiceWorker();
     this.consoleLine(
@@ -1623,7 +1618,7 @@ export class IdeController {
     if (folder) this.touchProject(folder.rootPath);
     const reload = folder ? this.folderManifests.get(folder.rootPath)?.reload : false;
     this.set({ dirty: this.snap.dirty.filter((x) => x !== abs) });
-    this.status(reload ? `saved ${baseName(abs)} — recompiling…` : `saved ${baseName(abs)} — hot-updating…`);
+    toast.success(reload ? `Saved ${baseName(abs)} — recompiling…` : `Saved ${baseName(abs)} — hot-updating…`);
   }
 
   // ── Source Control: diff tab + working-tree reload ──
@@ -1865,7 +1860,7 @@ export class IdeController {
     this.upsertProjectMeta({ name, rootPath: root, template: null });
     this.openFolder(root, name);
     void this.openFile(root + "/index.js");
-    this.status(`created ${name}`);
+    toast.success(`Created ${name}`);
   }
 
   async createFromTemplate({ templateId, name, dir, runInit }: {
@@ -1902,7 +1897,9 @@ export class IdeController {
     if (runInit) {
       this.runProject(root);
     } else {
-      this.status(`${name} created — run \`${t.manifest.install}\` then \`${t.manifest.dev}\``);
+      toast.success(`${name} created`, {
+        description: `Run \`${t.manifest.install}\` then \`${t.manifest.dev}\` to start it.`,
+      });
     }
   }
 
@@ -1964,7 +1961,7 @@ export class IdeController {
     }
     const tid = this.newShellTerminal({ cwd: root, run: manifest.dev, label: manifest.dev });
     this.runningProjects.set(root, { terminalId: tid, port: null });
-    this.status("installing from npm + booting in-VM…");
+    toast.info("Installing from npm + booting in-VM…");
   }
 
   // Run the currently-focused folder (TitleBar / command palette Run).
@@ -2178,7 +2175,7 @@ export class IdeController {
     }
     if (count) {
       this.bumpTree();
-      this.status(`imported ${count} file${count === 1 ? "" : "s"} into ${baseName(dest) || "/"}`);
+      toast.success(`Imported ${count} file${count === 1 ? "" : "s"} into ${baseName(dest) || "/"}`);
     }
     return targets;
   }
@@ -2236,7 +2233,6 @@ export class IdeController {
       toast.success(`Exported ${filename}`, {
         description: `${count} · node_modules excluded`,
       });
-      this.status(`exported ${count} → ${filename}`);
       if (truncated) toast.warning("Project was large — the export was truncated.");
     } catch (err) {
       toast.error("Export failed: " + errText(err));
@@ -2304,7 +2300,6 @@ export class IdeController {
     if (openTarget) void this.openFile(root + "/" + openTarget);
     const note = excludedNodeModules ? " (node_modules excluded)" : "";
     const count = `${files.length} file${files.length === 1 ? "" : "s"}`;
-    this.status(`imported ${count} as ${name}${note}`);
     if (!silent) {
       toast.success(`Imported ${name} — ${count}${note}`, {
         description: excludedNodeModules ? "Run the project to reinstall dependencies." : undefined,
@@ -2332,12 +2327,10 @@ export class IdeController {
           description: `Self-contained · source only · ${kb} KB`,
           position: "bottom-left",
         });
-        this.status(`share link copied (${kb} KB)`);
       } catch {
         toast.warning("Couldn't copy to clipboard — copy the link from the address bar.", {
           position: "bottom-left",
         });
-        this.status("share link ready");
       }
       return url;
     } catch (err) {
@@ -2498,7 +2491,7 @@ export class IdeController {
   copyPath(abs: string) {
     try {
       void navigator.clipboard?.writeText(abs);
-      this.status(`copied path: ${abs}`);
+      toast.success("Copied path", { description: abs });
     } catch {
       toast.error("Clipboard unavailable");
     }
@@ -2849,7 +2842,7 @@ export class IdeController {
     const opt = DEMOS.find((d) => d.id === demo);
     const tid = this.newShellTerminal({ demo, label: opt?.runLabel ?? "run" });
     this.runningDemos.set(demo, { terminalId: tid, port: null });
-    this.status("installing from npm + booting in-VM…");
+    toast.info("Installing from npm + booting in-VM…");
   }
 
   // ── UI toggles ──
@@ -3019,7 +3012,6 @@ export class IdeController {
     b.on("ready", () => {
       this.consoleLine("Kernel ready.", "32");
       this.set({ booted: true, kernelReady: true });
-      this.status("ready — create or open a project");
       this.newShellTerminal({ defer: true, activate: false });
       // If the URL carries a #share= payload, import it into a new project.
       void this.loadSharedFromUrl();
@@ -3076,7 +3068,7 @@ export class IdeController {
         this.runningDemos.delete(t.demo);
         if (gone?.port != null && this.portMap.delete(gone.port)) this.syncPorts();
         if (gone?.port != null && this.snap.previewTabs.some((t) => t.port === gone.port))
-          this.status("dev server stopped — preview will 502 until you Run again");
+          toast.warning("Dev server stopped — preview will 502 until you Run again.");
       }
       // A created/opened project's run tab ended → server gone.
       for (const [dir, r] of this.runningProjects) {
@@ -3085,7 +3077,7 @@ export class IdeController {
           if (r.port != null && this.portMap.delete(r.port)) this.syncPorts();
           this.syncKeepPrefixPorts();
           if (r.port != null && this.snap.previewTabs.some((t) => t.port === r.port))
-            this.status("dev server stopped — preview will 502 until you Run again");
+            toast.warning("Dev server stopped — preview will 502 until you Run again.");
         }
       }
       this.syncTerminals();
@@ -3129,15 +3121,13 @@ export class IdeController {
       });
       this.openFolder(dir, m.title as string);
       if (m.entry) void this.openFile(dir + "/" + (m.entry as string));
-      this.status(
-        m.reload ? `${m.title} running — edits recompile + restart` : `${m.title} running — edits hot-reload`,
-      );
+      toast.success(`${m.title} running`, { description: editHint(!!m.reload) });
     });
     b.on("demo-reload", (m) => {
       for (const t of this.snap.previewTabs) if (t.port === m.port) this.reloadPreviewTab(t.id);
-      this.status(`${m.title} restarted — preview reloaded`);
+      toast.info(`${m.title} restarted — preview reloaded`);
     });
-    b.on("demo-status", (m) => this.status(m.line as string));
+    b.on("demo-status", (m) => toast.info(m.line as string));
 
     // A created/opened project's dev server is up.
     b.on("project-ready", (m) => {
@@ -3147,7 +3137,7 @@ export class IdeController {
       // opened the folder + entry file.
       if (m.extra) {
         this.pointPreview(m.port as number);
-        this.status(`${m.title as string}: service on :${m.port} ready`);
+        toast.success(`${m.title as string}: service on :${m.port} ready`);
         return;
       }
       const r = this.runningProjects.get(dir);
@@ -3161,13 +3151,11 @@ export class IdeController {
       if (!this.snap.workspaceFolders.some((f) => f.rootPath === dir)) this.openFolder(dir, m.title as string);
       if (m.entry) void this.openFile(dir + "/" + (m.entry as string));
       this.touchProject(dir);
-      this.status(
-        m.reload ? `${m.title} running — edits recompile + restart` : `${m.title} running — edits hot-reload`,
-      );
+      toast.success(`${m.title} running`, { description: editHint(!!m.reload) });
     });
     b.on("project-reload", (m) => {
       for (const t of this.snap.previewTabs) if (t.port === m.port) this.reloadPreviewTab(t.id);
-      this.status(`${m.title} restarted — preview reloaded`);
+      toast.info(`${m.title} restarted — preview reloaded`);
     });
 
     // Streaming full-text search: batches of per-file results, then a final done.

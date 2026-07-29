@@ -1,7 +1,7 @@
 // Cloudflare Worker — mode C (wildcard per-port preview origins).
 //
 // In mode C every in-VM port is served from its OWN origin,
-// `<token>--<port>-vv.<domain>` (e.g. k3f9a2xh--5173-vv.jamesisme.com). That
+// `<token>--<port>-vv.<domain>` (e.g. k3f9a2xh--5173-vv.vivari.run). That
 // gives each preview real `localhost:<port>` web-platform semantics (its own
 // cookies/storage/CORS) and isolates previews from the IDE *and* from each other.
 // The `-vv` tag is a SUFFIX (not a prefix) because Cloudflare routes only allow

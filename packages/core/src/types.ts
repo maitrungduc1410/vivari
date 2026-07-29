@@ -34,8 +34,8 @@ export interface BootOptions {
   previewOrigin?: string;
   /**
    * Serve **each in-VM port from its own origin** (mode C, wildcard) — e.g.
-   * `<token>--5173-vv.jamesisme.com` and `<token>--3000-vv.jamesisme.com`. Set
-   * this to the **base domain** you control (e.g. `"jamesisme.com"`); Vivari
+   * `<token>--5173-vv.vivari.run` and `<token>--3000-vv.vivari.run`. Set
+   * this to the **base domain** you control (e.g. `"vivari.run"`); Vivari
    * composes `<token>--<port>-<tag>.<domain>` per port with a random per-boot
    * `<token>`. This isolates IDE↔preview **and** preview↔preview and matches real
    * `localhost:<port>` web-platform semantics. Because those hosts are subdomains

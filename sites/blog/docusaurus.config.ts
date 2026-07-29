@@ -7,7 +7,7 @@ const GITHUB_URL = "https://github.com/maitrungduc1410/vivari";
 // lives outside this site's baseUrl. Docusaurus prefixes baseUrl onto any
 // path-like link and then route-checks it, so reaching a sibling requires an
 // absolute URL, which Docusaurus treats as external.
-const SITE_URL = "https://vivari.jamesisme.com";
+const SITE_URL = "https://vivari.run";
 
 // Why this is a second Docusaurus site rather than a `/blog` route inside
 // sites/docs: the landing owns the origin root, and a Docusaurus build always

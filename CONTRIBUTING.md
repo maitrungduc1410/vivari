@@ -86,7 +86,7 @@ so a single site covering both `/docs/` and `/blog/` would have to take `/` and
 overwrite the landing. Consequences worth knowing:
 
 - Links between posts are root-relative to the blog (`/blocking-in-a-browser`).
-  Links to the docs must be absolute (`https://vivari.jamesisme.com/docs/...`),
+  Links to the docs must be absolute (`https://vivari.run/docs/...`),
   otherwise Docusaurus prefixes the blog baseUrl and the build fails the
   broken-link check.
 - `sites/blog/src/components/Playground.tsx` is a copy of the docs' one. Two

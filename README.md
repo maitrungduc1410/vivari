@@ -9,10 +9,10 @@
 virtual networking, with no server doing the work.
 
 <p>
-  <a href="https://vivari.jamesisme.com">Website</a> ·
-  <a href="https://vivari.jamesisme.com/docs">Docs</a> ·
-  <a href="https://vivari.jamesisme.com/blog/">Blog</a> ·
-  <a href="https://vivari.jamesisme.com/studio/">Studio</a> ·
+  <a href="https://vivari.run">Website</a> ·
+  <a href="https://vivari.run/docs">Docs</a> ·
+  <a href="https://vivari.run/blog/">Blog</a> ·
+  <a href="https://vivari.run/studio/">Studio</a> ·
   <a href="https://www.npmjs.com/package/@vivari/core">npm</a>
 </p>
 
@@ -44,7 +44,7 @@ await proc.exit;
 > Vivari needs a **cross-origin isolated** page (`COOP: same-origin` +
 > `COEP: require-corp`) so `SharedArrayBuffer` is available. Full guides,
 > the API reference, and interactive examples live in the
-> [documentation](https://vivari.jamesisme.com/docs).
+> [documentation](https://vivari.run/docs).
 
 ## How it works (in one breath)
 
@@ -53,7 +53,7 @@ Node's APIs are **synchronous**. Browsers won't let you block on async work
 execution. So `fs.readFileSync` parks the worker until the host answers over a
 `SharedArrayBuffer`; a kernel over a Rust/Wasm VFS services the syscalls, and a
 Service Worker previews an in-VM HTTP server live in an iframe. See
-[How it works](https://vivari.jamesisme.com/docs/how-it-works) for the full story.
+[How it works](https://vivari.run/docs/how-it-works) for the full story.
 
 ## Repository layout
 

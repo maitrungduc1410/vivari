@@ -26,10 +26,10 @@ run_worker_first = true
 # the literal `-vv` suffix keeps the route narrow (only Vivari preview hosts, never
 # other apps). NOTE: Cloudflare routes only allow the wildcard at the START of the
 # hostname, so the tag MUST be a suffix (`*-vv...`), not a prefix (`vv-*...` is
-# rejected as an infix wildcard). Change `jamesisme.com` to your own zone (keep it
+# rejected as an infix wildcard). Change `vivari.run` to your own zone (keep it
 # in sync with the IDE build's VITE_PREVIEW_WILDCARD_DOMAIN). Binding this route on
 # deploy needs an API token with "Workers Routes: Edit" on the zone; otherwise
 # comment this out and add the route in the dashboard (Workers → Domains & Routes).
 [[routes]]
-pattern = "*-vv.jamesisme.com/*"
-zone_name = "jamesisme.com"
+pattern = "*-vv.vivari.run/*"
+zone_name = "vivari.run"

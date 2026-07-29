@@ -74,7 +74,7 @@ back. Try importing another `node:` built-in or changing the loop.
 <Playground scenario="node" title="Live Node terminal" />
 
 :::tip Run real projects
-To scaffold a full project, `npm install`, and boot a dev server, [open the Studio](https://vivari.jamesisme.com/studio/) or
+To scaffold a full project, `npm install`, and boot a dev server, [open the Studio](https://vivari.run/studio/) or
 embed the [`<Vivari>` component](./react) on a cross-origin isolated page.
 :::
 

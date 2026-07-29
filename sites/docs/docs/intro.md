@@ -19,13 +19,13 @@ sealed environment in the browser where a whole project lives and runs.
 
 It ships in two forms:
 
-- **The [Studio](https://vivari.jamesisme.com/studio/)**: a full in-browser IDE built on Vivari.
+- **The [Studio](https://vivari.run/studio/)**: a full in-browser IDE built on Vivari.
 - **The SDK**: [`@vivari/core`](./core-api) (framework-agnostic) and
   [`@vivari/react`](./react) (a `<Vivari>` component + `useVivari()` hook) that
   you can embed in your own app.
 
 :::tip Try it now
-The fastest way to understand Vivari is to [open the Studio](https://vivari.jamesisme.com/studio/) and run a
+The fastest way to understand Vivari is to [open the Studio](https://vivari.run/studio/) and run a
 template: each shell command becomes its own worker/process, and an in-VM dev
 server is previewed live through a Service Worker.
 :::

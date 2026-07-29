@@ -121,7 +121,7 @@ as an infix wildcard, and `*.<domain>/*` would swallow your other subdomains).
 Cloudflare Pages can't attach a *wildcard* custom domain, so a small **Worker**
 (`worker/`) serves the SW runtime for every matching subdomain.
 
-1. Point a base domain (e.g. `jamesisme.com`) at Cloudflare (nameservers on
+1. Point a base domain (e.g. `vivari.run`) at Cloudflare (nameservers on
    Cloudflare) and add **one proxied (orange-cloud) wildcard DNS record**: `A * →`
    a placeholder IP like `192.0.2.1` (the Worker responds directly, never forwards).
    Explicit records for your existing subdomains always win over the wildcard
@@ -132,14 +132,14 @@ Cloudflare Pages can't attach a *wildcard* custom domain, so a small **Worker**
    npm run build:worker    # builds the studio + assembles worker/public/
    npm run deploy:worker   # wrangler deploy (from worker/)
    ```
-   `worker/wrangler.toml` ships with the route `*-vv.jamesisme.com/*` bound — change
+   `worker/wrangler.toml` ships with the route `*-vv.vivari.run/*` bound — change
    `zone_name`/`pattern` to your own zone. (The wildcard must lead: Cloudflare rejects
-   an infix pattern like `vv-*.jamesisme.com/*`.) Binding a route on deploy needs an
+   an infix pattern like `vv-*.vivari.run/*`.) Binding a route on deploy needs an
    API token with **Workers Routes: Edit** on the zone; otherwise comment the
    `[[routes]]` block out and add the route under **Workers → your Worker → Domains &
    Routes**. The Worker only acts on hosts matching `*-vv` and passes every other host
    through untouched.
-3. On the **main** (IDE) project set `VITE_PREVIEW_WILDCARD_DOMAIN=jamesisme.com`
+3. On the **main** (IDE) project set `VITE_PREVIEW_WILDCARD_DOMAIN=vivari.run`
    and redeploy. Because the preview hosts are subdomains of the IDE's base domain
    they are **same-site**, so "Open in new tab" connects **gate-free**.
 4. **Enable Universal SSL** (see the next paragraph) — this is the step people miss.

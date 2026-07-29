@@ -126,7 +126,7 @@ function cardSvg({ title, eyebrow }) {
   <text x="96" y="212" font-family="${MONO}" font-size="24" fill="#22d3ee">${escapeXml(eyebrow)}</text>
   <text font-family="${SANS}" font-size="${TITLE_SIZE}" font-weight="bold" fill="#eef1f8">${tspans}</text>
   <rect x="96" y="530" width="60" height="4" rx="2" fill="url(#mark)"/>
-  <text x="96" y="580" font-family="${SANS}" font-size="26" fill="#9aa3b8">An open-source WebContainer · vivari.jamesisme.com</text>
+  <text x="96" y="580" font-family="${SANS}" font-size="26" fill="#9aa3b8">An open-source WebContainer · vivari.run</text>
 </svg>`;
 }
 

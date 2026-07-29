@@ -13,7 +13,7 @@
 # the studio's Vite build imports @vivari/core (which pulls them in) to emit sw.js.
 #
 # Point the IDE build at this Worker's domain with:
-#   VITE_PREVIEW_WILDCARD_DOMAIN=jamesisme.com   (on the MAIN project)
+#   VITE_PREVIEW_WILDCARD_DOMAIN=vivari.run   (on the MAIN project)
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"

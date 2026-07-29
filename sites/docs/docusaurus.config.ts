@@ -8,7 +8,7 @@ const GITHUB_URL = "https://github.com/maitrungduc1410/vivari";
 // baseUrl onto any path-like link (`to`, `href`, `pathname://`) and route-checks
 // it, so linking to them requires an absolute URL, which Docusaurus treats as
 // external (no baseUrl, no broken-link check).
-const SITE_URL = "https://vivari.jamesisme.com";
+const SITE_URL = "https://vivari.run";
 
 const config: Config = {
   title: "Vivari",
