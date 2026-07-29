@@ -530,7 +530,7 @@ port instead of `findKernelClient()`. Selected at build time by `VITE_PREVIEW_OR
 its ws/SSE/CDP shims already reach the IDE via `parent.postMessage`.
 
 **Wildcard per-port preview origins (mode C).** Instead of one shared preview origin, a deploy can
-serve **each port from its own origin** — `<token>--<port>-vv.<domain>` (random per-boot `<token>`),
+serve **each port from its own origin** — `<token>--<port>.<domain>` (random per-boot `<token>`),
 selected by `VITE_PREVIEW_WILDCARD_DOMAIN` (takes precedence over `VITE_PREVIEW_ORIGIN`). This
 isolates previews from the IDE *and* from each other, and restores real `localhost:<port>`
 web-platform semantics (own cookies/storage/CORS). The SW reads the port from
@@ -539,10 +539,13 @@ path, so keep-prefix templates get their base auto-rewritten to `/` at creation.
 lazily stands up **one bridge iframe + `MessagePort` per port** (`ensurePreviewBridge`, keyed by
 origin) as servers `listen`, and `broadcastToPreviewSWs` fans ws/SSE out across all of them. Because
 Cloudflare Pages can't attach a *wildcard* custom domain, a small Cloudflare **Worker** (`worker/`,
-route `*-vv.<domain>/*`) serves the static SW runtime and stamps the isolation headers; it needs one
-**proxied** wildcard DNS record `*.<domain>`. The `-vv` tag is a **suffix** because Cloudflare routes
-only allow the `*` wildcard at the START of the hostname (an infix `vv-*` is rejected); the suffix
-also keeps the route narrow so other apps on the base domain are untouched. See `roadmap.md`
+route `*.<domain>/*`) serves the static SW runtime and stamps the isolation headers; it needs one
+**proxied** wildcard DNS record `*.<domain>`. The route is broader than the host set we serve, so the
+Worker gates on `PREVIEW_HOST` and passes any non-`<token>--<port>` host straight through — other
+subdomains on the base domain are untouched. A deploy sharing the domain with other apps can instead
+set `previewWildcardTag` (e.g. `"vv"`) to get `<token>--<port>-vv.<domain>` and narrow the route to
+`*-vv.<domain>/*`; the tag must be a **suffix** because Cloudflare routes only allow the `*` wildcard
+at the START of the hostname (an infix `vv-*` is rejected). See `roadmap.md`
 ("preview origin isolation") + `sites/docs/docs/deployment.md`.
 
 ### 8.4 WebSocket tunnel (Vite HMR)

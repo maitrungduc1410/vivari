@@ -34,32 +34,36 @@ export interface BootOptions {
   previewOrigin?: string;
   /**
    * Serve **each in-VM port from its own origin** (mode C, wildcard) — e.g.
-   * `<token>--5173-vv.vivari.run` and `<token>--3000-vv.vivari.run`. Set
+   * `<token>--5173.vivari.run` and `<token>--3000.vivari.run`. Set
    * this to the **base domain** you control (e.g. `"vivari.run"`); Vivari
-   * composes `<token>--<port>-<tag>.<domain>` per port with a random per-boot
+   * composes `<token>--<port>.<domain>` per port with a random per-boot
    * `<token>`. This isolates IDE↔preview **and** preview↔preview and matches real
    * `localhost:<port>` web-platform semantics. Because those hosts are subdomains
    * of the same base domain as the IDE, the isolated pop-out is **gate-free**
    * (same-site) — use a *different* base domain for max cross-site isolation.
    *
-   * The `<tag>` is a **suffix** (not a prefix) because Cloudflare Workers routes
-   * only allow the `*` wildcard at the **start** of the hostname (no infix `vv-*`).
-   * So the route is `*-<tag>.<domain>/*`, which stays narrow (only our per-port
-   * hosts) instead of the too-broad `*.<domain>/*` that would swallow other apps.
+   * On a base domain **dedicated** to Vivari the route is simply `*.<domain>/*`.
+   * If the domain also serves other apps, set {@link previewWildcardTag} so the
+   * route can stay narrow.
    *
    * Requires wildcard infra: a proxied `*` DNS record and a Cloudflare Worker on
-   * `*-<tag>.<domain>/*` serving `sw.js` + `__vv-bridge.html` +
+   * `*.<domain>/*` serving `sw.js` + `__vv-bridge.html` +
    * `__vv-preview-boot.html` (+ `vv-devtools/chobitsu.js`) with `COEP:
    * credentialless`, `CORP: cross-origin`, `Service-Worker-Allowed: /`. Takes
    * precedence over {@link previewOrigin} when both are set. Leave unset for mode A/B.
    */
   previewWildcardDomain?: string;
   /**
-   * Hostname **suffix** tag for wildcard preview origins (mode C). Default `"vv"`,
-   * yielding hosts `<token>--<port>-vv.<domain>` and route `*-vv.<domain>/*`. Lets
-   * the Worker cheaply tell Vivari preview hosts apart from other apps on the same
-   * base domain, and lets `sw.js` detect it's running on a per-port origin. If you
-   * change it, keep `sw.js` and `worker/` (regex + route) in sync.
+   * Optional hostname **suffix** tag for wildcard preview origins (mode C).
+   * Unset by default: hosts are `<token>--<port>.<domain>` and the Cloudflare
+   * route is `*.<domain>/*`, which is what you want on a base domain dedicated to
+   * Vivari. Set it (e.g. `"vv"`) when the domain **also serves other apps**: hosts
+   * become `<token>--<port>-vv.<domain>` and the route `*-vv.<domain>/*` matches
+   * only Vivari preview hosts. It must be a SUFFIX, not a prefix, because
+   * Cloudflare routes only allow the `*` wildcard at the **start** of the hostname.
+   *
+   * `sw.js` and `worker/src/index.js` accept any tag without changes, but the
+   * Cloudflare **route** must match whatever you pick.
    */
   previewWildcardTag?: string;
   /**

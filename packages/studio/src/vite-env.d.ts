@@ -18,7 +18,7 @@ interface ImportMetaEnv {
   /**
    * Mode C (wildcard per-port preview origins). Set to a **base domain** you
    * control (e.g. `"vivari.run"`); each in-VM port is served from its own
-   * origin `<token>--<port>-vv.<domain>` for full IDE↔preview and preview↔preview
+   * origin `<token>--<port>.<domain>` for full IDE↔preview and preview↔preview
    * isolation with real `localhost:<port>` semantics. Takes precedence over
    * VITE_PREVIEW_ORIGIN. Requires the wildcard Worker + DNS (see docs/deployment).
    * Unset in the default deploy + local dev.

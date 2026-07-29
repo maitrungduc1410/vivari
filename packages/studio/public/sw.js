@@ -12,14 +12,15 @@
 const PREVIEW_MARKER = "/preview/";
 
 // Mode C (wildcard per-port origin): when this SW is served on a preview host
-// like `<token>--<port>-vv.<domain>` the target port is encoded in the HOSTNAME
-// (one origin per port), not in a `/preview/<port>/` PATH. The `-vv` is a SUFFIX
-// (not a prefix) because Cloudflare routes only allow the `*` wildcard at the
-// START of the hostname — so the route is `*-vv.<domain>/*`. Detect the port once
-// at SW startup; when set, every request on this origin proxies to WILDCARD_PORT
-// and the path-based routing below is bypassed. On the IDE origin (modes A/B) the
-// hostname doesn't match, so WILDCARD_MODE is false and nothing changes.
-const WILDCARD_HOST = self.location.hostname.match(/^[a-z0-9]+--(\d+)-vv\./i);
+// like `<token>--<port>.<domain>` the target port is encoded in the HOSTNAME (one
+// origin per port), not in a `/preview/<port>/` PATH. An optional `-<tag>` may
+// follow the port (see BootOptions.previewWildcardTag) for deploys that share the
+// base domain with other apps; it is a SUFFIX because Cloudflare routes only allow
+// the `*` wildcard at the START of the hostname. Detect the port once at SW
+// startup; when set, every request on this origin proxies to WILDCARD_PORT and the
+// path-based routing below is bypassed. On the IDE origin (modes A/B) the hostname
+// doesn't match, so WILDCARD_MODE is false and nothing changes.
+const WILDCARD_HOST = self.location.hostname.match(/^[a-z0-9]+--(\d+)(?:-[a-z0-9]+)?\./i);
 const WILDCARD_PORT = WILDCARD_HOST ? parseInt(WILDCARD_HOST[1], 10) : 0;
 const WILDCARD_MODE = WILDCARD_PORT > 0;
 

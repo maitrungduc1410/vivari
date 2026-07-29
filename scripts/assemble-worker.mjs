@@ -1,7 +1,7 @@
 // Assemble the Cloudflare Worker's static assets (mode C — wildcard per-port
 // preview origins).
 //
-//   worker/public/            <- served by worker/src/index.js on *-vv.<domain>
+//   worker/public/            <- served by worker/src/index.js on *.<domain>
 //     sw.js                   <- the preview Service Worker (host-based routing)
 //     __vv-bridge.html        <- hidden bridge doc the IDE iframes to hand the SW a port
 //     __vv-preview-boot.html  <- first-party boot page for a standalone preview tab

@@ -22,14 +22,21 @@ binding = "ASSETS"
 run_worker_first = true
 
 # Wildcard route for the per-port preview hosts. Requires a PROXIED wildcard DNS
-# record `*.<domain>` on the zone. The `*` matches the `<token>--<port>` part and
-# the literal `-vv` suffix keeps the route narrow (only Vivari preview hosts, never
-# other apps). NOTE: Cloudflare routes only allow the wildcard at the START of the
-# hostname, so the tag MUST be a suffix (`*-vv...`), not a prefix (`vv-*...` is
-# rejected as an infix wildcard). Change `vivari.run` to your own zone (keep it
-# in sync with the IDE build's VITE_PREVIEW_WILDCARD_DOMAIN). Binding this route on
-# deploy needs an API token with "Workers Routes: Edit" on the zone; otherwise
-# comment this out and add the route in the dashboard (Workers → Domains & Routes).
+# record `*.<domain>` on the zone. vivari.run is dedicated to Vivari, so preview
+# hosts carry no marker label and the route is the plain `*.<domain>/*`. That is
+# broader than the host set we serve, which is why src/index.js gates on
+# PREVIEW_HOST and passes anything that is not a `<token>--<port>` host straight
+# through — adding e.g. a docs subdomain later stays safe.
+#
+# On a domain that ALSO serves other apps, set BootOptions.previewWildcardTag
+# (e.g. "vv") and narrow this to `*-vv.<domain>/*`. The tag must be a SUFFIX:
+# Cloudflare only allows the wildcard at the START of the hostname, so a prefix
+# `vv-*.<domain>/*` is rejected as an infix wildcard.
+#
+# Change `vivari.run` to your own zone (keep it in sync with the IDE build's
+# VITE_PREVIEW_WILDCARD_DOMAIN). Binding this route on deploy needs an API token
+# with "Workers Routes: Edit" on the zone; otherwise comment this out and add the
+# route in the dashboard (Workers → Domains & Routes).
 [[routes]]
-pattern = "*-vv.vivari.run/*"
+pattern = "*.vivari.run/*"
 zone_name = "vivari.run"

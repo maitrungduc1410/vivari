@@ -1,15 +1,16 @@
 // Cloudflare Worker — mode C (wildcard per-port preview origins).
 //
 // In mode C every in-VM port is served from its OWN origin,
-// `<token>--<port>-vv.<domain>` (e.g. k3f9a2xh--5173-vv.vivari.run). That
-// gives each preview real `localhost:<port>` web-platform semantics (its own
+// `<token>--<port>.<domain>` (e.g. k3f9a2xh--5173.vivari.run). That gives each
+// preview real `localhost:<port>` web-platform semantics (its own
 // cookies/storage/CORS) and isolates previews from the IDE *and* from each other.
-// The `-vv` tag is a SUFFIX (not a prefix) because Cloudflare routes only allow
-// the `*` wildcard at the START of the hostname — so the route `*-vv.<domain>/*`
-// is valid AND narrow (it matches only our per-port hosts, never other apps).
+// An optional `-<tag>` may follow the port (BootOptions.previewWildcardTag) for
+// deploys sharing the base domain with other apps, letting the route narrow to
+// `*-<tag>.<domain>/*`; it is a SUFFIX because Cloudflare routes only allow the
+// `*` wildcard at the START of the hostname.
 //
 // Cloudflare Pages can't attach a *wildcard* custom domain, so a Worker (bound to
-// a `*-vv.<domain>/*` route) plays the role the second Pages project plays in mode
+// a `*.<domain>/*` route) plays the role the second Pages project plays in mode
 // B: pure static hosting for the preview Service Worker runtime. It runs NO kernel
 // and NO studio UI. The SW it serves relays every preview request over a
 // MessagePort to the kernel living in the IDE tab (see packages/studio/public/
@@ -27,9 +28,10 @@
 //   4. Stamp cross-origin isolation headers on every response so the IDE
 //      (COEP:require-corp) can embed the bridge iframe and the SW can claim `/`.
 
-// A Vivari preview host: `<token>--<port>-vv.<rest>`. Keep this in sync with the
-// tag in packages/core (default "vv" suffix) and the regex in sw.js.
-const PREVIEW_HOST = /^[a-z0-9]+--\d+-vv\./i;
+// A Vivari preview host: `<token>--<port>[-<tag>].<rest>`. The tag is optional
+// (see BootOptions.previewWildcardTag) so this matches both the default tagless
+// hosts and tagged ones. Keep in sync with the regex in sw.js.
+const PREVIEW_HOST = /^[a-z0-9]+--\d+(?:-[a-z0-9]+)?\./i;
 
 // Cloudflare "clean URLs" serve `/x.html` as `/x`; map both forms to the file.
 const ALIASES = {

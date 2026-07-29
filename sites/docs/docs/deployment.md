@@ -85,7 +85,7 @@ the **studio (main) project** (the preview origin needs no env of its own).
 
 | | A. same-origin | B. shared origin | C. wildcard per-port |
 | --- | --- | --- | --- |
-| Preview URL | `…/preview/5173/` | `preview-origin/preview/5173/` | `<token>--5173-vv.<domain>/` |
+| Preview URL | `…/preview/5173/` | `preview-origin/preview/5173/` | `<token>--5173.<domain>/` |
 | Isolates IDE ↔ preview | ❌ | ✅ | ✅ |
 | Isolates preview ↔ preview | ❌ | ❌ | ✅ (own origin per port) |
 | Extra infra | none | +1 Pages project | wildcard DNS + a Worker |
@@ -112,14 +112,19 @@ both are set.
 
 ### Mode C — wildcard per-port preview origins
 
-Each in-VM port gets its own origin `<token>--<port>-vv.<domain>` (random per-boot
+Each in-VM port gets its own origin `<token>--<port>.<domain>` (random per-boot
 `<token>`), which gives every preview real `localhost:<port>` semantics and isolates
-previews from each other. The `-vv` is a **suffix** tag (not a prefix) because
-Cloudflare routes only allow the `*` wildcard at the **start** of the hostname — so
-the valid, narrow route is `*-vv.<domain>/*` (a prefix `vv-*.<domain>/*` is rejected
-as an infix wildcard, and `*.<domain>/*` would swallow your other subdomains).
-Cloudflare Pages can't attach a *wildcard* custom domain, so a small **Worker**
-(`worker/`) serves the SW runtime for every matching subdomain.
+previews from each other. On a base domain **dedicated** to Vivari the route is the
+plain `*.<domain>/*`. Cloudflare Pages can't attach a *wildcard* custom domain, so a
+small **Worker** (`worker/`) serves the SW runtime for every matching subdomain; it
+gates on the hostname and passes anything that isn't a `<token>--<port>` host
+straight through, so other subdomains you add later keep working.
+
+If the domain **also serves other apps** and you'd rather not point a broad route at
+it, set `previewWildcardTag` (e.g. `"vv"`) in `BootOptions`: hosts become
+`<token>--<port>-vv.<domain>` and the route narrows to `*-vv.<domain>/*`. The tag has
+to be a **suffix** — Cloudflare routes only allow the `*` wildcard at the **start**
+of the hostname, so a prefix `vv-*.<domain>/*` is rejected as an infix wildcard.
 
 1. Point a base domain (e.g. `vivari.run`) at Cloudflare (nameservers on
    Cloudflare) and add **one proxied (orange-cloud) wildcard DNS record**: `A * →`
@@ -132,13 +137,12 @@ Cloudflare Pages can't attach a *wildcard* custom domain, so a small **Worker**
    npm run build:worker    # builds the studio + assembles worker/public/
    npm run deploy:worker   # wrangler deploy (from worker/)
    ```
-   `worker/wrangler.toml` ships with the route `*-vv.vivari.run/*` bound — change
-   `zone_name`/`pattern` to your own zone. (The wildcard must lead: Cloudflare rejects
-   an infix pattern like `vv-*.vivari.run/*`.) Binding a route on deploy needs an
+   `worker/wrangler.toml` ships with the route `*.vivari.run/*` bound — change
+   `zone_name`/`pattern` to your own zone. Binding a route on deploy needs an
    API token with **Workers Routes: Edit** on the zone; otherwise comment the
    `[[routes]]` block out and add the route under **Workers → your Worker → Domains &
-   Routes**. The Worker only acts on hosts matching `*-vv` and passes every other host
-   through untouched.
+   Routes**. The Worker only acts on `<token>--<port>` hosts and passes every other
+   host through untouched, so the broad route doesn't disturb other subdomains.
 3. On the **main** (IDE) project set `VITE_PREVIEW_WILDCARD_DOMAIN=vivari.run`
    and redeploy. Because the preview hosts are subdomains of the IDE's base domain
    they are **same-site**, so "Open in new tab" connects **gate-free**.
@@ -159,7 +163,7 @@ isn't set to *Off*.
 :::
 
 Free Cloudflare Universal SSL covers the apex + a **single-level** wildcard
-(`*.<domain>`), which is exactly what `<token>--<port>-vv.<domain>` needs — no paid
+(`*.<domain>`), which is exactly what `<token>--<port>.<domain>` needs — no paid
 certificate. A nested scheme like `*.preview.<domain>` would be two levels and
 require Advanced Certificate Manager.
 

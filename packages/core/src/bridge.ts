@@ -45,11 +45,12 @@ export class KernelBridge {
   // Mode B (separate preview origin): the origin that hosts the preview SW +
   // bridge doc. Undefined in modes A/C.
   private readonly previewOrigin?: string;
-  // Mode C (wildcard): the base domain + a random per-boot token + a hostname
-  // suffix tag; every port gets `<token>--<port>-<tag>.<domain>`. The tag is a
-  // SUFFIX (not a prefix) because Cloudflare routes only allow the `*` wildcard at
-  // the START of the hostname — so the route `*-<tag>.<domain>/*` is valid and
-  // stays narrow (matches only our per-port hosts, not other apps on the domain).
+  // Mode C (wildcard): the base domain + a random per-boot token, plus an OPTIONAL
+  // hostname tag; every port gets `<token>--<port>[-<tag>].<domain>`. No tag by
+  // default — on a base domain dedicated to Vivari the route is simply
+  // `*.<domain>/*`. Set a tag when the domain also serves other apps: the route
+  // `*-<tag>.<domain>/*` then matches only our per-port hosts. The tag is a SUFFIX
+  // because Cloudflare routes only allow the `*` wildcard at the START of the host.
   private readonly wildcardDomain?: string;
   private readonly wildcardTag: string;
   private readonly previewToken: string;
@@ -82,7 +83,7 @@ export class KernelBridge {
     // stays on the simpler same-origin path.
     const here = typeof location !== "undefined" ? location.origin : "";
     const wildcardDomain = normalizeDomain(options.previewWildcardDomain);
-    this.wildcardTag = options.previewWildcardTag || "vv";
+    this.wildcardTag = (options.previewWildcardTag ?? "").replace(/^-+|-+$/g, "");
     this.previewToken = randomToken();
     if (wildcardDomain) {
       // Mode C takes precedence: previews are per-port origins under the wildcard.
@@ -195,16 +196,21 @@ export class KernelBridge {
 
   /**
    * Build the preview URL for an in-VM port. Mode A: relative `/preview/<port>/`.
-   * Mode B: `<origin>/preview/<port>/`. Mode C: `<scheme>//<token>--<port>-<tag>.<domain>/`.
+   * Mode B: `<origin>/preview/<port>/`. Mode C: `<scheme>//<token>--<port>[-<tag>].<domain>/`.
    * `pathAndQuery` is the in-server path (default `/`).
    */
   previewUrlFor(port: number, pathAndQuery = "/"): string {
     const p = pathAndQuery.startsWith("/") ? pathAndQuery : "/" + pathAndQuery;
     if (this.previewMode === "wildcard") {
       const scheme = typeof location !== "undefined" ? location.protocol : "https:";
-      return `${scheme}//${this.previewToken}--${port}-${this.wildcardTag}.${this.wildcardDomain}${p}`;
+      return `${scheme}//${this.previewToken}--${port}${this.wildcardSuffix}${p}`;
     }
     return `${this.previewOrigin ?? ""}/preview/${port}${p}`;
+  }
+
+  /** Everything after the `<token>--<port>` label: `[-<tag>].<domain>` (mode C). */
+  private get wildcardSuffix(): string {
+    return `${this.wildcardTag ? `-${this.wildcardTag}` : ""}.${this.wildcardDomain}`;
   }
 
   /** The origin that serves a given port's preview (undefined in mode A). */
@@ -221,8 +227,9 @@ export class KernelBridge {
 
   /**
    * Whether `origin` is one of our preview origins — the single `previewOrigin`
-   * in mode B, or a `<token>--<port>-<tag>.<domain>` host in mode C. Used to
-   * gate cross-origin postMessage from preview frames.
+   * in mode B, or a `<token>--<port>[-<tag>].<domain>` host in mode C. Used to
+   * gate cross-origin postMessage from preview frames. The per-boot random
+   * `<token>` is what makes this tight; the tag is only a routing marker.
    */
   isTrustedPreviewOrigin(origin: string): boolean {
     if (!origin) return false;
@@ -230,10 +237,7 @@ export class KernelBridge {
     if (this.previewMode === "wildcard") {
       try {
         const host = new URL(origin).hostname;
-        return (
-          host.startsWith(`${this.previewToken}--`) &&
-          host.endsWith(`-${this.wildcardTag}.${this.wildcardDomain}`)
-        );
+        return host.startsWith(`${this.previewToken}--`) && host.endsWith(this.wildcardSuffix);
       } catch {
         return false;
       }
