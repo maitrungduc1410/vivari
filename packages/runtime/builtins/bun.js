@@ -7,7 +7,13 @@
 // slice of Bun's documented API surface. This is the same "API-compatible drop-in"
 // philosophy the toolchain aliases use, applied to a runtime instead of a package.
 //
-// COVERED (see below): Bun.file/write, Bun.serve (bridged onto Node http so it
+// COVERED (see below): Bun.file/write — a BunFile with the Blob read protocol
+// (.text/.json/.bytes/.arrayBuffer/.stream/.slice/.size/.type), a LAZY .slice()
+// that is a window rather than a copy, .delete()/.unlink(), and an incrementally
+// flushing FileSink from .writer(), plus Bun.stdout/Bun.stderr as write targets
+// (see bun-file.js),
+// Bun.Cookie/Bun.CookieMap and the `req.cookies` hook on Bun.serve routes (see
+// bun-cookie.js), Bun.serve (bridged onto Node http so it
 // previews — with `routes`, `fetch`, an `error` handler, and server-side
 // `websocket` + pub/sub), Bun.env/argv/main/version, Bun.spawn/spawnSync/which,
 // Bun.$ (shell), Bun.sleep/Bun.sleepSync (a real Atomics.wait park, see
@@ -43,8 +49,13 @@
 // NOT SUPPORTED (documented, fails loudly rather than silently wrong): bun:ffi /
 // Bun.dlopen (native FFI), native addons, Bun macros, and Bun.build plugins —
 // these require capabilities the browser sandbox does not have. Loud for the
-// narrower reason that the shim has not implemented them: Bun.file(fd) (our fd
-// numbers are VFS handles, not OS fds), Bun.Transpiler.scan/scanImports (the
+// narrower reason that the shim has not implemented them: Bun.file(fd) and
+// Bun.write(fd, …) (our fd numbers are VFS handles, not OS fds — and anything
+// else that is not a string or a file: URL throws too, rather than being
+// String()-ed into a path like "undefined"), reading
+// Bun.stdout/Bun.stderr (write-only sinks here — the process's output is
+// delivered to the kernel by message, not backed by a readable file),
+// Bun.Transpiler.scan/scanImports (the
 // transform builds no import/export graph), Bun.hash.xxHash3/rapidhash (not
 // ported, and we have no reference vector to verify a port against), and the bun:jsc
 // heap-introspection helpers (no engine hook exists in a page). bun:sqlite is
@@ -63,6 +74,19 @@
 //
 // COVERED BUT SLOWER, not wrong: Bun.allocUnsafe returns zero-filled memory,
 // because `new Uint8Array(n)` is specified to be — see bun-bytes.js.
+//
+// COVERED WITH A DOCUMENTED DIVERGENCE: Bun.stdin is a Node Readable, not a
+// BunFile (see the Bun literal below); Bun.file(…).type omits the
+// `;charset=utf-8` suffix real Bun appends to textual types (bun-file.js); a
+// BunFile is not a platform Blob INSTANCE (Bun's extends Blob), so
+// `new Response(Bun.file(p))` stringifies instead of streaming — use
+// `new Response(Bun.file(p).stream())`, and see bun-file.js for why neither
+// duck-typing nor `extends Blob` is portable between Node and the browser Worker;
+// `sameSite: "none"` is serialised without an implicit `Secure`, exactly as Bun
+// does, so the browser is what rejects it (bun-cookie.js); and `req.cookies`
+// exists only on the BunRequest a `routes` handler receives, which is where Bun
+// documents it — a `fetch` handler builds its own
+// `new Bun.CookieMap(req.headers.get("cookie"))`.
 
 import { transpileTypeScript } from "../typescript-transform.js";
 // The data-format, text/terminal, bytes/streams, hash and glob members live in
@@ -78,6 +102,8 @@ import { createBunGlob } from "./bun-glob.js";
 import { createBunFileSystemRouter } from "./bun-fsrouter.js";
 import { createSleepSync } from "./bun-sleep.js";
 import { loadBunEnvFiles } from "./bun-env.js";
+import { Cookie, CookieMap, attachRequestCookies, pendingSetCookies } from "./bun-cookie.js";
+import { createBunFile } from "./bun-file.js";
 
 // The two documented Bun.hash members we did not port. The message names the
 // algorithm and says why, in the same spirit as the bun:ffi one: a caller who hits
@@ -123,86 +149,19 @@ export function createBunRuntime({ process, Buffer, require }) {
   const FileSystemRouter = createBunFileSystemRouter({ lazy, process });
 
   // ---- BunFile ---------------------------------------------------------------
-  // `Bun.file(path)` is a lazy handle; reads/writes hit the VFS through `fs`.
+  // `Bun.file()`, `Bun.write()`, the incremental `FileSink` from `.writer()` and
+  // the `Bun.stdout`/`Bun.stderr` write targets all live in ./bun-file.js — bulk
+  // implementation in a sibling, the same shape as the format/text/bytes/hash
+  // groups above. Read its header for the three contracts that file exists to
+  // keep: `.slice()` stays a lazy view, the FileSink flushes as it goes rather
+  // than buffering the whole file until `end()`, and every write is chunked to
+  // the 1 MiB syscall window.
   //
-  // `Bun.file(fd)` is deliberately NOT supported. Bun's overload wraps a real OS
-  // file descriptor, and there are none here: our fd numbers are indices into the
-  // runtime's own VFS descriptor table, and a BunFile is defined by a path it can
-  // re-open. Coercing the number to a string (what this used to do) turned
-  // `Bun.file(3)` into the relative path "3" — a silent wrong answer that only
-  // surfaces as a confusing ENOENT much later. Throw instead.
-  class BunFile {
-    constructor(pathOrFd, options) {
-      if (typeof pathOrFd === "number") {
-        throw new TypeError(
-          "Bun.file(fd) is not supported in Vivari: file descriptors here are VFS " +
-            "handles owned by the runtime, not OS file descriptors, so there is no " +
-            "file to open. Use Bun.file(path) instead."
-        );
-      }
-      this._path = typeof pathOrFd === "string" ? pathOrFd : String(pathOrFd);
-      this._type = (options && options.type) || guessMime(this._path);
-    }
-    get name() { return this._path; }
-    get size() {
-      const fs = lazy("fs");
-      try { return fs.statSync(this._path).size; } catch { return 0; }
-    }
-    get type() { return this._type; }
-    async exists() {
-      const fs = lazy("fs");
-      try { fs.statSync(this._path); return true; } catch { return false; }
-    }
-    async text() {
-      const fs = lazy("fs");
-      return fs.readFileSync(this._path, "utf8");
-    }
-    async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() {
-      const fs = lazy("fs");
-      const b = fs.readFileSync(this._path);
-      return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
-    }
-    async bytes() {
-      const fs = lazy("fs");
-      return new Uint8Array(fs.readFileSync(this._path));
-    }
-    stream() {
-      const fs = lazy("fs");
-      const nodeStream = fs.createReadStream(this._path);
-      // Prefer the Web stream Bun returns; fall back to the Node stream.
-      const Readable = lazy("stream").Readable;
-      return Readable.toWeb ? Readable.toWeb(nodeStream) : nodeStream;
-    }
-    writer() {
-      const fs = lazy("fs");
-      const chunks = [];
-      const self = this;
-      return {
-        write(chunk) { chunks.push(toBuf(chunk, Buffer)); return chunk.length; },
-        flush() {},
-        end() { fs.writeFileSync(self._path, Buffer.concat(chunks)); },
-      };
-    }
-  }
-
-  function bunFile(pathOrFd, options) { return new BunFile(pathOrFd, options); }
-
-  async function bunWrite(dest, input) {
-    const fs = lazy("fs");
-    const destPath = dest instanceof BunFile ? dest._path : String(dest);
-    let bytes;
-    if (input instanceof BunFile) bytes = fs.readFileSync(input._path);
-    else if (typeof input === "string") bytes = Buffer.from(input, "utf8");
-    else if (input instanceof ArrayBuffer) bytes = Buffer.from(new Uint8Array(input));
-    else if (ArrayBuffer.isView(input)) bytes = Buffer.from(input.buffer, input.byteOffset, input.byteLength);
-    else if (input && typeof input.arrayBuffer === "function") bytes = Buffer.from(new Uint8Array(await input.arrayBuffer()));
-    else bytes = Buffer.from(String(input), "utf8");
-    const slash = destPath.lastIndexOf("/");
-    if (slash > 0) { try { fs.mkdirSync(destPath.slice(0, slash), { recursive: true }); } catch {} }
-    fs.writeFileSync(destPath, bytes);
-    return bytes.length;
-  }
+  // `Bun.file(fd)` still throws (Phase 0): our fd numbers are VFS handles owned
+  // by the runtime, not OS file descriptors, so there is no file to wrap.
+  const files = createBunFile({ lazy, Buffer, process });
+  const bunFile = files.bunFile;
+  const bunWrite = files.bunWrite;
 
   // ---- Bun.serve -------------------------------------------------------------
   // Bun.serve is Bun's HTTP entry point. We back it with Node's real http.Server so
@@ -246,9 +205,32 @@ export function createBunRuntime({ process, Buffer, require }) {
 
     function cloneResponse(r) { try { return r.clone(); } catch { return r; } }
 
-    async function writeResponse(res, response) {
+    async function writeResponse(res, response, request) {
       res.statusCode = response.status || 200;
-      try { response.headers.forEach((v, k) => res.setHeader(k, v)); } catch {}
+      // Set-Cookie is the one header that is legitimately repeated, and
+      // Headers.forEach FLATTENS repeats into a single comma-joined value — which
+      // silently corrupts cookies, because an `Expires=Thu, 01 Jan 1970 …` value
+      // contains a comma of its own and cannot be split back apart. Pull the
+      // set-cookie list out with getSetCookie() (the API that exists for exactly
+      // this) and hand Node the array, which emits one header line each.
+      const setCookies = [];
+      try {
+        if (typeof response.headers.getSetCookie === "function") {
+          setCookies.push(...response.headers.getSetCookie());
+          response.headers.forEach((v, k) => {
+            if (String(k).toLowerCase() !== "set-cookie") res.setHeader(k, v);
+          });
+        } else {
+          response.headers.forEach((v, k) => res.setHeader(k, v));
+        }
+      } catch {}
+      // Cookies the handler changed on `req.cookies` become Set-Cookie headers on
+      // the way out, appended to (never replacing) whatever the Response carried.
+      // Applying them here rather than on the Response object is deliberate: a
+      // Response.redirect() has immutable headers, and Bun still sets cookies on
+      // a redirect.
+      try { setCookies.push(...pendingSetCookies(request)); } catch {}
+      if (setCookies.length) res.setHeader("Set-Cookie", setCookies);
       const ab = await response.arrayBuffer();
       res.end(Buffer.from(new Uint8Array(ab)));
     }
@@ -262,6 +244,14 @@ export function createBunRuntime({ process, Buffer, require }) {
           if (m) {
             if (m.response !== undefined) return cloneResponse(m.response);
             request.params = m.params;
+            // `cookies` belongs to BunRequest — the object a `routes` handler
+            // gets — and NOT to the plain Request a `fetch` handler gets. That
+            // split is Bun's, and reproducing it matters more than convenience:
+            // attaching `req.cookies` inside `fetch` would make code that works
+            // here fail under real Bun. In a `fetch` handler the documented route
+            // is `new Bun.CookieMap(req.headers.get("cookie"))` plus
+            // `toSetCookieHeaders()`, the same as for any non-Bun server.
+            attachRequestCookies(request, request.headers.get("cookie"));
             return m.handler(request, inst);
           }
         }
@@ -292,11 +282,11 @@ export function createBunRuntime({ process, Buffer, require }) {
         dispatch(request, method)
           .then(async (response) => {
             if (!response) { res.statusCode = 404; res.end("Not Found"); return; }
-            await writeResponse(res, response);
+            await writeResponse(res, response, request);
           })
           .catch((err) =>
             resolveServeError(errorHandler, err)
-              .then((response) => (res.headersSent ? res.end() : writeResponse(res, response)))
+              .then((response) => (res.headersSent ? res.end() : writeResponse(res, response, request)))
               .catch(() => { try { res.statusCode = 500; res.end("Bun.serve handler error"); } catch {} })
           );
       });
@@ -747,6 +737,10 @@ export function createBunRuntime({ process, Buffer, require }) {
     deepMatch,
     Glob,
     FileSystemRouter,
+    // Cookies (./bun-cookie.js). Defaults are path "/" + SameSite=Lax, both
+    // always emitted; `Bun.serve` routes get `req.cookies`.
+    Cookie,
+    CookieMap,
     escapeHTML,
     // Data formats (see ./bun-formats.js). Real parsers, not approximations:
     // Bun.TOML.parse throws on an integer it cannot hold losslessly, Bun.YAML.parse
@@ -786,9 +780,16 @@ export function createBunRuntime({ process, Buffer, require }) {
     resolveSync: (id, root) => bunResolveSync(id, root),
     resolve: async (id, root) => bunResolveSync(id, root),
     randomUUIDv7: (encoding, timestamp) => randomUUIDv7(lazy("crypto"), Buffer, encoding, timestamp),
+    // Bun.stdin stays the Node stream this shim has always returned, which is a
+    // known divergence (Bun's is a BunFile) kept on purpose: guest code here
+    // reads stdin with .on("data")/async iteration off the SAB-backed stream, and
+    // a BunFile wrapper would take that away to add a .text() we cannot make
+    // block. Bun.stdout/Bun.stderr ARE BunFiles, because their whole job in Bun's
+    // API is being a Bun.write() destination (`Bun.write(Bun.stdout, file)`) — see
+    // ./bun-file.js. Their read half throws rather than answering "".
     get stdin() { return process.stdin; },
-    get stdout() { return process.stdout; },
-    get stderr() { return process.stderr; },
+    get stdout() { return files.stdout; },
+    get stderr() { return files.stderr; },
     // GC / memory introspection: no-ops (no manual GC exposed in the sandbox).
     gc: () => {},
     // A thin Transpiler shim over the same TS transform the loader uses.
@@ -1456,14 +1457,4 @@ function shellEscape(v) {
 }
 function safeUrl(s) {
   try { return new URL(s); } catch { return { href: s, toString: () => s }; }
-}
-function guessMime(p) {
-  const ext = (p.split(".").pop() || "").toLowerCase();
-  const map = {
-    html: "text/html", htm: "text/html", css: "text/css", js: "text/javascript",
-    mjs: "text/javascript", json: "application/json", txt: "text/plain",
-    svg: "image/svg+xml", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
-    gif: "image/gif", webp: "image/webp", wasm: "application/wasm",
-  };
-  return map[ext] || "application/octet-stream";
 }

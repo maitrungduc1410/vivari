@@ -1472,8 +1472,9 @@ console.log("== Bun.readableStreamTo* ==");
   const multipart = '--X\r\nContent-Disposition: form-data; name="q"\r\n\r\nhi\r\n--X--\r\n';
   ok((await B.readableStreamToFormData(streamOf([enc(multipart)]), "X")).get("q") === "hi", "a boundary argument switches to multipart/form-data");
 
-  // BunFile.stream() can fall back to a Node Readable when Readable.toWeb is
-  // unavailable, and a Node Readable is async-iterable but has no getReader().
+  // Guest code hands these a Node Readable (fs.createReadStream, Bun.spawn's
+  // stdout) as readily as a web stream, and a Node Readable is async-iterable but
+  // has no getReader().
   ok((await B.readableStreamToText((async function* () { yield enc("ab"); })())) === "ab", "the consumers also accept a plain async iterable");
   ok((await B.readableStreamToText(streamOf([]))) === "", "an empty stream reads as empty, not as a hang or a throw");
 
@@ -2310,6 +2311,400 @@ console.log("== Bun.Glob / Bun.FileSystemRouter are on the Bun global ==");
   ok(typeof B.FileSystemRouter === "function", "Bun.FileSystemRouter is wired into the Bun object");
   ok(typeof new B.Glob("*.ts").scan === "function" && typeof new B.Glob("*.ts").scanSync === "function", "Bun.Glob has both scan entry points");
   ok(new B.Glob("*.ts").match("index.ts") === true, "…and still matches");
+}
+
+console.log("== Bun.Cookie: the defaults, and the attributes that change a cookie's scope ==");
+{
+  const B = bunWith();
+  const C = B.Cookie;
+  const throwsWith = (fn) => { try { fn(); return ""; } catch (e) { return e.message; } };
+
+  // THE two defaults, and the reason this block leads with them: Bun writes
+  // `Path=/` and `SameSite=Lax` even though the caller asked for neither, and a
+  // shim that omits Path stores the cookie against the REQUEST DIRECTORY
+  // (`/admin/login`, not `/`). It then reads back on the page that set it and
+  // nowhere else — a scope bug, not a crash, and the hardest kind to see.
+  ok(new C("a", "b").toString() === "a=b; Path=/; SameSite=Lax", "new Cookie(name, value) serialises Bun's documented defaults: Path=/ and SameSite=Lax");
+  ok(new C("a", "b").path === "/", "the default path is \"/\" — not the request directory");
+  ok(new C("a", "b").sameSite === "lax", "the default sameSite is \"lax\"");
+  ok(new C("a", "b").domain === null, "an unset domain reads back as null, not undefined or \"\"");
+  ok(new C("a", "b").expires === undefined, "an unset expires reads back as undefined (a session cookie)");
+  ok(new C("a", "b").maxAge === undefined, "an unset maxAge reads back as undefined");
+  ok(new C("a", "b").secure === false && new C("a", "b").httpOnly === false && new C("a", "b").partitioned === false, "the three boolean attributes default to false");
+
+  // Attribute order is Bun's, byte for byte, because these strings land in HTTP
+  // fixtures and snapshot tests on both sides of the sandbox boundary.
+  ok(
+    new C("id", "42", { domain: "example.com", path: "/app", maxAge: 3600, secure: true, httpOnly: true, partitioned: true, sameSite: "strict" }).toString() ===
+      "id=42; Domain=example.com; Path=/app; Max-Age=3600; Secure; HttpOnly; Partitioned; SameSite=Strict",
+    "every attribute serialises, in Bun's order"
+  );
+  ok(new C("a", "b", { expires: new Date(0) }).toString().indexOf("Expires=Thu, 01 Jan 1970 00:00:00 GMT") !== -1, "expires serialises as an RFC 6265 IMF-fixdate");
+  ok(new C("a", "b", { expires: 1700000000 }).expires.getTime() === 1700000000 * 1000, "a NUMBER expires is SECONDS since the epoch, the same unit as Max-Age");
+  ok(new C("a", "b", { maxAge: "3600" }).maxAge === undefined, "a stringly-typed maxAge is ignored rather than coerced — Bun only honours a number, and so a session cookie is what both produce");
+  ok(new C({ name: "a", value: "b", path: "/x" }).toString() === "a=b; Path=/x; SameSite=Lax", "the single-CookieInit-object constructor form works");
+  ok(new C("a=b; Path=/x; Secure").toString() === "a=b; Path=/x; Secure; SameSite=Lax", "the single-STRING constructor form parses a Set-Cookie");
+  ok(C.from("a", "b", { httpOnly: true }).httpOnly === true, "Cookie.from is the static spelling of the constructor");
+
+  // sameSite:"none" is the one attribute pair with a browser-level rule attached:
+  // no current browser will STORE a SameSite=None cookie that is not also Secure
+  // (RFC 6265bis §4.1.2.7). Bun does not add Secure for you, and neither do we —
+  // adding an attribute the caller never wrote is exactly the silent divergence
+  // this shim exists to avoid, and it would then behave differently here than in
+  // production while being invisible in the caller's own source.
+  ok(new C("a", "b", { sameSite: "none" }).toString() === "a=b; Path=/; SameSite=None", "sameSite:\"none\" does NOT gain an implicit Secure — we serialise what was asked for, as Bun does, and let the browser be the thing that rejects it");
+  ok(new C("a", "b", { sameSite: "none", secure: true }).toString() === "a=b; Path=/; Secure; SameSite=None", "adding Secure explicitly is the supported way to make a SameSite=None cookie storable");
+
+  // Percent-coding is ASYMMETRIC in Bun, and the asymmetry is load-bearing: the
+  // value is encoded on the way OUT (so `;` and `=` cannot inject a second
+  // attribute into a header we are about to write) and is NOT decoded on the way
+  // IN by Cookie.parse.
+  ok(new C("a", "hello world").toString() === "a=hello%20world; Path=/; SameSite=Lax", "serialize() percent-encodes the value");
+  ok(new C("a", "x;y=z").toString().indexOf("x%3By%3Dz") !== -1, "a value containing ; and = is encoded, so it cannot inject an attribute");
+  ok(new C("a", "café").toString().indexOf("caf%C3%A9") !== -1, "a non-ASCII value survives as UTF-8 percent escapes");
+  ok(C.parse("a=%20").value === "%20", "Cookie.parse does NOT decode: the value is the three literal characters %20");
+  ok(C.parse(new C("a", "hello world").toString()).value === "hello%20world", "the documented consequence: Set-Cookie round-tripping through parse() is not value-preserving");
+
+  // Validation. These are allow-lists transcribed from Bun, not heuristics: every
+  // excluded character is one that would let a caller inject an attribute or a
+  // second cookie, so throwing is the only safe answer — silently stripping would
+  // hand back a cookie under a name nobody asked for.
+  ok(/Invalid cookie name/.test(throwsWith(() => new C("a b", "v"))), "a name containing a space throws");
+  ok(/Invalid cookie name/.test(throwsWith(() => new C("a=b", "v"))), "a name containing = throws");
+  ok(/Invalid cookie name/.test(throwsWith(() => new C("a;b", "v"))), "a name containing ; throws");
+  ok(/Invalid cookie path/.test(throwsWith(() => new C("a", "v", { path: "/x;y" }))), "a path containing ; throws");
+  ok(/Invalid cookie domain/.test(throwsWith(() => new C("a", "v", { domain: "ex ample.com" }))), "a domain containing a space throws");
+  ok(/Invalid sameSite/.test(throwsWith(() => new C("a", "v", { sameSite: "Lax" }))), "the sameSite INIT is case-sensitive (Bun takes the lowercase spellings only)");
+  ok(C.parse("a=b; SameSite=LAX").sameSite === "lax", "...while the sameSite ATTRIBUTE in a header is matched case-insensitively — two inputs, two rules, both Bun's");
+  ok(/not a valid HTTP header value/.test(throwsWith(() => C.parse("a=café"))), "a Set-Cookie string that is not a valid HTTP header value throws (non-ASCII included)");
+  ok(/no '='/.test(throwsWith(() => C.parse("justaname"))), "a cookie string with no = throws instead of inventing an empty value");
+  ok(/Invalid cookie name/.test(throwsWith(() => C.parse(""))), "Cookie.parse(\"\") throws");
+
+  // Accessors.
+  const mutable = new C("a", "b");
+  mutable.name = "renamed";
+  ok(mutable.name === "a", "assigning to .name is silently ignored — Bun's accessor is getter-only with a no-op put, and throwing here would break strict-mode code that works there");
+  mutable.value = "c";
+  mutable.path = "/p";
+  mutable.secure = true;
+  ok(mutable.toString() === "a=c; Path=/p; Secure; SameSite=Lax", "value/path/secure are writable and re-serialise");
+  ok(/Invalid cookie path/.test(throwsWith(() => { mutable.path = "/;"; })), "the path setter validates too, not just the constructor");
+  const json = new C("a", "b", { maxAge: 60 }).toJSON();
+  ok(json.name === "a" && json.value === "b" && json.path === "/" && json.maxAge === 60 && json.sameSite === "lax" && json.domain === undefined, "toJSON exposes the fields, omitting an unset domain");
+}
+
+console.log("== Bun.Cookie: Max-Age beats Expires (RFC 6265 §5.3) ==");
+{
+  const B = bunWith();
+  const C = B.Cookie;
+
+  // The precedence is about the COMPUTED EXPIRY, not about which attribute is
+  // kept — so both survive parsing, both re-serialise, and the answer cannot
+  // depend on the order they appeared in.
+  const past = "Expires=Thu, 01 Jan 2015 00:00:00 GMT";
+  const both = C.parse("a=b; " + past + "; Max-Age=3600");
+  ok(both.isExpired() === false, "a live Max-Age beats a past Expires: the cookie is NOT expired");
+  ok(both.maxAge === 3600 && both.expires instanceof Date, "both attributes survive the parse — precedence is not deletion");
+  ok(C.parse("a=b; Max-Age=3600; " + past).serialize() === both.serialize(), "the result does not depend on which of the two came first in the header");
+  ok(C.parse("a=b; Max-Age=0; Expires=Thu, 01 Jan 2999 00:00:00 GMT").isExpired() === true, "and the precedence is unconditional: Max-Age=0 beats a FUTURE Expires");
+  ok(C.parse("a=b; Max-Age=0").isExpired() === true, "Max-Age=0 is expired now — that is the delete signal");
+  ok(C.parse("a=b; Max-Age=-1").isExpired() === true, "a negative Max-Age is expired now");
+  ok(C.parse("a=b; " + past).isExpired() === true, "a past Expires with no Max-Age is expired");
+  ok(C.parse("a=b; Expires=Thu, 01 Jan 2999 00:00:00 GMT").isExpired() === false, "a future Expires with no Max-Age is not");
+  ok(C.parse("a=b").isExpired() === false, "a session cookie (neither attribute) is never expired");
+
+  // Parsing details that decide scope.
+  ok(C.parse("a=b; path=/admin").path === "/admin", "attribute names are case-insensitive");
+  ok(C.parse("a=b; Path=admin").path === "/", "a Path that does not start with / is ignored, leaving the default — not stored as a relative path");
+  ok(C.parse("a=b; Domain=EXAMPLE.com").domain === "example.com", "Domain is lower-cased");
+  ok(C.parse("a=b; Max-Age=60abc").maxAge === 60, "Max-Age is parsed with parseInt, so trailing junk is tolerated as Bun does");
+  ok(C.parse("a=b; Unknown=1; Secure").secure === true, "an unrecognised attribute is skipped without disturbing the ones around it");
+  ok(C.parse("a=b; SameSite=weird").sameSite === "lax", "an unrecognised SameSite leaves the default rather than throwing — a header we did not write is not the caller's bug");
+  ok(C.parse("a=b; Path=/one; Path=/two").path === "/two", "the last occurrence of a repeated attribute wins (RFC 6265 §5.2)");
+  ok(C.parse("a=").value === "", "an empty value parses to the empty string");
+  ok(C.parse("a=b=c").value === "b=c", "only the FIRST = splits name from value");
+}
+
+console.log("== Bun.CookieMap ==");
+{
+  const B = bunWith();
+  const M = B.CookieMap;
+
+  const m = new M("session=abc; theme=dark");
+  ok(m.get("session") === "abc" && m.get("theme") === "dark", "a Cookie: request header parses into name/value pairs");
+  ok(m.get("nope") === null, "a missing cookie reads as null, not undefined");
+  ok(m.has("session") === true && m.has("nope") === false, "has() agrees with get()");
+  ok(m.size === 2, "size counts the cookies that arrived");
+  ok(JSON.stringify([...m]) === '[["session","abc"],["theme","dark"]]', "the map is iterable as [name, value] pairs");
+  ok([...m.keys()].join() === "session,theme" && [...m.values()].join() === "abc,dark", "keys() and values() agree with entries()");
+  let seen = "";
+  m.forEach((v, k) => { seen += k + "=" + v + ";"; });
+  ok(seen === "session=abc;theme=dark;", "forEach yields (value, name) in Map order");
+  ok(JSON.stringify(m.toJSON()) === '{"session":"abc","theme":"dark"}', "toJSON is a plain object");
+
+  // A REQUEST header is decoded (unlike Cookie.parse), and the decision is made
+  // once for the whole header — which is observationally the same as always
+  // decoding, since a value with no % decodes to itself.
+  ok(new M("a=hello%20world").get("a") === "hello world", "a request header's values ARE percent-decoded");
+  ok(new M("a=100%").get("a") === "100%", "a malformed escape is left alone rather than throwing");
+  // Names are never decoded, and that is a security property rather than an
+  // oversight: browsers apply the `__Host-`/`__Secure-` prefix rules to the
+  // LITERAL name, so an alias would let an unprotected cookie shadow a protected one.
+  const prefixed = new M("__%48ost-session=1");
+  ok(prefixed.get("__%48ost-session") === "1", "a percent-escaped NAME keeps its literal spelling");
+  ok(prefixed.get("__Host-session") === null, "...and does not answer to the decoded one — the __Host- prefix rules are enforced on the literal name");
+  ok(new M("a=1; ; b=2").size === 2, "an empty segment in the header is skipped");
+  ok(new M("a=1; novalue; b=2").get("novalue") === null, "an attribute-shaped fragment with no = is skipped, not guessed at");
+  ok(new M("").size === 0 && new M().size === 0 && new M(null).size === 0, "an empty/absent initialiser gives an empty map");
+  ok(new M([["a", "1"]]).get("a") === "1", "an array-of-pairs initialiser works");
+  ok(new M({ a: "1" }).get("a") === "1", "an object initialiser works");
+  ok(new M([["a", "%20"]]).get("a") === "%20", "values from an ARRAY initialiser are verbatim — only a real header goes through the decoder");
+
+  // The split that makes this useful: only cookies the handler CHANGED become
+  // Set-Cookie headers. A request that merely reads must emit none, or every plain
+  // GET rewrites every cookie the browser already had.
+  const rw = new M("session=abc");
+  ok(rw.toSetCookieHeaders().length === 0, "reading cookies produces NO Set-Cookie headers");
+  rw.set("theme", "dark");
+  ok(JSON.stringify(rw.toSetCookieHeaders()) === '["theme=dark; Path=/; SameSite=Lax"]', "set() produces exactly one Set-Cookie, with the same defaults as new Cookie()");
+  ok(rw.get("theme") === "dark" && rw.size === 2, "a set cookie is immediately visible through get()/size");
+  rw.set("session", "xyz");
+  ok(rw.toSetCookieHeaders().length === 2 && rw.get("session") === "xyz", "overwriting an arrived cookie replaces it rather than duplicating it");
+  ok(rw.size === 2, "...and size does not double-count it");
+  rw.set(new B.Cookie("flag", "1", { httpOnly: true }));
+  ok(rw.toSetCookieHeaders().some((h) => h === "flag=1; Path=/; HttpOnly; SameSite=Lax"), "set(Cookie) accepts a whole Cookie object");
+  rw.set({ name: "init", value: "2", secure: true });
+  ok(rw.get("init") === "2", "set(CookieInit) accepts an options object");
+
+  // A stored Cookie is held BY REFERENCE, as in Bun: mutating it afterwards
+  // changes what the map serialises. Copying would be the quieter wrong choice.
+  const byRef = new B.Cookie("ref", "one");
+  const refMap = new M();
+  refMap.set(byRef);
+  byRef.value = "two";
+  ok(refMap.get("ref") === "two" && refMap.toSetCookieHeaders()[0].indexOf("ref=two") === 0, "a Cookie handed to set() is stored by reference, not copied");
+
+  // Deletion is a tombstone: invisible to reads, but it still has to serialise.
+  const del = new M("session=abc; theme=dark");
+  del.delete("session");
+  ok(del.get("session") === null && del.has("session") === false, "a deleted cookie is invisible to get()/has()");
+  ok(del.size === 1 && [...del.keys()].join() === "theme", "...and to size and iteration");
+  ok(del.toSetCookieHeaders()[0] === "session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax", "...while still emitting the empty-value + past-expiry Set-Cookie that tells the browser to drop it");
+  ok(del.toJSON().session === undefined, "toJSON omits a deleted cookie");
+  const scoped = new M();
+  scoped.delete({ name: "s", path: "/admin", domain: "example.com" });
+  ok(scoped.toSetCookieHeaders()[0].indexOf("Domain=example.com; Path=/admin") !== -1, "delete() carries the path/domain it is given — a browser only drops a cookie whose scope matches");
+  const host = new M();
+  host.delete("__Host-session");
+  ok(host.toSetCookieHeaders()[0].indexOf("; Secure") !== -1, "deleting a __Host-/__Secure- cookie carries Secure, because the stored cookie necessarily had it and the scopes must match or the delete is a no-op");
+  ok(/Cookie name is required/.test((() => { try { new M().delete(42); return ""; } catch (e) { return e.message; } })()), "delete(non-string) throws rather than deleting something named \"42\"");
+}
+
+console.log("== the Bun.serve cookie hook (req.cookies) ==");
+{
+  // The hook itself, without a kernel or a socket: `attachRequestCookies` is what
+  // Bun.serve's route dispatch calls, and `pendingSetCookies` is what its response
+  // writer calls. The kernel spike (scripts/spike-bun.mjs) proves the same pair
+  // over a real request; this proves the semantics.
+  const { attachRequestCookies, pendingSetCookies } = await import("../packages/runtime/builtins/bun-cookie.js");
+
+  const req = attachRequestCookies(new Request("http://x/", { headers: { cookie: "session=abc" } }), "session=abc");
+  ok(req.cookies.get("session") === "abc", "req.cookies is a CookieMap over the request's Cookie header");
+  ok(req.cookies === req.cookies, "the map is memoised — two reads are the same object, so a set() through one is visible through the other");
+  ok(pendingSetCookies(req).length === 0, "a handler that only READ cookies contributes no Set-Cookie headers");
+  req.cookies.set("theme", "dark");
+  ok(JSON.stringify(pendingSetCookies(req)) === '["theme=dark; Path=/; SameSite=Lax"]', "a handler that set one contributes exactly that header");
+
+  const untouched = attachRequestCookies(new Request("http://x/", { headers: { cookie: "a=1" } }), "a=1");
+  ok(pendingSetCookies(untouched).length === 0, "a handler that never touched req.cookies contributes nothing — the map is built lazily on first access");
+  ok(pendingSetCookies(new Request("http://x/")) .length === 0, "and a plain Request that was never hooked (the `fetch` handler's) is safe to ask");
+  ok(!("cookies" in new Request("http://x/", { headers: { cookie: "a=1" } })), "a plain Request has NO .cookies: Bun puts it on BunRequest (the routes handler's argument) only, and offering it in `fetch` would make code that works here fail under real Bun");
+}
+
+console.log("== BunFile: Blob conformance and the lazy slice ==");
+{
+  const fs = nodeRequire("node:fs");
+  const os = nodeRequire("node:os");
+  const path = nodeRequire("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-bunfile-"));
+  const at = (rel) => path.join(dir, rel);
+  const io = [];
+  const B = createBunRuntime({
+    process: {
+      env: {}, argv: ["bun"], cwd: () => dir,
+      stdout: { isTTY: false, write: (s) => io.push("out:" + s) },
+      stderr: { isTTY: false, write: (s) => io.push("err:" + s) },
+      stdin: process.stdin,
+    },
+    Buffer,
+    require: nodeRequire,
+  }).Bun;
+  fs.writeFileSync(at("hello.txt"), "hello world");
+  const f = B.file(at("hello.txt"));
+  ok(f.name === at("hello.txt"), "Bun.file(path).name is the path");
+  ok(f.size === 11, "Blob.size is the file's current size");
+  ok(f.type === "text/plain", "Blob.type comes from the extension");
+  ok(B.file(at("x.json")).type === "application/json" && B.file(at("x.bin")).type === "application/octet-stream", "the extension table falls back to application/octet-stream");
+  ok(B.file(at("x.txt"), { type: "text/csv" }).type === "text/csv", "an explicit type option wins over the extension");
+  ok((await f.text()) === "hello world", ".text() reads the whole file");
+  ok((await f.bytes()) instanceof Uint8Array && (await f.bytes()).length === 11, ".bytes() returns a Uint8Array");
+  ok((await f.arrayBuffer()).byteLength === 11, ".arrayBuffer() returns an ArrayBuffer");
+  ok((await B.write(at("d.json"), '{"a":1}')) === 7 && (await B.file(at("d.json")).json()).a === 1, ".json() parses the file");
+  ok((await f.blob()) instanceof Blob, ".blob() hands back a real platform Blob");
+  ok(f.stream() instanceof ReadableStream, ".stream() returns a web ReadableStream, as Bun does");
+  ok((await new Response(f.stream()).text()) === "hello world", "...that yields the file's bytes");
+  ok((await f.exists()) === true && (await B.file(at("nope.txt")).exists()) === false, ".exists() answers for both");
+  ok((await B.file(dir).exists()) === false, ".exists() is false for a DIRECTORY — Bun documents it for regular files, and answering true turns the next read into a confusing EISDIR");
+  ok(B.file(at("nope.txt")).size === 0, "a missing file has size 0 rather than throwing (Bun documents this)");
+  ok(f.lastModified > 0, ".lastModified is the mtime");
+
+  // .slice() is a LAZY VIEW. Bun documents it as "does not copy the file, open the
+  // file, or modify the file" — the entire point is handing the last 4 KB of a 4 GB
+  // log to something, and a slice that materialises bytes has the right contents
+  // while turning a constant-memory program into an out-of-memory one.
+  const ghost = B.file(at("later.txt")).slice(6, 11);
+  fs.writeFileSync(at("later.txt"), "hello world");
+  ok((await ghost.text()) === "world", "a slice taken BEFORE the file existed reads correctly afterwards — proof nothing was opened or copied at slice() time");
+  ok(ghost.constructor.name === "BunFile" && typeof ghost.slice === "function", "slice() returns another BunFile, not a materialised Blob");
+  ok(ghost.name === at("later.txt"), "...over the same path");
+  ok(ghost.size === 5, "the slice's size is the window, not the file");
+  fs.appendFileSync(at("later.txt"), "!!!");
+  ok((await B.file(at("later.txt")).slice(6).text()) === "world!!!", "an open-ended slice follows a file that grows — the window resolves at READ time");
+  ok((await f.slice(0, 5).text()) === "hello", "slice(begin, end)");
+  ok((await f.slice(6).text()) === "world", "slice(begin)");
+  ok((await f.slice(-5).text()) === "world", "a negative begin counts back from the end");
+  ok((await f.slice(0, -6).text()) === "hello", "a negative end does too");
+  ok((await f.slice(0, 8).slice(6).text()) === "wo", "slices COMPOSE: the second window is resolved inside the first");
+  ok((await f.slice(0, 8).slice(0, 99).text()) === "hello wo", "a child slice cannot escape its parent's window");
+  ok(f.slice("text/csv").type === "text/csv" && f.slice(0, 5, "text/csv").type === "text/csv" && f.slice(0, "text/csv").type === "text/csv", "all three documented overloads read a string argument as the contentType");
+  ok(f.slice(0, 5).type === "text/plain", "a slice inherits the file's type when none is given");
+  ok((await new Response(f.slice(6).stream()).text()) === "world", ".stream() honours the slice window");
+  ok((await new Response(f.slice(3, 3).stream()).text()) === "", "an empty window streams as empty rather than throwing on end < start");
+  ok((await f.slice(3, 3).text()) === "" && f.slice(99, 200).size === 0, "a degenerate or out-of-range window reads as empty");
+
+  // Known divergence, pinned so it stays known: a BunFile here is not a platform
+  // Blob INSTANCE (Bun's extends Blob), so `new Response(Bun.file(p))` — Bun's
+  // one-liner for serving a file — stringifies instead of streaming. Making it
+  // work is not portable: duck-typing satisfies Node's undici and not the browser
+  // Worker's native Response, and `extends Blob` would make Node stream the file
+  // while the BROWSER served an empty body from the (empty) internal blob state.
+  // Silently right on the tier we test and silently wrong on the tier that ships
+  // is the worst of the options, so the gap stays visible. Use
+  // `new Response(Bun.file(p).stream())` or `await Bun.file(p).bytes()`.
+  ok(!(f instanceof Blob), "a BunFile is not a platform Blob instance here — a documented divergence; it implements the Blob READ protocol and .blob() converts");
+  ok((await new Response(f).text()).indexOf("object") !== -1, "so new Response(Bun.file(p)) stringifies rather than streaming — use .stream() (pinned as a known gap)");
+
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log("== BunFile: FileSink flushes incrementally, and every write is chunked ==");
+{
+  const fs = nodeRequire("node:fs");
+  const os = nodeRequire("node:os");
+  const path = nodeRequire("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-bunsink-"));
+  const at = (rel) => path.join(dir, rel);
+  const io = [];
+  const B = createBunRuntime({
+    process: {
+      env: {}, argv: ["bun"], cwd: () => dir,
+      stdout: { isTTY: false, write: (s) => io.push("out:" + s) },
+      stderr: { isTTY: false, write: (s) => io.push("err:" + s) },
+      stdin: process.stdin,
+    },
+    Buffer,
+    require: nodeRequire,
+  }).Bun;
+  const read = (rel) => (fs.existsSync(at(rel)) ? fs.readFileSync(at(rel), "utf8") : "<missing>");
+  const throwsWith = (fn) => { try { fn(); return ""; } catch (e) { return e.message; } };
+  const rejectsOn = async (fn) => { try { await fn(); return ""; } catch (e) { return (e.message || "") + " " + (e.code || ""); } };
+
+  // The behaviour this batch exists to fix. The old sink pushed every chunk into
+  // an array and wrote the lot in end(), which means a long-running writer holds
+  // the whole file in memory and anything that stops the process first — a crash,
+  // a process.exit, a killed preview — loses everything, silently.
+  const sink = B.file(at("app.log")).writer({ highWaterMark: 16 });
+  ok(sink.write("0123456789abcdefgh") === 18, "write() returns the byte count");
+  ok(read("app.log") === "0123456789abcdefgh", "crossing the high-water mark drains to disk with NO end() — a crash here loses nothing");
+  sink.write("ij");
+  ok(read("app.log") === "0123456789abcdefgh", "a write below the mark stays buffered (one syscall per mark, not one per write)");
+  ok(sink.flush() === 2, "flush() returns the bytes it drained");
+  ok(read("app.log") === "0123456789abcdefghij", "...which are on disk immediately afterwards");
+  ok(sink.flush() === 0, "flushing an empty buffer is a no-op returning 0");
+  ok(sink.end() === 20, "end() returns the total written over the sink's lifetime");
+  ok(/after end\(\)/.test(throwsWith(() => sink.write("x"))), "write() after end() throws instead of silently dropping data");
+  ok(/expects a string/.test(throwsWith(() => B.file(at("t.log")).writer().write(42))), "write(number) throws rather than String()-ing it into bytes");
+
+  ok(B.file(at("empty.log")).writer().end() === 0 && read("empty.log") === "", "end() materialises the file even when nothing was written — a loop that produced no rows must leave an empty file, not a missing one");
+  fs.writeFileSync(at("keep.log"), "keep");
+  B.file(at("keep.log")).writer();
+  ok(read("keep.log") === "keep", "creating a writer and abandoning it neither creates nor truncates — the fd opens on the first write");
+
+  // The 1 MiB syscall window (DATA_BYTES in packages/protocol/syscall.js; fs-client
+  // caps each fd write at FD_CHUNK = 512 KiB and SHORT-WRITES the rest). A write
+  // bigger than that must be chunked and the returned count believed, or the
+  // failure shows up as a truncated file — nothing that looks like a size problem.
+  const big = "x".repeat(1500000);
+  ok((await B.write(at("big.bin"), big)) === 1500000, "Bun.write reports every byte of a payload larger than the syscall window");
+  ok(fs.statSync(at("big.bin")).size === 1500000, "...and the file really is that long, not truncated at the window");
+  const bigSink = B.file(at("big2.bin")).writer();
+  bigSink.write(big);
+  ok(bigSink.end() === 1500000 && fs.statSync(at("big2.bin")).size === 1500000, "a single FileSink.write() larger than the window is chunked the same way");
+  ok((await B.file(at("big.bin")).slice(1499995).text()) === "xxxxx", "and a slice past the window boundary reads back correctly");
+
+  // Reading is bounded too. `.stream()` is built from fd reads rather than
+  // Readable.toWeb — which our vendored stream core leaves unimplemented, so it
+  // EXISTS as a function and throws when called (the kernel tier is where that
+  // surfaced) — and it hands out one 64 KiB chunk per pull, so streaming a file
+  // never materialises it.
+  const stream = B.file(at("big.bin")).stream();
+  ok(typeof stream.getReader === "function", ".stream() is a real WHATWG ReadableStream, not a Node Readable in disguise");
+  const reader = stream.getReader();
+  let streamed = 0;
+  let widest = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    streamed += value.length;
+    if (value.length > widest) widest = value.length;
+  }
+  ok(streamed === 1500000, "...that delivers every byte of a 1.5 MB file");
+  ok(widest <= 64 * 1024, "...in bounded chunks, so a stream of a file bigger than memory stays a stream");
+
+  // Bun.stdout / Bun.stderr as write targets. `Bun.write(Bun.stdout, Bun.file(p))`
+  // is Bun's three-line cat, which is the whole reason these are BunFiles.
+  ok((await B.write(B.stdout, "to-out")) === 6 && io.indexOf("out:to-out") !== -1, "Bun.write(Bun.stdout, string) writes to stdout and returns the byte count");
+  ok((await B.write(B.stderr, "to-err")) === 6 && io.indexOf("err:to-err") !== -1, "Bun.write(Bun.stderr, …) writes to stderr");
+  fs.writeFileSync(at("cat.txt"), "meow");
+  ok((await B.write(B.stdout, B.file(at("cat.txt")))) === 4 && io.indexOf("out:meow") !== -1, "Bun.write(Bun.stdout, Bun.file(p)) is Bun's cat");
+  const outSink = B.stdout.writer();
+  outSink.write("sunk");
+  outSink.flush();
+  ok(io.indexOf("out:sunk") !== -1, "Bun.stdout.writer() streams through the same sink type");
+  ok(/write-only sink/.test(await rejectsOn(() => B.stdout.text())), "reading Bun.stdout throws naming the API and the sandbox reason, rather than answering \"\"");
+  ok(/write-only sink/.test(await rejectsOn(() => B.stderr.bytes())), "the same for Bun.stderr");
+  ok(B.stdin === process.stdin, "Bun.stdin stays the Node stream this runtime has always returned — a documented divergence (Bun's is a BunFile) kept because guest code reads it with .on(\"data\")");
+
+  // delete()/unlink(), and the throws that must stay throws.
+  fs.writeFileSync(at("gone.txt"), "x");
+  await B.file(at("gone.txt")).delete();
+  ok(!fs.existsSync(at("gone.txt")), ".delete() removes the file");
+  fs.writeFileSync(at("gone.txt"), "x");
+  await B.file(at("gone.txt")).unlink();
+  ok(!fs.existsSync(at("gone.txt")), ".unlink() is the documented alias for it");
+  ok(/ENOENT/.test(await rejectsOn(() => B.file(at("gone.txt")).delete())), "deleting a file that is not there rejects, as fs.unlink would — it does not quietly succeed");
+
+  ok(/VFS handles/.test(throwsWith(() => B.file(3))), "Bun.file(fd) still throws: our fd numbers are VFS handles, and String(3) would have opened the relative path \"3\"");
+  ok(/VFS handles/.test(await rejectsOn(() => B.write(3, "x"))), "Bun.write(fd, …) throws for the same reason — it used to CREATE a file called \"1\" in the cwd and report success");
+  ok(/expects a string path/.test(throwsWith(() => B.file())), "Bun.file() with no path throws instead of handing back a handle on the path \"undefined\"");
+  ok(B.file(new URL("file://" + at("cat.txt"))).name === at("cat.txt"), "Bun.file(new URL(import.meta.url)) is accepted, and is not the literal path \"file:///…\"");
+
+  ok((await B.write(at("nested/deep/x.txt"), "deep")) === 4 && read("nested/deep/x.txt") === "deep", "Bun.write creates missing parent directories");
+  ok((await B.write(B.file(at("copy.txt")), B.file(at("cat.txt")))) === 4 && read("copy.txt") === "meow", "Bun.write(BunFile, BunFile) copies");
+  ok((await B.write(at("blob.txt"), new Blob(["blobby"]))) === 6 && read("blob.txt") === "blobby", "Bun.write accepts anything with the Blob read protocol");
+  ok((await B.file(at("copy.txt")).write("over")) === 4 && read("copy.txt") === "over", "BunFile.write(data) is Bun.write with this file as the destination");
+
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Bun checks passed");

@@ -778,9 +778,13 @@ unpacked:
   `FileSystemRouter`, `randomUUIDv7`, `gzip`/`gunzip`,
   password `hash`/`verify`, `CryptoHasher`, `Transpiler`, `$`) plus **`Bun.serve`**
   (fetch handler; `routes` with static paths, `:params`, `*` wildcards,
-  `BunRequest.params`, method-specific handlers; server-side **WebSockets** — RFC
+  `BunRequest.params` and **`BunRequest.cookies`**; server-side **WebSockets** — RFC
   6455 handshake, frame codec, `ServerWebSocket` send/close/subscribe/publish/cork
   + pub/sub topics) and **`bun:*` modules** (`bun:test` runner + `expect`).
+  Its response writer pulls Set-Cookie out with `Headers.getSetCookie()` and hands
+  Node the **array**: `Headers.forEach` flattens repeated headers into one
+  comma-joined value, and an `Expires=Thu, 01 Jan 1970 …` contains a comma of its
+  own, so a flattened pair can never be split back apart.
 - **`packages/runtime/builtins/bun-formats.js`** — `Bun.YAML`, `Bun.TOML`,
   `Bun.JSON5`, `Bun.JSONL` and `Bun.semver`, wired into the `Bun` literal by
   `bun.js`. The **one place in the Bun shim that vendors real libraries**
@@ -801,6 +805,32 @@ unpacked:
   because `null` is Bun's documented "not a colour" and must not also mean "we gave
   up". `Bun.color(…, "ansi")` reads the depth policy from the SAME precedence as
   `node/internal/util/colors.js`, so it and `util.styleText` cannot disagree.
+- **`packages/runtime/builtins/bun-cookie.js`** — `Bun.Cookie`, `Bun.CookieMap` and
+  the `req.cookies` hook `Bun.serve` calls, wired into the `Bun` literal by `bun.js`.
+  Hand-rolled, not vendored, for the same reason as `bun-glob.js`: `cookie` /
+  `set-cookie-parser` / `tough-cookie` each make a defensible choice exactly where
+  Bun made a *different* defensible one, and every such point changes the **scope or
+  lifetime** of a cookie a browser stores — which is a session that silently does not
+  come back, not a crash. The five that carry the risk: the defaults are `path: "/"`
+  and `sameSite: "lax"` and **both are always emitted** (omitting Path scopes the
+  cookie to the request *directory*); `Max-Age` beats `Expires` in `isExpired()`
+  (RFC 6265 §5.3) while **both attributes are kept and re-serialised**, so the answer
+  cannot depend on header order; values are percent-encoded on the way **out** and
+  **not** decoded by `Cookie.parse` on the way in; a `Cookie:` request header is
+  decoded but its **names never are** (a cookie called `__%48ost-session` must not
+  answer to `__Host-session`, since browsers apply the prefix rules to the literal
+  name); and `sameSite: "none"` gets **no implicit `Secure`** — Bun serialises what
+  you asked for and lets the browser reject it, and adding an attribute the caller
+  never wrote is the silent divergence this shim exists to avoid.
+- **`packages/runtime/builtins/bun-file.js`** — `Bun.file`, `Bun.write`, the `FileSink`
+  from `.writer()` and the `Bun.stdout`/`Bun.stderr` write targets. Three contracts:
+  `.slice()` is a **lazy window**, not a copy (Bun documents it as not opening the
+  file — a materialising slice has the right bytes and turns a constant-memory
+  program into an OOM); the `FileSink` **flushes as it goes** rather than buffering
+  until `end()` (the old one lost everything on a crash and held the whole file in
+  memory); and every write is chunked to `WRITE_CHUNK` = 512 KiB, mirroring `FD_CHUNK`,
+  with the returned short-write count believed. `.stream()` builds its own
+  `ReadableStream` from fd reads — see the `Readable.toWeb` gotcha below.
 - **`packages/runtime/builtins/bun-bytes.js`** — `Bun.ArrayBufferSink`, the seven
   `Bun.readableStreamTo*` consumers, `Bun.concatArrayBuffers` and `Bun.allocUnsafe`.
   Nothing vendored. Two contracts to preserve: `ArrayBufferSink.flush()` returns an
@@ -868,7 +898,9 @@ here is meant to run under real Bun, so anything that "works" in the sandbox and
 diverges in production is a trap. Two rules when touching the Bun shim:
 - **Never leave a placeholder return value.** `test.only` used to register an
   ordinary test (so an `only` run executed the whole suite), `Bun.file(3)` used to
-  `String()` the fd into the path `"3"`, `Bun.Transpiler.scan()` returned empty
+  `String()` the fd into the path `"3"` (as did `Bun.write(1, …)`, which CREATED a
+  file named `1` in the cwd and reported success, and `Bun.file()`, which handed
+  back a handle on the path `"undefined"`), `Bun.Transpiler.scan()` returned empty
   arrays, and the `bun:jsc` memory helpers returned `0`. All of those now either
   behave correctly or throw naming the API and the reason — the `bun:ffi` tier at
   `builtins/bun.js` (import-safe, call-loud). An unknown `bun` verb likewise says
@@ -932,6 +964,27 @@ precedence that is **per-segment, left to right**: `/acme/[page]` beats
 A scalar score cannot express that, so the two matchers are siblings on purpose —
 generalising one would put Bun.serve's routing (load-bearing for every previewed Bun
 app) at risk for the router's sake. They do share the directory walk.
+### `Readable.toWeb` THROWS — and a present-but-unimplemented function defeats a `typeof` guard
+`node/internal/webstreams/adapters.js` implements only `Readable.fromWeb` (the
+direction that turns a `fetch()` body into a Node stream, which is what corepack's
+tarball download needs). Every other direction — `Readable.toWeb`,
+`Writable.fromWeb`/`toWeb`, `Duplex.*` — is a real function that raises
+`ERR_METHOD_NOT_IMPLEMENTED` when called. So the defensive idiom that looks right,
+
+```js
+return Readable.toWeb ? Readable.toWeb(nodeStream) : nodeStream;   // WRONG
+```
+
+never takes the fallback: the property is there, and the throw happens one frame
+later. Worse, it only fails **in the VM** — on the host Node the offline spikes run
+on, `toWeb` works — so the offline tier goes green and the product is broken. That
+is exactly how `Bun.file(p).stream()` shipped un-runnable until the kernel spike ran
+it (`BunFile.stream()` now builds a `ReadableStream` from bounded fd reads instead;
+`Bun.spawn().stdout`/`.stderr` still use the guard and are still affected). Two
+rules: **feature-detect by capability, not by presence**, when the vendored runtime
+is allowed to stub a method loudly; and if a code path can only be exercised
+through the VM's own `fs`/`stream`, it is not covered until `scripts/spike-bun.mjs`
+(or a sibling kernel spike) exercises it.
 
 ### Python is Pyodide (CPython→WASM), lazily booted — with a Flask/FastAPI HTTP bridge
 Unlike the Node-backed Bun shim, `python`/`python3` boots **real CPython compiled to

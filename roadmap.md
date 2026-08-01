@@ -4481,5 +4481,114 @@ a running Bun process, symlinks and dangling links included, and re-checks the s
 to end: sorted relative results, pruning, `absolute`, `dot`, `onlyFiles: false`, the default
 `cwd`, both symlink options, and a `FileSystemRouter` over a scanned `pages/` directory down to
 its `src`, `params` and `query`. The offline gate goes from 463 checks to 579.
+## Bun cookies and the rest of `BunFile` (this change)
+
+Phase 2 batch C: `Bun.Cookie`/`Bun.CookieMap` (new), and the parts of `BunFile` the shim had
+been getting by without. Both are APIs where the plausible implementation and the correct one
+differ in ways nothing in a passing test run would tell you — a cookie with the wrong scope is
+a session that silently does not come back, and a writer that buffers is indistinguishable
+from one that streams right up until the process dies.
+
+- **`Bun.Cookie` / `Bun.CookieMap` are hand-rolled, not vendored.** The obvious move is
+  `cookie` or `set-cookie-parser`, and it is wrong for the same reason it was wrong for
+  `Bun.Glob`: at every point where a choice exists, those libraries made a defensible one and
+  Bun made a *different* defensible one, and each such point changes the **scope or lifetime**
+  of a cookie a browser actually stores. Five carry the risk and each is pinned. (1) The
+  defaults are `path: "/"` and `sameSite: "lax"` and **both are always emitted** —
+  `new Cookie("a","b").toString()` is `a=b; Path=/; SameSite=Lax`, where the npm `cookie`
+  package emits neither. A shim that omits Path writes the cookie against the *request
+  directory* (`/admin/login`, not `/`), so it reads back on the page that set it and vanishes
+  everywhere else. (2) `Max-Age` beats `Expires` (RFC 6265 §5.3), and the precedence is about
+  the **computed expiry**, not about which attribute survives: both are parsed, both are
+  re-serialised, `isExpired()` consults Max-Age first, and the answer does not depend on which
+  attribute came first in the header. `Max-Age=0` beats even a *future* `Expires`. (3) Values
+  are percent-encoded on the way **out** and **not** decoded by `Cookie.parse` on the way in
+  — `Cookie.parse("a=%20").value` is the three characters `%20` — which is Bun's asymmetry,
+  not ours, and means a Set-Cookie round trip through `parse()` is deliberately not
+  value-preserving. (4) A `Cookie:` *request* header follows a different rule again: values
+  are decoded, names never are, because browsers enforce the `__Host-`/`__Secure-` prefix
+  rules on the **literal** name and letting `__%48ost-session` answer to `__Host-session`
+  would let an unprotected cookie shadow a protected one. (5) `sameSite: "none"` gets **no
+  implicit `Secure`**. Every browser refuses to store such a cookie (RFC 6265bis §4.1.2.7),
+  and it is still the wrong thing for us to add: writing an attribute the caller never asked
+  for makes the shim disagree with Bun while being invisible in the caller's own source. The
+  sandbox has no excuse to differ here either — cross-origin isolation is mandatory for
+  SharedArrayBuffer, so Vivari is always a secure context and `secure: true` works in a
+  preview.
+- **`CookieMap` keeps two lists, not one map**, because the semantics need it: the cookies
+  that *arrived* and the cookies that *changed*. Only the second become `Set-Cookie` headers,
+  which is what stops every plain GET from rewriting every cookie the browser already had. A
+  deletion is a tombstone (empty value, 1970 expiry) — invisible to `get`/`has`/`size`/
+  iteration, still serialised — and it carries `Secure` for a `__Host-`/`__Secure-` name and
+  whatever path/domain it was given, since a browser only drops a cookie whose scope matches.
+- **The `Bun.serve` hook is deliberately narrow.** `cookies` is attached to `BunRequest` — the
+  object a `routes` handler receives — and *not* to the plain `Request` a `fetch` handler
+  gets, which is where Bun draws the line. Offering it in `fetch` would be more convenient and
+  would make code that works here fail under real Bun, the one direction of divergence that is
+  not allowed. On the way out, the response writer pulls Set-Cookie with
+  `Headers.getSetCookie()` and hands Node the **array**: `Headers.forEach` flattens repeated
+  headers into a single comma-joined value, and an `Expires=Thu, 01 Jan 1970 …` carries a
+  comma of its own, so a flattened pair cannot be split apart again by anything downstream.
+  Cookies are applied to the response rather than to the `Response` object because
+  `Response.redirect()` has immutable headers and Bun still sets cookies on a redirect.
+- **`BunFile.slice()` is a lazy window.** Bun documents it as not copying, opening or
+  modifying the file; the entire point is handing the last 4 KB of a 4 GB log to something. A
+  slice that materialises bytes has the right type and the right contents and turns a
+  constant-memory program into an out-of-memory one, which no assertion about its *contents*
+  can catch. Ours carries an absolute byte range and resolves it at **read** time, so slices
+  compose, an open-ended slice follows a file that is still growing, and — the check that
+  proves it — a slice taken *before the file exists* reads correctly once it does.
+- **The `FileSink` from `.writer()` flushes incrementally.** It used to push every chunk into
+  an array and write the lot in `end()`. That holds the whole file in memory, defeating the
+  only reason to reach for an incremental writer, and loses everything if anything stops the
+  process first — a crash, a `process.exit`, a killed preview — silently. It now opens the fd
+  on the first write and drains whenever the buffer passes the high-water mark. `end()` also
+  materialises the file when nothing was written, because a loop that produced no rows should
+  leave an empty file rather than a missing one.
+- **Every write is chunked to the syscall window**, which is the part that does not announce
+  itself: `fs-client.js` caps an fd write at `FD_CHUNK` = 512 KiB (half of `DATA_BYTES`) and
+  returns a **short write** for anything larger, so a sink that hands over 1.5 MB and assumes
+  it all landed produces a truncated file, not an error. Both `Bun.write` and the sink loop on
+  the returned count; the kernel spike writes 1.5 MB through the real Atomics bridge and reads
+  the tail back.
+- **`Bun.stdout`/`Bun.stderr` are BunFiles now**, because being a `Bun.write()` destination is
+  their whole job in Bun's API (`Bun.write(Bun.stdout, Bun.file(p))` is Bun's three-line
+  `cat`). Their read half throws rather than answering `""`. `Bun.stdin` stays the Node
+  Readable it has always been — a known divergence kept on purpose, since guest code reads it
+  with `.on("data")` off the SAB-backed stream and a BunFile wrapper would take that away to
+  add a `.text()` we cannot make block.
+- **Two more silent-wrong-value paths closed**, both the same shape as the `Bun.file(3)` fix in
+  Phase 0: `Bun.write(1, data)` used to `String()` the fd and *create a file named `1`* in the
+  cwd, reporting success, and `Bun.file()` with no argument handed back a handle on the path
+  `"undefined"`. Both throw naming the API and the reason. `Bun.file(fd)` stays a throw.
+
+**The kernel tier earned its keep.** `BunFile.stream()` had been inherited from the old
+implementation as `Readable.toWeb(fs.createReadStream(...))` behind a
+`Readable.toWeb ? … : …` guard, and it never worked in the VM: our vendored stream core
+implements only `Readable.fromWeb` and leaves the other interop directions as functions that
+throw `ERR_METHOD_NOT_IMPLEMENTED`. A function that *exists* and throws sails straight past a
+presence check, and on the host Node the offline spike runs on, `toWeb` works — so the API was
+green in the tier CI enforces and broken in the product. `.stream()` now builds a
+`ReadableStream` out of bounded fd reads (64 KiB per `pull()`), which also stops it from
+materialising a file it was asked to stream. Added to AGENTS.md as its own gotcha, because the
+guard idiom is everywhere and `Bun.spawn().stdout` still has it.
+
+One divergence is documented rather than fixed: a `BunFile` here is not a platform `Blob`
+instance (Bun's extends `Blob`), so `new Response(Bun.file(p))` stringifies instead of
+streaming the file. Both fixes are non-portable in opposite directions — duck-typing
+(`Symbol.toStringTag = "Blob"`) satisfies Node's undici and not a browser Worker's native
+`Response`, and `extends Blob` makes Node stream the file while the **browser** serves an
+empty body out of the empty internal blob state. Being silently right on the tier we test and
+silently wrong on the tier that ships is worse than a visible gap, so it is pinned in the
+offline spike with the working spellings (`new Response(Bun.file(p).stream())`,
+`await Bun.file(p).bytes()`) named next to it.
+
+Cookie parsing and serialisation are pure, so they are covered essentially completely in the
+tier that gates every PR: the offline spike goes from 463 checks to 626. The kernel spike adds
+two blocks that only it can prove — a `Bun.serve({ routes })` server whose handlers read
+`req.cookies` and set, delete and combine cookies with ones already on the `Response` (asserted
+on the real header array coming back through the bridge), and a script that drives `BunFile`,
+the `FileSink` and `Bun.write` against the real Wasm VFS, including the 1.5 MB chunked write
+and reading the sink's output back out of the VFS *before* `end()` is called.
 
 See ARCHITECTURE.md §9.2.

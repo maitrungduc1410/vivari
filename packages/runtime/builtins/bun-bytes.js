@@ -136,9 +136,11 @@ export function makeArrayBufferSink(Buffer) {
 
 // ---- Bun.readableStreamTo* --------------------------------------------------
 // Seven consumers over a ReadableStream. They also accept a plain async iterable,
-// because BunFile.stream() falls back to a Node Readable when Readable.toWeb is
-// unavailable (see bun.js) and a Node Readable is async-iterable — without this
-// the fallback path would throw "getReader is not a function".
+// which a Node Readable is: guest code hands these `fs.createReadStream(…)` and
+// `Bun.spawn().stdout` as readily as a web stream, and without it those callers
+// would get "getReader is not a function". (BunFile.stream() is a real web stream
+// — see bun-file.js, which builds one rather than going through the unimplemented
+// Readable.toWeb.)
 async function drain(stream, who) {
   if (stream && typeof stream.getReader === "function") {
     const reader = stream.getReader();

@@ -393,5 +393,157 @@ console.log("\n== bun run scan.ts (Bun.Glob.scan + Bun.FileSystemRouter over the
   }
 }
 
+// 10) bun run cookies.ts — Bun.Cookie / Bun.CookieMap over a real request/response
+// through the http bridge. The offline spike covers the parsing and serialisation
+// (it is pure); what only THIS tier can prove is the hook: that `req.cookies` sees
+// the header the bridge delivered, and that the Set-Cookie headers a handler
+// produced come back out as SEPARATE header lines. That second one is the
+// dangerous half — `Headers.forEach` flattens repeats into one comma-joined value,
+// and an `Expires=Thu, 01 Jan 1970 …` value contains a comma of its own, so a
+// flattened pair cannot be split apart again by anything downstream.
+console.log("\n== bun run cookies.ts (Bun.Cookie + Bun.CookieMap over Bun.serve) ==");
+{
+  const PORT = 3943;
+  write("cookies.ts", [
+    "const server = Bun.serve({",
+    "  port: " + PORT + ",",
+    "  routes: {",
+    // Reading cookies must emit NO Set-Cookie at all — otherwise every plain GET
+    // rewrites every cookie the browser already had.
+    "    '/read': (req: any) => new Response('session=' + req.cookies.get('session') + ' theme=' + req.cookies.get('theme') + ' missing=' + req.cookies.get('nope') + ' size=' + req.cookies.size),",
+    "    '/login': (req: any) => {",
+    "      req.cookies.set('session', 'abc123', { httpOnly: true, maxAge: 3600 });",
+    "      req.cookies.set('stamp', 's', { expires: new Date(0) });",
+    "      return new Response('ok', { headers: { 'set-cookie': 'from=response; Path=/' } });",
+    "    },",
+    "    '/logout': (req: any) => { req.cookies.delete('session'); return new Response('bye'); },",
+    "  },",
+    "  fetch(req: Request): Response { return new Response('cookies=' + new Bun.CookieMap(req.headers.get('cookie') || '').size); },",
+    "});",
+    "console.log('listening on ' + server.port);",
+  ].join("\n"));
+  kernel.start("bun", ["run", "cookies.ts"], { cwd: APP, env: ENV });
+  for (let i = 0; i < 150 && !listening.has(PORT); i++) await new Promise((r) => setTimeout(r, 100));
+  ok(listening.has(PORT), "Bun.serve(cookies) bound port " + PORT);
+
+  // The shared httpGet harness drops the response headers, and the headers are
+  // exactly what this block is about, so go at the bridge directly.
+  const httpRaw = async (url, headers = {}) => {
+    const r = await kernel.handleHttpRequest(PORT, {
+      port: PORT, method: "GET", url,
+      headers: { host: "127.0.0.1:" + PORT, ...headers },
+      body: "",
+    });
+    return {
+      status: r.status,
+      headers: r.headers || {},
+      body: typeof r.body === "string" ? r.body : Buffer.from(r.body || "").toString(),
+    };
+  };
+  const setCookiesOf = (res) => {
+    const v = res.headers["set-cookie"] || res.headers["Set-Cookie"];
+    return v === undefined ? [] : Array.isArray(v) ? v : [v];
+  };
+
+  const read = await httpRaw("/read", { cookie: "session=abc; theme=dark" });
+  console.log("  GET /read ->", read.status, JSON.stringify(read.body));
+  ok(read.status === 200 && /session=abc/.test(read.body), "req.cookies reads the Cookie header the bridge delivered");
+  ok(/theme=dark/.test(read.body) && /size=2/.test(read.body), "...both of them, and size counts them");
+  ok(/missing=null/.test(read.body), "a cookie that is not there reads as null");
+  ok(setCookiesOf(read).length === 0, "a handler that only READ cookies sends no Set-Cookie back");
+
+  const login = await httpRaw("/login");
+  const cookies = setCookiesOf(login);
+  console.log("  GET /login -> set-cookie", JSON.stringify(cookies));
+  ok(cookies.length === 3, "three Set-Cookie headers arrive as three SEPARATE header lines, not one comma-joined value");
+  ok(cookies.some((c) => c === "session=abc123; Path=/; Max-Age=3600; HttpOnly; SameSite=Lax"), "req.cookies.set() serialises with the documented Path=/ + SameSite=Lax defaults");
+  ok(cookies.some((c) => c === "stamp=s; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax"), "an Expires value keeps the comma inside its own date — proof the headers were never flattened and re-split");
+  ok(cookies.some((c) => c === "from=response; Path=/"), "a Set-Cookie the handler put on the Response survives alongside the ones from req.cookies");
+
+  const logout = await httpRaw("/logout", { cookie: "session=abc" });
+  ok(setCookiesOf(logout)[0] === "session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax", "delete() emits the empty-value + past-expiry tombstone that makes the browser drop the cookie");
+
+  const viaFetch = await httpRaw("/other", { cookie: "a=1; b=2" });
+  ok(/cookies=2/.test(viaFetch.body), "a `fetch` handler builds its own new Bun.CookieMap(req.headers.get('cookie')) — the documented path there, since `cookies` is BunRequest-only");
+}
+
+// 11) bun run files.ts — BunFile against the REAL Wasm VFS across the Atomics
+// bridge. The offline tier runs these against host Node's fs; only here do the
+// writes go through fs-client's 512 KiB fd window, which is the one part of this
+// batch whose failure mode (a silently truncated file, or a syscall that hangs
+// and 504s much later) looks nothing like its cause.
+console.log("\n== bun run files.ts (BunFile, FileSink and Bun.write over the VFS) ==");
+{
+  write("files.ts", [
+    "const dir = '/app/filetest';",
+    "async function main() {",
+    "  const r: any = {};",
+    "  r.written = await Bun.write(dir + '/hello.txt', 'hello world');",
+    "  const f = Bun.file(dir + '/hello.txt');",
+    "  r.size = f.size; r.type = f.type; r.text = await f.text(); r.bytes = (await f.bytes()).length;",
+    "  r.slice = await f.slice(6).text();",
+    // Laziness, proven the only way that cannot be faked: slice a file that does
+    // not exist yet, then create it.
+    "  const ghost = Bun.file(dir + '/later.txt').slice(0, 3);",
+    "  await Bun.write(dir + '/later.txt', 'abcdef');",
+    "  r.lazySlice = await ghost.text();",
+    "  r.stream = await Bun.readableStreamToText(f.slice(0, 5).stream());",
+    "  await Bun.write(dir + '/j.json', '{\"a\":7}');",
+    "  r.json = (await Bun.file(dir + '/j.json').json()).a;",
+    // Incremental flush, read back THROUGH THE VFS before end() is called.
+    "  const sink = Bun.file(dir + '/app.log').writer({ highWaterMark: 8 });",
+    "  sink.write('0123456789');",
+    "  r.midWrite = await Bun.file(dir + '/app.log').text();",
+    "  sink.write('ab');",
+    "  r.buffered = await Bun.file(dir + '/app.log').text();",
+    "  sink.flush();",
+    "  r.flushed = await Bun.file(dir + '/app.log').text();",
+    "  r.endTotal = sink.end();",
+    // Larger than the 1 MiB SAB window and than the 512 KiB fd chunk.
+    "  const big = 'x'.repeat(1500000);",
+    "  r.bigWrite = await Bun.write(dir + '/big.bin', big);",
+    "  r.bigSize = Bun.file(dir + '/big.bin').size;",
+    "  const bigSink = Bun.file(dir + '/big2.bin').writer();",
+    "  bigSink.write(big);",
+    "  r.bigSinkEnd = bigSink.end();",
+    "  r.bigSinkSize = Bun.file(dir + '/big2.bin').size;",
+    "  r.bigTail = await Bun.file(dir + '/big.bin').slice(1499997).text();",
+    "  await Bun.file(dir + '/hello.txt').delete();",
+    "  r.deleted = await Bun.file(dir + '/hello.txt').exists();",
+    "  await Bun.write(dir + '/u.txt', 'u');",
+    "  await Bun.file(dir + '/u.txt').unlink();",
+    "  r.unlinked = await Bun.file(dir + '/u.txt').exists();",
+    "  try { Bun.file(3); r.fdThrew = false; } catch (e) { r.fdThrew = /VFS handles/.test(String(e && e.message)); }",
+    "  try { await Bun.write(4, 'x'); r.fdWriteThrew = false; } catch (e) { r.fdWriteThrew = /VFS handles/.test(String(e && e.message)); }",
+    "  console.log('FILERESULT:' + JSON.stringify(r));",
+    // Bun's three-line cat, through the kernel's stdout rather than a file.
+    "  await Bun.write(Bun.stdout, Bun.file(dir + '/j.json'));",
+    "}",
+    "main().then(() => process.exit(0)).catch((e) => { console.log('FILEERROR:' + ((e && e.stack) || e)); process.exit(1); });",
+  ].join("\n"));
+  const run = await kernel.start("bun", ["run", "files.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (run.stdout || "") + (run.stderr || "");
+  if (LIVE) console.log(o);
+  const m = o.match(/FILERESULT:(\{.*\})/);
+  const r = m ? JSON.parse(m[1]) : {};
+  if (!m) console.log("  no FILERESULT; output:", o.slice(-2000));
+  console.log("  ->", JSON.stringify({ size: r.size, midWrite: r.midWrite, bigSize: r.bigSize }), "exit", run.code);
+  ok(run.code === 0, "files.ts exits 0");
+  ok(r.written === 11 && r.size === 11 && r.text === "hello world", "Bun.write + Bun.file round-trip through the Wasm VFS");
+  ok(r.type === "text/plain" && r.bytes === 11, ".type and .bytes()");
+  ok(r.slice === "world" && r.stream === "hello", ".slice() reads its window, and .stream() honours it");
+  ok(r.lazySlice === "abc", ".slice() taken before the file existed still reads — the window resolves at read time, nothing was copied");
+  ok(r.json === 7, ".json() parses a file out of the VFS");
+  ok(r.midWrite === "0123456789", "the FileSink drained to the VFS on crossing the high-water mark — with no end(), a crash here loses nothing");
+  ok(r.buffered === "0123456789" && r.flushed === "0123456789ab", "a write under the mark stays buffered until flush()");
+  ok(r.endTotal === 12, "end() reports the sink's lifetime total");
+  ok(r.bigWrite === 1500000 && r.bigSize === 1500000, "Bun.write chunks a 1.5 MB payload across the 512 KiB fd window instead of truncating at it");
+  ok(r.bigSinkEnd === 1500000 && r.bigSinkSize === 1500000, "one FileSink.write() larger than the window is chunked the same way");
+  ok(r.bigTail === "xxx", "...and the bytes past the window boundary read back");
+  ok(r.deleted === false && r.unlinked === false, ".delete() and its .unlink() alias really remove the file");
+  ok(r.fdThrew === true && r.fdWriteThrew === true, "Bun.file(fd) and Bun.write(fd, …) still throw naming VFS handles (Phase 0 stays fixed)");
+  ok(/\{"a":7\}/.test(o), "Bun.write(Bun.stdout, Bun.file(p)) — Bun's cat — reaches the kernel's stdout");
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");
 process.exit(failed ? 1 : 0);

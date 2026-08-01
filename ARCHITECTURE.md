@@ -1084,7 +1084,7 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   `escapeHTML`/`deepEquals`/`deepMatch`, `hash`/`crc32`, `Glob`, `FileSystemRouter`,
   `randomUUIDv7`, `gzip`/`gunzip`, password `hash`/`verify`,
   `CryptoHasher`, `Transpiler`, `$`, and **`Bun.serve`** (a fetch handler; `routes` with static
-  paths, `:params`, `*` wildcards and `BunRequest.params`; the documented `error(err)` hook,
+  paths, `:params`, `*` wildcards, `BunRequest.params` and `BunRequest.cookies`; the documented `error(err)` hook,
   falling back to a plain 500 when it is absent or declines; server-side **WebSockets** — RFC 6455
   handshake + frame codec + `ServerWebSocket` with pub/sub topics), plus **`bun:*` modules**
   (`bun:test` runner + `expect`, with Bun/Jest `test.only` filtering and `beforeEach`/`afterEach`
@@ -1116,6 +1116,42 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   `node/internal/util/colors.js` (the hook `util.styleText` consults), so under Studio, where the
   kernel exports `FORCE_COLOR=3`, it claims 24-bit, and in a headless kernel it returns the
   documented empty string.
+- `packages/runtime/builtins/bun-cookie.js` — `Bun.Cookie`, `Bun.CookieMap` and the
+  `req.cookies` hook, imported by `bun.js` and spread into the `Bun` literal. Hand-rolled
+  rather than vendored: the npm cookie libraries each differ from Bun at some point that
+  changes a cookie's **scope or lifetime**, and a mis-scoped cookie is a session that
+  silently fails to come back rather than an error anyone sees. The load-bearing rules are
+  that `path: "/"` and `sameSite: "lax"` are defaults *and are always emitted*; that
+  `Max-Age` takes precedence over `Expires` in the computed expiry (RFC 6265 §5.3) while
+  both attributes are retained and re-serialised, so the result is independent of header
+  order; that values are percent-encoded on serialisation and *not* decoded by
+  `Cookie.parse`, while a `Cookie:` request header *is* value-decoded and its names never
+  are (the `__Host-`/`__Secure-` prefix rules are enforced by browsers on the literal
+  name); and that `sameSite: "none"` is emitted **without** an implicit `Secure`, matching
+  Bun and leaving the browser to be the thing that rejects it. `CookieMap` keeps arrived
+  and changed cookies in two lists so that a handler which only *reads* emits no
+  `Set-Cookie` at all, and a deletion is a tombstone — empty value plus a 1970 expiry —
+  that is invisible to `get`/`size`/iteration but still serialises. On the response side
+  `Bun.serve` collects Set-Cookie via `Headers.getSetCookie()` and passes Node an array,
+  because `Headers.forEach` flattens repeats into one comma-joined value that an `Expires`
+  date's own comma makes unsplittable.
+- `packages/runtime/builtins/bun-file.js` — `Bun.file`, `Bun.write`, the `FileSink` returned
+  by `.writer()`, and `Bun.stdout`/`Bun.stderr` as write destinations. A `BunFile` is a lazy
+  handle: it holds a path plus an absolute byte window and resolves that window against the
+  file **at read time**, so `.slice()` is a view (Bun documents it as not copying or opening
+  the file), slices compose, and an open-ended slice follows a file that is still growing.
+  The `FileSink` opens its fd on the first write and drains whenever the buffer passes the
+  high-water mark, so a long-running writer neither holds the file in memory nor loses
+  everything if the process dies before `end()`; `end()` materialises the file even when
+  nothing was written. Every write is chunked to 512 KiB (mirroring `FD_CHUNK`) and loops on
+  the returned short-write count, and `.stream()` reads 64 KiB per `pull()` — the syscall
+  window (§2) is the constraint in both directions. `.stream()` builds its `ReadableStream`
+  directly rather than calling `Readable.toWeb`, which the vendored stream core leaves
+  unimplemented (it throws, while still being a function — so a `typeof` guard does not
+  save you, and only the kernel spike catches it). Divergence: a `BunFile` is not a platform
+  `Blob` instance, so `new Response(Bun.file(p))` stringifies rather than streaming; making
+  it work is not portable between Node's undici and a browser Worker's native `Response`, so
+  the gap is documented and pinned instead of papered over.
 - `packages/runtime/builtins/bun-bytes.js` — the bytes/streams APIs `Bun.ArrayBufferSink`, the
   seven `Bun.readableStreamTo*` consumers, `Bun.concatArrayBuffers` and `Bun.allocUnsafe`.
   Nothing vendored; these are standard web primitives. Two contracts carry the risk.
@@ -1178,7 +1214,10 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   `Bun.version`/`Bun.revision` cannot disagree; its embedded fallback literal is asserted equal
   in the offline spike, because `BUN_PROGRAM` is a template literal that cannot import.
 - Where the shim has no honest answer it **throws naming the API and the reason** rather than
-  returning a placeholder: `Bun.file(fd)` (our fds are VFS handles), `Bun.Transpiler.scan`/
+  returning a placeholder: `Bun.file(fd)` and `Bun.write(fd, …)` (our fds are VFS handles),
+  `Bun.file()` with a non-path argument, reading `Bun.stdout`/`Bun.stderr` (write-only sinks
+  here — the process's output reaches the kernel by message, not through a readable file),
+  `Bun.Transpiler.scan`/
   `scanImports` (the transform builds no import graph), the `bun:jsc` heap helpers (no engine
   hook). Same import-safe/call-loud tier as `bun:ffi`.
 - **APIs with an exact answer are ported byte-exact and pinned to an external vector**, because
