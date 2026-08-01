@@ -25,14 +25,18 @@
 // Bun.resolveSync/resolve (the `root` argument is a DIRECTORY and is honoured;
 // import.meta.resolveSync's is the importing FILE), Bun.hash (real wyhash, plus
 // xxHash32/64, murmur32v2/v3, murmur64v2, cityHash32/64, crc32, adler32 —
-// byte-exact, with the documented number-vs-bigint return typing)/CryptoHasher,
-// Bun.password (crypto-backed), Bun.Glob (.match(); `*` stops at `/`, `!` negates
-// only at pattern start, braces nest 10 deep — plus .scan()/.scanSync(), a real
-// pruning VFS walk with the documented cwd/dot/absolute/onlyFiles/followSymlinks/
-// throwErrorOnBrokenSymlink options), Bun.FileSystemRouter (Next.js-style
-// [param]/[...catchAll]/[[...optional]] with per-segment precedence — see
-// bun-fsrouter.js), Bun.randomUUIDv7 (a real time-ordered v7, monotonic within a
-// millisecond), Bun.gzipSync/…,
+// byte-exact, with the documented number-vs-bigint return typing), Bun.CryptoHasher
+// (Bun's whole 19-algorithm family, .copy()/.byteLength/static .hash()/.algorithms
+// and HMAC keying — including Bun's rule that a digested HMAC is dead, not reset)
+// and Bun.password (real argon2id/bcrypt emitting standard PHC / modular-crypt
+// strings that round-trip with real Bun, SHA-512 pre-hashing bcrypt inputs over 72
+// bytes as Bun does — see bun-crypto.js), Bun.Glob (.match(); `*` stops at `/`, `!`
+// negates only at pattern start, braces nest 10 deep — plus .scan()/.scanSync(), a
+// real pruning VFS walk with the documented cwd/dot/absolute/onlyFiles/
+// followSymlinks/throwErrorOnBrokenSymlink options), Bun.FileSystemRouter
+// (Next.js-style [param]/[...catchAll]/[[...optional]] with per-segment precedence
+// — see bun-fsrouter.js), Bun.randomUUIDv7 (a real time-ordered v7, monotonic
+// within a millisecond), Bun.gzipSync/…,
 // Bun.inspect (incl. .table and .custom)/deepEquals (loose AND strict)/deepMatch/
 // escapeHTML, Bun.pathToFileURL/fileURLToPath,
 // Bun.stringWidth/stripANSI/wrapAnsi/color/indexOfLine (see bun-text.js),
@@ -58,7 +62,12 @@
 // Bun.Transpiler.scan/scanImports (the
 // transform builds no import/export graph), Bun.hash.xxHash3/rapidhash (not
 // ported, and we have no reference vector to verify a port against), and the bun:jsc
-// heap-introspection helpers (no engine hook exists in a page). bun:sqlite is
+// heap-introspection helpers (no engine hook exists in a page). Bun.password
+// throws without the Rust/Wasm crypto codec rather than falling back: argon2id and
+// bcrypt have no JavaScript stand-in, and a hash that is not really one of them
+// verifies nowhere. Note Bun.CryptoHasher rejects "blake3" — that is not a gap,
+// real Bun has no blake3 either, and accepting it here would break sandbox code on
+// the first real `bun` run. bun:sqlite is
 // registered as a module but every call throws until a wasm SQLite backend is
 // wired into it (see makeBunSqlite) — treat it as not usable today. Also loud:
 // the CSS Color 4 function space in Bun.color — lab()/lch()/oklab()/oklch()/
@@ -104,6 +113,7 @@ import { createSleepSync } from "./bun-sleep.js";
 import { loadBunEnvFiles } from "./bun-env.js";
 import { Cookie, CookieMap, attachRequestCookies, pendingSetCookies } from "./bun-cookie.js";
 import { createBunFile } from "./bun-file.js";
+import { createBunCrypto } from "./bun-crypto.js";
 
 // The two documented Bun.hash members we did not port. The message names the
 // algorithm and says why, in the same spirit as the bun:ffi one: a caller who hits
@@ -617,53 +627,11 @@ export function createBunRuntime({ process, Buffer, require }) {
     return ((b << 16) | a) >>> 0;
   };
 
-  class CryptoHasher {
-    constructor(algorithm = "sha256") {
-      this.algorithm = algorithm;
-      this._h = lazy("crypto").createHash(algorithm);
-    }
-    update(data, encoding) { this._h.update(toBuf(data, Buffer), encoding); return this; }
-    digest(encoding) { return encoding ? this._h.digest(encoding) : new Uint8Array(this._h.digest()); }
-  }
-
-  const password = {
-    async hash(pw, opts) {
-      const crypto = lazy("crypto");
-      const algo = (opts && (typeof opts === "string" ? opts : opts.algorithm)) || "argon2id";
-      const salt = crypto.randomBytes(16);
-      const key = crypto.scryptSync(String(pw), salt, 32);
-      // A self-describing string (approximation of Bun's PHC output). verify() below
-      // parses it back. Not interoperable with real argon2/bcrypt hashes.
-      return "$vv-" + algo + "$" + salt.toString("base64") + "$" + Buffer.from(key).toString("base64");
-    },
-    async verify(pw, stored) {
-      try {
-        const crypto = lazy("crypto");
-        const parts = String(stored).split("$");
-        const salt = Buffer.from(parts[2], "base64");
-        const key = Buffer.from(parts[3], "base64");
-        const check = crypto.scryptSync(String(pw), salt, key.length);
-        return crypto.timingSafeEqual(key, check);
-      } catch { return false; }
-    },
-  };
-  password.hashSync = (pw, opts) => {
-    const crypto = lazy("crypto");
-    const algo = (opts && (typeof opts === "string" ? opts : opts.algorithm)) || "argon2id";
-    const salt = crypto.randomBytes(16);
-    const key = crypto.scryptSync(String(pw), salt, 32);
-    return "$vv-" + algo + "$" + salt.toString("base64") + "$" + Buffer.from(key).toString("base64");
-  };
-  password.verifySync = (pw, stored) => {
-    try {
-      const crypto = lazy("crypto");
-      const parts = String(stored).split("$");
-      const salt = Buffer.from(parts[2], "base64");
-      const key = Buffer.from(parts[3], "base64");
-      const check = crypto.scryptSync(String(pw), salt, key.length);
-      return crypto.timingSafeEqual(key, check);
-    } catch { return false; }
-  };
+  // Bun.CryptoHasher and Bun.password (bun-crypto.js). Both are real: the hasher
+  // covers Bun's whole documented algorithm family with HMAC keying and Bun's
+  // consumed-HMAC semantics, and the password functions are genuine argon2id and
+  // bcrypt emitting PHC / modular-crypt strings that round-trip with real Bun.
+  const { CryptoHasher, password } = createBunCrypto({ lazy, Buffer, process });
 
   // ---- misc helpers ----------------------------------------------------------
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms instanceof Date ? Math.max(0, ms - Date.now()) : ms));

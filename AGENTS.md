@@ -94,6 +94,11 @@ packages/
                    Bun's own parser, and $VAR expansion. `bun` processes only.
       bun-sleep.js Bun.sleepSync as a real Atomics.wait park (packages/protocol/
                    syscall.js `parkFor`/`canPark`), with the spin as a fallback.
+                   Bun's dialect is not minimatch's (see the Bun section below).
+      bun-crypto.js  Bun.CryptoHasher (19 algorithms + HMAC) and Bun.password (real
+                   argon2id/bcrypt over packages/crypto, standard PHC / modular-crypt
+                   output). Unlike bun-hash.js this is the CRYPTOGRAPHIC side; the two
+                   share no code and are not interchangeable.
     node/
       lib/         Node's REAL vendored lib/*.js (fs, net, http, stream, ...).
       internal/    Node's REAL internal/* (streams, errors, validators, ...).
@@ -777,6 +782,8 @@ unpacked:
   `main`, `env`, `escapeHTML`, `deepEquals`/`deepMatch`, `hash`/`crc32`, `Glob`,
   `FileSystemRouter`, `randomUUIDv7`, `gzip`/`gunzip`,
   password `hash`/`verify`, `CryptoHasher`, `Transpiler`, `$`) plus **`Bun.serve`**
+  `randomUUIDv7`, `gzip`/`gunzip`,
+  `Transpiler`, `$`) plus **`Bun.serve`**
   (fetch handler; `routes` with static paths, `:params`, `*` wildcards,
   `BunRequest.params` and **`BunRequest.cookies`**; server-side **WebSockets** — RFC
   6455 handshake, frame codec, `ServerWebSocket` send/close/subscribe/publish/cork
@@ -869,6 +876,23 @@ unpacked:
   `Bun.resolveSync(id, root)` takes a DIRECTORY ("pass `import.meta.dir`"), while
   `import.meta.resolveSync(id, parent)` takes the importing FILE and is defined by
   Bun's own typings as `Bun.resolveSync(id, path.dirname(parent))`.
+- **`packages/runtime/builtins/bun-crypto.js`** — `Bun.CryptoHasher` and
+  `Bun.password`, over `packages/crypto` (RustCrypto) through the same
+  `internalBinding('crypto')` seam `node:crypto` uses. This is the file where being
+  *approximately* right is a security bug, so two rules apply that do not elsewhere.
+  (1) **Bun.password emits and accepts the STANDARD encodings** — PHC for argon2id
+  (`$argon2id$v=19$m=65536,t=2,p=1$…`, Bun's defaults) and modular crypt for bcrypt
+  (`$2b$10$…`) — so a hash written in the sandbox verifies in production and vice
+  versa. It used to emit a bespoke `$vv-<algo>$…` string built from node scrypt while
+  reporting "argon2id" to the caller; those legacy strings are still **accepted** by
+  `verify` (nothing else on earth can read them, and real Bun can never hold one) but
+  are never produced again. Passwords over **72 bytes are SHA-512 pre-hashed** before
+  bcrypt, raw bytes, strictly `> 72` — Bun's construction exactly, or long passwords
+  silently stop verifying off-sandbox. (2) **There is no fallback**: without the wasm
+  codec both throw, naming the API. `Bun.CryptoHasher` covers Bun's 19 documented
+  algorithms and reproduces the rule that a **digested HMAC is consumed, not reset**.
+  It is a buffering hasher, so `.copy()` clones buffered input rather than a
+  mid-state context — observationally identical, different only in memory.
 - **`packages/kernel-host/programs/bun.js`** — the `bun`/`bunx` CLI: `bun run`,
   `bunx` (delegates to `npx`), install delegation, and it surfaces require/unhandled-
   rejection errors instead of a silent exit. `bun <file>` runs the file through the

@@ -1085,6 +1085,10 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   `randomUUIDv7`, `gzip`/`gunzip`, password `hash`/`verify`,
   `CryptoHasher`, `Transpiler`, `$`, and **`Bun.serve`** (a fetch handler; `routes` with static
   paths, `:params`, `*` wildcards, `BunRequest.params` and `BunRequest.cookies`; the documented `error(err)` hook,
+  `escapeHTML`/`deepEquals`/`deepMatch`, `hash`/`crc32`, `Glob`, `randomUUIDv7`,
+  `gzip`/`gunzip`,
+  `Transpiler`, `$`, and **`Bun.serve`** (a fetch handler; `routes` with static
+  paths, `:params`, `*` wildcards and `BunRequest.params`; the documented `error(err)` hook,
   falling back to a plain 500 when it is absent or declines; server-side **WebSockets** — RFC 6455
   handshake + frame codec + `ServerWebSocket` with pub/sub topics), plus **`bun:*` modules**
   (`bun:test` runner + `expect`, with Bun/Jest `test.only` filtering and `beforeEach`/`afterEach`
@@ -1233,6 +1237,27 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   has none of the time-ordering that is the only reason to choose v7. `Bun.hash.xxHash3` and
   `rapidhash` are documented members left unported, and throw, because there is no reference we
   can pin them against.
+- **The cryptographic members live in `builtins/bun-crypto.js` and are real, or they throw.**
+  `Bun.CryptoHasher` covers Bun's whole documented 19-algorithm family (md4/md5/sha1/sha2/
+  sha3/shake/ripemd160/blake2) with `.copy()`, `.byteLength`, static `.hash()`/`.algorithms`
+  and HMAC keying, over `packages/crypto`. Two behaviours are reproduced deliberately because
+  the natural implementation gets them wrong in a way that is invisible until the code runs
+  under real Bun: a **digested HMAC instance is consumed** — every later `.digest()`/`.update()`/
+  `.copy()`/`.byteLength` throws `HMAC has been consumed and is no longer usable`, while a
+  plain hasher *is* reset and reusable — and **`blake3` is rejected**, because Bun has no
+  blake3 and accepting it would mean sandbox code failing on its first real `bun` run. It is a
+  buffering hasher (the crate exposes one-shot digests), so `.copy()` clones buffered input
+  rather than a mid-state context; that is observationally identical for every documented
+  operation and differs only in memory held until `.digest()`.
+  `Bun.password` is genuine **argon2id** (Bun's documented defaults: m=65536 KiB, t=2, p=1,
+  32-byte salt and tag) and **bcrypt** (cost 10, `$2b$`), emitting and accepting the standard
+  **PHC** and **modular-crypt** strings, so hashes round-trip with real Bun in both directions —
+  pinned by hashes Bun itself printed. Inputs longer than **72 bytes are SHA-512 pre-hashed**
+  (raw digest bytes, strictly `> 72`) exactly as Bun does, since bcrypt otherwise truncates and
+  a long password hashed here would not verify in production. Neither function has a pure-JS
+  fallback: without the wasm codec they throw, because a password hash that is not really
+  argon2id or bcrypt cannot be verified anywhere. The pre-argon2 `$vv-…` scrypt strings this
+  replaced are still accepted by `verify` and never emitted again (§9.2).
 - **`Bun.Glob` is hand-rolled (`builtins/bun-glob.js`), not vendored**, because Bun's dialect
   differs from minimatch/picomatch in three documented ways that each change which files a build
   includes: `*` does not cross `/` or `\`, `!` negates only at the very start of a pattern, and

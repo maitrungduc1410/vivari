@@ -4590,5 +4590,97 @@ two blocks that only it can prove — a `Bun.serve({ routes })` server whose han
 on the real header array coming back through the bridge), and a script that drives `BunFile`,
 the `FileSink` and `Bun.write` against the real Wasm VFS, including the 1.5 MB chunked write
 and reading the sink's output back out of the VFS *before* `end()` is called.
+## Bun cryptography — `Bun.CryptoHasher` and real argon2id/bcrypt for `Bun.password` (this change)
+
+The previous Bun batches were about APIs that returned plausible wrong answers. This one is about
+the two members where a plausible wrong answer is a **security bug** rather than a correctness bug,
+and where the failure is not just silent but *delayed*: it does not surface in the sandbox at all,
+it surfaces in production, months later, as "nobody can log in".
+
+`Bun.password` was the worse of the two. It ran node's `scryptSync` and emitted
+`$vv-argon2id$<salt>$<key>` — a string that is not argon2, not bcrypt, not PHC, not modular crypt,
+and readable by nothing on earth except the twelve lines that produced it — while reporting
+`algorithm: "argon2id"` to the caller. It verified its own output perfectly, which is exactly why
+the existing check ("hash it, verify it, they match") passed for as long as it did. That check was
+not testing the property anyone cares about. The property anyone cares about is that a hash written
+here verifies **elsewhere**, and only a vector from elsewhere can demonstrate it.
+
+- **`Bun.password` is real argon2id and real bcrypt**, over the RustCrypto `argon2` and `bcrypt`
+  crates in `packages/crypto`, emitting and accepting the standard encodings — PHC
+  (`$argon2id$v=19$m=65536,t=2,p=1$…`) and modular crypt (`$2b$10$…`). The parameters are Bun's
+  documented defaults, read out of Bun's `PasswordObject.zig` rather than guessed: argon2id at
+  m=65536 KiB, t=2, p=1 with a 32-byte salt and a 32-byte tag; bcrypt at cost 10 with the `$2b$`
+  prefix. It is pinned by hashes **real Bun printed** — the two argon2id samples in Bun's own docs
+  and the bcrypt sample beside them all verify here, plus the `phc-winner-argon2` reference vector
+  and the canonical Openwall bcrypt vectors.
+- **bcrypt inputs longer than 72 bytes are SHA-512 pre-hashed**, because bcrypt's Blowfish key
+  schedule consumes at most 72 bytes and silently ignores the rest. Bun does this; skipping it
+  means a long password hashed in the sandbox does not verify in production, which is the exact
+  shape of failure this whole effort exists to remove. Three details had to be exactly right and
+  each of them is independently wrong-able: the test is `> 72` and **not** `>= 72` (a password of
+  exactly 72 bytes is passed through untouched), what bcrypt receives is the **raw 64-byte digest**
+  and not its hex or base64 form (base64 is the *better* engineering choice — it cannot contain a
+  NUL — and it is the wrong answer here, because interop is the requirement, not taste), and the
+  same transform has to happen on the verify path too. Bun's own test suite carries a bcrypt hash
+  written by Bun 1.2.4 for a 500-byte password, kept specifically so this construction cannot
+  drift; that hash verifies here, and it fails against the hex form, the base64 form and the
+  un-pre-hashed password, so the check discriminates rather than merely passing.
+- **Migration: `verify` still accepts the old `$vv-…` strings; nothing emits them again.** Silently
+  rejecting them was never on the table — returning `false` means "wrong password", which is the
+  unexplainable delayed failure in miniature. Between the two defensible answers (accept, or throw
+  something explanatory) accepting wins because the divergence it creates is *unobservable*: real
+  Bun throws `UnsupportedAlgorithm` on a `$vv-` string, and no real Bun deployment can ever hold
+  one, since only this shim ever wrote that prefix. So we accept a string Bun would reject, in a
+  namespace Bun can never encounter, and every string Bun **can** encounter behaves identically.
+- **Cost, measured, not assumed.** argon2id at Bun's default cost is a real 64 MiB allocation and
+  two passes over it. In wasm under Node it is **~97 ms to hash and ~97 ms to verify**, stable
+  across runs. That is slower than native (tens of ms) but nowhere near the "a spike takes minutes"
+  regime, so the default is Bun's default and stays there. Deliberately noted because the tempting
+  fix — quietly lowering `memoryCost` so the tests feel snappier — would be the worst possible
+  version of this change: a password KDF weakened invisibly, in code whose entire purpose is to
+  behave like the real thing. Only the one check that exercises the default runs at the default;
+  the rest use `memoryCost: 8` to stay cheap, exactly as Bun's own suite does.
+- **`Bun.CryptoHasher` is complete**: Bun's whole documented 19-algorithm family (md4, md5, sha1,
+  the sha2 family including sha512-224/256, the sha3 family, shake128/256, ripemd160, blake2b256/
+  blake2b512/blake2s256) with Bun's case-insensitive alias table, plus `.copy()`, `.byteLength`,
+  `.algorithm`, static `.hash()` and static `.algorithms`, `digest()` into a supplied `TypedArray`,
+  and HMAC keying via `new CryptoHasher(algo, key)`. The sha3/shake/ripemd160/md4/blake2 halves of
+  the crate are new; every one is pinned against OpenSSL or a published vector.
+- **The consumed-HMAC rule is reproduced on purpose.** In real Bun a keyed hasher is *not* reset by
+  `.digest()` — its context is released, and `.digest()`, `.update()`, `.copy()`, `.byteLength` and
+  `.algorithm` all throw `HMAC has been consumed and is no longer usable` afterwards — while an
+  unkeyed hasher *is* reset and is reusable from empty. The natural implementation resets both and
+  cheerfully keeps hashing. That is self-consistent and produces digests real Bun refuses to
+  produce at all, so it is invisible until the code leaves the sandbox. Both halves are pinned
+  separately, since they differ.
+- **HMAC is rejected at construction for shake128/shake256**, as in Bun: an extendable-output
+  function has no fixed digest length to key. `blake3` is rejected too — not an omission, Bun has
+  no blake3 in `EVP.Algorithm` or `CryptoHasherZig`, and accepting it would be the *more* dangerous
+  divergence, since sandbox code would then break on its first real `bun` run.
+- **Without the wasm crypto codec, `Bun.password` throws** and names the API and the reason.
+  There is deliberately no pure-JS fallback: argon2id and bcrypt have no stand-in, and a hash that
+  is not really one of them can be verified nowhere, which is strictly worse than not running.
+
+Two implementation notes worth recording because they look like shortcuts and are not. BLAKE2
+cannot go through RustCrypto's `hmac` (its core uses a lazy block buffer; `hmac` needs an eager
+one, and RustCrypto's position is that BLAKE2 has a native keyed mode so it deliberately does not
+wrap), so the HMAC construction is spelled out by hand against BLAKE2b's 128-byte block — and is
+therefore pinned against Bun's own published HMAC-blake2b512 vector rather than trusted. And
+`CryptoHasher` is a **buffering** hasher, not a streaming one, because the crate exposes one-shot
+digests across the wasm boundary; `.copy()` clones the buffered input rather than a mid-state
+context. That is observationally identical for every documented operation — a hash is a pure
+function of its concatenated input, so a copy that diverges produces the same bytes either way,
+and there is still only one hash computation per digest — and it differs only in memory held until
+`.digest()`. Said plainly here rather than left for someone to discover.
+
+The offline gate goes from 463 checks to 564. The new checks are split deliberately: the ones that
+can run without the wasm codec do (algorithm tables, the alias map, `.copy()`, the consumed-HMAC
+rule, the bcrypt pre-hash decision as a pure function, digests cross-checked against the host's
+OpenSSL), and the ones that genuinely need the Rust crate — argon2id, bcrypt, hand-written
+HMAC-BLAKE2b, and the two algorithms OpenSSL's default provider does not carry — announce
+themselves as skipped in the Wasm-free tier and run in CI's `verify` job, which builds the crate.
+`scripts/spike-bun.mjs` additionally drives the whole thing through a real guest process on the
+kernel, because the offline spike hands the shim a hand-built `internalBinding('crypto')` and a
+password hash that only works when the test rigs the binding is not a feature.
 
 See ARCHITECTURE.md §9.2.

@@ -27,11 +27,38 @@ fn norm(algo: &str) -> String {
 }
 
 // --- one-shot digest ------------------------------------------------------
+// The second group (blake2/sha3/shake/ripemd160/md4/sha512-224) is P2D: it is
+// the rest of Bun.CryptoHasher's documented algorithm list, which the Bun shim
+// reaches through internalBinding('crypto') directly. Note `norm()` strips
+// dashes, so "sha3-256" arrives here as "sha3256" and "blake2b256" unchanged.
+//
+// shake128/shake256 are extendable-output functions with no intrinsic digest
+// length; 16 and 32 bytes are the defaults both Bun and Node use, and are what
+// the callers ask for.
 #[wasm_bindgen]
 pub fn digest(algo: &str, data: &[u8]) -> Result<Vec<u8>, JsError> {
+    use blake2::{Blake2b512, Blake2s256};
+    use digest::consts::U32;
+    use md4::Md4;
     use md5::Md5;
+    use ripemd::Ripemd160;
     use sha1::Sha1;
-    use sha2::{Sha224, Sha256, Sha384, Sha512, Sha512_256};
+    use sha2::{Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256};
+    use sha3::digest::ExtendableOutput;
+    use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256};
+    // BLAKE2b-256 is NOT truncated BLAKE2b-512: the output length is mixed into
+    // the parameter block, so it is its own function. Blake2b<U32> is that
+    // function, and matches what OpenSSL/BoringSSL call "blake2b256".
+    type Blake2b256 = blake2::Blake2b<U32>;
+    macro_rules! xof {
+        ($t:ty, $len:expr) => {{
+            let mut out = vec![0u8; $len];
+            let mut h = <$t>::default();
+            sha3::digest::Update::update(&mut h, data);
+            h.finalize_xof_into(&mut out);
+            out
+        }};
+    }
     Ok(match norm(algo).as_str() {
         "md5" => Md5::digest(data).to_vec(),
         "sha1" => Sha1::digest(data).to_vec(),
@@ -39,18 +66,48 @@ pub fn digest(algo: &str, data: &[u8]) -> Result<Vec<u8>, JsError> {
         "sha256" => Sha256::digest(data).to_vec(),
         "sha384" => Sha384::digest(data).to_vec(),
         "sha512" => Sha512::digest(data).to_vec(),
+        "sha512224" => Sha512_224::digest(data).to_vec(),
         "sha512256" => Sha512_256::digest(data).to_vec(),
+        "md4" => Md4::digest(data).to_vec(),
+        "ripemd160" => Ripemd160::digest(data).to_vec(),
+        "blake2b256" => Blake2b256::digest(data).to_vec(),
+        "blake2b512" => Blake2b512::digest(data).to_vec(),
+        "blake2s256" => Blake2s256::digest(data).to_vec(),
+        "sha3224" => Sha3_224::digest(data).to_vec(),
+        "sha3256" => Sha3_256::digest(data).to_vec(),
+        "sha3384" => Sha3_384::digest(data).to_vec(),
+        "sha3512" => Sha3_512::digest(data).to_vec(),
+        "shake128" => xof!(Shake128, 16),
+        "shake256" => xof!(Shake256, 32),
         other => return Err(JsError::new(&format!("unsupported digest '{other}'"))),
     })
 }
 
 // --- one-shot HMAC --------------------------------------------------------
+// Everything except BLAKE2 goes through RustCrypto's `hmac`. BLAKE2 cannot: its
+// core uses a *lazy* block buffer (the last block is held back so the finalizer
+// can mark it), and hmac 0.12 requires an eager one — RustCrypto's position is
+// that BLAKE2 has its own native keyed mode, so it deliberately does not wrap.
+// But BoringSSL (and therefore Bun) exposes plain HMAC over blake2b, and the
+// HMAC construction itself is algorithm-agnostic, so it is spelled out below
+// against the 128-byte BLAKE2b block size. Pinned by Bun's own published
+// HMAC-blake2b512 vector in scripts/spike-bun-offline.mjs (which is also what
+// OpenSSL produces — the two were cross-checked).
+//
+// shake128/shake256 have no HMAC here, matching Bun: `new CryptoHasher(algo,
+// key)` throws for both.
 #[wasm_bindgen]
 pub fn hmac_digest(algo: &str, key: &[u8], data: &[u8]) -> Result<Vec<u8>, JsError> {
+    use blake2::Blake2b512;
+    use digest::consts::U32;
     use hmac::{Hmac, Mac};
+    use md4::Md4;
     use md5::Md5;
+    use ripemd::Ripemd160;
     use sha1::Sha1;
-    use sha2::{Sha224, Sha256, Sha384, Sha512, Sha512_256};
+    use sha2::{Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256};
+    use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512};
+    type Blake2b256 = blake2::Blake2b<U32>;
     macro_rules! mac {
         ($t:ty) => {{
             let mut m = <Hmac<$t>>::new_from_slice(key)
@@ -59,6 +116,27 @@ pub fn hmac_digest(algo: &str, key: &[u8], data: &[u8]) -> Result<Vec<u8>, JsErr
             m.finalize().into_bytes().to_vec()
         }};
     }
+    // HMAC (RFC 2104) written out for the digests hmac 0.12 will not wrap.
+    fn hmac_manual<D: sha2::Digest>(block: usize, key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut k = vec![0u8; block];
+        if key.len() > block {
+            let h = D::digest(key);
+            k[..h.len()].copy_from_slice(&h);
+        } else {
+            k[..key.len()].copy_from_slice(key);
+        }
+        let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+        let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+        let mut inner = D::new();
+        inner.update(&ipad);
+        inner.update(data);
+        let inner = inner.finalize();
+        let mut outer = D::new();
+        outer.update(&opad);
+        outer.update(&inner);
+        outer.finalize().to_vec()
+    }
+    const BLAKE2B_BLOCK: usize = 128;
     Ok(match norm(algo).as_str() {
         "md5" => mac!(Md5),
         "sha1" => mac!(Sha1),
@@ -66,7 +144,16 @@ pub fn hmac_digest(algo: &str, key: &[u8], data: &[u8]) -> Result<Vec<u8>, JsErr
         "sha256" => mac!(Sha256),
         "sha384" => mac!(Sha384),
         "sha512" => mac!(Sha512),
+        "sha512224" => mac!(Sha512_224),
         "sha512256" => mac!(Sha512_256),
+        "md4" => mac!(Md4),
+        "ripemd160" => mac!(Ripemd160),
+        "sha3224" => mac!(Sha3_224),
+        "sha3256" => mac!(Sha3_256),
+        "sha3384" => mac!(Sha3_384),
+        "sha3512" => mac!(Sha3_512),
+        "blake2b256" => hmac_manual::<Blake2b256>(BLAKE2B_BLOCK, key, data),
+        "blake2b512" => hmac_manual::<Blake2b512>(BLAKE2B_BLOCK, key, data),
         other => return Err(JsError::new(&format!("unsupported HMAC digest '{other}'"))),
     })
 }
@@ -490,6 +577,122 @@ pub fn scrypt_kdf(
     let mut out = vec![0u8; keylen];
     scrypt::scrypt(password, salt, &params, &mut out).map_err(je)?;
     Ok(out)
+}
+
+// =============================================================================
+// P2D — password hashing for Bun.password: argon2(id/i/d) + bcrypt
+//
+// These are the only two primitives in this crate whose OUTPUT is a string that
+// leaves the sandbox and has to be understood elsewhere: a password hash gets
+// written to somebody's database. So both emit the standard encodings — PHC
+// (`$argon2id$v=19$m=…,t=…,p=…$salt$hash`) for argon2, modular-crypt
+// (`$2b$10$…`) for bcrypt — and both verify strings produced by any other
+// implementation. The shim this replaced invented a `$vv-scrypt$…` format,
+// which meant a hash written in the sandbox was meaningless in production and
+// vice versa.
+//
+// Salts come from the same OsRng the keygen entry points use. Bun's parameters
+// are matched exactly by the JS layer (argon2id m=65536 KiB, t=2, p=1, 32-byte
+// salt, 32-byte tag; bcrypt cost 10, `$2b$`), so the strings are byte-compatible.
+//
+// NOT done here, on purpose: bcrypt's 72-byte input limit. Bun SHA-512-prehashes
+// longer passwords before bcrypt sees them, and that decision lives in the JS
+// layer (packages/runtime/builtins/bun-crypto.js) where it can be unit-tested
+// without a wasm build — exactly the split Bun itself uses (PasswordObject
+// prehashes; its pwhash module does not).
+// =============================================================================
+
+// argon2's memory cost is a real allocation. wasm32 has a 4 GiB address space
+// and Rust aborts the whole module on allocation failure (an abort here would
+// poison the instance, not throw), so an absurd m= from a hostile or corrupt
+// hash string must be rejected BEFORE it reaches the allocator. Real Bun caps
+// verification at m = 2^22 KiB (4 GiB); we cap lower because we cannot survive
+// getting it wrong. 1 GiB is ~16x the default and far past anything a real
+// deployment uses.
+const ARGON2_MAX_MEMORY_KIB: u32 = 1024 * 1024;
+const ARGON2_MAX_TIME_COST: u32 = 1 << 16;
+const ARGON2_MAX_PARALLELISM: u32 = 64;
+
+fn argon2_algorithm(name: &str) -> Result<argon2::Algorithm, JsError> {
+    match name {
+        "argon2id" => Ok(argon2::Algorithm::Argon2id),
+        "argon2i" => Ok(argon2::Algorithm::Argon2i),
+        "argon2d" => Ok(argon2::Algorithm::Argon2d),
+        other => Err(JsError::new(&format!("unsupported argon2 variant '{other}'"))),
+    }
+}
+
+fn argon2_guard(m_cost: u32, t_cost: u32, p_cost: u32) -> Result<(), JsError> {
+    if m_cost > ARGON2_MAX_MEMORY_KIB {
+        return Err(JsError::new(&format!(
+            "argon2 memoryCost {m_cost} KiB exceeds the {ARGON2_MAX_MEMORY_KIB} KiB the Vivari \
+             sandbox can allocate (wasm32 address space); real Bun would accept it"
+        )));
+    }
+    if t_cost > ARGON2_MAX_TIME_COST || p_cost > ARGON2_MAX_PARALLELISM {
+        return Err(JsError::new("argon2 timeCost/parallelism out of range"));
+    }
+    Ok(())
+}
+
+/// argon2 hash -> PHC string. `mode` is "argon2id" | "argon2i" | "argon2d".
+#[wasm_bindgen]
+pub fn argon2_hash(
+    password: &[u8],
+    mode: &str,
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> Result<String, JsError> {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    argon2_guard(m_cost, t_cost, p_cost)?;
+    // 32-byte salt + 32-byte tag: Bun's DEFAULT_SALT_LEN / DEFAULT_HASH_LEN.
+    let mut salt = [0u8; 32];
+    rand_core::RngCore::fill_bytes(&mut OsRng, &mut salt);
+    let salt = SaltString::encode_b64(&salt).map_err(je)?;
+    let params = argon2::Params::new(m_cost, t_cost, p_cost, Some(32)).map_err(je)?;
+    let hasher = argon2::Argon2::new(argon2_algorithm(mode)?, argon2::Version::V0x13, params);
+    Ok(hasher.hash_password(password, &salt).map_err(je)?.to_string())
+}
+
+/// Verify a PHC argon2 string. A malformed/foreign string is an ERROR (like
+/// Bun's), not a `false` — "this is not an argon2 hash" and "wrong password"
+/// are different answers and the caller must be able to tell them apart.
+#[wasm_bindgen]
+pub fn argon2_verify(password: &[u8], encoded: &str) -> Result<bool, JsError> {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    let parsed = PasswordHash::new(encoded).map_err(je)?;
+    // The params in the STRING drive the computation, so they are what has to be
+    // guarded — this is the hostile-input path.
+    let params = argon2::Params::try_from(&parsed).map_err(je)?;
+    argon2_guard(params.m_cost(), params.t_cost(), params.p_cost())?;
+    match argon2::Argon2::default().verify_password(password, &parsed) {
+        Ok(()) => Ok(true),
+        Err(argon2::password_hash::Error::Password) => Ok(false),
+        Err(e) => Err(je(e)),
+    }
+}
+
+/// bcrypt hash -> modular-crypt `$2b$<cost>$<22 salt><31 hash>` (60 chars).
+/// `password` is expected to be <= 72 bytes; the caller has already applied
+/// Bun's SHA-512 prehash if it was longer.
+#[wasm_bindgen]
+pub fn bcrypt_hash(password: &[u8], cost: u32) -> Result<String, JsError> {
+    if !(4..=31).contains(&cost) {
+        return Err(JsError::new("bcrypt cost must be between 4 and 31"));
+    }
+    let mut salt = [0u8; 16];
+    rand_core::RngCore::fill_bytes(&mut OsRng, &mut salt);
+    let parts = bcrypt::hash_with_salt(password, cost, salt).map_err(je)?;
+    Ok(parts.format_for_version(bcrypt::Version::TwoB))
+}
+
+/// Verify a modular-crypt bcrypt hash. Like the crate (and like Bun), the
+/// version prefix is not part of the comparison: `$2a$`/`$2b$`/`$2y$` hashes
+/// with the same salt and digest all verify.
+#[wasm_bindgen]
+pub fn bcrypt_verify(password: &[u8], encoded: &str) -> Result<bool, JsError> {
+    bcrypt::verify(password, encoded).map_err(je)
 }
 
 // --- sign / verify (auto-detect key kind) ------------------------------------

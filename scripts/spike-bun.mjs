@@ -545,5 +545,53 @@ console.log("\n== bun run files.ts (BunFile, FileSink and Bun.write over the VFS
   ok(/\{"a":7\}/.test(o), "Bun.write(Bun.stdout, Bun.file(p)) — Bun's cat — reaches the kernel's stdout");
 }
 
+// 12) bun run crypto.ts — Bun.CryptoHasher + Bun.password on the real runtime.
+//
+// scripts/spike-bun-offline.mjs already pins these against Bun's own vectors, but
+// it hands the shim a hand-built internalBinding('crypto'). This block is the one
+// that proves the production wiring: a real guest process reaching the Rust/Wasm
+// crypto codec through the real process.binding('crypto'), inside the kernel. A
+// password hash that only works when the test rigs the binding is not a feature.
+console.log("\n== bun run crypto.ts (CryptoHasher + password on the real runtime) ==");
+{
+  write("crypto.ts", [
+    "const out: string[] = [];",
+    // Digest and HMAC vectors published by Bun (docs + its own test suite).
+    "out.push('sha256=' + new Bun.CryptoHasher('sha256').update('hello world').digest('hex'));",
+    "out.push('hmac=' + new Bun.CryptoHasher('sha256', 'key').update('data\\n').digest('hex'));",
+    "out.push('blake2b512hmac=' + new Bun.CryptoHasher('blake2b512', 'key').update('data\\n').digest('hex'));",
+    // .copy() diverging from a shared prefix.
+    "const base = new Bun.CryptoHasher('sha256').update('hello ');",
+    "out.push('copy=' + base.copy().update('world').digest('hex'));",
+    // A consumed HMAC must be dead, not silently reusable.
+    "const h = new Bun.CryptoHasher('sha256', 'key'); h.update('x'); h.digest();",
+    "try { h.digest(); out.push('hmacreuse=nothrow'); } catch (e: any) { out.push('hmacreuse=' + e.message); }",
+    // A hash real Bun wrote, verified here; then one we write, round-tripped.
+    "out.push('bundoc=' + Bun.password.verifySync('hello', '$2b$10$Lyj9kHYZtiyfxh2G60TEfeqs7xkkGiEFFDi3iJGc50ZG/XJ1sxIFi'));",
+    "out.push('bunlong=' + Bun.password.verifySync('hello'.repeat(100), '$2b$10$PsJ3/W82mzNJoP0rSblfvet2ab9jZg2aH7tIxr1B8uFLJwuWk/jTi'));",
+    "const mine = Bun.password.hashSync('s3cret', { algorithm: 'argon2id', memoryCost: 8, timeCost: 1 });",
+    "out.push('phc=' + mine.slice(0, 27));",
+    "out.push('rt=' + Bun.password.verifySync('s3cret', mine) + ',' + Bun.password.verifySync('nope', mine));",
+    "console.log('CRYPTORESULT:' + JSON.stringify(out));",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "crypto.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (LIVE) console.log(o);
+  const m = o.match(/CRYPTORESULT:(\[.*\])/);
+  const got = m ? JSON.parse(m[1]) : [];
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim());
+  console.log("  ->", JSON.stringify(got.slice(4)));
+  ok(r.code === 0, "crypto.ts exits 0");
+  ok(got.includes("sha256=b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"), "CryptoHasher sha256 matches Bun's documented digest");
+  ok(got.includes("hmac=c7a7c96c73af32ea6e5b1ca6768b1d822249eb88f85160433d7b09bb2b21e170"), "HMAC-sha256 matches Bun's own test vector");
+  ok(got.includes("blake2b512hmac=9e66ba10f4d7e80abc2584150fc5f9a246634118280fd9ae086794d37cb9919d681ee285b68f9cec2eda9f878d157125cc465c8b0e3c023a7040ed0be7f25023"), "the crate's hand-written HMAC-BLAKE2b-512 matches Bun's vector through the kernel");
+  ok(got.includes("copy=b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"), "CryptoHasher.copy() continues the shared prefix");
+  ok(got.includes("hmacreuse=HMAC has been consumed and is no longer usable"), "reusing a digested HMAC throws Bun's message, in a real process");
+  ok(got.includes("bundoc=true"), "a bcrypt hash from Bun's docs verifies inside the VM");
+  ok(got.includes("bunlong=true"), "…and so does Bun 1.2.4's hash of a 500-byte password (the SHA-512 pre-hash)");
+  ok(got.includes("phc=$argon2id$v=19$m=8,t=1,p=1$"), "Bun.password.hash emits a real argon2id PHC string");
+  ok(got.includes("rt=true,false"), "…which verifies the right password and rejects the wrong one");
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");
 process.exit(failed ? 1 : 0);

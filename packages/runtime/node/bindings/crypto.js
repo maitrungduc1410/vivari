@@ -225,14 +225,51 @@ export function createCryptoBinding({ codec } = {}) {
     return new Uint8Array(codec.aes_gcm_decrypt(key, iv, aad || EMPTY, ctTag));
   }
 
+  // Everything the Rust crate's `digest()` implements. The second group arrived
+  // with Bun.CryptoHasher (which needs the whole documented Bun algorithm family)
+  // but they are ordinary node:crypto digests too, so getHashes() reports them
+  // rather than lying about what createHash accepts.
   const HASHES = codec
-    ? ["md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha512-256"]
+    ? [
+        "md4", "md5", "sha1", "sha224", "sha256", "sha384", "sha512",
+        "sha512-224", "sha512-256", "ripemd160",
+        "blake2b256", "blake2b512", "blake2s256",
+        "sha3-224", "sha3-256", "sha3-384", "sha3-512", "shake128", "shake256",
+      ]
     : ["md5", "sha1", "sha256"];
 
   // --- S3: scrypt + elliptic asymmetric (needs the wasm codec) ---------------
   function scrypt(pass, salt, n, r, p, keylen) {
     needCodec("scrypt");
     return new Uint8Array(codec.scrypt_kdf(pass, salt, n >>> 0, r >>> 0, p >>> 0, keylen >>> 0));
+  }
+
+  // --- password hashing: argon2 + bcrypt (needs the wasm codec) --------------
+  // These have no Node API above them — node:crypto has neither — so they exist
+  // for Bun.password (packages/runtime/builtins/bun-crypto.js), which reaches the
+  // binding through process.binding('crypto'). They are the only entry points
+  // here whose RESULT is a string that outlives the sandbox, so both sides speak
+  // the standard encodings: PHC for argon2, modular-crypt for bcrypt. There is
+  // deliberately no pure-JS fallback: an approximated password KDF produces a hash
+  // that verifies nowhere, which is strictly worse than not running.
+  function argon2Hash(pass, mode, memoryCost, timeCost, parallelism) {
+    needCodec("Bun.password.hash (argon2)");
+    return codec.argon2_hash(pass, String(mode), memoryCost >>> 0, timeCost >>> 0, parallelism >>> 0);
+  }
+  function argon2Verify(pass, encoded) {
+    needCodec("Bun.password.verify (argon2)");
+    return !!codec.argon2_verify(pass, String(encoded));
+  }
+  // `pass` must already be <= 72 bytes: Bun's SHA-512 pre-hash for longer inputs
+  // is applied by the caller (bun-crypto.js), where it can be pinned without a
+  // wasm build. See bcryptKeyMaterial() there.
+  function bcryptHash(pass, cost) {
+    needCodec("Bun.password.hash (bcrypt)");
+    return codec.bcrypt_hash(pass, cost >>> 0);
+  }
+  function bcryptVerify(pass, encoded) {
+    needCodec("Bun.password.verify (bcrypt)");
+    return !!codec.bcrypt_verify(pass, String(encoded));
   }
 
   // Keygen returns { privateDer, publicDer } as PKCS#8 / SPKI DER (Uint8Array).
@@ -339,6 +376,10 @@ export function createCryptoBinding({ codec } = {}) {
     aesGcmEncrypt,
     aesGcmDecrypt,
     scrypt,
+    argon2Hash,
+    argon2Verify,
+    bcryptHash,
+    bcryptVerify,
     generateKeyPair,
     inspectPrivate,
     inspectPublic,

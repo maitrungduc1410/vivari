@@ -33,6 +33,18 @@ import {
 } from "../packages/runtime/builtins/bun-env.js";
 import { createSleepSync } from "../packages/runtime/builtins/bun-sleep.js";
 import { canPark, parkFor } from "../packages/protocol/syscall.js";
+// Bun.CryptoHasher / Bun.password pure helpers, plus the internalBinding('crypto')
+// adapter, so the crypto checks at the end of this file can drive the real Rust
+// crate without a kernel. See the header of bun-crypto.js.
+import {
+  BCRYPT_MAX_INPUT_BYTES,
+  BUN_ARGON2_DEFAULTS,
+  BUN_BCRYPT_DEFAULT_COST,
+  bcryptKeyMaterial,
+  detectPasswordAlgorithm,
+  parsePasswordOptions,
+} from "../packages/runtime/builtins/bun-crypto.js";
+import { createCryptoBinding } from "../packages/runtime/node/bindings/crypto.js";
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -441,8 +453,19 @@ console.log("== Bun global API (node-backed) ==");
   ok(Bun.hash.crc32("hello") === Bun.hash.crc32("hello"), "Bun.hash.crc32 stable");
   const gz = Bun.gzipSync("hello vivari");
   ok(Buffer.from(Bun.gunzipSync(gz)).toString() === "hello vivari", "Bun.gzipSync/gunzipSync round-trip");
-  const h = Bun.password.hashSync("s3cret");
-  ok(Bun.password.verifySync("s3cret", h) === true && Bun.password.verifySync("nope", h) === false, "Bun.password hash/verify");
+  // INTENTIONAL CHANGE: this used to assert that Bun.password.hashSync round-tripped
+  // against its own verifySync. It did — the hash was node scrypt wrapped in a
+  // bespoke `$vv-argon2id$…` string, so it was perfectly self-consistent and
+  // verifiable by absolutely nothing else, while telling the caller "argon2id".
+  // Self-round-tripping is exactly the evidence that could not tell those apart.
+  // Bun.password is now real argon2id/bcrypt over the Rust crate, so in THIS
+  // process (no kernel, hence no wasm crypto codec) it must fail loudly instead of
+  // falling back to something that looks like a password hash and is not one.
+  // The real hashes are exercised against Bun's own published vectors at the end
+  // of this file, where the codec is available.
+  let pwErr = "";
+  try { Bun.password.hashSync("s3cret"); } catch (e) { pwErr = e.message; }
+  ok(/Wasm crypto codec/.test(pwErr) && /Bun\.password\.hash/.test(pwErr), "Bun.password.hash without the wasm codec throws, naming the API and the reason");
   ok(new Bun.CryptoHasher("sha256").update("abc").digest("hex").length === 64, "Bun.CryptoHasher sha256");
   ok(typeof Bun.serve === "function" && typeof Bun.$ === "function", "Bun.serve + Bun.$ present");
   ok(new Bun.Transpiler({ loader: "ts" }).transformSync("const x: number = 1;").indexOf(": number") === -1, "Bun.Transpiler strips types");
@@ -2705,6 +2728,347 @@ console.log("== BunFile: FileSink flushes incrementally, and every write is chun
   ok((await B.file(at("copy.txt")).write("over")) === 4 && read("copy.txt") === "over", "BunFile.write(data) is Bun.write with this file as the destination");
 
   fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log("== Bun.CryptoHasher: algorithms, copy, byteLength, static hash ==");
+{
+  // Everything below is pinned against a source OUTSIDE this repo: Bun's docs,
+  // Bun's own test suite, or OpenSSL via the host's node:crypto. Nothing here
+  // round-trips our output against our output.
+  //
+  // This first group runs with no wasm codec, so CryptoHasher falls back to the
+  // host's node:crypto (OpenSSL). That covers every algorithm except blake2b256
+  // and md4, which OpenSSL 3's default provider does not carry; those two are
+  // covered against the Rust crate in the codec-gated group further down.
+  const B = bunWith();
+  const H = B.CryptoHasher;
+
+  ok(H.algorithms.length === 19 && H.algorithms.includes("sha3-512") && H.algorithms.includes("blake2s256"), "CryptoHasher.algorithms lists Bun's 19 documented algorithms");
+  ok(!H.algorithms.includes("blake3"), "…and does NOT include blake3");
+
+  // blake3 is not an oversight. It is absent from Bun's documented list, from
+  // EVP.Algorithm and from CryptoHasherZig — real Bun throws on it. Accepting it
+  // would be the more dangerous divergence: sandbox code would break on real Bun.
+  let msg = "";
+  try { new H("blake3"); } catch (e) { msg = e.message; }
+  ok(/Unsupported algorithm blake3/.test(msg), "new CryptoHasher('blake3') throws like real Bun (blake3 is not a Bun algorithm)");
+  try { msg = ""; new H("nope"); } catch (e) { msg = e.message; }
+  ok(/Unsupported algorithm nope/.test(msg), "an unknown algorithm throws with Bun's wording");
+
+  // Bun's EVP.zig alias map, matched case-insensitively; `.algorithm` reports the
+  // CANONICAL name whichever spelling went in.
+  ok(new H("sha-256").algorithm === "sha256", "the 'sha-256' alias resolves, and .algorithm reports the canonical name");
+  ok(new H("SHA512-256").algorithm === "sha512-256", "algorithm names are case-insensitive");
+  ok(new H("sha-512/224").algorithm === "sha512-224" && new H("sha-512_224").algorithm === "sha512-224", "Bun's sha-512/224 and sha-512_224 spellings both resolve");
+  ok(new H("rmd160").algorithm === "ripemd160" && new H("sha128").algorithm === "sha1", "the rmd160 and sha128 aliases resolve the way Bun maps them");
+
+  // byteLength, including the two XOFs whose length is a Bun default, not intrinsic.
+  ok(new H("sha256").byteLength === 32 && new H("sha512").byteLength === 64, "byteLength reports the digest size");
+  ok(new H("shake128").byteLength === 16 && new H("shake256").byteLength === 32, "shake128/shake256 use Bun's default output lengths (16/32)");
+  ok(new H("sha512-224").byteLength === 28 && new H("ripemd160").byteLength === 20, "byteLength is right for the less common digests");
+
+  // Digests agree with OpenSSL for every algorithm the host provides.
+  const nodeCrypto = nodeRequire("node:crypto");
+  let agreed = 0, checked = 0;
+  for (const algo of H.algorithms) {
+    let expected;
+    try { expected = nodeCrypto.createHash(algo).update("hello world").digest("hex"); } catch { continue; }
+    checked++;
+    if (new H(algo).update("hello world").digest("hex") === expected) agreed++;
+  }
+  ok(checked >= 15 && agreed === checked, `every algorithm the host's OpenSSL provides agrees with it (${agreed}/${checked})`);
+
+  // digest() encodings and the write-into-a-TypedArray overload.
+  const sha256Hello = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+  ok(new H("sha256").update("hello world").digest("hex") === sha256Hello, "sha256('hello world') matches the digest Bun's docs print");
+  ok(new H("sha256").update("hello world").digest("base64") === "uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=", "…and so does the base64 form Bun's docs print");
+  const bytes = new H("sha256").update("hello world").digest();
+  ok(bytes instanceof Uint8Array && bytes.length === 32, "digest() with no argument returns 32 bytes");
+  const into = new Uint8Array(32);
+  const returned = new H("sha256").update("hello world").digest(into);
+  ok(returned === into && Buffer.from(into).toString("hex") === sha256Hello, "digest(typedArray) writes in place and returns that array");
+  try { msg = ""; new H("sha256").update("x").digest(new Uint8Array(8)); } catch (e) { msg = e.message; }
+  ok(/TypedArray must be at least 32 bytes/.test(msg), "a too-small TypedArray throws with Bun's message");
+
+  // update() input encodings.
+  ok(new H("sha256").update("68656c6c6f20776f726c64", "hex").digest("hex") === sha256Hello, "update(str, 'hex') decodes before hashing");
+  ok(new H("sha256").update(Buffer.from("hello world")).digest("hex") === sha256Hello, "update(Buffer) hashes the bytes");
+  ok(new H("sha256").update(new TextEncoder().encode("hello world").buffer).digest("hex") === sha256Hello, "update(ArrayBuffer) hashes the bytes");
+  try { msg = ""; new H("sha256").update("abc", "hex"); } catch (e) { msg = e.message; }
+  ok(/invalid for data of length 3/.test(msg), "odd-length hex is rejected rather than silently hashing the even prefix");
+  try { msg = ""; new H("sha256").update(null); } catch (e) { msg = e.message; }
+  ok(/expected a string/.test(msg), "update(null) throws");
+
+  // static hash().
+  ok(H.hash("sha256", "hello world", "hex") === sha256Hello, "CryptoHasher.hash(algo, input, 'hex')");
+  ok(Buffer.from(H.hash("sha256", "hello world")).toString("hex") === sha256Hello, "CryptoHasher.hash returns bytes with no encoding");
+  const staticInto = new Uint8Array(32);
+  ok(H.hash("sha256", "hello world", staticInto) === staticInto && Buffer.from(staticInto).toString("hex") === sha256Hello, "CryptoHasher.hash writes into a TypedArray");
+
+  // copy(): the whole point is hashing a shared prefix once, then diverging.
+  const base = new H("sha256").update("hello ");
+  const a = base.copy(), b = base.copy();
+  a.update("world");
+  b.update("there");
+  ok(a.digest("hex") === sha256Hello, "a copy that continues with 'world' gives sha256('hello world')");
+  ok(b.digest("hex") === nodeCrypto.createHash("sha256").update("hello there").digest("hex"), "…and the sibling copy diverges to sha256('hello there')");
+  ok(base.update("world").digest("hex") === sha256Hello, "the original is untouched by either copy");
+
+  // A plain (non-HMAC) hasher IS reset by digest() and is reusable — the exact
+  // opposite of the HMAC case below, which is why they are pinned separately.
+  const reusable = new H("sha256");
+  reusable.update("hello world");
+  ok(reusable.digest("hex") === sha256Hello, "a plain hasher digests");
+  ok(reusable.digest("hex") === nodeCrypto.createHash("sha256").digest("hex"), "…and is reset to empty afterwards, not left holding the old input");
+  ok(reusable.update("hello world").digest("hex") === sha256Hello, "…so the same instance can be reused from scratch");
+  ok(reusable.byteLength === 32 && reusable.algorithm === "sha256", "a used plain hasher still reports byteLength/algorithm");
+}
+
+console.log("== Bun.CryptoHasher HMAC: keyed digests and the consumed-instance trap ==");
+{
+  const B = bunWith();
+  const H = B.CryptoHasher;
+
+  // Known-answer table lifted verbatim from Bun's own test suite
+  // (test/js/bun/util/bun-cryptohasher.test.ts): key "key", data "data\n".
+  // These are Bun's numbers, not ours, and they are what makes this meaningful.
+  const HMAC_VECTORS = {
+    "md5": "4e7eb9f9332e4eb1dc5a2d7d065ba1bf",
+    "sha1": "e2e1f7f597941d9b0021978618218a9e08731426",
+    "sha224": "d34c3a2647d4f82a4e6baeaa7d94379eafd931e0c16cbc44b4ba4d1e",
+    "sha256": "c7a7c96c73af32ea6e5b1ca6768b1d822249eb88f85160433d7b09bb2b21e170",
+    "sha384": "2483522dcb7cb65fa13f0a3c1efe867abbd79ecb19a6ba4bac45d4f4bac31de2e2463b11838b8055601fad73d0b5af4c",
+    "sha512": "f82266c950db24eba03f899466fdf905494709f09f98f4b7d7db31f1443a33b4fe5ca82f74fb360609d8a05a87fb065dd77bee912c27de89cbba7897061ac735",
+    "sha512-224": "af398c7f21f58e1377580227a89590d3ab8be52b31182fad9ec4d667",
+    "sha512-256": "0ed15b2750a2a7281e96af006ab79e82ed54a7a2081bdb49e70a70d8c6bfeff0",
+    "sha3-224": "3dd0595758af01c6a9d662326acc3bc0c7e49b94573f74f800b6c114",
+    "sha3-256": "5b246f6c8b41fbd23b7aa3a73c0c93c6a35d4973bc727b24ad65f538d51ff3b6",
+    "sha3-384": "f0af5d4479dc409e11c6e23014893c42a51fbd3435c93452f6154a87128174e2492a6b31994b1436ae681b3f1d838613",
+    "sha3-512": "b15ed8373f1b493ccd417a7591745fdefbb4aa7b85c6937284de678e1a7b73b31e4da07561d358fefa30c6b1cf1a4b19a4c0d2f4f6e90ddfadc3a12367cb1a3c",
+    "ripemd160": "5291464ec22d15e61190b00b81b87c1a9dcb966f",
+    "blake2b512": "9e66ba10f4d7e80abc2584150fc5f9a246634118280fd9ae086794d37cb9919d681ee285b68f9cec2eda9f878d157125cc465c8b0e3c023a7040ed0be7f25023",
+  };
+  let hmacOk = 0, hmacRun = 0;
+  for (const [algo, expected] of Object.entries(HMAC_VECTORS)) {
+    let got;
+    try { got = new H(algo, "key").update("data\n").digest("hex"); } catch { continue; }
+    hmacRun++;
+    if (got === expected) hmacOk++;
+    else console.log("    HMAC-" + algo + " mismatch: " + got);
+  }
+  ok(hmacRun >= 13 && hmacOk === hmacRun, `every HMAC vector from Bun's test suite reproduces (${hmacOk}/${hmacRun})`);
+
+  // Key types Bun accepts.
+  const expectedSha256 = HMAC_VECTORS["sha256"];
+  ok(new H("sha256", Buffer.from("key")).update("data\n").digest("hex") === expectedSha256, "a Buffer key gives the same digest as a string key");
+  ok(new H("sha256", new TextEncoder().encode("key").buffer).update("data\n").digest("hex") === expectedSha256, "an ArrayBuffer key does too");
+
+  // Bun rejects XOFs for HMAC at CONSTRUCTION time (there is no fixed-length
+  // pairing to key), while the same algorithms are fine unkeyed.
+  for (const algo of ["shake128", "shake256"]) {
+    let threw = false;
+    try { new H(algo, "key"); } catch { threw = true; }
+    ok(threw, `new CryptoHasher('${algo}', key) throws — Bun has no HMAC for it`);
+    let plainOk = false;
+    try { new H(algo).update("x").digest(); plainOk = true; } catch {}
+    ok(plainOk, `…while unkeyed ${algo} still works, exactly as in Bun`);
+  }
+
+  // THE TRAP. In real Bun an HMAC instance is NOT reset by .digest(); its context
+  // is released and every further use throws "HMAC has been consumed and is no
+  // longer usable". The natural implementation resets it and cheerfully keeps
+  // hashing — self-consistent, and quietly producing digests real Bun refuses to
+  // produce at all, so the divergence only surfaces once the code leaves here.
+  const hmac = new H("sha256", "key");
+  hmac.update("data\n");
+  const copied = hmac.copy();
+  ok(hmac.algorithm === "sha256" && hmac.byteLength === 32, "a live HMAC reports algorithm and byteLength");
+  ok(copied instanceof H && copied.copy() instanceof H, "an HMAC can be copied before digesting, and copies can be copied");
+  ok(hmac.digest("hex") === expectedSha256, "the HMAC digests");
+  ok(copied.digest("hex") === expectedSha256, "and its copy independently produces the same digest");
+  for (const [what, fn] of [
+    ["digest", () => hmac.digest()],
+    ["update", () => hmac.update("more")],
+    ["copy", () => hmac.copy()],
+    ["byteLength", () => hmac.byteLength],
+    ["algorithm", () => hmac.algorithm],
+  ]) {
+    let m = "";
+    try { fn(); } catch (e) { m = e.message; }
+    ok(m === "HMAC has been consumed and is no longer usable", `.${what} on a consumed HMAC throws Bun's exact message`);
+  }
+  let m2 = "";
+  try { copied.digest(); } catch (e) { m2 = e.message; }
+  ok(/consumed/.test(m2), "the consumed copy is just as dead as the original");
+
+  // The copy-then-diverge example straight out of https://bun.com/docs/api/hashing,
+  // digests included. This is the documented behaviour of .copy() on an HMAC.
+  const doc = new H("sha256", "secret-key");
+  doc.update("hello world");
+  const docCopy = doc.copy();
+  docCopy.update("!");
+  ok(docCopy.digest("hex") === "3840176c3d8923f59ac402b7550404b28ab11cb0ef1fa199130a5c37864b5497", "the documented copy-and-extend digest matches Bun's docs");
+  ok(doc.digest("hex") === "095d5a21fe6d0646db223fdf3de6436bb8dfb2fab0b51677ecf6441fcf5f2a67", "…and the original still yields the documented digest for the shared prefix");
+}
+
+console.log("== Bun.password: pure helpers (no codec needed) ==");
+{
+  // The bcrypt pre-hash decision is the one piece of Bun.password that can be
+  // wrong in a way nothing catches until production, so it is isolated as a pure
+  // function and pinned on both sides of the boundary.
+  const enc = (s) => Buffer.from(s);
+  const sha512 = (b) => nodeRequire("node:crypto").createHash("sha512").update(b).digest();
+
+  ok(BCRYPT_MAX_INPUT_BYTES === 72, "bcrypt's key-material limit is 72 bytes");
+  const at71 = enc("a".repeat(71)), at72 = enc("a".repeat(72)), at73 = enc("a".repeat(73));
+  ok(bcryptKeyMaterial(at71, sha512) === at71, "a 71-byte password is passed to bcrypt untouched");
+  // Bun's test is `password.len > 72`, so exactly 72 is NOT pre-hashed. Off by one
+  // here and exactly one password length silently stops verifying in production.
+  ok(bcryptKeyMaterial(at72, sha512) === at72, "a password of exactly 72 bytes is NOT pre-hashed (Bun's test is > 72, not >= 72)");
+  const over = bcryptKeyMaterial(at73, sha512);
+  ok(over !== at73 && over.length === 64, "a 73-byte password IS pre-hashed, to 64 raw bytes");
+  ok(Buffer.from(over).equals(sha512(at73)), "…and those bytes are the RAW SHA-512 digest, not hex and not base64");
+  // Multibyte matters: 24 three-byte characters is 72 bytes, not 24.
+  ok(bcryptKeyMaterial(enc("héllo".repeat(15)), sha512).length === 64, "the limit is counted in bytes, so a multibyte passphrase crosses it sooner");
+
+  // Bun's default parameters, read out of PasswordObject.zig rather than guessed.
+  ok(BUN_ARGON2_DEFAULTS.memoryCost === 65536 && BUN_ARGON2_DEFAULTS.timeCost === 2 && BUN_ARGON2_DEFAULTS.parallelism === 1, "argon2id defaults are Bun's m=65536, t=2, p=1");
+  ok(BUN_BCRYPT_DEFAULT_COST === 10, "bcrypt's default cost is 10");
+  ok(parsePasswordOptions(undefined).algorithm === "argon2id", "no options means argon2id");
+  ok(parsePasswordOptions("bcrypt").cost === 10, "a bare 'bcrypt' string selects bcrypt at the default cost");
+  ok(parsePasswordOptions({ algorithm: "argon2id", memoryCost: 8, timeCost: 1 }).memoryCost === 8, "explicit argon2 costs are honoured, not clamped");
+  let optErr = "";
+  try { parsePasswordOptions({ algorithm: "bcrypt", cost: 3 }); } catch (e) { optErr = e.message; }
+  ok(/between 4 and 31/.test(optErr), "a bcrypt cost outside 4..31 throws with Bun's message");
+  try { optErr = ""; parsePasswordOptions({ algorithm: "scrypt" }); } catch (e) { optErr = e.message; }
+  ok(/unknown algorithm/.test(optErr), "an unknown algorithm throws with Bun's message");
+
+  // Bun's Algorithm.get(): the prefix decides, and a null answer is an ERROR.
+  ok(detectPasswordAlgorithm("$argon2id$v=19$m=8,t=1,p=1$aaaa$bbbb") === "argon2id", "a PHC argon2id string is detected");
+  ok(detectPasswordAlgorithm("$argon2i$x") === "argon2i" && detectPasswordAlgorithm("$argon2d$x") === "argon2d", "argon2i and argon2d are detected");
+  ok(detectPasswordAlgorithm("$2b$10$abc") === "bcrypt" && detectPasswordAlgorithm("$2a$10$abc") === "bcrypt" && detectPasswordAlgorithm("$2y$10$abc") === "bcrypt", "every bcrypt modular-crypt variant is detected");
+  ok(detectPasswordAlgorithm("notahash") === null && detectPasswordAlgorithm("$scrypt$x") === null, "an unrecognised string detects as null, which is what makes verify throw");
+  ok(detectPasswordAlgorithm("$vv-argon2id$c2FsdA==$a2V5") === "vv-legacy", "the pre-argon2 Vivari format is recognised as legacy (see the migration note in bun-crypto.js)");
+}
+
+console.log("== Bun.password / CryptoHasher against the real Rust crate ==");
+{
+  // The groups above deliberately run without the wasm codec. This one needs it:
+  // argon2id and bcrypt have no JavaScript stand-in, and the Rust HMAC for the
+  // BLAKE2 family is hand-written (RustCrypto's `hmac` will not wrap BLAKE2), so
+  // it has to be pinned against Bun's vector rather than against OpenSSL.
+  //
+  // The codec is gitignored and built by CI. In the Wasm-free gate it is absent
+  // and this group announces itself as skipped; the `verify` job builds
+  // build:crypto:node and re-runs this spike, so these checks do gate every PR.
+  let codec = null;
+  try {
+    codec = nodeRequire("../packages/crypto/pkg-node/vivari_crypto.js");
+  } catch {
+    codec = null;
+  }
+  if (!codec) {
+    console.log("  (skipped: packages/crypto/pkg-node not built — run 'npm run build:crypto:node'.");
+    console.log("   These run in CI's verify job, which builds the crate first.)");
+  } else {
+    // The same binding node:crypto uses, over the same codec, handed to the Bun
+    // shim through the process.binding('crypto') seam it uses in the runtime.
+    const binding = createCryptoBinding({ codec });
+    const proc = { env: {}, argv: ["bun"], cwd: () => "/", stdout: process.stdout, stderr: process.stderr, stdin: process.stdin, binding: (n) => (n === "crypto" ? binding : {}) };
+    const Bun = createBunRuntime({ process: proc, Buffer, require: nodeRequire }).Bun;
+
+    // The two algorithms the host's OpenSSL cannot provide, so they are only ever
+    // checked here. Published reference vectors, not our own output.
+    ok(new Bun.CryptoHasher("blake2b256").update("").digest("hex") === "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8", "blake2b256 matches the published BLAKE2b-256 vector for the empty input");
+    ok(new Bun.CryptoHasher("md4").update("abc").digest("hex") === "a448017aaf21d8525fc10ae87aa6729d", "md4('abc') matches RFC 1320");
+    // BLAKE2b cannot go through RustCrypto's `hmac` (it uses a lazy block buffer),
+    // so packages/crypto spells the HMAC construction out by hand. This is the
+    // check that says the hand-written version is right.
+    ok(new Bun.CryptoHasher("blake2b512", "key").update("data\n").digest("hex") === "9e66ba10f4d7e80abc2584150fc5f9a246634118280fd9ae086794d37cb9919d681ee285b68f9cec2eda9f878d157125cc465c8b0e3c023a7040ed0be7f25023", "the hand-written HMAC-BLAKE2b-512 matches Bun's published vector");
+
+    // ---- argon2id: hashes REAL BUN PRODUCED, taken from bun.com/docs/api/hashing.
+    // This is the property that matters and the one the old shim could not have:
+    // a string written by Bun verifies here, so a string written here verifies
+    // under Bun. Nothing about our own output is evidence of that.
+    ok(Bun.password.verifySync("super-secure-pa$$word", "$argon2id$v=19$m=65536,t=2,p=1$tFq+9AVr1bfPxQdh6E8DQRhEXg/M/SqYCNu6gVdRRNs$GzJ8PuBi+K+BVojzPfS5mjnC8OpLGtv8KJqF99eP6a4") === true, "an argon2id PHC hash printed in Bun's docs verifies");
+    ok(Bun.password.verifySync("hello", "$argon2id$v=19$m=65536,t=2,p=1$xXnlSvPh4ym5KYmxKAuuHVlDvy2QGHBNuI6bJJrRDOs$2YY6M48XmHn+s5NoBaL+ficzXajq2Yj8wut3r0vnrwI") === true, "so does the second argon2id hash in Bun's docs");
+    ok(Bun.password.verifySync("wrong", "$argon2id$v=19$m=65536,t=2,p=1$xXnlSvPh4ym5KYmxKAuuHVlDvy2QGHBNuI6bJJrRDOs$2YY6M48XmHn+s5NoBaL+ficzXajq2Yj8wut3r0vnrwI") === false, "…and a wrong password against it is false, not an error");
+    // The phc-winner-argon2 reference implementation's own vector.
+    ok(Bun.password.verifySync("password", "$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc") === true, "the phc-winner-argon2 reference vector verifies");
+
+    // ---- bcrypt: likewise a hash real Bun printed.
+    ok(Bun.password.verifySync("hello", "$2b$10$Lyj9kHYZtiyfxh2G60TEfeqs7xkkGiEFFDi3iJGc50ZG/XJ1sxIFi") === true, "the bcrypt modular-crypt hash printed in Bun's docs verifies");
+    // Canonical Openwall/crypt_blowfish vectors — the primitive itself.
+    ok(Bun.password.verifySync("U*U", "$2a$05$CCCCCCCCCCCCCCCCCCCCC.E5YPO9kmyuRGyh0XouQYb4YMJKvyOeW") === true, "the Openwall bcrypt vector U*U verifies");
+    ok(Bun.password.verifySync("U*U*U", "$2a$05$XXXXXXXXXXXXXXXXXXXXXOAcXxm9kjPGEMsLznoKqmqw7tc8WCx4a") === true, "the Openwall bcrypt vector U*U*U verifies");
+
+    // ---- THE >72-BYTE TRAP, pinned by Bun's own cross-version fixture.
+    // Bun's test suite carries this hash (written by Bun 1.2.4) with a comment
+    // saying that changing the pre-hash mechanism invalidates it. If our
+    // construction were hex, or base64, or SHA-256, or applied at >= 72 instead of
+    // > 72, this one line would fail and every other check here would still pass.
+    const long = "hello".repeat(100); // 500 bytes
+    ok(Bun.password.verifySync(long, "$2b$10$PsJ3/W82mzNJoP0rSblfvet2ab9jZg2aH7tIxr1B8uFLJwuWk/jTi") === true, "a 500-byte password verifies against the bcrypt hash Bun 1.2.4 wrote for it (SHA-512 pre-hash, raw bytes)");
+    ok(Bun.password.verifySync("hello".repeat(14), "$2b$10$PsJ3/W82mzNJoP0rSblfvet2ab9jZg2aH7tIxr1B8uFLJwuWk/jTi") === false, "a different long password does not");
+
+    // Our own hashes are parseable by the standard formats, and the boundary
+    // passwords round-trip in both directions across the pre-hash threshold.
+    const b72 = "a".repeat(72), b73 = "a".repeat(73);
+    const h72 = Bun.password.hashSync(b72, { algorithm: "bcrypt", cost: 4 });
+    const h73 = Bun.password.hashSync(b73, { algorithm: "bcrypt", cost: 4 });
+    ok(/^\$2b\$04\$[./A-Za-z0-9]{53}$/.test(h72) && h72.length === 60, "bcrypt output is a 60-character $2b$ modular-crypt string");
+    ok(Bun.password.verifySync(b72, h72) === true && Bun.password.verifySync(b73, h73) === true, "passwords just under and just over the 72-byte line each verify against their own hash");
+    ok(Bun.password.verifySync(b73, h72) === false && Bun.password.verifySync(b72, h73) === false, "…and do not verify against each other's, so the pre-hash is not silently truncating");
+
+    // argon2id output shape: Bun's exact PHC encoding.
+    const argonHash = Bun.password.hashSync("correct horse", { algorithm: "argon2id", memoryCost: 8, timeCost: 1 });
+    ok(argonHash.startsWith("$argon2id$v=19$m=8,t=1,p=1$"), "argon2id emits Bun's PHC encoding with the caller's costs, unclamped");
+    const fields = argonHash.split("$");
+    ok(fields[4].length === 43 && fields[5].length === 43, "…with Bun's 32-byte salt and 32-byte tag");
+    ok(Bun.password.verifySync("correct horse", argonHash) === true && Bun.password.verifySync("wrong horse", argonHash) === false, "argon2id round-trips");
+    ok(Bun.password.hashSync("x", { algorithm: "argon2i", memoryCost: 8, timeCost: 1 }).startsWith("$argon2i$"), "argon2i is selectable and self-identifies");
+    ok(Bun.password.hashSync("x", { algorithm: "argon2d", memoryCost: 8, timeCost: 1 }).startsWith("$argon2d$"), "argon2d too");
+    ok(Bun.password.hashSync("x", { algorithm: "argon2id", memoryCost: 8, timeCost: 1 }) !== Bun.password.hashSync("x", { algorithm: "argon2id", memoryCost: 8, timeCost: 1 }), "each hash gets a fresh random salt");
+
+    // A hostile or corrupted PHC string must be rejected BEFORE its m= reaches the
+    // allocator: wasm32 has a 4 GiB address space and Rust ABORTS the module on
+    // allocation failure, which would poison the whole process rather than throw.
+    for (const [what, tampered] of [
+      ["timeCost", argonHash.replace(",t=1,", ",t=100000,")],
+      ["memoryCost", argonHash.replace("$m=8,", "$m=4294967294,")],
+      ["parallelism", argonHash.replace(",p=1$", ",p=65$")],
+    ]) {
+      let threw = false;
+      try { Bun.password.verifySync("correct horse", tampered); } catch { threw = true; }
+      ok(threw, `an absurd ${what} in the encoded hash is rejected before anything is allocated from it`);
+    }
+
+    // verify() dispatches on the stored string, like Bun's Algorithm.get().
+    ok(Bun.password.verifySync("hello", "") === false, "an empty stored hash is false, not an error (Bun checks length first)");
+    let vErr = "";
+    try { Bun.password.verifySync("hello", "definitely-not-a-hash"); } catch (e) { vErr = e.message; }
+    ok(/not a recognised password hash/.test(vErr), "an unparseable stored hash THROWS — 'not a hash' and 'wrong password' are different answers");
+
+    // MIGRATION: pre-argon2 `$vv-…` hashes still verify, and nothing emits them
+    // any more. See the note on LEGACY_PREFIX in bun-crypto.js for why accepting
+    // beats throwing here (real Bun can never hold one of these strings).
+    const crypto = nodeRequire("node:crypto");
+    const legacySalt = crypto.randomBytes(16);
+    const legacy = "$vv-argon2id$" + legacySalt.toString("base64") + "$" + crypto.scryptSync("old-secret", legacySalt, 32).toString("base64");
+    ok(Bun.password.verifySync("old-secret", legacy) === true, "a hash written by the pre-argon2 shim still verifies");
+    ok(Bun.password.verifySync("wrong", legacy) === false, "…and rejects the wrong password rather than throwing");
+    ok(!Bun.password.hashSync("new-secret").startsWith("$vv-"), "but nothing produces the legacy format any more");
+
+    // Default algorithm and the async twins. This is the only place the DEFAULT
+    // argon2id cost (m=65536 KiB = 64 MiB, t=2) actually runs; see roadmap.md for
+    // the measured cost. Everything else above uses m=8 to stay cheap.
+    const t0 = Date.now();
+    const defaultHash = Bun.password.hashSync("s3cret");
+    const hashMs = Date.now() - t0;
+    ok(defaultHash.startsWith("$argon2id$v=19$m=65536,t=2,p=1$"), `the default is argon2id at Bun's documented cost (took ${hashMs}ms in wasm)`);
+    ok(Bun.password.verifySync("s3cret", defaultHash) === true && Bun.password.verifySync("nope", defaultHash) === false, "the default hash round-trips");
+    ok((await Bun.password.verify("s3cret", await Bun.password.hash("s3cret", { algorithm: "bcrypt", cost: 4 }))) === true, "the async hash/verify twins work too");
+  }
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Bun checks passed");

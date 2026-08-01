@@ -20,6 +20,14 @@ md-5 = "0.10"
 sha1 = { version = "0.10", features = ["oid"] }
 sha2 = { version = "0.10", features = ["oid"] }
 hmac = "0.12"
+# --- P2D: the rest of Bun.CryptoHasher's algorithm family --------------------
+# All four are the digest-0.10 generation, matching sha1/sha2/md-5 above, so
+# there is exactly one `digest::Digest` trait in the graph. `blake2` is the odd
+# one out at HMAC time — see the note on hmac_digest() in src/lib.rs.
+blake2 = { version = "0.10", default-features = false }
+sha3 = { version = "0.10", default-features = false }
+ripemd = { version = "0.1", default-features = false }
+md4 = { version = "0.10", default-features = false }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 aes = "0.8"
 cbc = { version = "0.1", default-features = false, features = ["alloc"] }
@@ -42,6 +50,24 @@ pkcs8 = { version = "0.10", default-features = false, features = ["alloc"] }
 spki = { version = "0.7", default-features = false, features = ["alloc"] }
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 getrandom = { version = "0.2", features = ["js"] }
+# --- P2D: Bun.password (argon2id / bcrypt) -----------------------------------
+# Real argon2 and bcrypt, emitting/parsing the standard PHC and modular-crypt
+# strings, so a hash written in the sandbox verifies under real Bun (and vice
+# versa). Neither is in RustCrypto's digest family; both are the reference pure-
+# Rust implementations, and both compile to wasm32-unknown-unknown.
+#
+# `password-hash` (via argon2) brings the PHC serializer/parser; salts are drawn
+# from the OsRng already used by keygen above rather than from each crate's own
+# entropy path, so there is one entropy source in this crate.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+bcrypt = { version = "0.19", default-features = false, features = ["std"] }
+# bcrypt pulls getrandom 0.4, whose wasm32-unknown-unknown backend is opt-in: it
+# hard `compile_error!`s unless `wasm_js` is enabled, even on the code paths we
+# never call (we pass our own salt). Declaring it here turns that feature on for
+# the whole graph. This is the 0.4-line twin of the `getrandom 0.2 + js` above —
+# both resolve to crypto.getRandomValues (WebCrypto in the Worker, node:crypto
+# under the nodejs target); the two majors cannot be unified.
+getrandom_v04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 # Trait bounds for the generic RSA sign/verify/OAEP bodies (AssociatedOid for the
 # PKCS#1v15 DigestInfo prefix; DynDigest for OAEP's MGF).
 digest = { version = "0.10", default-features = false, features = ["alloc", "oid"] }
