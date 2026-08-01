@@ -21,8 +21,12 @@
 // xxHash32/64, murmur32v2/v3, murmur64v2, cityHash32/64, crc32, adler32 —
 // byte-exact, with the documented number-vs-bigint return typing)/CryptoHasher,
 // Bun.password (crypto-backed), Bun.Glob (.match(); `*` stops at `/`, `!` negates
-// only at pattern start, braces nest 10 deep), Bun.randomUUIDv7 (a real
-// time-ordered v7, monotonic within a millisecond), Bun.gzipSync/…,
+// only at pattern start, braces nest 10 deep — plus .scan()/.scanSync(), a real
+// pruning VFS walk with the documented cwd/dot/absolute/onlyFiles/followSymlinks/
+// throwErrorOnBrokenSymlink options), Bun.FileSystemRouter (Next.js-style
+// [param]/[...catchAll]/[[...optional]] with per-segment precedence — see
+// bun-fsrouter.js), Bun.randomUUIDv7 (a real time-ordered v7, monotonic within a
+// millisecond), Bun.gzipSync/…,
 // Bun.inspect (incl. .table and .custom)/deepEquals (loose AND strict)/deepMatch/
 // escapeHTML, Bun.pathToFileURL/fileURLToPath,
 // Bun.stringWidth/stripANSI/wrapAnsi/color/indexOfLine (see bun-text.js),
@@ -41,15 +45,21 @@
 // these require capabilities the browser sandbox does not have. Loud for the
 // narrower reason that the shim has not implemented them: Bun.file(fd) (our fd
 // numbers are VFS handles, not OS fds), Bun.Transpiler.scan/scanImports (the
-// transform builds no import/export graph), Bun.Glob.scan/scanSync (they need a
-// VFS directory walk — Phase 2), Bun.hash.xxHash3/rapidhash (not ported, and we
-// have no reference vector to verify a port against), and the bun:jsc
+// transform builds no import/export graph), Bun.hash.xxHash3/rapidhash (not
+// ported, and we have no reference vector to verify a port against), and the bun:jsc
 // heap-introspection helpers (no engine hook exists in a page). bun:sqlite is
 // registered as a module but every call throws until a wasm SQLite backend is
 // wired into it (see makeBunSqlite) — treat it as not usable today. Also loud:
 // the CSS Color 4 function space in Bun.color — lab()/lch()/oklab()/oklch()/
 // color() throw rather than returning the `null` that means "not a colour"
-// (bun-text.js).
+// (bun-text.js); a Bun.FileSystemRouter `style` other than "nextjs", a page file
+// whose brackets do not parse, two page files resolving to the SAME route (Next.js
+// calls that a project error, and picking a winner by directory-iteration order is
+// not a shim's call), and .match() on a Request/Response whose `url` is "" (which
+// would otherwise quietly resolve to the index route) — bun-fsrouter.js. Likewise
+// Bun.Glob.scan({followSymlinks: true}) against a filesystem with no realpathSync:
+// there is no cycle guard without it, and the failure is a walk that never returns
+// rather than a wrong answer — bun-glob.js.
 //
 // COVERED BUT SLOWER, not wrong: Bun.allocUnsafe returns zero-filled memory,
 // because `new Uint8Array(n)` is specified to be — see bun-bytes.js.
@@ -64,7 +74,8 @@ import { createBunFormats } from "./bun-formats.js";
 import { createBunText } from "./bun-text.js";
 import { createBunBytes } from "./bun-bytes.js";
 import * as hashes from "./bun-hash.js";
-import { Glob } from "./bun-glob.js";
+import { createBunGlob } from "./bun-glob.js";
+import { createBunFileSystemRouter } from "./bun-fsrouter.js";
 import { createSleepSync } from "./bun-sleep.js";
 import { loadBunEnvFiles } from "./bun-env.js";
 
@@ -105,6 +116,11 @@ export function createBunRuntime({ process, Buffer, require }) {
   // tables inside bun-text.js are instantiated on first use, not here.
   const text = createBunText({ lazy, process });
   const bytes = createBunBytes({ Buffer });
+  // Glob and FileSystemRouter take `lazy`/`process` because their scan half walks
+  // the VFS (one synchronous syscall per directory) — the matcher halves stay pure
+  // and are unit-tested with no kernel. FileSystemRouter's scan IS Glob's walker.
+  const { Glob } = createBunGlob({ lazy, process });
+  const FileSystemRouter = createBunFileSystemRouter({ lazy, process });
 
   // ---- BunFile ---------------------------------------------------------------
   // `Bun.file(path)` is a lazy handle; reads/writes hit the VFS through `fs`.
@@ -730,6 +746,7 @@ export function createBunRuntime({ process, Buffer, require }) {
     deepEquals,
     deepMatch,
     Glob,
+    FileSystemRouter,
     escapeHTML,
     // Data formats (see ./bun-formats.js). Real parsers, not approximations:
     // Bun.TOML.parse throws on an integer it cannot hold losslessly, Bun.YAML.parse

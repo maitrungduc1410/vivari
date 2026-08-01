@@ -1081,8 +1081,8 @@ vendored and unpacked into the VFS — Bun is **emulated on top of our Node runt
 pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
 
 - `packages/runtime/builtins/bun.js` — a Node-backed `Bun` global: `version`/`main`/`env`,
-  `escapeHTML`/`deepEquals`/`deepMatch`, `hash`/`crc32`, `Glob`, `randomUUIDv7`,
-  `gzip`/`gunzip`, password `hash`/`verify`,
+  `escapeHTML`/`deepEquals`/`deepMatch`, `hash`/`crc32`, `Glob`, `FileSystemRouter`,
+  `randomUUIDv7`, `gzip`/`gunzip`, password `hash`/`verify`,
   `CryptoHasher`, `Transpiler`, `$`, and **`Bun.serve`** (a fetch handler; `routes` with static
   paths, `:params`, `*` wildcards and `BunRequest.params`; the documented `error(err)` hook,
   falling back to a plain 500 when it is absent or declines; server-side **WebSockets** — RFC 6455
@@ -1197,9 +1197,42 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
 - **`Bun.Glob` is hand-rolled (`builtins/bun-glob.js`), not vendored**, because Bun's dialect
   differs from minimatch/picomatch in three documented ways that each change which files a build
   includes: `*` does not cross `/` or `\`, `!` negates only at the very start of a pattern, and
-  braces nest at most 10 deep (deeper throws). The pattern compiles to a `RegExp`; `.match()`
-  works today, while `.scan()`/`.scanSync()` need a VFS directory walk and throw until Phase 2 —
-  an empty iterator would read as "no files matched".
+  braces nest at most 10 deep (deeper throws). The pattern compiles to a `RegExp`.
+- **`Bun.Glob.scan()`/`.scanSync()` prune, they do not walk-then-filter.** `scan()` is an
+  `AsyncIterable` and `scanSync()` an `Iterable` — the asymmetry is the API — and both are
+  generators over the same lazy traversal, supporting the documented `cwd`/`dot`/`absolute`/
+  `onlyFiles` (**true** by default)/`followSymlinks`/`throwErrorOnBrokenSymlink`. Pruning is not a
+  micro-optimisation here: every directory read is a synchronous syscall across the Atomics
+  bridge, and `readdirSync(withFileTypes)` costs one MORE per entry because our binding fills
+  dirent types with a per-name `lstat` (§4). So the walker reads names only, `lstat`s an entry
+  only when the answer can still change, and skips whole subtrees using a small NFA over the
+  pattern's path segments (`compileGlobPrefix`): `**` is a state that absorbs any number of
+  components, every other segment is a `RegExp` from the SAME compiler `.match()` uses, and an
+  ambiguous segment (a `**` glued to other characters, a brace group containing `/`) is widened
+  to `**`, which can only widen the search. Membership is always decided by `.match()`, so the
+  pruner can only ever cost files, never invent them — the offline spike asserts scan-with-pruning
+  equals walk-everything-then-match for a list of patterns. Symlinks are honoured rather than
+  flattened: the VFS stores real symlink inodes, so an unfollowed link to a directory is reported
+  as a directory (not as a file), a followed one is cycle-checked against its ancestor chain, and
+  a broken one is skipped unless `throwErrorOnBrokenSymlink` asks it to throw. The cycle check is
+  `realpathSync`-shaped, so `followSymlinks: true` against a filesystem that lacks it throws: with
+  no guard the walk does not return a wrong answer, it never returns at all.
+- **`Bun.FileSystemRouter` (`builtins/bun-fsrouter.js`) is a sibling matcher, not a
+  generalisation of `Bun.serve`'s.** Both map paths to handlers, but they are different grammars
+  with different precedence: `Bun.serve`'s `routes` uses `:param`/`*` and a single specificity
+  number per route, while Next.js-style routing has `[param]`/`[...catchAll]`/`[[...optional]]`,
+  `index` collapsing, and precedence that is **per-segment, left to right** — `/acme/[page]` beats
+  `/[org]/settings` for `/acme/settings` even though both hold exactly one dynamic segment, which
+  a scalar score cannot express. Teaching one matcher both would put Bun.serve's routing (which
+  every previewed Bun app depends on) at risk for the router's sake. The directory scan IS
+  `Bun.Glob`'s walker, so there is one traversal implementation. Documented divergences, all
+  pinned: catch-all params are the remaining segments joined with `/` (Bun types `params` as
+  `Record<string, string>`, not Next.js's array), `pathname` echoes the input including its query
+  string (as the documented example prints), `fileExtensions` defaults to the four Next.js
+  `pageExtensions` values, and two files claiming the same route name throw naming both rather
+  than letting directory order pick a winner. `.match()` on a Request/Response whose `url` is `""`
+  (i.e. any locally constructed Response) throws too, since an empty URL parses as the root path
+  and would otherwise resolve every one of them to the index route.
 - Zero-config `.ts`/`.tsx` runs through the loader's synchronous `typescript-transform.js` (§7).
 - The install/run detector (`kernel-worker.ts` `pmFromCmd`) maps `bun`/`bunx` to the `bun` PM,
   and the studio ships a **"Bun" template category** (serve / routes / websocket / react).

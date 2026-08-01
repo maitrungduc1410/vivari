@@ -83,7 +83,13 @@ packages/
       bun-hash.js  Bun.hash's algorithm family (wyhash, xxHash32/64, murmur, cityHash) —
                    byte-exact ports, each pinned by a known-answer vector in the spike.
       bun-glob.js  Bun.Glob's pattern compiler behind .match(). Hand-rolled on purpose:
-                   Bun's dialect is not minimatch's (see the Bun section below).
+                   Bun's dialect is not minimatch's (see the Bun section below). Also
+                   .scan()/.scanSync(): a PRUNING VFS walk (a syscall per directory, so
+                   pruning is not a micro-optimisation) with the filesystem injected,
+                   which is what keeps the walk testable in the offline tier.
+      bun-fsrouter.js  Bun.FileSystemRouter: Next.js-style [param]/[...catchAll]/
+                   [[...optional]] with per-SEGMENT precedence. A sibling of Bun.serve's
+                   compileRoutes/matchRoute, deliberately not a generalisation of it.
       bun-env.js   Bun's automatic .env loading: the file set + precedence, a port of
                    Bun's own parser, and $VAR expansion. `bun` processes only.
       bun-sleep.js Bun.sleepSync as a real Atomics.wait park (packages/protocol/
@@ -769,7 +775,7 @@ runtime**, and its pieces are ALWAYS on PATH (in `COREUTILS`), never lazily
 unpacked:
 - **`packages/runtime/builtins/bun.js`** — a Node-backed `Bun` global (`version`,
   `main`, `env`, `escapeHTML`, `deepEquals`/`deepMatch`, `hash`/`crc32`, `Glob`,
-  `randomUUIDv7`, `gzip`/`gunzip`,
+  `FileSystemRouter`, `randomUUIDv7`, `gzip`/`gunzip`,
   password `hash`/`verify`, `CryptoHasher`, `Transpiler`, `$`) plus **`Bun.serve`**
   (fetch handler; `routes` with static paths, `:params`, `*` wildcards,
   `BunRequest.params`, method-specific handlers; server-side **WebSockets** — RFC
@@ -896,6 +902,36 @@ pattern, and braces nest at most 10 deep — and every one of those changes whic
 files a build includes, with the other libraries' defaults looking perfectly
 reasonable in review. `bun-glob.js` is ~230 lines and its semantics are asserted
 directly; a vendored matcher would need auditing against the same list anyway.
+
+**Gotcha — a directory walk here is a syscall budget, not a loop.** `Bun.Glob.scan`/
+`scanSync` and the `Bun.FileSystemRouter` scan behind it read the VFS through the
+Atomics bridge: every `readdir` parks the calling worker until the fs worker
+answers, and `readdirSync(dir, {withFileTypes:true})` costs one MORE round trip per
+ENTRY, because our binding fills the dirent types with a per-name `lstat`
+(`node/bindings/fs.js`). So the walker reads NAMES only, `lstat`s an entry lazily
+and only when the answer can still change the result, and prunes whole subtrees via
+a small NFA over the pattern's path segments — `src/*.ts` reads two directories, not
+the project. Two rules if you touch it:
+- **The pruner may not decide membership.** `.match()` does, through the same
+  compiled RegExp, so a pruning bug can only ever LOSE files, never invent them; an
+  ambiguous segment is widened to `**` for the same reason. `spike-bun-offline.mjs`
+  asserts pruned-scan == walk-everything-then-`match()` over a list of patterns —
+  keep that check, it is the only thing standing between a clever prune and a build
+  that silently omits a file nobody looked for.
+- **Keep the filesystem an argument.** `scanGlobSync(fs, options)` takes it, which is
+  why the whole walk — options, symlinks, cycles, prune counts — is gated in the
+  offline tier against an in-memory tree, with `spike-bun.mjs` proving the same code
+  against the real Wasm VFS.
+
+**Gotcha — Bun has TWO route grammars, and they are not the same language.**
+`Bun.serve`'s `routes` (`compileRoutes`/`matchRoute` in `bun.js`) is `:param`/`*`
+with one specificity number per route. `Bun.FileSystemRouter` (`bun-fsrouter.js`) is
+Next.js-style `[param]`/`[...catchAll]`/`[[...optional]]` with `index` collapsing and
+precedence that is **per-segment, left to right**: `/acme/[page]` beats
+`/[org]/settings` for `/acme/settings` though both have exactly one dynamic segment.
+A scalar score cannot express that, so the two matchers are siblings on purpose —
+generalising one would put Bun.serve's routing (load-bearing for every previewed Bun
+app) at risk for the router's sake. They do share the directory walk.
 
 ### Python is Pyodide (CPython→WASM), lazily booted — with a Flask/FastAPI HTTP bridge
 Unlike the Node-backed Bun shim, `python`/`python3` boots **real CPython compiled to

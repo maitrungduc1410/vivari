@@ -289,7 +289,7 @@ console.log("\n== node env-check.mjs (no .env loading, no Bun import.meta member
   ok(got.dirname === APP, "…while Node's own import.meta.dirname still works");
 }
 
-// 9) `bun test` is Bun's test MODE, and the .env files from block 7 are still on
+// 8) `bun test` is Bun's test MODE, and the .env files from block 7 are still on
 // disk — including the .env.local that a test run must NOT see. Getting this wrong
 // is invisible locally and only shows up as a suite that passes on the machine with
 // an uncommitted .env.local and fails everywhere else (oven-sh/bun#9877).
@@ -310,6 +310,87 @@ console.log("\n== bun test (test mode: .env.test, no .env.local, NODE_ENV defaul
   const o = (r.stdout || "") + (r.stderr || "");
   if (LIVE || r.code !== 0) console.log(o);
   ok(r.code === 0 && /1 pass/.test(o) && /0 fail/.test(o), "bun test reads .env.test, skips .env.local, and defaults NODE_ENV to 'test'");
+}
+
+// 9) bun run scan.ts — Bun.Glob.scan()/scanSync() + Bun.FileSystemRouter over the
+// REAL Wasm VFS. This is the tier that matters for these two APIs: every readdir
+// and every lstat below is a synchronous syscall from the process worker across
+// the SharedArrayBuffer bridge to the fs worker, and none of that exists in
+// scripts/spike-bun-offline.mjs (which drives the same walker against an
+// in-memory tree). Symlinks in particular can only be proven here — the walk has
+// to agree with what the VFS actually stores.
+console.log("\n== bun run scan.ts (Bun.Glob.scan + Bun.FileSystemRouter over the VFS) ==");
+{
+  // No type annotations on purpose: this block is about the VFS walk, and the TS
+  // transform is already covered by the blocks above.
+  write("scan.ts", [
+    "const fs = require('fs');",
+    "const ROOT = '/app/scanroot';",
+    "fs.mkdirSync(ROOT + '/src/nested', { recursive: true });",
+    "fs.mkdirSync(ROOT + '/empty', { recursive: true });",
+    "fs.mkdirSync(ROOT + '/pages/blog', { recursive: true });",
+    "for (const f of ['index.ts', 'README.md', '.hidden.ts', 'src/index.ts', 'src/util.ts', 'src/nested/deep.ts']) fs.writeFileSync(ROOT + '/' + f, '');",
+    "for (const f of ['pages/index.tsx', 'pages/settings.tsx', 'pages/blog/index.tsx', 'pages/blog/[slug].tsx']) fs.writeFileSync(ROOT + '/' + f, '');",
+    // A symlink to a directory and a deliberately broken one. The VFS stores both
+    // as real symlink inodes, so lstat/stat disagree exactly like on a real fs.
+    "fs.symlinkSync(ROOT + '/src', ROOT + '/linkdir');",
+    "fs.symlinkSync(ROOT + '/nope', ROOT + '/broken');",
+    "const r = {};",
+    "const list = (pattern, opts) => Array.from(new Bun.Glob(pattern).scanSync(opts));",
+    "r.syncAll = list('**/*.ts', ROOT);",
+    "r.rooted = list('src/*.ts', { cwd: ROOT });",
+    "r.absolute = list('*.ts', { cwd: ROOT, absolute: true });",
+    "r.dot = list('*.ts', { cwd: ROOT, dot: true });",
+    "r.dirs = list('src/*', { cwd: ROOT, onlyFiles: false });",
+    "r.notFollowed = list('linkdir/*.ts', { cwd: ROOT });",
+    "r.followed = list('linkdir/*.ts', { cwd: ROOT, followSymlinks: true });",
+    // The default cwd is process.cwd(), which is /app here.
+    "r.defaultCwd = list('scanroot/src/*.ts');",
+    "try { list('**', { cwd: ROOT, onlyFiles: false, throwErrorOnBrokenSymlink: true }); r.broken = 'did not throw'; }",
+    "catch (e) { r.broken = String((e && e.message) || e); }",
+    "const router = new Bun.FileSystemRouter({ style: 'nextjs', dir: ROOT + '/pages', origin: 'https://x.dev', assetPrefix: '_next/static/' });",
+    "r.routes = Object.keys(router.routes).sort();",
+    "r.home = router.match('/');",
+    "r.post = router.match('/blog/hi?x=1');",
+    "r.miss = router.match('/nope');",
+    "async function main() {",
+    "  const out = [];",
+    "  for await (const f of new Bun.Glob('**/*.ts').scan(ROOT)) out.push(f);",
+    "  r.asyncAll = out;",
+    "  console.log('SCANRESULT:' + JSON.stringify(r));",
+    "}",
+    "main();",
+  ].join("\n"));
+  const run = await kernel.start("bun", ["run", "scan.ts"], { cwd: APP, env: ENV, capture: true });
+  if (run.stderr) console.log("  stderr:", run.stderr.trim());
+  const m = (run.stdout || "").match(/SCANRESULT:(\{.*\})/);
+  const r = m ? JSON.parse(m[1]) : null;
+  console.log("  ->", m ? JSON.stringify(r).slice(0, 160) + "…" : "(no result)", "exit", run.code);
+  ok(run.code === 0 && !!r, "scan.ts exits 0 and reports a result");
+  if (r) {
+    const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    ok(eq(r.syncAll, ["index.ts", "src/index.ts", "src/nested/deep.ts", "src/util.ts"]),
+      "scanSync('**/*.ts') walks the real VFS (sorted, relative, no dotfiles, .tsx not matched)");
+    ok(eq(r.asyncAll, r.syncAll), "scan() (AsyncIterable) returns the same entries as scanSync() (Iterable)");
+    ok(eq(r.rooted, ["src/index.ts", "src/util.ts"]), "a rooted pattern prunes to the one directory it can match");
+    ok(eq(r.absolute, ["/app/scanroot/index.ts"]), "absolute: true returns VFS-absolute paths");
+    ok(r.dot.indexOf(".hidden.ts") !== -1, "dot: true includes dotfiles (they are absent by default above)");
+    ok(eq(r.dirs, ["src/index.ts", "src/nested", "src/util.ts"]), "onlyFiles: false adds the matching directory");
+    ok(eq(r.defaultCwd, ["scanroot/src/index.ts", "scanroot/src/util.ts"]), "the default cwd is process.cwd()");
+    // Symlinks: the VFS stores them as their own inode kind, so this is the real
+    // behaviour and not an emulation of it.
+    ok(eq(r.notFollowed, []), "followSymlinks defaults to false: a symlinked directory in the VFS is not traversed");
+    ok(eq(r.followed, ["linkdir/index.ts", "linkdir/util.ts"]), "followSymlinks: true traverses it");
+    ok(/broken symbolic link/.test(r.broken) && r.broken.indexOf("/app/scanroot/broken") !== -1,
+      "throwErrorOnBrokenSymlink: true throws naming the dangling link");
+    // FileSystemRouter, over a directory it scanned through the same walker.
+    ok(eq(r.routes, ["/", "/blog", "/blog/[slug]", "/settings"]), "FileSystemRouter scanned the pages directory (index collapsed)");
+    ok(r.home && r.home.kind === "exact" && r.home.filePath === "/app/scanroot/pages/index.tsx", "match('/') resolves to index.tsx");
+    ok(r.home && r.home.src === "https://x.dev/_next/static/index.tsx", "src is origin + assetPrefix + the path relative to dir");
+    ok(r.post && r.post.name === "/blog/[slug]" && r.post.params.slug === "hi", "a dynamic route matches and captures its parameter");
+    ok(r.post && r.post.query.x === "1", "the query string is parsed");
+    ok(r.miss === null, "an unmatched path returns null (there is no catch-all in this tree)");
+  }
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");

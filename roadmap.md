@@ -4385,5 +4385,101 @@ process cwd with all four files present, `import.meta.main` true in the entry an
 module it imports, a `Bun.sleepSync(60)` that really blocks the worker, a plain `node` run next to
 the same `.env` files proving it reads none of them, and a `bun test` proving the test-mode file
 set.
+## Bun VFS scanning — `Bun.Glob.scan()`/`.scanSync()` and `Bun.FileSystemRouter` (this change)
+
+The previous Bun batch shipped `Bun.Glob` as a matcher and stopped there: `.scan()` and
+`.scanSync()` threw, naming themselves and naming Phase 2, because a directory walk is a
+different problem from a pattern compiler and an empty iterator would have read as "no files
+matched". This change is that walk, plus the one other Bun API that is mostly a directory walk
+with a grammar on top — `Bun.FileSystemRouter`. **Two APIs, one traversal.**
+
+- **`.scan()` is an `AsyncIterable`, `.scanSync()` an `Iterable`, and the asymmetry is the API.**
+  Bun types them that way, so a `for await` over `scanSync()` and a bare `for` over `scan()` both
+  have to be wrong here exactly as they are wrong there; the spike asserts the presence of one
+  iterator protocol and the *absence* of the other on each. It is not a difference in how much
+  work happens up front — our syscalls are synchronous in both cases, since the calling worker
+  parks in `Atomics.wait` until the fs worker answers — so `scan()` is the same lazy generator
+  surfaced through an async one, which at least lets the consumer's loop body interleave with the
+  traversal. Both are generators rather than materialised arrays, which is what makes breaking out
+  of a scan early stop the syscalls too, and that is pinned by counting directory reads.
+- **The walk prunes; it does not walk everything and filter.** This is the part that looks like a
+  micro-optimisation in a Node program and is not one here. Every `readdir` is a synchronous
+  round trip across the SharedArrayBuffer bridge, and `readdirSync(dir, { withFileTypes: true })`
+  costs one MORE round trip *per entry*, because our binding fills the dirent types with a
+  per-name `lstat` (`node/bindings/fs.js`). So the walker reads names only, `lstat`s an entry
+  lazily and only when the answer can still change the result, and skips whole subtrees using a
+  small NFA over the pattern's path segments: `**` is a state that absorbs any number of path
+  components, and every other segment compiles to a one-component `RegExp` through the SAME
+  `globToRegExpSource` the matcher uses, so the two cannot drift apart. `src/*.ts` reads two
+  directories instead of every directory in the project, `node_modules` included.
+  The safety argument matters more than the saving: **the pruner never decides membership.**
+  `.match()` does, through the same compiled `RegExp`, so a pruning bug can only ever cost us a
+  file, never invent one — and a segment whose shape is ambiguous about how many directory levels
+  it spans (a `**` glued to other characters, a brace group containing a `/`) is deliberately
+  widened to a `**` state, which errs toward descending into more places. The offline spike pins
+  this directly by running each of ten patterns twice, once pruned and once as a full walk
+  filtered by `.match()`, and asserting the two lists are identical. That check is the whole
+  reason the pruner is allowed to exist: the failure it guards against is a build that silently
+  omits a file nobody thought to look for, which no ordinary test notices.
+- **Symlinks are honoured, not flattened.** The Rust VFS stores real symlink inodes, so `lstat`
+  and `stat` genuinely disagree and the walker has to make choices rather than inherit them.
+  `followSymlinks` defaults to false, so a symlinked directory is not traversed — but it is still
+  `stat`ed, because `onlyFiles` needs to know whether it *names* a directory, and reporting a link
+  to a directory as a file merely because we declined to look through it would be the plausible
+  wrong answer this codebase forbids. With `followSymlinks: true` a cycle (`a/link -> a`) is an
+  infinite walk that the VFS's own `ELOOP` guard does not catch, since every individual
+  resolution is perfectly valid and it is the traversal that never terminates; the walker tracks
+  the resolved directories it reached *through* a link and refuses to re-enter an ancestor. A
+  broken link is skipped by default and throws naming the path under
+  `throwErrorOnBrokenSymlink: true`. `onlyFiles` defaults to **true**, which is the option people
+  get wrong, and a `cwd` that does not exist throws rather than yielding nothing — "no such
+  directory" and "no files matched" are different answers and only one of them is actionable.
+- **`Bun.FileSystemRouter` is a sibling of `Bun.serve`'s matcher, deliberately not a
+  generalisation of it.** `bun.js` already has a compiled route table with parameters and
+  precedence (`compileRoutes`/`matchRoute`, serving `Bun.serve`'s `routes`), so reusing it is the
+  obvious first move, and it is the wrong one — not because of syntax but because the two are
+  different languages with different precedence rules that happen to describe the same shape of
+  thing. `Bun.serve` routes are `/blog/:slug`, `/files/*`, `/*`, and a single specificity number
+  per route is enough for them because a serve route has one wildcard and it is always last.
+  Next.js-style routing has `[param]`, `[...catchAll]`, `[[...optional]]`, `index` collapsing and
+  extension stripping, and its precedence is **per-segment and left to right**, because two routes
+  can disagree at any position: `/acme/[page]` beats `/[org]/settings` for the path
+  `/acme/settings` even though both hold exactly one dynamic segment. A scalar score cannot
+  express that, so generalising `matchRoute` would mean teaching it that specificity is a vector,
+  and `Bun.serve`'s routing — load-bearing for every previewed Bun app — would then inherit the
+  risk of every edit made for the router. The two matchers are about forty lines each. They do
+  share the directory scan, which is `Bun.Glob`'s walker, so there is exactly one traversal
+  implementation and one place where symlinks, hidden files and the syscall budget are handled.
+  Precedence is the silently-wrong-if-approximated half, so it is pinned as behaviour and not
+  just as a rank table: static beats dynamic, dynamic beats a catch-all, a catch-all beats an
+  optional one, a required `[...page]` does not match its bare parent path while `[[...page]]`
+  does, and `/` resolves to `index.tsx` rather than to the optional catch-all that also matches it.
+
+Documented divergences, all pinned rather than "fixed" into what a reader might expect: catch-all
+params are the remaining segments joined with `/`, because Bun types `MatchedRoute.params` as
+`Record<string, string>` and not as Next.js's array; `pathname` echoes the input **including its
+query string**, which is what the documented example prints; and `fileExtensions` defaults to the
+four Next.js `pageExtensions` values, since Bun does not publish its own list and guessing wider
+invents routes while guessing narrower loses them.
+
+Four things throw where a quieter shim would guess. A `style` other than `"nextjs"` — the whole
+point of the option is which grammar the brackets are in, so falling back to Next.js semantics
+would answer a question the caller did not ask. A page file whose brackets do not parse (`[slug`),
+which is not a static segment named `[slug` in any useful sense but a route no request can reach.
+Two files resolving to the same route name (`blog.tsx` and `blog/index.tsx`), which Next.js also
+calls a project error and where the alternative is letting directory-iteration order decide which
+file serves `/blog`. And `.match()` on a Request or Response whose `url` is the empty string —
+only a *fetched* Response carries a URL, so every locally constructed one would otherwise parse
+as the root path and resolve to the index route.
+
+The kernel tier is where these two APIs are actually proved. `scripts/spike-bun-offline.mjs`
+drives the walker against an in-memory tree — which it can only do because `scanGlobSync(fs,
+options)` takes its filesystem as an argument — and that is enough for the option matrix, the
+prune-equals-full-walk invariant and the iterator-protocol split, but an in-memory object is not
+evidence about the VFS. So `scripts/spike-bun.mjs` builds a tree in the real Wasm VFS from inside
+a running Bun process, symlinks and dangling links included, and re-checks the same surface end
+to end: sorted relative results, pruning, `absolute`, `dot`, `onlyFiles: false`, the default
+`cwd`, both symlink options, and a `FileSystemRouter` over a scanned `pages/` directory down to
+its `src`, `params` and `query`. The offline gate goes from 463 checks to 579.
 
 See ARCHITECTURE.md §9.2.

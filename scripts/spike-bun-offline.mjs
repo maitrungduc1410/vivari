@@ -589,15 +589,11 @@ console.log("== Bun.Glob — the three ways Bun differs from minimatch/picomatch
   try { new Bun.Glob(nest(11)); } catch (e) { depthMsg = e.message; }
   ok(depthMsg.indexOf("10") !== -1, "braces nested 11 deep throw naming the limit");
 
-  // scan()/scanSync() need a VFS directory walk (Phase 2). An empty iterator would
-  // read as "no files matched" — the silently-wrong answer this batch exists to
-  // remove — so they follow the bun:ffi tier: constructing is fine, calling is loud.
-  const g = new Bun.Glob("**/*.ts");
-  for (const name of ["scan", "scanSync"]) {
-    let msg = "";
-    try { g[name]("."); } catch (e) { msg = e.message; }
-    ok(msg.indexOf("Phase 2") !== -1 && msg.indexOf(name) !== -1, `Bun.Glob.${name}() throws naming itself and Phase 2`);
-  }
+  // scan()/scanSync() used to throw here (they needed a VFS directory walk). They
+  // are implemented now — the walk, its pruning and its option matrix are checked
+  // at the end of this file against an in-memory tree, and against the real Wasm
+  // VFS in scripts/spike-bun.mjs.
+  ok(typeof new Bun.Glob("**/*.ts").scan === "function", "Bun.Glob.scan() exists");
   ok(new Bun.Glob("*.ts").match("index.ts"), "constructing a Glob is still safe after touching scan");
 }
 
@@ -1824,6 +1820,496 @@ console.log("== Bun.sleepSync parks instead of spinning ==");
   const t1 = Date.now();
   B.sleepSync(25);
   ok(Date.now() - t1 >= 20, "Bun.sleepSync(25) blocks for about 25ms");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2 batch B: Bun.Glob.scan()/scanSync() and Bun.FileSystemRouter.
+//
+// The walk itself is a VFS thing and scripts/spike-bun.mjs runs it against the
+// real Wasm VFS. Everything below runs here anyway because the walker takes its
+// filesystem as an argument: an in-memory tree is enough to pin the option
+// defaults, the symlink rules, the AsyncIterable/Iterable split, and — the part
+// that cannot be checked end-to-end without counting syscalls — that directory
+// PRUNING never changes which files come back.
+//
+// Imported dynamically so this whole batch is one appended block.
+// ─────────────────────────────────────────────────────────────────────────────
+const {
+  splitGlobSegments,
+  compileGlobPrefix,
+  prefixStart,
+  prefixStep,
+  prefixCanDescend,
+  createBunGlob,
+  scanGlobSync,
+} = await import("../packages/runtime/builtins/bun-glob.js");
+const {
+  parseRouteSegment,
+  compileFileSystemRoutes,
+  matchFileSystemRoute,
+  splitPathAndQuery,
+  createBunFileSystemRouter,
+  SEGMENT_RANK,
+} = await import("../packages/runtime/builtins/bun-fsrouter.js");
+const nodePath = await import("node:path");
+
+// A tiny in-memory filesystem with exactly the four calls the walker uses, plus
+// counters. `spec` maps an absolute path to "file", "dir" or { link: target }.
+function makeFakeFs(spec) {
+  const nodes = new Map([["/", "dir"]]);
+  for (const [p, kind] of Object.entries(spec)) {
+    const parts = p.split("/").filter(Boolean);
+    for (let i = 1; i < parts.length; i++) {
+      const dir = "/" + parts.slice(0, i).join("/");
+      if (!nodes.has(dir)) nodes.set(dir, "dir");
+    }
+    nodes.set(p, kind);
+  }
+  const counts = { readdir: 0, lstat: 0, stat: 0 };
+  const enoent = (p) => Object.assign(new Error("ENOENT: no such file or directory, '" + p + "'"), { code: "ENOENT" });
+  const stats = (kind) => ({
+    isDirectory: () => kind === "dir",
+    isSymbolicLink: () => typeof kind === "object" && kind !== null,
+    isFile: () => kind === "file",
+  });
+  const resolve = (p, depth) => {
+    if (depth > 20) throw enoent(p);
+    const kind = nodes.get(p);
+    if (kind === undefined) throw enoent(p);
+    if (typeof kind === "object") return resolve(kind.link, depth + 1);
+    return p;
+  };
+  // Every component EXCEPT the last is resolved, which is what lstat does and what
+  // makes a path through a symlinked directory (linkdir/index.ts) resolve at all.
+  const resolveParent = (p) => {
+    const i = p.lastIndexOf("/");
+    if (i <= 0) return p;
+    return resolve(p.slice(0, i), 0) + "/" + p.slice(i + 1);
+  };
+  return {
+    counts,
+    readdirSync(dirPath) {
+      counts.readdir++;
+      // readdir follows a trailing symlink, like the real one does — which is why
+      // the walker's refusal to traverse links has to be the walker's own decision.
+      const dir = resolve(dirPath, 0);
+      if (nodes.get(dir) !== "dir") throw enoent(dirPath);
+      const prefix = dir === "/" ? "/" : dir + "/";
+      const out = [];
+      for (const p of nodes.keys()) {
+        if (!p.startsWith(prefix) || p === dir) continue;
+        const rest = p.slice(prefix.length);
+        if (rest.indexOf("/") === -1) out.push(rest);
+      }
+      // Deliberately reversed: the walker is supposed to sort, and a fake fs that
+      // hands back sorted names would hide it if it stopped.
+      return out.reverse();
+    },
+    lstatSync(p) {
+      counts.lstat++;
+      const kind = nodes.get(resolveParent(p));
+      if (kind === undefined) throw enoent(p);
+      return stats(kind);
+    },
+    statSync(p) {
+      counts.stat++;
+      return stats(nodes.get(resolve(resolveParent(p), 0)));
+    },
+    realpathSync(p) {
+      return resolve(resolveParent(p), 0);
+    },
+  };
+}
+
+const TREE = {
+  "/app/index.ts": "file",
+  "/app/README.md": "file",
+  "/app/.hidden.ts": "file",
+  "/app/src/index.ts": "file",
+  "/app/src/util.ts": "file",
+  "/app/src/nested/deep.ts": "file",
+  "/app/src/nested/notes.md": "file",
+  "/app/test/a.test.ts": "file",
+  "/app/node_modules/pkg/index.ts": "file",
+  "/app/empty": "dir",
+  "/app/linkdir": { link: "/app/src" },
+  "/app/broken": { link: "/app/nope" },
+};
+
+// A Bun global's Glob, but with the fake filesystem injected where lazy("fs")
+// would hand back the runtime's VFS-backed one.
+function globWith(fs, cwd = "/app") {
+  const lazy = (name) => (name === "fs" ? fs : name === "path" ? nodePath.default : nodeRequire(name));
+  return createBunGlob({ lazy, process: { cwd: () => cwd } }).Glob;
+}
+
+console.log("== Bun.Glob.scan: pattern segmentation + the prune automaton (pure) ==");
+{
+  // Splitting happens at top-level `/` only. A `/` inside a brace group or a
+  // character class is part of that group — cutting there would build an automaton
+  // for a different pattern and silently skip a subtree.
+  ok(JSON.stringify(splitGlobSegments("src/**/*.ts")) === '["src","**","*.ts"]', "splitGlobSegments splits on path separators");
+  ok(JSON.stringify(splitGlobSegments("{src,test/deep}/**")) === '["{src,test/deep}","**"]', "a `/` inside braces does not split");
+  ok(JSON.stringify(splitGlobSegments("[a/b]x/y")) === '["[a/b]x","y"]', "a `/` inside a character class does not split");
+  ok(JSON.stringify(splitGlobSegments("a\\/b/c")) === '["a\\\\/b","c"]', "an escaped `/` stays with its segment");
+
+  const plan = compileGlobPrefix("src/*.ts");
+  ok(plan.segments.length === 2 && !plan.segments[0].globstar, "a plain segment compiles to a one-component RegExp");
+  ok(compileGlobPrefix("**/*.ts").segments[0].globstar === true, "`**` compiles to a globstar state");
+  // Ambiguous segments are WIDENED to a globstar. That can only make us look in
+  // more places, never fewer, which is the direction a pruner is allowed to be
+  // wrong in.
+  ok(compileGlobPrefix("{src,test/deep}/**").segments[0].widened === true, "a brace group spanning a `/` widens to a globstar");
+  ok(compileGlobPrefix("a**b/c").segments[0].widened === true, "a `**` glued to other characters widens to a globstar");
+
+  // The automaton answers one question: could anything under this directory match?
+  const p = compileGlobPrefix("src/*.ts");
+  ok(prefixCanDescend(p, prefixStep(p, prefixStart(p), "src")) === true, "src/*.ts: descend into src");
+  ok(prefixCanDescend(p, prefixStep(p, prefixStart(p), "docs")) === false, "src/*.ts: do NOT descend into docs");
+  const inSrc = prefixStep(p, prefixStart(p), "src");
+  ok(prefixCanDescend(p, prefixStep(p, inSrc, "nested")) === false, "src/*.ts: do NOT descend into src/nested (`*` stops at `/`)");
+  const gs = compileGlobPrefix("**/*.ts");
+  ok(prefixCanDescend(gs, prefixStep(gs, prefixStart(gs), "anything")) === true, "**/*.ts: descend everywhere");
+  ok(prefixStart(null) === null && prefixCanDescend(null, null) === true, "a null plan (negated pattern) means descend into everything");
+}
+
+console.log("== Bun.Glob.scanSync: results, and pruning that cannot change them ==");
+{
+  const fs = makeFakeFs(TREE);
+  const Glob = globWith(fs);
+  const scan = (pattern, opts) => Array.from(new Glob(pattern).scanSync(opts));
+
+  ok(
+    JSON.stringify(scan("**/*.ts")) ===
+      JSON.stringify(["index.ts", "node_modules/pkg/index.ts", "src/index.ts", "src/nested/deep.ts", "src/util.ts", "test/a.test.ts"]),
+    "**/*.ts walks the tree (sorted, relative to cwd, no dotfiles, symlinked dir not traversed)",
+  );
+  ok(JSON.stringify(scan("*.ts")) === '["index.ts"]', "`*` does not cross a directory boundary during a scan either");
+  ok(JSON.stringify(scan("src/*.ts")) === '["src/index.ts","src/util.ts"]', "a rooted pattern returns only that directory");
+  ok(JSON.stringify(scan("**/{README,notes}.md")) === '["README.md","src/nested/notes.md"]', "brace alternation works through the walk");
+
+  // Pruning. `src/*.ts` cannot match anything outside src, so the walker must read
+  // /app and /app/src and nothing else. In the browser each of those reads is a
+  // synchronous syscall across the Atomics bridge, so this is the difference
+  // between two round trips and one per directory in the project.
+  {
+    const counted = makeFakeFs(TREE);
+    Array.from(new (globWith(counted))("src/*.ts").scanSync());
+    ok(counted.counts.readdir === 2, `src/*.ts reads exactly 2 directories (got ${counted.counts.readdir})`);
+    const unpruned = makeFakeFs(TREE);
+    Array.from(new (globWith(unpruned))("**/*.ts").scanSync());
+    ok(unpruned.counts.readdir > counted.counts.readdir, "an unprunable pattern reads more directories, so the saving is real");
+    // Entries that can neither match nor lead to a match are never even lstat-ed.
+    ok(counted.counts.lstat <= 3, `src/*.ts lstats at most the entries it might return (got ${counted.counts.lstat})`);
+  }
+
+  // The invariant that makes the pruner safe to have at all: for every pattern,
+  // scanning equals walking the whole tree and filtering with .match(). If those
+  // ever disagree, the pruner is dropping files — the exact failure that would be
+  // invisible in a project where the missing file was not the one you looked at.
+  {
+    const all = Array.from(new Glob("**").scanSync({ onlyFiles: false }));
+    const files = new Set(Array.from(new Glob("**").scanSync()));
+    for (const pattern of [
+      "**/*.ts",
+      "src/*.ts",
+      "src/**/*.ts",
+      "*.ts",
+      "**/index.ts",
+      "{src,test}/**",
+      "**/*.{ts,md}",
+      "src/nested/*",
+      "!**/*.ts",
+      "**/[a-z]*.md",
+    ]) {
+      const g = new Glob(pattern);
+      const expected = all.filter((p) => g.match(p) && files.has(p));
+      const got = Array.from(g.scanSync());
+      ok(
+        JSON.stringify(got) === JSON.stringify(expected),
+        `pruned scan(${pattern}) == walk-everything-then-match (${got.length} entries)`,
+      );
+    }
+  }
+}
+
+console.log("== Bun.Glob.scan: the documented options ==");
+{
+  const fs = makeFakeFs(TREE);
+  const Glob = globWith(fs);
+  const scan = (pattern, opts) => Array.from(new Glob(pattern).scanSync(opts));
+
+  // onlyFiles defaults to TRUE, which is the option people are surprised by.
+  ok(JSON.stringify(scan("src/*")) === '["src/index.ts","src/util.ts"]', "onlyFiles defaults to true: src/nested is not returned");
+  ok(
+    JSON.stringify(scan("src/*", { onlyFiles: false })) === '["src/index.ts","src/nested","src/util.ts"]',
+    "onlyFiles: false adds matching directories",
+  );
+
+  ok(scan("**/*.ts").indexOf(".hidden.ts") === -1, "dot defaults to false: dotfiles are skipped");
+  ok(scan("**/*.ts", { dot: true }).indexOf(".hidden.ts") !== -1, "dot: true includes them");
+  // Documented as "allow patterns to match entries that begin with a period", so
+  // the filter is on the entry, not on the pattern: spelling the name out does not
+  // opt you in. Pinned because it is the kind of rule a later edit would "fix".
+  ok(scan(".hidden.ts").length === 0, "a literal dotfile pattern still needs dot: true");
+
+  ok(JSON.stringify(scan("*.ts", { absolute: true })) === '["/app/index.ts"]', "absolute: true returns absolute paths");
+  ok(JSON.stringify(scan("*.ts", "/app/src")) === '["index.ts","util.ts"]', "scanSync(root) takes a cwd string, not just an options object");
+  ok(JSON.stringify(scan("*.ts", { cwd: "/app/src" })) === '["index.ts","util.ts"]', "...and {cwd} means the same thing");
+  ok(JSON.stringify(scan("*.ts", { cwd: "src" })) === '["index.ts","util.ts"]', "a relative cwd resolves against process.cwd()");
+
+  // A cwd that does not exist has to be loud: an empty iterator here reads as "no
+  // files matched", which is the wrong answer to a typo'd directory.
+  let msg = "";
+  try { Array.from(new Glob("*").scanSync("/nope")); } catch (e) { msg = e.message; }
+  ok(/ENOENT|no such file/.test(msg), "scanning a nonexistent cwd throws rather than returning nothing");
+}
+
+console.log("== Bun.Glob.scan: symlinks ==");
+{
+  const fs = makeFakeFs(TREE);
+  const Glob = globWith(fs);
+  const scan = (pattern, opts) => Array.from(new Glob(pattern).scanSync(opts));
+
+  ok(scan("**/*.ts").every((p) => p.indexOf("linkdir/") !== 0), "followSymlinks defaults to false: a symlinked directory is not traversed");
+  ok(scan("linkdir/*.ts", { followSymlinks: true }).length === 2, "followSymlinks: true traverses it");
+  // A symlink to a directory is a DIRECTORY for onlyFiles purposes even when we
+  // refuse to follow it. Calling it a file because we declined to look would be a
+  // plausible-looking wrong answer, which is the one thing this shim may not do.
+  ok(scan("linkdir").length === 0, "an unfollowed symlink to a directory is not returned as a file");
+  ok(JSON.stringify(scan("linkdir", { onlyFiles: false })) === '["linkdir"]', "...it is returned as a directory when onlyFiles is off");
+
+  // Broken symlink: silently skipped by default (that IS the documented default),
+  // loud on request, and the message names the path.
+  ok(scan("**", { onlyFiles: false }).indexOf("broken") === -1, "a broken symlink is skipped by default");
+  let msg = "";
+  try { scan("**", { onlyFiles: false, throwErrorOnBrokenSymlink: true }); } catch (e) { msg = e.message; }
+  ok(/broken symbolic link/.test(msg) && msg.indexOf("/app/broken") !== -1, "throwErrorOnBrokenSymlink: true throws naming the path");
+
+  // A symlink loop is an infinite walk, and the VFS's own ELOOP guard does not
+  // catch it: every single resolution is valid, it is the traversal that never
+  // ends. Without the ancestor check this check hangs rather than fails.
+  const looped = makeFakeFs({ ...TREE, "/app/loop": { link: "/app" } });
+  const found = Array.from(new (globWith(looped))("**/index.ts").scanSync({ followSymlinks: true }));
+  ok(found.indexOf("loop/index.ts") !== -1, "a self-referential symlink is entered once");
+  ok(found.filter((p) => p.indexOf("loop/loop") === 0).length === 0, "...and not a second time (the cycle terminates)");
+
+  // The cycle guard is realpath-shaped, so a filesystem without realpathSync cannot
+  // have one. The failure mode there is not a wrong answer but a walk that never
+  // returns — a parked worker and a tab that looks hung — so it is loud.
+  const noRealpath = makeFakeFs(TREE);
+  delete noRealpath.realpathSync;
+  let loopMsg = "";
+  try { Array.from(new (globWith(noRealpath))("**/*.ts").scanSync({ followSymlinks: true })); } catch (e) { loopMsg = e.message; }
+  ok(/needs fs\.realpathSync/.test(loopMsg), "followSymlinks with no realpathSync throws instead of walking forever");
+  ok(Array.from(new (globWith(noRealpath))("**/*.ts").scanSync()).length > 0, "...and the default (unfollowed) walk is unaffected");
+}
+
+console.log("== Bun.Glob.scan() is async, scanSync() is sync — the asymmetry is the API ==");
+{
+  const fs = makeFakeFs(TREE);
+  const Glob = globWith(fs);
+  const g = new Glob("**/*.ts");
+
+  const sync = g.scanSync();
+  ok(typeof sync[Symbol.iterator] === "function", "scanSync() returns an Iterable");
+  ok(sync[Symbol.asyncIterator] === undefined, "...and NOT an AsyncIterable");
+  const async_ = g.scan();
+  ok(typeof async_[Symbol.asyncIterator] === "function", "scan() returns an AsyncIterable");
+  ok(async_[Symbol.iterator] === undefined, "...and NOT a plain Iterable");
+  ok(typeof async_.next === "function" && typeof async_.next().then === "function", "scan()'s next() is a promise (for await works)");
+
+  const collected = [];
+  for await (const file of g.scan()) collected.push(file);
+  ok(JSON.stringify(collected) === JSON.stringify(Array.from(g.scanSync())), "scan() and scanSync() return the same entries");
+
+  // Laziness: both are generators, so a consumer that stops early stops the
+  // syscalls too. With the walk eagerly materialised this reads the whole tree.
+  const lazyFs = makeFakeFs(TREE);
+  for (const _first of new (globWith(lazyFs))("**/*.ts").scanSync()) break;
+  const fullFs = makeFakeFs(TREE);
+  Array.from(new (globWith(fullFs))("**/*.ts").scanSync());
+  ok(
+    lazyFs.counts.readdir < fullFs.counts.readdir,
+    `breaking out of a scan stops the walk (${lazyFs.counts.readdir} of ${fullFs.counts.readdir} directory reads)`,
+  );
+}
+
+console.log("== scanGlobSync: the walker itself takes its filesystem as an argument ==");
+{
+  // The point of the injected fs is that the walk is testable with no kernel at
+  // all; this is the shape spike-bun.mjs exercises against the real VFS.
+  const fs = makeFakeFs(TREE);
+  const out = Array.from(
+    scanGlobSync(fs, {
+      root: "/app/src",
+      match: (p) => p.endsWith(".ts"),
+      prefix: compileGlobPrefix("**/*.ts"),
+    }),
+  );
+  ok(JSON.stringify(out) === '["index.ts","nested/deep.ts","util.ts"]', "scanGlobSync(fs, options) walks a plain object filesystem");
+}
+
+console.log("== Bun.FileSystemRouter: the Next.js grammar (pure) ==");
+{
+  ok(parseRouteSegment("blog", "x").kind === "static", "a bare name is a static segment");
+  ok(parseRouteSegment("[slug]", "x").kind === "dynamic" && parseRouteSegment("[slug]", "x").param === "slug", "[slug] is dynamic");
+  ok(parseRouteSegment("[...rest]", "x").kind === "catch-all", "[...rest] is a catch-all");
+  ok(parseRouteSegment("[[...rest]]", "x").kind === "optional-catch-all", "[[...rest]] is an optional catch-all");
+  // A typo'd bracket is not a static segment called "[slug" — it is a route no
+  // request can reach, so it throws at construction instead of at 404 time.
+  let msg = "";
+  try { parseRouteSegment("[slug", "pages/[slug.tsx"); } catch (e) { msg = e.message; }
+  ok(/cannot parse the route segment/.test(msg) && msg.indexOf("[slug.tsx") !== -1, "a malformed bracket segment throws naming the file");
+
+  ok(SEGMENT_RANK.static < SEGMENT_RANK.dynamic, "a static segment outranks a dynamic one");
+  ok(SEGMENT_RANK.dynamic < SEGMENT_RANK["catch-all"], "a dynamic segment outranks a catch-all");
+  ok(SEGMENT_RANK["catch-all"] < SEGMENT_RANK["optional-catch-all"], "a catch-all outranks an optional catch-all");
+
+  const q = splitPathAndQuery("/settings?foo=bar&foo=baz&n=1");
+  ok(q.path === "/settings" && q.query.n === "1", "splitPathAndQuery separates the query string");
+  ok(q.query.foo === "baz", "a repeated key keeps the last value (params are Record<string, string>)");
+}
+
+console.log("== Bun.FileSystemRouter: route precedence ==");
+{
+  // The documented pages directory, verbatim from the Bun docs.
+  const routes = compileFileSystemRoutes(
+    ["index.tsx", "settings.tsx", "blog/[slug].tsx", "blog/index.tsx", "[[...catchall]].tsx"],
+    {},
+  );
+  const match = (p) => matchFileSystemRoute(routes, p);
+  ok(match("/").route.name === "/" && match("/").route.kind === "exact", "/ resolves to index.tsx, not to the optional catch-all");
+  ok(match("/settings").route.name === "/settings", "/settings resolves to settings.tsx");
+  ok(match("/blog").route.name === "/blog", "blog/index.tsx collapses to /blog");
+  ok(match("/blog/my-cool-post").route.name === "/blog/[slug]", "/blog/my-cool-post resolves to the dynamic route");
+  ok(match("/blog/my-cool-post").params.slug === "my-cool-post", "...and captures the parameter");
+  ok(match("/a/b/c").route.name === "/[[...catchall]]", "an unmatched path falls through to the catch-all");
+  ok(match("/a/b/c").params.catchall === "a/b/c", "a catch-all captures the rest as a STRING (Bun types params as Record<string,string>)");
+
+  // Precedence is per-segment and left-to-right. This is the pair that a single
+  // "how dynamic is this route" score gets wrong: both routes have exactly one
+  // dynamic segment, and the answer is decided at position 0.
+  const mixed = compileFileSystemRoutes(["[org]/settings.tsx", "acme/[page].tsx"], {});
+  const hit = matchFileSystemRoute(mixed, "/acme/settings");
+  ok(hit.route.name === "/acme/[page]", "a static segment beats a dynamic one at the same position");
+  ok(hit.params.page === "settings", "...and the winning route's parameter is the one captured");
+  ok(matchFileSystemRoute(mixed, "/other/settings").route.name === "/[org]/settings", "the dynamic route still serves everything else");
+
+  const all = compileFileSystemRoutes(["static.tsx", "[x].tsx", "[...rest].tsx"], {});
+  ok(matchFileSystemRoute(all, "/static").route.kind === "exact", "static beats both");
+  ok(matchFileSystemRoute(all, "/other").route.kind === "dynamic", "dynamic beats the catch-all for a single segment");
+  ok(matchFileSystemRoute(all, "/a/b").route.kind === "catch-all", "the catch-all takes the multi-segment path");
+  ok(matchFileSystemRoute(all, "/a/b").params.rest === "a/b", "the catch-all parameter is the remaining path");
+
+  // A required catch-all must NOT match zero segments; an optional one must.
+  const req = compileFileSystemRoutes(["docs/[...page].tsx"], {});
+  ok(matchFileSystemRoute(req, "/docs") === null, "[...page] does not match the bare parent path");
+  const opt = compileFileSystemRoutes(["docs/[[...page]].tsx"], {});
+  ok(matchFileSystemRoute(opt, "/docs") !== null, "[[...page]] does match it");
+  ok(Object.keys(matchFileSystemRoute(opt, "/docs").params).length === 0, "...with no parameter set");
+
+  ok(matchFileSystemRoute(compileFileSystemRoutes(["blog/[slug].tsx"], {}), "/blog/a%20b").params.slug === "a b", "parameters are percent-decoded");
+  ok(matchFileSystemRoute(routes, "/nope/deep/deeper").route.kind === "optional-catch-all", "kind reports optional-catch-all");
+  ok(compileFileSystemRoutes(["index.tsx", "styles.css", "README.md"], {}).length === 1, "non-page extensions are not routes");
+  ok(compileFileSystemRoutes(["page.mjs"], {}).length === 0, "…and .mjs is not a page extension by default");
+  ok(compileFileSystemRoutes(["page.mjs"], { fileExtensions: [".mjs"] }).length === 1, "fileExtensions overrides the default set");
+
+  // Two files claiming one route is a project error. Next.js says so too, and
+  // "whichever the directory walk saw first" is not an answer.
+  let dup = "";
+  try { compileFileSystemRoutes(["blog.tsx", "blog/index.tsx"], {}); } catch (e) { dup = e.message; }
+  ok(/two files resolve to the route/.test(dup) && dup.indexOf("blog/index.tsx") !== -1, "a duplicate route name throws naming both files");
+  let late = "";
+  try { compileFileSystemRoutes(["[...all]/tail.tsx"], {}); } catch (e) { late = e.message; }
+  ok(/catch-all segment must be last/.test(late), "a catch-all that is not the last segment throws");
+}
+
+console.log("== Bun.FileSystemRouter: the class, over a scanned directory ==");
+{
+  const fs = makeFakeFs({
+    "/proj/pages/index.tsx": "file",
+    "/proj/pages/settings.tsx": "file",
+    "/proj/pages/blog/[slug].tsx": "file",
+    "/proj/pages/blog/index.tsx": "file",
+    "/proj/pages/[[...catchall]].tsx": "file",
+    "/proj/pages/styles.css": "file",
+    "/proj/pages/.hidden.tsx": "file",
+  });
+  const lazy = (name) => (name === "fs" ? fs : name === "path" ? nodePath.default : nodeRequire(name));
+  const FileSystemRouter = createBunFileSystemRouter({ lazy, process: { cwd: () => "/proj" } });
+  const router = new FileSystemRouter({
+    style: "nextjs",
+    dir: "./pages",
+    origin: "https://mydomain.com",
+    assetPrefix: "_next/static/",
+  });
+
+  // The documented example output, field by field.
+  const home = router.match("/");
+  ok(home.filePath === "/proj/pages/index.tsx", "filePath is absolute");
+  ok(home.kind === "exact" && home.name === "/", "kind/name match the docs");
+  ok(home.src === "https://mydomain.com/_next/static/index.tsx", "src is origin + assetPrefix + the path relative to dir");
+
+  const settings = router.match("/settings?foo=bar");
+  ok(settings.query.foo === "bar", "query parameters are parsed");
+  // Surprising but documented: pathname is the path AS PASSED, query included.
+  ok(settings.pathname === "/settings?foo=bar", "pathname keeps the query string (as the documented example prints it)");
+  ok(settings.filePath === "/proj/pages/settings.tsx", "…and the query does not affect matching");
+
+  const post = router.match("/blog/my-cool-post");
+  ok(post.kind === "dynamic" && post.params.slug === "my-cool-post", "dynamic route + params");
+  ok(post.name === "/blog/[slug]" && post.filePath === "/proj/pages/blog/[slug].tsx", "name keeps the bracket syntax");
+
+  ok(router.match(new Request("https://example.com/blog/my-cool-post")).params.slug === "my-cool-post", "match() accepts a Request");
+  ok(router.match("https://example.com/settings?foo=bar").query.foo === "bar", "…and a full URL string");
+  ok(router.match("/blog/deep/deeper").route === undefined, "a MatchedRoute exposes no internals");
+  ok(router.match("/blog/deep/deeper").kind === "optional-catch-all", "everything else falls through to the catch-all");
+
+  ok(router.routes["/"] === "/proj/pages/index.tsx", ".routes maps a route name to its file");
+  ok(Object.keys(router.routes).length === 5, "the .css and the dotfile are not routes");
+
+  // The directory is read at construction; .reload() re-reads it.
+  ok(router.match("/about").kind === "optional-catch-all", "/about is not a route yet");
+  const grown = makeFakeFs({
+    "/proj/pages/index.tsx": "file",
+    "/proj/pages/settings.tsx": "file",
+    "/proj/pages/blog/[slug].tsx": "file",
+    "/proj/pages/blog/index.tsx": "file",
+    "/proj/pages/[[...catchall]].tsx": "file",
+    "/proj/pages/about.tsx": "file",
+  });
+  const lazy2 = (name) => (name === "fs" ? grown : name === "path" ? nodePath.default : nodeRequire(name));
+  const r2 = new (createBunFileSystemRouter({ lazy: lazy2, process: { cwd: () => "/proj" } }))({ style: "nextjs", dir: "/proj/pages" });
+  r2.reload();
+  ok(r2.match("/about").kind === "exact", "reload() picks up a new page file");
+  ok(r2.match("/about").src === "/about.tsx", "with no origin/assetPrefix, src is just the relative path");
+
+  // Loud failures: an unsupported style must not quietly mean "nextjs", and a
+  // missing dir must not read as "a router with no routes".
+  let styleMsg = "";
+  try { new FileSystemRouter({ style: "sveltekit", dir: "./pages" }); } catch (e) { styleMsg = e.message; }
+  ok(/style must be "nextjs"/.test(styleMsg), "an unsupported style throws naming the supported one");
+  let dirMsg = "";
+  try { new FileSystemRouter({ style: "nextjs" }); } catch (e) { dirMsg = e.message; }
+  ok(/`dir` is required/.test(dirMsg), "a missing dir throws");
+  let missing = "";
+  try { new FileSystemRouter({ style: "nextjs", dir: "/proj/nope" }); } catch (e) { missing = e.message; }
+  ok(/ENOENT|no such file/.test(missing), "a dir that does not exist throws instead of matching nothing");
+  // A Response only carries a `url` when it came from fetch; one you constructed
+  // has "", which parses as the root path and would quietly return the index route.
+  let emptyUrl = "";
+  try { router.match(new Response("body")); } catch (e) { emptyUrl = e.message; }
+  ok(/`url` is the empty string/.test(emptyUrl), "a Request/Response with no URL throws rather than matching the index route");
+  ok(router.match(new Request("https://x.dev/settings")).name === "/settings", "...while a Request that has one still matches");
+}
+
+console.log("== Bun.Glob / Bun.FileSystemRouter are on the Bun global ==");
+{
+  const B = freshBun();
+  ok(typeof B.FileSystemRouter === "function", "Bun.FileSystemRouter is wired into the Bun object");
+  ok(typeof new B.Glob("*.ts").scan === "function" && typeof new B.Glob("*.ts").scanSync === "function", "Bun.Glob has both scan entry points");
+  ok(new B.Glob("*.ts").match("index.ts") === true, "…and still matches");
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Bun checks passed");
