@@ -248,6 +248,67 @@ export function encodeRequest(fields, flags = 0) {
   return buf;
 }
 
+// ---- thread parking, on its own (no syscall involved) -----------------------
+// The `Atomics.wait` park described at the top of this file is the mechanism the
+// whole sync bridge stands on, but it was only ever reachable as a side effect of
+// issuing a syscall. Some callers want the park WITHOUT a request — a blocking
+// sleep (`Bun.sleepSync`) is the obvious one. The alternative, a `while
+// (Date.now() < end);` spin, holds the core at 100% and starves nothing but
+// itself; on a one-worker-per-process kernel that is a whole CPU burnt to do
+// nothing. So the primitive is exported here, next to the ABI it belongs to,
+// rather than re-derived by each caller.
+//
+// The word is private to this module and nobody ever notifies it, so a wait on it
+// can only end by timing out — which is precisely a sleep.
+let parkWord = null;
+let parkAllowed = null; // null = not probed yet
+
+/**
+ * Whether this thread may block in `Atomics.wait` at all. TRUE on a Web Worker
+ * and on Node's main thread; FALSE on a browser's main thread, where the call is
+ * a TypeError ("Atomics.wait cannot be called in this context"), and on any host
+ * without SharedArrayBuffer (no cross-origin isolation). Probed once with a
+ * zero-length wait — there is no feature flag to read, only the throw.
+ */
+export function canPark() {
+  if (parkAllowed !== null) return parkAllowed;
+  parkAllowed = false;
+  try {
+    if (
+      typeof SharedArrayBuffer === "function" &&
+      typeof Atomics !== "undefined" &&
+      typeof Atomics.wait === "function"
+    ) {
+      parkWord = new Int32Array(new SharedArrayBuffer(4));
+      Atomics.wait(parkWord, 0, 0, 0); // returns "timed-out", or throws here
+      parkAllowed = true;
+    }
+  } catch {
+    parkAllowed = false; // main thread (or no SAB): the caller must do something else
+  }
+  return parkAllowed;
+}
+
+/**
+ * Park this thread for `ms` milliseconds without burning CPU. Returns true if it
+ * really parked, and FALSE — immediately, having done nothing — when parking is
+ * unavailable, so the caller can fall back rather than be left thinking it slept.
+ * A `false` that a caller ignored would be a silent wrong answer (a sleep that
+ * did not sleep), which is why this reports instead of throwing or spinning here.
+ *
+ * The loop re-checks the clock because `Atomics.wait` may return early: a wake is
+ * impossible on our private word, but a host that clamps the timeout is not.
+ */
+export function parkFor(ms) {
+  if (!(ms > 0)) return canPark(); // nothing to wait for; still report capability
+  if (!canPark()) return false;
+  const deadline = Date.now() + ms;
+  for (let left = ms; left > 0; left = deadline - Date.now()) {
+    Atomics.wait(parkWord, 0, 0, left);
+  }
+  return true;
+}
+
 /** Decode a request frame back into { flags, fields: Uint8Array[] }. */
 export function decodeRequest(bytes) {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);

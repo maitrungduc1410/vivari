@@ -84,6 +84,10 @@ packages/
                    byte-exact ports, each pinned by a known-answer vector in the spike.
       bun-glob.js  Bun.Glob's pattern compiler behind .match(). Hand-rolled on purpose:
                    Bun's dialect is not minimatch's (see the Bun section below).
+      bun-env.js   Bun's automatic .env loading: the file set + precedence, a port of
+                   Bun's own parser, and $VAR expansion. `bun` processes only.
+      bun-sleep.js Bun.sleepSync as a real Atomics.wait park (packages/protocol/
+                   syscall.js `parkFor`/`canPark`), with the spin as a fallback.
     node/
       lib/         Node's REAL vendored lib/*.js (fs, net, http, stream, ...).
       internal/    Node's REAL internal/* (streams, errors, validators, ...).
@@ -798,9 +802,48 @@ unpacked:
   `Bun.allocUnsafe` is **zero-filled** here (`new Uint8Array(n)` is specified to be) —
   safer and slower than real Bun, a performance-contract difference, not a bug.
   Async-generator `Response` bodies need no shim code; they already work.
+- **`packages/runtime/builtins/bun-env.js`** — Bun's automatic `.env` loading, which
+  Vivari did not do at all. **The precedence is the whole risk**: the files are read
+  `.env.{mode}.local` → `.env.local` → `.env.{mode}` → `.env` and applied WITHOUT
+  override, so the first file to define a key wins and the process environment beats
+  all of them. `.env.local` is skipped when `NODE_ENV=test` — and `bun test` is test
+  mode even with `NODE_ENV` unset, because Bun picks the file set FIRST and only then
+  defaults `NODE_ENV` to `test`; derive the mode from `NODE_ENV` at that point and a
+  plain `bun test` reads the `.env.local` Bun deliberately skips. The mode is one of
+  exactly three (`development`/`production`/`test` from `BUN_ENV ?? NODE_ENV`), so
+  `NODE_ENV=staging` reads `.env.development`. The parser is a port of Bun's
+  (`src/env_loader.zig`), not a fresh reading of "dotenv format", because the
+  formats genuinely differ — backtick quotes, `KEY: value`, `#` cutting an unquoted
+  value with no leading space, `$VAR`/`${VAR}`/`${VAR:-default}` expansion that also
+  applies inside single quotes. It is **not** shared with the `--env-file` reader in
+  `coreutils.js`: that one implements Node's smaller `--env-file` language and lives
+  inside a template literal, so there is no module to import.
+- **`packages/runtime/builtins/bun-sleep.js`** — `Bun.sleepSync` parks on
+  `Atomics.wait` (`parkFor` in `packages/protocol/syscall.js`) instead of spinning.
+  `Atomics.wait` is illegal on a browser MAIN thread, so `parkFor` reports its
+  capability and the spin stays as a documented fallback — a sleep that used to work
+  must not start throwing.
+- **`import.meta`** lives in `packages/runtime/esm.js` (`importMetaSource`). Bun's
+  `dir`/`file`/`path`/`env`/`main`/`resolveSync` are added **only when the Bun global
+  is installed**; `import.meta.env` under plain node would turn a Vite SSR file's
+  `import.meta.env.MODE` from a loud TypeError into a quiet `undefined`.
+  `import.meta.main` is `require.main === module` through the loader's live entry
+  link — never an argv[1] string compare — and throws if that link is missing.
+  **The two `resolveSync`s take different second arguments** and are easy to swap:
+  `Bun.resolveSync(id, root)` takes a DIRECTORY ("pass `import.meta.dir`"), while
+  `import.meta.resolveSync(id, parent)` takes the importing FILE and is defined by
+  Bun's own typings as `Bun.resolveSync(id, path.dirname(parent))`.
 - **`packages/kernel-host/programs/bun.js`** — the `bun`/`bunx` CLI: `bun run`,
   `bunx` (delegates to `npx`), install delegation, and it surfaces require/unhandled-
-  rejection errors instead of a silent exit.
+  rejection errors instead of a silent exit. `bun <file>` runs the file through the
+  loader's `runMain`, **not** a bare `require`, so the file becomes the process ENTRY
+  module — otherwise `/bin/bun.js` stays the entry and `require.main === module` /
+  `import.meta.main` are false inside the very file the user asked to run. It also
+  decides where `.env` is loaded: run/eval/test/build yes, `bun run <script>` no (the
+  `bun` the script itself starts loads it — oven-sh/bun#9635), install/x no (they
+  delegate to npm/npx, whose environment is not ours to rewrite from a project file).
+  `bun test` additionally forces the `test` file set and then defaults `NODE_ENV` to
+  `test` if nothing else set it — that order is Bun's and is load-bearing.
 - **Zero-config `.ts`/`.tsx`** runs through `packages/runtime/typescript-transform.js`
   (synchronous, dependency-free type-strip + JSX lowering, invoked by `module.js`;
   gated so plain JS is untouched). It strips return-type annotations inside object

@@ -216,5 +216,101 @@ console.log("\n== bun test ==");
   ok(/2 pass/.test(o) && /0 fail/.test(o), "bun:test reports 2 pass / 0 fail");
 }
 
+// 7) .env auto-loading + import.meta, through the real VFS and module loader.
+// These two are the reason this batch cannot be gated by the offline tier alone:
+// the file set has to be READ off the VFS from the process's cwd, and
+// `import.meta.main` is an identity check against the module the loader published
+// as the entry — neither exists without a kernel.
+console.log("\n== bun run env-app.ts (.env precedence + import.meta) ==");
+{
+  // Load order is decreasing precedence, so SHARED must come from the FIRST file
+  // here and nowhere else. NODE_ENV is unset, which is Bun's `development` mode.
+  write(".env", "SHARED=from-env\nONLY_BASE=base\nMODE_FILE=env\nGREETING=hello $WHO\nWHO=world\n");
+  write(".env.local", "SHARED=from-local\nLOCAL_ONLY=yes\n");
+  write(".env.development", "SHARED=from-dev\nMODE_FILE=dev\n");
+  write(".env.development.local", "SHARED=from-dev-local\n");
+  write("child.ts", "export const childIsMain: boolean = import.meta.main;\n");
+  write("env-app.ts", [
+    "import { childIsMain } from './child';",
+    "const e = process.env;",
+    "const t0 = Date.now();",
+    "Bun.sleepSync(60);",
+    "console.log('ENVRESULT:' + JSON.stringify({",
+    "  shared: e.SHARED, base: e.ONLY_BASE, mode: e.MODE_FILE, local: e.LOCAL_ONLY,",
+    "  expanded: e.GREETING,",
+    "  bunEnvAlias: Bun.env.SHARED === e.SHARED,",
+    "  metaEnvAlias: import.meta.env === process.env,",
+    "  main: import.meta.main, childMain: childIsMain,",
+    "  dir: import.meta.dir, file: import.meta.file, path: import.meta.path,",
+    "  resolved: import.meta.resolveSync('./child'),",
+    "  slept: Date.now() - t0,",
+    "}));",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "env-app.ts"], { cwd: APP, env: ENV, capture: true });
+  if (r.stderr) console.log("  stderr:", r.stderr.trim());
+  const m = (r.stdout || "").match(/ENVRESULT:(\{.*\})/);
+  const got = m ? JSON.parse(m[1]) : {};
+  console.log("  ->", JSON.stringify(got), "exit", r.code);
+  ok(r.code === 0, "env-app.ts exits 0");
+  ok(got.shared === "from-dev-local", ".env.development.local beats .env.local, .env.development and .env");
+  ok(got.base === "base" && got.mode === "dev", "lower-precedence files still supply the keys nobody else set");
+  ok(got.local === "yes", ".env.local is loaded (NODE_ENV is not test here)");
+  ok(got.expanded === "hello world", "$VAR expansion happened against a variable defined later in the same file");
+  ok(got.bunEnvAlias === true && got.metaEnvAlias === true, "Bun.env and import.meta.env are the same object as process.env");
+  ok(got.main === true, "import.meta.main is true in the entry the loader ran");
+  ok(got.childMain === false, "…and false in the module it imported");
+  ok(got.dir === APP && got.file === "env-app.ts" && got.path === APP + "/env-app.ts", "import.meta.dir/file/path describe the module");
+  ok(got.resolved === APP + "/child.ts", "import.meta.resolveSync went through the real resolver (.ts extension included)");
+  ok(got.slept >= 50, "Bun.sleepSync(60) really blocked the worker (parked on Atomics.wait): " + got.slept + "ms");
+}
+
+// The other half of the .env decision: a plain `node` process must be unchanged.
+// Automatic loading is Bun's behaviour — Node requires an explicit --env-file —
+// and Bun itself disables it when invoked as node.
+console.log("\n== node env-check.mjs (no .env loading, no Bun import.meta members) ==");
+{
+  write("env-check.mjs", [
+    "export const x = 1;",
+    "console.log('NODERESULT:' + JSON.stringify({",
+    "  shared: process.env.SHARED === undefined,",
+    "  metaEnv: import.meta.env === undefined,",
+    "  metaDir: import.meta.dir === undefined,",
+    "  dirname: import.meta.dirname,",
+    "}));",
+  ].join("\n"));
+  const r = await kernel.start("node", ["env-check.mjs"], { cwd: APP, env: ENV, capture: true });
+  if (r.stderr) console.log("  stderr:", r.stderr.trim());
+  const m = (r.stdout || "").match(/NODERESULT:(\{.*\})/);
+  const got = m ? JSON.parse(m[1]) : {};
+  console.log("  ->", JSON.stringify(got), "exit", r.code);
+  ok(r.code === 0, "env-check.mjs exits 0");
+  ok(got.shared === true, "node did NOT read the .env files sitting right next to it");
+  ok(got.metaEnv === true && got.metaDir === true, "node's import.meta has no Bun members");
+  ok(got.dirname === APP, "…while Node's own import.meta.dirname still works");
+}
+
+// 9) `bun test` is Bun's test MODE, and the .env files from block 7 are still on
+// disk — including the .env.local that a test run must NOT see. Getting this wrong
+// is invisible locally and only shows up as a suite that passes on the machine with
+// an uncommitted .env.local and fails everywhere else (oven-sh/bun#9877).
+console.log("\n== bun test (test mode: .env.test, no .env.local, NODE_ENV defaulted) ==");
+{
+  write(".env.test", "SHARED=from-test\nTEST_ONLY=yes\n");
+  write("envmode.test.ts", [
+    "import { test, expect } from 'bun:test';",
+    "test('test mode env', () => {",
+    "  expect(process.env.NODE_ENV).toBe('test');",
+    "  expect(process.env.SHARED).toBe('from-test');",
+    "  expect(process.env.TEST_ONLY).toBe('yes');",
+    "  expect(process.env.LOCAL_ONLY).toBe(undefined);",
+    "  expect(process.env.ONLY_BASE).toBe('base');",
+    "});",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["test", "envmode.test.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (LIVE || r.code !== 0) console.log(o);
+  ok(r.code === 0 && /1 pass/.test(o) && /0 fail/.test(o), "bun test reads .env.test, skips .env.local, and defaults NODE_ENV to 'test'");
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");
 process.exit(failed ? 1 : 0);

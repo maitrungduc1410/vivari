@@ -22,6 +22,17 @@ import {
   BUNX_PROGRAM,
   BUN_CLI_VERSION_FALLBACK,
 } from "../packages/kernel-host/programs/bun.js";
+import { importMetaSource, transpileEsm } from "../packages/runtime/esm.js";
+import {
+  bunEnvMode,
+  bunEnvFiles,
+  parseDotenv,
+  expandDotenvValue,
+  applyDotenv,
+  loadBunEnvFiles,
+} from "../packages/runtime/builtins/bun-env.js";
+import { createSleepSync } from "../packages/runtime/builtins/bun-sleep.js";
+import { canPark, parkFor } from "../packages/protocol/syscall.js";
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -1528,6 +1539,291 @@ console.log("== async-generator Response bodies (inherited, not shimmed) ==");
   // And the round trip a Bun.serve handler actually performs.
   const B = bunWith();
   ok((await B.readableStreamToText(new Response((async function* () { yield "str"; yield "eam"; })()).body)) === "stream", "Bun.readableStreamToText consumes an async-generator Response body");
+}
+
+console.log("== import.meta: the Node members are unconditional, Bun's are gated ==");
+{
+  // The prelude esm.js prepends to every ESM module. Evaluated here against a stub
+  // require/module, which is the whole reason importMetaSource is exported: the
+  // members below are decided by generated source, and a kernel run can only tell
+  // you that SOMETHING is wrong with it.
+  const src = importMetaSource("file:///app/src/index.ts", "/app/src/index.ts");
+  ok(src.indexOf("\n") === -1, "the prelude stays on one line (user line numbers are preserved)");
+
+  const entry = { id: "entry" };
+  const stubRequire = () => ({});
+  stubRequire.resolve = (s, o) => "R:" + s + ":" + ((o && o.paths && o.paths[0]) || "-");
+  Object.defineProperty(stubRequire, "main", { configurable: true, get: () => entry });
+  const evalMeta = (source, req, mod) =>
+    new Function("__oc_require", "__oc_module", source + "return __oc_meta;")(req, mod);
+
+  delete globalThis.Bun;
+  const nodeMeta = evalMeta(src, stubRequire, entry);
+  ok(nodeMeta.url === "file:///app/src/index.ts" && nodeMeta.filename === "/app/src/index.ts", "url + filename unchanged for a plain node process");
+  ok(nodeMeta.dirname === "/app/src" && typeof nodeMeta.resolve === "function", "dirname + resolve unchanged too");
+  // The gate, stated as a behaviour: `import.meta.env` must NOT exist under node.
+  // Vite SSR code reads `import.meta.env.MODE`; today that throws a TypeError it
+  // can act on, and an always-on alias of process.env would make it read
+  // `undefined` instead — a wrong answer wearing the right type.
+  ok(!("env" in nodeMeta), "import.meta.env is absent under node (it is not a Node member)");
+  ok(!("main" in nodeMeta) && !("dir" in nodeMeta) && !("file" in nodeMeta) && !("path" in nodeMeta), "dir/file/path/main are absent under node too");
+
+  globalThis.Bun = { version: BUN_VERSION };
+  try {
+    const meta = evalMeta(src, stubRequire, entry);
+    ok(meta.path === "/app/src/index.ts", "Bun: import.meta.path is the absolute path to the module");
+    ok(meta.dir === "/app/src", "Bun: import.meta.dir is its directory (no trailing slash)");
+    ok(meta.file === "index.ts", "Bun: import.meta.file is the basename WITH extension");
+    ok(meta.env === process.env, "Bun: import.meta.env is an alias of process.env, not a copy");
+    ok(meta.main === true, "Bun: import.meta.main is true for the module the loader published as the entry");
+    ok(evalMeta(src, stubRequire, { id: "other" }).main === false, "Bun: import.meta.main is false for any other module");
+
+    // Identity, not string comparison: a bin shim / symlink / realpath rewrite
+    // routinely makes argv[1] differ from the file that was actually loaded, so a
+    // path compare would answer confidently and wrongly.
+    const shimmed = { id: "entry-realpath" };
+    const shimRequire = () => ({});
+    Object.defineProperty(shimRequire, "main", { configurable: true, get: () => shimmed });
+    ok(evalMeta(src, shimRequire, shimmed).main === true, "main follows the loader's entry module even when the path would disagree");
+
+    // Loud when unanswerable: a require with no entry-module seam cannot say
+    // whether this file is the entrypoint, and `false` would be a plausible lie.
+    let mainMsg = "";
+    try { evalMeta(src, () => ({}), entry).main; } catch (e) { mainMsg = e.message; }
+    ok(/import\.meta\.main cannot be determined/.test(mainMsg), "main throws (naming itself) when the loader link is missing: " + mainMsg.slice(0, 40) + "…");
+
+    ok(meta.resolveSync("./sibling.ts") === "R:./sibling.ts:-", "resolveSync(specifier) resolves through the loader");
+    ok(meta.resolveSync("./sibling.ts", "file:///other/mod.js") === "R:./sibling.ts:/other", "resolveSync(specifier, parent) resolves from the parent module's directory");
+    ok(meta.resolveSync("./s.ts", "/other/mod.js") === "R:./s.ts:/other", "a plain path parent works as well as a file: URL");
+    ok(meta.resolveSync("./s.ts", "mod.js") === "R:./s.ts:.", "a parent with no directory part resolves from '.', the same answer path.dirname gives");
+    let resMsg = "";
+    try { evalMeta(src, () => ({}), entry).resolveSync("x"); } catch (e) { resMsg = e.message; }
+    ok(/resolveSync is unavailable/.test(resMsg), "resolveSync throws rather than echoing the specifier back when there is no resolver");
+
+    // Path edge cases the dir/file split has to get right.
+    const rootMeta = evalMeta(importMetaSource("file:///x.ts", "/x.ts"), stubRequire, entry);
+    ok(rootMeta.dir === "/" && rootMeta.file === "x.ts", "a file at the VFS root has dir '/' (not '')");
+    const bareMeta = evalMeta(importMetaSource("file://mod.js", "mod.js"), stubRequire, entry);
+    ok(bareMeta.dir === "." && bareMeta.file === "mod.js", "a bare filename has dir '.'");
+
+    // And the wiring: the transpiler must actually point `import.meta` at it.
+    const out = transpileEsm("export const d = import.meta.dir;\n", "/app/a.js");
+    ok(/__oc_meta\.dir/.test(out) && /__oc_meta\.path/.test(out), "transpileEsm rewrites import.meta.dir to the object built above");
+  } finally {
+    delete globalThis.Bun;
+  }
+}
+
+console.log("== Bun.resolveSync resolves from the root it is given ==");
+{
+  // Pinning `Bun.resolveSync` alongside import.meta.resolveSync because the two
+  // take DIFFERENT second arguments and used to be confusable: Bun.resolveSync's
+  // is a directory ("pass import.meta.dir"), import.meta.resolveSync's is the
+  // importing file (Bun's typings define it as
+  // `Bun.resolveSync(moduleId, path.dirname(parent))`). Bun.resolveSync accepted
+  // the root and then dropped it, which is not a resolution failure anyone can
+  // see — it is a real absolute path to the wrong file.
+  const bunWith = (resolve) => {
+    const proc = { env: {}, argv: ["bun"], cwd: () => "/", stdout: process.stdout, stderr: process.stderr, stdin: process.stdin };
+    const req = (id) => nodeRequire(id);
+    if (resolve) req.resolve = resolve;
+    return createBunRuntime({ process: proc, Buffer, require: req }).Bun;
+  };
+  const B = bunWith((id, o) => "R:" + id + ":" + ((o && o.paths && o.paths[0]) || "-"));
+  ok(B.resolveSync("./target.ts", "/path/to/project") === "R:./target.ts:/path/to/project", "Bun.resolveSync(specifier, root) resolves from that root DIRECTORY (not its parent)");
+  ok(B.resolveSync("zod") === "R:zod:-", "one argument resolves from the runtime's own base, as before");
+  ok((await B.resolve("./target.ts", "/root/dir")) === "R:./target.ts:/root/dir", "the async Bun.resolve honours the root too");
+
+  let msg = "";
+  try { bunWith(null).resolveSync("zod"); } catch (e) { msg = e.message; }
+  ok(/Bun\.resolveSync is unavailable/.test(msg), "with no resolver at all it throws instead of echoing the specifier back: " + msg.slice(0, 40) + "…");
+}
+
+console.log("== .env auto-loading: the file set and its precedence ==");
+{
+  // Bun's three modes, from BUN_ENV ?? NODE_ENV. Anything that is not an exact
+  // 'production' or 'test' is development — INCLUDING a real value like
+  // 'staging', which therefore reads .env.development and never .env.staging.
+  ok(bunEnvMode({}) === "development", "unset NODE_ENV means development");
+  ok(bunEnvMode({ NODE_ENV: "production" }) === "production", "NODE_ENV=production");
+  ok(bunEnvMode({ NODE_ENV: "test" }) === "test", "NODE_ENV=test");
+  ok(bunEnvMode({ NODE_ENV: "staging" }) === "development", "NODE_ENV=staging is development (Bun has only three modes)");
+  ok(bunEnvMode({ NODE_ENV: "production", BUN_ENV: "test" }) === "test", "BUN_ENV wins over NODE_ENV");
+
+  // Load order IS decreasing precedence: each file is applied without overriding a
+  // key that is already set. Reversing this list is the silent failure mode — every
+  // file still "loads", the values are just wrong.
+  ok(
+    bunEnvFiles({}).join(",") === ".env.development.local,.env.local,.env.development,.env",
+    "development load order: .env.development.local > .env.local > .env.development > .env"
+  );
+  ok(
+    bunEnvFiles({ NODE_ENV: "production" }).join(",") === ".env.production.local,.env.local,.env.production,.env",
+    "production load order"
+  );
+  // Documented in Bun's own docs: .env.local is machine-local developer state, so a
+  // test run must not inherit it.
+  ok(bunEnvFiles({ NODE_ENV: "test" }).indexOf(".env.local") === -1, "NODE_ENV=test does NOT read .env.local");
+  ok(
+    bunEnvFiles({ NODE_ENV: "test" }).join(",") === ".env.test.local,.env.test,.env",
+    "test load order keeps .env.test.local, which is not the same file"
+  );
+
+  // `bun test` is Bun's test MODE even with NODE_ENV unset: it picks the test file
+  // set first and only defaults NODE_ENV to 'test' afterwards ("unless it is
+  // already set in the environment or in .env files" —
+  // https://bun.com/docs/test/runtime-behavior). Deriving the mode from NODE_ENV
+  // at that point would read .env.local, and a suite would then pass on the laptop
+  // that has one and fail in CI (oven-sh/bun#9877). Hence the explicit override.
+  ok(
+    bunEnvFiles({}, "test").join(",") === ".env.test.local,.env.test,.env",
+    "an explicit test mode selects the test set even though NODE_ENV is unset"
+  );
+  ok(bunEnvFiles({ NODE_ENV: "production" }, "test").indexOf(".env.local") === -1, "the explicit mode wins over NODE_ENV");
+
+  const files = {
+    ".env": "SHARED=from-env\nONLY_BASE=base\nMODE_FILE=env\n",
+    ".env.development": "SHARED=from-dev\nMODE_FILE=dev\n",
+    ".env.local": "SHARED=from-local\n",
+    ".env.development.local": "SHARED=from-dev-local\n",
+  };
+  const reader = (p) => (Object.prototype.hasOwnProperty.call(files, p.replace("/app/", "")) ? files[p.replace("/app/", "")] : null);
+
+  const env = { PRESET: "from-shell", SHARED: undefined };
+  delete env.SHARED;
+  const loaded = loadBunEnvFiles({ env, cwd: "/app", readFile: reader });
+  ok(loaded.map((l) => l.file).join(",") === ".env.development.local,.env.local,.env.development,.env", "all four files were read, in load order");
+  ok(env.SHARED === "from-dev-local", "the highest-precedence file that defines a key wins");
+  ok(env.ONLY_BASE === "base" && env.MODE_FILE === "dev", "lower-precedence files still contribute the keys nobody else set");
+
+  const shellEnv = { SHARED: "from-shell" };
+  loadBunEnvFiles({ env: shellEnv, cwd: "/app", readFile: reader });
+  ok(shellEnv.SHARED === "from-shell", "a variable already in the environment beats every .env file");
+
+  const testEnv = { NODE_ENV: "test" };
+  loadBunEnvFiles({ env: testEnv, cwd: "/app", readFile: (p) => (p === "/app/.env.local" ? "SHARED=leaked\n" : p === "/app/.env" ? "SHARED=from-env\n" : null) });
+  ok(testEnv.SHARED === "from-env", "under NODE_ENV=test the .env.local value really is not applied");
+
+  const forcedTest = {};
+  loadBunEnvFiles({
+    env: forcedTest,
+    cwd: "/app",
+    mode: "test",
+    readFile: (p) => (p === "/app/.env.local" ? "SHARED=leaked\n" : p === "/app/.env" ? "SHARED=from-env\n" : null),
+  });
+  ok(forcedTest.SHARED === "from-env", "a forced test mode skips .env.local without needing NODE_ENV set first");
+
+  ok(loadBunEnvFiles({ env: {}, cwd: "/app", readFile: () => null }).length === 0, "no .env files present is not an error");
+  ok(loadBunEnvFiles({ env: {}, cwd: "/app", readFile: () => { throw new Error("EIO"); } }).length === 0, "an unreadable .env file is skipped, not fatal");
+}
+
+console.log("== .env parsing: Bun's dialect, not 'some dotenv' ==");
+{
+  const p = (s) => Object.fromEntries(parseDotenv(s));
+  ok(p("A=1\nB=2\n").A === "1" && p("A=1\nB=2\n").B === "2", "plain KEY=VALUE lines");
+  ok(p("# c\n\n  A=1\n").A === "1", "comments and blank lines are skipped");
+  ok(p("export A=1\n").A === "1", "a leading `export ` is stripped");
+  ok(p("A: 1\n").A === "1", "the `KEY: value` form (colon + whitespace) is accepted");
+  ok(p("A:1\n").A === undefined, "`KEY:value` without the space is NOT a key (so host:port survives on the right of an =)");
+  ok(p("A=host:1234\n").A === "host:1234", "a colon inside a value is untouched");
+  ok(p("A=  spaced  \n").A === "spaced", "an unquoted value is trimmed");
+  ok(p('A="  spaced  "\n').A === "  spaced  ", "a quoted value keeps its whitespace");
+  ok(p("A='v'\nB=`v`\nC=\"v\"\n").A === "v" && p("A='v'\nB=`v`\nC=\"v\"\n").B === "v", "single, double and BACKTICK quotes all work (Bun accepts all three)");
+  ok(p("A=x # trailing\n").A === "x", "an inline comment is stripped from an unquoted value");
+  ok(p("A=a#b\n").A === "a", "`#` needs no leading space — Bun cuts at it, dotenv would keep a#b");
+  ok(p('A="a#b"\n').A === "a#b", "…but not inside quotes");
+  ok(p('A="l1\nl2"\n').A === "l1\nl2", "a double-quoted value may span lines");
+  ok(p('A="a\\nb"\n').A === "a\nb", "\\n is unescaped inside double quotes");
+  ok(p("A='a\\nb'\n").A === "a\\nb", "…and stays literal inside single quotes");
+  ok(p('A="a\\qb"\n').A === "a\\qb", "an unknown escape is kept verbatim");
+  ok(p("A=1\nA=2\n").A === "2", "within ONE file the later assignment wins (oven-sh/bun#1262)");
+  ok(p("A.B-C=1\n")["A.B-C"] === "1", "`.` and `-` are legal key characters");
+  ok(p("=novalue\nA=1\n").A === "1", "a malformed line is skipped without derailing the rest of the file");
+  ok(p("A=\n").A === "", "an empty value is an empty string");
+}
+
+console.log("== .env expansion: $VAR, ${VAR}, ${VAR:-default}, \\$ ==");
+{
+  const look = { FOO: "world", EMPTY: "" };
+  const x = (v) => expandDotenvValue(v, (k) => look[k]);
+  ok(x("hello$FOO") === "helloworld", "$VAR is expanded (the documented example)");
+  ok(x("hello${FOO}!") === "helloworld!", "${VAR} is expanded");
+  ok(x("$FOO-$FOO") === "world-world", "several references in one value");
+  ok(x("a$MISSING b") === "a b", "an unset variable expands to nothing");
+  ok(x("${MISSING:-fallback}") === "fallback", "${VAR:-default} supplies a default");
+  ok(x("${FOO:-fallback}") === "world", "…and is ignored when the variable is set");
+  ok(x("hello\\$FOO") === "hello$FOO", "\\$ suppresses expansion and the backslash is dropped");
+  ok(x("costs 5$") === "costs 5$", "a trailing $ is literal (Bun's scan starts one character in)");
+  ok(x("$FOO") === "world", "a value that is nothing but a reference");
+  ok(x("$") === "$", "a lone $ is left alone");
+  // postgres://$DB_USER:$DB_PASSWORD@$DB_HOST — the docs' own worked example.
+  const env = {};
+  applyDotenv(env, "DB_USER=postgres\nDB_PASSWORD=secret\nDB_HOST=localhost\nDB_URL=postgres://$DB_USER:$DB_PASSWORD@$DB_HOST/db\n");
+  ok(env.DB_URL === "postgres://postgres:secret@localhost/db", "the docs' connection-string example composes");
+
+  // Expansion runs in file order, so a reference to a key defined EARLIER sees the
+  // expanded value and one defined LATER sees the raw text. Bun's order; pinned so
+  // a "tidier" two-pass rewrite cannot silently change it.
+  const ordered = {};
+  applyDotenv(ordered, "A=1\nB=$A/2\n");
+  ok(ordered.B === "1/2", "a backward reference resolves");
+  const backwards = {};
+  applyDotenv(backwards, "B=$A/2\nA=1\n");
+  ok(backwards.B === "1/2", "a forward reference resolves against the raw value parsed from the same file");
+
+  // Expansion looks at the whole environment, and single quotes do NOT stop it.
+  const withShell = { SHELL_VAR: "s" };
+  applyDotenv(withShell, "A=$SHELL_VAR\nB='$SHELL_VAR'\n");
+  ok(withShell.A === "s", "a .env value can reference a variable from the environment");
+  ok(withShell.B === "s", "Bun expands inside single quotes too (dotenv-expand does not)");
+
+  // applyDotenv must not touch a key that is already set, and must not expand it.
+  const preset = { KEEP: "$FOO" };
+  applyDotenv(preset, "KEEP=overwritten\nNEW=$KEEP\n");
+  ok(preset.KEEP === "$FOO", "an existing key is neither overwritten nor re-expanded");
+  ok(preset.NEW === "$FOO", "…and a reference to it reads what the environment actually holds");
+}
+
+console.log("== Bun.sleepSync parks instead of spinning ==");
+{
+  // In Node (and in a Web Worker) Atomics.wait is permitted, so the real park is
+  // exercised here rather than mocked.
+  ok(canPark() === true, "Atomics.wait parking is available on this thread");
+  const t0 = Date.now();
+  ok(parkFor(30) === true, "parkFor reports that it really parked");
+  ok(Date.now() - t0 >= 25, "…and the wall clock advanced by roughly the requested time");
+  ok(parkFor(0) === true, "parkFor(0) is a no-op that still reports the capability");
+
+  const calls = [];
+  const parked = createSleepSync({ park: (ms) => { calls.push(ms); return true; } });
+  parked(5);
+  ok(calls.length === 1 && calls[0] === 5, "sleepSync delegates to the park primitive");
+  parked(1.9);
+  ok(calls[1] === 1, "the duration is coerced to i32 exactly as Bun does (1.9 -> 1ms)");
+  calls.length = 0;
+  parked(0);
+  ok(calls.length === 0, "sleepSync(0) returns immediately without parking");
+
+  // The fallback matters as much as the fast path: on a browser MAIN thread
+  // Atomics.wait throws, and a sleep that has always worked must not start failing.
+  let spun = 0;
+  const spinning = createSleepSync({ park: () => false, now: () => (spun += 4) });
+  spinning(12);
+  ok(spun > 12, "when parking is unavailable it falls back to the spin (slow, never wrong)");
+
+  // Bun's own argument validation (src/bun.js/api/BunObject.zig), reproduced
+  // because these throws are Bun's, not sandbox limitations.
+  const throws = (fn) => { try { fn(); return ""; } catch (e) { return e.message; } };
+  ok(/requires 1 argument/.test(throws(() => parked())), "no argument throws");
+  ok(/must be of type number/.test(throws(() => parked("10"))), "a string throws (it is not coerced)");
+  ok(/must be of type number/.test(throws(() => parked(new Date(Date.now() + 10)))), "a Date throws — that overload belongs to the async Bun.sleep");
+  ok(/must not be negative/.test(throws(() => parked(-1))), "a negative duration throws rather than sleeping for 0");
+
+  // And through the Bun global, which is what guest code actually calls.
+  const B = freshBun();
+  const t1 = Date.now();
+  B.sleepSync(25);
+  ok(Date.now() - t1 >= 20, "Bun.sleepSync(25) blocks for about 25ms");
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Bun checks passed");

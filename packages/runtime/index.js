@@ -1306,8 +1306,17 @@ export function createRuntime({
   // `typeof Bun !== 'undefined'`. See packages/runtime/builtins/bun.js.
   const bunRuntime = createBunRuntime({ process, Buffer, require: vvRootRequire });
   for (const [name, mod] of Object.entries(bunRuntime.modules)) builtins[name] = mod;
-  globalThis.__ocInstallBun = () => {
+  // `{ dotenv: true }` additionally performs Bun's automatic `.env` loading into
+  // process.env (see builtins/bun-env.js). It is a parameter rather than part of
+  // installing the global because the CLI installs Bun for reasons that are not
+  // "run the user's code" — `bun --version` reads Bun.version off the global —
+  // and because real Bun skips the default files for `bun run <script>` too,
+  // leaving that to the `bun` the script itself starts (oven-sh/bun#9635).
+  // `{ mode }` pins the file set instead of deriving it from NODE_ENV, which only
+  // `bun test` needs (it chooses the `test` set before NODE_ENV is defaulted).
+  globalThis.__ocInstallBun = (options) => {
     globalThis.Bun = bunRuntime.Bun;
+    if (options && options.dotenv) bunRuntime.loadDotenv(options.mode);
     return bunRuntime.Bun;
   };
 

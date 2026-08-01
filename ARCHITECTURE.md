@@ -1127,11 +1127,52 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   performance-contract difference and stays a comment rather than a throw. Async-generator
   `Response` bodies are **inherited, not shimmed**: the platform `Response` accepts any async
   iterable, so the existing `Bun.serve` path already supports both documented forms.
+- `packages/runtime/builtins/bun-env.js` — Bun's automatic `.env` loading, which has no Node
+  equivalent (Node needs an explicit `--env-file`). Files are read in **decreasing**
+  precedence — `.env.{mode}.local`, `.env.local`, `.env.{mode}`, `.env` — and applied without
+  overriding a key that is already set, so the first file to define a key wins and a variable
+  exported by the shell beats every file. `.env.local` is skipped under `NODE_ENV=test`, and
+  `bun test` is test mode even with `NODE_ENV` unset: Bun chooses the file set first and only then
+  defaults `NODE_ENV` to `test` ("unless it is already set in the environment or in `.env` files"),
+  so the mode is passed in explicitly rather than read back off `NODE_ENV`. `{mode}` is otherwise
+  one of exactly three values derived from `BUN_ENV ?? NODE_ENV`, so `NODE_ENV=staging`
+  reads `.env.development` rather than a `.env.staging` that does not exist in Bun's model. The
+  parser is a port of Bun's (`src/env_loader.zig`) rather than a fresh reading of "dotenv
+  format": there is no dotenv specification, only implementations that disagree, and Bun's
+  differs in ways that change values — backtick quotes, the `KEY: value` form, `#` ending an
+  unquoted value with no space in front of it, and `$VAR`/`${VAR}`/`${VAR:-default}` expansion
+  that applies inside single quotes too. Loading is triggered from `__ocInstallBun({dotenv:true})`,
+  which only a `bun` process reaches, and only on the paths where Bun itself loads (running a
+  file, `-e`, `test`, `build` — not `bun run <script>`, which real Bun leaves to the `bun` the
+  script starts, and not the npm/npx delegations).
+- `packages/runtime/builtins/bun-sleep.js` — `Bun.sleepSync`, which was a `while (Date.now() <
+  end)` spin: right duration, one core held at 100% for it. It now parks on `Atomics.wait`
+  through `parkFor` in `packages/protocol/syscall.js` — the same primitive the synchronous
+  syscall bridge is built on, now exported without a request attached. `Atomics.wait` is illegal
+  on a browser MAIN thread, so `parkFor` reports whether it could park and the spin remains as a
+  documented fallback rather than becoming a throw in a context that used to work. Argument
+  handling is Bun's, including the i32 coercion and the throw on a negative duration.
+- `packages/runtime/esm.js` — `import.meta`. On top of the Node members (`url`, `filename`,
+  `dirname`, `resolve`) the prelude adds Bun's `dir`/`file`/`path`/`env`/`main`/`resolveSync`,
+  **gated on the Bun global being installed**. The gate is behavioural, not cosmetic:
+  `import.meta.env` is not a Node member, and aliasing it to `process.env` for every module
+  would turn a Vite SSR file's `import.meta.env.MODE` from a TypeError the caller can act on
+  into a silent `undefined`. `import.meta.main` is answered as `require.main === module` against
+  the loader's live entry-module link — an argv[1] path compare would confidently disagree
+  whenever a bin shim, symlink or realpath rewrite is involved — and throws, naming itself, if
+  that link is absent. `import.meta.resolveSync(id, parent)` takes the importing FILE and resolves
+  from its dirname (Bun's typings define it as `Bun.resolveSync(id, path.dirname(parent))`), which
+  is the opposite of `Bun.resolveSync(id, root)`, whose second argument is already a directory.
+  That one used to accept `root` and drop it, resolving every call from the runtime's own base —
+  a real absolute path to the wrong file — and now honours it, or throws when no resolver exists.
 - `packages/kernel-host/programs/bun.js` — the `bun`/`bunx` CLI (`bun run`, `bunx` → `npx`,
   install delegation). An unrecognised verb reports not-implemented; only a file-shaped argument
   or a `package.json` script name falls through to the run path. `bun upgrade` is not-implemented
   by design — it upgrades the Bun *binary*, which does not exist here — while `bun update`/`up`
-  still map to `npm update`.
+  still map to `npm update`. `bun <file>` hands the file to the loader's `runMain` rather than
+  `require`ing it, so it becomes the process entry module; with a bare require the launcher
+  itself stayed the entry and `require.main === module` / `import.meta.main` were false inside
+  the file the user ran.
 - **Version identity has one definition**, `BUN_VERSION`/`BUN_REVISION` in `builtins/bun.js`.
   The CLI installs the Bun global and reads them, so `bun --version`/`--revision` and
   `Bun.version`/`Bun.revision` cannot disagree; its embedded fallback literal is asserted equal

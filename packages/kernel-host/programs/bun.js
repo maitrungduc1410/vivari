@@ -66,8 +66,27 @@ function binPath(dir) {
 
 // Install the Bun global into this process realm (idempotent). Provided by the
 // runtime (packages/runtime/index.js) so a plain \`node\` process never sees Bun.
-function installBun() {
-  try { if (typeof globalThis.__ocInstallBun === 'function') globalThis.__ocInstallBun(); } catch (e) {}
+//
+// loadEnv asks the runtime to also perform Bun's automatic .env loading. Pass it
+// wherever this process is about to RUN user code (a file, an eval, tests, a
+// build) and only there. Two paths deliberately do not:
+//   - version/help, which reads Bun.version off the global and exits;
+//   - bun run <script>, which shells out: real Bun skips the default .env files
+//     for the script runner and lets the bun instance the script starts load
+//     them, so that a script like "NODE_ENV=production bun app.ts" is not handed
+//     the runner's development environment (oven-sh/bun#9635).
+// The install/x paths delegate to npm/npx, and we do not inject .env into that
+// child either: our installer is npm, not Bun's, and quietly changing npm's
+// environment from a project file is a surprise nobody asked for.
+//
+// mode, when given, pins which .env.{mode} files are read instead of deriving it
+// from NODE_ENV. Only bun test passes it — see doTest.
+function installBun(loadEnv, mode) {
+  try {
+    if (typeof globalThis.__ocInstallBun === 'function') {
+      globalThis.__ocInstallBun(loadEnv ? { dotenv: true, mode: mode || null } : null);
+    }
+  } catch (e) {}
 }
 
 // Version + revision come from the Bun global, which is the single definition
@@ -92,13 +111,26 @@ function runFile(target, rest) {
     err('bun: file not found: ' + target);
     process.exit(1);
   }
-  installBun();
+  installBun(true);
   process.argv = ['bun', abs, ...rest];
   // Surface load/parse/runtime errors from the entry directly (a bare throw here
   // would otherwise bubble up through the async main() chain as a silent
   // unhandled rejection and the process would just exit with no output).
   try {
-    require(abs);
+    // Through the loader's runMain, NOT a bare require: runMain publishes the file
+    // as the process ENTRY MODULE, which is what makes require.main === module and
+    // import.meta.main true inside it. With a plain require the entry stayed
+    // /bin/bun.js — this launcher — so the file the user actually ran reported
+    // import.meta.main === false, and every 'am I the entrypoint?' guard in it
+    // silently did nothing. It also gets the cmd-shim unwrapping and the
+    // top-level-await entry handling that runMain owns.
+    const moduleBuiltin = require('module');
+    const started = typeof moduleBuiltin.runMain === 'function' ? moduleBuiltin.runMain(abs) : require(abs);
+    // A top-level-await entry evaluates to a promise; a rejection in it must not
+    // become a silent exit either.
+    if (started && typeof started.then === 'function') {
+      started.catch(function (e) { err('bun: ' + ((e && e.stack) || e)); process.exit(1); });
+    }
   } catch (e) {
     err('bun: ' + ((e && e.stack) || e));
     process.exit(1);
@@ -215,7 +247,7 @@ function doExec(rest) {
 
 // ---- bun build : single-file TS/JSX transpile (no bundling) -----------------
 function doBuild(rest) {
-  installBun();
+  installBun(true);
   let entry = null, outfile = null, outdir = null;
   for (const a of rest) {
     if (a.indexOf('--outfile=') === 0) outfile = a.slice(10);
@@ -254,7 +286,17 @@ function findTestFiles(dir, acc) {
   return acc;
 }
 async function doTest(rest) {
-  installBun();
+  // A test run is Bun's TEST MODE, and that is two documented facts, in this
+  // order (https://bun.com/docs/test/runtime-behavior):
+  //   1. the .env file set is the test set -> .env.test.local, .env.test, .env.
+  //      .env.local is machine-local developer state and is deliberately skipped,
+  //      so a suite cannot pass on one laptop and fail in CI over a file nobody
+  //      committed (oven-sh/bun#9877);
+  //   2. NODE_ENV is then defaulted to 'test' -- 'unless it is already set in the
+  //      environment or in .env files', which is why it happens AFTER the load and
+  //      why the mode above cannot simply be derived from NODE_ENV.
+  installBun(true, 'test');
+  if (!process.env.NODE_ENV) process.env.NODE_ENV = 'test';
   const files = rest.filter((a) => a[0] !== '-');
   const targets = files.length ? files.map((f) => path.resolve(cwd, f)) : findTestFiles(cwd, []);
   if (!targets.length) { err('bun test: no test files found'); process.exit(1); }
@@ -310,7 +352,7 @@ async function main() {
   if (first === '--version' || first === '-v') { out(bunIdent().version); process.exit(0); }
   if (first === '--revision') { out(bunIdent().revision); process.exit(0); }
   if (first === '-e' || first === '--eval') {
-    installBun();
+    installBun(true);
     const code = argv[1] || '';
     const fn = new Function('code', 'return eval(code)');
     fn(code);

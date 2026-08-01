@@ -8,7 +8,9 @@
 // Covered: static import (default/named/namespace/side-effect), re-export
 // (`export {x} from`, `export * from`, `export * as ns from`), local exports
 // (const/let/var/function/class + `export {}` + `export default`), dynamic
-// import (-> a Promise), and import.meta.url/resolve. Named/default/namespace
+// import (-> a Promise), and import.meta (url/filename/dirname/resolve, plus
+// Bun's dir/file/path/env/main/resolveSync when the Bun global is installed —
+// see importMetaSource). Named/default/namespace
 // interop with CJS uses the standard __esModule rules. Live bindings are modeled
 // with getters. Top-level await is supported for the ENTRY module (module.js
 // recompiles a TLA body as an AsyncFunction and run() awaits it while driving the
@@ -52,25 +54,87 @@ function canStartRegex(src, i) {
   return false;
 }
 
-// Per-module interop helpers + import.meta, kept on ONE leading line so user
-// code line numbers are preserved. They close over the wrapper's `require`/
-// `__filename`, so dynamic import + import.meta.resolve resolve relative to the
-// importing module.
+// The `import.meta` object, as source — one statement, no newlines, because the
+// whole prelude sits on ONE leading line so user code line numbers survive. It is
+// split out of helpers() because half of it is conditional and all of it is worth
+// testing directly: scripts/spike-bun-offline.mjs evaluates this string against a
+// stub require/module instead of booting a kernel.
 //
-// import.meta carries url + resolve AND filename/dirname: Node has exposed
+// url + resolve + filename/dirname are the Node set. Node has exposed
 // `import.meta.filename` / `import.meta.dirname` (for file: modules) since
 // v20.11, and modern bundled ESM uses them directly instead of the older
 // `fileURLToPath(import.meta.url)` shim — e.g. unplugin 2.x:
 //   const LOADER = resolve(import.meta.dirname, "webpack/loaders/transform.mjs");
 // Without them `import.meta.dirname` is undefined and path.resolve throws
 // (`"paths[0]" argument must be of type string`).
-function helpers(fileUrl, filename) {
+//
+// The BUN ones
+// (path/dir/file/env/main/resolveSync — https://bun.com/docs/api/import-meta) are
+// installed only when the Bun global is present, i.e. only in a process started
+// by /bin/bun.js. That gate is not tidiness: `import.meta.env` in particular is
+// NOT a Node member, and defining it as an alias of process.env for every module
+// would turn a Vite SSR file's `import.meta.env.MODE` from a loud TypeError on
+// `undefined` into a quiet `undefined` — the exact silent-wrongness this shim
+// exists to avoid. Bun draws the same line from the other side: invoked as node,
+// it turns its own env behaviour off.
+//
+// `globalThis.Bun` rather than a bare `typeof Bun`: a module is free to declare
+// its own top-level `const Bun`, and this prelude runs in that same scope, so a
+// bare reference would hit the TDZ and throw before the module body starts.
+export function importMetaSource(fileUrl, filename) {
   const fp = filename || "";
-  let dir;
   const idx = fp.lastIndexOf("/");
-  if (idx < 0) dir = ".";
-  else if (idx === 0) dir = "/";
-  else dir = fp.slice(0, idx);
+  const dir = idx < 0 ? "." : idx === 0 ? "/" : fp.slice(0, idx);
+  const file = idx < 0 ? fp : fp.slice(idx + 1);
+  const J = JSON.stringify;
+  // `.main` is the entrypoint IDENTITY question, and only the loader can answer
+  // it: `require.main` is a live getter onto the module runMain() published as
+  // the entry (module.js), and `__oc_module` is this module's own record — so
+  // this is the ESM spelling of `require.main === module`, not a path-string
+  // comparison (which would disagree the moment a bin shim, a symlink or a
+  // realpath rewrite made argv[1] differ from the file we actually loaded). If a
+  // require without that seam ever reaches here we cannot answer, so we say so.
+  const noMain =
+    "import.meta.main cannot be determined: this module was loaded by a require " +
+    "without the loader's entry-module link, so the runtime does not know which " +
+    "module is the process entrypoint";
+  const noResolver =
+    "import.meta.resolveSync is unavailable: this module was loaded by a require " +
+    "with no resolver attached";
+  const noProcess = "import.meta.env is unavailable: this realm has no process object";
+  return (
+    "const __oc_meta={url:" + J(fileUrl) +
+      ",filename:" + J(fp) +
+      ",dirname:" + J(dir) +
+      ",resolve:function(s){return __oc_require.resolve?__oc_require.resolve(s):s;}};" +
+    "if(globalThis.Bun){" +
+      // path/dir/file are Bun's names for filename/dirname/basename. `.file` is
+      // the basename WITH its extension ("index.tsx"), per Bun's docs.
+      "__oc_meta.path=" + J(fp) + ";__oc_meta.dir=" + J(dir) + ";__oc_meta.file=" + J(file) + ";" +
+      // resolveSync(specifier, parent?) — the second argument is the importing
+      // MODULE, not a directory: Bun's own typings define this overload as
+      // `Bun.resolveSync(moduleId, path.dirname(parent))`, so we take the dirname.
+      // (Bun.resolveSync itself takes the directory directly — see builtins/bun.js.)
+      "__oc_meta.resolveSync=function(s,p){" +
+        "if(!__oc_require.resolve)throw new Error(" + J(noResolver) + ");" +
+        "if(p===undefined||p===null)return __oc_require.resolve(s);" +
+        "var b=String(p);if(b.slice(0,7)==='file://')b=b.slice(7);" +
+        "var i=b.lastIndexOf('/');" +
+        "return __oc_require.resolve(s,{paths:[i>0?b.slice(0,i):(i===0?'/':'.')]});};" +
+      "Object.defineProperty(__oc_meta,'env',{enumerable:true,configurable:true,get:function(){" +
+        "var p=globalThis.process;if(!p)throw new Error(" + J(noProcess) + ");return p.env;}});" +
+      "Object.defineProperty(__oc_meta,'main',{enumerable:true,configurable:true,get:function(){" +
+        "if(!__oc_require||!('main' in __oc_require))throw new Error(" + J(noMain) + ");" +
+        "return __oc_require.main===__oc_module;}});" +
+    "}"
+  );
+}
+
+// Per-module interop helpers + import.meta, kept on ONE leading line so user
+// code line numbers are preserved. They close over the wrapper's `require`/
+// `__filename`, so dynamic import + import.meta.resolve resolve relative to the
+// importing module.
+function helpers(fileUrl, filename) {
   return (
     "const __oc_def=function(m){return m&&m.__esModule?m.default:m;};" +
     "const __oc_ns=function(m){if(m&&m.__esModule)return m;var ns=Object.create(null);if(m)for(var k of Object.keys(m)){Object.defineProperty(ns,k,{enumerable:true,configurable:true,get:(function(k){return function(){return m[k];};})(k)});}ns.default=m;Object.defineProperty(ns,'__esModule',{value:true});return ns;};" +
@@ -89,10 +153,7 @@ function helpers(fileUrl, filename) {
     // requested module 'cssesc' is a CommonJS module…" on astro. __oc_ns is a no-op for
     // an ESM target (already __esModule) and synthesizes the namespace for CJS.
     "const __oc_import=function(s){return Promise.resolve().then(function(){return __oc_ns(__oc_require(s));});};" +
-    "const __oc_meta={url:" + JSON.stringify(fileUrl) +
-      ",filename:" + JSON.stringify(fp) +
-      ",dirname:" + JSON.stringify(dir) +
-      ",resolve:function(s){return __oc_require.resolve?__oc_require.resolve(s):s;}};"
+    importMetaSource(fileUrl, filename)
   );
 }
 

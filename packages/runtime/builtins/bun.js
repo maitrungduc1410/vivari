@@ -10,7 +10,14 @@
 // COVERED (see below): Bun.file/write, Bun.serve (bridged onto Node http so it
 // previews — with `routes`, `fetch`, an `error` handler, and server-side
 // `websocket` + pub/sub), Bun.env/argv/main/version, Bun.spawn/spawnSync/which,
-// Bun.$ (shell), Bun.sleep(Sync)/nanoseconds, Bun.hash (real wyhash, plus
+// Bun.$ (shell), Bun.sleep/Bun.sleepSync (a real Atomics.wait park, see
+// bun-sleep.js)/nanoseconds, automatic .env/.env.local/.env.{mode}(.local)
+// loading with Bun's precedence and $VAR expansion (bun-env.js; `bun` processes
+// only, never plain `node`; `bun test` uses the test file set and then defaults
+// NODE_ENV), import.meta.dir/file/path/env/main/resolveSync
+// (packages/runtime/esm.js, also gated on the Bun global),
+// Bun.resolveSync/resolve (the `root` argument is a DIRECTORY and is honoured;
+// import.meta.resolveSync's is the importing FILE), Bun.hash (real wyhash, plus
 // xxHash32/64, murmur32v2/v3, murmur64v2, cityHash32/64, crc32, adler32 —
 // byte-exact, with the documented number-vs-bigint return typing)/CryptoHasher,
 // Bun.password (crypto-backed), Bun.Glob (.match(); `*` stops at `/`, `!` negates
@@ -58,6 +65,8 @@ import { createBunText } from "./bun-text.js";
 import { createBunBytes } from "./bun-bytes.js";
 import * as hashes from "./bun-hash.js";
 import { Glob } from "./bun-glob.js";
+import { createSleepSync } from "./bun-sleep.js";
+import { loadBunEnvFiles } from "./bun-env.js";
 
 // The two documented Bun.hash members we did not port. The message names the
 // algorithm and says why, in the same spirit as the bun:ffi one: a caller who hits
@@ -652,14 +661,32 @@ export function createBunRuntime({ process, Buffer, require }) {
 
   // ---- misc helpers ----------------------------------------------------------
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms instanceof Date ? Math.max(0, ms - Date.now()) : ms));
-  const sleepSync = (ms) => {
-    // Best effort: a spin wait. The runtime has no Atomics-park primitive exposed
-    // to guest code here, so this blocks the loop briefly (Bun's is a true sleep).
-    const end = Date.now() + (ms | 0);
-    while (Date.now() < end) { /* spin */ }
-  };
+  // A real park on Atomics.wait (see ./bun-sleep.js), not the spin this used to
+  // be: same elapsed time, without holding a core at 100% for the duration.
+  const sleepSync = createSleepSync();
   const startNs = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
   const nanoseconds = () => Math.round(((typeof performance !== "undefined" && performance.now ? performance.now() : Date.now()) - startNs) * 1e6);
+
+  // Bun.resolveSync(specifier, root) / Bun.resolve(...) — `root` is the DIRECTORY
+  // to resolve from ("To resolve relative to the directory containing the current
+  // file, pass import.meta.dir"), not the importing file; import.meta.resolveSync
+  // takes the importing file instead and is documented as
+  // `Bun.resolveSync(id, path.dirname(parent))`, which is why esm.js takes a
+  // dirname and this does not. `root` used to be accepted and then dropped, so
+  // every call resolved from the runtime's own base instead: a real-looking
+  // absolute path to a different file, which is the exact failure mode this shim
+  // is not allowed to have. With no resolver at all we throw rather than echo the
+  // specifier back, for the same reason — Bun throws when it cannot resolve.
+  const bunResolveSync = (id, root) => {
+    if (!require.resolve) {
+      throw new Error(
+        "Bun.resolveSync is unavailable: the Bun global was created on a require with no " +
+          "resolver attached, so module specifiers cannot be resolved in this process"
+      );
+    }
+    if (root === undefined || root === null) return require.resolve(id);
+    return require.resolve(id, { paths: [String(root)] });
+  };
 
   const deepEquals = (a, b, strict) => bunDeepEquals(a, b, !!strict);
   const deepMatch = (subset, object) => bunDeepMatch(subset, object);
@@ -739,8 +766,8 @@ export function createBunRuntime({ process, Buffer, require }) {
     inflateSync: zlibSync("inflateSync"),
     fileURLToPath,
     pathToFileURL,
-    resolveSync: (id, parent) => require.resolve ? require.resolve(id) : id,
-    resolve: async (id, parent) => (require.resolve ? require.resolve(id) : id),
+    resolveSync: (id, root) => bunResolveSync(id, root),
+    resolve: async (id, root) => bunResolveSync(id, root),
     randomUUIDv7: (encoding, timestamp) => randomUUIDv7(lazy("crypto"), Buffer, encoding, timestamp),
     get stdin() { return process.stdin; },
     get stdout() { return process.stdout; },
@@ -761,7 +788,34 @@ export function createBunRuntime({ process, Buffer, require }) {
     "bun:sqlite": makeBunSqlite({ require }),
   };
 
-  return { Bun, modules };
+  // ---- automatic .env loading (see ./bun-env.js) ------------------------------
+  // Bun reads `.env`, `.env.{mode}`, `.env.local` and `.env.{mode}.local` at
+  // startup; our "startup" is the moment the Bun runtime is installed into a
+  // process (index.js's __ocInstallBun), which only ever happens for a `bun`
+  // process. It is deliberately NOT done for `node`: automatic loading is Bun's
+  // behaviour, not Node's — Node requires an explicit `--env-file` — and Bun
+  // itself turns it off when invoked AS node (`bun --bun`, a `node` symlink), for
+  // the same reason we do. Once per process; a second install is a no-op.
+  //
+  // `mode` forces the file set instead of deriving it from NODE_ENV; `bun test` is
+  // the one caller that needs it, because Bun picks the `test` set before NODE_ENV
+  // is defaulted to "test" (see kernel-host/programs/bun.js).
+  let dotenvLoaded = null;
+  function loadDotenv(mode) {
+    if (dotenvLoaded) return dotenvLoaded;
+    const fs = lazy("fs");
+    dotenvLoaded = loadBunEnvFiles({
+      env: process.env,
+      cwd: process.cwd(),
+      mode,
+      readFile: (p) => {
+        try { return fs.readFileSync(p, "utf8"); } catch { return null; }
+      },
+    });
+    return dotenvLoaded;
+  }
+
+  return { Bun, modules, loadDotenv };
 
   function makeTranspilerClass() {
     return class Transpiler {

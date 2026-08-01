@@ -4265,3 +4265,125 @@ The stub-runtime driver both tiers use moved to `scripts/lib/python-drive.mjs`, 
 pulled the serve-option parsing into the PR-gated tier where the argv bugs actually were.
 
 See ARCHITECTURE.md §9.3 and the AGENTS.md "Python is Pyodide" gotchas.
+
+## Bun runtime environment — `import.meta`, automatic `.env`, and a real `sleepSync` (this change)
+
+Three things a Bun project does before it does anything else: read `import.meta.dir` to find a
+file next to itself, read `process.env.DATABASE_URL` and expect the `.env` file to already be in
+it, and — occasionally — block. Vivari did the first partially, the second **not at all**, and
+the third by burning a core. None of the three announced itself: a project that works under Bun
+started here with `import.meta.dir === undefined`, an `undefined` connection string, and a sleep
+that pinned the CPU for its whole duration. **Phase 2, batch A.**
+
+- **`import.meta` gets Bun's members, and only under Bun.** The ESM prelude in
+  `packages/runtime/esm.js` already carried `url`, `resolve`, `filename` and `dirname` (Node's
+  set); it now also carries `path`, `dir`, `file`, `env`, `main` and `resolveSync`. The gate is
+  the interesting part: those six are installed **only when the `Bun` global is present**, i.e.
+  only in a process started by `/bin/bun.js`. That is not tidiness. `import.meta.env` is not a
+  Node member, and a Vite SSR file that reads `import.meta.env.MODE` under plain `node` is
+  *supposed* to get a `TypeError` on `undefined` — a failure the caller can see and act on.
+  Aliasing `import.meta.env` to `process.env` for every module would turn that into a quiet
+  `undefined` flowing onward as a mode string, which is the precise class of bug this shim exists
+  to avoid. Bun draws the same line from the other side: invoked as `node` (`bun --bun`, a `node`
+  symlink) it turns its own `import.meta.env` and `.env` behaviour off. The prelude reads
+  `globalThis.Bun`, never a bare `Bun`, because a module may declare its own top-level
+  `const Bun` and the prelude shares that scope — a bare reference would hit the TDZ and throw
+  before the module body started.
+- **`import.meta.main` is an identity check, never a path compare.** It answers
+  `require.main === module` against the loader's *live* entry-module link (`module.js` publishes
+  the entry in `runMain` before its body runs, and `require.main` is a getter onto it). The
+  tempting implementation — compare `import.meta.path` to `process.argv[1]` — is confidently
+  wrong the moment a bin shim, a symlink or a realpath rewrite makes argv[1] name something other
+  than the file that was actually loaded, and `if (import.meta.main)` guards silently doing
+  nothing is a bad way to find that out. When the seam is genuinely absent (a `require` with no
+  entry-module link) the getter **throws and names itself** rather than returning the plausible
+  `false`.
+- **The `bun` launcher runs the entry through `runMain`, not `require`.** This was the bug behind
+  the previous point rather than a refinement of it: `bun app.ts` used a bare `require(abs)`, so
+  the process entry module stayed `/bin/bun.js` — the launcher — and inside the file the user
+  actually asked to run, both `require.main === module` and `import.meta.main` were `false`. Going
+  through the loader's `runMain` also picks up cmd-shim unwrapping and the top-level-await entry
+  handling that `runMain` already owns; a TLA entry's rejection is caught and reported instead of
+  exiting silently.
+- **Automatic `.env` loading (`packages/runtime/builtins/bun-env.js`), and the precedence is the
+  whole risk.** Bun reads `.env` files with no opt-in, which is why Bun projects do not depend on
+  `dotenv`. Files are read `.env.{mode}.local` → `.env.local` → `.env.{mode}` → `.env` and each is
+  applied **without overriding a key that is already set**, so the *first* file to define a key
+  wins and a variable exported by the shell beats every file. Reverse that list and nothing looks
+  broken — every file still "loads", the values are just quietly the wrong ones — which is why the
+  order is asserted directly rather than inferred from a single end-to-end value. `.env.local` is
+  skipped under `NODE_ENV=test` (it is machine-local developer state; a suite that reads it passes
+  on the laptop that has one and fails everywhere else — oven-sh/bun#9877, and Bun's own docs call
+  the exception out). `{mode}` is one of exactly three values derived from `BUN_ENV ?? NODE_ENV`,
+  matched exactly, everything else falling to `development` — so `NODE_ENV=staging` reads
+  `.env.development` and never a `.env.staging`. That surprises people; it is still what Bun does,
+  and inventing `.env.staging` here would make a file load in the sandbox that is ignored in
+  production.
+- **The parser is a port of Bun's, not a fresh reading of "dotenv format".** There is no dotenv
+  specification — only implementations that disagree — and Bun's (`src/env_loader.zig`) disagrees
+  with the popular JS ones in ways that change values, not just style: backtick quotes, the
+  `KEY: value` form, `#` ending an unquoted value with no whitespace in front of it (`A=a#b` is
+  `a`, where dotenv keeps `a#b`), multi-line double-quoted values with `\n` unescaping, a later
+  assignment winning *within* one file, and `$VAR` / `${VAR}` / `${VAR:-default}` expansion that
+  applies inside single quotes too and treats a trailing `$` as literal. It is deliberately **not**
+  shared with the `--env-file` reader in `kernel-host/coreutils.js`: that one implements *Node's*
+  smaller `--env-file` language, which is Node's to define and not ours to widen, and it lives
+  inside the template literal that is the `node` program's source, so there is no module to import
+  anyway.
+- **`bun test` is Bun's test *mode*, in two steps and in that order.** The `.env` file set is the
+  test set — `.env.test.local`, `.env.test`, `.env`, no `.env.local` — and `NODE_ENV` is *then*
+  defaulted to `"test"`, "unless it is already set in the environment or in `.env` files". The
+  order matters and is why the mode cannot simply be read back off `NODE_ENV`: derive it there and
+  a plain `bun test` with no `NODE_ENV` picks the *development* set and reads the `.env.local` Bun
+  deliberately skips. An in-progress version of this change asserted the NODE_ENV default was
+  undocumented and left it out; it is documented (bun.com/docs/test/runtime-behavior), it is now
+  implemented, and the kernel spike runs a real `bun test` against the `.env.local` written by the
+  block before it to prove the file is not read.
+- **Where `.env` loading happens is a decision, not a default.** It is triggered from
+  `__ocInstallBun({dotenv:true})`, which only a `bun` process ever reaches, and only on the paths
+  where Bun itself loads: running a file, `-e`, `test`, `build`. Not `bun run <script>` — real Bun
+  skips the default files for the script *runner* and leaves them to the `bun` the script starts,
+  so that `"build": "NODE_ENV=production bun app.ts"` is not handed the runner's development
+  environment (oven-sh/bun#9635). Not `bun install`/`bun x` either: those delegate to npm/npx, and
+  quietly rewriting npm's environment from a project file is a surprise nobody asked for.
+- **`Bun.sleepSync` parks instead of spinning.** It was `while (Date.now() < end);` — the right
+  elapsed time and nothing else that is right, holding a core at 100% for the duration, which on a
+  one-worker-per-process kernel is a whole CPU spent waiting. Real Bun calls `nanosleep(2)`; the
+  browser's nearest equivalent is `Atomics.wait` on a word nobody ever notifies, which parks the
+  thread for real and ends by timing out. That is the same primitive the entire synchronous
+  syscall bridge already stands on, so it is exported from `packages/protocol/syscall.js` as
+  `parkFor`/`canPark` — next to the ABI it belongs to — rather than re-derived here. `Atomics.wait`
+  is **illegal on a browser main thread** (it throws), so `parkFor` reports its capability instead
+  of throwing and the old spin stays as an explicit, documented fallback: slow, never wrong, and a
+  sleep that used to work does not start failing. Argument handling is Bun's own, including the
+  i32 coercion (`1.9` sleeps 1ms) and the throws on a missing argument, a `Date` (that overload
+  belongs to the async `Bun.sleep`) and a negative duration — those are Bun's errors, not sandbox
+  limitations, so they are reproduced rather than softened.
+- **`Bun.resolveSync` stopped dropping its second argument** (found while pinning down
+  `import.meta.resolveSync`, and fixed here because it is the same question asked twice).
+  `Bun.resolveSync(specifier, root)` takes a **directory** to resolve from — the docs' own example
+  passes `import.meta.dir` — while `import.meta.resolveSync(specifier, parent)` takes the importing
+  **file**, and Bun's typings define the latter as `Bun.resolveSync(moduleId, path.dirname(parent))`.
+  Ours accepted `root` and ignored it, so every call resolved from the runtime's own base: a real,
+  absolute, plausible path to a *different file*. Both overloads are now correct and distinct, and
+  with no resolver attached at all they throw rather than echoing the specifier back.
+
+Divergences worth stating plainly. `bun test` under this shim runs the test *files* through our
+`bun:test` runner rather than Bun's, so "test mode" here means the environment semantics above and
+not Bun's runner internals. `import.meta.resolve` still returns a path where Bun (and Node) return
+a `file://` URL — pre-existing, unchanged by this batch, and called out here so it is not
+rediscovered as new. And `--env-file` / `--no-env-file` / `bunfig.toml`'s `env = false` are not
+wired up: the automatic set is all there is today.
+
+The offline tier goes from 463 checks to **557**, and it earns them: the `import.meta` prelude is
+evaluated as *source* against a stub `require`/`module` (which is why `importMetaSource` is
+exported at all — the members are decided by generated text, and a kernel run can only tell you
+that *something* about it is wrong), the file list is asserted as a list rather than inferred from
+one value, and each parser quirk is a separate check naming the library it disagrees with. The
+kernel tier adds two blocks that cannot be faked offline — `.env` read off the real VFS from the
+process cwd with all four files present, `import.meta.main` true in the entry and false in the
+module it imports, a `Bun.sleepSync(60)` that really blocks the worker, a plain `node` run next to
+the same `.env` files proving it reads none of them, and a `bun test` proving the test-mode file
+set.
+
+See ARCHITECTURE.md §9.2.
