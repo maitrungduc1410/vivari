@@ -853,5 +853,383 @@ console.log("== Bun.semver ==");
   ok(jsonEq(unsorted.slice().sort(s.order), ["1.0.0-alpha", "1.0.0-beta", "1.0.0-rc", "1.0.0", "1.0.1"]), "usable directly as Array#sort's comparator, prereleases first");
 }
 
+// Phase 1 batch B: text/terminal (bun-text.js) and bytes/streams (bun-bytes.js).
+// Every check below goes through the real `Bun` global rather than importing the
+// two modules directly, so the wiring in bun.js is gated with the implementations.
+// ---------------------------------------------------------------------------
+
+// Build a Bun global over a fake process. `env`/`stdout` are what Bun.color's
+// "ansi" depth policy reads, and faking them is the only way to pin that policy
+// from a spike that has no terminal of its own.
+const bunWith = (env = {}, stdout = { isTTY: false }) =>
+  createBunRuntime({
+    process: { env, argv: ["bun"], cwd: () => "/", stdout, stderr: process.stderr, stdin: process.stdin },
+    Buffer,
+    require: nodeRequire,
+  }).Bun;
+
+console.log("== Bun.stringWidth / stripANSI / wrapAnsi ==");
+{
+  // These are the `string-width` problem: the answer is Unicode data, not logic,
+  // which is why node/vendor/ansi-text.js bundles the real packages. The checks
+  // are the ones a hand-rolled table gets wrong.
+  const B = bunWith();
+
+  ok(B.stringWidth("hello") === 5, "stringWidth counts plain ASCII");
+  ok(B.stringWidth("") === 0, "stringWidth('') is 0");
+  ok(B.stringWidth("\u001b[31mhello\u001b[0m") === 5, "stringWidth ignores ANSI escapes by default");
+  ok(
+    B.stringWidth("\u001b[31mhello\u001b[0m", { countAnsiEscapeCodes: true }) === 12,
+    "stringWidth counts ANSI escapes with countAnsiEscapeCodes (Bun's documented 12)"
+  );
+  // Full-width and emoji are 2 columns each; a ZWJ family sequence is ONE glyph,
+  // so 2 and not 8. This is the check a naive per-code-point counter fails.
+  ok(B.stringWidth("古池や") === 6, "stringWidth counts East Asian Wide characters as 2 columns");
+  ok(B.stringWidth("\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}") === 2, "stringWidth counts a ZWJ emoji family as one 2-column glyph");
+  ok(B.stringWidth("a\u0301") === 1, "stringWidth counts a combining mark as 0 columns");
+
+  ok(B.stripANSI("\u001b[1mBold\u001b[0m") === "Bold", "stripANSI removes SGR styling");
+  ok(B.stripANSI("plain") === "plain", "stripANSI leaves un-styled text alone");
+  ok(
+    B.stripANSI("\u001b]8;;https://bun.com\u0007link\u001b]8;;\u0007") === "link",
+    "stripANSI removes OSC 8 hyperlinks, not just colours"
+  );
+
+  const wrapped = B.wrapAnsi("The quick brown fox jumps over the lazy dog", 20);
+  ok(wrapped === "The quick brown fox\njumps over the lazy\ndog", "wrapAnsi word-wraps at the column width");
+  ok(wrapped.split("\n").every((l) => B.stringWidth(l) <= 20), "no wrapAnsi row exceeds the requested width");
+  // The point of wrap-ansi over a plain split: an open style is closed at the end
+  // of each row and re-opened on the next, so every row renders on its own.
+  const wrappedAnsi = B.wrapAnsi("\u001b[31mThe quick brown fox jumps over the lazy dog\u001b[39m", 20);
+  ok(wrappedAnsi.split("\n").every((l) => l.indexOf("\u001b[31m") !== -1), "wrapAnsi re-opens the active style on every row");
+  ok(B.stripANSI(wrappedAnsi) === wrapped, "wrapAnsi wraps styled text at the same points as plain text");
+}
+
+console.log("== Bun.color: parsing and the output formats ==");
+{
+  const B = bunWith();
+
+  // Every input shape Bun documents has to reach the same colour.
+  for (const input of ["red", "#f00", "#ff0000", "rgb(255, 0, 0)", "rgba(255, 0, 0, 1)", "hsl(0, 100%, 50%)", "hsla(0, 100%, 50%, 1)"]) {
+    ok(B.color(input, "number") === 0xff0000, "color parses " + JSON.stringify(input));
+  }
+  ok(B.color(0xff0000, "number") === 0xff0000, "color parses a number");
+  ok(B.color({ r: 255, g: 0, b: 0 }, "number") === 0xff0000, "color parses an {r,g,b} object");
+  ok(B.color([255, 0, 0], "number") === 0xff0000, "color parses an [r,g,b] array");
+  ok(B.color("rgb(255 0 0 / 50%)", "rgba") === "rgba(255, 0, 0, 0.5)", "color parses the modern slash-alpha syntax");
+  ok(B.color("hwb(0 0% 0%)", "hex") === "#ff0000", "color parses hwb()");
+
+  // Each documented output format, on Bun's own worked example.
+  ok(B.color("red", "css") === "red", "css picks the most compact form (the colour name)");
+  ok(B.color(0xff0000, "css") === "red", "css normalises a number back to the name");
+  ok(B.color("red", "hex") === "#ff0000" && B.color("red", "HEX") === "#FF0000", "hex is lowercase and HEX uppercase");
+  ok(B.color("red", "rgb") === "rgb(255, 0, 0)", "rgb format");
+  ok(B.color("red", "hsl") === "hsl(0, 100%, 50%)", "hsl format");
+  ok(B.color("red", "ansi-16m") === "\u001b[38;2;255;0;0m", "ansi-16m emits a 24-bit escape");
+  // tmux's cube/greyscale snap, then the ansi-styles reduction to the base 16.
+  ok(B.color("red", "ansi-256") === "\u001b[38;5;196m", "ansi-256 snaps to the tmux 6x6x6 cube (196)");
+  ok(B.color("red", "ansi-16") === "\u001b[91m", "ansi-16 reduces via ansi-256 to bright red (91)");
+  ok(B.color("hsl(0, 0%, 50%)", "{rgba}").r === 128, "a mid grey rounds to 128, matching Bun's worked example");
+
+  // The object/array asymmetry is in Bun's docs and is the easiest thing here to
+  // get backwards: {rgba}.a is 0-1, [rgba][3] is 0-255.
+  const objHalf = B.color("rgba(255, 0, 0, 0.5)", "{rgba}");
+  const arrHalf = B.color("rgba(255, 0, 0, 0.5)", "[rgba]");
+  ok(objHalf.a === 0.5, "{rgba} carries alpha as a 0-1 float");
+  ok(arrHalf[3] === 128, "[rgba] carries alpha as a 0-255 integer");
+  ok(B.color("red", "{rgb}").a === undefined, "{rgb} omits alpha entirely");
+  ok(B.color("red", "[rgb]").length === 3, "[rgb] omits alpha entirely");
+
+  // Unparseable input is `null`, NOT a throw — callers branch on it.
+  for (const bad of ["not-a-color", "", "#12345", "rgb(1, 2)", {}, [1, 2], null, undefined, NaN]) {
+    ok(B.color(bad, "css") === null, "color returns null for " + JSON.stringify(bad === undefined ? "undefined" : bad));
+  }
+
+  // ...which is exactly why the colour spaces we did not implement must THROW:
+  // returning null would be indistinguishable from "that is not a colour", and
+  // real Bun parses these fine, so a caller would be silently wrong.
+  const throwsWith = (fn) => { try { fn(); return ""; } catch (e) { return e.message; } };
+  for (const fn of ["lab", "lch", "oklab", "oklch", "color", "color-mix"]) {
+    const msg = throwsWith(() => B.color(fn + "(50% 50 50)", "hex"));
+    ok(/not implemented in the Vivari shim/.test(msg), "color throws (never null) for the unimplemented " + fn + "()");
+  }
+  ok(/unknown output format/.test(throwsWith(() => B.color("red", "bogus"))), "an unknown output format throws rather than returning null");
+}
+
+console.log('== Bun.color(…, "ansi") depth detection ==');
+{
+  // Bun's "ansi" format detects stdout's colour depth from the environment and
+  // returns "" when there is no colour support. Vivari's terminal is virtual, so
+  // what this claims is a deliberate policy: reuse the precedence already in
+  // node/internal/util/colors.js, the hook util.styleText consults, so the two
+  // cannot disagree about whether colour is on.
+  const ansi = (env, stdout) => bunWith(env, stdout).color("red", "ansi");
+  const RED16M = "\u001b[38;2;255;0;0m";
+
+  ok(ansi({}, { isTTY: false }) === "", "headless (no env, non-TTY stdout) returns the documented empty string");
+  ok(ansi({}, { isTTY: false }) !== null, 'no-colour is "" and not null — null means "not a colour"');
+
+  // The Studio case: kernel-worker.ts exports TERM=xterm-256color + FORCE_COLOR=3,
+  // and xterm.js really does render truecolor, so claiming 24-bit is correct.
+  ok(ansi({ TERM: "xterm-256color", FORCE_COLOR: "3" }, { isTTY: false }) === RED16M, "the Studio kernel env (FORCE_COLOR=3) claims 24-bit colour");
+  ok(ansi({ FORCE_COLOR: "1" }, {}) === "\u001b[91m", "FORCE_COLOR=1 selects the 16-colour depth");
+  ok(ansi({ FORCE_COLOR: "2" }, {}) === "\u001b[38;5;196m", "FORCE_COLOR=2 selects the 256-colour depth");
+  ok(ansi({ FORCE_COLOR: "" }, {}) === RED16M, "FORCE_COLOR= (empty) is on, as in colors.js");
+
+  // Off switches, in precedence order. NO_COLOR must beat FORCE_COLOR.
+  ok(ansi({ FORCE_COLOR: "0" }, { isTTY: true }) === "", "FORCE_COLOR=0 forces colour off even on a TTY");
+  ok(ansi({ NO_COLOR: "1", FORCE_COLOR: "3" }, { isTTY: true }) === "", "NO_COLOR wins over FORCE_COLOR");
+  ok(ansi({ NODE_DISABLE_COLORS: "1" }, { isTTY: true }) === "", "NODE_DISABLE_COLORS forces colour off");
+  ok(ansi({ TERM: "dumb" }, { isTTY: true }) === "", "TERM=dumb forces colour off");
+  ok(ansi({ FORCE_COLOR: "nonsense" }, { isTTY: true }) === "", "an unrecognised FORCE_COLOR is off, exactly as colors.js treats it");
+
+  // With nothing forced, follow the stream and then COLORTERM/TERM for the depth.
+  ok(ansi({ COLORTERM: "truecolor" }, { isTTY: true }) === RED16M, "a TTY with COLORTERM=truecolor gets 24-bit");
+  ok(ansi({ TERM: "xterm-256color" }, { isTTY: true }) === "\u001b[38;5;196m", "a TTY with a -256color TERM gets 256");
+  ok(ansi({ TERM: "xterm" }, { isTTY: true }) === "\u001b[91m", "a plain TTY falls back to the base 16");
+  ok(ansi({ COLORTERM: "truecolor" }, { isTTY: false }) === "", "COLORTERM alone does not turn colour on for a non-TTY");
+
+  // The depth policy must not leak into the explicit formats: those are what a
+  // caller reaches for precisely to bypass detection.
+  ok(bunWith({ NO_COLOR: "1" }).color("red", "ansi-16m") === RED16M, "an explicit ansi-16m ignores NO_COLOR");
+  ok(bunWith({}).color("nope", "ansi") === null, "an unparseable colour is still null in ansi mode, not \"\"");
+}
+
+console.log("== Bun.indexOfLine ==");
+{
+  // "readline() without the IO", over possibly ill-formed UTF-8. It scans BYTES,
+  // which is the whole point: 0x0A can never be a UTF-8 continuation byte, so this
+  // is safe on a buffer that was cut mid-sequence.
+  const B = bunWith();
+  const buf = Buffer.from("ab\ncd\nef");
+
+  ok(B.indexOfLine(buf) === 2, "finds the first newline");
+  ok(B.indexOfLine(buf, 0) === 2, "an explicit offset of 0 matches the default");
+  ok(B.indexOfLine(buf, 3) === 5, "finds the next newline at or after an offset");
+  ok(B.indexOfLine(buf, 2) === 2, "the offset is inclusive");
+  ok(B.indexOfLine(buf, 6) === -1, "returns -1 when there is no newline left");
+  ok(B.indexOfLine(Buffer.from("no newline here")) === -1, "returns -1 for a buffer with no newline");
+  ok(B.indexOfLine(Buffer.from("")) === -1, "returns -1 for an empty buffer");
+
+  // A multi-byte character truncated mid-sequence must not derail the scan.
+  const illFormed = Buffer.concat([Buffer.from([0xe5, 0x8f]), Buffer.from("\nrest")]);
+  ok(B.indexOfLine(illFormed) === 2, "scans bytes, so ill-formed UTF-8 does not hide the newline");
+  ok(B.indexOfLine(new Uint8Array([0x61, 0x0a])) === 1, "accepts a bare Uint8Array");
+  ok(B.indexOfLine(new Uint8Array([0x61, 0x0a]).buffer) === 1, "accepts an ArrayBuffer");
+  // A view's byteOffset must be respected, not ignored.
+  ok(B.indexOfLine(Buffer.from("xx\nyy").subarray(3)) === -1, "respects a view's byteOffset instead of scanning the whole backing store");
+
+  let msg = "";
+  try { B.indexOfLine("a string"); } catch (e) { msg = e.message; }
+  ok(/expects an ArrayBuffer/.test(msg), "a non-buffer argument throws instead of being coerced");
+}
+
+console.log("== Bun.inspect.table / Bun.inspect.custom ==");
+{
+  const B = bunWith();
+
+  // Bun's documented frame, byte for byte — including the EMPTY header cell above
+  // the index column, where Node's console.table prints "(index)".
+  const table = B.inspect.table([{ a: 1, b: 2, c: 3 }, { a: 4, b: 5, c: 6 }, { a: 7, b: 8, c: 9 }]);
+  ok(
+    table ===
+      ["┌───┬───┬───┬───┐", "│   │ a │ b │ c │", "├───┼───┼───┼───┤", "│ 0 │ 1 │ 2 │ 3 │", "│ 1 │ 4 │ 5 │ 6 │", "│ 2 │ 7 │ 8 │ 9 │", "└───┴───┴───┴───┘"].join("\n"),
+    "inspect.table reproduces Bun's documented frame exactly"
+  );
+  ok(table.indexOf("(index)") === -1, "the index column header is blank, as in Bun (not Node's \"(index)\")");
+  ok(typeof table === "string" && table.indexOf("\n") !== -1, "inspect.table returns a string rather than printing");
+
+  const filtered = B.inspect.table([{ a: 1, b: 2, c: 3 }, { a: 4, b: 5, c: 6 }], ["a", "c"]);
+  ok(
+    filtered === ["┌───┬───┬───┐", "│   │ a │ c │", "├───┼───┼───┤", "│ 0 │ 1 │ 3 │", "│ 1 │ 4 │ 6 │", "└───┴───┴───┘"].join("\n"),
+    "a properties array selects and orders the columns"
+  );
+  ok(B.inspect.table([{ a: 1, b: 2 }], { colors: true }).indexOf("\u001b[") !== -1, "options in the second position still enable colours");
+
+  // Columns are measured in display columns, not code units, so a CJK or emoji
+  // cell still lines up. This is why inspect.table uses stringWidth.
+  const wide = B.inspect.table([{ k: "古池や" }, { k: "ab" }]).split("\n");
+  ok(new Set(wide.map((l) => B.stringWidth(l))).size === 1, "every row is the same display width with full-width cells");
+
+  ok(B.inspect.custom === nodeRequire("node:util").inspect.custom, "inspect.custom is the same registry symbol as util.inspect.custom");
+  class Foo { [B.inspect.custom]() { return "foo"; } }
+  ok(nodeRequire("node:util").inspect(new Foo()) === "foo", "an object using Bun.inspect.custom is honoured by the runtime's own inspect");
+  // Bun.inspect became a function object; it must still be the plain delegate.
+  ok(B.inspect({ x: 1 }) === "{ x: 1 }", "Bun.inspect still delegates to util.inspect");
+  ok(typeof B.inspect === "function", "Bun.inspect is still callable, not replaced by a namespace object");
+}
+
+console.log("== Bun.ArrayBufferSink: the polymorphic flush() ==");
+{
+  const B = bunWith();
+
+  // THE regression check for this batch. flush()'s return TYPE depends on what
+  // start() was given, and a caller that expects bytes and gets a number (or the
+  // reverse) fails far away from the mistake:
+  //   no start()/no stream            -> a NUMBER, bytes written since last flush
+  //   start({stream:true})            -> an ArrayBuffer
+  //   start({stream:true, asUint8Array:true}) -> a Uint8Array
+  const buffered = new B.ArrayBufferSink();
+  buffered.start({});
+  buffered.write("hel");
+  const bufferedFlush = buffered.flush();
+  ok(typeof bufferedFlush === "number", "flush() without stream:true returns a NUMBER, not bytes");
+  ok(bufferedFlush === 3, "that number is the bytes written since the last flush");
+  ok(buffered.flush() === 0, "a second flush() reports 0, the counter having reset");
+  // Buffer mode must NOT drain: end() still owes the caller everything written.
+  ok(new TextDecoder().decode(buffered.end()) === "hel", "flush() in buffer mode does not drain — end() still returns everything");
+
+  const defaulted = new B.ArrayBufferSink();
+  defaulted.write("hi");
+  ok(typeof defaulted.flush() === "number", "a sink that was never start()ed also flushes to a number");
+
+  const streamed = new B.ArrayBufferSink();
+  streamed.start({ stream: true });
+  streamed.write("h"); streamed.write("e"); streamed.write("l");
+  const first = streamed.flush();
+  ok(first instanceof ArrayBuffer, "flush() with stream:true returns an ArrayBuffer");
+  ok(new TextDecoder().decode(first) === "hel", "...containing everything written so far");
+  streamed.write("l"); streamed.write("o");
+  ok(new TextDecoder().decode(streamed.flush()) === "lo", "stream mode DRAINS: the next flush only sees later writes");
+
+  const streamedU8 = new B.ArrayBufferSink();
+  streamedU8.start({ stream: true, asUint8Array: true });
+  streamedU8.write("hi");
+  const u8 = streamedU8.flush();
+  ok(u8 instanceof Uint8Array, "flush() with stream:true + asUint8Array returns a Uint8Array");
+  ok(new TextDecoder().decode(u8) === "hi", "...with the same bytes");
+
+  // end() is the simpler polymorphism: ArrayBuffer, or Uint8Array on request.
+  const plain = new B.ArrayBufferSink();
+  // Note: an ArrayBuffer chunk is taken WHOLE, so this cannot be spelled
+  // `Buffer.from("lo").buffer` the way Bun's doc example does — that is a view
+  // into Node's shared 8 KB pool and would write all 8192 bytes.
+  plain.write("h"); plain.write(new Uint8Array([101, 108])); plain.write(new Uint8Array([108, 111]).buffer);
+  const ended = plain.end();
+  ok(ended instanceof ArrayBuffer, "end() returns an ArrayBuffer by default");
+  ok(new TextDecoder().decode(ended) === "hello", "write() accepts strings, typed arrays and ArrayBuffers alike");
+
+  const asU8 = new B.ArrayBufferSink();
+  asU8.start({ asUint8Array: true });
+  asU8.write("hello");
+  ok(asU8.end() instanceof Uint8Array, "end() returns a Uint8Array with asUint8Array");
+
+  // highWaterMark is a preallocation hint; accepting and ignoring it is a
+  // performance difference with no observable behaviour change.
+  const hwm = new B.ArrayBufferSink();
+  hwm.start({ highWaterMark: 1024 * 1024, asUint8Array: true });
+  hwm.write("ok");
+  ok(hwm.end().length === 2, "highWaterMark is accepted and does not change the result");
+
+  ok(new B.ArrayBufferSink().write("héllo") === 5 + 1, "write() returns BYTES written, not characters");
+
+  const throwsWith = (fn) => { try { fn(); return ""; } catch (e) { return e.message; } };
+  const closed = new B.ArrayBufferSink();
+  closed.write("x"); closed.end();
+  ok(/after end\(\)/.test(throwsWith(() => closed.write("y"))), "write() after end() throws instead of silently dropping data");
+  ok(/expects a string/.test(throwsWith(() => new B.ArrayBufferSink().write(42))), "write(number) throws instead of String()-ing it into bytes");
+  // The returned buffer must be standalone: Buffer.from(string) is a slice of an
+  // 8 KB pool, so handing back `.buffer` would leak neighbouring writes.
+  const detached = new B.ArrayBufferSink();
+  detached.write("abc");
+  ok(detached.end().byteLength === 3, "end() returns a right-sized buffer, not a view onto Node's shared pool");
+}
+
+console.log("== Bun.readableStreamTo* ==");
+{
+  const B = bunWith();
+  const enc = (s) => new TextEncoder().encode(s);
+  const streamOf = (chunks) => new ReadableStream({ start(c) { for (const x of chunks) c.enqueue(x); c.close(); } });
+
+  ok((await B.readableStreamToText(streamOf([enc("hel"), enc("lo")]))) === "hello", "readableStreamToText concatenates byte chunks");
+  ok((await B.readableStreamToText(streamOf(["a", "b"]))) === "ab", "readableStreamToText joins string chunks");
+  // A multi-byte character split across two chunks must survive: decode once over
+  // the joined bytes, never per chunk.
+  ok((await B.readableStreamToText(streamOf([new Uint8Array([0xe5, 0x8f]), new Uint8Array([0xa4])]))) === "古", "a UTF-8 character split across chunks decodes correctly");
+
+  const json = await B.readableStreamToJSON(streamOf([enc('{"a":'), enc("1}")]));
+  ok(json.a === 1, "readableStreamToJSON parses across a chunk boundary");
+
+  const arr = await B.readableStreamToArray(streamOf(["a", "b"]));
+  ok(Array.isArray(arr) && arr.length === 2 && arr[0] === "a", "readableStreamToArray returns the chunks untouched");
+
+  const bytes = await B.readableStreamToBytes(streamOf([enc("hi")]));
+  ok(bytes instanceof Uint8Array && bytes.length === 2, "readableStreamToBytes returns a Uint8Array");
+  const ab = await B.readableStreamToArrayBuffer(streamOf([enc("hi")]));
+  ok(ab instanceof ArrayBuffer && ab.byteLength === 2, "readableStreamToArrayBuffer returns an ArrayBuffer");
+  const blob = await B.readableStreamToBlob(streamOf([enc("hi")]));
+  ok(blob instanceof Blob && (await blob.text()) === "hi", "readableStreamToBlob returns a Blob");
+
+  // No boundary -> x-www-form-urlencoded; a boundary -> multipart/form-data.
+  const urlencoded = await B.readableStreamToFormData(streamOf([enc("a=1&b=2")]));
+  ok(urlencoded.get("a") === "1" && urlencoded.get("b") === "2", "readableStreamToFormData parses urlencoded bodies with no boundary");
+  const multipart = '--X\r\nContent-Disposition: form-data; name="q"\r\n\r\nhi\r\n--X--\r\n';
+  ok((await B.readableStreamToFormData(streamOf([enc(multipart)]), "X")).get("q") === "hi", "a boundary argument switches to multipart/form-data");
+
+  // BunFile.stream() can fall back to a Node Readable when Readable.toWeb is
+  // unavailable, and a Node Readable is async-iterable but has no getReader().
+  ok((await B.readableStreamToText((async function* () { yield enc("ab"); })())) === "ab", "the consumers also accept a plain async iterable");
+  ok((await B.readableStreamToText(streamOf([]))) === "", "an empty stream reads as empty, not as a hang or a throw");
+
+  let msg = "";
+  try { await B.readableStreamToText(42); } catch (e) { msg = e.message; }
+  ok(/expects a ReadableStream/.test(msg), "a non-stream argument throws naming the API");
+}
+
+console.log("== Bun.concatArrayBuffers / Bun.allocUnsafe ==");
+{
+  const B = bunWith();
+  const enc = (s) => new TextEncoder().encode(s);
+  const text = (b) => new TextDecoder().decode(b);
+
+  const joined = B.concatArrayBuffers([enc("ab"), enc("cd")]);
+  ok(joined instanceof ArrayBuffer, "concatArrayBuffers returns an ArrayBuffer by default");
+  ok(text(joined) === "abcd", "...with the inputs in order");
+  ok(B.concatArrayBuffers([enc("ab")], undefined, true) instanceof Uint8Array, "the third argument returns a Uint8Array instead");
+  ok(text(B.concatArrayBuffers([enc("ab"), enc("cd")], 3)) === "abc", "maxLength truncates the result");
+  ok(B.concatArrayBuffers([]).byteLength === 0, "concatenating nothing gives an empty buffer");
+  ok(text(B.concatArrayBuffers([enc("ab").buffer, enc("cd")])) === "abcd", "ArrayBuffers and typed arrays can be mixed");
+
+  let msg = "";
+  try { B.concatArrayBuffers(enc("ab")); } catch (e) { msg = e.message; }
+  ok(/expects an array/.test(msg), "concatArrayBuffers(non-array) throws instead of guessing");
+
+  // Bun's allocUnsafe hands back genuinely uninitialised memory. There is no such
+  // primitive in JavaScript — `new Uint8Array(n)` is SPECIFIED to be zero-filled —
+  // so this is safer than Bun's and slower. A performance-contract difference, not
+  // a behavioural one, and pinned here so nobody "fixes" it into a throw.
+  const unsafe = B.allocUnsafe(8);
+  ok(unsafe instanceof Uint8Array && unsafe.length === 8, "allocUnsafe returns a Uint8Array of the requested size");
+  ok(unsafe.every((b) => b === 0), "allocUnsafe is zero-filled here (safer and slower than real Bun, never wrong)");
+  ok(B.allocUnsafe(0).length === 0, "allocUnsafe(0) is an empty array, not an error");
+  try { msg = ""; B.allocUnsafe(-1); } catch (e) { msg = e.message; }
+  ok(/non-negative/.test(msg), "allocUnsafe(-1) throws");
+}
+
+console.log("== async-generator Response bodies (inherited, not shimmed) ==");
+{
+  // Bun documents async generators as a body source for Response/Request. This
+  // ALREADY works through the existing Bun.serve path — that path hands the
+  // handler's Response to Node's http server untouched, and the Response ctor is
+  // the platform's, which accepts any async iterable. So batch B added no code
+  // here; these checks exist because "works today by inheritance" is exactly what
+  // a future Response polyfill would silently take away.
+  ok((await new Response((async function* () { yield "hello"; yield "world"; })()).text()) === "helloworld", "a called async generator is accepted as a Response body");
+  ok(
+    (await new Response({ [Symbol.asyncIterator]: async function* () { yield "hello"; yield "world"; } }).text()) === "helloworld",
+    "an object with [Symbol.asyncIterator] is accepted too"
+  );
+  ok((await new Response((async function* () { yield new TextEncoder().encode("hi"); })()).text()) === "hi", "a generator yielding bytes is accepted");
+
+  // Known divergence: the generator FUNCTION itself is not a body source (it
+  // stringifies). Bun does not document that form either, and it is unfixable from
+  // Bun.serve — by then the body is already encoded. Pinned so it stays known.
+  ok((await new Response(async function* () { yield "x"; }).text()).indexOf("yield") !== -1, "passing the generator FUNCTION (not calling it) still stringifies — a known divergence");
+
+  // And the round trip a Bun.serve handler actually performs.
+  const B = bunWith();
+  ok((await B.readableStreamToText(new Response((async function* () { yield "str"; yield "eam"; })()).body)) === "stream", "Bun.readableStreamToText consumes an async-generator Response body");
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Bun checks passed");
 process.exit(failed ? 1 : 0);

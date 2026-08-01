@@ -11,11 +11,15 @@
 // previews — with `routes`, `fetch`, an `error` handler, and server-side
 // `websocket` + pub/sub), Bun.env/argv/main/version, Bun.spawn/spawnSync/which,
 // Bun.$ (shell), Bun.sleep(Sync)/nanoseconds, Bun.hash/CryptoHasher,
-// Bun.password (crypto-backed), Bun.gzipSync/…, Bun.inspect/deepEquals/escapeHTML,
-// Bun.pathToFileURL/fileURLToPath, the data formats Bun.YAML.parse,
+// Bun.password (crypto-backed), Bun.gzipSync/…, Bun.inspect (incl. .table and
+// .custom)/deepEquals/escapeHTML, Bun.pathToFileURL/fileURLToPath,
+// Bun.stringWidth/stripANSI/wrapAnsi/color/indexOfLine (see bun-text.js),
+// Bun.ArrayBufferSink/readableStreamTo*/concatArrayBuffers/allocUnsafe (see
+// bun-bytes.js), async-generator Response bodies (inherited from the platform
+// Response, no shim code — see bun-bytes.js), the data formats Bun.YAML.parse,
 // Bun.TOML.parse/stringify, Bun.JSON5.parse/stringify, Bun.JSONL.parse/parseChunk
 // and Bun.semver.satisfies/order (vendored real parsers — see ./bun-formats.js),
-// and the modules bun:test (a minimal runner +
+// and the modules bun:test (a runner +
 // expect, with Bun/Jest `test.only` filtering and beforeEach/afterEach that
 // inherit into nested describes) and bun:jsc (serialize/deserialize).
 //
@@ -27,13 +31,21 @@
 // transform builds no import/export graph), and the bun:jsc heap-introspection
 // helpers (no engine hook exists in a page). bun:sqlite is registered as a module
 // but every call throws until a wasm SQLite backend is wired into it (see
-// makeBunSqlite) — treat it as not usable today.
+// makeBunSqlite) — treat it as not usable today. Also loud: the CSS Color 4
+// function space in Bun.color — lab()/lch()/oklab()/oklch()/color() throw rather
+// than returning the `null` that means "not a colour" (bun-text.js).
+//
+// COVERED BUT SLOWER, not wrong: Bun.allocUnsafe returns zero-filled memory,
+// because `new Uint8Array(n)` is specified to be — see bun-bytes.js.
 
 import { transpileTypeScript } from "../typescript-transform.js";
-// The data-format APIs (Bun.YAML/TOML/JSON5/JSONL/semver) live in their own file:
-// they are self-contained pure computation over vendored parsers, and this one is
-// long enough already. See bun-formats.js for the vendoring rationale per format.
+// The data-format, text/terminal and bytes/streams members live in their own
+// files: this one is already long, and each group is self-contained pure
+// computation. See the header of each for why they are not inline here, and
+// bun-formats.js in particular for the vendoring rationale per format.
 import { createBunFormats } from "./bun-formats.js";
+import { createBunText } from "./bun-text.js";
+import { createBunBytes } from "./bun-bytes.js";
 
 // ---- version identity -------------------------------------------------------
 // The single definition of what this shim claims to be. `Bun.revision` is derived
@@ -57,6 +69,12 @@ const TRANSPILER_SCAN_UNSUPPORTED = (method) =>
 
 export function createBunRuntime({ process, Buffer, require }) {
   const lazy = (name) => require(name);
+
+  // Text/terminal and bytes/streams member groups (packages/runtime/builtins/
+  // bun-text.js, bun-bytes.js). Constructing these is cheap — the vendored Unicode
+  // tables inside bun-text.js are instantiated on first use, not here.
+  const text = createBunText({ lazy, process });
+  const bytes = createBunBytes({ Buffer });
 
   // ---- BunFile ---------------------------------------------------------------
   // `Bun.file(path)` is a lazy handle; reads/writes hit the VFS through `fs`.
@@ -655,7 +673,6 @@ export function createBunRuntime({ process, Buffer, require }) {
     password,
     deepEquals,
     escapeHTML,
-    inspect: (v, opts) => lazy("util").inspect(v, opts),
     // Data formats (see ./bun-formats.js). Real parsers, not approximations:
     // Bun.TOML.parse throws on an integer it cannot hold losslessly, Bun.YAML.parse
     // returns an array for multi-document input, and Bun.JSONL's two entry points
@@ -665,6 +682,26 @@ export function createBunRuntime({ process, Buffer, require }) {
     JSON5: formats.JSON5,
     JSONL: formats.JSONL,
     semver: formats.semver,
+    // Bun.inspect keeps delegating to util.inspect, but is now a function object
+    // carrying .table and .custom (see bun-text.js).
+    inspect: text.inspect,
+    // Text / terminal (bun-text.js).
+    stringWidth: text.stringWidth,
+    stripANSI: text.stripANSI,
+    wrapAnsi: text.wrapAnsi,
+    indexOfLine: text.indexOfLine,
+    color: text.color,
+    // Bytes / streams (bun-bytes.js).
+    ArrayBufferSink: bytes.ArrayBufferSink,
+    readableStreamToArray: bytes.readableStreamToArray,
+    readableStreamToArrayBuffer: bytes.readableStreamToArrayBuffer,
+    readableStreamToBytes: bytes.readableStreamToBytes,
+    readableStreamToBlob: bytes.readableStreamToBlob,
+    readableStreamToText: bytes.readableStreamToText,
+    readableStreamToJSON: bytes.readableStreamToJSON,
+    readableStreamToFormData: bytes.readableStreamToFormData,
+    concatArrayBuffers: bytes.concatArrayBuffers,
+    allocUnsafe: bytes.allocUnsafe,
     gzipSync: zlibSync("gzipSync"),
     gunzipSync: zlibSync("gunzipSync"),
     deflateSync: zlibSync("deflateSync"),

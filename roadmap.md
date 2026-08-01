@@ -3908,3 +3908,97 @@ comparisons and shift operators still survive — since the failure mode of a lo
 eating operators, not leaving types behind.
 
 See ARCHITECTURE.md §7.
+## Bun text, terminal and byte-stream utilities (this change)
+
+Phase 1 batch B of the Bun coverage plan: the `Bun.*` members that are pure computation over
+strings and standard web primitives. Like batch A, being pure computation is exactly what
+removes the excuse for an approximation — there is no missing capability to hide behind, so the
+target is "returns what real Bun returns", and every place we cannot reach that is named.
+
+- **`Bun.stringWidth`, `Bun.stripANSI`, `Bun.wrapAnsi`** — **vendored**, as one bundle
+  (`node/vendor/ansi-text.js`: string-width@7.2.0 + strip-ansi@7.1.0 + wrap-ansi@9.0.0 and their
+  transitive deps, 34 KB). This is the `string-width` problem, where the correctness lives in
+  data rather than logic: the Unicode East_Asian_Width ranges and the full emoji-sequence
+  grammar. A hand-rolled table is the classic 95%-right artifact that then miscounts one CJK
+  block forever, and Bun's own docs say `Bun.stringWidth` "passes `string-width`'s tests" and
+  that `Bun.wrapAnsi` is a drop-in for `wrap-ansi` — so these packages *are* the specification of
+  the behaviour being shimmed. One shared bundle because wrap-ansi depends on the other two;
+  bundling separately would ship the Unicode tables twice. The only divergence is speed: Bun's is
+  SIMD native code documented at ~6,756x the npm package, and this *is* the npm package.
+- **`Bun.color`** — **hand-rolled**, deliberately. It covers the sRGB grammar (148 named colours,
+  3/4/6/8-digit hex, `rgb`/`rgba`/`hsl`/`hsla`/`hwb` in both the legacy comma and modern
+  slash-alpha syntaxes, numbers, `{r,g,b,a}` objects and `[r,g,b,a]` arrays) and all fifteen
+  documented output formats, with the tmux `colour_find_rgb` cube/greyscale snap for `ansi-256`
+  and the standard two-step reduction to `ansi-16`. Not vendored because every library that
+  parses the full CSS Color 4 function space is larger than this entire file, and this ships into
+  every process worker. The consequence is handled rather than ignored: `Bun.color` returns
+  `null` for input that is not a colour, which is a contract callers branch on, so the spaces we
+  do **not** implement — `lab()`, `lch()`, `oklab()`, `oklch()`, `color()`, `color-mix()` —
+  **throw** instead. Returning `null` there would be indistinguishable from "not a colour" and
+  would send a caller down the wrong path forever.
+- **`Bun.color(…, "ansi")`** — the one member whose answer is a *policy*. Bun detects stdout's
+  colour depth from the environment and returns `""` when there is no colour support; Vivari's
+  terminal is virtual, so anything claimed here is a choice, not an observation. The runtime had
+  already made that choice once, in `node/internal/util/colors.js`, which is the hook
+  `util.styleText` consults, so this reuses that precedence value-for-value rather than inventing
+  a second one — otherwise `Bun.color` and `util.styleText` could disagree about whether colour
+  is on in the same terminal. Under Studio the kernel exports `FORCE_COLOR=3`/`TERM=xterm-256color`
+  and xterm.js genuinely renders truecolor, so 24-bit is the right claim; a headless kernel sets
+  nothing and writes to a non-TTY, so it returns the documented `""`. Both ends, the precedence
+  order (`NO_COLOR` beats `FORCE_COLOR`), and the fact that `""` is not `null` are all pinned.
+- **`Bun.indexOfLine`** — hand-rolled, ten lines. It scans **bytes**, not code points, which is
+  the entire point: it is documented for "potentially ill-formed UTF-8", and `0x0A` can never be
+  a UTF-8 continuation byte, so it stays correct on a buffer cut mid-sequence.
+- **`Bun.inspect.table` / `.custom`** — `Bun.inspect` already existed as a delegate to
+  `util.inspect`; it becomes a function object carrying both members. `.custom` is
+  `Symbol.for("nodejs.util.inspect.custom")`, the registry symbol, so it is literally the same
+  symbol the runtime's own `util` honours. `.table` reproduces Bun's documented frame byte for
+  byte, including the **empty** header cell above the index column where Node prints `(index)`,
+  and measures columns with `stringWidth` so a table of CJK or emoji cells still lines up.
+- **`Bun.ArrayBufferSink`** — hand-rolled. The whole risk is `flush()`, whose return **type**
+  depends on what `start()` was given: an `ArrayBuffer` under `{stream: true}`, a `Uint8Array`
+  when `asUint8Array` is added, and otherwise the **number** of bytes written since the last
+  flush. A caller that expects bytes and gets a number fails somewhere far from the mistake, so
+  all three configurations have explicit checks, as does the asymmetry that stream mode *drains*
+  the buffer while buffer mode does not (`end()` still owes the caller everything). `write()`
+  returns bytes and not characters, `write()` after `end()` throws rather than dropping data, and
+  a non-buffer chunk throws rather than being `String()`-ed into bytes — the coerce-and-hope
+  pattern Phase 0 removed elsewhere.
+- **`Bun.readableStreamTo*`** — all seven consumers. `Text` concatenates before decoding once, so
+  a multi-byte character split across two chunks survives; `FormData` hands the bytes to
+  `Response` rather than growing a second, worse multipart parser; and all of them accept a plain
+  async iterable, because `BunFile.stream()` can fall back to a Node `Readable` that has no
+  `getReader()`.
+- **`Bun.concatArrayBuffers` / `Bun.allocUnsafe`** — hand-rolled. `allocUnsafe` is the honest
+  compromise of the batch: Bun's returns genuinely uninitialised memory, and JavaScript has no
+  such primitive, since `new Uint8Array(n)` is *specified* to be zero-filled. So this is safer
+  than Bun's and slower — a performance-contract difference with no behavioural one, which makes
+  it worth an inline comment and a check that pins the zero-fill, not a throw.
+- **Async-generator response bodies** — **no code**, on purpose. Checking first showed both forms
+  Bun documents (a called `async function*` and an object with `[Symbol.asyncIterator]`) already
+  work through the existing `Bun.serve` path: that path hands the handler's `Response` to Node's
+  http server untouched, and the platform `Response` accepts any async iterable. They are pinned
+  anyway, because "works today by inheritance" is exactly what a future `Response` polyfill would
+  silently take away. The one form that does not work — passing the generator *function* instead
+  of calling it, which stringifies, and which Bun does not document either — is pinned as a known
+  divergence, since it is unfixable from `Bun.serve` once the body is already encoded.
+
+The implementations live in **two new files**, `packages/runtime/builtins/bun-text.js` and
+`bun-bytes.js`, wired into the `Bun` literal by `bun.js` with one import each plus a few literal
+lines. That deviates from the convention that a `Bun.*` member goes in `bun.js`, deliberately and
+for the same reason as batch A: `bun.js` is ~1100 lines, both groups are self-contained pure
+computation sharing no state with it, and three coverage batches are landing against that one
+object literal at once. The vendored bundle follows the `node/vendor/semver.js` precedent — an
+esbuild CJS bundle wrapped in a factory, with `package@version`, the license and the exact
+regenerate command in the header — and is instantiated on first use, so a process that never
+measures a string never runs the Unicode tables.
+
+Gated by `scripts/spike-bun-offline.mjs`, the only Bun tier CI enforces per-PR, which goes from
+215 checks to 356 — all of them through the real `Bun` global, so the wiring in `bun.js` is gated
+alongside the implementations, and the `Bun.color` depth policy is driven through a fake
+`process.env`/`stdout` because a spike has no terminal of its own. The checks that matter most
+are the ones a plausible refactor would silently undo: the three `ArrayBufferSink.flush()` return
+types, `""`-not-`null` for unsupported ANSI, the throw-not-`null` on unimplemented colour spaces,
+`allocUnsafe` being zero-filled, and a UTF-8 character split across stream chunks.
+
+See ARCHITECTURE.md §9.2.

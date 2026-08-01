@@ -77,6 +77,8 @@ packages/
     websocket.js   in-VM WebSocket client (used by the HMR tunnel).
     builtins/      hand-written: process, os, assert, child_process, bun (Bun global + bun:* modules),
                    bun-formats.js (Bun.YAML/TOML/JSON5/JSONL/semver over vendored parsers),
+                   bun-text.js (Bun.stringWidth/stripANSI/wrapAnsi/color/indexOfLine + inspect.table),
+                   bun-bytes.js (Bun.ArrayBufferSink/readableStreamTo*/concatArrayBuffers/allocUnsafe),
                    python (lazy Pyodide/CPython→WASM plug-in + Flask/FastAPI HTTP bridge).
     node/
       lib/         Node's REAL vendored lib/*.js (fs, net, http, stream, ...).
@@ -89,9 +91,10 @@ packages/
                      HTTPParser contract; regen the binary via scripts/vendor-llhttp.mjs.
       vendor/      third-party bundles, each an esbuild CJS bundle wrapped in a
                    factory (semver for npm; js-yaml/json5/smol-toml for the Bun
-                   data formats; es-module-lexer; the napi wasm runtime). Every
-                   header carries package@version, the license and the exact
-                   regenerate command — keep that true.
+                   data formats; ansi-text.js = string-width + strip-ansi +
+                   wrap-ansi for the Bun text APIs; es-module-lexer; the napi
+                   wasm runtime). Every header carries package@version, the
+                   license and the exact regenerate command — keep that true.
       internal-binding.js / primordials.js / loader.js   glue for the above.
 
   studio/          The primary UI: a Vite + React 19 (React Compiler) + Tailwind v4
@@ -774,6 +777,22 @@ unpacked:
   strings) and multi-document YAML returns an **array**, and `Bun.JSONL.parse`
   throws only when *zero* values parsed while `parseChunk` never throws at all.
   New format work goes here, not in `bun.js`.
+- **`packages/runtime/builtins/bun-text.js`** — `Bun.stringWidth`, `Bun.stripANSI`,
+  `Bun.wrapAnsi`, `Bun.color`, `Bun.indexOfLine` and `Bun.inspect.table`/`.custom`,
+  wired into the `Bun` literal by `bun.js`. The width/strip/wrap trio is **vendored**
+  (`node/vendor/ansi-text.js` = string-width + strip-ansi + wrap-ansi) because the
+  hard part is Unicode data, not logic. `Bun.color` is hand-rolled over the sRGB
+  grammar; the CSS Color 4 function space (`lab()`/`oklch()`/`color()`) **throws**,
+  because `null` is Bun's documented "not a colour" and must not also mean "we gave
+  up". `Bun.color(…, "ansi")` reads the depth policy from the SAME precedence as
+  `node/internal/util/colors.js`, so it and `util.styleText` cannot disagree.
+- **`packages/runtime/builtins/bun-bytes.js`** — `Bun.ArrayBufferSink`, the seven
+  `Bun.readableStreamTo*` consumers, `Bun.concatArrayBuffers` and `Bun.allocUnsafe`.
+  Nothing vendored. Two contracts to preserve: `ArrayBufferSink.flush()` returns an
+  **ArrayBuffer/Uint8Array under `start({stream:true})` and a NUMBER otherwise**, and
+  `Bun.allocUnsafe` is **zero-filled** here (`new Uint8Array(n)` is specified to be) —
+  safer and slower than real Bun, a performance-contract difference, not a bug.
+  Async-generator `Response` bodies need no shim code; they already work.
 - **`packages/kernel-host/programs/bun.js`** — the `bun`/`bunx` CLI: `bun run`,
   `bunx` (delegates to `npx`), install delegation, and it surfaces require/unhandled-
   rejection errors instead of a silent exit.

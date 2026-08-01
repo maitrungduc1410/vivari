@@ -1100,6 +1100,32 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   (so a bare date and `yes` stay strings) and multi-document input returns an array, and the two
   JSONL entry points report errors asymmetrically on purpose — `parse` throws only if *no* value
   parsed, `parseChunk` never throws and reports through `{values, read, done, error}`.
+- `packages/runtime/builtins/bun-text.js` — the text/terminal APIs `Bun.stringWidth`,
+  `Bun.stripANSI`, `Bun.wrapAnsi`, `Bun.color`, `Bun.indexOfLine` and `Bun.inspect.table`/
+  `.custom`, imported by `bun.js` and spread into the `Bun` literal. Pure computation, so it is
+  shimmed at full fidelity. Width/strip/wrap are **vendored** (`node/vendor/ansi-text.js`, one
+  esbuild bundle of string-width + strip-ansi + wrap-ansi) because the correctness is in Unicode
+  tables — East Asian widths and the emoji-sequence grammar — that a hand-rolled version gets 95%
+  right and then miscounts forever. `Bun.color` is hand-rolled instead: it covers the sRGB
+  grammar (names, hex, `rgb`/`hsl`/`hwb`, numbers, objects, arrays) and every documented output
+  format, and **throws** on the CSS Color 4 function space rather than returning `null` — `null`
+  is Bun's documented "that is not a colour", so reusing it for "we did not implement that space"
+  would be silently wrong. The `"ansi"` format's depth detection is a *policy*, not an
+  observation, because Vivari's terminal is virtual: it reuses the precedence in
+  `node/internal/util/colors.js` (the hook `util.styleText` consults), so under Studio, where the
+  kernel exports `FORCE_COLOR=3`, it claims 24-bit, and in a headless kernel it returns the
+  documented empty string.
+- `packages/runtime/builtins/bun-bytes.js` — the bytes/streams APIs `Bun.ArrayBufferSink`, the
+  seven `Bun.readableStreamTo*` consumers, `Bun.concatArrayBuffers` and `Bun.allocUnsafe`.
+  Nothing vendored; these are standard web primitives. Two contracts carry the risk.
+  `ArrayBufferSink.flush()` is **polymorphic on what `start()` was given** — an `ArrayBuffer`
+  under `{stream:true}`, a `Uint8Array` when `asUint8Array` is added, and otherwise the **number**
+  of bytes written since the last flush — and getting it wrong breaks callers far from the
+  mistake. `Bun.allocUnsafe` cannot be genuinely uninitialised here, since `new Uint8Array(n)` is
+  specified to be zero-filled; it is therefore safer and slower than real Bun, which is a
+  performance-contract difference and stays a comment rather than a throw. Async-generator
+  `Response` bodies are **inherited, not shimmed**: the platform `Response` accepts any async
+  iterable, so the existing `Bun.serve` path already supports both documented forms.
 - `packages/kernel-host/programs/bun.js` — the `bun`/`bunx` CLI (`bun run`, `bunx` → `npx`,
   install delegation). An unrecognised verb reports not-implemented; only a file-shaped argument
   or a `package.json` script name falls through to the run path. `bun upgrade` is not-implemented
