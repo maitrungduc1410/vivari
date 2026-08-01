@@ -422,7 +422,11 @@ console.log("== Bun global API (node-backed) ==");
   ok(Bun.escapeHTML("<a>&'\"") === "&lt;a&gt;&amp;&#x27;&quot;", "Bun.escapeHTML");
   ok(Bun.deepEquals({ a: [1, 2] }, { a: [1, 2] }) === true, "Bun.deepEquals deep");
   ok(Bun.deepEquals({ a: 1 }, { a: 2 }) === false, "Bun.deepEquals unequal");
-  ok(typeof Bun.hash("hello") === "number", "Bun.hash returns a number");
+  // INTENTIONAL CHANGE: this used to assert `typeof Bun.hash("hello") === "number"`,
+  // which was only true because the shim's hash was a bespoke 53-bit thing. Real
+  // Bun.hash is a 64-bit wyhash and returns a bigint; the old assertion was
+  // pinning the bug. The number-vs-bigint split is exercised properly below.
+  ok(typeof Bun.hash("hello") === "bigint", "Bun.hash returns a bigint (64-bit wyhash)");
   ok(Bun.hash.crc32("hello") === Bun.hash.crc32("hello"), "Bun.hash.crc32 stable");
   const gz = Bun.gzipSync("hello vivari");
   ok(Buffer.from(Bun.gunzipSync(gz)).toString() === "hello vivari", "Bun.gzipSync/gunzipSync round-trip");
@@ -434,6 +438,271 @@ console.log("== Bun global API (node-backed) ==");
   ok(modules["bun:test"] && modules["bun:ffi"] && modules["bun:sqlite"] && modules["bun:jsc"], "bun:* modules registered");
   let ffiThrew = false; try { modules["bun:ffi"].dlopen(); } catch { ffiThrew = true; }
   ok(ffiThrew, "bun:ffi.dlopen throws (documented unsupported)");
+}
+
+// A Bun global with no kernel, for the pure-function checks below.
+function freshBun() {
+  const proc = { env: {}, argv: ["bun"], cwd: () => "/", stdout: process.stdout, stderr: process.stderr, stdin: process.stdin };
+  return createBunRuntime({ process: proc, Buffer, require: nodeRequire }).Bun;
+}
+
+console.log("== Bun.hash is really wyhash (published known-answer vectors) ==");
+{
+  // These two digests are printed in https://bun.com/docs/runtime/hashing. They are
+  // the entire point of the change: the hash this replaced was perfectly
+  // self-consistent — same input, same output, every time — and disagreed with real
+  // Bun on every input there is. Only a vector from outside our own code can tell
+  // those two situations apart, which is why "stable" was never evidence of anything.
+  const Bun = freshBun();
+  ok(Bun.hash("some data here") === 11562320457524636935n, "Bun.hash('some data here') == 11562320457524636935n (documented)");
+  ok(Bun.hash("some data here", 1234) === 15724820720172937558n, "Bun.hash('some data here', 1234) == 15724820720172937558n (documented)");
+  ok(Bun.hash.wyhash("some data here") === 11562320457524636935n, "Bun.hash.wyhash agrees with the bare Bun.hash");
+
+  // Documented return typing: 32-bit hashes give a number, 64-bit hashes a bigint.
+  // This is load-bearing, not cosmetic — `Bun.hash("x") + 1` is a TypeError under
+  // real Bun, so a shim handing back a Number makes that line work here and fail
+  // in production.
+  for (const name of ["wyhash", "xxHash64", "murmur64v2", "cityHash64"]) {
+    ok(typeof Bun.hash[name]("hello", 1) === "bigint", `Bun.hash.${name} returns a bigint (64-bit)`);
+  }
+  for (const name of ["xxHash32", "murmur32v2", "murmur32v3", "cityHash32", "crc32", "adler32"]) {
+    ok(typeof Bun.hash[name]("hello", 1) === "number", `Bun.hash.${name} returns a number (32-bit)`);
+  }
+
+  // Seeds: the docs pass a plain number even to the 64-bit hashes, and say to use a
+  // BigInt above Number.MAX_SAFE_INTEGER. Both spellings must mean the same seed.
+  ok(Bun.hash("some data here", 1234n) === Bun.hash("some data here", 1234), "a bigint seed and a number seed agree");
+  ok(Bun.hash("some data here") !== Bun.hash("some data here", 1234), "the seed actually reaches the algorithm");
+
+  // Every documented input type must hash to the same bytes.
+  const u8 = new Uint8Array([1, 2, 3, 4]);
+  const viaBytes = Bun.hash(u8);
+  ok(Bun.hash(u8.buffer) === viaBytes, "Bun.hash(ArrayBuffer) == Bun.hash(TypedArray)");
+  ok(Bun.hash(new DataView(u8.buffer)) === viaBytes, "Bun.hash(DataView) == Bun.hash(TypedArray)");
+  ok(typeof Bun.hash("") === "bigint", "Bun.hash of the empty string does not throw");
+
+  // xxHash3 and rapidhash are documented members we did not port. Loud, not guessed.
+  for (const name of ["xxHash3", "rapidhash"]) {
+    let threw = "";
+    try { Bun.hash[name]("x"); } catch (e) { threw = e.message; }
+    ok(threw.indexOf(name) !== -1, `Bun.hash.${name} throws naming itself instead of returning a plausible number`);
+  }
+}
+
+console.log("== Bun.hash family: SMHasher verification codes ==");
+{
+  // SMHasher's standard known-answer procedure: hash the keys {0}, {0,1}, … {0..254}
+  // with seed 256-N, concatenate the little-endian digests, hash THAT with seed 0 and
+  // keep the low 32 bits. One transcribed constant or a mis-ordered tail anywhere in a
+  // port changes the code, so a single number per algorithm pins the whole function.
+  // The expected values are the ones Zig's own std.hash test suite asserts, Zig being
+  // where Bun gets these implementations.
+  const Bun = freshBun();
+  const verification = (fn, bits) => {
+    const size = bits / 8;
+    const key = new Uint8Array(256);
+    const digests = new Uint8Array(256 * size);
+    for (let i = 0; i < 256; i++) {
+      key[i] = i;
+      let v = BigInt(fn(key.subarray(0, i), 256 - i));
+      for (let k = 0; k < size; k++) digests[i * size + k] = Number((v >> BigInt(k * 8)) & 0xffn);
+    }
+    return Number(BigInt.asUintN(32, BigInt(fn(digests, 0))));
+  };
+  const cases = [
+    ["murmur32v2", 32, 0x27864c1e],
+    ["murmur32v3", 32, 0xb0f57ee3],
+    ["murmur64v2", 64, 0x1f0d3804],
+    ["cityHash32", 32, 0x68254f81],
+    ["cityHash64", 64, 0x5fabc5c5],
+    ["xxHash32", 32, 0xba88b743],
+    ["xxHash64", 64, 0x024b7cf4],
+  ];
+  for (const [name, bits, want] of cases) {
+    const got = verification((data, seed) => Bun.hash[name](data, seed), bits);
+    ok(got === want, `Bun.hash.${name} SMHasher code 0x${got.toString(16).toUpperCase().padStart(8, "0")} == 0x${want.toString(16).toUpperCase().padStart(8, "0")}`);
+  }
+
+  // crc32/adler32 were already correct and are deliberately untouched; pin them so a
+  // future edit to this file cannot quietly take them with it.
+  ok(Bun.hash.crc32("hello") === 907060870, "Bun.hash.crc32('hello') == 907060870 (unchanged)");
+  ok(Bun.hash.adler32("hello") === 103547413, "Bun.hash.adler32('hello') == 103547413 (unchanged)");
+}
+
+console.log("== Bun.Glob .match() — documented examples ==");
+{
+  const Bun = freshBun();
+  const m = (pattern, path) => new Bun.Glob(pattern).match(path);
+  // Verbatim from https://bun.com/docs/runtime/glob.
+  ok(m("*.ts", "index.ts") && !m("*.ts", "index.js"), "`*` matches within a segment");
+  ok(m("???.ts", "foo.ts") && !m("???.ts", "foobar.ts"), "`?` is exactly one character");
+  ok(m("**/*.ts", "index.ts") && m("**/*.ts", "src/index.ts") && !m("**/*.ts", "src/index.js"), "`**/` matches zero or more directories");
+  ok(m("ba[rz].ts", "bar.ts") && m("ba[rz].ts", "baz.ts") && !m("ba[rz].ts", "bat.ts"), "character classes");
+  ok(m("ba[a-z][0-9][^4-9].ts", "bar01.ts") && m("ba[a-z][0-9][^4-9].ts", "baz83.ts") && m("ba[a-z][0-9][^4-9].ts", "bat22.ts"),
+    "ranges and negated classes match the documented positives");
+  ok(!m("ba[a-z][0-9][^4-9].ts", "bat24.ts") && !m("ba[a-z][0-9][^4-9].ts", "ba0a8.ts"),
+    "ranges and negated classes reject the documented negatives");
+  ok(m("{a,b,c}.ts", "a.ts") && m("{a,b,c}.ts", "c.ts") && !m("{a,b,c}.ts", "d.ts"), "brace alternation");
+  ok(m("\\!index.ts", "!index.ts") && !m("\\!index.ts", "index.ts"), "`\\` escapes a leading `!`");
+}
+
+console.log("== Bun.Glob — the three ways Bun differs from minimatch/picomatch ==");
+{
+  // These are the reason this matcher is hand-rolled instead of vendored. Each one
+  // changes which files a build includes, and in each case the other libraries'
+  // default answer looks perfectly reasonable, so a drop-in replacement would pass
+  // review and quietly ship a different file set.
+  const Bun = freshBun();
+  const m = (pattern, path) => new Bun.Glob(pattern).match(path);
+
+  // 1. `*` does not cross a path separator — either flavour.
+  ok(!m("*.ts", "src/index.ts"), "`*` does not match across `/` (documented)");
+  ok(!m("src/*/x.ts", "src/a/b/x.ts"), "`*` matches exactly one segment, not a subtree");
+  ok(!m("*.ts", "src\\index.ts"), "`*` does not match across `\\` either");
+  ok(m("src/**", "src/a/b/c.ts"), "`**` does cross separators");
+
+  // 2. `!` negates ONLY at the start of a pattern; elsewhere it is an ordinary
+  //    character. Matchers with extglob treat `a!(b)` as negation mid-pattern.
+  ok(!m("!index.ts", "index.ts") && m("!index.ts", "foo.ts"), "a leading `!` inverts the match (documented)");
+  ok(m("a!b.ts", "a!b.ts"), "a `!` in the middle of a pattern is a literal `!`");
+  ok(!m("a!b.ts", "ab.ts"), "a mid-pattern `!` does not introduce a negation group");
+
+  // 3. Braces nest at most 10 deep. Deeper is a pattern bug, and erroring beats
+  //    either expanding a cross-product into memory or silently truncating.
+  const nest = (n) => "{a,".repeat(n) + "z" + "}".repeat(n) + ".ts";
+  ok(m("{a,{b,{c,d}}}.ts", "d.ts"), "nested braces match through every level");
+  let accepted10 = true;
+  try { new Bun.Glob(nest(10)); } catch { accepted10 = false; }
+  ok(accepted10, "braces nested 10 deep are accepted (the documented limit)");
+  let depthMsg = "";
+  try { new Bun.Glob(nest(11)); } catch (e) { depthMsg = e.message; }
+  ok(depthMsg.indexOf("10") !== -1, "braces nested 11 deep throw naming the limit");
+
+  // scan()/scanSync() need a VFS directory walk (Phase 2). An empty iterator would
+  // read as "no files matched" — the silently-wrong answer this batch exists to
+  // remove — so they follow the bun:ffi tier: constructing is fine, calling is loud.
+  const g = new Bun.Glob("**/*.ts");
+  for (const name of ["scan", "scanSync"]) {
+    let msg = "";
+    try { g[name]("."); } catch (e) { msg = e.message; }
+    ok(msg.indexOf("Phase 2") !== -1 && msg.indexOf(name) !== -1, `Bun.Glob.${name}() throws naming itself and Phase 2`);
+  }
+  ok(new Bun.Glob("*.ts").match("index.ts"), "constructing a Glob is still safe after touching scan");
+}
+
+console.log("== Bun.deepEquals: loose vs strict ==");
+{
+  // `strict` used to be accepted and ignored, which made expect().toStrictEqual()
+  // identical to expect().toEqual(). For a test-runner shim that is the worst
+  // available direction to be wrong in: the suite goes green here and red under real
+  // Bun. Every case below is from https://bun.com/docs/runtime/utils#bun-deepequals.
+  const Bun = freshBun();
+  const eq = Bun.deepEquals;
+
+  const a = { entries: [1, 2] };
+  const b = { entries: [1, 2], extra: undefined };
+  ok(eq(a, b) === true, "loose: an explicitly-undefined property is ignored (documented)");
+  ok(eq(a, b, true) === false, "strict: an explicitly-undefined property makes them unequal (documented)");
+  ok(eq({}, { a: undefined }, true) === false, "strict: {} != {a: undefined} (documented)");
+  ok(eq(["asdf"], ["asdf", undefined], true) === false, "strict: undefined padding in an array counts (documented)");
+  ok(eq([, 1], [undefined, 1], true) === false, "strict: a sparse hole != an explicit undefined (documented)");
+  class Foo { constructor() { this.a = 1; } }
+  ok(eq(new Foo(), { a: 1 }) === true, "loose: a class instance equals a literal with the same properties");
+  ok(eq(new Foo(), { a: 1 }, true) === false, "strict: prototype identity is checked (documented)");
+
+  // Everything below applies in BOTH modes and was simply absent before.
+  ok(eq(NaN, NaN) === true, "NaN equals itself");
+  ok(eq({ x: NaN }, { x: NaN }) === true, "NaN equals itself inside a structure");
+  ok(eq([1, 2], { 0: 1, 1: 2 }) === false, "an array is never equal to an object with the same numeric keys");
+  ok(eq(new Date(5), new Date(5)) === true && eq(new Date(5), new Date(6)) === false, "Date compares by time value");
+  ok(eq(/a/gi, /a/gi) === true && eq(/a/g, /a/i) === false, "RegExp compares source and flags");
+  ok(eq(new Map([["a", 1]]), new Map([["a", 1]])) === true, "Map compares by entries");
+  ok(eq(new Map([["a", 1]]), new Map([["a", 2]])) === false, "Map notices a differing value");
+  ok(eq(new Set([1, 2]), new Set([2, 1])) === true, "Set compares by membership, not order");
+  ok(eq(new Set([1, 2]), new Set([1, 3])) === false, "Set notices a differing member");
+  ok(eq(new Uint8Array([1, 2]), new Uint8Array([1, 2])) === true, "TypedArray compares by contents");
+  ok(eq(new Uint8Array([1, 2]), new Uint8Array([1, 3])) === false, "TypedArray notices a differing byte");
+  ok(eq(new Uint8Array([1, 2]), new Int8Array([1, 2])) === false, "TypedArrays of different types are unequal");
+  ok(eq(new Map(), new Set()) === false, "a Map is not a Set");
+
+  // Regression guard for the two checks that predate this change.
+  ok(eq({ a: [1, 2] }, { a: [1, 2] }) === true, "the original deep-equal case still holds");
+  ok(eq({ a: 1 }, { a: 2 }) === false, "the original unequal case still holds");
+}
+
+console.log("== Bun.deepMatch ==");
+{
+  const Bun = freshBun();
+  // Argument order is (subset, object) — the reverse of how the matcher reads, and
+  // getting it backwards inverts the assertion without changing its type.
+  ok(Bun.deepMatch({ a: 1 }, { a: 1, b: 2 }) === true, "a subset of properties matches");
+  ok(Bun.deepMatch({ a: 1, b: 2 }, { a: 1 }) === false, "a superset does not match");
+  ok(Bun.deepMatch({ c: { d: 3 } }, { c: { d: 3, e: 4 }, f: 5 }) === true, "matching recurses into nested objects");
+  ok(Bun.deepMatch({ c: { d: 9 } }, { c: { d: 3 } }) === false, "a differing nested value fails");
+  ok(Bun.deepMatch({ a: [1, 2] }, { a: [1, 2] }) === true, "arrays match element-wise");
+  ok(Bun.deepMatch({ a: [1] }, { a: [1, 2] }) === false, "arrays are compared whole, not as a prefix");
+}
+
+console.log("== Bun.randomUUIDv7 is a real v7, not crypto.randomUUID ==");
+{
+  // This used to call crypto.randomUUID(), a v4: the right shape, none of the point.
+  // v7 exists so ids sort in creation order and stay friendly to a B-tree index, and
+  // nothing in a v4's type or format tells you that you did not get it.
+  const Bun = freshBun();
+  const id = Bun.randomUUIDv7();
+  ok(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id), "the default encoding is a canonical hex UUID string");
+  ok(id[14] === "7", "the version nibble is 7 (a v4 would read 4 here)");
+  ok("89ab".indexOf(id[19]) !== -1, "the variant bits are RFC 9562's 0b10");
+
+  // The first 48 bits are a big-endian unix millisecond timestamp. A v4 would have
+  // random bits here, so this single check is what separates the two.
+  const before = Date.now();
+  const now = Bun.randomUUIDv7();
+  const after = Date.now();
+  const stamp = parseInt(now.slice(0, 8) + now.slice(9, 13), 16);
+  ok(stamp >= before && stamp <= after, `the leading 48 bits are the current time in ms (${stamp})`);
+
+  // An explicit timestamp is encoded verbatim, per the documented signature.
+  const at = 1730000000000;
+  const fixed = Bun.randomUUIDv7("hex", at);
+  ok(parseInt(fixed.slice(0, 8) + fixed.slice(9, 13), 16) === at, "an explicit timestamp is encoded verbatim");
+  // ...and a DIFFERENT explicit timestamp reseeds rather than being clamped forward
+  // to the last one — including a timestamp that moves backwards, which is the whole
+  // reason to be able to pass one (backfilling ids for historical rows).
+  const earlier = Bun.randomUUIDv7("hex", at - 86400000);
+  ok(parseInt(earlier.slice(0, 8) + earlier.slice(9, 13), 16) === at - 86400000, "an earlier explicit timestamp is honoured, not clamped to the previous one");
+  ok(earlier < fixed, "ids ordered by their explicit timestamps sort in that order");
+
+  // Monotonicity is the property naive v7 implementations skip, and a burst inside a
+  // single millisecond is where they break: the timestamp cannot separate the ids, so
+  // the counter has to. 5000 calls also overruns the counter's 12-bit space at least
+  // once, exercising the documented "bump the timestamp rather than wrap" rollover.
+  const ids = [];
+  for (let i = 0; i < 5000; i++) ids.push(Bun.randomUUIDv7());
+  let strictlyIncreasing = true;
+  for (let i = 1; i < ids.length; i++) if (!(ids[i] > ids[i - 1])) { strictlyIncreasing = false; break; }
+  ok(strictlyIncreasing, "5000 ids generated back-to-back are strictly increasing as strings");
+  ok(new Set(ids).size === ids.length, "no duplicates across the burst");
+  ok(ids.every((s) => s[14] === "7"), "every id in the burst is still version 7");
+  // Deliberately not "the FIRST id's millisecond is shared by another": whether the
+  // clock ticks between call 1 and call 2 is a coin flip, so that spelling flakes.
+  // What the burst has to demonstrate is that SOME millisecond ordered many ids by
+  // counter, and 5000 v7 generations cannot span 500 distinct milliseconds.
+  const msPrefixes = new Set(ids.map((s) => s.slice(0, 13)));
+  ok(msPrefixes.size < ids.length / 10, "the burst really did share milliseconds (so the counter, not the clock, ordered it)");
+
+  // The documented encodings.
+  const buf = Bun.randomUUIDv7("buffer");
+  ok(Buffer.isBuffer(buf) && buf.length === 16, "'buffer' returns a 16-byte Buffer");
+  ok((buf[6] & 0xf0) === 0x70 && (buf[8] & 0xc0) === 0x80, "the buffer form carries the same version and variant bits");
+  ok(Buffer.from(Bun.randomUUIDv7("base64"), "base64").length === 16, "'base64' round-trips to 16 bytes");
+  ok(Buffer.from(Bun.randomUUIDv7("base64url"), "base64url").length === 16, "'base64url' round-trips to 16 bytes");
+  // randomUUIDv7(timestamp) with no encoding is a documented overload.
+  const overload = Bun.randomUUIDv7(at + 1);
+  ok(typeof overload === "string" && parseInt(overload.slice(0, 8) + overload.slice(9, 13), 16) === at + 1, "randomUUIDv7(timestamp) overload returns a hex string at that time");
+  let encMsg = "";
+  try { Bun.randomUUIDv7("uuencode"); } catch (e) { encMsg = e.message; }
+  ok(encMsg.indexOf("uuencode") !== -1, "an unknown encoding throws instead of silently returning hex");
 }
 
 console.log("== bun:test runner + expect ==");
@@ -456,6 +725,36 @@ console.log("== bun:test runner + expect ==");
   ok(seen === 4, "beforeEach ran for each test");
   const mock = t.mock((x) => x * 2);
   ok(mock(21) === 42 && mock.mock.calls.length === 1, "bun:test mock records calls");
+}
+
+console.log("== bun:test expect matchers are backed by Bun.deepEquals ==");
+{
+  // toEqual is documented as loose deepEquals and toStrictEqual as strict. Both used
+  // to call the same private key-count compare, so toStrictEqual accepted input real
+  // Bun rejects — a shim that makes a suite pass here and fail in CI. Now that they
+  // route through the real thing, assert the split directly.
+  const { modules } = createBunRuntime({
+    process: { env: {}, argv: ["bun"], cwd: () => "/", stdout: process.stdout, stderr: process.stderr, stdin: process.stdin },
+    Buffer,
+    require: nodeRequire,
+  });
+  const { expect } = modules["bun:test"];
+  const passes = (fn) => { try { fn(); return true; } catch { return false; } };
+
+  ok(passes(() => expect({ a: 1 }).toEqual({ a: 1, b: undefined })), "toEqual ignores an undefined-valued property (loose)");
+  ok(!passes(() => expect({ a: 1 }).toStrictEqual({ a: 1, b: undefined })), "toStrictEqual does NOT (this is the behaviour change)");
+  class Point { constructor() { this.x = 1; } }
+  ok(passes(() => expect(new Point()).toEqual({ x: 1 })), "toEqual ignores prototype identity");
+  ok(!passes(() => expect(new Point()).toStrictEqual({ x: 1 })), "toStrictEqual checks prototype identity");
+  ok(passes(() => expect(NaN).toEqual(NaN)), "toEqual treats NaN as equal to itself");
+  ok(passes(() => expect(new Map([["k", 1]])).toEqual(new Map([["k", 1]]))), "toEqual understands a Map");
+  ok(!passes(() => expect([1, 2]).toEqual({ 0: 1, 1: 2 })), "toEqual no longer equates an array with a same-keyed object");
+  ok(passes(() => expect({ a: 1, b: 2 }).toMatchObject({ a: 1 })), "toMatchObject accepts a subset");
+  ok(!passes(() => expect({ a: 1 }).toMatchObject({ a: 1, b: 2 })), "toMatchObject rejects a missing property");
+  ok(passes(() => expect({ a: 1 }).not.toStrictEqual({ a: 1, b: undefined })), "negation still composes with the strict matcher");
+  // Regression guard: the matchers Phase 0 left alone must be untouched.
+  ok(passes(() => expect(1 + 1).toBe(2)) && !passes(() => expect(1).toBe(2)), "toBe still compares by identity");
+  ok(passes(() => expect({ a: 1 }).toEqual({ a: 1 })), "the original toEqual case still passes");
 }
 
 // A bun:test runner is per-runtime state (registered suites + the `only` flag), so

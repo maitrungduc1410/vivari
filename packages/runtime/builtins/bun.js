@@ -10,9 +10,14 @@
 // COVERED (see below): Bun.file/write, Bun.serve (bridged onto Node http so it
 // previews — with `routes`, `fetch`, an `error` handler, and server-side
 // `websocket` + pub/sub), Bun.env/argv/main/version, Bun.spawn/spawnSync/which,
-// Bun.$ (shell), Bun.sleep(Sync)/nanoseconds, Bun.hash/CryptoHasher,
-// Bun.password (crypto-backed), Bun.gzipSync/…, Bun.inspect (incl. .table and
-// .custom)/deepEquals/escapeHTML, Bun.pathToFileURL/fileURLToPath,
+// Bun.$ (shell), Bun.sleep(Sync)/nanoseconds, Bun.hash (real wyhash, plus
+// xxHash32/64, murmur32v2/v3, murmur64v2, cityHash32/64, crc32, adler32 —
+// byte-exact, with the documented number-vs-bigint return typing)/CryptoHasher,
+// Bun.password (crypto-backed), Bun.Glob (.match(); `*` stops at `/`, `!` negates
+// only at pattern start, braces nest 10 deep), Bun.randomUUIDv7 (a real
+// time-ordered v7, monotonic within a millisecond), Bun.gzipSync/…,
+// Bun.inspect (incl. .table and .custom)/deepEquals (loose AND strict)/deepMatch/
+// escapeHTML, Bun.pathToFileURL/fileURLToPath,
 // Bun.stringWidth/stripANSI/wrapAnsi/color/indexOfLine (see bun-text.js),
 // Bun.ArrayBufferSink/readableStreamTo*/concatArrayBuffers/allocUnsafe (see
 // bun-bytes.js), async-generator Response bodies (inherited from the platform
@@ -21,31 +26,47 @@
 // and Bun.semver.satisfies/order (vendored real parsers — see ./bun-formats.js),
 // and the modules bun:test (a runner +
 // expect, with Bun/Jest `test.only` filtering and beforeEach/afterEach that
-// inherit into nested describes) and bun:jsc (serialize/deserialize).
+// inherit into nested describes, and toEqual/toStrictEqual/toMatchObject backed
+// by deepEquals/deepMatch) and bun:jsc (serialize/deserialize).
 //
 // NOT SUPPORTED (documented, fails loudly rather than silently wrong): bun:ffi /
 // Bun.dlopen (native FFI), native addons, Bun macros, and Bun.build plugins —
 // these require capabilities the browser sandbox does not have. Loud for the
 // narrower reason that the shim has not implemented them: Bun.file(fd) (our fd
 // numbers are VFS handles, not OS fds), Bun.Transpiler.scan/scanImports (the
-// transform builds no import/export graph), and the bun:jsc heap-introspection
-// helpers (no engine hook exists in a page). bun:sqlite is registered as a module
-// but every call throws until a wasm SQLite backend is wired into it (see
-// makeBunSqlite) — treat it as not usable today. Also loud: the CSS Color 4
-// function space in Bun.color — lab()/lch()/oklab()/oklch()/color() throw rather
-// than returning the `null` that means "not a colour" (bun-text.js).
+// transform builds no import/export graph), Bun.Glob.scan/scanSync (they need a
+// VFS directory walk — Phase 2), Bun.hash.xxHash3/rapidhash (not ported, and we
+// have no reference vector to verify a port against), and the bun:jsc
+// heap-introspection helpers (no engine hook exists in a page). bun:sqlite is
+// registered as a module but every call throws until a wasm SQLite backend is
+// wired into it (see makeBunSqlite) — treat it as not usable today. Also loud:
+// the CSS Color 4 function space in Bun.color — lab()/lch()/oklab()/oklch()/
+// color() throw rather than returning the `null` that means "not a colour"
+// (bun-text.js).
 //
 // COVERED BUT SLOWER, not wrong: Bun.allocUnsafe returns zero-filled memory,
 // because `new Uint8Array(n)` is specified to be — see bun-bytes.js.
 
 import { transpileTypeScript } from "../typescript-transform.js";
-// The data-format, text/terminal and bytes/streams members live in their own
-// files: this one is already long, and each group is self-contained pure
-// computation. See the header of each for why they are not inline here, and
-// bun-formats.js in particular for the vendoring rationale per format.
+// The data-format, text/terminal, bytes/streams, hash and glob members live in
+// their own files: this one is already long, and each group is self-contained
+// pure computation pinned by its own checks. See the header of each for why they
+// are not inline here, and bun-formats.js in particular for the vendoring
+// rationale per format.
 import { createBunFormats } from "./bun-formats.js";
 import { createBunText } from "./bun-text.js";
 import { createBunBytes } from "./bun-bytes.js";
+import * as hashes from "./bun-hash.js";
+import { Glob } from "./bun-glob.js";
+
+// The two documented Bun.hash members we did not port. The message names the
+// algorithm and says why, in the same spirit as the bun:ffi one: a caller who hits
+// this needs to know it is absent, not that "something went wrong".
+const HASH_UNSUPPORTED = (name) =>
+  `Bun.hash.${name}() is not implemented in the Vivari shim. The other members ` +
+  `(wyhash, crc32, adler32, xxHash32/64, murmur32v2/v3, murmur64v2, cityHash32/64) ` +
+  `are byte-exact; ${name} is omitted rather than approximated because we have no ` +
+  `reference vector to verify a port against.`;
 
 // ---- version identity -------------------------------------------------------
 // The single definition of what this shim claims to be. `Bun.revision` is derived
@@ -532,22 +553,39 @@ export function createBunRuntime({ process, Buffer, require }) {
   }
 
   // ---- hashing / crypto ------------------------------------------------------
+  // Bun.hash is wyhash, and the digests are part of its contract: people put them
+  // in cache keys and shard ids, so "stable within this process" is not good
+  // enough. The algorithms live in bun-hash.js (they are bulk, and each one has to
+  // be byte-exact); this block is just the wiring, and its job is to get the two
+  // things the digest cannot tell you about right — the return TYPE and the seed.
+  //
+  // Documented typing, which we reproduce exactly: 32-bit hashes return a
+  // `number`, 64-bit hashes return a `bigint`. That distinction is load-bearing.
+  // `Bun.hash("x") + 1` throws a TypeError under real Bun (you cannot mix BigInt
+  // and Number) and a shim that hands back a Number instead makes that line
+  // "work" here and fail in production — the same class of bug as everything else
+  // in this file's history. A bare Bun.hash() is wyhash, so it is a bigint too.
   function bunHash(data, seed) {
-    // Bun.hash defaults to wyhash; we return a stable 53-bit numeric hash. Not
-    // byte-identical to Bun's wyhash, but stable + fast, which is what callers use.
-    const buf = toBuf(data, Buffer);
-    let h1 = 0xdeadbeef ^ (Number(seed) | 0);
-    let h2 = 0x41c6ce57 ^ (Number(seed) | 0);
-    for (let i = 0; i < buf.length; i++) {
-      const ch = buf[i];
-      h1 = Math.imul(h1 ^ ch, 2654435761);
-      h2 = Math.imul(h2 ^ ch, 1597334677);
-    }
-    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-    return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+    return hashes.wyhash(toBuf(data, Buffer), seed);
   }
-  bunHash.wyhash = (data, seed) => bunHash(data, seed);
+  bunHash.wyhash = (data, seed) => hashes.wyhash(toBuf(data, Buffer), seed);
+  bunHash.xxHash32 = (data, seed) => hashes.xxHash32(toBuf(data, Buffer), seed);
+  bunHash.xxHash64 = (data, seed) => hashes.xxHash64(toBuf(data, Buffer), seed);
+  bunHash.murmur32v2 = (data, seed) => hashes.murmur32v2(toBuf(data, Buffer), seed);
+  bunHash.murmur32v3 = (data, seed) => hashes.murmur32v3(toBuf(data, Buffer), seed);
+  bunHash.murmur64v2 = (data, seed) => hashes.murmur64v2(toBuf(data, Buffer), seed);
+  // cityHash32 takes no seed at all in Bun's typings — `(data) => number`. We
+  // accept one and ignore it (the reference implementation has no seeded form)
+  // rather than inventing a seeded variant nothing else would agree with.
+  bunHash.cityHash32 = (data) => hashes.cityHash32(toBuf(data, Buffer));
+  bunHash.cityHash64 = (data, seed) => hashes.cityHash64(toBuf(data, Buffer), seed);
+  // xxHash3 and rapidhash are documented members we have NOT ported. XXH3 is a
+  // much bigger construction than everything else here combined, and rapidhash is
+  // not in Zig's standard library, so there is no reference we can pin a
+  // known-answer test against — and an unverified hash is exactly the bug this
+  // change removes. Loud beats plausible-looking; same tier as bun:ffi.
+  bunHash.xxHash3 = () => { throw new Error(HASH_UNSUPPORTED("xxHash3")); };
+  bunHash.rapidhash = () => { throw new Error(HASH_UNSUPPORTED("rapidhash")); };
   bunHash.crc32 = (data) => {
     const buf = toBuf(data, Buffer);
     let crc = ~0;
@@ -623,17 +661,8 @@ export function createBunRuntime({ process, Buffer, require }) {
   const startNs = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
   const nanoseconds = () => Math.round(((typeof performance !== "undefined" && performance.now ? performance.now() : Date.now()) - startNs) * 1e6);
 
-  function deepEquals(a, b, strict) {
-    if (a === b) return true;
-    if (typeof a !== typeof b) return false;
-    if (a && b && typeof a === "object") {
-      const ka = Object.keys(a), kb = Object.keys(b);
-      if (ka.length !== kb.length) return false;
-      for (const k of ka) if (!deepEquals(a[k], b[k], strict)) return false;
-      return true;
-    }
-    return false;
-  }
+  const deepEquals = (a, b, strict) => bunDeepEquals(a, b, !!strict);
+  const deepMatch = (subset, object) => bunDeepMatch(subset, object);
   const escapeHTML = (s) =>
     String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#x27;");
 
@@ -672,6 +701,8 @@ export function createBunRuntime({ process, Buffer, require }) {
     CryptoHasher,
     password,
     deepEquals,
+    deepMatch,
+    Glob,
     escapeHTML,
     // Data formats (see ./bun-formats.js). Real parsers, not approximations:
     // Bun.TOML.parse throws on an integer it cannot hold losslessly, Bun.YAML.parse
@@ -710,7 +741,7 @@ export function createBunRuntime({ process, Buffer, require }) {
     pathToFileURL,
     resolveSync: (id, parent) => require.resolve ? require.resolve(id) : id,
     resolve: async (id, parent) => (require.resolve ? require.resolve(id) : id),
-    randomUUIDv7: () => lazy("crypto").randomUUID(),
+    randomUUIDv7: (encoding, timestamp) => randomUUIDv7(lazy("crypto"), Buffer, encoding, timestamp),
     get stdin() { return process.stdin; },
     get stdout() { return process.stdout; },
     get stderr() { return process.stderr; },
@@ -841,8 +872,12 @@ function makeBunTest({ process }) {
 function expect(received) {
   const make = (negate) => ({
     toBe(v) { assert(negate, received === v, `expected ${fmt(received)} to be ${fmt(v)}`); },
-    toEqual(v) { assert(negate, deepEq(received, v), `expected ${fmt(received)} to equal ${fmt(v)}`); },
-    toStrictEqual(v) { assert(negate, deepEq(received, v), `expected ${fmt(received)} to strictly equal ${fmt(v)}`); },
+    // toEqual is loose deepEquals and toStrictEqual is strict — that is the
+    // documented contract, and until now both called the same key-count compare,
+    // so toStrictEqual accepted input real Bun rejects.
+    toEqual(v) { assert(negate, bunDeepEquals(received, v, false), `expected ${fmt(received)} to equal ${fmt(v)}`); },
+    toStrictEqual(v) { assert(negate, bunDeepEquals(received, v, true), `expected ${fmt(received)} to strictly equal ${fmt(v)}`); },
+    toMatchObject(subset) { assert(negate, bunDeepMatch(subset, received), `expected ${fmt(received)} to match object ${fmt(subset)}`); },
     toBeTruthy() { assert(negate, !!received, `expected ${fmt(received)} to be truthy`); },
     toBeFalsy() { assert(negate, !received, `expected ${fmt(received)} to be falsy`); },
     toBeDefined() { assert(negate, received !== undefined, `expected value to be defined`); },
@@ -884,15 +919,6 @@ function expect(received) {
     if (!pass) throw new Error((negate ? "[not] " : "") + message);
   }
   function fmt(v) { try { return JSON.stringify(v); } catch { return String(v); } }
-  function deepEq(a, b) {
-    if (a === b) return true;
-    if (a && b && typeof a === "object" && typeof b === "object") {
-      const ka = Object.keys(a), kb = Object.keys(b);
-      if (ka.length !== kb.length) return false;
-      return ka.every((k) => deepEq(a[k], b[k]));
-    }
-    return false;
-  }
 }
 
 function makeMock() {
@@ -1004,6 +1030,218 @@ function makeBunSqlite({ require }) {
     throw new Error("bun:sqlite backend integration is experimental; wire your installed wasm SQLite here.");
   }
   return { Database, default: Database };
+}
+
+// ---- Bun.randomUUIDv7 -------------------------------------------------------
+// This used to be `crypto.randomUUID()`, which is a v4 — 122 bits of randomness
+// and nothing else. The entire reason to reach for v7 is that the first 48 bits
+// are a big-endian millisecond timestamp, so the ids sort in creation order and
+// stay friendly to a B-tree primary key. Aliasing v4 gives you a string of the
+// right shape that fails at the one job you picked it for, and nothing in the
+// type or the format tells you: you find out when your index fragments.
+//
+// Layout is RFC 9562 §5.7: 48-bit unix_ts_ms, version nibble 7, a 12-bit
+// counter, the 2-bit variant, then 62 bits of CSPRNG.
+//
+//   0                   1                   2                   3
+//   |         unix_ts_ms (48)          |ver|  rand_a (12)  |var| rand_b (62) |
+//
+// Monotonicity within a millisecond is the part naive implementations skip.
+// Bun's documented rule: when the clock advances, reseed the counter to a random
+// value with the high bit CLEAR (so at least 2048 increments remain before it
+// rolls); when it has not advanced, reuse the last timestamp and increment; if
+// the counter would roll over, bump the emitted timestamp rather than wrapping,
+// so output is strictly increasing even under a burst.
+const uuidState = { ts: 0, counter: 0 };
+// An explicit `timestamp` argument tracks its own counter and neither reads nor
+// disturbs the default path's state — otherwise passing a historical timestamp
+// would drag the monotonic clock backwards for every subsequent default call.
+const uuidExplicitState = { ts: -1, counter: 0 };
+
+// Seed a fresh counter: 12 bits with the high bit clear, so at least 2048
+// increments remain before it can roll.
+const uuidSeedCounter = (crypto) => crypto.randomBytes(2).readUInt16BE(0) & 0x7ff;
+
+function randomUUIDv7(crypto, Buffer, encoding, timestamp) {
+  // Overload: randomUUIDv7(timestamp) with no encoding.
+  if (typeof encoding === "number") { timestamp = encoding; encoding = undefined; }
+  const enc = encoding == null ? "hex" : encoding;
+
+  const explicit = timestamp != null;
+  const state = explicit ? uuidExplicitState : uuidState;
+  let ts = explicit ? Number(timestamp) : Date.now();
+
+  // The two paths run the same counter machinery but differ on what counts as
+  // "new", and the difference is documented rather than incidental. The default
+  // path is driven by a clock that only moves forward, so anything that is not
+  // strictly later is treated as the same instant and clamped to the last emitted
+  // timestamp — that clamp is what makes the default sequence strictly increasing
+  // even when Date.now() stalls or steps back. An explicit timestamp is instead
+  // encoded VERBATIM and any change to it reseeds: the caller asked for that exact
+  // instant, so clamping it forward would hand back an id for a different one.
+  const fresh = explicit ? ts !== state.ts : ts > state.ts;
+
+  if (fresh) {
+    state.ts = ts;
+    state.counter = uuidSeedCounter(crypto);
+  } else {
+    ts = state.ts;
+    state.counter++;
+    if (state.counter > 0xfff) {
+      // Rolling the counter would emit a smaller id than the previous one, so
+      // move the timestamp forward instead. Sortability wins over clock accuracy.
+      state.ts = ts = ts + 1;
+      state.counter = uuidSeedCounter(crypto);
+    }
+  }
+
+  const bytes = Buffer.alloc(16);
+  // 48-bit big-endian millisecond timestamp. writeUIntBE tops out at 6 bytes,
+  // which is exactly what we need.
+  bytes.writeUIntBE(ts, 0, 6);
+  bytes[6] = 0x70 | ((state.counter >> 8) & 0x0f); // version 7 + counter high nibble
+  bytes[7] = state.counter & 0xff;
+  const rand = crypto.randomBytes(8);
+  rand.copy(bytes, 8);
+  bytes[8] = 0x80 | (bytes[8] & 0x3f); // variant 0b10
+
+  if (enc === "buffer") return bytes;
+  if (enc === "base64") return bytes.toString("base64");
+  if (enc === "base64url") return bytes.toString("base64url");
+  if (enc !== "hex") {
+    throw new TypeError(`Bun.randomUUIDv7: unknown encoding ${JSON.stringify(enc)} (expected "hex", "base64", "base64url" or "buffer")`);
+  }
+  const h = bytes.toString("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+// ---- Bun.deepEquals / Bun.deepMatch -----------------------------------------
+// This used to be a key-count plus recursive compare that ACCEPTED the `strict`
+// argument and ignored it. That is worse than it sounds, because `strict` is not
+// a nicety here: `expect().toEqual()` is documented as loose deepEquals and
+// `expect().toStrictEqual()` as strict, so a shim where the two are identical
+// makes toStrictEqual pass on input real Bun rejects. For a test-runner shim that
+// is the worst possible direction to be wrong in — the suite goes green here and
+// red in CI, which is precisely the failure mode a sandbox is supposed to prevent.
+//
+// The documented loose-vs-strict difference is narrow and specific
+// (https://bun.com/docs/runtime/utils#bun-deepequals). Strict additionally treats
+// as UNEQUAL: properties explicitly set to `undefined` (`{}` vs `{a: undefined}`),
+// `undefined` padding in arrays (`["asdf"]` vs `["asdf", undefined]`), a sparse
+// hole vs an explicit `undefined` (`[, 1]` vs `[undefined, 1]`), and a class
+// instance vs an object literal with the same properties (prototype identity).
+// Everything else below applies in both modes and was simply missing before: the
+// old version had no Map/Set/Date/RegExp/TypedArray handling, said NaN !== NaN,
+// and compared `[1, 2]` equal to `{0: 1, 1: 2}` because it only counted keys.
+export function bunDeepEquals(a, b, strict) {
+  if (a === b) return true;
+  // NaN is the one primitive where === is not the right answer: Bun.deepEquals
+  // and every toEqual-style matcher treat NaN as equal to itself.
+  if (typeof a === "number" && typeof b === "number") return Number.isNaN(a) && Number.isNaN(b);
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+
+  // An array is never equal to a plain object, however similar their keys look.
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+
+  const ta = Object.prototype.toString.call(a);
+  if (ta !== Object.prototype.toString.call(b)) return false;
+
+  if (ta === "[object Date]") {
+    const x = a.getTime(), y = b.getTime();
+    return x === y || (Number.isNaN(x) && Number.isNaN(y));
+  }
+  if (ta === "[object RegExp]") return a.source === b.source && a.flags === b.flags;
+  if (ta === "[object Error]" || a instanceof Error) return a.name === b.name && a.message === b.message;
+
+  if (ArrayBuffer.isView(a) && !(a instanceof DataView)) {
+    if (a.constructor !== b.constructor || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;
+    return true;
+  }
+  if (a instanceof ArrayBuffer || a instanceof DataView) {
+    const x = new Uint8Array(a instanceof DataView ? a.buffer : a, a.byteOffset || 0, a.byteLength);
+    const y = new Uint8Array(b instanceof DataView ? b.buffer : b, b.byteOffset || 0, b.byteLength);
+    if (x.length !== y.length) return false;
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    return true;
+  }
+
+  if (a instanceof Map) {
+    if (a.size !== b.size) return false;
+    // Keys may themselves be structures, so a .get() lookup is not sufficient in
+    // general; fall back to a pairwise search only when the fast path misses.
+    outer: for (const [k, v] of a) {
+      if (b.has(k)) { if (bunDeepEquals(v, b.get(k), strict)) continue; return false; }
+      for (const [k2, v2] of b) {
+        if (bunDeepEquals(k, k2, strict) && bunDeepEquals(v, v2, strict)) continue outer;
+      }
+      return false;
+    }
+    return true;
+  }
+  if (a instanceof Set) {
+    if (a.size !== b.size) return false;
+    outer: for (const v of a) {
+      if (b.has(v)) continue;
+      for (const v2 of b) if (bunDeepEquals(v, v2, strict)) continue outer;
+      return false;
+    }
+    return true;
+  }
+
+  if (Array.isArray(a)) {
+    if (strict) {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        // A hole and an explicit undefined are different values in strict mode.
+        if ((i in a) !== (i in b)) return false;
+        if (!bunDeepEquals(a[i], b[i], strict)) return false;
+      }
+      return true;
+    }
+    // Loose mode ignores trailing/undefined padding, so reading past the end
+    // (which yields undefined) is the behaviour we want, not a bug.
+    const n = Math.max(a.length, b.length);
+    for (let i = 0; i < n; i++) if (!bunDeepEquals(a[i], b[i], strict)) return false;
+    return true;
+  }
+
+  if (strict && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+
+  // In loose mode an own property whose value is undefined is indistinguishable
+  // from an absent one; in strict mode it is not.
+  const keys = (o) => (strict ? Object.keys(o) : Object.keys(o).filter((k) => o[k] !== undefined));
+  const ka = keys(a), kb = keys(b);
+  if (ka.length !== kb.length) return false;
+  for (const k of ka) {
+    if (!Object.prototype.hasOwnProperty.call(b, k) && strict) return false;
+    if (!bunDeepEquals(a[k], b[k], strict)) return false;
+  }
+  return true;
+}
+
+// Bun.deepMatch(subset, object) — true when every property in `subset` exists in
+// `object` with an equal value. This is what powers expect().toMatchObject().
+// Note the argument order is (subset, object), which is the reverse of how the
+// matcher reads; getting it backwards silently inverts the assertion.
+export function bunDeepMatch(subset, object) {
+  if (subset === null || typeof subset !== "object") return bunDeepEquals(subset, object, false);
+  if (object === null || typeof object !== "object") return false;
+
+  if (Array.isArray(subset)) {
+    if (!Array.isArray(object) || subset.length !== object.length) return false;
+    return subset.every((v, i) => bunDeepMatch(v, object[i]));
+  }
+  // Only plain objects are treated as "subsets"; a Date/Map/Set/TypedArray on the
+  // subset side is compared whole, because a partial Date is meaningless.
+  if (Object.prototype.toString.call(subset) !== "[object Object]") {
+    return bunDeepEquals(subset, object, false);
+  }
+  for (const k of Object.keys(subset)) {
+    if (!(k in object)) return false;
+    if (!bunDeepMatch(subset[k], object[k])) return false;
+  }
+  return true;
 }
 
 // ---- Bun.serve error rendering ----------------------------------------------

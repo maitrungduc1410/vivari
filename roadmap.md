@@ -4000,5 +4000,74 @@ alongside the implementations, and the `Bun.color` depth policy is driven throug
 are the ones a plausible refactor would silently undo: the three `ArrayBufferSink.flush()` return
 types, `""`-not-`null` for unsupported ANSI, the throw-not-`null` on unimplemented colour spaces,
 `allocUnsafe` being zero-filled, and a UTF-8 character split across stream chunks.
+## Bun exactness — `Bun.Glob`, and making hash / deepEquals / randomUUIDv7 real (this change)
+
+Phase 0 dealt with shim APIs that returned obvious placeholders. This batch deals with the
+harder version of the same problem: three APIs that returned *plausible* answers. Each one had
+the right type, the right shape and perfect run-to-run stability, and each disagreed with real
+Bun on essentially every input. Nothing in a passing test run could tell you, because the only
+thing the existing checks asserted was that the shim agreed with itself — which is exactly the
+property a wrong implementation already has. **One new API, three replacements.**
+
+- **`Bun.hash` is now really wyhash.** It was a bespoke 53-bit multiply-xor hash with an inline
+  comment admitting as much, and `Bun.hash.wyhash` was aliased straight back to it, so the two
+  agreed with each other and with nothing else. `Bun.hash` is a *stable* API — its digests end up
+  in cache keys, shard ids and bloom filters — so "stable within this process" is not the
+  contract. It is now wyhash final v3 (the variant Zig's `std.hash.Wyhash` implements, which is
+  where Bun gets it), and the family alongside it is real too: `xxHash32`/`xxHash64`,
+  `murmur32v2`/`murmur32v3`/`murmur64v2`, `cityHash32`/`cityHash64`. The documented return typing
+  is preserved exactly — `number` for the 32-bit members, `bigint` for the 64-bit ones — which is
+  load-bearing rather than cosmetic, since `Bun.hash("x") + 1` is a `TypeError` under real Bun and
+  a shim returning a Number makes that line work here and fail in production. `crc32` and
+  `adler32` were already correct and are untouched (now pinned, so they stay that way).
+  `xxHash3` and `rapidhash` are documented members left unported and throw naming themselves:
+  XXH3 is a larger construction than the rest of the file combined and rapidhash is not in Zig's
+  standard library, so for neither do we have a reference to verify a port against — and an
+  unverified hash is the precise bug being removed here.
+- **`Bun.deepEquals` implements `strict`.** The third argument was accepted and ignored, so
+  `expect().toStrictEqual()` — which is *defined* as strict deepEquals — behaved identically to
+  `expect().toEqual()` and accepted input real Bun rejects. For a test-runner shim that is the
+  worst available direction to be wrong in: the suite goes green in the sandbox and red in CI,
+  the exact failure a sandbox exists to prevent. Strict now diverges where the docs say it does
+  (properties explicitly set to `undefined`, `undefined` padding in arrays, a sparse hole vs an
+  explicit `undefined`, and prototype identity). Beyond the loose/strict split, the comparison
+  itself was thin: it handled no `Map`, `Set`, `Date`, `RegExp`, `TypedArray` or `ArrayBuffer`,
+  reported `NaN !== NaN`, and counted keys — so it called `[1, 2]` equal to `{0: 1, 1: 2}`. All
+  fixed, and `Bun.deepMatch` is added alongside, backing a new `expect().toMatchObject()`.
+- **`Bun.randomUUIDv7` emits a v7.** It called `crypto.randomUUID()`, which is a **v4**: 122 bits
+  of randomness and nothing else. Time-ordered sortability is the entire reason to reach for v7,
+  so this returned a string of exactly the right shape that failed at the one job it was picked
+  for — and neither its type nor its format tells you, so you find out when the index it was
+  supposed to keep tidy fragments. It is now RFC 9562 §5.7: a 48-bit big-endian millisecond
+  prefix, version and variant nibbles, and a 12-bit counter that makes a burst inside a single
+  millisecond strictly increasing (on rollover the emitted timestamp is bumped rather than the
+  counter wrapped). An explicit `timestamp` is encoded verbatim against its own counter, so
+  backfilling ids for historical rows works and does not disturb the default path's clock.
+- **`Bun.Glob` is new, `.match()` only, and hand-rolled.** The obvious move is to vendor
+  picomatch or minimatch, and it is the wrong one: Bun's dialect differs in three documented ways
+  that each change *which files a build includes*, and in each case the other libraries' default
+  is the plausible-looking answer. `*` does not cross `/` or `\`; `!` negates only at the very
+  start of a pattern (there is no mid-pattern extglob negation, so `a!b` is a literal `!`); and
+  braces nest at most 10 deep, deeper being an error rather than a silently truncated pattern or
+  an eagerly expanded cross-product. The compiler targets a `RegExp` — globs are a regular
+  language and the translation is mechanical. `.scan()`/`.scanSync()` need a VFS directory walk,
+  which is a different problem and is scheduled for **Phase 2**; they throw, because an empty
+  iterator would read as "no files matched", which is the category of bug this whole change is
+  about.
+
+Testing is the point of the change, so it is worth being specific about what counts. Every claim
+above is pinned in `scripts/spike-bun-offline.mjs` by a value from **outside this repository**:
+the two wyhash digests Bun's own docs print, the SMHasher verification codes that Zig's
+`std.hash` test suite asserts (hash the keys `{0}`…`{0..254}`, fold the digests, keep 32 bits —
+one mistyped constant anywhere in a port moves the code), the worked examples in Bun's glob docs
+plus a direct assertion of each of the three divergences, the documented loose-vs-strict
+deepEquals cases verbatim, and a 5,000-id v7 burst checked for strict ordering. A
+self-consistency check would have passed against every one of the old implementations. The gate
+goes from 356 checks to 463.
+
+One deliberate test change: the spike asserted `typeof Bun.hash("hello") === "number"`, which was
+only true because the hash was wrong. Real `Bun.hash` is 64-bit and returns a `bigint`, so that
+assertion was pinning the bug; it now asserts `bigint`, and the number-vs-bigint split is
+exercised properly across the whole family.
 
 See ARCHITECTURE.md §9.2.

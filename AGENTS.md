@@ -80,6 +80,10 @@ packages/
                    bun-text.js (Bun.stringWidth/stripANSI/wrapAnsi/color/indexOfLine + inspect.table),
                    bun-bytes.js (Bun.ArrayBufferSink/readableStreamTo*/concatArrayBuffers/allocUnsafe),
                    python (lazy Pyodide/CPython→WASM plug-in + Flask/FastAPI HTTP bridge).
+      bun-hash.js  Bun.hash's algorithm family (wyhash, xxHash32/64, murmur, cityHash) —
+                   byte-exact ports, each pinned by a known-answer vector in the spike.
+      bun-glob.js  Bun.Glob's pattern compiler behind .match(). Hand-rolled on purpose:
+                   Bun's dialect is not minimatch's (see the Bun section below).
     node/
       lib/         Node's REAL vendored lib/*.js (fs, net, http, stream, ...).
       internal/    Node's REAL internal/* (streams, errors, validators, ...).
@@ -760,7 +764,8 @@ There is no `wasm32` build of Bun, so unlike the real npm/yarn/pnpm/corepack/tsg
 runtime**, and its pieces are ALWAYS on PATH (in `COREUTILS`), never lazily
 unpacked:
 - **`packages/runtime/builtins/bun.js`** — a Node-backed `Bun` global (`version`,
-  `main`, `env`, `escapeHTML`, `deepEquals`, `hash`/`crc32`, `gzip`/`gunzip`,
+  `main`, `env`, `escapeHTML`, `deepEquals`/`deepMatch`, `hash`/`crc32`, `Glob`,
+  `randomUUIDv7`, `gzip`/`gunzip`,
   password `hash`/`verify`, `CryptoHasher`, `Transpiler`, `$`) plus **`Bun.serve`**
   (fetch handler; `routes` with static paths, `:params`, `*` wildcards,
   `BunRequest.params`, method-specific handlers; server-side **WebSockets** — RFC
@@ -828,6 +833,26 @@ diverges in production is a trap. Two rules when touching the Bun shim:
   `spike-bun.mjs` runs in the **`verify`** job, which is the only one that builds
   the Wasm crates (`run-spikes.mjs --offline dep-cache bun`). It used to run in no
   job at all, because the Wasm-free gate silently skips `needsWasm` spikes.
+
+**Gotcha — for an API with an exact answer, test against a value from OUTSIDE this
+repo.** A placeholder is at least visible once you look; an algorithm that is wrong
+in the details is not. `Bun.hash` was a bespoke multiply-xor hash that satisfied
+every round-trip check we had — same input, same output, always — while agreeing
+with real Bun on nothing, and `Bun.randomUUIDv7` returned a well-formed v4. Neither
+can be caught by a self-consistency test, because self-consistency is exactly the
+property both already had. So when the shim implements something with a *defined*
+answer, pin it to a published one: `bun-hash.js` is checked against Bun's own two
+documented wyhash digests plus the SMHasher verification codes from Zig's test
+suite, `Bun.Glob` against the examples in Bun's glob docs, and `Bun.randomUUIDv7`
+against the RFC 9562 layout and its own monotonicity guarantee. Same rule for
+anything added next: if a real implementation exists, a vector from it is the test.
+
+Related: **prefer hand-rolling to vendoring when the dialect differs.** Bun's glob
+is not minimatch's — `*` does not cross `/`, `!` negates only at the start of a
+pattern, and braces nest at most 10 deep — and every one of those changes which
+files a build includes, with the other libraries' defaults looking perfectly
+reasonable in review. `bun-glob.js` is ~230 lines and its semantics are asserted
+directly; a vendored matcher would need auditing against the same list anyway.
 
 ### Python is Pyodide (CPython→WASM), lazily booted — with a Flask/FastAPI HTTP bridge
 Unlike the Node-backed Bun shim, `python`/`python3` boots **real CPython compiled to

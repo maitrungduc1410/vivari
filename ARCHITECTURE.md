@@ -1081,7 +1081,8 @@ vendored and unpacked into the VFS — Bun is **emulated on top of our Node runt
 pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
 
 - `packages/runtime/builtins/bun.js` — a Node-backed `Bun` global: `version`/`main`/`env`,
-  `escapeHTML`/`deepEquals`, `hash`/`crc32`, `gzip`/`gunzip`, password `hash`/`verify`,
+  `escapeHTML`/`deepEquals`/`deepMatch`, `hash`/`crc32`, `Glob`, `randomUUIDv7`,
+  `gzip`/`gunzip`, password `hash`/`verify`,
   `CryptoHasher`, `Transpiler`, `$`, and **`Bun.serve`** (a fetch handler; `routes` with static
   paths, `:params`, `*` wildcards and `BunRequest.params`; the documented `error(err)` hook,
   falling back to a plain 500 when it is absent or declines; server-side **WebSockets** — RFC 6455
@@ -1139,6 +1140,25 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   returning a placeholder: `Bun.file(fd)` (our fds are VFS handles), `Bun.Transpiler.scan`/
   `scanImports` (the transform builds no import graph), the `bun:jsc` heap helpers (no engine
   hook). Same import-safe/call-loud tier as `bun:ffi`.
+- **APIs with an exact answer are ported byte-exact and pinned to an external vector**, because
+  the failure mode here is not a missing function but a plausible wrong number. `Bun.hash` is a
+  real wyhash (`builtins/bun-hash.js`, alongside xxHash32/64, murmur32v2/v3, murmur64v2 and
+  cityHash32/64), returning a `number` for the 32-bit members and a `bigint` for the 64-bit ones
+  as documented; it is verified against Bun's own two published digests and the SMHasher
+  verification codes from Zig's `std.hash` suite, not against itself. `Bun.deepEquals` implements
+  the documented loose/strict split (`strict` was previously accepted and ignored), which matters
+  because `expect().toEqual()`/`toStrictEqual()` in `bun:test` are defined in terms of it.
+  `Bun.randomUUIDv7` is a real RFC 9562 §5.7 v7 — 48-bit big-endian millisecond prefix plus a
+  monotonic 12-bit counter — rather than an alias for `crypto.randomUUID()`, which is a v4 and so
+  has none of the time-ordering that is the only reason to choose v7. `Bun.hash.xxHash3` and
+  `rapidhash` are documented members left unported, and throw, because there is no reference we
+  can pin them against.
+- **`Bun.Glob` is hand-rolled (`builtins/bun-glob.js`), not vendored**, because Bun's dialect
+  differs from minimatch/picomatch in three documented ways that each change which files a build
+  includes: `*` does not cross `/` or `\`, `!` negates only at the very start of a pattern, and
+  braces nest at most 10 deep (deeper throws). The pattern compiles to a `RegExp`; `.match()`
+  works today, while `.scan()`/`.scanSync()` need a VFS directory walk and throw until Phase 2 —
+  an empty iterator would read as "no files matched".
 - Zero-config `.ts`/`.tsx` runs through the loader's synchronous `typescript-transform.js` (§7).
 - The install/run detector (`kernel-worker.ts` `pmFromCmd`) maps `bun`/`bunx` to the `bun` PM,
   and the studio ships a **"Bun" template category** (serve / routes / websocket / react).
