@@ -7,17 +7,33 @@
 // a native binary with no pure-JS build, so this is a purpose-built analog:
 //   bun / bun run <file>     run a TS/JS/TSX file with the Bun global installed
 //   bun run <script>         run a package.json script (with pre/post), via sh
-//   bun install|add|remove|update|ci   DELEGATE to the real npm CLI, then write a
-//                            best-effort text bun.lock (Bun cannot install natively
-//                            in-browser; npm's proven installer does the work)
+//   bun install|add|remove|update|up|ci   DELEGATE to the real npm CLI, then write
+//                            a best-effort text bun.lock (Bun cannot install
+//                            natively in-browser; npm's proven installer does the
+//                            work). NOTE `update`/`up` only — see `upgrade` below.
 //   bun x / bunx <pkg>       run a package bin (delegates to npx)
 //   bun build <entry>        single-file TS/JSX transpile to --outfile/--outdir
 //   bun test [files]         run bun:test suites and report
 //   bun --version | -v       print the shim's Bun version
+//   bun --revision           print <version>-vivari (same string as Bun.revision)
+//   bun upgrade              NOT IMPLEMENTED: real `bun upgrade` replaces the Bun
+//                            binary, which does not exist here. It used to be an
+//                            alias for `npm update`, which is a different action.
+//   bun init|create|pm|link|unlink|<unknown verb>   NOT IMPLEMENTED, exit 1. An
+//                            argument that names a file or a package.json script
+//                            still runs (that is real `bun <file>` / `bun <script>`).
 //
 // Authoring note: like programs/npm.js this source is embedded as a template
 // string, so it deliberately uses NO backticks, NO ${...} and NO backslashes.
-// Newlines come from String.fromCharCode(10).
+// Newlines come from String.fromCharCode(10). That also means the program cannot
+// import the runtime's BUN_VERSION; it carries the fallback literal below instead,
+// and scripts/spike-bun-offline.mjs asserts the two never drift.
+
+// The version the CLI reports when the Vivari runtime is not present to install
+// the Bun global (a plain `node` host, e.g. the offline spike). MUST equal
+// BUN_VERSION in packages/runtime/builtins/bun.js — that is the real definition,
+// and scripts/spike-bun-offline.mjs fails the build if these drift apart.
+export const BUN_CLI_VERSION_FALLBACK = "1.1.34";
 
 export const BUN_PROGRAM = `
 'use strict';
@@ -26,7 +42,7 @@ const path = require('path');
 const cp = require('child_process');
 
 const NL = String.fromCharCode(10);
-const BUN_VERSION = (typeof Bun !== 'undefined' && Bun.version) || '1.1.34';
+const VERSION_FALLBACK = '1.1.34';
 function out(s) { process.stdout.write(s + NL); }
 function err(s) { process.stderr.write(s + NL); }
 
@@ -52,6 +68,20 @@ function binPath(dir) {
 // runtime (packages/runtime/index.js) so a plain \`node\` process never sees Bun.
 function installBun() {
   try { if (typeof globalThis.__ocInstallBun === 'function') globalThis.__ocInstallBun(); } catch (e) {}
+}
+
+// Version + revision come from the Bun global, which is the single definition
+// (packages/runtime/builtins/bun.js). Installing it first is what makes this a
+// read rather than a second copy; VERSION_FALLBACK only applies on a host with no
+// Vivari runtime. --revision used to print its own '-vivari' suffix while
+// Bun.revision said 'vivari-shim'; now both come from Bun.revision.
+function bunIdent() {
+  installBun();
+  const g = typeof globalThis.Bun !== 'undefined' ? globalThis.Bun : null;
+  return {
+    version: (g && g.version) || VERSION_FALLBACK,
+    revision: (g && g.revision) || (VERSION_FALLBACK + '-vivari'),
+  };
 }
 
 // ---- run a file with the Bun runtime active --------------------------------
@@ -122,7 +152,7 @@ function mapInstallArgs(sub, rest) {
   let npmSub = 'install';
   if (sub === 'add') npmSub = 'install';
   else if (sub === 'remove' || sub === 'rm' || sub === 'uninstall') npmSub = 'uninstall';
-  else if (sub === 'update' || sub === 'upgrade') npmSub = 'update';
+  else if (sub === 'update') npmSub = 'update';
   else if (sub === 'ci') npmSub = 'ci';
   return { npmSub: npmSub, args: [npmSub, ...pkgs, ...flags] };
 }
@@ -238,25 +268,47 @@ async function doTest(rest) {
 }
 
 // ---- dispatch --------------------------------------------------------------
-const HELP = [
-  'Vivari bun (shim) ' + BUN_VERSION,
-  '',
-  'Usage: bun <command|file> [...args]',
-  '',
-  '  bun <file.ts>            run a TS/JS/TSX file (Bun global + zero-config TS)',
-  '  bun run <script|file>    run a package.json script or a file',
-  '  bun install|add|remove   manage dependencies (delegates to npm; writes bun.lock)',
-  '  bun x <pkg>              run a package binary (bunx)',
-  '  bun build <entry>       transpile a single TS/JSX file',
-  '  bun test [files]        run bun:test suites',
-  '  bun --version           print the shim Bun version',
-].join(NL);
+function helpText() {
+  return [
+    'Vivari bun (shim) ' + bunIdent().version,
+    '',
+    'Usage: bun <command|file> [...args]',
+    '',
+    '  bun <file.ts>            run a TS/JS/TSX file (Bun global + zero-config TS)',
+    '  bun run <script|file>    run a package.json script or a file',
+    '  bun install|add|remove   manage dependencies (delegates to npm; writes bun.lock)',
+    '  bun x <pkg>              run a package binary (bunx)',
+    '  bun build <entry>       transpile a single TS/JSX file',
+    '  bun test [files]        run bun:test suites',
+    '  bun --version           print the shim Bun version',
+  ].join(NL);
+}
+
+// Tell a file argument apart from an unknown subcommand, so that bun ./app.ts and
+// bun app.ts keep working while bun publish reports not-implemented instead of the
+// misleading 'file not found: publish'. Path-shaped or a known script extension
+// counts, and so does anything that actually resolves on disk (an extensionless
+// entry, or one runFile would find by appending .ts/.tsx/.js).
+function looksLikeFile(a) {
+  if (!a || a[0] === '-') return false;
+  if (a.indexOf('/') !== -1) return true;
+  if (/[.](ts|tsx|js|jsx|mjs|cjs|mts|cts|json)$/.test(a)) return true;
+  const abs = path.resolve(cwd, a);
+  return isFile(abs) || isFile(abs + '.ts') || isFile(abs + '.tsx') || isFile(abs + '.js');
+}
+// bun <script> is real Bun shorthand for bun run <script>, so a package.json
+// script name is not an unknown verb either.
+function isScriptName(a) {
+  const pkg = readJSON(path.join(cwd, 'package.json'));
+  const scripts = (pkg && pkg.scripts) || {};
+  return Object.prototype.hasOwnProperty.call(scripts, a);
+}
 
 async function main() {
   const first = argv[0];
-  if (!first || first === '--help' || first === '-h' || first === 'help') { out(HELP); process.exit(0); }
-  if (first === '--version' || first === '-v') { out(BUN_VERSION); process.exit(0); }
-  if (first === '--revision') { out(BUN_VERSION + '-vivari'); process.exit(0); }
+  if (!first || first === '--help' || first === '-h' || first === 'help') { out(helpText()); process.exit(0); }
+  if (first === '--version' || first === '-v') { out(bunIdent().version); process.exit(0); }
+  if (first === '--revision') { out(bunIdent().revision); process.exit(0); }
   if (first === '-e' || first === '--eval') {
     installBun();
     const code = argv[1] || '';
@@ -271,18 +323,30 @@ async function main() {
     case 'install': case 'i': return doInstall('install', rest);
     case 'add': case 'a': return doInstall('add', rest);
     case 'remove': case 'rm': case 'uninstall': return doInstall('remove', rest);
-    case 'update': case 'upgrade': case 'up': return doInstall('update', rest);
+    case 'update': case 'up': return doInstall('update', rest);
     case 'ci': return doInstall('ci', rest);
     case 'x': case 'exec': return doExec(rest);
     case 'build': return doBuild(rest);
     case 'test': return doTest(rest);
+    case 'upgrade':
+      // Real bun upgrade replaces the Bun binary itself. There is no binary here
+      // (Bun is emulated on the Node runtime), so this cannot be done, and the old
+      // alias to npm update quietly did something else entirely.
+      err('bun upgrade upgrades the Bun binary itself, which the Vivari shim cannot do: Bun is emulated on the Node runtime, not installed as a binary.');
+      err('Did you mean "bun update" (update the dependencies in package.json)?');
+      process.exit(1);
+      return;
     case 'init': case 'create': case 'pm': case 'link': case 'unlink':
       err('bun ' + first + ' is not implemented in the Vivari shim yet.');
       process.exit(1);
       return;
     default:
-      // Bare \`bun <file>\` -> run the file.
-      return doRun(argv);
+      // Bare bun <file> / bun <script> -> run it. Anything else is a subcommand we
+      // do not have; say so instead of failing later as a missing file.
+      if (looksLikeFile(first) || isScriptName(first)) return doRun(argv);
+      err('bun ' + first + ' is not implemented in the Vivari shim yet.');
+      process.exit(1);
+      return;
   }
 }
 

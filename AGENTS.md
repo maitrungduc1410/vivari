@@ -760,6 +760,26 @@ unpacked:
   react). Gated by `scripts/spike-bun*.mjs` (offline + kernel) covering the
   transform, the route matcher, the WS frame codec, and the Bun global API.
 
+**Gotcha — a shim stub that lies is worse than a missing API.** Bun code written
+here is meant to run under real Bun, so anything that "works" in the sandbox and
+diverges in production is a trap. Two rules when touching the Bun shim:
+- **Never leave a placeholder return value.** `test.only` used to register an
+  ordinary test (so an `only` run executed the whole suite), `Bun.file(3)` used to
+  `String()` the fd into the path `"3"`, `Bun.Transpiler.scan()` returned empty
+  arrays, and the `bun:jsc` memory helpers returned `0`. All of those now either
+  behave correctly or throw naming the API and the reason — the `bun:ffi` tier at
+  `builtins/bun.js` (import-safe, call-loud). An unknown `bun` verb likewise says
+  "not implemented" rather than falling through to "file not found: publish"; only
+  a file-shaped argument or a `package.json` script name still runs.
+- **`bun --version`/`--revision` read the Bun global**, which is the one definition
+  (`BUN_VERSION`/`BUN_REVISION` in `builtins/bun.js`). `BUN_PROGRAM` cannot import
+  it (no-interpolation template literal), so it carries a fallback literal that
+  `spike-bun-offline.mjs` asserts against `BUN_VERSION` — bump both or CI fails.
+- **CI gate:** `spike-bun-offline.mjs` runs in `toolchain-gate`; the kernel-level
+  `spike-bun.mjs` runs in the **`verify`** job, which is the only one that builds
+  the Wasm crates (`run-spikes.mjs --offline dep-cache bun`). It used to run in no
+  job at all, because the Wasm-free gate silently skips `needsWasm` spikes.
+
 ### Python is Pyodide (CPython→WASM), lazily booted — with a Flask/FastAPI HTTP bridge
 Unlike the Node-backed Bun shim, `python`/`python3` boots **real CPython compiled to
 WASM (Pyodide)** the first time a python process runs (nothing at studio boot). Pieces:

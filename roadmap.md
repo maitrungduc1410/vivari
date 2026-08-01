@@ -3734,3 +3734,56 @@ The controller writes through a private `status(text)` helper, which keeps the c
 (status bar vs. toast) a one-word decision at each call site.
 
 See ARCHITECTURE.md §8.12.
+## Bun shim — make the covered surface honest, and gate it (this change)
+
+The Bun shim's problem was never only its size. A handful of APIs were listed as covered and
+were quietly wrong, which is strictly worse than missing: code written against them passes
+in the sandbox and breaks under real Bun, and nothing in the run tells you. This change fixes
+those and closes the CI hole that let them survive. **No new API surface.**
+
+- **`bun:test` semantics.** `test.only` registered an ordinary test and filtered nothing, so an
+  `only` run executed the entire suite — the most dangerous divergence in the shim. It now
+  narrows the run globally (Bun/Jest semantics: one `only` anywhere focuses everything), and a
+  suite with nothing selected does not run its `beforeAll`/`afterAll`. Separately, root-level
+  `beforeEach`/`afterEach` were collected and never executed, and a nested `describe` did not
+  inherit its parents' each-hooks; both now work, in Jest order (`beforeEach` outermost-first,
+  `afterEach` innermost-first). A skipped test used to run `beforeEach` and then `continue` past
+  `afterEach`, leaving them unpaired — it now runs neither.
+- **`Bun.serve` honors `opts.error`.** The documented hook was never read; every handler throw
+  rendered a hard-coded 500 with the message inlined in the body. The handler's `Response` is now
+  served, and the old 500 is kept verbatim as the fallback when the option is absent, returns
+  nothing, or throws in turn. The precedence lives in an exported `resolveServeError` so it is
+  testable without binding a port.
+- **Loud instead of placeholder.** `Bun.file(3)` used to `String()` the fd into the relative path
+  `"3"`; our fd numbers are VFS handles, not OS descriptors, so there is nothing to open and it
+  throws. `Bun.Transpiler.scan()`/`scanImports()` returned empty arrays, indistinguishable from a
+  file with no imports — the transform is a type-stripper and builds no import graph, so they
+  throw. The `bun:jsc` memory helpers returned `0`/zeros, which a memory-budget check reads as
+  "nothing is allocated"; no engine exposes heap introspection to page code, so they throw. All
+  three follow the existing `bun:ffi` tier: import-safe, call-loud, message names the API and why.
+- **CLI verb dispatch.** `bun upgrade` was an alias for `npm update`. Real `bun upgrade` replaces
+  the Bun binary, which does not exist here, so it is now not-implemented and points at
+  `bun update` (which, with `bun up`, still delegates to npm). Unrecognised verbs fell through to
+  the run path and reported `file not found: publish`; they now say not-implemented. The genuine
+  run paths are preserved by classifying the argument: path-shaped, a known script extension, an
+  entry that resolves on disk, or a `package.json` script name still runs.
+- **One version definition.** `Bun.version` was hard-coded in two files and `Bun.revision`
+  (`"vivari-shim"`) disagreed with what `bun --revision` printed (`"1.1.34-vivari"`). `BUN_VERSION`
+  and a derived `BUN_REVISION` now live in `builtins/bun.js`; the CLI installs the Bun global and
+  reads them. `BUN_PROGRAM` is a no-interpolation template literal and cannot import, so it keeps
+  a fallback literal for a non-Vivari host — and the offline spike asserts that literal equals
+  `BUN_VERSION`, which is what makes it a single source rather than a third copy.
+- **The gate.** `scripts/spike-bun.mjs` ran in **no CI job at all**: `toolchain-gate` runs
+  `run-spikes --offline` without the Wasm crates, so `run-spikes.mjs` auto-skips `needsWasm`
+  spikes with a `(skip …)` note that reads as green, and the `verify` job — the one that does
+  build them — filtered to `dep-cache`. The filter is now `dep-cache bun`. Everything above is
+  only as durable as this line.
+
+Every fix has a regression check in `scripts/spike-bun-offline.mjs`, the only Bun tier CI enforces
+per-PR. The CLI ones execute `BUN_PROGRAM` as a real Node subprocess in a temp dir, which is
+possible because it is an ordinary CommonJS program and `installBun()` is a guarded no-op off
+Vivari — that covers verb dispatch, the version output, and the preserved run-a-file/run-a-script
+paths without a kernel. The spike also asserts that `ci.yml` still names the bun spike, so the
+gate cannot be quietly dropped again.
+
+See ARCHITECTURE.md §9.2.

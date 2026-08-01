@@ -72,10 +72,13 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('packages/*/Cargo.lock') }}
       - name: Build Wasm crates for Node
         run: npm run build:vfs:node && npm run build:codec:node && npm run build:crypto:node && npm run build:wasi-demo
-      # dep-cache is offline but needs the Rust/Wasm VFS, so it can't run in the
-      # Wasm-free toolchain-gate; run it here where the crates are built.
-      - name: dep-cache spike (needs Wasm VFS)
-        run: node scripts/run-spikes.mjs --offline dep-cache
+      # dep-cache and bun are offline but need the Rust/Wasm VFS, so they can't run
+      # in the Wasm-free toolchain-gate (run-spikes.mjs would silently skip them);
+      # run them here, after the crates are built above. The `bun` filter is a
+      # substring match, so it also re-runs the Wasm-free bun-offline spike — cheap,
+      # and it means a Bun change is never merged on a green run that skipped Bun.
+      - name: dep-cache + bun spikes (need the Wasm VFS)
+        run: node scripts/run-spikes.mjs --offline dep-cache bun
       - run: npm run verify
 
   # --- network tier: real template installs from the live registry -----------

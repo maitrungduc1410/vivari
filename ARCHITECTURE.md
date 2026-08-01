@@ -1079,15 +1079,31 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
 - `packages/runtime/builtins/bun.js` — a Node-backed `Bun` global: `version`/`main`/`env`,
   `escapeHTML`/`deepEquals`, `hash`/`crc32`, `gzip`/`gunzip`, password `hash`/`verify`,
   `CryptoHasher`, `Transpiler`, `$`, and **`Bun.serve`** (a fetch handler; `routes` with static
-  paths, `:params`, `*` wildcards and `BunRequest.params`; server-side **WebSockets** — RFC 6455
+  paths, `:params`, `*` wildcards and `BunRequest.params`; the documented `error(err)` hook,
+  falling back to a plain 500 when it is absent or declines; server-side **WebSockets** — RFC 6455
   handshake + frame codec + `ServerWebSocket` with pub/sub topics), plus **`bun:*` modules**
-  (`bun:test` runner + `expect`).
+  (`bun:test` runner + `expect`, with Bun/Jest `test.only` filtering and `beforeEach`/`afterEach`
+  that run at the root and inherit into nested `describe`s).
 - `packages/kernel-host/programs/bun.js` — the `bun`/`bunx` CLI (`bun run`, `bunx` → `npx`,
-  install delegation).
+  install delegation). An unrecognised verb reports not-implemented; only a file-shaped argument
+  or a `package.json` script name falls through to the run path. `bun upgrade` is not-implemented
+  by design — it upgrades the Bun *binary*, which does not exist here — while `bun update`/`up`
+  still map to `npm update`.
+- **Version identity has one definition**, `BUN_VERSION`/`BUN_REVISION` in `builtins/bun.js`.
+  The CLI installs the Bun global and reads them, so `bun --version`/`--revision` and
+  `Bun.version`/`Bun.revision` cannot disagree; its embedded fallback literal is asserted equal
+  in the offline spike, because `BUN_PROGRAM` is a template literal that cannot import.
+- Where the shim has no honest answer it **throws naming the API and the reason** rather than
+  returning a placeholder: `Bun.file(fd)` (our fds are VFS handles), `Bun.Transpiler.scan`/
+  `scanImports` (the transform builds no import graph), the `bun:jsc` heap helpers (no engine
+  hook). Same import-safe/call-loud tier as `bun:ffi`.
 - Zero-config `.ts`/`.tsx` runs through the loader's synchronous `typescript-transform.js` (§7).
 - The install/run detector (`kernel-worker.ts` `pmFromCmd`) maps `bun`/`bunx` to the `bun` PM,
   and the studio ships a **"Bun" template category** (serve / routes / websocket / react).
-- Proven by `scripts/spike-bun*.mjs` (the transform, route matcher, WS frame codec, Bun global API).
+- Proven by `scripts/spike-bun*.mjs` (the transform, route matcher, WS frame codec, Bun global API,
+  the `bun:test` semantics above, and CLI verb dispatch). `spike-bun-offline.mjs` gates every PR;
+  the kernel-level `spike-bun.mjs` runs in the `verify` job, the only one that builds the Wasm
+  crates it needs.
 
 ### 9.3 Python (Pyodide / CPython→WASM) — a lazy plug-in
 

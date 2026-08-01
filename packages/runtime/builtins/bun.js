@@ -8,25 +8,67 @@
 // philosophy the toolchain aliases use, applied to a runtime instead of a package.
 //
 // COVERED (see below): Bun.file/write, Bun.serve (bridged onto Node http so it
-// previews — with `routes`, `fetch`, and server-side `websocket` + pub/sub),
-// Bun.env/argv/main/version, Bun.spawn/spawnSync/which, Bun.$ (shell),
-// Bun.sleep(Sync)/nanoseconds, Bun.hash/CryptoHasher, Bun.password (crypto-backed),
-// Bun.gzipSync/…, Bun.inspect/deepEquals/escapeHTML, Bun.pathToFileURL/fileURLToPath,
-// and the modules bun:test (a minimal runner + expect) and bun:jsc (small stubs).
+// previews — with `routes`, `fetch`, an `error` handler, and server-side
+// `websocket` + pub/sub), Bun.env/argv/main/version, Bun.spawn/spawnSync/which,
+// Bun.$ (shell), Bun.sleep(Sync)/nanoseconds, Bun.hash/CryptoHasher,
+// Bun.password (crypto-backed), Bun.gzipSync/…, Bun.inspect/deepEquals/escapeHTML,
+// Bun.pathToFileURL/fileURLToPath, and the modules bun:test (a minimal runner +
+// expect, with Bun/Jest `test.only` filtering and beforeEach/afterEach that
+// inherit into nested describes) and bun:jsc (serialize/deserialize).
 //
 // NOT SUPPORTED (documented, fails loudly rather than silently wrong): bun:ffi /
-// Bun.dlopen (native FFI), native addons, Bun macros, and Bun.build plugins. These
-// require capabilities the browser sandbox does not have.
+// Bun.dlopen (native FFI), native addons, Bun macros, and Bun.build plugins —
+// these require capabilities the browser sandbox does not have. Loud for the
+// narrower reason that the shim has not implemented them: Bun.file(fd) (our fd
+// numbers are VFS handles, not OS fds), Bun.Transpiler.scan/scanImports (the
+// transform builds no import/export graph), and the bun:jsc heap-introspection
+// helpers (no engine hook exists in a page). bun:sqlite is registered as a module
+// but every call throws until a wasm SQLite backend is wired into it (see
+// makeBunSqlite) — treat it as not usable today.
 
 import { transpileTypeScript } from "../typescript-transform.js";
+
+// ---- version identity -------------------------------------------------------
+// The single definition of what this shim claims to be. `Bun.revision` is derived
+// from the version rather than being its own literal: `bun --revision` prints the
+// same string (packages/kernel-host/programs/bun.js), and the two used to disagree
+// ("vivari-shim" here vs "1.1.34-vivari" there). Real Bun prints a git SHA; we
+// cannot, so we print something that is at least self-consistent and obviously a
+// shim. The CLI program cannot import this (it is embedded as a template literal
+// with no interpolation), so it carries a fallback literal that
+// scripts/spike-bun-offline.mjs asserts against BUN_VERSION.
+export const BUN_VERSION = "1.1.34";
+export const BUN_REVISION = BUN_VERSION + "-vivari";
+
+const TRANSPILER_SCAN_UNSUPPORTED = (method) =>
+  "Bun.Transpiler." +
+  method +
+  "() is not implemented in the Vivari shim: it is backed by the loader's " +
+  "type-stripping transform, which does not parse an import/export graph. It " +
+  "used to return an empty result, which was indistinguishable from a file with " +
+  "no imports.";
 
 export function createBunRuntime({ process, Buffer, require }) {
   const lazy = (name) => require(name);
 
   // ---- BunFile ---------------------------------------------------------------
   // `Bun.file(path)` is a lazy handle; reads/writes hit the VFS through `fs`.
+  //
+  // `Bun.file(fd)` is deliberately NOT supported. Bun's overload wraps a real OS
+  // file descriptor, and there are none here: our fd numbers are indices into the
+  // runtime's own VFS descriptor table, and a BunFile is defined by a path it can
+  // re-open. Coercing the number to a string (what this used to do) turned
+  // `Bun.file(3)` into the relative path "3" — a silent wrong answer that only
+  // surfaces as a confusing ENOENT much later. Throw instead.
   class BunFile {
     constructor(pathOrFd, options) {
+      if (typeof pathOrFd === "number") {
+        throw new TypeError(
+          "Bun.file(fd) is not supported in Vivari: file descriptors here are VFS " +
+            "handles owned by the runtime, not OS file descriptors, so there is no " +
+            "file to open. Use Bun.file(path) instead."
+        );
+      }
       this._path = typeof pathOrFd === "string" ? pathOrFd : String(pathOrFd);
       this._type = (options && options.type) || guessMime(this._path);
     }
@@ -109,6 +151,10 @@ export function createBunRuntime({ process, Buffer, require }) {
     let fetchHandler = typeof opts.fetch === "function" ? opts.fetch : null;
     let routes = compileRoutes(opts.routes);
     let wsHandlers = opts.websocket && typeof opts.websocket === "object" ? opts.websocket : null;
+    // Bun's documented `error(err)` hook. It gets the throw from `fetch`/a route
+    // handler and returns the Response to render; returning nothing (or throwing)
+    // falls back to the plain 500 below, which is what this always did before.
+    let errorHandler = typeof opts.error === "function" ? opts.error : null;
     if (!fetchHandler && !routes && !wsHandlers) {
       throw new TypeError("Bun.serve requires a `fetch` handler or `routes`");
     }
@@ -128,6 +174,13 @@ export function createBunRuntime({ process, Buffer, require }) {
     }
 
     function cloneResponse(r) { try { return r.clone(); } catch { return r; } }
+
+    async function writeResponse(res, response) {
+      res.statusCode = response.status || 200;
+      try { response.headers.forEach((v, k) => res.setHeader(k, v)); } catch {}
+      const ab = await response.arrayBuffer();
+      res.end(Buffer.from(new Uint8Array(ab)));
+    }
 
     // Route + fetch dispatch. Returns a Promise<Response|undefined>.
     function dispatch(request, method) {
@@ -168,15 +221,13 @@ export function createBunRuntime({ process, Buffer, require }) {
         dispatch(request, method)
           .then(async (response) => {
             if (!response) { res.statusCode = 404; res.end("Not Found"); return; }
-            res.statusCode = response.status || 200;
-            try { response.headers.forEach((v, k) => res.setHeader(k, v)); } catch {}
-            const ab = await response.arrayBuffer();
-            res.end(Buffer.from(new Uint8Array(ab)));
+            await writeResponse(res, response);
           })
-          .catch((err) => {
-            res.statusCode = 500;
-            res.end("Bun.serve handler error: " + ((err && err.message) || err));
-          });
+          .catch((err) =>
+            resolveServeError(errorHandler, err)
+              .then((response) => (res.headersSent ? res.end() : writeResponse(res, response)))
+              .catch(() => { try { res.statusCode = 500; res.end("Bun.serve handler error"); } catch {} })
+          );
       });
     });
 
@@ -306,6 +357,7 @@ export function createBunRuntime({ process, Buffer, require }) {
         if (typeof next.fetch === "function") fetchHandler = next.fetch;
         if (next.routes) routes = compileRoutes(next.routes);
         if (next.websocket) wsHandlers = next.websocket;
+        if (typeof next.error === "function") errorHandler = next.error;
       },
       // Called synchronously inside `fetch` to hand a request off to the websocket
       // handler. Returns true if this request is being upgraded.
@@ -575,8 +627,8 @@ export function createBunRuntime({ process, Buffer, require }) {
 
   // ---- the Bun global --------------------------------------------------------
   const Bun = {
-    version: "1.1.34",
-    revision: "vivari-shim",
+    version: BUN_VERSION,
+    revision: BUN_REVISION,
     get env() { return process.env; },
     get argv() { return process.argv; },
     get main() { return process.argv && process.argv[1] ? process.argv[1] : ""; },
@@ -635,8 +687,12 @@ export function createBunRuntime({ process, Buffer, require }) {
         return transpileTypeScript(code, "input" + ext);
       }
       async transform(code, loader) { return this.transformSync(code, loader); }
-      scan() { return { exports: [], imports: [] }; }
-      scanImports() { return []; }
+      // scan()/scanImports() used to return hard-coded empties, which reads as "this
+      // file imports nothing" — a wrong answer a caller cannot detect. The transform
+      // in typescript-transform.js is a type-stripper, not a parser: it never builds
+      // an import/export graph, so there is nothing honest to return. Fail loudly.
+      scan() { throw new Error(TRANSPILER_SCAN_UNSUPPORTED("scan")); }
+      scanImports() { throw new Error(TRANSPILER_SCAN_UNSUPPORTED("scanImports")); }
     };
   }
 }
@@ -654,14 +710,20 @@ function makeBunTest({ process }) {
     current = suite;
     try { fn && fn(); } finally { current = parent; }
   };
+  // Bun/Jest `only` semantics are global, not per-suite: registering a single
+  // test.only anywhere narrows the whole run to the `only` tests. This flag is why
+  // it has to be tracked at registration time — by the time __run() walks the tree
+  // the suites are already built.
+  let hasOnly = false;
   const test = (name, fn, opts) => {
-    const t = { name, fn, skip: !!(opts && opts.skip) };
+    const t = { name, fn, skip: !!(opts && opts.skip), only: !!(opts && opts.only) };
+    if (t.only) hasOnly = true;
     if (current) current.tests.push(t);
     else suites.push({ name: "", tests: [t], hooks: emptyHooks() });
   };
   test.skip = (name, fn) => test(name, fn, { skip: true });
   test.todo = (name) => test(name, () => {}, { skip: true });
-  test.only = (name, fn) => test(name, fn);
+  test.only = (name, fn) => test(name, fn, { only: true });
   const it = test;
 
   const hook = (kind) => (fn) => {
@@ -678,21 +740,39 @@ function makeBunTest({ process }) {
     async __run() {
       let pass = 0, fail = 0;
       const write = (s) => process.stdout.write(s);
-      for (const fn of rootHooks.beforeAll) await fn();
-      const runSuite = async (suite, prefix) => {
+      // With an `only` registered, everything else is filtered out silently rather
+      // than reported as skipped: `only` is a focus tool, and printing the suite you
+      // asked not to run defeats it. Suites with nothing selected are skipped whole,
+      // so their beforeAll/afterAll do not run either.
+      const selected = (t) => (hasOnly ? t.only : true);
+      const suiteSelected = (s) => s.tests.some(selected) || (s.children || []).some(suiteSelected);
+
+      // `each` hooks inherit down the describe tree, root hooks included. Order is
+      // Jest's: beforeEach outermost-first, afterEach innermost-first.
+      const runSuite = async (suite, prefix, outerBeforeEach, outerAfterEach) => {
+        if (!suiteSelected(suite)) return;
+        const beforeEach = outerBeforeEach.concat(suite.hooks.beforeEach);
+        const afterEach = suite.hooks.afterEach.concat(outerAfterEach);
         for (const fn of suite.hooks.beforeAll) await fn();
         for (const t of suite.tests) {
-          for (const fn of suite.hooks.beforeEach) await fn();
+          if (!selected(t)) continue;
           const label = (prefix ? prefix + " > " : "") + t.name;
+          // A skipped test must not run the hooks either — this used to run
+          // beforeEach and then `continue` past afterEach, leaving them unpaired.
           if (t.skip) { write("  - " + label + " (skipped)\n"); continue; }
+          for (const fn of beforeEach) await fn();
           try { await t.fn(); write("  \u2713 " + label + "\n"); pass++; }
           catch (e) { write("  \u2717 " + label + "\n    " + ((e && e.message) || e) + "\n"); fail++; }
-          for (const fn of suite.hooks.afterEach) await fn();
+          for (const fn of afterEach) await fn();
         }
-        for (const child of suite.children || []) await runSuite(child, (prefix ? prefix + " > " : "") + child.name);
+        for (const child of suite.children || []) {
+          await runSuite(child, (prefix ? prefix + " > " : "") + child.name, beforeEach, afterEach);
+        }
         for (const fn of suite.hooks.afterAll) await fn();
       };
-      for (const s of suites) await runSuite(s, s.name);
+
+      for (const fn of rootHooks.beforeAll) await fn();
+      for (const s of suites) await runSuite(s, s.name, rootHooks.beforeEach, rootHooks.afterEach);
       for (const fn of rootHooks.afterAll) await fn();
       write("\n " + pass + " pass, " + fail + " fail\n");
       return fail === 0 ? 0 : 1;
@@ -790,13 +870,25 @@ function spyOn(obj, method) {
 }
 
 // bun:jsc — a couple of the introspection helpers, backed by web primitives.
+//
+// The memory helpers follow the bun:ffi pattern below: exported so an
+// `import { heapSize } from "bun:jsc"` still loads, loud on call. They used to
+// answer 0 / {current: 0, peak: 0}, which a memory-budget check reads as "nothing
+// is allocated" and happily passes. No engine exposes heap introspection to page
+// JavaScript, so there is no number we could return honestly.
 function makeBunJsc() {
+  const noHeapIntrospection = (name) => () => {
+    throw new Error(
+      "bun:jsc." + name + "() is not supported in Vivari (browser sandbox): the " +
+        "JavaScript engine exposes no heap-introspection hook to page code."
+    );
+  };
   return {
     serialize: (v) => new Uint8Array(Buffer.from(JSON.stringify(v), "utf8")),
     deserialize: (b) => JSON.parse(Buffer.from(b).toString("utf8")),
-    estimateShallowMemoryUsageOf: () => 0,
-    heapSize: () => 0,
-    memoryUsage: () => ({ current: 0, peak: 0 }),
+    estimateShallowMemoryUsageOf: noHeapIntrospection("estimateShallowMemoryUsageOf"),
+    heapSize: noHeapIntrospection("heapSize"),
+    memoryUsage: noHeapIntrospection("memoryUsage"),
   };
 }
 
@@ -858,6 +950,25 @@ function makeBunSqlite({ require }) {
     throw new Error("bun:sqlite backend integration is experimental; wire your installed wasm SQLite here.");
   }
   return { Database, default: Database };
+}
+
+// ---- Bun.serve error rendering ----------------------------------------------
+// What Bun.serve renders when a `fetch`/route handler throws. Bun hands the error
+// to the server's `error(err)` option and serves whatever Response it returns; if
+// there is no handler, or it declines by returning nothing, or it throws in turn,
+// we fall back to the shim's original hard-coded 500 (so the pre-`error` behaviour
+// is exactly preserved). Exported because this precedence is pure logic and
+// spike-bun-offline.mjs must be able to test it without binding a port.
+export async function resolveServeError(errorHandler, err) {
+  if (typeof errorHandler === "function") {
+    try {
+      const response = await errorHandler(err);
+      if (response) return response;
+    } catch (handlerErr) {
+      err = handlerErr;
+    }
+  }
+  return new Response("Bun.serve handler error: " + ((err && err.message) || err), { status: 500 });
 }
 
 // ---- Bun.serve routing ------------------------------------------------------
