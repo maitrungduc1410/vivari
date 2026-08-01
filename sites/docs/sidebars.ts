@@ -14,7 +14,7 @@ const sidebars: SidebarsConfig = {
       type: "category",
       label: "Concepts",
       collapsed: false,
-      items: ["how-it-works", "cross-origin-isolation"],
+      items: ["how-it-works", "python", "cross-origin-isolation"],
     },
     "deployment",
   ],

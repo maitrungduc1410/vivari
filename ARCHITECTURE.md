@@ -1178,9 +1178,9 @@ interpreter really is WASM (like the Wasm engines above), not a Node-backed shim
   its FS, runs scripts / `-c` / a REPL (stdout/stderr → terminal), and auto-loads wheels
   the code imports. Exposed to the VM via a Bun-style `globalThis.__ocInstallPython`.
 - `packages/kernel-host/programs/python.js` — the `python`/`python3` CLI (arg parse,
-  `-m` module handling incl. `uvicorn`/`flask`).
-- `packages/kernel-host/coreutils.js` — `uvicorn`/`flask` PATH shims (delegate to
-  `python -m …`).
+  `-m` module handling incl. `uvicorn`/`flask`/`gunicorn`/`pytest`).
+- `packages/kernel-host/coreutils.js` — `uvicorn`/`flask`/`gunicorn`/`pytest` PATH shims
+  (delegate to `python -m …`).
 - `scripts/vendor-pyodide.mjs` — vendors the Pyodide core + selected wheels into
   `packages/studio/public/vendor/pyodide/` and writes a **hybrid `pyodide-lock.json`**:
   successfully vendored packages get relative paths; the rest keep absolute CDN URLs so
@@ -1210,14 +1210,100 @@ as base64 in a JSON string. Two Pyodide-specific fixes:
   event loop (templates also use `async def` idiomatically).
 - **Proxy prefix → `root_path`/`SCRIPT_NAME`.** The bridge reads the SW's
   `X-Forwarded-Prefix` (§8.3) and sets the ASGI `root_path` / WSGI `SCRIPT_NAME`, so the
-  app emits prefixed absolute URLs that route back through the tunnel. Route matching is
-  unaffected (paths are already stripped). This is what fixes FastAPI's Swagger UI, and it
-  works across preview modes A/B (prefix `/preview/<port>`) and C (served at origin root,
-  no prefix → no header). Verified against FastAPI 0.140 / Starlette 1.3.
+  app emits prefixed absolute URLs that route back through the tunnel. On the **ASGI**
+  side the prefix is also prepended back onto `scope["path"]`/`raw_path`, because ASGI
+  defines `path` as the full path *including* `root_path`, and Starlette recovers the
+  route path by subtracting one from the other. The subtraction that bites is not the
+  top-level one — `get_route_path` strips only when `path` actually starts with
+  `root_path`, so a pre-stripped path passes through it untouched — it is the one inside
+  a mount: `Mount.matches` gives the sub-app `root_path + matched_path` (`/preview/8000`
+  + `/static`), and a `path` that never had the prefix cannot have that longer prefix
+  removed either. So every `Mount()` — `StaticFiles` above all — 404'd behind the preview
+  proxy while top-level routes were unaffected, which is why it went unnoticed. **WSGI** needs no equivalent;
+  `SCRIPT_NAME` + `PATH_INFO` is already the split form the spec asks for. This is what
+  fixes FastAPI's Swagger UI, and it works across preview modes A/B (prefix
+  `/preview/<port>`) and C (served at origin root, no prefix → no header, so the path is
+  unchanged). Verified against FastAPI 0.140 / Starlette 1.3.
 
-Templates: the **"Native" category** in `templates.ts` — Python (stdout), Python data
-science (NumPy + pandas), Python plotting (Matplotlib), FastAPI, and Flask (both with a
-live preview).
+**The `-m` allowlist is entrypoints, not implementations.** `pip`, `uvicorn`, `flask`,
+`gunicorn` and `pytest` are accepted; anything else is refused with an explicit error.
+None of them imports the package it is named after. `doUvicorn`/`doFlask`/`doGunicorn`
+parse argv and call `serve()`; `gunicorn` is the generic **WSGI** seam, so Django, Flask,
+Bottle and Pyramid share one implementation. That is an honest entrypoint rather than a
+stub in the sense of §9.2's rule: the contract it advertises — *this app is now served on
+this port* — is the one it delivers. What it cannot deliver is gunicorn's **process
+model**, so those flags are loud rather than ignored: `--worker-class`/`-k` and uvicorn's
+`--factory` are refused, because they change *what* gets served (a worker class selects a
+server model; a factory means the named attribute builds the app rather than being it) —
+`-k sync` is the exception, since the in-process WSGI bridge *is* the sync worker — while
+`--workers`/`--threads`/`--reload`/`-D` warn and continue. A value-taking flag is
+consumed even when ignored, or it would be read as the app spec. `doPytest` needs no runtime API at all — it
+synthesises `sys.exit(int(pytest.main([...])))` and runs it down the ordinary script path,
+which gets wheel auto-loading and exit-code propagation for free. That last part is why
+`terminationFromError` reports `SystemExit` the way CPython does (silent for an integer or
+bare exit, message-only for `sys.exit("text")`) instead of dumping a WASM traceback.
+
+**Django is WSGI-only.** Its ASGI path goes through `asgiref`, which starts a
+`ThreadPoolExecutor` for every request even when the views are `async def`, and the WASM
+VM has no OS threads. The `anyio` patch above does not help — different library. It also
+needs `DJANGO_ALLOW_ASYNC_UNSAFE=1` (Pyodide always has an event loop, so Django's
+`async_unsafe` guard rejects every ORM call) and the `tzdata` package (the WASM stdlib
+ships no timezone database). Both are set in the template, not the runtime.
+
+Templates: the **"Native" category** in `templates.ts` — 12 Python templates. Terminal:
+Python (stdout), data science (NumPy + pandas), plotting (Matplotlib), SQLite (stdlib
+only, fully offline), imaging (Pillow), and testing (pytest). Live preview: FastAPI,
+Flask, Flask App (Jinja + static + SQLite), FastAPI CRUD (Pydantic + Swagger), Data
+Dashboard (pandas + Matplotlib rendered into the preview), and Django.
+
+Gated by **two** spikes, split along what CI can actually enforce.
+
+`scripts/spike-python-bridge.mjs` is the real proof and runs on the **network tier**. It is
+kernel-free by necessity — `bootPyodide` does `import(indexUrl + "pyodide.mjs")`, which
+cannot be reached from Node (`import('http://…')` was removed in Node 22, and a `file://`
+indexURL then makes the browser-masked boot `fetch()` file URLs) — so it proves Python
+semantics and the bridge's protocol conversion, driving the exported `setupSource` against
+template files read out of `templates.ts`. It does **not** prove port registration, the SW
+tunnel, wheel delivery or terminal rendering, which is why all seven new templates ship
+`experimental`.
+
+`scripts/spike-python-offline.mjs` is what gates a PR. Pyodide is ~30 MB that is neither
+committed (`public/vendor` is gitignored) nor installed by CI, so the spike above can only
+be `net: true` — and that tier is schedule/dispatch-only and `continue-on-error`, so on its
+own Python would be enforced by nothing, the same hole §9.2 describes for `spike-bun.mjs`.
+Everything provable without an interpreter therefore lives in the offline spike: the argv
+contract of all four CLI seams (executed as real Node subprocesses, including the refuse/
+warn rules above), CPython-faithful `SystemExit`, the generated dispatch source — the ASGI
+`root_path` regression included — and template-registry integrity (entry files, icons, and
+`dev`/`install` commands resolving to programs that exist on PATH). It is `net: false` with
+no `needsWasm`, so `toolchain-gate`'s unfiltered `run-spikes.mjs --offline` runs it on every
+push and PR, and it asserts its own registration so the gate cannot be dropped silently.
+Both spikes read the shipped `templates.ts` through `scripts/lib/python-templates.mjs`, so
+neither can drift from what ships, and both drive the CLI seams through the one stub-runtime
+driver in `scripts/lib/python-drive.mjs`.
+
+**Terminal output is byte-transparent.** `sys.stdout`/`sys.stderr` go through Pyodide's
+byte `Writer` (`byteWriter` in `builtins/python.js`) straight onto the guest's
+`process.stdout`, so Python alone decides where its newlines fall. The `batched` load
+option is deliberately unused: it delivers newline-stripped chunks per flush, which turned
+pytest's `...........` into eleven separate lines and silently discarded any final partial
+chunk. Because CPython block-buffers a stdout it does not consider a terminal, the runtime
+calls `flushStreams()` at each point where the user should already be seeing output — after
+a script or `-c` run (before any error report, so ordering holds), after every REPL line so
+the result precedes the next `>>> `, and after each request a served app handles so a
+`print()` in a view is not held for 8 KB.
+
+Where an assertion has an authority outside this repo, that authority is what it checks
+against — a suite that only agrees with itself passes just as happily when both sides share
+a mistaken assumption. Concretely: the ASGI scope is read by Starlette's own `Mount.matches`
+and `get_route_path`, the WSGI environ runs behind `wsgiref.validate` (CPython's PEP 3333
+validator) and must satisfy the spec's `SCRIPT_NAME + PATH_INFO` invariant, `SystemExit`
+codes come from `scripts/lib/cpython-exit.mjs` and are re-derived from the machine's real
+`python3`, the CLI flag inventory is read off gunicorn's, uvicorn's and Flask's own `--help`,
+and `DJANGO_ALLOW_ASYNC_UNSAFE` is checked against Django's source. What has no outside
+authority is said to be self-referential rather than dressed up: the template-registry
+integrity checks are claims about our own registry, and the `setupSource` string assertions
+are a drift guard, not evidence of spec conformance.
 
 ---
 

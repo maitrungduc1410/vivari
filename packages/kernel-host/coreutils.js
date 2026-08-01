@@ -25,10 +25,12 @@ export const COREUTILS = {
   python: PYTHON_PROGRAM,
   python3: PYTHON_PROGRAM,
 
-  // uvicorn / flask — authentic entrypoints for the Python web-server templates.
-  // They just delegate to the `python` launcher's `-m uvicorn` / `-m flask`
-  // handling (which boots Pyodide and bridges the WSGI/ASGI app to a guest http
-  // server so the preview opens). See packages/kernel-host/programs/python.js.
+  // uvicorn / flask / gunicorn / pytest — authentic entrypoints for the Python
+  // templates. They just delegate to the `python` launcher's `-m <mod>` handling
+  // (which boots Pyodide and, for the three servers, bridges the WSGI/ASGI app to
+  // a guest http server so the preview opens). gunicorn is the generic WSGI
+  // entrypoint, so Django, Flask, Bottle and Pyramid all share one seam.
+  // See packages/kernel-host/programs/python.js.
   uvicorn: `
 'use strict';
 const cp = require('child_process');
@@ -46,6 +48,24 @@ if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
 if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
 child.on('exit', (code) => process.exit(code | 0));
 child.on('error', (e) => { process.stderr.write('flask: ' + ((e && e.message) || e) + String.fromCharCode(10)); process.exit(1); });
+`,
+  gunicorn: `
+'use strict';
+const cp = require('child_process');
+const child = cp.spawn('python', ['-m', 'gunicorn'].concat(process.argv.slice(2)), { cwd: process.cwd(), env: process.env });
+if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
+if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
+child.on('exit', (code) => process.exit(code | 0));
+child.on('error', (e) => { process.stderr.write('gunicorn: ' + ((e && e.message) || e) + String.fromCharCode(10)); process.exit(1); });
+`,
+  pytest: `
+'use strict';
+const cp = require('child_process');
+const child = cp.spawn('python', ['-m', 'pytest'].concat(process.argv.slice(2)), { cwd: process.cwd(), env: process.env });
+if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
+if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
+child.on('exit', (code) => process.exit(code | 0));
+child.on('error', (e) => { process.stderr.write('pytest: ' + ((e && e.message) || e) + String.fromCharCode(10)); process.exit(1); });
 `,
 
   // NOTE: there is no built-in `npm` here anymore. The Turbo-analog installer

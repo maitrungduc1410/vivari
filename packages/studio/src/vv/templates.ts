@@ -2798,6 +2798,1639 @@ bridges each preview request through the WSGI protocol (buffered, no streaming).
   };
 }
 
+// ── Native: Django (full-stack MVC on Pyodide) ───────────────────────────────
+// Django's ORM, migrations, template engine and URL router, all in the tab. It is
+// served over WSGI, not ASGI: Django's ASGI path goes through asgiref, which
+// starts a ThreadPoolExecutor per request even for `async def` views, and the
+// WASM VM has no OS threads. `gunicorn` is the Vivari shim for that (the generic
+// WSGI entrypoint — see packages/kernel-host/programs/python.js).
+function djangoTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "django",
+      framework: "django",
+      icon: "django",
+      category: "Native",
+      name: "Django",
+      language: "Python",
+      description: "A full-stack Django app (ORM, migrations, templates) on CPython/WASM with a live preview",
+      port: 8000,
+      openPath: "/",
+      entry: "notes/views.py",
+      hmr: false,
+      reload: false,
+      install: "python -m pip install -r requirements.txt",
+      dev: "gunicorn wsgi:application --bind 0.0.0.0:8000",
+      experimental: true,
+    },
+    files: {
+      "requirements.txt": `django>=5.0,<6.0
+tzdata
+`,
+      "settings.py": `"""Django settings for the Vivari starter — one file, no project package."""
+
+import os
+from pathlib import Path
+
+# Pyodide always has an asyncio event loop running (its WebLoop), so Django's
+# async_unsafe() guard thinks every ORM call is happening inside async context
+# and raises SynchronousOnlyOperation. This is Django's own documented escape
+# hatch, and it is safe here for a reason specific to this environment: the WASM
+# VM is single-threaded and has no OS threads, so the data race the guard exists
+# to prevent cannot occur. Set before django.setup() so every entrypoint —
+# wsgi.py, manage.py, the shell — inherits it.
+os.environ.setdefault("DJANGO_ALLOW_ASYNC_UNSAFE", "1")
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# Demo-only key. Generate a real one for anything you deploy.
+SECRET_KEY = "django-insecure-vivari-starter-do-not-use-in-production"
+DEBUG = True
+
+# The preview is served from a Vivari-generated hostname, so accept any host.
+ALLOWED_HOSTS = ["*"]
+CSRF_TRUSTED_ORIGINS = ["http://localhost:8000", "https://*.vivari.run"]
+
+INSTALLED_APPS = [
+    "django.contrib.contenttypes",
+    "notes",
+]
+
+# No session/auth/messages middleware: this starter has no login, and every
+# middleware costs boot time on a cold Pyodide start.
+MIDDLEWARE = [
+    "django.middleware.common.CommonMiddleware",
+]
+
+ROOT_URLCONF = "urls"
+WSGI_APPLICATION = "wsgi.application"
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [BASE_DIR / "templates"],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.request",
+            ],
+        },
+    },
+]
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": BASE_DIR / "db.sqlite3",
+    }
+}
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# Django 5 stores aware datetimes, and rendering one in a template converts it
+# into TIME_ZONE via zoneinfo. The WASM build of CPython ships no timezone
+# database at all — not even UTC — so zoneinfo raises unless the \`tzdata\`
+# package is loaded. That is why tzdata is in requirements.txt.
+USE_TZ = True
+TIME_ZONE = "UTC"
+`,
+      "urls.py": `from django.urls import path
+
+from notes import views
+
+urlpatterns = [
+    path("", views.index, name="index"),
+    path("notes/<int:note_id>/", views.detail, name="detail"),
+    path("notes/create/", views.create, name="create"),
+    path("notes/<int:note_id>/pin/", views.toggle_pin, name="toggle-pin"),
+    path("api/notes/", views.api_notes, name="api-notes"),
+]
+`,
+      "wsgi.py": `"""WSGI entrypoint — what \`gunicorn wsgi:application\` imports.
+
+Django normally expects \`manage.py migrate\` to have been run first. Every
+\`python\` command in Vivari is a *fresh* Pyodide interpreter with a fresh
+filesystem view, so this module brings the schema up to date itself: it is
+cheap, idempotent, and it means the preview works on a single command.
+"""
+
+import os
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "settings")
+
+import django
+from django.core.management import call_command
+from django.core.wsgi import get_wsgi_application
+
+django.setup()
+
+# run_syncdb creates tables for the apps that ship no migrations, so the starter
+# needs no migrations/ directory checked in. Add your own with
+# \`python manage.py makemigrations\` once the model settles.
+call_command("migrate", run_syncdb=True, verbosity=0)
+
+from notes.models import Note  # noqa: E402  (must follow django.setup())
+
+if not Note.objects.exists():
+    Note.objects.create(
+        title="Welcome to Django on Pyodide",
+        body="This whole app — ORM, templates, routing — runs in your browser tab.",
+        pinned=True,
+    )
+    Note.objects.create(title="Add a note below", body="It is written to db.sqlite3.")
+
+application = get_wsgi_application()
+`,
+      "manage.py": `#!/usr/bin/env python
+"""Django's command-line utility. \`python manage.py <command>\` works in Vivari
+for anything that does not need a socket or a subprocess — migrate, makemigrations,
+showmigrations, shell, check. \`runserver\` does NOT: it binds a real socket, which
+Pyodide has no way to do. Use \`gunicorn wsgi:application --bind 0.0.0.0:8000\`
+instead — Vivari bridges that to the preview.
+"""
+
+import os
+import sys
+
+
+def main() -> None:
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "settings")
+    from django.core.management import execute_from_command_line
+
+    execute_from_command_line(sys.argv)
+
+
+if __name__ == "__main__":
+    main()
+`,
+      "notes/__init__.py": ``,
+      "notes/apps.py": `from django.apps import AppConfig
+
+
+class NotesConfig(AppConfig):
+    name = "notes"
+`,
+      "notes/models.py": `from django.db import models
+
+
+class Note(models.Model):
+    """A note. Django derives the table, the admin form and the migration from this."""
+
+    title = models.CharField(max_length=120)
+    body = models.TextField(blank=True)
+    pinned = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-pinned", "-created_at"]
+
+    def __str__(self) -> str:
+        return self.title
+`,
+      "notes/views.py": `from django.http import Http404, JsonResponse
+from django.shortcuts import redirect, render
+from django.urls import reverse
+from django.views.decorators.http import require_POST
+
+from .models import Note
+
+
+def index(request):
+    notes = Note.objects.all()
+    return render(request, "notes/index.html", {"notes": notes})
+
+
+def detail(request, note_id: int):
+    try:
+        note = Note.objects.get(pk=note_id)
+    except Note.DoesNotExist as exc:
+        raise Http404(f"no note {note_id}") from exc
+    return render(request, "notes/detail.html", {"note": note})
+
+
+@require_POST
+def create(request):
+    title = (request.POST.get("title") or "").strip()
+    if title:
+        Note.objects.create(title=title, body=request.POST.get("body", ""))
+    # reverse() returns a path that already carries the preview prefix, because
+    # the bridge hands Vivari's X-Forwarded-Prefix to Django as SCRIPT_NAME.
+    return redirect(reverse("index"))
+
+
+@require_POST
+def toggle_pin(request, note_id: int):
+    note = Note.objects.filter(pk=note_id).first()
+    if note is not None:
+        note.pinned = not note.pinned
+        note.save(update_fields=["pinned"])
+    return redirect(reverse("index"))
+
+
+def api_notes(request):
+    """The ORM's .values() straight to JSON."""
+    rows = list(Note.objects.values("id", "title", "body", "pinned"))
+    return JsonResponse({"count": len(rows), "notes": rows})
+`,
+      "templates/base.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}Django on Pyodide{% endblock %}</title>
+    {% comment %}
+      CSS is inline on purpose. Django resolves STATIC_URL once and then caches
+      it, and that first read happens at import time — before any request has
+      told Django it is mounted under /preview/<port> — so the {% templatetag
+      openblock %} static {% templatetag closeblock %} tag would emit a link that
+      escapes the preview. URL reversing has no such problem: it runs per
+      request. See the README, and the flask-app / fastapi-dashboard templates
+      for static-file serving that does work here.
+    {% endcomment %}
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0; padding: 3rem 1rem; background: #0e1120; color: #eef1ff;
+        font: 16px/1.65 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main {
+        width: min(36rem, 100%); margin: 0 auto; background: #191e35;
+        border-radius: 14px; padding: 2rem; box-shadow: 0 18px 40px rgb(0 0 0 / .35);
+      }
+      h1 { margin: 0 0 .25rem; font-size: 1.6rem; }
+      .sub { color: #99a1c7; font-size: .9rem; }
+      a { color: #7fa8ff; }
+      ul.notes { list-style: none; margin: 1.5rem 0; padding: 0; display: grid; gap: .5rem; }
+      ul.notes li {
+        display: flex; align-items: center; gap: .7rem; padding: .6rem .8rem;
+        background: rgb(255 255 255 / .04); border-radius: 9px;
+      }
+      ul.notes li.empty { color: #99a1c7; justify-content: center; }
+      form { margin: 0; }
+      form.add { display: grid; grid-template-columns: 1fr 1fr auto; gap: .5rem; }
+      input {
+        border: 1px solid rgb(255 255 255 / .14); border-radius: 8px; padding: .55rem .75rem;
+        background: rgb(0 0 0 / .25); color: inherit;
+      }
+      button {
+        cursor: pointer; border: 0; border-radius: 8px; padding: .45rem .9rem;
+        background: #7fa8ff; color: #10132a; font-weight: 700;
+      }
+      ul.notes button { background: transparent; color: #ffd166; font-size: 1.1rem; padding: 0 .2rem; }
+    </style>
+  </head>
+  <body>
+    <main>{% block content %}{% endblock %}</main>
+  </body>
+</html>
+`,
+      "notes/templates/notes/index.html": `{% extends "base.html" %}
+
+{% block title %}Notes — Django on Pyodide{% endblock %}
+
+{% block content %}
+  <h1>Notes</h1>
+  <p class="sub">Django's ORM, template engine and URL router — all in your browser tab.</p>
+
+  <ul class="notes">
+    {% for note in notes %}
+      <li>
+        <form method="post" action="{% url 'toggle-pin' note.id %}">
+          <button type="submit" title="Pin">{% if note.pinned %}★{% else %}☆{% endif %}</button>
+        </form>
+        {# {% url %} emits the preview-prefixed path, so links stay in the preview. #}
+        <a href="{% url 'detail' note.id %}">{{ note.title }}</a>
+      </li>
+    {% empty %}
+      <li class="empty">No notes yet.</li>
+    {% endfor %}
+  </ul>
+
+  <form class="add" method="post" action="{% url 'create' %}">
+    <input name="title" placeholder="Note title…" autocomplete="off" required />
+    <input name="body" placeholder="Body (optional)" autocomplete="off" />
+    <button type="submit">Add</button>
+  </form>
+
+  <p class="sub">JSON: <a href="{% url 'api-notes' %}">/api/notes/</a></p>
+{% endblock %}
+`,
+      "notes/templates/notes/detail.html": `{% extends "base.html" %}
+
+{% block title %}{{ note.title }}{% endblock %}
+
+{% block content %}
+  <h1>{{ note.title }}</h1>
+  <p class="sub">
+    {% if note.pinned %}Pinned · {% endif %}created {{ note.created_at }}
+  </p>
+  <p>{{ note.body|default:"(no body)" }}</p>
+  <p><a href="{% url 'index' %}">&larr; All notes</a></p>
+{% endblock %}
+`,
+      "README.md": `# Django starter (Pyodide)
+
+A real **Django** project — ORM, migrations, the template engine and URL routing —
+running on **CPython compiled to WebAssembly** (Pyodide), entirely in your browser.
+
+\`\`\`bash
+python -m pip install -r requirements.txt   # installs Django from PyPI (micropip)
+gunicorn wsgi:application --bind 0.0.0.0:8000
+\`\`\`
+
+\`gunicorn\` is a Vivari shim. Pyodide has no real sockets, so it boots Pyodide,
+imports \`wsgi:application\`, and bridges each preview request through WSGI. It is
+the generic WSGI entrypoint, so the same command works for Flask, Bottle or
+Pyramid.
+
+## Layout
+
+| File | Role |
+| --- | --- |
+| \`settings.py\` | one-file settings — no project package |
+| \`urls.py\` | URL routing |
+| \`notes/\` | the app: model, views, templates |
+| \`wsgi.py\` | entrypoint; runs \`migrate\` so one command is enough |
+| \`manage.py\` | Django's CLI |
+
+\`python manage.py <command>\` works for anything that needs no socket or
+subprocess — \`check\`, \`migrate\`, \`makemigrations\`, \`showmigrations\`, \`shell\`.
+**\`runserver\` does not**: it binds a real socket, which Pyodide cannot do. It
+fails with \`emscripten does not support processes\`. Use \`gunicorn\` instead.
+
+## Things that are specific to running Django in a browser
+
+**WSGI only — not ASGI.** Django's ASGI path goes through \`asgiref\`, which starts
+a \`ThreadPoolExecutor\` for every request even when your views are \`async def\`.
+The WASM VM has no OS threads, so that raises \`can't start new thread\`. The WSGI
+path skips \`asgiref\` entirely, which is why this starter uses \`gunicorn\` rather
+than \`uvicorn\`.
+
+**\`DJANGO_ALLOW_ASYNC_UNSAFE=1\`** is set at the top of \`settings.py\`. Pyodide
+always has an asyncio event loop running, so Django's \`async_unsafe()\` guard
+believes every ORM call is happening inside async context and raises
+\`SynchronousOnlyOperation\`. The guard exists to prevent a data race that cannot
+happen here: the VM is single-threaded.
+
+**\`tzdata\` is in \`requirements.txt\`.** The WASM build of CPython ships no
+timezone database — not even UTC — so rendering an aware datetime raises
+\`ZoneInfoNotFoundError\` without it.
+
+**CSS is inline in \`templates/base.html\`.** Django reads \`STATIC_URL\` once and
+caches it, and that first read happens at import time, before any request has
+told Django it is mounted under \`/preview/<port>\`. So \`{% static %}\` emits a link
+that escapes the preview. URL reversing — \`{% url %}\` and \`reverse()\` — is
+resolved per request and *is* prefix-correct, which is why every link and form
+action here uses it. For static-file serving that works, see the \`flask-app\` and
+\`fastapi-dashboard\` templates.
+
+**\`db.sqlite3\` lives inside the VM.** Files written by a *served* app are not
+mirrored back into the editor (only files written by \`python script.py\` are), so
+the database will not appear in the file explorer.
+
+Django is not part of Pyodide's prebuilt wheel set, so it is installed from PyPI
+via **micropip** on first run — that needs network access in the browser.
+`,
+    },
+  };
+}
+
+// ── Native: Flask app (Jinja + static + SQLite on Pyodide) ───────────────────
+// The step up from the `flask` starter: templates, a stylesheet, a database and a
+// JSON API rather than a single string response.
+function flaskAppTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "flask-app",
+      framework: "flask",
+      icon: "flask",
+      category: "Native",
+      name: "Flask App",
+      language: "Python",
+      description: "A Flask app with Jinja templates, static files and SQLite on CPython/WASM",
+      port: 8000,
+      openPath: "/",
+      entry: "main.py",
+      hmr: false,
+      reload: false,
+      install: "python -m pip install -r requirements.txt",
+      dev: "flask --app main run --port 8000",
+      experimental: true,
+    },
+    files: {
+      "requirements.txt": `flask
+`,
+      "main.py": `# A realistic Flask app on CPython/WASM (Pyodide): Jinja templates, a static
+# stylesheet, SQLite persistence and a JSON API — served straight into Vivari's
+# preview pane.
+#
+# Pyodide has no real sockets, so \`flask run\` is a Vivari shim: it boots Pyodide,
+# imports this module, and bridges each preview request through WSGI.
+import sqlite3
+from pathlib import Path
+
+from flask import Flask, g, jsonify, redirect, render_template, request, url_for
+
+DB = Path(__file__).with_name("tasks.db")
+
+app = Flask(__name__)
+
+
+# ---- database ---------------------------------------------------------------
+# One connection per request, closed on teardown — the standard Flask pattern.
+def get_db() -> sqlite3.Connection:
+    if "db" not in g:
+        g.db = sqlite3.connect(DB)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(_exc: object) -> None:
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def init_db() -> None:
+    with sqlite3.connect(DB) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT    NOT NULL,
+                done  INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        (count,) = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
+        if count == 0:
+            conn.executemany(
+                "INSERT INTO tasks (title, done) VALUES (?, ?)",
+                [("Read the Flask template", 1), ("Add a task below", 0)],
+            )
+
+
+init_db()
+
+
+# ---- pages ------------------------------------------------------------------
+@app.get("/")
+def index() -> str:
+    tasks = get_db().execute("SELECT * FROM tasks ORDER BY id").fetchall()
+    return render_template("index.html", tasks=tasks)
+
+
+@app.post("/tasks")
+def create_task():
+    title = (request.form.get("title") or "").strip()
+    if title:
+        db = get_db()
+        db.execute("INSERT INTO tasks (title) VALUES (?)", (title,))
+        db.commit()
+    # url_for() generates a path that includes the preview prefix, because the
+    # bridge passes Vivari's X-Forwarded-Prefix through as WSGI SCRIPT_NAME.
+    return redirect(url_for("index"))
+
+
+@app.post("/tasks/<int:task_id>/toggle")
+def toggle_task(task_id: int):
+    db = get_db()
+    db.execute("UPDATE tasks SET done = 1 - done WHERE id = ?", (task_id,))
+    db.commit()
+    return redirect(url_for("index"))
+
+
+# ---- JSON API ---------------------------------------------------------------
+@app.get("/api/tasks")
+def list_tasks():
+    rows = get_db().execute("SELECT * FROM tasks ORDER BY id").fetchall()
+    return jsonify([dict(row) for row in rows])
+
+
+@app.post("/api/tasks")
+def add_task():
+    payload = request.get_json(silent=True) or {}
+    title = (payload.get("title") or "").strip()
+    if not title:
+        return jsonify(error="title is required"), 400
+    db = get_db()
+    cur = db.execute("INSERT INTO tasks (title) VALUES (?)", (title,))
+    db.commit()
+    return jsonify(id=cur.lastrowid, title=title, done=0), 201
+`,
+      "templates/index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Flask tasks on Pyodide</title>
+    <!-- url_for() emits the preview-prefixed path, so this resolves inside the preview. -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}" />
+  </head>
+  <body>
+    <main>
+      <h1>Tasks</h1>
+      <p class="sub">Flask + Jinja + SQLite, running on CPython compiled to WebAssembly.</p>
+
+      <ul class="tasks">
+        {% for task in tasks %}
+          <li class="{{ 'done' if task['done'] else '' }}">
+            <form method="post" action="{{ url_for('toggle_task', task_id=task['id']) }}">
+              <button type="submit" aria-label="Toggle">{{ '✓' if task['done'] else '○' }}</button>
+            </form>
+            <span>{{ task['title'] }}</span>
+          </li>
+        {% else %}
+          <li class="empty">Nothing here yet.</li>
+        {% endfor %}
+      </ul>
+
+      <form class="add" method="post" action="{{ url_for('create_task') }}">
+        <input name="title" placeholder="Add a task…" autocomplete="off" required />
+        <button type="submit">Add</button>
+      </form>
+
+      <p class="sub">
+        JSON API: <a href="{{ url_for('list_tasks') }}">/api/tasks</a>
+      </p>
+    </main>
+  </body>
+</html>
+`,
+      "static/app.css": `:root {
+  color-scheme: light dark;
+  --bg: #0f1225;
+  --card: #191d38;
+  --text: #eef0ff;
+  --muted: #9aa0c9;
+  --accent: #7c9cff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: start center;
+  padding: 3rem 1rem;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+main {
+  width: min(34rem, 100%);
+  background: var(--card);
+  border-radius: 14px;
+  padding: 2rem;
+  box-shadow: 0 18px 40px rgb(0 0 0 / 0.35);
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.6rem;
+}
+
+.sub {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.tasks {
+  list-style: none;
+  margin: 1.5rem 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.tasks li {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.8rem;
+  background: rgb(255 255 255 / 0.04);
+  border-radius: 9px;
+}
+
+.tasks li.done span {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.tasks li.empty {
+  color: var(--muted);
+  justify-content: center;
+}
+
+form {
+  margin: 0;
+}
+
+button {
+  cursor: pointer;
+  border: 0;
+  border-radius: 8px;
+  padding: 0.45rem 0.9rem;
+  background: var(--accent);
+  color: #10132a;
+  font-weight: 700;
+}
+
+.tasks button {
+  background: transparent;
+  color: var(--accent);
+  padding: 0.1rem 0.35rem;
+  font-size: 1.1rem;
+}
+
+.add {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.add input {
+  flex: 1;
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-radius: 8px;
+  padding: 0.55rem 0.75rem;
+  background: rgb(0 0 0 / 0.25);
+  color: inherit;
+}
+
+a {
+  color: var(--accent);
+}
+`,
+      "README.md": `# Flask app starter (Pyodide)
+
+A realistic **Flask** app — Jinja templates, a static stylesheet, SQLite
+persistence and a JSON API — running on **CPython compiled to WebAssembly**
+(Pyodide), entirely in your browser.
+
+\`\`\`bash
+python -m pip install -r requirements.txt   # installs Flask from PyPI (micropip)
+flask --app main run --port 8000            # serves the app + opens the preview
+\`\`\`
+
+Pyodide has no real sockets, so \`flask run\` is a Vivari shim: it boots Pyodide,
+imports \`main:app\`, and bridges each preview request through WSGI.
+
+## What it shows
+
+- **Jinja templates** — \`templates/index.html\`, rendered with \`render_template\`.
+- **Static files** — \`static/app.css\`, served through Flask's own static route.
+- **SQLite** — a real \`tasks.db\`, one connection per request via \`g\`, closed on
+  teardown.
+- **Forms and a JSON API** on the same routes, with \`url_for\` for every link.
+
+\`url_for()\` generates paths that include the preview prefix, because the bridge
+passes Vivari's \`X-Forwarded-Prefix\` to Flask as the WSGI \`SCRIPT_NAME\`. Always
+use it rather than hardcoding \`/…\`, or links will escape the preview frame back
+to the studio.
+
+## Limits worth knowing
+
+Flask is not part of Pyodide's prebuilt wheel set, so it is installed from PyPI
+via **micropip** on first run — that needs network access in the browser.
+
+Requests and responses are buffered end to end: no streaming, no Server-Sent
+Events, no WebSocket. \`tasks.db\` lives inside the VM and is not mirrored back
+into the editor, because only files written by \`python script.py\` are.
+`,
+    },
+  };
+}
+
+// ── Native: FastAPI CRUD (Pydantic + SQLite on Pyodide) ──────────────────────
+// The step up from the `fastapi` starter: a validated CRUD resource with real
+// status codes, backed by SQLite, with Swagger at /docs. Keeps one deliberately
+// sync endpoint so the anyio threadpool patch stays exercised.
+function fastapiCrudTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "fastapi-crud",
+      framework: "fastapi",
+      icon: "fastapi",
+      category: "Native",
+      name: "FastAPI CRUD",
+      language: "Python",
+      description: "A FastAPI CRUD service with Pydantic models, SQLite and Swagger docs on CPython/WASM",
+      port: 8000,
+      openPath: "/",
+      entry: "main.py",
+      hmr: false,
+      reload: false,
+      install: "python -m pip install -r requirements.txt",
+      dev: "uvicorn main:app --port 8000",
+      experimental: true,
+    },
+    files: {
+      "requirements.txt": `fastapi
+`,
+      "main.py": `# A FastAPI CRUD service on CPython/WASM (Pyodide): Pydantic request/response
+# models, SQLite persistence, proper status codes, and the auto-generated Swagger
+# UI at /docs.
+#
+# Pyodide has no real sockets, so \`uvicorn\` is a Vivari shim: it boots Pyodide,
+# imports this module, and bridges each preview request through ASGI.
+import sqlite3
+from contextlib import closing
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+
+DB = Path(__file__).with_name("notes.db")
+
+app = FastAPI(
+    title="Notes API",
+    description="A small CRUD service running entirely in your browser.",
+    version="1.0.0",
+)
+
+
+# ---- schema -----------------------------------------------------------------
+# Pydantic models are the contract: FastAPI validates requests against them,
+# serialises responses through them, and derives the OpenAPI schema from them.
+class NoteIn(BaseModel):
+    title: str = Field(min_length=1, max_length=120, examples=["Buy milk"])
+    body: str = Field(default="", max_length=2000)
+
+
+class Note(NoteIn):
+    id: int
+
+
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with closing(connect()) as conn, conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notes (
+                id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                body  TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        (count,) = conn.execute("SELECT COUNT(*) FROM notes").fetchone()
+        if count == 0:
+            conn.execute(
+                "INSERT INTO notes (title, body) VALUES (?, ?)",
+                ("Welcome", "Edit main.py and the preview reloads on the next request."),
+            )
+
+
+init_db()
+
+
+# ---- routes -----------------------------------------------------------------
+# Endpoints are \`async def\` so they run directly on the event loop. A plain \`def\`
+# also works — Vivari patches Starlette's threadpool to run inline, because the
+# WASM VM has no OS threads — but async is the idiomatic choice.
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def index() -> str:
+    # Relative links keep navigation inside the preview (/preview/<port>/…).
+    return """
+    <!doctype html>
+    <html>
+      <head><title>Notes API</title></head>
+      <body style="font-family: system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; line-height: 1.7;">
+        <h1>Notes API</h1>
+        <p>A FastAPI CRUD service on CPython compiled to WebAssembly.</p>
+        <ul>
+          <li><a href="docs">Swagger UI</a> — try every endpoint from the browser</li>
+          <li><a href="redoc">ReDoc</a></li>
+          <li><a href="notes">GET /notes</a></li>
+        </ul>
+      </body>
+    </html>
+    """
+
+
+@app.get("/notes", response_model=list[Note], tags=["notes"])
+async def list_notes() -> list[Note]:
+    with closing(connect()) as conn:
+        rows = conn.execute("SELECT * FROM notes ORDER BY id").fetchall()
+    return [Note(**dict(row)) for row in rows]
+
+
+@app.get("/notes/{note_id}", response_model=Note, tags=["notes"])
+async def read_note(note_id: int) -> Note:
+    with closing(connect()) as conn:
+        row = conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no note {note_id}")
+    return Note(**dict(row))
+
+
+@app.post("/notes", response_model=Note, status_code=status.HTTP_201_CREATED, tags=["notes"])
+async def create_note(payload: NoteIn) -> Note:
+    with closing(connect()) as conn, conn:
+        cur = conn.execute(
+            "INSERT INTO notes (title, body) VALUES (?, ?)", (payload.title, payload.body)
+        )
+    return Note(id=cur.lastrowid, **payload.model_dump())
+
+
+@app.put("/notes/{note_id}", response_model=Note, tags=["notes"])
+async def update_note(note_id: int, payload: NoteIn) -> Note:
+    with closing(connect()) as conn, conn:
+        cur = conn.execute(
+            "UPDATE notes SET title = ?, body = ? WHERE id = ?",
+            (payload.title, payload.body, note_id),
+        )
+    if cur.rowcount == 0:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no note {note_id}")
+    return Note(id=note_id, **payload.model_dump())
+
+
+@app.delete("/notes/{note_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["notes"])
+async def delete_note(note_id: int) -> None:
+    with closing(connect()) as conn, conn:
+        cur = conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+    if cur.rowcount == 0:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no note {note_id}")
+
+
+# A sync endpoint, kept deliberately: it proves the threadpool patch still works.
+@app.get("/health", tags=["meta"])
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+`,
+      "README.md": `# FastAPI CRUD starter (Pyodide)
+
+A **FastAPI** CRUD service — Pydantic models, SQLite persistence, real status
+codes and the auto-generated Swagger UI — running on **CPython compiled to
+WebAssembly** (Pyodide), entirely in your browser.
+
+\`\`\`bash
+python -m pip install -r requirements.txt   # loads FastAPI (vendored wheels)
+uvicorn main:app --port 8000                # serves the app + opens the preview
+\`\`\`
+
+Open **\`/docs\`** in the preview and use "Try it out" to exercise every endpoint
+without leaving the browser.
+
+## What it shows
+
+| Endpoint | |
+| --- | --- |
+| \`GET /notes\` | list, serialised through a Pydantic response model |
+| \`POST /notes\` | validated body, \`201 Created\` |
+| \`GET /notes/{id}\` | \`404\` via \`HTTPException\` when missing |
+| \`PUT /notes/{id}\` | update |
+| \`DELETE /notes/{id}\` | \`204 No Content\` |
+| \`GET /health\` | a deliberately **sync** \`def\` endpoint |
+
+\`/health\` is sync on purpose. Starlette would normally push a sync endpoint onto
+a threadpool, which the WASM VM cannot do — Vivari patches
+\`anyio.to_thread.run_sync\` to run the callable inline instead. Keeping one sync
+route here means that patch is exercised, not just assumed.
+
+FastAPI, Starlette and Pydantic all ship in Vivari's vendored Pyodide bundle, so
+this template loads same-origin and works offline.
+
+## Limits worth knowing
+
+Endpoints are \`async def\` and run directly on the event loop. Note that
+\`asyncio.run()\` does **not** work under Pyodide — it needs WebAssembly stack
+switching. Use module-level \`await\` if you need to run a coroutine at import
+time.
+
+Requests and responses are buffered end to end: no streaming responses, no
+Server-Sent Events, no WebSocket. \`notes.db\` lives inside the VM and is not
+mirrored back into the editor, because only files written by \`python script.py\`
+are.
+`,
+    },
+  };
+}
+
+// ── Native: Data dashboard (pandas + Matplotlib into the preview) ────────────
+// The Matplotlib starter writes a PNG you have to open by hand; this one renders
+// the figure into an HTTP response, so the chart shows up in the preview pane.
+// Everything it needs is in the vendored wheel closure, so it runs offline.
+function fastapiDashboardTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "fastapi-dashboard",
+      framework: "fastapi",
+      icon: "fastapi",
+      category: "Native",
+      name: "Data Dashboard",
+      language: "Python",
+      description: "pandas + Matplotlib rendered into a live preview by FastAPI, on CPython/WASM",
+      port: 8000,
+      openPath: "/",
+      entry: "main.py",
+      hmr: false,
+      reload: false,
+      install: "python -m pip install -r requirements.txt",
+      dev: "uvicorn main:app --port 8000",
+      experimental: true,
+    },
+    files: {
+      "requirements.txt": `fastapi
+matplotlib
+pandas
+`,
+      "main.py": `# A data dashboard on CPython/WASM (Pyodide): pandas does the aggregation,
+# Matplotlib renders the chart, and FastAPI serves it straight into the preview
+# pane as a PNG — no DOM, no plotting window, no server.
+#
+# Everything here loads from Vivari's vendored wheels, so it runs offline.
+import io
+
+import matplotlib
+
+matplotlib.use("Agg")  # headless: draw into a buffer, never a window
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
+
+app = FastAPI(title="Sales dashboard")
+
+REGIONS = ["North", "South", "East", "West"]
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun"]
+
+
+def sales_frame() -> pd.DataFrame:
+    """Deterministic sample data — same numbers on every run."""
+    rng = np.random.default_rng(seed=20240501)
+    data = rng.integers(low=40, high=140, size=(len(MONTHS), len(REGIONS)))
+    trend = np.arange(len(MONTHS)).reshape(-1, 1) * 6
+    return pd.DataFrame(data + trend, index=MONTHS, columns=REGIONS)
+
+
+DF = sales_frame()
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> str:
+    totals = DF.sum().sort_values(ascending=False)
+    best_region = str(totals.index[0])
+    rows = "\\n".join(
+        f"<tr><th>{month}</th>"
+        + "".join(f"<td>{int(value)}</td>" for value in DF.loc[month])
+        + "</tr>"
+        for month in DF.index
+    )
+    headers = "".join(f"<th>{region}</th>" for region in DF.columns)
+    # Relative URLs keep every request inside the preview (/preview/<port>/…).
+    return f"""
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>Sales dashboard</title>
+        <link rel="stylesheet" href="static/app.css" />
+      </head>
+      <body>
+        <main>
+          <h1>Sales dashboard</h1>
+          <p class="sub">
+            pandas + Matplotlib, rendered server-side on CPython/WASM.
+            Best region so far: <strong>{best_region}</strong> ({int(totals.iloc[0]):,} units).
+          </p>
+          <img src="chart.png" alt="Monthly sales by region" width="880" />
+          <table>
+            <thead><tr><th></th>{headers}</tr></thead>
+            <tbody>{rows}</tbody>
+          </table>
+          <p class="sub">Raw numbers: <a href="api/summary">/api/summary</a></p>
+        </main>
+      </body>
+    </html>
+    """
+
+
+@app.get("/chart.png")
+async def chart() -> Response:
+    """Render the figure into memory and return the PNG bytes."""
+    fig, ax = plt.subplots(figsize=(11, 4.5), dpi=110)
+    for region in DF.columns:
+        ax.plot(DF.index, DF[region], marker="o", linewidth=2, label=region)
+    ax.set_title("Monthly sales by region")
+    ax.set_xlabel("Month")
+    ax.set_ylabel("Units")
+    ax.grid(True, alpha=0.25)
+    ax.legend(ncols=len(DF.columns), loc="upper left")
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)  # release the figure; the WASM heap is not infinite
+    return Response(buf.getvalue(), media_type="image/png")
+
+
+@app.get("/api/summary")
+async def summary() -> dict[str, object]:
+    totals = DF.sum()
+    return {
+        "months": list(DF.index),
+        "regions": list(DF.columns),
+        "total_units": int(totals.sum()),
+        "per_region": {region: int(value) for region, value in totals.items()},
+        "best_month": str(DF.sum(axis=1).idxmax()),
+    }
+
+
+# StaticFiles is a Mount, so it exercises the ASGI root_path handling that makes
+# mounted apps resolve correctly behind Vivari's preview proxy.
+app.mount("/static", StaticFiles(directory="static"), name="static")
+`,
+      "static/app.css": `:root {
+  color-scheme: dark;
+  --bg: #10131f;
+  --card: #1a1f33;
+  --text: #eef1ff;
+  --muted: #98a0c4;
+  --accent: #6ea8ff;
+}
+
+body {
+  margin: 0;
+  padding: 2.5rem 1rem;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+main {
+  width: min(60rem, 100%);
+  margin: 0 auto;
+}
+
+h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.7rem;
+}
+
+.sub {
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+img {
+  width: 100%;
+  height: auto;
+  margin: 1.5rem 0;
+  border-radius: 12px;
+  background: #fff;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--card);
+  border-radius: 12px;
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+}
+
+th,
+td {
+  padding: 0.55rem 0.85rem;
+  text-align: right;
+  border-bottom: 1px solid rgb(255 255 255 / 0.06);
+}
+
+thead th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+tbody th {
+  text-align: left;
+  font-weight: 600;
+}
+
+tbody tr:last-child td,
+tbody tr:last-child th {
+  border-bottom: 0;
+}
+
+a {
+  color: var(--accent);
+}
+`,
+      "README.md": `# Data dashboard starter (Pyodide)
+
+**pandas** aggregates, **Matplotlib** renders, and **FastAPI** serves the chart
+straight into the preview pane as a PNG — all on **CPython compiled to
+WebAssembly** (Pyodide), entirely in your browser.
+
+\`\`\`bash
+python -m pip install -r requirements.txt   # loads the vendored wheels
+uvicorn main:app --port 8000                # serves the app + opens the preview
+\`\`\`
+
+Every package here — FastAPI, pandas, Matplotlib, NumPy — ships in Vivari's
+vendored Pyodide bundle, so this template loads same-origin and runs **offline**.
+
+## What it shows
+
+- **A chart in the preview, not a file.** The Matplotlib template writes
+  \`plot.png\` and asks you to open it. Here \`/chart.png\` renders the figure into
+  an in-memory buffer and returns the bytes as an \`image/png\` response, so the
+  browser displays it inline.
+- **The headless \`Agg\` backend.** The process runs in a Web Worker with no DOM,
+  so there is no interactive plot window — \`matplotlib.use("Agg")\` is required.
+  \`plt.close(fig)\` afterwards matters: the WASM heap is not infinite.
+- **\`StaticFiles\`.** \`app.mount("/static", ...)\` is an ASGI \`Mount\`, which
+  resolves correctly behind the preview proxy.
+- **Deterministic data.** The sample frame is seeded, so the numbers are the same
+  on every run and the page is safe to diff.
+
+## Limits worth knowing
+
+Requests and responses are buffered end to end: no streaming, no Server-Sent
+Events, no WebSocket. Regenerating the chart on every request is fine at this
+size, but each render costs real CPU inside the tab — cache the PNG if you make
+the figure much bigger.
+`,
+    },
+  };
+}
+
+// ── Native: Python testing (pytest) ──────────────────────────────────────────
+// Terminal-first. `pytest` is a Vivari shim over `python -m pytest`, which
+// synthesises sys.exit(pytest.main([...])) so the real exit code propagates.
+function pythonPytestTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "python-pytest",
+      framework: "python",
+      icon: "pytest",
+      category: "Native",
+      name: "Testing",
+      language: "Python",
+      description: "A pytest suite on CPython (Pyodide) — fixtures, parametrize and real exit codes",
+      port: 8000,
+      openPath: "/",
+      entry: "tests/test_cart.py",
+      hmr: false,
+      reload: false,
+      install: "python -m pip install -r requirements.txt",
+      dev: "pytest -q",
+      experimental: true,
+    },
+    files: {
+      "requirements.txt": `pytest
+`,
+      "cart.py": `"""A tiny shopping cart — the code under test."""
+
+from dataclasses import dataclass, field
+
+
+class OutOfStock(Exception):
+    """Raised when a line item asks for more than the catalogue holds."""
+
+
+@dataclass(frozen=True)
+class Item:
+    sku: str
+    price_cents: int
+    stock: int
+
+
+@dataclass
+class Cart:
+    catalogue: dict[str, Item]
+    lines: dict[str, int] = field(default_factory=dict)
+
+    def add(self, sku: str, quantity: int = 1) -> None:
+        if quantity < 1:
+            raise ValueError("quantity must be at least 1")
+        item = self.catalogue[sku]
+        wanted = self.lines.get(sku, 0) + quantity
+        if wanted > item.stock:
+            raise OutOfStock(f"only {item.stock} x {sku} left")
+        self.lines[sku] = wanted
+
+    def subtotal_cents(self) -> int:
+        return sum(self.catalogue[sku].price_cents * n for sku, n in self.lines.items())
+
+    def total_cents(self, discount_percent: int = 0) -> int:
+        if not 0 <= discount_percent <= 100:
+            raise ValueError("discount must be between 0 and 100")
+        subtotal = self.subtotal_cents()
+        return subtotal - round(subtotal * discount_percent / 100)
+`,
+      "tests/test_cart.py": `"""The suite. Run it with \`pytest -q\` in the terminal."""
+
+import pytest
+
+from cart import Cart, Item, OutOfStock
+
+CATALOGUE = {
+    "mug": Item("mug", price_cents=1200, stock=4),
+    "tee": Item("tee", price_cents=2500, stock=2),
+    "cap": Item("cap", price_cents=1800, stock=0),
+}
+
+
+@pytest.fixture
+def cart() -> Cart:
+    """A fresh cart per test — fixtures keep tests independent."""
+    return Cart(catalogue=dict(CATALOGUE))
+
+
+def test_empty_cart_costs_nothing(cart: Cart) -> None:
+    assert cart.subtotal_cents() == 0
+
+
+def test_add_accumulates_quantity(cart: Cart) -> None:
+    cart.add("mug")
+    cart.add("mug", 2)
+    assert cart.lines == {"mug": 3}
+    assert cart.subtotal_cents() == 3600
+
+
+@pytest.mark.parametrize(
+    ("discount", "expected"),
+    [(0, 3700), (10, 3330), (50, 1850), (100, 0)],
+)
+def test_discount_is_applied(cart: Cart, discount: int, expected: int) -> None:
+    """One test body, four cases — parametrize reports them separately."""
+    cart.add("mug")
+    cart.add("tee")
+    assert cart.total_cents(discount) == expected
+
+
+def test_cannot_oversell(cart: Cart) -> None:
+    with pytest.raises(OutOfStock, match="only 2 x tee left"):
+        cart.add("tee", 3)
+
+
+def test_out_of_stock_item_is_never_addable(cart: Cart) -> None:
+    with pytest.raises(OutOfStock):
+        cart.add("cap")
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_quantity_must_be_positive(cart: Cart, bad: int) -> None:
+    with pytest.raises(ValueError):
+        cart.add("mug", bad)
+
+
+def test_unknown_sku_raises_keyerror(cart: Cart) -> None:
+    with pytest.raises(KeyError):
+        cart.add("hat")
+`,
+      "conftest.py": `# An empty conftest.py at the project root is the conventional way to make the
+# root importable from tests: pytest inserts the directory holding a conftest.py
+# onto sys.path, so \`from cart import Cart\` resolves without any packaging.
+`,
+      "README.md": `# Python testing starter (pytest)
+
+A **pytest** suite running on **CPython compiled to WebAssembly** (Pyodide),
+entirely in your browser.
+
+\`\`\`bash
+python -m pip install -r requirements.txt   # warms the pytest wheel
+pytest -q                                   # run the suite
+pytest -q -k discount                       # run a subset
+pytest tests/test_cart.py::test_cannot_oversell
+\`\`\`
+
+\`pytest\` and \`python -m pytest\` are the same thing here: Vivari's shim
+synthesises \`sys.exit(pytest.main([...]))\` and runs it, so pytest's real exit
+code becomes the process exit code — 0 when green, 1 when a test fails. That
+means \`pytest && echo ok\` behaves the way you would expect in a shell script.
+
+## What it shows
+
+\`cart.py\` is the code under test; \`tests/test_cart.py\` covers it with the four
+things you reach for most:
+
+- **fixtures** — a fresh \`Cart\` per test, so tests stay independent
+- **\`@pytest.mark.parametrize\`** — one body, four discount cases, reported
+  separately
+- **\`pytest.raises\`** — including \`match=\` to assert on the message
+- **exception types** as part of the contract (\`OutOfStock\`, \`ValueError\`,
+  \`KeyError\`)
+
+The empty \`conftest.py\` at the project root is what makes \`from cart import Cart\`
+resolve: pytest puts the directory containing a \`conftest.py\` on \`sys.path\`.
+
+## Limits worth knowing
+
+The \`pytest\` wheel is not in Vivari's vendored bundle, so it is fetched from the
+Pyodide CDN on first run — that needs network access in the browser. It is cached
+afterwards.
+
+Plugins that need processes or threads do **not** work: no \`pytest-xdist\`
+(\`-n auto\`), no \`--looponfail\`. The WASM VM has neither \`fork\` nor OS threads.
+Plain pure-Python plugins are fine.
+`,
+    },
+  };
+}
+
+// ── Native: Python SQLite (stdlib only) ──────────────────────────────────────
+// The only Python starter with zero dependencies: sqlite3 is compiled into the
+// interpreter, so this one needs no wheel fetch and no network at all.
+function pythonSqliteTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "python-sqlite",
+      framework: "python",
+      icon: "sqlite",
+      category: "Native",
+      name: "SQLite",
+      language: "Python",
+      description: "Python's stdlib sqlite3 — schema, joins and aggregates, with no wheels and no network",
+      port: 8000,
+      openPath: "/",
+      entry: "main.py",
+      hmr: false,
+      reload: false,
+      install: "python --version",
+      dev: "python main.py",
+      experimental: true,
+    },
+    files: {
+      "main.py": `# SQLite with Python's standard library, running on CPython/WASM (Pyodide).
+# sqlite3 is compiled into the interpreter, so this template needs NO wheels and
+# NO network — it is the one Python starter that works fully offline.
+#
+# The database is a real file. Vivari mirrors files a script writes back into the
+# editor, so library.db shows up in the explorer when this finishes.
+import sqlite3
+from pathlib import Path
+
+DB = "library.db"
+
+SCHEMA = """
+DROP TABLE IF EXISTS loans;
+DROP TABLE IF EXISTS books;
+DROP TABLE IF EXISTS members;
+
+CREATE TABLE members (
+    id      INTEGER PRIMARY KEY,
+    name    TEXT NOT NULL
+);
+
+CREATE TABLE books (
+    id      INTEGER PRIMARY KEY,
+    title   TEXT NOT NULL,
+    author  TEXT NOT NULL,
+    year    INTEGER NOT NULL
+);
+
+CREATE TABLE loans (
+    id        INTEGER PRIMARY KEY,
+    book_id   INTEGER NOT NULL REFERENCES books(id),
+    member_id INTEGER NOT NULL REFERENCES members(id)
+);
+"""
+
+MEMBERS = [(1, "Ada"), (2, "Grace"), (3, "Alan")]
+
+BOOKS = [
+    (1, "The Left Hand of Darkness", "Le Guin", 1969),
+    (2, "A Wizard of Earthsea", "Le Guin", 1968),
+    (3, "Kindred", "Butler", 1979),
+    (4, "Parable of the Sower", "Butler", 1993),
+    (5, "Solaris", "Lem", 1961),
+]
+
+LOANS = [(1, 1, 1), (2, 2, 1), (3, 3, 2), (4, 5, 2), (5, 4, 3)]
+
+
+def main() -> None:
+    with sqlite3.connect(DB) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        conn.executemany("INSERT INTO members (id, name) VALUES (?, ?)", MEMBERS)
+        conn.executemany(
+            "INSERT INTO books (id, title, author, year) VALUES (?, ?, ?, ?)", BOOKS
+        )
+        conn.executemany(
+            "INSERT INTO loans (id, book_id, member_id) VALUES (?, ?, ?)", LOANS
+        )
+
+        print("Books per author")
+        print("-" * 32)
+        rows = conn.execute(
+            """
+            SELECT author, COUNT(*) AS n, MIN(year) AS earliest
+            FROM books
+            GROUP BY author
+            ORDER BY n DESC, author
+            """
+        ).fetchall()
+        for row in rows:
+            print(f"  {row['author']:<8} {row['n']} book(s), earliest {row['earliest']}")
+
+        print()
+        print("Who borrowed what (a join)")
+        print("-" * 32)
+        rows = conn.execute(
+            """
+            SELECT members.name AS member, books.title AS title
+            FROM loans
+            JOIN books   ON books.id = loans.book_id
+            JOIN members ON members.id = loans.member_id
+            ORDER BY members.name, books.title
+            """
+        ).fetchall()
+        for row in rows:
+            print(f"  {row['member']:<8} {row['title']}")
+
+        print()
+        # Parameterised query — never build SQL with string formatting.
+        before = 1970
+        (count,) = conn.execute(
+            "SELECT COUNT(*) FROM books WHERE year < ?", (before,)
+        ).fetchone()
+        print(f"{count} of {len(BOOKS)} books were published before {before}.")
+
+    size = Path(DB).stat().st_size
+    print()
+    print(f"Wrote {DB} ({size:,} bytes) — open it from the file explorer.")
+
+
+if __name__ == "__main__":
+    main()
+`,
+      "README.md": `# Python SQLite starter
+
+A real relational database with Python's standard library, on **CPython compiled
+to WebAssembly** (Pyodide).
+
+\`\`\`bash
+python main.py        # builds library.db and prints a few queries
+\`\`\`
+
+\`sqlite3\` is compiled into the interpreter, so this template needs **no wheels
+and no network** — it is the one Python starter that works completely offline
+with nothing to install.
+
+## What it shows
+
+- \`executescript\` for schema, \`executemany\` for bulk inserts
+- \`sqlite3.Row\` so rows can be read by column name
+- a \`GROUP BY\` aggregate and a two-table \`JOIN\`
+- parameterised queries — never build SQL with string formatting
+
+## The database is a real file
+
+\`library.db\` is written to the project directory, and Vivari mirrors files a
+script creates back into the editor, so it appears in the file explorer when the
+run finishes.
+
+One caveat: the mirror detects changes by file **size**. If a later run rewrites
+the database to exactly the same byte length, the editor's copy will not be
+refreshed. Deleting \`library.db\` before re-running avoids the question entirely.
+`,
+    },
+  };
+}
+
+// ── Native: Python imaging (Pillow) ──────────────────────────────────────────
+// Pillow is already inside the vendored Pyodide closure (0 MB marginal cost), so
+// this runs offline. No DOM in the worker, so it writes PNGs the editor renders.
+function pythonImagingTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "python-imaging",
+      framework: "python",
+      icon: "pillow",
+      category: "Native",
+      name: "Imaging",
+      language: "Python",
+      description: "Pillow image generation and filtering via Pyodide — writes PNGs you open in the editor",
+      port: 8000,
+      openPath: "/",
+      entry: "main.py",
+      hmr: false,
+      reload: false,
+      install: "python -m pip install -r requirements.txt",
+      dev: "python main.py",
+      experimental: true,
+    },
+    files: {
+      "requirements.txt": `pillow
+`,
+      "main.py": `# Image processing with Pillow on CPython/WASM (Pyodide).
+#
+# Pillow is already inside Vivari's vendored Pyodide bundle, so its wheel loads
+# same-origin: this template runs with no network at all. Vivari auto-loads it
+# from the \`from PIL import ...\` line below — the pip step just makes that
+# explicit.
+#
+# There is no DOM in the process worker, so nothing can be displayed directly.
+# Pillow writes PNGs instead, and the studio renders them inline when you open
+# them from the file explorer.
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+WIDTH, HEIGHT = 640, 360
+OUT = "art.png"
+THUMB = "thumb.png"
+
+
+def gradient(width: int, height: int) -> Image.Image:
+    """A vertical two-colour gradient, one horizontal line at a time."""
+    img = Image.new("RGB", (width, height))
+    draw = ImageDraw.Draw(img)
+    top, bottom = (14, 22, 46), (86, 44, 122)
+    for y in range(height):
+        t = y / max(height - 1, 1)
+        colour = tuple(round(a + (b - a) * t) for a, b in zip(top, bottom))
+        draw.line([(0, y), (width, y)], fill=colour)
+    return img
+
+
+def main() -> None:
+    img = gradient(WIDTH, HEIGHT)
+    draw = ImageDraw.Draw(img)
+
+    # Concentric circles, drawn onto the gradient.
+    for i, radius in enumerate(range(40, 180, 24)):
+        box = [
+            WIDTH // 2 - radius,
+            HEIGHT // 2 - radius,
+            WIDTH // 2 + radius,
+            HEIGHT // 2 + radius,
+        ]
+        draw.ellipse(box, outline=(255, 214, 102), width=3 - (i % 2))
+
+    draw.rectangle([24, 24, WIDTH - 24, HEIGHT - 24], outline=(255, 255, 255), width=2)
+    # load_default() always exists; no font files ship in the WASM filesystem.
+    draw.text((40, 40), "Pillow on Pyodide", fill=(255, 255, 255), font=ImageFont.load_default())
+
+    # A real filter pass — this is C code compiled to WebAssembly, not a shim.
+    blurred = img.filter(ImageFilter.GaussianBlur(radius=1.2))
+    blurred.save(OUT)
+    print(f"Wrote {OUT} ({blurred.width}x{blurred.height})")
+
+    thumb = blurred.copy()
+    thumb.thumbnail((160, 160))
+    thumb.save(THUMB)
+    print(f"Wrote {THUMB} ({thumb.width}x{thumb.height})")
+
+    print()
+    print("Open either PNG from the file explorer — the studio renders it inline.")
+
+
+if __name__ == "__main__":
+    main()
+`,
+      "README.md": `# Python imaging starter (Pillow)
+
+Image generation and processing with **Pillow**, on **CPython compiled to
+WebAssembly** (Pyodide).
+
+\`\`\`bash
+python -m pip install -r requirements.txt   # loads the vendored Pillow wheel
+python main.py                              # writes art.png and thumb.png
+\`\`\`
+
+Pillow is already inside Vivari's vendored Pyodide bundle, so its wheel loads
+same-origin and this template runs **offline**. It is also auto-loaded from the
+\`from PIL import ...\` line, so \`python main.py\` works even without the install
+step.
+
+## What it shows
+
+- drawing primitives — \`ImageDraw\` lines, ellipses, rectangles and text
+- a per-pixel-row gradient built in pure Python
+- a real filter pass (\`ImageFilter.GaussianBlur\`) — C compiled to WebAssembly,
+  not a shim
+- \`thumbnail()\`, which resizes in place while preserving aspect ratio
+
+## No DOM, so no window
+
+The Python process runs in a Web Worker with no DOM, so nothing can be displayed
+directly. Pillow writes PNGs instead; Vivari mirrors them back into the project,
+and the studio renders images inline when you open them from the file explorer.
+
+\`ImageFont.load_default()\` is used deliberately — no font files ship in the WASM
+filesystem, so \`truetype()\` has nothing to load unless you add a \`.ttf\` to the
+project yourself.
+`,
+    },
+  };
+}
+
 // ── Server-Sent Events (Express) ─────────────────────────────────────────────
 function sseTemplate(): TemplateDef {
   return {
@@ -6166,6 +7799,13 @@ export const TEMPLATES: TemplateDef[] = [
   pythonMatplotlibTemplate(),
   fastapiTemplate(),
   flaskTemplate(),
+  flaskAppTemplate(),
+  fastapiCrudTemplate(),
+  fastapiDashboardTemplate(),
+  djangoTemplate(),
+  pythonPytestTemplate(),
+  pythonSqliteTemplate(),
+  pythonImagingTemplate(),
   // Fullstack
   nextTemplate(true),
   nextTemplate(false),

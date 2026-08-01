@@ -3734,6 +3734,7 @@ The controller writes through a private `status(text)` helper, which keeps the c
 (status bar vs. toast) a one-word decision at each call site.
 
 See ARCHITECTURE.md §8.12.
+
 ## Bun shim — make the covered surface honest, and gate it (this change)
 
 The Bun shim's problem was never only its size. A handful of APIs were listed as covered and
@@ -4071,3 +4072,196 @@ assertion was pinning the bug; it now asserts `bigint`, and the number-vs-bigint
 exercised properly across the whole family.
 
 See ARCHITECTURE.md §9.2.
+
+## Python, broadened — 7 more templates, a gunicorn seam, and an ASGI spec fix (this change)
+
+The previous Python entry shipped the runtime and five templates. Those five are one
+hello-world, two "import a library and print", and two web servers that return a
+string — enough to prove Pyodide works, not enough to build anything with. This
+change takes the **Native** category from 5 Python templates to 12 and fixes what got
+in the way of writing them.
+
+Everything below was **executed against real Pyodide 314.0.3** — the exact vendored
+version — before it was written down. Where a claim could not be tested headlessly,
+it says so.
+
+- **Preview templates.** `django` (full-stack MVC: ORM, migrations, template engine,
+  URL routing), `flask-app` (Jinja + static files + SQLite CRUD + JSON API),
+  `fastapi-crud` (Pydantic models, SQLite, real status codes, Swagger), and
+  `fastapi-dashboard` (pandas + Matplotlib rendered *into* the preview as a PNG —
+  the Matplotlib starter makes you open a file by hand).
+- **Terminal templates.** `python-pytest` (fixtures, parametrize, `raises`, real exit
+  codes), `python-sqlite` (stdlib only — the one Python starter that needs no wheel
+  and no network at all), and `python-imaging` (Pillow, already inside the vendored
+  closure).
+- **No `vendor-pyodide.mjs` change.** Pillow and Jinja2 are already in the vendored
+  wheel closure at 0.00 MB marginal cost, so the ship size stays at 19.02 MB. Django
+  and Flask are micropip-only by nature; pytest resolves from the CDN through the
+  hybrid lock. Vendoring pytest was considered and rejected: +2.53 MB (+13%) on every
+  user for one non-offline-critical template.
+
+**A real bug in the shipped ASGI bridge.** `scope["path"]` was set to the
+SW-stripped path while `root_path` was also set — but ASGI defines `path` as the full
+path *including* `root_path`, and Starlette recovers the route path by subtracting one
+from the other. The subtraction that bites is the one *inside* a mount, not the top-level
+one: `get_route_path` strips only when `path` starts with `root_path`, so a pre-stripped
+path sails past it, while `Mount.matches` hands the sub-app `root_path + matched_path`
+(`/preview/8000` + `/static`) — a prefix a stripped path certainly does not carry. So
+**every `Mount()` — `StaticFiles` above all — 404'd behind the preview proxy** while
+top-level routes stayed fine, which is why nobody noticed. Measured 404-before/200-after
+on the same app, with preview mode C (no prefix) unaffected. `ARCHITECTURE.md` §9.3
+asserted the opposite ("route matching is unaffected") and is corrected.
+
+**A `gunicorn` seam rather than a Django one.** Django needs a WSGI entrypoint.
+`gunicorn` is *the* canonical one, it mirrors how `doUvicorn` already works (parse
+argv → `serve()`, never import the package), and one ~30-line seam unlocks every WSGI
+framework instead of one shim per framework. `python -m django runserver` was
+rejected: the real command binds a socket, so the shim would diverge confusingly —
+and it does, loudly, if you try it (`emscripten does not support processes`).
+
+**`python -m pytest`, with no new runtime API.** It synthesises
+`sys.exit(int(pytest.main([...])))` and runs it down the ordinary script path, which
+gets wheel auto-loading and exit-code propagation for free. That exposed a fidelity
+bug worth fixing: CPython prints **no** traceback when `SystemExit` reaches the top
+level, but we dumped the whole WASM traceback, so a green test run would have ended
+looking like a crash. `terminationFromError` now reports the way CPython does.
+
+**Four Django-specific constraints**, each documented in the template that hits it:
+it runs on **WSGI only** (its ASGI path goes through `asgiref`, which starts a
+`ThreadPoolExecutor` per request even for `async def` views); it needs
+`DJANGO_ALLOW_ASYNC_UNSAFE=1` (Pyodide always has an event loop, so the `async_unsafe`
+guard rejects every ORM call — and the race it guards against cannot happen in a
+single-threaded VM); it needs `tzdata` (the WASM stdlib ships no timezone database,
+not even UTC); and `{% static %}` cannot work behind the preview proxy at all, because
+`STATIC_URL` is resolved once and cached at import time, before any request has set
+the script prefix. `{% url %}` and `reverse()` are per-request and *are* correct.
+
+**`scripts/spike-python-bridge.mjs`** (network tier, 8 cases, ~40 s). It is
+kernel-free by necessity, not by choice: `bootPyodide` does
+`import(indexUrl + "pyodide.mjs")`, and from Node there is no way to reach the
+vendored bundle — `import('http://…')` is `ERR_UNSUPPORTED_ESM_URL_SCHEME` since
+network imports were removed in Node 22, and a `file://` indexURL imports fine but
+then makes the browser-masked boot `fetch()` file URLs. Both were tested. So it
+follows `spike-bun-offline.mjs`. It drives the exported `setupSource` against template
+files read out of `templates.ts`, so neither the bridge nor the templates can drift
+away from what is tested, and each case runs in its own process because sharing one
+interpreter makes `sys.modules` serve an earlier template's `main` to a later one.
+
+**What is genuinely impossible**, as opposed to merely hard: Streamlit, Jupyter and
+Gradio (no installable wheels, and each needs sockets, threads or streaming);
+anything using `requests`/`socket`/`threading`/`multiprocessing`/`subprocess`;
+`asyncio.run()` (needs WebAssembly stack switching); and any streaming/SSE/WebSocket
+Python app (the bridge is buffered end to end, and the `vv-sse` tunnel would deadlock
+against it). Nine further candidates — sympy, scipy, scikit-learn, duckdb, polars and
+friends — all *passed* their probes and were still cut: they demonstrate Pyodide,
+which `python-data` already does, at 4–18 MB of wheels each.
+
+**Verification is bounded, and the templates are labelled accordingly.** The spike
+proves Python semantics and the bridge's protocol conversion. It does not prove port
+registration, preview-tab opening, the service-worker tunnel, wheel delivery from
+`public/vendor/pyodide/`, terminal rendering, or `mirrorBack` surfacing files in the
+editor — all of which need a browser. Per AGENTS.md, all seven ship `experimental`
+until someone runs that pass.
+
+**User-facing docs.** The docs site had no Python page at all. `sites/docs/docs/python.md`
+now covers what works and — since this is a pure client-side environment — an explicit
+list of what cannot, so the limits are somewhere a user will actually find them. Every
+limit quotes the error a user actually sees, taken from a probe rather than from memory.
+
+**The same CI hole the Bun entry above closed, closed for Python.** That entry found
+`spike-bun.mjs` running in no job at all; this one would have shipped the identical gap.
+`spike-python-bridge.mjs` has to be `net: true`, because Pyodide is ~30 MB that is neither
+committed (`public/vendor` is gitignored) nor installed by CI, and the network tier is
+schedule/dispatch-only *and* `continue-on-error` — so on its own it gates nothing. It stays
+where it is, and everything provable without an interpreter moved into a second spike,
+`scripts/spike-python-offline.mjs` (`net: false`, no `needsWasm`), which `toolchain-gate`
+runs on every push and PR via its unfiltered `run-spikes.mjs --offline`: the argv contract
+of all four CLI seams as real Node subprocesses, CPython-faithful `SystemExit`, the
+generated dispatch source including the ASGI `root_path` regression, and template-registry
+integrity. It asserts its own registration, so the gate cannot be dropped quietly. Both
+spikes read `templates.ts` through one parser (`scripts/lib/python-templates.mjs`).
+
+**Audited against that entry's other finding — "a shim stub that lies is worse than a
+missing API".** The seams themselves come out clean: `gunicorn`/`uvicorn` never import the
+package they are named after, but they are honest *entrypoints*, not stubs, because the
+contract they advertise is the one they keep; `pytest` hands its whole argv to real pytest,
+so there are no dropped flags to lie about; `-m <unknown>` already refused by name. The
+violations were in argv. Flags we could not honour were silently swallowed, which is the
+same lie in a different spelling — `gunicorn -w 4` said nothing while serving one worker.
+Now `--worker-class`/`-k` (other than `sync`, which is exactly what the bridge is) and
+uvicorn's `--factory` **refuse**, since they change what gets served; `--workers`,
+`--threads`, `--reload`, `-D` and flask's `--debug` **warn** and carry on. The uvicorn and
+flask seams predate this change and had the same defect; fixing only gunicorn would have
+left the two entrypoints disagreeing about what honesty means.
+
+**Audited again, against the Glob entry's "test against a value from OUTSIDE this repo".**
+Three of these suites were measuring us against ourselves, and each one was hiding a bug.
+
+- **`SystemExit`.** The table of expected exit codes was written from what we assumed
+  CPython does, and the traceback strings it fed in were invented too. Two rows were
+  wrong. `sys.exit(None)` never produces `SystemExit: None` — real Pyodide raises a bare
+  `SystemExit` — so that row tested a shape that cannot occur. And bools are ints in
+  Python: `sys.exit(False)` exits **0** printing nothing, where the shim exited 1 and
+  printed `False`, so `sys.exit(not ok)` — the idiom — **reported failure on a successful
+  run**. The vectors now live in `scripts/lib/cpython-exit.mjs`, captured from a real
+  interpreter; the offline tier re-derives them from the `python3` on the machine so they
+  cannot rot, and the bridge tier raises each `sys.exit()` in real Pyodide and feeds what
+  it genuinely throws to `terminationFromError`, so there is no fixture left to be wrong.
+  One deliberate divergence is recorded rather than papered over: CPython reports
+  `sys.exit(-1)` as 255 because a POSIX exit status is 8 bits, but that truncation is the
+  OS's, and Vivari's kernel carries exit codes as plain integers for every program — so
+  the shim passes `-1` through, and truncating in Python alone would be the inconsistency.
+- **The ASGI scope.** The sharpest case, since the bug being guarded was a spec-conformance
+  bug. The 404-before/200-after comparison was already grounded — it runs real Starlette —
+  but a status code is a coarse oracle, and nothing stated the rule. The scope our dispatch
+  builds is now read by Starlette's own `Mount.matches` and `get_route_path`. Doing that
+  corrected our account of the mechanism: top-level `get_route_path` is *guarded*, so the
+  pre-fix scope passes it happily — the failure is one level down, where `Mount` extends
+  `root_path` to `root_path + "/static"`. The write-ups above said Starlette subtracts
+  `root_path` from `path` and left it there, which is true and not where the bug lived.
+  The WSGI half had no outside check at all and now runs behind `wsgiref.validate`,
+  CPython's own PEP 3333 validator, plus the spec's `SCRIPT_NAME + PATH_INFO` invariant.
+- **The CLI flags.** Which flags exist and which take a value belongs to gunicorn,
+  uvicorn and Flask, not to us, and reading their `--help` output turned up three we had
+  wrong. `gunicorn -t 30 wsgi:app` served an app called `30` — `-t` is the short spelling
+  of `--timeout`, and an unconsumed value silently becomes the app spec. Enumerating the
+  ~56 value-taking flags was the wrong shape; the ~12 `store_true` ones are the short,
+  stable list, so everything else consumes a value and the failure mode flips from
+  "silently serves the wrong app" to a visible "no app specified". Same fix for uvicorn.
+  Flask spells its host flag `-h`, not `--help`, and `flask run -h 0.0.0.0` was being
+  dropped on the floor. Django's `DJANGO_ALLOW_ASYNC_UNSAFE` is now checked against
+  Django's own source, because a misspelling there is a settings file that imports fine,
+  reviews fine and does nothing.
+
+**A rendering bug the user found by running the template.** `python-pytest` printed one
+progress dot per line where real pytest prints `...........`. The results were right; the
+terminal was not. Cause: Pyodide's `batched` stdout handler fires once per *flush* with the
+trailing newline stripped, and the runtime appended one back — correct when the flush ended
+a line, wrong when it did not, and pytest flushes after every dot. Thirteen handler calls,
+eleven of them a single `.`. The fix is the byte `Writer`, which passes Python's bytes
+through verbatim; a heuristic like "append a newline unless the chunk looks partial" would
+have been the same class of bug. Moving off the batched handler exposed that it was also
+*discarding* any final partial chunk — `print("x", end="")` produced no output at all, and
+an explicit flush did not bring it back — so the runtime now flushes Python's own buffer
+wherever control returns to us: end of a script (before the error report, so ordering
+holds), each REPL line so a result precedes the next `>>> `, and each served request so a
+`print()` in a view is not held until 8 KB accumulate. Verified against real pytest under
+real Pyodide, byte for byte against what real pytest pipes; the REPL's partial-line case
+matches CPython's own `>>> hello>>> ` shape. The bridge spike was itself rendering through
+a batched handler and joining on `\n`, so it could not have caught this; it now renders
+through the shipped writer. Interpreter-free parts of the guard (no newline added,
+consecutive partial writes stay on one line, the buffer is copied) live in the offline
+tier; that real pytest renders as one line needs an interpreter and stays in the bridge
+tier. Left alone deliberately: the `Loading …/Loaded …` package lists are Pyodide's
+`loadPackage` progress, and they appear twice because each `python` is a fresh interpreter,
+which is correct and documented. They are ugly, but they are the only feedback during a
+multi-megabyte first fetch, and reshaping them into pip's `Collecting`/`Successfully
+installed` would be claiming an install that does not persist.
+
+Reported as already sound, rather than churned: the template-registry checks are
+self-referential by nature — "the entry file this manifest names is one it ships" has no
+outside authority — and the `setupSource` string assertions are a drift guard and say so.
+The stub-runtime driver both tiers use moved to `scripts/lib/python-drive.mjs`, which also
+pulled the serve-option parsing into the PR-gated tier where the argv bugs actually were.
+
+See ARCHITECTURE.md §9.3 and the AGENTS.md "Python is Pyodide" gotchas.

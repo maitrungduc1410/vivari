@@ -858,8 +858,35 @@ directly; a vendored matcher would need auditing against the same list anyway.
 Unlike the Node-backed Bun shim, `python`/`python3` boots **real CPython compiled to
 WASM (Pyodide)** the first time a python process runs (nothing at studio boot). Pieces:
 `packages/runtime/builtins/python.js` (boot + FS mirror + exec + `serve`),
-`packages/kernel-host/programs/python.js` (CLI + `-m uvicorn`/`-m flask`), the
-`uvicorn`/`flask` PATH shims in `coreutils.js`, and `scripts/vendor-pyodide.mjs`. Gotchas:
+`packages/kernel-host/programs/python.js` (CLI + `-m uvicorn`/`-m flask`/`-m gunicorn`/
+`-m pytest`), the `uvicorn`/`flask`/`gunicorn`/`pytest` PATH shims in `coreutils.js`, and
+`scripts/vendor-pyodide.mjs`. Gated by **two** spikes — see the CI gate gotcha below.
+Gotchas:
+- **CI gate: `spike-python-offline.mjs` is the one that runs per-PR.** Pyodide is ~30 MB
+  that is neither committed (`public/vendor` is gitignored) nor installed by CI (no job
+  runs `npm ci`), so the interpreter-backed `spike-python-bridge.mjs` has to be `net: true`
+  — and the network tier is schedule/dispatch-only *and* `continue-on-error`, i.e. it gates
+  nothing. Everything provable without an interpreter therefore lives in
+  `spike-python-offline.mjs` (`net: false`, no `needsWasm`), which `toolchain-gate` picks up
+  because it runs `run-spikes.mjs --offline` **unfiltered**. Same hole the Bun Phase 0
+  change closed; the spike asserts its own registration so it cannot be reopened quietly.
+  A Python change that only the network tier covers is a Python change nothing enforces.
+- **The "stub that lies" rule applies to argv, not just to APIs** (see the Bun gotcha
+  above). `gunicorn`/`uvicorn` never import the package they are named after — that is an
+  honest *entrypoint*, because the contract they advertise (your app is served on this
+  port) is the one they keep. What they cannot keep is the process model, so those flags
+  are loud: `--worker-class`/`-k` (anything but `sync`, which is what the bridge already
+  is) and `--factory` **refuse**, because they change what gets served; while
+  `--workers`/`--threads`/`--reload`/`-D` **warn** and carry on (the server
+  still serves, just not the way the flag asked). Silently swallowing them is the argv
+  spelling of a placeholder return value. Flags that take a value must consume it even
+  when ignored, or it is read as the app spec — `gunicorn -t 30 wsgi:app` served an app
+  called `30` until `-t` was recognised as `--timeout`'s short form. Which flags exist,
+  and which of them take a value, is **read off the real tools' `--help`, not guessed**:
+  the shim enumerates the ~12 `store_true` flags gunicorn and uvicorn actually have and
+  consumes a value for everything else, so being wrong costs a visible "no app specified"
+  instead of silently serving the wrong app. Flask is the trap — there `-h` is `--host`,
+  not `--help`.
 - **Two Node probes must BOTH be masked** or boot dies on `import("node:module")`:
   `process.browser = true` (pyodide.mjs) AND `process.type = "renderer"`
   (Emscripten's pyodide.asm.mjs). Hold both across the whole boot, then restore.
@@ -879,6 +906,53 @@ WASM (Pyodide)** the first time a python process runs (nothing at studio boot). 
   `X-Forwarded-Prefix` to the ASGI `root_path` / WSGI `SCRIPT_NAME` so absolute URLs
   (Swagger's openapi.json link + "Try it out") carry `/preview/<port>` and route back.
   Keep the `sw.js` → bridge header contract in sync. See ARCHITECTURE.md §9.3.
+  (3) On ASGI, `scope["path"]` must keep the prefix — ASGI defines `path` as INCLUDING
+  `root_path`. Note *where* a pre-stripped path breaks: top-level `get_route_path` is
+  guarded (it strips only when `path` starts with `root_path`, so a stripped path sails
+  through), but `Mount.matches` hands the sub-app `root_path + matched_path`, and THAT
+  subtraction a pre-stripped path cannot survive — so every `Mount()` (`StaticFiles`
+  above all) 404s while top-level routes look fine. WSGI is the opposite: `SCRIPT_NAME` +
+  `PATH_INFO` is already the split form. The spike checks the scope against Starlette's
+  own `Mount`/`get_route_path` and the environ against `wsgiref.validate`, rather than
+  against our own idea of the shape.
+- **One Pyodide per process — `pip install` does NOT persist.** Each `python` command is
+  a fresh boot (`:66–68`), so `python -m pip install -r requirements.txt` is a browser
+  cache warm-up, not an install. Scripts get their packages from
+  `loadPackagesFromImports(source)` on the entry file; `serve()` separately reads
+  `requirements.txt`. When testing several templates in one interpreter, `sys.modules`
+  will serve an earlier template's `main` to a later one — boot per case instead.
+- **Never wire Python's output through Pyodide's `batched` handler.** It fires once per
+  *flush* with the trailing newline stripped, so "add the newline back" is right only
+  when the flush ended a line — and wrong for every progress renderer, which flushes
+  mid-line. A user hit this: pytest flushes after each `.`, so an 11-test run printed
+  eleven lines instead of `...........`. The batched handler also *drops* a final partial
+  chunk, so `print("x", end="")` never arrived and no flush could recover it. Use the byte
+  `Writer` (`setStdout({ write })`, exported as `byteWriter`), copy the buffer (Pyodide
+  reuses it), and return the byte count. Then `flushStreams()` wherever control comes back
+  to us — end of a script, each REPL line, each served request — because Python
+  block-buffers a non-tty stdout and holds the partial line until something asks. Do not
+  set `isatty`; the guest's own `process.stdout` reports `isTTY: false`, and claiming
+  otherwise makes pytest emit `\r` progress the terminal will not redraw.
+- **`SystemExit` must not print a traceback.** CPython exits silently on an integer or
+  bare `sys.exit()`, and prints only the argument for `sys.exit("text")`;
+  `terminationFromError` matches that. **Bools are ints here** — `sys.exit(False)` is exit
+  0 printing nothing, so reading it as a message made `sys.exit(not ok)` report failure on
+  a successful run. Expected values live in `scripts/lib/cpython-exit.mjs`, captured from
+  a real interpreter and re-derived from the machine's `python3` on every offline run;
+  do not hand-edit them. `sys.exit(-1)` deliberately stays `-1` rather than CPython's 255,
+  because that truncation is the OS's 8-bit exit status and the VM has no such boundary
+  for any program. It matters because `python -m pytest` synthesises
+  `sys.exit(pytest.main(...))` on every run. Note Pyodide's WebLoop *also* re-raises
+  SystemExit as a second, unhandled rejection — harmless in a browser, but Node aborts on
+  it, so headless harnesses must swallow it.
+- **Django works, but only on WSGI**, and only with `DJANGO_ALLOW_ASYNC_UNSAFE=1` and
+  `tzdata`. Its ASGI path goes through `asgiref`, which starts a `ThreadPoolExecutor` per
+  request even for `async def` views — the existing `anyio` patch does not help, that is a
+  different library. Pyodide always has an event loop running, so Django's `async_unsafe`
+  guard rejects every ORM call. The WASM stdlib ships no timezone database, so rendering an
+  aware datetime raises. And `{% static %}` cannot work behind the preview proxy at all:
+  `STATIC_URL` is resolved once and cached, at import time, before any request has set the
+  script prefix. `{% url %}`/`reverse()` are per-request and are prefix-correct.
 
 ### Real TypeScript 7 (`tsc`/`tsgo`) is Go compiled to wasm — don't try to `require` it
 

@@ -58,6 +58,206 @@ function withTrailingSlash(u) {
   return s.endsWith("/") ? s : s + "/";
 }
 
+
+// Pass Python's bytes through verbatim and let IT decide where its newlines go.
+//
+// Pyodide's `stdout`/`stderr` load options are the *batched* handlers: it calls
+// them once per flush with the trailing newline stripped, so appending one back
+// is only correct when the flush happened to end a line. It does not for a
+// partial-line flush, which is how every progress renderer works — pytest
+// flushes after each `.`, so an 11-test run rendered as eleven lines instead of
+// `...........`. The batched handler drops a final partial chunk outright as
+// well, so `print("x", end="")` never arrived at all, and no amount of flushing
+// brought it back. A byte Writer has neither problem. It must return how many
+// bytes it accepted.
+export function byteWriter(stream) {
+  return {
+    write: (buf) => {
+      // Copy: stream.write may be asynchronous and Pyodide reuses the buffer as
+      // soon as this returns.
+      stream.write(globalThis.Buffer.from(buf));
+      return buf.length;
+    },
+  };
+}
+
+// Python block-buffers a stdout it does not consider a terminal, so whatever a
+// script wrote without a trailing newline is still inside CPython when the
+// script ends — the byte Writer above never sees it until something flushes.
+// Call this wherever control returns to us and the user should already be
+// looking at that output.
+export function flushStreams(pyodide) {
+  try {
+    pyodide.runPython("import sys; sys.stdout.flush(); sys.stderr.flush()");
+  } catch {
+    /* interpreter already gone, or streams replaced: nothing to flush */
+  }
+}
+
+// How a top-level exception ends the process: the exit code, plus what (if
+// anything) to print. CPython prints NO traceback when SystemExit reaches the
+// top level — it exits with that code silently, or, if the argument isn't an
+// integer, prints just that argument and exits 1. We used to dump the whole
+// WASM traceback for every sys.exit(), which meant a clean `sys.exit(0)` — what
+// `python -m pytest` does on every green run — looked like a crash.
+export function terminationFromError(e) {
+  const msg = (e && e.message) || String(e);
+  const last = msg.trimEnd().split("\n").pop().trim();
+  const isExit = (e && e.type === "SystemExit") || /^SystemExit\b/.test(last);
+  if (!isExit) return { code: 1, report: msg };
+  const m = /^SystemExit:\s*([\s\S]*)$/.exec(last);
+  const value = m ? m[1].trim() : "";
+  if (!value || value === "None") return { code: 0, report: "" }; // bare sys.exit()
+  if (/^-?\d+$/.test(value)) return { code: Number(value) | 0, report: "" };
+  // Bools ARE ints in Python: sys.exit(True) exits 1 and sys.exit(False) exits
+  // 0, printing nothing either way. The traceback spells both as
+  // "SystemExit: True"/"False" — indistinguishable from sys.exit("True"), so
+  // the message is a lossy channel and this picks the far likelier reading.
+  // `sys.exit(not ok)` is a common idiom; exiting with the literal string
+  // "False" is not. It is also the reading that keeps a *successful* run
+  // reporting success, which the string reading got backwards.
+  if (value === "True") return { code: 1, report: "" };
+  if (value === "False") return { code: 0, report: "" };
+  return { code: 1, report: value }; // sys.exit("message")
+}
+
+// Python side of the bridge. Imports the user's app once and defines a single
+// dispatch function per protocol. Requests/responses cross as JSON strings with
+// base64 bodies (JS strings convert to Python str cleanly; PyProxy/typed-array
+// conversions do not need to be reasoned about). Injected: module + attr.
+//
+// Exported so scripts/spike-python-bridge.mjs drives the SHIPPED dispatch source
+// rather than a copy that would silently drift away from it.
+export function setupSource(moduleName, attrName, mode) {
+  const mod = JSON.stringify(moduleName);
+  const attr = JSON.stringify(attrName);
+  const common = `
+import sys, json, base64, importlib, traceback
+_vv_mod = importlib.import_module(${mod})
+_vv_app = getattr(_vv_mod, ${attr})
+`;
+  if (mode === "asgi") {
+    return (
+      common +
+      `
+# Pyodide (WASM) has no OS threads, so FastAPI/Starlette's default threadpool for
+# sync endpoints (anyio.to_thread.run_sync -> threading.Thread) raises "can't
+# start new thread". Run such callables inline on the event loop instead — correct
+# for our single-threaded model (starlette reads run_sync at call time, so this
+# takes effect for every sync route/dependency).
+try:
+  import anyio.to_thread as _vv_att
+  async def _vv_run_sync(func, *args, **kwargs):
+      return func(*args)
+  _vv_att.run_sync = _vv_run_sync
+except Exception:
+  pass
+
+
+async def _vv_dispatch(req_json):
+  d = json.loads(req_json)
+  body = base64.b64decode(d["body_b64"]) if d.get("body_b64") else b""
+    # ASGI defines "path" as the FULL request path INCLUDING root_path, with
+    # root_path naming only the prefix the app is mounted under. The preview
+    # tunnel hands us the already-stripped path, so we put the prefix back:
+    # Starlette's get_route_path() subtracts root_path from path, and with a
+    # pre-stripped path it subtracts a prefix that isn't there — which makes
+    # every Mount(), StaticFiles included, 404 behind the preview proxy. WSGI
+    # needs no equivalent: SCRIPT_NAME + PATH_INFO is already the split form.
+  _vv_root = d.get("root_path", "")
+  _vv_path = _vv_root + d["path"] if _vv_root else d["path"]
+  scope = {
+      "type": "http",
+      "asgi": {"version": "3.0", "spec_version": "2.3"},
+      "http_version": d.get("http_version", "1.1"),
+      "method": d["method"],
+      "scheme": "http",
+      "path": _vv_path,
+      "raw_path": _vv_path.encode("utf-8"),
+      "query_string": d.get("query", "").encode("utf-8"),
+      "root_path": _vv_root,
+      "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in d["headers"]],
+      "server": ("localhost", 80),
+      "client": ("127.0.0.1", 0),
+  }
+  _sent = {"done": False}
+  async def receive():
+      if not _sent["done"]:
+          _sent["done"] = True
+          return {"type": "http.request", "body": body, "more_body": False}
+      return {"type": "http.disconnect"}
+  out = {"status": 200, "headers": [], "body": bytearray()}
+  async def send(message):
+      t = message["type"]
+      if t == "http.response.start":
+          out["status"] = message["status"]
+          out["headers"] = [
+              [bytes(k).decode("latin-1"), bytes(v).decode("latin-1")]
+              for k, v in message.get("headers", [])
+          ]
+      elif t == "http.response.body":
+          out["body"].extend(bytes(message.get("body", b"")))
+  await _vv_app(scope, receive, send)
+  return json.dumps({
+      "status": out["status"],
+      "headers": out["headers"],
+      "body_b64": base64.b64encode(bytes(out["body"])).decode("ascii"),
+  })
+`
+    );
+  }
+  // WSGI (Flask)
+  return (
+    common +
+    `
+import io
+def _vv_dispatch(req_json):
+  d = json.loads(req_json)
+  body = base64.b64decode(d["body_b64"]) if d.get("body_b64") else b""
+  environ = {
+      "REQUEST_METHOD": d["method"],
+      "SCRIPT_NAME": d.get("root_path", ""),
+      "PATH_INFO": d["path"],
+      "QUERY_STRING": d.get("query", ""),
+      "SERVER_NAME": "localhost",
+      "SERVER_PORT": "80",
+      "SERVER_PROTOCOL": "HTTP/" + d.get("http_version", "1.1"),
+      "wsgi.version": (1, 0),
+      "wsgi.url_scheme": "http",
+      "wsgi.input": io.BytesIO(body),
+      "wsgi.errors": sys.stderr,
+      "wsgi.multithread": False,
+      "wsgi.multiprocess": False,
+      "wsgi.run_once": False,
+  }
+  for k, v in d["headers"]:
+      key = k.upper().replace("-", "_")
+      if key in ("CONTENT_TYPE", "CONTENT_LENGTH"):
+          environ[key] = v
+      else:
+          environ["HTTP_" + key] = v
+  captured = {}
+  def start_response(status, response_headers, exc_info=None):
+      captured["status"] = status
+      captured["headers"] = response_headers
+      return lambda data: None
+  result = _vv_app(environ, start_response)
+  try:
+      chunks = b"".join(bytes(c) for c in result)
+  finally:
+      if hasattr(result, "close"):
+          result.close()
+  status = captured.get("status", "200 OK")
+  code = int(status.split(" ", 1)[0])
+  return json.dumps({
+      "status": code,
+      "headers": [[k, v] for k, v in captured.get("headers", [])],
+      "body_b64": base64.b64encode(chunks).decode("ascii"),
+  })
+`
+  );
+}
+
 export function createPythonRuntime({ process, require, trackHost }) {
   const req = (name) => require(name);
 
@@ -97,15 +297,9 @@ export function createPythonRuntime({ process, require, trackHost }) {
         process.browser = true;
         process.type = "renderer";
         const mod = await import(/* @vite-ignore */ url + "pyodide.mjs");
-        const decoder = new TextDecoder();
-        const toText = (chunk) =>
-          typeof chunk === "string" ? chunk : decoder.decode(chunk);
-        const pyodide = await mod.loadPyodide({
-          indexURL: url,
-          // Emscripten calls these line-at-a-time without the trailing newline.
-          stdout: (line) => process.stdout.write(toText(line) + "\n"),
-          stderr: (line) => process.stderr.write(toText(line) + "\n"),
-        });
+        const pyodide = await mod.loadPyodide({ indexURL: url });
+        pyodide.setStdout(byteWriter(process.stdout));
+        pyodide.setStderr(byteWriter(process.stderr));
         return pyodide;
       } finally {
         restoreEnv();
@@ -222,13 +416,6 @@ export function createPythonRuntime({ process, require, trackHost }) {
   }
 
   // ---- execution -------------------------------------------------------------
-  function exitCodeFromError(e) {
-    const msg = (e && e.message) || String(e);
-    const m = /SystemExit:\s*(-?\d+)/.exec(msg);
-    if (m) return Number(m[1]) | 0;
-    if (/SystemExit/.test(msg)) return 0; // bare sys.exit()
-    return 1;
-  }
 
   async function runSource(indexUrl, source, opts) {
     const { filename = "<stdin>", argv, cwd } = opts || {};
@@ -256,10 +443,14 @@ export function createPythonRuntime({ process, require, trackHost }) {
     let code = 0;
     try {
       await pyodide.runPythonAsync(source, { filename });
+      flushStreams(pyodide);
     } catch (e) {
-      const msg = (e && e.message) || String(e);
-      process.stderr.write(msg.endsWith("\n") ? msg : msg + "\n");
-      code = exitCodeFromError(e);
+      // Before our own report, so the script's output stays ahead of the error
+      // that ended it.
+      flushStreams(pyodide);
+      const { code: rc, report } = terminationFromError(e);
+      if (report) process.stderr.write(report.endsWith("\n") ? report : report + "\n");
+      code = rc;
     } finally {
       if (cwd && snapshot) {
         try {
@@ -371,6 +562,9 @@ export function createPythonRuntime({ process, require, trackHost }) {
             process.stderr.write(((e && e.message) || String(e)) + "\n");
             more = false;
           }
+          // The statement's own output has to land before the next prompt, or
+          // buffered text appears after the ">>> " that invited the next line.
+          flushStreams(pyodide);
           prompt();
         };
 
@@ -431,130 +625,6 @@ export function createPythonRuntime({ process, require, trackHost }) {
     }
   }
 
-  // Python side of the bridge. Imports the user's app once and defines a single
-  // dispatch function per protocol. Requests/responses cross as JSON strings with
-  // base64 bodies (JS strings convert to Python str cleanly; PyProxy/typed-array
-  // conversions do not need to be reasoned about). Injected: module + attr.
-  function setupSource(moduleName, attrName, mode) {
-    const mod = JSON.stringify(moduleName);
-    const attr = JSON.stringify(attrName);
-    const common = `
-import sys, json, base64, importlib, traceback
-_vv_mod = importlib.import_module(${mod})
-_vv_app = getattr(_vv_mod, ${attr})
-`;
-    if (mode === "asgi") {
-      return (
-        common +
-        `
-# Pyodide (WASM) has no OS threads, so FastAPI/Starlette's default threadpool for
-# sync endpoints (anyio.to_thread.run_sync -> threading.Thread) raises "can't
-# start new thread". Run such callables inline on the event loop instead — correct
-# for our single-threaded model (starlette reads run_sync at call time, so this
-# takes effect for every sync route/dependency).
-try:
-    import anyio.to_thread as _vv_att
-    async def _vv_run_sync(func, *args, **kwargs):
-        return func(*args)
-    _vv_att.run_sync = _vv_run_sync
-except Exception:
-    pass
-
-
-async def _vv_dispatch(req_json):
-    d = json.loads(req_json)
-    body = base64.b64decode(d["body_b64"]) if d.get("body_b64") else b""
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
-        "http_version": d.get("http_version", "1.1"),
-        "method": d["method"],
-        "scheme": "http",
-        "path": d["path"],
-        "raw_path": d["path"].encode("utf-8"),
-        "query_string": d.get("query", "").encode("utf-8"),
-        "root_path": d.get("root_path", ""),
-        "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in d["headers"]],
-        "server": ("localhost", 80),
-        "client": ("127.0.0.1", 0),
-    }
-    _sent = {"done": False}
-    async def receive():
-        if not _sent["done"]:
-            _sent["done"] = True
-            return {"type": "http.request", "body": body, "more_body": False}
-        return {"type": "http.disconnect"}
-    out = {"status": 200, "headers": [], "body": bytearray()}
-    async def send(message):
-        t = message["type"]
-        if t == "http.response.start":
-            out["status"] = message["status"]
-            out["headers"] = [
-                [bytes(k).decode("latin-1"), bytes(v).decode("latin-1")]
-                for k, v in message.get("headers", [])
-            ]
-        elif t == "http.response.body":
-            out["body"].extend(bytes(message.get("body", b"")))
-    await _vv_app(scope, receive, send)
-    return json.dumps({
-        "status": out["status"],
-        "headers": out["headers"],
-        "body_b64": base64.b64encode(bytes(out["body"])).decode("ascii"),
-    })
-`
-      );
-    }
-    // WSGI (Flask)
-    return (
-      common +
-      `
-import io
-def _vv_dispatch(req_json):
-    d = json.loads(req_json)
-    body = base64.b64decode(d["body_b64"]) if d.get("body_b64") else b""
-    environ = {
-        "REQUEST_METHOD": d["method"],
-        "SCRIPT_NAME": d.get("root_path", ""),
-        "PATH_INFO": d["path"],
-        "QUERY_STRING": d.get("query", ""),
-        "SERVER_NAME": "localhost",
-        "SERVER_PORT": "80",
-        "SERVER_PROTOCOL": "HTTP/" + d.get("http_version", "1.1"),
-        "wsgi.version": (1, 0),
-        "wsgi.url_scheme": "http",
-        "wsgi.input": io.BytesIO(body),
-        "wsgi.errors": sys.stderr,
-        "wsgi.multithread": False,
-        "wsgi.multiprocess": False,
-        "wsgi.run_once": False,
-    }
-    for k, v in d["headers"]:
-        key = k.upper().replace("-", "_")
-        if key in ("CONTENT_TYPE", "CONTENT_LENGTH"):
-            environ[key] = v
-        else:
-            environ["HTTP_" + key] = v
-    captured = {}
-    def start_response(status, response_headers, exc_info=None):
-        captured["status"] = status
-        captured["headers"] = response_headers
-        return lambda data: None
-    result = _vv_app(environ, start_response)
-    try:
-        chunks = b"".join(bytes(c) for c in result)
-    finally:
-        if hasattr(result, "close"):
-            result.close()
-    status = captured.get("status", "200 OK")
-    code = int(status.split(" ", 1)[0])
-    return json.dumps({
-        "status": code,
-        "headers": [[k, v] for k, v in captured.get("headers", [])],
-        "body_b64": base64.b64encode(chunks).decode("ascii"),
-    })
-`
-    );
-  }
 
   // Long-running: boot Pyodide, import the WSGI/ASGI app, then stand up a guest
   // Node http server on `port`. Resolves only when the server closes/errors, so
@@ -638,6 +708,10 @@ def _vv_dispatch(req_json):
               });
               const resultJson =
                 mode === "asgi" ? await dispatch(reqJson) : dispatch(reqJson);
+              // A server never "ends", so a print() inside a view would sit in
+              // Python's buffer until 8 KB of it accumulated. Flush per request
+              // instead: the request already cost far more than this does.
+              flushStreams(pyodide);
               const out = JSON.parse(resultJson);
               const outHeaders = {};
               for (const [k, v] of out.headers || []) outHeaders[k] = v;

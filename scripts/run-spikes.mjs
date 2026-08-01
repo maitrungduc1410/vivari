@@ -47,6 +47,13 @@ const SPIKES = [
   // API surface, the bun:test runner, and the /bin/bun.js CLI source — all proven
   // with no kernel/wasm, so this runs in the Wasm-free toolchain-gate.
   { name: "bun-offline", file: "spike-bun-offline.mjs", net: false, timeout: 60000 },
+  // Python (pure-JS tier): the python/gunicorn/uvicorn/flask argv seams run as
+  // real Node subprocesses, CPython-faithful SystemExit, the generated bridge
+  // dispatch source, and template-registry integrity. Pyodide itself is neither
+  // committed nor installed by CI, so the interpreter-backed proof has to be
+  // `net` (see "python" below) — everything provable without it lives here so
+  // that Python, like Bun, is gated on every PR rather than nightly.
+  { name: "python-offline", file: "spike-python-offline.mjs", net: false, timeout: 60000 },
   // Persistent dependency cache (P1): pack node_modules → snapshot → wipe →
   // restore → require, against the real Wasm VFS. Offline + deterministic.
   // `needsWasm`: offline but requires the Node Wasm VFS build (pkg-node), so it
@@ -107,6 +114,13 @@ const SPIKES = [
   // Astro dev server — Vite + @astrojs/compiler (Go/wasm) + esbuild; exercises the full
   // loader stack (live-binding fallback, globalThis.fs pre-seat, re-export getters). Heavy.
   { name: "astro", file: "spike-astro.mjs", net: true, timeout: 600000 },
+  // Python: the WSGI/ASGI bridge + the seven Python templates, driven against real
+  // Pyodide. Kernel-free by necessity (bootPyodide can't be reached from Node —
+  // see the header of the spike), so it proves Python semantics and protocol
+  // conversion, not the preview tunnel. `net` because Django/Flask come from PyPI
+  // via micropip and pytest from the Pyodide CDN; the pyodide npm package is
+  // provisioned into the same scratch dir vendor-pyodide.mjs uses.
+  { name: "python", file: "spike-python-bridge.mjs", net: true, timeout: 600000 },
 ];
 
 const args = process.argv.slice(2);

@@ -12,6 +12,8 @@
 //   python -m pip install ... install packages (vendored wheel first, else micropip)
 //   python -m uvicorn m:app   serve a FastAPI/ASGI app via a guest http bridge
 //   python -m flask run       serve a Flask/WSGI app via a guest http bridge
+//   python -m gunicorn m:app  serve any WSGI app (Django, Flask, ...) the same way
+//   python -m pytest [args]   run a pytest suite and propagate its exit code
 //   python --version          print the interpreter version (does NOT boot Pyodide)
 //
 // The heavy Pyodide bundle is fetched from the same-origin vendored index
@@ -27,6 +29,30 @@ export const PYTHON_PROGRAM = `
 const NL = String.fromCharCode(10);
 function out(s) { process.stdout.write(s + NL); }
 function err(s) { process.stderr.write(s + NL); }
+
+// Swallowing a flag we cannot honour is the "stub that lies" failure in argv
+// form: real gunicorn -w 4 forks four workers, and accepting the flag in
+// silence tells the user we did. Two tiers, mirroring builtins/bun.js:
+//   warn   - the server still does the job, just not the way the flag asked
+//   refuse - the flag changes WHAT is served, so guessing would be wrong
+function warnIgnored(cmd, flag, why) {
+  err(cmd + ': ' + flag + ' is ignored here - ' + why + '.');
+}
+function refuse(cmd, flag, why) {
+  err(cmd + ': ' + flag + ' is not supported here - ' + why + '.');
+  process.exit(1);
+}
+
+// --flag=value and "--flag value" spell the same thing; normalise so the
+// dispatch below states each rule once.
+function flagName(a) {
+  const eq = a.indexOf('=');
+  return eq === -1 ? a : a.slice(0, eq);
+}
+function inlineValue(a) {
+  const eq = a.indexOf('=');
+  return eq === -1 ? null : a.slice(eq + 1);
+}
 
 const argv = process.argv.slice(2);
 
@@ -45,6 +71,8 @@ const HELP = [
   '  python -m pip install ...   install packages (vendored wheel, else micropip)',
   '  python -m uvicorn main:app  serve a FastAPI/ASGI app (opens a preview)',
   '  python -m flask run         serve a Flask/WSGI app (opens a preview)',
+  '  python -m gunicorn wsgi:app serve any WSGI app - Django, Flask, ... (opens a preview)',
+  '  python -m pytest [args]     run a pytest suite',
   '  python --version            print the interpreter version',
 ].join(NL);
 
@@ -102,17 +130,29 @@ async function doPip(rest) {
   process.exit(code | 0);
 }
 
+// Same contract as doGunicorn on the ASGI side, and the same rule about flags
+// it cannot honour. (Predates the gunicorn seam; brought up to the same
+// standard here so the two entrypoints do not disagree about what honesty is.)
 async function doUvicorn(rest) {
   let app = '';
   let host = '';
   let port = 0;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
-    if (a === '--host') { host = rest[i + 1] || ''; i++; }
-    else if (a.indexOf('--host=') === 0) { host = a.slice(7); }
-    else if (a === '--port' || a === '-p') { port = parseInt(rest[i + 1] || '0', 10); i++; }
-    else if (a.indexOf('--port=') === 0) { port = parseInt(a.slice(7), 10); }
-    else if (a.charAt(0) === '-') { /* ignore uvicorn-only flags (--reload, --factory, --workers, ...) */ }
+    const name = flagName(a);
+    const inline = inlineValue(a);
+    const valueOf = function () { if (inline !== null) return inline; i++; return rest[i]; };
+    if (name === '--host') { host = valueOf() || ''; }
+    else if (name === '--port' || name === '-p') { port = parseInt(valueOf() || '0', 10); }
+    // --factory means the app spec names a callable that RETURNS the app. The
+    // bridge imports the attribute and serves it as-is, so honouring the flag
+    // silently would serve the factory function itself.
+    else if (name === '--factory') { refuse('uvicorn', name, 'the bridge serves the imported attribute directly, so an app factory would be served instead of the app it builds'); }
+    else if (name === '--workers' || name === '-w') { valueOf(); warnIgnored('uvicorn', name, 'the WASM VM has no OS threads and no fork, so there is exactly one worker'); }
+    else if (name === '--reload') { warnIgnored('uvicorn', name, 'reloading needs a file watcher, which needs a thread; restart the process to pick up changes'); }
+    // Same rule as gunicorn: consume the value, or '--log-level debug main:app'
+    // serves an app called 'debug'.
+    else if (a.charAt(0) === '-') { if (inline === null && UVICORN_BOOLEAN.indexOf(name) === -1) valueOf(); }
     else if (!app) { app = a; }
   }
   if (!app) { err('uvicorn: no app specified (expected module:attr, e.g. main:app)'); process.exit(1); return; }
@@ -132,11 +172,17 @@ async function doFlask(rest) {
     if (a === '--app' || a === '-A') { appSpec = rest[i + 1] || appSpec; i++; }
     else if (a.indexOf('--app=') === 0) { appSpec = a.slice(6); }
     else if (a === 'run') { hasRun = true; }
-    else if (a === '--host') { host = rest[i + 1] || ''; i++; }
+    // Flask spells the short host flag '-h', not '--help' — a real difference
+    // from every other CLI here, and dropping it silently ignored the bind
+    // address in 'flask run -h 0.0.0.0'.
+    else if (a === '--host' || a === '-h') { host = rest[i + 1] || ''; i++; }
     else if (a.indexOf('--host=') === 0) { host = a.slice(7); }
     else if (a === '--port' || a === '-p') { port = parseInt(rest[i + 1] || '0', 10); i++; }
     else if (a.indexOf('--port=') === 0) { port = parseInt(a.slice(7), 10); }
-    else { /* ignore --debug / --reload / etc. */ }
+    // --debug turns on the reloader and the interactive debugger, both of which
+    // need a watcher thread; --reload asks for half of that on its own.
+    else if (a === '--debug' || a === '--reload') { warnIgnored('flask', a, 'the reloader and the interactive debugger both need a file watcher, which needs a thread'); }
+    else { /* --no-reload, --cert, and friends: nothing to contradict */ }
   }
   if (!hasRun) { err('flask: only the "run" command is supported in the Vivari shim.'); process.exit(1); return; }
   if (!appSpec) appSpec = 'app';
@@ -144,6 +190,96 @@ async function doFlask(rest) {
   const py = getPy();
   await py.serve({ app: appSpec, mode: 'wsgi', host: host, port: port });
   process.exit(0);
+}
+
+// gunicorn ADDRESS is host:port, port-only, or host-only.
+function parseBind(value) {
+  const v = String(value || '');
+  const c = v.lastIndexOf(':');
+  if (c === -1) return { host: '', port: parseInt(v, 10) || 0 };
+  return { host: v.slice(0, c), port: parseInt(v.slice(c + 1), 10) || 0 };
+}
+
+// gunicorn is THE canonical WSGI entrypoint, so it is the seam every WSGI
+// framework reaches for — Django, Flask, Bottle, Pyramid — rather than one shim
+// per framework. Like doUvicorn it never imports the package it is named after:
+// it parses argv and hands the app spec to the same guest-http bridge. That is
+// an honest entrypoint rather than a stub, because the observable contract —
+// "your WSGI app is now served on this port" — is the one it delivers; what it
+// cannot deliver is gunicorn's PROCESS MODEL, so those flags say so out loud.
+// Every flag real gunicorn declares as store_true, from its own --help
+// (gunicorn 23.x); everything else that starts with a dash there takes a value.
+// Listing the ~12 booleans rather than the ~56 value-takers is both smaller and
+// the safer way to be wrong: mistaking a boolean for a value-taker eats the app
+// spec and reports 'no app specified', which the user sees, while the reverse
+// leaves the value sitting there to be read as the app spec, and silently
+// serves something they never named.
+var GUNICORN_BOOLEAN = [
+  '--reload', '--spew', '--check-config', '--print-config', '--preload',
+  '--no-sendfile', '--reuse-port', '--initgroups', '--capture-output',
+  '--log-syslog', '--no-control-socket', '--daemon', '-D',
+  '--version', '-v', '--help', '-h',
+];
+
+// Likewise for uvicorn, from its own --help (uvicorn 0.3x). Click spells the
+// negatable ones '--x / --no-x'; both spellings are boolean.
+var UVICORN_BOOLEAN = [
+  '--reload', '--factory', '--version', '--help', '--reset-contextvars',
+  '--access-log', '--no-access-log', '--use-colors', '--no-use-colors',
+  '--proxy-headers', '--no-proxy-headers', '--server-header',
+  '--no-server-header', '--date-header', '--no-date-header',
+];
+
+async function doGunicorn(rest) {
+  let app = '';
+  let host = '';
+  let port = 0;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    const name = flagName(a);
+    const inline = inlineValue(a);
+    const valueOf = function () { if (inline !== null) return inline; i++; return rest[i]; };
+    if (name === '--bind' || name === '-b') { const b = parseBind(valueOf()); host = b.host; port = b.port; }
+    // -k picks the server model itself. 'sync' IS what the bridge does, so
+    // spelling out the default is honoured; anything else (gevent, eventlet,
+    // uvicorn.workers.UvicornWorker) would serve a different protocol, and
+    // ignoring it would hand an ASGI app to the WSGI bridge and blame the app.
+    else if (name === '--worker-class' || name === '-k') {
+      const cls = valueOf();
+      if (cls !== 'sync') { refuse('gunicorn', name + ' ' + cls, 'the bridge serves WSGI in-process, so only the default sync worker exists here'); }
+    }
+    else if (name === '--workers' || name === '-w' || name === '--threads') { valueOf(); warnIgnored('gunicorn', name, 'the WASM VM has no OS threads and no fork, so there is exactly one worker'); }
+    else if (name === '--reload') { warnIgnored('gunicorn', name, 'reloading needs a file watcher, which needs a thread; restart the process to pick up changes'); }
+    else if (name === '--daemon' || name === '-D') { warnIgnored('gunicorn', name, 'there is no process to detach into, so the server stays in the foreground'); }
+    // Tuning and logging knobs with no worker to apply them to. Nothing to
+    // honour or contradict, but the VALUE has to be consumed or it becomes the
+    // app spec: 'gunicorn -t 30 wsgi:app' used to serve an app called '30'.
+    else if (a.charAt(0) === '-') { if (inline === null && GUNICORN_BOOLEAN.indexOf(name) === -1) valueOf(); }
+    else if (!app) { app = a; }
+  }
+  if (!app) { err('gunicorn: no app specified (expected module:attr, e.g. wsgi:application)'); process.exit(1); return; }
+  if (!port) port = parseInt(process.env.PORT || '8000', 10);
+  const py = getPy();
+  await py.serve({ app: app, mode: 'wsgi', host: host, port: port });
+  process.exit(0);
+}
+
+// pytest needs no new runtime API: synthesise the two-line program a user would
+// write by hand and run it through the ordinary script path. That gets package
+// auto-loading for free (the synthesised source imports pytest, so
+// loadPackagesFromImports fetches the wheel) and exit-code propagation for free
+// (sys.exit raises SystemExit, which the runtime already maps to a process exit
+// code). int() because pytest.main returns an ExitCode enum.
+async function doPytest(rest) {
+  const args = rest.length ? rest : ['-q'];
+  const src = [
+    'import sys',
+    'import pytest',
+    'sys.exit(int(pytest.main(' + JSON.stringify(args) + ')))',
+  ].join(NL);
+  const py = getPy();
+  const rc = await py.runCode(src, args);
+  process.exit(rc | 0);
 }
 
 async function main() {
@@ -166,7 +302,9 @@ async function main() {
     if (mod === 'pip') { return doPip(rest); }
     if (mod === 'uvicorn') { return doUvicorn(rest); }
     if (mod === 'flask') { return doFlask(rest); }
-    err('python -m ' + mod + ': running arbitrary modules is not supported in the Vivari shim yet (only "pip", "uvicorn", "flask").');
+    if (mod === 'gunicorn') { return doGunicorn(rest); }
+    if (mod === 'pytest') { return doPytest(rest); }
+    err('python -m ' + mod + ': running arbitrary modules is not supported in the Vivari shim yet (only "pip", "uvicorn", "flask", "gunicorn", "pytest").');
     process.exit(1);
     return;
   }
