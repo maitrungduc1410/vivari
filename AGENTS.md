@@ -76,6 +76,7 @@ packages/
     fs-client.js   env-agnostic Atomics syscall client (the caller side).
     websocket.js   in-VM WebSocket client (used by the HMR tunnel).
     builtins/      hand-written: process, os, assert, child_process, bun (Bun global + bun:* modules),
+                   bun-formats.js (Bun.YAML/TOML/JSON5/JSONL/semver over vendored parsers),
                    python (lazy Pyodide/CPython→WASM plug-in + Flask/FastAPI HTTP bridge).
     node/
       lib/         Node's REAL vendored lib/*.js (fs, net, http, stream, ...).
@@ -86,6 +87,11 @@ packages/
         llhttp/      llhttp compiled to Wasm (vendored from undici) + the bridge
                      (llhttp-parser.js) folding llhttp callbacks onto Node's
                      HTTPParser contract; regen the binary via scripts/vendor-llhttp.mjs.
+      vendor/      third-party bundles, each an esbuild CJS bundle wrapped in a
+                   factory (semver for npm; js-yaml/json5/smol-toml for the Bun
+                   data formats; es-module-lexer; the napi wasm runtime). Every
+                   header carries package@version, the license and the exact
+                   regenerate command — keep that true.
       internal-binding.js / primordials.js / loader.js   glue for the above.
 
   studio/          The primary UI: a Vite + React 19 (React Compiler) + Tailwind v4
@@ -263,6 +269,18 @@ README.md · roadmap.md · research.md · ARCHITECTURE.md · AGENTS.md
 ---
 
 ## Critical gotchas (these have bitten us repeatedly)
+
+### `capture: true` hides a process's stderr from `VV_LIVE=1`
+`kernel.start(cmd, args, { capture: true })` buffers the child's output into
+`r.stdout`/**`r.stderr`** and, on that path, the kernel's `stdout`/`stderr`
+callbacks are **never called** (`kernel.js` `onOutput` returns early when
+`proc.capture`). So the usual "stream it and look" escape hatch — `VV_LIVE=1`,
+which only wires those callbacks — shows nothing for a captured process. A spike
+that asserts on `r.stdout` alone therefore reports a crashed child as an empty
+string and a bare non-zero exit, with the real error sitting unread in `r.stderr`.
+That is exactly how a plain `SyntaxError: Unexpected token '<'` in the TS
+transform reached CI as four unexplained failures. **When a captured check can
+fail, print `r.stderr`** (see block 2 of `scripts/spike-bun.mjs`).
 
 ### The 1 MiB SAB window — internalize this one
 `DATA_BYTES = 1 << 20`. **Every syscall request AND response must fit in 1 MiB.**
@@ -733,7 +751,7 @@ sha512 integrity), and execs it. What's special / must-not-regress:
   downloads+runs yarn AND pnpm), using the SAME env (not CLI flags). The off-disk
   Path B proof is `scripts/spike-corepack.mjs`.
 
-### Bun is a Node-backed SHIM, not a real binary — nothing is vendored
+### Bun is a Node-backed SHIM, not a real binary — only its parsers are vendored
 There is no `wasm32` build of Bun, so unlike the real npm/yarn/pnpm/corepack/tsgo
 (vendored packs unpacked into the VFS) Bun is **emulated on top of our Node
 runtime**, and its pieces are ALWAYS on PATH (in `COREUTILS`), never lazily
@@ -745,14 +763,26 @@ unpacked:
   `BunRequest.params`, method-specific handlers; server-side **WebSockets** — RFC
   6455 handshake, frame codec, `ServerWebSocket` send/close/subscribe/publish/cork
   + pub/sub topics) and **`bun:*` modules** (`bun:test` runner + `expect`).
+- **`packages/runtime/builtins/bun-formats.js`** — `Bun.YAML`, `Bun.TOML`,
+  `Bun.JSON5`, `Bun.JSONL` and `Bun.semver`, wired into the `Bun` literal by
+  `bun.js`. The **one place in the Bun shim that vendors real libraries**
+  (`node/vendor/js-yaml.js`, `json5.js`, `smol-toml.js`; `Bun.semver` reuses the
+  `semver.js` bundled for npm). Vendored because Bun's parsers are Rust/C++ with
+  documented behaviour the stock npm libraries get differently — a TOML integer
+  outside ±(2^53−1) **throws** rather than rounding, TOML date/times come back as
+  their **source strings**, YAML is **1.2 core** (a bare date and `yes` stay
+  strings) and multi-document YAML returns an **array**, and `Bun.JSONL.parse`
+  throws only when *zero* values parsed while `parseChunk` never throws at all.
+  New format work goes here, not in `bun.js`.
 - **`packages/kernel-host/programs/bun.js`** — the `bun`/`bunx` CLI: `bun run`,
   `bunx` (delegates to `npx`), install delegation, and it surfaces require/unhandled-
   rejection errors instead of a silent exit.
 - **Zero-config `.ts`/`.tsx`** runs through `packages/runtime/typescript-transform.js`
   (synchronous, dependency-free type-strip + JSX lowering, invoked by `module.js`;
   gated so plain JS is untouched). It strips return-type annotations inside object
-  literals (the `Bun.serve` shape), typed/destructured params, and inline
-  object/function type annotations — do NOT route plain `.js` through it.
+  literals (the `Bun.serve` shape), typed/destructured params, inline
+  object/function type annotations, and the type parameters of a generic **arrow**
+  (`<T>(x: T): T => x`) — do NOT route plain `.js` through it.
 - Install/run detection: `kernel-worker.ts` `pmFromCmd` maps `bun`/`bunx` to the
   `bun` PM (see the install-command builder), so a Bun template's Run auto-installs
   with `bun`.

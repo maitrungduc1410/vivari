@@ -235,6 +235,48 @@ console.log("== inline object-type & function-type annotations ==");
   }
 }
 
+console.log("== generic arrow functions ==");
+{
+  // Regression: the type parameters of a generic ARROW were never stripped, so
+  // `const add = <T extends number>(a: T, b: T): T => ...` emitted `<T extends
+  // number>(a, b)=>` — a hard SyntaxError. isGenericOpen only fires when the
+  // token before `<` is an identifier / `)` / `>`, but an arrow starts an
+  // EXPRESSION, so what precedes it is `=`, `(`, `,`, `return`, … Only
+  // `async <T>(…)` worked, by accident: `async` is an identifier.
+  //
+  // This is what made block 2 of scripts/spike-bun.mjs fail on its first CI run
+  // ("bun: SyntaxError: Unexpected token '<' (while compiling /app/index.ts)").
+  // The bug predates the Phase 0 CI wiring; that wiring is only what revealed it.
+  const cases = [
+    ["extends bound", "const add = <T extends number>(a: T, b: T): T => (a + b) as T; __r = add(1, 2);", 3],
+    ["bare parameter", "const id = <T>(x: T): T => x; __r = id(7);", 7],
+    ["two parameters", "const pair = <A, B>(a: A, b: B) => [a, b]; __r = pair(1, 2).join(',');", "1,2"],
+    ["default parameter", "const d = <T = string>(x: T) => x; __r = d('z');", "z"],
+    ["nested type argument", "const f = <T extends Array<number>>(x: T): T => x; __r = f([1, 2]).length;", 2],
+    ["block body", "const b = <T>(x: T): T => { return x; }; __r = b(6);", 6],
+    ["no return annotation", "const n = <T>(x: T) => x; __r = n(5);", 5],
+    ["as a call argument", "const call = (f: any) => f(5); __r = call(<T>(x: T): T => x);", 5],
+    ["in an object literal", "const o = { m: <T>(x: T): T => x }; __r = o.m(4);", 4],
+    ["in an array literal", "const a = [<T>(x: T) => x]; __r = a[0](9);", 9],
+    ["after return", "function w() { return <T>(x: T): T => x; } __r = w()(8);", 8],
+    ["async (already worked)", "const g = async <T>(x: T): T => x; __r = typeof g;", "function"],
+  ];
+  for (const [name, src, want] of cases) {
+    const out = transpileTypeScript(src, "t.ts");
+    let got, err = null;
+    try { got = evalJs("let __r; " + out + "\nmodule.exports = __r;"); }
+    catch (e) { err = e.constructor.name + ": " + e.message; }
+    ok(err === null && got === want, "generic arrow: " + name + (err ? " -> " + err : " -> " + JSON.stringify(got)));
+  }
+  // The heuristic must not start eating real comparisons. `a < b > (c)` is left
+  // alone here on purpose: TypeScript itself parses that as the generic call
+  // `a<b>(c)`, so treating it as one is correct, not a regression.
+  const cmp = transpileTypeScript("const a = 1, b = 2; __r = (a < b) && !(b > 3); module.exports = __r;", "t.ts");
+  ok(evalJs(cmp) === true, "plain `<` / `>` comparisons still survive the transform");
+  const shift = transpileTypeScript("const n = 8; module.exports = (n >> 1) + (n << 1);", "t.ts");
+  ok(evalJs(shift) === 20, "shift operators still survive the transform");
+}
+
 console.log("== reported react.tsx inline prop type ==");
 {
   // The exact snippet the user reported crashing with `SyntaxError: Unexpected token '{'`.
@@ -623,6 +665,192 @@ console.log("== CI actually gates the Bun spikes ==");
   const spikeLines = ci.split("\n").filter((l) => l.indexOf("run-spikes.mjs") !== -1);
   ok(spikeLines.some((l) => /run-spikes\.mjs --offline\s.*\bbun\b/.test(l)), "a CI job runs the Wasm-backed bun spike");
   ok(spikeLines.some((l) => /run-spikes\.mjs --offline\s.*\bdep-cache\b/.test(l)), "that job still runs the dep-cache spike");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 batch A — the data-format APIs (Bun.YAML/TOML/JSON5/JSONL/semver).
+// Everything below goes through the real Bun global, so it gates the wiring in
+// bun.js as well as the implementations in bun-formats.js. Each block ends with
+// the divergences that a stock npm parser gets differently from Bun; those are
+// the checks a future refactor would silently undo.
+const formatsProc = { env: { PATH: "/bin" }, argv: ["bun", "/app/x.ts"], cwd: () => "/app", stdout: process.stdout, stderr: process.stderr, stdin: process.stdin };
+const { Bun: FBun } = createBunRuntime({ process: formatsProc, Buffer, require: nodeRequire });
+const jsonEq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const threw = (fn) => { try { fn(); return null; } catch (e) { return e; } };
+
+console.log("== Bun.YAML.parse ==");
+{
+  ok(jsonEq(FBun.YAML.parse("name: John\nage: 30\nhobbies:\n  - a\n  - b\n"), { name: "John", age: 30, hobbies: ["a", "b"] }), "parses a mapping with a nested sequence");
+
+  // Documented shape change: multi-document input returns an ARRAY, single
+  // document input returns the document. A caller that assumes one breaks on
+  // the other, so both directions are pinned.
+  const multi = FBun.YAML.parse("\n---\nname: Document 1\n---\nname: Document 2\n---\nname: Document 3\n");
+  ok(Array.isArray(multi) && multi.length === 3 && multi[2].name === "Document 3", "multi-document input returns an array of documents");
+  const single = FBun.YAML.parse("---\nname: Document 1\n");
+  ok(!Array.isArray(single) && single.name === "Document 1", "a single document (even with an explicit ---) is NOT wrapped in an array");
+  // Bun's docs do not pin the no-document case; what matters for a caller is
+  // that it is never an array, because that is the branch multi-document input
+  // takes. Empty input follows js-yaml's load("") (undefined); a comment-only
+  // document keeps YAML's own answer for an empty node (null).
+  ok(FBun.YAML.parse("") === undefined && FBun.YAML.parse("# just a comment\n") === null, "empty and comment-only input yield a single value, never an array");
+
+  ok(jsonEq(FBun.YAML.parse("base: &b\n  t: 5\nuse:\n  <<: *b\n  x: 1\n"), { base: { t: 5 }, use: { t: 5, x: 1 } }), "anchors, aliases and the << merge key");
+  ok(jsonEq(FBun.YAML.parse("lit: |\n  l1\n  l2\nfold: >\n  f1\n  f2\n"), { lit: "l1\nl2\n", fold: "f1 f2\n" }), "literal and folded block scalars");
+  ok(FBun.YAML.parse("a: !!str 123").a === "123", "an explicit !!str tag");
+
+  // Bun parses YAML 1.2; js-yaml's DEFAULT_SCHEMA is 1.1 and would resolve both
+  // of these to non-strings (a Date and `true`). bun-formats.js picks
+  // CORE_SCHEMA for exactly this reason — a config value silently changing type
+  // between the sandbox and production is the whole failure mode of a shim.
+  ok(FBun.YAML.parse("expires: 2001-12-14").expires === "2001-12-14", "YAML 1.2 core: a bare date stays a string, it is not a Date");
+  ok(FBun.YAML.parse("debug: yes\nprod: no").debug === "yes", "YAML 1.2 core: `yes` stays a string, it is not a boolean");
+  ok(FBun.YAML.parse("a: true\nb: 0x1F\nc: ~").a === true, "YAML 1.2 core still resolves true/hex/null");
+
+  ok(threw(() => FBun.YAML.parse("invalid: yaml: content:")) instanceof SyntaxError, "invalid YAML throws a SyntaxError (js-yaml's YAMLException is not one)");
+}
+
+console.log("== Bun.TOML.parse ==");
+{
+  ok(jsonEq(FBun.TOML.parse('name = "my-app"\n[database]\nport = 5432\n'), { name: "my-app", database: { port: 5432 } }), "scalars and a [table]");
+  ok(jsonEq(FBun.TOML.parse("a.b.c = 1\n[[x]]\ny = 1\n[[x]]\ny = 2\n"), { a: { b: { c: 1 } }, x: [{ y: 1 }, { y: 2 }] }), "dotted keys and an array of tables");
+  ok(jsonEq(FBun.TOML.parse("h = 0xDEADBEEF\no = 0o14\nb = 0b101\n"), { h: 3735928559, o: 12, b: 5 }), "hex, octal and binary integers");
+  ok(FBun.TOML.parse("a = inf\nb = -inf").a === Infinity, "inf floats");
+  ok(Number.isNaN(FBun.TOML.parse("n = nan").n), "nan floats");
+  ok(jsonEq(FBun.TOML.parse('a = [1, "x", true, [2]]').a, [1, "x", true, [2]]), "mixed-type and nested arrays");
+  ok(FBun.TOML.parse("a = 'C:\\x'").a === "C:\\x", "a literal string does not process escapes");
+  ok(FBun.TOML.parse("b = \"\"\"\nml\n\"\"\"\n").b === "ml\n", "a multi-line basic string drops the newline after the opening delimiter");
+
+  // The TOML 1.1 syntax Bun's docs list as supported. This is the claim the
+  // smol-toml vendor header makes to justify choosing that library, so it is
+  // pinned here rather than left as prose: a regenerate that quietly dropped 1.1
+  // would otherwise surface as a parse failure in someone's config file.
+  ok(jsonEq(FBun.TOML.parse("a = {\n  b = 1,\n  c = 2,\n}\n").a, { b: 1, c: 2 }), "TOML 1.1 multi-line inline tables");
+  ok(FBun.TOML.parse('s = "\\x41"').s === "A" && FBun.TOML.parse('s = "\\e"').s === "\u001b", "TOML 1.1 \\xHH and \\e escapes");
+  ok(FBun.TOML.parse('s = "\\U0001F600"').s === "\u{1F600}", "\\UHHHHHHHH escapes outside the BMP");
+
+  // THE one that a stock TOML library gets wrong. Most silently return a lossy
+  // float, so a snowflake id in a config file "parses successfully" as the wrong
+  // number. Bun throws, and so must this.
+  ok(threw(() => FBun.TOML.parse("id = 9223372036854775807")) instanceof SyntaxError, "an integer above 2^53-1 THROWS rather than becoming a lossy float");
+  ok(threw(() => FBun.TOML.parse("id = -9223372036854775808")) instanceof SyntaxError, "the same below -(2^53-1)");
+  ok(threw(() => FBun.TOML.parse("id = 9007199254740992")) instanceof SyntaxError, "2^53 exactly is already unrepresentable, so it throws");
+  ok(FBun.TOML.parse("id = 9007199254740991").id === 9007199254740991, "2^53-1 is the largest integer that still parses");
+
+  // Also documented: date/times come back as their SOURCE TEXT, not as Date
+  // objects. Round-tripping through a Date loses the offset form and the case.
+  const dt = FBun.TOML.parse("odt = 1979-05-27T07:32:00Z\nldt = 1979-05-27T07:32:00\nld = 1979-05-27\nlt = 07:32:00.5\noff = 1979-05-27T00:32:00-07:00\n");
+  ok(jsonEq(dt, { odt: "1979-05-27T07:32:00Z", ldt: "1979-05-27T07:32:00", ld: "1979-05-27", lt: "07:32:00.5", off: "1979-05-27T00:32:00-07:00" }), "all four date/time kinds are returned as their source strings, verbatim");
+  ok(typeof dt.odt === "string" && !(dt.odt instanceof Date), "a TOML datetime is a string, not a Date");
+
+  ok(threw(() => FBun.TOML.parse("invalid = = =")) instanceof SyntaxError, "invalid TOML throws a SyntaxError (smol-toml's TomlError is not one)");
+}
+
+console.log("== Bun.TOML.stringify ==");
+{
+  // Bun's documented layout: scalars first, then [table], then [[array-of-tables]].
+  const doc = FBun.TOML.stringify({ name: "app", server: { host: "localhost", port: 8080 }, points: [{ x: 1 }, { x: 2 }] });
+  ok(doc === 'name = "app"\n\n[server]\nhost = "localhost"\nport = 8080\n\n[[points]]\nx = 1\n\n[[points]]\nx = 2\n', "matches Bun's documented output exactly");
+  ok(FBun.TOML.parse(doc).points[1].x === 2, "and round-trips through parse");
+
+  // The value rules TOML cannot express. smol-toml disagrees with Bun on all
+  // four of these in both directions, which is why stringify normalises first.
+  ok(threw(() => FBun.TOML.stringify({ a: null })) instanceof TypeError, "null throws (TOML has no null) rather than being dropped");
+  ok(threw(() => FBun.TOML.stringify({ a: 1n })) instanceof TypeError, "a BigInt throws rather than being written as an integer");
+  ok(FBun.TOML.stringify({ a: 1, b: undefined, c: () => {}, d: Symbol("s") }) === "a = 1\n", "undefined, function and symbol properties are skipped");
+  ok(threw(() => FBun.TOML.stringify({ a: [1, undefined] })) instanceof TypeError, "...but inside an array they throw (TOML arrays cannot have holes)");
+  ok(threw(() => FBun.TOML.stringify({ a: [1, , 2] })) instanceof TypeError, "an array hole throws for the same reason");
+  const circular = { a: 1 };
+  circular.self = circular;
+  ok(/circular/.test(String(threw(() => FBun.TOML.stringify(circular)))), "a circular structure throws, and says so");
+  const shared = { x: 1 };
+  ok(FBun.TOML.stringify({ a: shared, b: shared }).indexOf("[b]") !== -1, "a repeated sibling is not mistaken for a cycle");
+  ok(threw(() => FBun.TOML.stringify([1, 2])) instanceof TypeError, "the top-level value must be an object (a TOML document is a table)");
+  ok(FBun.TOML.stringify({ at: new Date(Date.UTC(1979, 4, 27, 7, 32, 0)) }) === "at = 1979-05-27T07:32:00.000Z\n", "a Date becomes a TOML offset date-time");
+}
+
+console.log("== Bun.JSON5 ==");
+{
+  const v = FBun.JSON5.parse("{\n  // comment\n  unquoted: 'single',\n  /* block */ hex: 0xDEADbeef,\n  half: .5,\n  plus: +42,\n  to: Infinity,\n  nan: NaN,\n  trailing: [1, 2,],\n}");
+  ok(v.unquoted === "single" && v.hex === 3735928559 && v.half === 0.5 && v.plus === 42, "comments, unquoted keys, single quotes, hex, leading-dot and +42");
+  ok(v.to === Infinity && Number.isNaN(v.nan) && jsonEq(v.trailing, [1, 2]), "Infinity, NaN and trailing commas");
+  ok(FBun.JSON5.parse("{multi: 'line 1 \\\nline 2'}").multi === "line 1 line 2", "backslash line continuations in strings");
+  const edges = FBun.JSON5.parse("{trail: 5., neg: -Infinity, signed: +.5}");
+  ok(edges.trail === 5 && edges.neg === -Infinity && edges.signed === 0.5, "a trailing decimal point, -Infinity and a signed leading dot");
+
+  ok(FBun.JSON5.stringify({ name: "my-app", version: "1.0.0" }) === "{name:'my-app',version:'1.0.0'}", "stringify matches Bun's compact output (unquoted keys, single quotes)");
+  ok(FBun.JSON5.stringify({ name: "my-app", debug: true, tags: ["web", "api"] }, null, 2) === "{\n  name: 'my-app',\n  debug: true,\n  tags: [\n    'web',\n    'api',\n  ],\n}", "stringify with a space argument matches Bun's pretty output, trailing commas included");
+  ok(FBun.JSON5.stringify({ inf: Infinity, ninf: -Infinity, nan: NaN }) === "{inf:Infinity,ninf:-Infinity,nan:NaN}", "stringify keeps Infinity/NaN literal where JSON.stringify writes null");
+  ok(FBun.JSON5.stringify({ a: 1 }, null, "\t") === "{\n\ta: 1,\n}", "a string `space` argument is used as the indent verbatim, not coerced to a width");
+
+  ok(threw(() => FBun.JSON5.parse("{invalid}")) instanceof SyntaxError, "invalid JSON5 throws a SyntaxError");
+}
+
+console.log("== Bun.JSONL ==");
+{
+  ok(jsonEq(FBun.JSONL.parse('{"id":1}\n{"id":2}\n{"id":3}\n'), [{ id: 1 }, { id: 2 }, { id: 3 }]), "parse returns every value");
+  ok(jsonEq(FBun.JSONL.parse('42\n"hello"\ntrue\nnull\n[1,2,3]\n{"k":"v"}\n'), [42, "hello", true, null, [1, 2, 3], { k: "v" }]), "each line may be any JSON value, not just an object");
+  ok(jsonEq(FBun.JSONL.parse('{"a":1}'), [{ a: 1 }]), "parse treats end-of-input as terminating the last value");
+  ok(jsonEq(FBun.JSONL.parse('{"a":1}\n\n\n{"b":2}\n'), [{ a: 1 }, { b: 2 }]), "blank lines are skipped, not errors");
+
+  // THE asymmetry. These two contracts are deliberately different and one error
+  // strategy cannot serve both; implementing them together is how a refactor
+  // silently breaks the streaming side.
+  ok(threw(() => FBun.JSONL.parse("{invalid}\n")) instanceof SyntaxError, "parse throws when ZERO values parsed");
+  const partial = FBun.JSONL.parse('{"a":1}\n{invalid}\n{"b":2}\n');
+  ok(jsonEq(partial, [{ a: 1 }]), "parse returns the partial result SILENTLY once at least one value parsed");
+
+  const bad = FBun.JSONL.parseChunk('{"a":1}\n{invalid}\n{"b":2}\n');
+  ok(bad.error instanceof SyntaxError && jsonEq(bad.values, [{ a: 1 }]), "parseChunk NEVER throws: the error comes back in .error, with the values parsed before it");
+  ok(bad.read === 7 && bad.done === false, "parseChunk reports read=7 (Bun's documented value) and done=false");
+
+  const cut = FBun.JSONL.parseChunk('{"id":1}\n{"id":2}\n{"id":3');
+  ok(jsonEq(cut.values, [{ id: 1 }, { id: 2 }]) && cut.read === 17 && cut.done === false && cut.error === null, "an incomplete trailing value is left unconsumed: read=17, done=false, error=null");
+  ok(FBun.JSONL.parseChunk('{"a":1}\n').done === true, "a fully consumed chunk reports done");
+
+  // Streaming: slice at `read` and the remainder must parse on the next pass.
+  const stream = '{"id":1}\n{"id":2}\n{"id":3';
+  const rest = stream.slice(cut.read) + '}\n';
+  ok(jsonEq(FBun.JSONL.parseChunk(rest).values, [{ id: 3 }]), "slicing at read and appending the rest resumes correctly");
+
+  const buf = new TextEncoder().encode('{"a":1}\n{"b":2}\n{"c":3}\n');
+  ok(jsonEq(FBun.JSONL.parse(buf), [{ a: 1 }, { b: 2 }, { c: 3 }]), "Uint8Array input");
+  const fromByte8 = FBun.JSONL.parseChunk(buf, 8);
+  ok(jsonEq(fromByte8.values, [{ b: 2 }, { c: 3 }]) && fromByte8.read === 23, "a start byte offset, with read absolute into the original buffer (Bun's documented 23)");
+  ok(jsonEq(FBun.JSONL.parseChunk(buf, 0, 8).values, [{ a: 1 }]), "an end byte offset bounds the range");
+  const bom = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode('{"a":1}\n')]);
+  ok(jsonEq(FBun.JSONL.parse(bom), [{ a: 1 }]), "a UTF-8 BOM at the head of a buffer is skipped");
+  ok(threw(() => FBun.JSONL.parse(42)) instanceof TypeError, "a non string/Uint8Array input is an argument error, not a parse error");
+}
+
+console.log("== Bun.semver ==");
+{
+  const s = FBun.semver;
+  ok(s.satisfies("1.0.0", "^1.0.0") === true && s.satisfies("1.0.0", "^1.0.1") === false, "caret ranges");
+  ok(s.satisfies("1.0.0", "~1.0.0") === true && s.satisfies("1.0.0", "~1.0.1") === false, "tilde ranges");
+  ok(s.satisfies("1.0.0", "1.0.x") === true && s.satisfies("1.0.0", "x.x.x") === true, "x-ranges");
+  ok(s.satisfies("1.0.0", "1.0.0 - 2.0.0") === true, "hyphen ranges");
+  // Compound and union ranges are where a hand-rolled matcher goes quietly wrong,
+  // which is why this reuses the vendored real node-semver.
+  ok(s.satisfies("1.5.0", ">=1 <2") === true && s.satisfies("2.5.0", ">=1 <2") === false, "compound ranges");
+  ok(s.satisfies("2.1.0", "1 || 2") === true, "union ranges");
+  ok(s.satisfies("1.0.0", "nonsense") === false && s.satisfies("not-a-version", "^1.0.0") === false, "an invalid version OR range returns false rather than throwing");
+
+  // node-semver's prerelease rule: a prerelease satisfies a range only if the range
+  // itself names a prerelease of the same major.minor.patch. It is the one rule a
+  // hand-rolled matcher is most likely to get backwards, and getting it backwards
+  // means an alpha build quietly passes a production dependency check.
+  ok(s.satisfies("1.0.0-alpha", "^1.0.0") === false, "a prerelease does NOT satisfy a range that names no prerelease");
+  ok(s.satisfies("1.0.0-alpha.2", ">=1.0.0-alpha.1") === true, "...but does satisfy one that does");
+
+  ok(s.order("1.0.0", "1.0.0") === 0 && s.order("1.0.0", "1.0.1") === -1 && s.order("1.0.1", "1.0.0") === 1, "order returns 0 / -1 / 1");
+  // Deliberately NOT symmetric with satisfies. Bun documents "returns false" for
+  // satisfies and says nothing about order, so an unparseable version throws
+  // instead of being reported equal — reporting 0 would make an unsortable array
+  // come back looking sorted, which is the silent-wrong failure the shim forbids.
+  ok(threw(() => s.order("nonsense", "1.0.0")) instanceof TypeError, "order throws on an unparseable version rather than inventing an ordering");
+  const unsorted = ["1.0.0", "1.0.1", "1.0.0-alpha", "1.0.0-beta", "1.0.0-rc"];
+  ok(jsonEq(unsorted.slice().sort(s.order), ["1.0.0-alpha", "1.0.0-beta", "1.0.0-rc", "1.0.0", "1.0.1"]), "usable directly as Array#sort's comparator, prereleases first");
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Bun checks passed");

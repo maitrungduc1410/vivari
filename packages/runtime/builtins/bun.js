@@ -12,7 +12,10 @@
 // `websocket` + pub/sub), Bun.env/argv/main/version, Bun.spawn/spawnSync/which,
 // Bun.$ (shell), Bun.sleep(Sync)/nanoseconds, Bun.hash/CryptoHasher,
 // Bun.password (crypto-backed), Bun.gzipSync/…, Bun.inspect/deepEquals/escapeHTML,
-// Bun.pathToFileURL/fileURLToPath, and the modules bun:test (a minimal runner +
+// Bun.pathToFileURL/fileURLToPath, the data formats Bun.YAML.parse,
+// Bun.TOML.parse/stringify, Bun.JSON5.parse/stringify, Bun.JSONL.parse/parseChunk
+// and Bun.semver.satisfies/order (vendored real parsers — see ./bun-formats.js),
+// and the modules bun:test (a minimal runner +
 // expect, with Bun/Jest `test.only` filtering and beforeEach/afterEach that
 // inherit into nested describes) and bun:jsc (serialize/deserialize).
 //
@@ -27,6 +30,10 @@
 // makeBunSqlite) — treat it as not usable today.
 
 import { transpileTypeScript } from "../typescript-transform.js";
+// The data-format APIs (Bun.YAML/TOML/JSON5/JSONL/semver) live in their own file:
+// they are self-contained pure computation over vendored parsers, and this one is
+// long enough already. See bun-formats.js for the vendoring rationale per format.
+import { createBunFormats } from "./bun-formats.js";
 
 // ---- version identity -------------------------------------------------------
 // The single definition of what this shim claims to be. `Bun.revision` is derived
@@ -626,6 +633,7 @@ export function createBunRuntime({ process, Buffer, require }) {
   function pathToFileURL(p) { return safeUrl("file://" + p); }
 
   // ---- the Bun global --------------------------------------------------------
+  const formats = createBunFormats({ process });
   const Bun = {
     version: BUN_VERSION,
     revision: BUN_REVISION,
@@ -648,6 +656,15 @@ export function createBunRuntime({ process, Buffer, require }) {
     deepEquals,
     escapeHTML,
     inspect: (v, opts) => lazy("util").inspect(v, opts),
+    // Data formats (see ./bun-formats.js). Real parsers, not approximations:
+    // Bun.TOML.parse throws on an integer it cannot hold losslessly, Bun.YAML.parse
+    // returns an array for multi-document input, and Bun.JSONL's two entry points
+    // report errors differently on purpose.
+    YAML: formats.YAML,
+    TOML: formats.TOML,
+    JSON5: formats.JSON5,
+    JSONL: formats.JSONL,
+    semver: formats.semver,
     gzipSync: zlibSync("gzipSync"),
     gunzipSync: zlibSync("gunzipSync"),
     deflateSync: zlibSync("deflateSync"),

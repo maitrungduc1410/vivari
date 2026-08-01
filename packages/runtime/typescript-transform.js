@@ -289,6 +289,72 @@ function isGenericOpen(toks, i) {
   return false;
 }
 
+// Token that may precede the `<` of a GENERIC ARROW (see isGenericArrowOpen).
+// These are the positions where an expression may begin.
+const EXPR_START_PUNC = new Set([
+  "=", "(", ",", "[", ":", ";", "{", "}", "=>", "?", "!", "&&", "||", "??",
+  "+", "-", "*", "/", "%", "==", "!=", "===", "!==", "...", "+=", "-=",
+]);
+const EXPR_START_KEYWORDS = new Set([...KEYWORDS_BEFORE_REGEX, "default"]);
+
+// Decide whether a `<` at index `i` opens the type PARAMETERS of a generic arrow
+// function (`<T>(x: T): T => x`). isGenericOpen cannot see these: it requires the
+// previous token to be an identifier / `)` / `>`, but a generic arrow starts an
+// EXPRESSION, so what precedes it is `=`, `(`, `,`, `return`, … Only `async <T>(…)`
+// happened to be caught, because `async` is an identifier.
+//
+// Plain JS cannot begin an expression with `<`, so requiring a balanced `<...>`
+// followed by a parameter list that leads to `=>` (directly, or after a `: T`
+// return annotation) is enough to tell this apart from a comparison. `.tsx`/`.jsx`
+// sources have JSX lowered before stripTypes runs, so no JSX ambiguity remains.
+function isGenericArrowOpen(toks, i) {
+  const p = prevSig(toks, i);
+  if (p >= 0) {
+    const pt = toks[p];
+    const okPunc = pt.type === "punc" && EXPR_START_PUNC.has(pt.value);
+    const okKeyword = pt.type === "id" && EXPR_START_KEYWORDS.has(pt.value);
+    if (!okPunc && !okKeyword) return false;
+  }
+  // 1) balanced `<...>`, containing nothing that is clearly not a type.
+  let depth = 0;
+  let k = i;
+  for (; k < toks.length; k++) {
+    const t = toks[k];
+    if (t.type === "ws" || t.type === "comment") continue;
+    if (t.type === "str" || t.type === "tmpl" || t.type === "regex") return false;
+    if (t.type === "punc") {
+      const v = t.value;
+      if (v === "<") depth++;
+      else if (v === ">") { depth--; if (depth === 0) { k++; break; } }
+      else if (v === ">>") { depth -= 2; if (depth <= 0) { k++; break; } }
+      else if (v === ">>>") { depth -= 3; if (depth <= 0) { k++; break; } }
+      else if (v === ";" || v === "{" || v === "=>" || v === "&&" || v === "||") return false;
+    }
+    if (k - i > 400) return false; // runaway guard
+  }
+  if (depth > 0) return false;
+  // 2) the type parameters must be followed by a parameter list.
+  const open = nextSig(toks, k - 1);
+  if (open < 0 || toks[open].type !== "punc" || toks[open].value !== "(") return false;
+  // 3) …whose matching `)` is followed by `=>`, or by a `: T` return type.
+  let pdepth = 0;
+  for (let j = open; j < toks.length; j++) {
+    const t = toks[j];
+    if (t.type !== "punc") continue;
+    if (t.value === "(") pdepth++;
+    else if (t.value === ")") {
+      pdepth--;
+      if (pdepth === 0) {
+        const after = nextSig(toks, j);
+        if (after < 0 || toks[after].type !== "punc") return false;
+        return toks[after].value === "=>" || toks[after].value === ":";
+      }
+    }
+    if (j - open > 4000) return false; // runaway guard
+  }
+  return false;
+}
+
 // ---- main transform ---------------------------------------------------------
 
 const MEMBER_MODIFIERS = new Set(["public", "private", "protected", "readonly", "abstract", "override", "declare"]);
@@ -448,8 +514,9 @@ function stripTypes(src) {
     if (t.type === "punc") {
       const v = t.value;
 
-      // Generic open `<` — type args (call site) or type params (decl site).
-      if (v === "<" && isGenericOpen(toks, i)) {
+      // Generic open `<` — type args (call site), type params (decl site), or the
+      // type params of a generic arrow function in expression position.
+      if (v === "<" && (isGenericOpen(toks, i) || isGenericArrowOpen(toks, i))) {
         const close = skipAngle(toks, i);
         i = drop(i, close);
         continue;

@@ -3787,3 +3787,124 @@ paths without a kernel. The spike also asserts that `ci.yml` still names the bun
 gate cannot be quietly dropped again.
 
 See ARCHITECTURE.md §9.2.
+
+## Bun data formats — YAML, TOML, JSON5, JSONL and semver (this change)
+
+Phase 1 batch A of the Bun coverage plan: five `Bun.*` namespaces that were entirely absent,
+all of them pure computation with no sandbox constraint. Being pure computation is what makes
+them worth doing properly — there is no capability excuse for an approximation here, so the
+target is not "parses my test file" but "returns what real Bun returns", including where real
+Bun disagrees with the obvious npm library.
+
+That distinction is the whole point of the batch. A parser that is 95% right is the worst
+outcome available: the code runs green in the sandbox and hands production a different value,
+with nothing in the run to say so. So each format is backed by a real vendored library chosen
+for the behaviour Bun documents, and every documented divergence has a named regression check.
+
+- **`Bun.YAML.parse`** — vendored **js-yaml@4.3.1**, because anchors/aliases, merge keys, the
+  block-scalar chomping modes and implicit type resolution are exactly where a small hand-rolled
+  YAML parser returns the wrong shape rather than an error. The schema is the deliberate part:
+  js-yaml's default is YAML **1.1**, where `expires: 2030-01-01` resolves to a `Date` and
+  `debug: yes` to `true`; Bun parses **1.2 core**, where both stay strings. It is instantiated
+  with `CORE_SCHEMA` plus the merge type (`<<: *defaults` is not in 1.2 core, but Bun's own docs
+  demonstrate it). Multi-document input returns an **array**, single-document input does not —
+  a shape change, not a formatting detail, and pinned in both directions.
+- **`Bun.TOML.parse`/`.stringify`** — vendored **smol-toml@1.7.1**, picked over `@iarna/toml` at
+  a tenth the size and, decisively, because it already **throws** on an integer outside
+  ±(2^53 − 1) instead of silently rounding it to a lossy float. Most TOML libraries round, which
+  makes a snowflake id in a config file "parse successfully" as the wrong number. One patch marks
+  the other documented divergence: date/times come back as their **source text**, not `Date`s,
+  because reconstructing the source from a `Date` loses the offset form and sub-second precision.
+  `stringify` normalises its input first — smol-toml drops `null` and emits `BigInt` where Bun
+  throws, and throws on function/symbol values where Bun skips them.
+- **`Bun.JSON5.parse`/`.stringify`** — vendored **json5@2.2.3**, the reference implementation,
+  used unwrapped: it passes the same official suite Bun documents passing 100% of, and its
+  `stringify` already emits Bun's exact output (unquoted identifier keys, single-quoted strings,
+  a trailing comma per line under `space`, and `Infinity`/`NaN` literal where `JSON.stringify`
+  writes `null`).
+- **`Bun.JSONL.parse`/`.parseChunk`** — **hand-written**, the one format not vendored. Its whole
+  surface is one JSON value per line, so the parsing is `JSON.parse` in a loop and all of the
+  design is in an error contract that is **deliberately asymmetric** and that no npm JSONL
+  library reproduces: `parse` throws only if **zero** values parsed (line 900 of 1000 being
+  corrupt gets you 899 values and no exception), while `parseChunk` **never** throws and reports
+  through `{values, read, done, error}`, because a chunk boundary mid-value is normal for a
+  stream and must not be fatal. Both run on one scanner that differs only in whether
+  end-of-input terminates the last value. Bun's documented worked offsets (`read` of 7, 17 and
+  23) are asserted, since `read` is what a streaming caller slices on.
+- **`Bun.semver.satisfies`/`.order`** — **no new vendoring**: it reuses the real node-semver
+  already bundled for the npm program. Bun documents this as node-semver-compatible, and ranges
+  are precisely where a subset matcher goes wrong quietly — `>=1 <2`, `1 || 2`, hyphen ranges,
+  and the rule that a prerelease only satisfies a range that itself names one. `satisfies`
+  returns `false` for an invalid version or range, as documented. `order` is left to surface
+  node-semver's `TypeError` on an unparseable version, which Bun's docs do not specify: guessing
+  `0` would make an unsortable array look sorted, which is the silent-wrong failure this shim
+  forbids.
+
+The implementations live in a **new file**, `packages/runtime/builtins/bun-formats.js`, wired
+into the `Bun` literal by `bun.js` with one import and five lines. That deviates from the
+convention that a `Bun.*` member goes in `bun.js`, deliberately: `bun.js` is ~1100 lines, the
+formats share no state with anything in it, and three coverage batches are landing against that
+one object literal at once. The vendored bundles follow the `node/vendor/semver.js` precedent
+exactly — an esbuild CJS bundle wrapped in a factory, with `package@version`, the license and
+the regenerate command in the header. They are factories, so a process that never parses YAML
+never runs js-yaml's bundle body.
+
+Gated by `scripts/spike-bun-offline.mjs`, the only Bun tier CI enforces per-PR, which goes from
+124 checks to 201 (215 with the generic-arrow fix below) — every one of them through the real
+`Bun` global, so the wiring in `bun.js` is
+gated alongside the implementations. The checks that matter most are the ones a plausible future
+refactor would silently undo: the TOML integer-overflow throw, TOML date/times staying strings,
+YAML 1.2 core not coercing a bare date or `yes`, multi-document YAML returning an array, and the
+two JSONL error contracts being different from each other.
+
+See ARCHITECTURE.md §9.2.
+
+## Generic arrow functions were never type-stripped (this change)
+
+The first CI run of `scripts/spike-bun.mjs` — newly wired into the `verify` job by the Phase 0
+gate — failed exactly four checks, all in block 2 (`bun run index.ts`), with an empty stdout and
+exit 1. **This is a pre-existing bug, not a Phase 0 regression.** Verified by running the spike
+at `1305e2e` (pre-Phase-0) and at `1f412d0` (master): byte-identical failures at both. Phase 0
+never touched `packages/runtime/typescript-transform.js`; it only built the gate that could see
+the bug. Before it, this spike ran in **no** CI job and needed the Wasm crates to run locally,
+which is precisely why a hard `SyntaxError` in the zero-config TS path survived unnoticed.
+
+**Root cause.** The type parameters of a generic **arrow** were never stripped, so
+
+```ts
+const add = <T extends number>(a: T, b: T): T => (a + b) as T;
+```
+
+emitted `const add = <T extends number>(a, b)=> (a + b) ;` — the annotations and the `as` cast
+went, the type parameter list stayed — and the entry died at compile with `bun: SyntaxError:
+Unexpected token '<' (while compiling /app/index.ts [cjs])`.
+
+`isGenericOpen` decides whether a `<` opens a generic by looking at the **previous** significant
+token, and accepts only an identifier, `)` or `>`. That covers every declaration and call site
+(`function f<T>`, `class Box<T>`, `f<number>(1)`, `new C<T>()`), which is why blocks 3–5 and the
+whole existing offline suite passed. But an arrow is an *expression*, so what precedes its `<` is
+`=`, `(`, `,`, `return`, … and none of those match. The single case that did work, `async <T>(x)`,
+worked by accident: `async` is an identifier. Block 2 is the only spike file with a generic arrow,
+so it was the only one that failed — and the `interface`/`enum` it also uses, the other suspects,
+were both handled correctly all along.
+
+**Fix.** A companion predicate, `isGenericArrowOpen`, handles the expression position. It is
+deliberately narrow: the previous token must be one that can precede an expression, the `<…>` must
+balance and contain nothing obviously non-type, it must be followed by a parameter list, and that
+list's matching `)` must be followed by `=>` or by a `: T` return annotation. Plain JS cannot begin
+an expression with `<`, and `.tsx`/`.jsx` sources have JSX lowered *before* `stripTypes` runs, so
+no JSX ambiguity remains at that point. `a < b > (c)` is untouched and still transpiles to `a(c)` —
+correct, because TypeScript itself parses that as the generic call `a<b>(c)`.
+
+**Why the failure was mute.** `kernel.start(…, { capture: true })` buffers stderr into `r.stderr`
+and skips the kernel's stderr callback entirely, so `VV_LIVE=1` could not surface it either; block
+2 asserted on `r.stdout` alone and threw the diagnosis away. It now prints `r.stderr`, which turns
+"exit 1, no output" into the one-line answer. Recorded in AGENTS.md "Critical gotchas".
+
+Fourteen regression checks land in `scripts/spike-bun-offline.mjs` (201 → 215) rather than in the
+kernel spike, because the transform is pure JS and the offline tier is the one CI enforces on every
+PR. Ten of them fail without the fix. Two of the fourteen guard the other direction — that real `<`
+comparisons and shift operators still survive — since the failure mode of a loosened heuristic is
+eating operators, not leaving types behind.
+
+See ARCHITECTURE.md §7.

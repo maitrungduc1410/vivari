@@ -374,6 +374,10 @@ Module system:
 - `typescript-transform.js` — a **synchronous, dependency-free TS/JSX transform**
   (type-strip + JSX lowering) the loader applies for zero-config `.ts`/`.tsx`
   execution (Bun; see §9.2). Gated so plain JS is passed through untouched.
+  Deciding whether a `<` opens a generic or is a comparison is the delicate part:
+  `isGenericOpen` covers the declaration/call sites (previous token is an
+  identifier / `)` / `>`), and `isGenericArrowOpen` covers a generic **arrow**,
+  which begins an *expression* and so is preceded by `=`, `(`, `,`, `return`, ….
 - `index.js` — `createRuntime()`: wires builtins + globals + the HTTP bridge +
   the WebSocket client, and returns `run(entry)`.
 - `loop.js` — the **per-process event loop** (see §7.1).
@@ -1084,6 +1088,18 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   handshake + frame codec + `ServerWebSocket` with pub/sub topics), plus **`bun:*` modules**
   (`bun:test` runner + `expect`, with Bun/Jest `test.only` filtering and `beforeEach`/`afterEach`
   that run at the root and inherit into nested `describe`s).
+- `packages/runtime/builtins/bun-formats.js` — the data-format APIs `Bun.YAML.parse`,
+  `Bun.TOML.parse`/`stringify`, `Bun.JSON5.parse`/`stringify`, `Bun.JSONL.parse`/`parseChunk`
+  and `Bun.semver.satisfies`/`order`, imported by `bun.js` and spread into the `Bun` literal.
+  Pure computation, so it is shimmed at full fidelity rather than approximated — and that means
+  **real vendored parsers** (`node/vendor/js-yaml.js`, `json5.js`, `smol-toml.js`, each an
+  esbuild CJS bundle in a factory; `Bun.semver` reuses the `semver.js` already bundled for the
+  npm program). The libraries are chosen and wrapped for behaviours a stock parser differs on:
+  a TOML integer outside ±(2^53−1) throws instead of silently rounding, TOML date/times are
+  returned as their source text rather than as `Date`s, YAML is parsed with the 1.2 core schema
+  (so a bare date and `yes` stay strings) and multi-document input returns an array, and the two
+  JSONL entry points report errors asymmetrically on purpose — `parse` throws only if *no* value
+  parsed, `parseChunk` never throws and reports through `{values, read, done, error}`.
 - `packages/kernel-host/programs/bun.js` — the `bun`/`bunx` CLI (`bun run`, `bunx` → `npx`,
   install delegation). An unrecognised verb reports not-implemented; only a file-shaped argument
   or a `package.json` script name falls through to the run path. `bun upgrade` is not-implemented

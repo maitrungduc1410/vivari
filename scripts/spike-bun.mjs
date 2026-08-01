@@ -91,6 +91,11 @@ console.log("\n== bun run index.ts (TS + Bun global) ==");
   const r = await kernel.start("bun", ["run", "index.ts"], { cwd: APP, env: ENV, capture: true });
   const o = (r.stdout || "").trim();
   console.log("  ->", JSON.stringify(o), "exit", r.code);
+  // `capture: true` routes the child's stderr into r.stderr, NOT to the kernel's
+  // stderr callback — so VV_LIVE=1 cannot show it either. Printing it here is the
+  // difference between "exit 1, no output" and the actual error: this block failed
+  // its first CI run with an empty stdout and no clue, hiding a plain SyntaxError.
+  if (r.stderr) console.log("  stderr:", r.stderr.trim());
   ok(r.code === 0, "bun run index.ts exits 0");
   ok(/sum=3/.test(o), "TS stripped + generic ran (sum=3)");
   ok(/kind=1/.test(o), "enum lowered (Kind.B === 1)");
