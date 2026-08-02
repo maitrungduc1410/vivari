@@ -115,8 +115,23 @@ import httpAgentFactory from "./lib/_http_agent.js";
 import internalHttpFactory from "./internal/http.js";
 import freelistFactory from "./internal/freelist.js";
 import httpsFactory from "./lib/https.js";
+import fetchTransportFactory from "./internal/fetch-transport.js";
+import httpEgressFactory from "./internal/http-egress.js";
 import tlsFactory from "./lib/tls.js";
 import undiciFactory from "./internal/deps/undici/undici.js";
+
+// `http` = the vendored module + the outbound-egress seam. lib/http.js is Node
+// verbatim ("do not edit the body") and its client path ends at
+// net.createConnection, which our loopback-only net cannot use to reach an
+// outside host. So once the vendored factory has built the module,
+// internal/http-egress.js wraps request/get IN PLACE: a destination the virtual
+// network itself would refuse goes over the same fetch-backed transport https
+// uses, everything else calls the untouched vendored function. createServer and
+// every loopback client are unaffected — they never enter the wrapper.
+const httpWithEgressFactory = (exports, require, module, process, internalBinding, primordials) => {
+  httpFactory(exports, require, module, process, internalBinding, primordials);
+  require("internal/http-egress").install(module.exports);
+};
 
 // Compatibility fill-ins (consolidation): commonly-required builtins that used to
 // throw. dns is loopback-aware (unblocks vendored net.js hostname connect);
@@ -301,7 +316,7 @@ const FACTORIES = {
   url: urlPublicFactory,
   querystring: querystringFactory,
   "internal/querystring": internalQuerystringFactory,
-  http: httpFactory,
+  http: httpWithEgressFactory,
   _http_common: httpCommonFactory,
   _http_incoming: httpIncomingFactory,
   _http_outgoing: httpOutgoingFactory,
@@ -311,6 +326,10 @@ const FACTORIES = {
   "internal/http": internalHttpFactory,
   "internal/freelist": freelistFactory,
   https: httpsFactory,
+  // The fetch-backed client transport (shared by https and http's egress path)
+  // and the router that decides which http requests take it.
+  "internal/fetch-transport": fetchTransportFactory,
+  "internal/http-egress": httpEgressFactory,
   tls: tlsFactory,
   "internal/deps/undici/undici": undiciFactory,
   dns: dnsFactory,

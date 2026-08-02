@@ -5829,3 +5829,108 @@ line* is no safer to copy wholesale than an upstream body; ARCHITECTURE.md's `.s
 justification is now laziness and the pull bound rather than a broken `toWeb`; and the two
 historical write-ups above (`BunFile.stream()`, `Bun.spawn()`) are marked as history so nobody
 reads them as the present.
+
+## Plain `http://` egress — the loopback/outside split, and the browser's ceiling (this change)
+
+`https://` to the outside world worked; `http://` did not. `lib/https.js` is hand-written on the
+Fetcher Worker (`__ocfetchAsync` / `__ocfetch`) and battle-tested carrying the real npm.
+`lib/http.js` is Node v24.18.0 verbatim, and its client path ends at
+`Agent.prototype.createConnection` → `net.createConnection`, i.e. at a loopback-only virtual
+network. Until recently that failed *dishonestly* — `dns.js` flattens every name to `127.0.0.1`,
+so `net.connect(3000, "api.example.com")` was quietly served by whatever in-VM dev server owned
+`:3000`, returning a wrong 200 from a different service. That was fixed (non-local destinations
+now fail `EHOSTUNREACH`/`ENOTFOUND`, and **that must not be undone**), which is what turned
+plain-HTTP egress from invisibly wrong into visibly broken. Real code paths need it:
+self-hosted/corporate registries and mirrors, local-network APIs, older SDKs.
+
+### The routing predicate is the whole change
+
+Everything else here is plumbing. The decision — loopback or egress — is made on the
+**destination host only**, and by asking the virtual network rather than re-deriving its rules:
+`bindings/net.js` now exports `isLocalDestination` on the `tcp_wrap` binding, **the same function
+object** `connect()` accepts or refuses a dial with (`isLocalHostname`, which delegates to
+`isLoopbackAddress` for a bare literal, so one entry point covers both shapes). A request
+therefore egresses exactly when `connect()` would have refused it, and the two decisions cannot
+drift apart in a later edit.
+
+**It is deliberately not made on the port**, which is the tempting answer because `listen()` does
+register ports (in-process `listeners`, mirrored to the kernel). That table answers a different
+question and is wrong in both directions: "we serve `:3000`" would send
+`http://api.example.com:3000` to the in-VM server — reinventing the bug that was just fixed — and
+"we do not serve `:9999`" would send `http://127.0.0.1:9999` out to the internet, where a
+stranger's server may answer 200, instead of the `ECONNREFUSED` every
+wait-for-the-dev-server-to-start loop depends on. A cross-process in-VM port (Nitro's SSR worker)
+is not in this process's registry at all; only the kernel's pipe table knows, and asking it opens
+a connection as a side effect. Host is the only axis that answers the question. Every remaining
+ambiguity resolves *away* from egress — an unparseable URL, `socketPath`, a caller-supplied
+`createConnection`, an agent that overrides it (proxy agents), an agent carrying `kProxyConfig`
+(`HTTP_PROXY`; inert by default here since `getOptionValue('--use-env-proxy')` is undefined) — all
+keep the vendored path, because being wrong in the permissive direction sends a request meant for
+the preview server out to the internet, while being wrong the other way only reproduces today's
+honest `EHOSTUNREACH`.
+
+### The seam, and the two seams rejected
+
+`http.js` stays byte-identical. `internal/http-egress.js` wraps `request`/`get` **in place** where
+the loader builds the module (`loader.js`'s `httpWithEgressFactory`) — in place because
+`module.exports` carries accessors (`globalAgent`, `maxHeaderSize`, `WebSocket`) a copied object
+would flatten, and because the vendored `request` stays reachable and unmodified for every
+loopback call. An `Agent`/`createConnection` seam was the obvious candidate and is the one to
+avoid: `createConnection` is *on the loopback path* (it is how every in-VM client socket is made),
+so patching it puts new code in front of the case that must not break, and a socket-level seam
+would need an HTTP request *parser* plus a response *serializer* — a second, byte-level
+translation of what the object-level transport already does. Sharing one transport was the third
+option and is the one taken: `internal/fetch-transport.js` now holds the client extracted from
+`https.js` (which becomes the https-shaped shell around it: scheme/port defaults, the no-op
+`Agent`, the absent server), so the protocols cannot grow two divergent copies.
+
+### The ceiling is the browser, not the runtime
+
+Plain `http://` egress is issued by a page, so **mixed content** applies and no runtime work can
+change it. Per the spec the block is on URLs that are not *potentially trustworthy*, and
+`http://localhost`, `127.0.0.0/8` and `::1` are — so an `https://`-served studio can reach an
+`http://localhost:*` target but a LAN or public `http://` host is blocked outright (Chrome's
+Private Network Access adds further conditions on the localhost case, and COEP `require-corp`
+still demands CORP/CORS on the response, as it does for `https`). From a locally served
+(`http://localhost:5173`) studio the scheme matches and it simply works — which is also the case
+`http://host.vivari.internal:<port>/` was built for: the Fetcher Worker rewrites that host to the
+studio's own hostname, and the alias is documented in `http://` form. So the feature ships *and*
+the constraint is named: an `http://` failure now carries the mixed-content explanation and the
+alias, instead of a bare `ECONNREFUSED`. A protocol **upgrade** cannot ride a fetch at all — no
+socket comes back, so `ws`'s handshake would wait forever on a request that "succeeded" — so an
+`Upgrade` header or a `CONNECT` method fails with `ERR_VIVARI_UPGRADE_UNSUPPORTED` (this also
+closes the same latent hang on the `https`/`wss` side). `ws://` to an in-VM server is untouched:
+that is loopback.
+
+### Two bugs the harness found in the extracted transport
+
+Both were latent in `https.js` and only harmless because it served registry hostnames. Its
+`buildUrl` stripped a trailing port with `/:\d+$/`, which turns the IPv6 literal `::1` into `:` —
+the routing table caught it immediately as `::1` egressing while `net.connect()` happily
+connected. `hostOf` now unwraps `[::1]:80`, `::1`, `example.com:80` and `example.com` to the same
+bare host, and `buildUrl` re-brackets a literal. Separately, `options.headers` may be a raw list
+(flat `[k, v, …]` or pairs, `_http_client.js:354`), and `Object.keys()` over an array yields its
+indices — the request would have gone out with headers named `"0"`, `"1"`, `"2"`.
+
+### Gating, and what is unprovable here
+
+`scripts/probe-http-egress.mjs` (new, `npm run probe:http-egress`) drives the real vendored module
+graph through `loader.js` over an in-memory syscall stub and a stubbed `__ocfetch`, with a
+hand-drained tick queue for the loop: 46 checks, all green. Its centrepiece is the routing table
+over 14 destinations — loopback IP/name with a listening and a non-listening port, `127.0.0.0/8`,
+`::1`, `0.0.0.0`, `vivari`, `.localhost`, a LAN address, a private-range address, a corporate
+mirror by name, a public host, the `host.vivari.internal` alias — where each branch is
+cross-checked against an **independent oracle**: a real `net.connect()` to the same destination
+through the same binding. The contract asserted is exact agreement, not a hand-written expectation
+per row. Alongside: a real `http.createServer()` served over the real net path with the fetcher
+asserted untouched (0 calls), the request/`IncomingMessage` translation, the honest failures, and
+`https` still working through the refactored transport. `probe-node-registry.mjs` PASS and the
+offline tier 9/9 both before and after.
+
+**No kernel-tier run, and no real request.** `packages/vfs/pkg-node` is absent with no
+`cargo`/`rustc`/`wasm-pack` and no network, so the Rust→Wasm VFS cannot be built and neither
+`npm run verify` nor the Wasm spike tiers can run here. Everything above is host Node driving the
+same guest module graph the VM uses. Specifically unverified: whether a real browser blocks or
+allows any given `http://` target (the mixed-content and Private Network Access behaviour is
+argued from the specs, not observed), the async `__ocfetchAsync` path against the real kernel
+scheduler rather than a resolved promise, and a real outbound plain-HTTP request end to end.

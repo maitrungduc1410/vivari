@@ -679,14 +679,53 @@ downloads in flight at once. The wiring, keep every link intact:
   **Both** process-worker entries — `packages/core/src/workers/process-worker.ts` (browser)
   and `scripts/process-worker.mjs` (headless) — MUST route `fetch-done` →
   `control.dispatchFetch`, or downloads hang.
-- `node/lib/https.js` `_dispatch()` prefers `__ocfetchAsync` and falls back to the
-  blocking `globalThis.__ocfetch`; keep the fallback (it's the compatibility path
-  when async isn't wired).
+- `node/internal/fetch-transport.js` `_dispatch()` prefers `__ocfetchAsync` and
+  falls back to the blocking `globalThis.__ocfetch`; keep the fallback (it's the
+  compatibility path when async isn't wired). This is the transport under BOTH
+  `lib/https.js` and `http`'s egress path — see the next gotcha.
 - The kernel bounds fan-out: `fetchConcurrency` (10) via `_scheduleFetch` /
   `_drainFetchQueue`, dedupes identical in-flight URLs (`_fetchInflight`), and
   streams each body into the VFS (`_fetchIntoVfs` / `_doNetworkFetch`) with the
   SAME cache + dedupe as the blocking path. Don't drop the cap or the dedupe — a
   burst of npm downloads would otherwise open hundreds of sockets at once.
+
+### `http` egress: split loopback from outside on the HOST, never on the port
+
+`http.request` has two possible transports and picking the wrong one is expensive
+in both directions. `lib/http.js` is Node verbatim and its client ends at
+`net.createConnection`, which our loopback-only `net` cannot use to reach an
+outside host; so `internal/http-egress.js` wraps `request`/`get` where the loader
+builds the module (`loader.js`'s `httpWithEgressFactory`) and sends only the
+unreachable destinations over the Fetcher Worker, via the same
+`internal/fetch-transport.js` that backs `https`. **Do not grow a second
+fetch-backed client** — one drifting copy per protocol is exactly what that file
+exists to prevent.
+
+The decision is made by the virtual network's own predicate,
+`internalBinding('tcp_wrap').isLocalDestination` — the same function object
+`bindings/net.js`'s `connect()` accepts or refuses a dial with, so the two cannot
+disagree. **Do not re-derive it by pattern-matching hostnames, and do not route on
+the port.** The port registry answers a different question and is wrong both ways:
+"we serve `:3000`" would send `http://api.example.com:3000` to the in-VM dev
+server (the silent-wrong-answer bug that was fixed by making `connect()` refuse
+non-local destinations — never restore any form of it), and "we do not serve
+`:9999`" would send `http://127.0.0.1:9999` to the internet instead of reporting
+`ECONNREFUSED`, which every wait-for-the-dev-server-to-start loop depends on. A
+cross-process in-VM port isn't in this process's registry at all.
+Everything ambiguous resolves to the vendored net path: unclear URL, `socketPath`,
+a caller-supplied `createConnection`, an agent that overrides it (proxy agents), an
+agent carrying `kProxyConfig`. Wrong in the permissive direction sends a request
+meant for the preview server out to the internet; wrong the other way only
+reproduces the honest `EHOSTUNREACH`. Gate: `node scripts/probe-http-egress.mjs`,
+whose routing table cross-checks every branch against a real `net.connect()`.
+
+Two limits worth knowing before you debug a report: plain `http://` egress is
+subject to the browser's **mixed-content** rules (an `https://`-served studio can
+only fetch `http://localhost` / `127.0.0.0/8` / `::1`; a LAN or public `http://`
+host is blocked no matter what the runtime does — the failure says so), and a
+protocol **upgrade** (WebSocket, `CONNECT`) can never ride a fetch, so it fails
+with `ERR_VIVARI_UPGRADE_UNSUPPORTED` rather than hanging. `ws://` to an in-VM
+server is unaffected: that's loopback.
 
 ### `writeLarge` must transfer a STANDALONE ArrayBuffer
 The kernel hands a fetched tarball to the FS Worker over a *transferred* buffer
@@ -2685,8 +2724,15 @@ cost multiple sessions:
 - `npm run probe:node-registry` — `scripts/probe-node-registry.mjs`, static: asserts
   every builtin id, `internalBinding` namespace and primordial name that `lib/` +
   `internal/` reference actually resolves. Catches the lazy-`require` miss that
-  imports cleanly and throws only on first use. **Run after touching `loader.js`,
+  imports cleanly and throws only on first use.   **Run after touching `loader.js`,
   `primordials.js` or `internal-binding.js`.** No Wasm build, no browser, no network.
+- `npm run probe:http-egress` — `scripts/probe-http-egress.mjs`: the
+  loopback-vs-egress routing table (each destination cross-checked against a real
+  `net.connect()`), an in-VM server served over the real net path with the fetcher
+  asserted untouched, and the request/`IncomingMessage` translation over a stubbed
+  `__ocfetch`. **Run after touching `bindings/net.js`, `internal/http-egress.js`,
+  `internal/fetch-transport.js` or `lib/https.js`.** No Wasm build, no browser, no
+  network.
 - `npm run spikes` (`scripts/run-spikes.mjs`) — the CI runner over the per-template/
   subsystem spikes. Tiers: `npm run spikes:offline` (Wasm-free, seconds — e.g. the
   `spike-toolchain.mjs` subsystem guard), `npm run spikes:net` (installs real

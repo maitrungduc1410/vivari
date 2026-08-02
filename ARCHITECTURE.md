@@ -323,7 +323,8 @@ only wired when `VV_DEBUG` is set, so non-debug runs never allocate it.
   `wasm32-wasi` fallback is what loads instead.
   **Downloads are parallel.** npm issues many packument + tarball requests at once,
   but the blocking `OP_FETCH` would serialize them (each parks the worker until its
-  body lands). So the `https` shim (`node/lib/https.js`) prefers a NON-blocking
+  body lands). So the fetch-backed transport under `https` (and under `http`'s
+  egress path — `node/internal/fetch-transport.js`) prefers a NON-blocking
   fetch: `globalThis.__ocfetchAsync` (wired in `runtime/index.js` over
   `fs-client.fetchAsync` → `OP_FETCH_ASYNC`) returns a Promise and the kernel posts
   each result back as a `fetch-done` message (`dispatchFetch` settles it), so npm's
@@ -477,6 +478,57 @@ fall back to this **only** when the same-process registry misses, so
 single-process loopback and external (Service Worker) routing are unchanged.
 Probes: `scripts/probe-xpipe.mjs` (UNIX sockets) and `scripts/probe-xtcp.mjs`
 (TCP, the Nitro `:3000`→worker shape), each covering both directions.
+
+**The edge of the loopback, and what is on the other side.** A `connect()` to a
+destination that is *not this machine* cannot work here, and is refused —
+`EHOSTUNREACH` for a non-loopback IP literal, `ENOTFOUND` for a non-local
+hostname (`dns.js` resolves every name to `127.0.0.1`, so the binding judges the
+name the caller asked for, kept on the socket as `_host`). It must stay refused:
+before, the hostname was ignored and the dial was quietly served by whatever in-VM
+server owned that port number, which returns a *wrong* 200 from a *different*
+service and surfaces nowhere near its cause. Outbound `http:`/`https:` for those
+destinations rides the Fetcher Worker instead (§8.1 egress below); everything else
+about `net` is loopback and stays that way.
+
+**Outbound egress (`http:` / `https:`).** There are no real sockets, so an
+outbound request goes out as one `fetch` through the Fetcher Worker
+(`__ocfetchAsync` / `__ocfetch`). `internal/fetch-transport.js` is that transport
+— it buffers the request, issues one fetch, and delivers a standard
+`http.IncomingMessage` over the body the kernel materialized in the VFS — and both
+protocols share it:
+- **`https`** (`node/lib/https.js`) egresses *unconditionally*. There is no in-VM
+  TLS socket at all, so there is no loopback alternative and no in-VM https server.
+- **`http`** keeps Node's real vendored client for every destination the loopback
+  net can serve, and egresses only the rest. `lib/http.js` is Node verbatim, so the
+  seam is where the loader builds the module: `internal/http-egress.js` wraps
+  `http.request`/`http.get` in place (`loader.js`'s `httpWithEgressFactory`).
+  `createServer`, every loopback client, `socketPath`, a caller-supplied
+  `createConnection` and any proxy-aware agent all stay on the untouched vendored
+  path.
+
+The routing decision is made on the **destination host only**, and by the virtual
+network's own predicate: `internalBinding('tcp_wrap').isLocalDestination` is
+literally the function `connect()` accepts or refuses a dial with, so a request
+egresses exactly when `connect()` would have refused it and the two cannot drift.
+It is deliberately *not* made on the port — "we serve this port" would send
+`http://api.example.com:3000` to the in-VM dev server (the bug above), and "we do
+not serve this port" would send `http://127.0.0.1:9999` out to the internet
+instead of reporting `ECONNREFUSED`, which every wait-for-the-server-to-start loop
+depends on. Evidence table: `scripts/probe-http-egress.mjs`, which cross-checks
+each branch against a real `net.connect()` to the same destination.
+
+**Plain `http://` egress additionally depends on the browser.** The fetch is
+issued by a page, so mixed-content rules apply: a studio served over `https://`
+may only fetch `http://` URLs whose host is potentially trustworthy
+(`localhost`, `127.0.0.0/8`, `::1`) — a LAN or public `http://` host is blocked,
+and no amount of runtime work changes that. It *does* work from a locally served
+(`http://localhost:…`) studio, which is also the case the
+`http://host.vivari.internal:<port>/` alias exists for (the Fetcher Worker rewrites
+that host to the studio's own hostname to reach a service on the host machine).
+Where the browser refuses, the request fails with an error naming the constraint
+rather than a bare `ECONNREFUSED`. A protocol upgrade (WebSocket, `CONNECT`) can
+never ride a fetch — there is no socket to hand back — so those fail loudly with
+`ERR_VIVARI_UPGRADE_UNSUPPORTED` instead of hanging on a request that "succeeded".
 
 ### 8.2 Cross-VM reachability (the kernel port registry)
 

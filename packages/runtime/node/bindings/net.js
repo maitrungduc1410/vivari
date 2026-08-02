@@ -536,7 +536,21 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
 
   class TCPConnectWrap {}
 
-  const tcp_wrap = { TCP, TCPConnectWrap, constants: TCPConstants };
+  // `isLocalDestination` is the SAME function object connect() judges a dial with
+  // (isLocalHostname handles a bare IP literal by delegating to
+  // isLoopbackAddress, so one entry point covers both shapes). It is exported so
+  // internal/http-egress.js can ask the virtual network "would you serve this
+  // destination?" instead of pattern-matching hostnames of its own: a request
+  // that egresses over the Fetcher Worker is then exactly one connect() would
+  // have refused, and the two decisions cannot drift apart.
+  //
+  // Note what is deliberately NOT exported: the `listeners` port registry. Which
+  // ports we serve is a routing table for loopback dials, not an answer to "is
+  // this destination this machine" — a public host on a port we happen to serve
+  // is still a public host (retargeting it onto the in-VM server is the bug this
+  // predicate exists to prevent), and a loopback port nobody serves is still
+  // loopback and must still get ECONNREFUSED.
+  const tcp_wrap = { TCP, TCPConnectWrap, constants: TCPConstants, isLocalDestination: isLocalHostname };
 
   // ---- pipe_wrap: in-process UNIX-domain-socket / named-pipe loopback --------
   // Node's lib/net.js drives a pipe server as `new Pipe(SERVER); bind(path);
