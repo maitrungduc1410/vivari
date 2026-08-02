@@ -960,6 +960,13 @@ stay sonner toasts — they need to survive the 4s window and be dismissed delib
   as an optionalDependency, so npm auto-selects it and the Rust bundler executes
   in-VM (`rspack build`/`rspack serve`/`rsbuild dev` all bind + serve). Proven by
   `scripts/spike-rspack.mjs` and `scripts/spike-rsbuild.mjs`.
+  The vendored host normally shadows the project's own copy (it carries a
+  loop-liveness patch), but an addon ships a matched binding+host+`@emnapi/*` set
+  and the host<->emnapi bridge is a private ABI. emnapi 2 changed it, so
+  `module.js` hands the project's own `@napi-rs/wasm-runtime` to trees with
+  `@emnapi/runtime` major >= 2 (rolldown >= 1.2.1, so all of Vite 8) and keeps the
+  vendored host for emnapi-1 addons. See AGENTS.md for why it isn't "always
+  prefer installed".
 
 The codec + crypto Wasm are compiled **once** in the Kernel Worker and the
 `WebAssembly.Module`s are handed to each Process Worker, which instantiates them

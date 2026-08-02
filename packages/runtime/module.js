@@ -57,6 +57,28 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
   // Vendored modules the loader can serve lazily (e.g. `semver`) without eagerly
   // instantiating them for every process — resolved only when actually required.
   const hasLazyBuiltin = (request) => !!nodeModules && nodeModules.has(request);
+  // A wasm N-API addon ships a matched set: the binding, the @napi-rs/wasm-runtime
+  // host and the @emnapi/* halves are built together, and the bridge between the
+  // host and emnapi is a private ABI, not a public API. We vendor only the host
+  // (at 0.2.x, patched for our cooperative loop) and it normally wins as a
+  // builtin — which silently mismatches any addon that brings a newer emnapi.
+  // emnapi 2 is the break: its NodeEnv calls bridge.setLastError/deleteEnv, which
+  // the 0.2.x bundle has never heard of, so the addon dies in instantiate. That is
+  // every Vite 8 project, via rolldown >= 1.2.1.
+  //
+  // So hand an emnapi-2 addon the copy it installed, which is self-consistent by
+  // construction, and leave everything else on the vendored host: emnapi-1 addons
+  // (rspack, tailwind's oxide) are proven against it by their spikes, and their
+  // newer hosts don't work here anyway — the threaded path hangs where the
+  // vendored one takes the sync route.
+  const emnapiMajor = (fromDir) => {
+    for (const nm of nodeModulesPaths(fromDir)) {
+      const pkg = readPkg(path.join(nm, "@emnapi/runtime"));
+      const major = pkg && typeof pkg.version === "string" ? parseInt(pkg.version, 10) : NaN;
+      if (!Number.isNaN(major)) return major;
+    }
+    return 0;
+  };
 
   function Module(id) {
     this.id = id;
@@ -275,8 +297,11 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
 
   function resolveFilename(request, fromDir) {
     if (request.startsWith("file://")) request = fromFileUrl(request);
-    if (hasBuiltin(request)) return { builtin: true, id: request };
-    if (hasLazyBuiltin(request)) return { builtin: true, id: request };
+    const overridable = request === "@napi-rs/wasm-runtime" && emnapiMajor(fromDir) >= 2;
+    if (!overridable) {
+      if (hasBuiltin(request)) return { builtin: true, id: request };
+      if (hasLazyBuiltin(request)) return { builtin: true, id: request };
+    }
 
     if (request[0] === "#") {
       const r = resolveImports(request, fromDir);
@@ -320,6 +345,9 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     }
 
     if (!resolved) {
+      // Nothing installed — fall back to the vendored copy.
+      if (overridable && (hasBuiltin(request) || hasLazyBuiltin(request)))
+        return { builtin: true, id: request };
       const err = new Error(`Cannot find module '${request}' from '${fromDir}'`);
       err.code = "MODULE_NOT_FOUND";
       throw err;

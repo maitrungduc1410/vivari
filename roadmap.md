@@ -946,6 +946,14 @@ constructor" above): `_load`/`_resolveFilename`/`_nodeModulePaths`/`_cache`/`_ex
       Node byte-for-byte) + a browser `/api/napi` route. Addon vendored at
       `scripts/fixtures/napi-crc32/` (prebuilt `.wasm`, can't be rebuilt locally without
       wasi-sdk/@napi-rs/cli).
+      **emnapi 2 exception (added later).** The vendored host shadows the project's copy, which
+      breaks once an addon ships emnapi 2: its `NodeEnv` calls `bridge.setLastError`/`deleteEnv`,
+      absent from the 0.2.x bundle, so instantiate throws and the addon looks "not installed".
+      That took out every Vite 8 project when `rolldown` 1.2.1 moved to `@emnapi/core`
+      2.0.0-alpha.3. `module.js` now prefers the project's `@napi-rs/wasm-runtime` when its tree
+      has `@emnapi/runtime` major >= 2, and keeps the vendored (liveness-patched) host otherwise —
+      emnapi-1 addons hang on their own newer hosts. Re-vendoring at 1.2.x instead does NOT work:
+      the installed `@emnapi/*` halves still cross with the bundled ones.
     - **Stage 2b (real `worker_threads`) — core DONE.** `new Worker(entry)` now spawns a **real
       nested thread**: a process worker asks the kernel to spawn a worker (its own syscall SAB +
       File System Worker registration, so the thread does real fs/net syscalls), and the kernel

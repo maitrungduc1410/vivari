@@ -455,6 +455,26 @@ and `node-sass` are listed as "no verified substitute" rather than guessed at.
 `process.dlopen` throws the same error, because `node-gyp-build`, `bindings` and
 `node-pre-gyp` resolve the path themselves and call it instead of `require`.
 
+### The vendored napi host shadows the installed one — EXCEPT against emnapi 2
+`node/loader.js` maps the bare specifier `@napi-rs/wasm-runtime` to our vendored
+copy (`node/vendor/napi-wasm-runtime.js`, 0.2.12), so it shadows whatever the
+project installed. That is deliberate: the copy carries a loop-liveness patch,
+without which an addon that `unref`s its worker pool lets our cooperative loop go
+idle and the process exits mid-build having emitted nothing (exit 0, no output).
+
+emnapi 2 is the exception. An addon ships a matched set — binding, napi host and
+`@emnapi/*` halves built together — and the bridge between host and emnapi is a
+private ABI, not a public API: emnapi 2's `NodeEnv` calls `bridge.setLastError`/
+`deleteEnv`, which the 0.2.x bundle has never heard of, so the addon dies in
+instantiate with `this.bridge.setLastError is not a function`. `module.js`
+therefore resolves `@napi-rs/wasm-runtime` from the project whenever its tree has
+`@emnapi/runtime` major >= 2 (rolldown >= 1.2.1 — i.e. every Vite 8 project) and
+keeps the vendored host for everyone else. Do NOT widen that to "always prefer
+what's installed": the emnapi-1 bindings (rspack, Tailwind's oxide) hang on their
+own newer hosts, which take a threaded path the vendored one sidesteps. Both
+sides are gated by the nightly network tier — `spike-preact` for emnapi 2,
+`spike-rspack`/`spike-tailwind` for emnapi 1.
+
 ### esbuild/rollup are aliased to their wasm drop-ins — DON'T add per-project overrides
 esbuild and rollup ship no `wasm32` build, and their WASM drop-ins live under a
 DIFFERENT package name (`esbuild-wasm`, `@rollup/wasm-node`) that npm's
