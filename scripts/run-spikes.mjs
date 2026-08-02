@@ -5,8 +5,10 @@
 // Tiers:
 //   --offline   only spikes that need NO live registry network (fast; the default
 //               gate). Still needs the Wasm VFS build for kernel-based ones.
-//   --net       only spikes that install from the live npm registry (slow; needs a
-//               vendored real npm at /tmp/vv-vendor — auto-provisioned here).
+//   --net       only spikes that cannot run without the network (slow). Needs a
+//               vendored real npm at /tmp/vv-vendor, plus per-spike scratch dirs
+//               and studio delivery assets — all auto-provisioned here, see
+//               VENDORS below.
 //   --all       both tiers (default when no tier flag is given).
 //
 // Filters: any extra args are substring filters on the spike name, e.g.
@@ -24,8 +26,43 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const VENDOR_DIR = "/tmp/vv-vendor";
 const VENDOR_NPM = path.join(VENDOR_DIR, "node_modules/npm");
 
-// The curated spike set. `net` marks spikes that hit the live registry.
-// `timeout` overrides the default where an install is unusually heavy.
+// Host provisioning some spikes need before they can run at all. Two shapes:
+//
+//   { install: [<pkg@ver>...], dir, arg, probe }
+//       `npm install` into a throwaway scratch dir. `arg` (relative to `dir`) is
+//       the package root handed to the spike as argv[2]; `probe` (relative to
+//       that root) is the idempotency check. Used by the spikes that load a real
+//       CLI off the host disk — yarn/pnpm/corepack/tsgo/ws-demo.
+//
+//   { script: "vendor:<x>", asset: <repo-relative path> }
+//       `npm run vendor:*`, which packs the browser DELIVERY asset the `-studio`
+//       spikes decode through the shared loader. The vendor scripts are already
+//       idempotent (they skip when the asset exists), and the assets are
+//       gitignored build artifacts, so CI has to build them.
+//
+// Both shapes shell out to the live registry. That is why every spike carrying a
+// `vendor` is `net: true` even when its own assertions are offline — the tier
+// flag means "this spike cannot run without the network", not "it asserts over
+// the network".
+//
+// Keep the pins in sync with the spike that asserts on them and with the matching
+// scripts/vendor-*.mjs (each of those already carries the same note).
+const VENDORS = {
+  yarn: { install: ["yarn@1.22.22"], dir: "/tmp/vv-vendor-yarn", arg: "node_modules/yarn", probe: "bin/yarn.js" },
+  pnpm: { install: ["pnpm@9.15.9"], dir: "/tmp/vv-vendor-pnpm", arg: "node_modules/pnpm", probe: "bin/pnpm.cjs" },
+  corepack: { install: ["corepack@0.35.0"], dir: "/tmp/vv-vendor-corepack", arg: "node_modules/corepack", probe: "dist/corepack.js" },
+  tsgo: { install: ["tsgo-wasm"], dir: "/tmp/vv-vendor-tsgo", arg: "node_modules/tsgo-wasm", probe: "tsgo.wasm" },
+  wsDemo: { install: ["express@^4.21.0", "ws@^8.18.0"], dir: "/tmp/vv-vendor-wsdemo", arg: ".", probe: "node_modules/ws/package.json" },
+  npmAsset: { script: "vendor:npm", asset: "packages/studio/public/vendor/npm-pack.bin" },
+  yarnAsset: { script: "vendor:yarn", asset: "packages/studio/public/vendor/yarn-pack.bin" },
+  pnpmAsset: { script: "vendor:pnpm", asset: "packages/studio/public/vendor/pnpm-pack.bin" },
+  corepackAsset: { script: "vendor:corepack", asset: "packages/studio/public/vendor/corepack-pack.bin" },
+  tsgoAsset: { script: "vendor:tsgo", asset: "packages/studio/public/vendor/tsgo-pack.bin" },
+};
+
+// The curated spike set. `net` marks spikes that cannot run without the live
+// registry — either they install from it, or they need a `vendor` provisioned off
+// it. `timeout` overrides the default where an install is unusually heavy.
 const SPIKES = [
   // --- offline (no live registry) --------------------------------------------
   { name: "toolchain", file: "spike-toolchain.mjs", net: false, timeout: 60000 },
@@ -71,6 +108,13 @@ const SPIKES = [
   { name: "preact", file: "spike-preact.mjs", net: true },
   { name: "lit", file: "spike-lit.mjs", net: true },
   { name: "solid", file: "spike-solid.mjs", net: true },
+  // Svelte + Qwik round out the Vite frontend variants (same runViteSpike gates as
+  // preact/lit/solid: install, dev-server bind, GET / with the title marker,
+  // /@vite/client, and the entry module — the last one is what catches a broken
+  // Svelte compiler pass or Qwik optimizer plugin). Pinned to Vite 7 on purpose;
+  // see the spike headers for the rolldown-wasi bug that rules Vite 8 out.
+  { name: "svelte", file: "spike-svelte.mjs", net: true },
+  { name: "qwik", file: "spike-qwik.mjs", net: true },
   { name: "vue", file: "spike-vue.mjs", net: true },
   { name: "next", file: "spike-next.mjs", net: true, timeout: 600000 },
   { name: "docusaurus", file: "spike-docusaurus.mjs", net: true, timeout: 600000 },
@@ -136,6 +180,55 @@ const SPIKES = [
   // via micropip and pytest from the Pyodide CDN; the pyodide npm package is
   // provisioned into the same scratch dir vendor-pyodide.mjs uses.
   { name: "python", file: "spike-python-bridge.mjs", net: true, timeout: 600000 },
+  // --- crypto-driven libraries (need `npm run build:crypto:node`) -------------
+  // jsonwebtoken/jws: HS256/384/512 through the Wasm createHmac + the symmetric
+  // KeyObject shim, and the RS256/PS256 asymmetric path through createSign/
+  // createVerify. Proves the crypto layer holds up under a real library rather
+  // than under our own unit calls.
+  { name: "jwt", file: "spike-jwt.mjs", net: true, needsWasm: true },
+  // jose importX509: the phase-3 X.509 driver. Imports a public key straight out
+  // of a certificate via createPublicKey(certPem) and verifies a JWT with it
+  // (RS256 + ES256), off the committed throwaway certs in scripts/fixtures/x509.
+  { name: "jose", file: "spike-jose.mjs", net: true, needsWasm: true },
+  // --- package managers: the North Star gate ---------------------------------
+  // Running the REAL npm/yarn/pnpm/corepack CLIs in-VM is the headline capability
+  // (README/roadmap), so it gets gated rather than hand-run. Each PM has two
+  // spikes and they prove different things, so both are registered:
+  //   <pm>         — the CLI loaded off the host disk: boots, does a live https
+  //                  request through the in-VM stack, and completes a real install.
+  //   <pm>-studio  — the BROWSER delivery path studio actually ships: the packed
+  //                  vendor asset decodes + unpacks through the shared kernel-host
+  //                  loader, and the CLI resolves on PATH via its /bin shim.
+  // All of them drive the kernel, hence `needsWasm`. The `vendor` entries are what
+  // make them runnable unattended — without one, the spike exits 2 on its own
+  // "no vendored <pm>" preflight, which would register as a permanent FAIL.
+  // npm additionally covers ground npm-studio does not: lifecycle scripts
+  // (pre/post-install), the node-gyp stub being non-fatal, a dep's own JS
+  // postinstall, .bin shim creation, `npm exec`, and an `npm ci` reinstall — three
+  // full installs, hence the long budget.
+  { name: "npm", file: "spike-npm.mjs", net: true, needsWasm: true, timeout: 600000 },
+  { name: "npm-studio", file: "spike-npm-studio.mjs", net: true, needsWasm: true, vendor: VENDORS.npmAsset, timeout: 180000 },
+  { name: "yarn", file: "spike-yarn.mjs", net: true, needsWasm: true, vendor: VENDORS.yarn, timeout: 600000 },
+  { name: "yarn-studio", file: "spike-yarn-studio.mjs", net: true, needsWasm: true, vendor: VENDORS.yarnAsset, timeout: 180000 },
+  // pnpm is the riskiest PM: real worker_threads for fetch/extract and a SYMLINKED
+  // node_modules, on a ~20 MB / 900-file tree. Long budget for both.
+  { name: "pnpm", file: "spike-pnpm.mjs", net: true, needsWasm: true, vendor: VENDORS.pnpm, timeout: 600000 },
+  { name: "pnpm-studio", file: "spike-pnpm-studio.mjs", net: true, needsWasm: true, vendor: VENDORS.pnpmAsset, timeout: 300000 },
+  // corepack proves the download->gunzip->untar->sha512-verify->exec path, so a
+  // project can pin any yarn/pnpm version rather than only our vendored one.
+  { name: "corepack", file: "spike-corepack.mjs", net: true, needsWasm: true, vendor: VENDORS.corepack, timeout: 600000 },
+  { name: "corepack-studio", file: "spike-corepack-studio.mjs", net: true, needsWasm: true, vendor: VENDORS.corepackAsset, timeout: 300000 },
+  // --- other real toolchains -------------------------------------------------
+  // TypeScript 7 (tsgo): the Go/wasm compiler boots in a Process Worker off
+  // globalThis.fs and type-checks VFS files. Gates both directions — a clean
+  // project exits 0, and a real type error exits non-zero with a TS diagnostic
+  // (without that second gate a compiler that never checks anything would pass).
+  { name: "tsgo", file: "spike-tsgo.mjs", net: true, needsWasm: true, vendor: VENDORS.tsgo, timeout: 600000 },
+  { name: "tsgo-studio", file: "spike-tsgo-studio.mjs", net: true, needsWasm: true, vendor: VENDORS.tsgoAsset, timeout: 300000 },
+  // WebSocket template end-to-end: the kernel routes a tunneled ws 'open' to the
+  // real `ws` backend on :3001 and relays frames BOTH ways (server push + a
+  // client->server->client echo). No install in-VM, so a short budget is enough.
+  { name: "ws-demo", file: "spike-ws-demo.mjs", net: true, needsWasm: true, vendor: VENDORS.wsDemo, timeout: 120000 },
 ];
 
 const args = process.argv.slice(2);
@@ -178,6 +271,28 @@ async function ensureVendoredNpm() {
   return r === 0 && fs.existsSync(path.join(VENDOR_NPM, "bin/npm-cli.js"));
 }
 
+/** Absolute path a `vendor` spec produces, and which the spike is handed as argv[2]. */
+function vendorRoot(v) {
+  return v.script ? path.join(ROOT, v.asset) : path.resolve(v.dir, v.arg);
+}
+
+/** Provision one `vendor` spec (see VENDORS). Idempotent; returns false if it failed. */
+async function ensureVendor(v) {
+  const root = vendorRoot(v);
+  const probe = v.script ? root : path.join(root, v.probe);
+  if (fs.existsSync(probe)) return true;
+  if (v.script) {
+    console.log(`\n== provisioning ${v.asset} (npm run ${v.script}) ==`);
+    const r = await spawnInherit("npm", ["run", v.script], ROOT);
+    return r === 0 && fs.existsSync(probe);
+  }
+  console.log(`\n== provisioning ${v.install.join(" ")} at ${v.dir} ==`);
+  fs.rmSync(v.dir, { recursive: true, force: true });
+  fs.mkdirSync(v.dir, { recursive: true });
+  const r = await spawnInherit("npm", ["install", ...v.install, "--no-save", "--no-audit", "--no-fund"], v.dir);
+  return r === 0 && fs.existsSync(probe);
+}
+
 function spawnInherit(cmd, argv, cwd) {
   return new Promise((resolve) => {
     const c = spawn(cmd, argv, { cwd, stdio: "inherit" });
@@ -190,7 +305,11 @@ function runSpike(s) {
     const timeout = s.timeout || DEFAULT_TIMEOUT;
     const started = Date.now();
     let timedOut = false;
-    const child = spawn("node", [path.join("scripts", s.file), VENDOR_NPM], {
+    // argv[2] is the vendored tree the spike loads off the host disk. Spikes with
+    // their own scratch dir get that; everything else gets the shared real npm.
+    // (The `-studio` spikes read their packed asset from the repo and ignore it.)
+    const vendorArg = s.vendor?.install ? vendorRoot(s.vendor) : VENDOR_NPM;
+    const child = spawn("node", [path.join("scripts", s.file), vendorArg], {
       cwd: ROOT,
       env: { ...process.env },
       stdio: process.env.VV_LIVE === "1" ? "inherit" : ["ignore", "pipe", "pipe"],
@@ -209,7 +328,7 @@ function runSpike(s) {
       if (!pass && process.env.VV_LIVE !== "1") {
         console.log(buf.slice(-2000));
       }
-      console.log(`  ${pass ? "PASS" : "FAIL"}  ${s.name.padEnd(12)} (${secs}s${timedOut ? ", TIMED OUT" : `, exit ${code}`})`);
+      console.log(`  ${pass ? "PASS" : "FAIL"}  ${s.name.padEnd(16)} (${secs}s${timedOut ? ", TIMED OUT" : `, exit ${code}`})`);
       resolve({ name: s.name, pass });
     });
   });
@@ -226,6 +345,14 @@ if (needNet && !(await ensureVendoredNpm())) {
 const results = [];
 for (const s of selected) {
   console.log(`\n=== spike: ${s.name} (${s.net ? "network" : "offline"}) ===`);
+  // Provisioning failure is a FAIL, not a skip: these spikes exit 2 on their own
+  // "no vendored <x>" preflight, and a gate that quietly disappears when its
+  // input is missing is the failure mode this table exists to avoid.
+  if (s.vendor && !(await ensureVendor(s.vendor))) {
+    console.log(`  FAIL  ${s.name.padEnd(16)} (could not provision ${s.vendor.asset || s.vendor.install.join(" ")})`);
+    results.push({ name: s.name, pass: false });
+    continue;
+  }
   results.push(await runSpike(s));
 }
 

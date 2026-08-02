@@ -33,6 +33,7 @@
     "spikes": "node scripts/run-spikes.mjs",
     "spikes:offline": "node scripts/run-spikes.mjs --offline",
     "spikes:net": "node scripts/run-spikes.mjs --net",
+    "spikes:pm": "node scripts/run-spikes.mjs --net npm yarn pnpm corepack",
     "build:vfs": "wasm-pack build packages/vfs --target web --out-dir pkg",
     "build:vfs:node": "wasm-pack build packages/vfs --target nodejs --out-dir pkg-node",
     "build:codec": "wasm-pack build packages/codec --target web --out-dir pkg",
