@@ -7,6 +7,9 @@ name: CI
 #             such as esbuild-wasm drift or a broken native->wasm alias table.
 #   verify  - the hermetic offline suite (scripts/verify-node.mjs). Needs the Wasm
 #             VFS/codec/crypto built for Node; runs on PRs + the default branch.
+#   pm-gate - the package-manager North Star (real npm/yarn/pnpm/corepack in-VM).
+#             Network + the Wasm VFS/codec/crypto, so it's manual/scheduled like
+#             the spikes tier — but it FAILS the run, unlike spikes-net.
 #   spikes  - the network tier: boots real templates and installs from the live
 #             npm registry in-VM. Slow + registry-dependent, so it's manual/scheduled.
 
@@ -87,6 +90,53 @@ jobs:
       - name: dep-cache + bun spikes (need the Wasm VFS)
         run: node scripts/run-spikes.mjs --offline dep-cache bun
       - run: npm run verify
+
+  # --- package-manager gate: the North Star, gated on its own ----------------
+  # Running the real npm/yarn/pnpm/corepack CLIs in-VM is the headline capability,
+  # so it gets a job that can actually go red. It is deliberately NOT part of
+  # spikes-net: that job is `continue-on-error: true` (registry flakiness across
+  # 40+ template installs would make it noise), which means a broken package
+  # manager would show up as a green run there.
+  #
+  # Not on push/PR either: each PM spike vendors a real CLI and runs a real
+  # install from the registry, so the eight of them cost far more than the PR
+  # budget allows. Making this PR-blocking needs the vendor assets cached or
+  # committed first — see scripts/run-spikes.mjs VENDORS.
+  pm-gate:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/*/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('packages/*/Cargo.lock') }}
+      # All three crates, not just the VFS. A package manager is a crypto and
+      # compression workload before it is a filesystem one: npm verifies every
+      # tarball against its sha512 integrity, and only md5/sha1/sha256 have a JS
+      # fallback, so without the crypto crate `npm install` dies on the first
+      # dependency with FETCH_ERROR "digest 'sha512' needs the wasm codec". The
+      # codec crate is just as load-bearing — a registry tarball is a .tgz, and
+      # without zlib the extract fails with "zlib wasm codec is not available".
+      - name: Build the Node Wasm crates
+        run: npm run build:vfs:node && npm run build:codec:node && npm run build:crypto:node
+      # Provisions its own scratch dirs + studio delivery assets (see VENDORS);
+      # a provisioning failure is reported as a FAIL, not skipped.
+      - run: npm run spikes:pm
 
   # --- network tier: real template installs from the live registry -----------
   # Manual (workflow_dispatch) or scheduled: slow and depends on

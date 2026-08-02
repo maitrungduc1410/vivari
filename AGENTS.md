@@ -2777,6 +2777,14 @@ cost multiple sessions:
   `.gitlab-ci.yml`. **A template must have a green spike before it graduates out of
   `experimental`** — add `spike-<name>.mjs` (use `lib/spike-harness.mjs`) and list it
   in `run-spikes.mjs`.
+  **An ok-flag must start `false`, or a skipped gate must be reported as a skip.**
+  Spikes written to be hand-run put the expensive assertion behind an env flag and
+  initialise its flag to `true`, so skipping it does not skip — it passes, and the
+  runner only prints a spike's stdout when it fails, so the `(gate skipped)` line
+  never reaches the log. That is how `pm-gate` shipped reporting the package
+  managers healthy while doing nothing but `npm --version`. If a spike has such a
+  flag, the tier turns it on: registry entries take an `env`, and owning the policy
+  there beats flipping defaults in each spike.
 - `node scripts/verify-express.mjs` — installs + runs real Express, esbuild-wasm,
   a Vite build, Vite dev+HMR, and a real `ws` server. **Needs network** (npm).
 - `node scripts/probe-realdev.mjs [vite|nest]` — the demo's exact flow headless:

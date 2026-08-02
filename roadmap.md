@@ -6002,3 +6002,38 @@ stripped down to a dangling ` from "./foo";` satisfies that perfectly. It passed
 it existed. The replacement asserts the output **parses**, and the kernel tier runs the file:
 the namespace import loads, and the renamed export arrives as `2` rather than `undefined`.
 That is the general rule now in AGENTS.md — a string assertion cannot see a load failure.
+
+## The package-manager gate was green because it was not running (this change)
+
+The `pm-gate` job landed with the 15 spike registrations, on the argument that the North Star
+deserved a tier that could go red. It never had. On its first real execution — a nightly that
+had not yet fired, so nobody had watched one — it fails four of eight, and the four that pass
+are worse news than the four that fail.
+
+**The four failures are the job's own build step.** It built only the VFS, under a comment
+asserting that was all the PM spikes need: "they drive the kernel, not codec/crypto." A package
+manager is a crypto and compression workload before it is a filesystem one. npm checks every
+tarball against its `sha512` integrity, and `bindings/crypto.js` only has JS cores for
+md5/sha1/sha256, so the first dependency dies with `FETCH_ERROR … digest 'sha512' needs the
+wasm codec`. Drop the codec crate instead and pnpm gets one step further before
+`ERR_PNPM_TARBALL_EXTRACT … zlib wasm codec is not available` — a registry tarball is a `.tgz`.
+The job now builds all three, same as `verify`.
+
+**The four passes are the real defect.** Each `-studio` spike finished in under a second. They
+were written to be hand-run, so the install is opt-in behind `VV_NET=1` — and `installOk` is
+initialised to `true`, so skipping the gate does not skip it, it **passes** it. `spike-npm.mjs`
+hides its whole PHASE 2 (lifecycle scripts, the node-gyp stub, `.bin` shims, `npm exec`, an
+`npm ci` reinstall) behind `VV_PHASE2=1` the same way — ground the registration comment already
+claimed the spike covered. The runner prints a spike's stdout only when it fails, so the
+`(install gate skipped)` line was never once displayed. A tier had been built that checked
+`npm --version` and reported the North Star healthy.
+
+Registry entries take an `env` now, and the tier sets the flags. Nothing in the product needed
+fixing: with the crates built and the gates switched on, all eight pass, PHASE 2 included. That
+is the point — the capability worked the whole time, and the gate could not have told us.
+
+**The lesson, and it is the third time.** A skipped assertion that leaves its flag `true` is not
+a gap in coverage, it is a false report, and it is indistinguishable from a pass at the tier
+above. `toWeb` shipped twice behind a test pinned to the broken behaviour; this shipped behind a
+test that did not run. AGENTS.md already says a string assertion cannot see a load failure. The
+companion: an ok-flag must start `false`, or a skip must be reported as a skip.
