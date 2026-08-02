@@ -75,7 +75,7 @@ packages/
     boot.js        process bootstrap shared by browser + Node worker entries.
     fs-client.js   env-agnostic Atomics syscall client (the caller side).
     websocket.js   in-VM WebSocket client (used by the HMR tunnel).
-    builtins/      hand-written: process, os, assert, child_process, bun (Bun global + bun:* modules),
+    builtins/      hand-written: process, os, child_process, bun (Bun global + bun:* modules),
                    bun-formats.js (Bun.YAML/TOML/JSON5/JSONL/semver over vendored parsers),
                    bun-text.js (Bun.stringWidth/stripANSI/wrapAnsi/color/indexOfLine + inspect.table),
                    bun-bytes.js (Bun.ArrayBufferSink/readableStreamTo*/concatArrayBuffers/allocUnsafe),
@@ -831,11 +831,12 @@ sha512 integrity), and execs it. What's special / must-not-regress:
   `/bin/{npm,yarn,pnpm}.js` shims — those stay the defaults. corepack is the extra
   "run a project-pinned version" path (`corepack yarn …`, `corepack use pnpm@x`).
 - It downloads via the GLOBAL `fetch()` (not the http/https kernel fetcher) and
-  streams the tarball out of `response.body` through `Readable.fromWeb` —
-  implemented in `node/internal/webstreams/adapters.js` as a reader pump. The
-  reader's `read()`/`cancel()` promises settle off our loop, so they're wrapped to
-  ref the event loop in `runtime/index.js` (next to the `fetch`/`Response` wraps);
-  without that the process exits mid-download.
+  streams the tarball out of `response.body` through `Readable.fromWeb` — one of
+  the six converters in `node/internal/webstreams/adapters.js` (see the adapters
+  gotcha below; they are all real now, and that file is a hand-written adaptation,
+  not a verbatim vendor). The reader's and writer's host promises settle off our
+  loop, so they're wrapped to ref the event loop in `runtime/index.js` (next to
+  the `fetch`/`Response` wraps); without that the process exits mid-download.
 - It execs the downloaded PM in-process via `require('module').runMain(binPath)` —
   `runMain` is exposed on the `module` builtin (`runtime/index.js`), plus no-op
   `enableCompileCache`/`flushCompileCache` (so corepack skips `v8-compile-cache`).
@@ -1489,8 +1490,33 @@ so every template runs correctly in every mode. Modes A/B keep the template verb
 - Exposed: `_load`, `_resolveFilename` (honors `options.paths`), `_nodeModulePaths`,
   `_cache`, `_extensions`, `wrap`/`wrapper`, `isBuiltin`, `createRequire` (accepts
   `file://` URLs), `syncBuiltinESMExports`, no-op `register`/`registerHooks`,
-  `prototype.{require,load,_compile}`. `builtinModules` is the public list only
-  (snapshot BEFORE the `node:` aliases are added — don't move that line after).
+  `prototype.{require,load,_compile}`. `builtinModules` is the public list only,
+  and it is **derived, not hand-listed**: `listPublicBuiltins()` in
+  `runtime/index.js` intersects Node v24's public core ids with what `require()`
+  can genuinely serve (the eager `builtins` table ∪ `nodeModules.has(id)` — the
+  same predicate `module.js` uses to answer `builtin: true`), so the list is
+  resolvability by construction. **Its placement is load-bearing in both
+  directions:** it must sit AFTER `builtins.module = Module` (the old snapshot sat
+  above that line and so omitted `module` itself) and BEFORE the `node:` alias loop
+  (no prefixed dupes). It is also the memoizing call, so
+  `process.binding('natives')` reports the same set — see that gotcha below.
+
+### Don't shadow a vendored `lib/` module with an eager `builtins` shim
+`module.js` consults `hasBuiltin` (the eager `builtins` table in `runtime/index.js`)
+**before** `hasLazyBuiltin` (the vendored `loader.js`), so an id present in both is
+served by the shim and the vendored module becomes unreachable — silently, under
+the same name. `assert` was the live instance: a 51-line `builtins/assert.js`
+answered `require('assert')` while `require('assert/strict')` went through the
+loader to the real 246-line `node/lib/assert.js`. The two ids were therefore
+*structurally different objects*, ten members were missing, `deepEqual` was aliased
+to `deepStrictEqual`, and worst of all `throws(fn, ExpectedError)` **ignored its
+second argument** — a test asserting one specific error passed on any throw at all.
+That shim is deleted; `assert`, `node:assert` and `assert/strict` all resolve
+through the loader now and `assert/strict === assert.strict`. Consequence to expect:
+in-VM assertions that were vacuous now genuinely assert, so a guest suite that was
+green can legitimately go red. Rule: `builtins/` is for what Node's `lib/` can't
+give us (`process`, `os`, `child_process`, the Bun surface); when a vendored `lib/`
+module exists, route to it instead of parking a shim in front of it.
 
 ### vitest runs in-VM — pool=threads, and don't break these
 Real `vitest@4` (Vite/rolldown) runs a suite to green in-VM — gated by
@@ -1525,7 +1551,60 @@ the install at the "Fetching packages" step. It also reassigns `fs.WriteStream`
 via `lib/fs.js`'s `set WriteStream(val)` setter, so `createWriteStream` then runs
 graceful-fs's wrapper. If you ever rewrite these as classes, yarn/fs-extra break.
 
-### Enumerating `fs` trips its lazy getters — vendor every internal it names
+### Web Streams interop is ADAPTED, not vendored — and its host promises must ref the loop
+`node/internal/webstreams/adapters.js` is the seam behind `Readable`/`Writable`/
+`Duplex`'s `toWeb`/`fromWeb` (fetch and `Response` bodies, `Blob`/`File`, the
+preview Service Worker path). All six converters are implemented; only
+`newWritableStreamFromStreamBase`/`newReadableStreamFromStreamBase` throw
+`ERR_METHOD_NOT_IMPLEMENTED` on purpose (they drive a libuv StreamBase handle
+directly, which our `stream_wrap` JS shim doesn't implement — nothing in the
+runtime calls them, and net/http reach Web Streams via `toWeb` on the socket).
+Unlike everything under `internal/streams/**`, this file is a **hand-written
+adaptation of upstream, not a verbatim vendor**, for two structural reasons — so
+don't "restore" it from an upstream copy:
+- Upstream builds on Node's own bundled WHATWG implementation
+  (`internal/webstreams/{readablestream,writablestream,queuingstrategies}`). We
+  bundle none: `stream/web` (`node/loader.js`) re-exports whichever WHATWG globals
+  the host realm provides — the browser Worker's own classes in the studio, Node's
+  in the headless twin. So the classes resolve from `globalThis`, **per call** (a
+  realm-capability problem must not make `require` of the module fail), and
+  `isReadableStream`/`isWritableStream` duck-type via `internal/streams/utils`
+  rather than brand-check (a browser-realm `ReadableStream` fails a Node brand check).
+- Upstream reads the `SafePromiseAll`/`SafePromisePrototypeFinally` primordials,
+  which `node/primordials.js` cannot resolve — *destructuring* them throws. The
+  file uses plain intrinsics, like the other hand-written `internal/*` modules.
+
+One deliberate divergence from upstream's logic: `writev` splits its fulfilled and
+rejected handlers. Upstream installs one handler for both and calls `.filter()` on
+it, which on the rejection path is an `Error` — upstream survives because the real
+error also arrives via `writer.closed`, but here `runtime/index.js` escalates any
+non-sentinel unhandled rejection to `uncaughtException`, which kills the guest.
+
+**The loop-liveness contract.** Every host-realm promise these adapters await must
+be wrapped in `runtime/index.js` or the per-process loop can decide the process is
+idle and exit mid-transfer (`loop.isAlive()` is an OR over the liveness counters,
+and a pure stream transfer has no socket/timer to hold it up). Covered: the reader's
+`read()`/`cancel()`, the writer's `write()`/`close()`/`abort()`, and `writer.ready`
+plus both `closed` accessors. Two traps if you extend this:
+- `ready`/`closed` are **getters**, so `wrapHostAsync` skips them (it early-returns
+  unless the property is a function) — use `wrapHostAsyncGetter`, which replaces
+  only `get` and keeps the property an accessor. Collapsing it to a data property
+  would pin the first promise forever; `ready` hands out a *different* one each time
+  the queue fills and drains.
+- Accessors need `trackHostOnce` (a `WeakSet`), not `trackHost`. Per spec `closed`
+  is created once per reader/writer and returned on *every* read, so refing each
+  access stacks up refs that its single settlement can never balance — a
+  permanently-alive loop, i.e. a hung guest.
+
+One liveness semantic came with this, deliberately: `closed` stays pending for the
+stream's whole lifetime and the adapters read it eagerly at construction, so a guest
+that builds an adapter and then neither consumes nor destroys it now hangs where it
+used to exit. That is
+arguably the correct emulation (in real Node the underlying handle refs the loop),
+and the transfer-safety fix doesn't depend on it — the retreat is dropping `"closed"`
+from the two lists in `runtime/index.js`.
+
+### Enumerating `fs`/`util`/`net` trips their lazy getters — vendor every internal they name
 `lib/fs.js` exposes several members as lazy getters (`get Utf8Stream` →
 `internal/streams/fast-utf8-stream`, and `defineLazyProperties(fs,
 'internal/fs/dir', ['Dir','opendir','opendirSync'])`, plus streams/promises).
@@ -1535,6 +1614,31 @@ touches EVERY key — fires those getters, and a missing target module throws
 `internal/streams/fast-utf8-stream` and `internal/fs/dir` are now provided
 (pragmatic, functional shims) and registered in `node/loader.js`. If you add a new
 lazy `fs` getter, register its module too, or bare enumeration will crash.
+
+**The same trap runs wider than `fs`, and lazily-required ids are the general
+case.** An `internal/*` id that the vendored `lib/` only reaches from inside a
+function — `defineLazyProperties`, `defineReplaceableLazyAttribute`,
+`getLazy(() => require('id'))`, or a plain `require` in a cold branch — imports
+cleanly however wrong the `FACTORIES` table is, and throws only on first *use*. A
+static sweep of `node/lib/**` + `node/internal/**` for every id reachable that way
+found **13 unregistered; it is now 3**, all deliberate and all recorded in
+`roadmap.md`:
+- `util` is clean. `util.MIMEType`, `util.diff` and `util.setTraceSigInt` (an
+  honest "not implemented" stub) resolve, so spreading `util` no longer throws;
+  same for `fs.cp`/`cpSync`, `fs.rm` recursive, `fs.glob`/`globSync`,
+  `path.matchesGlob`, `fs.watch(dir, {recursive:true})` and `events.on()`.
+- `net` is the one instance left, and it is on purpose: `net.BlockList` and
+  `net.SocketAddress` are getters over `internal/blocklist` /
+  `internal/socketaddress`, which need the C++ `block_list` CIDR matcher and
+  `internal/worker/js_transferable`. So `{...net}` (a promisify-all helper) still
+  throws. Reimplementing v4/v6 subnet matching in JS with no test suite is worse
+  than useless for a security primitive callers use to *accept* a connection — a
+  wrong `BlockList` beats an honest throw only in appearance. `util.getCallSites()`
+  likewise still throws, one layer lower than people expect: it needs
+  `internalBinding('util').getCallSites`, so registering
+  `internal/source_map/source_map_cache` would not fix it.
+When you vendor a `lib/` module, sweep it for lazily-required ids and register them
+in the same change — "it imports fine" proves nothing about them.
 
 ### `process.binding(name)` is a real (legacy) surface some bundles need
 Deprecated in Node but still called by bundled deps (yarn's `safer-buffer` →
@@ -1546,10 +1650,39 @@ legacy path). `runtime/index.js` wires `process.binding` to delegate to the same
 still yields the core-module list, and unknown names return `{}` instead of
 throwing. Don't remove it — several ecosystem packages break without it.
 
+**`'natives'` and `Module.builtinModules` must stay ONE list.** Both now answer
+from `listPublicBuiltins()` (see the `module` gotcha above), so `is-core-module` /
+`builtin-modules` and `Module.isBuiltin` cannot give different answers. They used
+to be hardcoded separately and were wrong in opposite directions: `natives` vouched
+for `dgram`/`domain`/`repl`/`sys`, which hard-throw `no vendored Node builtin '…'`
+on require — so `is-core-module` sent callers straight into that throw instead of
+letting them fall back to a browser polyfill — while `builtinModules` listed only
+the eager table (19 names) and so disagreed with `Module.isBuiltin`, which has
+always consulted the loader too. Don't re-introduce a literal array in either
+place; add the id to `NODE_PUBLIC_CORE_IDS` and let the filter decide. Note the
+blast radius when you do: bundlers read `builtinModules` to mark externals.
+
 ### Never silently swallow a syscall throw
 `bridgeHttp`'s `reply()` once wrapped `respond()` in a bare `try/catch`, so a
 "too large" throw turned into a silent hang. Any catch around a syscall must
 **fail the pending operation**, not drop it.
+
+### A builtin whose factory throws must be EVICTED from the loader's cache
+`loader.js`'s `nodeRequire` registers `{exports:{}}` in `modules` *before* running
+the factory — it has to, or a cyclic `internal/*` require would recurse forever.
+But it used to leave that entry behind when the factory threw, so the first
+`require` reported the real error and **every later one silently returned `{}`**:
+the loudest failure mode in the runtime degrading into an empty object on the
+second call. What that looks like from the outside: reading `util.MIMEType` threw
+once (an unresolvable primordial, at the time), returned `undefined` forever after,
+and the caller died much later and somewhere else with "X is not a constructor".
+The factory call is now wrapped so a throw `modules.delete(id)`s before re-throwing.
+Cycle tolerance is unaffected — eviction only happens on the throw path. Known
+residual: if A requires B, B captures A's partial exports and succeeds, and *then*
+A throws, A is evicted while B still holds a reference to A's dead partial (better
+than a permanently poisoned cache, not perfect). General rule for any cache keyed
+on "in progress": the failure path has to unwind the entry the success path would
+have completed.
 
 ### Missing error constructors → "X is not a constructor"
 Node's `lib/` destructures error classes from `internal/errors` eagerly but only
@@ -1558,6 +1691,46 @@ If a class is undefined you get a cryptic minified `TypeError: Je is not a
 constructor` the first time that path runs. When you add a `lib/` module, make
 sure every `ERR_*` / `*Exception*` it references is exported from
 `node/internal/errors.js` (stream, http, and net families are all there now).
+
+Related contract in the same file: `makeSystemError` sets `err.code` to the
+**`ERR_*` key** (`ERR_FS_EISDIR`) and carries the libuv name on `err.info`, with
+the syscall and path in the message. That's Node's actual contract and it is what
+every ecosystem `err.code === 'ERR_FS_CP_*'`-style check reads; it previously set
+the libuv name (`EISDIR`) as `err.code`, so all of those checks missed. Don't
+"simplify" it back — a bare libuv code is only right on errors coming straight out
+of the fs *binding* (`vvError`), not on SystemErrors.
+
+### `primordials` resolves by naming scheme — and `Promise` is the ONE bound namespace
+`node/primordials.js` derives Node's "safe intrinsics" from their names through a
+Proxy (`<Ns><Static>` → `Ns[static]`, `<Ns>Prototype<Method>` → uncurried, …; the
+file's header has the full table) instead of hand-maintaining Node's giant literal.
+Unknown names throw loudly, which is what surfaces the exact intrinsic a
+newly-vendored module needs. Two things a later edit must not undo:
+- **`BIND_STATICS`, the documented exception to that naming scheme.** A static that
+  reads `this` as the constructor to instantiate cannot be handed out raw: a
+  destructured `PromiseResolve(x)` runs with `this === undefined` and throws "is not
+  a constructor". So `resolve()` binds statics whose namespace is in `BIND_STATICS`
+  — which holds `Promise` and nothing else, mirroring the single
+  `copyPropsRenamedBound` list in Node's own `per_context/primordials.js`. Because
+  it *is* an exception to the header, it looks like something to tidy away; doing so
+  re-kills `events.on()`, `internal/fs/cp/cp` and `internal/streams/duplexify`.
+  Widening it to every namespace is wrong in the other direction: `%TypedArray%`'s
+  statics need a **concrete subclass**, never the abstract base, so a bound
+  `TypedArrayFrom` would look resolved and never work, where unbound it keeps
+  throwing honestly. If a future module needs a bound static from another namespace,
+  add that namespace — the symptom will be a loud throw at the call site.
+  (Bound functions change `.name`: `PromiseResolve.name` is `"bound resolve"`.
+  Faithful to Node, but don't add code that reflects on it.)
+- **`Safe*` names are not derivable.** They match no `<Ns>` prefix, so they only
+  exist if hand-listed in `SPECIALS` — and *merely destructuring* a missing one
+  throws at module load, which is how `internal/mime` and `internal/fs/cp/cp` used
+  to die on require. `SafePromiseAll` and `SafeStringPrototypeSearch` are there now,
+  written with the file's own `uncurryThis` so they don't route through patchable
+  prototypes. They are "safe" in this file's sense, not upstream's: like
+  `SafeMap`/`SafeSet`, they're the plain intrinsic rather than a monkeypatch-proof
+  subclass, so `SafePromiseAll` still iterates via a patchable `Symbol.iterator`.
+  Fine for vendored callers; revisit all of them together if this runtime ever has
+  to defend against hostile guest code.
 
 ### Async `fs.*stat` must not share the `statValues` scratch buffer
 `bindings/fs.js` fills one shared `statValues` Float64Array in place (this is
@@ -1573,6 +1746,81 @@ and **HMR/edits silently do nothing** (no error). Fix in place: async stat calls
 pass `fresh=true` to `makeStatArray` so each result is a private snapshot. Rule:
 any deferred/async syscall result that references a shared scratch buffer must
 snapshot it at call time, not at delivery time.
+
+### `chmod`/`chown`/`utimes` can't persist — and `access(f, X_OK)` now says so
+The VFS keeps a per-inode `mode` (`packages/vfs/src/lib.rs`) but only ever assigns
+it at **creation** — `open()` honours its `mode` argument on the `O_CREAT` branch,
+`write_file`/`mkdir` hardcode `0o644`/`0o755` — and it models neither uid/gid nor
+atime/ctime at all. There is no `OP_CHMOD`/`OP_CHOWN`/`OP_UTIMES` in
+`protocol/syscall.js`, so none of these ops can change anything. Three rules follow:
+- **They report success on purpose.** `ENOSYS` here breaks `npm install` outright:
+  npm's `bin-links` does an unconditional `chmod(file, mode)` per installed bin and
+  propagates the rejection, and node-tar errors an extracted entry when `futimes`
+  *and* `utimes` both fail — i.e. on every tarball npm/yarn/pnpm unpacks. It is also
+  not clearly the dishonest answer: this is a filesystem with no mutable permission
+  model, exactly the case where real implementations accept the call and move on
+  (Node on Windows, any FAT mount). Nothing fabricates a value on the way back —
+  `stat` keeps reporting what the VFS actually holds, so chmod-then-stat is
+  self-consistent, just unchanged. `fsync`/`fdatasync` are a different case and
+  genuinely truthful: the VFS *is* the storage (Wasm linear memory), so there is no
+  write-back buffer between a returned write and it.
+- **They do throw `ENOENT` when the target doesn't exist.** That part was a real
+  lie and costs one stat. `statFor` relabels the error with the caller's syscall
+  name, so you get `ENOENT: chmod '/nope'`, not `ENOENT: stat '/nope'`. The **fd**
+  variants (`fchmod`/`fchown`/`futimes`) deliberately skip the equivalent `EBADF`
+  check — node-tar calls all three on every extracted file, each check would be
+  another sync round-trip on npm's per-file hot path, and the write that just went
+  through that fd already proves it is live. That is the one residual dishonesty
+  here, and it is knowing.
+- **`access()` enforces `X_OK`,** and the coupling to the above is the trap.
+  Everything runs as uid 0 and POSIX lets root bypass the read/write checks, so
+  `R_OK`/`W_OK` passing for anything that exists is the correct answer rather than a
+  shortcut; `X_OK` is the one root does **not** get free. So
+  `chmod(f, 0o755)` followed by `access(f, X_OK)` now **throws** where it used to
+  falsely pass. That is the intended direction — it surfaces the missing `OP_CHMOD`
+  at the point of use instead of hiding it, and it agrees with `stat`, which has
+  always reported those files as non-executable (`isexe`, which npm's `which` uses,
+  reads `stat.mode` and already answered "no"). The way to get an executable file
+  today is to pass the mode at creation: `writeFileSync(p, s, { mode: 0o755 })` goes
+  through `open(O_CREAT, mode)`, which the VFS *does* honour. If a bundled tool
+  trips on it, the revert is the single `if` block in `access`.
+
+Making these real is a Rust-side change — `OP_CHMOD`/`OP_UTIMES` in
+`protocol/syscall.js` plus `set_mode`/`set_mtime` on `VirtualFileSystem`, then
+`fs-client.js`/`fs-server.js` and the binding — and it retires the `access` caveat
+with it. Tracked in `roadmap.md`.
+
+### The virtual network is loopback-only — `connect()` now rejects everything else
+`listen()` registers a **port** and `connect()` finds a server by port; no host ever
+enters the table. `lib/dns.js` also resolves every name to `127.0.0.1` (deliberately
+— it's what makes `net.connect(p, 'localhost')` work), so `net.connect(3000,
+'api.example.com')` used to reach the binding as `("127.0.0.1", 3000)` and be served
+by whatever in-VM dev server owned `:3000`. Connecting *successfully* to the wrong
+machine is the worst outcome on offer: the caller gets a 200 from the wrong service
+and the mistake surfaces nowhere near its cause. `bindings/net.js` `connect()` now
+judges the destination **before** the port lookup — non-loopback hostname →
+`ENOTFOUND`, non-loopback IP literal → `EHOSTUNREACH` (both added to the `uv`
+errmap; `ENOTFOUND` rides libuv's `EAI_NONAME` number because nothing here goes
+through Node's dns translation layer and `ENOTFOUND` is what `lib/dns.js` already
+returns). Allowed: `localhost`, `*.localhost`, `""`, `vivari` (mirrors
+`builtins/os.js`'s `hostname()` — a program dialling its own hostname is dialling
+itself), and the loopback/unspecified literals `127.0.0.0/8`, `::1`, `::`,
+`0.0.0.0`, `::ffff:`-mapped v4. Three details are load-bearing:
+- The requested hostname is recovered from the Socket's `_host` via
+  `handle[owner_symbol]` (`lib/net.js` stashes it there *before* the lookup).
+  That symbol is minted in `internal/async_hooks.js`, which the bindings layer
+  cannot require, so it's located by `Symbol.description` and cached — and
+  **re-probed rather than negatively cached**, since a bare TCP handle with no owner
+  would otherwise blind every later connect.
+- The guard sits before **both** the `listeners` lookup and the cross-process
+  `pipeConnect` fallback, so the HMR/WebSocket relay, the preview replay and the
+  Nitro/Nuxt-style cross-process proxy paths are all untouched.
+- On the failure path `req.address` is set to the host the caller asked for, or
+  `afterConnect` would build the message from `127.0.0.1` and hide the very mistake
+  being reported.
+Real outbound access is `globalThis.fetch` (the host fetch), which is unaffected —
+this is about the in-VM TCP table only. `dns.lookup`'s `127.0.0.1` behaviour is
+also unchanged.
 
 ### ESM ↔ CJS interop
 `esm.js` transpiles ESM to our sync CJS. Two traps already handled — respect them:
@@ -1676,6 +1924,18 @@ worker.js` shadows it with a writable own property. Keep that shim.
 Tools call newish Node APIs. We've had to add e.g. `crypto.hash()` (Node 20.12+).
 When a tool fails with `X is not a function`, check whether it's a recent Node
 addition and implement it in the matching `lib/`/binding.
+
+A missing API doesn't always fail loudly, and the quiet case is the dangerous one:
+security-sensitive code feature-detects. `crypto.timingSafeEqual ?
+crypto.timingSafeEqual(a, b) : a === b` is the standard shape, so for as long as
+that function was absent, every such call site silently degraded to `===` and
+reintroduced the exact timing leak the call existed to prevent — nothing threw.
+It's implemented now (`ArrayBuffer`/`TypedArray`/`DataView` only, strings rejected
+with `ERR_INVALID_ARG_TYPE`, `ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH` on a length
+mismatch, branch-free XOR accumulation with no early exit; the comment is honest
+that JS can't promise instruction-level constant time the way the C++ original
+does). When you find an API that callers feature-detect, implementing it beats
+leaving the hole.
 
 ### TypeScript / native-binary walls
 - Pin `typescript@5` for in-VM `tsc`: **`typescript@7` is the native Go compiler**
@@ -1843,6 +2103,11 @@ browser first.
 - `npm run verify` — `scripts/verify-node.mjs`, headless end-to-end (fs, process,
   shell, http, timers, watch, worker_threads incl. `receiveMessageOnPort`). **Run
   this after any runtime/protocol change.** No network needed.
+- `npm run probe:node-registry` — `scripts/probe-node-registry.mjs`, static: asserts
+  every builtin id, `internalBinding` namespace and primordial name that `lib/` +
+  `internal/` reference actually resolves. Catches the lazy-`require` miss that
+  imports cleanly and throws only on first use. **Run after touching `loader.js`,
+  `primordials.js` or `internal-binding.js`.** No Wasm build, no browser, no network.
 - `npm run spikes` (`scripts/run-spikes.mjs`) — the CI runner over the per-template/
   subsystem spikes. Tiers: `npm run spikes:offline` (Wasm-free, seconds — e.g. the
   `spike-toolchain.mjs` subsystem guard), `npm run spikes:net` (installs real

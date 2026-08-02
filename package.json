@@ -28,6 +28,7 @@
     "preview:studio": "cd packages/studio && bun run preview",
     "verify": "node scripts/verify-node.mjs",
     "smoke": "node scripts/smoke-sdk.mjs",
+    "probe:node-registry": "node scripts/probe-node-registry.mjs",
     "build:example": "npm run build --workspace @vivari/example-basic",
     "spikes": "node scripts/run-spikes.mjs",
     "spikes:offline": "node scripts/run-spikes.mjs --offline",

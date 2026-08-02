@@ -31,6 +31,9 @@ const UV_DIRENT_LINK = 3;
 // COPYFILE_EXCL bit.
 const COPYFILE_EXCL = 1;
 
+// access(2) mode bit — must match internalBinding('constants').fs.X_OK.
+const X_OK = 1;
+
 const STAT_FIELDS = 18;
 
 const textDecoder = new TextDecoder();
@@ -156,6 +159,17 @@ export function createFsBinding({ sys: rawSys, process }) {
       bigint ? new BigInt64Array(STAT_FIELDS) : fresh ? new Float64Array(STAT_FIELDS) : statValues,
       st,
     );
+
+  // stat/lstat a path on behalf of ANOTHER syscall, re-labelling the error with
+  // the caller's name so `fs.chmodSync('/nope')` reports
+  // "ENOENT: chmod '/nope'" the way Node does, not "ENOENT: stat '/nope'".
+  const statFor = (syscall, path, follow) => {
+    try {
+      return follow ? sys.stat(path) : sys.lstat(path);
+    } catch (e) {
+      throw vvError((e && e.code) || "ENOENT", syscall, path);
+    }
+  };
 
   const kindToDirent = (kind) =>
     kind === "dir" ? UV_DIRENT_DIR : kind === "symlink" ? UV_DIRENT_LINK : UV_DIRENT_FILE;
@@ -311,12 +325,25 @@ export function createFsBinding({ sys: rawSys, process }) {
         sys.ftruncate(fd, len < 0 ? 0 : len);
       });
     },
+    // Genuinely nothing to flush: the VFS IS the storage (Wasm linear memory),
+    // there is no page cache or write-back buffer between us and it, so a write
+    // that has returned is already as durable as this filesystem gets. Reporting
+    // success is the truth here, not a shim - unlike the metadata ops below.
+    // (Deliberately NOT validating `fd`: fsync sits on write-file-atomic's hot
+    // path and the write that precedes it already proved the descriptor.)
     fsync(fd, ...rest) {
       return dispatch(findReq(rest), () => {});
     },
     fdatasync(fd, ...rest) {
       return dispatch(findReq(rest), () => {});
     },
+    // fd-based metadata writes: accepted and discarded, see the block comment on
+    // `chmod` below for why that is the right call and what the follow-up is.
+    // These skip the fd-existence check their path-based twins do on purpose -
+    // node-tar calls fchmod + futimes + fchown on EVERY file it extracts (i.e.
+    // every file of every package npm installs), and each check would be another
+    // sync round-trip on that path, while the write that just happened through
+    // this same fd already proves it is live.
     fchmod(fd, mode, ...rest) {
       return dispatch(findReq(rest), () => {});
     },
@@ -356,10 +383,30 @@ export function createFsBinding({ sys: rawSys, process }) {
       for (let i = 0; i < 8; i++) arr[i] = bigint ? BigInt(v[i]) : v[i];
       return arr;
     },
+    // access(2). Follows symlinks, like the real thing.
+    //
+    // Every process here runs as uid 0, and POSIX lets root bypass the read and
+    // write permission checks entirely - so R_OK and W_OK passing for anything
+    // that exists is the correct answer, not a shortcut. X_OK is the one root
+    // does NOT get for free: it still requires at least one execute bit. We have
+    // that bit (the VFS stores mode and `stat` already reports it), and ignoring
+    // it meant access(f, X_OK) vouched for files `stat` calls non-executable -
+    // two answers to the same question. Now they agree.
+    //
+    // Consequence worth knowing: because chmod cannot persist a mode change
+    // (see the block comment on chmod), `chmod(f, 0o755)` followed by
+    // `access(f, X_OK)` now THROWS instead of falsely passing. That is the
+    // intended direction - it surfaces the missing OP_CHMOD at the point of use
+    // rather than hiding it - and the working way to get an executable file
+    // today is to pass the mode at creation: `writeFileSync(p, s, {mode: 0o755})`
+    // goes through open(O_CREAT, mode), which the VFS does honour.
     access(path, mode, ...rest) {
       const req = findReq(rest);
       return dispatch(req, () => {
-        if (!sys.exists(path)) throw vvError("ENOENT", "access", path);
+        const st = statFor("access", path, true);
+        if ((mode & X_OK) !== 0 && (st.mode & 0o111) === 0) {
+          throw vvError("EACCES", "access", path);
+        }
       });
     },
     mkdir(path, mode, recursive, ...rest) {
@@ -465,20 +512,51 @@ export function createFsBinding({ sys: rawSys, process }) {
         sys.writeFile(dest, sys.readFile(src));
       });
     },
+    // ---- metadata writes the VFS cannot persist ----
+    // The Rust VFS keeps a per-inode `mode` (packages/vfs/src/lib.rs) but only
+    // ever assigns it at CREATION time (open(O_CREAT) honours its `mode`
+    // argument; write_file/mkdir hardcode 0o644/0o755), and it models neither
+    // uid/gid nor atime/ctime at all. There is no OP_CHMOD / OP_CHOWN /
+    // OP_UTIMES in packages/protocol/syscall.js, so none of these can change
+    // anything, and adding one is a Rust-side change.
+    //
+    // They still report success, and that is a considered decision rather than
+    // the usual "shim that lies": this is a filesystem with no mutable
+    // permission/ownership model, which is precisely the case where real
+    // implementations accept the call and move on (Node on Windows, any FAT or
+    // permission-less mount). Nothing fabricates a result on the way back out -
+    // `stat` keeps reporting the mode/mtime the VFS actually holds - so a caller
+    // that chmods and then stats sees the honest, unchanged value.
+    //
+    // Failing them with ENOSYS was the obvious alternative and it breaks
+    // `npm install` outright, so it is not on the table until the VFS can
+    // actually store the change:
+    //   • npm's bin-links does an UNCONDITIONAL `chmod(file, mode)` per
+    //     installed bin and propagates the rejection (bin-links/lib/fix-bin.js).
+    //   • node-tar errors an extracted entry when futimes AND utimes both fail
+    //     (tar/lib/unpack.js) - i.e. every tarball npm/yarn/pnpm unpacks.
+    // FOLLOW-UP to make these real: add OP_CHMOD/OP_UTIMES to the syscall
+    // protocol + a set_mode/set_mtime on the VFS, then implement these against
+    // it (and tighten `access` below to match).
+    //
+    // What IS enforced - because it was a genuine lie and costs one stat - is
+    // that the target exists. Real Node throws ENOENT here; the old no-ops
+    // "succeeded" against a path that was never created, hiding the real fault
+    // (a build step that never emitted the file) far from its cause.
     chmod(path, mode, ...rest) {
-      return dispatch(findReq(rest), () => {});
+      return dispatch(findReq(rest), () => void statFor("chmod", path, true));
     },
     chown(path, uid, gid, ...rest) {
-      return dispatch(findReq(rest), () => {});
+      return dispatch(findReq(rest), () => void statFor("chown", path, true));
     },
     lchown(path, uid, gid, ...rest) {
-      return dispatch(findReq(rest), () => {});
+      return dispatch(findReq(rest), () => void statFor("lchown", path, false));
     },
     utimes(path, atime, mtime, ...rest) {
-      return dispatch(findReq(rest), () => {});
+      return dispatch(findReq(rest), () => void statFor("utimes", path, true));
     },
     lutimes(path, atime, mtime, ...rest) {
-      return dispatch(findReq(rest), () => {});
+      return dispatch(findReq(rest), () => void statFor("lutimes", path, false));
     },
     mkdtemp(prefix, encoding, ...rest) {
       const req = findReq(rest);

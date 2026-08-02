@@ -181,6 +181,16 @@ export default function (exports, require, module, process, internalBinding, pri
     (message) => message || "Access to this API has been restricted",
   );
 
+  // Thrown by internal/mime.js (util.MIMEType / util.MIMEParams) on every parse
+  // failure — the whole point of that API is to reject malformed input.
+  const ERR_INVALID_MIME_SYNTAX = makeNodeError(
+    TypeError,
+    "ERR_INVALID_MIME_SYNTAX",
+    (production, str, invalidIndex) =>
+      `The MIME syntax for a ${production} in "${str}" is invalid` +
+      (invalidIndex !== -1 ? ` at ${invalidIndex}` : ""),
+  );
+
   const ERR_FS_FILE_TOO_LARGE = makeNodeError(
     RangeError,
     "ERR_FS_FILE_TOO_LARGE",
@@ -188,16 +198,30 @@ export default function (exports, require, module, process, internalBinding, pri
   );
 
   // SystemError-shaped: built from a ctx object ({ code, message, path, ... }).
+  //
+  // `code` is the ERR_* key, NOT ctx.code — that is Node's contract and callers
+  // branch on it: `fs.rm(dir)` without `recursive` rejects with
+  // ERR_FS_EISDIR, `fs.cp` over an existing file with ERR_FS_CP_EEXIST. The
+  // libuv-level code ('EISDIR', 'EEXIST') stays reachable through `.info`, the
+  // way real Node exposes it. Reading ctx.code here instead reported the raw
+  // errno name, so every `err.code === 'ERR_FS_*'` check in the ecosystem
+  // silently missed and the error fell through as an unrecognised failure.
   const makeSystemError = (code) => {
     const Cls = class extends Error {
       constructor(ctx = {}) {
-        super(ctx.message ? `${code}: ${ctx.message}` : code);
-        this.code = ctx.code || code;
+        const syscall = ctx.syscall ? `${ctx.syscall} returned ${ctx.code}` : ctx.code;
+        super(
+          [code + ":", syscall, ctx.message && `(${ctx.message})`, ctx.path]
+            .filter(Boolean)
+            .join(" "),
+        );
+        this.code = code;
+        this.info = ctx;
         if (ctx.errno !== undefined) this.errno = ctx.errno;
         if (ctx.syscall !== undefined) this.syscall = ctx.syscall;
         if (ctx.path !== undefined) this.path = ctx.path;
         if (ctx.dest !== undefined) this.dest = ctx.dest;
-        this.name = `SystemError [${this.code}]`;
+        this.name = "SystemError";
       }
     };
     Cls.HideStackFramesError = Cls;
@@ -343,6 +367,15 @@ export default function (exports, require, module, process, internalBinding, pri
     Error,
     "ERR_MULTIPLE_CALLBACK",
     () => "Callback called multiple times",
+  );
+  // lib/stream.js installs the Readable helpers (map/filter/take/…) with a
+  // `if (new.target) throw new ERR_ILLEGAL_CONSTRUCTOR()` guard, so `new
+  // readable.map(...)` reported "ERR_ILLEGAL_CONSTRUCTOR is not a constructor"
+  // instead of the intended TypeError.
+  const ERR_ILLEGAL_CONSTRUCTOR = makeNodeError(
+    TypeError,
+    "ERR_ILLEGAL_CONSTRUCTOR",
+    () => "Illegal constructor",
   );
   const ERR_STREAM_ALREADY_FINISHED = makeNodeError(
     Error,
@@ -574,12 +607,25 @@ export default function (exports, require, module, process, internalBinding, pri
       ERR_ACCESS_DENIED,
       ERR_FS_FILE_TOO_LARGE,
       ERR_FS_EISDIR,
+      ERR_INVALID_MIME_SYNTAX,
       // fs.js also destructures these two but only uses them in edge/async paths.
       ERR_FS_CP_EINVAL: makeSystemError("ERR_FS_CP_EINVAL"),
+      // The rest of the ERR_FS_CP_* family, thrown by internal/fs/cp/cp.js on
+      // every guarded branch of fs.cp (dest exists, type mismatch, unsupported
+      // file type). Without them the guard itself dies as "X is not a
+      // constructor" and a rejected copy looks like a successful one.
+      ERR_FS_CP_DIR_TO_NON_DIR: makeSystemError("ERR_FS_CP_DIR_TO_NON_DIR"),
+      ERR_FS_CP_EEXIST: makeSystemError("ERR_FS_CP_EEXIST"),
+      ERR_FS_CP_FIFO_PIPE: makeSystemError("ERR_FS_CP_FIFO_PIPE"),
+      ERR_FS_CP_NON_DIR_TO_DIR: makeSystemError("ERR_FS_CP_NON_DIR_TO_DIR"),
+      ERR_FS_CP_SOCKET: makeSystemError("ERR_FS_CP_SOCKET"),
+      ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY: makeSystemError("ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY"),
+      ERR_FS_CP_UNKNOWN: makeSystemError("ERR_FS_CP_UNKNOWN"),
       ERR_INVALID_ARG_TYPE_RANGE: ERR_OUT_OF_RANGE,
       // streams
       ERR_METHOD_NOT_IMPLEMENTED,
       ERR_MULTIPLE_CALLBACK,
+      ERR_ILLEGAL_CONSTRUCTOR,
       ERR_STREAM_ALREADY_FINISHED,
       ERR_STREAM_CANNOT_PIPE,
       ERR_STREAM_DESTROYED,

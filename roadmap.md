@@ -1350,13 +1350,47 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
   - `crypto` **S3**: ✅ scrypt + elliptic sign/verify + EC/Ed25519 keygen (phase 1, #12);
     ✅ RSA — RS/PS sign/verify + publicEncrypt/privateDecrypt (OAEP/PKCS1v15) + keygen +
     PKCS#1 parsing (phase 2); ✅ X509Certificate parse/verify + SEC1 `EC PRIVATE KEY`
-    parsing (phase 3, drives jose importX509); remaining — DH/ECDH, JWK.
+    parsing (phase 3, drives jose importX509); ✅ `timingSafeEqual` — remaining: DH/ECDH, JWK.
   - `child_process`: parent→child **stdin** pipe (#15). (`fork` is now implemented — an IPC
     channel over the worker-thread spawn path — which unblocked `next dev`.)
   - WASI: **stdin**, `poll_oneoff` (event-driven) (#16 s1).
   - `worker_threads`: transferring more complex objects (#16 s2b).
-  - Stubbed builtins: `http2` (load-safe stub), `readline` (partial), `tls`/`https`,
-    `dgram`, `perf_hooks`, `cluster`.
+  - Stubbed / partial builtins: `http2` (load-safe stub), `readline` (partial), `tls`/`https`,
+    `perf_hooks`, `cluster`. **Absent rather than stubbed** — they hard-throw
+    `no vendored Node builtin '…'` on require, and are no longer advertised by
+    `Module.builtinModules` / `process.binding('natives')`: `dgram`, `domain`, `repl`, `sys`,
+    `sqlite`, `test`, `test/reporters`, `stream/consumers`, `trace_events`. (`dgram` was listed
+    here as "stubbed" and never was.)
+  - ✅ **Lazily-required `internal/*` ids: 13 unregistered → 3.** These are the ones the vendored
+    `lib/` only reaches from inside a function, so they imported cleanly and threw on first *use*
+    — `fs.cp`/`cpSync`, `fs.rm` recursive, `fs.glob`/`globSync`, `path.matchesGlob`,
+    `fs.watch(dir, {recursive:true})`, `util.MIMEType`, `util.diff`, `events.on()` and
+    `util.setTraceSigInt` (an honest not-implemented stub) all resolve now, and spreading `util`
+    no longer throws. The 3 left out are deliberate, each for a stated reason:
+    `internal/blocklist` and `internal/socketaddress` (need the C++ `block_list` CIDR matcher +
+    `internal/worker/js_transferable`; a hand-rolled v4/v6 subnet matcher is worse than useless
+    for a primitive callers use to *accept* connections) and `internal/source_map/source_map_cache`
+    (~1500 lines of further vendoring that would change nothing observable — see `getCallSites`
+    below). Consequence still standing: `net.BlockList`/`net.SocketAddress` are getters, so
+    **enumerating `net`** (`{...net}`, promisify-all helpers) throws. That's the last instance of
+    the trap AGENTS.md documents for `fs`, and the natural follow-up.
+  - ✅ **Web Streams ⇄ Node interop** (`internal/webstreams/adapters.js`): all six
+    `Readable`/`Writable`/`Duplex` `toWeb`/`fromWeb` converters are real; only
+    `newWritableStreamFromStreamBase`/`newReadableStreamFromStreamBase` still throw
+    (`ERR_METHOD_NOT_IMPLEMENTED`, deliberately — they need a libuv StreamBase handle our
+    `stream_wrap` shim doesn't implement, and nothing in the runtime calls them). The file is a
+    hand-written **adaptation**, not a verbatim vendor — reasons in the entry below.
+  - ✅ **One `assert`.** The eager `builtins/assert.js` shim is gone, so `assert`, `node:assert`
+    and `assert/strict` all resolve to the vendored `node/lib/assert.js`. Expect guest suites to
+    get stricter: `throws(fn, ExpectedError)` used to ignore its second argument.
+  - ✅ **One builtin list.** `Module.builtinModules` and `process.binding('natives')` are both
+    derived from `listPublicBuiltins()` — 48 ids that `require()` can genuinely serve, replacing a
+    41-entry `natives` array with 4 phantoms and a 19-name `builtinModules` snapshot that
+    disagreed with `Module.isBuiltin`.
+  - Known-throwing, each for one identified reason (not general gaps): `fsPromises.cp` — async
+    `fs.cp` works, but `lib/fs/promises.js` wires `cp: wrap("cpSync")` and so routes into the
+    deliberately-unimplemented sync path; a one-line fix in `node/lib/**`. `util.getCallSites()` —
+    needs `internalBinding('util').getCallSites`, one layer below the source-map cache.
   - ✅ `module` builtin is now a real **constructor** (`Module.prototype.{require,load,_compile}`,
     `_resolveFilename`, `_load`, `_cache`, `_extensions`, `wrap`, `isBuiltin`, `createRequire`) and
     `require` routes through `Module._load`, so require-patching tools (`ts-node`, `tsconfig-paths`,
@@ -1364,8 +1398,20 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     this — and Next 16 now boots in-VM on webpack + wasm SWC; see the framework matrix below.)
 - **Network (browser-platform limits, not just unimplemented):**
   - Outbound raw TCP is impossible in a browser — only the fetch/WebSocket bridge exists.
+  - ✅ And it now **says so**: `net.connect` rejects a non-loopback destination (`ENOTFOUND` for a
+    hostname, `EHOSTUNREACH` for an IP literal) instead of silently retargeting it onto whatever
+    in-VM server happens to own that port. `dns.lookup` still maps every name to `127.0.0.1` — on
+    purpose — which is exactly what made that guard necessary rather than redundant.
   - HTTP: streaming request/response bodies, keep-alive, more concurrent in-flight (#8).
 - **Persistence:** exact `mode`/`chmod` restore (needs a VFS `chmod`; files get default mode).
+  Concretely: `OP_CHMOD`/`OP_UTIMES` in `packages/protocol/syscall.js` + `set_mode`/`set_mtime` on
+  `VirtualFileSystem`, then `fs-client.js`/`fs-server.js` and `bindings/fs.js` against them (~30
+  lines across five files). Until that lands, `chmod`/`chown`/`utimes` accept the call and discard
+  it — see the entry below for why `ENOSYS` is not the answer — and they now at least throw `ENOENT`
+  on a missing path. **The coupling worth knowing:** `access()` enforces `X_OK` now, so
+  `chmod(f, 0o755)` followed by `access(f, X_OK)` **throws** instead of falsely passing. Passing the
+  mode at creation (`writeFileSync(p, s, { mode: 0o755 })` → `open(O_CREAT, mode)`) is the only way
+  to get an executable file today. This item retires that caveat with it.
 - **npm:** `package-lock.json`, `os`/`libc` optional-dep gating (#10/#16 s2c). (Real npm now
   BOOTS/installs/runs lifecycle scripts AND is the studio shell's `npm`/`npx` via a vendored
   delivery asset — see "Real package managers — progress" above. Remaining: `npm ci`, deleting
@@ -5031,3 +5077,301 @@ proves the same thing where it actually matters: a real `require()` of a real EL
 inside a guest process on the Wasm VFS.
 
 See ARCHITECTURE.md §9.2.
+
+## Node APIs that failed silently, or lied (this change)
+
+One theme, five slices: find the places where a Node API returned instead of failing. Not
+missing APIs — those announce themselves — but the ones that imported cleanly and threw only
+on first use, or accepted a call and discarded it, or answered a question with something
+plausible and wrong. Every one of these had already been paid for once, in a debugging
+session that started far from the cause.
+
+**A — thirteen builtin ids were registered nowhere.** The vendored `lib/` reaches a fair
+number of `internal/*` modules only from *inside* a function: `defineLazyProperties`,
+`defineReplaceableLazyAttribute`, `getLazy(() => require('id'))`, or a plain `require` in a
+cold branch. None of those run at import time, so `loader.js`'s `FACTORIES` table could be
+missing an id for as long as nobody exercised the feature — and then `fs.cp`, `fs.rm(dir,
+{recursive:true})`, `fs.glob`, `path.matchesGlob`, `fs.watch(dir, {recursive:true})`,
+`util.MIMEType`, `util.diff` and `events.on()` each threw `Vivari: no vendored Node builtin
+'…'` from a stack that named none of them. A static sweep of `node/lib/**` +
+`node/internal/**` for every id reachable through those patterns found 13; there are
+now **3**, and each of the three is a decision rather than a gap (see the coverage list
+above). Twelve new `internal/*` files close it: eleven vendored bodies, plus one honest
+not-implemented stub (`internal/util/trace_sigint`, 34 lines, correctly argued). With the
+`ERR_*` constructors they need, **all 195 `ERR_*` names destructured anywhere in the tree now
+resolve**, where
+`ERR_ILLEGAL_CONSTRUCTOR` had been missing and turned `new readable.map()` into
+"ERR_ILLEGAL_CONSTRUCTOR is not a constructor".
+
+Two things about those vendored bodies are worth writing down rather than discovering later.
+**Their provenance is v22.23.2, not the v24.18.0 the repo pins** — there is no network here,
+so each body was taken from the host's own `process.binding('natives')`; the headers say so
+and ask for a re-diff on a network-capable checkout. Each was checked against its *v24
+caller* rather than assumed compatible, and the one genuine v22→v24 move was found that way:
+v24 relocated `path.matchesGlob`'s matcher into `internal/fs/glob`, so `matchGlobPattern` is
+re-exported there (the body is v22 `lib/path.js`'s own `glob()` helper, verbatim). The other
+two deltas are forced by our substrate, not by taste: `rimraf` reads directories in string
+mode because `bindings/fs.js` ignores `readdir`'s `encoding` and always returns strings, so
+the verbatim `'buffer'` body would throw on the first non-empty directory — i.e. on exactly
+the case the file exists for; and `cp-sync` throws explicitly when the `cpSyncCheckPaths` /
+`cpSyncOverrideFile` / `cpSyncCopyDir` native helpers are absent, which they are, because
+otherwise it dies as `TypeError: fsBinding.cpSyncCheckPaths is not a function` and reads like
+a bug in user code. It still has to *load*: `lib/fs.js`'s `lazyLoadCp()` pulls `cp` and
+`cp-sync` together, so without it the fully-working async `fs.cp` would be unreachable too.
+The riskiest residue is `internal/deps/minimatch/index` — 1913 lines of Node's own bundled
+third-party build, from a different Node minor, unreviewable by hand and exercised only
+through the glob tests.
+
+**And the registration table was only half of it.** `loader.js` inserted a module into the
+cache *before* running its factory — it has to, or a cyclic `internal/*` require recurses
+forever — and never rolled back on a throw. So a builtin whose factory failed was cached as
+`{}`: the first `require` threw the real error, **every later one silently returned an empty
+object**. That is this change set's own theme sitting in the loader itself, and it had been
+hiding three failures — the moment the eviction went in, three tests that had been "passing"
+started failing honestly, because the poisoned cache had been handing back `{}` instead of
+re-throwing. Related, same file: `makeSystemError` set `err.code` to the libuv name
+(`EISDIR`) where real Node sets the `ERR_*` key (`ERR_FS_EISDIR`) and keeps the libuv name on
+`err.info`. Every ecosystem `err.code === 'ERR_FS_CP_*'` check missed. Checked against the
+host Node's real output for both `ERR_FS_EISDIR` call sites; the only in-tree readers of a
+raw `'EISDIR'` are in `rimraf.js`, and they inspect errors from the fs *binding*, not
+SystemErrors.
+
+**B — shims that lied.** `require('assert')` resolved to a 51-line hand-written shim, because
+`module.js` consults the eager `builtins` table before the loader, while
+`require('assert/strict')` went through to the real vendored module. Two structurally
+different objects under two ids that Node guarantees are two halves of one module — and the
+shim's `throws(fn, ExpectedError)` **ignored its second argument**, so a test asserting one
+specific error passed on any throw at all. Deleted. Expect in-VM suites to get stricter: an
+assertion that was vacuous now actually asserts, and a guest suite that was green can
+legitimately go red.
+
+`chmod`/`chown`/`utimes` were silent no-ops; they now at least require the target to exist,
+throwing `ENOENT` labelled with the caller's own syscall name. They still cannot *persist* —
+the VFS assigns `mode` only at creation and models neither uid/gid nor atime/ctime, and
+there is no `OP_CHMOD` in the protocol — and `ENOSYS` was considered and rejected rather than
+skipped: npm's `bin-links` does an unconditional `chmod` per installed bin and propagates the
+rejection, and node-tar errors an extracted entry when `futimes` *and* `utimes` both fail, so
+`ENOSYS` trades a quiet wrong-metadata problem for "no package manager works". Both were read
+out of the real npm tree on disk, not from memory. The fd variants keep skipping the
+equivalent `EBADF` check, deliberately, and that is the one residual dishonesty left knowingly
+in place: node-tar calls all three on every extracted file, and the write that just went
+through that fd already proves it is live.
+
+`access()` ignored its `mode` and now enforces `X_OK`. `R_OK`/`W_OK` stay passing because
+every process here is uid 0 and POSIX lets root bypass those checks — that is the correct
+answer, not a shortcut — but `X_OK` is the one root does not get free, and the execute bit is
+real and already reported by `stat`. This is the highest-risk item in the set and its risk is
+worth stating rather than burying: **because `chmod` cannot persist, `chmod(f, 0o755)` then
+`access(f, X_OK)` now throws where it used to falsely pass.** That is the loud wrong answer
+chosen over the quiet one — it surfaces the missing `OP_CHMOD` at the point of use, and it
+agrees with `stat`, which has always reported those files as non-executable, and with `isexe`,
+which npm's `which` uses. No in-repo caller of `fs.access` exists; if a bundled tool trips on
+it, the revert is one `if` block.
+
+`net.connect` dispatched on the port alone. `lib/dns.js` maps every hostname to `127.0.0.1`
+on purpose, so `net.connect(3000, 'api.example.com')` arrived at the binding as
+`("127.0.0.1", 3000)` and was served by whatever in-VM dev server owned `:3000` — a 200 from
+the wrong service, which is the worst available outcome. The destination is now judged before
+the port lookup: non-loopback hostname → `ENOTFOUND`, non-loopback IP literal →
+`EHOSTUNREACH`. Loopback preservation is the actual work here and it was verified by test
+rather than asserted — the guard sits before both the `listeners` lookup and the cross-process
+`pipeConnect` fallback, and the HMR/WebSocket relay, the Service Worker preview replay and a
+stubbed Nitro/Nuxt-shaped cross-process proxy were each driven through it. A sweep of every
+`host:`/`hostname:`/`connect(port, '…')` literal in `scripts/`, `packages/runtime/*.js`,
+`packages/kernel-host/` and `packages/core/` found only `127.0.0.1`, `localhost`, `0.0.0.0`
+and `''`.
+
+`process.binding('natives')` and `Module.builtinModules` were two hardcoded lists, wrong in
+opposite directions — `natives` vouched for `dgram`/`domain`/`repl`/`sys`, which hard-throw
+on require, so `is-core-module` sent callers into that throw instead of letting them reach a
+browser polyfill; `builtinModules` listed only the eager table (19 names) and so disagreed
+with `Module.isBuiltin`, which had always consulted the loader too. Both now read one derived
+list: Node v24's public core ids ∩ what `require()` can actually serve, 48 names, using the
+same predicate `module.js` uses to answer `builtin: true`, so the list is resolvability by
+construction. Second-highest-risk item: bundlers read `builtinModules` to decide what not to
+bundle, and it went from 19 names to 48.
+
+And `crypto.timingSafeEqual` did not exist. The reason that one matters more than a missing
+API usually does is the shape of its call sites: auth code writes
+`crypto.timingSafeEqual ? crypto.timingSafeEqual(a, b) : a === b`, so its absence silently
+degraded every such comparison to `===` and reintroduced the exact timing leak the call was
+there to prevent. Nothing threw. Implemented to Node's contract and checked differentially
+against the host's real implementation across 9 cases, return value and error code.
+
+**C — the Web Streams adapters were six functions, five of which threw.**
+`internal/webstreams/adapters.js` went 80 → 797 lines; all six `Readable`/`Writable`/`Duplex`
+`toWeb`/`fromWeb` converters are real, and the previous `Readable.fromWeb` "pragmatic pump"
+(no `reader.closed` wiring, no `signal`, no `objectMode`/`encoding` validation, every chunk
+force-wrapped in a `Buffer`) is gone. **It is a hand-written adaptation, not a verbatim
+vendor, and that distinction has to stay recorded** or someone will "restore" it from
+upstream and break it: upstream builds on Node's own bundled WHATWG implementation, which we
+do not have — `stream/web` re-exports whichever globals the host realm provides, the browser
+Worker's classes in the studio and Node's in the headless twin — and upstream reads two
+`Safe*` primordials that our Proxy cannot resolve, where merely *destructuring* them throws.
+So the classes resolve from `globalThis` per call (a realm-capability problem must not make
+`require` of the module fail), `isReadableStream`/`isWritableStream` duck-type instead of
+brand-checking (a browser-realm `ReadableStream` fails a Node brand check), and the file uses
+plain intrinsics like the other hand-written `internal/*` modules. Control flow is otherwise
+one-for-one with upstream, including behaviours that look wrong and are not (`Writable.toWeb`
+using count semantics even in byte mode; `Readable.toWeb` producing a non-byte stream, so
+`getReader({mode:'byob'})` throws) — those are pinned by tests so nobody "fixes" them.
+
+One divergence is a real upstream bug rather than an adaptation. Upstream's `writev` installs
+one handler as both the fulfilled and the rejected callback and starts it with
+`error.filter(…)`; on the rejection path the reason is an `Error`, so it throws
+`TypeError: error.filter is not a function` inside the promise chain. Reproduced against the
+host's own `Writable.fromWeb`. Upstream gets away with it because the real error still
+arrives via `writer.closed` — here it would be fatal, because `runtime/index.js` escalates
+any non-sentinel unhandled rejection to `uncaughtException` and kills the guest. The handlers
+are split, in `Writable.fromWeb` and `Duplex.fromWeb` both.
+
+Still throwing on purpose: `newWritableStreamFromStreamBase` / `newReadableStreamFromStreamBase`.
+They drive a libuv StreamBase handle directly, which our JS `stream_wrap` shim does not
+implement, so any version would be a partially-correct conversion that silently drops
+writes — precisely what this change set is about. Nothing in the runtime calls them; net and
+http reach Web Streams through `toWeb` on the socket. They are exported so that a future
+caller gets `ERR_METHOD_NOT_IMPLEMENTED` naming StreamBase and the alternative, rather than
+`undefined is not a function`.
+
+**D — and then the event loop could exit out from under them.** The adapters await host-realm
+promises, which settle off our loop; `runtime/index.js` already wrapped the *reader*'s
+`read()`/`cancel()` in `trackHost` for exactly this reason (the comment there cites corepack's
+tarball download by name). The new writer paths were not covered: `Writable.fromWeb`'s pump is
+`writer.ready.then(() => writer.write(chunk).then(…))`, both halves host promises, and under
+backpressure `hostLiveness.active` stayed at 0 for the whole transfer — so a stream transfer
+with no socket or timer alongside it could have the loop decide the process was idle mid-write.
+`write`/`close`/`abort` now go through `wrapHostAsync`, and `writer.ready`, `writer.closed` and
+the readers' `closed` through a new `wrapHostAsyncGetter`, because `wrapHostAsync` early-returns
+on anything that is not a function and these are **getters**. Two details are load-bearing and
+easy to get wrong in the obvious way: the wrapper must stay an accessor (`ready` hands out a
+different promise each time the queue fills and drains, so collapsing it to a data property
+pins the first one forever, and reading the original getter at patch time would force a promise
+into existence before any stream is in play); and accessors need at-most-once tracking via a
+`WeakSet`, because per spec `closed` is created once per reader/writer and returned on every
+read, so refing each access stacks up refs its single settlement can never balance — a
+permanently alive loop, i.e. a hung guest instead of an exited one.
+
+Tracking the `closed` accessors is a change of liveness *semantics*, not just a bug fix, and
+is flagged rather than smuggled: `closed` stays pending for the stream's whole lifetime and the
+adapters read it eagerly at construction, so a guest that builds an adapter and then neither
+consumes nor destroys it now hangs where it used to exit. Every adapter path does drive its
+stream to a terminal state, so within the adapters the ref always clears, and it is arguably
+the correct emulation — in real Node the underlying handle refs the loop. The mid-transfer fix
+does not depend on it either way (between chunks there is always a tracked `ready` or `write`
+pending); what `closed` buys is delivery of the premature-close and stream-error notifications.
+The retreat is one line: drop `"closed"` from the two lists.
+
+**E — `primordials` handed out four `Promise` statics that could not be called.** `resolve()`
+returned `Promise.resolve` itself, so a destructured `PromiseResolve(x)` ran with
+`this === undefined` and threw "is not a constructor" — `PromiseResolve`, `PromiseReject`,
+`PromiseAll` and `PromiseWithResolvers`, which is what kept `events.on()` from working at all.
+Node binds exactly one namespace for this reason and now so do we, through a `BIND_STATICS`
+set. **Only `Promise` is in it, deliberately**, and the narrow choice is the point: binding
+every namespace reached through the `<Ns><Member>` scheme rewrites ~100 working intrinsics to
+fix 4, and `%TypedArray%`'s statics are the counter-example that makes it concrete — they do
+need a receiver, but they need a *concrete subclass*, never the abstract base, so a bound
+`TypedArrayFrom` would look resolved and never work, where unbound it keeps throwing honestly.
+Under the narrow version `p.ArrayIsArray === Array.isArray` still holds. Both variants produce
+identical harness output, so the narrowing costs nothing measurable. `BIND_STATICS` is an
+**exception to the naming scheme documented in that file's own header**, which makes it look
+like something to tidy away; it is now written into AGENTS.md for that reason.
+
+The same file could not resolve `SafePromiseAll` or `SafeStringPrototypeSearch` at all — they
+match no `<Ns>` prefix, so the Proxy threw on read, and since a vendored module *destructures*
+its primordials at load, `internal/fs/cp/cp` and `internal/mime` died on require rather than on
+use. Both are hand-written into `SPECIALS` now, using the file's own `uncurryThis` rather than
+raw `.call`/`.map` (a file whose entire purpose is monkeypatch-proofing should not route through
+a live `Array.prototype.map`), and verified with those two prototypes replaced by throwing
+stubs. `SafeStringPrototypeSearch` mutates the regex it is handed by resetting `lastIndex` —
+that is upstream's exact implementation and it is what makes `internal/mime.js`'s module-level
+`/g` regexes behave like `.search`, verified across repeated calls. After this, **0 of the 123
+primordial names the vendored tree destructures are unresolvable.** One audit finding was
+rejected on inspection rather than acted on: `ObjectDefineProperty`/`ObjectDefineProperties`
+appear broken to a probe that pattern-matches error text, but `Object.defineProperty` ignores
+`this` entirely and reports "called on non-object" about its *target argument*. That was the
+only evidence that could have justified binding beyond `Promise`.
+
+### Verification — what actually ran, and what did not
+
+**`npm run verify` could not run at all, and nothing here claims it did.** It dies at startup
+in `scripts/fs-worker.mjs` with `Cannot find module '../packages/vfs/pkg-node/vivari_vfs.js'`:
+`packages/vfs/pkg-node` is gitignored `wasm-pack` output, this machine has no
+`cargo`/`rustc`/`wasm-pack`, and there is no network to fetch them, so the Rust→Wasm VFS
+cannot be built. **The runtime-behaviour leg of this change set is therefore unverified
+end-to-end and needs a run on a machine with the Rust toolchain before this is trusted in the
+browser.** `npm run smoke` does pass (0 failed, 1 skipped — the pre-existing
+`packages/core/dist not built` skip), but it is a source-level check of the SDK surface that
+never loads the runtime, so it says nothing about any of this. Host Node here is v22.23.2.
+
+What was run instead: per-slice harnesses on plain Node that import the **real, modified**
+modules — no re-typed logic — with stubbed syscalls or a host-fs-backed `syscalls` shim
+standing in for the VFS. They lived outside the repo and are the obvious thing to promote into
+`scripts/` if we want them kept.
+
+- **Loader + builtins exercise matrix (not `npm run smoke`): 37 pass / 2 fail**, and **all 120
+  registered builtin ids instantiate**. Without the primordials fix it is 24 / 15. Newly green:
+  `events.on()`, `fs.cp` tree copy, `ERR_FS_EISDIR`, `ERR_FS_CP_EEXIST`, the `cpSync` honest
+  throw, `util.MIMEType` + `ERR_INVALID_MIME_SYNTAX`, and enumerating `util` (34 lazy keys).
+  Already green and kept: `fs.rm` recursive/ENOENT/force, `fs.glob` ×5, `path.matchesGlob`,
+  `fs.watch` recursive, `util.diff`, enumerating `fs`. The **2 remaining failures are the
+  documented omissions**: enumerating `net` (`BlockList`/`SocketAddress`) and
+  `util.getCallSites()` — the latter *not* the source-map-cache omission, as had been assumed;
+  it fails one layer lower on a missing `internalBinding('util').getCallSites` and would still
+  fail if that module were registered.
+- **Web Streams adapters: 39/39**, against the realm's real `ReadableStream`/`WritableStream`/
+  `TransformStream`, with a primordials Proxy that throws on *any* read (so the tests passing is
+  itself the proof that the file reads none). The backpressure cases are real assertions, not
+  smoke: they hold a chunk in flight and assert the next one never reaches the far side until a
+  drain, in both directions. Last case is the realistic shape — a web `ReadableStream` through
+  `zlib.createGzip()` into a web `WritableStream`, gunzipped back and compared.
+- **`trackHost` coverage: 69/69**, driving real host streams with deferred-gated sinks so each
+  promise is observed while genuinely pending, and with descriptors snapshotted *before*
+  patching so the shape assertions compare against ground truth. The direct regression proof is
+  a 5-chunk transfer through a HWM=1 sink: peak `active=2` where it was `0` before, `active=0`
+  after, chunks in order.
+- **fs + net bindings: 37/37** (including the async `FSReqCallback` variants and the
+  cross-process pipe relay). **`assert` identity/behaviour: 21/21** against the real
+  `loader.js`. **`timingSafeEqual`: 9/9 identical** to the host's own implementation.
+- **Static audits:** every builtin id reachable from `node/lib/**` + `node/internal/**` (read
+  two independent ways — a brace-depth-aware scrape of the table, so it can be pointed at
+  `git show HEAD:…/loader.js` for the before-run, plus the live `has()` — and cross-checked by
+  a dumber grep for every bare `'internal/…'` literal); all 195 `ERR_*` names; all 123
+  primordial names. The one cross-check disagreement is `internal/watchdog`, which is prose
+  inside a comment rather than a `require` — the two scans disagreeing on exactly that string
+  is the expected signature of a mention.
+
+Vendored bodies were diffed against the same builtin id out of the host's own
+`process.binding('natives')`, which is how the three necessary deltas were separated from
+accidental drift — but the host is v22.23.2, so **byte-level parity with the pinned v24.18.0
+is not claimed** for any of the eleven vendored bodies or for `adapters.js`.
+
+Also not verified, and worth naming: anything realm-specific to the browser Worker. The
+adapters and the `trackHost` patch were exercised against Node's bundled Web Streams; Chromium
+and Firefox differ in queue accounting and in how `writer.ready` settles relative to `write()`,
+and the interaction with our own `loop.js` is precisely the thing no Node-side test can see.
+
+### Follow-ups this leaves behind
+
+- ⏳ `OP_CHMOD`/`OP_UTIMES` + `set_mode`/`set_mtime` on the VFS, which is what makes
+  `chmod`/`chown`/`utimes` real and retires the `access(f, X_OK)` caveat. See "Persistence"
+  in the deferred list above.
+- ⏳ `fsPromises.cp` routes into the deliberately-unimplemented sync path
+  (`lib/fs/promises.js` wires `cp: wrap("cpSync")`) even though async `fs.cp` works — a
+  one-line fix.
+- ⏳ Enumerating `net` still throws on the `BlockList`/`SocketAddress` getters. It is the last
+  instance of the trap AGENTS.md documents for `fs`, and it was not papered over with a stub
+  class on purpose: a subtly wrong CIDR matcher is worse than an honest throw for a primitive
+  callers use to decide whether to *accept* a connection.
+- ⏳ Promote the per-slice harnesses into `scripts/` (or fold their cases into
+  `verify-node.mjs`) so none of the above can silently regress — per the standing rule that a
+  new Node API gets a probe.
+- 🧊 Re-diff the eleven vendored bodies and `adapters.js` against genuine v24.18.0 sources on a
+  network-capable checkout.
+- 🧊 `internalBinding('icu')` is referenced by `lib/buffer.js` and does not exist. Pre-existing
+  and dormant — `config.hasIntl` is `false`, which is what keeps `Buffer.transcode` from
+  reaching it — but it is the same class of latent throw and it is now the only one the sweep
+  can see.
+
+See the AGENTS.md gotchas added with this change: the loader cache eviction, `primordials`
+`BIND_STATICS`, the Web Streams adapters and their loop-liveness contract, the eager-shim
+shadowing rule, the `chmod`/`X_OK` coupling, and the loopback-only `connect()`.

@@ -18,6 +18,8 @@ import pathFactory from "./lib/path.js";
 import bufferFactory from "./lib/buffer.js";
 import fsFactory from "./lib/fs.js";
 import eventsFactory from "./lib/events.js";
+import fixedQueueFactory from "./internal/fixed_queue.js";
+import eventsSymbolsFactory from "./internal/events/symbols.js";
 import utilPublicFactory from "./lib/util.js";
 import constantsFactory from "./internal/constants.js";
 import validatorsFactory from "./internal/validators.js";
@@ -28,14 +30,24 @@ import utilInspectFactory from "./internal/util/inspect.js";
 import utilDebuglogFactory from "./internal/util/debuglog.js";
 import utilColorsFactory from "./internal/util/colors.js";
 import utilComparisonsFactory from "./internal/util/comparisons.js";
+import utilDiffFactory from "./internal/util/diff.js";
+import myersDiffFactory from "./internal/assert/myers_diff.js";
+import mimeFactory from "./internal/mime.js";
+import traceSigintFactory from "./internal/util/trace_sigint.js";
 import parseArgsFactory from "./internal/util/parse_args/parse_args.js";
 import parseArgsUtilsFactory from "./internal/util/parse_args/utils.js";
 import internalBufferFactory from "./internal/buffer.js";
 import startupSnapshotFactory from "./internal/v8/startup_snapshot.js";
 import optionsFactory from "./internal/options.js";
 import fsUtilsFactory from "./internal/fs/utils.js";
+import fsRimrafFactory from "./internal/fs/rimraf.js";
+import fsCpFactory from "./internal/fs/cp/cp.js";
+import fsCpSyncFactory from "./internal/fs/cp/cp-sync.js";
 import fsReadContextFactory from "./internal/fs/read/context.js";
 import fsWatchersFactory from "./internal/fs/watchers.js";
+import fsRecursiveWatchFactory from "./internal/fs/recursive_watch.js";
+import fsGlobFactory from "./internal/fs/glob.js";
+import minimatchFactory from "./internal/deps/minimatch/index.js";
 import fsStreamsFactory from "./internal/fs/streams.js";
 import urlFactory from "./internal/url.js";
 import blobFactory from "./internal/blob.js";
@@ -188,14 +200,32 @@ const FACTORIES = {
   "internal/util/debuglog": utilDebuglogFactory,
   "internal/util/colors": utilColorsFactory,
   "internal/util/comparisons": utilComparisonsFactory,
+  // lib/util.js exposes these through defineLazyProperties, so merely READING
+  // util.MIMEType / util.diff (or spreading `util`) used to throw.
+  "internal/util/diff": utilDiffFactory,
+  "internal/assert/myers_diff": myersDiffFactory,
+  "internal/mime": mimeFactory,
+  "internal/util/trace_sigint": traceSigintFactory,
   "internal/util/parse_args/parse_args": parseArgsFactory,
   "internal/util/parse_args/utils": parseArgsUtilsFactory,
   "internal/buffer": internalBufferFactory,
   "internal/v8/startup_snapshot": startupSnapshotFactory,
   "internal/options": optionsFactory,
   "internal/fs/utils": fsUtilsFactory,
+  "internal/fs/rimraf": fsRimrafFactory,
+  // lib/fs.js's lazyLoadCp() requires BOTH, on the async path too, so fs.cp
+  // needs cp-sync registered even though cpSyncFn itself is not implemented.
+  "internal/fs/cp/cp": fsCpFactory,
+  "internal/fs/cp/cp-sync": fsCpSyncFactory,
   "internal/fs/read/context": fsReadContextFactory,
   "internal/fs/watchers": fsWatchersFactory,
+  // On linux lib/fs.js routes EVERY `fs.watch(p, { recursive: true })` to this
+  // JS watcher (its native branch is macOS/Windows only).
+  "internal/fs/recursive_watch": fsRecursiveWatchFactory,
+  // fs.glob / fs.globSync / path.matchesGlob. Node itself bundles minimatch for
+  // this and reaches it through the same builtin id.
+  "internal/fs/glob": fsGlobFactory,
+  "internal/deps/minimatch/index": minimatchFactory,
   "internal/fs/streams": fsStreamsFactory,
   "internal/url": urlFactory,
   "internal/blob": blobFactory,
@@ -208,6 +238,11 @@ const FACTORIES = {
     module.exports = require("assert").strict;
   },
   "internal/events/abort_listener": abortListenerFactory,
+  // Both are lazily required by `events.on(emitter, name)` (the async-iterator
+  // API) the first time it runs — never at import time, so a missing one only
+  // surfaces when a consumer actually iterates events.
+  "internal/fixed_queue": fixedQueueFactory,
+  "internal/events/symbols": eventsSymbolsFactory,
   "internal/event_target": eventTargetFactory,
   "internal/process/task_queues": taskQueuesFactory,
   "internal/streams/utils": streamsUtilsFactory,
@@ -324,7 +359,18 @@ export function createNodeModules({ process, syscalls, netLiveness, netServers, 
     }
     const module = { exports: {} };
     modules.set(id, module); // register BEFORE running so cycles see the partial
-    factory(module.exports, nodeRequire, module, process, internalBinding, primordials);
+    try {
+      factory(module.exports, nodeRequire, module, process, internalBinding, primordials);
+    } catch (e) {
+      // A factory that threw left a half-initialised module in the cache, so the
+      // NEXT require handed back its empty `exports` instead of re-throwing —
+      // turning a loud module-level failure into a silent `{}`. Concretely: the
+      // first read of `util.MIMEType` threw, every read after it returned
+      // undefined, and the caller died much later with "not a constructor".
+      // Evict, so the real error is reported every time.
+      modules.delete(id);
+      throw e;
+    }
     return module.exports;
   }
 

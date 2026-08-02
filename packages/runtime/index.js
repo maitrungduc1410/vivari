@@ -7,7 +7,6 @@ import { createEventLoop } from "./loop.js";
 import { createNodeModules } from "./node/loader.js";
 import { createOs } from "./builtins/os.js";
 import { createProcess } from "./builtins/process.js";
-import { createAssert } from "./builtins/assert.js";
 import { createChildProcess } from "./builtins/child_process.js";
 import { createModuleSystem } from "./module.js";
 import { createWebSocket } from "./websocket.js";
@@ -334,7 +333,11 @@ export function createRuntime({
   // Phase 2 #8 stage 2: `http` IS Node's real lib/http.js now (Brick 5 is gone).
   // The browser preview reaches it through the bridge wired below.
   const http = nodeModules.require("http");
-  const assert = createAssert(util);
+  // NOTE: `assert` is deliberately NOT in the eager table below. It is served
+  // lazily by the vendored `node/lib/assert.js`, so `require('assert')` and
+  // `require('assert/strict')` return the two halves of ONE module. An eager
+  // shim used to win here (module.js consults `builtins` before the loader),
+  // which made the two ids structurally different objects.
 
   // ---- real event surface on `process` --------------------------------------
   // Node's `process` IS an EventEmitter, and real tools depend on it: npm's
@@ -441,20 +444,15 @@ export function createRuntime({
   // (`process.binding('constants')`), and a `util` legacy path. Delegate to the
   // same internalBinding seam the vendored Node lib uses; `natives` (source
   // strings - we have none) becomes a name→'' map so `Object.keys` yields the
-  // core module list. Unknown names return {} rather than throwing.
+  // core module list - drawn from listPublicBuiltins(), the SAME truthful source
+  // Module.builtinModules uses. Unknown names return {} rather than throwing.
   {
-    const NATIVE_MODULE_NAMES = [
-      "assert", "async_hooks", "buffer", "child_process", "cluster", "console",
-      "constants", "crypto", "dgram", "diagnostics_channel", "dns", "domain",
-      "events", "fs", "http", "http2", "https", "inspector", "module", "net",
-      "os", "path", "perf_hooks", "process", "punycode", "querystring",
-      "readline", "repl", "stream", "string_decoder", "sys", "timers", "tls",
-      "tty", "url", "util", "v8", "vm", "wasi", "worker_threads", "zlib",
-    ];
     process.binding = (name) => {
       if (name === "natives") {
         const out = {};
-        for (const n of NATIVE_MODULE_NAMES) out[n] = "";
+        // Called long after boot (only by user bundles), so `builtins` - which
+        // listPublicBuiltins() reads - is fully wired by now.
+        for (const n of listPublicBuiltins()) out[n] = "";
         return out;
       }
       let b = {};
@@ -967,6 +965,34 @@ export function createRuntime({
     wrapped.__ocHostWrapped = true;
     obj[name] = wrapped;
   };
+  // Accessors need at-most-once tracking where methods do not: a method mints a
+  // fresh promise per call, but `closed` is created once per reader/writer and
+  // handed back on every read, so refing each access would stack up refs that its
+  // single settlement can never balance - a permanently alive loop, i.e. a hung
+  // guest.
+  const trackedHostPromises = new WeakSet();
+  const trackHostOnce = (p) => {
+    if (!p || typeof p.then !== "function" || trackedHostPromises.has(p)) return p;
+    trackedHostPromises.add(p);
+    return trackHost(p);
+  };
+  // Getter variant of wrapHostAsync, for host promises exposed as accessors
+  // rather than methods (writer.ready, writer.closed, reader.closed) -
+  // wrapHostAsync bails on those because the property is not a function. The
+  // replacement stays an accessor: `ready` hands out a *different* promise each
+  // time the queue fills and drains, so collapsing it to a data property would
+  // pin the first one forever, and reading the original getter here at patch
+  // time would force the promise into existence before any stream is in play.
+  const wrapHostAsyncGetter = (obj, name) => {
+    const desc = obj && Object.getOwnPropertyDescriptor(obj, name);
+    if (!desc || typeof desc.get !== "function" || desc.get.__ocHostWrapped || !desc.configurable) return;
+    const origGet = desc.get;
+    const get = function () {
+      return trackHostOnce(origGet.call(this));
+    };
+    get.__ocHostWrapped = true;
+    Object.defineProperty(obj, name, { ...desc, get });
+  };
   if (typeof WebAssembly !== "undefined") {
     for (const m of ["compile", "instantiate", "compileStreaming", "instantiateStreaming"]) {
       wrapHostAsync(WebAssembly, m);
@@ -1033,6 +1059,25 @@ export function createRuntime({
       wrapHostAsync(C.prototype, "read");
       wrapHostAsync(C.prototype, "cancel");
     }
+  }
+  // The writer side of the same story. Writable.fromWeb / Duplex.fromWeb pump a
+  // `writer.ready` -> `writer.write(chunk)` pair per chunk and finish with
+  // close()/abort(), all settling on the host's queues; unrefed, the loop can
+  // exit out from under a half-written transfer exactly as it could mid-download
+  // before. The `closed` accessors matter too: the adapters hang the stream's
+  // premature-close and error reporting off them (adapters.js), so a loop that
+  // exits while one is pending drops the failure on the floor. Realms without
+  // Web Streams (the headless worker_threads runtime) simply skip this.
+  {
+    const C = globalThis.WritableStreamDefaultWriter;
+    if (typeof C === "function" && C.prototype) {
+      for (const m of ["write", "close", "abort"]) wrapHostAsync(C.prototype, m);
+      for (const g of ["ready", "closed"]) wrapHostAsyncGetter(C.prototype, g);
+    }
+  }
+  for (const ctor of ["ReadableStreamDefaultReader", "ReadableStreamBYOBReader"]) {
+    const C = globalThis[ctor];
+    if (typeof C === "function" && C.prototype) wrapHostAsyncGetter(C.prototype, "closed");
   }
 
   // Exit-sentinel safety net. process.exit() throws a sentinel that the loop's
@@ -1135,13 +1180,50 @@ export function createRuntime({
     loop.wakeNet();
   };
 
+  // Node v24's PUBLIC core module ids - the candidate set, not the answer. It is
+  // intersected with what we can actually serve (see listPublicBuiltins), so an
+  // id we don't implement never reaches a caller. Internal (`internal/*`),
+  // underscore-legacy (`_http_*`) and our non-core vendored extras (`semver`,
+  // `@napi-rs/wasm-runtime`) are deliberately absent: neither surface below is
+  // supposed to advertise them.
+  const NODE_PUBLIC_CORE_IDS = [
+    "assert", "assert/strict", "async_hooks", "buffer", "child_process", "cluster",
+    "console", "constants", "crypto", "dgram", "diagnostics_channel", "dns",
+    "dns/promises", "domain", "events", "fs", "fs/promises", "http", "http2",
+    "https", "inspector", "inspector/promises", "module", "net", "os", "path",
+    "path/posix", "path/win32", "perf_hooks", "process", "punycode", "querystring",
+    "readline", "readline/promises", "repl", "sqlite", "stream", "stream/consumers",
+    "stream/promises", "stream/web", "string_decoder", "sys", "test",
+    "test/reporters", "timers", "timers/promises", "tls", "trace_events", "tty",
+    "url", "util", "util/types", "v8", "vm", "wasi", "worker_threads", "zlib",
+  ];
+  let publicBuiltinIds = null;
+  // The ONE truthful builtin list. Both public "what can I require?" surfaces -
+  // `process.binding('natives')` (read by is-core-module / builtin-modules) and
+  // `Module.builtinModules` - answer from this, so they can't disagree, and it is
+  // derived from what require() can genuinely serve: the eager `builtins` table
+  // UNION the vendored loader's public ids. Previously the two were hardcoded
+  // separately and both wrong in opposite directions - `natives` vouched for
+  // dgram/domain/repl/sys (which hard-throw on require, so is-core-module sent
+  // callers straight into that throw), while builtinModules listed only the eager
+  // table (~20 names) and so disagreed with Module.isBuiltin, which has always
+  // consulted the loader too.
+  // Declared as a hoisted `function` on purpose: the process.binding shim above
+  // closes over it long before this point in the file.
+  function listPublicBuiltins() {
+    if (publicBuiltinIds) return publicBuiltinIds;
+    publicBuiltinIds = NODE_PUBLIC_CORE_IDS.filter(
+      (id) => Object.prototype.hasOwnProperty.call(builtins, id) || nodeModules.has(id),
+    );
+    return publicBuiltinIds;
+  }
+
   const builtins = {
     fs,
     path,
     os,
     process,
     util,
-    assert,
     child_process,
     http,
     events: EventEmitter,
@@ -1264,9 +1346,6 @@ export function createRuntime({
   // lets `const { Module } = require('module')`, `require('module') === Module`,
   // and monkey-patching `Module.prototype`/`_load`/`_extensions` all behave.
   const Module = moduleSystem.Module;
-  // `builtinModules` must be the public list only (no `node:`-prefixed dupes and
-  // no internal names). Snapshot before the node: aliases are added below.
-  Module.builtinModules = Object.keys(builtins).filter((n) => !n.startsWith("node:") && !n.startsWith("_"));
   Module.Module = Module;
   Module.createRequire = Module.createRequire || ((from) => moduleSystem.makeRequire(path.dirname(typeof from === "string" ? from : "/")));
   // Node exposes `runMain` on the `module` builtin (=== Module.runMain); real
@@ -1292,6 +1371,17 @@ export function createRuntime({
     findEntry() { return {}; }
   };
   builtins.module = Module;
+
+  // `builtinModules` is the public list only (no `node:`-prefixed dupes and no
+  // internal names) and comes from listPublicBuiltins() - the same truthful
+  // source `process.binding('natives')` uses, so the two can never drift apart
+  // and both agree with `Module.isBuiltin`.
+  // Placement is load-bearing in BOTH directions: it must come AFTER
+  // `builtins.module = Module` (or `module` itself is missing from the list -
+  // the old snapshot sat above this line and did omit it) and BEFORE the `node:`
+  // alias loop below. listPublicBuiltins() memoizes on first call, and this is
+  // that call, so this is also what `process.binding('natives')` will report.
+  Module.builtinModules = listPublicBuiltins().slice();
 
   // Support both `require('fs')` and `require('node:fs')`.
   for (const name of Object.keys(builtins)) builtins["node:" + name] = builtins[name];

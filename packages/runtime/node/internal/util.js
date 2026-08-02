@@ -215,6 +215,15 @@ export default function (exports, require, module, process, internalBinding, pri
   // anyway. We keep the construct-anyway behaviour (deprecation notice omitted).
   const deprecateInstantiation = (ctor, _code, ...args) => new ctor(...args);
 
+  // Real Node's `sleep` is internalBinding('util').sleep — a blocking sleep. We
+  // have no such binding, so busy-wait: the only caller is internal/fs/rimraf's
+  // SYNC retry loop, which runs only after an EBUSY/EPERM-class failure and only
+  // when the caller opted into retries (fs.rmSync defaults to maxRetries: 0).
+  const sleep = (msec) => {
+    const end = Date.now() + msec;
+    while (Date.now() < end);
+  };
+
   module.exports = {
     isWindows,
     isMacOS,
@@ -222,6 +231,7 @@ export default function (exports, require, module, process, internalBinding, pri
     guessHandleType,
     assignFunctionName,
     deprecateInstantiation,
+    sleep,
     customInspectSymbol,
     kIsEncodingSymbol,
     kEmptyObject,

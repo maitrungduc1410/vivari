@@ -874,6 +874,48 @@ export default function (exports, require, module, process, internalBinding) {
     throw new Error(`Vivari crypto: ${name} is not supported yet`);
   };
 
+  // --- timingSafeEqual -----------------------------------------------------
+  // This one has to EXIST, not just be correct. Auth code routinely writes
+  // `crypto.timingSafeEqual ? crypto.timingSafeEqual(a, b) : a === b` — so while
+  // it was missing here, every such call site silently degraded a token/HMAC
+  // comparison to `===` and reintroduced exactly the timing leak the call was
+  // there to prevent. Nothing threw; the check just quietly got weaker.
+  //
+  // Node's contract, followed exactly: ArrayBuffer / TypedArray / DataView only
+  // (strings are rejected — `toBytes` is deliberately NOT used here, since
+  // encoding a string is itself input-dependent work and accepting one would
+  // paper over the caller's bug), equal byte lengths required, boolean result.
+  function timingSafeEqualBytes(value, name) {
+    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    if (ArrayBuffer.isView(value)) {
+      return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    }
+    const err = new TypeError(
+      `The "${name}" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView. ` +
+        `Received ${value === null ? "null" : typeof value}`,
+    );
+    err.code = "ERR_INVALID_ARG_TYPE";
+    throw err;
+  }
+  function timingSafeEqual(buf1, buf2) {
+    const a = timingSafeEqualBytes(buf1, "buf1");
+    const b = timingSafeEqualBytes(buf2, "buf2");
+    if (a.length !== b.length) {
+      const err = new RangeError("Input buffers must have the same byte length");
+      err.code = "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH";
+      throw err;
+    }
+    // One pass over the whole buffer: no early exit and no data-dependent
+    // branch, so the work done depends only on the length — which the throw
+    // above already makes public. (JS can't promise instruction-level constant
+    // time the way the C++ original can; branch-free accumulation is the
+    // strongest guarantee available at this layer, and it is the one every
+    // JS implementation of this primitive makes.)
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+    return diff === 0;
+  }
+
   module.exports = {
     createHash: (algo, options) => new (classes().Hash)(algo, options),
     createHmac: (algo, key, options) => new (classes().Hmac)(algo, key, options),
@@ -898,6 +940,7 @@ export default function (exports, require, module, process, internalBinding) {
     randomFillSync,
     randomInt,
     randomUUID,
+    timingSafeEqual,
     getRandomValues: (arr) => webcrypto.getRandomValues(arr),
     getHashes: () => binding.getHashes(),
     getCiphers: () => ["aes-128-cbc", "aes-192-cbc", "aes-256-cbc", "aes-128-gcm", "aes-256-gcm"],

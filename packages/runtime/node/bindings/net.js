@@ -63,6 +63,12 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
     UV_ETIMEDOUT: -110,
     UV_EAGAIN: -11,
     UV_ENOENT: -2,
+    UV_EHOSTUNREACH: -113,
+    // libuv's UV_EAI_NONAME. Node's own errmap spells this one 'EAI_NONAME' and
+    // lets the dns layer translate it, but nothing here goes through that layer,
+    // and 'ENOTFOUND' is both what callers match on and what our lib/dns.js
+    // already returns for a name it can't resolve. Keep the two consistent.
+    UV_ENOTFOUND: -3008,
   };
   const UV_MESSAGES = {
     [-4095]: ["EOF", "end of file"],
@@ -79,6 +85,8 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
     [-110]: ["ETIMEDOUT", "connection timed out"],
     [-11]: ["EAGAIN", "resource temporarily unavailable"],
     [-2]: ["ENOENT", "no such file or directory"],
+    [-113]: ["EHOSTUNREACH", "host is unreachable"],
+    [-3008]: ["ENOTFOUND", "name not resolved"],
   };
   const uv = {
     ...UV_CODES,
@@ -128,6 +136,57 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
   // The NUL prefix keeps it out of the real socket-path namespace (tools bind
   // `/tmp/*.sock`), so it can never collide with a genuine UNIX socket.
   const tcpXKey = (port) => "\u0000oc-tcp:" + (port >>> 0);
+
+  // ---- who is a legitimate connect() destination? ---------------------------
+  // The virtual network is loopback-only: `listen()` registers a PORT, and
+  // connect() finds a server by port. That is correct for every in-VM dial, but
+  // it used to be the ONLY thing connect() looked at — and lib/dns.js resolves
+  // every hostname to 127.0.0.1 (deliberately, so `net.connect(p,'localhost')`
+  // works), so `net.connect(3000, 'api.example.com')` arrived here as
+  // "127.0.0.1":3000 and was quietly served by whatever in-VM dev server owned
+  // :3000. Connecting successfully to the WRONG machine is the worst outcome
+  // available: the caller gets a 200 from the wrong service and the mistake
+  // surfaces nowhere near its cause. So the destination is now checked, and
+  // anything genuinely external fails instead of being retargeted.
+  const isLoopbackAddress = (addr) => {
+    if (!addr) return true; // no address → lib/net.js's 'localhost' default
+    const a = String(addr).toLowerCase();
+    if (a.startsWith("::ffff:")) return isLoopbackAddress(a.slice(7)); // v4-mapped
+    // 0.0.0.0 / :: are the unspecified addresses; connecting to them means
+    // "this host" (and servers commonly bind there, then dial themselves).
+    return a === "::1" || a === "::" || a === "0.0.0.0" || /^127\./.test(a);
+  };
+  const isLocalHostname = (host) => {
+    const h = String(host).toLowerCase().replace(/\.$/, "");
+    // "vivari" mirrors builtins/os.js's hostname() — a program that dials
+    // os.hostname() is dialling itself.
+    if (h === "" || h === "localhost" || h.endsWith(".localhost") || h === "vivari") return true;
+    // lib/net.js only populates `_host` when the host wasn't already an IP, so
+    // this shouldn't trigger — but a caller reaching the binding directly can
+    // still put a literal here, and a loopback literal is a loopback literal.
+    return isLoopbackAddress(h);
+  };
+  // The hostname the caller actually asked for, or null when it dialled an IP.
+  // lib/net.js runs dns.lookup FIRST and hands connect() the resolved address,
+  // stashing the original on the Socket as `_host` (null for an IP literal) and
+  // the Socket on the handle under `owner_symbol`. That symbol is minted in
+  // internal/async_hooks.js, which the bindings layer has no way to require, so
+  // it is found by description — once, then cached.
+  let ownerSymbol = null;
+  const requestedHost = (handle) => {
+    let sym = ownerSymbol;
+    // Re-probe (rather than caching a miss) when the cached symbol isn't on this
+    // handle: a bare TCP handle driven without a net.Socket has no owner at all,
+    // and caching that miss would blind every later connect().
+    if (!sym || handle[sym] === undefined) {
+      sym = Object.getOwnPropertySymbols(handle).find((s) => s.description === "owner_symbol");
+      if (!sym) return null;
+      ownerSymbol = sym;
+    }
+    const socket = handle[sym];
+    const host = socket && socket._host;
+    return typeof host === "string" && host ? host : null;
+  };
 
   const EOF = Symbol("EOF");
 
@@ -271,6 +330,25 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
 
     connect(req, address, port) {
       const p = port >>> 0;
+      // Reject a destination that isn't this machine BEFORE looking at the port,
+      // so an external target can never be retargeted onto an in-VM server that
+      // happens to share the port number. Judged on the hostname when there was
+      // one (dns.lookup has already flattened it to 127.0.0.1 by now) and on the
+      // literal address otherwise.
+      const host = requestedHost(this);
+      const unreachable = host === null
+        ? (isLoopbackAddress(address) ? 0 : UV_CODES.UV_EHOSTUNREACH)
+        : (isLocalHostname(host) ? 0 : UV_CODES.UV_ENOTFOUND);
+      if (unreachable) {
+        this._remoteAddress = address;
+        this._remotePort = p;
+        // afterConnect builds the error from req.address; point it at what the
+        // caller actually asked for, or the message would name 127.0.0.1 and
+        // hide the very mistake we're reporting.
+        if (host !== null) req.address = host;
+        nextTick(() => req.oncomplete(unreachable, this, req, false, false));
+        return 0;
+      }
       const server = listeners.get(p);
       this._remoteAddress = address;
       this._remotePort = p;

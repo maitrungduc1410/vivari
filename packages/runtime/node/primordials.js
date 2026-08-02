@@ -74,6 +74,15 @@ const NAMESPACES = {
 };
 const NS_NAMES = Object.keys(NAMESPACES).sort((a, b) => b.length - a.length);
 
+// Namespaces whose statics read `this` as the constructor to instantiate, so
+// they have to be bound before being handed out: destructured `PromiseResolve`
+// called bare runs with `this === undefined` and throws "is not a constructor".
+// Node binds exactly this set and no more. In particular %TypedArray%'s statics
+// also need a receiver but must NOT be bound — they want a concrete subclass,
+// never the abstract base — so TypedArrayFrom keeps throwing, which is the
+// honest answer.
+const BIND_STATICS = new Set(["Promise"]);
+
 const GLOBALS = {
   globalThis,
   ...NAMESPACES,
@@ -129,6 +138,25 @@ const AsyncIteratorPrototype = Object.getPrototypeOf(
   Object.getPrototypeOf(async function* () {}).prototype,
 );
 
+// The two Safe* helpers Node hand-writes rather than derives from a namespace.
+// `search` goes through the patchable Symbol.search, so spell it with exec
+// instead; resetting lastIndex is what makes a /g regex — which internal/mime.js
+// uses — search from the start rather than resume mid-string, matching `search`.
+const RegExpPrototypeExec = uncurryThis(RegExp.prototype.exec);
+const ArrayPrototypeMap = uncurryThis(Array.prototype.map);
+
+const SafeStringPrototypeSearch = (str, regexp) => {
+  regexp.lastIndex = 0;
+  const match = RegExpPrototypeExec(regexp, str);
+  return match ? match.index : -1;
+};
+
+// Upstream runs this through its SafePromise subclass and re-wraps the result in
+// a plain Promise purely to keep that subclass out of user-land; with a plain
+// Promise to begin with the wrapper would be a no-op, so it is omitted.
+const SafePromiseAll = (promises, mapFn) =>
+  Promise.all(mapFn ? ArrayPrototypeMap(promises, mapFn) : promises);
+
 // Names that don't follow the <Ns><Member> scheme. `uncurryThis` is a primordial
 // helper itself; the Safe* collections are Node's monkeypatch-proof subclasses —
 // plain Map/Set/WeakMap are behaviourally equivalent for our vendored modules.
@@ -140,6 +168,8 @@ const SPECIALS = {
   SafeSet: Set,
   SafeWeakMap: WeakMap,
   SafeWeakSet: WeakSet,
+  SafePromiseAll,
+  SafeStringPrototypeSearch,
   AsyncIteratorPrototype,
   SymbolDispose: Symbol.dispose ?? Symbol("nodejs.dispose"),
   SymbolAsyncDispose: Symbol.asyncDispose ?? Symbol("nodejs.asyncDispose"),
@@ -163,8 +193,11 @@ function resolve(name) {
     // Static method or constant: try lowerFirst (isArray, defineProperty) then
     // the raw name (MAX_SAFE_INTEGER, POSITIVE_INFINITY).
     const lf = lowerFirst(rest);
-    if (lf in base) return base[lf];
-    if (rest in base) return base[rest];
+    const key = lf in base ? lf : rest in base ? rest : undefined;
+    if (key !== undefined) {
+      const value = base[key];
+      return typeof value === "function" && BIND_STATICS.has(ns) ? value.bind(base) : value;
+    }
   }
   return undefined;
 }
