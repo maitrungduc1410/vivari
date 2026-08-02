@@ -140,6 +140,8 @@ self.onmessage = async (event) => {
     control && control.dispatchPipe(event.data);
   // An interactive stdin chunk for this process (host terminal / parent -> child).
   else if (type === "stdin") control && control.dispatchStdin(event.data);
+  // A catchable signal (SIGTERM/SIGINT) the kernel is delivering to us.
+  else if (type === "signal") control && control.dispatchSignal(event.data);
   // An async fetch result relayed by the kernel (parallel downloads).
   else if (type === "fetch-done") control && control.dispatchFetch(event.data);
   // A CDP debugger command for this process while it is RUNNING (paused commands

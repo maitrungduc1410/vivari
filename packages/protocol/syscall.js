@@ -16,12 +16,14 @@
 //
 // Memory layout of the single SharedArrayBuffer:
 //
-//   [ control region: 4 x Int32 = 16 bytes ][ data region: N bytes ]
+//   [ control region: 6 x Int32 = 24 bytes ][ data region: N bytes ]
 //
 //   control[0] = STATE   (the word we Atomics.wait / Atomics.notify on)
 //   control[1] = OPCODE  (which syscall)
 //   control[2] = REQ_LEN (bytes of request payload in the data region)
 //   control[3] = RES_LEN (bytes of response payload in the data region)
+//   control[4] = SIGNAL  (pending-signal bitmask, host -> worker; see below)
+//   control[5] = —       (reserved; keeps the data region 8-byte aligned)
 //
 // Request frame inside the data region:
 //   [ flags: u32 ][ fieldCount: u32 ]( [ len: u32 ][ bytes ] )*
@@ -30,7 +32,7 @@
 //   STATE_RESPONSE_OK  -> raw bytes, meaning is opcode-specific
 //   STATE_RESPONSE_ERR -> UTF-8 errno code ("ENOENT", "ENOTDIR", ...)
 
-export const CTRL_SLOTS = 4;
+export const CTRL_SLOTS = 6;
 export const CTRL_BYTES = CTRL_SLOTS * 4;
 export const DATA_BYTES = 1 << 20; // 1 MiB payload window, plenty for the PoC
 export const SAB_BYTES = CTRL_BYTES + DATA_BYTES;
@@ -185,11 +187,76 @@ export function isFsOpcode(op) {
   );
 }
 
-// control[0..3] indices, named for clarity
+// control[0..5] indices, named for clarity
 export const I_STATE = 0;
 export const I_OPCODE = 1;
 export const I_REQ_LEN = 2;
 export const I_RES_LEN = 3;
+export const I_SIGNAL = 4;
+
+// ---- signals ---------------------------------------------------------------
+// A catchable signal has to reach a guest that may be parked in `Atomics.wait`
+// half-way through a syscall — where it is, by construction, not draining its
+// message queue (the same reason the breakpoint debugger has its own SAB
+// channel, see kernel.js). So the pending set lives in shared memory: the host
+// ORs the bit into control[4] and notifies control[0], which is the word the
+// parked caller is already waiting on. The caller wakes spuriously (no response
+// yet), harvests the bits, and re-parks — so the signal is *observed* during the
+// park even though it can only be *delivered* on the next event-loop turn.
+//
+// It is a bitmask, not a value, because Unix pending signals are a SET: two
+// SIGTERMs before the process gets a turn collapse into one, which is exactly
+// what `Atomics.or` gives us for free. SIGKILL is deliberately absent — it is
+// not deliverable to the guest at all, the kernel just terminates the worker.
+export const SIGNAL_BITS = {
+  SIGHUP: 1 << 0,
+  SIGINT: 1 << 1,
+  SIGQUIT: 1 << 2,
+  SIGTERM: 1 << 3,
+  SIGUSR1: 1 << 4,
+  SIGUSR2: 1 << 5,
+};
+
+/** Can a guest handler intercept `name`? (SIGKILL and anything unknown: no.) */
+export function isCatchableSignal(name) {
+  return typeof name === "string" && Object.prototype.hasOwnProperty.call(SIGNAL_BITS, name);
+}
+
+/**
+ * Exit code a process gets when a signal is applied to it rather than handled.
+ * These are the codes the kernel has always used; graceful exits do not come
+ * through here (the process picks its own).
+ */
+export function defaultSignalExitCode(name) {
+  return name === "SIGKILL" ? 137 : 143;
+}
+
+/**
+ * Host side: mark `name` pending for the process owning `ctrl` and wake it if it
+ * is parked. Returns false for a signal that is not deliverable.
+ */
+export function postSignal(ctrl, name) {
+  const bit = SIGNAL_BITS[name];
+  if (!bit) return false;
+  Atomics.or(ctrl, I_SIGNAL, bit);
+  Atomics.notify(ctrl, I_STATE);
+  return true;
+}
+
+/**
+ * Guest side: atomically take (and clear) the pending set. Returns an array of
+ * signal names, or null when nothing was pending — the common case, so callers
+ * on the syscall hot path pay one atomic load-and-clear and nothing else.
+ */
+export function takePendingSignals(ctrl) {
+  const bits = Atomics.exchange(ctrl, I_SIGNAL, 0);
+  if (!bits) return null;
+  const names = [];
+  for (const name of Object.keys(SIGNAL_BITS)) {
+    if (bits & SIGNAL_BITS[name]) names.push(name);
+  }
+  return names.length ? names : null;
+}
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();

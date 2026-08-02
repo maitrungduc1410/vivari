@@ -4,6 +4,7 @@
 
 import { createSyscalls } from "./fs-client.js";
 import { createEventLoop } from "./loop.js";
+import { createSignalDelivery } from "./signals.js";
 import { createNodeModules } from "./node/loader.js";
 import { createOs } from "./builtins/os.js";
 import { createProcess } from "./builtins/process.js";
@@ -105,7 +106,20 @@ export function createRuntime({
   // otherwise → the debugger + instrumentation stay completely dormant.
   debug = null,
 }) {
-  const syscalls = createSyscalls({ ctrl, data, notify });
+  // Signal delivery (packages/runtime/signals.js). Built after `process` is a
+  // real EventEmitter (it needs newListener/emit), so the syscall park loop and
+  // the event loop reach it through these forward declarations.
+  let onPendingSignals = () => {};
+  let drainSignals = () => {};
+  let dispatchSignalEvent = () => {};
+
+  const syscalls = createSyscalls({
+    ctrl,
+    data,
+    notify,
+    // Called while parked mid-syscall: queue only, never run guest code here.
+    onSignal: (names) => onPendingSignals(names),
+  });
 
   // Breakpoint debugger (packages/runtime/debugger.js). Created lazily in run() so
   // the parser (acorn) + backend code-split out of every non-debug process. Held
@@ -198,6 +212,7 @@ export function createRuntime({
     doThreads: () => drainThreadEvents(),
     doWatch: () => drainWatchEvents(),
     doStdin: () => drainStdin(),
+    doSignal: () => drainSignals(),
   });
 
   const os = createOs();
@@ -372,6 +387,20 @@ export function createRuntime({
     const rawExit = process.exit;
     process.exit = (code) =>
       rawExit(code == null ? (process.exitCode == null ? 0 : process.exitCode | 0) : code | 0);
+  }
+
+  // ---- signals ---------------------------------------------------------------
+  // `process.on('SIGTERM'|'SIGINT', …)` is now real: the kernel posts the signal
+  // to us (SAB bits + a message) and we emit it on a loop turn. Registering a
+  // listener is also what tells the kernel to POST rather than APPLY the signal,
+  // so a process with no handler keeps today's immediate termination. Deliberately
+  // no loop-liveness ref, matching Node: a signal handler does not keep a
+  // process alive on its own.
+  {
+    const signals = createSignalDelivery({ process, loop, postRaw });
+    onPendingSignals = signals.onPending;
+    drainSignals = signals.drain;
+    dispatchSignalEvent = signals.dispatch;
   }
 
   // ---- fork IPC (child side): process.send / 'message' / disconnect ----------
@@ -1488,6 +1517,9 @@ export function createRuntime({
     /** External delivery from the kernel: an interactive stdin chunk for THIS
      * process ({type:'stdin', chunk} - chunk null = EOF). Feeds process.stdin. */
     dispatchStdin: (msg) => dispatchStdin(msg),
+    /** External delivery from the kernel: a catchable signal for THIS process
+     * ({type:'signal', signal:'SIGTERM'|'SIGINT'|…}). Emitted on a loop turn. */
+    dispatchSignal: (msg) => dispatchSignalEvent(msg),
     /** External delivery from the kernel: a CDP debugger command (JSON string) for
      * THIS process, delivered while it is RUNNING (paused commands ride the debug
      * SAB instead). No-op until a debug session is attached. */

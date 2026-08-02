@@ -3,10 +3,12 @@
 // Upstream (https://github.com/nodejs/node/blob/v24.18.0/lib/internal/util/trace_sigint.js)
 // is ~20 lines that hand `util.setTraceSigInt` to `internal/watchdog`'s
 // SigintWatchdog, which is a thin wrapper over internalBinding('watchdog') — a
-// native SIGINT handler that dumps a JS stack when Ctrl-C arrives. This runtime
-// has no such binding and no SIGINT at all (a guest process is a Web/worker
-// thread; the kernel signals it out of band), so there is nothing faithful to
-// vendor: any implementation would be a no-op pretending to arm a handler.
+// native SIGINT handler that dumps a JS stack when Ctrl-C arrives. A guest DOES
+// receive SIGINT now — the kernel posts it out of band and the runtime emits it
+// on `process` (packages/runtime/signals.js), so `process.on('SIGINT')` works —
+// but that is a JS-level handler, not the V8 watchdog this reaches for. There is
+// no such binding here and nothing faithful to vendor: any implementation would
+// be a no-op pretending to arm a native stack dumper.
 //
 // It is still REGISTERED rather than left missing, because lib/util.js publishes
 // setTraceSigInt via `defineLazyProperties(module.exports, 'internal/util/
@@ -23,8 +25,9 @@ export default function (exports, require, module, process, internalBinding, pri
   function setTraceSigInt() {
     const err = new Error(
       "Vivari: util.setTraceSigInt is not implemented — it needs Node's native " +
-        "SIGINT watchdog (internalBinding('watchdog')), and this sandbox delivers " +
-        "no POSIX signals to a guest process.",
+        "SIGINT watchdog (internalBinding('watchdog')) to dump a JS stack from " +
+        "outside the VM. Use process.on('SIGINT', …), which this runtime does " +
+        "deliver, if you want to observe Ctrl-C.",
     );
     err.code = "ERR_METHOD_NOT_IMPLEMENTED";
     throw err;

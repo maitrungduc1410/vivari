@@ -46,7 +46,7 @@ const makeMacrotask = () => {
   return (fn) => hostSetTimeout(fn, 0);
 };
 
-export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch, doStdin } = {}) {
+export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch, doStdin, doSignal } = {}) {
   isAlive = isAlive || (() => false);
   doNet = doNet || (() => {});
   // #15: drain async child-process events (stdout/stderr/exit delivered as
@@ -62,6 +62,10 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
   // into process.stdin inside a controlled turn, so the 'data' listener (a REPL,
   // our shell's line editor) runs with microtasks flushed after it, like the rest.
   doStdin = doStdin || (() => {});
+  // Catchable signals (SIGTERM/SIGINT) the kernel posted to us. Delivered on a
+  // turn like everything else above, and FIRST in the turn: a process being
+  // asked to shut down should hear about it before it accepts more work.
+  doSignal = doSignal || (() => {});
 
   const scheduleMacrotask = makeMacrotask();
   const macrotaskYield = () => new Promise((resolve) => scheduleMacrotask(resolve));
@@ -305,6 +309,8 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
   const drive = async () => {
     for (;;) {
       if (exiting) break;
+      await drainMicrotasks();
+      runCallback(doSignal, []); // deliver pending SIGTERM/SIGINT to their handlers
       await drainMicrotasks();
       runDueTimers();
       await drainMicrotasks();

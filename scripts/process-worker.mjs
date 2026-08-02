@@ -94,6 +94,8 @@ parentPort.on("message", (msg) => {
     control && control.dispatchPipe(msg);
   // An interactive stdin chunk for this process (host terminal / parent -> child).
   else if (msg.type === "stdin") control && control.dispatchStdin(msg);
+  // A catchable signal (SIGTERM/SIGINT) the kernel is delivering to us.
+  else if (msg.type === "signal") control && control.dispatchSignal(msg);
   // An async fetch result relayed by the kernel (parallel downloads).
   else if (msg.type === "fetch-done") control && control.dispatchFetch(msg);
 });

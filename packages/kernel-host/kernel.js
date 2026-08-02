@@ -45,6 +45,9 @@ import {
   OP_PIPE_LISTEN,
   OP_PIPE_CONNECT,
   OP_PIPE_CLOSE_SERVER,
+  postSignal,
+  isCatchableSignal,
+  defaultSignalExitCode,
 } from "../protocol/syscall.js";
 import { DBG_SAB_BYTES, makeDebugViews, writeDebugCommand } from "../protocol/debug.js";
 import { COREUTILS } from "./coreutils.js";
@@ -62,7 +65,7 @@ function b64ToBytes(b64) {
 }
 
 export class Kernel {
-  constructor({ fs, spawnWorker, stdout, stderr, fetcher }) {
+  constructor({ fs, spawnWorker, stdout, stderr, fetcher, signalGraceMs }) {
     this.fs = fs;
     this.spawnWorker = spawnWorker;
     this.stdout = stdout || (() => {});
@@ -70,6 +73,23 @@ export class Kernel {
     this.procs = new Map(); // pid -> process record
     this.nextPid = 1;
     this.onProcExit = null; // optional observer (pid, result)
+
+    // ---- signals ----
+    // How long a process that CAUGHT a signal gets to shut itself down before we
+    // terminate it the way we always have. Every init system has this number and
+    // every one of them picks it for its own workload: `docker stop` waits 10 s,
+    // Kubernetes 30 s, systemd 90 s. Those budgets are sized for draining
+    // in-flight requests behind a load balancer and flushing to remote storage.
+    // Ours is not that: a guest's graceful shutdown is closing an in-VM listener
+    // and flushing to a Wasm VFS in the same tab — microseconds of real work,
+    // a handful of event-loop turns at worst. What we DO have that Docker does
+    // not is a human staring at a browser tab through a dev-server restart loop,
+    // where a 10 s stall per save would be intolerable. 5 s is far above any
+    // legitimate in-VM shutdown and below the point where a person assumes the
+    // page has hung; overridable for hosts that know better. Note this window
+    // only ever opens for a process that registered a handler — everything else
+    // is still terminated immediately, as before.
+    this.signalGraceMs = signalGraceMs == null ? 5000 : signalGraceMs | 0;
 
     // ---- virtual network (brick 5) ----
     this.listeners = new Map(); // port -> pid of the server process
@@ -436,6 +456,13 @@ export class Kernel {
       // project it was started in — even for a manually run `npm start` that has no
       // VV_RUN wiring (see kernel-worker's projectDirForPid).
       cwd: spec.cwd,
+      // Signals this process has a live `process.on(...)` listener for. The guest
+      // announces changes as they happen (signal-listen below); anything not in
+      // here gets the default action — terminate now — so a process that ignores
+      // SIGTERM does not accidentally start surviving it.
+      sigHandlers: new Set(),
+      graceTimer: null, // armed while a caught signal is being given time to work
+      gracePending: null, // which signal that window belongs to
       serverInbox: [], // queued { reqId, port, req } drained by non-blocking accept
       // #16 stage 2b: reqId -> child pid for worker_threads this process spawned.
       threads: null,
@@ -501,6 +528,9 @@ export class Kernel {
         // Interactive stdin: this process wrote to a child's stdin — deliver the
         // bytes to that child's own process.stdin.
         "child-stdin": (m) => this.handleChildStdin(pid, m),
+        // The guest gained or lost a `process.on('SIGTERM'|…)` listener, which is
+        // what decides whether a signal is posted to it or applied to it.
+        "signal-listen": (m) => this.handleSignalListen(pid, m),
         // #19 stage C: this process relays a ws frame outward (in-VM ws server ->
         // browser preview) for a tunneled connection.
         "ws-out": (m) => this.handleWsOut(pid, m),
@@ -784,6 +814,13 @@ export class Kernel {
     const proc = this.procs.get(pid);
     if (!proc || proc.finalized) return;
     proc.finalized = true;
+    // However we got here — the process exited on its own, a grace window ran
+    // out, something killed it outright — any armed grace timer is now moot.
+    if (proc.graceTimer != null) {
+      clearTimeout(proc.graceTimer);
+      proc.graceTimer = null;
+      proc.gracePending = null;
+    }
     // Cascade to the subtree: terminating a process takes down every process it
     // spawned. Tools spawn servers behind a shell wrapper (`nest start` runs the
     // app as `sh -c "node ... dist/main"`), so if we only killed the shell the
@@ -1338,18 +1375,98 @@ export class Kernel {
     if (this.procs.has(childPid)) this.sendStdin(childPid, m.chunk == null ? null : m.chunk);
   }
 
-  // Deliver a signal to a running process. We ack the killer first (it called
-  // sys.kill synchronously and is parked), then finalize the target — which
-  // terminates its worker and posts child-exit to its parent (possibly the killer).
+  // ---- signals ---------------------------------------------------------------
+  // The guest announces that it gained (or lost) a listener for a catchable
+  // signal. This is the whole opt-in: with no listener a signal is applied to the
+  // process (terminate now, as it always was), with one it is delivered to it.
+  handleSignalListen(pid, m) {
+    const proc = this.procs.get(pid);
+    if (!proc || !m || !isCatchableSignal(m.signal)) return;
+    if (m.active) proc.sigHandlers.add(m.signal);
+    else proc.sigHandlers.delete(m.signal);
+  }
+
+  /**
+   * Send `name` to a running process. Returns false if the pid is gone.
+   *
+   * Uncatchable signals, and every signal the target has no handler for, take
+   * the path this has always taken: finalize() right here, synchronously, with
+   * the same exit codes. That matters beyond fidelity — a caller that kills a
+   * process and immediately respawns it (NestJS watch mode) depends on the port
+   * being free by the time kill() returns.
+   *
+   * A caught signal is posted instead: bits into the target's syscall SAB (so a
+   * worker parked in Atomics.wait can see it) plus a message (so an idle one
+   * gets it within a turn), and a grace window after which we terminate it the
+   * old way regardless. Internal teardown paths — stop(), the subtree cascade,
+   * thread termination — deliberately do not come through here: they must not be
+   * interceptable.
+   */
+  signal(pid, name = "SIGTERM") {
+    const proc = this.procs.get(pid);
+    if (!proc || proc.finalized) return false;
+    const sig = String(name);
+
+    if (!isCatchableSignal(sig) || !proc.sigHandlers.has(sig)) {
+      this.finalize(pid, defaultSignalExitCode(sig), sig);
+      return true;
+    }
+
+    // Repeating a signal whose grace window is still open escalates to a
+    // force-kill. This is not POSIX — a second SIGTERM would just run the
+    // handler again — but it is what a person hammering Ctrl-C in the shell
+    // means, and it cannot be worse than today, where the FIRST one already
+    // killed outright.
+    if (proc.graceTimer != null && proc.gracePending === sig) {
+      this.finalize(pid, defaultSignalExitCode(sig), sig);
+      return true;
+    }
+
+    postSignal(proc.ctrl, sig);
+    this.postToProc(pid, { type: "signal", signal: sig });
+
+    if (proc.graceTimer == null) {
+      proc.gracePending = sig;
+      const timer = setTimeout(() => {
+        proc.graceTimer = null;
+        proc.gracePending = null;
+        if (!this.procs.has(pid)) return;
+        // Say so. A process that vanishes some seconds after a Ctrl-C, with no
+        // explanation, is exactly the kind of mystery this codebase keeps
+        // having to un-mystify.
+        try {
+          this.stderr(
+            `\x1b[33mvivari: pid ${pid} did not exit within ${this.signalGraceMs}ms of ${sig}; forcing termination.\x1b[0m\r\n`,
+            pid,
+          );
+        } catch {
+          /* sink gone */
+        }
+        this.finalize(pid, defaultSignalExitCode(sig), sig);
+      }, this.signalGraceMs);
+      // Never let a pending grace window be the reason a host stays alive.
+      if (timer && typeof timer.unref === "function") timer.unref();
+      proc.graceTimer = timer;
+    }
+    return true;
+  }
+
+  // OP_KILL. We ack the killer first (it called sys.kill synchronously and is
+  // parked on it), then deliver — the target may BE the killer's parent, and the
+  // signal path can post messages, so the shared window must be free first.
   handleKill(proc, msg) {
     const pid = msg.pid | 0;
     if (!this.procs.has(pid)) {
       this.respondErr(proc, "ESRCH");
       return;
     }
-    const signal = msg.signal || "SIGTERM";
+    const raw = msg.signal;
     this.respondOk(proc, EMPTY);
-    this.finalize(pid, signal === "SIGKILL" ? 137 : 143, signal);
+    // Signal 0 is POSIX's existence probe: no signal is sent, and the ESRCH
+    // check above already IS the answer. It used to fall through to the
+    // `|| "SIGTERM"` default below and kill the process it was asking about.
+    if (raw === 0 || raw === "0") return;
+    this.signal(pid, raw || "SIGTERM");
   }
 
   // ---- worker_threads brokering (#16 stage 2b) ------------------------------

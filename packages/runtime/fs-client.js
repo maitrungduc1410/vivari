@@ -56,6 +56,7 @@ import {
   OP_PIPE_LISTEN,
   OP_PIPE_CONNECT,
   OP_PIPE_CLOSE_SERVER,
+  takePendingSignals,
 } from "../protocol/syscall.js";
 
 // Cap each fd read/write to keep both request and response inside the 1 MiB
@@ -63,7 +64,12 @@ import {
 // file is transferred in chunks transparently.
 const FD_CHUNK = 512 * 1024;
 
-export function createSyscalls({ ctrl, data, notify }) {
+// `onSignal(names)` (optional) is called from inside the park below when the
+// host makes a signal pending while we are blocked. It runs mid-syscall, with
+// our request still occupying the shared window, so it must NOT run guest code
+// or issue another syscall — the runtime only queues the names and nudges its
+// event loop, which delivers them on the next turn.
+export function createSyscalls({ ctrl, data, notify, onSignal = null }) {
   const b = encodeString;
 
   function call(opcode, request) {
@@ -79,7 +85,18 @@ export function createSyscalls({ ctrl, data, notify }) {
     // opcodes are serviced by the dedicated File System Worker over this same
     // SAB, everything else by the kernel. `notify` routes by opcode.
     notify(opcode);
-    Atomics.wait(ctrl, I_STATE, STATE_REQUEST);
+    // The park can end without a response: the host notifies this same word to
+    // hand us a pending signal (postSignal in protocol/syscall.js), because a
+    // worker blocked here is not draining its message queue. So re-check the
+    // state on every wake instead of assuming the wake means "answered".
+    for (;;) {
+      Atomics.wait(ctrl, I_STATE, STATE_REQUEST);
+      if (onSignal) {
+        const names = takePendingSignals(ctrl);
+        if (names) onSignal(names);
+      }
+      if (Atomics.load(ctrl, I_STATE) !== STATE_REQUEST) break;
+    }
 
     const state = Atomics.load(ctrl, I_STATE);
     const payload = data.slice(0, Atomics.load(ctrl, I_RES_LEN));
@@ -153,8 +170,12 @@ export function createSyscalls({ ctrl, data, notify }) {
     spawnAsync: (spec) =>
       JSON.parse(decodeBytes(call(OP_SPAWN_ASYNC, encodeRequest([b(JSON.stringify(spec))])))),
     // Send a signal to a running child. Throws ESRCH if the pid is gone.
+    // Signal 0 is POSIX's existence probe and must reach the kernel AS 0 — the
+    // `|| "SIGTERM"` default that used to sit here turned every probe into a
+    // kill, so `process.kill(pid, 0)` killed the process it was asking about.
     kill: (pid, signal) => {
-      call(OP_KILL, encodeRequest([b(JSON.stringify({ pid: pid | 0, signal: signal || "SIGTERM" }))]));
+      const sig = signal === 0 || signal === "0" ? 0 : signal || "SIGTERM";
+      call(OP_KILL, encodeRequest([b(JSON.stringify({ pid: pid | 0, signal: sig }))]));
       return true;
     },
 
