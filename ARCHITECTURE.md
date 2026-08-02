@@ -1600,7 +1600,14 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   and would otherwise resolve every one of them to the index route.
 - Zero-config `.ts`/`.tsx` runs through the loader's synchronous `typescript-transform.js` (§7).
 - The install/run detector (`kernel-worker.ts` `pmFromCmd`) maps `bun`/`bunx` to the `bun` PM,
-  and the studio ships a **"Bun" template category** (serve / routes / websocket / react).
+  and the studio ships a **"Bun" template category** — nine templates: serve / routes /
+  websocket / react (servers), plus test / SQLite / shell / bundler / API tour. None are
+  `experimental`, because `spike-bun-templates.mjs` runs each one's SHIPPED bytes (below).
+- `import { $, file, write } from "bun"` — the bare specifier, registered next to the `bun:*`
+  modules and bound to the `Bun` global **itself**: checked against a real binary, the module's
+  key set, per-key object identity and lack of a default export all match the global exactly, so
+  assigning the namespace is both the faithful implementation and the one that cannot drift.
+  (Our loader does add an interop `default`; real Bun has none.)
 - Proven by `scripts/spike-bun*.mjs` (the transform, route matcher, WS frame codec, Bun global API,
   the `bun:test` semantics above, and CLI verb dispatch). `spike-bun-offline.mjs` gates every PR;
   the kernel-level `spike-bun.mjs` runs in the `verify` job, the only one that builds the Wasm
@@ -1610,6 +1617,16 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   writes a database in one process and reads it back in a **different** one, asserting the file
   is in the VFS and starts with SQLite's documented `"SQLite format 3\0"` header. Neither can
   skip: the engine is a committed artifact, and a missing one fails the assertion.
+- `scripts/spike-bun-templates.mjs` closes the gap those two leave: they prove the **APIs**
+  against sources written inline in the spike, which says nothing about whether the thing a
+  user clicks still boots. This one reads each Bun template's real file map and manifest out
+  of `templates.ts`, writes them into the VFS the way `vv-create-project` does, and runs the
+  manifest's own `dev` command — a server template gets its routes fetched, a terminal one gets
+  its output asserted. The **category** is the input rather than a list kept in the spike, so a
+  template added to the Bun tab cannot skip the gate by not being registered, and one with no
+  expectation fails loudly rather than passing untested. It skips `install` (offline) and
+  asserts instead that no Bun template has a RUNTIME dependency, which is what makes skipping
+  sound; the moment one does, that assertion fails and the reasoning gets revisited.
   `bun:test` follows the `Bun.hash` rule rather than the round-trip one: its formatters are
   pinned to strings **captured from a real `bun test`**, not to our own output, because a
   serializer that is self-consistently wrong passes every round-trip. The kernel tier carries
@@ -1731,8 +1748,12 @@ warn rules above), CPython-faithful `SystemExit`, the generated dispatch source 
 `dev`/`install` commands resolving to programs that exist on PATH). It is `net: false` with
 no `needsWasm`, so `toolchain-gate`'s unfiltered `run-spikes.mjs --offline` runs it on every
 push and PR, and it asserts its own registration so the gate cannot be dropped silently.
-Both spikes read the shipped `templates.ts` through `scripts/lib/python-templates.mjs`, so
-neither can drift from what ships, and both drive the CLI seams through the one stub-runtime
+Both spikes read the shipped `templates.ts` through `scripts/lib/shipped-templates.mjs` —
+which `import`s the file and hands back the real exported objects, Node 22 stripping the
+types on the way in. It used to be ~160 lines of hand-written scanner looking for
+`manifest: {…}` / `files: {…}` blocks, which could only see inline string literals: a file
+built by a helper (`backendDemoHtml("Bun")`) or interpolating a local came back skipped, or
+holding the UNEVALUATED `${…}` source. So neither can drift from what ships, and both drive the CLI seams through the one stub-runtime
 driver in `scripts/lib/python-drive.mjs`.
 
 **Terminal output is byte-transparent.** `sys.stdout`/`sys.stderr` go through Pyodide's

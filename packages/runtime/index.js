@@ -1481,6 +1481,25 @@ export function createRuntime({
       // Bytes of the in-process esbuild Go wasm heap (0 if esbuild isn't here) -
       // attributes a concrete slice of this process's footprint.
       esbuildBytes: esbuildWasmBytes(),
+      // WHY this process's loop is still alive, named handle by handle. A guest
+      // that printed everything it was going to print and then never exited is
+      // being ref'd by one of these, and from outside the worker every cause looks
+      // identical: a pid that stays in the table. Reported alongside the memory
+      // stats because they ride the same request, so `__vv.diag()` gains it for
+      // free. Only the non-zero entries mean anything; all-zero means the loop is
+      // NOT what is holding the process (look at a parent waiting on a child, or a
+      // syscall that never got its reply).
+      alive: {
+        net: netLiveness.active,
+        child: childLiveness.active,
+        thread: threadLiveness.active,
+        host: hostLiveness.active,
+        watch: watchLiveness.active,
+        ws: wsLiveness.active,
+        sse: sseLiveness.active,
+        stdin: stdinLiveness.active,
+        ...loop.handleStats(),
+      },
     }),
     /** External delivery from the kernel: an async child's stdout/stderr/exit
      * ({type:'child-stdout'|'child-stderr'|'child-exit', childPid, ...}). #15.
@@ -1598,6 +1617,21 @@ export function createRuntime({
         }
         return code;
       };
+      // Anything already holding the loop at this point is not the guest's, because
+      // the guest has not run a line yet — so it must not keep the guest alive.
+      //
+      // We install our timers ON globalThis (setInterval above), and a Process
+      // Worker's globals are shared with whatever else the host put in that worker.
+      // Any of it that registers a handle registers it in the GUEST's loop, where it
+      // votes on whether the guest is done. Nothing host-side has that right.
+      //
+      // Disowning rather than clearing: those callbacks belong to the host and should
+      // keep firing, they just have no business keeping a finished guest alive.
+      //
+      // This is not sufficient on its own. The dev server's HMR ping — the hang this
+      // was written for — is armed from an async connect AFTER the entry starts, so
+      // it slips past this entirely; loop.js unrefs that one by its creation frame.
+      loop.disownExistingHandles();
       let started;
       try {
         // Runs the entry's synchronous body now (may throw the process.exit

@@ -1865,7 +1865,6 @@ function bunTemplate(): TemplateDef {
       reload: false,
       install: "bun install",
       dev: "bun run index.ts",
-      experimental: true,
       // Proven in-VM by scripts/spike-bun.mjs (bun run + Bun.serve + bun:test) and
       // scripts/spike-bun-offline.mjs (transform + Bun API), with `bun install`
       // delegation covered by scripts/spike-bun-install.mjs.
@@ -2026,7 +2025,6 @@ function bunRoutesTemplate(): TemplateDef {
       reload: false,
       install: "bun install",
       dev: "bun run index.ts",
-      experimental: true,
       // Route matching proven by scripts/spike-bun-offline.mjs (matcher unit) and
       // scripts/spike-bun.mjs (in-VM Bun.serve routing round-trip).
     },
@@ -2189,7 +2187,6 @@ function bunWebSocketTemplate(): TemplateDef {
       reload: false,
       install: "bun install",
       dev: "bun run index.ts",
-      experimental: true,
       // Proven by scripts/spike-bun.mjs (in-VM WebSocket client vs the shim's
       // Bun.serve ws server: open, echo, server.publish broadcast, close).
     },
@@ -2311,7 +2308,6 @@ function bunReactTemplate(): TemplateDef {
       reload: false,
       install: "bun install",
       dev: "bun run index.ts",
-      experimental: true,
       // app.tsx transpile + parse is covered by scripts/spike-bun-offline.mjs; the
       // Bun.serve host path is the same one proven by scripts/spike-bun.mjs.
     },
@@ -2408,6 +2404,870 @@ if (root) createRoot(root).render(<App />);
 }
 
 // ── Node.js (blank) ──────────────────────────────────────────────────────────
+function bunBuildTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "bun-build",
+      framework: "bun",
+      icon: "bun",
+      category: "Bun",
+      name: "bundler",
+      language: "TypeScript",
+      description: "Bun.build — bundle a multi-module TypeScript project, with plugins, in the terminal",
+      // No server: this one bundles, reports, runs the output and exits.
+      port: 3000,
+      openPath: "/",
+      entry: "build.ts",
+      hmr: false,
+      reload: false,
+      install: "bun install",
+      dev: "bun run build.ts",
+      // The bundler is proven by scripts/spike-bun-offline.mjs and
+      // scripts/spike-bun.mjs; these exact bytes by scripts/spike-bun-templates.mjs.
+    },
+    files: {
+      "package.json": `{
+  "name": "bun-build-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "module": "build.ts",
+  "scripts": { "build": "bun run build.ts", "dev": "bun run build.ts" },
+  "devDependencies": { "@types/bun": "latest" }
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true
+  }
+}
+`,
+      "src/greet.ts": `export const greet = (name: string): string => "Hello, " + name + "!";
+`,
+      "src/inventory.ts": `// A second module, so the bundle has a real (if small) dependency graph.
+export interface Part {
+  name: string;
+  qty: number;
+}
+
+export const PARTS: Part[] = [
+  { name: "flux capacitor", qty: 1 },
+  { name: "sprocket", qty: 12 },
+  { name: "grommet", qty: 40 },
+];
+
+export function totalUnits(parts: Part[]): number {
+  return parts.reduce((sum, p) => sum + p.qty, 0);
+}
+`,
+      "src/index.ts": `import { greet } from "./greet";
+import { PARTS, totalUnits } from "./inventory";
+
+// Replaced at build time by \`define\` — see build.ts.
+declare const BUILD_STAMP: string;
+
+export function main(): void {
+  console.log(greet("Vivari"));
+  console.log("parts: " + PARTS.length + ", units: " + totalUnits(PARTS));
+  console.log("built at: " + BUILD_STAMP);
+}
+
+main();
+`,
+      "build.ts": `// Bun.build — a real dependency-graph bundler, running in your browser. It reads
+// the TypeScript in src/, follows the imports, strips the types and emits one
+// JavaScript file. Docs: https://bun.com/docs/bundler
+import { build, file } from "bun";
+
+const stamp = new Date().toISOString();
+
+// A plugin: intercept and rewrite modules as they are loaded. This one is a
+// no-op that just reports what the bundler asked for, which is the easiest way
+// to see the graph being walked.
+const seen: string[] = [];
+const auditPlugin = {
+  name: "audit",
+  setup(builder: any) {
+    builder.onLoad({ filter: /\\.ts$/ }, async (args: { path: string }) => {
+      seen.push(args.path.split("/").pop() ?? args.path);
+      return { contents: await file(args.path).text(), loader: "ts" };
+    });
+  },
+};
+
+console.log("── bundling ────────────────────────────────────────────────────");
+const result = await build({
+  entrypoints: ["./src/index.ts"],
+  outdir: "./dist",
+  target: "browser",
+  // Compile-time constants. BUILD_STAMP is declared in src/index.ts and only
+  // exists because of this line.
+  define: { BUILD_STAMP: JSON.stringify(stamp) },
+  plugins: [auditPlugin],
+});
+
+if (!result.success) {
+  for (const log of result.logs) console.error(log);
+  throw new Error("build failed");
+}
+
+console.log("success: " + result.success);
+console.log("modules the plugin saw: " + seen.join(", "));
+for (const out of result.outputs) {
+  console.log("  " + out.path + "  (" + out.size + " bytes, kind=" + out.kind + ")");
+}
+
+console.log("\\n── a second entry point, with a dependency left external ─────");
+// \`external\` tells the bundler to leave an import alone rather than following
+// it — the usual way to keep a runtime dependency out of a library bundle.
+const lib = await build({
+  entrypoints: ["./src/greet.ts", "./src/inventory.ts"],
+  outdir: "./dist-lib",
+  target: "bun",
+  external: ["node:fs"],
+});
+for (const out of lib.outputs) {
+  console.log("  " + out.path + "  (" + out.size + " bytes)");
+}
+
+console.log("\\n── options this bundler refuses ─────────────────────────────────");
+// Vivari's bundler THROWS on these rather than ignoring them, because a build that
+// reported success without honouring them would hand you an artifact that is wrong
+// in a way nothing tells you about. Real Bun implements all three, so this same
+// script prints the other line there — which is the point: the script tells you
+// which runtime you are on instead of guessing. Need them here? esbuild-wasm,
+// rolldown and rspack all install and run in Vivari.
+for (const option of ["minify", "splitting", "sourcemap"] as const) {
+  try {
+    await build({ entrypoints: ["./src/index.ts"], outdir: "./dist-x", [option]: true });
+    console.log("  " + option + ": implemented by this runtime");
+  } catch {
+    console.log("  " + option + ": refused here, deliberately — not silently ignored");
+  }
+}
+
+console.log("\\n── running the bundle ──────────────────────────────────────────");
+// The output is ordinary JavaScript, so just run it. Everything it prints below
+// came out of the bundle, not out of src/.
+await import("./dist/index.js");
+
+console.log("\\nBUILD DEMO COMPLETE — bundled and executed inside your browser.");
+`,
+    },
+  };
+}
+
+function bunApisTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "bun-apis",
+      framework: "bun",
+      icon: "bun",
+      category: "Bun",
+      name: "API tour",
+      language: "TypeScript",
+      description: "A tour of Bun's standard library: files, hashing, passwords, YAML/TOML, Glob, semver, Transpiler",
+      // No server: this one prints a tour and exits.
+      port: 3000,
+      openPath: "/",
+      entry: "tour.ts",
+      hmr: false,
+      reload: false,
+      install: "bun install",
+      dev: "bun run tour.ts",
+      // Every API below has unit coverage in scripts/spike-bun-offline.mjs; these
+      // exact bytes are run by scripts/spike-bun-templates.mjs.
+    },
+    files: {
+      "package.json": `{
+  "name": "bun-apis-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "module": "tour.ts",
+  "scripts": { "start": "bun run tour.ts", "dev": "bun run tour.ts" },
+  "devDependencies": { "@types/bun": "latest" }
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true
+  }
+}
+`,
+      "config.yaml": `service: checkout
+replicas: 3
+features:
+  - fast-path
+  - retries
+limits:
+  cpu: 500m
+  memory: 256Mi
+`,
+      "config.toml": `title = "Checkout"
+
+[owner]
+name = "Platform"
+oncall = true
+
+[limits]
+rps = 250
+`,
+      "tour.ts": `// A tour of Bun's standard library, running on Vivari's Bun shim in your
+// browser. Every line below does real work — nothing here is stubbed.
+import { file, write, hash, password, semver, Glob, stringWidth, stripANSI, color, CryptoHasher, Transpiler, nanoseconds, inspect } from "bun";
+
+const rule = (title: string) => console.log("\\n── " + title + " " + "─".repeat(Math.max(0, 60 - title.length)));
+
+rule("1. files");
+// Bun.file() is lazy — nothing is read until you ask for the contents.
+await write("notes/hello.txt", "written by Bun.write\\n");
+const f = file("notes/hello.txt");
+console.log("size:", f.size, "bytes, type:", f.type);
+console.log("text:", JSON.stringify(await f.text()));
+console.log("exists (missing file):", await file("notes/nope.txt").exists());
+
+rule("2. hashing");
+// Bun.hash is a fast NON-cryptographic hash (wyhash) for cache keys and the like.
+console.log("Bun.hash:", hash("the quick brown fox").toString());
+console.log("wyhash  :", Bun.hash.wyhash("the quick brown fox").toString());
+console.log("crc32   :", Bun.hash.crc32("the quick brown fox"));
+// CryptoHasher is the cryptographic one.
+console.log("sha256  :", new CryptoHasher("sha256").update("the quick brown fox").digest("hex"));
+console.log("blake2b :", new CryptoHasher("blake2b256").update("the quick brown fox").digest("hex").slice(0, 32) + "…");
+
+rule("3. passwords");
+// Real argon2id, with cost parameters kept low so the demo stays snappy.
+const hashed = await password.hash("correct horse battery staple", {
+  algorithm: "argon2id",
+  memoryCost: 1024,
+  timeCost: 2,
+});
+console.log("stored :", hashed.slice(0, 48) + "…");
+console.log("verify (right password):", await password.verify("correct horse battery staple", hashed));
+console.log("verify (wrong password):", await password.verify("hunter2", hashed));
+
+rule("4. config formats");
+// YAML, TOML, JSON5 and JSONC parse with no dependency to install.
+const yaml = Bun.YAML.parse(await file("config.yaml").text()) as Record<string, unknown>;
+console.log("YAML :", JSON.stringify(yaml));
+const toml = Bun.TOML.parse(await file("config.toml").text()) as Record<string, unknown>;
+console.log("TOML :", JSON.stringify(toml));
+
+rule("5. semver");
+console.log("1.2.3 satisfies ^1.0.0 :", semver.satisfies("1.2.3", "^1.0.0"));
+console.log("2.0.0 satisfies ^1.0.0 :", semver.satisfies("2.0.0", "^1.0.0"));
+console.log("sorted                 :", ["1.10.0", "1.2.0", "1.9.9"].sort(semver.order).join(" < "));
+
+rule("6. globs");
+// Glob.scan walks the real filesystem; .match() is a pure string test.
+const glob = new Glob("**/*.{ts,yaml}");
+const matches: string[] = [];
+for await (const path of glob.scan(".")) matches.push(path);
+console.log("scan('.') :", matches.sort().join(", "));
+console.log("match     :", glob.match("tour.ts"), glob.match("notes/hello.txt"));
+
+rule("7. terminal text");
+// stringWidth counts DISPLAY columns, not code units — wide CJK glyphs are 2.
+console.log("width of 'hello'   :", stringWidth("hello"));
+console.log("width of '日本語'  :", stringWidth("日本語"));
+const painted = color("#f472b6", "ansi") + "pink text" + "\\u001b[0m";
+console.log("coloured           :", painted);
+console.log("stripANSI          :", JSON.stringify(stripANSI(painted)));
+console.log(inspect.table([
+  { api: "Bun.file", sync: false },
+  { api: "Bun.hash", sync: true },
+]));
+
+rule("8. the transpiler");
+// Bun.Transpiler answers "what does this file import and export" without
+// resolving or running any of it.
+const t = new Transpiler({ loader: "ts" });
+const source = 'import { readFile } from "node:fs/promises";\\nexport const ready = true;\\nexport default 42;';
+const scanned = t.scan(source);
+console.log("imports:", JSON.stringify(scanned.imports));
+console.log("exports:", JSON.stringify(scanned.exports));
+console.log("stripped:", JSON.stringify(t.transformSync("const x: number = 1;")));
+
+rule("9. timing");
+// A monotonic nanosecond clock, measured from process start.
+const t0 = nanoseconds();
+for (let i = 0; i < 1e5; i++) Math.sqrt(i);
+console.log("100k sqrt took", ((nanoseconds() - t0) / 1e6).toFixed(2), "ms");
+
+console.log("\\nTOUR COMPLETE — every API above ran inside your browser.");
+`,
+    },
+  };
+}
+
+function bunShellTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "bun-shell",
+      framework: "bun",
+      icon: "bun",
+      category: "Bun",
+      name: "shell",
+      language: "TypeScript",
+      description: "Bun.$ — cross-platform shell scripting with pipes, redirects and typed output, in the terminal",
+      // No server: this one runs a script and exits. The port is unused.
+      port: 3000,
+      openPath: "/",
+      entry: "script.ts",
+      hmr: false,
+      reload: false,
+      install: "bun install",
+      dev: "bun run script.ts",
+      // Bun.$ is proven by scripts/spike-bun.mjs; these exact bytes by
+      // scripts/spike-bun-templates.mjs.
+    },
+    files: {
+      "package.json": `{
+  "name": "bun-shell-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "module": "script.ts",
+  "scripts": { "start": "bun run script.ts", "dev": "bun run script.ts" },
+  "devDependencies": { "@types/bun": "latest" }
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true
+  }
+}
+`,
+      "script.ts": `// Bun.$ — shell scripting without leaving TypeScript. The commands below are
+// real processes in Vivari's process table, not string parsing.
+// Docs: https://bun.com/docs/runtime/shell
+//
+// One honest note before you start: a browser has no /usr/bin. Vivari ships a
+// small set of commands — cat, echo, ls, mkdir, pwd, rm, sh, true, false, plus
+// bun/bunx/node/npx and the Python family — and nothing else resolves. That is
+// less of a limit than it sounds, because the Bun answer to "I need sort/uniq/awk"
+// is to do it in TypeScript, which is exactly what the pipeline in step 4 does.
+import { $, file, write } from "bun";
+
+// \`import { $ } from "bun"\` and the \`Bun.$\` global are the same function; the
+// import is what Bun's own docs use, so that is what this template uses.
+
+console.log("── 1. running a command ─────────────────────────────────────────");
+// Awaiting the template tag runs it and streams its output straight through.
+await $\`echo Hello from a real subprocess\`;
+
+console.log("\\n── 2. capturing output instead of printing it ───────────────────");
+// .text() captures stdout as a string; .quiet() keeps it off your terminal.
+const listing = await $\`ls -1\`.text();
+console.log("files here: " + listing.trim().split("\\n").join(", "));
+
+console.log("\\n── 3. interpolation is ESCAPED, not concatenated ────────────────");
+// An interpolated value is passed as ONE argument even with spaces in it, so
+// there is no quoting to get wrong and nothing to inject.
+const awkward = "a file with spaces.txt";
+await write(awkward, "written by Bun.write\\n");
+console.log((await $\`cat \${awkward}\`.text()).trim());
+
+console.log("\\n── 4. pipes ────────────────────────────────────────────────────");
+// The right-hand side of a pipe can be another Bun script. Text processing in
+// TypeScript beats remembering awk syntax, and it is the same everywhere.
+await write("fruit.txt", "banana\\napple\\ncherry\\napple\\nbanana\\n");
+const unique = await $\`cat fruit.txt | bun run tools/uniq.ts\`.text();
+console.log("unique, sorted: " + unique.trim().split("\\n").join(" "));
+
+console.log("\\n── 5. redirects ────────────────────────────────────────────────");
+// Redirect into a file, then read it back through Bun.file.
+await $\`echo written by a redirect > out.txt\`;
+console.log("out.txt says: " + (await file("out.txt").text()).trim());
+
+console.log("\\n── 6. exit codes ───────────────────────────────────────────────");
+// A non-zero exit THROWS by default — the thing every hand-rolled exec wrapper
+// forgets. .nothrow() opts out and hands you the code instead.
+try {
+  await $\`false\`.quiet();
+  console.log("unreachable");
+} catch {
+  console.log("a failing command threw, as it should");
+}
+const probe = await $\`false\`.nothrow().quiet();
+console.log("with .nothrow() the exit code is " + probe.exitCode);
+
+console.log("\\n── 7. environment and working directory ────────────────────────");
+const greeting = await $\`bun run tools/env.ts\`.env({ ...process.env, GREETING: "set for one command" }).text();
+console.log("GREETING = " + greeting.trim());
+
+await $\`mkdir -p workspace/nested\`;
+const where = await $\`pwd\`.cwd("workspace/nested").text();
+console.log("pwd inside .cwd() = " + where.trim());
+
+console.log("\\n── 8. a real task ──────────────────────────────────────────────");
+// Line-count every TypeScript file in this project.
+const names = (await $\`ls -1\`.text()).trim().split("\\n").filter((f) => f.endsWith(".ts"));
+for (const name of names.sort()) {
+  const lines = (await file(name).text()).split("\\n").length;
+  console.log("  " + String(lines).padStart(4) + "  " + name);
+}
+
+console.log("\\nSHELL DEMO COMPLETE — every command above ran inside your browser.");
+`,
+      "tools/uniq.ts": `// The right-hand side of the pipe in step 4. Reads stdin, dedupes, sorts —
+// the job you would hand to \\\`sort | uniq\\\` on a machine that had them.
+const input: string = await Bun.stdin.text();
+const lines = input.split("\\n").map((l) => l.trim()).filter(Boolean);
+for (const line of [...new Set(lines)].sort()) console.log(line);
+`,
+      "tools/env.ts": `// Prints one variable, to show that .env() applies to that command only.
+console.log(process.env.GREETING ?? "(unset)");
+`,
+    },
+  };
+}
+
+function bunSqliteTemplate(): TemplateDef {
+  const HOME = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>bun:sqlite · Vivari</title>
+    <style>${bunPageStyles()}</style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Vivari · bun:sqlite</p>
+      <h1>Real SQLite</h1>
+      <p class="sub">
+        This is not an in-memory fake. It is SQLite compiled to WebAssembly, writing a
+        <code>notes.sqlite</code> file to the virtual filesystem — so your rows survive a reload,
+        and a page refresh re-reads them with <code>SELECT</code>.
+      </p>
+      <div class="card">
+        <h2>Add a note</h2>
+        <label for="title">Title</label>
+        <input id="title" placeholder="Something worth remembering" />
+        <label for="body">Body</label>
+        <input id="body" placeholder="…" />
+        <button id="add">INSERT</button>
+        <p class="status" id="status"></p>
+      </div>
+      <div class="card">
+        <h2>Rows <code>SELECT * FROM notes ORDER BY id DESC</code></h2>
+        <pre id="rows">Loading…</pre>
+        <button id="refresh">Re-run the query</button>
+        <button id="clear">DELETE FROM notes</button>
+      </div>
+      <div class="card">
+        <h2>Query plan <code>EXPLAIN QUERY PLAN</code></h2>
+        <pre id="plan">…</pre>
+      </div>
+    </main>
+    <script>
+      (function () {
+        // In the Vivari preview the page lives under /preview/<port>/, so every
+        // request is prefixed with that explicit proxy path.
+        var pm = location.pathname.match(/^(\\/preview\\/\\d+)\\//);
+        var base = pm ? pm[1] : '';
+        var statusEl = document.getElementById('status');
+
+        function j(path, opts) {
+          return fetch(base + path, opts).then(function (r) {
+            return r.json().then(function (b) { return { ok: r.ok, body: b }; });
+          });
+        }
+        function refresh() {
+          j('/api/notes').then(function (o) {
+            document.getElementById('rows').textContent = JSON.stringify(o.body.rows, null, 2);
+            document.getElementById('plan').textContent = o.body.plan.join('\\n');
+          });
+        }
+        document.getElementById('add').addEventListener('click', function () {
+          var title = document.getElementById('title').value;
+          var body = document.getElementById('body').value;
+          if (!title) { statusEl.textContent = 'A title is required (NOT NULL).'; statusEl.className = 'status err'; return; }
+          j('/api/notes', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ title: title, body: body }),
+          }).then(function (o) {
+            statusEl.textContent = o.ok ? 'Inserted row id ' + o.body.id : 'Failed: ' + o.body.error;
+            statusEl.className = 'status ' + (o.ok ? 'ok' : 'err');
+            document.getElementById('title').value = '';
+            document.getElementById('body').value = '';
+            refresh();
+          });
+        });
+        document.getElementById('refresh').addEventListener('click', refresh);
+        document.getElementById('clear').addEventListener('click', function () {
+          j('/api/notes', { method: 'DELETE' }).then(function () {
+            statusEl.textContent = 'Table emptied.';
+            statusEl.className = 'status';
+            refresh();
+          });
+        });
+        refresh();
+      })();
+    </script>
+  </body>
+</html>
+`;
+  return {
+    manifest: {
+      id: "bun-sqlite",
+      framework: "bun",
+      icon: "bun",
+      category: "Bun",
+      name: "SQLite",
+      language: "TypeScript",
+      description: "bun:sqlite — a real SQLite database on the virtual filesystem, behind a Bun.serve CRUD API",
+      port: 3000,
+      openPath: "/",
+      entry: "db.ts",
+      hmr: false,
+      reload: false,
+      install: "bun install",
+      dev: "bun run index.ts",
+      // The engine, the custom VFS and the statement API are proven by
+      // scripts/spike-bun.mjs; these exact files by scripts/spike-bun-templates.mjs.
+    },
+    files: {
+      "package.json": `{
+  "name": "bun-sqlite-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "module": "index.ts",
+  "scripts": { "start": "bun run index.ts", "dev": "bun run index.ts" },
+  "devDependencies": { "@types/bun": "latest" }
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true
+  }
+}
+`,
+      "db.ts": `// The data layer. \`bun:sqlite\` is real SQLite compiled to WebAssembly, talking
+// to a VFS backed by Vivari's synchronous filesystem — so \`notes.sqlite\` below is
+// an actual file you can see in the explorer, and it is still there after a
+// reload. Docs: https://bun.com/docs/api/sqlite
+import { Database } from "bun:sqlite";
+
+export interface Note {
+  id: number;
+  title: string;
+  body: string;
+  created_at: string;
+}
+
+export const db = new Database("notes.sqlite");
+
+// WAL is the usual advice for concurrent readers. Vivari has no file locking, so
+// it is a no-op here rather than a lie — left in because it is what you would
+// write against real Bun, and it does not fail.
+db.run("PRAGMA journal_mode = WAL");
+
+db.run(\`CREATE TABLE IF NOT EXISTS notes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  title      TEXT NOT NULL,
+  body       TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)\`);
+db.run("CREATE INDEX IF NOT EXISTS notes_created_at ON notes (created_at)");
+
+// Prepared once, reused for every request — the statement is compiled by SQLite
+// a single time and only the bound parameters change.
+const insertNote = db.prepare("INSERT INTO notes (title, body) VALUES (?, ?) RETURNING id");
+const selectAll = db.query<Note, []>("SELECT id, title, body, created_at FROM notes ORDER BY id DESC");
+const deleteAll = db.prepare("DELETE FROM notes");
+
+export function listNotes(): Note[] {
+  return selectAll.all();
+}
+
+export function addNote(title: string, body: string): number {
+  const row = insertNote.get(title, body) as { id: number };
+  return row.id;
+}
+
+export function clearNotes(): void {
+  deleteAll.run();
+}
+
+/** Proof the index above is really used, straight from SQLite's planner. */
+export function queryPlan(): string[] {
+  const rows = db
+    .query("EXPLAIN QUERY PLAN SELECT id, title FROM notes ORDER BY created_at DESC")
+    .all() as Array<{ detail: string }>;
+  return rows.map((r) => r.detail);
+}
+
+// A transaction is all-or-nothing: if the callback throws, every statement in it
+// is rolled back. Seeding an empty table is the natural place to show it.
+const seed = db.transaction((rows: Array<[string, string]>) => {
+  for (const [title, body] of rows) insertNote.get(title, body);
+  return rows.length;
+});
+
+export function seedIfEmpty(): number {
+  const { n } = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM notes").get()!;
+  if (n > 0) return 0;
+  return seed([
+    ["Rows survive a reload", "This file lives in the VFS, not in memory."],
+    ["Prepared statements", "Compiled once by SQLite, re-bound per call."],
+    ["Transactions roll back", "Throw inside db.transaction() and nothing lands."],
+  ]);
+}
+`,
+      "index.ts": `// A CRUD API over bun:sqlite, served by Bun.serve. Every route below runs a
+// real SQL statement; nothing is faked or held in a JS array.
+import { addNote, clearNotes, listNotes, queryPlan, seedIfEmpty } from "./db";
+
+const HOME: string = ${JSON.stringify(HOME)};
+
+const seeded = seedIfEmpty();
+if (seeded > 0) console.log("Seeded " + seeded + " notes (the table was empty).");
+
+const port = Number(process.env.PORT ?? 3000);
+
+const server = Bun.serve({
+  port,
+  routes: {
+    "/api/notes": {
+      GET: () => Response.json({ rows: listNotes(), plan: queryPlan() }),
+
+      POST: async (req: Request) => {
+        const { title, body } = (await req.json()) as { title?: string; body?: string };
+        // The NOT NULL constraint is SQLite's, so let it be the one to complain.
+        if (!title) return Response.json({ error: "title is required" }, { status: 400 });
+        return Response.json({ id: addNote(title, body ?? "") }, { status: 201 });
+      },
+
+      DELETE: () => {
+        clearNotes();
+        return new Response(null, { status: 204 });
+      },
+    },
+  },
+  fetch() {
+    return new Response(HOME, { headers: { "content-type": "text/html; charset=utf-8" } });
+  },
+});
+
+console.log("bun:sqlite demo on http://localhost:" + server.port);
+console.log("Rows are in notes.sqlite — open the file explorer, or reload and watch them persist.");
+`,
+    },
+  };
+}
+
+function bunTestTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "bun-test",
+      framework: "bun",
+      icon: "bun",
+      category: "Bun",
+      name: "test",
+      language: "TypeScript",
+      description: "bun:test — describe/expect, mocks, spies, parameterised cases and snapshots, in the terminal",
+      // No server: this one runs a test suite and exits. The port is unused
+      // (nothing binds it), same as the Python templates.
+      port: 3000,
+      openPath: "/",
+      entry: "src/cart.test.ts",
+      hmr: false,
+      reload: false,
+      install: "bun install",
+      dev: "bun test",
+      // The runner itself is proven by scripts/spike-bun-offline.mjs (matchers,
+      // mocks, lifecycle) and scripts/spike-bun.mjs (in-VM discovery + exit
+      // code); THIS file's exact bytes are run by scripts/spike-bun-templates.mjs.
+    },
+    files: {
+      "package.json": `{
+  "name": "bun-test-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "test": "bun test", "dev": "bun test" },
+  "devDependencies": { "@types/bun": "latest" }
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "types": ["bun-types"],
+    "skipLibCheck": true
+  }
+}
+`,
+      "src/cart.ts": `// The code under test. Nothing Bun-specific — the point is that the RUNNER is
+// Bun's, running in your browser.
+export interface Item {
+  sku: string;
+  price: number;
+  qty: number;
+}
+
+export class Cart {
+  private items: Item[] = [];
+
+  add(sku: string, price: number, qty = 1): this {
+    if (qty < 1) throw new RangeError("qty must be at least 1");
+    const existing = this.items.find((i) => i.sku === sku);
+    if (existing) existing.qty += qty;
+    else this.items.push({ sku, price, qty });
+    return this;
+  }
+
+  remove(sku: string): this {
+    this.items = this.items.filter((i) => i.sku !== sku);
+    return this;
+  }
+
+  get lines(): Item[] {
+    return [...this.items];
+  }
+
+  subtotal(): number {
+    return this.items.reduce((sum, i) => sum + i.price * i.qty, 0);
+  }
+
+  /** Rounded to cents so floating point never leaks into an assertion. */
+  total(taxRate = 0): number {
+    return Math.round(this.subtotal() * (1 + taxRate) * 100) / 100;
+  }
+}
+
+/** Deliberately async, to show off awaiting inside a test. */
+export async function fetchPrice(sku: string, lookup: (sku: string) => Promise<number>): Promise<number> {
+  const price = await lookup(sku);
+  if (!Number.isFinite(price)) throw new Error("no price for " + sku);
+  return price;
+}
+`,
+      "src/cart.test.ts": `// bun:test, running on Vivari's Bun shim. \`bun test\` discovers *.test.ts,
+// transpiles the types away and runs them — no jest, no ts-node, no config.
+//
+//   bun test                     run everything
+//   bun test -t "applies tax"    only tests whose name matches
+//   bun test --bail              stop at the first failure
+//
+// Docs: https://bun.com/docs/cli/test
+import { describe, expect, test, beforeEach, afterAll, mock, spyOn } from "bun:test";
+import { Cart, fetchPrice } from "./cart";
+
+describe("Cart", () => {
+  let cart: Cart;
+
+  // Runs before each test in this block, so no test can be polluted by another.
+  beforeEach(() => {
+    cart = new Cart();
+  });
+
+  test("starts empty", () => {
+    expect(cart.lines).toEqual([]);
+    expect(cart.subtotal()).toBe(0);
+  });
+
+  test("adds a line and totals it", () => {
+    cart.add("KEYBOARD", 79.5).add("MOUSE", 25);
+    expect(cart.lines).toHaveLength(2);
+    expect(cart.subtotal()).toBeCloseTo(104.5);
+  });
+
+  test("merges a repeated sku instead of duplicating it", () => {
+    cart.add("CABLE", 9, 2).add("CABLE", 9, 3);
+    expect(cart.lines).toHaveLength(1);
+    expect(cart.lines[0]).toMatchObject({ sku: "CABLE", qty: 5 });
+  });
+
+  test("chaining returns the cart itself", () => {
+    expect(cart.add("A", 1)).toBe(cart);
+  });
+
+  test("rejects a nonsense quantity", () => {
+    expect(() => cart.add("A", 1, 0)).toThrow(RangeError);
+    expect(() => cart.add("A", 1, 0)).toThrow("qty must be at least 1");
+  });
+
+  // One case per row — the name is filled in from the arguments.
+  test.each([
+    [0, 100],
+    [0.1, 110],
+    [0.2, 120],
+  ])("applies tax of %p to give %p", (rate, expected) => {
+    cart.add("WIDGET", 100);
+    expect(cart.total(rate)).toBe(expected);
+  });
+
+  test("remove() drops only the matching sku", () => {
+    cart.add("A", 1).add("B", 2).remove("A");
+    expect(cart.lines.map((l) => l.sku)).toEqual(["B"]);
+  });
+});
+
+describe("mocks and spies", () => {
+  test("mock() records how it was called", async () => {
+    const lookup = mock(async (_sku: string) => 42);
+    await expect(fetchPrice("WIDGET", lookup)).resolves.toBe(42);
+
+    expect(lookup).toHaveBeenCalled();
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(lookup).toHaveBeenCalledWith("WIDGET");
+  });
+
+  test("a rejecting dependency surfaces as a rejection", async () => {
+    const lookup = mock(async () => NaN);
+    await expect(fetchPrice("GHOST", lookup)).rejects.toThrow("no price for GHOST");
+  });
+
+  test("spyOn() wraps a real method, leaving it working", () => {
+    const cart = new Cart().add("A", 10);
+    const spy = spyOn(cart, "subtotal");
+    expect(cart.total()).toBe(10); // total() calls subtotal() internally
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
+  });
+});
+
+describe("snapshots", () => {
+  // The first run writes __snapshots__/cart.test.ts.snap; later runs compare
+  // against it. \`bun test -u\` accepts a deliberate change.
+  test("a cart serialises the way we expect", () => {
+    const cart = new Cart().add("KEYBOARD", 79.5).add("MOUSE", 25, 2);
+    expect(cart.lines).toMatchSnapshot();
+  });
+});
+
+afterAll(() => {
+  console.log("\\nEvery one of these ran inside your browser — no Node, no CI runner.");
+});
+`,
+    },
+  };
+}
+
 function nodeTemplate(): TemplateDef {
   return {
     manifest: {
@@ -8220,6 +9080,11 @@ export const TEMPLATES: TemplateDef[] = [
   bunRoutesTemplate(),
   bunWebSocketTemplate(),
   bunReactTemplate(),
+  bunTestTemplate(),
+  bunSqliteTemplate(),
+  bunShellTemplate(),
+  bunBuildTemplate(),
+  bunApisTemplate(),
   // Native
   pythonTemplate(),
   pythonDataScienceTemplate(),

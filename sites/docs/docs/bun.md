@@ -97,6 +97,62 @@ Bun rather than to itself: `Bun.hash` is checked against Bun's own published
 wyhash digests, and a `Bun.password` hash written in the sandbox verifies under
 real Bun and vice versa.
 
+Both spellings of the import work — the `Bun` global, and the bare module Bun's
+own documentation tends to use:
+
+```ts
+import { $, file, write, semver } from "bun";
+```
+
+That module *is* the global (same objects, not re-exports), so anything reachable
+one way is reachable the other.
+
+### Nine templates in the Bun tab
+
+Every one of them boots in CI from the exact bytes the studio writes into your
+project, so none is marked experimental:
+
+| Template | What it shows |
+| --- | --- |
+| serve / routes / websocket / react | `Bun.serve` — plain `fetch`, the `routes` table, server-side WebSockets, and on-the-fly TSX |
+| test | the `bun:test` runner: matchers, `mock`/`spyOn`, `test.each`, snapshots |
+| SQLite | `bun:sqlite` — a CRUD API over a real database file that survives a reload |
+| shell | `Bun.$` — pipes, redirects, exit codes, per-command `env` and `cwd` |
+| bundler | `Bun.build` — a multi-module bundle, a plugin, `define`, `external` |
+| API tour | hashing, `Bun.password`, YAML/TOML, `Glob`, `semver`, `stringWidth`, `Bun.Transpiler` |
+
+### Scripting with `Bun.$`
+
+The shell is lazy, exactly as in Bun: nothing runs until you `await`, which is
+what lets the modifiers mean anything.
+
+```ts
+import { $ } from "bun";
+
+const branch = (await $`git rev-parse --abbrev-ref HEAD`.text()).trim();
+const { exitCode } = await $`test -f missing.txt`.nothrow().quiet();
+await $`npm run build`.env({ ...process.env, NODE_ENV: "production" }).cwd("./app");
+
+for await (const line of $`cat access.log`.lines()) {
+  if (line.includes(" 500 ")) console.log(line);
+}
+```
+
+`.text()`, `.json()`, `.bytes()`, `.blob()`, `.arrayBuffer()` and `.lines()` read
+the output — and reading it means capturing it, so none of them also echo to the
+terminal. `.quiet()` suppresses the passthrough for a command you are *not*
+reading, `.nothrow()` returns a non-zero exit instead of throwing, and
+`.throws(false)` is the same thing spelled the other way.
+
+Piped input reads the same as it does in Bun:
+
+```ts
+const input = await Bun.stdin.text();
+```
+
+`Bun.stdin` also remains a Node `Readable`, so `.on("data")` and `for await`
+still work on it.
+
 ### `bun test`
 
 The runner covers the surface a real suite uses: `describe`/`test` with the whole

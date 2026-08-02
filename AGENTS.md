@@ -593,6 +593,39 @@ type-only imports had regex-matched for absent type names, so a statement stripp
 down to a dangling ` from "./foo";` passed it for as long as it existed. A string
 assertion cannot see a load failure; `scripts/spike-bun.mjs` runs the file.
 
+### The stripper's context rules were tuned on snippets, not on real files
+
+Four more bugs of the same family surfaced the first time anyone wrote a few
+hundred lines of ordinary TypeScript against it (the studio's Bun templates —
+`scripts/spike-bun-templates.mjs`). Every one produced a `SyntaxError` on a line
+the author had no reason to suspect, and every one had a passing snippet test
+sitting next to it:
+
+- **A `{` after `=>` was classified as an object literal**, so every annotation
+  inside an arrow BODY survived — `describe("x", () => { let c: Cart; })` kept its
+  `: Cart`. The identical declaration inside a `function` body or a bare block was
+  stripped correctly, which is exactly why it lasted: the broken case is the one
+  modern code is written in. A `{` after an arrow is the body, always — returning
+  an object literal requires `() => ({ … })`, which puts a `(` in the way.
+- **`skipType()` counted braces only at depth 0**, so the `}` of
+  `Array<{ detail: string }>` looked unbalanced, the type "ended" there, and the
+  tail `}>;` was left behind as live code.
+- **`isGenericOpen()` rejected any `{` between the angles**, so
+  `db.query<{ n: number }>(…)` and `new Map<string, { v: number }>()` were not
+  recognised as type arguments at all and stayed in as `<`/`>` operators. The
+  rejection existed to avoid swallowing `if (a < b) { … }`, so the fix is
+  positional: a `{` opens an object type only where a type may begin.
+- **`as`/`satisfies` were treated as cast keywords after ANY token.** The comment
+  said "only when it follows an expression"; the code tested `p >= 0`, which is
+  true of the `.` in a member access. So a method with one of those names was
+  eaten along with its arguments — including `Bun.semver.satisfies(…)`, an API
+  this very runtime ships.
+
+The pattern is the same each time: a rule that is right for the shape it was
+written against, applied in a position nobody tried. When adding one, write the
+counter-example too — the plain-JavaScript construct that must come through
+BYTE-FOR-BYTE — not just the TypeScript one that must disappear.
+
 ### Feature-detecting a Node API by `typeof` — `Readable.toWeb` is the trap
 
 **Do not write `X.method ? X.method(…) : fallback` against a vendored Node API.**
@@ -1856,6 +1889,32 @@ Gotchas:
 - **Two Node probes must BOTH be masked** or boot dies on `import("node:module")`:
   `process.browser = true` (pyodide.mjs) AND `process.type = "renderer"`
   (Emscripten's pyodide.asm.mjs). Hold both across the whole boot, then restore.
+- **A THIRD Node probe, and it belongs to urllib3 — `process.release.name` is load-
+  bearing for Python's HTTP.** `requests` in Pyodide does not use sockets; urllib3's
+  Emscripten transport picks a door at request time — `has_jspi()`, else
+  **`is_in_node()` → raise**, else a *synchronous* `XMLHttpRequest`, which is precisely
+  what a Web Worker has. And it answers `is_in_node()` by reading
+  `js.process.release.name`, which `builtins/process.js` deliberately sets to `"node"`
+  because real tools branch on it — and `globalThis.process` is what Pyodide hands
+  Python as `js.process`. So urllib3 concluded a browser Worker was Node, skipped the
+  XHR, and told users to pass `--experimental-wasm-stack-switching` to a Node that is
+  not there; the same expression also decided `_fetcher` at import time, so streaming
+  was off too. **If you touch the masquerade, this breaks silently and only in a
+  browser.** `URLLIB3_REALM_PATCH` (`builtins/python.js`) fixes it by asking the
+  *realm* — `hasattr(js, "XMLHttpRequest")` — not by returning `False`: the headless
+  spike tiers really are Node, and there urllib3's answer is correct and must survive,
+  or the tier goes green for a reason that does not hold where the code ships. It runs
+  as a `sys.meta_path` post-import hook because urllib3 is not installed at boot and
+  importing it eagerly would pull a wheel into every python process, and through
+  `installUrllib3RealmPatch()` into a **namespace of its own** — the same interpreter is
+  the REPL, so `runPython`-ing it into `__main__` would put our plumbing in the user's
+  `dir()`. Two consequences
+  worth knowing: re-enabling `_fetcher` means urllib3 may print its own "streaming
+  fetch worker isn't ready" notice until the nested worker reports in (its
+  `wait_for_streaming_ready()` is the cure, and the buffered path is unaffected), and
+  a `_StreamingFetcher()` that throws must leave `_fetcher = None` rather than break
+  the import. **Unverified in a real browser**: that a Worker's synchronous XHR
+  behaves as the spec says. If it does not, the patch is inert, not harmful.
 - **`vendor:pyodide` writes gitignored assets under `packages/studio/public/vendor/pyodide/`.**
   It's in the root `prebuild:studio` hook, but the studio's own `bun run build` does NOT
   fire that hook — so `scripts/cloudflare-build.sh` **must list `npm run vendor:pyodide`
@@ -1887,6 +1946,11 @@ Gotchas:
   `loadPackagesFromImports(source)` on the entry file; `serve()` separately reads
   `requirements.txt`. When testing several templates in one interpreter, `sys.modules`
   will serve an earlier template's `main` to a later one — boot per case instead.
+  Because of that, a bare `Installed: X` was the argv spelling of a placeholder return
+  value — true of the interpreter that just exited, false of the next one, and the user
+  finds out when their import fails with the successful pip run still on screen. `pip()`
+  now prints the scope on stderr alongside the success line. Do not "clean that up": the
+  line is the honesty, not noise. It goes away when the packages actually persist.
 - **Never wire Python's output through Pyodide's `batched` handler.** It fires once per
   *flush* with the trailing newline stripped, so "add the newline back" is right only
   when the flush ended a line — and wrong for every progress renderer, which flushes
@@ -2650,6 +2714,75 @@ candidates). Terminals use xterm `convertEol:true`, so guest code should emit `\
   captured/piped output stays plain (this is why `verify-node`'s `ls` assertion sees
   a bare `a`). `--color=always` forces it; `--color=never`/`NO_COLOR` disable it.
   Don't emit ANSI unconditionally again.
+- **A delivery that arrives before the runtime exists must be QUEUED, not dropped.**
+  The Process Worker only gets its `control` handle in `bootProcess`'s `onReady`,
+  which is several async ticks after the worker starts — the runtime and its wasm
+  codecs are built first. Every kernel delivery used to be guarded by
+  `control && control.dispatchX(...)`, so anything landing in that window vanished.
+  The case that loses is a **pipeline**: `cat fruit.txt | bun run tools/uniq.ts`
+  spawns both stages up front, `cat` is a tiny coreutil that finishes at once, and
+  the reader is a full runtime boot — so the kernel relays `cat`'s EOF to a worker
+  with no `control`, the reader never sees end-of-input, and the pipeline hangs
+  forever. Both workers now buffer pre-ready deliveries in arrival order and flush
+  them on ready. Dropping is never right for any of them: they are one-shot events
+  (an EOF, an exit, a signal, a fetch result), not state that can be re-read later.
+  **Our Node tiers cannot catch this class of bug.** `bootProcess` reaches
+  `onReady` synchronously under `worker_threads`, so the pre-ready window never
+  opens and a spike passes with or without the queue — confirmed by deleting the
+  queue and watching the test still pass. That is exactly how it shipped: every
+  gate we own runs on the end of the race that always wins. When a hang reproduces
+  only in the browser, suspect an ordering window the Node harness closes for free,
+  and reach for `await __vv.diag()` rather than a spike. The tell here was a
+  process with `syscalls: 0` and `booted: true` whose pipeline writer had already
+  left the table — parked on input that was delivered to nobody.
+- **`__vv.diag()` now names the handles holding each loop (`proc.alive`).** A pid
+  that never leaves the table looks the same whatever the cause, so `alive` breaks
+  it down: the runtime's liveness counters (`net`, `child`, `thread`, `host`,
+  `watch`, `ws`, `sse`, `stdin`) plus the loop's own ref'd `timers`, `immediates`
+  and `nextTicks`. Read only the non-zero entries. **All zero is itself a result**:
+  the loop is not what's holding the process, so look at a parent waiting on a
+  child, or a syscall that never got its reply. It rides the existing `proc-mem`
+  round-trip, so it costs nothing extra. `spike-diag-liveness.mjs` holds a guest
+  open two different ways and requires the two breakdowns to differ — a field that
+  only says "something is alive" would be no better than the pid.
+  `timerDetail` gives each ref'd timer's shape (`everyMs` for intervals, `delayMs`,
+  `dueInMs`), because the count alone stalled an investigation once: every process
+  reported exactly `timers: 1` and nothing said which. Known shapes — `1073741824`
+  (`1 << 30`) is the esbuild keepalive in `esbuild-inproc-patch.js`, `120` is the
+  ws reconnect in `index.js`. `30000` was the one that started it: see below.
+- **A Process Worker's globals are shared with the host page, and we install the
+  guest's timers on them.** `globalThis.setInterval = loop.setInterval` means ANY
+  code in that worker — not just the guest — registers ref'd handles in the guest's
+  event loop, where they vote on whether the guest is done. In a **Vite dev server**
+  that is the HMR client, which arms a 30s keepalive ping (`setInterval(ping, 3e4)`)
+  from its async `connect`. It landed in the guest's loop as a ref'd handle, so
+  `hasRefWork()` was true forever and **no guest that merely finished could exit** —
+  it printed its last line and hung. It looked like a Bun bug because the Bun
+  templates are plain scripts that end; servers were unaffected (they stay up
+  anyway) and so was anything calling `process.exit()` (npm does). Dev-only, and
+  invisible to every Node tier.
+  Two defences, and they are not interchangeable:
+  - `loop.disownExistingHandles()`, called immediately before the entry runs —
+    nothing registered before the guest's first line can belong to the guest. It
+    unrefs rather than clears, since those callbacks are the host's and should keep
+    firing. **This alone does not catch the HMR ping**, which is armed later, from
+    an async connect, long after the entry starts. It was shipped believing it did.
+  - the `HOST_TOOLING_FRAME` check in the `Timeout` constructor, which unrefs an
+    interval whose creation stack names `/@vite/client`. Matching a frame is narrow
+    on purpose: the general rule ("only the guest, or the runtime acting for it, may
+    hold the loop") cannot be read off a stack safely, because a production bundle
+    has no distinguishable paths and a path-based rule would unref things that must
+    stay ref'd — the esbuild keepalive among them. Defaulting to ref'd and naming
+    the one known host frame keeps the failure mode conservative.
+  Both are covered by `spike-diag-liveness.mjs` (`VV_SIMULATE_DEV_HMR_PING=1`), which
+  arms the ping **mid-run from a `/@vite/client` frame** via `sourceURL`. Both
+  details matter: an earlier seam armed it in `onReady`, and the before-entry fix
+  passed against it while the browser stayed broken.
+  **How it was found, after two wrong answers.** The count said "a timer"; the period
+  (`30000`) named a suspect; reading Vite's source then appeared to exonerate it,
+  because Vite prepends `/@vite/env` to module workers and that file has no timer —
+  the client is nonetheless loaded there. Only `timerDetail.createdAt`, the creation
+  stack, settled it. Reach for the stack before the theory.
 
 ### OPFS persistence
 The VFS mirrors to OPFS and **survives reload**. If a demo behaves as if old files
@@ -2745,6 +2878,14 @@ a **second SAB** the paused worker parks on. Load-bearing details:
 The runtime runs headless under Node `worker_threads`, so validate without a
 browser first.
 
+**Reading `process.env` inside a Process Worker after boot reads the GUEST's env.**
+`bootProcess` replaces `globalThis.process` with the guest's, whose env is only the
+spec's (`HOME`/`PATH`/`PWD`). A `process.env.VV_*` check in `onReady` or in a message
+handler therefore reads the wrong object and the flag looks unset, with no error —
+this silently disabled three test seams in a row before it was spotted. Snapshot the
+real env at module load (`const HOST_ENV = { ...process.env }` in
+`scripts/process-worker.mjs`), while `process` is still Node's.
+
 ### First: build the Wasm, or nothing runs (and the errors will lie to you)
 
 The repo ships **no built Wasm** (`pkg/`, `pkg-node/` are gitignored), so on a fresh
@@ -2769,6 +2910,14 @@ cost multiple sessions:
    comes back mangled (its keys nested under `dependencies`) on the next build.
 5. If a Bun crypto spike fails on hashes/argon2id/bcrypt, your `crypto` Wasm is stale
    relative to `packages/crypto/src` — rebuild it before debugging anything else.
+6. **The `:node` builds do not update the browser's Wasm.** `pkg-node/` is what the
+   spikes load; `pkg/` is what the Studio loads, and each Rust crate needs both
+   (`npm run build:crypto` alongside `build:crypto:node`, or `npm run build` for all
+   of them). Skip the browser half after touching Rust and the two tiers disagree:
+   every spike passes while the browser throws a stale-capability error naming the
+   thing you just added — `unsupported digest 'blake2b256'`, with a Wasm stack — which
+   reads like a code bug and is not one. Suspect the artifact before the source
+   whenever the browser alone rejects a capability the Node tier exercises happily.
 
 - `npm run verify` — `scripts/verify-node.mjs`, headless end-to-end (fs, process,
   shell, http, timers, watch, worker_threads incl. `receiveMessageOnPort`). **Run

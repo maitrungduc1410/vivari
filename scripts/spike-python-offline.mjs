@@ -44,7 +44,7 @@ import {
   setupSource,
   terminationFromError,
 } from "../packages/runtime/builtins/python.js";
-import { readShippedManifests, readShippedTemplates, readTemplatesSource } from "./lib/python-templates.mjs";
+import { readShippedManifests, readShippedTemplates, readTemplatesSource } from "./lib/shipped-templates.mjs";
 import { MODELLED_FRAGMENTS, STANDIN, normalize } from "./lib/urllib3-emscripten.mjs";
 import { CPYTHON_EXITS, UNTRUNCATED, realCPythonExit } from "./lib/cpython-exit.mjs";
 import { drivePython, servedApp } from "./lib/python-drive.mjs";
@@ -309,8 +309,8 @@ console.log("\n== shipped Python templates are internally consistent ==");
 // ---------------------------------------------------------------------------
 {
   const source = readTemplatesSource();
-  const files = readShippedTemplates(source);
-  const manifests = readShippedManifests(source);
+  const files = await readShippedTemplates(source);
+  const manifests = await readShippedManifests(source);
   const icons = fs.readFileSync(path.join(ROOT, "packages/studio/src/components/ide/templateIcons.tsx"), "utf8");
   const programs = new Set(Object.keys(COREUTILS));
 

@@ -132,6 +132,11 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
 
   // ---- timers ---------------------------------------------------------------
 
+  // Frames belonging to the host page's dev tooling rather than to this sandbox.
+  // An interval created from one of these does not keep the guest alive; see the
+  // Timeout constructor for why this is a named frame and not a general rule.
+  const HOST_TOOLING_FRAME = /\/@vite\/client/;
+
   class Timeout {
     constructor(cb, delay, args, isInterval) {
       this._cb = cb;
@@ -141,6 +146,38 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
       this._ref = true;
       this._id = nextTimerId++;
       this._due = now() + this._delay;
+      // Where an INTERVAL came from, for __vv.diag(). A repeating timer is the one
+      // that can hold a process open forever, and "which timer" is the question the
+      // count and the period could not answer — an unexplained 30s interval in every
+      // process cost several wrong guesses about its origin. Intervals are rare
+      // enough that one Error per creation is not a hot path; timeouts get nothing.
+      if (isInterval) {
+        try {
+          // Drop "Error", `new Timeout` and `setInterval` — start at the caller.
+          this._origin = (new Error().stack || "").split("\n").slice(3, 7).join("\n").trim();
+        } catch {
+          this._origin = null;
+        }
+        // An interval armed by the page's dev tooling is not the guest's work.
+        //
+        // We install the guest's timers on globalThis, and a Process Worker's
+        // globals are shared with whatever else the host put in that worker. In a
+        // Vite dev server that is the HMR client, which arms a 30s keepalive ping
+        // (`setInterval(ping, 3e4)`) from its async `connect`. That landed in the
+        // GUEST's loop as a ref'd handle, so `hasRefWork()` was true forever and no
+        // guest that merely finished could exit — it printed its last line and hung.
+        // Every process in a dev studio carried exactly one, confirmed by the
+        // creation stack this same block records.
+        //
+        // Matching the frame is narrow on purpose. The general rule ("only the guest
+        // and the runtime acting for it may hold the loop") cannot be read off a
+        // stack safely: a production bundle has no distinguishable paths, so a
+        // path-based rule would unref things that must stay ref'd — the esbuild
+        // keepalive in esbuild-inproc-patch.js among them. Defaulting to ref'd and
+        // naming the one host frame we know keeps the failure mode conservative,
+        // and `/@vite/client` cannot appear in a production build at all.
+        if (this._origin && HOST_TOOLING_FRAME.test(this._origin)) this._ref = false;
+      }
       timers.set(this._id, this);
     }
     ref() {
@@ -358,5 +395,41 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
       wake();
     },
     drive,
+    // Unref every handle registered so far, without cancelling any of it.
+    //
+    // Called once, immediately before the guest's entry runs. Nothing in the loop
+    // at that moment belongs to the guest, so nothing in it should be able to keep
+    // the guest alive — but the callbacks still need to fire, because they belong
+    // to whatever else shares this worker's globals (in a Vite dev server, the HMR
+    // client's 30s keepalive ping). See the call site in runtime/index.js.
+    disownExistingHandles: () => {
+      for (const t of timers.values()) t._ref = false;
+      for (const im of immediates) im._ref = false;
+    },
+    // Diagnostic: what the loop itself is holding, for __vv.diag(). A process that
+    // has finished printing but will not exit is being kept alive by SOMETHING, and
+    // without this the only visible symptom is a pid that never leaves the table —
+    // true of every possible cause, so it distinguishes nothing. Counts only; no
+    // handle is touched, so this stays safe to call while something is stuck.
+    handleStats: () => {
+      const refd = [...timers.values()].filter((t) => t._ref);
+      return {
+        timers: refd.length,
+        immediates: immediates.filter((im) => im._ref && !im._cancelled).length,
+        nextTicks: nextTickQueue.length,
+        // The count alone says "a timer holds this process" and stops there, which
+        // is where the last hang investigation stalled — every process reported
+        // exactly one and there was no way to tell WHICH. The shape identifies it:
+        // a `1073741824ms` interval is the esbuild keepalive, `120ms` is the ws
+        // reconnect, a long one-shot is usually a guest's own. Capped, because a
+        // process legitimately holding hundreds is not a case this needs to name.
+        timerDetail: refd.slice(0, 8).map((t) => ({
+          everyMs: t._interval ? t._delay : null,
+          delayMs: t._delay,
+          dueInMs: Math.round(t._due - now()),
+          createdAt: t._origin || null,
+        })),
+      };
+    },
   });
 }

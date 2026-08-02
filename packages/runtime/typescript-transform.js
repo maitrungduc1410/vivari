@@ -249,6 +249,12 @@ function skipType(toks, start, stopExtra) {
     else if (v === ")") { if (paren === 0) break; paren--; }
     else if (v === "[") brack++;
     else if (v === "]") { if (brack === 0) break; brack--; }
+    // A `{` nested inside `(`/`[`/`<` — `Array<{ detail: string }>`,
+    // `Promise<{ a: 1 }>`, `(x: { a: 1 }) => void`. Only the depth-0 case is
+    // handled above (where `{` is ambiguous with a function body), so without
+    // this the counter stayed at 0, the matching `}` looked unbalanced and the
+    // type ended THERE — leaving the tail (`}>;`) behind as live code.
+    else if (v === "{") brace++;
     else if (v === "}") { if (brace === 0) break; brace--; }
     else if (v === "<") angle++;
     else if (v === ">") { if (angle > 0) angle--; }
@@ -271,23 +277,48 @@ function isGenericOpen(toks, i) {
   if (!(pt.type === "id" || (pt.type === "punc" && (pt.value === ")" || pt.value === ">")))) return false;
   // scan to matching close, allowing nested <>
   let depth = 0;
+  let brace = 0;   // inside an object TYPE within the type args
+  let prev = null; // previous significant token, to place a legal `{`
   for (let k = i; k < toks.length; k++) {
     const t = toks[k];
     if (t.type === "ws" || t.type === "comment") continue;
     const v = t.value;
+    // Inside an object type — `Map<string, { v: number }>` — nothing is
+    // suspicious, so only balance and move on. A `;` between members is legal
+    // there (`{ a: 1; b: 2 }`) and a string is a legal literal type.
+    if (brace > 0) {
+      if (t.type === "punc") {
+        if (v === "{") brace++;
+        else if (v === "}") brace--;
+      }
+      prev = t;
+      if (k - i > 400) return false;
+      continue;
+    }
     if (t.type === "punc") {
       if (v === "<") depth++;
       else if (v === ">") { depth--; if (depth === 0) { return true; } }
       else if (v === ">>") { depth -= 2; if (depth <= 0) return true; }
       else if (v === ">>>") { depth -= 3; if (depth <= 0) return true; }
+      // An object type is only an object type where a TYPE may begin. Rejecting
+      // every `{` (as this did) threw away `db.query<{ n: number }>(…)` and
+      // `new Map<string, { v: number }>()`, so the args were left in place as
+      // live `<`/`>` comparisons. Accepting every `{` would instead swallow
+      // `if (a < b) { … }`, so the position is what decides.
+      else if (v === "{" && prev && prev.type === "punc" && TYPE_MAY_START_AFTER.has(prev.value)) brace = 1;
       // Anything clearly not type-ish inside kills the guess.
       else if (v === ";" || v === "{" || v === "&&" || v === "||" || v === "==" || v === "===") return false;
     }
     if (t.type === "str" || t.type === "tmpl" || t.type === "regex") return false;
+    prev = t;
     if (k - i > 400) return false; // runaway guard
   }
   return false;
 }
+
+// Punctuation after which a type may begin, so a following `{` opens an object
+// type rather than a block: `<{…}>`, `, {…}`, `: {…}`, `| {…}`, `& {…}`, `(…)`.
+const TYPE_MAY_START_AFTER = new Set(["<", ",", ":", "|", "&", "(", "=>", "["]);
 
 // Token that may precede the `<` of a GENERIC ARROW (see isGenericArrowOpen).
 // These are the positions where an expression may begin.
@@ -489,8 +520,26 @@ function stripTypes(src) {
       // `as` / `satisfies` cast: drop the keyword and the following type. The type
       // may be an object type (`as { x: number }`) so we do NOT stop at `{`.
       if (kw === "as" || kw === "satisfies") {
-        // Only when it follows an expression (prev is id/)/]/str/num/tmpl/`this`).
-        if (p >= 0) {
+        // Only when it follows an EXPRESSION. The comment here always said so, but
+        // the test was `p >= 0` — true for any token at all, including a `.`. So a
+        // property or method that happens to be named `as` or `satisfies` was read
+        // as a cast and the call was eaten with the "type":
+        //
+        //   semver.satisfies("1.2.3", "^1.0.0")   ->   semver.
+        //
+        // which is not a corner case: `satisfies` is the name of Bun's own semver
+        // API, and `.as` is common in query builders. A keyword that starts an
+        // expression (`return`, `typeof`, `new`, …) is excluded too, so
+        // `return satisfies` is a value, not a cast.
+        const pt = p >= 0 ? toks[p] : null;
+        const followsExpression =
+          !!pt &&
+          ((pt.type === "id" && !KEYWORDS_BEFORE_REGEX.has(pt.value)) ||
+            pt.type === "str" ||
+            pt.type === "num" ||
+            pt.type === "tmpl" ||
+            (pt.type === "punc" && (pt.value === ")" || pt.value === "]" || pt.value === "}")));
+        if (followsExpression) {
           const end = skipType(toks, nextSig(toks, i));
           i = drop(i, end);
           continue;
@@ -881,11 +930,21 @@ function stripTypes(src) {
       else if (v === "{") {
         if (brace === 0) {
           // Is this `{` an object literal or a block? If the token before `{` is
-          // `=` `(` `,` `[` `return` `:` `=>` `?` `||` `&&` etc -> object literal.
+          // `=` `(` `,` `[` `return` `:` `?` `||` `&&` etc -> object literal.
+          //
+          // `=>` is deliberately NOT in that list. A `{` directly after an arrow
+          // is the arrow's BODY, always — returning an object literal from a
+          // concise arrow requires parenthesising it (`() => ({ a: 1 })`), which
+          // puts a `(` before the `{` instead. Treating `=> {` as an object made
+          // every annotation inside an arrow body look like a property value, so
+          // `describe("x", () => { let c: Cart; })` kept its `: Cart` and the file
+          // failed to parse — while the same declaration inside a `function` body
+          // or a bare block stripped fine. Arrow callbacks being where most
+          // modern code lives, this was the common case, not the corner.
           const pb = prevSig(tk, k);
           if (pb >= 0) {
             const pbt = tk[pb];
-            const objBefore = (pbt.type === "punc" && ["=", "(", ",", "[", ":", "=>", "?", "||", "&&", "??", "return"].includes(pbt.value)) ||
+            const objBefore = (pbt.type === "punc" && ["=", "(", ",", "[", ":", "?", "||", "&&", "??"].includes(pbt.value)) ||
               (pbt.type === "id" && pbt.value === "return");
             return objBefore ? "object" : "block";
           }

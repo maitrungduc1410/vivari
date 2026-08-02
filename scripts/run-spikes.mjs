@@ -96,6 +96,12 @@ const SPIKES = [
   // postMessage cannot reach) as well as the default action, the grace window and
   // SIGKILL staying uncatchable. No VFS, no kernel-tier build needed.
   { name: "signals", file: "spike-signals.mjs", net: false, timeout: 60000 },
+  // `__vv.diag()` must say WHY a process will not exit, not just that one hasn't.
+  // Holds a guest open two different ways (a ref'd timer, a stdin reader) and
+  // requires the reported `alive` breakdown to tell them apart — the distinction
+  // the Bun template hang investigation had no way to make. Real Kernel + Workers,
+  // no VFS needed.
+  { name: "diag-liveness", file: "spike-diag-liveness.mjs", net: false, needsWasm: true, timeout: 60000 },
   // Persistent dependency cache (P1): pack node_modules → snapshot → wipe →
   // restore → require, against the real Wasm VFS. Offline + deterministic.
   // `needsWasm`: offline but requires the Node Wasm VFS build (pkg-node), so it
@@ -105,6 +111,12 @@ const SPIKES = [
   // app.ts` (TS strip + Bun global), Bun.serve preview through the http bridge,
   // and `bun test`. Needs the Node Wasm VFS build → runs in the verify job.
   { name: "bun", file: "spike-bun.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // Every template in the studio's "Bun" tab, run from its SHIPPED bytes: the file
+  // map and manifest are read out of templates.ts and the manifest's own `dev`
+  // command is run in the kernel. The spike above proves the APIs; this proves the
+  // things a user actually clicks. Offline — the Bun templates take no runtime
+  // dependencies, which the spike asserts rather than assumes.
+  { name: "bun-templates", file: "spike-bun-templates.mjs", net: false, needsWasm: true, timeout: 180000 },
   // --- network: graduated templates gated here -------------------------------
   { name: "koa", file: "spike-koa.mjs", net: true },
   { name: "hono", file: "spike-hono.mjs", net: true },

@@ -6066,3 +6066,131 @@ path were never the same path. A green spike said nothing about a tab, and the d
 documented as a footnote rather than treated as a hole. The policy is now one shared module
 asserted as pure logic by `npm run probe:egress-headers` in `toolchain-gate` — because the only
 test that can catch this is one that does not need a browser to run.
+## Nine Bun templates — and the seven gaps that writing them exposed (this change)
+
+The studio's Bun tab had four templates, and all four were the same program: a
+`Bun.serve` HTTP server, varied by routing, WebSockets or React. Everything the shim
+had gained over the previous phases — `bun:test`, `bun:sqlite`, `Bun.build`, `Bun.$`,
+the hashes, the config parsers, `Bun.Transpiler` — was invisible from the picker. So
+five templates were added: **test** (the `bun:test` runner), **SQLite** (a CRUD API
+over a real database file on the VFS), **shell** (`Bun.$`), **bundler** (`Bun.build`)
+and **API tour**.
+
+Writing them was the point. A few hundred lines of ordinary TypeScript, of the kind a
+user would actually type, found **seven** defects that every existing spike was green
+through — because the spikes were written against the code paths their authors already
+had in mind:
+
+1. **`import { $ } from "bun"` did not resolve.** The bare specifier was never
+   registered, only `bun:test`/`bun:jsc`/`bun:ffi`/`bun:sqlite` — so the form Bun's own
+   documentation uses failed with `Cannot find module 'bun'` while the identical `Bun.$`
+   global worked. Checked against a real binary, that module is the `Bun` global itself:
+   same key set, same object per key, no default export. It is now assigned, not curated,
+   so it cannot drift as members are added.
+2. **Annotations inside arrow bodies were never stripped.** A `{` following `=>` was
+   classified as an object literal, so `describe("x", () => { let c: Cart; })` kept its
+   `: Cart` and failed to parse. Inside a `function` body or a bare block it worked
+   perfectly — the broken case was the one modern code is written in.
+3. **Object types nested in angle brackets broke two different ways.**
+   `as Array<{ detail: string }>` left the tail `}>;` behind as live code, and
+   `new Map<string, { v: number }>()` was not recognised as type arguments at all.
+4. **`semver.satisfies(…)` was eaten.** `as`/`satisfies` were treated as cast keywords
+   after any token including a `.`, so a method with either name lost its call — and
+   `satisfies` is the name of an API this runtime ships.
+5. **Top-level `await` failed in a file with no import or export.** ESM-ness is decided
+   by syntax, so such a file took the CJS path, got a non-async wrapper, and died with
+   "await is only valid in async functions and the top level bodies of modules". The ESM
+   path had had an AsyncFunction retry for exactly this since forever; CJS just never got
+   one. A genuine syntax error still reports as itself.
+6. **`Bun.stdin.text()` did not exist**, so the one-liner every piped Bun script opens
+   with was unavailable. The old note said `.text()` could not be made to block — it
+   never had to; Bun's returns a Promise too. The readers are attached to the existing
+   Node stream, so `.on("data")` is untouched.
+7. **`Bun.$` ran eagerly.** It called `exec()` and *then* attached `.quiet()`/`.nothrow()`,
+   which worked only because both flags happen to be read later. `.env()`/`.cwd()` are read
+   at spawn time, so under that design they could not have worked at all — which is why
+   they were simply missing. The ShellPromise is lazy now, and `.throws()`, `.lines()`,
+   `.bytes()`, `.blob()` and `.arrayBuffer()` came with it.
+8. **Reading the output did not stop it being echoed.** Found by running the finished
+   templates in a browser rather than in the spike: every `.text()` in a script printed
+   the raw output and then printed whatever the script made of it, so the shell template
+   said `package.json / script.ts / …` and then `files here: package.json, script.ts, …`.
+   Bun treats reading as capturing — `await $`ls`.text()` prints nothing — and the
+   passthrough is what `.quiet()` is for on a command you are NOT reading. The spike was
+   structurally unable to see this: it greps the whole of captured stdout for the
+   PROCESSED line, and an extra copy of the raw one is invisible to that. The check now
+   asserts the raw form is ABSENT, and was confirmed to go red with the fix reverted.
+
+**The templates are now gated on running.** `scripts/spike-bun-templates.mjs` reads each
+Bun template's real file map and manifest out of `templates.ts` and runs the manifest's
+own `dev` command in the kernel — servers get their routes fetched, terminal templates get
+their output asserted. Nothing like it existed, which is why all four original templates
+had sat at `experimental: true` with no mechanism able to graduate them; all nine are now
+stable. The Bun *category* is the input rather than a list inside the spike, so a template
+added to that tab cannot skip the gate, and one with no expectation fails rather than
+passing untested.
+
+That spike also replaced `scripts/lib/python-templates.mjs` (a misnomer — it was never
+Python-specific) with `shipped-templates.mjs`, which simply `import`s `templates.ts` and
+lets Node 22 strip the types. The 160 lines of scanner it deletes could only see inline
+string literals, so any file built by a helper came back skipped or still holding its
+unevaluated `${…}` source.
+
+---
+
+## Update: a Vite dev-server ping was holding every guest's event loop open
+
+The hang that three Bun templates showed — print everything, then never return the
+prompt — was never about Bun. It was the studio's own dev server.
+
+A Process Worker's globals are shared with whatever else the host page put in that
+worker, and the runtime installs the guest's timers on exactly those globals
+(`globalThis.setInterval = loop.setInterval`). Vite's HMR client runs in that worker
+and, from its async `connect`, arms a 30s keepalive ping. That ping became a **ref'd
+handle in the guest's event loop**, `hasRefWork()` was true forever, and no guest
+that merely finished could exit. Servers were unaffected (they stay up anyway), and
+so was anything calling `process.exit()` — npm does — which is why only the plain
+scripts hung, and why production, with no HMR client, never showed it.
+
+**The fix.** An interval whose creation stack names `/@vite/client` is created
+unref'd. Matching a frame is narrow on purpose: the general rule — only the guest, or
+the runtime acting for it, may hold the loop — cannot be read off a stack safely,
+because a production bundle has no distinguishable paths and a path-based rule would
+unref handles that must stay ref'd, the esbuild keepalive among them. Defaulting to
+ref'd and naming the one known host frame keeps the failure mode conservative.
+Alongside it, `loop.disownExistingHandles()` runs immediately before the guest's
+entry: nothing registered before the guest's first line can belong to the guest.
+
+**Three rounds, and what each cost.** This is worth recording, because the pattern
+was the same each time: a theory outran the evidence.
+
+1. *The dropped pre-ready delivery.* Diagnosed from the first `__vv.diag()` paste,
+   and a real latent bug — a one-shot kernel delivery arriving before `control`
+   exists was silently discarded, stranding any pipeline whose writer finished before
+   the reader booted. Fixed and kept. It was not this hang; `stdin: 0` on the parked
+   reader ruled it out as soon as the liveness breakdown existed.
+2. *Vite's ping, guessed then wrongly retracted.* The breakdown showed one ref'd
+   `30000ms` interval in every process, including an idle root shell. Vite's client
+   pings at `3e4`, which matched — but reading Vite's source seemed to exonerate it,
+   since Vite prepends `/@vite/env` to module workers and that file arms no timer.
+   The client is loaded there regardless. A fix built on the guess (disown before the
+   entry) also missed, because the ping is armed *after* the entry starts.
+3. *The creation stack.* `timerDetail.createdAt` named `Object.connect` at
+   `/@vite/client:435` and ended the argument in one paste.
+
+The count named a category, the period named a suspect, and only the stack named the
+culprit. Each round the diagnostic got more specific and the theory got less
+confident — that is the right direction, and it should have been taken sooner.
+
+**Testing this one honestly.** `spike-diag-liveness.mjs` arms the ping **mid-run,
+from a `/@vite/client` frame** (via `sourceURL`) under
+`VV_SIMULATE_DEV_HMR_PING=1`. Both details are load-bearing: an earlier seam armed it
+in `onReady`, and the before-entry fix passed against that while the browser stayed
+broken. The check now fails without the fix. Note what this means about our tiers —
+no Node harness has a Vite dev server, so this class of bug is invisible to all of
+them until the browser is simulated deliberately.
+
+**A trap found on the way.** Reading `process.env` inside a Process Worker after boot
+reads the **guest's** env, because `bootProcess` replaces `globalThis.process`. Three
+test seams in a row silently did nothing before that was spotted. Snapshot the real
+env at module load instead.

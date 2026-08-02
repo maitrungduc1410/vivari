@@ -1197,6 +1197,7 @@ function queryAllProcMem(timeoutMs = 2000) {
               modules: data.modules,
               esbuildInproc: !!data.esbuildInproc,
               esbuildBytes: Number(data.esbuildBytes) || 0,
+              alive: data.alive ?? null,
             }),
           );
           setTimeout(() => {
@@ -2342,6 +2343,10 @@ self.onmessage = async (event) => {
           if (mem) {
             p.heapBytes = mem.heap;
             p.modules = mem.modules;
+            // What is keeping this process's event loop alive, handle by handle —
+            // the difference between "wedged on a syscall" and "finished, but still
+            // ref'd by an open handle it never closed".
+            if (mem.alive) p.alive = mem.alive;
           }
           p.terminalId = terminalForPid(p.pid) ?? null;
         }

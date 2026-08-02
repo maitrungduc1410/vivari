@@ -50,7 +50,7 @@ import {
   setupSource,
   terminationFromError,
 } from "../packages/runtime/builtins/python.js";
-import { readShippedTemplates, readTemplatesSource } from "./lib/python-templates.mjs";
+import { readShippedTemplates, readTemplatesSource } from "./lib/shipped-templates.mjs";
 import { CPYTHON_EXITS, UNTRUNCATED } from "./lib/cpython-exit.mjs";
 import { MODELLED_FRAGMENTS, normalize } from "./lib/urllib3-emscripten.mjs";
 import { DRIVE_ENV, drivePython } from "./lib/python-drive.mjs";
@@ -161,7 +161,7 @@ const CASES = {
 if (process.env.VV_SPIKE_CASE) {
   const name = process.env.VV_SPIKE_CASE;
   const spec = CASES[name];
-  const templates = readShippedTemplates(readTemplatesSource());
+  const templates = await readShippedTemplates(readTemplatesSource());
   // Pyodide's WebLoop re-raises SystemExit as a second, unhandled rejection
   // alongside the one runPythonAsync() already rejects with. Node aborts on
   // those; a browser only logs them.
@@ -649,7 +649,7 @@ _out
 // Parent process.
 // ---------------------------------------------------------------------------
 console.log("== shipped template sources ==");
-const templates = readShippedTemplates(readTemplatesSource());
+const templates = await readShippedTemplates(readTemplatesSource());
 for (const id of Object.keys(CASES)) {
   if (CASES[id].synthetic) continue; // drives a purpose-built app, not a template
   const t = templates[id];

@@ -5082,5 +5082,82 @@ console.log("== the type stripper and module clauses ==");
   ok(parses("export const a = (b as number);"), "`export const` with a cast is still ordinary code");
 }
 
+// ---------------------------------------------------------------------------
+// The type stripper and the shapes real code is actually written in.
+//
+// Everything below was found by writing the Bun templates — ordinary TypeScript
+// that any user would type — rather than by reading the stripper. Each one
+// produced a file that failed to PARSE, so the failure mode was a SyntaxError
+// pointing at a line the author had no reason to suspect.
+// ---------------------------------------------------------------------------
+{
+  console.log("\n== the type stripper, on shapes real code uses ==");
+  const T = (src) => transpileTypeScript(src, "x.ts");
+  const parses = (src) => { try { new Function(T(src)); return true; } catch { return false; } };
+  // Left byte-for-byte alone: these are plain JavaScript, not types.
+  const untouched = (src, why) => ok(T(src).replace(/\s+/g, " ").trim() === src.replace(/\s+/g, " ").trim(), why);
+
+  // 1) An annotation inside an ARROW body. `enclosingContext()` classified a `{`
+  //    that follows `=>` as an object literal, so every declaration inside an
+  //    arrow looked like a property value and kept its type. A `{` after an arrow
+  //    is the body, always — returning an object literal needs `() => ({…})`.
+  //    The same declaration inside a `function` body or a bare block was fine,
+  //    which is why this survived: the broken case is the one modern code uses.
+  ok(!/: Cart/.test(T('describe("Cart", () => { let cart: Cart; });')), "an annotation inside an arrow body is stripped");
+  ok(!/: string/.test(T("f(() => { const a: string = x; });")), "…including a const with an initialiser");
+  ok(!/: T\b/.test(T("a(() => { b(() => { let z: T; }); });")), "…and nested two arrows deep");
+  untouched("const f = () => ({ a: 1, b: cond ? 2 : 3 });", "an arrow RETURNING an object literal is still untouched");
+  untouched("const o = { run: () => { let q = 1; } };", "…and an arrow that is an object's property value");
+
+  // 2) An object type nested inside `<…>`. skipType() only counted braces at
+  //    depth 0, so the `}` of `Array<{ detail: string }>` looked unbalanced, the
+  //    type "ended" there, and the tail `}>;` was left behind as live code.
+  ok(parses("const rows = q.all() as Array<{ detail: string }>;"), "a cast to a generic containing an object type");
+  ok(parses("const p: Promise<{ a: number }> = go();"), "…and the same as an annotation");
+
+  // 3) The generic-vs-less-than heuristic rejected ANY `{` inside the angles, so
+  //    these were not recognised as type arguments at all and were left in place
+  //    as `<` and `>` operators.
+  ok(parses("const q = db.query<{ n: number }, []>('S').get();") && !/[<>]/.test(T("const q = db.query<{ n: number }, []>('S').get();")), "type arguments containing an object type are removed");
+  ok(!/[<>]/.test(T("const m = new Map<string, { v: number }>();")), "…including on a constructor call");
+  // The reason the `{` was rejected in the first place — do not regress it.
+  untouched("if (a < b) { go(); }", "a comparison followed by a block is still not a generic");
+  untouched("for (let i = 0; i < n; i++) { s += i; }", "…nor a for-loop condition");
+
+  // 4) `as`/`satisfies` as a PROPERTY name. The guard here claimed to require an
+  //    expression before the keyword but only tested `p >= 0`, which is true of
+  //    any token — including the `.` of a member access. So the method call was
+  //    eaten along with its "type". `satisfies` is the name of Bun's own semver
+  //    API, so this broke `Bun.semver.satisfies(…)`.
+  untouched('semver.satisfies("1.2.3", "^1.0.0")', "a method named `satisfies` is a call, not a cast");
+  untouched('q.as("alias").from("t")', "…and one named `as`");
+  untouched("const o = { satisfies: 1, as: 2 };", "…and both as object keys");
+  ok(!/\bas\b/.test(T("const x = y as string;")), "a real `as` cast is still stripped");
+  ok(!/satisfies/.test(T("const c = { a: 1 } satisfies Config;")), "…and a real `satisfies`");
+}
+
+// ---------------------------------------------------------------------------
+// The bare `bun` module: `import { $, file, write } from "bun"`.
+// ---------------------------------------------------------------------------
+{
+  console.log("\n== the `bun` module ==");
+  // Registered alongside bun:test / bun:sqlite / …, and it is the SAME object as
+  // the global rather than a curated re-export. Checked against a real binary:
+  // `import * as ns from "bun"` has exactly the `Bun` global's key set, the same
+  // object per key, and no default export.
+  const rt = createBunRuntime({
+    process: { env: {}, argv: ["bun", "/app/x.ts"], cwd: () => "/app" },
+    Buffer,
+    require: nodeRequire,
+  });
+  const mod = rt.modules.bun;
+  ok(mod === rt.Bun, "`bun` resolves to the Bun global itself");
+  ok(typeof mod.$ === "function" && typeof mod.file === "function" && typeof mod.write === "function", "…so $, file and write are all importable from it");
+  ok(!("default" in mod), "there is no default export to import by mistake");
+  for (const name of ["serve", "spawn", "hash", "password", "Glob", "semver", "YAML", "TOML", "Transpiler", "build"])
+    ok(typeof mod[name] !== "undefined", "`" + name + "` is reachable through the module");
+  ok(rt.modules["bun:test"] && rt.modules["bun:sqlite"], "the bun:* modules are still registered alongside it");
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Bun checks passed");
 process.exit(failed ? 1 : 0);

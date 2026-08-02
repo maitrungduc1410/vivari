@@ -609,10 +609,30 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
           throw e2;
         }
       } else {
-        // Compilation (parse) errors are otherwise anonymous ("<anonymous>"); name
-        // the offending file + module kind so loader bugs are debuggable.
-        err.message += ` (while compiling ${filename} [cjs])`;
-        throw err;
+        // The same retry, for a file that reached the CJS path only because it has
+        // no import/export to detect. `transpileEsm` decides ESM-ness by SYNTAX, so
+        // a script whose only module-level feature is a top-level await —
+        //
+        //   const input = await Bun.stdin.text();   // tools/uniq.ts, no imports
+        //
+        // looked like CommonJS, got the non-async wrapper, and failed with "await is
+        // only valid in async functions and the top level bodies of modules", which
+        // tells the author nothing they can act on. Bun runs that file, and so does
+        // Node given `"type": "module"`.
+        //
+        // The CJS parameter names are kept rather than switching to the ESM wrapper,
+        // so `require`/`module`/`exports`/`__filename` keep working alongside the
+        // await — which is also what Bun does. A file that was simply mis-typed
+        // fails this compile too, and the ORIGINAL error is what gets reported.
+        try {
+          wrapper = new AsyncFunction("exports", "require", "module", "__filename", "__dirname", source + "\n");
+          isAsync = true;
+        } catch {
+          // Compilation (parse) errors are otherwise anonymous ("<anonymous>"); name
+          // the offending file + module kind so loader bugs are debuggable.
+          err.message += ` (while compiling ${filename} [cjs])`;
+          throw err;
+        }
       }
     }
     // Run an ESM wrapper with the live-binding fallback: a circular import of a
@@ -660,7 +680,8 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
           const ret = runEsm();
           if (isAsync) module.evaluating = ret;
         } else {
-          wrapper.call(module.exports, module.exports, require, module, filename, dirname);
+          const ret = wrapper.call(module.exports, module.exports, require, module, filename, dirname);
+          if (isAsync) module.evaluating = ret;
         }
       } catch (e) {
         try {
@@ -691,7 +712,11 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
       // is none), so its exports are complete for require() callers.
       if (isAsync) module.evaluating = ret;
     } else {
-      wrapper.call(module.exports, module.exports, require, module, filename, dirname);
+      // A CJS-shaped file that needed the async wrapper (top-level await) also
+      // evaluates to a Promise, and the entry has to be able to await it — same
+      // contract as the ESM branch above.
+      const ret = wrapper.call(module.exports, module.exports, require, module, filename, dirname);
+      if (isAsync) module.evaluating = ret;
     }
   }
 

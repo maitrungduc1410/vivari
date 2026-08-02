@@ -48,9 +48,38 @@ try {
 }
 
 let control = null;
+let selfPid = 0;
 
+// Read at module load, while `process` is still NODE's. bootProcess replaces
+// globalThis.process with the GUEST's, whose env is just the spec's (HOME/PATH/PWD)
+// — so a `process.env.VV_*` check inside onReady silently reads the wrong object and
+// the flag never appears to be set. Cost me three inert test seams before I noticed.
+const HOST_ENV = { ...process.env };
+
+// Kernel deliveries that arrive BEFORE the runtime exists have to wait, not vanish.
+// The browser twin (packages/core/src/workers/process-worker.ts) carries the full
+// explanation; the short version is that `control` is only assigned in onReady, and
+// a pipeline whose writer finishes before the reader has booted had its EOF dropped,
+// hanging the reader forever.
+//
+// Kept in lockstep with that twin, but be clear about what this tier can prove:
+// NOTHING. bootProcess() reaches onReady synchronously here, so the pre-ready window
+// never opens and no spike can fail without this queue — measured, not assumed, by
+// deleting the queue and watching the test still pass. That is exactly why the bug
+// shipped: every gate we own runs on the end of the race that wins. The proof for
+// this one is a browser.
+const beforeReady = [];
+const onControl = (fn) => {
+  if (control) fn(control);
+  else beforeReady.push(fn);
+};
+const flushBeforeReady = (c) => {
+  const queued = beforeReady.splice(0, beforeReady.length);
+  for (const fn of queued) fn(c);
+};
 parentPort.on("message", (msg) => {
   if (msg.type === "init") {
+    selfPid = (msg.spec && msg.spec.pid) | 0;
     bootProcess({
       sab: msg.sab,
       spec: msg.spec,
@@ -60,6 +89,32 @@ parentPort.on("message", (msg) => {
       send: (type, extra) => parentPort.postMessage({ type, ...extra }),
       onReady: (c) => {
         control = c;
+        flushBeforeReady(c);
+        // VV_SIMULATE_DEV_HMR_PING=1 reproduces what a Vite dev server does to a
+        // Process Worker. Its HMR client shares these globals and, once its
+        // WebSocket opens, arms `setInterval(ping, 3e4)` — which by then is the
+        // runtime's, so the ping lands in the GUEST's loop as a ref'd timer and no
+        // guest that merely finishes can ever exit.
+        //
+        // Two details are load-bearing, both learned from getting them wrong. The
+        // ping is armed LATE, from the client's async `connect`, well after the
+        // guest's entry has started — an earlier version of this seam armed it in
+        // onReady, which a fix that only ran before the entry appeared to pass. And
+        // the fix keys on the CALLER's frame, so the simulated ping has to come from
+        // a `/@vite/client` frame; `sourceURL` is what puts one in the stack. There
+        // is no HMR client in this tier, so the bug is otherwise unobservable here.
+        // `=early` covers the other defence instead: a host handle armed BEFORE the
+        // entry, from an ordinary frame the `/@vite/client` match would not catch.
+        // That is what loop.disownExistingHandles() is for, and without a case of
+        // its own it is untested code.
+        if (HOST_ENV.VV_SIMULATE_DEV_HMR_PING === "early") {
+          globalThis.setInterval(() => {}, 30000);
+        } else if (HOST_ENV.VV_SIMULATE_DEV_HMR_PING) {
+          const armPing = new Function(
+            "return setInterval(() => {}, 30000);\n//# sourceURL=http://localhost:5173/@vite/client",
+          );
+          setTimeout(armPing, 250);
+        }
       },
       codec: makeZStream,
       cryptoCodec,
@@ -75,27 +130,38 @@ parentPort.on("message", (msg) => {
     });
     return;
   }
+  // Diagnostic twin of the browser worker's "proc-mem": report this worker's
+  // runtime stats, including the `alive` breakdown that names which handles are
+  // holding the event loop. Mirrored here so the diagnostic can be exercised
+  // headlessly — the browser is otherwise the only place it can be read, and a
+  // diagnostic nobody can test is one that quietly reports nothing.
+  if (msg.type === "proc-mem") {
+    const heap = typeof process.memoryUsage === "function" ? process.memoryUsage().heapUsed : -1;
+    const stats = control && control.memStats ? control.memStats() : { modules: -1, esbuildInproc: false };
+    parentPort.postMessage({ type: "proc-mem-reply", id: msg.id, pid: selfPid, heap, ...stats });
+    return;
+  }
   // Kernel nudge: a network request is queued for us — wake the event loop.
-  if (msg.type === "net") control && control.wakeNet();
+  if (msg.type === "net") onControl((c) => c.wakeNet());
   // An async child's output/exit relayed by the kernel (#15).
   else if (msg.type === "child-stdout" || msg.type === "child-stderr" || msg.type === "child-exit")
-    control && control.dispatchChild(msg);
+    onControl((c) => c.dispatchChild(msg));
   // A worker_thread's online/exit relayed by the kernel (#16 stage 2b).
   else if (msg.type === "thread-started" || msg.type === "thread-exit")
-    control && control.dispatchThread(msg);
+    onControl((c) => c.dispatchThread(msg));
   // A browser preview ws tunnel message relayed by the kernel (#19 stage C).
   else if (msg.type === "ws-open" || msg.type === "ws-in" || msg.type === "ws-close")
-    control && control.dispatchWs(msg);
+    onControl((c) => c.dispatchWs(msg));
   // A browser preview SSE tunnel message relayed by the kernel.
   else if (msg.type === "sse-open" || msg.type === "sse-close")
-    control && control.dispatchSse(msg);
+    onControl((c) => c.dispatchSse(msg));
   // A cross-process pipe (UNIX socket) message relayed by the kernel.
   else if (msg.type === "pipe-open" || msg.type === "pipe-data" || msg.type === "pipe-shutdown" || msg.type === "pipe-close")
-    control && control.dispatchPipe(msg);
+    onControl((c) => c.dispatchPipe(msg));
   // An interactive stdin chunk for this process (host terminal / parent -> child).
-  else if (msg.type === "stdin") control && control.dispatchStdin(msg);
+  else if (msg.type === "stdin") onControl((c) => c.dispatchStdin(msg));
   // A catchable signal (SIGTERM/SIGINT) the kernel is delivering to us.
-  else if (msg.type === "signal") control && control.dispatchSignal(msg);
+  else if (msg.type === "signal") onControl((c) => c.dispatchSignal(msg));
   // An async fetch result relayed by the kernel (parallel downloads).
-  else if (msg.type === "fetch-done") control && control.dispatchFetch(msg);
+  else if (msg.type === "fetch-done") onControl((c) => c.dispatchFetch(msg));
 });

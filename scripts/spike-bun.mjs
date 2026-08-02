@@ -1680,5 +1680,122 @@ console.log("\n== bun run scan.ts (Bun.Transpiler.scan over a file read from the
   ok(got && !got.imports.some((x) => x.includes("Unused")), "the type-only import contributes nothing");
 }
 
+// 21) The four things a real process shows that a string check cannot: the bare
+// `bun` module specifier resolving, top-level await in a file with no import or
+// export, Bun.stdin as a readable Blob, and Bun.$ being lazy enough for its own
+// modifiers to mean something.
+//
+// All four were found by writing the studio's Bun templates rather than by
+// reading the shim — see scripts/spike-bun-templates.mjs, which runs those
+// templates' shipped bytes.
+console.log("\n== the bare `bun` module, top-level await, Bun.stdin, lazy Bun.$ ==");
+{
+  // `import { $ } from "bun"` is how Bun's own docs reach most of this surface,
+  // and it used to fail with "Cannot find module 'bun'" while `Bun.$` worked.
+  write(
+    "bare-import.ts",
+    [
+      'import { $, file, write, version } from "bun";',
+      'import * as ns from "bun";',
+      "const same = ns.file === Bun.file && ns.$ === Bun.$;",
+      'console.log("BARE:" + JSON.stringify({',
+      "  fns: typeof $ + typeof file + typeof write,",
+      "  version: typeof version,",
+      "  same,",
+      "  keys: Object.keys(ns).length > 50,",
+      "  defaultIsBun: ns.default === Bun,",
+      "}));",
+    ].join("\n"),
+  );
+  const r = await kernel.start("bun", ["run", "bare-import.ts"], { cwd: APP, env: ENV, capture: true });
+  const m = /BARE:(\{.*\})/.exec(r.stdout || "");
+  const got = m ? JSON.parse(m[1]) : null;
+  if (!got) console.log("  stderr:", (r.stderr || "").split("\n").slice(0, 3).join(" | "));
+  ok(r.code === 0 && !!got, '`import { $ } from "bun"` resolves and runs');
+  ok(got && got.fns === "functionfunctionfunction", "$, file and write all come through as functions");
+  ok(got && got.same, "they are the SAME objects as the globals, not copies");
+  ok(got && got.keys, "the namespace carries the whole Bun surface, not a curated subset");
+  // Real Bun has NO default export from "bun". Ours does, because the loader gives
+  // every builtin namespace a `default` for CJS interop, and it is the same object
+  // the namespace already is. Asserted rather than glossed over: a caller writing
+  // `import Bun from "bun"` gets something workable here and a TypeError under real
+  // Bun, so the divergence is in the forgiving direction, but it IS a divergence.
+  ok(got && got.defaultIsBun, "…plus an interop `default` (real Bun has none) that is the same object");
+}
+{
+  // A script whose only module-level feature is a top-level await. ESM-ness is
+  // decided by SYNTAX, so with no import or export this took the CJS path, got a
+  // non-async wrapper and failed with "await is only valid in async functions and
+  // the top level bodies of modules" — which names nothing the author can fix.
+  write("tla.ts", ['const value: number = await Promise.resolve(7);', 'console.log("TLA:" + value);'].join("\n"));
+  const r = await kernel.start("bun", ["run", "tla.ts"], { cwd: APP, env: ENV, capture: true });
+  if (r.code !== 0) console.log("  stderr:", (r.stderr || "").split("\n")[0]);
+  ok(r.code === 0 && /TLA:7/.test(r.stdout || ""), "top-level await runs in a file with no import or export");
+
+  // The retry must not paper over a genuine syntax error, which would turn a
+  // one-line parse failure into a confusing runtime one.
+  write("broken.ts", "const x = ;\n");
+  const bad = await kernel.start("bun", ["run", "broken.ts"], { cwd: APP, env: ENV, capture: true });
+  ok(bad.code !== 0 && /SyntaxError/.test(bad.stderr || ""), "…and a real syntax error still fails as a syntax error");
+}
+{
+  // `const input = await Bun.stdin.text()` is how every piped Bun script starts.
+  // Bun.stdin stays a Node stream here (guest code reads it with .on("data")), so
+  // the Blob readers are attached to that stream rather than replacing it.
+  write("pipe.ts", ['const input: string = await Bun.stdin.text();', 'console.log("PIPE:" + input.trim().split("\\n").length + ":" + input.trim().replace(/\\n/g, ","));'].join("\n"));
+  write("feed.txt", "one\ntwo\nthree\n");
+  const r = await kernel.start("sh", ["-c", "cat feed.txt | bun run pipe.ts"], { cwd: APP, env: ENV, capture: true });
+  if (r.code !== 0) console.log("  stderr:", (r.stderr || "").split("\n").slice(0, 3).join(" | "));
+  ok(r.code === 0 && /PIPE:3:one,two,three/.test(r.stdout || ""), "Bun.stdin.text() drains a real pipe");
+  // The readers are attached to the existing stream rather than replacing it, so
+  // code already reading stdin with .on("data") / async iteration is unaffected.
+  write("stdin-shape.ts", 'console.log("SHAPE:" + JSON.stringify({ on: typeof Bun.stdin.on, same: Bun.stdin === process.stdin, text: typeof Bun.stdin.text }));\n');
+  const shape = await kernel.start("bun", ["run", "stdin-shape.ts"], { cwd: APP, env: ENV, capture: true });
+  ok(/"on":"function"/.test(shape.stdout || "") && /"same":true/.test(shape.stdout || "") && /"text":"function"/.test(shape.stdout || ""), "…and it is still the same Node Readable, with .on() intact");
+}
+{
+  // Bun.$ used to call exec() immediately and then attach .quiet()/.nothrow(),
+  // which worked only because both flags are read later. .env()/.cwd() are read
+  // at SPAWN time, so under that design they could not work at all — and were
+  // simply absent. The ShellPromise is lazy now, so all four mean something.
+  write(
+    "shell.ts",
+    [
+      'import { $ } from "bun";',
+      'await $`mkdir -p sub/dir`;',
+      'const cwd = (await $`pwd`.cwd("sub/dir").text()).trim();',
+      // Read back through a real process rather than `sh -c "echo $MARKER"`: the
+      // in-VM sh does no variable expansion, so that would prove nothing.
+      'const env = (await $`bun run show-marker.ts`.env({ ...process.env, MARKER: "from-env" }).text()).trim();',
+      "const failed = await $`false`.nothrow().quiet();",
+      "let threw = false;",
+      "try { await $`false`.quiet(); } catch { threw = true; }",
+      // A reader CAPTURES, so nothing reaches the terminal. Bun prints nothing for
+      // `await $`echo …`.text()`, and this script prints no marker of its own, so
+      // any occurrence in stdout is an echo that should not be there.
+      "const captured = (await $`echo not-on-the-terminal`.text()).trim();",
+      "const lines = [];",
+      'for await (const line of $`echo a\\necho b`.lines()) lines.push(line);',
+      'console.log("SHELL:" + JSON.stringify({ cwd, env, code: failed.exitCode, threw, lines, captured }));',
+    ].join("\n"),
+  );
+  write("show-marker.ts", 'console.log(process.env.MARKER ?? "(unset)");\n');
+  const r = await kernel.start("bun", ["run", "shell.ts"], { cwd: APP, env: ENV, capture: true });
+  const m = /SHELL:(\{.*\})/.exec(r.stdout || "");
+  const got = m ? JSON.parse(m[1]) : null;
+  if (!got) console.log("  stderr:", (r.stderr || "").split("\n").slice(0, 3).join(" | "));
+  ok(r.code === 0 && !!got, "the Bun.$ modifier script runs");
+  ok(got && /sub\/dir$/.test(got.cwd), ".cwd() actually changes the child's directory");
+  ok(got && got.env === "from-env", ".env() is applied to that command only");
+  ok(got && got.code !== 0 && got.threw, ".nothrow() reports the code where the default throws");
+  ok(got && got.lines.length === 2 && got.lines[0] === "a", ".lines() yields lines without the trailing empty one");
+  // The leak this missed for a whole review cycle: `.text()` buffered the output AND
+  // echoed it, so every capturing line in a script printed the raw output and then
+  // printed whatever the script made of it. Invisible to an assertion that greps the
+  // whole of stdout for the processed form — so assert the RAW form is absent.
+  ok(got && got.captured === "not-on-the-terminal", ".text() returns the output");
+  ok(!/not-on-the-terminal/.test((r.stdout || "").replace(/"captured":"[^"]*"/, "")), "…and does NOT also echo it to the terminal");
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");
 process.exit(failed ? 1 : 0);

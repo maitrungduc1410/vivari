@@ -30,6 +30,34 @@ try {
 
 let control = null;
 
+// Kernel deliveries that arrive BEFORE the runtime exists have to wait, not vanish.
+//
+// `control` is only assigned in bootProcess()'s onReady, which is several async
+// ticks after this worker starts: the runtime has to be constructed and its wasm
+// codecs built first. Until then every branch below read `control && …`, so
+// anything the kernel sent in that window was silently dropped.
+//
+// A pipeline is the case that loses: `cat fruit.txt | bun run tools/uniq.ts` spawns
+// both stages up front, and `cat` is a tiny coreutils program that finishes almost
+// immediately, while the reader is a full runtime boot. The kernel then relays
+// `cat`'s EOF to a worker that has no `control` yet — so the reader never sees end
+// of input and waits for a chunk that will never come, hanging the whole pipeline.
+// It is a race, so it hides wherever workers start fast (Node's worker_threads) and
+// shows up where they don't (the browser).
+//
+// Queue in arrival order and replay on ready. Dropping is never right for any of
+// these — they are all one-shot deliveries (an exit, a signal, a fetch result),
+// not state that can be re-read later.
+const beforeReady = [];
+const onControl = (fn) => {
+  if (control) fn(control);
+  else beforeReady.push(fn);
+};
+const flushBeforeReady = (c) => {
+  const queued = beforeReady.splice(0, beforeReady.length);
+  for (const fn of queued) fn(c);
+};
+
 // [optimize] Native codecs (Phase 2 #11 zlib, #12 crypto): the Rust/Wasm cores
 // beneath Node's real lib/zlib.js and our lib/crypto.js. The kernel worker
 // compiled the wasm ONCE and handed us the `WebAssembly.Module`s; here we only
@@ -100,6 +128,7 @@ self.onmessage = async (event) => {
       send: (msgType, extra) => self.postMessage({ type: msgType, ...extra }),
       onReady: (c) => {
         control = c;
+        flushBeforeReady(c);
       },
       codec: makeZStream,
       cryptoCodec,
@@ -122,29 +151,29 @@ self.onmessage = async (event) => {
     return;
   }
   // Kernel nudge: a network request is queued for us — wake the event loop.
-  if (type === "net") control && control.wakeNet();
+  if (type === "net") onControl((c) => c.wakeNet());
   // An async child's output/exit relayed by the kernel (#15).
   else if (type === "child-stdout" || type === "child-stderr" || type === "child-exit")
-    control && control.dispatchChild(event.data);
+    onControl((c) => c.dispatchChild(event.data));
   // A worker_thread's online/exit relayed by the kernel (#16 stage 2b).
   else if (type === "thread-started" || type === "thread-exit")
-    control && control.dispatchThread(event.data);
+    onControl((c) => c.dispatchThread(event.data));
   // A browser preview ws tunnel message relayed by the kernel (#19 stage C).
   else if (type === "ws-open" || type === "ws-in" || type === "ws-close")
-    control && control.dispatchWs(event.data);
+    onControl((c) => c.dispatchWs(event.data));
   // A browser preview SSE tunnel message relayed by the kernel.
   else if (type === "sse-open" || type === "sse-close")
-    control && control.dispatchSse(event.data);
+    onControl((c) => c.dispatchSse(event.data));
   // A cross-process pipe (UNIX socket) message relayed by the kernel.
   else if (type === "pipe-open" || type === "pipe-data" || type === "pipe-shutdown" || type === "pipe-close")
-    control && control.dispatchPipe(event.data);
+    onControl((c) => c.dispatchPipe(event.data));
   // An interactive stdin chunk for this process (host terminal / parent -> child).
-  else if (type === "stdin") control && control.dispatchStdin(event.data);
+  else if (type === "stdin") onControl((c) => c.dispatchStdin(event.data));
   // A catchable signal (SIGTERM/SIGINT) the kernel is delivering to us.
-  else if (type === "signal") control && control.dispatchSignal(event.data);
+  else if (type === "signal") onControl((c) => c.dispatchSignal(event.data));
   // An async fetch result relayed by the kernel (parallel downloads).
-  else if (type === "fetch-done") control && control.dispatchFetch(event.data);
+  else if (type === "fetch-done") onControl((c) => c.dispatchFetch(event.data));
   // A CDP debugger command for this process while it is RUNNING (paused commands
   // arrive over the debug SAB instead). Feeds the in-guest Debugger backend.
-  else if (type === "dbg-cmd") control && control.dispatchDebugCommand(event.data.data);
+  else if (type === "dbg-cmd") onControl((c) => c.dispatchDebugCommand(event.data.data));
 };

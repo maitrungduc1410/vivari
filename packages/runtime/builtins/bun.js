@@ -948,8 +948,17 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
 
   // ---- Bun.$ (shell) ---------------------------------------------------------
   // A small tagged-template shell. Interpolations are shell-escaped. The returned
-  // value is a thenable resolving to { exitCode, stdout, stderr } with Bun's
-  // .text()/.json()/.quiet()/.nothrow() helpers.
+  // value is Bun's ShellPromise: a thenable resolving to { exitCode, stdout,
+  // stderr } with .text()/.json()/.bytes()/.arrayBuffer()/.blob()/.lines() and the
+  // .quiet()/.nothrow()/.throws()/.env()/.cwd() modifiers.
+  //
+  // It is LAZY — the command starts on the first await/.then(), not when the tag
+  // is evaluated. That is Bun's semantics, and it is also the only way the
+  // modifiers can mean anything: this used to call exec() immediately and then
+  // attach .quiet()/.nothrow(), which happened to work only because both flags are
+  // read later (in a data handler, and at close). .env()/.cwd() are read at SPAWN
+  // time, so under the eager version they could not have worked at all, which is
+  // why they were simply absent.
   function makeShell() {
     const run = (strings, exprs, opts) => {
       const cp = lazy("child_process");
@@ -958,15 +967,22 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
         cmd += strings[i];
         if (i < exprs.length) cmd += shellEscape(exprs[i]);
       }
-      let nothrow = !!(opts && opts.nothrow);
-      let quiet = !!(opts && opts.quiet);
+      const state = {
+        nothrow: !!(opts && opts.nothrow),
+        quiet: !!(opts && opts.quiet),
+        env: null, // null -> inherit process.env, read at spawn time
+        cwd: null, // null -> inherit process.cwd()
+      };
       const exec = () =>
         new Promise((resolve, reject) => {
-          const child = cp.spawn("sh", ["-c", cmd], { cwd: process.cwd(), env: process.env });
+          const child = cp.spawn("sh", ["-c", cmd], {
+            cwd: state.cwd || process.cwd(),
+            env: state.env || process.env,
+          });
           const outParts = [];
           const errParts = [];
-          if (child.stdout) child.stdout.on("data", (d) => { outParts.push(toBuf(d, Buffer)); if (!quiet) process.stdout.write(d); });
-          if (child.stderr) child.stderr.on("data", (d) => { errParts.push(toBuf(d, Buffer)); if (!quiet) process.stderr.write(d); });
+          if (child.stdout) child.stdout.on("data", (d) => { outParts.push(toBuf(d, Buffer)); if (!state.quiet) process.stdout.write(d); });
+          if (child.stderr) child.stderr.on("data", (d) => { errParts.push(toBuf(d, Buffer)); if (!state.quiet) process.stderr.write(d); });
           child.on("error", reject);
           child.on("close", (code) => {
             const stdout = Buffer.concat(outParts);
@@ -978,19 +994,51 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
               text: () => stdout.toString("utf8"),
               json: () => JSON.parse(stdout.toString("utf8")),
             };
-            if (code !== 0 && !nothrow) {
+            if (code !== 0 && !state.nothrow) {
               const e = new Error("Command failed with exit code " + code + ": " + cmd);
               Object.assign(e, result);
               reject(e);
             } else resolve(result);
           });
         });
-      const promise = exec();
-      promise.quiet = () => { quiet = true; return promise; };
-      promise.nothrow = () => { nothrow = true; return promise; };
-      promise.text = async () => (await promise).text();
-      promise.json = async () => (await promise).json();
-      return promise;
+
+      // Started at most once, however many times it is awaited.
+      let started = null;
+      const start = () => (started || (started = exec()));
+      // READING the output means you are capturing it, and Bun does not ALSO echo
+      // it to the terminal — `await $`ls`.text()` prints nothing. Reading is the
+      // only signal available, because the shell is lazy precisely so that the
+      // modifiers can be applied before the spawn; there is no other point at which
+      // to notice. Without this every `.text()` in a script printed the raw output
+      // and then printed whatever the script did with it, twice over.
+      const capture = () => { state.quiet = true; return start(); };
+      const api = {
+        quiet() { state.quiet = true; return api; },
+        nothrow() { state.nothrow = true; return api; },
+        throws(shouldThrow) { state.nothrow = !shouldThrow; return api; },
+        env(vars) { state.env = vars == null ? null : vars; return api; },
+        cwd(dir) { state.cwd = dir == null ? null : lazy("path").resolve(process.cwd(), dir); return api; },
+        then(onOk, onErr) { return start().then(onOk, onErr); },
+        catch(onErr) { return start().catch(onErr); },
+        finally(onDone) { return start().finally(onDone); },
+        async text() { return (await capture()).text(); },
+        async json() { return (await capture()).json(); },
+        async bytes() { return new Uint8Array((await capture()).stdout); },
+        async arrayBuffer() {
+          const b = (await capture()).stdout;
+          return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+        },
+        async blob() { return new Blob([(await capture()).stdout]); },
+        // Bun yields lines WITHOUT the trailing newline, and does not yield a final
+        // empty string for output that ends in one.
+        async *lines() {
+          const text = (await capture()).stdout.toString("utf8");
+          const parts = text.split("\n");
+          if (parts.length && parts[parts.length - 1] === "") parts.pop();
+          for (const line of parts) yield line;
+        },
+      };
+      return api;
     };
     const $ = (strings, ...exprs) => run(strings, exprs, {});
     $.braces = (s) => [s];
@@ -1248,14 +1296,24 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     resolveSync: (id, root) => bunResolveSync(id, root),
     resolve: async (id, root) => bunResolveSync(id, root),
     randomUUIDv7: (encoding, timestamp) => randomUUIDv7(lazy("crypto"), Buffer, encoding, timestamp),
-    // Bun.stdin stays the Node stream this shim has always returned, which is a
-    // known divergence (Bun's is a BunFile) kept on purpose: guest code here
-    // reads stdin with .on("data")/async iteration off the SAB-backed stream, and
-    // a BunFile wrapper would take that away to add a .text() we cannot make
-    // block. Bun.stdout/Bun.stderr ARE BunFiles, because their whole job in Bun's
-    // API is being a Bun.write() destination (`Bun.write(Bun.stdout, file)`) — see
-    // ./bun-file.js. Their read half throws rather than answering "".
-    get stdin() { return process.stdin; },
+    // Bun.stdin stays the Node stream this shim has always returned, rather than
+    // becoming a BunFile: guest code here reads stdin with .on("data") / async
+    // iteration off the SAB-backed stream, and swapping in a wrapper would take
+    // that away. Bun.stdout/Bun.stderr ARE BunFiles, because their whole job in
+    // Bun's API is being a Bun.write() destination (`Bun.write(Bun.stdout, file)`)
+    // — see ./bun-file.js. Their read half throws rather than answering "".
+    //
+    // What the stream DOES now carry is the read half of Bun's Blob interface, so
+    // the one-liner every piped Bun script opens with works:
+    //
+    //   const input = await Bun.stdin.text();     // cat x | bun run f.ts
+    //
+    // These are additive — the stream is still the same object, with the same
+    // events — and they are async, so there is no blocking read to fake. (The
+    // earlier note here claimed .text() "cannot be made to block"; it never had
+    // to. Bun's returns a Promise too.) `size` is still absent: unlike a file,
+    // a pipe has no length until it ends.
+    get stdin() { return withBlobReaders(process.stdin); },
     get stdout() { return files.stdout; },
     get stderr() { return files.stderr; },
     // GC / memory introspection: no-ops (no manual GC exposed in the sandbox).
@@ -1296,6 +1354,17 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     // honestly missing (fsync, locking, WAL). Nothing is loaded until the first
     // `new Database()`: this call only builds the host descriptor.
     "bun:sqlite": createBunSqlite(createVivariSqliteHost({ require, makeCwdRequire, process })),
+    // The bare `bun` specifier — `import { $, file, write, serve } from "bun"`,
+    // which is how Bun's own docs reach most of this surface, and what every
+    // copied-in snippet uses. It was missing entirely, so those imports failed
+    // with "Cannot find module 'bun'" while the identical `Bun.$` global worked.
+    //
+    // It is the SAME object, not a curated re-export: checked against a real
+    // binary, `import * as ns from "bun"` has exactly the `Bun` global's key set,
+    // the same object identity per key (`ns.$ === Bun.$`), and NO default export.
+    // Assigning the namespace is therefore the faithful implementation as well as
+    // the cheap one, and it cannot drift as members are added to `Bun`.
+    bun: Bun,
   };
 
   // ---- automatic .env loading (see ./bun-env.js) ------------------------------
@@ -1343,6 +1412,34 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
 // answer 0 / {current: 0, peak: 0}, which a memory-budget check reads as "nothing
 // is allocated" and happily passes. No engine exposes heap introspection to page
 // JavaScript, so there is no number we could return honestly.
+// Give a Node Readable the read half of Bun's Blob interface (`Bun.stdin`).
+// Attached once, in place, so the stream keeps its identity and its events: code
+// that was already doing `for await (const chunk of Bun.stdin)` is unaffected.
+//
+// Each reader drains the stream, so — exactly as with a real pipe — the SECOND
+// call sees nothing. Bun's BunFile can be re-read because it is backed by a file
+// descriptor it can rewind; a pipe cannot be, in Bun either.
+function withBlobReaders(stream) {
+  if (!stream || typeof stream.text === "function") return stream;
+  const drain = () =>
+    new Promise((resolve, reject) => {
+      const chunks = [];
+      stream.on("data", (c) => chunks.push(typeof c === "string" ? Buffer.from(c) : c));
+      stream.once("end", () => resolve(Buffer.concat(chunks)));
+      stream.once("error", reject);
+      if (typeof stream.resume === "function") stream.resume();
+    });
+  stream.text = async () => (await drain()).toString("utf8");
+  stream.json = async () => JSON.parse((await drain()).toString("utf8"));
+  stream.bytes = async () => new Uint8Array(await drain());
+  stream.arrayBuffer = async () => {
+    const b = await drain();
+    return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+  };
+  stream.blob = async () => new Blob([await drain()]);
+  return stream;
+}
+
 function makeBunJsc() {
   const noHeapIntrospection = (name) => () => {
     throw new Error(
