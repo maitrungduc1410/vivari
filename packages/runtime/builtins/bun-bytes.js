@@ -139,8 +139,8 @@ export function makeArrayBufferSink(Buffer) {
 // which a Node Readable is: guest code hands these `fs.createReadStream(…)` and
 // `Bun.spawn().stdout` as readily as a web stream, and without it those callers
 // would get "getReader is not a function". (BunFile.stream() is a real web stream
-// — see bun-file.js, which builds one rather than going through the unimplemented
-// Readable.toWeb.)
+// — see bun-file.js, which builds one out of bounded fd reads rather than going
+// through Readable.toWeb; the reasons are recorded there.)
 async function drain(stream, who) {
   if (stream && typeof stream.getReader === "function") {
     const reader = stream.getReader();

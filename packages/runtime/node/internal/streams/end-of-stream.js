@@ -2,6 +2,17 @@
 // Source: https://github.com/nodejs/node/blob/v24.18.0/lib/internal/streams/end-of-stream.js
 // Wrapped as a builtin factory. Runs unmodified over our internalBinding layer (Path B).
 // Do not edit the body.
+//
+// ONE DIVERGENCE, and it is in the exports, not the body: upstream ends with
+// `module.exports = eos; module.exports.finished = finished;` — a CALLABLE module
+// with the promise form hung off it. This file exports the plain pair
+// `{ eos, finished }` (see the bottom). So upstream call sites that do
+// `const finished = require('internal/streams/end-of-stream')` and then call it
+// bind an object here and die with a code-less `TypeError: finished is not a
+// function`. That cost the whole Readable/Writable/Duplex `toWeb` surface once,
+// in internal/webstreams/adapters.js. Import `{ eos }` for the callback form that
+// returns a cleanup function — as every sibling in this directory does — and
+// `{ finished }` only when you want the promise (internal/streams/operators.js).
 export default function (exports, require, module, process, internalBinding, primordials) {
 // Ported from https://github.com/mafintosh/end-of-stream with
 // permission from the author, Mathias Buus (@mafintosh).

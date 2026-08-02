@@ -35,14 +35,17 @@
 //     Getting this wrong does not look like a size problem: it looks like a
 //     truncated file, or a syscall that hangs and 504s much later.
 //
-//   * `.stream()` must NOT go through `Readable.toWeb`. That is the obvious
-//     one-liner and it throws in the VM: node/internal/webstreams/adapters.js
-//     implements only `fromWeb` (what consuming a `fetch()` body needs) and
-//     leaves the other directions as functions that raise
-//     ERR_METHOD_NOT_IMPLEMENTED — so the natural `Readable.toWeb ? … : …` guard
-//     sails right past it, and the offline tier (host Node, where it works) never
-//     notices. `.stream()` builds a ReadableStream out of bounded fd reads
-//     instead, which also keeps one chunk in memory rather than a whole file.
+//   * `.stream()` does not go through `Readable.toWeb`. It predates a working
+//     one: `toWeb` used to be a stub that threw in the VM while still being a
+//     function, so the natural `Readable.toWeb ? … : …` guard sailed right past
+//     it and only the kernel tier noticed. That is fixed
+//     (node/internal/webstreams/adapters.js), but `.stream()` stays hand-built,
+//     because what it does is not what `toWeb(fs.createReadStream(…))` would do:
+//     it opens no fd until the consumer pulls, reads the slice window directly,
+//     and enqueues exactly one <= 64 KiB chunk per pull. Through a Readable the
+//     chunking would follow that stream's highWaterMark and the adapter would
+//     buffer ahead of the reader — and `spike-bun-offline.mjs` asserts the
+//     bound. Same conclusion in bun.js's Bun.spawn().
 //
 // Known divergence worth naming here, because it looks like a bug: a BunFile is
 // NOT a platform `Blob` instance. Bun's extends Blob, so `new Response(Bun.file(p))`
@@ -326,17 +329,18 @@ export function createBunFile({ lazy, Buffer, process }) {
     }
 
     // Bun returns a WHATWG ReadableStream. This builds one directly out of fd
-    // reads rather than the obvious `Readable.toWeb(fs.createReadStream(...))`,
-    // and the reason is not style: `Readable.toWeb` is one of the interop
-    // directions our vendored stream core deliberately leaves unimplemented
-    // (node/internal/webstreams/adapters.js implements only fromWeb, which is what
-    // consuming a fetch() body needs), so it THROWS in the VM. It is present as a
-    // function, so a `Readable.toWeb ? … : …` guard sails straight past it and the
-    // failure only appears in the kernel tier — which is where this one was found.
+    // reads rather than the obvious `Readable.toWeb(fs.createReadStream(...))`.
+    // That started as a workaround — `Readable.toWeb` was an unimplemented stub
+    // that threw in the VM, and being a function it sailed past every
+    // `Readable.toWeb ? … : …` guard, so the failure only appeared in the kernel
+    // tier. It works now (node/internal/webstreams/adapters.js), and this stays
+    // hand-built on its own merits, not because toWeb is broken:
     //
-    // Reading per pull also keeps the stream doing what a stream is for: one
-    // bounded chunk in memory at a time, each comfortably inside the syscall
-    // window, over however large a file.
+    // reading per pull keeps the stream doing what a stream is for — one bounded
+    // chunk in memory at a time, each comfortably inside the syscall window, over
+    // however large a file, with no fd opened until the consumer actually pulls.
+    // Through a Readable the chunk size would be that stream's highWaterMark and
+    // the adapter would run ahead of the reader instead.
     stream() {
       if (typeof ReadableStream !== "function") {
         throw new Error(

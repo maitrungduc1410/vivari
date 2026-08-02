@@ -1379,7 +1379,12 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     `newWritableStreamFromStreamBase`/`newReadableStreamFromStreamBase` still throw
     (`ERR_METHOD_NOT_IMPLEMENTED`, deliberately — they need a libuv StreamBase handle our
     `stream_wrap` shim doesn't implement, and nothing in the runtime calls them). The file is a
-    hand-written **adaptation**, not a verbatim vendor — reasons in the entry below.
+    hand-written **adaptation**, not a verbatim vendor — reasons in the entry below. Read this
+    bullet with its correction: as merged the six were real but **the three `toWeb` directions
+    still threw in the VM**, on an upstream import line that this tree's vendored
+    `internal/streams/end-of-stream` does not fit (`TypeError: finished is not a function`, no
+    `code`). Host-Node checks could not see it; the `bun` kernel spike could. Fixed in "Web
+    Streams `toWeb` was dead in the VM" at the end of this file.
   - ✅ **One `assert`.** The eager `builtins/assert.js` shim is gone, so `assert`, `node:assert`
     and `assert/strict` all resolve to the vendored `node/lib/assert.js`. Expect guest suites to
     get stricter: `throws(fn, ExpectedError)` used to ignore its second argument.
@@ -4625,7 +4630,11 @@ presence check, and on the host Node the offline spike runs on, `toWeb` works �
 green in the tier CI enforces and broken in the product. `.stream()` now builds a
 `ReadableStream` out of bounded fd reads (64 KiB per `pull()`), which also stops it from
 materialising a file it was asked to stream. Added to AGENTS.md as its own gotcha, because the
-guard idiom is everywhere and `Bun.spawn().stdout` still has it.
+guard idiom is everywhere and `Bun.spawn().stdout` still has it. (Historical, and true when
+written — but read it in the past tense on two counts: `Bun.spawn().stdout` lost the guard in
+"`Bun.serve` hardening" below, and `Readable.toWeb` is implemented and no longer throws, see
+"Web Streams `toWeb` was dead in the VM" at the end of this file. `.stream()` is still
+hand-built, now for the laziness and the 64 KiB pull bound rather than to avoid a throw.)
 
 One divergence is documented rather than fixed: a `BunFile` here is not a platform `Blob`
 instance (Bun's extends `Blob`), so `new Response(Bun.file(p))` stringifies instead of
@@ -4947,6 +4956,10 @@ the offline tier stayed green because host Node's `toWeb` works. `.stdout`/`.std
 as `ReadableStream`s by hand. This is the third place this exact trap has bitten, so it is written
 up in AGENTS.md "Critical gotchas" with the rule that follows: Web-Streams interop must be proven
 in the kernel tier, because an offline check that passes for a host-Node reason is not evidence.
+(Historical, and true when written. `Readable.toWeb` is real now and no longer raises
+`ERR_METHOD_NOT_IMPLEMENTED` — see "Web Streams `toWeb` was dead in the VM" at the end of this
+file, where it turns out the trap survived the implementation in a nastier form. `Bun.spawn()`
+keeps its hand-built `.stdout`/`.stderr`, deliberately.)
 
 **Streaming responses: assessed and deliberately not started.** A `Response` whose body is a
 `ReadableStream` is still buffered in full. This is not a `Bun.serve` bug and cannot be fixed in
@@ -5232,6 +5245,22 @@ writes — precisely what this change set is about. Nothing in the runtime calls
 http reach Web Streams through `toWeb` on the socket. They are exported so that a future
 caller gets `ERR_METHOD_NOT_IMPLEMENTED` naming StreamBase and the alternative, rather than
 `undefined is not a function`.
+
+**Correction to C, and it is the important one: this shipped broken in the VM.** All six
+converters were real and the 39/39 recorded under "Verification" below was honest, but the
+rewrite also carried upstream's
+`const finished = require("internal/streams/end-of-stream")` in verbatim. That is right
+upstream, whose copy of that module is callable; **ours exports the pair `{ eos, finished }`**,
+so the name bound an object and the first `finished(stream, cb)` inside a converter threw
+`TypeError: finished is not a function` — no `code`. The three `toWeb` directions were dead in
+the VM from the moment this merged; the three `fromWeb` directions, including the one corepack
+streams its tarball through, were untouched. The `bun` kernel spike caught it as
+`toWeb-throws:undefined`. Fixed one line and one entry later: "Web Streams `toWeb` was dead in
+the VM", at the end of this file, which also explains why a host-Node harness of any size was
+structurally unable to see it. The pinned behaviours named earlier in C stay pinned and are now
+load-bearing for a second reason — `Readable.toWeb` producing a **non-byte** stream is what
+makes "byte semantics" a wrong argument for keeping the hand-rolled Bun streams, since none of
+those is a `type: "bytes"` stream either.
 
 **D — and then the event loop could exit out from under them.** The adapters await host-realm
 promises, which settle off our loop; `runtime/index.js` already wrapped the *reader*'s
@@ -5664,3 +5693,139 @@ builtin check removed, the ESM re-export dropped) — eight mutations, each brea
 and ten checks, in both tiers.
 
 See ARCHITECTURE.md §9.2.
+
+## Web Streams `toWeb` was dead in the VM — one import line (this change)
+
+The previous change set made all six `Readable`/`Writable`/`Duplex` `toWeb`/`fromWeb` converters
+real (entry C above). **Three of them never worked in the VM.** The rewritten
+`internal/webstreams/adapters.js` kept upstream's own import line verbatim —
+`const finished = require("internal/streams/end-of-stream")` — which is correct upstream, where
+that module is callable (`module.exports = eos`, with `finished` hung off it). Our copy exports
+the plain pair `{ eos, finished }` (`internal/streams/end-of-stream.js:344`), so `finished` bound
+the module *object* and the first `finished(stream, cb)` inside a converter threw
+`TypeError: finished is not a function` — a bare `TypeError` with **no `code`**, which is exactly
+how CI printed it: `toWeb-throws:undefined`. The fix is one line,
+`const { eos: finished } = require("internal/streams/end-of-stream")`.
+
+**That one line is not this entry's contribution.** Two changes diagnosed this regression from the
+same CI failure in parallel, reached the same conclusion, and wrote the same fix; the `bun:test`
+change (!125) landed first and carries it, along with a spike that now asserts `toWeb` *works*
+rather than that it throws. This entry keeps the write-up because that change fixed the code and
+left the story untold: nothing in this file recorded the regression, and the docs still taught the
+opposite — see the last paragraph. What is genuinely added here is the reasoning below, the
+`end-of-stream` divergence note that stops the next re-vendor from reintroducing it, and a spike
+that reads the bytes back instead of only checking that the call returned.
+
+**Blast radius, measured rather than reasoned.** `finished` is called from
+`newWritableStreamFromStreamWritable` and `newReadableStreamFromStreamReadable`, and
+`newReadableWritablePairFromDuplex` calls both — so precisely the three `toWeb` directions were
+dead and the three `fromWeb` directions were fine throughout. **Corepack was never affected**: it
+streams its tarball through `Readable.fromWeb` (`packages/kernel-host/load-real-corepack.js:25`,
+`packages/runtime/index.js:1053`). Nothing else in `packages/` calls `toWeb` at all; the only
+callers are guest programs, which is why the product symptom was confined to the VM's guest
+surface. `packages/runtime/index.js` needed no change — the working hypothesis going in was that
+the guest realm lacked `CountQueuingStrategy`/`ByteLengthQueuingStrategy`, and that was checked
+and disproven: all 23 globals, classes and helpers the three converters touch resolve in the
+guest, all four Web Streams globals included, and deleting both queuing-strategy classes still
+yields working conversions through the plain-object fallbacks in `adapters.js`'s
+`countStrategy`/`byteLengthStrategy` (L92-102).
+
+**Why 39/39 host-Node checks could not see it, and why only the kernel tier could.** The defect
+is not in `adapters.js` and not in `end-of-stream.js`; it is in the **seam between them**, and it
+is a difference in *export shape*, not in resolvability. Any harness that lets
+`require("internal/streams/end-of-stream")` reach host Node's own copy — callable — is testing a
+module graph the VM never runs, and will pass no matter how many cases it has. The offline spike
+tier has the same blind spot for the same reason: it runs on host Node, whose `toWeb` genuinely
+works. `scripts/probe-node-registry.mjs` is blind here **by design**, and its "what it does not
+catch" header says so in as many words: *"An id that is registered but whose factory throws at
+load, or whose exports are missing the member the caller destructures, passes here."* The id
+resolves; only its shape is wrong. That leaves the kernel tier — the one that executes the real
+vendored graph inside the real VM — as the only place this class of bug is visible, which is the
+standing rule from the previous change set doing its job.
+
+**The fix is aliased, not renamed, and `eos` is the only correct binding.**
+`const { eos: finished }` keeps the six converter bodies character-identical to upstream
+v24.18.0, which is what makes re-vendoring diffable. The near-miss matters enough to be written
+down: `const { finished }` *is*
+a function, so it looks right and would move the failure one frame later — it is the
+**promise-returning** variant (`end-of-stream.js:321`) and would hand the adapters a `Promise`
+where they call the returned value as `cleanup()`, i.e. a stream that silently never cleans up.
+`eos` is the callback form that returns the cleanup function, and it is what every other file in
+`internal/streams/**` already imports (`readable.js:57`, `writable.js:54`, `pipeline.js:18`, …).
+Both the call site and the file header's "deliberate divergences" list now record why, so
+restoring upstream's line is a visible mistake rather than an invisible one. No defensive
+machinery was added on purpose — a load-time member-shape assertion duplicates the import list
+and rots into cover, and a wrapper that re-codes escaping `TypeError`s would mislabel genuine
+user errors (a bad `options.strategy` legitimately throws a code-less `TypeError` out of the
+WHATWG constructor) as internal gaps. The durable protection is the spike.
+
+**`scripts/spike-bun.mjs` asserted the *broken* behaviour, which is how the throw survived the
+rewrite meant to remove it.** The old block pinned `toWeb-throws:ERR_METHOD_NOT_IMPLEMENTED`, so
+when the stub became a real implementation that failed in a new way, the assertion did not stop
+it — it simply stopped matching. !125 flipped it to assert `toWeb-works:true` and to report
+`e.code || e.message`, which is what makes a code-less throw nameable from the CI log without a
+second run. This change adds the part that check still misses: it converts a real `Readable` in
+the guest and **reads the bytes back** (`toWeb-reads:toweb-bytes`), because "did not throw" passes
+equally for a converter that hands out an empty stream — and an empty stream is exactly what a
+half-wired adapter produces. The throw is also quoted into the failing check's own line. The
+`Bun.spawn().stdout` assertions in the same block are untouched.
+
+**The mirror note, on the other side of the seam.** `internal/streams/end-of-stream.js` is headed
+`VENDORED VERBATIM … Do not edit the body` with no mention of its export divergence, which is
+precisely what made copying upstream's import line look safe. Its header now names the shape
+(`{ eos, finished }` here versus a callable module upstream), the symptom it produced, and which
+binding to reach for. The importing side already carries the same note, so the next re-vendor
+has to walk past two of them.
+
+**The three hand-rolled Bun streams stay hand-built — and the usual justification for that is
+wrong.** It is *not* byte semantics. None of them is a `type: "bytes"` stream; they are ordinary
+default `ReadableStream`s enqueuing `Uint8Array`s, exactly like `Readable.toWeb`, and
+`getReader({mode:'byob'})` fails on both (see the pinned behaviour in entry C). Do not repeat that
+argument. The real reasons are per site. `bun-file.js`'s `.stream()` is not an implementation of
+the same behaviour at all: it opens **no fd until the consumer pulls**, so `.stream()` on a lazy
+`.slice()` stays as lazy as the slice, and it enqueues exactly one ≤64 KiB chunk per pull, where
+`Readable.toWeb(fs.createReadStream(…))` would chunk by the Readable's `highWaterMark` and the
+adapter would run ahead of the reader (it pushes from `'data'` and pauses only when
+`desiredSize <= 0`). `spike-bun-offline.mjs` asserts that bound directly (`widest <= 64 * 1024`),
+so switching would be a behaviour change against a live assertion inside a regression fix.
+`bun.js`'s `Bun.spawn().stdout`/`.stderr` is the more marginal call — `toWeb` would actually be
+*better* on backpressure — but it degrades worse: the hand-built helper returns the Node stream
+unchanged in a realm with no global `ReadableStream`, and `bun-bytes.js`'s
+`Bun.readableStreamTo*` consumers accept either, where `toWeb` would put
+`ERR_METHOD_NOT_IMPLEMENTED` inside `Bun.spawn()` itself. Switching is a behaviour change with no
+bug behind it and belongs in its own change with its own kernel-tier gate. All four comments
+(`bun.js:~970`, `bun-file.js` header and `.stream()`, `bun-bytes.js:~143`) now say the code
+*predates* a working `toWeb` and what the standing reason to stay hand-built is, instead of
+asserting that `toWeb` throws.
+
+**Verification — and the honest gap.** The `bun` kernel spike, the one that failed, **was not
+run**: `packages/vfs/pkg-node` is absent, there is no `cargo`/`rustc`/`wasm-pack` and no network,
+so the Rust→Wasm VFS cannot be built here and `scripts/run-spikes.mjs` skips the tier outright
+(`skip dep-cache: Wasm VFS not built`). What was run instead is the strongest substitute
+available: a harness that drives **the same guest module graph the VM uses** — `loader.js`'s own
+`FACTORIES` table, so the `Readable` under test is the vendored guest one and not host Node's —
+against the pre-fix and post-fix files. Pre-fix it reproduces the CI symptom bit for bit
+(`code=undefined`, `finished is not a function`); post-fix all 16 checks pass, covering the three
+`toWeb` directions reading their bytes back, multi-chunk pull-and-close, source-error
+propagation, the round trip through `Duplex`, the two StreamBase converters still throwing
+`ERR_METHOD_NOT_IMPLEMENTED`, and argument validation keeping its `ERR_INVALID_ARG_TYPE`s. A
+degraded realm with the queuing strategies deleted also passes, and one with `ReadableStream`
+deleted still produces the coded, message-bearing honest failure the previous change set promised.
+Alongside: `node --check` on all seven JS files touched, `probe-node-registry.mjs` PASS, and the
+offline tier 9/9. **None of that is an in-VM run.** The in-VM behaviour of this fix is argued and
+reproduced against the identical vendored module graph on host Node, not confirmed by a real
+kernel run — **CI is the first one.** Also still unverified: whether the rewritten
+`spawn-stream.ts` guest snippet transpiles and runs under the kernel's TS transform, and
+`Readable.toWeb` against the browser Worker's WHATWG classes rather than Node's.
+
+**Docs corrected with this change**, because several of them taught the opposite — and after
+!125 landed the code fix they contradicted the repository's own spike: `AGENTS.md` still said
+"`scripts/spike-bun.mjs` now asserts … that calling it throws" while that spike asserted
+`toWeb-works:true`. Specifically: AGENTS.md's
+`typeof`-guard gotcha is re-based on the real two-act story (the stub, then the code-less
+`TypeError`) and now absorbs the near-duplicate `Readable.toWeb` THROWS section that followed the
+Bun shim; the "ADAPTED, not vendored" gotcha gains the lesson this cost us — an upstream *import
+line* is no safer to copy wholesale than an upstream body; ARCHITECTURE.md's `.stream()`
+justification is now laziness and the pull bound rather than a broken `toWeb`; and the two
+historical write-ups above (`BunFile.stream()`, `Bun.spawn()`) are marked as history so nobody
+reads them as the present.

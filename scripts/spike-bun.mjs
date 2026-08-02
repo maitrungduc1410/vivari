@@ -1124,7 +1124,13 @@ console.log("\n== bun run ws-cork.ts (cork really coalesces into one socket writ
 // TypeError from an adapter that required end-of-stream's module object as if it
 // were the function. So this asserts toWeb WORKS, and that Bun.spawn() streams
 // whether or not it routes through it.
-console.log("\n== bun run spawn-stream.ts (Bun.spawn().stdout is a real ReadableStream in the VM) ==");
+//
+// "Did not throw" is not enough on its own — it would also pass for a converter
+// that hands out an empty stream — so the check below converts a real Readable
+// and READS THE BYTES BACK. Both throws report `e.code || e.message`, because the
+// second bug printed `toWeb-throws:undefined`: a code-less throw is the shape a
+// wrong binding takes, and it is the shape a CI log has to be able to name.
+console.log("\n== bun run spawn-stream.ts (Readable.toWeb + Bun.spawn().stdout in the VM) ==");
 {
   write("spawn-stream.ts", [
     "const out: string[] = [];",
@@ -1135,6 +1141,13 @@ console.log("\n== bun run spawn-stream.ts (Bun.spawn().stdout is a real Readable
     "const proc = Bun.spawn(['echo', 'hello-from-spawn']);",
     "out.push('stdout-has-getReader:' + (typeof proc.stdout.getReader === 'function'));",
     "(async () => {",
+    "  try {",
+    "    const web = Readable.toWeb(Readable.from([Buffer.from('toweb-bytes')]));",
+    "    const wr = web.getReader();",
+    "    let s = '';",
+    "    for (;;) { const c = await wr.read(); if (c.done) break; s += Buffer.from(c.value).toString('utf8'); }",
+    "    out.push('toWeb-reads:' + s);",
+    "  } catch (e: any) { out.push('toWeb-throws:' + (e && (e.code || e.message))); }",
     "  const reader = proc.stdout.getReader();",
     "  let text = '';",
     "  for (;;) {",
@@ -1156,8 +1169,12 @@ console.log("\n== bun run spawn-stream.ts (Bun.spawn().stdout is a real Readable
   const got = m ? JSON.parse(m[1]) : [];
   console.log("  ->", JSON.stringify(got));
   if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 800));
+  // The throw is quoted into the failing check itself, so the CI log names the
+  // failure without needing a second run.
+  const toWebThrow = got.find((s) => typeof s === "string" && s.startsWith("toWeb-throws:"));
   ok(got.includes("toWeb-looks-present:true"), "Readable.toWeb IS a function in the VM — which is why the `toWeb ? …` guard passed");
-  ok(got.includes("toWeb-works:true"), "…and calling it returns a stream instead of throwing, so the guard is finally safe");
+  ok(got.includes("toWeb-works:true"), "…and calling it returns a stream instead of throwing, so the guard is finally safe" + (toWebThrow ? " — got " + JSON.stringify(toWebThrow) : ""));
+  ok(got.includes("toWeb-reads:toweb-bytes"), "…and that stream really yields the source bytes, not an empty one");
   ok(got.includes("stdout-has-getReader:true"), "Bun.spawn().stdout is a WHATWG ReadableStream built by hand instead");
   ok(got.includes("stdout-text:hello-from-spawn"), "…and it actually streams the child's output");
   ok(got.includes("exited:0"), "proc.exited still resolves the exit code");

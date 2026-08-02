@@ -1222,9 +1222,15 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   nothing was written. Every write is chunked to 512 KiB (mirroring `FD_CHUNK`) and loops on
   the returned short-write count, and `.stream()` reads 64 KiB per `pull()` — the syscall
   window (§2) is the constraint in both directions. `.stream()` builds its `ReadableStream`
-  directly rather than calling `Readable.toWeb`, which the vendored stream core leaves
-  unimplemented (it throws, while still being a function — so a `typeof` guard does not
-  save you, and only the kernel spike catches it). Divergence: a `BunFile` is not a platform
+  directly rather than calling `Readable.toWeb(fs.createReadStream(…))`, and the reason is
+  laziness plus that bound, not a gap in the stream core: it opens no fd until the consumer
+  pulls (so `.stream()` on a lazy `.slice()` stays as lazy as the slice) and enqueues exactly
+  one ≤64 KiB chunk per pull, where through a Readable the chunking would follow that stream's
+  `highWaterMark` and the adapter would run ahead of the reader. `Readable.toWeb` did throw
+  in the VM for most of this file's life while still *being* a function — a `typeof` guard
+  does not save you there, and only the kernel spike catches it — but that is fixed
+  (`node/internal/webstreams/adapters.js`); it is history, not a live constraint. Divergence:
+  a `BunFile` is not a platform
   `Blob` instance, so `new Response(Bun.file(p))` stringifies rather than streaming; making
   it work is not portable between Node's undici and a browser Worker's native `Response`, so
   the gap is documented and pinned instead of papered over.

@@ -340,32 +340,64 @@ README.md · roadmap.md · research.md · ARCHITECTURE.md · AGENTS.md
 
 **Do not write `X.method ? X.method(…) : fallback` against a vendored Node API.**
 Our `node/lib/*` are Node's real files, so the *method exists*; what may not exist
-is its **implementation** underneath. `node/internal/webstreams/adapters.js`
-implements only `fromWeb` (what consuming a `fetch()` body needs) and leaves the
-other directions as functions that throw `ERR_METHOD_NOT_IMPLEMENTED`. So:
+— or may not work — is the **implementation** underneath. `Readable.toWeb` has
+failed that way twice, in two different shapes, and the presence check held through
+both of them:
 
 ```js
-typeof Readable.toWeb === "function"   // true, in the VM
-Readable.toWeb(stream)                 // throws ERR_METHOD_NOT_IMPLEMENTED
+typeof Readable.toWeb === "function"                              // true in the VM, in BOTH acts
+return Readable.toWeb ? Readable.toWeb(nodeStream) : nodeStream;  // so this never takes the fallback —
+                                                                  // the throw lands one frame later
 ```
 
-This has now bitten three separate places (`BunFile.stream()`, `Bun.spawn().stdout`
-and `.stderr`). It is nasty for one specific reason: **the offline spike tier runs
-on host Node, where `toWeb` genuinely works**, so the guard passes there and the
-code only fails inside the real VM. `Bun.spawn()` shipped in a state where every
-call threw, and the offline tier was green the whole time.
+1. **It was a stub.** `node/internal/webstreams/adapters.js` used to implement only
+   `fromWeb` (what consuming a `fetch()` body needs) and left the other directions
+   as functions that threw `ERR_METHOD_NOT_IMPLEMENTED`. That bit three separate
+   places (`BunFile.stream()`, `Bun.spawn().stdout` and `.stderr`); `Bun.spawn()`
+   shipped in a state where every call threw.
+2. **Then the real implementation died on an import line.** All six converters are
+   genuine now — but the version that merged kept upstream's
+   `const finished = require("internal/streams/end-of-stream")`, which is correct
+   upstream because *upstream's* copy of that module is callable. **Ours exports
+   the pair `{ eos, finished }`**, so `finished` bound the module object and every
+   conversion threw `TypeError: finished is not a function` at the first
+   `finished(stream, cb)` — a bare `TypeError` with **no `code`**. All three
+   `toWeb` directions were dead in the VM; the three `fromWeb` directions were
+   unaffected, which is why corepack never noticed. The fix is
+   `const { eos: finished } = require("internal/streams/end-of-stream")`.
+
+Act 2 is the stronger version of the lesson, not a retirement of it: a presence
+guard sails past a code-less `TypeError` exactly as happily as past
+`ERR_METHOD_NOT_IMPLEMENTED`, and this time there is not even an error code to
+match on. Both acts were invisible outside the VM for the same structural reason:
+**the offline spike tier runs on host Node, where `toWeb` genuinely works**, so the
+guard passes there and the code only fails inside the real VM.
+`scripts/probe-node-registry.mjs` cannot see this class either, and says so in its
+own header — a registered id whose exports lack the member the caller destructures
+passes the probe, because the id resolves and only its *shape* is wrong.
 
 Two rules follow:
 
 1. **Detect by behaviour, not by presence** — or better, don't detect: build the
    `ReadableStream` by hand from `'data'`/`'end'`/`'error'` (see the `web()` helper
-   in `builtins/bun.js` and `.stream()` in `builtins/bun-file.js`).
+   in `builtins/bun.js` and `.stream()` in `builtins/bun-file.js`). Read those two
+   comments before assuming why they are hand-built, though: `toWeb` works now, and
+   they stay hand-built on their own merits — `.stream()` for its laziness and its
+   one-chunk-≤64-KiB-per-pull bound, `Bun.spawn()` because it returns the Node
+   stream unchanged in a realm with no global `ReadableStream`, where `toWeb`
+   throws `ERR_METHOD_NOT_IMPLEMENTED`.
 2. **Anything touching Web-Streams interop must be proven in the kernel tier**
    (`scripts/spike-bun.mjs`), not just the offline tier. If a check would pass on
    host Node for a reason that has nothing to do with our runtime, it is not
-   evidence. `scripts/spike-bun.mjs` now asserts *both* that `typeof
-   Readable.toWeb === "function"` and that calling it throws, so this specific
-   trap stays documented by a test rather than by memory.
+   evidence. This is the rule that caught act 2 — CI reported it as
+   `toWeb-throws:undefined`. The spike now converts a real `Readable` in the VM and
+   **reads the bytes back** (present / does not throw / yields `toweb-bytes`),
+   because "did not throw" would also pass for a converter that hands out an empty
+   stream, and it reports `e.code || e.message` so a code-less failure is nameable
+   from the CI log alone. The `toWeb-works` half of that landed with the fix
+   (!125); the byte read-back was added afterwards and **has not run in the VM at
+   the time of writing** — the Wasm VFS the kernel tier needs could not be built in
+   the environment it was written in, so CI is its first real in-VM run.
 
 ### `capture: true` hides a process's stderr from `VV_LIVE=1`
 `kernel.start(cmd, args, { capture: true })` buffers the child's output into
@@ -955,7 +987,9 @@ unpacked:
   until `end()` (the old one lost everything on a crash and held the whole file in
   memory); and every write is chunked to `WRITE_CHUNK` = 512 KiB, mirroring `FD_CHUNK`,
   with the returned short-write count believed. `.stream()` builds its own
-  `ReadableStream` from fd reads — see the `Readable.toWeb` gotcha below.
+  `ReadableStream` from bounded fd reads — for the laziness (no fd until the consumer
+  pulls) and the one-chunk-≤64-KiB-per-pull bound, not because `Readable.toWeb` is
+  broken; it works now. See the `typeof`-guard gotcha above for that history.
 - **`packages/runtime/builtins/bun-bytes.js`** — `Bun.ArrayBufferSink`, the seven
   `Bun.readableStreamTo*` consumers, `Bun.concatArrayBuffers` and `Bun.allocUnsafe`.
   Nothing vendored. Two contracts to preserve: `ArrayBufferSink.flush()` returns an
@@ -1267,28 +1301,6 @@ used the root require and told users to `bun add @sqlite.org/sqlite-wasm`, i.e. 
 it somewhere the probe was structurally unable to look. Anything resolving a user package
 must use `makeCwdRequire()` (a factory, so a `process.chdir()` is honoured), which is the
 same thing `__ocImport` in `index.js` already does for bare specifiers.
-
-### `Readable.toWeb` THROWS — and a present-but-unimplemented function defeats a `typeof` guard
-`node/internal/webstreams/adapters.js` implements only `Readable.fromWeb` (the
-direction that turns a `fetch()` body into a Node stream, which is what corepack's
-tarball download needs). Every other direction — `Readable.toWeb`,
-`Writable.fromWeb`/`toWeb`, `Duplex.*` — is a real function that raises
-`ERR_METHOD_NOT_IMPLEMENTED` when called. So the defensive idiom that looks right,
-
-```js
-return Readable.toWeb ? Readable.toWeb(nodeStream) : nodeStream;   // WRONG
-```
-
-never takes the fallback: the property is there, and the throw happens one frame
-later. Worse, it only fails **in the VM** — on the host Node the offline spikes run
-on, `toWeb` works — so the offline tier goes green and the product is broken. That
-is exactly how `Bun.file(p).stream()` shipped un-runnable until the kernel spike ran
-it (`BunFile.stream()` now builds a `ReadableStream` from bounded fd reads instead;
-`Bun.spawn().stdout`/`.stderr` still use the guard and are still affected). Two
-rules: **feature-detect by capability, not by presence**, when the vendored runtime
-is allowed to stub a method loudly; and if a code path can only be exercised
-through the VM's own `fs`/`stream`, it is not covered until `scripts/spike-bun.mjs`
-(or a sibling kernel spike) exercises it.
 
 ### Python is Pyodide (CPython→WASM), lazily booted — with a Flask/FastAPI HTTP bridge
 Unlike the Node-backed Bun shim, `python`/`python3` boots **real CPython compiled to
@@ -1671,6 +1683,21 @@ don't "restore" it from an upstream copy:
 - Upstream reads the `SafePromiseAll`/`SafePromisePrototypeFinally` primordials,
   which `node/primordials.js` cannot resolve — *destructuring* them throws. The
   file uses plain intrinsics, like the other hand-written `internal/*` modules.
+
+The same distinction bites in the small, and cost the whole `toWeb` surface once:
+**an import line copied from upstream is not safe here either.** This file shipped
+with upstream's `const finished = require("internal/streams/end-of-stream")`, correct
+upstream because that module is callable there. Ours exports the plain pair
+`{ eos, finished }` (`node/internal/streams/end-of-stream.js:344`), so the line bound
+an object and all three `toWeb` conversions died in the VM on
+`TypeError: finished is not a function`, with no `code` to grep for. It reads
+`const { eos: finished } = require(…)` now, aliased rather than renamed so the six
+converter bodies stay character-identical to upstream and re-vendoring stays
+diffable. `eos` is the callback form that returns a cleanup function; the sibling
+`finished` export is the **promise-returning** variant, so the plausible-looking
+`const { finished } = require(…)` is also wrong and would break the cleanup contract
+one frame later instead. Check what a module in this tree actually exports before
+trusting upstream's binding for it.
 
 One deliberate divergence from upstream's logic: `writev` splits its fulfilled and
 rejected handlers. Upstream installs one handler for both and calls `.filter()` on

@@ -2894,10 +2894,11 @@ console.log("== BunFile: FileSink flushes incrementally, and every write is chun
   ok((await B.file(at("big.bin")).slice(1499995).text()) === "xxxxx", "and a slice past the window boundary reads back correctly");
 
   // Reading is bounded too. `.stream()` is built from fd reads rather than
-  // Readable.toWeb — which our vendored stream core leaves unimplemented, so it
-  // EXISTS as a function and throws when called (the kernel tier is where that
-  // surfaced) — and it hands out one 64 KiB chunk per pull, so streaming a file
-  // never materialises it.
+  // Readable.toWeb — it predates a working toWeb (which threw in the VM until
+  // internal/webstreams/adapters.js was fixed) and it stays hand-built for the
+  // bound this very check asserts: one <= 64 KiB chunk per pull, so streaming a
+  // file never materialises it. Through a Readable the chunk size would be that
+  // stream's highWaterMark. See builtins/bun-file.js.
   const stream = B.file(at("big.bin")).stream();
   ok(typeof stream.getReader === "function", ".stream() is a real WHATWG ReadableStream, not a Node Readable in disguise");
   const reader = stream.getReader();

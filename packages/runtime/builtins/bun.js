@@ -1014,14 +1014,17 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
       env: opts.env || process.env,
     });
     // Bun types `.stdout`/`.stderr` as ReadableStream, so we do have to adapt the
-    // Node stream — but NOT with `Readable.toWeb`. That is the obvious one-liner
-    // and it is a trap, the same one documented at length in bun-file.js:
-    // node/internal/webstreams/adapters.js implements only `fromWeb` and leaves
-    // `toWeb` as a function that raises ERR_METHOD_NOT_IMPLEMENTED. So the
-    // natural `Readable.toWeb ? … : …` guard is TRUE and then throws — and it
-    // throws from Bun.spawn() itself, meaning every Bun.spawn call failed in the
-    // VM while the offline tier (host Node, where toWeb works) stayed green.
-    // Feature-detecting by presence is the bug; we adapt by hand instead.
+    // Node stream. This adapts by hand rather than calling `Readable.toWeb`.
+    //
+    // It was written that way because `toWeb` was a throwing stub — present as a
+    // function, so the natural `Readable.toWeb ? … : …` guard sailed past it and
+    // then threw from inside Bun.spawn() itself. That is FIXED (see
+    // node/internal/webstreams/adapters.js); toWeb now works in the VM and the
+    // spike proves it. This code is kept because it is what CI exercises and
+    // because it degrades where toWeb cannot: a realm with no global
+    // ReadableStream gets the Node stream back (bun-bytes.js's consumers accept
+    // either), where toWeb would throw ERR_METHOD_NOT_IMPLEMENTED. Switching is
+    // a behaviour change, not a fix — do it deliberately, with its own gate.
     const web = (nodeStream) => {
       if (!nodeStream) return nodeStream;
       if (typeof ReadableStream !== "function") return nodeStream;

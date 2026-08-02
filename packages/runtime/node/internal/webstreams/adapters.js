@@ -25,6 +25,9 @@
 //   * `isReadableStream`/`isWritableStream` come from internal/streams/utils
 //     (duck-typing) rather than upstream's brand checks, because there is no
 //     bundled implementation to brand-check against.
+//   * `finished` is bound as `{ eos: finished }` — this tree's
+//     internal/streams/end-of-stream exports a pair, not a callable module.
+//     Re-vendoring upstream's import line reintroduces the bug it caused.
 //   * `writev` splits its fulfilled/rejected handlers (upstream shares one and
 //     then calls `.filter()` on the rejection reason, which is an Error).
 //   * newWritableStreamFromStreamBase / newReadableStreamFromStreamBase are not
