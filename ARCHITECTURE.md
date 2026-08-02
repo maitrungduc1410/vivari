@@ -1466,9 +1466,21 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   returning a placeholder: `Bun.file(fd)` and `Bun.write(fd, …)` (our fds are VFS handles),
   `Bun.file()` with a non-path argument, reading `Bun.stdout`/`Bun.stderr` (write-only sinks
   here — the process's output reaches the kernel by message, not through a readable file),
-  `Bun.Transpiler.scan`/
-  `scanImports` (the transform builds no import graph), the `bun:jsc` heap helpers (no engine
+  the `bun:jsc` heap helpers (no engine
   hook). Same import-safe/call-loud tier as `bun:ffi`.
+- `packages/runtime/builtins/bun-transpiler.js` — **`Bun.Transpiler`**, including the scan
+  family. `scan`/`scanImports` used to be in that throwing tier, on the honest grounds that
+  the transform is a type stripper and builds no import graph. `Bun.build` changed the facts:
+  its dependency walk already lexes ESM (the vendored `es-module-lexer`) and already finds
+  `require()` calls with a real JS lexer, so the scan family is those two run over the same
+  type-stripped source and merged by offset to recover source order.
+  **The two methods report different sets, and reproducing that is the point:** `scan()`
+  carries `import-statement`, `dynamic-import` and `require-resolve`; `scanImports()` carries
+  `import-statement`, `dynamic-import` and `require-call`. A file whose only dependency is
+  `require("x")` therefore scans as importing nothing, exactly as under real Bun. Neither
+  result is deduplicated, both are in source order, and `exports` is sorted by code unit
+  rather than left in source order. Every case is pinned to output captured from a real
+  binary (1.3.6) in `scripts/spike-bun-offline.mjs`.
 - **`packages/runtime/builtins/bun-unsupported.js` is the catalogue of what a browser tab
   cannot do**, and the one file here with no implementation to read. Roughly twenty of Bun's
   APIs were plain `undefined` — `Bun.listen`/`connect` (raw TCP), `Bun.udpSocket`,

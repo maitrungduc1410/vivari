@@ -5934,3 +5934,71 @@ same guest module graph the VM uses. Specifically unverified: whether a real bro
 allows any given `http://` target (the mixed-content and Private Network Access behaviour is
 argued from the specs, not observed), the async `__ocfetchAsync` path against the real kernel
 scheduler rather than a resolved promise, and a real outbound plain-HTTP request end to end.
+
+## `Bun.Transpiler.scan()` — and the three module clauses the type stripper ate (this change)
+
+The last item the Bun plan left open. `scan()`/`scanImports()` had been made to throw in the
+first correctness pass, on grounds that were true when written: they had returned hard-coded
+empty arrays, which reads as "this file imports nothing" and is a wrong answer a caller cannot
+detect, and the transform behind them is a type stripper, not a parser. The note said "make
+real in Phase 5". Phase 5 shipped `Bun.build` and did not come back to it — but it built the
+missing half on the way past, so this is mostly wiring: the bundler's dependency walk already
+lexes ESM with the vendored `es-module-lexer`, and already finds `require()` with a real JS
+lexer that skips strings, comments and regex. Run both over the same type-stripped source,
+merge by offset, and source order falls out.
+
+**The interesting part was not the implementation; it was discovering what Bun actually
+answers.** Every case was captured from a real binary (1.3.6, d530ed99) rather than read out
+of the docs, and the docs would not have got there. `scan()` and `scanImports()` are not the
+same scanner with different return shapes — they report *different sets*:
+
+| | `import-statement` | `dynamic-import` | `require-call` | `require-resolve` |
+| --- | --- | --- | --- | --- |
+| `scan()` | ✅ | ✅ | ❌ | ✅ |
+| `scanImports()` | ✅ | ✅ | ✅ | ❌ |
+
+So a CommonJS file whose only dependency is `require("x")` scans as importing **nothing**, and
+a file whose only dependency is `require.resolve("x")` scanImports as importing nothing. That
+is reproduced rather than smoothed over, for the usual reason: a caller who picked the wrong
+method under real Bun should get the same empty answer here, not a sandbox that is quietly
+more helpful than production. Also captured and pinned: results are **not** deduplicated, they
+are in source order, `exports` **is** sorted by code unit (so `["A","B","a","b"]`, not the
+source's order), `import type` contributes nothing while an inline `{ type T, v }` still
+reports its module, and a dynamic `import(x)` with a non-literal specifier reports nothing
+rather than guessing. 47 cases, byte-for-byte.
+
+Two divergences are written down instead of faked. Real Bun's automatic JSX runtime injects
+`react/jsx-runtime` and `react` require-calls into `scanImports()` for a file that uses JSX;
+ours emits classic `React.createElement`, which introduces no specifier at all, so they are
+absent — emitting them would name a module Vivari would never load. And the scanner is a lexer,
+not a parser, so genuinely invalid source can still scan cleanly where Bun raises a
+`BuildMessage`.
+
+### The part that was not planned
+
+Pinning `scan()` against a real binary meant the type stripper's output had to parse, and it
+turned out that for three ordinary TypeScript constructs it did not. All three are in
+`typescript-transform.js`, all three are the same mistake — a rule written for *expressions*
+reaching into an `import`/`export` **clause**, which looks like one and is not:
+
+- `import type { T } from "m";` became ` from "m";`. `dropStatement()`'s rule is "a balanced
+  `{…}` ends the statement", which is right for an `interface` or `enum` body and wrong for a
+  specifier list, which the statement continues past. **`SyntaxError` at load.**
+- `import * as ns from "m";` became `import * ;`. The `as`/`satisfies` cast rule ate the
+  namespace binding. **`SyntaxError` at load** — every `import * as fs from "fs"` in a `.ts`
+  file, one of the most ordinary lines in TypeScript.
+- `export { a, b as c };` became `export { a, b };`. Same rule, and the worst outcome of the
+  three: the rename is silently dropped, the importer receives `undefined`, and the process
+  **exits 0**. Nothing anywhere says a thing.
+
+An `import` declaration, and an `export` before `{` or `*`, are now copied through verbatim —
+nothing inside a module clause is ever a type. `export default …` and `export const x = y as T`
+are ordinary code and still get stripped.
+
+**Why this survived.** These only bite files the loader itself compiles: in a Vite or Next
+project the bundler transpiles TS, so the templates never exercised it. And the check that
+covered type-only imports had asserted the *type names were absent* with a regex — a statement
+stripped down to a dangling ` from "./foo";` satisfies that perfectly. It passed for as long as
+it existed. The replacement asserts the output **parses**, and the kernel tier runs the file:
+the namespace import loads, and the renamed export arrives as `2` rather than `undefined`.
+That is the general rule now in AGENTS.md — a string assertion cannot see a load failure.

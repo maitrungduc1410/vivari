@@ -87,7 +87,7 @@ The shim is not a stub list. `Bun.serve` (with `routes`, `fetch`, an `error`
 handler and server-side WebSockets), `Bun.file`/`Bun.write` and the incremental
 `FileSink`, `Bun.$`, `Bun.spawn`, `Bun.Glob`, `Bun.FileSystemRouter`,
 `Bun.CryptoHasher` and `Bun.password`, `Bun.hash`, `Bun.YAML`/`TOML`/`JSON5`,
-`Bun.build` and `Bun.plugin` (see below), zero-config TypeScript, automatic
+`Bun.build` and `Bun.plugin` (see below), `Bun.Transpiler`, zero-config TypeScript, automatic
 `.env` loading with Bun's precedence rules, and
 the `bun:test` runner all behave as documented — and where they diverge, the
 divergence is written down rather than discovered.
@@ -126,6 +126,46 @@ Four divergences, all deliberate:
 rather than something created, are real Bun behaviours and are reproduced.
 
 Start from any template in the Studio's **Bun** category.
+
+### `Bun.Transpiler` and the scan family
+
+`transformSync`/`transform` strip types with the same transform the loader uses.
+`scan()` and `scanImports()` report what a file imports and exports, without
+resolving or running anything:
+
+```ts
+const t = new Bun.Transpiler({ loader: "ts" });
+
+t.scan(`import { a } from "./a"; export const b = 1;`);
+// { exports: ["b"], imports: [{ kind: "import-statement", path: "./a" }] }
+```
+
+**The two methods do not report the same set.** This surprises people, so it is
+worth stating plainly — it is Bun's behaviour, reproduced deliberately:
+
+| kind | `scan()` | `scanImports()` |
+| --- | :---: | :---: |
+| `import-statement` (including `export … from`) | ✅ | ✅ |
+| `dynamic-import` | ✅ | ✅ |
+| `require-call` | ❌ | ✅ |
+| `require-resolve` | ✅ | ❌ |
+
+So a CommonJS file whose only dependency is `require("x")` **scans as importing
+nothing**. If you are crawling dependencies, `scanImports()` is almost always the
+one you want.
+
+Other behaviour worth knowing, all of it matching real Bun: results are in source
+order and are **not** deduplicated, so a module imported twice appears twice;
+`exports` **is** sorted (by code unit, so `["A", "B", "a", "b"]`); `import type`
+contributes nothing; and a dynamic `import(someVariable)` reports nothing rather
+than guessing at the specifier.
+
+Two things differ from real Bun. A `.jsx`/`.tsx` file that uses JSX gets two extra
+`require-call` entries from Bun — `react/jsx-runtime` and `react`, injected by its
+automatic JSX runtime — which are absent here, because Vivari's JSX transform emits
+classic `React.createElement` and introduces no new specifier at all. And the
+scanner is a lexer rather than a full parser, so source that is genuinely invalid
+may scan cleanly instead of raising.
 
 ## Bundling with `Bun.build`
 

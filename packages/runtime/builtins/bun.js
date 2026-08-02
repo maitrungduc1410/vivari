@@ -50,7 +50,12 @@
 // Response, no shim code — see bun-bytes.js), the data formats Bun.YAML.parse,
 // Bun.TOML.parse/stringify, Bun.JSON5.parse/stringify, Bun.JSONL.parse/parseChunk
 // and Bun.semver.satisfies/order (vendored real parsers — see ./bun-formats.js),
-// Bun.Transpiler.transformSync/transform (the loader's own type-stripper),
+// Bun.Transpiler — transformSync/transform (the loader's own type-stripper) and
+// scan()/scanImports(), which report a file's imports and exports without
+// resolving anything, backed by the module lexer plus a require scanner over the
+// same lexer Bun.build uses. The two methods report DIFFERENT sets and that is
+// reproduced, not smoothed over: scan() carries require.resolve but NOT
+// require(), scanImports() the exact inverse (see bun-transpiler.js),
 // Bun.build — a REAL dependency-graph bundler (multi-file, npm deps, JSON, TS/JSX,
 // ESM+CJS mixed, cycles) written against the loader's own resolver so no bundler
 // need be installed, returning Bun's {success, outputs: BuildArtifact[], logs} with
@@ -136,8 +141,7 @@
 // String()-ed into a path like "undefined"), reading
 // Bun.stdout/Bun.stderr (write-only sinks here — the process's output is
 // delivered to the kernel by message, not backed by a readable file),
-// Bun.Transpiler.scan/scanImports (the
-// transform builds no import/export graph), Bun.hash.xxHash3/rapidhash (not
+// Bun.hash.xxHash3/rapidhash (not
 // ported, and we have no reference vector to verify a port against), and the bun:jsc
 // heap-introspection helpers (no engine hook exists in a page). Bun.password
 // throws without the Rust/Wasm crypto codec rather than falling back: argon2id and
@@ -239,7 +243,6 @@
 // SQLite stays in its `delete` journal mode, which is what SQLite itself does when
 // a VFS declines WAL.
 
-import { transpileTypeScript } from "../typescript-transform.js";
 // The data-format, text/terminal, bytes/streams, hash and glob members live in
 // their own files: this one is already long, and each group is self-contained
 // pure computation pinned by its own checks. See the header of each for why they
@@ -278,6 +281,11 @@ import { createBunUnsupported, createBunFfi, assertNoPty } from "./bun-unsupport
 // why the bundler is ours rather than esbuild-wasm, and for the standing caveat
 // that the output bytes are NOT identical to real Bun's.
 import { createBunBuild } from "./bun-build.js";
+// Bun.Transpiler. scan()/scanImports() moved out with it when they stopped
+// throwing: they are backed by the module lexer and the require scanner the
+// bundler above already owns, and the two methods report DIFFERENT sets (see
+// that file's header — it is Bun's behaviour, not ours).
+import { makeTranspilerClass } from "./bun-transpiler.js";
 
 // The two documented Bun.hash members we did not port. The message names the
 // algorithm and says why, in the same spirit as the bun:ffi one: a caller who hits
@@ -299,14 +307,6 @@ const HASH_UNSUPPORTED = (name) =>
 // scripts/spike-bun-offline.mjs asserts against BUN_VERSION.
 export const BUN_VERSION = "1.1.34";
 export const BUN_REVISION = BUN_VERSION + "-vivari";
-
-const TRANSPILER_SCAN_UNSUPPORTED = (method) =>
-  "Bun.Transpiler." +
-  method +
-  "() is not implemented in the Vivari shim: it is backed by the loader's " +
-  "type-stripping transform, which does not parse an import/export graph. It " +
-  "used to return an empty result, which was indistinguishable from a file with " +
-  "no imports.";
 
 // `require` is rooted at "/" (packages/runtime/index.js). `makeCwdRequire()` builds one
 // rooted at the running process's working directory, so a bare specifier finds the
@@ -1260,7 +1260,8 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     get stderr() { return files.stderr; },
     // GC / memory introspection: no-ops (no manual GC exposed in the sandbox).
     gc: () => {},
-    // A thin Transpiler shim over the same TS transform the loader uses.
+    // transformSync/transform over the same TS transform the loader uses, plus a
+    // real scan()/scanImports() — see ./bun-transpiler.js.
     Transpiler: makeTranspilerClass(),
     // Bundling + plugins (./bun-build.js). Output is NOT byte-identical to Bun's.
     build: builder.build,
@@ -1325,24 +1326,6 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
   }
 
   return { Bun, modules, loadDotenv };
-
-  function makeTranspilerClass() {
-    return class Transpiler {
-      constructor(opts) { this._opts = opts || {}; }
-      transformSync(code, loaderOrOpts) {
-        const loader = typeof loaderOrOpts === "string" ? loaderOrOpts : (this._opts.loader || "tsx");
-        const ext = loader === "ts" ? ".ts" : loader === "jsx" ? ".jsx" : loader === "js" ? ".js" : ".tsx";
-        return transpileTypeScript(code, "input" + ext);
-      }
-      async transform(code, loader) { return this.transformSync(code, loader); }
-      // scan()/scanImports() used to return hard-coded empties, which reads as "this
-      // file imports nothing" — a wrong answer a caller cannot detect. The transform
-      // in typescript-transform.js is a type-stripper, not a parser: it never builds
-      // an import/export graph, so there is nothing honest to return. Fail loudly.
-      scan() { throw new Error(TRANSPILER_SCAN_UNSUPPORTED("scan")); }
-      scanImports() { throw new Error(TRANSPILER_SCAN_UNSUPPORTED("scanImports")); }
-    };
-  }
 }
 
 // ---- bun:test ---------------------------------------------------------------

@@ -38,6 +38,9 @@ import {
   loadBunEnvFiles,
 } from "../packages/runtime/builtins/bun-env.js";
 import { createSleepSync } from "../packages/runtime/builtins/bun-sleep.js";
+// Bun.Transpiler's scan family, exported for the same reason: the answers are
+// pinned to a real Bun binary's, and both are pure functions of a source string.
+import { bunScan, bunScanImports } from "../packages/runtime/builtins/bun-transpiler.js";
 // The pure halves of the bun:test runner. They are exported precisely so this
 // tier can pin them against bytes captured from a real `bun test` — see the
 // Phase 5A sections at the end of this file.
@@ -1126,8 +1129,14 @@ console.log("== silently-wrong stubs now throw ==");
 
   const tr = new Bun.Transpiler({ loader: "ts" });
   const throws = (fn) => { try { fn(); return ""; } catch (e) { return e.message; } };
-  ok(/Bun\.Transpiler\.scan\(\) is not implemented/.test(throws(() => tr.scan("import a from 'b';"))), "Transpiler.scan() throws instead of returning empty arrays");
-  ok(/Bun\.Transpiler\.scanImports\(\) is not implemented/.test(throws(() => tr.scanImports("import a from 'b';"))), "Transpiler.scanImports() throws instead of returning []");
+  // scan()/scanImports() used to throw here: they had returned hard-coded empty
+  // arrays, which reads as "this file imports nothing" and is a wrong answer a
+  // caller cannot detect. They are real now (see the pinned section at the end of
+  // this file); these two check the WIRING — that the class reaches them and
+  // carries its constructor loader — rather than the answers.
+  ok(JSON.stringify(tr.scan("import a from 'b';")) === '{"exports":[],"imports":[{"kind":"import-statement","path":"b"}]}', "Transpiler.scan() answers through the class");
+  ok(JSON.stringify(tr.scanImports("import a from 'b';")) === '[{"kind":"import-statement","path":"b"}]', "Transpiler.scanImports() likewise");
+  ok(tr.scan("enum E { A }\nexport const a = 1;").exports.length === 1, "…using the loader the constructor was given (a `ts` source scans)");
   ok(tr.transformSync("const x: number = 1;").indexOf(": number") === -1, "Transpiler.transformSync still works");
 
   const jsc = modules["bun:jsc"];
@@ -4905,6 +4914,172 @@ console.log("== bun test CLI flags are parsed, not dropped (BUN_PROGRAM as a rea
   } finally {
     fsMod.rmSync(dir, { recursive: true, force: true });
   }
+}
+
+console.log("== Bun.Transpiler.scan / scanImports (pinned to real Bun 1.3.6) ==");
+{
+  // Every row below is what a real `bun` binary answered (1.3.6, d530ed99),
+  // captured rather than derived: the two methods report DIFFERENT sets, and no
+  // amount of reading the docs would have predicted that a file whose only
+  // dependency is `require("x")` scans as importing nothing. Columns are
+  // [name, loader, source, scan().exports, scan().imports, scanImports()].
+  const T = [
+  ["default import", "ts", "import a from \"m1\";", [], [["import-statement","m1"]], [["import-statement","m1"]]],
+  ["named import", "ts", "import { a, b as c } from \"m2\";", [], [["import-statement","m2"]], [["import-statement","m2"]]],
+  ["namespace import", "ts", "import * as ns from \"m3\";", [], [["import-statement","m3"]], [["import-statement","m3"]]],
+  ["side-effect import", "ts", "import \"m4\";", [], [["import-statement","m4"]], [["import-statement","m4"]]],
+  ["default + named", "ts", "import d, { a as b } from \"m\";", [], [["import-statement","m"]], [["import-statement","m"]]],
+  ["dynamic import", "ts", "const p = import(\"m5\");", [], [["dynamic-import","m5"]], [["dynamic-import","m5"]]],
+  ["dynamic import template", "ts", "const p = import(`m6`);", [], [["dynamic-import","m6"]], [["dynamic-import","m6"]]],
+  ["dynamic import variable", "ts", "const p = import(x);", [], [], []],
+  ["require call", "ts", "const r = require(\"m7\");", [], [], [["require-call","m7"]]],
+  ["require template", "ts", "const r = require(`tpl`);", [], [], [["require-call","tpl"]]],
+  ["require.resolve", "ts", "const r = require.resolve(\"m8\");", [], [["require-resolve","m8"]], []],
+  ["import attributes", "ts", "import a from \"m\" with { type: \"json\" };", [], [["import-statement","m"]], [["import-statement","m"]]],
+  ["import.meta", "ts", "const u = import.meta.url;", [], [], []],
+  ["export from", "ts", "export { a } from \"m9\";", ["a"], [["import-statement","m9"]], [["import-statement","m9"]]],
+  ["export star from", "ts", "export * from \"m10\";", [], [["import-statement","m10"]], [["import-statement","m10"]]],
+  ["export star as", "ts", "export * as ns from \"m11\";", ["ns"], [["import-statement","m11"]], [["import-statement","m11"]]],
+  ["import type", "ts", "import type { T } from \"m12\";", [], [], []],
+  ["inline type specifier", "ts", "import { type T, v } from \"m13\";", [], [["import-statement","m13"]], [["import-statement","m13"]]],
+  ["export type from", "ts", "export type { T } from \"m14\";", [], [], []],
+  ["export const/fn/class", "ts", "export const a = 1; export function b() {} export class C {}", ["C","a","b"], [], []],
+  ["export default", "ts", "export default 1;", ["default"], [], []],
+  ["export default fn", "ts", "export default function foo(){}", ["default"], [], []],
+  ["export list with rename", "ts", "const a = 1, b = 2; export { a, b as c };", ["a","c"], [], []],
+  ["export as default", "ts", "const a=1; export { a as default };", ["default"], [], []],
+  ["export destructured", "ts", "export const { a, b } = obj; export const [c, d] = arr;", ["a","b","c","d"], [], []],
+  ["export let/var", "ts", "export let a=1; export var b=2;", ["a","b"], [], []],
+  ["export enum", "ts", "export enum E { A }", ["E"], [], []],
+  ["export interface", "ts", "export interface I {}", [], [], []],
+  ["export type alias", "ts", "export type X = number;", [], [], []],
+  ["export ordering", "ts", "export const b=1; export const A=2; export const a=3; export const B=4;", ["A","B","a","b"], [], []],
+  ["export ordering symbols", "ts", "export const _a=1; export const $b=2; export const c=3;", ["$b","_a","c"], [], []],
+  ["cjs module.exports", "ts", "module.exports = { a: 1 };", [], [], []],
+  ["empty source", "ts", "", [], [], []],
+  ["require in string", "ts", "const s = 'require(\"no\")';", [], [], []],
+  ["require in comment", "ts", "// require(\"no\")\nconst a = 1;", [], [], []],
+  ["commented import", "ts", "// import x from \"commented\";\nconst a = 1;", [], [], []],
+  ["member .require", "ts", "const r = obj.require(\"nope\");", [], [], []],
+  ["require variable arg", "ts", "const r = require(x);", [], [], []],
+  ["require concatenated", "ts", "const r = require(\"a\" + \"b\");", [], [], []],
+  ["require conditional", "ts", "if (x) { require(\"cond\"); }", [], [], [["require-call","cond"]]],
+  ["require shadowed param", "ts", "function f(require){ return require(\"shadow\"); }", [], [], [["require-call","shadow"]]],
+  ["nested require", "ts", "function f() { return require(\"deep\"); }", [], [], [["require-call","deep"]]],
+  ["source order", "ts", "require(\"z\"); import a from \"y\"; const p = import(\"x\");", [], [["import-statement","y"],["dynamic-import","x"]], [["require-call","z"],["import-statement","y"],["dynamic-import","x"]]],
+  ["duplicates kept", "ts", "import a from \"dup\"; import b from \"dup\"; require(\"dup\");", [], [["import-statement","dup"],["import-statement","dup"]], [["import-statement","dup"],["import-statement","dup"],["require-call","dup"]]],
+  ["import and require same", "ts", "import a from \"same\"; const r = require(\"same\");", [], [["import-statement","same"]], [["import-statement","same"],["require-call","same"]]],
+  ["js loader", "js", "import a from \"m15\"; export const b = 1;", ["b"], [["import-statement","m15"]], [["import-statement","m15"]]],
+  ["tsx no jsx used", "tsx", "import React from \"react\"; export const x = 1;", ["x"], [["import-statement","react"]], [["import-statement","react"]]],
+  ];
+  const pair = (list) => list.map((x) => [x.kind, x.path]);
+  let mismatched = 0;
+  for (const [name, loader, src, wantExports, wantImports, wantScanImports] of T) {
+    const s = bunScan(src, loader);
+    const i = bunScanImports(src, loader);
+    const bad =
+      JSON.stringify(s.exports) !== JSON.stringify(wantExports) ||
+      JSON.stringify(pair(s.imports)) !== JSON.stringify(wantImports) ||
+      JSON.stringify(pair(i)) !== JSON.stringify(wantScanImports);
+    if (bad) {
+      mismatched++;
+      console.log("     " + name + ": exports=" + JSON.stringify(s.exports) + " imports=" + JSON.stringify(pair(s.imports)) + " scanImports=" + JSON.stringify(pair(i)));
+      console.log("     " + " ".repeat(name.length) + "  want " + JSON.stringify(wantExports) + " / " + JSON.stringify(wantImports) + " / " + JSON.stringify(wantScanImports));
+    }
+  }
+  ok(mismatched === 0, T.length + " scan/scanImports cases match real Bun byte-for-byte");
+
+  // The two divergences, asserted so they cannot drift silently.
+  //
+  // 1) scan() drops require-call, scanImports() drops require-resolve. Spelled
+  //    out separately because it is the single most surprising thing here.
+  ok(bunScan('require("x");', "ts").imports.length === 0, "scan() reports NO import for a bare require() — as Bun does");
+  ok(JSON.stringify(bunScanImports('require("x");', "ts")) === '[{"kind":"require-call","path":"x"}]', "…while scanImports() reports it");
+  ok(JSON.stringify(bunScan('require.resolve("x");', "ts").imports) === '[{"kind":"require-resolve","path":"x"}]', "scan() reports require.resolve()");
+  ok(bunScanImports('require.resolve("x");', "ts").length === 0, "…while scanImports() does NOT — the exact inverse");
+
+  // 2) Real Bun's automatic JSX runtime injects `react/jsx-runtime` + `react`
+  //    require-calls into scanImports() for a file that uses JSX. Ours emits
+  //    classic React.createElement, which introduces no specifier at all, so
+  //    they are absent. Reporting them would name a module Vivari never loads.
+  const jsx = bunScanImports('import React from "react";\nexport const A = () => <div/>;', "tsx");
+  ok(JSON.stringify(pair(jsx)) === '[["import-statement","react"]]', "a JSX file reports only its own import, not Bun's injected jsx-runtime pair");
+
+  // Source order is preserved and duplicates are NOT collapsed, both of which a
+  // dependency crawler depends on.
+  ok(
+    JSON.stringify(pair(bunScanImports('require("z"); import a from "y"; const p = import("x");', "ts"))) ===
+      '[["require-call","z"],["import-statement","y"],["dynamic-import","x"]]',
+    "the three kinds interleave in SOURCE order, not kind order",
+  );
+  ok(bunScanImports('import a from "d"; import b from "d";', "ts").length === 2, "a specifier imported twice is reported twice");
+
+  // exports is sorted by code unit, which is Bun's order and not the source's.
+  ok(JSON.stringify(bunScan("export const b=1; export const A=2;", "ts").exports) === '["A","b"]', "exports are sorted, uppercase first");
+
+  // Argument and loader validation, in Bun's own words.
+  for (const [method, fn] of [["scan", bunScan], ["scanImports", bunScanImports]]) {
+    let msg = "";
+    try { fn(undefined, "ts"); } catch (e) { msg = e.message; }
+    ok(msg === "Expected code to be a string or Uint8Array for '" + method + "'.", method + "() names the accepted argument types exactly as Bun does");
+  }
+  ok(JSON.stringify(bunScan(new TextEncoder().encode('import a from "b";'), "ts").imports) === '[{"kind":"import-statement","path":"b"}]', "a Uint8Array source is decoded, not rejected");
+  {
+    let e1 = null, e2 = null;
+    try { bunScan("", "nope"); } catch (e) { e1 = e; }
+    try { bunScan("", "css"); } catch (e) { e2 = e; }
+    ok(e1 && e1.code === "ERR_INVALID_ARG_TYPE" && /^invalid loader - must be js, jsx, tsx, ts, css/.test(e1.message), "an unknown loader name is refused with Bun's list");
+    ok(e2 && e2.code === "ERR_INVALID_ARG_TYPE" && e2.message === "only JavaScript-like loaders supported for now", "a real but non-JS loader is refused separately, as Bun's constructor does");
+  }
+}
+
+console.log("== the type stripper and module clauses ==");
+{
+  // Three bugs the scan work above uncovered, each of which corrupted ordinary
+  // TypeScript long before Bun.Transpiler existed. They are checked here by
+  // asserting the OUTPUT PARSES, which is what the previous check for this area
+  // never did — it regex-matched for absent type names, so a statement stripped
+  // down to a dangling ` from "./foo";` passed it.
+  const parses = (src) => {
+    try { new Function(transpileTypeScript(src, "t.ts").replace(/^\s*(import|export)\b.*$/gm, "")); return true; }
+    catch { return false; }
+  };
+  const T = (src) => transpileTypeScript(src, "t.ts");
+
+  // 1) `import type { X } from "m"` — dropStatement() ended the statement at the
+  //    specifier list's `}`, stranding ` from "m";`. A SyntaxError at load.
+  ok(!/from/.test(T('import type { Foo } from "./foo";\nconst a=1;')), "a braced type-only import is removed whole, not down to a dangling `from`");
+  ok(!/from/.test(T('import type { Foo } from "./foo"\nconst a=1')), "…including without the semicolon, where ASI ends the statement");
+  ok(!/from/.test(T('export type { Qux } from "./qux";\nconst a=1;')), "…and the `export type … from` form");
+  ok(/const a=1/.test(T('import type { Foo } from "./foo";\nconst a=1;')), "…and the statement after it survives");
+
+  // 2) `import * as ns from "m"` — the `as` rule treated a namespace RENAME as a
+  //    cast and ate it, leaving `import * ;`. Every `import * as fs from "fs"`
+  //    in a .ts file failed to load.
+  ok(T('import * as ns from "m";') === 'import * as ns from "m";', "a namespace import is passed through untouched");
+  ok(T('export * as ns from "m";') === 'export * as ns from "m";', "…as is `export * as`");
+
+  // 3) `export { a, b as c }` — the same rule silently dropped the rename, so the
+  //    importer got undefined and the process still exited 0. The worst shape a
+  //    bug can take here, and the reason clauses are now copied verbatim.
+  ok(T("const a=1,b=2; export { a, b as c };") === "const a=1,b=2; export { a, b as c };", "an export rename survives — it is a rename, not a cast");
+  ok(T('import { a as b } from "m";') === 'import { a as b } from "m";', "…and an import rename");
+
+  // Copying a clause verbatim means knowing exactly where it ENDS, and the
+  // side-effect form is the one with no `from` and no clause to close. Without a
+  // case of its own the end-of-statement search runs to the next `;` in the file
+  // and swallows everything between, so the statement after it keeps its types
+  // and never gets stripped. Every clause form is checked without a semicolon.
+  for (const head of ['import "m"', 'import a from "m"', 'import * as ns from "m"', 'import { a } from "m"', "export { a }", 'export * from "m"']) {
+    ok(!/: number/.test(T(head + "\nconst z: number = 1")), "`" + head + "` without a semicolon does not swallow the statement after it");
+  }
+  ok(T('import "m"') === 'import "m"', "…and a side-effect import as the last line of a file does not run off the end");
+
+  // The cast rule itself still applies everywhere it should.
+  ok(!/as/.test(T("const x = y as Foo;")), "`as` is still stripped in an expression");
+  ok(!/satisfies/.test(T("const x = y satisfies Foo;")), "`satisfies` too");
+  ok(/class X/.test(T("export default class X { private a = 1; }")) && !/private/.test(T("export default class X { private a = 1; }")), "`export default class` is still stripped — only clause forms are exempt");
+  ok(parses("export const a = (b as number);"), "`export const` with a cast is still ordinary code");
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Bun checks passed");

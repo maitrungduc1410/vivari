@@ -1610,5 +1610,75 @@ console.log("\n== Bun.build + Bun.plugin from inside a guest process ==");
   ok(r.runtimePlugin === 99, "Bun.plugin() rewires require() inside the running process (the module-loader seam)");
 }
 
+// 20) The module clauses the type stripper used to corrupt, and Bun.Transpiler's
+// scan family running inside a real process.
+//
+// This is the tier that matters for the stripper fixes. The offline tier calls
+// transpileTypeScript() and inspects a STRING, so it can assert the output looks
+// right but never that the module system accepts it — and the two worst bugs here
+// were only visible at load: `import * as fs from "fs"` was rewritten to
+// `import * ;` and died with "Cannot use import statement outside a module", and
+// `export { a, b as c }` lost the rename, handing the importer `undefined` while
+// the process still exited 0. A green string check and a broken program.
+console.log("\n== bun run clauses.ts (module clauses survive the type stripper, in-VM) ==");
+{
+  write("dep.ts", ["const a: number = 1;", "const b: number = 2;", "export { a, b as renamed };"].join("\n"));
+  write("clauses.ts", [
+    "import * as path from 'node:path';",
+    "import type { Nope } from './dep';",
+    "import { renamed } from './dep';",
+    "const out: string[] = [];",
+    "out.push('join:' + path.join('a', 'b'));",
+    "out.push('renamed:' + renamed);",
+    "out.push('typeof-ns:' + typeof path);",
+    "console.log('CLAUSES:' + JSON.stringify(out));",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "clauses.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  const m = o.match(/CLAUSES:(\[.*\])/);
+  const got = m ? JSON.parse(m[1]) : [];
+  console.log("  ->", JSON.stringify(got), "exit", r.code);
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 400));
+  ok(r.code === 0, "a .ts file using `import * as ns` LOADS (it used to be rewritten to `import * ;`)");
+  ok(got.includes("join:a/b"), "…and the namespace object is the real module");
+  ok(got.includes("renamed:2"), "an `export { b as renamed }` rename survives — it used to arrive as undefined, exit 0");
+  ok(got.includes("typeof-ns:object"), "…and `import type` next to them removed itself without stranding its `from`");
+}
+
+console.log("\n== bun run scan.ts (Bun.Transpiler.scan over a file read from the VFS) ==");
+{
+  write("sample.ts", [
+    "import { readFileSync } from 'node:fs';",
+    "import type { Unused } from './dep';",
+    "const lazy = () => import('./dep');",
+    "const r = require('./dep');",
+    "const p = require.resolve('./dep');",
+    "export const value = 1;",
+    "export default readFileSync;",
+  ].join("\n"));
+  write("scan.ts", [
+    "const src = require('fs').readFileSync('/app/sample.ts', 'utf8');",
+    "const t = new Bun.Transpiler({ loader: 'ts' });",
+    "const s = t.scan(src);",
+    "const i = t.scanImports(src);",
+    "const kinds = (l: any[]) => l.map((x: any) => x.kind + ':' + x.path);",
+    "console.log('SCAN:' + JSON.stringify({ exports: s.exports, imports: kinds(s.imports), scanImports: kinds(i) }));",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "scan.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  const m = o.match(/SCAN:(\{.*\})/);
+  const got = m ? JSON.parse(m[1]) : null;
+  console.log("  ->", JSON.stringify(got), "exit", r.code);
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 400));
+  ok(r.code === 0 && got, "scan.ts exits 0 and reports a result");
+  ok(got && JSON.stringify(got.exports) === '["default","value"]', "exports are the ESM ones, sorted (`default` before `value`)");
+  // The require/require.resolve split, proven against a real file rather than a
+  // string literal in the spike — the two methods genuinely disagree.
+  ok(got && got.imports.includes("require-resolve:./dep") && !got.imports.some((x) => x.startsWith("require-call:")), "scan() carries require.resolve and NOT require()");
+  ok(got && got.scanImports.includes("require-call:./dep") && !got.scanImports.some((x) => x.startsWith("require-resolve:")), "scanImports() is the exact inverse");
+  ok(got && got.imports.includes("dynamic-import:./dep") && got.imports.includes("import-statement:node:fs"), "both static and dynamic imports are reported");
+  ok(got && !got.imports.some((x) => x.includes("Unused")), "the type-only import contributes nothing");
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");
 process.exit(failed ? 1 : 0);

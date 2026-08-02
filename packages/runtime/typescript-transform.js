@@ -429,9 +429,29 @@ function stripTypes(src) {
           // But NOT `export type` used as `export type X = ...` (also dropped) — both are type-only.
           // Guard against `import typeof` (flow) — treat `type` followed by ident/brace/star.
           if (nx2 >= 0 && (toks[nx2].value === "{" || toks[nx2].value === "*" || toks[nx2].type === "id")) {
-            i = dropStatement(toks, i);
+            i = drop(i, moduleStatementEnd(toks, nx2));
             continue;
           }
+        }
+
+        // A module clause is not an expression, so nothing in it is a cast: the
+        // `as` in `import * as ns from "m"` and `export { a, b as c }` is a
+        // RENAME. The `as` rule below would eat it — turning the first into
+        // `import * ;` and silently dropping the rename in the second, which
+        // hands the importer `undefined` while the program still exits 0. Copy
+        // the whole declaration through untouched instead.
+        //
+        // Only the forms that are unambiguously a clause: `import` unless it is
+        // the `import(…)` expression or `import.meta`, and `export` only before
+        // `{` or `*`. `export default …` and `export const x = y as T` are
+        // ordinary code and still need stripping.
+        const isImportDecl = kw === "import" && nx >= 0 && !(toks[nx].type === "punc" && (toks[nx].value === "(" || toks[nx].value === "."));
+        const isExportClause = kw === "export" && nx >= 0 && toks[nx].type === "punc" && (toks[nx].value === "{" || toks[nx].value === "*");
+        if (isImportDecl || isExportClause) {
+          const end = moduleStatementEnd(toks, nx);
+          for (let k = i; k < end; k++) emit(toks[k].value);
+          i = end;
+          continue;
         }
       }
 
@@ -703,6 +723,62 @@ function stripTypes(src) {
         else if (x.value === ">") { if (angle > 0) angle--; }
         else if (x.value === ";" && depth === 0) return k + 1;
       }
+    }
+    return N;
+  }
+
+  // Where an `import`/`export` DECLARATION ends. dropStatement() cannot answer
+  // this: its rule is "a balanced {…} ends the statement", which is right for an
+  // interface or enum BODY but wrong for a module clause, where the braces are a
+  // specifier list and the statement continues to `from "m"`. Stopping at `}`
+  // strands ` from "m";`, which is a syntax error rather than a removed type.
+  //
+  // `head` is the first token of the clause, which decides the shape:
+  //   "m"        — a side-effect import; ends at the specifier itself
+  //   { A, B }   — a specifier list; ends at `}`, then optional `from "m"`, `;`
+  //   X | * as X — ends at `from "m"`, or at `;` for an `export type X = …`
+  function moduleStatementEnd(tk, head) {
+    const eat = (k) => {
+      // an optional `from "spec"`, then an optional `;`. Every lookahead can run
+      // off the end — `import "m"` as the last line of a file has neither.
+      let j = k;
+      const f = nextSig(tk, k - 1);
+      if (f >= 0 && tk[f].type === "id" && tk[f].value === "from") {
+        const s = nextSig(tk, f);
+        j = s >= 0 && tk[s].type === "str" ? s + 1 : f + 1;
+      }
+      const semi = nextSig(tk, j - 1);
+      return semi >= 0 && tk[semi].type === "punc" && tk[semi].value === ";" ? semi + 1 : j;
+    };
+
+    // `import "m"` has no clause and no `from`, so the searches below would run
+    // past it to the next `;` in the file and swallow whatever is in between.
+    if (tk[head].type === "str") return eat(head + 1);
+
+    if (tk[head].type === "punc" && tk[head].value === "{") {
+      let brace = 0;
+      for (let k = head; k < N; k++) {
+        const x = tk[k];
+        if (x.type !== "punc") continue;
+        if (x.value === "{") brace++;
+        else if (x.value === "}" && --brace === 0) return eat(k + 1);
+      }
+      return N;
+    }
+
+    // No clause braces: scan for `from` (an import) or `;` (a type alias). A
+    // `from` nested inside a type body — `type X = { from: string }` — is not a
+    // terminator, so brace depth still has to be tracked.
+    let brace = 0;
+    for (let k = head; k < N; k++) {
+      const x = tk[k];
+      if (x.type === "punc") {
+        if (x.value === "{") brace++;
+        else if (x.value === "}") brace--;
+        else if (x.value === ";" && brace === 0) return k + 1;
+        continue;
+      }
+      if (brace === 0 && x.type === "id" && x.value === "from") return eat(k);
     }
     return N;
   }

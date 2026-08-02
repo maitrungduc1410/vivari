@@ -490,8 +490,13 @@ function regexCanStart(prev) {
   return "([{,;:=!&|?+-*%^~<>".includes(prev);
 }
 
-// `(  "spec"  )` immediately after a callee name -> the decoded specifier.
-function literalCallArgument(src, from) {
+// `(  "spec"  )` immediately after a callee name -> the decoded specifier, and
+// the offset it starts at. `allowTemplate` additionally accepts a
+// substitution-free template literal: Bun's scanImports() counts `require(`x`)`
+// as a static require, while the bundler deliberately does not (a template is
+// where a dynamic specifier usually starts, and guessing is how you bundle the
+// wrong file), so only the scanner passes it.
+function literalCallArgument(src, from, allowTemplate) {
   const n = src.length;
   let k = from;
   while (k < n && isSpace(src[k])) k++;
@@ -499,11 +504,20 @@ function literalCallArgument(src, from) {
   k++;
   while (k < n && isSpace(src[k])) k++;
   const q = src[k];
+  const closes = (end) => {
+    let m = end;
+    while (m < n && isSpace(src[m])) m++;
+    return src[m] === ")";
+  };
+  if (allowTemplate && q === "`") {
+    const end = skipTemplate(src, k);
+    const raw = src.slice(k + 1, end - 1);
+    if (raw.includes("${") || !closes(end)) return null;
+    return { value: raw, pos: k + 1 };
+  }
   if (q !== '"' && q !== "'") return null;
   const end = skipQuoted(src, k);
-  let m = end;
-  while (m < n && isSpace(src[m])) m++;
-  if (src[m] !== ")") return null;
+  if (!closes(end)) return null;
   const raw = src.slice(k + 1, end - 1);
   let value;
   try {
@@ -511,7 +525,63 @@ function literalCallArgument(src, from) {
   } catch {
     return null;
   }
-  return { value };
+  return { value, pos: k + 1 };
+}
+
+/**
+ * Every `require("x")` and `require.resolve("x")` in a source, with the offset of
+ * each specifier so a caller can interleave them with an ES-module lexer's
+ * imports and recover source order. This is what Bun.Transpiler's scan family
+ * needs and the module lexer cannot give: the lexer knows ESM syntax only.
+ *
+ * It reuses this file's lexer, which is the point — a naive regex reports the
+ * `require("no")` inside a string literal, the one in a comment, and desyncs on
+ * a regex containing a quote. What it does NOT do is resolve scope: a parameter
+ * that shadows `require` still counts, because matching is syntactic. Real Bun
+ * behaves the same way, so that is fidelity rather than a shortcut.
+ */
+export function scanRequireCalls(src) {
+  const found = [];
+  const n = src.length;
+  let i = 0;
+  let prev = "";
+  while (i < n) {
+    const c = src[i];
+    if (c === '"' || c === "'") { i = skipQuoted(src, i); prev = '"'; continue; }
+    if (c === "`") { i = skipTemplate(src, i); prev = "`"; continue; }
+    if (c === "/" && src[i + 1] === "/") { while (i < n && src[i] !== "\n") i++; continue; }
+    if (c === "/" && src[i + 1] === "*") { i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++; i += 2; continue; }
+    if (c === "/" && regexCanStart(prev)) { i = skipRegex(src, i); prev = "/"; continue; }
+    if (isIdentStart(c)) {
+      let j = i;
+      while (j < n && isIdentPart(src[j])) j++;
+      const word = src.slice(i, j);
+      // `obj.require(…)` is a method call, not the module-system require.
+      if (word === "require" && prev !== ".") {
+        let k = j;
+        while (k < n && isSpace(src[k])) k++;
+        let lit = null;
+        let kind = "require-call";
+        if (src[k] === ".") {
+          let m = k + 1;
+          while (m < n && isSpace(src[m])) m++;
+          if (src.startsWith("resolve", m) && !isIdentPart(src[m + 7] || "")) {
+            kind = "require-resolve";
+            lit = literalCallArgument(src, m + 7, true);
+          }
+        } else {
+          lit = literalCallArgument(src, j, true);
+        }
+        if (lit) found.push({ kind, path: lit.value, pos: lit.pos });
+      }
+      prev = "w:" + word;
+      i = j;
+      continue;
+    }
+    if (!isSpace(c)) prev = c;
+    i++;
+  }
+  return found;
 }
 
 // ---- per-module transform ---------------------------------------------------

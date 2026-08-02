@@ -125,6 +125,13 @@ packages/
                    bun.js) is a front door onto this same engine, so a flag cannot
                    be honoured in one and ignored in the other. The plugin registry
                    is module state that module.js reads on every resolve/load.
+      bun-transpiler.js  Bun.Transpiler: transformSync/transform plus the scan
+                   family. scan()/scanImports() reuse the vendored es-module-lexer
+                   and scanRequireCalls() from bun-build.js rather than parsing
+                   again. The two methods report DIFFERENT sets — scan() carries
+                   require.resolve but not require(), scanImports() the inverse —
+                   which is real Bun's behaviour, pinned case-by-case in the
+                   offline tier. Both are pure functions of a source string.
       bun-test.js  the whole of `bun:test`: the runner (describe/test with the full
                    .skip/.only/.todo/.each/.if/.failing family, per-test timeouts,
                    retry/repeats, -t/--bail/--todo/--reporter), `expect` with the
@@ -556,6 +563,36 @@ packuments cut metadata *transfer* by ~72%, but they would save single-digit MB 
 resident memory, which is why they are not a lever for peak RAM. `mem_bytes` also
 counts the hot-read cache of decompressed files, which is not accounted for above and
 is the least-explored part of the peak.
+
+### The type stripper must not touch an `import`/`export` CLAUSE
+
+`typescript-transform.js` is a token rewriter, not a parser, and its rules are
+written for *expressions*. A module clause looks like one and is not, so three
+rules reached into a place they had no business being. All three shipped, and all
+three were found at once by work that needed the stripper's output to parse:
+
+| Source | Became | Symptom |
+| --- | --- | --- |
+| `import type { T } from "m";` | ` from "m";` | `SyntaxError` at load |
+| `import * as ns from "m";` | `import * ;` | `SyntaxError` at load |
+| `export { a, b as c };` | `export { a, b };` | importer gets `undefined`, **exit 0** |
+
+The first is `dropStatement()`, whose rule is "a balanced `{…}` ends the
+statement" — right for an `interface` or `enum` body, wrong for a specifier list,
+which the statement continues past. The other two are the `as`/`satisfies` cast
+rule: the `as` in a namespace import and in `{ b as c }` is a **rename**, and
+eating it is how the third row happens — the worst shape a bug takes here, because
+the program still runs.
+
+**The rule: an `import` declaration, and an `export` before `{` or `*`, are copied
+through verbatim.** Nothing inside them is a type. `export default …` and
+`export const x = y as T` are ordinary code and still get stripped.
+
+**When you touch this file, assert the output PARSES.** The check that covered
+type-only imports had regex-matched for absent type names, so a statement stripped
+down to a dangling ` from "./foo";` passed it for as long as it existed. A string
+assertion cannot see a load failure; `scripts/spike-bun.mjs` runs the file.
+
 ### Feature-detecting a Node API by `typeof` — `Readable.toWeb` is the trap
 
 **Do not write `X.method ? X.method(…) : fallback` against a vendored Node API.**
