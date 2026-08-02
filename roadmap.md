@@ -6037,3 +6037,32 @@ a gap in coverage, it is a false report, and it is indistinguishable from a pass
 above. `toWeb` shipped twice behind a test pinned to the broken behaviour; this shipped behind a
 test that did not run. AGENTS.md already says a string assertion cannot see a load failure. The
 companion: an ok-flag must start `false`, or a skip must be reported as a skip.
+
+## Authenticated egress went out anonymous — the header strip was never scoped (this change)
+
+The Fetcher Worker dropped every non-CORS-safelisted request header before calling the
+browser's `fetch()`. That is the right move for `registry.npmjs.org`, which answers the GET
+with `Access-Control-Allow-Origin: *` but does not answer a preflight, so npm's
+`npm-session`/`pacote-*`/`authorization` headers would have blocked every install. It was
+applied to **every host**, and there the cost was not a blocked request — it was a wrong one.
+
+A SigV4-signed S3 request loses `Authorization` and every `x-amz-*` on that path, which does not
+fail: it goes out **anonymous**. Against a public bucket AWS answers `200`, and since `Range` is
+not safelisted either, it answers with the *whole object* instead of the hundred bytes asked for.
+The caller gets success and the wrong bytes. Every `Bearer` API had the same shape.
+
+`scripts/probe-s3-cors.mjs` is the demonstration, and it needs no credentials: sign with a bogus
+key against a public bucket and let AWS say which happened. Headless, the full header set
+survives and AWS rejects the key — `InvalidAccessKeyId`. Under the browser's policy the same
+request returns `200` and 2,159,575 bytes.
+
+The strip is now scoped to the package registries (`packages/runtime/egress-header-policy.js`);
+everything else keeps its headers, pays for a preflight, and either works — an S3 bucket with a
+CORS policy allowing `authorization` and `x-amz-*` — or fails loudly.
+
+**The part worth remembering is why this survived.** Node has no CORS, and the headless fetchers
+under `scripts/spike-*.mjs` deliberately forward every header, so the browser path and the tested
+path were never the same path. A green spike said nothing about a tab, and the divergence was
+documented as a footnote rather than treated as a hole. The policy is now one shared module
+asserted as pure logic by `npm run probe:egress-headers` in `toolchain-gate` — because the only
+test that can catch this is one that does not need a browser to run.

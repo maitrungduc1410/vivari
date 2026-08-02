@@ -44,6 +44,11 @@ jobs:
       # had.
       - run: npm run probe:node-registry
       - run: npm run probe:http-egress
+      # The browser egress header policy. Pure logic on purpose: Node has no CORS
+      # and the headless fetchers forward every header, so no spike can see a
+      # regression here — a stripped Authorization header shows up as a request
+      # that quietly succeeds anonymously.
+      - run: npm run probe:egress-headers
 
   # SDK packaging + public-API contract guard (offline, no Wasm, no browser).
   # Also regression-checks the shipped preview sw.js branding + examples/basic.

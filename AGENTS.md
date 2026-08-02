@@ -685,20 +685,35 @@ throw that gets swallowed. Rules:
 - **Downloads** (`OP_FETCH`) stream straight into the VFS, bypassing the window.
 - If you add a syscall that can carry big data, chunk it from day one.
 
-### The Fetcher strips non-CORS-safelisted request headers (browser only)
-`packages/core/src/workers/fetcher-worker.ts` (`corsSafeHeaders`) keeps ONLY the CORS-safelisted
+### The Fetcher strips non-CORS-safelisted request headers — for the REGISTRIES only
+`packages/runtime/egress-header-policy.js` decides what the browser Fetcher Worker
+puts on a `fetch()`. For a package registry it keeps ONLY the CORS-safelisted
 request headers (`accept`, `accept-language`, `content-language`, a simple
-`content-type`) before calling the browser `fetch()`. Real npm/pacote attach
-custom headers (`npm-command`, `npm-session`, `npm-auth-type`, `pacote-*`,
-`authorization`, …); any non-safelisted header makes the browser fire a
-preflight `OPTIONS`, and `registry.npmjs.org` does not answer it with a matching
-`Access-Control-Allow-Headers` — so the request is blocked even though the
-actual GET returns `Access-Control-Allow-Origin: *`. None of those headers are
-needed to fetch public packuments/tarballs, so dropping them turns every
-registry request back into a simple, preflight-free GET. This is a browser-only
-concern (Node has no CORS), so the headless fetchers in `scripts/spike-*.mjs`
-deliberately keep the full header set. (Symptom if you regress it: "blocked by
-CORS policy … No 'Access-Control-Allow-Origin' header" for every registry URL.)
+`content-type`). Real npm/pacote attach custom headers (`npm-command`,
+`npm-session`, `npm-auth-type`, `pacote-*`, `authorization`, …); any non-safelisted
+header makes the browser fire a preflight `OPTIONS`, and `registry.npmjs.org` does
+not answer it with a matching `Access-Control-Allow-Headers` — so the request is
+blocked even though the actual GET returns `Access-Control-Allow-Origin: *`. None
+of those headers are needed to fetch public packuments/tarballs, so dropping them
+turns every registry request back into a simple, preflight-free GET. (Symptom if
+you regress that: "blocked by CORS policy … No 'Access-Control-Allow-Origin'
+header" for every registry URL.)
+
+**Every other host keeps its headers, and the scoping is the point.** The strip
+used to apply to all of them, which made authenticated egress silently wrong
+rather than broken: a SigV4-signed S3 request lost `Authorization` and every
+`x-amz-*`, went out ANONYMOUS, and against a public bucket came back **200 with
+the wrong bytes** (a dropped `Range` returns the whole object). Nothing errored.
+The same held for any `Bearer` API.
+
+**No spike can catch a regression here.** Node has no CORS and the headless
+fetchers in `scripts/spike-*.mjs` forward the full header set, so the browser and
+headless paths genuinely differ and green spikes prove nothing about the tab. The
+policy is therefore pure, shared, and asserted directly:
+`npm run probe:egress-headers` (offline, in `toolchain-gate`). If you need to see
+the divergence end to end, `scripts/probe-s3-cors.mjs` signs with a bogus key
+against a public bucket and reads AWS's answer — `InvalidAccessKeyId` means the
+header survived, a 200 means it was dropped.
 
 ### Package downloads run in parallel via a NON-blocking async fetch
 `OP_FETCH` parks the calling worker on `Atomics.wait` until the body lands, so
@@ -1841,32 +1856,6 @@ Gotchas:
 - **Two Node probes must BOTH be masked** or boot dies on `import("node:module")`:
   `process.browser = true` (pyodide.mjs) AND `process.type = "renderer"`
   (Emscripten's pyodide.asm.mjs). Hold both across the whole boot, then restore.
-- **A THIRD Node probe, and it belongs to urllib3 — `process.release.name` is load-
-  bearing for Python's HTTP.** `requests` in Pyodide does not use sockets; urllib3's
-  Emscripten transport picks a door at request time — `has_jspi()`, else
-  **`is_in_node()` → raise**, else a *synchronous* `XMLHttpRequest`, which is precisely
-  what a Web Worker has. And it answers `is_in_node()` by reading
-  `js.process.release.name`, which `builtins/process.js` deliberately sets to `"node"`
-  because real tools branch on it — and `globalThis.process` is what Pyodide hands
-  Python as `js.process`. So urllib3 concluded a browser Worker was Node, skipped the
-  XHR, and told users to pass `--experimental-wasm-stack-switching` to a Node that is
-  not there; the same expression also decided `_fetcher` at import time, so streaming
-  was off too. **If you touch the masquerade, this breaks silently and only in a
-  browser.** `URLLIB3_REALM_PATCH` (`builtins/python.js`) fixes it by asking the
-  *realm* — `hasattr(js, "XMLHttpRequest")` — not by returning `False`: the headless
-  spike tiers really are Node, and there urllib3's answer is correct and must survive,
-  or the tier goes green for a reason that does not hold where the code ships. It runs
-  as a `sys.meta_path` post-import hook because urllib3 is not installed at boot and
-  importing it eagerly would pull a wheel into every python process, and through
-  `installUrllib3RealmPatch()` into a **namespace of its own** — the same interpreter is
-  the REPL, so `runPython`-ing it into `__main__` would put our plumbing in the user's
-  `dir()`. Two consequences
-  worth knowing: re-enabling `_fetcher` means urllib3 may print its own "streaming
-  fetch worker isn't ready" notice until the nested worker reports in (its
-  `wait_for_streaming_ready()` is the cure, and the buffered path is unaffected), and
-  a `_StreamingFetcher()` that throws must leave `_fetcher = None` rather than break
-  the import. **Unverified in a real browser**: that a Worker's synchronous XHR
-  behaves as the spec says. If it does not, the patch is inert, not harmful.
 - **`vendor:pyodide` writes gitignored assets under `packages/studio/public/vendor/pyodide/`.**
   It's in the root `prebuild:studio` hook, but the studio's own `bun run build` does NOT
   fire that hook — so `scripts/cloudflare-build.sh` **must list `npm run vendor:pyodide`
@@ -1898,11 +1887,6 @@ Gotchas:
   `loadPackagesFromImports(source)` on the entry file; `serve()` separately reads
   `requirements.txt`. When testing several templates in one interpreter, `sys.modules`
   will serve an earlier template's `main` to a later one — boot per case instead.
-  Because of that, a bare `Installed: X` was the argv spelling of a placeholder return
-  value — true of the interpreter that just exited, false of the next one, and the user
-  finds out when their import fails with the successful pip run still on screen. `pip()`
-  now prints the scope on stderr alongside the success line. Do not "clean that up": the
-  line is the honesty, not noise. It goes away when the packages actually persist.
 - **Never wire Python's output through Pyodide's `batched` handler.** It fires once per
   *flush* with the trailing newline stripped, so "add the newline back" is right only
   when the flush ended a line — and wrong for every progress renderer, which flushes
@@ -2808,6 +2792,14 @@ cost multiple sessions:
   `.gitlab-ci.yml`. **A template must have a green spike before it graduates out of
   `experimental`** — add `spike-<name>.mjs` (use `lib/spike-harness.mjs`) and list it
   in `run-spikes.mjs`.
+  **An ok-flag must start `false`, or a skipped gate must be reported as a skip.**
+  Spikes written to be hand-run put the expensive assertion behind an env flag and
+  initialise its flag to `true`, so skipping it does not skip — it passes, and the
+  runner only prints a spike's stdout when it fails, so the `(gate skipped)` line
+  never reaches the log. That is how `pm-gate` shipped reporting the package
+  managers healthy while doing nothing but `npm --version`. If a spike has such a
+  flag, the tier turns it on: registry entries take an `env`, and owning the policy
+  there beats flipping defaults in each spike.
 - `node scripts/verify-express.mjs` — installs + runs real Express, esbuild-wasm,
   a Vite build, Vite dev+HMR, and a real `ws` server. **Needs network** (npm).
 - `node scripts/probe-realdev.mjs [vite|nest]` — the demo's exact flow headless:
