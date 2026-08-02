@@ -1093,6 +1093,47 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   handshake + frame codec + `ServerWebSocket` with pub/sub topics), plus **`bun:*` modules**
   (`bun:test` runner + `expect`, with Bun/Jest `test.only` filtering and `beforeEach`/`afterEach`
   that run at the root and inherit into nested `describe`s).
+- `packages/runtime/builtins/bun-serve.js` — the **option policy** for `Bun.serve` and the
+  **RFC 6455 rules** its handshake and frame reader enforce, kept pure (no sockets, no Node
+  builtins) so the Wasm-free spike tier can drive them directly. `Bun.serve` previously accepted
+  eight documented options and silently ignored all of them; each now has a written-down answer,
+  chosen by one rule. **Implement** where the sandbox genuinely can: `idleTimeout` (Vivari's
+  `net.js` is Node's real one, so `socket.setTimeout()` fires), `maxRequestBodySize` (enforced as
+  the body arrives, 413), `static` (an exact-path map of pre-built `Response`s, matched before
+  `routes`, as Bun does) and `unix` (a real UNIX socket — the net layer's `Pipe` binding works;
+  the caveat is discovery, not the socket, since the preview finds servers by TCP port).
+  **Degrade loudly** where production is a superset the sandbox cannot reach but serving without
+  it is still faithful — `tls` (plaintext; refusing to boot would break every app that merely has
+  a certificate configured), `reusePort`, `ipv6Only`. **Throw** where running without the option
+  means serving something that is not the protocol the caller asked for — `http3`, since there is
+  no QUIC in a tab. Degradations are announced once per process per option, never per request.
+  The RFC half fixes three real handshake defects: the server used to echo the client's *first*
+  offered subprotocol unconditionally (a §4.2.2 violation, and a divergence from Bun, where you
+  select one explicitly via `server.upgrade(req, {headers})`), emit a **duplicate**
+  `Sec-WebSocket-Protocol` when both sides named one, and accept any `Sec-WebSocket-Version` and
+  a missing key. Frame validation (§5.1 masking, §5.2 RSV bits and reserved opcodes, §5.4
+  fragmentation order, §5.5 control-frame limits, plus `maxPayloadLength` → 1009) now closes the
+  connection instead of acting on an illegal frame. It is a separate function from the reader on
+  purpose: the reader is shared with the client-role codec in `runtime/websocket.js`, and only a
+  *server* may reject an unmasked frame. `scripts/spike-bun-offline.mjs` pins all of it to
+  RFC 6455's own worked examples — the §1.3 `dGhlIHNhbXBsZSBub25jZQ==` → `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`
+  handshake, and the six §5.7 wire frames — rather than to our own encoder's output.
+
+  **The remaining gap is streaming responses, and it is not a `Bun.serve` gap.** A `Response`
+  whose body is a `ReadableStream` is buffered in full before anything is written, and that is
+  forced from below: `OP_RESPOND` (§4) carries a `total` byte count that the kernel reassembles
+  against before resolving a **one-shot** Promise per `reqId`, and `sw.js` builds a buffered
+  `Response` from the single object it gets back. SSE and WebSockets reach the browser only via
+  the dedicated `vv-sse` / `vv-ws` **postMessage side channels**, which bypass Service-Worker
+  `fetch` interception entirely — so they are not evidence that a streaming `Response` would
+  work, and an app doing `fetch()` + `body.getReader()` still buffers today. Lifting this means
+  changing the protocol, kernel, host bridge and Service Worker together (golden rule 4) *and*
+  designing flow control, which cannot be borrowed from the socket layer because the in-VM
+  loopback has none (`node/bindings/net.js` `doWrite` completes every write synchronously;
+  measured at 25 MB into an unread socket with `writableLength` never leaving 0 — the same fact
+  that makes a `websocket.drain` handler correct but inert here). It is left honestly buffered
+  rather than half-implemented, since a response that streams in the sandbox and buffers in
+  production is worse than one that always buffers.
 - `packages/runtime/builtins/bun-formats.js` — the data-format APIs `Bun.YAML.parse`,
   `Bun.TOML.parse`/`stringify`, `Bun.JSON5.parse`/`stringify`, `Bun.JSONL.parse`/`parseChunk`
   and `Bun.semver.satisfies`/`order`, imported by `bun.js` and spread into the `Bun` literal.

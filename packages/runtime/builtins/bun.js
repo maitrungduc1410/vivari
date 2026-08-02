@@ -14,8 +14,13 @@
 // (see bun-file.js),
 // Bun.Cookie/Bun.CookieMap and the `req.cookies` hook on Bun.serve routes (see
 // bun-cookie.js), Bun.serve (bridged onto Node http so it
-// previews — with `routes`, `fetch`, an `error` handler, and server-side
-// `websocket` + pub/sub), Bun.env/argv/main/version, Bun.spawn/spawnSync/which,
+// previews — with `routes`, `fetch`, an `error` handler, `static` route maps, a
+// genuinely enforced `idleTimeout` and `maxRequestBodySize`, a real `unix`
+// socket, and server-side `websocket` + pub/sub whose ping/pong are real RFC 6455
+// control frames, whose cork() batches into one socket write, and whose
+// handshake validates the version/key and negotiates a subprotocol instead of
+// echoing the client's (see bun-serve.js), Bun.env/argv/main/version,
+// Bun.spawn/spawnSync/which,
 // Bun.$ (shell), Bun.sleep/Bun.sleepSync (a real Atomics.wait park, see
 // bun-sleep.js)/nanoseconds, automatic .env/.env.local/.env.{mode}(.local)
 // loading with Bun's precedence and $VAR expansion (bun-env.js; `bun` processes
@@ -92,8 +97,45 @@
 // there is no cycle guard without it, and the failure is a walk that never returns
 // rather than a wrong answer — bun-glob.js.
 //
+// Bun.serve({ http3 }) throws: HTTP/3 is QUIC over UDP, a browser tab has no UDP
+// socket, and answering HTTP/1.1 to code written for HTTP/3 would be a silent
+// approximation of a wire protocol (bun-serve.js).
+//
 // COVERED BUT SLOWER, not wrong: Bun.allocUnsafe returns zero-filled memory,
 // because `new Uint8Array(n)` is specified to be — see bun-bytes.js.
+//
+// ACCEPTED BUT DEGRADED, announced once per process on the console rather than
+// ignored (bun-serve.js): Bun.serve({ tls }) serves plaintext — there is no
+// network hop inside the VM and the preview rides the page's own origin, and
+// throwing would refuse to boot every app that merely HAS a production
+// certificate configured; `reusePort` cannot load-balance one port across
+// processes when there is only one; `ipv6Only` has no dual-stack socket to
+// restrict on an IPv4-only loopback; `websocket.perMessageDeflate` and the
+// `compress` argument to send()/publish() do nothing, because no
+// Sec-WebSocket-Extensions is negotiated; and a `websocket.drain` handler is
+// wired to real backpressure but will not fire, because the in-VM loopback
+// completes every write synchronously and so never builds any (measured: 25 MB
+// into an unread socket, getBufferedAmount() never left 0). Bun.serve({ unix })
+// binds a REAL socket that in-VM clients can reach, but the browser preview
+// cannot see it — the Service Worker finds servers by TCP port.
+//
+// NOT SUPPORTED, and the largest remaining gap: STREAMING responses. A Response
+// whose body is a ReadableStream is fully buffered before anything is written.
+// This is not fixable in this file — the kernel's OP_RESPOND carries a `total`
+// byte count that the kernel reassembles against before resolving a
+// one-shot Promise, and the Service Worker builds a buffered Response from it.
+// SSE and WebSockets reach the browser only through dedicated postMessage side
+// channels (vv-sse / vv-ws) that bypass Service-Worker fetch entirely. Said here
+// because a half-streaming implementation — one that streams in the sandbox and
+// buffers in production — would be worse than this honest buffering. Note that
+// `idleTimeout` IS enforced, so a long-lived endpoint no longer runs forever
+// here and gets cut off in production.
+//
+// A documented divergence in the WebSocket write path: Bun's send()/publish()
+// return 0 to mean "dropped for backpressure". We never return 0 on a live
+// connection, because a Node socket QUEUES rather than drops — the message
+// really is going to be sent, and reporting it as dropped would be a lie in the
+// other direction. -1 (closed) and the byte count are as documented.
 //
 // COVERED WITH A DOCUMENTED DIVERGENCE: Bun.stdin is a Node Readable, not a
 // BunFile (see the Bun literal below); Bun.file(…).type omits the
@@ -138,6 +180,15 @@ import { Cookie, CookieMap, attachRequestCookies, pendingSetCookies } from "./bu
 import { createBunFile } from "./bun-file.js";
 import { createBunCrypto } from "./bun-crypto.js";
 import { createBunSqlite, createVivariSqliteHost } from "./bun-sqlite.js";
+import {
+  normalizeServeOptions,
+  compileStaticRoutes,
+  validateUpgradeRequest,
+  negotiateSubprotocol,
+  buildHandshakeResponse,
+  wsFrameProtocolError,
+  WS_GUID,
+} from "./bun-serve.js";
 
 // The two documented Bun.hash members we did not port. The message names the
 // algorithm and says why, in the same spirit as the bun:ffi one: a caller who hits
@@ -228,19 +279,71 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
     if (!fetchHandler && !routes && !wsHandlers) {
       throw new TypeError("Bun.serve requires a `fetch` handler or `routes`");
     }
-    const hostname = opts.hostname || "0.0.0.0";
-    const port = opts.port != null ? opts.port | 0 : 3000;
+    // Every documented option gets a deliberate answer here — implemented,
+    // degraded loudly, or thrown. See ./bun-serve.js for which and why. This
+    // throws for `http3` and for out-of-range `idleTimeout`/`maxRequestBodySize`,
+    // so a bad value fails at Bun.serve() rather than at the first request.
+    const { config, warnings } = normalizeServeOptions(opts);
+    for (const w of warnings) serveWarnOnce(w.key, w.message);
+    const hostname = config.hostname;
+    const port = config.port;
+    let staticRoutes = config.staticRoutes;
+    const maxRequestBodySize = config.maxRequestBodySize;
+    // Bun's idleTimeout is in seconds; Node's socket.setTimeout is milliseconds,
+    // and 0 means "no timeout" in both.
+    const idleTimeoutMs = config.idleTimeout * 1000;
+    // `websocket.perMessageDeflate` and `send(msg, compress)` both ask for
+    // permessage-deflate (RFC 7692). We never offer Sec-WebSocket-Extensions in
+    // the handshake, so no extension is negotiated and compression is simply not
+    // happening. Warning once here is the difference between "my frames are
+    // smaller in production" and a silent 3x bandwidth surprise.
+    // `drain` is wired to the socket's real 'drain' event and the real return
+    // value of write() — it does NOT fire unconditionally, which is what it used
+    // to do (never, in fact: it was never called at all). But it also will not
+    // fire in practice here, and that is worth saying rather than leaving an
+    // author to discover it: Vivari's loopback (node/bindings/net.js `doWrite`)
+    // hands every write straight to the peer's inbox and reports it complete
+    // synchronously, so there is no send queue to overflow, write() never returns
+    // false, and getBufferedAmount() stays 0. Verified by writing 25 MB into an
+    // unread socket. Under real Bun this handler carries real load-shedding
+    // logic, so code that depends on it must be exercised there.
+    if (wsHandlers && typeof wsHandlers.drain === "function") {
+      serveWarnOnce(
+        "drain",
+        "Bun.serve({ websocket: { drain } }) is wired up correctly but will not fire in Vivari: " +
+          "the in-VM loopback completes every socket write synchronously, so a WebSocket never " +
+          "builds backpressure and getBufferedAmount() stays 0. Your handler is not dead code " +
+          "under real Bun — it just has nothing to react to here.",
+      );
+    }
+    if (wsHandlers && wsHandlers.perMessageDeflate) {
+      serveWarnOnce(
+        "perMessageDeflate",
+        "Bun.serve({ websocket: { perMessageDeflate } }) is accepted but ignored: this shim " +
+          "negotiates no Sec-WebSocket-Extensions, so frames are sent uncompressed. The " +
+          "`compress` argument to ws.send()/publish() is ignored for the same reason.",
+      );
+    }
 
     // Pub/sub topic registry: topic -> Set<ServerWebSocket>.
     const topics = new Map();
     const allSockets = new Set();
     const publishToSelf = !!(wsHandlers && wsHandlers.publishToSelf);
-    function topicPublish(topic, message, exclude) {
+    // Bun documents publish() as returning the number of BYTES published (0 when
+    // nothing was delivered), not the number of recipients — `subscriberCount()`
+    // is the API for that. `opcode` forces text/binary for publishText/Binary;
+    // undefined lets toWsPayload pick from the JS type, as plain publish() does.
+    function topicPublish(topic, message, exclude, opcode) {
       const set = topics.get(topic);
-      if (!set) return 0;
-      let n = 0;
-      for (const ws of set) { if (ws === exclude || ws.readyState !== 1) continue; ws.send(message); n++; }
-      return n;
+      if (!set || !set.size) return 0;
+      const framed = opcode === undefined ? toWsPayload(message, Buffer) : { opcode, payload: toBuf(message, Buffer) };
+      let delivered = 0;
+      for (const ws of set) {
+        if (ws === exclude || ws.readyState !== 1) continue;
+        ws._sendFrame(framed.opcode, framed.payload);
+        delivered++;
+      }
+      return delivered ? framed.payload.length : 0;
     }
 
     function cloneResponse(r) { try { return r.clone(); } catch { return r; } }
@@ -278,8 +381,15 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
     // Route + fetch dispatch. Returns a Promise<Response|undefined>.
     function dispatch(request, method) {
       return Promise.resolve().then(() => {
+        const pathname = new URL(request.url).pathname;
+        // `static` is checked before `routes`, on an exact pathname only, which
+        // is Bun's precedence. The stored Response is cloned per request because
+        // a Response body can only be consumed once.
+        if (staticRoutes) {
+          const hit = staticRoutes.get(pathname);
+          if (hit !== undefined) return cloneResponse(hit);
+        }
         if (routes) {
-          const pathname = new URL(request.url).pathname;
           const m = matchRoute(routes, pathname, method);
           if (m) {
             if (m.response !== undefined) return cloneResponse(m.response);
@@ -307,9 +417,31 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
       const collect = (cb) => {
         if (method === "GET" || method === "HEAD") return cb(null);
         const parts = [];
-        req.on("data", (c) => parts.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
-        req.on("end", () => cb(Buffer.concat(parts)));
-        req.on("error", () => cb(null));
+        let received = 0;
+        let aborted = false;
+        req.on("data", (c) => {
+          if (aborted) return;
+          const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
+          received += chunk.length;
+          // `maxRequestBodySize` enforced as the body arrives, not after: the
+          // point of the limit is to NOT hold an oversized body in the VM's
+          // heap, so buffering it first and then complaining would defeat it.
+          // 413 is the documented answer; the socket is torn down because the
+          // client is still sending and there is nothing left to read it into.
+          if (received > maxRequestBodySize) {
+            aborted = true;
+            try {
+              res.statusCode = 413;
+              res.setHeader("content-type", "text/plain");
+              res.end("Request body exceeds maxRequestBodySize of " + maxRequestBodySize + " bytes");
+            } catch {}
+            try { req.destroy(); } catch {}
+            return;
+          }
+          parts.push(chunk);
+        });
+        req.on("end", () => { if (!aborted) cb(Buffer.concat(parts)); });
+        req.on("error", () => { if (!aborted) cb(null); });
       };
       collect((body) => {
         let request;
@@ -339,24 +471,88 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
     // 101 handshake + framing if it opted in.
     const upgradeCtx = new Map(); // request -> { req, socket, head, done }
 
+    // Bun's documented default cap on an inbound message. Enforced with close
+    // code 1009 rather than by growing the buffer until the VM runs out of heap.
+    const maxPayloadLength = (wsHandlers && wsHandlers.maxPayloadLength) || 16 * 1024 * 1024;
+
     class ServerWebSocket {
       constructor(socket, data) {
         this._socket = socket;
         this.data = data;
         this.readyState = 1; // OPEN
+        // The genuine peer address of the loopback socket. Unlike requestIP()
+        // this is not fabricated — an in-VM client really did connect from
+        // 127.0.0.1 — so it is reported as-is.
         this.remoteAddress = (socket && socket.remoteAddress) || "127.0.0.1";
+        this.binaryType = "arraybuffer";
         this._subs = new Set();
         this._buf = Buffer.alloc(0);
         this._fragOpcode = 0;
         this._fragChunks = [];
+        this._fragActive = false;
+        this._fragLen = 0;
+        // cork() batching state and the backpressure flag that drives `drain`.
+        this._corkDepth = 0;
+        this._corkBuf = null;
+        this._backpressure = false;
       }
       get subscriptions() { return Array.from(this._subs); }
-      send(message) {
-        if (this.readyState !== 1) return -1;
-        const { opcode, payload } = toWsPayload(message, Buffer);
-        try { this._socket.write(encodeWsFrame(Buffer, opcode, payload, false)); return payload.length; }
-        catch { return 0; }
+
+      // ---- the write path ----------------------------------------------------
+      // All frames go through here so that cork() can batch them and so that one
+      // place decides what backpressure means.
+      _enqueue(buf) {
+        if (this._corkDepth > 0) { this._corkBuf.push(buf); return true; }
+        return this._flushWrite(buf);
       }
+      _flushWrite(buf) {
+        try {
+          // Node's write() returns false once the socket's buffer is over its
+          // high-water mark. That is the ONLY honest backpressure signal we have,
+          // and it is what makes `drain` meaningful rather than unconditional.
+          if (this._socket.write(buf) === false) this._backpressure = true;
+          return true;
+        } catch { return false; }
+      }
+      // Bun documents send() as: -1 if the connection is closed, 0 if the message
+      // was dropped for backpressure, otherwise the byte count. We never return 0:
+      // a Node socket QUEUES rather than drops, so the message really is going to
+      // be sent and reporting it as dropped would be a lie in the other direction.
+      // Backpressure is observable via getBufferedAmount() and the `drain` handler.
+      _sendFrame(opcode, payload) {
+        if (this.readyState !== 1) return -1;
+        return this._enqueue(encodeWsFrame(Buffer, opcode, payload, false)) ? payload.length : 0;
+      }
+      send(message, _compress) {
+        const { opcode, payload } = toWsPayload(message, Buffer);
+        return this._sendFrame(opcode, payload);
+      }
+      // Bun's explicit-opcode variants. They exist because toWsPayload() picks the
+      // opcode from the JS type, and callers sometimes need to force it — a string
+      // sent as binary, or bytes sent as text.
+      sendText(message, _compress) {
+        return this._sendFrame(0x1, Buffer.from(String(message), "utf8"));
+      }
+      sendBinary(message, _compress) {
+        return this._sendFrame(0x2, toBuf(message, Buffer));
+      }
+      // ---- control frames ----------------------------------------------------
+      // These were empty no-ops, so a keepalive loop looked healthy and sent
+      // nothing: the peer saw an idle connection and dropped it. RFC 6455 §5.5
+      // caps a control-frame payload at 125 bytes and forbids fragmenting it.
+      _controlFrame(opcode, data, name) {
+        if (this.readyState !== 1) return -1;
+        const payload = data === undefined || data === null ? Buffer.alloc(0) : toBuf(data, Buffer);
+        if (payload.length > 125) {
+          throw new RangeError(
+            "ws." + name + "() payload cannot exceed 125 bytes (RFC 6455 §5.5), got " + payload.length,
+          );
+        }
+        return this._enqueue(encodeWsFrame(Buffer, opcode, payload, false)) ? payload.length : 0;
+      }
+      ping(data) { return this._controlFrame(0x9, data, "ping"); }
+      pong(data) { return this._controlFrame(0xa, data, "pong"); }
+
       close(code, reason) {
         if (this.readyState === 3 || this.readyState === 2) return;
         this.readyState = 2;
@@ -369,40 +565,127 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
         try { this._socket.end(); } catch {}
         this._closed(typeof code === "number" ? code : 1000, reason || "", true);
       }
+      // Bun's abrupt counterpart to close(): drop the connection without the
+      // closing handshake. 1006 is the code RFC 6455 §7.4.1 reserves for exactly
+      // this "connection closed abnormally, no close frame" case.
+      terminate() {
+        if (this.readyState === 3) return;
+        try { this._socket.destroy(); } catch {}
+        this._closed(1006, "", false);
+      }
+
       subscribe(topic) { if (!topics.has(topic)) topics.set(topic, new Set()); topics.get(topic).add(this); this._subs.add(topic); return true; }
       unsubscribe(topic) { this._subs.delete(topic); const s = topics.get(topic); if (s) { s.delete(this); if (!s.size) topics.delete(topic); } return true; }
       isSubscribed(topic) { return this._subs.has(topic); }
-      publish(topic, message) { return topicPublish(topic, message, publishToSelf ? null : this); }
-      cork(cb) { return cb(this); }
-      ping() {} pong() {}
+      publish(topic, message, _compress) { return topicPublish(topic, message, publishToSelf ? null : this); }
+      publishText(topic, message, _compress) { return topicPublish(topic, String(message), publishToSelf ? null : this, 0x1); }
+      publishBinary(topic, message, _compress) { return topicPublish(topic, message, publishToSelf ? null : this, 0x2); }
+
+      // How many bytes are queued in the socket but not yet flushed. Real Node
+      // state, not a guess, so `while (ws.getBufferedAmount() > N) await drain`
+      // actually terminates.
+      getBufferedAmount() {
+        try { return this._socket.writableLength | 0; } catch { return 0; }
+      }
+      // cork() batches every frame written inside the callback into ONE socket
+      // write. It used to just invoke the callback, which is why it "worked" and
+      // saved nothing. Nesting is tracked so only the outermost cork flushes.
+      cork(cb) {
+        if (this._corkDepth === 0) this._corkBuf = [];
+        this._corkDepth++;
+        try {
+          return cb(this);
+        } finally {
+          this._corkDepth--;
+          if (this._corkDepth === 0) {
+            const chunks = this._corkBuf;
+            this._corkBuf = null;
+            if (chunks && chunks.length) this._flushWrite(Buffer.concat(chunks));
+          }
+        }
+      }
+      // Called from the socket's own 'drain' event — i.e. when the kernel buffer
+      // has genuinely emptied, not on a timer and not unconditionally.
+      _onDrain() {
+        if (!this._backpressure) return;
+        this._backpressure = false;
+        if (wsHandlers && wsHandlers.drain) {
+          try { wsHandlers.drain(this); } catch (e) { if (wsHandlers.error) wsHandlers.error(this, e); }
+        }
+      }
+
+      // ---- the read path -----------------------------------------------------
       _onData(chunk) {
         this._buf = Buffer.concat([this._buf, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
         for (;;) {
           const r = readWsFrame(Buffer, this._buf);
           if (!r) break;
+          if (r.oversized) {
+            this._failProtocol({ code: 1009, reason: "frame length exceeds 2^32 bytes" });
+            return;
+          }
           this._buf = r.rest;
-          this._handleFrame(r.frame);
+          if (this._handleFrame(r.frame) === false) return;
         }
       }
+      // Fail the connection per RFC 6455 §7.1.7: send a Close with the status
+      // code, then drop it. Returns false so _onData stops parsing the rest of a
+      // buffer we have already decided is untrustworthy.
+      _failProtocol(err) {
+        const r = Buffer.from(err.reason || "", "utf8");
+        const payload = Buffer.alloc(2 + r.length);
+        payload.writeUInt16BE(err.code, 0);
+        r.copy(payload, 2);
+        try { this._socket.write(encodeWsFrame(Buffer, 0x8, payload, false)); } catch {}
+        try { this._socket.end(); } catch {}
+        this._closed(err.code, err.reason || "", false);
+        return false;
+      }
       _handleFrame(frame) {
+        // Every inbound frame is checked against the rules a SERVER has to
+        // enforce before it is acted on: masking, RSV bits, control-frame size,
+        // fragmentation order, and maxPayloadLength. See ./bun-serve.js.
+        const err = wsFrameProtocolError(frame, {
+          fragmented: this._fragActive,
+          maxPayloadLength,
+          receivedLength: this._fragLen,
+        });
+        if (err) return this._failProtocol(err);
+
         const { fin, opcode, payload } = frame;
         if (opcode === 0x8) {
           const code = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
           const reason = payload.length > 2 ? payload.subarray(2).toString("utf8") : "";
           try { this._socket.write(encodeWsFrame(Buffer, 0x8, payload.length >= 2 ? payload : Buffer.alloc(0), false)); } catch {}
           try { this._socket.end(); } catch {}
-          this._closed(code, reason, true); return;
+          this._closed(code, reason, true); return false;
         }
-        if (opcode === 0x9) { try { this._socket.write(encodeWsFrame(Buffer, 0xa, payload, false)); } catch {} return; }
-        if (opcode === 0xa) return;
-        if (opcode === 0x1 || opcode === 0x2) { this._fragOpcode = opcode; this._fragChunks = [payload]; }
-        else if (opcode === 0x0) { this._fragChunks.push(payload); }
-        if (!fin) return;
+        if (opcode === 0x9) {
+          // RFC 6455 §5.5.2: a pong MUST carry the ping's payload. Bun also
+          // surfaces the ping to the app, which we now do too.
+          try { this._socket.write(encodeWsFrame(Buffer, 0xa, payload, false)); } catch {}
+          this._invoke("ping", payload);
+          return true;
+        }
+        if (opcode === 0xa) { this._invoke("pong", payload); return true; }
+
+        if (opcode === 0x1 || opcode === 0x2) { this._fragOpcode = opcode; this._fragChunks = [payload]; this._fragLen = payload.length; }
+        else { this._fragChunks.push(payload); this._fragLen += payload.length; }
+        this._fragActive = !fin;
+        if (!fin) return true;
         const full = this._fragChunks.length === 1 ? this._fragChunks[0] : Buffer.concat(this._fragChunks);
         this._fragChunks = [];
+        this._fragLen = 0;
         const isText = this._fragOpcode === 0x1;
         const msg = isText ? full.toString("utf8") : full.buffer.slice(full.byteOffset, full.byteOffset + full.byteLength);
         if (wsHandlers && wsHandlers.message) { try { wsHandlers.message(this, msg); } catch (e) { if (wsHandlers.error) wsHandlers.error(this, e); else throw e; } }
+        return true;
+      }
+      // A handler that is optional in Bun: absent means the frame is simply not
+      // surfaced, which is not an error.
+      _invoke(name, payload) {
+        if (!wsHandlers || typeof wsHandlers[name] !== "function") return;
+        try { wsHandlers[name](this, payload); } catch (e) { if (wsHandlers.error) wsHandlers.error(this, e); }
       }
       _closed(code, reason, clean) {
         if (this.readyState === 3) return;
@@ -416,27 +699,55 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
 
     function finishUpgrade(ctx, extraHeaders, data) {
       const crypto = lazy("crypto");
-      const key = ctx.req.headers["sec-websocket-key"] || "";
-      const accept = crypto.createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
-      let head =
-        "HTTP/1.1 101 Switching Protocols\r\n" +
-        "Upgrade: websocket\r\n" +
-        "Connection: Upgrade\r\n" +
-        "Sec-WebSocket-Accept: " + accept + "\r\n";
-      const proto = ctx.req.headers["sec-websocket-protocol"];
-      if (proto) head += "Sec-WebSocket-Protocol: " + String(proto).split(",")[0].trim() + "\r\n";
+      // RFC 6455 §4.2.1: reject a version we do not speak (426, advertising 13)
+      // and a missing/malformed key (400) BEFORE computing an Accept the client
+      // would reject anyway. This used to accept anything and hash whatever was
+      // there, including the empty string.
+      const refusal = validateUpgradeRequest(ctx.req.headers);
+      if (refusal) {
+        let head = "HTTP/1.1 " + refusal.status + " " + refusal.statusText + "\r\nConnection: close\r\n";
+        for (const k of Object.keys(refusal.headers)) head += k + ": " + refusal.headers[k] + "\r\n";
+        try { ctx.socket.write(head + "\r\n" + refusal.reason); } catch {}
+        try { ctx.socket.destroy(); } catch {}
+        return null;
+      }
+      const key = String(ctx.req.headers["sec-websocket-key"] || "").trim();
+      const accept = crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
+
+      // Collect the caller's upgrade headers once, so the subprotocol they asked
+      // for can be negotiated against what the CLIENT offered and then emitted
+      // exactly once. Previously the client's first offer was echoed blindly AND
+      // the caller's header was appended, producing two Sec-WebSocket-Protocol
+      // lines whenever both were present.
+      const extraPairs = [];
+      let offered = null;
       if (extraHeaders) {
         try {
           const h = extraHeaders instanceof Headers ? extraHeaders : new Headers(extraHeaders);
-          h.forEach((v, k) => { head += k + ": " + v + "\r\n"; });
+          h.forEach((v, k) => {
+            if (String(k).toLowerCase() === "sec-websocket-protocol") offered = v;
+            else extraPairs.push([k, v]);
+          });
         } catch {}
       }
-      head += "\r\n";
-      try { ctx.socket.write(head); } catch {}
+      const protocol = negotiateSubprotocol(ctx.req.headers["sec-websocket-protocol"], offered);
+      try { ctx.socket.write(buildHandshakeResponse(accept, protocol, extraPairs)); } catch {}
+
       const ws = new ServerWebSocket(ctx.socket, data);
+      ws.protocol = protocol || "";
       allSockets.add(ws);
       inst.pendingWebSockets = allSockets.size;
+      // A WebSocket is long-lived by design, so the HTTP idle timeout must not
+      // apply to it. Bun has a separate `websocket.idleTimeout`; when it is not
+      // set the connection is left alone rather than being killed by the request
+      // timeout, which is what an app expects from a socket it is holding open.
+      const wsIdle = wsHandlers && wsHandlers.idleTimeout;
+      try { ctx.socket.setTimeout(typeof wsIdle === "number" ? wsIdle * 1000 : 0); } catch {}
+      if (typeof wsIdle === "number" && wsIdle > 0) {
+        ctx.socket.on("timeout", () => { try { ws.close(1001, "idle timeout"); } catch {} });
+      }
       ctx.socket.on("data", (chunk) => ws._onData(chunk));
+      ctx.socket.on("drain", () => ws._onDrain());
       ctx.socket.on("close", () => ws._closed(1006, "", false));
       ctx.socket.on("error", () => ws._closed(1006, "", false));
       if (ctx.head && ctx.head.length) ws._onData(ctx.head);
@@ -457,6 +768,7 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
         next = next || {};
         if (typeof next.fetch === "function") fetchHandler = next.fetch;
         if (next.routes) routes = compileRoutes(next.routes);
+        if (next.static) staticRoutes = compileStaticRoutes(next.static);
         if (next.websocket) wsHandlers = next.websocket;
         if (typeof next.error === "function") errorHandler = next.error;
       },
@@ -466,15 +778,27 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
         const ctx = upgradeCtx.get(request);
         if (!ctx || ctx.done) return false;
         ctx.done = true;
-        finishUpgrade(ctx, upOpts && upOpts.headers, upOpts && upOpts.data);
-        return true;
+        // A handshake we refused (bad version/key) is not an upgrade. Returning
+        // true there would make the caller `return` from `fetch` with nothing to
+        // serve on a socket that is already gone.
+        return finishUpgrade(ctx, upOpts && upOpts.headers, upOpts && upOpts.data) !== null;
       },
-      publish(topic, message) { return topicPublish(topic, message, null); },
+      publish(topic, message, _compress) { return topicPublish(topic, message, null); },
+      publishText(topic, message, _compress) { return topicPublish(topic, String(message), null, 0x1); },
+      publishBinary(topic, message, _compress) { return topicPublish(topic, message, null, 0x2); },
       subscriberCount(topic) { const s = topics.get(topic); return s ? s.size : 0; },
-      requestIP() { return { address: "127.0.0.1", family: "IPv4", port: 0 }; },
+      // Bun's own types make this `SocketAddress | null`, and null is the honest
+      // answer here. It used to return a hard-coded 127.0.0.1 for every caller,
+      // which is not a harmless placeholder: a rate limiter or an audit log keyed
+      // on requestIP() silently treats every visitor on Earth as one client, and
+      // it does so while looking like it works. Real peer addresses do not
+      // survive the Service-Worker preview hop — the kernel forwards a request
+      // object, not a socket — so there is nothing true to report.
+      requestIP() { return null; },
       get pendingRequests() { return 0; },
       pendingWebSockets: 0,
     };
+    if (config.id !== undefined) inst.id = config.id;
 
     if (wsHandlers || fetchHandler) {
       server.on("upgrade", (req, socket, head) => {
@@ -500,7 +824,31 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
       });
     }
 
-    server.listen(port, hostname);
+    // idleTimeout, genuinely enforced. This matters more than it looks: an
+    // ignored idleTimeout means a long-lived endpoint (SSE, a slow upload) runs
+    // fine in the sandbox and is silently cut off in production, and the symptom
+    // — a stream that just stops — points nowhere near the cause. Vivari's net.js
+    // is Node's real one, so setTimeout() on the accepted socket genuinely fires.
+    if (idleTimeoutMs > 0) {
+      server.on("connection", (socket) => {
+        socket.setTimeout(idleTimeoutMs, () => {
+          // An idle HTTP connection is closed, not reset: anything already
+          // written still reaches the client.
+          try { socket.end(); } catch {}
+        });
+      });
+    }
+
+    // `unix` binds a real UNIX-domain socket (Vivari's net layer has a working
+    // Pipe binding). normalizeServeOptions has already warned that this is not
+    // reachable from the browser preview, which finds servers by port.
+    if (config.unix) {
+      inst.unix = config.unix;
+      inst.url = safeUrl("unix://" + config.unix);
+      server.listen({ path: config.unix });
+    } else {
+      server.listen(port, hostname);
+    }
     return inst;
   }
 
@@ -567,9 +915,28 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
       cwd: opts.cwd || process.cwd(),
       env: opts.env || process.env,
     });
+    // Bun types `.stdout`/`.stderr` as ReadableStream, so we do have to adapt the
+    // Node stream — but NOT with `Readable.toWeb`. That is the obvious one-liner
+    // and it is a trap, the same one documented at length in bun-file.js:
+    // node/internal/webstreams/adapters.js implements only `fromWeb` and leaves
+    // `toWeb` as a function that raises ERR_METHOD_NOT_IMPLEMENTED. So the
+    // natural `Readable.toWeb ? … : …` guard is TRUE and then throws — and it
+    // throws from Bun.spawn() itself, meaning every Bun.spawn call failed in the
+    // VM while the offline tier (host Node, where toWeb works) stayed green.
+    // Feature-detecting by presence is the bug; we adapt by hand instead.
     const web = (nodeStream) => {
-      const Readable = lazy("stream").Readable;
-      return nodeStream && Readable.toWeb ? Readable.toWeb(nodeStream) : nodeStream;
+      if (!nodeStream) return nodeStream;
+      if (typeof ReadableStream !== "function") return nodeStream;
+      return new ReadableStream({
+        start(controller) {
+          nodeStream.on("data", (c) => {
+            try { controller.enqueue(c instanceof Uint8Array ? c : new Uint8Array(toBuf(c, Buffer))); } catch {}
+          });
+          nodeStream.on("end", () => { try { controller.close(); } catch {} });
+          nodeStream.on("error", (e) => { try { controller.error(e); } catch {} });
+        },
+        cancel() { try { nodeStream.destroy(); } catch {} },
+      });
     };
     return {
       pid: child.pid,
@@ -1274,6 +1641,20 @@ export function bunDeepMatch(subset, object) {
   return true;
 }
 
+// ---- Bun.serve degradation warnings -----------------------------------------
+// An option we accept but cannot honour has to say so — once. Once per process
+// per option, not per request and not per server: a warning that repeats on every
+// request is scrolled past and becomes as invisible as the silence it replaced.
+// Module scope (not per-runtime) is deliberate, so two Bun.serve() calls in one
+// process do not each re-announce the same limitation.
+const serveWarned = new Set();
+export function serveWarnOnce(key, message) {
+  if (serveWarned.has(key)) return false;
+  serveWarned.add(key);
+  try { console.warn("[vivari] " + message); } catch {}
+  return true;
+}
+
 // ---- Bun.serve error rendering ----------------------------------------------
 // What Bun.serve renders when a `fetch`/route handler throws. Bun hands the error
 // to the server's `error(err)` option and serves whatever Response it returns; if
@@ -1375,15 +1756,34 @@ export function encodeWsFrame(Buffer, opcode, payload, masked) {
 
 // Parse one frame off the head of `buf`; returns { frame, rest } or null if the
 // buffer does not yet hold a complete frame.
+// The returned frame also carries `masked` and the three RSV bits. They used to
+// be parsed and dropped, which is precisely why the reader could not tell a
+// legal frame from an illegal one: RFC 6455 §5.1 requires a server to reject an
+// UNMASKED client frame, and §5.2 requires it to reject a set RSV bit when no
+// extension was negotiated (we negotiate none). The parser stays permissive and
+// role-agnostic — it is shared with the client-role codec in ../websocket.js —
+// and wsFrameProtocolError() in ./bun-serve.js is what applies the server rules.
 export function readWsFrame(Buffer, buf) {
   if (buf.length < 2) return null;
   const fin = (buf[0] & 0x80) !== 0;
+  const rsv1 = (buf[0] & 0x40) !== 0;
+  const rsv2 = (buf[0] & 0x20) !== 0;
+  const rsv3 = (buf[0] & 0x10) !== 0;
   const opcode = buf[0] & 0x0f;
   const masked = (buf[1] & 0x80) !== 0;
   let len = buf[1] & 0x7f;
   let offset = 2;
   if (len === 126) { if (buf.length < 4) return null; len = buf.readUInt16BE(2); offset = 4; }
-  else if (len === 127) { if (buf.length < 10) return null; len = buf.readUInt32BE(6); offset = 10; }
+  else if (len === 127) {
+    if (buf.length < 10) return null;
+    // 64-bit length. The high word used to be skipped silently, so a frame
+    // claiming >4 GiB was read as its low 32 bits — a length confusion rather
+    // than an error. We cannot buffer such a frame anyway, so report it.
+    const high = buf.readUInt32BE(2);
+    if (high !== 0) return { frame: null, rest: buf, oversized: true };
+    len = buf.readUInt32BE(6);
+    offset = 10;
+  }
   const maskLen = masked ? 4 : 0;
   if (buf.length < offset + maskLen + len) return null;
   let payload = buf.subarray(offset + maskLen, offset + maskLen + len);
@@ -1395,7 +1795,7 @@ export function readWsFrame(Buffer, buf) {
   } else {
     payload = Buffer.from(payload);
   }
-  return { frame: { fin, opcode, payload }, rest: buf.subarray(offset + maskLen + len) };
+  return { frame: { fin, rsv1, rsv2, rsv3, opcode, masked, payload }, rest: buf.subarray(offset + maskLen + len) };
 }
 
 // ---- small shared helpers ---------------------------------------------------

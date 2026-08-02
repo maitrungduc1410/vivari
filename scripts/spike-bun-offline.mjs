@@ -32,6 +32,17 @@ import {
   loadBunEnvFiles,
 } from "../packages/runtime/builtins/bun-env.js";
 import { createSleepSync } from "../packages/runtime/builtins/bun-sleep.js";
+// Bun.serve option handling + the RFC 6455 rules, as pure functions so this
+// Wasm-free tier can drive them without binding a port. See bun-serve.js.
+import {
+  normalizeServeOptions,
+  compileStaticRoutes,
+  validateUpgradeRequest,
+  negotiateSubprotocol,
+  buildHandshakeResponse,
+  wsFrameProtocolError,
+  WS_GUID,
+} from "../packages/runtime/builtins/bun-serve.js";
 import { canPark, parkFor } from "../packages/protocol/syscall.js";
 // Bun.CryptoHasher / Bun.password pure helpers, plus the internalBinding('crypto')
 // adapter, so the crypto checks at the end of this file can drive the real Rust
@@ -381,6 +392,188 @@ console.log("== Bun.serve WebSocket frame codec ==");
   // Payload typing: binary vs text opcode selection.
   ok(toWsPayload("hi", Buffer).opcode === 0x1, "string -> text opcode");
   ok(toWsPayload(new Uint8Array([1, 2, 3]), Buffer).opcode === 0x2, "typed array -> binary opcode");
+}
+
+// The checks above are self-consistency: our encoder feeding our decoder. They
+// would pass just as happily against a codec that was wrong in a matching way on
+// both sides. RFC 6455 §5.7 prints the exact bytes for six frames, so these pin
+// the codec to the specification instead.
+console.log("== WebSocket codec matches the RFC 6455 §5.7 wire examples ==");
+{
+  const hex = (b) => Buffer.from(b).toString("hex");
+  const HELLO = Buffer.from("Hello", "utf8");
+
+  // "A single-frame unmasked text message" — 0x81 0x05 0x48 0x65 0x6c 0x6c 0x6f
+  ok(hex(encodeWsFrame(Buffer, 0x1, HELLO, false)) === "810548656c6c6f", "§5.7 single-frame unmasked text 'Hello' encodes to the RFC's bytes");
+
+  // "A single-frame masked text message" — the RFC uses masking key 0x37fa213d.
+  // We cannot pin our own encoder's output (it picks a random key, as §5.3
+  // requires), but we MUST decode the RFC's literal frame.
+  const rfcMasked = Buffer.from([0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58]);
+  const maskedDec = readWsFrame(Buffer, rfcMasked);
+  ok(maskedDec && maskedDec.frame.payload.toString("utf8") === "Hello", "§5.7 masked text frame from the RFC unmasks to 'Hello'");
+  ok(maskedDec.frame.masked === true && maskedDec.frame.fin === true, "…and is reported as masked with FIN set");
+
+  // "A fragmented unmasked text message" — 0x01 0x03 "Hel" then 0x80 0x02 "lo".
+  const frag1 = readWsFrame(Buffer, Buffer.from([0x01, 0x03, 0x48, 0x65, 0x6c]));
+  const frag2 = readWsFrame(Buffer, Buffer.from([0x80, 0x02, 0x6c, 0x6f]));
+  ok(frag1.frame.fin === false && frag1.frame.opcode === 0x1 && frag1.frame.payload.toString() === "Hel", "§5.7 first fragment: FIN clear, text opcode, 'Hel'");
+  ok(frag2.frame.fin === true && frag2.frame.opcode === 0x0 && frag2.frame.payload.toString() === "lo", "§5.7 final fragment: FIN set, continuation opcode, 'lo'");
+
+  // "Unmasked Ping request and masked Pong response".
+  ok(hex(encodeWsFrame(Buffer, 0x9, HELLO, false)) === "890548656c6c6f", "§5.7 unmasked Ping 'Hello' encodes to the RFC's bytes");
+  const rfcPong = Buffer.from([0x8a, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58]);
+  const pongDec = readWsFrame(Buffer, rfcPong);
+  ok(pongDec && pongDec.frame.opcode === 0xa && pongDec.frame.payload.toString() === "Hello", "§5.7 masked Pong frame from the RFC decodes");
+
+  // "256 bytes binary message in a single unmasked frame" — 0x82 0x7E 0x0100.
+  const b256 = encodeWsFrame(Buffer, 0x2, Buffer.alloc(256, 0), false);
+  ok(hex(b256.subarray(0, 4)) === "827e0100", "§5.7 256-byte binary uses the 16-bit length header 0x82 0x7E 0x0100");
+
+  // "64KiB binary message in a single unmasked frame" — 0x82 0x7F 0x0000000000010000.
+  const b64k = encodeWsFrame(Buffer, 0x2, Buffer.alloc(65536, 0), false);
+  ok(hex(b64k.subarray(0, 10)) === "827f0000000000010000", "§5.7 65536-byte binary uses the 64-bit length header");
+  ok(readWsFrame(Buffer, b64k).frame.payload.length === 65536, "…and the 64-bit length frame round-trips");
+
+  // The RSV bits are now surfaced rather than parsed and dropped, which is what
+  // lets the server enforce §5.2 at all.
+  const rsvFrame = Buffer.from([0xc1, 0x00]); // FIN + RSV1 + text, empty payload
+  ok(readWsFrame(Buffer, rsvFrame).frame.rsv1 === true, "RSV1 is reported by the reader (§5.2 needs it)");
+}
+
+console.log("== Bun.serve WebSocket handshake follows RFC 6455 §4 ==");
+{
+  // RFC 6455 §1.3 prints a complete worked example: the key `dGhlIHNhbXBsZSBub25jZQ==`
+  // concatenated with the GUID and SHA-1'd must base64 to `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`.
+  // This is the single best external pin available for the handshake.
+  const RFC_KEY = "dGhlIHNhbXBsZSBub25jZQ==";
+  const RFC_ACCEPT = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+  const accept = nodeRequire("node:crypto").createHash("sha1").update(RFC_KEY + WS_GUID).digest("base64");
+  ok(WS_GUID === "258EAFA5-E914-47DA-95CA-C5AB0DC85B11", "the handshake GUID is the one RFC 6455 §1.3 fixes");
+  ok(accept === RFC_ACCEPT, "key + GUID -> SHA-1 -> base64 reproduces the RFC's worked Accept value");
+
+  // §4.1: version 13, and a key that is a base64'd 16-byte nonce.
+  ok(validateUpgradeRequest({ "sec-websocket-version": "13", "sec-websocket-key": RFC_KEY }) === null, "a well-formed v13 upgrade is accepted");
+  const badVer = validateUpgradeRequest({ "sec-websocket-version": "8", "sec-websocket-key": RFC_KEY });
+  ok(badVer && badVer.status === 426, "§4.4: an unsupported version is refused with 426 Upgrade Required");
+  ok(badVer.headers["Sec-WebSocket-Version"] === "13", "…and advertises the version the server does speak");
+  const noKey = validateUpgradeRequest({ "sec-websocket-version": "13" });
+  ok(noKey && noKey.status === 400, "a missing Sec-WebSocket-Key is refused with 400 (it used to be hashed as '')");
+  ok(validateUpgradeRequest({ "sec-websocket-version": "13", "sec-websocket-key": "short" }).status === 400, "a malformed key is refused too");
+
+  // §4.2.2 step 4: echo a subprotocol ONLY if the server selected one AND the
+  // client offered it. The shim used to echo the client's first offer blindly,
+  // which both violates the RFC and diverges from Bun (where you select one
+  // explicitly via server.upgrade(req, { headers })).
+  ok(negotiateSubprotocol("chat, superchat", null) === null, "no server-offered protocol -> none selected (was: blindly echo 'chat')");
+  ok(negotiateSubprotocol("chat, superchat", "superchat") === "superchat", "a server protocol the client offered is selected");
+  ok(negotiateSubprotocol("chat", "graphql-ws") === null, "§4.1: a protocol the client never offered is NOT echoed back");
+  ok(negotiateSubprotocol("chat, superchat", ["graphql-ws", "chat"]) === "chat", "the server's preference order wins among mutually-supported protocols");
+  ok(negotiateSubprotocol("", "chat") === null, "a client offering nothing gets nothing selected");
+
+  // The duplicate-header bug: both a negotiated protocol and caller headers.
+  const head = buildHandshakeResponse(RFC_ACCEPT, "chat", [["X-Trace", "abc"], ["Sec-WebSocket-Protocol", "sneaky"]]);
+  const protoLines = head.split("\r\n").filter((l) => /^sec-websocket-protocol:/i.test(l));
+  ok(protoLines.length === 1, "exactly one Sec-WebSocket-Protocol line is emitted (two used to be)");
+  ok(protoLines[0] === "Sec-WebSocket-Protocol: chat", "…and it is the negotiated value, not the caller's raw header");
+  ok(head.startsWith("HTTP/1.1 101 Switching Protocols\r\n"), "§4.2.2: the handshake response is a 101");
+  ok(/\r\nUpgrade: websocket\r\n/.test(head) && /\r\nConnection: Upgrade\r\n/.test(head), "…with the required Upgrade/Connection fields");
+  ok(head.indexOf("X-Trace: abc") !== -1, "caller headers still pass through");
+  ok(head.endsWith("\r\n\r\n"), "…and the head is terminated by a blank line");
+  ok(buildHandshakeResponse(RFC_ACCEPT, null, []).indexOf("Sec-WebSocket-Protocol") === -1, "no protocol selected -> the header is omitted entirely");
+}
+
+console.log("== WebSocket frame validation enforces the RFC 6455 §5 server rules ==");
+{
+  const frame = (over) => ({ fin: true, opcode: 0x1, masked: true, rsv1: false, rsv2: false, rsv3: false, payload: Buffer.alloc(0), ...over });
+  const st = (over) => ({ fragmented: false, maxPayloadLength: 0, receivedLength: 0, ...over });
+
+  ok(wsFrameProtocolError(frame(), st()) === null, "a masked, RSV-clear text frame is legal");
+
+  // §5.1: "The server MUST close the connection upon receiving a frame that is not masked."
+  const unmasked = wsFrameProtocolError(frame({ masked: false }), st());
+  ok(unmasked && unmasked.code === 1002, "§5.1: an UNMASKED client frame is a protocol error (1002)");
+
+  // §5.2: RSV bits must be 0 when no extension was negotiated — and we negotiate none.
+  ok(wsFrameProtocolError(frame({ rsv1: true }), st()).code === 1002, "§5.2: RSV1 set with no negotiated extension is 1002");
+  ok(wsFrameProtocolError(frame({ rsv3: true }), st()).code === 1002, "§5.2: RSV3 set is 1002 too");
+
+  // §5.2: unknown opcodes.
+  ok(wsFrameProtocolError(frame({ opcode: 0x3 }), st()).code === 1002, "§5.2: a reserved DATA opcode (0x3) is 1002");
+  ok(wsFrameProtocolError(frame({ opcode: 0xb }), st()).code === 1002, "§5.2: a reserved CONTROL opcode (0xB) is 1002");
+
+  // §5.5: control frames are <=125 bytes and never fragmented.
+  ok(wsFrameProtocolError(frame({ opcode: 0x9, payload: Buffer.alloc(126) }), st()).code === 1002, "§5.5: a 126-byte control frame is 1002");
+  ok(wsFrameProtocolError(frame({ opcode: 0x9, payload: Buffer.alloc(125) }), st()) === null, "§5.5: a 125-byte control frame is exactly legal");
+  ok(wsFrameProtocolError(frame({ opcode: 0x8, fin: false }), st()).code === 1002, "§5.5: a fragmented control frame is 1002");
+
+  // §5.4: fragmentation ordering.
+  ok(wsFrameProtocolError(frame({ opcode: 0x0 }), st()).code === 1002, "§5.4: a continuation with nothing to continue is 1002");
+  ok(wsFrameProtocolError(frame({ opcode: 0x0 }), st({ fragmented: true })) === null, "§5.4: a continuation IS legal mid-message");
+  ok(wsFrameProtocolError(frame({ opcode: 0x1 }), st({ fragmented: true })).code === 1002, "§5.4: a new data frame mid-fragment is 1002");
+  // A control frame may legally interleave with a fragmented data message.
+  ok(wsFrameProtocolError(frame({ opcode: 0x9 }), st({ fragmented: true })) === null, "§5.4: a control frame MAY interleave with a fragmented message");
+
+  // maxPayloadLength -> 1009 "message too big" (§7.4.1), accumulated across fragments.
+  ok(wsFrameProtocolError(frame({ payload: Buffer.alloc(200) }), st({ maxPayloadLength: 100 })).code === 1009, "maxPayloadLength exceeded closes with 1009, not 1002");
+  ok(wsFrameProtocolError(frame({ opcode: 0x0, payload: Buffer.alloc(60) }), st({ fragmented: true, maxPayloadLength: 100, receivedLength: 60 })).code === 1009, "…and the limit accumulates across fragments");
+}
+
+console.log("== Bun.serve options: implemented, degraded loudly, or refused ==");
+{
+  const cfg = (o) => normalizeServeOptions(o).config;
+  const warns = (o) => normalizeServeOptions(o).warnings.map((w) => w.key);
+  const throws = (fn) => { try { fn(); return ""; } catch (e) { return e.message; } };
+
+  // Baseline: none of these options set -> no warnings, Bun's documented defaults.
+  const base = normalizeServeOptions({ fetch() {} });
+  ok(base.warnings.length === 0, "a plain Bun.serve warns about nothing");
+  ok(base.config.port === 3000, "the default port is 3000");
+  ok(base.config.idleTimeout === 10, "Bun's documented default idleTimeout is 10 seconds");
+  ok(base.config.maxRequestBodySize === 128 * 1024 * 1024, "Bun's documented default maxRequestBodySize is 128 MiB");
+
+  // THROW: serving HTTP/1.1 to code that asked for HTTP/3 is a silent approximation.
+  const h3 = throws(() => normalizeServeOptions({ http3: true }));
+  ok(/http3.*not supported/i.test(h3) && /QUIC/.test(h3), "http3 throws and explains that QUIC/UDP does not exist in a tab");
+
+  // DEGRADE: accepted, ignored, announced once.
+  ok(warns({ tls: { cert: "x", key: "y" } }).includes("tls"), "tls DEGRADES (accepted + warned), it does not throw");
+  ok(cfg({ tls: { cert: "x" } }).tls === true, "…and the fact that TLS was requested is recorded");
+  ok(warns({ reusePort: true }).includes("reusePort"), "reusePort warns (SO_REUSEPORT needs several processes; we have one)");
+  ok(warns({ ipv6Only: true }).includes("ipv6Only"), "ipv6Only warns (the in-VM loopback is IPv4-only)");
+  const tlsMsg = normalizeServeOptions({ tls: {} }).warnings[0].message;
+  ok(/plaintext/i.test(tlsMsg) && /deploy/i.test(tlsMsg), "the tls warning says what happens instead AND that production is unaffected");
+
+  // IMPLEMENT: idleTimeout, validated at Bun's own u8 boundary.
+  ok(cfg({ idleTimeout: 30 }).idleTimeout === 30, "idleTimeout is carried through");
+  ok(cfg({ idleTimeout: 0 }).idleTimeout === 0, "idleTimeout 0 (disabled) is preserved, not treated as absent");
+  ok(cfg({ idleTimeout: 255 }).idleTimeout === 255, "255 seconds is exactly allowed");
+  ok(/cannot exceed 255/.test(throws(() => normalizeServeOptions({ idleTimeout: 256 }))), "256 is refused at the same boundary real Bun refuses it");
+  ok(/non-negative integer/.test(throws(() => normalizeServeOptions({ idleTimeout: 1.5 }))), "a fractional idleTimeout is refused");
+  ok(/non-negative integer/.test(throws(() => normalizeServeOptions({ idleTimeout: -1 }))), "a negative idleTimeout is refused");
+
+  // IMPLEMENT: maxRequestBodySize.
+  ok(cfg({ maxRequestBodySize: 1024 }).maxRequestBodySize === 1024, "maxRequestBodySize is carried through");
+  ok(/non-negative number/.test(throws(() => normalizeServeOptions({ maxRequestBodySize: -5 }))), "a negative maxRequestBodySize is refused");
+
+  // IMPLEMENT (with an honest caveat): unix.
+  ok(cfg({ unix: "/tmp/x.sock" }).unix === "/tmp/x.sock", "unix is carried through and really binds a socket");
+  const unixWarn = normalizeServeOptions({ unix: "/tmp/x.sock" }).warnings[0].message;
+  ok(/preview/i.test(unixWarn) && /port/i.test(unixWarn), "…but warns that the browser preview finds servers by port and cannot reach it");
+  ok(/must be a socket path string/.test(throws(() => normalizeServeOptions({ unix: 5 }))), "a non-string unix path is refused");
+
+  // ACCEPT: id is observable, nothing is being approximated.
+  ok(cfg({ id: "my-server" }).id === "my-server", "id is kept and exposed on the server instance");
+  ok(warns({ id: "x" }).length === 0, "id does not warn — there is nothing it fails to do");
+
+  // static: a real Bun feature, implemented rather than stubbed.
+  const R = (t) => ({ __tag: t, arrayBuffer() {} });
+  const s = compileStaticRoutes({ "/health": R("OK"), "/robots.txt": R("ROBOTS") });
+  ok(s instanceof Map && s.size === 2, "static compiles to an exact-path map");
+  ok(s.get("/health").__tag === "OK", "…keyed by the exact pathname");
+  ok(compileStaticRoutes(undefined) === null && compileStaticRoutes({}) === null, "no static routes -> null (skips the lookup entirely)");
+  // Putting a handler in `static` is a mistake that would otherwise never fire.
+  ok(/pre-built Response/.test(throws(() => compileStaticRoutes({ "/x": () => {} }))), "a function in `static` throws instead of silently never being called");
 }
 
 console.log("== React (Bun) app.tsx transpiles + parses ==");

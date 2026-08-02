@@ -4797,4 +4797,125 @@ rather than the VFS root. Both fail loudly if the engine is missing; neither can
 assertions are pinned to things outside this repo — SQLite's file format, SQLite's result-code
 names, Bun's documented return shapes — rather than to our own output.
 
+## `Bun.serve` hardening — honored options, WebSocket parity, and an honest streaming verdict (this change)
+
+`Bun.serve` was already the best part of the Bun shim — a real Node `http.Server`, which is why
+it previews through the same Service-Worker path as any Node server, with a genuine RFC 6455
+handshake and frame codec. This change closes the gaps in it. Nothing here is a rescue; it is the
+one Bun API people actually build on, so the bar was fidelity, not coverage.
+
+**Eight options were accepted and silently ignored.** That is the failure mode this project cares
+most about: code passes in the sandbox and breaks in production, and nothing tells the author.
+Each now has a written-down answer (`builtins/bun-serve.js`), chosen by one rule — implement where
+the sandbox genuinely can, degrade *loudly* where production is a superset we cannot reach but
+serving without it is still faithful, throw where running without it means serving something that
+is not the protocol the caller asked for.
+
+- **Implemented.** `idleTimeout` — the nastiest of the eight, because ignoring it means a
+  long-lived SSE endpoint works forever in the sandbox and gets silently cut off in production,
+  and the symptom (a stream that just stops) points nowhere near the cause. It is real:
+  `runtime/node/lib/net.js` is Node's vendored file, so `socket.setTimeout()` genuinely fires, and
+  the kernel spike proves an idle connection is closed after ~1s with `idleTimeout: 1`. Validated
+  at Bun's own u8 boundary, so a value real Bun rejects (256) is rejected here too rather than
+  quietly working. `maxRequestBodySize` — enforced *as the body arrives*, with a 413; buffering
+  it first and then complaining would defeat the point of the limit. `static` — a real Bun
+  feature, so it is implemented properly (an exact-path map of pre-built `Response`s, matched
+  before `routes`, cloned per request) rather than stubbed. `unix` — a genuine UNIX-domain
+  socket; the net layer's `Pipe` binding works and an in-VM client fetches through it. The catch
+  is discovery, not the socket: the preview finds servers by TCP port and a path has no port, so
+  that is warned about explicitly. `id` is simply kept and exposed as `server.id` — nothing is
+  being approximated, so it does not warn.
+- **Degraded, announced once per process.** `tls` accepts the config and serves plaintext.
+  Throwing was rejected deliberately: it would refuse to boot every app that merely *has* a
+  production certificate configured, which is most of them, and there is no network hop inside
+  the VM to protect. `server.url` reports `http:`, honestly. `reusePort` cannot load-balance one
+  port across processes when the port registry binds it to exactly one. `ipv6Only` has no
+  dual-stack socket to restrict on an IPv4-only loopback.
+- **Threw.** `http3`. HTTP/3 is QUIC over UDP, a browser tab has no UDP socket, and answering
+  HTTP/1.1 to code written for HTTP/3 is the silent-approximation failure in its purest form.
+
+**`requestIP()` now returns `null`.** It used to fabricate `127.0.0.1` for every caller. That is
+not a harmless placeholder — Bun's own types say `SocketAddress | null`, rate limiters and audit
+logs branch on it, and a fabricated address makes a rate limiter silently treat every visitor on
+Earth as one client while looking like it works. Peer addresses do not survive the Service-Worker
+hop (the kernel forwards a request object, not a socket), so there is nothing true to report.
+
+**WebSocket parity.** `ws.ping()`/`ws.pong()` were `ping() {} pong() {}` — literally empty, so a
+keepalive loop sent nothing while looking healthy and the peer dropped the connection as idle.
+They are now real control frames, with RFC 6455 §5.5's 125-byte limit enforced (a 126-byte
+payload throws), and inbound ping/pong are surfaced to the `websocket.ping`/`pong` handlers.
+`cork()` used to just invoke its callback, which is why it "worked" and saved nothing; it now
+batches every frame written inside into **one** socket write — proven, not asserted, by a raw
+socket that does its own handshake and counts inbound chunks: 3 sends arrive as 1 chunk corked
+and 3 uncorked. Added `sendText`/`sendBinary`/`publishText`/`publishBinary`, `terminate()`, and
+`getBufferedAmount()`. `publish()` now returns the byte count Bun documents rather than a
+recipient count (`subscriberCount()` is the API for that).
+
+**`drain` is wired to real backpressure — and will not fire, which is worth more than a
+half-truth.** It is driven by the socket's actual `'drain'` event and the actual return value of
+`write()`, not called unconditionally. But `node/bindings/net.js` `doWrite` hands every write
+straight to the peer's inbox and reports it complete synchronously, so a loopback socket has no
+send queue to overflow: measured at **25 MB written into an unread socket with
+`getBufferedAmount()` never leaving 0**. So the handler is correct code with nothing to react to
+here, and `Bun.serve` says so once if you register one. The kernel spike pins that measurement,
+so if the net binding ever grows a queue, the check fails and tells whoever changed it that
+`drain` has become live.
+
+**Three real handshake defects, found and fixed.** The server echoed the client's *first* offered
+subprotocol unconditionally — both an RFC 6455 §4.2.2 violation (it can name a protocol the
+server does not speak) and a divergence from Bun, where you select one explicitly via
+`server.upgrade(req, {headers})`; the sandbox therefore accepted a subprotocol that real Bun
+would refuse. An earlier investigation flagged this fix as delicate because changing it might
+break the in-VM client — **that turned out to be false, and was checked rather than assumed**: a
+probe against a server that deliberately omits the echo shows the client opens normally with
+`ws.protocol === ""`, which is what §4.2.2 permits. Second, a **duplicate**
+`Sec-WebSocket-Protocol` header was emitted whenever both the caller's `headers` and the client's
+request named one. Third, `Sec-WebSocket-Version` and the key were never validated — a missing
+key was hashed as the empty string and the handshake "succeeded". Now: 426 (advertising 13) for a
+bad version, 400 for a missing/malformed key.
+
+**Frame validation.** The reader parsed the mask bit and the RSV bits and threw them away, so it
+could not tell a legal frame from an illegal one. They are now surfaced, and a separate pure
+function applies the rules a *server* must enforce: §5.1 (an unmasked client frame is a protocol
+error — the shim used to accept them), §5.2 (RSV bits set with no negotiated extension; reserved
+opcodes), §5.4 (a continuation with nothing to continue; a new data frame mid-fragment), §5.5
+(control frames ≤125 bytes and never fragmented), plus `maxPayloadLength` → 1009. Validation is
+deliberately *not* inside the reader: the reader is shared with the client-role codec in
+`runtime/websocket.js`, and only a server may reject an unmasked frame. A 64-bit length whose
+high word is non-zero is now reported instead of being silently truncated to its low 32 bits.
+
+**A latent defect confirmed and fixed: `Bun.spawn()` threw on every call.** `Bun.spawn` adapted
+its stdio with `Readable.toWeb ? Readable.toWeb(s) : s`. In the VM `typeof Readable.toWeb` is
+`"function"` and calling it throws `ERR_METHOD_NOT_IMPLEMENTED` — our
+`internal/webstreams/adapters.js` implements only `fromWeb`. So the guard passed and then
+exploded, and **`Bun.spawn` was completely broken in the VM** (not merely its `.stdout`), while
+the offline tier stayed green because host Node's `toWeb` works. `.stdout`/`.stderr` are now built
+as `ReadableStream`s by hand. This is the third place this exact trap has bitten, so it is written
+up in AGENTS.md "Critical gotchas" with the rule that follows: Web-Streams interop must be proven
+in the kernel tier, because an offline check that passes for a host-Node reason is not evidence.
+
+**Streaming responses: assessed and deliberately not started.** A `Response` whose body is a
+`ReadableStream` is still buffered in full. This is not a `Bun.serve` bug and cannot be fixed in
+`bun.js`: `OP_RESPOND` carries a `total` byte count that the kernel reassembles against before
+resolving a **one-shot** Promise per `reqId`, and `sw.js` builds a buffered `Response` from the
+one object it receives. The `vv-sse` tunnel does **not** show the path exists — it is a dedicated
+`postMessage` side channel feeding an injected `EventSource` polyfill, bypassing Service-Worker
+`fetch` interception entirely (as `vv-ws` does for WebSockets), so an app doing `fetch()` +
+`body.getReader()` buffers today even though SSE "works". Lifting it means changing the protocol,
+kernel, host bridge and Service Worker together (golden rule 4) *and* designing flow control from
+scratch, since the loopback has none (see `drain` above). Half-implementing it would produce a
+response that streams in the sandbox and buffers in production, which is worse than one that
+honestly buffers — so it is left buffered and written up for a follow-up. Worth noting that
+`idleTimeout`, the option most likely to silently kill a long-lived stream in production, is now
+enforced, so that particular divergence is closed even though streaming is not.
+
+The offline gate goes from **866 checks to 938**, the kernel gate from **88 to 123**. The split is
+deliberate. The offline tier gets the pure policy and the RFC rules, pinned to values from
+**outside this repo** — RFC 6455 §1.3's worked handshake example
+(`dGhlIHNhbXBsZSBub25jZQ==` → `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`) and the six §5.7 wire frames, byte
+for byte — rather than to our own encoder's output, which would pass against a codec that was
+wrong symmetrically on both sides. The kernel tier gets everything that only real sockets and real
+timers can prove: the idle timeout firing, the 413, `static`, the unix socket, ping/pong round
+trips, cork's write coalescing, the absence of backpressure, and the `Bun.spawn` stream fix.
+
 See ARCHITECTURE.md §9.2.

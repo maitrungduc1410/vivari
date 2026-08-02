@@ -109,6 +109,11 @@ packages/
                    lets the offline tier drive the SHIPPED code over node:fs.
                    No durability (fsync is a no-op) and no locking; see the Bun
                    section below and ARCHITECTURE.md §9.2.
+      bun-serve.js Bun.serve's OPTION POLICY (implement / degrade loudly / throw, one
+                   written-down answer per documented option) and the RFC 6455 rules
+                   its handshake and frame reader enforce. Pure — no sockets, no Node
+                   builtins — so the offline tier drives it directly; the stateful
+                   half (http.Server, ServerWebSocket, pub/sub) stays in bun.js.
     node/
       lib/         Node's REAL vendored lib/*.js (fs, net, http, stream, ...).
       internal/    Node's REAL internal/* (streams, errors, validators, ...).
@@ -301,6 +306,37 @@ README.md · roadmap.md · research.md · ARCHITECTURE.md · AGENTS.md
 ---
 
 ## Critical gotchas (these have bitten us repeatedly)
+
+### Feature-detecting a Node API by `typeof` — `Readable.toWeb` is the trap
+
+**Do not write `X.method ? X.method(…) : fallback` against a vendored Node API.**
+Our `node/lib/*` are Node's real files, so the *method exists*; what may not exist
+is its **implementation** underneath. `node/internal/webstreams/adapters.js`
+implements only `fromWeb` (what consuming a `fetch()` body needs) and leaves the
+other directions as functions that throw `ERR_METHOD_NOT_IMPLEMENTED`. So:
+
+```js
+typeof Readable.toWeb === "function"   // true, in the VM
+Readable.toWeb(stream)                 // throws ERR_METHOD_NOT_IMPLEMENTED
+```
+
+This has now bitten three separate places (`BunFile.stream()`, `Bun.spawn().stdout`
+and `.stderr`). It is nasty for one specific reason: **the offline spike tier runs
+on host Node, where `toWeb` genuinely works**, so the guard passes there and the
+code only fails inside the real VM. `Bun.spawn()` shipped in a state where every
+call threw, and the offline tier was green the whole time.
+
+Two rules follow:
+
+1. **Detect by behaviour, not by presence** — or better, don't detect: build the
+   `ReadableStream` by hand from `'data'`/`'end'`/`'error'` (see the `web()` helper
+   in `builtins/bun.js` and `.stream()` in `builtins/bun-file.js`).
+2. **Anything touching Web-Streams interop must be proven in the kernel tier**
+   (`scripts/spike-bun.mjs`), not just the offline tier. If a check would pass on
+   host Node for a reason that has nothing to do with our runtime, it is not
+   evidence. `scripts/spike-bun.mjs` now asserts *both* that `typeof
+   Readable.toWeb === "function"` and that calling it throws, so this specific
+   trap stays documented by a test rather than by memory.
 
 ### `capture: true` hides a process's stderr from `VV_LIVE=1`
 `kernel.start(cmd, args, { capture: true })` buffers the child's output into
@@ -906,6 +942,24 @@ unpacked:
   algorithms and reproduces the rule that a **digested HMAC is consumed, not reset**.
   It is a buffering hasher, so `.copy()` clones buffered input rather than a
   mid-state context — observationally identical, different only in memory.
+- **`packages/runtime/builtins/bun-serve.js`** — `Bun.serve`'s option policy and its
+  RFC 6455 rules, kept pure so the offline tier can drive them. The rule for adding
+  an option here: **implement** it if the sandbox genuinely can (`idleTimeout` works
+  because `node/lib/net.js` is Node's real one and `socket.setTimeout()` fires;
+  `unix` works because the net layer has a `Pipe` binding), **degrade loudly** —
+  accept it, run without it, warn ONCE per process — if production is a superset we
+  cannot reach but serving without it is still faithful (`tls` is the archetype:
+  throwing would refuse to boot every app that merely *has* a certificate
+  configured), or **throw** if running without it means serving something that is
+  not the protocol the caller asked for (`http3`). Never silently ignore one: that
+  is code passing in the sandbox and breaking in production, which is the failure
+  mode this project cares most about. Two things worth knowing before changing it:
+  frame validation is a separate function from the frame *reader* on purpose,
+  because the reader is shared with the client-role codec in `runtime/websocket.js`
+  and only a **server** may reject an unmasked frame (§5.1); and `drain` /
+  `getBufferedAmount()` are correct but inert here, because the in-VM loopback
+  completes every write synchronously and so never builds backpressure (see the
+  kernel spike, which pins that).
 - **`packages/kernel-host/programs/bun.js`** — the `bun`/`bunx` CLI: `bun run`,
   `bunx` (delegates to `npx`), install delegation, and it surfaces require/unhandled-
   rejection errors instead of a silent exit. `bun <file>` runs the file through the

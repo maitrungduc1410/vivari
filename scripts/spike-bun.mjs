@@ -12,7 +12,7 @@
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
-import { httpGet } from "./lib/spike-harness.mjs";
+import { httpGet, httpPost } from "./lib/spike-harness.mjs";
 import { Worker, MessageChannel } from "node:worker_threads";
 
 const LIVE = process.env.VV_LIVE === "1";
@@ -729,6 +729,435 @@ console.log("\n== bun:sqlite (real Wasm VFS, real processes) ==");
       "a bad VV_SQLITE_WASM_PATH throws an actionable error instead of a mystery");
     ok(!!em && /VV_SQLITE_WASM_PATH/.test(em[1]), "…naming the override that was set");
   }
+}
+
+// ── Bun.serve option handling, on real sockets ───────────────────────────────
+// The offline tier proves normalizeServeOptions returns the right CONFIG. Only
+// this tier can prove the config is actually enforced: that an idle socket is
+// really closed by a real timer, that an oversized body really gets a 413, and
+// that `static` really serves without a handler.
+console.log("\n== bun run serve-options.ts (static, maxRequestBodySize, requestIP, tls degradation) ==");
+{
+  const PORT = 3951;
+  write("serve-options.ts", [
+    "const server = Bun.serve({",
+    "  port: " + PORT + ",",
+    // TLS must DEGRADE, not throw: this server has a certificate configured and
+    // still has to boot and serve plaintext.
+    "  tls: { cert: 'fake-cert', key: 'fake-key' },",
+    "  maxRequestBodySize: 64,",
+    "  id: 'options-demo',",
+    "  static: {",
+    "    '/health': new Response('STATIC-OK', { headers: { 'content-type': 'text/plain' } }),",
+    "  },",
+    "  routes: {",
+    "    '/health': () => new Response('ROUTE-SHOULD-NOT-WIN'),",
+    "  },",
+    "  fetch(req: Request, server: any): Response {",
+    "    const url = new URL(req.url);",
+    "    if (url.pathname === '/ip') return new Response(JSON.stringify(server.requestIP(req)));",
+    "    if (url.pathname === '/id') return new Response(String(server.id));",
+    "    if (url.pathname === '/proto') return new Response(String(server.url));",
+    "    if (url.pathname === '/echo') return new Response('echoed');",
+    "    return new Response('home');",
+    "  },",
+    "});",
+    "console.log('listening on ' + server.port);",
+  ].join("\n"));
+  kernel.start("bun", ["run", "serve-options.ts"], { cwd: APP, env: ENV });
+  for (let i = 0; i < 150 && !listening.has(PORT); i++) await new Promise((r) => setTimeout(r, 100));
+  ok(listening.has(PORT), "Bun.serve with a `tls` option still BOOTS and binds " + PORT + " (degrade, not throw)");
+
+  const health = await httpGet(kernel, PORT, "/health");
+  ok(health.status === 200 && /STATIC-OK/.test(health.body), "`static` serves a pre-built Response");
+  ok(!/ROUTE-SHOULD-NOT-WIN/.test(health.body), "…and takes precedence over a `routes` entry on the same path, as Bun does");
+
+  const ip = await httpGet(kernel, PORT, "/ip");
+  ok(ip.body.trim() === "null", "requestIP() returns null, not a fabricated 127.0.0.1 (a rate limiter can now tell)");
+
+  const id = await httpGet(kernel, PORT, "/id");
+  ok(id.body.trim() === "options-demo", "the `id` option is exposed as server.id");
+
+  const proto = await httpGet(kernel, PORT, "/proto");
+  ok(/^http:/.test(proto.body.trim()), "server.url reports http:, honestly, even though tls was configured");
+
+  // maxRequestBodySize is enforced as the body arrives.
+  const small = await httpPost(kernel, PORT, "/echo", "x".repeat(10));
+  ok(small.status === 200 && /echoed/.test(small.body), "a body under maxRequestBodySize is served normally");
+  const big = await httpPost(kernel, PORT, "/echo", "x".repeat(5000));
+  ok(big.status === 413, "a body over maxRequestBodySize is refused with 413, not silently accepted");
+}
+
+console.log("\n== bun run serve-idle.ts (idleTimeout is a real timer on a real socket) ==");
+{
+  const PORT = 3952;
+  write("serve-idle.ts", [
+    "const net = require('net');",
+    "const PORT = " + PORT + ";",
+    "const server = Bun.serve({",
+    "  port: PORT,",
+    // 1 second: long enough not to race the connect, short enough for CI.
+    "  idleTimeout: 1,",
+    "  fetch(): Response { return new Response('hi'); },",
+    "});",
+    "const out: string[] = [];",
+    // Open a connection and deliberately send nothing. With idleTimeout ignored
+    // (the old behaviour) this socket stays open forever; honoured, it is closed.
+    "const idle = net.connect(PORT, '127.0.0.1', () => { out.push('connected'); });",
+    "const t0 = Date.now();",
+    "idle.on('close', () => {",
+    "  out.push('closed-after-ms:' + (Date.now() - t0));",
+    "  console.log('IDLERESULT:' + JSON.stringify(out));",
+    "  try { server.stop(); } catch (e) {}",
+    "  setTimeout(() => process.exit(0), 50);",
+    "});",
+    "setTimeout(() => { out.push('STILL-OPEN'); console.log('IDLERESULT:' + JSON.stringify(out)); process.exit(0); }, 6000);",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "serve-idle.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (LIVE) console.log(o);
+  const m = o.match(/IDLERESULT:(\[.*\])/);
+  const got = m ? JSON.parse(m[1]) : [];
+  console.log("  ->", JSON.stringify(got));
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 600));
+  ok(got.includes("connected"), "the idle client connected");
+  ok(!got.includes("STILL-OPEN"), "idleTimeout genuinely closed an idle connection (it used to be ignored entirely)");
+  const closedAt = (got.find((s) => typeof s === "string" && s.startsWith("closed-after-ms:")) || "").split(":")[1];
+  ok(closedAt !== undefined && Number(closedAt) >= 900, "…and it waited out the full idleTimeout (" + closedAt + "ms) rather than closing immediately");
+}
+
+console.log("\n== bun run serve-unix.ts (the `unix` option binds a real socket) ==");
+{
+  write("serve-unix.ts", [
+    "const net = require('net');",
+    "const server = Bun.serve({",
+    "  unix: '/tmp/bun-serve.sock',",
+    "  fetch(): Response { return new Response('unix-served'); },",
+    "});",
+    "const out: string[] = [];",
+    "out.push('url=' + String(server.url));",
+    "const c = net.connect({ path: '/tmp/bun-serve.sock' }, () => {",
+    "  c.write('GET / HTTP/1.1' + String.fromCharCode(13,10) + 'Host: x' + String.fromCharCode(13,10) + String.fromCharCode(13,10));",
+    "});",
+    "let buf = '';",
+    "c.on('data', (d: any) => {",
+    "  buf += String(d);",
+    "  if (buf.indexOf('unix-served') !== -1) {",
+    "    out.push('body-ok');",
+    "    console.log('UNIXRESULT:' + JSON.stringify(out));",
+    "    process.exit(0);",
+    "  }",
+    "});",
+    "c.on('error', (e: any) => { out.push('err=' + e.message); console.log('UNIXRESULT:' + JSON.stringify(out)); process.exit(0); });",
+    "setTimeout(() => { out.push('timeout'); console.log('UNIXRESULT:' + JSON.stringify(out)); process.exit(0); }, 5000);",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "serve-unix.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (LIVE) console.log(o);
+  const m = o.match(/UNIXRESULT:(\[.*\])/);
+  const got = m ? JSON.parse(m[1]) : [];
+  console.log("  ->", JSON.stringify(got));
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 600));
+  ok(got.includes("body-ok"), "Bun.serve({ unix }) binds a real UNIX socket that an in-VM client can fetch through");
+  ok(got.some((s) => /^url=unix:/.test(s)), "…and server.url reports the unix: scheme rather than a fake http://localhost:0");
+}
+
+// ── WebSocket parity, against the in-VM client ───────────────────────────────
+console.log("\n== bun run ws-parity.ts (ping/pong control frames, cork, sendText/Binary, publish*) ==");
+{
+  const PORT = 3953;
+  write("ws-parity.ts", [
+    "const PORT = " + PORT + ";",
+    "const out: string[] = [];",
+    "const server = Bun.serve({",
+    "  port: PORT,",
+    "  fetch(req: Request, server: any): any {",
+    "    if (new URL(req.url).pathname === '/ws') { if (server.upgrade(req)) return; return new Response('no', { status: 400 }); }",
+    "    return new Response('home');",
+    "  },",
+    "  websocket: {",
+    "    open(ws: any) {",
+    "      ws.subscribe('room');",
+    "      out.push('buffered-is-number:' + (typeof ws.getBufferedAmount() === 'number'));",
+    // cork() must batch and must propagate the callback's return value.
+    "      const corkRet = ws.cork((w: any) => { w.sendText('c1'); w.sendText('c2'); w.sendText('c3'); return 'CORKRET'; });",
+    "      out.push('cork-returns:' + corkRet);",
+    "      ws.sendBinary(new Uint8Array([1, 2, 3]));",
+    // A real RFC 6455 ping. The in-VM client auto-answers with a pong, which
+    // must land in the server's `pong` handler.
+    "      ws.ping('pingpayload');",
+    "    },",
+    "    message(ws: any, msg: any) {",
+    "      if (typeof msg === 'string') out.push('text:' + msg);",
+    "      else out.push('binary:' + new Uint8Array(msg).join(','));",
+    "    },",
+    "    pong(ws: any, data: any) {",
+    "      out.push('pong:' + Buffer.from(data).toString('utf8'));",
+    "      finish();",
+    "    },",
+    "    close() {},",
+    "  },",
+    "});",
+    // A ping payload over 125 bytes must be refused, per RFC 6455 §5.5.
+    "let sock: any = null;",
+    "function finish() {",
+    "  server.publishText('room', 'pub-text');",
+    "  setTimeout(() => {",
+    "    console.log('WSPARITY:' + JSON.stringify(out));",
+    "    try { sock.close(); } catch (e) {}",
+    "    try { server.stop(); } catch (e) {}",
+    "    setTimeout(() => process.exit(0), 50);",
+    "  }, 300);",
+    "}",
+    "sock = new WebSocket('ws://127.0.0.1:' + PORT + '/ws');",
+    "sock.binaryType = 'arraybuffer';",
+    "sock.onmessage = (e: any) => {",
+    "  if (typeof e.data === 'string') out.push('client-got:' + e.data);",
+    "  else out.push('client-got-binary:' + new Uint8Array(e.data).join(','));",
+    "};",
+    "setTimeout(() => { out.push('TIMEOUT'); console.log('WSPARITY:' + JSON.stringify(out)); process.exit(0); }, 8000);",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "ws-parity.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (LIVE) console.log(o);
+  const m = o.match(/WSPARITY:(\[.*\])/);
+  const got = m ? JSON.parse(m[1]) : [];
+  console.log("  ->", JSON.stringify(got));
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 800));
+  ok(r.code === 0, "ws-parity.ts exits 0");
+  ok(!got.includes("TIMEOUT"), "the parity run completed without hitting its watchdog");
+  // ping/pong used to be `ping() {} pong() {}` — literally empty. A keepalive
+  // loop therefore sent nothing while looking healthy.
+  ok(got.includes("pong:pingpayload"), "ws.ping() sends a REAL control frame: the client's pong came back with the payload (RFC 6455 §5.5.2)");
+  ok(got.includes("cork-returns:CORKRET"), "cork() returns the callback's value");
+  ok(got.includes("client-got:c1") && got.includes("client-got:c2") && got.includes("client-got:c3"), "all three corked messages were delivered");
+  ok(got.indexOf("client-got:c1") < got.indexOf("client-got:c2"), "…and cork preserves ordering");
+  ok(got.includes("client-got-binary:1,2,3"), "sendBinary() delivers a binary frame");
+  ok(got.includes("client-got:pub-text"), "server.publishText() reaches the subscriber as text");
+  ok(got.includes("buffered-is-number:true"), "getBufferedAmount() reports real socket state");
+}
+
+console.log("\n== bun run ws-limits.ts (control-frame and payload limits are enforced) ==");
+{
+  const PORT = 3954;
+  write("ws-limits.ts", [
+    "const PORT = " + PORT + ";",
+    "const out: string[] = [];",
+    "const server = Bun.serve({",
+    "  port: PORT,",
+    "  fetch(req: Request, server: any): any {",
+    "    if (new URL(req.url).pathname === '/ws') { if (server.upgrade(req)) return; return new Response('no', { status: 400 }); }",
+    "    return new Response('home');",
+    "  },",
+    "  websocket: {",
+    "    open(ws: any) {",
+    // RFC 6455 §5.5: a control frame payload cannot exceed 125 bytes.
+    "      try { ws.ping('x'.repeat(126)); out.push('oversized-ping-allowed'); }",
+    "      catch (e: any) { out.push('oversized-ping-threw:' + /125 bytes/.test(e.message)); }",
+    "      out.push('ping125-ok:' + (ws.ping('y'.repeat(125)) === 125));",
+    "      out.push('send-returns-bytes:' + ws.send('hello'));",
+    "      setTimeout(() => {",
+    "        console.log('WSLIMITS:' + JSON.stringify(out));",
+    "        try { server.stop(); } catch (e) {}",
+    "        setTimeout(() => process.exit(0), 50);",
+    "      }, 300);",
+    "    },",
+    "    message() {},",
+    "    close() {},",
+    "  },",
+    "});",
+    "const sock = new WebSocket('ws://127.0.0.1:' + PORT + '/ws');",
+    "setTimeout(() => { out.push('TIMEOUT'); console.log('WSLIMITS:' + JSON.stringify(out)); process.exit(0); }, 8000);",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "ws-limits.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (LIVE) console.log(o);
+  const m = o.match(/WSLIMITS:(\[.*\])/);
+  const got = m ? JSON.parse(m[1]) : [];
+  console.log("  ->", JSON.stringify(got));
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 600));
+  ok(got.includes("oversized-ping-threw:true"), "a 126-byte ping payload throws, naming RFC 6455's 125-byte control-frame limit");
+  ok(got.includes("ping125-ok:true"), "a 125-byte ping is exactly legal and reports its byte count");
+  ok(got.includes("send-returns-bytes:5"), "send() returns the byte count Bun documents");
+}
+
+// `drain` is now driven by the socket's real 'drain' event and the real return
+// value of write(), rather than never being called. But it cannot actually fire
+// on this loopback, and pinning that here is the point: node/bindings/net.js
+// `doWrite` completes every write synchronously into the peer's inbox, so there
+// is no send queue, no high-water mark, and no backpressure. If that binding ever
+// grows a queue, this check fails and tells whoever changed it that `drain` and
+// getBufferedAmount() have become live.
+console.log("\n== bun run ws-backpressure.ts (the loopback genuinely never backpressures) ==");
+{
+  const PORT = 3956;
+  write("ws-backpressure.ts", [
+    "const PORT = " + PORT + ";",
+    "const out: string[] = [];",
+    "const server = Bun.serve({",
+    "  port: PORT,",
+    "  fetch(req: Request, server: any): any { if (server.upgrade(req)) return; return new Response('no', { status: 400 }); },",
+    "  websocket: {",
+    "    open(ws: any) {",
+    // 400 x 64 KiB = 25 MB into a peer that is not reading.
+    "      const big = 'x'.repeat(64 * 1024);",
+    "      let maxBuffered = 0;",
+    "      for (let i = 0; i < 400; i++) { ws.send(big); const b = ws.getBufferedAmount(); if (b > maxBuffered) maxBuffered = b; }",
+    "      out.push('max-buffered:' + maxBuffered);",
+    "      setTimeout(() => {",
+    "        out.push('drain-fired:' + drained);",
+    "        console.log('WSBP:' + JSON.stringify(out));",
+    "        try { server.stop(); } catch (e) {}",
+    "        setTimeout(() => process.exit(0), 50);",
+    "      }, 1000);",
+    "    },",
+    "    drain() { drained++; },",
+    "    message() {}, close() {},",
+    "  },",
+    "});",
+    "let drained = 0;",
+    "const sock = new WebSocket('ws://127.0.0.1:' + PORT + '/ws');",
+    "setTimeout(() => { out.push('TIMEOUT'); console.log('WSBP:' + JSON.stringify(out)); process.exit(0); }, 9000);",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "ws-backpressure.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (LIVE) console.log(o);
+  const m = o.match(/WSBP:(\[.*\])/);
+  const got = m ? JSON.parse(m[1]) : [];
+  console.log("  ->", JSON.stringify(got));
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 600));
+  ok(got.includes("max-buffered:0"), "25 MB written into an unread socket never buffers — the loopback completes writes synchronously");
+  ok(got.includes("drain-fired:0"), "…so `drain` correctly does NOT fire (it is real backpressure, not an unconditional callback)");
+  ok(/websocket: { drain } .*will not fire/.test(o) || /drain.*will not fire/.test(o), "…and Bun.serve warns once that a `drain` handler has nothing to react to here");
+}
+
+// cork()'s whole point is coalescing several frames into ONE socket write. The
+// WebSocket client above reassembles frames, so it cannot see write boundaries —
+// which means the parity run proves delivery and ordering but NOT batching. This
+// block drives a raw socket through its own handshake and counts inbound chunks,
+// which is the only place the difference is observable.
+console.log("\n== bun run ws-cork.ts (cork really coalesces into one socket write) ==");
+{
+  const PORT = 3955;
+  write("ws-cork.ts", [
+    "const net = require('net');",
+    "const crypto = require('crypto');",
+    "const PORT = " + PORT + ";",
+    "const out: string[] = [];",
+    "const server = Bun.serve({",
+    "  port: PORT,",
+    "  fetch(req: Request, server: any): any {",
+    "    const mode = new URL(req.url).pathname;",
+    "    if (server.upgrade(req, { data: { mode } })) return;",
+    "    return new Response('no', { status: 400 });",
+    "  },",
+    "  websocket: {",
+    "    open(ws: any) {",
+    "      const send3 = (w: any) => { w.sendText('aaaa'); w.sendText('bbbb'); w.sendText('cccc'); };",
+    "      if (ws.data.mode === '/corked') ws.cork(send3);",
+    "      else send3(ws);",
+    "    },",
+    "    message() {}, close() {},",
+    "  },",
+    "});",
+    // A raw client: do the RFC 6455 handshake by hand, then count how many
+    // distinct TCP chunks carry the three frames.
+    "function probe(path: string, done: (n: number) => void) {",
+    "  const key = crypto.randomBytes(16).toString('base64');",
+    "  const c = net.connect(PORT, '127.0.0.1', () => {",
+    "    c.write('GET ' + path + ' HTTP/1.1' + String.fromCharCode(13,10) +",
+    "      'Host: 127.0.0.1' + String.fromCharCode(13,10) +",
+    "      'Upgrade: websocket' + String.fromCharCode(13,10) +",
+    "      'Connection: Upgrade' + String.fromCharCode(13,10) +",
+    "      'Sec-WebSocket-Version: 13' + String.fromCharCode(13,10) +",
+    "      'Sec-WebSocket-Key: ' + key + String.fromCharCode(13,10) + String.fromCharCode(13,10));",
+    "  });",
+    "  let sawHandshake = false;",
+    "  let chunks = 0;",
+    "  let bytes = 0;",
+    "  c.on('data', (d: any) => {",
+    "    const s = String(d);",
+    "    if (!sawHandshake) {",
+    // The 101 may arrive in the same chunk as the frames; only count what
+    // follows the header terminator.
+    "      const idx = s.indexOf(String.fromCharCode(13,10,13,10));",
+    "      if (idx !== -1) {",
+    "        sawHandshake = true;",
+    "        const rest = d.subarray(idx + 4);",
+    "        if (rest.length) { chunks++; bytes += rest.length; }",
+    "        return;",
+    "      }",
+    "      return;",
+    "    }",
+    "    chunks++; bytes += d.length;",
+    "  });",
+    "  setTimeout(() => { try { c.destroy(); } catch (e) {} done(chunks); }, 600);",
+    "}",
+    "probe('/corked', (corked: number) => {",
+    "  out.push('corked-chunks:' + corked);",
+    "  probe('/plain', (plain: number) => {",
+    "    out.push('plain-chunks:' + plain);",
+    "    console.log('WSCORK:' + JSON.stringify(out));",
+    "    try { server.stop(); } catch (e) {}",
+    "    setTimeout(() => process.exit(0), 50);",
+    "  });",
+    "});",
+    "setTimeout(() => { out.push('TIMEOUT'); console.log('WSCORK:' + JSON.stringify(out)); process.exit(0); }, 9000);",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "ws-cork.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (LIVE) console.log(o);
+  const m = o.match(/WSCORK:(\[.*\])/);
+  const got = m ? JSON.parse(m[1]) : [];
+  console.log("  ->", JSON.stringify(got));
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 800));
+  const num = (p) => Number((got.find((s) => typeof s === "string" && s.startsWith(p)) || ":").split(":")[1]);
+  ok(num("corked-chunks:") === 1, "three sends inside cork() arrive as ONE socket write (got " + num("corked-chunks:") + ")");
+  ok(num("plain-chunks:") > 1, "…and the same three sends WITHOUT cork arrive as several (got " + num("plain-chunks:") + ") — so cork is really batching");
+}
+
+// ── the Readable.toWeb defect, which ONLY this tier can catch ────────────────
+// `typeof Readable.toWeb === "function"` is TRUE in the VM and calling it throws
+// ERR_METHOD_NOT_IMPLEMENTED, so the natural feature-detect passes and then
+// explodes. Under host Node (the offline tier) toWeb works, so the offline tier
+// cannot see this at all — which is exactly how it shipped.
+console.log("\n== bun run spawn-stream.ts (Bun.spawn().stdout is a real ReadableStream in the VM) ==");
+{
+  write("spawn-stream.ts", [
+    "const out: string[] = [];",
+    "const { Readable } = require('stream');",
+    "out.push('toWeb-looks-present:' + (typeof Readable.toWeb === 'function'));",
+    "try { Readable.toWeb(Readable.from([Buffer.from('x')])); out.push('toWeb-works:true'); }",
+    "catch (e: any) { out.push('toWeb-throws:' + e.code); }",
+    "const proc = Bun.spawn(['echo', 'hello-from-spawn']);",
+    "out.push('stdout-has-getReader:' + (typeof proc.stdout.getReader === 'function'));",
+    "(async () => {",
+    "  const reader = proc.stdout.getReader();",
+    "  let text = '';",
+    "  for (;;) {",
+    "    const { done, value } = await reader.read();",
+    "    if (done) break;",
+    "    text += Buffer.from(value).toString('utf8');",
+    "  }",
+    "  out.push('stdout-text:' + text.trim());",
+    "  out.push('exited:' + (await proc.exited));",
+    "  console.log('SPAWNRESULT:' + JSON.stringify(out));",
+    "  process.exit(0);",
+    "})();",
+    "setTimeout(() => { out.push('TIMEOUT'); console.log('SPAWNRESULT:' + JSON.stringify(out)); process.exit(0); }, 8000);",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "spawn-stream.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (LIVE) console.log(o);
+  const m = o.match(/SPAWNRESULT:(\[.*\])/);
+  const got = m ? JSON.parse(m[1]) : [];
+  console.log("  ->", JSON.stringify(got));
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 800));
+  ok(got.includes("toWeb-looks-present:true"), "Readable.toWeb IS a function in the VM — which is why the `toWeb ? …` guard passed");
+  ok(got.includes("toWeb-throws:ERR_METHOD_NOT_IMPLEMENTED"), "…and calling it throws, so that guard was the bug (offline Node hides this)");
+  ok(got.includes("stdout-has-getReader:true"), "Bun.spawn().stdout is a WHATWG ReadableStream built by hand instead");
+  ok(got.includes("stdout-text:hello-from-spawn"), "…and it actually streams the child's output");
+  ok(got.includes("exited:0"), "proc.exited still resolves the exit code");
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");
