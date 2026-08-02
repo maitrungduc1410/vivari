@@ -23,8 +23,8 @@ Vivari is **MIT-licensed** — there is no commercial license and no usage fee: 
 ## Install
 
 ```bash
-npm install @vivari/core        # framework-agnostic SDK
-npm install @vivari/react       # React <Vivari> component + useVivari()
+npm install @vivari/core                 # framework-agnostic SDK
+npm install @vivari/react @vivari/core   # React bindings (core is a peer dep)
 ```
 
 ```ts
@@ -37,7 +37,7 @@ await vivari.mount({
 });
 
 const proc = await vivari.spawn("node", ["index.js"]);
-proc.output.pipeTo(new WritableStream({ write: (c) => console.log(c) }));
+for await (const chunk of proc.output) console.log(chunk);
 await proc.exit;
 ```
 
@@ -60,7 +60,7 @@ Service Worker previews an in-VM HTTP server live in an iframe. See
 ```
 packages/
   core/      @vivari/core   — the framework-agnostic SDK
-  react/     @vivari/react  — <Vivari> component + useVivari()
+  react/     @vivari/react  — React components + hooks
   vfs/ codec/ crypto/       — Rust crates compiled to Wasm
   runtime/ kernel-host/ protocol/  — the Node runtime shim + kernel
   studio/    the studio IDE (Vite + React)

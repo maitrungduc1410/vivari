@@ -1,10 +1,18 @@
 // Public type surface for @vivari/core.
 
+import type { VivariError } from "./errors.js";
+
 /** A message posted between the page and the kernel worker. */
 export interface KernelMessage {
   type: string;
   [key: string]: unknown;
 }
+
+/** Unsubscribe handle returned by every `on(...)`-style subscription. */
+export type Unsubscribe = () => void;
+
+/** Text encodings the VFS can decode to a string. Both spellings of UTF-8 work. */
+export type Encoding = "utf-8" | "utf8";
 
 /** Options for {@link Vivari.boot}. */
 export interface BootOptions {
@@ -94,6 +102,14 @@ export interface BootOptions {
    * same-origin, otherwise every preview would 404 on that script.
    */
   devtools?: boolean;
+  /**
+   * How long to wait for the kernel to report `ready` before giving up, in ms.
+   * Default 60 000. On expiry `boot()` rejects with `ERR_BOOT_TIMEOUT` and tears
+   * down the half-built instance rather than leaving the caller pending forever.
+   */
+  timeout?: number;
+  /** Abort the boot. The returned promise rejects with `ERR_ABORTED`. */
+  signal?: AbortSignal;
 }
 
 /** A recursive description of files/directories to write into the VFS. */
@@ -119,25 +135,135 @@ export interface DirEnt {
   isFile(): boolean;
 }
 
+/** Metadata for one VFS entry, in the shape of a Node `fs.Stats` subset. */
+export interface Stats {
+  /** Size in bytes for a file; the child count for a directory. */
+  size: number;
+  /** Last modification time, ms since the epoch. */
+  mtimeMs: number;
+  /** POSIX mode bits, as recorded by the VFS. */
+  mode: number;
+  /** Inode id. Stable across different paths to the same entry (e.g. hard links). */
+  ino: number;
+  isDirectory(): boolean;
+  isFile(): boolean;
+}
+
+/**
+ * Why a watched path fired. Mirrors Node's `fs.watch` vocabulary: `"rename"` for a
+ * directory entry appearing/disappearing/moving, `"change"` for contents edited in
+ * place.
+ */
+export type FsChangeKind = "rename" | "change";
+
+/** One filesystem change notification. */
+export interface FsChangeEvent {
+  kind: FsChangeKind;
+  /** Absolute VFS path of the entry that changed. */
+  path: string;
+}
+
+/** Options for {@link FileSystemAPI.watch}. */
+export interface WatchOptions {
+  /**
+   * Also report changes below `path`. Default `true` — the kernel reports the exact
+   * path that changed, so a non-recursive watch is a prefix filter on top.
+   */
+  recursive?: boolean;
+  /** Stop watching when the signal aborts. Equivalent to calling `close()`. */
+  signal?: AbortSignal;
+}
+
+/** Options accepted by the read/write methods on {@link FileSystemAPI}. */
+export interface FsOperationOptions {
+  signal?: AbortSignal;
+}
+
+/** Options for {@link Vivari.mount}. */
+export interface MountOptions {
+  /** Directory to write the tree into. Default `"/"`. */
+  mountPoint?: string;
+  signal?: AbortSignal;
+}
+
+/** Options for {@link Vivari.export}. */
+export interface ExportOptions {
+  /**
+   * Directory names to skip anywhere in the tree, on top of the always-excluded
+   * `node_modules` and `.git`.
+   */
+  exclude?: string[];
+  signal?: AbortSignal;
+}
+
+/** One file in an {@link ExportResult}, with a path relative to the exported root. */
+export interface ExportedFile {
+  path: string;
+  contents: Uint8Array;
+}
+
+/** The result of {@link Vivari.export}. */
+export interface ExportResult {
+  files: ExportedFile[];
+  /**
+   * True when the walk hit the kernel's file-count or total-byte cap and stopped
+   * early, so `files` is a prefix of the tree rather than all of it.
+   */
+  truncated: boolean;
+}
+
 /** Options for {@link Vivari.spawn}. */
 export interface SpawnOptions {
   /** Working directory for the process. Defaults to the VM root (or active project). */
   cwd?: string;
   /** Extra environment variables, merged over Vivari's package-manager-friendly defaults. */
   env?: Record<string, string>;
+  /**
+   * Kill the process when the signal aborts. An already-aborted signal makes
+   * `spawn()` reject with `ERR_ABORTED` without launching anything.
+   */
+  signal?: AbortSignal;
 }
 
+/** Whether a port started or stopped being served inside the VM. */
+export type PortKind = "open" | "close";
+
+/**
+ * The events {@link Vivari.on} can deliver, as listener argument tuples.
+ *
+ * - `server-ready` — a server is listening **and has answered a request**. Dev
+ *   servers bind, close and rebind several times while starting, so this fires
+ *   only once the port really serves; point an iframe at `url` here.
+ * - `port` — the raw bind/unbind, with no serving check. Fires before
+ *   `server-ready` for the same port, and again with `"close"` when it goes away.
+ * - `fs-change` — something under the VFS changed. Coalesce these; a single
+ *   install fires thousands.
+ * - `error` — an unrecoverable kernel error.
+ */
+export interface VivariEventMap {
+  "server-ready": [port: number, url: string];
+  port: [port: number, kind: PortKind, url: string];
+  "fs-change": [event: FsChangeEvent];
+  error: [error: VivariError];
+}
+
+/** The listener signature for one {@link VivariEventMap} event. */
+export type VivariListener<E extends keyof VivariEventMap> = (...args: VivariEventMap[E]) => void;
+
 /** Fired when a server inside the VM starts listening and its preview is reachable. */
-export type ServerReadyListener = (port: number, url: string) => void;
+export type ServerReadyListener = VivariListener<"server-ready">;
 
 /** Fired when a port opens/closes inside the VM. */
-export type PortListener = (port: number, kind: "open" | "close", url: string) => void;
+export type PortListener = VivariListener<"port">;
+
+/** Fired when the VFS changes. */
+export type FsChangeListener = VivariListener<"fs-change">;
 
 /** Fired on unrecoverable kernel errors. */
-export type ErrorListener = (error: { message: string }) => void;
+export type ErrorListener = VivariListener<"error">;
 
-export interface VivariEventMap {
-  "server-ready": ServerReadyListener;
-  port: PortListener;
-  error: ErrorListener;
+/** Options accepted by {@link Vivari.on} / {@link Vivari.once}. */
+export interface ListenerOptions {
+  /** Unsubscribe when the signal aborts. */
+  signal?: AbortSignal;
 }

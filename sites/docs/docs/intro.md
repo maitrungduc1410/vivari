@@ -21,8 +21,8 @@ It ships in two forms:
 
 - **The [Studio](https://vivari.run/studio/)**: a full in-browser IDE built on Vivari.
 - **The SDK**: [`@vivari/core`](./core-api) (framework-agnostic) and
-  [`@vivari/react`](./react) (a `<Vivari>` component + `useVivari()` hook) that
-  you can embed in your own app.
+  [`@vivari/react`](./react) (components and hooks for embedding a VM, its
+  preview, its files and its processes) that you can embed in your own app.
 
 :::tip Try it now
 The fastest way to understand Vivari is to [open the Studio](https://vivari.run/studio/) and run a
@@ -57,5 +57,5 @@ commercial license and no usage fee: embed it, fork it, ship it.
 
 - [Getting started](./getting-started): install and boot your first instance.
 - [Core API](./core-api): the `@vivari/core` reference.
-- [React](./react): `<Vivari>` and `useVivari()`.
+- [React](./react): the `@vivari/react` components and hooks.
 - [Deployment](./deployment): host the landing, docs, and studio on Cloudflare Pages.

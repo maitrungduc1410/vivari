@@ -15,7 +15,8 @@
 //
 //   node scripts/smoke-sdk.mjs
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = new URL("../", import.meta.url);
@@ -53,7 +54,10 @@ section("package manifests");
   ok(react.name === "@vivari/react", "@vivari/react: name");
   ok(react.type === "module", "@vivari/react: ESM (type: module)");
   ok(!!react.peerDependencies?.react, "@vivari/react: react is a peerDependency");
-  ok(!!react.dependencies?.["@vivari/core"], "@vivari/react: depends on @vivari/core");
+  // A peer, not a dependency: two copies of core in one page mean two kernels,
+  // two SharedArrayBuffer worlds and a preview Service Worker registered twice.
+  ok(!!react.peerDependencies?.["@vivari/core"], "@vivari/react: @vivari/core is a peerDependency");
+  ok(!react.dependencies?.["@vivari/core"], "@vivari/react: does not bundle its own @vivari/core");
   ok(react.exports?.["."]?.types && react.exports?.["."]?.default,
     "@vivari/react: exports['.'] has types + default");
 
@@ -68,9 +72,8 @@ section("public API surface");
   const coreIndex = read("packages/core/src/index.ts");
   const coreValues = [
     "Vivari",
-    "FileSystemAPI",
-    "VivariProcess",
-    "previewUrl",
+    "VivariError",
+    "VivariFsError",
     "KernelBridge",
     "isCrossOriginIsolated",
     "resetVfs",
@@ -79,12 +82,23 @@ section("public API surface");
     ok(new RegExp(`export\\s*\\{[^}]*\\b${name}\\b`).test(coreIndex),
       `@vivari/core exports ${name}`);
   }
+  // FileSystemAPI/VivariProcess are handed to consumers but never constructed by
+  // them, so they must stay type-only exports.
+  for (const name of ["FileSystemAPI", "VivariProcess"]) {
+    ok(new RegExp(`export type\\s*\\{[^}]*\\b${name}\\b`).test(coreIndex),
+      `@vivari/core exports ${name} as a type only`);
+  }
   const coreTypes = [
     "BootOptions",
+    "ExportResult",
     "FileSystemTree",
-    "SpawnOptions",
+    "FsChangeEvent",
     "KernelMessage",
+    "OutputStream",
+    "SpawnOptions",
+    "Stats",
     "VivariEventMap",
+    "VivariErrorCode",
   ];
   for (const name of coreTypes) {
     ok(new RegExp(`\\b${name}\\b`).test(coreIndex), `@vivari/core exports type ${name}`);
@@ -95,6 +109,27 @@ section("public API surface");
     ok(new RegExp(`export\\s*\\{[^}]*\\b${name}\\b`).test(reactIndex),
       `@vivari/react exports ${name}`);
   }
+}
+
+// --- 2b. declaration-emit resolution (node16/nodenext) -----------------------
+// `tsc` writes import specifiers into the .d.ts verbatim, so an extensionless
+// relative specifier here is a hard TS2834 in any consumer using
+// `moduleResolution: node16` — a break they cannot patch from their side.
+section("declaration specifiers resolve under node16");
+{
+  const dir = p("packages/core/src");
+  const sources = readdirSync(dir).filter((f) => f.endsWith(".ts")); // src/workers is bundled, not emitted
+  let bad = [];
+  for (const file of sources) {
+    const text = readFileSync(join(dir, file), "utf8");
+    for (const match of text.matchAll(/\bfrom\s+"(\.[^"]*)"/g)) {
+      if (!/\.(js|json|wasm)$/.test(match[1])) bad.push(`${file} -> ${match[1]}`);
+    }
+  }
+  ok(sources.length > 0, `scanned ${sources.length} public source files`);
+  ok(bad.length === 0,
+    "every relative import carries a file extension" +
+      (bad.length ? " (missing: " + bad.join(", ") + ")" : ""));
 }
 
 // --- 3. the shipped preview Service Worker -----------------------------------
@@ -149,12 +184,17 @@ if (existsSync(p("packages/core/dist/index.js"))) {
   const mod = await import(new URL("packages/core/dist/index.js", root));
   ok(typeof mod.Vivari === "function", "dist: Vivari is exported");
   ok(typeof mod.Vivari.boot === "function", "dist: Vivari.boot is a function");
-  ok(typeof mod.previewUrl === "function", "dist: previewUrl is a function");
   ok(typeof mod.KernelBridge === "function", "dist: KernelBridge is exported");
   ok(typeof mod.isCrossOriginIsolated === "function", "dist: isCrossOriginIsolated is exported");
-  // previewUrl is pure — exercise it with an explicit origin (no browser needed).
-  ok(mod.previewUrl(3000, "https://app.test") === "https://app.test/preview/3000/",
-    "dist: previewUrl(port, origin) builds the same-origin proxy URL");
+  // The error classes are pure — exercise the discrimination contract consumers
+  // are told to rely on (instanceof + a machine-readable code) with no browser.
+  const fsErr = new mod.VivariFsError("ENOENT", "read", "/missing.txt");
+  ok(fsErr instanceof mod.VivariError && fsErr instanceof Error,
+    "dist: VivariFsError is a VivariError and an Error");
+  ok(fsErr.code === "ENOENT" && fsErr.path === "/missing.txt" && fsErr.syscall === "read",
+    "dist: VivariFsError carries code + path + syscall");
+  ok(new mod.VivariError("ERR_BOOT_TIMEOUT", "boom").code === "ERR_BOOT_TIMEOUT",
+    "dist: VivariError carries its code");
   ok(existsSync(p("packages/core/dist/assets/sw.js")), "dist: vendored assets/sw.js is present");
 } else {
   skip("packages/core/dist not built — run `npm run build:sdk` for the runtime leg");

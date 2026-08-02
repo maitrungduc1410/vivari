@@ -483,6 +483,20 @@ async function announceProjectReady(dir, port) {
   }
 }
 
+// Announce a port as genuinely serving, for the SDK's `server-ready` event. The
+// project/demo paths below do the same probe plus studio-specific orchestration;
+// this one is the framework-agnostic version every listened port gets.
+async function announceServing(port) {
+  const ok = await waitServing(port, 60000);
+  // Never answered, or it went away while we were probing — leave the port
+  // un-announced and re-arm so a later listen probes again.
+  if (!ok || !listening.has(port)) {
+    servingProbed.delete(port);
+    return;
+  }
+  post("serving", { port });
+}
+
 // A project's run started ANOTHER server (a second/third port from the same run
 // shell — e.g. a backend alongside the frontend) — surface it as an EXTRA preview
 // tab once it answers, without re-opening the folder/entry (the primary did that).
@@ -588,6 +602,10 @@ let kernel = null;
 // project/demo run helpers and the process-exit snapshot hook. Set in boot().
 let kernelFsRef = null;
 const listening = new Set();
+// Ports already probed for the SDK's `serving` announcement. A dev server binds,
+// closes and rebinds several times while starting, so each of those emits a
+// `listen`; probe a port once and re-arm only when it genuinely goes away.
+const servingProbed = new Set();
 
 // ── Persistent dependency cache (P1) ─────────────────────────────────────────
 // Cache the RESULT of an install (node_modules) keyed by the lockfile, so a
@@ -1393,6 +1411,14 @@ async function boot() {
   kernel.onListen = (port, pid) => {
     listening.add(port);
     post("listen", { port, pid });
+    // `listen` is the raw bind; it is NOT safe to point a preview at yet. Drive
+    // real GET /'s through the kernel until one is answered and announce THAT as
+    // `serving`, so an SDK consumer's iframe never loads into a momentarily-closed
+    // port (which the preview proxy answers with 502).
+    if (!servingProbed.has(port)) {
+      servingProbed.add(port);
+      announceServing(port);
+    }
     // Created/opened project attribution FIRST (by pid chain), so a project's
     // dev server is matched to *its* run-shell regardless of the port it picked
     // (and never confused with a hard-coded DEMO that shares e.g. 5173/3000).
@@ -1443,6 +1469,13 @@ async function boot() {
       demoReadyPending.add(port);
       announceDemoReady(id, port);
     }
+  };
+  // The mirror of onListen: a server closed its port, or the process holding it
+  // died. Fires before onProcExit, so `listening` is still populated here.
+  kernel.onClose = (port) => {
+    if (!listening.delete(port)) return;
+    servingProbed.delete(port);
+    post("port-close", { port });
   };
   kernel.onFetch = (url, info) => {
     const tid = terminalForPid(info.pid);
@@ -1614,6 +1647,26 @@ function registerLazyTools() {
 
 // ── File-operation helpers (host Explorer: delete / copy / cut-paste) ────────
 const errMsg = (err) => (err && err.message) || String(err);
+
+// The sync fs bridge tags every VFS failure with the errno the Rust VFS raised
+// ("ENOENT", "EEXIST", …; see packages/kernel-host/kernel-fs.js). Forward it so the
+// SDK can throw a VivariError the caller can discriminate on instead of a bare
+// message string.
+const errCode = (err) => (err && err.code) || undefined;
+// Raise the errno the VFS would have raised, for the strict-mode checks the VFS
+// itself can't make (it only implements the recursive/forgiving variants).
+function fsError(code, syscall, path) {
+  const err = new Error(`${code}: ${syscall} '${path}'`);
+  err.code = code;
+  return err;
+}
+const replyErr = (reqId, err) =>
+  post("vv-reply", { reqId, ok: false, error: errMsg(err), code: errCode(err) });
+const replyNotReady = (reqId) =>
+  post("vv-reply", { reqId, ok: false, error: "kernel not ready", code: "ERR_NOT_READY" });
+// `kind` follows Node's fs.watch vocabulary: "rename" when an entry appears,
+// disappears or moves, "change" when existing contents are edited in place.
+const postFsChanged = (path, kind) => post("vv-fs-changed", { path, kind });
 
 // Recursively remove a path (file, or directory + contents).
 function rmRecursive(path) {
@@ -1945,7 +1998,13 @@ self.onmessage = async (event) => {
   if (m.type === "init") {
     // Default on: only an explicit `compress: false` (BootOptions.compress) disables it.
     vfsCompression = m.compress !== false;
-    boot().catch((err) => post("log", { line: "kernel worker boot failed: " + err, stream: "stderr" }));
+    // `error` (not just `log`) so the SDK's boot() has something to reject on —
+    // otherwise a kernel that dies here never posts `ready` and the caller waits
+    // out its whole timeout with no idea why.
+    boot().catch((err) => {
+      post("log", { line: "kernel worker boot failed: " + err, stream: "stderr" });
+      post("error", { message: "kernel worker boot failed: " + errMsg(err), fatal: true });
+    });
     return;
   }
 
@@ -2058,25 +2117,29 @@ self.onmessage = async (event) => {
   // to the preview iframe; Nest --watch recompiles + restarts (its re-listen then
   // triggers a preview reload via kernel.onListen above). No orchestration here.
   if (m.type === "vv-write") {
-    if (kernel) {
-      try {
-        const slash = m.path.lastIndexOf("/");
-        if (slash > 0) kernel.mkdirp(m.path.slice(0, slash));
-        // `bytes` (a Uint8Array) is used for binary imports (dropped images /
-        // files); `contents` (a string) for text edits. writeFile accepts either.
-        kernel.writeFile(m.path, m.bytes ?? m.contents ?? "");
-        post("vv-fs-changed", { path: m.path });
-      } catch (err) {
-        post("log", { line: "[edit] write failed: " + ((err && err.message) || err), stream: "stderr" });
-      }
+    if (!kernel) {
+      if (m.reqId != null) replyNotReady(m.reqId);
+      return;
     }
-    if (m.reqId != null) post("vv-reply", { reqId: m.reqId, ok: true });
+    try {
+      const slash = m.path.lastIndexOf("/");
+      if (slash > 0) kernel.mkdirp(m.path.slice(0, slash));
+      const existed = kernel.exists(m.path);
+      // `bytes` (a Uint8Array) is used for binary imports (dropped images /
+      // files); `contents` (a string) for text edits. writeFile accepts either.
+      kernel.writeFile(m.path, m.bytes ?? m.contents ?? "");
+      if (m.reqId != null) post("vv-reply", { reqId: m.reqId, ok: true });
+      postFsChanged(m.path, existed ? "change" : "rename");
+    } catch (err) {
+      post("log", { line: "[edit] write failed: " + errMsg(err), stream: "stderr" });
+      if (m.reqId != null) replyErr(m.reqId, err);
+    }
     return;
   }
 
   // ── VFS queries for the multi-root Explorer (request/response via vv-reply) ──
   if (m.type === "vv-readdir") {
-    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    if (!kernel) { replyNotReady(m.reqId); return; }
     try {
       const base = m.path.replace(/\/+$/, "");
       const names = kernel.readdir(m.path);
@@ -2087,51 +2150,67 @@ self.onmessage = async (event) => {
       });
       post("vv-reply", { reqId: m.reqId, ok: true, path: m.path, entries });
     } catch (err) {
-      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      replyErr(m.reqId, err);
     }
     return;
   }
   if (m.type === "vv-read") {
-    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    if (!kernel) { replyNotReady(m.reqId); return; }
     try {
       post("vv-reply", { reqId: m.reqId, ok: true, path: m.path, contents: kernel.readFile(m.path) });
     } catch (err) {
-      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      replyErr(m.reqId, err);
     }
     return;
   }
   // Raw bytes for binary files (images) so the editor's image viewer gets an
   // uncorrupted buffer — readFile decodes to a JS string, which mangles binary.
   if (m.type === "vv-read-bytes") {
-    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    if (!kernel) { replyNotReady(m.reqId); return; }
     try {
       const bytes = kernel.readFileBytes(m.path);
       post("vv-reply", { reqId: m.reqId, ok: true, path: m.path, bytes });
     } catch (err) {
-      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      replyErr(m.reqId, err);
     }
     return;
   }
-  // Existence + kind check used to validate a new project's target directory.
+  // Existence + kind check used to validate a new project's target directory, and
+  // the backing call for the SDK's fs.stat/fs.exists. `exists: false` is a normal
+  // answer (not an error) so `exists()` needn't catch; the VFS metadata rides along
+  // so `stat()` can report size/mtime without a second round-trip.
   if (m.type === "vv-stat") {
     if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: true, exists: false, isDir: false }); return; }
     try {
       if (!kernel.exists(m.path)) { post("vv-reply", { reqId: m.reqId, ok: true, exists: false, isDir: false }); return; }
       const st = kernel.stat(m.path);
-      post("vv-reply", { reqId: m.reqId, ok: true, exists: true, isDir: st.kind === "dir" });
-    } catch {
-      post("vv-reply", { reqId: m.reqId, ok: true, exists: false, isDir: false });
+      post("vv-reply", {
+        reqId: m.reqId, ok: true, exists: true, isDir: st.kind === "dir",
+        size: st.size, mtimeMs: st.mtimeMs, mode: st.mode, ino: st.ino,
+      });
+    } catch (err) {
+      replyErr(m.reqId, err);
     }
     return;
   }
+  // `recursive: false` asks for POSIX mkdir semantics (parents must exist, EEXIST if
+  // the target already does). The VFS only implements mkdirp, so enforce the strict
+  // variant here rather than accepting the option and quietly ignoring it.
   if (m.type === "vv-mkdirp") {
-    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    if (!kernel) { replyNotReady(m.reqId); return; }
     try {
+      if (m.recursive === false) {
+        const slash = m.path.replace(/\/+$/, "").lastIndexOf("/");
+        const parent = slash > 0 ? m.path.slice(0, slash) : "/";
+        if (!kernel.exists(parent)) throw fsError("ENOENT", "mkdir", m.path);
+        if (kernel.stat(parent).kind !== "dir") throw fsError("ENOTDIR", "mkdir", m.path);
+        if (kernel.exists(m.path)) throw fsError("EEXIST", "mkdir", m.path);
+      }
       kernel.mkdirp(m.path);
       post("vv-reply", { reqId: m.reqId, ok: true });
-      post("vv-fs-changed", { path: m.path });
+      postFsChanged(m.path, "rename");
     } catch (err) {
-      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      replyErr(m.reqId, err);
     }
     return;
   }
@@ -2187,7 +2266,7 @@ self.onmessage = async (event) => {
       if (batch.length) await kernel.writeFilesBatch(batch);
       if (m.manifest) registerProject(dir, m.manifest, m.title);
       post("vv-reply", { reqId: m.reqId, ok: true });
-      post("vv-fs-changed", { path: dir });
+      postFsChanged(dir, "rename");
     } catch (err) {
       post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
     }
@@ -2227,19 +2306,23 @@ self.onmessage = async (event) => {
   // round-trips — excluding node_modules/.git and bounded by file count + bytes.
   // Returns [{ path (relative to root), bytes }] plus a `truncated` flag.
   if (m.type === "vv-read-tree") {
-    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    if (!kernel) { replyNotReady(m.reqId); return; }
     try {
       const root = String(m.root || "").replace(/\/+$/, "");
+      // `strict` is the SDK's export(): a missing root is an error, not an empty
+      // archive. The studio's own export tolerates it (it walks what it can).
+      if (m.strict && !kernel.exists(root || "/")) throw fsError("ENOENT", "export", m.root);
       const skip = new Set(["node_modules", ".git", ...(Array.isArray(m.exclude) ? m.exclude : [])]);
       const MAX_FILES = 20000;
       const MAX_BYTES = 64 * 1024 * 1024;
       const files: { path: string; bytes: Uint8Array }[] = [];
       let bytes = 0;
       let truncated = false;
+      // `dir` is "" at the VFS root so the joins below produce "/name", not "//name".
       const walk = (dir: string, rel: string) => {
         if (truncated) return;
         let names: string[];
-        try { names = kernel.readdir(dir); } catch { return; }
+        try { names = kernel.readdir(dir || "/"); } catch { return; }
         for (const name of names) {
           if (truncated) return;
           if (skip.has(name)) continue;
@@ -2258,10 +2341,10 @@ self.onmessage = async (event) => {
           }
         }
       };
-      if (kernel.exists(root)) walk(root, "");
+      if (kernel.exists(root || "/")) walk(root, "");
       post("vv-reply", { reqId: m.reqId, ok: true, files, truncated });
     } catch (err) {
-      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      replyErr(m.reqId, err);
     }
     return;
   }
@@ -2269,19 +2352,24 @@ self.onmessage = async (event) => {
   // Bulk-write an imported tree (folder import / shared-project load) into `dir`
   // in one batch. `files` is [{ path (relative to dir), bytes }].
   if (m.type === "vv-import-tree") {
-    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    if (!kernel) { replyNotReady(m.reqId); return; }
     try {
       const dir = String(m.dir || "").replace(/\/+$/, "");
-      kernel.mkdirp(dir);
+      if (dir) kernel.mkdirp(dir);
+      // Empty directories carry meaning in a mounted tree (and writeFilesBatch only
+      // creates the parents its files need), so materialise them explicitly first.
+      for (const d of Array.isArray(m.dirs) ? m.dirs : []) {
+        kernel.mkdirp(dir + "/" + String(d).replace(/^\/+/, ""));
+      }
       const incoming = Array.isArray(m.files) ? m.files : [];
       const batch = incoming
         .filter((f) => f && typeof f.path === "string")
         .map((f) => ({ path: dir + "/" + String(f.path).replace(/^\/+/, ""), bytes: f.bytes ?? f.contents ?? "" }));
       if (batch.length) await kernel.writeFilesBatch(batch);
       post("vv-reply", { reqId: m.reqId, ok: true, count: batch.length });
-      post("vv-fs-changed", { path: dir });
+      postFsChanged(dir || "/", "rename");
     } catch (err) {
-      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      replyErr(m.reqId, err);
     }
     return;
   }
@@ -2336,7 +2424,7 @@ self.onmessage = async (event) => {
           lines[li] = lines[li].slice(0, start) + out + lines[li].slice(start + length);
           kernel.writeFile(file, lines.join("\n"));
           filesChanged = 1; replaced = 1;
-          post("vv-fs-changed", { path: file });
+          postFsChanged(file, "change");
         }
       } else {
         for (const file of m.files || []) {
@@ -2349,7 +2437,7 @@ self.onmessage = async (event) => {
           if (next !== content) {
             kernel.writeFile(file, next);
             filesChanged++; replaced += count;
-            post("vv-fs-changed", { path: file });
+            postFsChanged(file, "change");
           }
         }
       }
@@ -2367,21 +2455,33 @@ self.onmessage = async (event) => {
     const op = m.type.slice(3); // rename | rm | copy
     if (!kernel) {
       post("vv-fs-result", { op, ok: false, error: "kernel not ready", ...m });
-      if (m.reqId != null) post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" });
+      if (m.reqId != null) replyNotReady(m.reqId);
       return;
     }
     try {
       if (m.type === "vv-rename") kernel.rename(m.from, m.to);
-      else if (m.type === "vv-rm") rmRecursive(m.path);
+      // `force`/`recursive` default to the forgiving behaviour the Explorer wants;
+      // the SDK passes them explicitly to get Node's stricter `fs.rm` contract.
+      else if (m.type === "vv-rm") {
+        const exists = kernel.exists(m.path);
+        if (!exists) {
+          if (m.force === false) throw fsError("ENOENT", "rm", m.path);
+        } else if (m.recursive === false && kernel.stat(m.path).kind === "dir") {
+          if (kernel.readdir(m.path).length) throw fsError("ENOTEMPTY", "rm", m.path);
+          kernel.rmdir(m.path);
+        } else {
+          rmRecursive(m.path);
+        }
+      }
       else copyRecursive(m.from, m.to);
       post("vv-fs-result", { op, ok: true, from: m.from, to: m.to, path: m.path });
-      post("vv-fs-changed", { path: m.to || m.path });
+      postFsChanged(m.to || m.path, "rename");
       // The SDK fs facade correlates by reqId; the studio Explorer keys off the
       // vv-fs-result above. Both are emitted so neither path is disturbed.
       if (m.reqId != null) post("vv-reply", { reqId: m.reqId, ok: true });
     } catch (err) {
       post("vv-fs-result", { op, ok: false, error: errMsg(err), from: m.from, to: m.to, path: m.path });
-      if (m.reqId != null) post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      if (m.reqId != null) replyErr(m.reqId, err);
     }
     return;
   }

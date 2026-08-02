@@ -37,6 +37,13 @@ Only if you run `npm` / `yarn` / `pnpm` in-VM. Vivari fetches vendored PM
 deliveries from `/vendor/...` on your origin; host that directory too, or skip
 installs.
 
+:::note Isolated previews need more
+Those two are all you need for the default same-origin previews. If you set
+`previewOrigin` or `previewWildcardDomain` in `BootOptions` to isolate previews on
+their own origin, that origin has to serve its own copy of `sw.js` plus a bridge
+document — see [Preview isolation modes](./deployment#preview-isolation-modes-optional).
+:::
+
 ## Headers
 
 Every HTML document that boots Vivari (and the `sw.js` script) needs:

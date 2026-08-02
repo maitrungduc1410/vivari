@@ -1,6 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { Vivari } from "@vivari/core";
-import type { VivariProcess } from "@vivari/core";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useSpawn, useVivari } from "@vivari/react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { Editor } from "../components/Editor";
@@ -47,15 +46,36 @@ export function NodeTerminal({
   filename = "index.js",
   packageJson = '{ "name": "demo", "type": "module" }',
 }: NodeTerminalProps = {}) {
-  const [status, setStatus] = useState<Status>("booting");
   const codeRef = useRef(source);
   const termHost = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
-  const vivariRef = useRef<Vivari | null>(null);
-  const procRef = useRef<VivariProcess | null>(null);
+  const [mounted, setMounted] = useState(false);
+
+  // No preview iframe here, so no Service Worker to register. Its own key keeps
+  // this off the default kernel that the React preview scenario boots.
+  const { vivari, status: bootStatus, error: bootError } = useVivari({
+    instanceKey: "node-terminal",
+    serviceWorkerUrl: false,
+  });
+
+  const writeToTerm = useCallback((chunk: string) => termRef.current?.write(chunk), []);
+
+  // Spawning, output streaming, stdin and kill-on-unmount all come from the
+  // hook; this scenario used to hand-write every one of them.
+  const runner = useSpawn("node", [filename], {
+    onOutput: writeToTerm,
+    onExit: (code) =>
+      termRef.current?.writeln(
+        `\r\n\x1b[38;5;244m[process exited with code ${code}]\x1b[0m`,
+      ),
+    onError: (err) =>
+      termRef.current?.writeln(`\r\n\x1b[38;5;203m${err.message}\x1b[0m`),
+  });
+
+  const status: Status =
+    runner.status === "running" ? "running" : mounted ? "ready" : "booting";
 
   useEffect(() => {
-    let disposed = false;
     const term = new Terminal({
       convertEol: true,
       cursorBlink: true,
@@ -70,6 +90,9 @@ export function NodeTerminal({
     fit.fit();
     termRef.current = term;
 
+    // Forward keystrokes to the running process so interactive scripts work.
+    const onData = term.onData(runner.write);
+
     const ro = new ResizeObserver(() => {
       try {
         fit.fit();
@@ -79,76 +102,68 @@ export function NodeTerminal({
     });
     if (termHost.current) ro.observe(termHost.current);
 
-    (async () => {
+    return () => {
+      onData.dispose();
+      ro.disconnect();
+      term.dispose();
+      termRef.current = null;
+    };
+  }, [runner.write]);
+
+  // Mount the project once the shared kernel is up. Teardown is the hook's job:
+  // the instance is ref-counted and any running process is killed on unmount.
+  useEffect(() => {
+    if (!vivari) return;
+    let cancelled = false;
+    void (async () => {
       try {
-        const vivari = await Vivari.boot({ serviceWorkerUrl: false });
-        if (disposed) {
-          vivari.teardown();
-          return;
-        }
         await vivari.mount({
           "package.json": { file: { contents: packageJson } },
           [filename]: { file: { contents: source } },
         });
-        vivariRef.current = vivari;
-        setStatus("ready");
-        term.writeln(
+        if (cancelled) return;
+        setMounted(true);
+        termRef.current?.writeln(
           `\x1b[38;5;244mReady. Edit ${filename} and press Run.\x1b[0m`,
         );
       } catch (err) {
-        term.writeln(
-          "\x1b[38;5;203mFailed to boot: " +
-            (err instanceof Error ? err.message : String(err)) +
-            "\x1b[0m",
+        if (cancelled) return;
+        termRef.current?.writeln(
+          `\x1b[38;5;203mFailed to mount: ${err instanceof Error ? err.message : String(err)}\x1b[0m`,
         );
       }
     })();
-
     return () => {
-      disposed = true;
-      ro.disconnect();
-      procRef.current?.kill();
-      vivariRef.current?.teardown();
-      term.dispose();
+      cancelled = true;
     };
-  }, [source, filename, packageJson]);
+  }, [vivari, source, filename, packageJson]);
+
+  // A kernel that cannot boot at all (no cross-origin isolation, no workers) is
+  // reported with an actionable message rather than a spinner that never stops.
+  useEffect(() => {
+    if (bootStatus === "error" || bootStatus === "unsupported") {
+      termRef.current?.writeln(
+        `\x1b[38;5;203mFailed to boot: ${bootError?.message}\x1b[0m`,
+      );
+    }
+  }, [bootStatus, bootError]);
 
   async function run() {
-    const vivari = vivariRef.current;
+    const vm = vivari;
     const term = termRef.current;
-    if (!vivari || !term || status === "running") return;
-    setStatus("running");
+    if (!vm || !term || !mounted || runner.status === "running") return;
+
     term.clear();
     term.writeln(`\x1b[38;5;51m$\x1b[0m node ${filename}`);
-
     try {
-      await vivari.fs.writeFile(`/${filename}`, codeRef.current);
-      const proc = await vivari.spawn("node", [filename]);
-      procRef.current = proc;
-
-      // Forward keystrokes to the process so interactive scripts work too.
-      const writer = proc.input.getWriter();
-      const onData = term.onData((d) => void writer.write(d));
-
-      await proc.output.pipeTo(
-        new WritableStream({ write: (chunk) => term.write(chunk) }),
-      );
-      const code = await proc.exit;
-      onData.dispose();
-      await writer.close().catch(() => {});
-      term.writeln(
-        `\r\n\x1b[38;5;244m[process exited with code ${code}]\x1b[0m`,
-      );
+      await vm.fs.writeFile(`/${filename}`, codeRef.current);
     } catch (err) {
       term.writeln(
-        "\r\n\x1b[38;5;203m" +
-          (err instanceof Error ? err.message : String(err)) +
-          "\x1b[0m",
+        `\r\n\x1b[38;5;203m${err instanceof Error ? err.message : String(err)}\x1b[0m`,
       );
-    } finally {
-      procRef.current = null;
-      setStatus("ready");
+      return;
     }
+    await runner.run();
   }
 
   return (

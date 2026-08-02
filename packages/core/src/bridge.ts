@@ -1,12 +1,17 @@
 // Low-level transport to the Vivari kernel worker.
 //
+// **This is internal, unstable API.** It is reachable as `vivari.internal` and is
+// NOT covered by semver: the kernel message vocabulary (`vv-mkdirp`, `proc-out`,
+// …) changes whenever the runtime does, and none of it is typed beyond
+// `KernelMessage`. Everything an application needs is on `Vivari`; reach in here
+// only to build something the facade cannot express yet (the studio IDE does),
+// and expect to fix up your call sites on any release.
+//
 // This is the single point of contact with the runtime: it boots the kernel
 // worker (which itself spawns the fs / fetcher / process workers and the
 // Rust/Wasm VFS), optionally registers the preview Service Worker and relays its
-// HTTP requests into the VM, and exposes a tiny typed pub/sub over the worker's
-// message protocol. It is framework-agnostic — the higher-level `Vivari` facade
-// (and the `@vivari/react` bindings) are built on top of it, but you can also use
-// it directly for full control over the message vocabulary.
+// HTTP requests into the VM, and exposes a tiny pub/sub over the worker's
+// message protocol.
 //
 // A bundler (Vite/Rollup/webpack 5/esbuild) resolves the worker below plus its
 // nested `new Worker(new URL('./fs-worker.ts' | './process-worker.ts' |
@@ -14,12 +19,34 @@
 // .wasm', import.meta.url)` asset, emitting them beside the package so everything
 // is served same-origin (which COEP requires).
 
-import type { KernelMessage } from "./types";
+import { VivariError } from "./errors.js";
+import type { KernelMessage, Unsubscribe } from "./types.js";
 
 type Handler = (m: KernelMessage) => void;
 
 /** How previews are served. See BootOptions.previewOrigin / previewWildcardDomain. */
 export type PreviewMode = "same-origin" | "shared" | "wildcard";
+
+/**
+ * Broadcast to every handler immediately before {@link KernelBridge.destroy} tears
+ * the transport down, so long-lived subscribers (a running process's streams) can
+ * settle instead of being abandoned mid-flight.
+ */
+export const TEARDOWN_MESSAGE = "vv-teardown";
+
+/** Options accepted by {@link KernelBridge.request}. */
+export interface RequestOptions {
+  signal?: AbortSignal;
+  /** Reject with `ERR_TIMEOUT` after this many ms. Unbounded when unset. */
+  timeout?: number;
+}
+
+interface PendingRequest {
+  resolve: (m: KernelMessage) => void;
+  reject: (err: unknown) => void;
+  /** Detaches the abort listener / clears the timeout, whether we settle or not. */
+  dispose: () => void;
+}
 
 // One cross-origin preview bridge: the hidden iframe on a preview origin + the
 // persistent MessagePort to the SW living there. Mode B has exactly one (the
@@ -31,13 +58,20 @@ interface PreviewConn {
 }
 
 export class KernelBridge {
-  readonly worker: Worker;
+  private readonly worker: Worker;
   private readonly handlers = new Map<string, Set<Handler>>();
   private readonly anyHandlers = new Set<Handler>();
+  private readonly workerErrorHandlers = new Set<(message: string) => void>();
   private swRegistered = false;
+  private destroyed = false;
   // Correlation table for request()/vv-reply round-trips (readdir, read, etc.).
-  private readonly pending = new Map<number, (m: KernelMessage) => void>();
+  private readonly pending = new Map<number, PendingRequest>();
   private reqSeq = 1;
+  // Every listener this bridge attached to a target it does NOT own (window,
+  // navigator.serviceWorker). Without these, an instance that is torn down keeps
+  // relaying preview traffic into a terminated worker for the life of the page —
+  // which is exactly what happens when a component remounts.
+  private readonly disposers: Array<() => void> = [];
 
   // Where previews are served — see PreviewMode. mode A: same-origin; mode B:
   // one shared `previewOrigin`; mode C: one origin per port under a wildcard.
@@ -103,19 +137,31 @@ export class KernelBridge {
     this.worker.onmessage = (event: MessageEvent<KernelMessage>) => {
       const m = event.data;
       if (m.type === "vv-reply") {
-        const resolve = this.pending.get(m.reqId as number);
-        if (resolve) {
+        const pending = this.pending.get(m.reqId as number);
+        if (pending) {
           this.pending.delete(m.reqId as number);
-          resolve(m);
+          pending.dispose();
+          pending.resolve(m);
         }
         return;
       }
       this.emit(m);
     };
+    // A worker that fails to load (a bundler that didn't emit the chunk, a wasm
+    // asset that 404s) never posts anything at all, so without this every caller
+    // waiting on the kernel — `boot()` most visibly — would wait forever.
+    this.worker.onerror = (event) => {
+      const message =
+        (typeof event === "object" && event && "message" in event
+          ? String((event as ErrorEvent).message)
+          : "") || "kernel worker failed to load";
+      for (const h of [...this.workerErrorHandlers]) h(message);
+      this.failPending(new VivariError("ERR_WORKER", message));
+    };
 
     // Best-effort flush of the OPFS write-behind buffer as the page goes away.
     if (typeof addEventListener === "function") {
-      addEventListener("pagehide", () =>
+      this.listen(globalThis, "pagehide", () =>
         this.worker.postMessage({ type: "fs-flush" }),
       );
 
@@ -123,12 +169,38 @@ export class KernelBridge {
       // events UP to this window; relay them down to the kernel worker. In modes
       // B/C the preview iframe is cross-origin, so only trust messages from a
       // recognised preview origin (its `parent` is still this window).
-      addEventListener("message", (event: MessageEvent) => {
-        if (this.previewMode !== "same-origin" && !this.isTrustedPreviewOrigin(event.origin)) return;
-        const d = event.data;
+      this.listen(globalThis, "message", (event: Event) => {
+        const msg = event as MessageEvent;
+        if (this.previewMode !== "same-origin" && !this.isTrustedPreviewOrigin(msg.origin)) return;
+        const d = msg.data;
         if (!d || d.dir !== "out" || (d.type !== "vv-ws" && d.type !== "vv-sse")) return;
         this.worker.postMessage({ type: d.type as string, msg: d });
       });
+    }
+  }
+
+  /**
+   * `target.addEventListener(...)`, remembered so {@link destroy} can detach it.
+   * Everything this bridge attaches to a target it does not own goes through here.
+   */
+  private listen(target: EventTarget, type: string, handler: (event: Event) => void): void {
+    target.addEventListener(type, handler);
+    this.disposers.push(() => target.removeEventListener(type, handler));
+  }
+
+  /** Subscribe to a fatal kernel-worker load/runtime error. Returns an unsubscribe fn. */
+  onWorkerError(handler: (message: string) => void): Unsubscribe {
+    this.workerErrorHandlers.add(handler);
+    return () => this.workerErrorHandlers.delete(handler);
+  }
+
+  /** Reject every in-flight `request()`; used on worker failure and on teardown. */
+  private failPending(err: VivariError): void {
+    const inFlight = [...this.pending.values()];
+    this.pending.clear();
+    for (const p of inFlight) {
+      p.dispose();
+      p.reject(err);
     }
   }
 
@@ -161,11 +233,45 @@ export class KernelBridge {
    * Request/response round-trip: post `type` with a correlation id and resolve
    * when the worker answers with `{type:"vv-reply", reqId, ...}`. Used for VFS
    * queries (readdir/read/stat), writes, and file operations.
+   *
+   * Rejects if the signal aborts, the (optional) timeout expires, the worker dies,
+   * or the bridge is destroyed — never leaves the caller pending. There is no
+   * default timeout because reply latency is data-dependent (a tree export of a
+   * large project is legitimately slow); bound it per call where you can.
    */
-  request(type: string, extra?: Record<string, unknown>): Promise<KernelMessage> {
+  request(
+    type: string,
+    extra?: Record<string, unknown>,
+    options: RequestOptions = {},
+  ): Promise<KernelMessage> {
+    const { signal, timeout } = options;
+    if (this.destroyed) {
+      return Promise.reject(new VivariError("ERR_TORN_DOWN", `${type}: the Vivari instance was torn down`));
+    }
+    if (signal?.aborted) {
+      return Promise.reject(new VivariError("ERR_ABORTED", `${type}: aborted`));
+    }
     const reqId = this.reqSeq++;
-    return new Promise((resolve) => {
-      this.pending.set(reqId, resolve);
+    return new Promise<KernelMessage>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const onAbort = () => settle(new VivariError("ERR_ABORTED", `${type}: aborted`));
+      const dispose = () => {
+        if (timer !== undefined) clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const settle = (err: VivariError) => {
+        if (!this.pending.delete(reqId)) return;
+        dispose();
+        reject(err);
+      };
+      if (timeout !== undefined) {
+        timer = setTimeout(
+          () => settle(new VivariError("ERR_TIMEOUT", `${type}: no reply within ${timeout}ms`)),
+          timeout,
+        );
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.pending.set(reqId, { resolve, reject, dispose });
       this.worker.postMessage({ type, reqId, ...extra });
     });
   }
@@ -328,10 +434,10 @@ export class KernelBridge {
     }
     // The SW posts each preview request here; forward it to the kernel worker,
     // transferring the reply port so the worker answers the SW directly.
-    navigator.serviceWorker.addEventListener("message", (event) => {
-      const d = event.data;
+    this.listen(navigator.serviceWorker, "message", (event: Event) => {
+      const d = (event as MessageEvent).data;
       if (d?.type === "vv-http") {
-        this.worker.postMessage({ type: "vv-http", req: d.req }, [event.ports[0]]);
+        this.worker.postMessage({ type: "vv-http", req: d.req }, [(event as MessageEvent).ports[0]]);
         return;
       }
       // ws/SSE from a preview opened in its OWN tab (COOP severs window.opener, so
@@ -348,9 +454,7 @@ export class KernelBridge {
     // SW's "top-level window" fallback would otherwise pick the host document,
     // which has no kernel. Re-announce on controllerchange (SW update/claim).
     this.announceKernelHost();
-    navigator.serviceWorker.addEventListener("controllerchange", () =>
-      this.announceKernelHost(),
-    );
+    this.listen(navigator.serviceWorker, "controllerchange", () => this.announceKernelHost());
     this.swRegistered = true;
     return true;
   }
@@ -401,11 +505,13 @@ export class KernelBridge {
     conn.iframe = iframe;
     if (!(await ready)) return false;
 
+    if (this.destroyed) return false;
     this.connectPort(origin, conn);
     // The SW is evicted when idle, losing the in-memory port. The bridge doc
     // notices (its `controllerchange` / a probe) and asks us to re-hand a port.
-    window.addEventListener("message", (event: MessageEvent) => {
-      if (event.origin !== origin || !event.data || event.data.type !== "vv-need-connect") return;
+    this.listen(window, "message", (event: Event) => {
+      const msg = event as MessageEvent;
+      if (msg.origin !== origin || !msg.data || msg.data.type !== "vv-need-connect") return;
       this.connectPort(origin, conn);
     });
     this.swRegistered = true;
@@ -509,8 +615,27 @@ export class KernelBridge {
     this.worker.postMessage({ type: "init", compress });
   }
 
-  /** Tear down the worker and all nested workers/VFS it owns. */
+  /**
+   * Tear down the worker and all nested workers/VFS it owns. Idempotent.
+   *
+   * Order matters: in-flight requests are rejected and {@link TEARDOWN_MESSAGE} is
+   * broadcast BEFORE the handler tables are dropped, so anything waiting on the
+   * kernel settles instead of being abandoned. Then every listener attached to a
+   * target we don't own (window, `navigator.serviceWorker`) is detached — a torn
+   * down bridge must stop relaying preview traffic into a terminated worker.
+   */
   destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.failPending(new VivariError("ERR_TORN_DOWN", "the Vivari instance was torn down"));
+    this.emit({ type: TEARDOWN_MESSAGE });
+    for (const dispose of this.disposers.splice(0)) {
+      try {
+        dispose();
+      } catch {
+        /* target already gone */
+      }
+    }
     for (const conn of this.previewConns.values()) {
       try {
         conn.port?.close();
@@ -520,10 +645,12 @@ export class KernelBridge {
       conn.iframe?.remove();
     }
     this.previewConns.clear();
+    this.worker.onmessage = null;
+    this.worker.onerror = null;
     this.worker.terminate();
     this.handlers.clear();
     this.anyHandlers.clear();
-    this.pending.clear();
+    this.workerErrorHandlers.clear();
   }
 }
 

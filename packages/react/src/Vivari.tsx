@@ -1,8 +1,48 @@
-import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import type { BootOptions, FileSystemTree, Vivari as VivariInstance } from "@vivari/core";
-import { useVivari, type VivariStatus } from "./useVivari";
+"use client";
 
-export interface VivariProps extends BootOptions {
+// The drop-in embed: boot, mount files, install, run, preview.
+//
+// It is now a thin composition of useVivari + <VivariPreview> rather than a
+// closed widget, so anything it does you can also do yourself. Pass `children`
+// (a node or a render prop) to take over rendering entirely and still get the
+// boot + install + run orchestration.
+
+import {
+  forwardRef,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type IframeHTMLAttributes,
+  type ReactNode,
+} from "react";
+import type {
+  BootOptions,
+  FileSystemTree,
+  Vivari as VivariInstance,
+  VivariProcess,
+} from "@vivari/core";
+import { useVivariContext } from "./context";
+import { useVivari, type UseVivariResult, type VivariUnsupportedReason } from "./useVivari";
+import { VivariPreview } from "./VivariPreview";
+
+/** Which step of the embed's lifecycle failed. */
+export type VivariPhase = "unsupported" | "boot" | "mount" | "install" | "run";
+
+export type VivariFailure =
+  | { phase: "unsupported"; error: Error; reason: VivariUnsupportedReason }
+  | { phase: "boot" | "mount" | "install" | "run"; error: Error; reason?: undefined };
+
+export interface VivariProps
+  // Real iframe props (id, className, style, allow, sandbox, loading, …) reach
+  // the frame instead of being swallowed. `onError` is ours, not the DOM's.
+  extends Omit<IframeHTMLAttributes<HTMLIFrameElement>, "src" | "children" | "onError"> {
+  /** Boot options for the underlying kernel. */
+  boot?: BootOptions;
+  /** Share a kernel with the rest of the tree. Defaults to the enclosing provider's. */
+  instanceKey?: string;
+  /** `false` defers the boot until the render prop's `boot()` is called. */
+  autoBoot?: boolean;
   /** Files to mount into the VM before running commands. */
   files?: FileSystemTree;
   /** Install step. Default `["npm", "install"]`; pass `false` to skip. */
@@ -11,191 +51,232 @@ export interface VivariProps extends BootOptions {
   run?: string | string[];
   /** Called once the instance is booted and files are mounted. */
   onReady?: (vivari: VivariInstance) => void;
-  /** Called when an in-VM server starts listening; `url` is the preview URL. */
+  /** Called when a server starts listening inside the VM (the raw kernel event). */
   onServerReady?: (port: number, url: string) => void;
   /** Called for each stdout/stderr chunk of the install + run commands. */
   onOutput?: (chunk: string) => void;
-  /** Render the preview <iframe> when a server is ready. Default `true`. */
+  /** Called for every failure, at any phase. Nothing is swallowed. */
+  onError?: (failure: VivariFailure) => void;
+  /** Render the preview `<iframe>`. Default `true`. */
   showPreview?: boolean;
-  className?: string;
-  style?: CSSProperties;
-  /** Shown while booting / before a preview URL exists. */
+  /** Preview a specific port instead of the first one that listens. */
+  previewPort?: number;
+  /** Path within the previewed server. Default `/`. */
+  previewPath?: string;
+  /** Shown while booting / installing / before a preview URL exists. */
   fallback?: ReactNode;
+  /** Replace the built-in failure UI. */
+  renderError?: (failure: VivariFailure) => ReactNode;
+  /** Take over rendering. A function receives the live boot state. */
+  children?: ReactNode | ((state: UseVivariResult) => ReactNode);
 }
 
+const DEFAULT_INSTALL = ["npm", "install"];
+
+// Whitespace-split; prefer the array form for anything containing quotes.
 function toCommand(cmd: string | string[]): [string, string[]] {
   const parts = Array.isArray(cmd) ? cmd : cmd.trim().split(/\s+/);
   return [parts[0], parts.slice(1)];
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/**
- * Wait until the in-VM dev server at `url` is actually serving, then warm it, so
- * the preview iframe loads a working (and already-optimized) page.
- *
- * Why: a dev server (Vite/rolldown) binds -> closes -> rebinds its port several
- * times during startup, so the first `listen` event is transient. Pointing the
- * iframe there immediately races that window and the Service Worker preview proxy
- * returns `502 No server listening on port N`. This mirrors the studio's
- * kernel-side `waitServing` + `warmDevServer`, but over the same SW proxy the
- * iframe uses (so it needs no extra kernel API). Best-effort throughout: any
- * failure just falls through so the iframe still gets a chance to load.
- */
-async function waitForPreview(url: string, timeoutMs = 60000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  // 1) Poll until the server answers with something other than the proxy's
-  //    "no listener yet" / gateway statuses (Vite rebinds during boot).
-  for (;;) {
-    try {
-      const res = await fetch(url, { cache: "no-store" });
-      if (res.status !== 502 && res.status !== 503 && res.status !== 504) break;
-    } catch {
-      /* not answering yet */
-    }
-    if (Date.now() > deadline) return;
-    await sleep(150);
-  }
-  // 2) Warm the dependency optimizer: fetch the entry module scripts (+ Vite's
-  //    client) so the cold optimize completes BEFORE the iframe requests them —
-  //    otherwise those subresources can race the SW's per-request timeout on a
-  //    cold `.vite` cache and 504.
-  try {
-    const res = await fetch(url, { cache: "no-store" });
-    const html = await res.text();
-    const mods = new Set<string>(["/@vite/client"]);
-    const re = /<script[^>]*type=["']module["'][^>]*src=["']([^"']+)["']/gi;
-    for (let m; (m = re.exec(html)); ) if (m[1].startsWith("/")) mods.add(m[1]);
-    const origin = new URL(url).origin;
-    const base = url.replace(origin, "").replace(/\/$/, ""); // e.g. /preview/5173
-    await Promise.all(
-      [...mods].map((p) =>
-        fetch(origin + base + p, { cache: "no-store" }).catch(() => {}),
-      ),
-    );
-  } catch {
-    /* warm is best-effort; the iframe will still load */
-  }
+function FailureNotice({
+  failure,
+  className,
+  style,
+}: {
+  failure: VivariFailure;
+  className?: string;
+  style?: CSSProperties;
+}) {
+  return (
+    <div className={className} style={style} role="alert">
+      {failure.phase === "unsupported" ? (
+        <>
+          <p>{failure.error.message}</p>
+          <pre>
+            Cross-Origin-Opener-Policy: same-origin{"\n"}
+            Cross-Origin-Embedder-Policy: require-corp
+          </pre>
+        </>
+      ) : (
+        <p>
+          Vivari failed during {failure.phase}: {failure.error.message}
+        </p>
+      )}
+    </div>
+  );
 }
 
 /**
- * Drop-in embed: boots Vivari, mounts `files`, runs `install` then `run`, and
- * renders the resulting dev-server preview in an <iframe>.
+ * Boots Vivari, mounts `files`, runs `install` then `run`, and renders the
+ * resulting dev-server preview in an `<iframe>`.
  *
  *   <Vivari files={tree} run="npm run dev" style={{ height: 480 }} />
  *
  * The host page must be cross-origin isolated (COOP + COEP).
  */
-export function Vivari(props: VivariProps): ReactNode {
+export const Vivari = forwardRef<HTMLIFrameElement, VivariProps>(function Vivari(props, ref) {
   const {
+    boot,
+    instanceKey,
+    autoBoot,
     files,
-    install = ["npm", "install"],
+    install = DEFAULT_INSTALL,
     run,
     onReady,
     onServerReady,
     onOutput,
+    onError,
     showPreview = true,
-    className,
-    style,
+    previewPort,
+    previewPath,
     fallback,
-    ...bootOptions
+    renderError,
+    children,
+    ...iframeProps
   } = props;
 
-  const { vivari, status, error } = useVivari(bootOptions);
-  const [previewSrc, setPreviewSrc] = useState<string | null>(null);
-  // Latest callbacks without re-triggering the orchestration effect.
-  const cbs = useRef({ onReady, onServerReady, onOutput });
-  cbs.current = { onReady, onServerReady, onOutput };
-  const startedRef = useRef(false);
-  // Guards the preview against the dev server's transient boot re-binds: only the
-  // first listened port drives the iframe, and only after it's really serving.
-  const previewStartedRef = useRef(false);
-  // The preview <iframe>; inbound HMR/SSE frames are delivered to its shim.
-  const frameRef = useRef<HTMLIFrameElement | null>(null);
+  // Join an enclosing provider's kernel rather than booting a second one.
+  const parent = useVivariContext({ optional: true });
+  const state = useVivari({
+    ...boot,
+    instanceKey: instanceKey ?? parent?.instanceKey,
+    autoBoot,
+  });
+  const { vivari } = state;
+  const [runFailure, setRunFailure] = useState<VivariFailure | null>(null);
+
+  // Latest callbacks without re-triggering the orchestration effect. In an effect,
+  // not the render body: a render can be started and thrown away, and a ref write
+  // during it is not undone. Declared first so it is current before that effect.
+  const cbs = useRef({ onReady, onServerReady, onOutput, onError });
+  useEffect(() => {
+    cbs.current = { onReady, onServerReady, onOutput, onError };
+  });
+
+  // Keyed on the instance, not a boolean, so restart() re-orchestrates.
+  const orchestratedFor = useRef<VivariInstance | null>(null);
 
   useEffect(() => {
-    if (!vivari || startedRef.current) return;
-    startedRef.current = true;
-    let disposed = false;
+    if (!vivari || orchestratedFor.current === vivari) return;
+    orchestratedFor.current = vivari;
+    setRunFailure(null);
 
-    // Inbound half of the HMR/SSE tunnel. The preview's WS/SSE shim posts OUTbound
-    // frames to this window (the bridge forwards them to the kernel); the kernel's
-    // INbound frames arrive here as vv-ws/vv-sse and must be delivered back to the
-    // iframe's shim, or Vite HMR stays stuck at "[vite] connecting…". The frame
-    // carries no port, so we deliver to our single iframe; the shim ignores frames
-    // for connIds it doesn't own. (The studio does the same in its controller.)
-    const relay = (type: "vv-ws" | "vv-sse") =>
-      vivari.bridge.on(type, (m) => {
-        const win = frameRef.current?.contentWindow;
-        const msg = (m as { msg?: Record<string, unknown> }).msg;
-        if (win && msg) win.postMessage({ ...msg, type, dir: "in" }, "*");
-      });
-    const offWs = relay("vv-ws");
-    const offSse = relay("vv-sse");
+    let disposed = false;
+    const procs = new Set<VivariProcess>();
+
+    const fail = (error: unknown, phase: "mount" | "install" | "run") => {
+      if (disposed) return;
+      const e = error instanceof Error ? error : new Error(String(error));
+      const failure: VivariFailure = { phase, error: e };
+      setRunFailure(failure);
+      cbs.current.onError?.(failure);
+    };
 
     const offServer = vivari.on("server-ready", (port, url) => {
-      // A dev server rebinds its port a few times during boot, firing several
-      // `listen` events; act on the first and only after it's actually serving,
-      // so the iframe never loads into a momentarily-closed port (502).
-      if (disposed || previewStartedRef.current) return;
-      previewStartedRef.current = true;
-      void waitForPreview(url).then(() => {
-        if (disposed) return;
-        setPreviewSrc(url);
-        cbs.current.onServerReady?.(port, url);
-      });
+      if (!disposed) cbs.current.onServerReady?.(port, url);
     });
 
-    const pump = (proc: { output: ReadableStream<string> }) =>
-      proc.output.pipeTo(
-        new WritableStream({
-          write: (chunk) => cbs.current.onOutput?.(chunk),
-        }),
-      ).catch(() => {});
+    const pump = (proc: VivariProcess) =>
+      proc.output
+        .pipeTo(new WritableStream({ write: (chunk) => cbs.current.onOutput?.(chunk) }))
+        .catch(() => {
+          /* cancelled by kill() on unmount; not a failure */
+        });
 
-    (async () => {
-      if (files) await vivari.mount(files);
+    const spawn = async (cmd: string | string[], phase: "install" | "run") => {
+      const [bin, args] = toCommand(cmd);
+      try {
+        const proc = await vivari.spawn(bin, args);
+        // Unmounted while the spawn was in flight — don't leak the process.
+        if (disposed) {
+          proc.kill();
+          return null;
+        }
+        procs.add(proc);
+        void pump(proc);
+        return proc;
+      } catch (e) {
+        fail(e, phase);
+        return null;
+      }
+    };
+
+    void (async () => {
+      try {
+        if (files) await vivari.mount(files);
+      } catch (e) {
+        return fail(e, "mount");
+      }
+      if (disposed) return;
       cbs.current.onReady?.(vivari);
+
       if (install !== false) {
-        const [cmd, args] = toCommand(install);
-        const proc = await vivari.spawn(cmd, args);
-        void pump(proc);
+        const proc = await spawn(install, "install");
+        if (!proc) return;
         const code = await proc.exit;
-        if (code !== 0 || disposed) return;
+        if (disposed) return;
+        if (code !== 0) {
+          const [bin, args] = toCommand(install);
+          return fail(
+            new Error(`\`${[bin, ...args].join(" ")}\` exited with code ${code}`),
+            "install",
+          );
+        }
       }
-      if (run) {
-        const [cmd, args] = toCommand(run);
-        const proc = await vivari.spawn(cmd, args);
-        void pump(proc);
-      }
-    })().catch(() => {});
+
+      if (run && !disposed) await spawn(run, "run");
+    })();
 
     return () => {
       disposed = true;
       offServer();
-      offWs();
-      offSse();
+      // An unmounted embed must not leave `npm run dev` running inside a VM
+      // nobody is watching — the instance may be shared and outlive this tree.
+      for (const p of procs) p.kill();
+      procs.clear();
     };
+    // `files`/`install`/`run` are read once per instance; change them by
+    // restarting or remounting with a new `instanceKey`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vivari]);
 
-  if (status === "error") {
-    return fallback ?? <div className={className} style={style}>Vivari failed to boot: {error?.message}</div>;
+  // `fallback` is the *pending* slot only. Routing failures through it is what
+  // made a non-isolated page render "Booting…" forever with the actionable
+  // COOP/COEP message discarded.
+  const failure: VivariFailure | null =
+    state.status === "unsupported"
+      ? { phase: "unsupported", error: state.error, reason: state.reason }
+      : state.status === "error"
+        ? { phase: "boot", error: state.error }
+        : runFailure;
+
+  if (failure) {
+    return (
+      <>
+        {renderError ? (
+          renderError(failure)
+        ) : (
+          <FailureNotice
+            failure={failure}
+            className={iframeProps.className}
+            style={iframeProps.style}
+          />
+        )}
+      </>
+    );
+  }
+  if (children !== undefined) {
+    return <>{typeof children === "function" ? children(state) : children}</>;
   }
   if (!showPreview) return null;
-  if (!previewSrc) {
-    return (fallback as ReactNode) ?? null;
-  }
   return (
-    <iframe
-      ref={frameRef}
-      src={previewSrc}
-      className={className}
-      style={style}
-      title="Vivari preview"
-      allow="cross-origin-isolated"
+    <VivariPreview
+      {...iframeProps}
+      ref={ref}
+      port={previewPort}
+      path={previewPath}
+      fallback={fallback}
     />
   );
-}
-
-export type { VivariStatus };
+});

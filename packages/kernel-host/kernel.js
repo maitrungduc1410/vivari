@@ -76,6 +76,7 @@ export class Kernel {
     this.pendingHttp = new Map(); // reqId -> { resolve, pid }
     this.nextReqId = 1;
     this.onListen = null; // optional observer (port, pid) — e.g. wire a preview
+    this.onClose = null; // optional observer (port, pid) — the mirror of onListen
 
     // ---- WebSocket tunnel (roadmap #19 stage C) ----
     // The browser preview tunnels each ws connection to us (it can't reach an
@@ -548,7 +549,10 @@ export class Kernel {
     // Drop any ports this process was serving and fail its in-flight requests,
     // so a fetch that was waiting on a now-dead server does not hang forever.
     for (const [port, owner] of this.listeners) {
-      if (owner === pid) this.listeners.delete(port);
+      if (owner === pid) {
+        this.listeners.delete(port);
+        if (this.onClose) this.onClose(port, pid);
+      }
     }
     for (const [reqId, pend] of this.pendingHttp) {
       if (pend.pid === pid) {
@@ -724,7 +728,10 @@ export class Kernel {
     }
     // OP_CLOSE_SERVER
     const port = msg.port | 0;
-    if (this.listeners.get(port) === proc.pid) this.listeners.delete(port);
+    if (this.listeners.get(port) === proc.pid) {
+      this.listeners.delete(port);
+      if (this.onClose) this.onClose(port, proc.pid);
+    }
     this.respondOk(proc, EMPTY);
   }
 

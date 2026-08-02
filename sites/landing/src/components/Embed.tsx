@@ -14,8 +14,8 @@ await vivari.mount({
 });
 
 const proc = await vivari.spawn("node", ["index.js"]);
-proc.output.pipeTo(new WritableStream({ write: (c) => console.log(c) }));
-await proc.exit;`,
+for await (const chunk of proc.output) console.log(chunk);
+console.log("exit code:", await proc.exit);`,
   react: `import { Vivari } from "@vivari/react";
 
 export function Playground() {
@@ -23,6 +23,7 @@ export function Playground() {
     <Vivari
       files={tree}
       run="npm run dev"
+      onError={({ phase, error }) => console.error(phase, error)}
       style={{ width: "100%", height: 480 }}
     />
   );

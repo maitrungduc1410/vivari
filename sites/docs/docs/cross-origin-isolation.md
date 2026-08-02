@@ -25,6 +25,11 @@ import { isCrossOriginIsolated } from "@vivari/core";
 console.log(isCrossOriginIsolated()); // must be true before Vivari.boot()
 ```
 
+You don't have to check first: `Vivari.boot()` performs the same test and rejects
+with `VivariError("ERR_NOT_ISOLATED")` before starting any workers. Calling
+`isCrossOriginIsolated()` yourself is useful when you want to render a
+"headers missing" state without attempting a boot at all.
+
 ## Header recipes
 
 ### Vite (dev + preview)

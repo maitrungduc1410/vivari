@@ -5,7 +5,7 @@
 //
 // The page must be cross-origin isolated (COOP + COEP) — see vite.config.ts.
 
-import { Vivari, type FileSystemTree } from "@vivari/core";
+import { Vivari, VivariError, type FileSystemTree, type OutputStream } from "@vivari/core";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -19,14 +19,10 @@ function append(pre: HTMLPreElement, chunk: string) {
   pre.scrollTop = pre.scrollHeight;
 }
 
-// Pipe a process's merged stdout/stderr into a <pre>.
-function stream(
-  proc: { output: ReadableStream<string> },
-  pre: HTMLPreElement,
-): Promise<void> {
-  return proc.output.pipeTo(
-    new WritableStream({ write: (chunk) => append(pre, chunk) }),
-  );
+// Pipe a process's merged stdout/stderr into a <pre>. `proc.stdout` / `proc.stderr`
+// are separate views of the same output if you need them apart.
+async function stream(proc: { output: OutputStream }, pre: HTMLPreElement) {
+  for await (const chunk of proc.output) append(pre, chunk);
 }
 
 const project: FileSystemTree = {
@@ -95,9 +91,13 @@ async function main() {
 }
 
 main().catch((err) => {
+  // Everything the SDK throws is a VivariError with a machine-readable `code`
+  // (here: ERR_NOT_ISOLATED, ERR_BOOT_TIMEOUT, ERR_WORKER, …), so a real app can
+  // branch on it instead of matching the message text.
+  const code = err instanceof VivariError ? err.code : "UNKNOWN";
   const message = err instanceof Error ? err.message : String(err);
   runStatus.textContent = "Failed to boot Vivari.";
-  append(runOutput, "\n[error] " + message + "\n");
+  append(runOutput, `\n[${code}] ${message}\n`);
   previewStatus.textContent = "unavailable";
   // The most common cause is a page that isn't cross-origin isolated.
   console.error(err);
