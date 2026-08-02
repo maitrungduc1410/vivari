@@ -593,5 +593,143 @@ console.log("\n== bun run crypto.ts (CryptoHasher + password on the real runtime
   ok(got.includes("rt=true,false"), "…which verifies the right password and rejects the wrong one");
 }
 
+// N) bun:sqlite on the REAL Wasm VFS, in real processes.
+//
+// This is the end-to-end proof the offline tier cannot give: the offline spike drives
+// the same engine over node:fs, which shows the SQL and the API are right but says
+// nothing about whether SQLite's VFS callbacks survive being routed through the
+// SharedArrayBuffer syscall bridge into the Rust/Wasm VFS. Here they are — and the
+// database is a real file in the project tree that OUTLIVES the process that wrote it.
+//
+// The engine is delivered by VV_SQLITE_WASM_PATH (a path inside the VFS). In the browser
+// the kernel instead sets VV_SQLITE_WASM_URL and the guest pulls the same bytes through
+// the blocking OP_FETCH syscall; there is no HTTP server in this harness, so the path
+// override — a documented embedder escape hatch, not a test-only hook — stands in.
+console.log("\n== bun:sqlite (real Wasm VFS, real processes) ==");
+{
+  const { readFileSync, existsSync } = await import("node:fs");
+  const ENGINE_SRC = new URL("../packages/runtime/vendor/sqlite/sqlite3.wasm", import.meta.url);
+
+  // The artifact is COMMITTED. A missing one is a broken checkout, and skipping would
+  // make this spike pass while proving nothing — the trap AGENTS.md names.
+  if (!existsSync(ENGINE_SRC)) {
+    ok(false, "packages/runtime/vendor/sqlite/sqlite3.wasm is missing (committed artifact — restore it with git, or `node scripts/vendor-sqlite.mjs --refresh`)");
+  } else {
+    const engineBytes = new Uint8Array(readFileSync(ENGINE_SRC));
+    const engineSize = engineBytes.length; // writeLarge transfers (and detaches) the buffer
+    const ENGINE_VFS_PATH = "/usr/lib/vivari/sqlite3.wasm";
+    kernel.mkdirp("/usr/lib/vivari");
+    await kernel.fs.writeLarge(ENGINE_VFS_PATH, engineBytes);
+    ok(kernel.exists(ENGINE_VFS_PATH), `the ${engineSize}-byte engine is in the VFS at ${ENGINE_VFS_PATH}`);
+    const SQL_ENV = { ...ENV, VV_SQLITE_WASM_PATH: ENGINE_VFS_PATH };
+
+    // --- process 1: create the database and write to it, synchronously ---
+    write("db-write.ts", [
+      "import { Database } from 'bun:sqlite';",
+      // No `await` anywhere in this file. That is the whole premise: bun:sqlite is a
+      // synchronous API and there is nowhere to await an engine boot.
+      "const db = new Database('./data.db');",
+      "db.run('CREATE TABLE todo(id INTEGER PRIMARY KEY, task TEXT NOT NULL, big INTEGER)');",
+      "const insert = db.query('INSERT INTO todo(task, big) VALUES($task, $big)');",
+      "const tx = db.transaction((rows: any[]) => { for (const r of rows) insert.run(r); });",
+      "tx([{ $task: 'write it', $big: 9007199254740993n }, { $task: 'read it back', $big: 2n }]);",
+      "const rows = db.query('SELECT id, task FROM todo ORDER BY id').all();",
+      "const safe = new Database('./data.db', { safeIntegers: true });",
+      "const big = safe.query('SELECT big FROM todo WHERE id = 1').get() as any;",
+      "console.log('WROTE:' + JSON.stringify({",
+      "  version: (db.query('SELECT sqlite_version() v').get() as any).v,",
+      "  rows,",
+      "  filename: db.filename,",
+      "  big: String(big.big),",
+      "  bigType: typeof big.big,",
+      "}));",
+      "safe.close(); db.close();",
+    ].join("\n"));
+
+    const w = await kernel.start("bun", ["run", "db-write.ts"], { cwd: APP, env: SQL_ENV, capture: true });
+    if (w.stderr) console.log("  stderr:", w.stderr.trim());
+    const wm = (w.stdout || "").match(/WROTE:(\{.*\})/);
+    const wrote = wm ? JSON.parse(wm[1]) : null;
+    console.log("  ->", JSON.stringify(wrote));
+    ok(w.code === 0, "bun run db-write.ts exits 0");
+    ok(!!wrote && /^3\.\d+\.\d+$/.test(wrote.version), `real SQLite booted in-process (${wrote && wrote.version})`);
+    ok(!!wrote && wrote.rows.length === 2, "two rows inserted inside a transaction and read back");
+    ok(!!wrote && wrote.rows[0].task === "write it", "…with the right column values");
+    ok(!!wrote && wrote.big === "9007199254740993" && wrote.bigType === "bigint",
+      "safeIntegers:true returns an exact BigInt for a value above 2^53, through the kernel");
+
+    // --- the database is a real file in the VFS, visible in the project tree ---
+    ok(kernel.exists(APP + "/data.db"), "the database exists in the VFS at /app/data.db");
+    const onDisk = kernel.readFileBytes(APP + "/data.db");
+    ok(onDisk.length >= 4096, `…and has real content (${onDisk.length} bytes)`);
+    ok(Buffer.from(onDisk.subarray(0, 16)).toString("latin1") === "SQLite format 3\0",
+      "…starting with SQLite's documented 16-byte file header");
+    ok(kernel.readdir(APP).includes("data.db"), "…and it shows up in a directory listing (so, in the file tree)");
+    ok(!kernel.exists(APP + "/data.db-journal"), "no rollback journal is left behind after a clean commit");
+
+    // --- process 2: a DIFFERENT process reads what the first one committed ---
+    write("db-read.ts", [
+      "import { Database } from 'bun:sqlite';",
+      "const db = new Database('./data.db', { readonly: true });",
+      "const rows = db.query('SELECT task FROM todo ORDER BY id').values().flat();",
+      "console.log('READ:' + JSON.stringify({ rows, pid: process.pid }));",
+      "db.close();",
+    ].join("\n"));
+    const r2 = await kernel.start("bun", ["run", "db-read.ts"], { cwd: APP, env: SQL_ENV, capture: true });
+    if (r2.stderr) console.log("  stderr:", r2.stderr.trim());
+    const rm = (r2.stdout || "").match(/READ:(\{.*\})/);
+    const read = rm ? JSON.parse(rm[1]) : null;
+    console.log("  ->", JSON.stringify(read));
+    ok(r2.code === 0, "bun run db-read.ts exits 0");
+    ok(!!read && JSON.stringify(read.rows) === '["write it","read it back"]',
+      "a SECOND process opens the same file and sees the committed rows");
+    ok(!!read && read.pid !== undefined, "…as a genuinely separate process");
+
+    // --- cwd resolution, :memory:, and the loud refusals, in a real process ---
+    write("sub/nested.ts", [
+      "import { Database } from 'bun:sqlite';",
+      "import { existsSync } from 'node:fs';",
+      "const out: any = { cwd: process.cwd() };",
+      // A relative path must land next to the running script's cwd, not at the VFS root.
+      "const db = new Database('./local.db');",
+      "db.run('CREATE TABLE t(v TEXT)'); db.run(\"INSERT INTO t VALUES('here')\");",
+      "out.here = (db.query('SELECT v FROM t').get() as any).v; db.close();",
+      "const mem = new Database(':memory:');",
+      "out.mem = (mem.query('SELECT 1+1 AS v').get() as any).v;",
+      "try { mem.loadExtension('x'); out.ext = 'NO THROW'; } catch (e: any) { out.ext = e.message.slice(0, 90); }",
+      "out.rootFree = !existsSync('/local.db');",
+      "console.log('NESTED:' + JSON.stringify(out));",
+    ].join("\n"));
+    const r3 = await kernel.start("bun", ["run", "nested.ts"], { cwd: APP + "/sub", env: SQL_ENV, capture: true });
+    if (r3.stderr) console.log("  stderr:", r3.stderr.trim());
+    const nm = (r3.stdout || "").match(/NESTED:(\{.*\})/);
+    const nested = nm ? JSON.parse(nm[1]) : null;
+    console.log("  ->", JSON.stringify(nested));
+    ok(r3.code === 0, "bun run sub/nested.ts exits 0");
+    ok(kernel.exists(APP + "/sub/local.db"), "a relative filename resolves against the PROCESS cwd (/app/sub/local.db)");
+    ok(!!nested && nested.rootFree === true, "…and not against the VFS root");
+    ok(!!nested && nested.cwd === APP + "/sub" && nested.here === "here", "…and reads back what it wrote there");
+    ok(!!nested && nested.mem === 2, ":memory: works and needs no file");
+    ok(!!nested && /not supported in Vivari/.test(nested.ext || ""), "loadExtension() throws inside a real process");
+
+    // --- a missing engine names the cause rather than failing mysteriously ---
+    write("noengine.ts", [
+      "import { Database } from 'bun:sqlite';",
+      "try { new Database(':memory:'); console.log('ENGINE:NO THROW'); }",
+      "catch (e: any) { console.log('ENGINE:' + e.message.split('\\n')[0]); }",
+    ].join("\n"));
+    const r4 = await kernel.start("bun", ["run", "noengine.ts"], {
+      cwd: APP,
+      env: { ...ENV, VV_SQLITE_WASM_PATH: "/usr/lib/vivari/does-not-exist.wasm" },
+      capture: true,
+    });
+    const em = (r4.stdout || "").match(/ENGINE:(.*)/);
+    console.log("  ->", em && em[1]);
+    ok(!!em && /could not load a SQLite engine/.test(em[1]),
+      "a bad VV_SQLITE_WASM_PATH throws an actionable error instead of a mystery");
+    ok(!!em && /VV_SQLITE_WASM_PATH/.test(em[1]), "…naming the override that was set");
+  }
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");
 process.exit(failed ? 1 : 0);

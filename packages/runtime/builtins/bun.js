@@ -48,7 +48,17 @@
 // and the modules bun:test (a runner +
 // expect, with Bun/Jest `test.only` filtering and beforeEach/afterEach that
 // inherit into nested describes, and toEqual/toStrictEqual/toMatchObject backed
-// by deepEquals/deepMatch) and bun:jsc (serialize/deserialize).
+// by deepEquals/deepMatch), bun:jsc (serialize/deserialize), and bun:sqlite —
+// REAL SQLite (the official sqlite.org Wasm build, driven by our own glue so it
+// instantiates synchronously) over a purpose-written VFS on Vivari's positional
+// fdRead/fdWrite, so a .sqlite file is an ordinary file in the tree that outlives
+// the process: Database (query/prepare/run/exec/transaction with SAVEPOINT
+// nesting and .deferred/.immediate/.exclusive, serialize/deserialize, WAL/readonly
+// /create/strict options, `filename`, `inTransaction`), Statement (all/get/run/
+// values/iterate/as/finalize/columnNames/columnTypes/paramsCount, `$foo`/`:foo`/
+// `@foo` named and positional binding) and safeIntegers as BOTH a constructor
+// option and a per-Database/per-Statement toggle, so 64-bit ids survive as BigInt
+// instead of silently rounding past 2^53 — see bun-sqlite.js.
 //
 // NOT SUPPORTED (documented, fails loudly rather than silently wrong): bun:ffi /
 // Bun.dlopen (native FFI), native addons, Bun macros, and Bun.build plugins —
@@ -67,9 +77,10 @@
 // bcrypt have no JavaScript stand-in, and a hash that is not really one of them
 // verifies nowhere. Note Bun.CryptoHasher rejects "blake3" — that is not a gap,
 // real Bun has no blake3 either, and accepting it here would break sandbox code on
-// the first real `bun` run. bun:sqlite is
-// registered as a module but every call throws until a wasm SQLite backend is
-// wired into it (see makeBunSqlite) — treat it as not usable today. Also loud:
+// the first real `bun` run. In bun:sqlite, Database.loadExtension and
+// Database.fileControl throw (both need a native SQLite: loadable extensions are
+// .so/.dylib files, and fileControl is a raw pointer ABI), and so does
+// Database.setCustomSQLite (there is no system libsqlite3 to point at). Also loud:
 // the CSS Color 4 function space in Bun.color — lab()/lch()/oklab()/oklch()/
 // color() throw rather than returning the `null` that means "not a colour"
 // (bun-text.js); a Bun.FileSystemRouter `style` other than "nextjs", a page file
@@ -95,7 +106,19 @@
 // does, so the browser is what rejects it (bun-cookie.js); and `req.cookies`
 // exists only on the BunRequest a `routes` handler receives, which is where Bun
 // documents it — a `fetch` handler builds its own
-// `new Bun.CookieMap(req.headers.get("cookie"))`.
+// `new Bun.CookieMap(req.headers.get("cookie"))`. And three in bun:sqlite, all
+// consequences of the sandbox rather than of the shim (bun-sqlite.js documents
+// each at its call site): xSync is a no-op because Vivari's fsync/fdatasync are
+// (fs.js:314) — a rollback journal is still written and replayed, so a crash
+// mid-transaction recovers, but nothing is forced to durable storage, so power
+// loss is not survivable the way real SQLite promises; there is no file locking,
+// which is what the upstream Emscripten build ships too (its default VFS is
+// literally `unix-none`, and its POSIX lock stubs report every file unlocked), so
+// two processes writing the SAME database concurrently can corrupt it — one
+// writer is safe, many readers are safe; and `journal_mode = WAL` cannot be
+// honoured (WAL needs mmap'd shared memory across processes), so it warns once and
+// SQLite stays in its `delete` journal mode, which is what SQLite itself does when
+// a VFS declines WAL.
 
 import { transpileTypeScript } from "../typescript-transform.js";
 // The data-format, text/terminal, bytes/streams, hash and glob members live in
@@ -114,6 +137,7 @@ import { loadBunEnvFiles } from "./bun-env.js";
 import { Cookie, CookieMap, attachRequestCookies, pendingSetCookies } from "./bun-cookie.js";
 import { createBunFile } from "./bun-file.js";
 import { createBunCrypto } from "./bun-crypto.js";
+import { createBunSqlite, createVivariSqliteHost } from "./bun-sqlite.js";
 
 // The two documented Bun.hash members we did not port. The message names the
 // algorithm and says why, in the same spirit as the bun:ffi one: a caller who hits
@@ -144,7 +168,13 @@ const TRANSPILER_SCAN_UNSUPPORTED = (method) =>
   "used to return an empty result, which was indistinguishable from a file with " +
   "no imports.";
 
-export function createBunRuntime({ process, Buffer, require }) {
+// `require` is rooted at "/" (packages/runtime/index.js). `makeCwdRequire()` builds one
+// rooted at the running process's working directory, so a bare specifier finds the
+// PROJECT's node_modules rather than only /node_modules — see the note at the bun:sqlite
+// entry in the modules object below. It is a factory rather than a require so it is built
+// at the moment of use and therefore honours a `process.chdir()`, and it is optional so a
+// caller that has only the root require (tests, older embedders) still works.
+export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
   const lazy = (name) => require(name);
 
   // Text/terminal and bytes/streams member groups (packages/runtime/builtins/
@@ -771,7 +801,11 @@ export function createBunRuntime({ process, Buffer, require }) {
     "bun:test": makeBunTest({ process }),
     "bun:jsc": makeBunJsc(),
     "bun:ffi": makeBunFfi(),
-    "bun:sqlite": makeBunSqlite({ require }),
+    // Real SQLite on the vendored sqlite3.wasm, over a custom VFS backed by Vivari's
+    // synchronous fs — see ./bun-sqlite.js for the whole design, including what is
+    // honestly missing (fsync, locking, WAL). Nothing is loaded until the first
+    // `new Database()`: this call only builds the host descriptor.
+    "bun:sqlite": createBunSqlite(createVivariSqliteHost({ require, makeCwdRequire, process })),
   };
 
   // ---- automatic .env loading (see ./bun-env.js) ------------------------------
@@ -1026,50 +1060,6 @@ function makeBunFfi() {
     suffix: "so",
     read: {},
   };
-}
-
-// bun:sqlite — API surface backed by a project-installed wasm SQLite when present
-// (e.g. a `sql.js`/`@sqlite.org/sqlite-wasm` drop-in). Without a backend it throws
-// a clear, actionable error rather than pretending to be a database.
-function makeBunSqlite({ require }) {
-  class Database {
-    constructor(filename, options) {
-      this.filename = filename || ":memory:";
-      this._backend = null;
-      try {
-        // Prefer a project-provided backend if one is installed.
-        this._backend = require("@sqlite.org/sqlite-wasm");
-      } catch {
-        try { this._backend = require("sql.js"); } catch { this._backend = null; }
-      }
-      if (!this._backend) {
-        throw new Error(
-          "bun:sqlite has no in-VM backend. Install a wasm SQLite drop-in " +
-            "(e.g. `bun add @sqlite.org/sqlite-wasm`) — native SQLite cannot run in the browser sandbox.",
-        );
-      }
-    }
-    query(sql) { return this.prepare(sql); }
-    prepare(sql) {
-      const be = this._backend;
-      return {
-        sql,
-        all: (...params) => runBackend(be, sql, params, "all"),
-        get: (...params) => runBackend(be, sql, params, "get"),
-        run: (...params) => runBackend(be, sql, params, "run"),
-        values: (...params) => runBackend(be, sql, params, "values"),
-        finalize() {},
-      };
-    }
-    run(sql) { return this.prepare(sql).run(); }
-    exec(sql) { return this.prepare(sql).run(); }
-    close() {}
-    static open(filename, options) { return new Database(filename, options); }
-  }
-  function runBackend() {
-    throw new Error("bun:sqlite backend integration is experimental; wire your installed wasm SQLite here.");
-  }
-  return { Database, default: Database };
 }
 
 // ---- Bun.randomUUIDv7 -------------------------------------------------------

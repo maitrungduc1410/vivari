@@ -99,6 +99,16 @@ packages/
                    argon2id/bcrypt over packages/crypto, standard PHC / modular-crypt
                    output). Unlike bun-hash.js this is the CRYPTOGRAPHIC side; the two
                    share no code and are not interchangeable.
+      bun-sqlite.js  bun:sqlite on REAL SQLite: the official sqlite.org wasm build
+                   (committed at packages/runtime/vendor/sqlite/, refreshed by
+                   scripts/vendor-sqlite.mjs --refresh), instantiated SYNCHRONOUSLY
+                   with our own glue instead of Emscripten's async one, over a
+                   purpose-written sqlite3_vfs on the runtime's positional
+                   fdRead/fdWrite — so a .sqlite file is a real file in the tree.
+                   The host (fs/path/cwd/engine bytes) is injected, which is what
+                   lets the offline tier drive the SHIPPED code over node:fs.
+                   No durability (fsync is a no-op) and no locking; see the Bun
+                   section below and ARCHITECTURE.md §9.2.
     node/
       lib/         Node's REAL vendored lib/*.js (fs, net, http, stream, ...).
       internal/    Node's REAL internal/* (streams, errors, validators, ...).
@@ -487,6 +497,9 @@ through host `WebAssembly`. Gotchas when touching them:
   N-API addon (no wasm32) and `/web` is remote-only; neither is a self-contained in-VM DB.
 - **Gated by `scripts/spike-sqlite.mjs` + `scripts/spike-pglite.mjs`** (net tier in
   `run-spikes.mjs`; PGlite gets a longer timeout). Both stay `experimental` until green.
+- **`bun:sqlite` is a fourth, different thing** — same idea (a wasm SQL engine over the
+  VFS) but the engine ships WITH us instead of coming from the project's `node_modules`,
+  and it is instantiated synchronously because Bun's API is. See the Bun section below.
 
 ### The studio is a multi-root workspace — absolute paths + the VFS is truth
 Since the workspace rewrite there is NO single "current project" and NO static file
@@ -988,6 +1001,53 @@ precedence that is **per-segment, left to right**: `/acme/[page]` beats
 A scalar score cannot express that, so the two matchers are siblings on purpose —
 generalising one would put Bun.serve's routing (load-bearing for every previewed Bun
 app) at risk for the router's sake. They do share the directory walk.
+
+**`bun:sqlite` is REAL SQLite, and the wasm is COMMITTED.** `bun-sqlite.js` runs the
+official `@sqlite.org/sqlite-wasm` binary — the same C source SQLite tests — from
+`packages/runtime/vendor/sqlite/sqlite3.wasm` (844 KiB, in git, with a
+`manifest.json` recording the upstream version + SHA-256). It is committed rather
+than placed under the gitignored `packages/studio/public/vendor/` because BOTH spike
+tiers need it on a bare checkout, and the trap below (a spike that skips when its
+artifact is missing looks green) is exactly what a build-time-only artifact would
+walk into. `npm run vendor:sqlite` copies it into the studio's public tree for the
+browser (that copy IS gitignored); `npm run vendor:sqlite -- --refresh` re-pulls from
+npm, validates exports/imports/memory against what the loader supplies, and rewrites
+the committed binary. Four things to internalize before touching it:
+- **Emscripten's JS glue is not used, and must not be.** It is async-init and it
+  routes I/O through MEMFS/NODEFS. `bun:sqlite` is a synchronous API — `db.query(sql)
+  .all()` returns rows — so there is nowhere to await a boot. The loader supplies the
+  ~40 imports itself and uses bare `new WebAssembly.Module()` + `new
+  WebAssembly.Instance()`, which are synchronous and legal in a Worker (the
+  `llhttp-wasm.js` precedent). It creates `env.memory` too: this build **imports**
+  memory rather than exporting it.
+- **Re-derive typed-array views after anything that can allocate.** Growth through
+  `emscripten_resize_heap` detaches the old `ArrayBuffer`, so a cached `HEAPU8` from
+  before a `malloc` reads a corpse. The loader compares `memory.buffer` identity on
+  every access; keep that if you add a fast path.
+- **No durability and no locking, on purpose, and it is documented that way.** `xSync`
+  is a no-op because our `fsync`/`fdatasync` are — a crash mid-transaction still
+  recovers from the rollback journal, but power loss is not survivable. There is no
+  file locking anywhere in the fs stack, so two processes writing the same database
+  can corrupt it; this is what UPSTREAM ships too (the official build's default VFS is
+  literally `unix-none`), not a Vivari-specific compromise. `journal_mode = WAL` needs
+  cross-process shared memory, so it warns once and stays in `delete` mode. Do not
+  "fix" any of these by making them look like they work.
+- **Keep the host injected.** `createBunSqlite(host)` takes `{fs, path, cwd,
+  randomBytes, resolveEngineBytes}`, which is the only reason `spike-bun-offline.mjs` can drive the
+  SHIPPED code over `node:fs` with no kernel. `spike-bun.mjs` then proves the same code
+  against the real Wasm VFS across two processes.
+
+**Gotcha — the Bun shim gets TWO `require`s, and reaching for the wrong one is silent.**
+`createBunRuntime({require, makeCwdRequire})`: `require` is rooted at `/` and is right
+for builtins, which are base-agnostic. It cannot see a PROJECT dependency, because
+`nodeModulesPaths` walks *parent* directories, so from `/` the only candidate it ever
+produces is `/node_modules` — a package in `<project>/node_modules` is unreachable no
+matter what the user installs. This is not hypothetical: `bun:sqlite`'s old backend probe
+used the root require and told users to `bun add @sqlite.org/sqlite-wasm`, i.e. to install
+it somewhere the probe was structurally unable to look. Anything resolving a user package
+must use `makeCwdRequire()` (a factory, so a `process.chdir()` is honoured), which is the
+same thing `__ocImport` in `index.js` already does for bare specifiers.
+
 ### `Readable.toWeb` THROWS — and a present-but-unimplemented function defeats a `typeof` guard
 `node/internal/webstreams/adapters.js` implements only `Readable.fromWeb` (the
 direction that turns a `fetch()` body into a Node stream, which is what corepack's

@@ -1304,7 +1304,22 @@ export function createRuntime({
   // installed lazily by the /bin/bun.js launcher through __ocInstallBun — so a
   // plain `node` process is never mistaken for Bun by libraries that branch on
   // `typeof Bun !== 'undefined'`. See packages/runtime/builtins/bun.js.
-  const bunRuntime = createBunRuntime({ process, Buffer, require: vvRootRequire });
+  //
+  // TWO requires, deliberately. `vvRootRequire` is rooted at "/" and is right for
+  // builtins, which are base-agnostic. It is WRONG for a project package: resolution
+  // walks parent directories collecting node_modules (module.js nodeModulesPaths), so
+  // from "/" the only candidate is /node_modules and a dependency installed into
+  // <project>/node_modules is never on the path. bun:sqlite's old backend probe hit
+  // exactly this — its own error message told users to `bun add @sqlite.org/sqlite-wasm`,
+  // which installs somewhere the probe could not look. The second one resolves from the
+  // running process's directory, the same precedent __ocImport already sets above. It is
+  // a factory so it is built at the moment of use and a `process.chdir()` is honoured.
+  const bunRuntime = createBunRuntime({
+    process,
+    Buffer,
+    require: vvRootRequire,
+    makeCwdRequire: () => moduleSystem.makeRequire(process.cwd() || cwd || "/"),
+  });
   for (const [name, mod] of Object.entries(bunRuntime.modules)) builtins[name] = mod;
   // `{ dotenv: true }` additionally performs Bun's automatic `.env` loading into
   // process.env (see builtins/bun-env.js). It is a parameter rather than part of

@@ -892,6 +892,12 @@ function baseProcEnv(dir) {
     // /bin/python.js launcher (only when a `python` process runs) to lazily boot
     // Pyodide — nothing here is fetched at boot. See packages/runtime/builtins/python.js.
     VV_PYODIDE_INDEX_URL: vendorUrl("vendor/pyodide/"),
+    // Same-origin URL of the vendored SQLite engine. Read by bun:sqlite on the FIRST
+    // `new Database()` and never before — a process that does not open a database
+    // fetches nothing (see packages/runtime/builtins/bun-sqlite.js). Unlike Pyodide
+    // this is not gated on a launcher, because bun:sqlite is a builtin any process can
+    // require; the laziness lives in the module instead.
+    VV_SQLITE_WASM_URL: vendorUrl("vendor/sqlite/sqlite3.wasm"),
   };
 }
 

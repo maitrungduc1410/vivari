@@ -3071,5 +3071,472 @@ console.log("== Bun.password / CryptoHasher against the real Rust crate ==");
   }
 }
 
+// ── bun:sqlite ───────────────────────────────────────────────────────────────
+// The REAL engine, driven with no kernel: packages/runtime/builtins/bun-sqlite.js
+// takes its filesystem by injection, so the same shipped code that runs against the
+// Wasm VFS in a guest process runs here against node:fs. That is what lets the tier CI
+// enforces on every PR test actual SQL rather than a mock.
+//
+// Assertions are pinned to facts from OUTSIDE this repo wherever possible — SQLite's
+// documented result codes and file header, Bun's documented return shapes and its own
+// worked examples — rather than to what this implementation happens to produce, which
+// would pass just as happily against a wrong one.
+{
+  console.log("\n== bun:sqlite (real wasm SQLite over node:fs) ==");
+  const nodeFs = nodeRequire("node:fs");
+  const nodePath = nodeRequire("node:path");
+  const nodeCrypto = nodeRequire("node:crypto");
+  const { createBunSqlite, resultCodeName, transactionPlan, coerceBoundValue, readInteger,
+    planBindings, trampolineModuleBytes, makeTrampoline, IO_METHODS_SIZE, VFS_SIZE,
+    ENGINE_MEMORY } = await import("../packages/runtime/builtins/bun-sqlite.js");
+
+  // ---- pure helpers: no engine needed ----
+  //
+  // The trampoline encoder and the struct sizes are the two places where a one-byte or
+  // one-field mistake produces a wild indirect call and a crash with no usable stack.
+  // They are cheap to pin and expensive to debug, so they are pinned.
+  {
+    const bytes = trampolineModuleBytes("iiiij");
+    ok(bytes[0] === 0x00 && bytes[1] === 0x61 && bytes[2] === 0x73 && bytes[3] === 0x6d,
+      "trampoline module starts with the wasm magic \\0asm");
+    ok(WebAssembly.validate(bytes), "trampoline module for 'iiiij' validates");
+    const roundTrip = makeTrampoline((a, b, c, d) => Number(d) + a + b + c, "iiiij");
+    ok(roundTrip(1, 2, 3, 10n) === 16, "trampoline passes i32s and an i64 (BigInt) through");
+    ok(makeTrampoline((x) => x * 2, "dd")(2.5) === 5, "trampoline handles f64");
+    let threw = null;
+    try { trampolineModuleBytes("zz"); } catch (e) { threw = e; }
+    ok(threw instanceof TypeError, "an unknown signature letter throws rather than emitting bad bytes");
+    // sqlite3_io_methods v1 = iVersion + 12 pointers; sqlite3_vfs v1 = 6 header fields
+    // + 12 pointers. Both from sqlite3.h, at 4-byte wasm32 pointers.
+    ok(IO_METHODS_SIZE === 52, `sqlite3_io_methods (v1) is 52 bytes, got ${IO_METHODS_SIZE}`);
+    ok(VFS_SIZE === 72, `sqlite3_vfs (v1) is 72 bytes, got ${VFS_SIZE}`);
+    ok(ENGINE_MEMORY.initial === 128 && ENGINE_MEMORY.maximum === 32768 ,
+      "engine memory matches the limits the module declares (128..32768 pages, unshared)");
+  }
+
+  // Result-code names, pinned to sqlite3.h's own arithmetic (extended = primary |
+  // subcode<<8). These are what land on SQLiteError.code, which applications branch on.
+  {
+    ok(resultCodeName(0) === "SQLITE_OK", "0 -> SQLITE_OK");
+    ok(resultCodeName(19) === "SQLITE_CONSTRAINT", "19 -> SQLITE_CONSTRAINT");
+    ok(resultCodeName(2067) === "SQLITE_CONSTRAINT_UNIQUE", "2067 -> SQLITE_CONSTRAINT_UNIQUE");
+    ok(resultCodeName(1299) === "SQLITE_CONSTRAINT_NOTNULL", "1299 -> SQLITE_CONSTRAINT_NOTNULL");
+    ok(resultCodeName(787) === "SQLITE_CONSTRAINT_FOREIGNKEY", "787 -> SQLITE_CONSTRAINT_FOREIGNKEY");
+    ok(resultCodeName(522) === "SQLITE_IOERR_SHORT_READ", "522 -> SQLITE_IOERR_SHORT_READ");
+    ok(resultCodeName(101) === "SQLITE_DONE", "101 -> SQLITE_DONE");
+    ok(resultCodeName(19 | (99 << 8)) === "SQLITE_CONSTRAINT",
+      "an unknown subcode degrades to the primary name instead of inventing one");
+  }
+
+  // Transaction SQL. Bun documents the exact spellings: a bare call uses "BEGIN" and
+  // .deferred uses "BEGIN DEFERRED". Depth > 0 must be a SAVEPOINT, and its rollback
+  // must be BOTH statements — ROLLBACK TO alone leaves the savepoint on the stack.
+  {
+    ok(transactionPlan("default", 0).begin === "BEGIN", "depth 0 default -> BEGIN");
+    ok(transactionPlan("deferred", 0).begin === "BEGIN DEFERRED", "depth 0 deferred -> BEGIN DEFERRED");
+    ok(transactionPlan("immediate", 0).begin === "BEGIN IMMEDIATE", "depth 0 immediate -> BEGIN IMMEDIATE");
+    ok(transactionPlan("exclusive", 0).begin === "BEGIN EXCLUSIVE", "depth 0 exclusive -> BEGIN EXCLUSIVE");
+    ok(transactionPlan("default", 0).commit === "COMMIT", "depth 0 commits with COMMIT");
+    ok(JSON.stringify(transactionPlan("default", 0).rollback) === '["ROLLBACK"]', "depth 0 rolls back with ROLLBACK");
+    const nested = transactionPlan("immediate", 1);
+    ok(nested.begin === "SAVEPOINT _bun_sqlite_sp_1", "depth 1 -> SAVEPOINT, not BEGIN");
+    ok(nested.commit === "RELEASE _bun_sqlite_sp_1", "depth 1 commits with RELEASE");
+    ok(JSON.stringify(nested.rollback) === '["ROLLBACK TO _bun_sqlite_sp_1","RELEASE _bun_sqlite_sp_1"]',
+      "depth 1 rollback is ROLLBACK TO *and* RELEASE");
+    ok(transactionPlan("default", 2).begin === "SAVEPOINT _bun_sqlite_sp_2", "savepoint names are per-depth");
+  }
+
+  // Value coercion, per Bun's documented datatype table.
+  {
+    ok(coerceBoundValue(null).kind === "null" && coerceBoundValue(undefined).kind === "null",
+      "null and undefined both bind NULL");
+    ok(coerceBoundValue(true).value === 1n && coerceBoundValue(false).value === 0n, "boolean -> INTEGER 1/0");
+    ok(coerceBoundValue(7).kind === "int" && coerceBoundValue(7).value === 7n, "an integral number binds as int64");
+    ok(coerceBoundValue(1.5).kind === "double", "a non-integral number binds as double");
+    ok(coerceBoundValue("x").kind === "text", "string -> TEXT");
+    ok(coerceBoundValue(new Uint8Array(2)).kind === "blob", "Uint8Array -> BLOB");
+    ok(coerceBoundValue(new ArrayBuffer(2)).kind === "blob", "ArrayBuffer -> BLOB");
+    let threw = null;
+    try { coerceBoundValue(2n ** 64n); } catch (e) { threw = e; }
+    ok(threw instanceof RangeError && /out of range/.test(threw.message),
+      "a bigint beyond int64 throws RangeError rather than wrapping");
+    ok(coerceBoundValue(2n ** 63n - 1n).value === 2n ** 63n - 1n, "int64 max binds exactly");
+    threw = null;
+    try { coerceBoundValue({ a: 1 }); } catch (e) { threw = e; }
+    ok(threw instanceof TypeError, "an unsupported type throws instead of being stringified into the database");
+    // Bun's own documented example: 9007199254741093n comes back as 9007199254741092.
+    ok(readInteger(9007199254741093n, false) === 9007199254741092,
+      "safeIntegers off reproduces Bun's documented 9007199254741093 -> 9007199254741092");
+    ok(readInteger(9007199254741093n, true) === 9007199254741093n, "safeIntegers on keeps the BigInt");
+  }
+
+  // Binding plans. strict changes BOTH the key spelling and the missing-key behaviour.
+  {
+    const names = ["$a", "$b"];
+    ok(JSON.stringify(planBindings([1, 2], names, false)) === '[{"index":1,"value":1},{"index":2,"value":2}]',
+      "rest arguments bind positionally");
+    ok(planBindings([{ $a: 9 }], names, false).length === 1, "non-strict binds only the keys present");
+    ok(planBindings([{ $a: 9 }], names, false)[0].value === 9, "non-strict matches on the prefixed name");
+    ok(planBindings([{ a: 9 }], names, false).length === 0, "non-strict ignores an unprefixed key (-> NULL)");
+    ok(planBindings([{ a: 9, b: 8 }], names, true).length === 2, "strict matches on the bare name");
+    let threw = null;
+    try { planBindings([{ a: 9 }], names, true); } catch (e) { threw = e; }
+    ok(threw && /Missing parameter "b"/.test(threw.message), "strict names the missing parameter");
+    ok(planBindings([new Uint8Array(2)], ["?"], false).length === 1,
+      "a lone Uint8Array is a positional blob, not a named-binding object");
+  }
+
+  // ---- the real engine ----
+  //
+  // The artifact is COMMITTED (packages/runtime/vendor/sqlite/sqlite3.wasm), so a
+  // missing one means a broken checkout, not an un-run build step. Fail loudly: a spike
+  // that skips here would go green while testing nothing, which is the trap AGENTS.md
+  // warns about.
+  const ENGINE = nodePath.resolve("packages/runtime/vendor/sqlite/sqlite3.wasm");
+  if (!nodeFs.existsSync(ENGINE)) {
+    console.log("  \u2717 " + ENGINE + " is missing — it is a COMMITTED artifact, so this is a broken");
+    console.log("      checkout. Restore it with git, or re-create it with:");
+    console.log("      node scripts/vendor-sqlite.mjs --refresh");
+    failed++;
+  } else {
+    const DIR = nodeFs.mkdtempSync(nodePath.join(nodeRequire("node:os").tmpdir(), "vv-spike-sqlite-"));
+    const sqlite = createBunSqlite({
+      fs: nodeFs,
+      path: nodePath.posix,
+      cwd: () => DIR,
+      randomBytes: (n) => nodeCrypto.randomFillSync(new Uint8Array(n)),
+      resolveEngineBytes: () => nodeFs.readFileSync(ENGINE),
+    });
+    const { Database, SQLiteError, constants } = sqlite;
+
+    // The engine is the official sqlite.org build, and our VFS really is the default.
+    {
+      const db = new Database(":memory:");
+      const version = db.query("SELECT sqlite_version() AS v").get().v;
+      ok(/^3\.\d+\.\d+$/.test(version), `sqlite_version() is a real SQLite version (${version})`);
+      ok(sqlite.__engineInfo().vfs === "vivari", "the registered VFS is the default one");
+      db.close();
+    }
+
+    // Types round-trip, and .get()/.run() return what Bun documents.
+    {
+      const db = new Database(":memory:");
+      db.run("CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT, f REAL, b BLOB, n INTEGER)");
+      const r = db.run("INSERT INTO t(s,f,b,n) VALUES(?,?,?,?)", "hi", 1.5, new Uint8Array([1, 2, 3]), null);
+      ok(r.changes === 1, "run() reports changes");
+      ok(r.lastInsertRowid === 1, "run() reports lastInsertRowid");
+      const row = db.query("SELECT * FROM t").get();
+      ok(row.s === "hi" && row.f === 1.5, "TEXT and REAL round-trip");
+      ok(row.b instanceof Uint8Array && row.b.length === 3 && row.b[2] === 3, "BLOB comes back as a Uint8Array");
+      ok(row.n === null, "SQL NULL comes back as JS null");
+      ok(db.query("SELECT 1 WHERE 0").get() === null, "Bun documents .get() as null (not undefined) with no rows");
+      ok(JSON.stringify(db.query("SELECT id,s FROM t").values()) === '[[1,"hi"]]', ".values() is an array of arrays");
+      ok(db.query("SELECT s FROM t").all().length === 1, ".all() is an array of row objects");
+      // UTF-8 past the BMP: a length-in-bytes vs length-in-chars bug truncates here.
+      db.run("INSERT INTO t(s) VALUES(?)", "héllo 🌍 世界");
+      ok(db.query("SELECT s FROM t WHERE id=2").get().s === "héllo 🌍 世界", "multi-byte UTF-8 survives the heap round-trip");
+      db.close();
+    }
+
+    // Statement metadata + caching.
+    {
+      const db = new Database(":memory:");
+      db.run("CREATE TABLE m(a INTEGER, b TEXT)");
+      db.run("INSERT INTO m VALUES(1,'x')");
+      const st = db.query("SELECT a, b FROM m");
+      ok(st.columnTypes === null, "columnTypes is null until a row has been produced (Bun's documented rule)");
+      st.all();
+      ok(JSON.stringify(st.columnNames) === '["a","b"]', "columnNames");
+      ok(JSON.stringify(st.columnTypes) === '["INTEGER","TEXT"]', "columnTypes reflects the first row's actual values");
+      ok(JSON.stringify(st.declaredTypes) === '["INTEGER","TEXT"]', "declaredTypes comes from the schema");
+      ok(db.query("SELECT ?1, ?2, ?3").paramsCount === 3, "paramsCount");
+      ok(db.query("SELECT 1") === db.query("SELECT 1"), "query() returns the SAME cached Statement (Bun)");
+      ok(db.prepare("SELECT 1") !== db.prepare("SELECT 1"), "prepare() is uncached");
+      const reused = db.query("SELECT ? AS v");
+      ok(reused.get(1).v === 1 && reused.get(2).v === 2 && reused.get(3).v === 3,
+        "a cached statement rebinds fresh parameters each call (Bun's documented example)");
+      const q = db.query("SELECT $p AS p");
+      q.run(42);
+      ok(q.toString() === "SELECT 42 AS p", `toString() expands the bound SQL (got ${q.toString()})`);
+      db.close();
+    }
+
+    // safeIntegers, both directions. This is the single most likely silent-corruption
+    // bug in the whole surface, so it is checked at the 2^53 boundary specifically.
+    {
+      const loose = new Database(":memory:");
+      ok(loose.query("SELECT 9007199254741093 AS n").get().n === 9007199254741092,
+        "default (safeIntegers off) reproduces Bun's documented truncation");
+      const safe = new Database(":memory:", { safeIntegers: true });
+      ok(safe.query("SELECT 9007199254741093 AS n").get().n === 9007199254741093n,
+        "safeIntegers:true returns an exact BigInt");
+      safe.run("CREATE TABLE i(n INTEGER)");
+      const max = 9223372036854775807n; // int64 max
+      safe.run("INSERT INTO i VALUES(?)", max);
+      ok(safe.query("SELECT n FROM i").get().n === max, "int64 max binds and reads back exactly");
+      let threw = null;
+      try { safe.run("INSERT INTO i VALUES(?)", 2n ** 64n); } catch (e) { threw = e; }
+      ok(threw instanceof RangeError, "a bound bigint beyond 64 bits throws (Bun documents this for safeIntegers)");
+      // lastInsertRowid follows the same rule, per Bun's Changes type.
+      ok(typeof safe.run("INSERT INTO i VALUES(1)").lastInsertRowid === "bigint",
+        "lastInsertRowid is a bigint when safeIntegers is on");
+      ok(typeof loose.run("CREATE TABLE j(x)").lastInsertRowid === "number",
+        "…and a number when it is off");
+      const perStatement = loose.query("SELECT 9007199254741093 AS n").safeIntegers(true);
+      ok(perStatement.get().n === 9007199254741093n, "safeIntegers can be varied per statement");
+      loose.close(); safe.close();
+    }
+
+    // Named + strict binding against the real binder.
+    {
+      const loose = new Database(":memory:");
+      ok(loose.query("SELECT $m AS m").get({ $m: "hi" }).m === "hi", "non-strict binds with the $ prefix");
+      ok(loose.query("SELECT :a AS a").get({ ":a": 5 }).a === 5, "the : sigil");
+      ok(loose.query("SELECT @b AS b").get({ "@b": 6 }).b === 6, "the @ sigil");
+      // Bun's own typo example: non-strict does NOT throw, the parameter is just NULL.
+      ok(loose.query("SELECT $message AS m").get({ messag: "typo" }).m === null,
+        "non-strict leaves a mis-typed parameter unbound (NULL), exactly as Bun documents");
+      const strict = new Database(":memory:", { strict: true });
+      ok(strict.query("SELECT $message AS m").get({ message: "hi" }).m === "hi",
+        "strict binds without the prefix");
+      let threw = null;
+      try { strict.query("SELECT $message AS m").get({ messag: "typo" }); } catch (e) { threw = e; }
+      ok(threw && /Missing parameter/.test(threw.message), "…and throws on the same typo");
+      loose.close(); strict.close();
+    }
+
+    // Nested transactions. The failure this guards is an inner rollback silently
+    // discarding the outer transaction's committed work.
+    {
+      const db = new Database(":memory:");
+      db.run("CREATE TABLE t(v TEXT)");
+      const inner = db.transaction((v) => {
+        db.run("INSERT INTO t VALUES(?)", v);
+        throw new Error("inner failed");
+      });
+      const outer = db.transaction((v) => {
+        db.run("INSERT INTO t VALUES(?)", v);
+        try { inner("inner"); } catch { /* handled; the outer transaction continues */ }
+      });
+      outer("outer");
+      const rows = db.query("SELECT v FROM t").values().flat();
+      ok(JSON.stringify(rows) === '["outer"]',
+        `an inner rollback discards only the inner work (got ${JSON.stringify(rows)})`);
+      ok(db.inTransaction === false, "inTransaction is false outside");
+      ok(db.transaction(() => db.inTransaction)() === true, "inTransaction is true inside");
+      ok(db.transaction((a, b) => a + b)(2, 3) === 5, "arguments and the return value pass through");
+      let threw = null;
+      try { db.transaction(() => { throw new Error("boom"); })(); } catch (e) { threw = e; }
+      ok(threw && threw.message === "boom", "the original exception propagates, not a rollback error");
+      ok(db.inTransaction === false, "…and the transaction is rolled back, not left open");
+      threw = null;
+      try { db.transaction(async () => 1)(); } catch (e) { threw = e; }
+      ok(threw instanceof TypeError && /async/.test(threw.message),
+        "an async transaction function throws rather than committing before it settles");
+      ok(db.inTransaction === false, "…and leaves no dangling transaction");
+      const t = db.transaction((v) => db.run("INSERT INTO t VALUES(?)", v));
+      t.deferred("d"); t.immediate("i"); t.exclusive("e");
+      ok(db.query("SELECT count(*) AS c FROM t").get().c === 4, "all three variants commit");
+      ok(db.transaction(() => 1)() === 1 && db.transaction(() => 2)() === 2,
+        "a transaction function is re-runnable");
+      db.close();
+    }
+
+    // SQLiteError carries SQLite's own codes.
+    {
+      const db = new Database(":memory:");
+      db.run("CREATE TABLE u(x INTEGER UNIQUE, y INTEGER NOT NULL)");
+      db.run("INSERT INTO u VALUES(1,1)");
+      let e = null;
+      try { db.run("INSERT INTO u VALUES(1,1)"); } catch (err) { e = err; }
+      ok(e instanceof SQLiteError, "a constraint violation throws SQLiteError");
+      ok(e.name === "SQLiteError", "…with name SQLiteError");
+      ok(e.errno === 2067, `…errno is the EXTENDED code 2067 (got ${e && e.errno})`);
+      ok(e.code === "SQLITE_CONSTRAINT_UNIQUE", `…code is SQLITE_CONSTRAINT_UNIQUE (got ${e && e.code})`);
+      let e2 = null;
+      try { db.run("INSERT INTO u(x) VALUES(2)"); } catch (err) { e2 = err; }
+      ok(e2 && e2.code === "SQLITE_CONSTRAINT_NOTNULL", "a NOT NULL violation reports SQLITE_CONSTRAINT_NOTNULL");
+      let e3 = null;
+      try { db.query("SELECT * FROM does_not_exist"); } catch (err) { e3 = err; }
+      ok(e3 && /no such table/.test(e3.message), "SQLite's own message is preserved");
+      ok(e3 && typeof e3.byteOffset === "number", "byteOffset is present (sqlite3_error_offset)");
+      db.close();
+    }
+
+    // iterate / as / dispose.
+    {
+      const db = new Database(":memory:");
+      db.run("CREATE TABLE m(title TEXT, year INTEGER)");
+      db.run("INSERT INTO m VALUES('Iron Man',2008),('The Avengers',2012),('Ant-Man',2023)");
+      const titles = [];
+      for (const row of db.query("SELECT * FROM m")) titles.push(row.title);
+      ok(titles.length === 3, "@@iterator walks every row");
+      const it = db.query("SELECT * FROM m").iterate();
+      const one = it.next();
+      ok(one.value.title === "Iron Man" && one.done === false, "iterate() yields lazily");
+      it.return();
+      class Movie {
+        get label() { return `${this.title} (${this.year})`; }
+      }
+      const first = db.query("SELECT * FROM m").as(Movie).get();
+      ok(first instanceof Movie, ".as(Class) produces instances of the class");
+      ok(first.label === "Iron Man (2008)", "…and the class's getters see the row's columns");
+      const all = db.query("SELECT * FROM m").as(Movie).all();
+      ok(all.length === 3 && all.every((m) => m instanceof Movie), ".as(Class) applies to .all() too");
+      db.close();
+    }
+
+    // .exec() applies a whole multi-statement script. The previous shim collapsed
+    // exec() to prepare(sql).run(), which silently dropped everything after the first
+    // semicolon — the shape of every ORM's migration step.
+    {
+      const db = new Database(":memory:");
+      db.exec(`
+        CREATE TABLE a(x INTEGER);
+        CREATE TABLE b(y TEXT);
+        INSERT INTO a VALUES(1),(2);
+        -- a trailing comment, and trailing whitespace
+      `);
+      ok(db.query("SELECT count(*) AS c FROM sqlite_master WHERE type='table'").get().c === 2,
+        "exec() creates BOTH tables, not just the first");
+      ok(db.query("SELECT count(*) AS c FROM a").get().c === 2, "…and runs the insert after them");
+      // sqlite3_changes is sticky — it reports the last INSERT/UPDATE/DELETE, not the
+      // statement just run. That is SQLite's documented behaviour and Bun inherits it,
+      // so a SELECT through run() must NOT reset it to 0.
+      ok(db.run("SELECT 1").changes === 2, "run() over a SELECT leaves sqlite3_changes at the last write's count");
+      db.close();
+    }
+
+    // A real file: the whole point. Bytes on disk, a valid SQLite header, and a
+    // relative path resolved against the process CWD rather than "/".
+    {
+      const db = new Database("./app.db");
+      ok(nodeFs.existsSync(nodePath.join(DIR, "app.db")),
+        "a relative filename resolves against the process cwd, not the filesystem root");
+      db.run("CREATE TABLE k(v TEXT)");
+      db.run("INSERT INTO k VALUES('persisted')");
+      db.close();
+      const header = nodeFs.readFileSync(nodePath.join(DIR, "app.db")).subarray(0, 16);
+      // SQLite's documented file header: "SQLite format 3\0".
+      ok(header.toString("latin1") === "SQLite format 3\0", "the file starts with SQLite's documented 16-byte header");
+      const again = new Database(nodePath.join(DIR, "app.db"));
+      ok(again.query("SELECT v FROM k").get().v === "persisted", "a fresh connection reads back the committed row");
+      again.close();
+      let threw = null;
+      try { new Database(nodePath.join(DIR, "nope.db"), { readonly: true }); } catch (e) { threw = e; }
+      ok(threw instanceof SQLiteError, "opening a missing file readonly throws SQLiteError");
+      // A rollback journal must not be left behind after a clean commit.
+      ok(!nodeFs.existsSync(nodePath.join(DIR, "app.db-journal")), "no journal file is left behind after commit");
+    }
+
+    // serialize / deserialize — also the migration path for anyone on sql.js today.
+    {
+      const src = new Database(":memory:");
+      src.run("CREATE TABLE s(v TEXT)");
+      src.run("INSERT INTO s VALUES('round trip')");
+      const bytes = src.serialize();
+      ok(bytes.length >= 4096, `serialize() returns the database image (${bytes.length} bytes)`);
+      ok(Buffer.from(bytes.subarray(0, 15)).toString("latin1") === "SQLite format 3",
+        "…and the image carries SQLite's header");
+      const copy = Database.deserialize(bytes);
+      ok(copy.query("SELECT v FROM s").get().v === "round trip", "deserialize() restores the rows");
+      copy.run("INSERT INTO s VALUES('and writable')");
+      ok(copy.query("SELECT count(*) AS c FROM s").get().c === 2, "…into a writable (RESIZEABLE) database");
+      src.close(); copy.close();
+    }
+
+    // The loud refusals. Each must throw, name the API, and say why.
+    {
+      const db = new Database(":memory:");
+      ok(typeof db.loadExtension === "function", "loadExtension exists on the prototype (a feature check must not crash)");
+      ok(typeof db.fileControl === "function", "fileControl exists on the prototype");
+      for (const [name, call] of [
+        ["loadExtension", () => db.loadExtension("myext")],
+        ["fileControl", () => db.fileControl(constants.SQLITE_FCNTL_PERSIST_WAL, 0)],
+        ["setCustomSQLite", () => Database.setCustomSQLite("/path/to/libsqlite.dylib")],
+      ]) {
+        let threw = null;
+        try { call(); } catch (e) { threw = e; }
+        ok(threw && threw.message.includes("not supported in Vivari"), `${name}() throws`);
+        ok(threw && threw.message.includes(name), `…and the message names ${name}()`);
+      }
+      ok(constants.SQLITE_FCNTL_PERSIST_WAL === 10, "constants.SQLITE_FCNTL_PERSIST_WAL is SQLite's value 10");
+      ok(constants.SQLITE_OPEN_READONLY === 1 && constants.SQLITE_OPEN_CREATE === 4,
+        "the open-flag constants match sqlite3.h");
+      db.close();
+    }
+
+    // WAL. SQLite's documented behaviour on a VFS with no xShmMap is to leave the mode
+    // alone and report the one in effect — silently. We keep the silence broken.
+    {
+      const db = new Database("./wal.db");
+      const warnings = [];
+      const realWarn = console.warn;
+      console.warn = (m) => warnings.push(String(m));
+      db.run("PRAGMA journal_mode = WAL;");
+      db.run("PRAGMA journal_mode = WAL;");
+      console.warn = realWarn;
+      ok(warnings.length === 1, `the WAL warning fires exactly once per process (got ${warnings.length})`);
+      ok(warnings[0] && /xShmMap/.test(warnings[0]), "…and names the missing VFS capability");
+      ok(db.query("PRAGMA journal_mode").get().journal_mode === "delete",
+        "…and the mode really is 'delete', which is what SQLite reports");
+      db.close();
+    }
+
+    // Heap growth. emscripten_resize_heap detaches memory.buffer; a cached view over the
+    // old one reads freed memory. 9 MB is comfortably past the 8 MB initial heap.
+    {
+      const db = new Database("./big.db");
+      db.run("CREATE TABLE big(b BLOB)");
+      const payload = nodeCrypto.randomFillSync(new Uint8Array(9 * 1024 * 1024));
+      db.run("INSERT INTO big VALUES(?)", payload);
+      const back = db.query("SELECT b FROM big").get().b;
+      ok(back.length === payload.length, `a 9 MB blob round-trips (${back.length} bytes)`);
+      ok(Buffer.compare(Buffer.from(back), Buffer.from(payload)) === 0,
+        "…byte for byte, so the heap grew without invalidating a cached view");
+      ok(db.query("SELECT length(b) AS n FROM big").get().n === payload.length,
+        "…and SQLite agrees about its length");
+      db.close();
+    }
+
+    // Lifecycle.
+    {
+      const db = new Database(":memory:");
+      const q = db.query("SELECT 1 AS v");
+      q.all();
+      let threw = null;
+      try { db.close(true); } catch (e) { threw = e; }
+      ok(threw && /unfinalized/.test(threw.message), "close(true) refuses while a statement is live");
+      q.finalize();
+      ok(true, "finalize() succeeds");
+      threw = null;
+      try { q.all(); } catch (e) { threw = e; }
+      ok(threw && /finalized/.test(threw.message), "a finalized statement refuses to run again");
+      db.close(true);
+      threw = null;
+      try { db.query("SELECT 1"); } catch (e) { threw = e; }
+      ok(threw && /closed/.test(threw.message), "a closed database refuses new queries");
+      db.close();
+      ok(true, "close() is idempotent");
+    }
+
+    nodeFs.rmSync(DIR, { recursive: true, force: true });
+  }
+
+  // The module really is registered under `bun:sqlite` in the Bun runtime, with the
+  // members Bun exports beside Database.
+  {
+    const rt = createBunRuntime({ process, Buffer, require: nodeRequire });
+    const mod = rt.modules["bun:sqlite"];
+    ok(!!mod, "bun:sqlite is registered as a bun:* module");
+    ok(typeof mod.Database === "function", "…exporting Database");
+    ok(mod.default === mod.Database, "…with Database as the default export");
+    ok(typeof mod.Statement === "function", "…plus Statement");
+    ok(typeof mod.SQLiteError === "function", "…plus SQLiteError");
+    ok(typeof mod.constants === "object", "…plus constants");
+    ok(mod.__engineInfo() === null, "no engine is loaded until a Database is constructed (lazy)");
+  }
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Bun checks passed");
 process.exit(failed ? 1 : 0);

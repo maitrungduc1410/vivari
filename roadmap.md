@@ -4684,3 +4684,117 @@ kernel, because the offline spike hands the shim a hand-built `internalBinding('
 password hash that only works when the test rigs the binding is not a feature.
 
 See ARCHITECTURE.md §9.2.
+
+## `bun:sqlite` — real SQLite, on a VFS-backed store (this change)
+
+`bun:sqlite` was registered and unusable. `makeBunSqlite` probed for
+`@sqlite.org/sqlite-wasm` or `sql.js` and, if it found neither, threw an install message — and
+if it found one, every query path still landed in a `runBackend()` whose entire body was
+`throw new Error("bun:sqlite backend integration is experimental; wire your installed wasm
+SQLite here.")`. There was no path through it. The install advice was also **unreachable by
+construction**: the `require` handed to the Bun shim was rooted at `/`, and
+`nodeModulesPaths` walks *parent* directories, so from `/` the only candidate was
+`/node_modules` — a package installed into `<project>/node_modules` could never be found, no
+matter what the user did. That second bug is fixed independently of SQLite: `createBunRuntime`
+now also receives a CWD-rooted `require`, mirroring what `__ocImport` already did for bare
+specifiers.
+
+**The engine is the official `@sqlite.org/sqlite-wasm` build**, 3.53.0-build1 — the same C
+source the SQLite authors test, compiled by them. What was rejected: `sql.js` (a fork of the
+same C, but older, unmaintained relative to upstream, and its Emscripten glue is the part we
+cannot use anyway, so the "smaller ecosystem" argument buys nothing); `node:sqlite`/
+`better-sqlite3` (native N-API, no wasm32 build — the reason `libsql` is not a template
+either); and compiling SQLite ourselves against the existing Rust toolchain (a fourth crate to
+build, a fourth thing CI must have a toolchain for, to arrive at a binary the SQLite project
+already publishes and signs).
+
+**844 KiB, or 0.86 MB, committed** at `packages/runtime/vendor/sqlite/sqlite3.wasm`, not
+generated at build time. That is the interesting decision, and it goes against the surface
+reading of the repo's convention (small artifacts committed, large vendored runtimes under the
+gitignored `packages/studio/public/vendor/`). The reason is the trap AGENTS.md documents: a
+spike that SKIPS because its artifact is absent looks green. The `toolchain-gate` job runs the
+offline tier with no Rust and no vendor step, and `verify` builds only the Rust crates; an
+engine fetched at build time would mean `bun:sqlite` is either untested on every PR or CI grows
+a network dependency on npm. 0.86 MB in git — about what `packages/crypto` compiles to, and it
+changes only when SQLite cuts a release — buys a spike that cannot silently skip. `scripts/vendor-sqlite.mjs` copies it into the studio's public tree
+for the browser (that copy is gitignored, and `predev`/`prebuild:studio` run it); `--refresh`
+re-pulls from npm and **validates** the result — magic bytes, the required export set, that the
+imports are a subset of what our loader supplies, and that the declared memory minimum still
+fits — so an upstream ABI change fails the refresh rather than a user's first query.
+
+**Emscripten's shipped JS glue is not used.** It cannot be: it is async-init, and `bun:sqlite`
+is synchronous by definition — `db.query(sql).all()` returns rows, so there is nowhere to await
+a boot. `bun-sqlite.js` supplies its 36 imports itself and instantiates with a bare
+`new WebAssembly.Module(bytes)` + `new WebAssembly.Instance(...)`, which are synchronous
+operations and legal in a Worker, where all guest code runs. That is the `llhttp-wasm.js`
+precedent applied to something 16× larger; compiling 844 KiB measures at ~2 ms. Two details the
+earlier investigation had left open are now settled: this build **imports** `env.memory` rather
+than exporting it, so the loader creates it (128 pages initial — the binary's own declared
+minimum, read back out of the import section by the vendor script — 2 GiB max, unshared); and
+the Emscripten stack helpers are not exported and are not needed, because nothing here calls a
+varargs C function.
+
+**Storage is a real `sqlite3_vfs`, not a shim over one.** `xOpen`/`xRead`/`xWrite`/`xTruncate`/
+`xFileSize`/`xDelete`/`xAccess`/`xFullPathname`/`xRandomness` call the runtime's own `fs`,
+i.e. the SharedArrayBuffer syscall bridge, and `fdRead`/`fdWrite` take explicit offsets — which
+is exactly the `pread`/`pwrite` a VFS wants, so no per-fd cursor emulation is needed after all
+(the earlier note that the build imports no `__syscall_pread64` is true and turns out not to
+matter, because we are not implementing Emscripten's syscall layer at all — we are replacing
+the VFS above it, and once our VFS is the default **zero** Emscripten syscall stubs are
+reached). The C function pointers SQLite needs are genuine ones: each JS callback is wrapped in
+a hand-assembled 40-byte Wasm trampoline module and installed into
+`__indirect_function_table`. The result is that a `.sqlite` file is an ordinary file in the
+tree — it shows up in the Explorer, it survives the process, and the next process reads it.
+
+**Three limits are stated rather than papered over.** `xSync` is a no-op, because the runtime's
+`fsync`/`fdatasync` are: the rollback journal is still written and replayed, so a crash
+mid-transaction recovers, but nothing is forced to durable storage and power loss is not
+survivable the way SQLite promises. There is no file locking, so two processes writing the SAME
+database concurrently can corrupt it — and this one is worth being precise about, because it is
+**not** a Vivari compromise: the official Emscripten build's default VFS is literally
+`unix-none`, SQLite's lock-free VFS, and its POSIX lock stubs report every file unlocked. Code
+that would corrupt data here would corrupt it in the browser under real sqlite-wasm too. And
+`journal_mode = WAL` needs mmap'd shared memory across processes, so it is declined with a
+one-time warning and SQLite stays in `delete` mode — which is SQLite's own behaviour when a VFS
+cannot do WAL, and means an ORM that sets WAL opportunistically keeps working instead of
+failing to open.
+
+**The two semantics that corrupt data when approximated are implemented.** `safeIntegers` is a
+constructor option *and* a per-`Database`/per-`Statement` toggle, with statements inheriting the
+database's setting at prepare time; it governs reads (`true` → exact `BigInt`, `false` →
+`Number`, lossy above 2^53, which is Bun's documented behaviour and the reason the switch
+exists) and the type of `lastInsertRowid`. Binding is exact either way — a `bigint` goes in via
+`sqlite3_bind_int64`, and one outside int64 throws `RangeError` naming the value rather than
+wrapping. `db.transaction()` nests via **SAVEPOINT**: top level is `BEGIN`/`COMMIT` with
+`.deferred`/`.immediate`/`.exclusive` choosing the BEGIN flavour, nested is
+`SAVEPOINT`/`RELEASE`, so an inner rollback discards only inner work. Nesting is decided by
+`sqlite3_get_autocommit` rather than a counter we keep, so a hand-written `BEGIN` is seen too;
+rollback is skipped when SQLite already rolled back for us (an `ON CONFLICT ROLLBACK`); and a
+transaction function that returns a Promise throws, because committing before the async work
+finishes is the failure this API invites. `loadExtension` (wants a `.so`), `fileControl` (a raw
+pointer ABI) and `setCustomSQLite` (wants a system libsqlite3) throw naming the reason. Errors
+are `SQLiteError` carrying SQLite's `code` (`SQLITE_CONSTRAINT_UNIQUE`, …), `errno` (the
+extended result code) and `byteOffset`, as Bun's do.
+
+**Nothing is paid for until it is used.** No fetch, no compile, no instantiation until the first
+`new Database()`; then one engine cached per realm. Bytes come from `VV_SQLITE_WASM_PATH` (a VFS
+path — the embedder escape hatch, and what the kernel spike uses), else the project's own
+`@sqlite.org/sqlite-wasm` if it happens to be installed, else `VV_SQLITE_WASM_URL`, which the
+kernel points at the same-origin `vendor/sqlite/sqlite3.wasm` and the guest pulls through the
+blocking `OP_FETCH` syscall. There is no CDN in any branch.
+
+**Verification: 937 → 1077 offline checks, 88 → 110 kernel checks.** The offline spike imports
+`createBunSqlite` and hands it a `node:fs` host, so it drives the code that ships rather than a
+parallel copy: types round-tripping, `.get()` returning `null` (not `undefined`) for no rows,
+`.run()`'s `{changes, lastInsertRowid}`, all three named-parameter sigils, strict vs non-strict
+binding, `SQLITE_CONSTRAINT_UNIQUE` on the error, SAVEPOINT nesting where an inner rollback
+leaves outer work intact, `safeIntegers` above 2^53 in both directions, `serialize`/
+`deserialize`, and heap growth under a multi-megabyte blob. The kernel spike is the part the
+offline tier cannot claim: it writes a database in one process and reads it back in a
+**different** one, asserts the file is in the VFS and begins with SQLite's documented
+`"SQLite format 3\0"` header, and checks a relative filename resolves against the process's cwd
+rather than the VFS root. Both fail loudly if the engine is missing; neither can skip. The
+assertions are pinned to things outside this repo — SQLite's file format, SQLite's result-code
+names, Bun's documented return shapes — rather than to our own output.
+
+See ARCHITECTURE.md §9.2.
