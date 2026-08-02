@@ -33,7 +33,10 @@ export default function (exports, require, module, process, internalBinding, pri
   "use strict";
 
   const { Writable, Readable, Duplex, destroy } = require("stream");
-  const finished = require("internal/streams/end-of-stream");
+  // Upstream's end-of-stream sets `module.exports = eos` and hangs `finished` off
+  // it; ours exports `{ eos, finished }`, where `finished` is the promise form.
+  // The adapters want the callback form that returns a cleanup function: `eos`.
+  const { eos: finished } = require("internal/streams/end-of-stream");
   const {
     isDestroyed,
     isReadable,
