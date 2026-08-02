@@ -86,6 +86,12 @@ const firstSeg = (p) => {
 const O_CREAT = 0o100;
 const O_TRUNC = 0o1000;
 
+// Where the kernel materializes fetched response bodies. MUST match
+// Kernel._fetchCachePath — asserted by the fetch-body-lifetime spike. Reads under
+// this prefix are reported via onBodyConsumed so the kernel can free them.
+const FETCH_BODY_PREFIX = "/var/cache/vv-fetch/";
+const isFetchBody = (p) => typeof p === "string" && p.startsWith(FETCH_BODY_PREFIX);
+
 export class FsServer {
   // `persistence` (optional) is the OPFS write-behind adapter. When present we
   // forward every successful mutation to it so the VFS survives a reload; when
@@ -93,6 +99,13 @@ export class FsServer {
   constructor(vfs, persistence = null) {
     this.vfs = vfs;
     this.persistence = persistence;
+    // Optional: (path) => void, called once a read of a kernel-fetched body has
+    // finished, so the kernel can drop its reference and free the scratch file (see
+    // Kernel.releaseFetchBody). The kernel hands a process a PATH and cannot see
+    // the read itself — it happens here, over the SAB — so this is the only place
+    // "the reader is done" is observable. Left null by an embedder that doesn't
+    // care: bodies then simply live until their process exits.
+    this.onBodyConsumed = null;
     this.clients = new Map(); // clientId -> { ctrl, data, port }
     // fd -> path, so fd-based ops (fd_write/ftruncate/close) know which file they
     // touch — needed both for persistence re-mirroring and for watch events.
@@ -283,8 +296,13 @@ export class FsServer {
     const p = this.persistence; // null when persistence is off (headless)
     const s = (i) => decodeBytes(fields[i]);
     switch (opcode) {
-      case OP_READ_FILE:
-        return vfs.read_file(s(0));
+      case OP_READ_FILE: {
+        const path = s(0);
+        const bytes = vfs.read_file(path);
+        // Whole-file read: the reader is done the moment this returns.
+        if (this.onBodyConsumed && isFetchBody(path)) this.onBodyConsumed(path);
+        return bytes;
+      }
       case OP_WRITE_FILE: {
         const path = s(0);
         const existed = this.couldNotify(path) ? vfs.exists(path) : false;
@@ -381,6 +399,10 @@ export class FsServer {
         const path = this.fdPaths.get(fd);
         this.fdPaths.delete(fd);
         if (path && p) p.onWrite(path); // flush the final contents on close
+        // fs.readFileSync(path) with no encoding goes open()+readSync()+close(), so
+        // close is where a body read finishes. Reporting on open() instead would
+        // free the file while the fd was still being read.
+        if (path && this.onBodyConsumed && isFetchBody(path)) this.onBodyConsumed(path);
         return EMPTY;
       }
       case OP_FD_READ:

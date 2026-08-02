@@ -227,7 +227,8 @@ packages/
                           run in-VM). Spans React/Vue/Svelte/Solid/Qwik/Preact/Lit, Express/
                           Nest/Fastify/Koa/Hono/h3/Nitro, Next/Nuxt/SvelteKit/Astro/React
                           Router, Tailwind+shadcn, TanStack Router, Vitest, the Bun family
-                          (serve/routes/websocket/react), Docusaurus/VitePress/Slidev,
+                          (serve/routes/websocket/react), Docusaurus/VitePress/Rspress/Slidev
+                          (Starlight installs with --ignore-scripts — see its section),
                           Rsbuild/webpack/Angular, the sqlite/pglite/trpc/monorepo showcases, and
                           the Native family (Python / data-science / Matplotlib / FastAPI / Flask,
                           CPython via Pyodide). The install command is inferred per PM (npm/yarn/pnpm/bun).
@@ -336,6 +337,225 @@ README.md · roadmap.md · research.md · ARCHITECTURE.md · AGENTS.md
 
 ## Critical gotchas (these have bitten us repeatedly)
 
+### A dead process worker used to be INVISIBLE — and "no output" is still not "dead"
+The single most expensive bug class in this project: a process that stops producing
+output, forever, with no error anywhere. It cost two full rounds of misdiagnosis on
+one Starlight install report. The cause was structural, in two halves:
+
+- `spawnWorker` (`kernel-worker.ts`) attached only `onmessage`. A `Worker` that threw
+  at boot, failed to load its module graph, or was reclaimed by the browser under
+  memory pressure fired an `error` event that **nothing listened to**.
+- `Kernel.start()` was `new Promise((resolve) => …)` with no reject parameter, and the
+  only settle path was `proc.onExit`, which only runs from `finalize()`, which only
+  runs on the worker's own `exit` message. No message, no settle, ever.
+
+Both are fixed: worker `error`/`messageerror` route to the kernel's `worker-error`
+channel → `handleWorkerError`, and a worker that **failed to boot** goes down the NORMAL
+`finalize()` path so every waiter is released (`start()`'s promise, a parent parked on
+`OP_SPAWN`, a `worker_threads` creator awaiting `thread-exit`, the studio's `term-exit`,
+in-flight HTTP requests). A worker that is merely *throwing* is left alone — see below.
+`start()` now rejects with `err.code === "EPROCFAIL"` and `err.result`; `onProcExit`
+(what the studio and SDK actually use — they go through `launch()`, not `start()`)
+still always fires, with a new `error` field set only on a worker fault.
+
+**`worker.onerror` is NOT worker death — do not finalize on it.** This correction cost
+a whole extra round, and shipping it made the bug worse than before the fix. On the web
+platform an uncaught exception inside a Worker is *reported* to the `Worker` object and
+the worker **carries on servicing its event loop**; only a failure to load or evaluate
+the module graph is fatal. `astro dev` throws ~113 uncaught
+`SyntaxError: "[object Object]" is not valid JSON` per run from inside its own code and
+had always survived them (`bound` in 9 of 9 runs). Finalizing on the first one killed the
+dev server before it could listen — 0 of 5 — leaving the shell back at a prompt and the
+studio waiting forever on a server that no longer existed: *the same dead terminal the
+change was written to explain.* Note the trap: this is unreachable from Node, so
+`verify-node` and every spike passed while real Chrome failed. Use
+`scripts/repro-starlight-browser.mjs` for anything touching worker error handling.
+
+The fatal/not-fatal call is therefore made in `kernel-worker.ts`, where the platform
+detail lives, and passed to the kernel as `m.fatal`: a worker that has posted any
+message evidently booted, and one still alive 5s after spawn did too. With no evidence
+either way we assume **not** fatal, because wrongly killing a live process is far worse
+than being slow to finalize a dead one — the watchdog covers the latter in seconds.
+Uncaught errors are counted (`workerErrors`, in `__vv.diag()`) and only the first is
+printed, so a flood cannot bury the terminal.
+
+**What is still not detectable, by construction:** a worker that vanishes with no event
+at all — an OOM kill fires *nothing* in Chrome. That is what the **liveness watchdog**
+is for, and it has one subtlety that made it useless in its first form:
+
+- It keys on **`lastOutput`**, not `lastActivity`. Silence-of-output is what the user
+  experiences and what the message claims to measure. Keying it on syscall activity
+  (which is what it originally did) made it unable to fire in the one case it was built
+  for, and nobody noticed because a watchdog that never fires looks exactly like a
+  healthy system.
+- **A process's filesystem traffic never reaches the kernel.** It goes straight to the FS
+  worker over its own SAB. Measured: a guest in a tight `writeFileSync` loop registers
+  **zero** kernel syscalls while writing 80,000 files. So `proc.syscalls` is near-zero for
+  ordinary scripts, and a flat syscall count must **never** be reported as "stuck" — that
+  would call every slow install dead. Progress is judged from the VFS file count, which
+  only `kernel-worker.ts` can ask for (it has the FS worker; the kernel does not).
+
+It is **report-only and never kills** — a process can legitimately be silent for minutes.
+
+So when triaging "it hangs": check the terminal for a `[runtime] PID … has printed
+nothing for …` line, which now also says whether the filesystem grew since the previous
+check. Then run **`await __vv.diag()`** in the DevTools console for live per-process
+state. Four rounds of one hang were spent inferring the state of a machine we could not
+reach; that hook exists so one paste-back settles it.
+
+**Reading `__vv.diag()` without falling into the trap above:** `syscalls` is **near-zero
+for ordinary scripts** and a zero there does *not* mean nothing is happening. Filesystem
+traffic never reaches the kernel, and stdout is a plain message rather than a syscall, so
+only network/spawn-heavy work moves that counter. The fields that carry the signal are
+**`sinceOutputMs`** (what the user is staring at) and the **VFS file count** (whether work
+is landing); call it twice a few seconds apart and compare. `workerErrors` counts uncaught
+exceptions the worker survived, and `booted` distinguishes "never started" from "started
+and quiet".
+
+It is installed by `KernelBridge`'s constructor, **not** by `Vivari.boot()` — the studio
+builds a bridge directly and never calls `boot()`, so hooking it there left the diagnostic
+missing from the only place a user actually is. That was caught by watching `__vv.diag()`
+throw in a real studio page, which is the only way it could have been caught.
+
+### A shipped node_modules snapshot removes the first-run install entirely
+The expensive, silent, repeatedly-misdiagnosed path is a template's *first* install. It can
+be skipped: the dep-cache key is a SHA-256 of `package.json` bytes, which is derivable at
+BUILD time, so the app can ship a prebuilt snapshot and restore instead of installing.
+Verified end to end in a real studio page — the key computed from `templates.ts` bytes
+matched the one a real in-VM install produced, byte for byte.
+
+Measured in Chrome, cold origin, Starlight: fetch 0.4s (locally served), **restore 4.0s for
+13,459 entries**, dev server listening at 31.8s, and OPFS holding 112 MB instead of 246 MB
+because npm's `_cacache` is never written. Note the restore figure: it is **4.0s in the
+browser versus 0.1s headless**, and the difference is the OPFS mirror, which the headless
+number omits. The structural claim ("restore cannot be worse than install") holds, but do
+not quote 0.1s as the browser cost.
+
+The asset is 111.4 MB raw / **26.0 MB gzipped**, which is *less* than the ~135 MB a cold
+install pulls from the registry, so shipping it reduces transfer.
+
+The consumer is `tryRestoreDeps` → `tryFetchShippedSnapshot` in `kernel-worker.ts`, keyed
+off `vendor/depcache/index.json`. That manifest is the feature's on/off switch: **if it is
+not served, nothing is fetched** and every project installs normally — not even a 404 per
+project. Every failure (no entry, HTTP error, malformed archive) logs one line and falls
+back to a normal install; none is fatal.
+
+Two things to know before touching it:
+
+- **Imported archives are validated, `save()`d ones are not.** An archive off the network
+  can be truncated, be an HTML error page served with a 200, or carry a `../` path that
+  would escape `node_modules` — so `dep-cache.js` `importArchive()` checks the header,
+  every file slice's bounds, and every path *before* storing, and returns null on anything
+  suspect. `verify-node` asserts all seven rejection modes.
+- **The archive buffer is TRANSFERRED, not copied** (`depCacheImport`), because these are
+  ~100 MB and a structured clone would double that on a memory-scarce machine. The caller's
+  view is detached afterwards — do not read it again.
+
+Shipped snapshots are marked `shipped` and are evicted **before** a user's own snapshots
+despite LRU order: re-acquiring a shipped one costs a request, while re-acquiring a user's
+costs the whole install it was made to avoid.
+
+### Reify throughput is NOT the bottleneck — measured, so stop re-deriving it
+A plausible and wrong theory for the 30-minute stall was that per-file cost degrades as
+`node_modules` grows (quadratic directory scan, rehash, per-write tree walk), turning a
+40-second install into an overnight one with no crash. Measured directly against the
+Wasm VFS in the shape reify produces (12,000 files, ~1,100 packages, scoped and nested,
+compression on):
+
+| tree size          | per-file write |
+| ------------------ | -------------- |
+| first 1,000 files  | 6.9 us         |
+| files 11,000–12,000| 3.6 us         |
+
+Cost is **flat** — the whole 12,000-file tree lands in ~44 ms, and the first bucket is
+only slower because of warmup. At full size, `stat` is 8.3 us, `readdir` of a package
+dir 3.3 us, reading a leaf back 3.4 us. There is a mild superlinear effect on inserts
+into a *single* directory past ~30,000 entries (2.4 us → 20.8 us at 40,000) and
+`readdir` of such a directory costs 11.9 ms — so a scan that readdirs a 40k-entry
+directory per entry *would* be quadratic — but nothing real gets there: `node_modules`
+holds ~1,100 entries and `_cacache` is hex-sharded. Install time lives in the network,
+tar extraction, npm's own JS, and the OPFS mirror, not in VFS write throughput.
+
+### The OPFS mirror rewrites a whole file per enqueue — never mirror an APPENDED file
+`opfs-persistence.js` is a write-behind mirror: `FsServer` enqueues a path on every
+write syscall, and `drain()` then re-reads and rewrites **the entire file**. So a file
+built up incrementally costs O(size x appends), not O(size). Two shapes under the
+otherwise-persisted package-manager cache dominated an entire Starlight install
+(measured on a cold run, with per-path attribution):
+
+- `_cacache/tmp/<uuid>` — cacache writes content to a staging file then renames it.
+  One of these cost **1,461 MB across 76 writes**, and it is deleted moments later.
+- `_logs/*-debug-0.log` — npm appends a line at a time: **607 MB across 3,799 writes**.
+
+Together with `writeManifest()` (the whole index serialized every time the queue
+emptied — **12,847 rewrites totalling ~2.1 GB** to index ~3,000 paths), that was
+**~4.7 GB of OPFS writes to persist 53 MB**. `shouldPersist` now excludes `_logs/`
+and `tmp/` **inside a `.cache` directory**, and the manifest is coalesced to at most
+one write per second (forced on `flush()`), which brings it to ~144 MB. Rules:
+
+- **Do not blanket-exclude `/home/user/.cache`.** It is deliberately durable — npm's
+  integrity-keyed `_cacache` surviving reloads is what makes a second project skip
+  re-downloading. Exclude the volatile shapes inside it, not the cache.
+- Before persisting any new path, ask whether it is appended to or renamed over. If
+  so, either exclude it or snapshot it the way `dep-cache.js` handles `node_modules`.
+- This is write **churn**, not residency: the live mirror was ~134 MB before and after.
+  It matters for OPFS I/O time, quota, and GC pressure — and much more in Incognito,
+  where Chrome backs OPFS with memory instead of disk.
+
+### A fetched body must outlive its reader — and measure the VFS with compression ON
+`OP_FETCH` does not hand a process bytes; it materializes the response body at
+`/var/cache/vv-fetch/<gen>-<key>` and returns a **path**, which the process reads in
+a *later* turn (`https.js` does `fs.readFileSync(meta.path)` inside a `nextTick`).
+Eviction of the LRU scratch cache runs in that gap, on other downloads' completions.
+It used to `unlink()` freely, so it could delete a body whose reader had not read it
+yet — and `https.js` swallows the resulting ENOENT as an **empty body on a 200**.
+Silent truncation, no error anywhere. Reproduced deterministically: at a 4 MiB cap,
+303 of 977 body reads failed and the install broke; at the old 128 MiB cap eviction
+almost never ran, which is the only reason it was never seen.
+
+Bodies are therefore **reference counted** (`Kernel._fetchBodyPins`): pinned on every
+handoff (fresh, cache hit, or in-flight de-dupe share — sharers read the SAME file),
+released when `FsServer` reports the read finished, and force-released when the
+owning process exits so nothing leaks. Eviction always drops the *accounting*, but a
+pinned file becomes an orphan and is unlinked by the last release. Rules if you touch
+this:
+
+- **Never `unlink` a fetched body outside `_reapFetchBody`.** At a 16 MiB cap ~45
+  bodies per Starlight install are evicted while still unread; each one is a
+  corruption that the refcount is the only thing preventing.
+- Body paths carry a generation prefix. Keep it: without it a re-fetch of an evicted
+  URL reuses the path and a stale deferred unlink deletes the *new* body.
+- The read happens in the FS worker, over the SAB — the kernel cannot see it. That is
+  why the signal comes back via `FsServer.onBodyConsumed` →
+  `createKernelFs`'s `fetch-body-consumed` → `Kernel.releaseFetchBody`. An embedder
+  that doesn't wire it is still correct, just keeps bodies until the process exits.
+- `scripts/fs-worker.mjs` is the headless twin of `packages/core/src/workers/fs-worker.ts`.
+  Wire both or headless spikes silently test a different body lifetime than the browser.
+
+**Measure residency with compression ON.** The browser sets `vfsCompression = true`
+by default, so `vfs.mem_bytes()` (physical, post-compression) is what actually
+occupies Wasm linear memory; `logical_mem_bytes()` is the uncompressed size and
+**overstates residency**. A headless rig that forgets `fs-set-compression` measures
+something the product never experiences — that mistake produced a "379 MB VFS peak"
+figure in an earlier round when the real, browser-shaped peak was 176 MB. Cold
+Starlight install, compression on, before → after the cap change: physical peak
+176 → 150 MB, linear reservation 398 → 372 MB, whole-process RSS peak 1003 → 924 MB.
+
+What remains is mostly *necessary* data — npm's `_cacache` resident alongside the
+`node_modules` it was extracted into — and it is worth knowing which parts of it are
+actually expensive, because compression changes the ranking completely:
+
+| resident content        | raw     | compressed |
+| ----------------------- | ------- | ---------- |
+| packument JSON          | 39.1 MB | 8.2 MB     |
+| tarballs (`.tgz`)       | 13.5 MB | 13.4 MB    |
+
+So **metadata volume is not a residency problem** — it compresses ~4.8x, and the
+tarballs (already gzipped) are the incompressible part. Abbreviated "corgi"
+packuments cut metadata *transfer* by ~72%, but they would save single-digit MB of
+resident memory, which is why they are not a lever for peak RAM. `mem_bytes` also
+counts the hot-read cache of decompressed files, which is not accounted for above and
+is the least-explored part of the peak.
 ### Feature-detecting a Node API by `typeof` — `Readable.toWeb` is the trap
 
 **Do not write `X.method ? X.method(…) : fallback` against a vendored Node API.**
@@ -395,9 +615,11 @@ Two rules follow:
    because "did not throw" would also pass for a converter that hands out an empty
    stream, and it reports `e.code || e.message` so a code-less failure is nameable
    from the CI log alone. The `toWeb-works` half of that landed with the fix
-   (!125); the byte read-back was added afterwards and **has not run in the VM at
-   the time of writing** — the Wasm VFS the kernel tier needs could not be built in
-   the environment it was written in, so CI is its first real in-VM run.
+   (!125); the byte read-back was added afterwards, in an environment that could not
+   build the Wasm VFS the kernel tier needs, so it shipped un-run in the VM. **It has
+   now run there and passes** — `toWeb-reads:toweb-bytes`, on a tree with the Wasm
+   crates built (recorded because the note above correctly flagged itself as
+   unverified, and that flag should not outlive the verification).
 
 ### `capture: true` hides a process's stderr from `VV_LIVE=1`
 `kernel.start(cmd, args, { capture: true })` buffers the child's output into
@@ -764,6 +986,17 @@ AFTER `installCoreutils()`. The loader unpacks the tree to
   assets through `routeByClient` fails under COEP `require-corp`.
 - Verify browser-shape changes headlessly with `scripts/spike-npm-studio.mjs`
   (it drives the SAME shared loader + PATH shims), not just `spike-npm.mjs`.
+- **This applies to TEMPLATES too, not just runtime changes.** The Starlight
+  template shipped with a green `spike-starlight.mjs` and still hung on first run
+  in the browser, because the harness's `npmInstall()` runs `node <vfs
+  npm>/bin/npm-cli.js install` while the studio resolves `npm` through the
+  `/bin/npm.js` shim, under `baseProcEnv` (`HOME=/`, cache in
+  `/home/user/.cache/npm`), inside the **interactive** shell that auto-runs
+  `<install> && <dev>` via `VV_RUN`. A heavy template needs a `*-studio.mjs` gate
+  in the shape a user actually triggers — see `scripts/spike-starlight-studio.mjs`,
+  which also budgets registry-metadata volume rather than wall-clock, since the
+  failure there was "far too slow and memory-heavy", which no timeout catches
+  reliably on fast CI.
 
 ### Real yarn (classic) is the studio shell's `yarn` — same pattern as npm
 Yarn is wired exactly like npm, one tier up: `scripts/vendor-yarn.mjs` packs
@@ -873,6 +1106,200 @@ in-VM required handling three distinct issues; all are reflected in the shipped 
    language NOT in that list still throws — add it. WARNING: the spike runs under Node's real
    `worker_threads`, where synckit works, so it canNOT catch a missing language; validate the
    language path in a real browser.
+
+### Rspress works in-VM (Docs template, graduated) — but MUST disable Rspack's persistent cache
+Rspress is the Rspack-powered docs SSG, so it inherits the wasm Rspack path Rsbuild already
+uses: `@rspress/core` → `@rsbuild/core` ^2.1.x → `@rspack/core` → `@rspack/binding`, whose
+`optionalDependencies` include **`@rspack/binding-wasm32-wasi`**. Because the runtime reports
+`process.arch === "wasm32"`, npm's platform auto-select picks that wasm32-wasip1-threads
+binding and no native `.node` addon is ever fetched — **no registry aliasing needed** (unlike
+esbuild/rollup/lightningcss, whose wasm builds live under a different package name).
+
+- **Ship v2, and only v2 — `@rspress/core`, not `rspress`.** Rspress v2 shipped stable under
+  the renamed package `@rspress/core` (2.x); the old `rspress` package stops at `2.0.0-beta`
+  and its `latest` dist-tag still points at v1. And v1 is not merely older, it is *impossible*
+  in-VM: `rspress@1.47.x` pins `@rsbuild/core ~1.3.18` → `@rspack/core 1.3.9` →
+  `@rspack/binding 1.3.9` **exactly**, and `@rspack/binding` only began publishing
+  `@rspack/binding-wasm32-wasi` in **1.4.0**. So v1's whole chain is exact-pinned to a
+  pre-wasm Rspack and dies requiring a native addon.
+- **THE GOTCHA: `RSPRESS_PERSISTENT_CACHE=false` is load-bearing.** Rspress (unlike plain
+  Rsbuild) enables Rspack's **persistent build cache** by default
+  (`performance.buildCache` in its Rsbuild config). That cache calls `std::process::id()`,
+  which is unsupported on wasm32-wasip1, so the Rust core aborts with a hard panic — the dev
+  server binds its port, prints its banner, and then never compiles:
+  `thread 'tokio-0' panicked at library/std/src/sys/process/unsupported.rs: no pids on this
+  platform` → `RuntimeError: unreachable`. Rspress gates it on `RSPRESS_PERSISTENT_CACHE`, so
+  the template sets that in `manifest.env` (a framework-honored lever — no project config).
+  Drop it and you get a blank page. This is the ONLY reason `rsbuildTemplate` boots in-VM
+  while a stock Rspress config does not. Rspress's other Rust-adjacent default, **lazy
+  compilation, was measured and is fine** in-VM — left at its default, do not "fix" it.
+- The three VitePress gotchas do **not** apply: config goes through `@rsbuild/core`'s own
+  `loadConfig` (the loader the green Rsbuild template already exercises with an `.mjs`
+  config, so the template ships `rspress.config.mjs`); the bundled Tinypool is used only by
+  SSG page rendering in `rspress build`, never the dev server, and the runtime already
+  defaults `PISCINA_DISABLE_ATOMICS=1`; and Shiki runs inside the async MDX/unified pipeline
+  (`@shikijs/rehype`), not synckit, so there is no language allowlist to maintain.
+- Client-routed SPA (react-router history mode) → config `base: "/preview/3000/"` +
+  `keepPreviewPrefix: true`, forwarded to Rsbuild as `server.base`.
+- Gated by `scripts/spike-rspress.mjs` (net tier, 900s). Gate 1 asserts the wasm binding
+  landed **and** that no native `@rspack/binding-*` did, so a regression onto a native addon
+  fails loudly. Run `VV_BASE=/preview/3000/` to exercise the base-prefixed path the template
+  ships (shell + an asset under the prefix); the default `/` is the fast regression run.
+
+### Astro Starlight (Docs template) — pinned to Astro 5, `ec.config.mjs` is mandatory, and its install MUST skip lifecycle scripts
+**The four-round "install hangs forever" bug was sharp's install script, and it was a deadlock.**
+`astro` depends on sharp; npm runs `node install/check.js` during reify, immediately after the
+downloads finish — precisely where every user report stopped. Caught in the act, `__vv.diag()`
+reports:
+
+```
+pid 3  npm install                                    idle 153s
+pid 4  sh -c node install/check.js || npm run build    idle 152s   [node_modules/sharp]
+pid 5  node install/check.js            28 modules, 2 syscalls, idle 152s
+```
+
+with `fetch` inflight/queued/active all 0, `pendingHttp` 0, `booted: true`, `paused: false`. The
+script loads, does almost nothing, and then never exits — it is not waiting on anything, and the
+runtime never concludes it is finished. npm waits on the child forever. The template therefore
+installs with `--ignore-scripts` (same choice as the Angular template; the project's
+`package.json` stays vanilla), which removes the mechanism rather than timing it out: **4 of 4
+runs wedged before, 2 of 2 completed after**, on the same rig. Nothing is lost — the image
+service is passthrough so sharp is never loaded, and esbuild's postinstall is moot because the
+registry aliases it to esbuild-wasm.
+
+**Reproducing it needs a slow page, which is why it went unreproduced for three rounds.** A
+production build usually wins the race and installs fine; the studio served by `vite dev` wedges
+every time. Serve `vite dev`, ensure `vendor/depcache/index.json` is NOT served so the install
+path is actually taken, then run `scripts/repro-starlight-browser.mjs`.
+
+**The terminal is not dropping output — this was measured, not assumed.** The rig reads the text
+xterm actually painted (`.xterm-rows`, every panel), not character counts. `added 364 packages`
+reaches the screen, 0.4s after the `tsconfck` warning that precedes it, as does the runtime's
+watchdog line, in order, including output that follows a `\r`-terminated progress line. Two
+traps if you repeat this: the studio runs **three** xterm instances, and reading only the first
+captures the boot console while a healthy project terminal looks frozen; and the DOM renderer
+holds only the visible viewport, so a row that scrolls away between samples is never observed
+even though it was painted — absence is not evidence of a drop.
+
+**Still unexplained (but not the hang):** `astro dev` throws 8–113 uncaught
+`SyntaxError: "[object Object]" is not valid JSON` per run inside its process worker; Rspress on
+the same path throws zero. The dev server bound in 7 of 7 runs on HEAD with all of them firing,
+so they are not fatal today — but they only survive because a browser Worker survives an
+uncaught error. With `worker.onerror` treated as worker death, 0 of 4 runs bound versus 9 of 9
+without it. No stack is obtainable: `Runtime.exceptionThrown` delivers these with an empty stack,
+and booting the worker from a module blob that shims `JSON.parse` to trap the call site stops the
+kernel booting, so that route is closed too.
+
+**Ruled out, with measurements, so nobody re-derives them:**
+- *Chrome Incognito / memory-backed OPFS.* A cold A/B of an incognito browser context against
+  a fresh profile came out indistinguishable (53.7 s / 57.3 s vs 52.3 s / 66.2 s).
+- *Registry-metadata volume.* Real (420 MB → 108 MB, see the `.npmrc` note) but it is the
+  resolve/download phase, and it did not change what users hit.
+- *A single worker being OOM-killed.* Memory does set a floor — a cold install peaks around
+  **1.87 GB across the whole Chrome process tree**, and under a ~1.6 GB ceiling the kernel
+  SIGKILLs the **renderer** (`errorCode 9`, cgroup `failcnt` climbing), not one worker. That
+  is Chrome's crash page, not a frozen terminal, so it is a different failure from the report.
+
+**No Node-based spike can gate the browser half of this.** `worker.onerror` semantics and the
+timing that triggers the sharp deadlock only exist in a browser, so `spike-starlight` and
+`spike-starlight-studio` passed throughout — including while real Chrome wedged. Both now pass
+`--ignore-scripts` so they at least run the command the studio runs.
+`scripts/repro-starlight-browser.mjs` is the only thing here that catches the browser-only
+class; it is deliberately not in `run-spikes.mjs` because it needs a Chrome binary and a served
+studio build.
+
+Two process lessons worth keeping:
+- **A template fix cannot reach an already-created project.** `vv-create-project` writes
+  template files only at creation; reopening a project uses `vv-register-project`, which
+  deliberately does not rewrite files. So a user who presses Run on a project created before
+  a template change silently keeps the old files, with no indication that a fix exists.
+- **A first-run install that prints nothing for minutes is indistinguishable from a hang.**
+  npm's own spinner covers the fetch phase and then gets overwritten; reify is silent. The
+  kernel already reports per-URL sizes to `onFetch`, so progress *can* be surfaced — worth
+  doing on its own merit, in the runtime/studio layer rather than in a template.
+
+Starlight rides the Astro path the shipped `astro` template already proves: Vite's dev server,
+the Go/wasm `@astrojs/compiler`, and the `rollup → @rollup/wasm-node` registry alias. Nothing
+new was needed for those. What Starlight adds — a content-collection pipeline (`docsLoader` +
+MDX + expressive-code) and a themed **multi-page** site — surfaced four things:
+
+- **Pin `astro ^5`, NOT the latest — Astro ≥6 is rolldown and does not load in-VM.** Astro 6/7
+  move Vite 6 → Vite 7, whose bundler is rolldown. `astro dev` on Astro 7 logs
+  `[rolldown] Downloading @rolldown/binding-wasm32-wasi@1.2.1 on WebContainer` — so rolldown
+  *does* detect wasm and reach for a wasm binding — and then dies with
+  `TypeError: Class extends value undefined is not a constructor or null` **before binding a
+  port**. Same family as the `VITE_DEV = "npm run dev -- --configLoader native"` workaround in
+  `templates.ts`, which exists because Vite's rolldown *config* bundler also fails here. So the
+  template pins `astro ^5.18.0` plus the newest Starlight line that peers on astro ^5,
+  `@astrojs/starlight ^0.37.7`. **Bump those two together, and only once rolldown works in-VM** —
+  Starlight ≥0.38 peers on astro ^7 and will drag rolldown in.
+- **THE GOTCHA: ship `ec.config.mjs` or the dev server never binds.** Starlight always loads
+  `astro-expressive-code`, whose `loadEcConfigFile()` dynamic-imports `<root>/ec.config.mjs` and
+  treats the file as merely *absent* only when the failure reports the **ESM** code
+  `ERR_MODULE_NOT_FOUND` (or `ERR_LOAD_URL`). In-VM that import fails with the **CommonJS** code
+  `MODULE_NOT_FOUND`, so expressive-code concludes the config exists but is *broken*, and
+  hard-exits the `astro:config:setup` hook:
+  `[astro-expressive-code] An unhandled error occurred … Your project includes an Expressive Code
+  config file ("ec.config.mjs") that could not be loaded` → `Error: process.exit called`. The
+  file is never reached, so no port is ever bound. Shipping the file sidesteps the misread, and
+  it is a real Starlight file users want anyway. Keep it **import-free** (a plain default-export
+  object): it is loaded by a bare dynamic import that Vite never processes, so avoid an ESM
+  re-export chain at boot — `defineEcConfig` is only a typing helper. This is a *runtime* gap
+  worth fixing generally: a failed dynamic ESM import should report `ERR_MODULE_NOT_FOUND`, and
+  any library branching on that code hits the same trap.
+- **`image: { service: passthroughImageService() }` — don't go near the sharp path.** Astro lists
+  `sharp` as an `optionalDependency` and Starlight's `astro:assets` usage would otherwise build
+  the sharp-backed image service. Worth correcting a natural assumption here: it is **not** true
+  that sharp is simply unavailable in-VM. Measured on astro 5.18 (which pins `sharp ^0.34`), npm's
+  platform auto-select skips every *native* `@img/sharp-<platform>` package **and installs
+  `@img/sharp-wasm32` 0.34.5**, sharp's own WebAssembly build. So a sharp-backed service would
+  probably work at *runtime*. **This paragraph used to claim 0.34's `install` script
+  (`node install/check.js`) "is benign and exits clean, unlike sharp 0.32.6's, which is what
+  killed the Gatsby investigation" — that was wrong, and it cost four rounds.** 0.34's script
+  hangs exactly like 0.32.6's; it is the hang documented above, and the reason this template
+  installs with `--ignore-scripts`. The lesson is narrower than "sharp is unavailable": sharp's
+  *runtime* is fine in-VM, its *install script* is not, and those two facts were conflated.
+  We still use passthrough: that path is unproven in-VM, wasm image transcoding is slow, and a
+  docs site loses nothing by serving images untransformed. `scripts/spike-starlight.mjs` prints whether the wasm
+  sharp landed but deliberately does **not** assert it — the gate that matters is that no *native*
+  binary landed and that the dev log is free of image-service errors.
+- **`pagefind: false` — search is the one feature traded away.** Starlight's built-in search
+  shells out to Pagefind, whose binaries are optional platform packages (`@pagefind/linux-x64`
+  and friends) that npm also skips on wasm32, so there is no runnable binary. Dev never invokes
+  it; disabling it keeps `npm run build` honest too.
+- **The template ships an `.npmrc` with `legacy-peer-deps=true`.** Worth keeping, but note what
+  it does *not* fix: it shortens the resolve/download phase, while the unreproduced first-install
+  stall above happens later, in reify. It was still by far the heaviest install of any template.
+  **Optional peerDependencies are a first-class in-VM cost**, because npm's ideal-tree builder always
+  requests **FULL** packuments (arborist's `#fetchManifest` hardcodes `fullMetadata: true`) and
+  resolves a manifest for every optional peer even though it installs none. Astro's own
+  `unstorage`/`db0` name ~19 of them, several among the largest packages on npm (`@prisma/client`
+  65 MB, `drizzle-orm` 61 MB, `prisma` 42 MB, `react-native`, `@azure/cosmos`, `@xata.io/client`).
+  Measured decoded volume through the fetcher + VFS on a cold cache: **421 MB without the
+  `.npmrc`, 108 MB with it**; Rspress is 100 MB and the shipped Docusaurus 341 MB. Note the
+  registry gzips packuments ~10x, so the *wire* cost is ~45 MB while the VFS/parse cost is the
+  full 421 MB — always reason about the **decoded** figure in-VM. `legacy-peer-deps` is safe in
+  this tree because its only peer edge (`@astrojs/starlight` → `astro`) is a direct dependency.
+  `--omit=peer` does **not** help: it omits installing peers, not resolving them.
+
+**`keepPreviewPrefix: true` is required here even though the `astro` template needs no base.**
+This was settled empirically, not assumed. Starlight renders its sidebar, prev/next pager and
+site-title link as **root-absolute** hrefs that follow Astro's `base`. Clicking one is a
+top-level navigation, and `packages/studio/public/sw.js` deliberately refuses to proxy a
+navigation carrying no `/preview/<port>/` marker (`if (event.request.mode === "navigate")
+return;` — it assumes such a document is the studio's own). With the default base those links
+render as `/guides/…`, so the site would load and then break on the first sidebar click. Hence
+`base: "/preview/4321/"` + `keepPreviewPrefix: true`. The single-page `astro` template escapes
+this only because it has no internal links at all. Note the *asset* side differs: Vite's dev URLs
+(`/@id/…`, `/@vite/client`, `/@fs/…`) are **not** base-prefixed and that is correct — they are
+subresources, so `routeByClient` infers the port from the issuing iframe's own prefixed URL. Do
+not "fix" that by asserting every asset sits under the base.
+
+- Gated by `scripts/spike-starlight.mjs` (net tier, 900s). It defaults to the base the template
+  actually ships, so the CI run exercises the real config; `VV_BASE=/` reproduces the no-base
+  control (its link check is vacuous there, since every root-absolute href trivially starts with
+  `/`). Gate 1 asserts no *native* `@img/sharp-*` landed and gate 4 asserts the dev log is free of
+  sharp/image-service errors, so a regression cannot hide behind a page that still renders.
 
 ### Real corepack is the studio's PM version manager — DOWNLOADS + runs pinned PMs
 corepack is wired like the PMs but is a *version manager*, not a package manager
@@ -1574,7 +2001,9 @@ framework whose **client** router re-matches routes against the iframe's own
 `location.pathname` (which IS `/preview/<port>/…`) lands on its NotFound page even
 when SSR rendered `/` fine. Fix: set `manifest.keepPreviewPrefix: true` (SW keeps the
 prefix) **and** point the app's base at `/preview/<port>/` so SSR and the hydrated
-client agree. Templates doing this: **Docusaurus** (`baseUrl`), **React Router 7**
+client agree. Templates doing this: **Docusaurus** (`baseUrl`), **Rspress** (`base`, forwarded
+to Rsbuild as `server.base`), **Starlight** (Astro `base` — its sidebar/pager links are
+root-absolute, and the SW does not proxy a prefix-less *navigation*), **React Router 7**
 (`react-router.config.ts` `basename` + Vite `base`, both `/preview/5173/`, trailing
 slash required). Symptom if you forget: "not found" on first load / `No route matches
 URL "/preview/<port>/"`.
@@ -2224,6 +2653,31 @@ a **second SAB** the paused worker parks on. Load-bearing details:
 
 The runtime runs headless under Node `worker_threads`, so validate without a
 browser first.
+
+### First: build the Wasm, or nothing runs (and the errors will lie to you)
+
+The repo ships **no built Wasm** (`pkg/`, `pkg-node/` are gitignored), so on a fresh
+clone `verify`/`spikes` cannot boot. The full recipe, including two steps that have
+cost multiple sessions:
+
+1. **Node 22+** (`engines.node`). Under Node 20 the runtime fails in ways that look
+   like hangs rather than errors, so check `node -v` before believing any hang.
+2. `rustup` + `cargo install wasm-pack --locked`, and `rustup target add wasm32-wasip1`
+   if you plan to run `npm run verify` (it needs `build:wasi-demo`).
+3. `npm run build:vfs:node && npm run build:codec:node && npm run build:crypto:node`.
+   `crypto` is the slow one — `wasm-opt` can take several minutes, and wasm-pack writes
+   its `package.json` **last**, so a missing `pkg-node/package.json` usually means
+   "still building", not "wasm-pack didn't emit one".
+4. **Add `"type": "commonjs"` to each `pkg-node/package.json` afterwards.** wasm-pack
+   emits CommonJS for `--target nodejs` but no `type` field, so the repo root's
+   `"type": "module"` makes Node parse it as ESM. The failure is far from the cause:
+   you get `exports is not defined in ES module scope`, surfacing as a bogus
+   `npm error code FETCH_ERROR … Invalid response body while trying to fetch
+   <registry url>` on the first packument of a spike. Do NOT hand-write these files
+   either — wasm-pack MERGES into an existing `package.json`, so a hand-written one
+   comes back mangled (its keys nested under `dependencies`) on the next build.
+5. If a Bun crypto spike fails on hashes/argon2id/bcrypt, your `crypto` Wasm is stale
+   relative to `packages/crypto/src` — rebuild it before debugging anything else.
 
 - `npm run verify` — `scripts/verify-node.mjs`, headless end-to-end (fs, process,
   shell, http, timers, watch, worker_threads incl. `receiveMessageOnPort`). **Run

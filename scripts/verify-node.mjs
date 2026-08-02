@@ -2261,6 +2261,296 @@ setInterval(() => {}, 1000);
   assert(kernel.exists("/w1/count.txt"),
     "fs.watch: an in-tree write still fires after unrelated cross-tree churn");
 
+  // === shipped dep-cache snapshots: import, restore, and reject bad archives ===
+  // A first run on a fresh origin is the expensive path users keep dying in, so the
+  // app can ship a prebuilt node_modules and RESTORE instead of installing. The
+  // archive arrives over the network, which makes validation the interesting part:
+  // a truncated download, an HTML error page served with a 200, or a doctored path
+  // must each degrade to "no snapshot" — never to a half-unpacked node_modules.
+  {
+    const encT = new TextEncoder();
+    // Build an archive the way a build-time producer would: the same
+    // [u32le headerLen][headerJSON][blob] layout dep-cache.js packs.
+    const mkArchive = (entries, blobParts) => {
+      const blob = blobParts.length
+        ? blobParts.reduce((acc, p) => { const m = new Uint8Array(acc.length + p.length); m.set(acc); m.set(p, acc.length); return m; }, new Uint8Array(0))
+        : new Uint8Array(0);
+      const header = encT.encode(JSON.stringify({ v: 1, entries }));
+      const out = new Uint8Array(4 + header.length + blob.length);
+      new DataView(out.buffer).setUint32(0, header.length, true);
+      out.set(header, 4);
+      out.set(blob, 4 + header.length);
+      return out;
+    };
+    const fileA = encT.encode('module.exports = "from a shipped snapshot";\n');
+    const fileB = encT.encode('{"name":"shipped-pkg","version":"1.0.0","main":"index.js"}\n');
+    const goodEntries = [
+      { p: "shipped-pkg", k: "d", m: 0o755 },
+      { p: ".bin", k: "d", m: 0o755 },
+      { p: "shipped-pkg/index.js", k: "f", m: 0o644, o: 0, l: fileA.length },
+      { p: "shipped-pkg/package.json", k: "f", m: 0o644, o: fileA.length, l: fileB.length },
+      // Symlinked bins are the fragile part of any pack/restore, and dev servers are
+      // launched through one.
+      { p: ".bin/shipped", k: "l", m: 0o777, t: "../shipped-pkg/index.js" },
+    ];
+    const good = mkArchive(goodEntries, [fileA, fileB]);
+    // Built NOW, because importing transfers the buffer and detaches our view of it
+    // (deliberate — these archives are ~100 MB and a structured clone would double
+    // that). A caller must not reuse an array it has handed to depCacheImport.
+    const truncated = mkArchive(goodEntries, [fileA, fileB]).slice(0, 24);
+
+    kernel.mkdirp("/shipped-proj");
+    kernel.writeFile("/shipped-proj/package.json", '{"name":"p","dependencies":{"shipped-pkg":"1.0.0"}}');
+    // Shaped like a real key: hashDepKey produces `<pm>:<src>:<sha256hex>`, and the
+    // package.json form is what a fresh project (no lockfile yet) looks up.
+    const key = "npm:package.json:" + "de".repeat(32);
+
+    assert(!(await kernel.fs.depCacheHas(key)),
+      "a key with no snapshot misses before anything is imported (so a normal install runs)");
+    const imported = await kernel.fs.depCacheImport(key, good);
+    assert(!!imported && imported.entries === goodEntries.length,
+      `a build-time archive imports into the store (${imported ? imported.entries : 0} entries)`);
+    assert(await kernel.fs.depCacheHas(key),
+      "the imported snapshot is then a HIT — which is what makes the fresh-project lookup skip install");
+
+    const count = await kernel.fs.depCacheRestore(key, "/shipped-proj");
+    assert(count === goodEntries.length, `restoring a shipped snapshot recreates every entry (${count})`);
+    assert(kernel.readFile("/shipped-proj/node_modules/shipped-pkg/index.js").includes("from a shipped snapshot"),
+      "a restored file has its real contents");
+    assert(kernel.exists("/shipped-proj/node_modules/.bin/shipped"),
+      "a restored .bin symlink exists (dev servers are launched through one)");
+
+    // Every malformed shape must be REJECTED, not partially applied. Each is a real
+    // failure mode of shipping a ~100 MB asset over a CDN.
+    const bad = {
+      "an HTML error page served with a 200": encT.encode("<!DOCTYPE html><html><body>404</body></html>"),
+      "an empty response": new Uint8Array(0),
+      "a truncated download (header longer than the body)": truncated,
+      "a file slice pointing past the end of the blob": mkArchive(
+        [{ p: "x", k: "d", m: 0o755 }, { p: "x/y.js", k: "f", m: 0o644, o: 0, l: 1 << 20 }], [fileA]),
+      "a path escaping node_modules via ..": mkArchive(
+        [{ p: "../../etc/passwd", k: "f", m: 0o644, o: 0, l: fileA.length }], [fileA]),
+      "an absolute path": mkArchive(
+        [{ p: "/etc/passwd", k: "f", m: 0o644, o: 0, l: fileA.length }], [fileA]),
+      "an unknown entry kind": mkArchive([{ p: "weird", k: "?", m: 0o644 }], []),
+    };
+    let rejected = 0;
+    for (const [what, archive] of Object.entries(bad)) {
+      const res = await kernel.fs.depCacheImport("npm:package.json:bad" + rejected, archive);
+      assert(res === null, `rejected: ${what}`);
+      if (res === null) rejected++;
+    }
+    assert(!kernel.exists("/etc/passwd"),
+      "no rejected archive wrote anything outside node_modules");
+    assert(rejected === Object.keys(bad).length,
+      `every malformed archive was rejected (${rejected}/${Object.keys(bad).length}) — each one falls back to a normal install`);
+  }
+
+  // === liveness watchdog: a BUSY but SILENT process must report itself ===
+  // This is the case the watchdog exists for and the one it originally could not
+  // detect: it keyed on `lastActivity`, which every syscall bumps, so npm's reify
+  // phase (~12,000 file writes, no output) reset the timer thousands of times a
+  // second while the terminal sat dead. Output silence is what the user experiences,
+  // so output silence is what must be measured. The process below writes files in a
+  // loop and prints nothing — exactly that shape.
+  {
+    kernel._stopStallWatchdog(); // adopt the test's interval, not the default 15s
+    const savedThreshold = kernel.stallThresholdMs;
+    const savedCheck = kernel.stallCheckMs;
+    // Generous margins: this runs alongside the rest of the suite, so give the
+    // watchdog many chances to tick rather than racing a loaded machine.
+    kernel.stallThresholdMs = 300;
+    kernel.stallCheckMs = 50;
+    // Earlier tests leave long-lived silent processes alive (the fs.watch watchers
+    // sit on setInterval and print nothing), and they are legitimately reported too —
+    // so scope every assertion to the process under test.
+    const stalls = [];
+    kernel.onProcStall = (pid, info) => stalls.push({ pid, ...info });
+    const forScript = (name) => stalls.filter((s) => (s.args || []).some((a) => String(a).includes(name)));
+
+    kernel.mkdirp("/stall");
+    kernel.writeFile(
+      "/stall/busy.js",
+      `
+const fs = require('fs');
+// Print ONCE, then go quiet while working — precisely npm's shape: it announces the
+// reify phase and then writes ~12,000 files in silence. Anchoring the output here also
+// keeps the test independent of how long the runtime takes to boot.
+process.stdout.write('starting work\\n');
+const end = Date.now() + 4000;
+let n = 0;
+while (Date.now() < end) fs.writeFileSync('/stall/f' + (n++ % 50) + '.txt', 'x'.repeat(64));
+fs.writeFileSync('/stall/done.txt', String(n));
+`,
+    );
+    const busyRun = await kernel.start("node", ["/stall/busy.js"], { cwd: "/stall", capture: true });
+    assert(busyRun.code === 0,
+      `the busy-but-silent test process ran cleanly (exit ${busyRun.code}${busyRun.code ? ": " + String(busyRun.stderr || "").slice(0, 300) : ""})`);
+
+    const busy = forScript("busy.js");
+    assert(busy.length > 0,
+      `watchdog reported a busy-but-silent process (${busy.length} report(s))`);
+    // Repeat reports back off by doubling, so silence is strictly increasing.
+    assert(busy.length < 2 || busy[busy.length - 1].silentMs > busy[0].silentMs,
+      "repeat stall reports show the silence growing, on a doubling backoff");
+    // The process really was working the whole time it was being reported silent.
+    assert(kernel.exists("/stall/done.txt") && Number(kernel.readFile("/stall/done.txt")) > 100,
+      `the "silent" process was in fact writing files throughout ` +
+      `(${kernel.exists("/stall/done.txt") ? kernel.readFile("/stall/done.txt") : 0} writes)`);
+    const last = busy[busy.length - 1];
+    // The finding that makes the *message* wording matter: a guest hammering the
+    // filesystem registers ZERO kernel syscalls, because fs traffic goes straight to
+    // the FS worker over its own SAB. So syscall counts must never be used to
+    // conclude "wedged" — progress has to come from the VFS (see onProcStall in
+    // kernel-worker.ts, which asks the FS worker for the file count).
+    assert(last.syscalls === 0,
+      `a filesystem-only workload is invisible to the kernel (${last.syscalls} kernel syscalls) ` +
+      "— so 'no syscalls' must NOT be reported as 'stuck'");
+    // Observation, not inference: this is the state the user's terminal now describes.
+    // Read defensively — a *diagnostic* line must never be able to abort the suite,
+    // which it did when a loaded machine left the writer short of finishing.
+    const writes = kernel.exists("/stall/done.txt") ? kernel.readFile("/stall/done.txt") : "?";
+    console.log(`    ↳ observed: PID ${last.pid} printed nothing for ${last.silentMs}ms while ` +
+      `writing ${writes} files — reported, and correctly NOT called dead`);
+
+    // And the inverse: a process that produces output must NOT be reported.
+    kernel.writeFile(
+      "/stall/chatty.js",
+      `let n = 0;
+const t = setInterval(() => { process.stdout.write('tick ' + (++n) + '\\n'); if (n > 25) clearInterval(t); }, 60);
+`,
+    );
+    await kernel.start("node", ["/stall/chatty.js"], { cwd: "/stall", capture: true });
+    const chatty = forScript("chatty.js");
+    assert(chatty.length === 0,
+      `a process that keeps printing is never reported as stalled (${chatty.length} reports)`);
+
+    kernel.onProcStall = null;
+    kernel.stallThresholdMs = savedThreshold;
+    kernel.stallCheckMs = savedCheck;
+    kernel._stopStallWatchdog();
+  }
+
+  // === an uncaught error in a RUNNING worker is not death ===
+  // A browser Worker's `error` event fires for an uncaught exception and the worker
+  // keeps servicing its event loop. Finalizing on it killed `astro dev`, which throws
+  // ~113 uncaught SyntaxErrors per run and had always survived them.
+  {
+    kernel.writeFile(
+      "/stall/survivor.js",
+      `const fs = require('fs');
+process.stdout.write('up\\n');
+setTimeout(() => { fs.writeFileSync('/stall/survived.txt', 'still here'); }, 400);
+`,
+    );
+    const pid = kernel.launch("node", ["/stall/survivor.js"], { cwd: "/stall", capture: true });
+    await waitFor(() => kernel.procs.get(pid)?.booted, "survivor never started", 50);
+    // Exactly what the browser delivers mid-run for an uncaught error: no `fatal`
+    // flag, because the worker had already posted messages.
+    kernel.handleWorkerError(pid, { error: '"[object Object]" is not valid JSON' });
+    assert(kernel.procs.has(pid) && !kernel.procs.get(pid).finalized,
+      "an uncaught worker error does not kill a running process");
+    // Read the counter now: the process is short-lived and its row is gone once it exits.
+    assert(kernel.procs.get(pid)?.workerErrors === 1,
+      "the uncaught error is still counted for diagnostics");
+    await waitFor(() => kernel.exists("/stall/survived.txt"),
+      "process did not keep running after an uncaught worker error", 100);
+    assert(kernel.exists("/stall/survived.txt"),
+      "the process kept running and completed its work after an uncaught worker error");
+
+    // …but a worker that never came up MUST still be finalized, or start() and every
+    // other waiter hangs forever. That is the case Fix A was written for, and it is
+    // reported by the environment as `fatal` since only it can tell the difference.
+    const deadPid = kernel.launch("node", ["/stall/survivor.js"], { cwd: "/stall", capture: true });
+    let settled = null;
+    kernel.procs.get(deadPid).onExit = (r) => { settled = r; };
+    kernel.handleWorkerError(deadPid, { error: "Failed to fetch dynamically imported module", fatal: true });
+    assert(!kernel.procs.has(deadPid), "a worker that failed to BOOT is still finalized");
+    assert(settled && settled.code === 1, "a boot failure settles its waiters with a non-zero exit");
+  }
+
+  // === diagnostics(): enough to tell slow from wedged without the machine ===
+  // NOTE what is deliberately NOT asserted: a rising `syscalls`. Almost nothing a
+  // plain script does is a kernel syscall — fs goes to the FS worker, stdout is a
+  // plain message — so `syscalls` is only meaningful for network/spawn-heavy work.
+  // The field the user's paste-back actually turns on is `sinceOutputMs`.
+  {
+    const pid = kernel.launch("node", ["/stall/busy.js"], { cwd: "/stall", capture: true });
+    await waitFor(() => kernel.procs.get(pid)?.booted, "busy proc never ran", 50);
+    const row = kernel.diagnostics().procs.find((p) => p.pid === pid);
+    assert(!!row && row.command.includes("busy.js"),
+      "diagnostics() lists a live process with its full command line");
+    assert(!!row && row.sinceOutputMs >= 0 && row.sinceSyscallMs >= 0 && row.booted === true,
+      "diagnostics() reports both silence clocks and whether the worker came up");
+    await new Promise((r) => setTimeout(r, 300));
+    const row2 = kernel.diagnostics().procs.find((p) => p.pid === pid);
+    assert(!!row2 && row2.sinceOutputMs > row.sinceOutputMs,
+      "output silence grows across two diagnostics() calls — the signal a stuck-looking install is judged on");
+    const d = kernel.diagnostics();
+    assert(!!d.fetch && typeof d.fetch.inflight === "number" && Array.isArray(d.listeners),
+      "diagnostics() also reports fetch state and bound ports, to tell a stuck download from a stuck write");
+  }
+
+  // === fetched-body lifetime: eviction must never outrun a reader ===
+  // The kernel hands a process a PATH and the process reads the bytes back in a
+  // later turn. Eviction runs in between, on other downloads. Before bodies were
+  // reference counted it would unlink a body its reader had not read yet, and
+  // https.js turns the resulting ENOENT into an empty 200 — a silent truncation,
+  // not an error. cap=0 forces eviction on every single fetch, so the window that
+  // is normally timing-dependent is hit deterministically here.
+  {
+    const savedCap = kernel.fetchCacheMaxBytes;
+    kernel.fetchCacheMaxBytes = 0;
+    const fetchBody = (url) => kernel._fetchIntoVfs(1, { url });
+
+    // A is handed out and NOT read yet; B..D evict it from the accounting.
+    const a = await fetchBody("https://registry.npmjs.org/lifetime-a");
+    for (const u of ["lifetime-b", "lifetime-c", "lifetime-d"]) {
+      await fetchBody("https://registry.npmjs.org/" + u);
+    }
+    assert(kernel.exists(a.path),
+      "fetch body survives eviction while its reader still holds it (the silent-truncation race)");
+
+    // Reading it is what frees it: FsServer reports the completed read through the
+    // kernel-fs channel, which drops the last reference and reaps the file. This
+    // also proves the whole release path is wired, not just the bookkeeping.
+    const bytes = kernel.readFileBytes(a.path);
+    assert(bytes && bytes.length > 0, "fetch body still had its contents when finally read");
+    await waitFor(() => !kernel.exists(a.path),
+      "fetch body was not reclaimed after its reader finished", 100);
+    assert(!kernel.exists(a.path), "fetch body is reclaimed once its last reader is done");
+
+    // Two readers of one body (what in-flight de-dupe produces): the FIRST read
+    // must not pull the file out from under the second.
+    const e = await fetchBody("https://registry.npmjs.org/lifetime-e");
+    kernel._pinFetchBody(e.path, 1); // simulate a second sharer of the same body
+    await fetchBody("https://registry.npmjs.org/lifetime-f"); // evict e
+    kernel.releaseFetchBody(e.path);
+    assert(kernel.exists(e.path), "a shared fetch body survives the first of its two readers");
+    kernel.releaseFetchBody(e.path);
+    assert(!kernel.exists(e.path), "a shared fetch body is reclaimed after the last of its readers");
+
+    // Each fetch gets a distinct body path, so a re-fetch after eviction can never
+    // be deleted by a stale pending unlink from the previous generation. (The
+    // intervening fetch is what evicts i1 — otherwise the re-fetch is a cache hit
+    // and legitimately returns the same path.)
+    const i1 = await fetchBody("https://registry.npmjs.org/lifetime-i");
+    kernel.releaseFetchBody(i1.path);
+    await fetchBody("https://registry.npmjs.org/lifetime-j");
+    const i2 = await fetchBody("https://registry.npmjs.org/lifetime-i");
+    assert(i1.path !== i2.path, "a re-fetched body gets a fresh path, not the evicted one");
+
+    // Backstop: a process handed a body that dies without ever reading it must not
+    // pin that body for the rest of the session.
+    const g = await fetchBody("https://registry.npmjs.org/lifetime-g");
+    await fetchBody("https://registry.npmjs.org/lifetime-h"); // evict g while pinned
+    assert(kernel.exists(g.path), "a body handed to a live process is not reclaimed early");
+    kernel._releaseFetchBodiesForPid(1);
+    assert(!kernel.exists(g.path), "a dead process's unread fetch bodies are reclaimed");
+
+    kernel.fetchCacheMaxBytes = savedCap;
+  }
+
   // === process table actually allocated many PIDs ===
   assert(kernel.nextPid - 1 >= 10, `PID table grew (${kernel.nextPid - 1} processes spawned)`);
 

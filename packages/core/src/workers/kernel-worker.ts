@@ -82,6 +82,14 @@ const REAL_COREPACK_ASSET = "vendor/corepack-pack.bin";
 // vendor:tsgo`). ~11 MB gz, so it's loaded LAZILY in the background after boot;
 // unpacked into the VFS so `tsc`/`tsgo` on PATH are the real Go compiler.
 const REAL_TSGO_ASSET = "vendor/tsgo-pack.bin";
+// Prebuilt node_modules snapshots for the templates, produced by running each
+// install once at build time. A first run on a fresh origin can then RESTORE the
+// tree (~0.1s, zero network) instead of installing it (~11.5s here, and the phase
+// where heavy templates have repeatedly appeared to hang). The manifest maps a
+// dep-cache key to its asset, and is the feature's on/off switch: if it is not
+// served, nothing is fetched and every project installs normally, so an origin that
+// doesn't ship snapshots pays nothing — not even a 404 per project.
+const DEPCACHE_MANIFEST = "vendor/depcache/index.json";
 
 // Resolve a vendored asset name to a full URL against the app's configured base
 // (Vite's import.meta.env.BASE_URL — "/studio/", "/embed/", or "/"). The vendor
@@ -711,6 +719,79 @@ async function computeDepSaveKeys(dir, pm) {
   return { primary, aliases };
 }
 
+// ---- shipped snapshots ------------------------------------------------------
+// The manifest, fetched at most once per session. `undefined` = not looked at yet,
+// `null` = not served (feature off, remembered so we never ask twice).
+let depCacheManifest: Record<string, { asset: string; bytes?: number; entries?: number }> | null | undefined;
+let depCacheManifestPromise: Promise<typeof depCacheManifest> | null = null;
+// Keys already attempted this session, so a corrupt or missing asset costs one
+// fetch rather than one per project run.
+const depCacheAssetTried = new Set<string>();
+
+function loadDepCacheManifest() {
+  if (depCacheManifest !== undefined) return Promise.resolve(depCacheManifest);
+  if (!depCacheManifestPromise) {
+    depCacheManifestPromise = (async () => {
+      try {
+        const r = await fetch(vendorUrl(DEPCACHE_MANIFEST));
+        // Not served, or served as an SPA index.html fallback (which is why the
+        // parse below is inside the try): the feature is simply off.
+        depCacheManifest = r.ok ? await r.json() : null;
+      } catch {
+        depCacheManifest = null;
+      }
+      return depCacheManifest;
+    })();
+  }
+  return depCacheManifestPromise;
+}
+
+// A dep-cache lookup missed, but the app may SHIP a snapshot for this exact key.
+// Fetch it and hand it to the store, so the caller's `depCacheRestore` then hits.
+// Returns true only if the snapshot is now in the store. Every failure path —
+// no manifest, no entry for this key, a fetch error, a malformed archive — returns
+// false and leaves the caller to install normally.
+async function tryFetchShippedSnapshot(key: string, pm: string): Promise<boolean> {
+  if (depCacheAssetTried.has(key)) return false;
+  const manifest = await loadDepCacheManifest();
+  const entry = manifest && manifest[key];
+  if (!entry || !entry.asset) return false;
+  depCacheAssetTried.add(key);
+  const mb = entry.bytes ? ` ${(entry.bytes / 1048576).toFixed(1)} MB` : "";
+  // Announce BEFORE the download: this is the one moment where a working restore
+  // and a wedged VM look identical, and the download is the slow part.
+  post("log", { line: `  [depcache] fetching prebuilt node_modules for ${pm}${mb}…`, dim: true });
+  const t0 = Date.now();
+  try {
+    const r = await fetch(vendorUrl(entry.asset));
+    if (!r.ok) {
+      post("log", { line: `  [depcache] prebuilt snapshot unavailable (HTTP ${r.status}) — installing normally.`, dim: true });
+      return false;
+    }
+    const bytes = new Uint8Array(await r.arrayBuffer());
+    const res = await kernelFsRef.fs.depCacheImport(key, bytes);
+    if (!res) {
+      // The store validated the archive and rejected it (truncated download, wrong
+      // asset, an error page served with a 200). Not fatal — just install.
+      post("log", { line: "  [depcache] prebuilt snapshot was not usable — installing normally.", dim: true });
+      return false;
+    }
+    post("log", {
+      line:
+        `  [depcache] prebuilt snapshot ready (${res.entries.toLocaleString()} entries, ` +
+        `${(res.bytes / 1048576).toFixed(1)} MB, ${Date.now() - t0}ms).`,
+      dim: true,
+    });
+    return true;
+  } catch (err) {
+    post("log", {
+      line: `  [depcache] prebuilt snapshot fetch failed (${(err && err.message) || err}) — installing normally.`,
+      dim: true,
+    });
+    return false;
+  }
+}
+
 // Try to restore node_modules for `dir` from the dependency cache. Returns true
 // (and the shell can skip install) only on a real restore. Best-effort: any
 // failure just falls back to a normal install.
@@ -720,7 +801,14 @@ async function tryRestoreDeps(dir, pmHint) {
     const pm = pmName(pmHint);
     const key = await computeDepKey(dir, pm);
     if (!key) return false;
-    if (!(await kernelFsRef.fs.depCacheHas(key))) return false;
+    if (!(await kernelFsRef.fs.depCacheHas(key))) {
+      // Nothing installed this tree before — but the app may ship it prebuilt,
+      // which is the whole first-run cost for a template.
+      if (!(await tryFetchShippedSnapshot(key, pm))) return false;
+    }
+    // Restoring ~13k entries is fast but not instant, and until it finishes the
+    // terminal says nothing. Say what is happening first.
+    post("log", { line: `  [depcache] restoring node_modules for ${pm}…`, dim: true });
     const t0 = Date.now();
     const count = await kernelFsRef.fs.depCacheRestore(key, dir);
     if (count > 0) {
@@ -730,6 +818,7 @@ async function tryRestoreDeps(dir, pmHint) {
       });
       return true;
     }
+    post("log", { line: `  [depcache] snapshot restored nothing for ${pm} — installing normally.`, dim: true });
   } catch {
     /* best effort — fall back to install */
   }
@@ -1278,6 +1367,8 @@ async function boot() {
       type: "module",
       name: "Process Worker PID " + info.pid,
     });
+    // Proof the worker's module graph evaluated — see reportWorkerError below.
+    let sawMessage = false;
     worker.onmessage = (event) => {
       // Diagnostic reply path (per-PID Measure Memory) — resolve its waiter
       // instead of routing through the kernel's per-process handler table.
@@ -1289,9 +1380,49 @@ async function boot() {
         }
         return;
       }
+      sawMessage = true;
       const handler = info.on[event.data.type];
       if (handler) handler(event.data);
     };
+    // A worker that fails to BOOT never sends 'exit', so without these handlers the
+    // kernel never finalizes it and every waiter hangs forever — the terminal keeps
+    // its last line, start()'s promise never settles, a parent parked on OP_SPAWN is
+    // stuck. What the platform gives us, and what it actually means:
+    //   onerror        — either the worker failed to load/evaluate its module graph
+    //                    (fatal: it never ran), or an uncaught exception propagated
+    //                    out of a RUNNING worker's event loop. The second case is
+    //                    NOT death: per spec the error is merely reported and the
+    //                    worker keeps servicing tasks. The kernel distinguishes them
+    //                    by whether the worker has ever posted a message; killing on
+    //                    the second case broke `astro dev`, which throws ~113 times
+    //                    per run and had always survived it.
+    //   onmessageerror — a message failed to deserialize (an untransferable value in
+    //                    workerData, say); the worker is alive.
+    // Neither is how an OOM kill arrives: Chrome reclaims a worker without firing
+    // anything at all, which is why the liveness watchdog exists. ErrorEvent.message
+    // is often empty for cross-origin errors, hence the fallback text.
+    // Whether the worker ever came up is decided HERE, where the platform detail
+    // lives: a worker that has posted even one message evaluated its module graph and
+    // is running, so an `error` from it is an uncaught exception, not a death. The
+    // 5s floor covers the one shape the message test misses — a process that boots and
+    // does only filesystem work, which the kernel never hears from (fs traffic goes
+    // direct to the FS worker) — because a worker still alive after 5s plainly booted.
+    // Erring towards NOT fatal is deliberate: wrongly killing a live process is the
+    // regression that broke `astro dev`, whereas a genuinely dead worker that is not
+    // finalized is caught by the liveness watchdog seconds later.
+    const spawnedAt = Date.now();
+    const reportWorkerError = (error: string) => {
+      const handler = info.on["worker-error"];
+      if (handler) handler({ type: "worker-error", error, fatal: !sawMessage && Date.now() - spawnedAt < 5000 });
+    };
+    worker.onerror = (event) => {
+      const e = event as ErrorEvent;
+      reportWorkerError(
+        (e && (e.message || (e.error && e.error.message))) || "worker terminated without an error message",
+      );
+    };
+    // Never fatal: the worker is alive, it just could not read one message.
+    worker.onmessageerror = () => reportWorkerError("worker could not deserialize a message");
     procWorkers.set(info.pid, { worker, name: "PID " + info.pid });
     const { port1, port2 } = new MessageChannel();
     fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
@@ -1344,14 +1475,69 @@ async function boot() {
     stderr: (chunk, pid) => {
       const eid = execByPid.get(pid);
       if (eid !== undefined) { post("proc-out", { execId: eid, stream: "stderr", chunk }); return; }
-      const tid = termByPid.get(pid);
+      // Direct hit first (the common case: a shell's own output). Falling back to the
+      // parent chain matters for a CHILD that died — its stderr normally relays through
+      // the parent worker, which is exactly what is unavailable when the parent is gone
+      // too, and that text is the diagnosis. Without this it goes to the studio console
+      // where the user never sees it.
+      const tid = termByPid.get(pid) ?? terminalForPid(pid);
       if (tid !== undefined) {
         clearProgress(tid);
         post("term-out", { terminalId: tid, chunk });
       } else post("stderr", { chunk });
     },
   });
+  // Liveness watchdog: a process has gone quiet for a long time. This is the only
+  // thing the user can see when the VM stops making progress — previously a wedged
+  // install left the terminal on its last line with no indication whether it was
+  // working or dead, which cost two rounds of misdiagnosis. Purely informational:
+  // a slow-but-healthy install prints one line and carries on.
+  // "Is it working or wedged?" cannot be answered from the kernel: a process's file
+  // writes bypass it entirely (they go straight to the FS worker over a SAB), so a
+  // process extracting 12,000 packages registers zero kernel syscalls. The VFS file
+  // count is the signal that actually tracks reify progress, and only this side can
+  // ask for it. Remembered per process so each report is a comparison, not a snapshot.
+  const stallVfsSeen = new Map<number, number>();
+  kernel.onProcStall = async (pid, info) => {
+    const secs = Math.round(info.silentMs / 1000);
+    const what = [info.command, ...(info.args || [])].join(" ").slice(0, 80);
+    const vfs = await queryVfsMem(1500);
+    const files = vfs && vfs.files >= 0 ? vfs.files : null;
+    const before = stallVfsSeen.get(pid);
+    if (files !== null) stallVfsSeen.set(pid, files);
+    const grew = files !== null && before !== undefined ? files - before : null;
+
+    let verdict: string;
+    if (grew !== null && grew > 0) {
+      verdict =
+        `It IS still working — the filesystem gained ${grew.toLocaleString()} files since the ` +
+        `last check (${files!.toLocaleString()} total). A first install writes tens of thousands.`;
+    } else if (grew !== null && grew === 0 && info.idleMs > 5000) {
+      verdict =
+        `Nothing has changed since the last check (${files!.toLocaleString()} files, no syscall for ` +
+        `${Math.round(info.idleMs / 1000)}s), so it looks stuck rather than slow.`;
+    } else {
+      // First report for this process, or ambiguous — describe, don't diagnose.
+      verdict =
+        `It may just be slow — a first install downloads and writes a lot` +
+        (files !== null ? ` (${files.toLocaleString()} files in the VFS so far)` : "") +
+        ". Watch whether the next check shows progress.";
+    }
+    const line =
+      `  [runtime] PID ${pid} (${what}) has printed nothing for ${secs}s. ${verdict}` +
+      (info.workerErrors ? ` (${info.workerErrors} uncaught worker errors so far.)` : "") +
+      " Run `await __vv.diag()` in the DevTools console for live detail.";
+    const tid = terminalForPid(pid);
+    if (tid === undefined) {
+      post("log", { line, dim: true });
+      return;
+    }
+    clearProgress(tid);
+    post("term-out", { terminalId: tid, chunk: `\r\x1b[2K\x1b[2m${line}\x1b[0m\r\n` });
+  };
+
   kernel.onProcExit = (pid, res) => {
+    stallVfsSeen.delete(pid);
     // Persistent dependency cache (P1): a package-manager install that just
     // finished cleanly is our signal to snapshot node_modules. Keying off the
     // process invocation covers every install path uniformly — the auto-run
@@ -1365,7 +1551,10 @@ async function boot() {
     if (eid !== undefined) {
       execByPid.delete(pid);
       pidByExec.delete(eid);
-      post("proc-exit", { execId: eid, code: res.code });
+      // `error` is set only when the process died of a worker fault rather than
+      // exiting, so an SDK consumer can tell "the program failed" from "the VM lost
+      // the program". The other proc-exit sites already carry this field.
+      post("proc-exit", { execId: eid, code: res.code, ...(res.error ? { error: res.error } : {}) });
       return;
     }
     const tid = termByPid.get(pid);
@@ -2134,6 +2323,31 @@ self.onmessage = async (event) => {
       post("log", { line: "[edit] write failed: " + errMsg(err), stream: "stderr" });
       if (m.reqId != null) replyErr(m.reqId, err);
     }
+    return;
+  }
+
+  // ── live runtime diagnostics (the page exposes this as __vv.diag()) ──
+  // Deliberately cheap and side-effect free, so it is safe to call repeatedly while
+  // something is stuck. Combines the kernel's per-process liveness with the VFS size
+  // and per-worker heaps, which is enough to tell "slow" from "wedged" from "out of
+  // memory" without access to the machine.
+  if (m.type === "vv-diag") {
+    if (!kernel) { post("vv-reply", { reqId: m.reqId, ok: false, error: "kernel not ready" }); return; }
+    const diag = kernel.diagnostics();
+    Promise.all([queryVfsMem(), queryAllProcMem()])
+      .then(([vfs, procMem]) => {
+        const byPid = new Map((procMem || []).map((r) => [r.pid, r]));
+        for (const p of diag.procs) {
+          const mem = byPid.get(p.pid);
+          if (mem) {
+            p.heapBytes = mem.heap;
+            p.modules = mem.modules;
+          }
+          p.terminalId = terminalForPid(p.pid) ?? null;
+        }
+        post("vv-reply", { reqId: m.reqId, ok: true, diag: { ...diag, vfs } });
+      })
+      .catch((err) => post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) }));
     return;
   }
 

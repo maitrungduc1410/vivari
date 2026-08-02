@@ -6989,6 +6989,433 @@ console.log(greet("Vivari"));
   };
 }
 
+// ── Rspress ──────────────────────────────────────────────────────────────────
+// Rspress is the Rspack-powered docs SSG (MDX + React + Shiki). It rides the
+// Rsbuild path we already prove in-VM (rsbuildTemplate + scripts/spike-rsbuild.mjs):
+// @rspress/core depends on @rsbuild/core ^2.1.x -> @rspack/core -> @rspack/binding,
+// whose optionalDependencies include @rspack/binding-wasm32-wasi. Our runtime reports
+// `process.arch === "wasm32"`, so npm's platform auto-select picks that wasm32-wasip1-
+// threads binding and NO native .node addon is ever fetched — no registry aliasing
+// needed (unlike esbuild/rollup/lightningcss, which need the fetcher's native->wasm
+// packument aliasing because their wasm builds live under a different package name).
+//
+// WHICH MAJOR: v2, and it must be v2. The v1 line (`rspress` 1.47.x) pins
+// @rsbuild/core ~1.3.18 -> @rspack/core 1.3.9 -> @rspack/binding 1.3.9 exactly, and
+// @rspack/binding only started publishing @rspack/binding-wasm32-wasi in 1.4.0. So
+// Rspress v1's whole chain is exact-pinned to a pre-wasm Rspack: in-VM it would
+// resolve no binding at all and die requiring a native addon. Rspress v2 shipped
+// stable under the RENAMED package `@rspress/core` (2.x); the old `rspress` package
+// stops at 2.0.0-beta and its `latest` tag still points at v1 — hence the dependency
+// on `@rspress/core`, not `rspress`.
+//
+// THE GOTCHA — Rspack's persistent build cache panics the wasm binding. Rspress (unlike
+// plain Rsbuild) turns Rspack's persistent build cache ON by default. That cache calls
+// `std::process::id()`, which is unsupported on wasm32-wasip1, so the Rust core aborts
+// mid-build with a hard panic — the dev server binds its port and then never compiles:
+//     thread 'tokio-0' panicked at library/std/src/sys/process/unsupported.rs:
+//     no pids on this platform
+//     RuntimeError: unreachable
+// Rspress gates that cache on RSPRESS_PERSISTENT_CACHE, so the manifest's `env` sets it
+// to "false" — a framework-honored lever, no project-level config needed. This is the
+// ONLY reason rsbuildTemplate works in-VM while a stock Rspress config does not; keep
+// that env var or the template regresses to a blank page. (Rspress's other Rust-adjacent
+// default, lazy compilation, was measured and is FINE in-VM — left at its default.)
+//
+// Checked against the three VitePress in-VM gotchas — none of those bite here:
+//   1. Config loading. Rspress loads `rspress.config.*` via @rsbuild/core's own
+//      `loadConfig`, i.e. the exact loader the green Rsbuild template already
+//      exercises with an .mjs config — so we ship `rspress.config.mjs` (NOT the
+//      scaffolder's .ts, which would add a transpile step, and not a `__dirname`
+//      reference: `root` is omitted so it defaults to `<cwd>/docs`).
+//   2. worker_threads transferList / Atomics. @rspress/core bundles Tinypool, but
+//      only for SSG page rendering (`rspress build`), never the dev server; and the
+//      runtime already defaults PISCINA_DISABLE_ATOMICS=1 so pools use message
+//      passing (see packages/runtime/builtins/process.js).
+//   3. Shiki via synckit. Rspress highlights inside the async MDX/unified pipeline
+//      (@shikijs/rehype), not through synckit's Atomics.wait bridge, so there is no
+//      sync-language-load path to pre-empt — no `languages` allowlist needed.
+//
+// Proven headless by scripts/spike-rspress.mjs (install picks the wasm binding ->
+// `rspress dev` binds -> GET returns the Rspress shell), registered in the net tier of
+// scripts/run-spikes.mjs; also run with VV_BASE=/preview/3000/ so the base-prefixed
+// path this template actually ships is covered (shell + an asset under the prefix).
+function rspressTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "rspress",
+      framework: "rspress",
+      icon: "rspress",
+      category: "Docs",
+      name: "Rspress",
+      language: "JavaScript",
+      description: "Rspress — Rspack-powered docs site (MDX + React) running the Rust bundler as WebAssembly",
+      port: 3000,
+      openPath: "/",
+      entry: "docs/index.md",
+      hmr: true,
+      reload: false,
+      install: "npm install",
+      dev: "npm run dev",
+      // Rspack's persistent build cache calls std::process::id(), which panics the
+      // wasm32-wasip1 binding mid-build ("no pids on this platform"). Rspress enables
+      // that cache by default and honors this env var to turn it off — see the header
+      // comment. Without it the dev server binds but the site never compiles.
+      env: { RSPRESS_PERSISTENT_CACHE: "false" },
+      // Rspress is a client-routed SPA (react-router history mode): served at "/" its
+      // router lands on 404, so `base` below matches the proxy prefix and we keep it.
+      keepPreviewPrefix: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "rspress-site",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "rspress dev --port 3000",
+    "build": "rspress build",
+    "preview": "rspress preview --port 3000"
+  },
+  "dependencies": {
+    "@rspress/core": "^2.0.19"
+  },
+  "devDependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  }
+}
+`,
+      // An .mjs config on purpose — @rsbuild/core's loadConfig handles it on the same
+      // path the Rsbuild template already proves in-VM. `root` is left out so it
+      // defaults to <cwd>/docs, which avoids needing __dirname here.
+      "rspress.config.mjs": `import { defineConfig } from "@rspress/core";
+
+export default defineConfig({
+  // The Vivari preview serves this dev server under /preview/3000/. Rspress is a
+  // client-routed SPA, so set \`base\` to that prefix (paired with the template's
+  // keepPreviewPrefix flag) — otherwise the first load resolves to a 404 page.
+  // Rspress forwards this to Rsbuild as \`server.base\`.
+  base: "/preview/3000/",
+  lang: "en",
+  title: "Rspress in Vivari",
+  description: "Rspack-powered docs that build and run entirely in the browser VM",
+  themeConfig: {
+    socialLinks: [
+      { icon: "github", mode: "link", content: "https://github.com/web-infra-dev/rspress" },
+    ],
+  },
+});
+`,
+      "docs/_nav.json": `[
+  { "text": "Guide", "link": "/guide/getting-started", "activeMatch": "/guide/" }
+]
+`,
+      "docs/index.md": `---
+pageType: home
+
+hero:
+  name: Rspress in Vivari
+  text: Docs, in the browser VM
+  tagline: An Rspack-powered docs site compiled entirely client-side
+  actions:
+    - theme: brand
+      text: Get Started
+      link: /guide/getting-started
+features:
+  - title: Rust bundler as WebAssembly
+    details: Rspack's core runs as a wasm32-wasip1-threads binding — no native addon.
+    icon: 🦀
+  - title: Markdown & MDX
+    details: Write content in Markdown, drop in React components when you need them.
+    icon: 📦
+  - title: Instant HMR
+    details: Edit a page and it hot-reloads — no full rebuild, no native dependencies.
+    icon: 🔥
+---
+`,
+      "docs/guide/_meta.json": `["getting-started"]
+`,
+      "docs/guide/getting-started.md": `# Getting Started
+
+Welcome to **Rspress**, running entirely inside Vivari's in-browser VM.
+
+Edit \`docs/guide/getting-started.md\` and this page hot-reloads. Code blocks are
+highlighted by Shiki during MDX compilation, which happens in the VM:
+
+\`\`\`ts
+export function greet(name: string): string {
+  return \`Hello, \${name}!\`;
+}
+
+console.log(greet("Vivari"));
+\`\`\`
+
+## How this runs
+
+Rspress builds on [Rspack](https://rspack.rs), a Rust bundler. In the browser there
+is no native N-API addon to load, so npm resolves \`@rspack/binding-wasm32-wasi\`
+instead — the same WebAssembly binding the Rsbuild template uses.
+
+- Add a page by dropping a \`.md\` / \`.mdx\` file under \`docs/\`
+- Order the sidebar with \`_meta.json\`
+- Add nav entries in \`docs/_nav.json\`
+`,
+    },
+  };
+}
+// ── Starlight ────────────────────────────────────────────────────────────────
+// Astro Starlight rides the Astro path that is already proven in-VM by the shipped
+// `astro` template and scripts/spike-astro.mjs: the Vite dev server, the Go/wasm
+// @astrojs/compiler, and the rollup -> @rollup/wasm-node registry alias. What Starlight
+// adds on top — a content-collection pipeline (docsLoader + MDX + expressive-code) and a
+// themed MULTI-page site — is what needed proving, and it surfaced four in-VM gotchas:
+//
+//   1. Astro 5, NOT the latest. Astro >=6 moves Vite 6 -> Vite 7, whose bundler is
+//      rolldown, and rolldown does not load here: `astro dev` on Astro 7 logs
+//      "[rolldown] Downloading @rolldown/binding-wasm32-wasi@… on WebContainer" and dies
+//      with "TypeError: Class extends value undefined is not a constructor or null"
+//      before it ever binds a port. (Same family as the VITE_DEV `--configLoader native`
+//      workaround above, which exists because Vite's rolldown config bundler also fails
+//      in-VM.) So this pins astro ^5 and the newest Starlight line that peers on it,
+//      0.37.x. Revisit both together once rolldown works in-VM.
+//   2. Images go through `passthroughImageService()`, so no image binary is ever needed.
+//      Astro lists `sharp` as an optionalDependency and Starlight's `astro:assets` usage
+//      would otherwise construct the sharp-backed service. Measured in-VM: npm's platform
+//      auto-select skips every NATIVE @img/sharp-<platform> package and installs sharp
+//      0.34 plus its own wasm build, `@img/sharp-wasm32` — so a sharp-backed service is
+//      not strictly unavailable here. We still don't use it: that path is unproven in-VM
+//      and image transcoding in wasm is slow, and passthrough costs a docs site nothing
+//      (images are served untransformed). Treat the wasm sharp as a happy accident, not a
+//      dependency — the spike prints whether it landed but does not require it.
+//   3. `ec.config.mjs` MUST exist. Starlight always loads astro-expressive-code, whose
+//      loadEcConfigFile() dynamic-imports `<root>/ec.config.mjs` and treats the file as
+//      merely ABSENT only when the failure reports the ESM code ERR_MODULE_NOT_FOUND (or
+//      ERR_LOAD_URL). In-VM that import fails with the CommonJS code MODULE_NOT_FOUND, so
+//      expressive-code concludes the config exists but is BROKEN and hard-exits the
+//      "astro:config:setup" hook — `astro dev` never binds. Shipping the file sidesteps
+//      the misread entirely, and it is a real Starlight file users want anyway.
+//   4. `pagefind: false`. Starlight's built-in search shells out to Pagefind, whose
+//      binaries are optional platform packages (@pagefind/linux-x64 and friends) that npm
+//      also skips on wasm32 — so a production build would reach for a binary that has no
+//      wasm32 equivalent. Dev never invokes it; disabling it keeps `npm run build` honest
+//      too. Search is the one feature knowingly traded away to run in-VM.
+//   5. `.npmrc` with legacy-peer-deps — a real but PARTIAL win, and read gotcha 6 before
+//      assuming it fixed anything user-visible. Astro's `unstorage`/`db0` declare ~19
+//      OPTIONAL peerDependencies naming some of the largest packages on npm (Prisma,
+//      Drizzle, react-native, Azure, Xata). npm resolves a manifest for each even though it
+//      installs none, and arborist's #fetchManifest always asks for FULL packuments, so a
+//      cold install pulled ~420 MB of DECODED JSON through the fetcher + VFS (measured;
+//      ~45 MB on the wire, ~10x that once gunzipped) — 4x Rspress, more than Docusaurus.
+//      This file brings it to ~108 MB. That is worth keeping on its own merit, but it
+//      addresses the RESOLVE/DOWNLOAD phase, and the failure users actually hit is later
+//      (gotcha 6). Do not delete it without re-measuring;
+//      scripts/spike-starlight-studio.mjs fails if the volume regresses past its budget.
+//   6. THE HANG USERS ACTUALLY HIT, and why `install` carries --ignore-scripts. `astro`
+//      depends on sharp, and npm runs its install script during reify — right after the
+//      downloads finish, which is exactly where four separate reports said the terminal
+//      stopped. It is a DEADLOCK, not slowness. Caught wedged, `__vv.diag()` says:
+//        pid 3  npm install                                    idle 153s
+//        pid 4  sh -c node install/check.js || npm run build    idle 152s  [node_modules/sharp]
+//        pid 5  node install/check.js            28 modules, 2 syscalls, idle 152s
+//      with fetch inflight/queued/active all 0, pendingHttp 0, booted true, paused false.
+//      So sharp's check script loads, does almost nothing, and then never exits — nothing
+//      is pending for it to wait on, and the runtime never decides it is finished. npm
+//      waits on the child forever, so `npm install && npm run dev` never reaches the dev
+//      server. Skipping scripts removes the mechanism outright: 4 of 4 runs wedged before,
+//      2 of 2 completed after, on the same rig. Nothing is lost here — the image service is
+//      passthrough so sharp is never loaded, and esbuild's postinstall is moot because the
+//      registry aliases it to esbuild-wasm.
+//      Reproduce it (the wedge needs a slow enough page — a production build usually wins
+//      the race and installs fine, which is why this went unreproduced for so long): serve
+//      the studio with `vite dev`, make sure vendor/depcache/index.json is NOT served so the
+//      install path is taken, then run scripts/repro-starlight-browser.mjs.
+//   7. Starlight's `astro dev` also throws 8-113 UNCAUGHT
+//      `SyntaxError: "[object Object]" is not valid JSON` per run inside its process worker
+//      (Rspress, same install path, throws zero). These are NOT the hang — the dev server
+//      bound in 7 of 7 runs on current HEAD with all of them firing — but they are real and
+//      unexplained. A browser Worker survives an uncaught error, so they only become fatal
+//      if something treats `worker.onerror` as worker death: with such a change in place 0
+//      of 4 runs bound, versus 9 of 9 without it. Do not add one back.
+//      No stack is available for them: Runtime.exceptionThrown delivers these with an EMPTY
+//      stack, and booting the worker from a module blob that shims JSON.parse (to trap the
+//      call site) stops the kernel booting, so that route is a dead end too.
+//      What this is NOT: not packument volume (gotcha 5), not the reify phase in general,
+//      not Chrome Incognito (a cold A/B of an incognito context vs a fresh profile came out
+//      indistinguishable: 53.7 s / 57.3 s vs 52.3 s / 66.2 s), and NOT the terminal
+//      dropping output. That last one was tested directly by reading the text xterm painted
+//      rather than counting characters: `added 364 packages`, the tsconfck warning that
+//      precedes it by 0.4s, and the runtime's own watchdog line all reach the screen, in
+//      order, including output following a \r-terminated progress line. Memory does set a
+//      hard floor — a cold install peaks around 1.87 GB across the whole Chrome process
+//      tree, and under a 1.6 GB ceiling the kernel SIGKILLs the RENDERER (errorCode 9),
+//      which is Chrome's crash page, not a frozen terminal.
+//
+// keepPreviewPrefix is REQUIRED here, unlike the `astro` template — settled empirically,
+// not assumed. Starlight renders its sidebar, prev/next pager and site-title link as
+// ROOT-ABSOLUTE hrefs that follow Astro's `base`. Clicking one is a top-level navigation,
+// and packages/studio/public/sw.js deliberately refuses to proxy a navigation carrying no
+// /preview/<port>/ marker (it assumes such a document is the studio's own). With the
+// default base those links come out as "/guides/…", so the site would load and then break
+// on the first sidebar click. So `base` matches the proxy prefix and we keep it. The
+// single-page `astro` template escapes this only because it has no internal links at all.
+//
+// Proven headless by scripts/spike-starlight.mjs (install lands no native sharp ->
+// `astro dev` binds -> the Starlight shell, a deep link, every internal link and both
+// asset shapes all check out under the prefix), registered in the net tier of
+// scripts/run-spikes.mjs.
+function starlightTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "starlight",
+      framework: "starlight",
+      icon: "starlight",
+      category: "Docs",
+      name: "Starlight",
+      language: "TypeScript",
+      description:
+        "Astro Starlight — full-featured docs site (Markdown/MDX content collections) on Astro's Vite dev server",
+      port: 4321,
+      openPath: "/",
+      entry: "src/content/docs/index.mdx",
+      hmr: true,
+      reload: false,
+      // --ignore-scripts is LOAD-BEARING, not tidiness: astro pulls sharp, whose install
+      // script (`node install/check.js`) starts, loads 28 modules, makes two syscalls and
+      // then never exits — no fetch in flight, no pending HTTP, not paused, just idle
+      // forever. npm waits on it, so `npm install && npm run dev` stops dead right after
+      // the downloads finish. That is the hang users reported for four rounds; see gotcha 6.
+      // Nothing is lost: the image service is passthrough, so sharp is never loaded, and
+      // esbuild's postinstall is moot because the registry aliases it to esbuild-wasm.
+      // The project's package.json stays vanilla — this is a studio-side install choice,
+      // same as the Angular template.
+      install: "npm install --ignore-scripts",
+      dev: "npm run dev",
+      // NOT experimental any more, on this evidence: the deadlock in gotcha 6 is gone by
+      // construction (sharp's script is never run), the rig that wedged 4 of 4 times now
+      // completes 2 of 2, spike-starlight / -studio / -depcache and rspress are all green,
+      // and in a real browser first run is a dep-cache RESTORE rather than an install
+      // (5.4 s for 13,459 entries, dev server listening 13 s after Create). The dev server
+      // bound in 7 of 7 runs on HEAD. The uncaught JSON errors in gotcha 7 are still
+      // unexplained — if you make them fatal, or if a change puts an install script back in
+      // the first-run path, this template is the one that will break first.
+      // Starlight's nav/sidebar links are root-absolute, and the SW won't proxy a
+      // navigation without the proxy prefix — see the header comment.
+      keepPreviewPrefix: true,
+    },
+    files: {
+      "package.json": `{
+  "name": "starlight-docs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev --port 4321",
+    "build": "astro build",
+    "preview": "astro preview --port 4321"
+  },
+  "dependencies": {
+    "astro": "^5.18.0",
+    "@astrojs/starlight": "^0.37.7"
+  }
+}
+`,
+      "astro.config.mjs": `import { defineConfig, passthroughImageService } from 'astro/config'
+import starlight from '@astrojs/starlight'
+
+export default defineConfig({
+  // Matches the studio's preview proxy path (manifest keepPreviewPrefix) so Starlight's
+  // root-absolute sidebar links stay inside the preview.
+  base: '/preview/4321/',
+      // Keep image handling off the sharp path entirely — see the header comment.
+      // Passthrough serves images untransformed.
+      image: { service: passthroughImageService() },
+  integrations: [
+    starlight({
+      title: 'Starlight on Vivari',
+      description: 'Docs that build and run entirely in the browser VM',
+      // Pagefind's search binaries have no wasm32 build — see the header comment.
+      pagefind: false,
+      sidebar: [
+        { label: 'Guides', items: [{ label: 'Getting Started', slug: 'guides/getting-started' }] },
+      ],
+    }),
+  ],
+})
+`,
+      // Load-bearing for first-run install cost — see gotcha 5 in the header comment.
+      ".npmrc": `# Why this exists (it is not a style preference):
+#
+# Astro's own \`unstorage\` (and its \`db0\` sibling) declare ~19 OPTIONAL peerDependencies
+# pointing at some of the biggest packages on npm — @prisma/client, drizzle-orm, prisma,
+# react-native, @azure/cosmos, @xata.io/client. npm resolves a manifest for every one of
+# them even though it installs none, and npm's ideal-tree builder always asks for FULL
+# packuments (arborist's #fetchManifest hardcodes fullMetadata: true). On a cold cache that
+# dragged ~420 MB of DECODED JSON through the in-browser fetcher and VFS — four times the
+# Rspress template and more than Docusaurus. Ignoring peer resolution cuts it to ~108 MB
+# (measured), i.e. back in line with the other docs templates. This shortens the download
+# phase; it is not a cure for a first install that stalls after downloading.
+#
+# Safe here: the only peer relationship in this tree is @astrojs/starlight -> astro, and
+# astro is a direct dependency above, so nothing is left unsatisfied. If you add a package
+# that genuinely needs its peers installed for you, drop this line and run npm install again.
+legacy-peer-deps=true
+`,
+      // Required, not decorative: without this file expressive-code misreads "absent" as
+      // "broken" in-VM and `astro dev` exits. See the header comment.
+      "ec.config.mjs": `// Expressive Code options for Starlight's code blocks.
+// Deliberately a plain object with NO imports: this file is loaded by a bare dynamic
+// import from the project root (Vite never processes it), so keeping it dependency-free
+// avoids an ESM re-export chain at boot. \`defineEcConfig\` from
+// '@astrojs/starlight/expressive-code' is only a typing helper, so nothing is lost.
+export default {
+  styleOverrides: { borderRadius: '0.4rem' },
+}
+`,
+      // Starlight's default <head> points at /favicon.svg; ship the official starter's
+      // mark (withastro/starlight examples/basics) so the shell has no 404. Its embedded
+      // prefers-color-scheme style adapts it to light and dark.
+      "public/favicon.svg": `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><path fill-rule="evenodd" d="M81 36 64 0 47 36l-1 2-9-10a6 6 0 0 0-9 9l10 10h-2L0 64l36 17h2L28 91a6 6 0 1 0 9 9l9-10 1 2 17 36 17-36v-2l9 10a6 6 0 1 0 9-9l-9-9 2-1 36-17-36-17-2-1 9-9a6 6 0 1 0-9-9l-9 10v-2Zm-17 2-2 5c-4 8-11 15-19 19l-5 2 5 2c8 4 15 11 19 19l2 5 2-5c4-8 11-15 19-19l5-2-5-2c-8-4-15-11-19-19l-2-5Z" clip-rule="evenodd"/><path d="M118 19a6 6 0 0 0-9-9l-3 3a6 6 0 1 0 9 9l3-3Zm-96 4c-2 2-6 2-9 0l-3-3a6 6 0 1 1 9-9l3 3c3 2 3 6 0 9Zm0 82c-2-2-6-2-9 0l-3 3a6 6 0 1 0 9 9l3-3c3-2 3-6 0-9Zm96 4a6 6 0 0 1-9 9l-3-3a6 6 0 1 1 9-9l3 3Z"/><style>path{fill:#000}@media (prefers-color-scheme:dark){path{fill:#fff}}</style></svg>
+`,
+      "src/content.config.ts": `import { defineCollection } from 'astro:content'
+import { docsLoader } from '@astrojs/starlight/loaders'
+import { docsSchema } from '@astrojs/starlight/schema'
+
+export const collections = {
+  docs: defineCollection({ loader: docsLoader(), schema: docsSchema() }),
+}
+`,
+      "src/content/docs/index.mdx": `---
+title: Starlight on Vivari
+description: An Astro Starlight docs site compiled entirely in the browser VM
+---
+
+Welcome to **Starlight**, running entirely inside Vivari's in-browser VM — Astro's Vite
+dev server and the WebAssembly build of Astro's compiler, no native binaries.
+
+- Write docs in Markdown or MDX
+- Live hot reload as you edit
+- Zero native dependencies
+`,
+      "src/content/docs/guides/getting-started.md": `---
+title: Getting Started
+description: Add a page, order the sidebar, and watch it hot-reload
+---
+
+Add a page by dropping a \`.md\` / \`.mdx\` file under \`src/content/docs/\`,
+then list it in the \`sidebar\` array in \`astro.config.mjs\`.
+
+Code blocks are rendered by Expressive Code, configured in \`ec.config.mjs\`:
+
+\`\`\`ts
+export function greet(name: string): string {
+  return \`Hello, \${name}!\`
+}
+\`\`\`
+`,
+    },
+  };
+}
+
 // ── Angular ──────────────────────────────────────────────────────────────────
 // Angular 21 runs in-VM on its stock `@angular/build` toolchain (esbuild + Vite
 // dev server) from a completely vanilla project — same package.json / angular.json
@@ -7817,6 +8244,8 @@ export const TEMPLATES: TemplateDef[] = [
   slidevTemplate(),
   docusaurusTemplate(),
   vitepressTemplate(),
+  rspressTemplate(),
+  starlightTemplate(),
   // Creative
   threeTemplate(),
   gsapReactTemplate(),

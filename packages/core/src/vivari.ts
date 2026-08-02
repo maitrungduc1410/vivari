@@ -192,6 +192,9 @@ export class Vivari {
     }
     const failure = await outcome;
     if (failure) throw failure;
+    // `__vv.diag()` is installed by KernelBridge itself, not here — the studio builds
+    // a bridge directly and never calls boot(), so hooking it here made the
+    // diagnostic invisible in the one place a user actually is.
     return vivari;
   }
 

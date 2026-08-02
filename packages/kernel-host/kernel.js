@@ -129,6 +129,22 @@ export class Kernel {
     this.debugQueue = new Map(); // pid -> string[] of commands awaiting the SAB slot
     this.onDebugEvent = null; // (pid, jsonString)
     this.onDebugTarget = null; // (pid, added:boolean, info)
+
+    // ---- process liveness watchdog -------------------------------------------
+    // A process worker can die without saying so: it throws at boot, or the browser
+    // reclaims it under memory pressure. Nothing then arrives on its 'exit' channel,
+    // so finalize() never runs and every waiter (start()'s promise, a parent parked
+    // on OP_SPAWN, the studio terminal awaiting term-exit) waits forever. Worker
+    // 'error'/'messageerror' now route to handleWorkerError so the common cases DO
+    // finalize — but a worker can also just stop making progress with no event at
+    // all, which is indistinguishable from a slow install. So we also track a
+    // last-activity stamp per process and report anything that has gone quiet, which
+    // turns "the terminal froze" into a line of text the user can act on. Reporting
+    // only, never a kill: a genuinely slow `npm install` must not be terminated.
+    this.onProcStall = null; // (pid, { command, args, cwd, silentMs, reported })
+    this.stallThresholdMs = 60000; // report a process that has been silent this long
+    this.stallCheckMs = 15000; // how often to look
+    this._stallTimer = null;
     // Live "debug mode" flag, toggled from the studio. When on, every debuggable
     // process (see skip-list in createProcess) becomes a debug target — regardless
     // of when its terminal opened, so toggling debug mode takes effect immediately
@@ -143,11 +159,44 @@ export class Kernel {
     // scratch: the durable, reusable copy is the package manager's OWN content-
     // addressed cache under /home/user/.cache (persisted in OPFS). So cap the
     // total and evict the least-recently-used bodies — dropping both the
-    // fetchCache entry AND its VFS file — once we exceed the cap. Because meta and
-    // body file are evicted together, "meta present ⟺ body present" stays true, so
-    // a cache hit never points at a missing file.
-    this.fetchCacheMaxBytes = 128 * 1024 * 1024; // 128 MiB scratch ceiling
+    // fetchCache entry AND its VFS file — once we exceed the cap.
+    //
+    // Evicting meta and file together keeps "meta present ⟺ body present" true, so
+    // a future cache HIT never points at a missing file. But that was never the
+    // dangerous window. We hand a process a PATH and it reads the bytes back later,
+    // in its own turn; between those two moments eviction runs on other threads'
+    // downloads. Evicting there unlinks a body its reader has not read yet, and
+    // https.js turns the resulting ENOENT into an empty 200 — silent corruption,
+    // not an error. Measured: at a 4 MiB cap, 303 of 977 body reads failed that way
+    // and the install broke; at 128 MiB eviction almost never runs, which is the
+    // only reason it has never been seen in the wild.
+    //
+    // So bodies are REFERENCE COUNTED (_fetchBodyPins) from handoff until the FS
+    // layer reports the read finished. Eviction may always drop the accounting, but
+    // the file itself only goes once the last reader releases it (or its process
+    // exits). That makes the cap safe to lower, which is what actually matters:
+    // the VFS holds these bodies in Wasm memory that never shrinks, so the cap is a
+    // direct lever on peak residency — 128 MiB of scratch was ~200 MB of peak RSS
+    // to avoid 4.3 MB of re-download (44 hits in a Starlight install).
+    this.fetchCacheMaxBytes = 16 * 1024 * 1024; // 16 MiB scratch ceiling
     this._fetchCacheBytes = 0; // running total of cached body sizes
+    // path -> pid[]: one entry per outstanding handoff, so a body shared by an
+    // in-flight de-dupe is only freed after EVERY sharer has read it. Array (not a
+    // count) so a dead process's references can be dropped precisely.
+    this._fetchBodyPins = new Map();
+    // Bodies evicted from the accounting while still pinned: unlink on last release.
+    this._fetchBodyOrphans = new Set();
+    // Body paths are uniquified per fetch (see _fetchCachePath). Without this, a
+    // re-fetch after eviction would reuse the evicted path and a stale pending
+    // unlink would delete the NEW body.
+    this._fetchBodySeq = 0;
+    // The read of a fetched body happens in the FS layer, not here, so the kernel
+    // has to be told when it finishes. Embedders whose fs client can report it
+    // (createKernelFs) wire it automatically; one that can't simply keeps bodies
+    // until the owning process exits, which is safe, just less thrifty.
+    if (this.fs && typeof this.fs.setBodyConsumedHandler === "function") {
+      this.fs.setBodyConsumedHandler((path) => this.releaseFetchBody(path));
+    }
 
     // ---- async fetch: parallel downloads (OP_FETCH_ASYNC) ----
     // The real npm/yarn/pnpm issue many registry requests at once, but its Agent
@@ -345,7 +394,39 @@ export class Kernel {
       outBuf: [],
       errBuf: [],
       onExit: null,
+      // Settled instead of onExit when the process died of a WORKER fault rather
+      // than running to completion (see finalize). start() wires this to its
+      // promise's reject; callers that only set onExit still get the result there,
+      // so every existing consumer keeps working unchanged.
+      onError: null,
       finalized: false,
+      // Liveness watchdog bookkeeping. Two stamps, because they answer different
+      // questions and conflating them made the watchdog unable to ever fire:
+      //   lastActivity — any syscall OR output. "Is this process doing anything?"
+      //   lastOutput   — output only. "Has the user seen anything?"
+      // The stall we actually need to report is a process that is BUSY and SILENT:
+      // npm's reify phase writes ~12k files, so syscalls stream continuously and a
+      // syscall-based threshold never trips, while the user stares at a dead
+      // terminal. So the watchdog keys on lastOutput and reports syscall counts as
+      // evidence of what the process is doing. `stallReportedAt` is the silence
+      // duration at the last report, so repeats back off by doubling instead of
+      // spamming a slow-but-healthy install.
+      lastActivity: Date.now(),
+      lastOutput: Date.now(),
+      syscalls: 0,
+      stallReportedAt: 0,
+      // Uncaught errors reported by the worker itself (browser `error` event). NOT
+      // deaths — see handleWorkerError. Counted so a process throwing in a loop is
+      // visible in diagnostics without spamming the terminal 113 times.
+      workerErrors: 0,
+      firstWorkerError: null,
+      // Set by the first syscall or byte of output. A worker whose module graph
+      // evaluated always reaches one almost immediately (the runtime reads its entry
+      // script through the VFS), so this is solid evidence it came up — and it is
+      // derived from signals every embedder already routes, rather than needing each
+      // spawnWorker to report boot separately. An `error` event while this is still
+      // false means the worker never ran, which IS fatal (nothing else settles it).
+      booted: false,
       handle: null,
       command: spec.command,
       // The launch args, kept so process exit can report the full invocation (e.g.
@@ -405,6 +486,14 @@ export class Kernel {
         stdout: (m) => this.onOutput(pid, m.chunk, false),
         stderr: (m) => this.onOutput(pid, m.chunk, true),
         exit: (m) => this.finalize(pid, m.code | 0),
+        // The worker died rather than exited: it threw at boot, its module graph
+        // failed to load, or the browser reclaimed it (a V8 OOM kill). The
+        // environment's spawnWorker reports it here; without this the process would
+        // simply never finalize. See handleWorkerError.
+        // The worker reported an `error`/`messageerror` event. This is NOT
+        // necessarily death — see handleWorkerError, which only treats it as fatal
+        // before the worker has come up.
+        "worker-error": (m) => this.handleWorkerError(pid, m),
         // #16 stage 2b: this process' worker_threads asks the kernel to spawn /
         // terminate a nested thread worker.
         "thread-spawn": (m) => this.handleThreadSpawn(pid, m),
@@ -431,6 +520,7 @@ export class Kernel {
     if (debugEnabled && this.onDebugTarget) {
       this.onDebugTarget(pid, true, { command: spec.command, args: spec.args || [], cwd: spec.cwd });
     }
+    this._startStallWatchdog();
     return pid;
   }
 
@@ -496,6 +586,11 @@ export class Kernel {
   onOutput(pid, chunk, isErr) {
     const proc = this.procs.get(pid);
     if (!proc) return;
+    // Output is the only progress the USER can see, so it gets its own stamp; the
+    // watchdog keys on it. (A `capture: true` process is not user-visible, but it is
+    // also not being watched by anyone staring at a terminal, so it is stamped too.)
+    proc.lastOutput = proc.lastActivity = Date.now();
+    proc.booted = true;
     if (proc.capture) {
       (isErr ? proc.errBuf : proc.outBuf).push(chunk);
       return;
@@ -515,7 +610,177 @@ export class Kernel {
     (isErr ? this.stderr : this.stdout)(chunk, pid);
   }
 
-  finalize(pid, code, signal = null) {
+  /**
+   * A process worker faulted instead of exiting. Surface it on the process's own
+   * stderr (so it lands in the terminal the user is staring at) and then run the
+   * NORMAL exit path, so every waiter is released: start()'s promise, a parent
+   * parked on OP_SPAWN, a worker_threads creator awaiting 'thread-exit', the
+   * studio's term-exit, and any in-flight HTTP request finalize() already 502s.
+   *
+   * Exit code 1 with `error` set, rather than a bespoke code, because callers
+   * already branch on `code !== 0`; the `error` string is the new information.
+   */
+  /**
+   * A process worker reported an error event.
+   *
+   * IMPORTANT: on the web platform a Worker's `error` event does NOT mean the worker
+   * died. An uncaught exception inside a worker is *reported* to the Worker object
+   * and the worker CARRIES ON servicing its event loop. Treating it as death was a
+   * real regression: `astro dev` throws ~113 uncaught SyntaxErrors per run from deep
+   * inside its own code, had always survived them (the dev server bound in 9 of 9
+   * runs), and finalizing on the first one killed it before it could ever listen —
+   * 0 of 5 runs bound. The shell returned to a prompt and the studio waited forever
+   * on a server that no longer existed, which looks exactly like the hang this was
+   * meant to fix.
+   *
+   * The one case that IS fatal is a worker that never came up — a script that failed
+   * to load or threw while evaluating its module graph. Nothing else will ever settle
+   * that, and it is the hang Fix A was written for. Only the environment can tell the
+   * two apart (it sees whether the worker ever posted a message), so it says so with
+   * `m.fatal`; absent that flag we assume NOT fatal, because wrongly killing a live
+   * process is far worse than being slow to report a dead one — the liveness watchdog
+   * catches the latter within seconds.
+   *
+   * Note this means an OOM-killed worker is NOT caught here either: Chrome reclaims a
+   * worker without firing any event at all. The watchdog is the only cover for that.
+   */
+  handleWorkerError(pid, m) {
+    const proc = this.procs.get(pid);
+    if (!proc || proc.finalized) return;
+    const msg = (m && (m.error || m.message)) || "process worker terminated unexpectedly";
+    proc.workerErrors++;
+    if (!proc.firstWorkerError) proc.firstWorkerError = msg;
+
+    if (m && m.fatal) {
+      const oom = /out of memory|OOM|allocation failed/i.test(msg);
+      const detail = oom
+        ? `${proc.command}: process worker ran out of memory (${msg}). The VM is out of ` +
+          "room for this process — close other previews/terminals or reload the page and try again.\n"
+        : `${proc.command}: process worker failed to start (${msg})\n`;
+      this.onOutput(pid, detail, true);
+      this.finalize(pid, 1, null, msg);
+      return;
+    }
+
+    // Running worker: surface the FIRST error only. These arrive in floods (113 for
+    // one `astro dev`) and 113 terminal lines would bury the output the user needs.
+    // The running total is available from diagnostics (see diagnostics()).
+    if (proc.workerErrors === 1) {
+      this.onOutput(
+        pid,
+        `${proc.command}: uncaught error in process worker (${msg})` +
+          " — the process is still running; further occurrences are counted, not printed\n",
+        true,
+      );
+    }
+  }
+
+  // ---- liveness watchdog ----------------------------------------------------
+  // Runs only while processes exist. Reports any process that has produced no OUTPUT
+  // for `stallThresholdMs`, whether or not it is making syscalls.
+  //
+  // Keying this on `lastActivity` instead — as it originally did — conflated two
+  // different things and made the report both unreliable and mislabelled ("has
+  // produced no output" while measuring syscalls). The user's complaint is "no
+  // output", so output is what must be measured.
+  //
+  // A vital caveat for anyone extending this: `syscalls`/`lastActivity` only count
+  // KERNEL syscalls (spawn, fetch, listen, …). A process's filesystem traffic goes
+  // straight to the FS worker over its own SAB and never reaches the kernel at all,
+  // so a process writing 12,000 files looks completely idle from here. Do NOT
+  // conclude "wedged" from a flat syscall count — measured: a guest in a tight
+  // writeFileSync loop registers ZERO kernel syscalls. Progress has to be judged from
+  // the VFS itself, which is what the environment's onProcStall handler does (it has
+  // the FS worker to ask; the kernel does not).
+  _startStallWatchdog() {
+    if (this._stallTimer || typeof setInterval !== "function") return;
+    this._stallTimer = setInterval(() => {
+      if (!this.procs.size) {
+        this._stopStallWatchdog();
+        return;
+      }
+      const now = Date.now();
+      for (const [pid, proc] of this.procs) {
+        if (proc.finalized) continue;
+        // A process parked at a breakpoint is *supposed* to be silent.
+        if (this.debugPaused.has(pid)) continue;
+        const silentMs = now - proc.lastOutput;
+        // Report at the threshold, then only when the silence has DOUBLED (60s, 2m,
+        // 4m, …). One line is not enough — the user who waited 30 minutes needs to
+        // keep seeing that nothing is happening — but a fixed interval would spam a
+        // slow-but-healthy install. Doubling is informative and self-limiting.
+        if (silentMs < proc.stallReportedAt * 2 || silentMs < this.stallThresholdMs) continue;
+        proc.stallReportedAt = silentMs;
+        if (this.onProcStall) {
+          this.onProcStall(pid, {
+            command: proc.command,
+            args: proc.args || [],
+            cwd: proc.cwd,
+            silentMs,
+            // Kernel-level activity only — see the caveat above. Useful evidence, but
+            // NOT sufficient to call a process wedged.
+            idleMs: now - proc.lastActivity,
+            syscalls: proc.syscalls,
+            workerErrors: proc.workerErrors,
+          });
+        }
+      }
+    }, this.stallCheckMs);
+    // Node only: don't hold the event loop open just for the watchdog (browsers
+    // have no unref, hence the guard).
+    if (this._stallTimer && typeof this._stallTimer.unref === "function") this._stallTimer.unref();
+  }
+
+  _stopStallWatchdog() {
+    if (!this._stallTimer) return;
+    clearInterval(this._stallTimer);
+    this._stallTimer = null;
+  }
+
+  /**
+   * A snapshot of live process state, for answering "it's just sitting there" without
+   * access to the machine. Surfaced to the page as `__vv.diag()`.
+   *
+   * The two silence numbers are the point: `sinceOutputMs` is what the user perceives,
+   * `sinceSyscallMs` is whether the process is actually doing anything. Busy and
+   * silent (high output silence, low syscall silence, climbing `syscalls`) is a slow
+   * install; silent on both is wedged. Call it twice a few seconds apart — the delta
+   * in `syscalls` settles it immediately.
+   */
+  diagnostics() {
+    const now = Date.now();
+    return {
+      now,
+      procs: [...this.procs.values()].map((p) => ({
+        pid: p.pid,
+        ppid: p.parentPid ?? 0,
+        command: [p.command, ...(p.args || [])].join(" "),
+        cwd: p.cwd,
+        sinceOutputMs: now - p.lastOutput,
+        sinceSyscallMs: now - p.lastActivity,
+        syscalls: p.syscalls,
+        // Uncaught errors inside the worker: NOT deaths, but a flood of them is a
+        // strong hint (see handleWorkerError).
+        workerErrors: p.workerErrors,
+        firstWorkerError: p.firstWorkerError,
+        booted: p.booted,
+        paused: this.debugPaused.has(p.pid),
+      })),
+      // Fetch scratch state, so a stuck install can be told from a stuck download.
+      fetch: {
+        inflight: this._fetchInflight ? this._fetchInflight.size : 0,
+        queued: this._fetchQueue ? this._fetchQueue.length : 0,
+        active: this._fetchActive || 0,
+        cachedEntries: this.fetchCache.size,
+        cachedBytes: this._fetchCacheBytes,
+        pinnedBodies: this._fetchBodyPins.size,
+      },
+      listeners: [...this.listeners.keys()],
+      pendingHttp: this.pendingHttp ? this.pendingHttp.size : 0,
+    };
+  }
+
+  finalize(pid, code, signal = null, error = null) {
     const proc = this.procs.get(pid);
     if (!proc || proc.finalized) return;
     proc.finalized = true;
@@ -546,6 +811,9 @@ export class Kernel {
       this.debugPaused.delete(pid);
       if (this.onDebugTarget) this.onDebugTarget(pid, false, {});
     }
+    // Any fetched body this process was handed but never read would otherwise stay
+    // pinned for the rest of the session.
+    this._releaseFetchBodiesForPid(pid);
     // Drop any ports this process was serving and fail its in-flight requests,
     // so a fetch that was waiting on a now-dead server does not hang forever.
     for (const [port, owner] of this.listeners) {
@@ -595,6 +863,9 @@ export class Kernel {
       code,
       pid,
       signal,
+      // Non-null only when the process died of a worker fault rather than exiting.
+      // Consumers can treat it as "this code is not the program's own exit status".
+      error,
       stdout: proc.outBuf.join(""),
       stderr: proc.errBuf.join(""),
       // The invocation, so an observer (kernel-worker's onProcExit) can tell that
@@ -603,8 +874,13 @@ export class Kernel {
       args: proc.args || [],
       cwd: proc.cwd,
     };
-    if (proc.onExit) proc.onExit(result);
+    // A worker fault goes to onError when a caller asked for one (start()), so it can
+    // reject rather than look like a clean non-zero exit. Everything else — and every
+    // caller that only wired onExit — settles exactly as before.
+    if (error && proc.onError) proc.onError(result);
+    else if (proc.onExit) proc.onExit(result);
     if (this.onProcExit) this.onProcExit(pid, result);
+    if (!this.procs.size) this._stopStallWatchdog();
   }
 
   /**
@@ -636,7 +912,7 @@ export class Kernel {
   start(command, args = [], opts = {}) {
     const cwd = opts.cwd || "/";
     const programPath = this.resolveProgram(command, cwd, opts.env || {});
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       if (!programPath) {
         resolve({ pid: -1, code: 127, stdout: "", stderr: command + ": not found\n" });
         return;
@@ -645,7 +921,18 @@ export class Kernel {
         { command, programPath, args, cwd, env: opts.env || {} },
         { capture: !!opts.capture },
       );
-      this.procs.get(pid).onExit = resolve;
+      const proc = this.procs.get(pid);
+      proc.onExit = resolve;
+      // A worker fault is not an exit status, so reject rather than hand back a
+      // fabricated code the caller would read as the program's own. The result is
+      // attached so stdout/stderr collected before the fault aren't lost. This
+      // promise had NO reject path before: a dead worker left it pending forever.
+      proc.onError = (result) => {
+        const err = new Error(`${command}: ${result.error || "process worker died"}`);
+        err.code = "EPROCFAIL";
+        err.result = result;
+        reject(err);
+      };
     });
   }
 
@@ -667,6 +954,13 @@ export class Kernel {
   serviceSyscall(pid) {
     const proc = this.procs.get(pid);
     if (!proc) return;
+    // A syscall proves the process is alive and doing work, but NOT that the user can
+    // see anything — npm's reify writes ~12k files without printing a line. So it
+    // stamps lastActivity (and counts, as evidence for diagnostics) but deliberately
+    // does NOT touch lastOutput, which is what the stall watchdog keys on.
+    proc.lastActivity = Date.now();
+    proc.syscalls++;
+    proc.booted = true;
     const opcode = Atomics.load(proc.ctrl, I_OPCODE);
     const { fields } = decodeRequest(
       proc.data.slice(0, Atomics.load(proc.ctrl, I_REQ_LEN)),
@@ -1115,8 +1409,67 @@ export class Kernel {
   // VFS path where a fetched body is materialized. The cache key (method + url +
   // accept) is encodeURIComponent'd into a single flat filename (no '/'), so
   // distinct request variants of the same URL never share a body file.
+  // A generation prefix makes every materialized body a DISTINCT path, so a
+  // re-fetch of an evicted URL cannot collide with a pending deferred unlink from
+  // the previous generation (and two concurrent uncacheable fetches of the same URL
+  // no longer clobber each other's body). The cache key stays in the name for
+  // debuggability; only the stored meta.path is ever used to read it back.
   _fetchCachePath(cacheKey) {
-    return "/var/cache/vv-fetch/" + encodeURIComponent(cacheKey);
+    return "/var/cache/vv-fetch/" + ++this._fetchBodySeq + "-" + encodeURIComponent(cacheKey);
+  }
+
+  // ---- fetched-body lifetime ------------------------------------------------
+  // A body must outlive its readers. `_pinFetchBody` is called for EVERY handoff of
+  // a meta to a process (fresh download, cache hit, or in-flight share);
+  // `releaseFetchBody` is called by the FS layer once a read of that path has
+  // finished (fd closed, or a whole-file read serviced). See fs-server.js.
+  _pinFetchBody(path, pid) {
+    if (!path) return;
+    const pins = this._fetchBodyPins.get(path);
+    if (pins) pins.push(pid | 0);
+    else this._fetchBodyPins.set(path, [pid | 0]);
+  }
+
+  /**
+   * The FS layer observed a completed read of a fetched body. Drops one reference;
+   * the file is unlinked when the last one goes IF eviction already wanted it gone.
+   * Safe to call for unknown/duplicate paths — a body read twice simply releases
+   * what is there and then no-ops.
+   */
+  releaseFetchBody(path) {
+    const pins = this._fetchBodyPins.get(path);
+    if (!pins) return;
+    pins.pop();
+    if (pins.length) return;
+    this._fetchBodyPins.delete(path);
+    this._reapFetchBody(path);
+  }
+
+  // Backstop: a process can die (or abort a request) without ever reading a body it
+  // was handed, which would pin it forever. Its references go when it does, so a
+  // missing or unwired release signal can never leak past the process's lifetime.
+  _releaseFetchBodiesForPid(pid) {
+    if (!this._fetchBodyPins.size) return;
+    for (const [path, pins] of this._fetchBodyPins) {
+      const kept = pins.filter((p) => p !== pid);
+      if (kept.length === pins.length) continue;
+      if (kept.length) this._fetchBodyPins.set(path, kept);
+      else {
+        this._fetchBodyPins.delete(path);
+        this._reapFetchBody(path);
+      }
+    }
+  }
+
+  // Unlink a now-unpinned body, but only if eviction already dropped its accounting.
+  // Still-cached bodies stay on disk for a future hit until they are evicted.
+  _reapFetchBody(path) {
+    if (!this._fetchBodyOrphans.delete(path)) return;
+    try {
+      this.fs.unlink(path);
+    } catch {
+      /* already gone */
+    }
   }
 
   _fetchCacheKey(method, url, headers) {
@@ -1164,6 +1517,7 @@ export class Kernel {
       // insertion order), protecting a just-served body from imminent eviction.
       this.fetchCache.delete(cacheKey);
       this.fetchCache.set(cacheKey, cached);
+      this._pinFetchBody(cached.path, pid);
       if (this.onFetch) this.onFetch(url, { cached: true, size: cached.size, pid });
       return { ...cached, cached: true };
     }
@@ -1176,6 +1530,9 @@ export class Kernel {
     // same dep from several branches at once) shares ONE network op + one write.
     if (cacheable && this._fetchInflight.has(cacheKey)) {
       const meta = await this._fetchInflight.get(cacheKey);
+      // Sharers read the SAME body file, so each needs its own reference — the last
+      // one to finish is what frees it.
+      this._pinFetchBody(meta.path, pid);
       if (this.onFetch) this.onFetch(url, { cached: true, size: meta.size, pid });
       return { ...meta, cached: true };
     }
@@ -1188,6 +1545,7 @@ export class Kernel {
       work.then(clear, clear);
     }
     const meta = await work;
+    this._pinFetchBody(meta.path, pid);
     return { ...meta, cached: false };
   }
 
@@ -1243,6 +1601,12 @@ export class Kernel {
   // byte cap, freeing each body's VFS file as it goes. `protectKey` (the entry we
   // just added) is never evicted, so a fresh download is always available to the
   // process about to read it back.
+  //
+  // Dropping the ACCOUNTING is unconditional, so the cap is always honoured. The
+  // FILE is only unlinked here when nothing holds a reference to it; a pinned body
+  // becomes an orphan and is reaped by the last release (or its process's exit).
+  // Without that, eviction could delete a body a process had been handed but not
+  // yet read — see the constructor note.
   _evictFetchCacheIfNeeded(protectKey) {
     if (this._fetchCacheBytes <= this.fetchCacheMaxBytes) return;
     for (const [key, meta] of this.fetchCache) {
@@ -1250,6 +1614,10 @@ export class Kernel {
       if (key === protectKey) continue;
       this.fetchCache.delete(key);
       this._fetchCacheBytes -= meta.size | 0;
+      if (this._fetchBodyPins.has(meta.path)) {
+        this._fetchBodyOrphans.add(meta.path);
+        continue;
+      }
       try {
         this.fs.unlink(meta.path);
       } catch {

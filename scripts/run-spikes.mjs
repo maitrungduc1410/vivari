@@ -81,6 +81,21 @@ const SPIKES = [
   // server. Rust-core installs are heavy, so give them the longer budget.
   { name: "rspack", file: "spike-rspack.mjs", net: true, timeout: 600000 },
   { name: "rsbuild", file: "spike-rsbuild.mjs", net: true, timeout: 600000 },
+  // Rspress (docs SSG on Rsbuild) — same wasm Rspack binding, plus an MDX/React/Shiki
+  // pipeline and a much larger dep tree than plain Rsbuild, so budget like Docusaurus.
+  { name: "rspress", file: "spike-rspress.mjs", net: true, timeout: 900000 },
+  // Starlight (docs SSG on Astro) — Astro's first in-VM Vite build plus a content-collection
+  // pipeline; installs ~500 packages, so budget like the other docs templates.
+  { name: "starlight", file: "spike-starlight.mjs", net: true, timeout: 900000 },
+  // The STUDIO-shape counterpart, and the gate that should have existed first: spike-starlight
+  // above drives npm through the kernel directly, which passed while the browser hung. This one
+  // uses the shared loader + /bin shims + baseProcEnv + the interactive shell's VV_RUN, and
+  // budgets the registry metadata a cold install pulls (see its header).
+  { name: "starlight-studio", file: "spike-starlight-studio.mjs", net: true, timeout: 900000 },
+  // Measures whether a PRE-BUILT dep-cache snapshot could replace a heavy template's first
+  // install: install once, snapshot, wipe, restore, compare. Asserts a speedup RATIO rather
+  // than a wall-clock budget so it does not go flaky on slower CI.
+  { name: "starlight-depcache", file: "spike-starlight-depcache.mjs", net: true, timeout: 900000 },
   { name: "vitest", file: "spike-vitest.mjs", net: true },
   // Tailwind v4: proves the lightningcss -> lightningcss-wasm alias + the
   // @tailwindcss/oxide-wasm32-wasi selection let the v4 dev server generate CSS

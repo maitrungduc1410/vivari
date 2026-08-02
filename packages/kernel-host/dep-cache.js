@@ -165,6 +165,75 @@ export async function createDepCache({ access, storage, maxBytes = DEFAULT_MAX_B
     return { key, bytes: archive.length, files: fileCount, entries: entryCount };
   }
 
+  // ---- import an externally produced archive --------------------------------
+  // Is `raw` a well-formed archive, and does every entry stay inside the tree?
+  // Everything `save()` writes is trusted by construction, but an imported archive
+  // arrives over the network, so it is validated BEFORE it is stored: a truncated
+  // download, a half-written asset or an HTML error page served with a 200 must be
+  // rejected here rather than half-unpacked over a project's node_modules. Returns
+  // counts on success, null on anything suspect — callers treat null as "no
+  // snapshot" and fall back to a normal install.
+  function inspect(raw) {
+    if (!(raw instanceof Uint8Array) || raw.length < 4) return null;
+    const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+    const headerLen = dv.getUint32(0, true);
+    if (!headerLen || headerLen > raw.length - 4) return null;
+    let header;
+    try {
+      header = JSON.parse(dec.decode(raw.subarray(4, 4 + headerLen)));
+    } catch {
+      return null;
+    }
+    if (!header || !Array.isArray(header.entries) || header.entries.length === 0) return null;
+    const blobLen = raw.length - (4 + headerLen);
+    let fileCount = 0;
+    for (const e of header.entries) {
+      if (!e || typeof e.p !== "string") return null;
+      // Paths are relative to node_modules and must stay there. `restore()` joins
+      // them onto the project dir, so a leading slash or a `..` segment would
+      // escape the tree entirely — the one failure here that could damage a
+      // project rather than merely waste a fetch.
+      if (e.p.startsWith("/") || e.p.split("/").some((seg) => seg === ".." || seg === ".")) return null;
+      if (e.k === "f") {
+        // Slices must land inside the blob; otherwise restore reads whatever
+        // follows in memory, or nothing.
+        if (!Number.isInteger(e.o) || !Number.isInteger(e.l) || e.o < 0 || e.l < 0 || e.o + e.l > blobLen) {
+          return null;
+        }
+        fileCount++;
+      } else if (e.k === "l") {
+        if (typeof e.t !== "string") return null;
+      } else if (e.k !== "d") {
+        return null;
+      }
+    }
+    return { fileCount, entryCount: header.entries.length };
+  }
+
+  /**
+   * Store an archive produced ELSEWHERE (a snapshot shipped with the app, built by
+   * running the install once at build time) under `key` plus `aliasKeys`, so the
+   * very next `restore(key, …)` hits. Returns the same shape as `save()`, or null
+   * if the archive is not well formed — see `inspect`.
+   *
+   * `shipped` marks the entry as re-fetchable, which changes only one thing: LRU
+   * eviction drops it before a user's own snapshot. A shipped snapshot can be
+   * downloaded again for the cost of a request, whereas a user snapshot can only be
+   * rebuilt by re-running the install it was made to avoid.
+   */
+  async function importArchive(key, archive, aliasKeys = [], { shipped = false } = {}) {
+    const info = inspect(archive);
+    if (!info) return null;
+    await storage.put(key, archive);
+    index.entries[key] = { blob: true, size: archive.length, atime: Date.now(), shipped: !!shipped };
+    for (const a of aliasKeys) {
+      if (a && a !== key) index.entries[a] = { alias: key, atime: Date.now() };
+    }
+    await evict(key);
+    await persistIndex();
+    return { key, bytes: archive.length, files: info.fileCount, entries: info.entryCount };
+  }
+
   // ---- unpack --------------------------------------------------------------
   /**
    * Restore the snapshot for `key` into `dir/node_modules`. `onPath(absPath)` is
@@ -228,11 +297,19 @@ export async function createDepCache({ access, storage, maxBytes = DEFAULT_MAX_B
   // Evict least-recently-used snapshots until under the cap. `protectKey` (the
   // one we just wrote) is never evicted. Drops each snapshot's blob AND any
   // aliases pointing at it.
+  //
+  // Shipped snapshots go first, regardless of age: re-acquiring one costs a request,
+  // while re-acquiring a user's own snapshot costs the whole install it was created
+  // to skip. Cheapest-to-rebuild is the right thing to discard.
   async function evict(protectKey) {
     if (totalBytes() <= maxBytes) return;
     const blobKeys = Object.keys(index.entries)
       .filter((k) => index.entries[k] && index.entries[k].blob && k !== protectKey)
-      .sort((a, b) => (index.entries[a].atime | 0) - (index.entries[b].atime | 0));
+      .sort(
+        (a, b) =>
+          (index.entries[a].shipped ? 0 : 1) - (index.entries[b].shipped ? 0 : 1) ||
+          (index.entries[a].atime | 0) - (index.entries[b].atime | 0),
+      );
     for (const k of blobKeys) {
       if (totalBytes() <= maxBytes) break;
       try {
@@ -263,5 +340,5 @@ export async function createDepCache({ access, storage, maxBytes = DEFAULT_MAX_B
     await persistIndex();
   }
 
-  return { has, save, restore, clear, hashDepKey };
+  return { has, save, importArchive, restore, clear, hashDepKey };
 }

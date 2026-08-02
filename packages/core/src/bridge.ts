@@ -57,6 +57,29 @@ interface PreviewConn {
   ready?: Promise<boolean>;
 }
 
+// Expose a console-reachable diagnostic handle on the page: `await __vv.diag()`.
+//
+// Installed by the BRIDGE, not by Vivari.boot(): the studio constructs a KernelBridge
+// directly and never calls boot(), so hooking it there left the diagnostic missing from
+// the only place a user actually is — verified by watching `__vv.diag()` throw in a real
+// studio page. Every consumer goes through a bridge, so this is the layer that covers
+// both. Additive and read-only, and any existing `__vv` keys are preserved (the browser
+// repro rig installs its own).
+//
+// It exists because four rounds of one hang were spent inferring the state of a machine
+// we could not reach. A hung VM looks identical from outside whether a process is
+// grinding through 12,000 file writes, wedged, or gone — the numbers separate them at
+// once, and asking for one pasted object is cheaper than another round of guessing.
+function installDiagGlobal(bridge: KernelBridge): void {
+  try {
+    const g = globalThis as unknown as Record<string, unknown>;
+    const existing = (g.__vv as Record<string, unknown> | undefined) || {};
+    g.__vv = { ...existing, diag: () => bridge.diag(), bridge };
+  } catch {
+    /* sealed global — diagnostics are a nicety, never a boot failure */
+  }
+}
+
 export class KernelBridge {
   private readonly worker: Worker;
   private readonly handlers = new Map<string, Set<Handler>>();
@@ -177,6 +200,8 @@ export class KernelBridge {
         this.worker.postMessage({ type: d.type as string, msg: d });
       });
     }
+
+    installDiagGlobal(this);
   }
 
   /**
@@ -274,6 +299,18 @@ export class KernelBridge {
       this.pending.set(reqId, { resolve, reject, dispose });
       this.worker.postMessage({ type, reqId, ...extra });
     });
+  }
+
+  /**
+   * Live runtime diagnostics — what every process is doing right now.
+   *
+   * Installed on the page as `__vv.diag()` so a user hitting a hang can paste the
+   * state back instead of us guessing. Cheap and side-effect free; call it twice a
+   * few seconds apart and compare `syscalls` to tell a slow process from a stuck one.
+   */
+  async diag(): Promise<unknown> {
+    const reply = await this.request("vv-diag");
+    return reply.ok ? reply.diag : { error: reply.error };
   }
 
   /** How previews are served (same-origin / shared / wildcard). */

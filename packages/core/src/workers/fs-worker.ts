@@ -113,6 +113,23 @@ function handle(msg) {
         }
       })();
       break;
+    // Take in a snapshot the app SHIPS (built by running the install at build time)
+    // so a first run on a fresh origin can restore instead of installing. The bytes
+    // are fetched by the kernel worker, which owns network access; the store
+    // validates them (see importArchive) and answers null on anything malformed, so
+    // a truncated or wrong asset degrades to a normal install.
+    case "dep-cache-import":
+      (async () => {
+        try {
+          const res = depCache
+            ? await depCache.importArchive(msg.key, msg.archive, msg.aliases || [], { shipped: true })
+            : null;
+          post("dep-cache-import-ok", { id: msg.id, result: res });
+        } catch (err) {
+          post("dep-cache-import-err", { id: msg.id, error: String(err?.message || err) });
+        }
+      })();
+      break;
     case "dep-cache-restore":
       (async () => {
         try {
@@ -220,6 +237,30 @@ function buildAccess(vfs) {
 // persisting those tarball bodies is pure dead weight — the durable, reusable copy
 // is npm/yarn/pnpm's own content-addressed cache under /home/user/.cache.
 const IGNORE = ["/bin", "/tmp", "/proc", "/dev", "/etc", "/usr", "/var/cache"];
+
+// Volatile paths INSIDE an otherwise-persisted package-manager cache. The cache
+// itself is deliberately durable (see npm_config_cache in kernel-worker) — these
+// two shapes are not, and mirroring them dominated the whole install:
+//
+//   _logs/…      npm appends to its debug log on every log line. Every append
+//                re-enqueues the path, and drain() rewrites the file IN FULL each
+//                time, so a log that grows to ~1.5 MB gets rewritten thousands of
+//                times. Measured on a cold Starlight install: 3,800 enqueues of
+//                one log file, and that single file accounted for essentially all
+//                of the ~2.7 GB of mirrored file bytes. It is a diagnostic that
+//                nothing reads back across reloads.
+//   …/tmp/…      cacache (and yarn) write content to a staging file and then
+//                rename it into place, so every one of these is written to OPFS
+//                and deleted moments later. Pure waste: 820 renames on the same
+//                install. The renamed-to path IS persisted, so nothing is lost.
+//
+// Kept deliberately narrow: only under a `.cache` directory, so a user's own
+// `_logs/` or `tmp/` in their project is still mirrored.
+const isVolatileCachePath = (p) => {
+  if (!p.includes("/.cache/")) return false;
+  return p.includes("/_logs/") || p.endsWith("/_logs") || p.includes("/tmp/") || p.endsWith("/tmp");
+};
+
 const shouldPersist = (p) => {
   // node_modules is NOT mirrored file-by-file: it's large (thousands of files),
   // which made the per-file OPFS restore the dominant cold-reopen cost. Instead
@@ -229,6 +270,7 @@ const shouldPersist = (p) => {
   // so a restored node_modules isn't re-mirrored (no double storage).
   if (p.endsWith("/node_modules") || p.includes("/node_modules/")) return false;
   for (const pre of IGNORE) if (p === pre || p.startsWith(pre + "/")) return false;
+  if (isVolatileCachePath(p)) return false;
   return true;
 };
 
@@ -343,6 +385,12 @@ async function createOpfsDepStorage() {
   }
 
   server = new FsServer(vfs, persistence);
+  // Tell the kernel when a fetched response body has been fully read, so it can
+  // drop its reference and reclaim the scratch file. These bodies live in Wasm
+  // memory that never shrinks, so holding them past their single read is a direct
+  // cost to peak residency — and the kernel cannot see the read, which happens
+  // here over the SAB.
+  server.onBodyConsumed = (path) => post("fetch-body-consumed", { path });
   post("ready");
   for (const msg of queue.splice(0)) handle(msg);
 })();

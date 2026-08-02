@@ -13,6 +13,10 @@ const wasm = require("../packages/vfs/pkg-node/vivari_vfs.js");
 
 const vfs = new wasm.VirtualFileSystem();
 const server = new FsServer(vfs);
+// Mirror of the browser fs-worker: report a finished read of a kernel-fetched body
+// so the kernel can free the scratch file. Kept in step so headless spikes exercise
+// the same body lifetime the browser does.
+server.onBodyConsumed = (path) => parentPort.postMessage({ type: "fetch-body-consumed", path });
 
 // A vfs-bound facade for the dependency cache (mirror of buildAccess in the
 // browser fs-worker). Headless has no OPFS, so the snapshot store is an in-memory
@@ -47,8 +51,10 @@ function buildAccess(v) {
   };
 }
 
+let snapshotStore = null;
 function createMemoryStorage() {
   const map = new Map();
+  snapshotStore = map;
   return {
     async get(key) { return map.has(key) ? map.get(key) : null; },
     async put(key, bytes) { map.set(key, bytes); },
@@ -108,6 +114,37 @@ parentPort.on("message", (msg) => {
           parentPort.postMessage({ type: "dep-cache-save-ok", id: msg.id, result });
         } catch (err) {
           parentPort.postMessage({ type: "dep-cache-save-err", id: msg.id, error: String(err?.message || err) });
+        }
+      });
+      break;
+    // Mirror of the browser fs-worker: take in a snapshot produced elsewhere (the app ships
+    // one per template, built by running the install at build time) after the store has
+    // validated it. Kept in step deliberately — the export side below is headless-only, but
+    // if IMPORT were, headless tests would exercise a different first-run path than the
+    // browser, which is the drift this file's twin has caused before.
+    case "dep-cache-import":
+      depCacheReady.then(async () => {
+        try {
+          const result = depCache
+            ? await depCache.importArchive(msg.key, msg.archive, msg.aliases || [], { shipped: true })
+            : null;
+          parentPort.postMessage({ type: "dep-cache-import-ok", id: msg.id, result });
+        } catch (err) {
+          parentPort.postMessage({ type: "dep-cache-import-err", id: msg.id, error: String(err?.message || err) });
+        }
+      });
+      break;
+    // Headless-only: hand the packed archive back to the main thread so a build step can write
+    // it to disk (see scripts/spike-starlight-depcache.mjs). The browser keeps snapshots in
+    // OPFS and has no reason to export them.
+    case "dep-cache-export":
+      depCacheReady.then(() => {
+        const bytes = snapshotStore && snapshotStore.get(msg.key);
+        if (bytes) {
+          const copy = new Uint8Array(bytes);
+          parentPort.postMessage({ type: "dep-cache-export-ok", id: msg.id, bytes: copy }, [copy.buffer]);
+        } else {
+          parentPort.postMessage({ type: "dep-cache-export-err", id: msg.id, error: "no snapshot for key" });
         }
       });
       break;

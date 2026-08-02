@@ -54,6 +54,8 @@ export function createKernelFs(fsWorker) {
   const sab = new SharedArrayBuffer(SAB_BYTES);
   const { ctrl, data } = makeViews(sab);
   fsWorker.postMessage({ type: "fs-register", client: KERNEL_CLIENT, sab });
+  // Set by the Kernel via fs.setBodyConsumedHandler; see onMessage.
+  let onBodyConsumed = null;
 
   function call(opcode, request) {
     if (request.length > data.length) {
@@ -154,9 +156,27 @@ export function createKernelFs(fsWorker) {
   function depCacheRestore(key, dir) {
     return depCacheCall("dep-cache-restore", { key, dir });
   }
+  // Hand a shipped snapshot's bytes to the store. The buffer is TRANSFERRED, not
+  // copied — these archives are ~100 MB and a structured clone would briefly double
+  // that on a machine where memory is the scarce thing. Consequence for callers:
+  // `archive` is detached once this returns, so do not read it afterwards.
+  function depCacheImport(key, archive, aliases = []) {
+    return new Promise((resolve, reject) => {
+      const id = seq++;
+      pending.set(id, { resolve, reject });
+      fsWorker.postMessage({ type: "dep-cache-import", id, key, archive, aliases }, [archive.buffer]);
+    });
+  }
 
   function onMessage(msg) {
     if (!msg) return;
+    if (msg.type === "fetch-body-consumed") {
+      // The FS worker saw a process finish reading a fetched body. Routed here
+      // rather than in each embedder's message handler so the browser and headless
+      // twins cannot drift; the Kernel installs the handler on construction.
+      if (onBodyConsumed) onBodyConsumed(msg.path);
+      return;
+    }
     if (msg.type === "fs-write-large-ok" || msg.type === "fs-write-batch-ok") {
       const p = pending.get(msg.id);
       if (p) {
@@ -175,13 +195,14 @@ export function createKernelFs(fsWorker) {
     } else if (msg.type === "dep-cache-restore-ok") {
       const p = pending.get(msg.id);
       if (p) { pending.delete(msg.id); p.resolve(msg.count | 0); }
-    } else if (msg.type === "dep-cache-save-ok") {
+    } else if (msg.type === "dep-cache-save-ok" || msg.type === "dep-cache-import-ok") {
       const p = pending.get(msg.id);
       if (p) { pending.delete(msg.id); p.resolve(msg.result || null); }
     } else if (
       msg.type === "dep-cache-has-err" ||
       msg.type === "dep-cache-restore-err" ||
-      msg.type === "dep-cache-save-err"
+      msg.type === "dep-cache-save-err" ||
+      msg.type === "dep-cache-import-err"
     ) {
       const p = pending.get(msg.id);
       if (p) { pending.delete(msg.id); p.reject(new Error(msg.error || "EIO")); }
@@ -249,6 +270,11 @@ export function createKernelFs(fsWorker) {
     depCacheHas,
     depCacheSave,
     depCacheRestore,
+    depCacheImport,
+    // Called by the Kernel constructor to receive fetched-body read completions.
+    setBodyConsumedHandler(fn) {
+      onBodyConsumed = fn;
+    },
   };
 
   return { fs, onMessage };

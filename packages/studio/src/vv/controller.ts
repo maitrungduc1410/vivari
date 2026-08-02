@@ -65,11 +65,12 @@ function normalizePreviewWildcardDomain(raw: string | undefined): string | undef
 
 // Rewrite a keep-prefix template's framework **base** config (`base` / `basename`
 // / `baseUrl` set to `"/preview/<port>/"`) to the origin root `"/"`. Keep-prefix
-// templates (Docusaurus, VitePress, React Router 7, TanStack Router) hardcode that
-// base for the path-multiplexed modes A/B; in mode C each port is its OWN origin
-// served at `/`, so the hardcoded base would 404. We touch ONLY those config keys,
-// so legitimate cross-service URLs in app code (e.g. `'/preview/' + PORT + '/api'`,
-// which still route via the SW/shim in mode C) are left intact.
+// templates (Docusaurus, VitePress, Rspress, Starlight, React Router 7, TanStack
+// Router) hardcode that base for the path-multiplexed modes A/B; in mode C each
+// port is its OWN origin served at `/`, so the hardcoded base would 404. We touch
+// ONLY those config keys, so legitimate cross-service URLs in app code (e.g.
+// `'/preview/' + PORT + '/api'`, which still route via the SW/shim in mode C) are
+// left intact.
 function rewritePreviewBaseToRoot(files: Record<string, string>): Record<string, string> {
   const re = /((?:base|basename|baseUrl)\s*:\s*)(['"`])\/preview\/\d+\/\2/g;
   const out: Record<string, string> = {};

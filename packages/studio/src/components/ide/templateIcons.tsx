@@ -20,11 +20,16 @@ import DocusaurusIcon from "~icons/vscode-icons/file-type-docusaurus";
 import AngularIcon from "~icons/vscode-icons/file-type-angular";
 import PythonIcon from "~icons/vscode-icons/file-type-python";
 
-// Rsbuild/Rspack ship no icon in any Iconify set, so bundle their official brand
-// SVGs (the mascot logos from assets.rspack.rs) as base-aware asset URLs and render
-// them as <img>. Vite returns a resolved URL for .svg imports (no SVGR here).
+// Rsbuild/Rspack/Rspress ship no icon in any Iconify set, so bundle their official
+// brand SVGs (the mascot logos from assets.rspack.rs) as base-aware asset URLs and
+// render them as <img>. Vite returns a resolved URL for .svg imports (no SVGR here).
 import rsbuildLogo from "@/assets/rsbuild-logo.svg";
 import rspackLogo from "@/assets/rspack-logo.svg";
+import rspressLogo from "@/assets/rspress-logo.svg";
+// Starlight's official mark (withastro/starlight examples/basics favicon). It carries an
+// embedded prefers-color-scheme style, so as an <img> it follows the OS theme on its own
+// and needs no currentColor treatment.
+import starlightLogo from "@/assets/starlight-logo.svg";
 // TanStack / Vitest ship official raster logos; bundle them as base-aware asset
 // URLs and render via <img>, same as the Rsbuild/Rspack marks above.
 import tanstackLogo from "@/assets/tanstack-logo.png";
@@ -351,6 +356,8 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   slidev: SlidevIcon,
   docusaurus: (p) => <DocusaurusIcon className={p.className} />,
   vitepress: VitePressIcon,
+  rspress: ImgIcon(rspressLogo, "Rspress"),
+  starlight: ImgIcon(starlightLogo, "Starlight"),
   // Phase 3 — frontend variants
   preact: (p) => <PreactIcon className={p.className} />,
   lit: LitIcon,
