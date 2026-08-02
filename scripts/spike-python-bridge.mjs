@@ -16,15 +16,21 @@
 // explicit about the rest.
 //
 // WHAT IT PROVES: Python-level semantics of all seven templates, the bridge's
-// WSGI/ASGI protocol conversion, preview-prefix URL generation, and the argv
-// seams. It drives the SHIPPED dispatch source (setupSource is exported from the
+// WSGI/ASGI protocol conversion, preview-prefix URL generation, the argv seams,
+// and — against real urllib3 — that Python's outbound HTTP works once our own
+// Node masquerade stops answering urllib3's realm question for it. It drives the
+// SHIPPED dispatch source and the SHIPPED patch source (both exported from the
 // runtime) against the SHIPPED template files (read out of templates.ts), so
-// neither can drift away from what is tested here.
+// none of them can drift away from what is tested here.
 //
 // WHAT IT DOES NOT PROVE: guest port registration, preview-tab opening, the
 // service-worker tunnel, same-origin wheel delivery from public/vendor/pyodide,
 // terminal rendering, or mirrorBack surfacing files in the editor. Those need a
 // browser. All seven templates stay `experimental` until someone runs that pass.
+// The urllib3 case is in the same position on one point, stated where it is
+// simulated: that a real browser Worker's synchronous XMLHttpRequest behaves as
+// the spec says. If it does not, the fix is inert rather than harmful — the
+// realm predicate only ever moves urllib3 onto a door it already prefers.
 //
 // Needs network on a cold run: Django and Flask come from PyPI via micropip, and
 // pytest from the Pyodide CDN. Tiered `net: true` in run-spikes.mjs.
@@ -39,12 +45,14 @@ import { PYTHON_PROGRAM } from "../packages/kernel-host/programs/python.js";
 import { COREUTILS } from "../packages/kernel-host/coreutils.js";
 import {
   byteWriter,
+  installUrllib3RealmPatch,
   flushStreams,
   setupSource,
   terminationFromError,
 } from "../packages/runtime/builtins/python.js";
 import { readShippedTemplates, readTemplatesSource } from "./lib/python-templates.mjs";
 import { CPYTHON_EXITS, UNTRUNCATED } from "./lib/cpython-exit.mjs";
+import { MODELLED_FRAGMENTS, normalize } from "./lib/urllib3-emscripten.mjs";
 import { DRIVE_ENV, drivePython } from "./lib/python-drive.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -138,6 +146,8 @@ const CASES = {
   "asgi-root-path": { kind: "asgi-root-path", synthetic: true },
   // The WSGI half, checked against CPython's own PEP 3333 validator.
   "wsgi-environ": { kind: "wsgi-environ", synthetic: true },
+  // Python's HTTP, and the Node masquerade that was switching it off.
+  "urllib3-realm": { kind: "urllib3-realm", synthetic: true },
   // sys.exit() raised for real, judged against what real CPython does.
   "termination": { kind: "termination", synthetic: true },
 };
@@ -478,6 +488,159 @@ if (process.env.VV_SPIKE_CASE) {
     ok(env.QUERY_STRING === "a=1", `PEP 3333: QUERY_STRING excludes the '?' (${JSON.stringify(env.QUERY_STRING)})`);
   }
 
+  // --- Python's HTTP, and the masquerade that was switching it off ----------
+  if (spec.kind === "urllib3-realm") {
+    // `requests` in Pyodide does not use sockets. urllib3's Emscripten transport
+    // chooses at request time, and one of its branches asks whether this is Node
+    // by reading js.process.release.name — which our runtime sets to "node" on
+    // purpose. This case proves the whole chain against REAL urllib3: what it
+    // does untouched, what the shipped patch changes, and — the assertion that
+    // stops the patch becoming a lie in the other direction — what it must NOT
+    // change here, where the answer "this is Node" is simply true.
+    await ensure(["requests"]);
+    const P = (code) => py.runPythonAsync(code);
+
+    // First, the half of the offline tier's bargain that only a live interpreter
+    // can keep. spike-python-offline.mjs runs the shipped patch against a
+    // stand-in for this module, because urllib3's Emscripten transport exists
+    // nowhere but inside Pyodide — and a test against a fixture we wrote is a
+    // test of our own opinion unless something checks the fixture. This is that
+    // something: every fragment the stand-in copies, found in the real source.
+    const realSrc = String(await P("import inspect, urllib3.contrib.emscripten.fetch as f\ninspect.getsource(f)"));
+    for (const { label, source } of MODELLED_FRAGMENTS) {
+      ok(normalize(realSrc).includes(normalize(source)),
+        `real urllib3 (${String(await P("import urllib3\nurllib3.__version__"))}) still defines ${label} exactly as the offline stand-in models it`);
+    }
+    // The mechanism the fix is FOR, read off urllib3 rather than modelled: the
+    // branch that refuses, and the synchronous XHR it refuses in favour of.
+    ok(/elif is_in_node\(\):\s*\n\s*raise _RequestError\(/.test(realSrc),
+      "…and that send_request still refuses outright when is_in_node() is true");
+    ok(/js_xhr = js\.XMLHttpRequest\.new\(\)/.test(realSrc) && /js_xhr\.open\([^)]*False\)/.test(realSrc),
+      "…in favour of a SYNCHRONOUS XMLHttpRequest, which is what a Worker has and Node has not");
+    // Keep urllib3's OWN function, so the counterfactual below restores the real
+    // thing rather than a replica of it written by us.
+    await P("import urllib3.contrib.emscripten.fetch as f\nf._vv_pristine = f.is_in_node");
+    const get = async (url) => String(await P(`
+import requests
+try:
+    _r = requests.get(${JSON.stringify(url)})
+    _out = "OK " + str(_r.status_code) + " " + _r.text[:60] + " ct=" + str(_r.headers.get("content-type"))
+except BaseException as e:
+    _out = type(e).__name__ + ": " + str(e)[:160]
+_out
+`));
+    const isInNode = async () => String(await P("from urllib3.contrib.emscripten.fetch import is_in_node\nstr(is_in_node())"));
+
+    // -- this really is Node, and urllib3 is right about that -----------------
+    const jspi = String(await P("from urllib3.contrib.emscripten.fetch import has_jspi\nstr(has_jspi())")) === "True";
+    ok(await isInNode() === "True", "real Node, untouched: urllib3's is_in_node() is True");
+    if (jspi) {
+      // node --experimental-wasm-stack-switching: send_request never reaches the
+      // is_in_node branch. Say so rather than asserting something else's absence.
+      console.log("      | JSPI is enabled in this Node, so the Node/JSPI error branch is unreachable here");
+    } else {
+      ok(/only works in Node\.js/.test(await get("https://example.invalid/x")),
+        "…and requests raises urllib3's own Node/JSPI error");
+    }
+
+    // -- the patch must not lie about a realm that IS Node --------------------
+    ok(installUrllib3RealmPatch(py), "the shipped installer applied the patch");
+    // This interpreter is also the REPL. Our plumbing must not be sitting in the
+    // namespace a user's dir() reports.
+    ok(String(await P('[n for n in dir() if n.startswith("_vv") or n.startswith("_Vv")]')) === "[]",
+      "…without leaving any of its own names in __main__");
+    ok(await isInNode() === "True", "with the shipped patch applied, is_in_node() is STILL True in real Node");
+    ok(String(await P('import urllib3.contrib.emscripten.fetch as f\nstr(getattr(f.is_in_node, "_vv_realm_derived", False))')) === "False",
+      "…because the patch left the function alone entirely, rather than wrapping it to return the same answer");
+    if (!jspi) {
+      ok(/only works in Node\.js/.test(await get("https://example.invalid/x")),
+        "…so the honest Node error still reaches the user");
+    }
+
+    // -- a browser dedicated Worker, as Vivari runs one -----------------------
+    // No `window`; cross-origin isolated (Vivari needs SharedArrayBuffer, so
+    // COOP/COEP are on); Worker + Blob present; and a real SYNCHRONOUS
+    // XMLHttpRequest, which is the transport urllib3 wants and Node has not.
+    // The response is canned: the claim under test is that the transport is
+    // reached and its answer is translated, not that some third party is up.
+    const BODY = '{"hello":"from a synchronous XHR"}';
+    const xhr = { calls: 0, async: null, method: null, url: null };
+    globalThis.XMLHttpRequest = class {
+      constructor() { this.status = 0; this.response = null; this.responseType = ""; }
+      open(m, u, isAsync) { xhr.method = m; xhr.url = u; xhr.async = isAsync; }
+      setRequestHeader() {}
+      overrideMimeType() {}
+      getAllResponseHeaders() { return "content-type: application/json\r\n"; }
+      send() { xhr.calls++; this.status = 200; this.response = new TextEncoder().encode(BODY); }
+    };
+    globalThis.crossOriginIsolated = true;
+    globalThis.Blob = globalThis.Blob || class {};
+    globalThis.Worker = globalThis.Worker || class {};
+
+    // A sentinel for _StreamingFetcher, so "the gate was re-evaluated" is
+    // observable without depending on Blob/URL/Worker plumbing only a browser
+    // really has. That the real one constructs is a browser-tier question.
+    await P([
+      "import urllib3.contrib.emscripten.fetch as f",
+      "class _Sentinel:",
+      "    def __init__(self): self.streaming_ready = False",
+      "f._StreamingFetcher = _Sentinel",
+      "f._fetcher = None",
+    ].join("\n"));
+    installUrllib3RealmPatch(py);
+
+    ok(await isInNode() === "False", "browser-Worker realm: is_in_node() is now False");
+    ok(String(await P("import urllib3.contrib.emscripten.fetch as f\nstr(type(f._fetcher).__name__)")) === "_Sentinel",
+      "…and _fetcher was re-decided, so streaming is not left off by the evaluation the old gate made at import time");
+
+    xhr.calls = 0;
+    let r = await get("https://example.invalid/items");
+    ok(r.startsWith("OK 200"), `requests.get() returns a real response (${r.slice(0, 48)})`);
+    ok(r.includes("from a synchronous XHR"), "…carrying the body urllib3 read off the transport");
+    ok(r.includes("ct=application/json"), "…and the response headers it parsed");
+    ok(xhr.calls === 1, `…through exactly ${xhr.calls} XMLHttpRequest call`);
+    ok(xhr.async === false, `…opened synchronously — open(${JSON.stringify(xhr.method)}, …, ${xhr.async})`);
+
+    // -- same realm, only the predicate varying -------------------------------
+    // The both-ways proof: hold everything else still and put urllib3's own
+    // is_in_node back, so what is being measured is the gate and nothing else.
+    await P("import urllib3.contrib.emscripten.fetch as f\nf._vv_fixed = f.is_in_node\nf.is_in_node = f._vv_pristine");
+    xhr.calls = 0;
+    r = await get("https://example.invalid/items");
+    ok(/only works in Node\.js/.test(r), "restoring urllib3's OWN is_in_node breaks the SAME realm again");
+    ok(xhr.calls === 0, "…without the transport ever being reached");
+    await P("import urllib3.contrib.emscripten.fetch as f\nf.is_in_node = f._vv_fixed");
+    ok((await get("https://example.invalid/items")).startsWith("OK 200"), "…and the realm-derived predicate makes it 200 again");
+
+    // -- the re-enabled streaming gate must not be able to break requests -----
+    await P([
+      "import urllib3.contrib.emscripten.fetch as f",
+      "def _boom(): raise RuntimeError('no nested worker here')",
+      "f._StreamingFetcher = _boom",
+      "f._fetcher = None",
+      "f.is_in_node = f._vv_pristine",
+    ].join("\n"));
+    installUrllib3RealmPatch(py);
+    ok(String(await P("import urllib3.contrib.emscripten.fetch as f\nstr(f._fetcher)")) === "None",
+      "a _StreamingFetcher that throws leaves _fetcher None");
+    ok((await get("https://example.invalid/items")).startsWith("OK 200"),
+      "…and the buffered transport still works, so the streaming re-run cannot cost us the fix");
+
+    // -- the other two doors, which the docs now claim outright ---------------
+    // These need no patch and never did; they are asserted because python.md
+    // states them, and a docs claim with nothing behind it is how this started.
+    delete globalThis.XMLHttpRequest;
+    const ping = "https://cdn.jsdelivr.net/pyodide/v" + (process.env.VV_PYODIDE_VERSION || "") + "/full/pyodide-lock.json";
+    for (const [label, code] of [
+      ["pyodide.http.pyfetch", `from pyodide.http import pyfetch\n_r = await pyfetch(${JSON.stringify(ping)})\nstr(_r.status)`],
+      ["js.fetch", `import js\n_r = await js.fetch(${JSON.stringify(ping)})\nstr(_r.status)`],
+    ]) {
+      let status;
+      try { status = String(await P(code)); } catch (e) { status = String(e.message || e).split("\n").pop(); }
+      ok(status === "200", `${label} reaches the network from Python with no patching at all (${status})`);
+    }
+  }
+
   console.log(failed ? `CASE ${name}: FAIL (${failed})` : `CASE ${name}: PASS`);
   process.exit(failed ? 1 : 0);
 }
@@ -559,7 +722,7 @@ for (const name of names) {
   const started = Date.now();
   const code = await new Promise((resolve) => {
     const child = fork(fileURLToPath(import.meta.url), [], {
-      cwd: ROOT, env: { ...process.env, VV_SPIKE_CASE: name }, stdio: "inherit",
+      cwd: ROOT, env: { ...process.env, VV_SPIKE_CASE: name, VV_PYODIDE_VERSION: version }, stdio: "inherit",
     });
     child.on("close", (c) => resolve(c | 0));
   });

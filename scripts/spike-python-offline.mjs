@@ -16,12 +16,18 @@
 //
 // WHAT IT PROVES: the CLI seams' argv contract (including that flags we cannot
 // honour say so), CPython-faithful termination, the shape of the generated
-// bridge dispatch source (the ASGI root_path regression in particular), and
-// that the shipped templates are internally consistent with the shims they
-// invoke. All against the SHIPPED sources, never a copy.
+// bridge dispatch source (the ASGI root_path regression in particular), that
+// the shipped templates are internally consistent with the shims they invoke,
+// and — using the host's own python3 — the actual behaviour of the urllib3
+// realm hook, which is ordinary Python and so needs no Pyodide to run. All
+// against the SHIPPED sources, never a copy.
 //
-// WHAT IT DOES NOT PROVE: that any of it runs. Nothing here boots an
-// interpreter. spike-python-bridge.mjs does that, on the network tier.
+// WHAT IT DOES NOT PROVE: that any of it runs under Pyodide. Nothing here boots
+// an interpreter, and the one place that matters most is called out where it
+// happens: the realm hook is exercised against a stand-in for urllib3's
+// Emscripten transport, because the real module exists nowhere but inside
+// Pyodide. spike-python-bridge.mjs checks the stand-in against the real thing,
+// on the network tier. See scripts/lib/urllib3-emscripten.mjs.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -31,8 +37,15 @@ import { fileURLToPath } from "node:url";
 
 import { PYTHON_PROGRAM } from "../packages/kernel-host/programs/python.js";
 import { COREUTILS } from "../packages/kernel-host/coreutils.js";
-import { byteWriter, setupSource, terminationFromError } from "../packages/runtime/builtins/python.js";
+import {
+  PIP_SCOPE_NOTE,
+  URLLIB3_REALM_PATCH,
+  byteWriter,
+  setupSource,
+  terminationFromError,
+} from "../packages/runtime/builtins/python.js";
 import { readShippedManifests, readShippedTemplates, readTemplatesSource } from "./lib/python-templates.mjs";
+import { MODELLED_FRAGMENTS, STANDIN, normalize } from "./lib/urllib3-emscripten.mjs";
 import { CPYTHON_EXITS, UNTRUNCATED, realCPythonExit } from "./lib/cpython-exit.mjs";
 import { drivePython, servedApp } from "./lib/python-drive.mjs";
 
@@ -341,6 +354,254 @@ console.log("\n== shipped Python templates are internally consistent ==");
     const m = manifests[id] || {};
     ok(String(m.dev || "").includes(String(m.port)), `${id}: the dev command binds the port the manifest advertises (${m.port})`);
   }
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the urllib3 realm hook, executed in real CPython ==");
+// urllib3's Emscripten transport asks js.process.release.name whether it is
+// running under Node. We answer "node" on purpose, so it skipped the synchronous
+// XMLHttpRequest a Web Worker has and told browser users to pass a Node flag.
+// URLLIB3_REALM_PATCH is the fix, and it is ordinary Python — so the host's own
+// interpreter can run it, and this tier can gate the LOGIC on every PR rather
+// than only string-matching it.
+//
+// The split, stated plainly. What runs here: our hook, in real CPython, against
+// a stand-in module. What CANNOT run here: real urllib3, which exists only
+// inside Pyodide. So the stand-in is a model, and a model is worth exactly as
+// much as the check that it matches — spike-python-bridge.mjs asserts, against
+// the real module, that every name and gate expression copied below is really
+// urllib3's. Neither tier is sufficient alone; that is the point of the pair.
+// ---------------------------------------------------------------------------
+{
+  // Drives the shipped patch through six scenarios and reports as JSON, so the
+  // assertions below read as claims rather than as output parsing.
+  const DRIVER = `
+import importlib, json, os, pathlib, sys, types
+
+PATCH = pathlib.Path(os.environ["VV_PATCH"]).read_text()
+PKG = pathlib.Path(os.environ["VV_PKG"])
+TARGET = "urllib3.contrib.emscripten.fetch"
+sys.path.insert(0, str(PKG))
+
+def realm(*, xhr, worker=True, coi=True, main_thread=False):
+    """A fresh JS realm and a fresh import state, as a new process would have."""
+    for name in [n for n in list(sys.modules) if n.split(".")[0] == "urllib3"]:
+        del sys.modules[name]
+    sys.meta_path[:] = [f for f in sys.meta_path
+                        if type(f).__name__ != "_VvEmscriptenFetchFinder"]
+    js = types.ModuleType("js")
+    # The masquerade itself: this is what builtins/process.js really sets.
+    js.process = types.SimpleNamespace(release=types.SimpleNamespace(name="node"))
+    if xhr:
+        js.XMLHttpRequest = object()
+    if worker:
+        js.Worker = object()
+        js.Blob = object()
+    if coi:
+        js.crossOriginIsolated = True
+    if main_thread:
+        js.window = object()
+        js.self = js.window
+    sys.modules["js"] = js
+    importlib.invalidate_caches()
+
+def apply_patch():
+    exec(compile(PATCH, "<URLLIB3_REALM_PATCH>", "exec"), {"__name__": "__vv_patch__"})
+
+def finders():
+    return [f for f in sys.meta_path if type(f).__name__ == "_VvEmscriptenFetchFinder"]
+
+def wrap_depth(fn):
+    """How many of OUR predicates are stacked in front of urllib3's own function.
+
+    Counting closure cells would not do it: a re-wrap closes over the previous
+    wrapper and still has exactly one cell. Walk the chain instead.
+    """
+    n = 0
+    while getattr(fn, "_vv_realm_derived", False):
+        n += 1
+        inner = [c.cell_contents for c in (fn.__closure__ or ()) if callable(c.cell_contents)]
+        if not inner:
+            break
+        fn = inner[0]
+    return n
+
+out = {}
+
+# 1. a browser Worker: the patch takes effect
+realm(xhr=True)
+apply_patch()
+import urllib3.contrib.emscripten.fetch as f
+out["browser_is_in_node"] = f.is_in_node()
+out["browser_fetcher"] = type(f._fetcher).__name__
+out["browser_exec_count"] = f.EXEC_COUNT
+out["browser_marker"] = getattr(f.is_in_node, "_vv_realm_derived", False)
+
+# 2. real Node: urllib3's own answer must survive untouched
+realm(xhr=False)
+apply_patch()
+import urllib3.contrib.emscripten.fetch as f
+out["node_is_in_node"] = f.is_in_node()
+out["node_marker"] = getattr(f.is_in_node, "_vv_realm_derived", False)
+out["node_fetcher"] = type(f._fetcher).__name__
+
+# 3. the hook is scoped to one module and does not intercept its siblings
+realm(xhr=True)
+apply_patch()
+(PKG / "urllib3/contrib/emscripten/other.py").write_text("VALUE = 42\\n")
+importlib.invalidate_caches()
+import urllib3.contrib.emscripten.other as other
+out["sibling_value"] = other.VALUE
+out["sibling_untouched"] = not hasattr(other, "is_in_node")
+
+# 4. already imported before the patch runs (a re-run, or a harness ordering)
+realm(xhr=True)
+import urllib3.contrib.emscripten.fetch as f
+out["preimport_before"] = f.is_in_node()
+apply_patch()
+out["preimport_after"] = f.is_in_node()
+
+# 5. idempotent, in BOTH orderings. Applying the patch before the module is
+#    imported reaches _vv_patch_fetch only once however many times it is run
+#    (the hook fires on the single import), so repetition has to be tested
+#    where it can actually bite: against a module that is already loaded.
+realm(xhr=True)
+import urllib3.contrib.emscripten.fetch as f  # loaded BEFORE any patch
+apply_patch()
+apply_patch()
+apply_patch()
+out["finder_count"] = len(finders())
+out["wrap_depth"] = wrap_depth(f.is_in_node)
+out["idempotent_is_in_node"] = f.is_in_node()
+
+# …and the other way round: patched by the hook at import, then re-applied.
+realm(xhr=True)
+apply_patch()
+import urllib3.contrib.emscripten.fetch as f  # the hook wraps it here
+apply_patch()
+apply_patch()
+out["wrap_depth_hooked"] = wrap_depth(f.is_in_node)
+
+# 6. a _StreamingFetcher that throws must not cost us the fix
+realm(xhr=True)
+apply_patch()
+import urllib3.contrib.emscripten.fetch as f
+f.is_in_node = f.__dict__["is_in_node"]
+sys.modules[TARGET].__dict__["_fetcher"] = None
+def boom():
+    raise RuntimeError("no nested worker here")
+sys.modules[TARGET].__dict__["_StreamingFetcher"] = boom
+del sys.modules[TARGET].__dict__["is_in_node"]._vv_realm_derived
+apply_patch()
+out["boom_fetcher"] = repr(f._fetcher)
+out["boom_is_in_node"] = f.is_in_node()
+
+print(json.dumps(out))
+`;
+
+  // Half of the pair: the model still contains everything it claims to model.
+  // The other half — that this list is really urllib3's — is the bridge tier's,
+  // against the installed module.
+  for (const { label, source } of MODELLED_FRAGMENTS) {
+    ok(normalize(STANDIN).includes(normalize(source)), `the stand-in reproduces urllib3's ${label} verbatim`);
+  }
+
+  const probe = spawnSync("python3", ["-c", "import sys; print(sys.version.split()[0])"], { encoding: "utf8" });
+  if (probe.status !== 0) {
+    // Loud, not skipped: a silent skip reads as green, which is the whole
+    // reason this tier exists.
+    console.log("  ! no python3 on PATH: the hook's LOGIC was not executed here — only the drift guards below ran");
+  } else {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-python-realm-"));
+    const pkg = path.join(dir, "pkg");
+    for (const p of ["urllib3", "urllib3/contrib", "urllib3/contrib/emscripten"]) {
+      fs.mkdirSync(path.join(pkg, p), { recursive: true });
+      fs.writeFileSync(path.join(pkg, p, "__init__.py"), "");
+    }
+    fs.writeFileSync(path.join(pkg, "urllib3/contrib/emscripten/fetch.py"), STANDIN);
+    const patchFile = path.join(dir, "patch.py");
+    fs.writeFileSync(patchFile, URLLIB3_REALM_PATCH);
+    const driver = path.join(dir, "driver.py");
+    fs.writeFileSync(driver, DRIVER);
+
+    const r = spawnSync("python3", [driver], {
+      encoding: "utf8", env: { ...process.env, VV_PATCH: patchFile, VV_PKG: pkg },
+    });
+    if (r.status !== 0) {
+      ok(false, `the patch runs under CPython ${probe.stdout.trim()}`);
+      console.log((r.stderr || "").split("\n").slice(-14).map((l) => "      | " + l).join("\n"));
+    } else {
+      const o = JSON.parse(r.stdout.trim().split("\n").pop());
+      console.log(`  (CPython ${probe.stdout.trim()})`);
+
+      ok(o.browser_is_in_node === false, "browser Worker realm: is_in_node() is False, so requests takes the XHR branch");
+      ok(o.browser_marker === true, "…via our predicate, which is marked so a second application cannot re-wrap it");
+      ok(o.browser_fetcher === "_StreamingFetcher", "…and _fetcher is re-decided, not left off by the import-time evaluation");
+      ok(o.browser_exec_count === 1, "…with the module executed exactly once (the wrapped loader does not double-exec)");
+
+      // The assertion that stops the fix becoming a lie in the other direction.
+      ok(o.node_is_in_node === true, "real Node realm: is_in_node() is STILL True — the predicate is realm-derived, not a flat False");
+      ok(o.node_marker === false, "…and the patch does not even wrap it there, so urllib3's own function is what answers");
+      ok(o.node_fetcher === "NoneType", "…and _fetcher stays off, as urllib3 decided");
+
+      ok(o.sibling_value === 42 && o.sibling_untouched === true,
+        "the hook intercepts that one module and lets its siblings import normally");
+      ok(o.preimport_before === true && o.preimport_after === false,
+        "a module already imported before the patch runs is patched in place");
+      ok(o.finder_count === 1, `applying the patch three times installs one finder (${o.finder_count})`);
+      ok(o.wrap_depth === 1, `…and wraps an already-loaded module's predicate once, not once per application (${o.wrap_depth})`);
+      ok(o.wrap_depth_hooked === 1, `…and once for a module the hook itself wrapped, too (${o.wrap_depth_hooked})`);
+      ok(o.idempotent_is_in_node === false, "…and still answers correctly afterwards");
+      ok(o.boom_fetcher === "None" && o.boom_is_in_node === false,
+        "a _StreamingFetcher that throws leaves _fetcher None and does NOT cost us the is_in_node fix");
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  // Drift guards for the wiring, which no amount of running the patch can show.
+  const runtime = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  ok(/installUrllib3RealmPatch\(pyodide\);/.test(runtime), "bootPyodide installs the hook, so it is in place before any user code imports requests");
+  ok(/runPython\(URLLIB3_REALM_PATCH, \{ globals: ns \}\)/.test(runtime), "…into a namespace of its own, so the REPL's __main__ does not fill up with our plumbing");
+  ok(URLLIB3_REALM_PATCH.includes("urllib3.contrib.emscripten.fetch"), "the hook names the module urllib3 actually puts the gate in");
+  ok(/hasattr\(js, "XMLHttpRequest"\)/.test(URLLIB3_REALM_PATCH), "the predicate asks the realm for the capability urllib3 wants");
+  ok(!/def is_in_node\(\):\s*\n\s*return False/.test(URLLIB3_REALM_PATCH), "…rather than being hard-coded to False");
+  ok(/meta_path/.test(URLLIB3_REALM_PATCH) && !/^\s*import urllib3/m.test(URLLIB3_REALM_PATCH),
+    "it hooks the import instead of importing urllib3 at boot (which would pull a wheel into every python process)");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== pip does not report an install it cannot keep ==");
+// Every python command is a fresh Pyodide boot, so `Installed: X` is true of the
+// interpreter that just exited and false of the next one. The install is real,
+// so the success line and exit 0 stay; what was missing was the scope.
+// ---------------------------------------------------------------------------
+{
+  const runtime = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  ok(/THIS interpreter only/.test(PIP_SCOPE_NOTE), "the note says the install is scoped to this interpreter");
+  ok(/fresh\n\s*Pyodide boot/.test(PIP_SCOPE_NOTE), "…names the reason (a fresh boot per command)");
+  ok(/requirements\.txt/.test(PIP_SCOPE_NOTE) && /imports are auto-loaded/.test(PIP_SCOPE_NOTE),
+    "…and points at the two things that DO work, rather than only saying no");
+  // stderr, so `pip install x > log` still captures the same stdout it always did.
+  const writes = runtime.match(/process\.(stdout|stderr)\.write\(PIP_SCOPE_NOTE\)/g) || [];
+  ok(writes.length === 2, `both install paths print it (${writes.length}/2)`);
+  ok(writes.every((w) => w.includes("stderr")), "…on stderr, leaving stdout as it was");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the docs claims this change corrected ==");
+// These were published and wrong. A guard here is the cheapest way to stop the
+// old wording coming back in a later edit.
+// ---------------------------------------------------------------------------
+{
+  const docs = fs.readFileSync(path.join(ROOT, "sites/docs/docs/python.md"), "utf8");
+  ok(!/No outbound network from Python/.test(docs), "the 'no outbound network' claim is gone (it was false: requests, pyfetch and js.fetch all reach the network)");
+  ok(/## Talking to the network/.test(docs), "…replaced by a section that shows how");
+  ok(/TLS not supported in this environment/.test(docs), "the real socket-level limit is named: ssl is a stub");
+  ok(/Access-Control-Allow-Origin/.test(docs) && /not something Vivari can lift/.test(docs),
+    "…and CORS is named as the ceiling, with no bypass implied");
+  ok(!/not shipping yet/.test(docs), "the asyncio.run() claim no longer says the capability is unshipped");
+  ok(/Chrome\s+\n?ships from 137|ships from 137/.test(docs) && /Firefox from 139/.test(docs),
+    "…it names the versions that ship JSPI instead");
 }
 
 // ---------------------------------------------------------------------------

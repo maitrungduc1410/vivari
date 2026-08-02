@@ -121,6 +121,153 @@ export function terminationFromError(e) {
   return { code: 1, report: value }; // sys.exit("message")
 }
 
+// `Installed: X` is true of the interpreter that just ran and false of the next
+// one — every python command is a fresh Pyodide boot, so nothing here survives
+// the process. Reporting a bare success for that is the argv spelling of a
+// placeholder return value: the user runs their script, the import fails, and
+// the pip run is still on screen saying it worked. The success line and the exit
+// code stay (the install did happen); what was missing is its scope.
+//
+// Exported so the offline spike asserts the text itself rather than grepping for
+// it, the way resolveServeError is testable without binding a port.
+export const PIP_SCOPE_NOTE =
+  "pip: installed into THIS interpreter only - every python command is a fresh\n" +
+  "     Pyodide boot, so the next one will not see it. What does persist is the\n" +
+  "     browser's cache of the wheels, which makes the next resolve faster.\n" +
+  "     To have a package present when your code runs: import it (a script's\n" +
+  "     imports are auto-loaded before it runs), or name it in requirements.txt,\n" +
+  "     which a served app reads at startup.\n";
+
+// Undo one consequence of our own Node masquerade: it switches Python's HTTP off.
+//
+// `requests` in Pyodide does not use sockets — it cannot, there are none. urllib3
+// ships an Emscripten transport that picks a door at request time
+// (urllib3/contrib/emscripten/fetch.py):
+//
+//     if has_jspi():     return send_jspi_request(...)      # stack switching
+//     elif is_in_node(): raise _RequestError(NODE_JSPI_ERROR)
+//     js_xhr = js.XMLHttpRequest.new(); js_xhr.open(method, url, False)
+//
+// and it answers `is_in_node()` by reading `js.process.release.name`. We set that
+// to "node" on purpose (builtins/process.js) because real tools branch on it, and
+// `globalThis.process` is the object Pyodide hands Python as `js.process`. So
+// urllib3 concludes that a browser Web Worker is Node, skips the synchronous
+// XMLHttpRequest a Worker actually has, and tells the user to pass
+// `--experimental-wasm-stack-switching` to a Node that is not there. The same
+// expression also decides `_fetcher` at import time, so streaming is off too.
+//
+// The fix asks the REALM instead of asking `process`: a dedicated Worker has a
+// synchronous XMLHttpRequest, the headless Node harnesses do not — and there the
+// Node answer is the true one and must survive, which is why this is a derived
+// predicate and not `return False`. Changing `process.release.name` was the other
+// candidate and is the wrong one: it is load-bearing for real tools, and a
+// `python` process genuinely IS a guest Node process.
+//
+// It has to run as a post-import hook rather than at boot, because urllib3 is not
+// installed at boot and importing it eagerly would pull a wheel into every python
+// process. Exported, with its installer, so scripts/spike-python-bridge.mjs
+// drives the SHIPPED source through the SHIPPED call.
+export const URLLIB3_REALM_PATCH = `
+import sys as _vv_sys
+from importlib.machinery import PathFinder as _VvPathFinder
+
+_VV_FETCH = "urllib3.contrib.emscripten.fetch"
+
+
+def _vv_browser_realm():
+    # The realm question, asked of the realm. Synchronous XMLHttpRequest is
+    # exactly the capability urllib3 is looking for, and it is the thing a
+    # Worker has and Node has not.
+    import js
+    return hasattr(js, "XMLHttpRequest")
+
+
+def _vv_patch_fetch(mod):
+    if getattr(mod.is_in_node, "_vv_realm_derived", False):
+        return
+    if not _vv_browser_realm():
+        return  # real Node: urllib3's own answer is correct, leave it alone
+    _vv_node_answer = mod.is_in_node
+
+    def is_in_node():
+        return (not _vv_browser_realm()) and _vv_node_answer()
+
+    is_in_node._vv_realm_derived = True
+    mod.is_in_node = is_in_node
+    # The import-time gate below ran with the OLD predicate, so replacing the
+    # function alone would leave streaming off by an evaluation that no longer
+    # holds. Re-run the module's own decision, verbatim, with the fixed one.
+    if mod._fetcher is None and mod.is_worker_available() and (
+        mod.is_cross_origin_isolated() and not mod.is_in_browser_main_thread()
+    ):
+        try:
+            mod._fetcher = mod._StreamingFetcher()
+        except Exception:
+            mod._fetcher = None  # buffered transport still works; streaming does not
+
+
+class _VvPatchedLoader:
+    def __init__(self, inner):
+        self._vv_inner = inner
+
+    def create_module(self, spec):
+        return self._vv_inner.create_module(spec)
+
+    def exec_module(self, module):
+        self._vv_inner.exec_module(module)
+        try:
+            _vv_patch_fetch(module)
+        except Exception:
+            pass  # an unbreak must never break the import it decorates
+
+    def __getattr__(self, name):
+        # Explicit, so a missing _vv_inner raises instead of recursing.
+        return getattr(object.__getattribute__(self, "_vv_inner"), name)
+
+
+class _VvEmscriptenFetchFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != _VV_FETCH:
+            return None
+        # 'path' is the parent package's __path__, handed to us by the import
+        # machinery, so PathFinder resolves the real module without re-entering
+        # sys.meta_path and without importing the parent a second time.
+        spec = _VvPathFinder.find_spec(fullname, path, target)
+        if spec is None or spec.loader is None:
+            return None
+        spec.loader = _VvPatchedLoader(spec.loader)
+        return spec
+
+
+# Compared by name, not isinstance: re-running this source rebinds the class, so
+# an isinstance check would install a second finder every time.
+if not any(type(_f).__name__ == "_VvEmscriptenFetchFinder" for _f in _vv_sys.meta_path):
+    _vv_sys.meta_path.insert(0, _VvEmscriptenFetchFinder())
+
+# Already imported (a re-run, or a harness that got there first): patch in place.
+_vv_loaded = _vv_sys.modules.get(_VV_FETCH)
+if _vv_loaded is not None:
+    try:
+        _vv_patch_fetch(_vv_loaded)
+    except Exception:
+        pass
+`;
+
+// Runs the patch in a namespace of its own, so none of those _vv names land in
+// the user's `__main__` — this interpreter is also the REPL, and `dir()` there
+// should show what the user defined, not our plumbing. The functions keep the
+// dict alive through their __globals__, which is what the meta_path finder needs
+// to still resolve them at import time, long after this returns.
+export function installUrllib3RealmPatch(pyodide) {
+  const ns = pyodide.toPy({});
+  try {
+    pyodide.runPython(URLLIB3_REALM_PATCH, { globals: ns });
+    return true;
+  } catch {
+    return false; // an unbreak, not a dependency: Python is fine without it
+  }
+}
+
 // Python side of the bridge. Imports the user's app once and defines a single
 // dispatch function per protocol. Requests/responses cross as JSON strings with
 // base64 bodies (JS strings convert to Python str cleanly; PyProxy/typed-array
@@ -300,6 +447,10 @@ export function createPythonRuntime({ process, require, trackHost }) {
         const pyodide = await mod.loadPyodide({ indexURL: url });
         pyodide.setStdout(byteWriter(process.stdout));
         pyodide.setStderr(byteWriter(process.stderr));
+        // Before any user code can import requests. Installing a meta_path hook
+        // costs one import of sys/importlib and touches nothing else, so a
+        // process that never uses urllib3 pays nothing for it.
+        installUrllib3RealmPatch(pyodide);
         return pyodide;
       } finally {
         restoreEnv();
@@ -504,6 +655,7 @@ export function createPythonRuntime({ process, require, trackHost }) {
       // that aren't in Pyodide's distribution at all.
       await pyodide.loadPackage(list);
       process.stdout.write(`Installed: ${list.join(", ")}\n`);
+      process.stderr.write(PIP_SCOPE_NOTE);
       return 0;
     } catch {
       /* not a Pyodide-distributed package — fall through to micropip (PyPI) */
@@ -513,6 +665,7 @@ export function createPythonRuntime({ process, require, trackHost }) {
       const micropip = pyodide.pyimport("micropip");
       await micropip.install(list);
       process.stdout.write(`Installed via micropip: ${list.join(", ")}\n`);
+      process.stderr.write(PIP_SCOPE_NOTE);
       return 0;
     } catch (e) {
       process.stderr.write(

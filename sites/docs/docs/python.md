@@ -32,6 +32,7 @@ project never touches Python, it never pays for it.
 | **Web frameworks** | Flask, FastAPI and Django, with a live preview |
 | **pytest** | including real exit codes, so `pytest && …` behaves |
 | **Pure-Python packages from PyPI** | installed at runtime through `micropip` |
+| **Outbound HTTP** | `requests`, or `pyfetch` if you want it async — subject to the target's CORS headers |
 
 Start from any of the templates in the Studio's **Native** tab.
 
@@ -83,6 +84,42 @@ What it actually buys you is a warm browser cache, making the next run faster.
 You rarely need to run it by hand — a script's imports pull what they need, and
 a served app reads its `requirements.txt`.
 
+## Talking to the network
+
+Python reaches the network the way the page does — through the browser's `fetch`
+and `XMLHttpRequest` — rather than through a TCP stack of its own. `requests`
+works, because Pyodide's `urllib3` ships a transport built on exactly those:
+
+```python
+import requests
+
+r = requests.get("https://api.example.com/items")
+print(r.status_code, r.json())
+```
+
+If you would rather be asynchronous, the JavaScript side is right there, and
+Vivari runs your script where module-level `await` is valid — so there is no
+wrapper to write:
+
+```python
+from pyodide.http import pyfetch
+
+resp = await pyfetch("https://api.example.com/items")
+data = await resp.json()
+```
+
+**What you do not get is a socket.** `socket`, `urllib.request`, `http.client`,
+`smtplib` and `ftplib` all reach below the level a browser exposes, and this
+build's `ssl` is a stub — anything that negotiates TLS itself stops at
+`RuntimeError: TLS not supported in this environment`. Use `requests`.
+
+**And the browser's rules apply, because the browser is what makes the request.**
+The server has to allow this origin (`Access-Control-Allow-Origin`) and satisfy
+the studio's cross-origin isolation (a `Cross-Origin-Resource-Policy`, or CORS).
+An API that sends no CORS headers cannot be read from Python here — and moving
+the call to JavaScript does not help, because it is the same restriction. This
+one is not something Vivari can lift.
+
 ## Limits
 
 Vivari is a pure client-side environment, and that has real consequences. None
@@ -102,16 +139,18 @@ You do not have to discover this from the flags' silence: `gunicorn -w 4` and
 flag that would change what gets served — `--worker-class gevent`, `--factory` —
 stops rather than serving you something else.
 
-**No outbound network from Python.** Python has no TCP stack of its own here,
-and the worker that does perform real network requests is not wired through to
-it — so `socket`, `urllib` and `requests` have nothing to reach. `requests` will
-even install, since it is pure Python; it just cannot connect. Fetch your data
-from the JavaScript side, or read it from a file in the project.
+**No sockets, and no way around CORS.** Outbound HTTP does work — see [Talking to
+the network](#talking-to-the-network) — but it is the browser that makes the
+request. So `socket`, `urllib.request` and `http.client` have no TCP stack under
+them and `ssl` is a stub, and a server that sends no CORS headers is unreachable
+from the tab at all, in any language.
 
-**No `asyncio.run()`.** It raises `RuntimeError: WebAssembly stack switching not
-supported in this JavaScript runtime` — the browser capability it depends on is
-not shipping yet. Use module-level `await` instead: Vivari runs your script in a
-context where that is valid.
+**`asyncio.run()` depends on a browser feature that is not yet everywhere.** It
+needs WebAssembly JavaScript Promise Integration — stack switching — which Chrome
+ships from 137 and Firefox from 139. Where it is missing you get `RuntimeError:
+WebAssembly stack switching not supported in this JavaScript runtime`.
+Module-level `await` needs none of it and works regardless, so prefer it: Vivari
+runs your script in a context where that is valid.
 
 **Buffered request/response only.** No streaming responses, no Server-Sent
 Events, no WebSocket from Python. Each request is converted, run, and returned
