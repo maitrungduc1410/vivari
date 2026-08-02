@@ -114,6 +114,17 @@ packages/
                    its handshake and frame reader enforce. Pure — no sockets, no Node
                    builtins — so the offline tier drives it directly; the stateful
                    half (http.Server, ServerWebSocket, pub/sub) stays in bun.js.
+      bun-test.js  the whole of `bun:test`: the runner (describe/test with the full
+                   .skip/.only/.todo/.each/.if/.failing family, per-test timeouts,
+                   retry/repeats, -t/--bail/--todo/--reporter), `expect` with the
+                   asymmetric matchers and `.resolves`/`.rejects`, the mock/spy
+                   family + `mock.module()`, and Bun-format snapshots. Split out of
+                   bun.js because a test framework is where being APPROXIMATELY
+                   right is worst: a wrong matcher makes a green suite lie. Its
+                   pure halves (the `.each` title formatter, the snapshot
+                   serializer, the .snap codec, the JUnit writer) are exported so
+                   the offline tier can pin them BYTE-FOR-BYTE against output
+                   captured from a real `bun test` — see the Bun section below.
       bun-unsupported.js  the APIs a browser tab CANNOT provide (raw TCP/UDP, Redis,
                    Bun.SQL's Postgres/MySQL, bun:ffi, WebView, mmap, peek, secrets),
                    each import-safe and loud on call, plus the native `.node` addon
@@ -1025,6 +1036,43 @@ unpacked:
   native-addon message and `NATIVE_ADDON_SUBSTITUTES` (see the node-gyp gotcha
   above) — `module.js` and `process.js` import it, since `require('bcrypt')` from
   plain Node code hits the identical wall.
+- **`packages/runtime/builtins/bun-test.js`** — all of `bun:test`. It is the one
+  file in the shim where **an approximately-right answer is worse than a missing
+  one**: everything else fails visibly, a wrong matcher makes a whole suite report
+  success. So the rule here is stricter than elsewhere — every behaviour was
+  checked against a real `bun test` (1.3.6) and the surprising ones are reproduced
+  with the observation written at the call site. Five worth knowing before you
+  touch it:
+  - **`.only` THROWS when `$CI` is truthy** ("disabled in CI environments to
+    prevent accidentally skipping tests"; `CI=false`/`0`/empty are not CI), and
+    **snapshot CREATION is refused under CI** unless `--update-snapshots`. Both
+    exist so a committed `.only` or a first green build cannot prove nothing.
+    Reproduce them, do not "improve" them away.
+  - **`expect(settledPromise).rejects.toThrow()` returns `undefined` in real Bun**
+    — it peeks the settled promise synchronously and throws. We cannot peek (see
+    `Bun.peek` in `bun-unsupported.js`), so ours always returns a real Promise
+    **and** the runner drains outstanding async assertions after each test body, so
+    a forgotten `await` still fails the test instead of silently passing. That is
+    the one place the shim is deliberately stricter than Bun.
+  - **The `.each` title formatter has two upstream bugs and both are reproduced**,
+    because the title is what `-t` filters and what keys a snapshot: `%s`
+    substitutes only STRINGS and `%d`/`%i`/`%f` only NUMBERS (a `%s` handed a
+    number leaves the literal `%s` in the title *and* still consumes the argument),
+    and the `$property` pass swallows one extra character whenever the lookup
+    misses (`"$ end"` → `"$end"`, `"$a-b"` → `"$ab"`).
+  - **The snapshot format is Bun's, byte-for-byte**, header included — object keys
+    SORTED, getters printed as `[native code]` rather than invoked, a snapshot key
+    joining describe blocks with a SPACE while the reporter joins them with `" > "`.
+    A `.snap` file written here was handed to a real `bun test`, which read it and
+    passed; that round-trip is what the format claim rests on. Two shapes **throw**
+    instead: a Map or a Set NESTED in a container, where Bun's own bytes are
+    malformed and not even self-consistent between the two (a nested Set gains
+    indent-width padding, a nested Map at the same depth gains none), so there is
+    no rule to encode and tidier bytes would fail under real Bun.
+  - **`bun test`'s flags are parsed, and an unknown one is refused by name.** They
+    used to be dropped by `rest.filter(a => a[0] !== '-')`, so `bun test -t auth`
+    ran the whole suite and exited 0. A positional is a **filename filter**, not a
+    path (Bun's documented semantics).
 - **`packages/kernel-host/programs/bun.js`** — the `bun`/`bunx` CLI: `bun run`,
   `bunx` (delegates to `npx`), install delegation, and it surfaces require/unhandled-
   rejection errors instead of a silent exit. `bun <file>` runs the file through the

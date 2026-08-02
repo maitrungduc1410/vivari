@@ -66,6 +66,24 @@
 // option and a per-Database/per-Statement toggle, so 64-bit ids survive as BigInt
 // instead of silently rounding past 2^53 — see bun-sqlite.js.
 //
+// bun:test in full (./bun-test.js, which the clause above now understates): the
+// modifier family on both describe and test (.skip/.only/.todo/.each/.if/.skipIf/
+// .todoIf, plus test.failing), per-test timeouts from Bun's `number | {timeout,
+// retry, repeats}` third argument, `mock` with the whole jest surface
+// (mockReturnValueOnce/mockResolvedValue/…, results recording THROWS, restorable
+// spies and a working mock.restore()), `mock.module()` over the loader's require
+// cache, the toHaveBeenCalled* / toHaveReturned* matchers, the asymmetric matchers
+// (expect.any/anything/objectContaining/arrayContaining/stringContaining/
+// stringMatching/closeTo, expect.not.*, expect.extend) honoured recursively inside
+// toEqual/toStrictEqual/toMatchObject/toHaveBeenCalledWith, `.resolves`/`.rejects`
+// carrying the FULL matcher set with negation (and tracked by the runner, so a
+// forgotten `await` fails the test instead of passing), file-backed
+// toMatchSnapshot() writing Bun's own .snap format byte-for-byte, and the
+// `bun test` flags -t/--test-name-pattern, --bail, --timeout, --todo, -u and
+// --reporter=junit|dots. Two Bun behaviours are reproduced because they exist to
+// stop a suite lying: `.only` THROWS when $CI is truthy, and a MISSING snapshot is
+// a failure under CI rather than something quietly created.
+//
 // NOT SUPPORTED — cannot ever work in a browser tab, so every one of these is
 // LOUD ON CALL rather than silently wrong or silently missing. They live in
 // ./bun-unsupported.js, whose header explains the pattern: the symbol EXISTS (so
@@ -130,7 +148,16 @@
 // would otherwise quietly resolve to the index route) — bun-fsrouter.js. Likewise
 // Bun.Glob.scan({followSymlinks: true}) against a filesystem with no realpathSync:
 // there is no cycle guard without it, and the failure is a walk that never returns
-// rather than a wrong answer — bun-glob.js.
+// rather than a wrong answer — bun-glob.js. And four in bun:test (bun-test.js):
+// toMatchInlineSnapshot() with NO argument, which would have to rewrite the user's
+// source and has no trustworthy call-site position to do it from (the loader
+// transpiles TS before compiling); snapshotting a Map or a Set NESTED in a
+// container, where Bun's own bytes are malformed and not self-consistent between
+// the two, so writing tidier ones would produce a .snap that fails under real Bun;
+// `setSystemTime()`, which has no clock seam to hook; and mock.module() against a
+// BUILTIN — real Bun leaves the builtin silently unmocked there, and asserting
+// against the real module while believing it is mocked is the one outcome this
+// shim will not produce.
 //
 // Bun.serve({ http3 }) throws: HTTP/3 is QUIC over UDP, a browser tab has no UDP
 // socket, and answering HTTP/1.1 to code written for HTTP/3 would be a silent
@@ -221,6 +248,7 @@ import { Cookie, CookieMap, attachRequestCookies, pendingSetCookies } from "./bu
 import { createBunFile } from "./bun-file.js";
 import { createBunCrypto } from "./bun-crypto.js";
 import { createBunSqlite, createVivariSqliteHost } from "./bun-sqlite.js";
+import { createBunTest } from "./bun-test.js";
 import {
   normalizeServeOptions,
   compileStaticRoutes,
@@ -1235,7 +1263,7 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
 
   // ---- bun:* modules ---------------------------------------------------------
   const modules = {
-    "bun:test": makeBunTest({ process }),
+    "bun:test": createBunTest({ process, lazy, deepEquals: bunDeepEquals, deepMatch: bunDeepMatch }),
     "bun:jsc": makeBunJsc(),
     "bun:ffi": createBunFfi(),
     // Real SQLite on the vendored sqlite3.wasm, over a custom VFS backed by Vivari's
@@ -1293,172 +1321,13 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
   }
 }
 
-// ---- bun:test — a minimal but functional test runner ------------------------
-function makeBunTest({ process }) {
-  const suites = [];
-  let current = null;
-  const rootHooks = { beforeAll: [], afterAll: [], beforeEach: [], afterEach: [] };
-
-  const describe = (name, fn) => {
-    const parent = current;
-    const suite = { name, tests: [], hooks: { beforeAll: [], afterAll: [], beforeEach: [], afterEach: [] }, parent };
-    (parent ? parent.children || (parent.children = []) : suites).push(suite);
-    current = suite;
-    try { fn && fn(); } finally { current = parent; }
-  };
-  // Bun/Jest `only` semantics are global, not per-suite: registering a single
-  // test.only anywhere narrows the whole run to the `only` tests. This flag is why
-  // it has to be tracked at registration time — by the time __run() walks the tree
-  // the suites are already built.
-  let hasOnly = false;
-  const test = (name, fn, opts) => {
-    const t = { name, fn, skip: !!(opts && opts.skip), only: !!(opts && opts.only) };
-    if (t.only) hasOnly = true;
-    if (current) current.tests.push(t);
-    else suites.push({ name: "", tests: [t], hooks: emptyHooks() });
-  };
-  test.skip = (name, fn) => test(name, fn, { skip: true });
-  test.todo = (name) => test(name, () => {}, { skip: true });
-  test.only = (name, fn) => test(name, fn, { only: true });
-  const it = test;
-
-  const hook = (kind) => (fn) => {
-    (current ? current.hooks[kind] : rootHooks[kind]).push(fn);
-  };
-
-  const runner = {
-    describe, test, it, expect,
-    beforeAll: hook("beforeAll"), afterAll: hook("afterAll"),
-    beforeEach: hook("beforeEach"), afterEach: hook("afterEach"),
-    mock: makeMock(), spyOn,
-    jest: { fn: makeMock(), spyOn },
-    // Invoked by the `bun test` command after loading the test files.
-    async __run() {
-      let pass = 0, fail = 0;
-      const write = (s) => process.stdout.write(s);
-      // With an `only` registered, everything else is filtered out silently rather
-      // than reported as skipped: `only` is a focus tool, and printing the suite you
-      // asked not to run defeats it. Suites with nothing selected are skipped whole,
-      // so their beforeAll/afterAll do not run either.
-      const selected = (t) => (hasOnly ? t.only : true);
-      const suiteSelected = (s) => s.tests.some(selected) || (s.children || []).some(suiteSelected);
-
-      // `each` hooks inherit down the describe tree, root hooks included. Order is
-      // Jest's: beforeEach outermost-first, afterEach innermost-first.
-      const runSuite = async (suite, prefix, outerBeforeEach, outerAfterEach) => {
-        if (!suiteSelected(suite)) return;
-        const beforeEach = outerBeforeEach.concat(suite.hooks.beforeEach);
-        const afterEach = suite.hooks.afterEach.concat(outerAfterEach);
-        for (const fn of suite.hooks.beforeAll) await fn();
-        for (const t of suite.tests) {
-          if (!selected(t)) continue;
-          const label = (prefix ? prefix + " > " : "") + t.name;
-          // A skipped test must not run the hooks either — this used to run
-          // beforeEach and then `continue` past afterEach, leaving them unpaired.
-          if (t.skip) { write("  - " + label + " (skipped)\n"); continue; }
-          for (const fn of beforeEach) await fn();
-          try { await t.fn(); write("  \u2713 " + label + "\n"); pass++; }
-          catch (e) { write("  \u2717 " + label + "\n    " + ((e && e.message) || e) + "\n"); fail++; }
-          for (const fn of afterEach) await fn();
-        }
-        for (const child of suite.children || []) {
-          await runSuite(child, (prefix ? prefix + " > " : "") + child.name, beforeEach, afterEach);
-        }
-        for (const fn of suite.hooks.afterAll) await fn();
-      };
-
-      for (const fn of rootHooks.beforeAll) await fn();
-      for (const s of suites) await runSuite(s, s.name, rootHooks.beforeEach, rootHooks.afterEach);
-      for (const fn of rootHooks.afterAll) await fn();
-      write("\n " + pass + " pass, " + fail + " fail\n");
-      return fail === 0 ? 0 : 1;
-    },
-  };
-  return runner;
-
-  function emptyHooks() { return { beforeAll: [], afterAll: [], beforeEach: [], afterEach: [] }; }
-}
-
-// bun:test expect() — a compact matcher set covering the common surface.
-function expect(received) {
-  const make = (negate) => ({
-    toBe(v) { assert(negate, received === v, `expected ${fmt(received)} to be ${fmt(v)}`); },
-    // toEqual is loose deepEquals and toStrictEqual is strict — that is the
-    // documented contract, and until now both called the same key-count compare,
-    // so toStrictEqual accepted input real Bun rejects.
-    toEqual(v) { assert(negate, bunDeepEquals(received, v, false), `expected ${fmt(received)} to equal ${fmt(v)}`); },
-    toStrictEqual(v) { assert(negate, bunDeepEquals(received, v, true), `expected ${fmt(received)} to strictly equal ${fmt(v)}`); },
-    toMatchObject(subset) { assert(negate, bunDeepMatch(subset, received), `expected ${fmt(received)} to match object ${fmt(subset)}`); },
-    toBeTruthy() { assert(negate, !!received, `expected ${fmt(received)} to be truthy`); },
-    toBeFalsy() { assert(negate, !received, `expected ${fmt(received)} to be falsy`); },
-    toBeDefined() { assert(negate, received !== undefined, `expected value to be defined`); },
-    toBeUndefined() { assert(negate, received === undefined, `expected value to be undefined`); },
-    toBeNull() { assert(negate, received === null, `expected ${fmt(received)} to be null`); },
-    toBeNaN() { assert(negate, Number.isNaN(received), `expected ${fmt(received)} to be NaN`); },
-    toContain(v) { assert(negate, received && received.includes && received.includes(v), `expected ${fmt(received)} to contain ${fmt(v)}`); },
-    toHaveLength(n) { assert(negate, received && received.length === n, `expected length ${received && received.length} to be ${n}`); },
-    toBeGreaterThan(n) { assert(negate, received > n, `expected ${fmt(received)} > ${n}`); },
-    toBeGreaterThanOrEqual(n) { assert(negate, received >= n, `expected ${fmt(received)} >= ${n}`); },
-    toBeLessThan(n) { assert(negate, received < n, `expected ${fmt(received)} < ${n}`); },
-    toBeLessThanOrEqual(n) { assert(negate, received <= n, `expected ${fmt(received)} <= ${n}`); },
-    toMatch(re) { assert(negate, (typeof re === "string" ? received.includes(re) : re.test(received)), `expected ${fmt(received)} to match ${re}`); },
-    toBeInstanceOf(C) { assert(negate, received instanceof C, `expected value to be instanceof ${C && C.name}`); },
-    toThrow(msg) {
-      let threw = false, err;
-      try { received(); } catch (e) { threw = true; err = e; }
-      const okMsg = msg == null || (err && String(err.message || err).includes(typeof msg === "string" ? msg : ""));
-      assert(negate, threw && okMsg, `expected function to throw${msg ? " " + msg : ""}`);
-    },
-  });
-  const api = make(false);
-  api.not = make(true);
-  api.resolves = {
-    async toBe(v) { expect(await received).toBe(v); },
-    async toEqual(v) { expect(await received).toEqual(v); },
-  };
-  api.rejects = {
-    async toThrow(msg) {
-      let threw = false, err;
-      try { await received; } catch (e) { threw = true; err = e; }
-      assert(false, threw, `expected promise to reject`);
-    },
-  };
-  return api;
-
-  function assert(negate, cond, message) {
-    const pass = negate ? !cond : cond;
-    if (!pass) throw new Error((negate ? "[not] " : "") + message);
-  }
-  function fmt(v) { try { return JSON.stringify(v); } catch { return String(v); } }
-}
-
-function makeMock() {
-  const fn = (impl) => {
-    const calls = [];
-    const results = [];
-    const f = (...args) => {
-      calls.push(args);
-      const r = impl ? impl(...args) : undefined;
-      results.push({ type: "return", value: r });
-      return r;
-    };
-    f.mock = { calls, results };
-    f.mockClear = () => { calls.length = 0; results.length = 0; return f; };
-    f.mockReset = () => { impl = undefined; return f.mockClear(); };
-    f.mockImplementation = (i) => { impl = i; return f; };
-    f.mockReturnValue = (v) => { impl = () => v; return f; };
-    f.mockResolvedValue = (v) => { impl = () => Promise.resolve(v); return f; };
-    return f;
-  };
-  return fn;
-}
-function spyOn(obj, method) {
-  const original = obj[method];
-  const mock = makeMock()((...args) => original.apply(obj, args));
-  mock.mockRestore = () => { obj[method] = original; };
-  obj[method] = mock;
-  return mock;
-}
+// ---- bun:test ---------------------------------------------------------------
+// The runner, expect(), the mock/spy family and snapshots live in ./bun-test.js.
+// They moved out of this file when they grew past a "minimal but functional"
+// runner: a test framework is the one part of the shim where a subtly wrong
+// answer makes a whole suite lie, so it carries its own rules (every behaviour
+// checked against a real bun test, the surprising ones reproduced with the
+// observation written down) and its own pure, spike-pinned halves.
 
 // bun:jsc — a couple of the introspection helpers, backed by web primitives.
 //

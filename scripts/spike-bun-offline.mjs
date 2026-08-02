@@ -38,6 +38,16 @@ import {
   loadBunEnvFiles,
 } from "../packages/runtime/builtins/bun-env.js";
 import { createSleepSync } from "../packages/runtime/builtins/bun-sleep.js";
+// The pure halves of the bun:test runner. They are exported precisely so this
+// tier can pin them against bytes captured from a real `bun test` — see the
+// Phase 5A sections at the end of this file.
+import {
+  formatEachTitle,
+  prettyFormat,
+  formatSnapshotFile,
+  parseSnapshotFile,
+  dedentInlineSnapshot,
+} from "../packages/runtime/builtins/bun-test.js";
 // Bun.serve option handling + the RFC 6455 rules, as pure functions so this
 // Wasm-free tier can drive them without binding a port. See bun-serve.js.
 import {
@@ -3975,6 +3985,573 @@ console.log("== bun build --compile fails loudly (BUN_PROGRAM as a real process)
     const plain = bun("build", "app.ts", "--outfile=out.js");
     ok(!/--compile is not supported/.test(plain.text), "a build without --compile does not hit the guard");
     ok(/Bun is not defined/.test(plain.text), "…it reaches the transpile path (which needs the Bun global this harness has no kernel to install)");
+  } finally {
+    fsMod.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ── bun:test runner parity (Phase 5A) ────────────────────────────────────────
+// Everything below was captured from a REAL `bun test` (1.3.6, d530ed99) and is
+// asserted byte-for-byte, per the rule in AGENTS.md: for an API with a defined
+// answer, the test is a value from outside this repo. The `.each` titles and the
+// snapshot bytes in particular are not "what looks right" — they are what the
+// binary printed, upstream bugs included, and several of them are surprising.
+console.log("== bun:test .each titles reproduce Bun's formatter, bugs included ==");
+{
+  // The printf pass substitutes %s only for STRINGS and %d/%i/%f only for NUMBERS:
+  // a %s handed a number leaves the literal "%s" in the title AND still consumes
+  // the argument. Every expectation here is a line of real `bun test` output.
+  ok(formatEachTitle("A %s|%s", [1, "z"], 0) === "A %s|z", "%s substitutes a string and leaves the token for a number");
+  ok(formatEachTitle("B %d|%s", [1, "z"], 0) === "B 1|z", "%d substitutes a number");
+  ok(formatEachTitle("C %i|%j", [1, "z"], 0) === 'C 1|"z"', "%i integer, %j JSON");
+  ok(formatEachTitle("D %f|%o", [1, "z"], 0) === 'D 1|"z"', "%f number, %o JSON");
+  ok(formatEachTitle("E %p|%#", [1, "z"], 0) === "E 1|0", "%p pretty-format, %# the row index");
+  ok(formatEachTitle("F %% %s", [1, "z"], 0) === "F % %s", "%% is a literal percent and consumes no argument");
+  ok(formatEachTitle("index %# and %% and %s %j %o %p", [1, 2], 0) === "index 0 and % and %s 2 %o %p",
+    "a token with no argument left stays literal");
+  ok(formatEachTitle("A %s|%s|%s", [true, null, undefined], 0) === "A %s|%s|%s", "%s rejects true/null/undefined");
+  ok(formatEachTitle("B %d|%d", ["s", 1], 0) === "B %d|1", "%d rejects a string but still consumes it");
+  ok(formatEachTitle("C %j|%o", [new Map([["k", 1]]), { a: { b: 2 } }], 0) === 'C {}|{"a":{"b":2}}',
+    "%j is JSON.stringify, so a Map renders as {}");
+  // JSC stores 1.7 and -0 as doubles, and Bun's %i wants an int32 — so both come
+  // back as the literal token. This is the sort of detail a from-scratch
+  // reimplementation gets wrong in a way nobody notices until a title changes.
+  ok(formatEachTitle("A i=%i", [1.7], 0) === "A i=%i", "%i rejects a float");
+  ok(formatEachTitle("D i=%i", [-0], 0) === "D i=%i", "%i rejects -0 (JSC holds it as a double)");
+  ok(formatEachTitle("B d=%d", [1.7], 0) === "B d=1.7" && formatEachTitle("E d=%d", [NaN], 0) === "E d=NaN", "%d takes any number");
+
+  // The $property pass, and its off-by-one: on a MISS Bun emits the literal $path
+  // and then swallows the next character.
+  ok(formatEachTitle("E $a.b $n $#", { a: { b: 7 }, n: "q" }, 0) === "E 7 q $", "$path walks a dotted path; $# is not a token");
+  ok(formatEachTitle("B $ end", { n: 1 }, 0) === "B $end", "a bare $ eats the following space (upstream off-by-one)");
+  ok(formatEachTitle("C $n$n end", { n: 1 }, 0) === "C $n$nend", "$ is an identifier character, so $n$n is one (missing) path");
+  ok(formatEachTitle("F $a-b end", { "a-b": 1 }, 0) === "F $ab end", "the path stops at '-', then the '-' is swallowed");
+  ok(formatEachTitle("E pre$n.x post", { n: "s" }, 0) === "E pre$n.xpost", "a partial path miss eats the space too");
+  ok(formatEachTitle("F $missing", { a: 1 }, 0) === "F $missing", "an unknown key is left alone");
+  ok(formatEachTitle("G $0 $1", [10, 20], 0) === "G $0 $1", "$ substitution is inert for an ARRAY row — no character is eaten");
+  ok(formatEachTitle("D $n end", { n: { a: 1 } }, 0) === 'D {\n  "a": 1,\n} end', "an object value is pretty-formatted into the title");
+}
+
+console.log("== bun:test snapshot serializer is byte-exact with Bun's ==");
+{
+  // Each expectation is the exact body real Bun wrote into a .snap file. This is
+  // the check that lets the shim claim compatibility rather than resemblance: a
+  // .snap written here was fed back to a real `bun test` and matched.
+  ok(prettyFormat({ a: 1, b: [1, 2], c: "str", d: null, e: undefined }) ===
+    '{\n  "a": 1,\n  "b": [\n    1,\n    2,\n  ],\n  "c": "str",\n  "d": null,\n  "e": undefined,\n}', "object/array/undefined");
+  ok(prettyFormat("hello") === '"hello"' && prettyFormat("") === '""' && prettyFormat(42) === "42" &&
+    prettyFormat(true) === "true" && prettyFormat(null) === "null" && prettyFormat(undefined) === "undefined", "primitives");
+  ok(prettyFormat("a\nb") === '"a\nb"', "a top-level multi-line string keeps its newlines unescaped");
+  ok(prettyFormat({ b: 1, A: 2, 10: 3, 2: 4, _z: 5, a: 6 }) ===
+    '{\n  "10": 3,\n  "2": 4,\n  "A": 2,\n  "_z": 5,\n  "a": 6,\n  "b": 1,\n}', "keys are SORTED, by codepoint");
+  ok(prettyFormat({ e: new Error("bad"), t: new TypeError("tt") }) === '{\n  "e": [Error: bad],\n  "t": [TypeError: tt],\n}', "errors");
+  ok(prettyFormat({ p: Promise.resolve(1) }) === '{\n  "p": Promise {},\n}', "a promise is not awaited");
+  ok(prettyFormat({ d: new Date(0), r: /x/ }) === '{\n  "d": 1970-01-01T00:00:00.000Z,\n  "r": /x/,\n}', "Date/RegExp are unquoted");
+  ok(prettyFormat(Object.create(null)) === "{}", "a null-prototype object gets no prefix");
+  // Bun prints a getter as [native code] rather than invoking it — which is also
+  // the safe behaviour, since a snapshot must not run user code with side effects.
+  ok(prettyFormat(Object.defineProperty({}, "g", { get: () => 1, enumerable: true })) === '{\n  "g": [native code],\n}', "a getter is not invoked");
+  {
+    const sparse = [1]; sparse[3] = 4;
+    ok(prettyFormat(sparse) === "[\n  1,\n  undefined,\n  undefined,\n  4,\n]", "a hole prints as undefined");
+    const cyc = { a: 1 }; cyc.self = cyc;
+    ok(prettyFormat(cyc) === '{\n  "a": 1,\n  "self": [Circular],\n}', "a cycle is [Circular], not a stack overflow");
+  }
+  class Point { constructor() { this.x = 1; this.y = 2; } }
+  // Bun reads a function's DECLARED name only: an arrow assigned to a property has
+  // an inferred .name but still prints as plain [Function].
+  ok(prettyFormat({ cls: new Point(), buf: new Uint8Array([1, 2]), big: 10n, sym: Symbol("s"), neg: -0, nan: NaN, inf: Infinity, fn: function named() {}, anon: () => {} }) ===
+    '{\n  "anon": [Function],\n  "big": 10n,\n  "buf": Uint8Array [\n    1,\n    2,\n  ],\n  "cls": Point {\n    "x": 1,\n    "y": 2,\n  },\n  "fn": [Function: named],\n  "inf": Infinity,\n  "nan": NaN,\n  "neg": -0,\n  "sym": Symbol(s),\n}',
+    "class instance / typed array / bigint / symbol / -0 / declared-vs-inferred function name");
+  ok(prettyFormat(new Map([["k", 1]])) === 'Map {\n  "k" => 1,\n}' && prettyFormat(new Set([1])) === "Set {\n  1,\n}", "a TOP-LEVEL Map/Set");
+  // Bun indents a nested multi-line string at column 0 and closes it with a lone
+  // comma. That is an upstream bug, but it is stable and it is what a .snap file
+  // written by the real binary contains, so it is reproduced rather than tidied.
+  ok(prettyFormat({ s: "a\nb" }) === '{\n  "s": \n"a\nb"\n,\n}', "a nested multi-line string keeps Bun's odd layout");
+  ok(prettyFormat({ x: { s: "a\nb" } }) === '{\n  "x": {\n    "s": \n"a\nb"\n,\n  },\n}', "…at any depth");
+  ok(prettyFormat(["a\nb"]) === '[\n  \n"a\nb"\n,\n]', "…and inside an array");
+  // A nested Map/Set is where Bun's layout stops being self-consistent (a nested
+  // Set gains indent-width padding, a nested Map at the same depth gains none), so
+  // there is no rule to encode and this refuses instead of inventing bytes.
+  let nestedSet = "";
+  try { prettyFormat({ s: new Set([1]) }); } catch (e) { nestedSet = e.message; }
+  ok(/cannot snapshot a Set nested inside/.test(nestedSet), "a NESTED Set throws instead of writing bytes real Bun would reject");
+  let nestedMap = "";
+  try { prettyFormat([new Map()]); } catch (e) { nestedMap = e.message; }
+  ok(/cannot snapshot a Map nested inside/.test(nestedMap) && /toEqual/.test(nestedMap), "…same for a nested Map, and the message says what to use instead");
+}
+
+console.log("== bun:test .snap file codec round-trips Bun's escaping ==");
+{
+  const body = '{\n  "a": "back`tick",\n  "b": "dollar${x}",\n  "c": "back\\slash",\n}';
+  const text = formatSnapshotFile(new Map([["escapes 1", body]]));
+  // A .snap file is executable CommonJS, so the body sits inside a template
+  // literal: a backslash, a backtick or a ${ has to be escaped or the file stops
+  // parsing. These are the exact bytes real Bun wrote for the same value.
+  ok(text === '// Bun Snapshot v1, https://bun.sh/docs/test/snapshots\n\nexports[`escapes 1`] = `\n{\n  "a": "back\\`tick",\n  "b": "dollar\\${x}",\n  "c": "back\\\\slash",\n}\n`;\n',
+    "backtick / ${ / backslash are escaped exactly as Bun escapes them");
+  ok(parseSnapshotFile(text).get("escapes 1") === body, "…and reading undoes it");
+  ok(parseSnapshotFile(formatSnapshotFile(new Map([["k 1", "42"]]))).get("k 1") === "42", "a single-line body is stored inline, not wrapped in newlines");
+  // Bun writes an inline snapshot back into the source indented to the call site,
+  // so the stored text carries the file's indentation and has to be stripped
+  // before comparison — otherwise every inline snapshot inside a describe fails on
+  // whitespace alone.
+  ok(dedentInlineSnapshot('\n    {\n      "a": 1,\n    }\n  ') === '{\n  "a": 1,\n}', "an inline snapshot written at depth is dedented");
+  ok(dedentInlineSnapshot('"plain"') === '"plain"', "a single-line inline snapshot is untouched");
+}
+
+// A bun:test runner is per-runtime state, and several checks below need a
+// specific process env (CI in particular), so each builds its own.
+function bunTestWith(env, cwd) {
+  const logs = [];
+  const proc = {
+    env: env || {}, argv: ["bun"], cwd: () => cwd || "/",
+    stdout: { write: (s) => logs.push(s) }, stderr: { write: (s) => logs.push(s) }, stdin: process.stdin,
+  };
+  const { modules } = createBunRuntime({ process: proc, Buffer, require: nodeRequire });
+  return { t: modules["bun:test"], report: () => logs.join("") };
+}
+
+console.log("== bun:test describe/test modifiers ==");
+{
+  // describe was a plain function with no properties at all, and test had no
+  // .each/.if/.failing — a suite using any of them died at load with "is not a
+  // function", which at least was loud. The risk now is the opposite one: a
+  // modifier that registers a test it should have skipped.
+  const { t } = bunTestWith();
+  const ran = [];
+  t.describe.skip("s", () => t.test("a", () => ran.push("a")));
+  t.describe.todo("td", () => t.test("b", () => ran.push("b")));
+  t.describe("n", () => t.test("c", () => ran.push("c")));
+  t.describe.if(true)("it", () => t.test("d", () => ran.push("d")));
+  t.describe.if(false)("if", () => t.test("e", () => ran.push("e")));
+  t.describe.skipIf(true)("si", () => t.test("f", () => ran.push("f")));
+  t.describe.todoIf(true)("ti", () => t.test("g", () => ran.push("g")));
+  t.test.if(false)("h", () => ran.push("h"));
+  t.test.skipIf(true)("i", () => ran.push("i"));
+  t.test.todoIf(true)("j", () => ran.push("j"));
+  const code = await t.__run();
+  ok(ran.join(",") === "c,d", "only the un-skipped tests run (ran: " + ran.join(",") + ")");
+  ok(code === 0, "skipped and todo tests do not fail the run");
+}
+{
+  const { t, report } = bunTestWith();
+  // test.failing inverts the verdict — and a test that starts PASSING is a signal,
+  // so Bun fails it with a message telling you to remove the modifier.
+  t.test.failing("throws as designed", () => { throw new Error("x"); });
+  t.test.failing("passes unexpectedly", () => {});
+  const code = await t.__run();
+  ok(code === 1, "test.failing: a throwing test passes, a passing one fails the run");
+  ok(/marked as failing but it passed/.test(report()), "…with Bun's own explanation");
+}
+{
+  const { t, report } = bunTestWith();
+  t.test.each([[1, 2, 3], [2, 3, 5]])("t %i + %i = %i", (a, b, c) => { if (a + b !== c) throw new Error("bad"); });
+  t.describe.each([[1, 2, 3]])("d %i + %i = %i", (a, b, c) => t.test("adds", () => { if (a + b !== c) throw new Error("bad"); }));
+  t.test.each([{ name: "x", v: 1 }])("obj $name -> $v", (row) => { if (typeof row.v !== "number") throw new Error("bad"); });
+  const code = await t.__run();
+  const r = report();
+  ok(code === 0 && /4 pass/.test(r) && /0 fail/.test(r), "each runs one test per row with the row spread as arguments");
+  ok(r.includes("t 1 + 2 = 3") && r.includes("t 2 + 3 = 5"), "test.each titles are formatted per row");
+  ok(r.includes("d 1 + 2 = 3 > adds"), "describe.each names the SUITE, and its tests nest under it");
+  ok(r.includes("obj x -> 1"), "a non-array row is one argument and enables $property titles");
+}
+
+console.log("== bun:test per-test timeouts ==");
+{
+  // The options bag used to read only {skip, only} — Bun's public third argument is
+  // `number | {timeout, retry, repeats}`, so a per-test timeout was silently
+  // ignored and a hung test hung the run forever.
+  const { t, report } = bunTestWith();
+  t.test("async over budget", async () => { await new Promise((r) => setTimeout(r, 200)); }, 40);
+  t.test("sync over budget", () => { const s = Date.now(); while (Date.now() - s < 120) { /* burn */ } }, 40);
+  t.test("under budget", async () => { await new Promise((r) => setTimeout(r, 5)); }, { timeout: 500 });
+  const code = await t.__run();
+  const r = report();
+  ok(code === 1, "a test over its timeout fails the run");
+  ok((r.match(/timed out after 40ms/g) || []).length === 2, "both the number and the {timeout} form are honoured");
+  // Nothing in JavaScript can interrupt a synchronous loop, and real Bun does not
+  // either — it lets the body finish and reports the timeout afterwards. Matching
+  // that is the honest behaviour; pretending to abort would be the lie.
+  ok(/✓ under budget/.test(r) || /\u2713 under budget/.test(r), "a test inside its budget still passes");
+}
+{
+  const { t } = bunTestWith();
+  let attempts = 0, runs = 0;
+  t.test("retried", () => { attempts++; if (attempts < 3) throw new Error("flaky"); }, { retry: 3 });
+  t.test("repeated", () => { runs++; }, { repeats: 2 });
+  const code = await t.__run();
+  ok(code === 0 && attempts === 3, "retry re-runs a failing test (attempts: " + attempts + ")");
+  ok(runs === 3, "repeats: 2 runs the body three times (runs: " + runs + ")");
+}
+{
+  const { t, report } = bunTestWith();
+  t.test("default budget", async () => { await new Promise((r) => setTimeout(r, 30)); });
+  await t.__run({ timeout: 5 });
+  ok(/timed out after 5ms/.test(report()), "--timeout sets the default for tests that declare none");
+}
+
+console.log("== bun:test .only is refused under CI (Bun's guard, and the reason for it) ==");
+{
+  // A committed `.only` narrows a CI run to one test and reports success. Bun
+  // throws at REGISTRATION when $CI is truthy rather than letting that happen, and
+  // this shim's own history (test.only used to filter nothing at all) is why the
+  // guard is worth reproducing exactly.
+  const { t } = bunTestWith({ CI: "true" });
+  let onlyMsg = "", describeMsg = "";
+  try { t.test.only("x", () => {}); } catch (e) { onlyMsg = e.message; }
+  try { t.describe.only("y", () => {}); } catch (e) { describeMsg = e.message; }
+  ok(/\.only is disabled in CI environments/.test(onlyMsg), "test.only throws under CI=true");
+  ok(/\.only is disabled in CI environments/.test(describeMsg), "describe.only too");
+  ok(/CI=false/.test(onlyMsg), "…and the message says how to override it");
+  for (const v of ["false", "0", ""]) {
+    const { t: t2 } = bunTestWith({ CI: v });
+    let threw = false;
+    try { t2.test.only("x", () => {}); } catch { threw = true; }
+    ok(!threw, `CI=${JSON.stringify(v)} is not a CI environment`);
+  }
+}
+{
+  const { t } = bunTestWith();
+  const ran = [];
+  t.describe.only("focused", () => t.test("a", () => ran.push("a")));
+  t.describe("other", () => t.test("b", () => ran.push("b")));
+  await t.__run();
+  ok(ran.join(",") === "a", "describe.only focuses the whole run, not just its own suite");
+}
+
+console.log("== bun:test toThrow: the argument forms are four different comparisons ==");
+{
+  const { t } = bunTestWith();
+  const e = t.expect;
+  const passes = (fn) => { try { fn(); return true; } catch { return false; } };
+  const boom = () => { throw new Error("boom happened"); };
+  class MyErr extends Error {}
+  ok(passes(() => e(boom).toThrow("boom")), "a STRING is a substring match");
+  ok(passes(() => e(boom).toThrow(/happ/)), "a REGEXP is tested against the message");
+  // Regression: the old matcher fed a RegExp to `includes("")`, so every error
+  // matched every pattern — an assertion that could not fail.
+  ok(!passes(() => e(boom).toThrow(/nope/)), "…and a non-matching RegExp now FAILS (it used to always pass)");
+  ok(passes(() => e(() => { throw new MyErr("c"); }).toThrow(MyErr)), "a CLASS is an instanceof check");
+  ok(!passes(() => e(boom).toThrow(MyErr)), "…and the wrong class fails");
+  // An Error INSTANCE compares the message for EQUALITY — the opposite of the
+  // string form, which is the surprise worth pinning.
+  ok(passes(() => e(boom).toThrow(new Error("boom happened"))), "an Error INSTANCE compares the message for equality");
+  ok(!passes(() => e(boom).toThrow(new Error("boom"))), "…so a partial message does NOT match an instance");
+  ok(passes(() => e(boom).not.toThrow("nope")) && !passes(() => e(boom).not.toThrow("boom")), "negation composes with the message argument");
+  ok(passes(() => e(() => { throw "plain string"; }).toThrow("plain")), "a thrown non-Error is matched against its own string");
+  ok(passes(() => e(boom).toThrowError("boom")), "toThrowError is the documented alias");
+  ok(!passes(() => e(5).toThrow()), "a non-callable receiver is a usage error, not a passing assertion");
+}
+
+console.log("== bun:test .resolves / .rejects carry the whole matcher set ==");
+{
+  // `.resolves` had exactly two matchers and `.rejects.toThrow` ignored both its
+  // message argument and negation — so `rejects.toThrow('anything at all')` passed
+  // for every rejection.
+  const { t } = bunTestWith();
+  const e = t.expect;
+  const settles = async (fn) => { try { await fn(); return true; } catch { return false; } };
+  const rej = () => Promise.reject(new Error("nope happened"));
+  ok(await settles(() => e(rej()).rejects.toThrow("nope")), "rejects.toThrow matches the message");
+  ok(!(await settles(() => e(rej()).rejects.toThrow("something else"))), "…and a wrong message FAILS (the message used to be ignored)");
+  ok(await settles(() => e(rej()).rejects.not.toThrow("something else")), "rejects.not composes (negation used to be ignored)");
+  ok(!(await settles(() => e(rej()).rejects.not.toThrow("nope"))), "…in both directions");
+  ok(await settles(() => e(Promise.reject(42)).rejects.toBe(42)), "the matcher runs against the rejection VALUE, not just Errors");
+  ok(await settles(() => e(Promise.reject({ a: 1 })).rejects.toEqual({ a: 1 })), "…with any matcher");
+  ok(await settles(() => e(Promise.resolve([1, 2])).resolves.toHaveLength(2)), "resolves has the full set too (it had toBe and toEqual)");
+  ok(await settles(() => e(Promise.resolve(1)).resolves.not.toBe(2)), "resolves.not");
+  ok(!(await settles(() => e(rej()).resolves.toBe(1))), "resolves on a rejecting promise fails");
+  ok(!(await settles(() => e(Promise.resolve(1)).rejects.toThrow())), "rejects on a resolving promise fails");
+  // Bun rejects a function here (Jest accepts one); reproduced so a suite written
+  // against Bun behaves the same way.
+  ok(!(await settles(() => e(rej).rejects.toThrow("nope"))), "a FUNCTION is not a promise — Bun refuses it and so do we");
+  // Real Bun returns UNDEFINED from `.rejects.toThrow()` on an already-settled
+  // promise: it peeks the settled value synchronously and throws. No browser engine
+  // exposes that peek (see bun-unsupported.js), so ours always returns a promise —
+  // the safe direction, since `await undefined` would silently assert nothing.
+  const returned = e(Promise.resolve(1)).resolves.toBe(1);
+  ok(!!returned && typeof returned.then === "function", "…and ours always returns a real promise");
+  await returned;
+}
+{
+  const { t } = bunTestWith();
+  // The other half of that decision: a missing `await` must not turn a red test
+  // green. The runner drains outstanding async assertions before it scores a test.
+  t.test("forgot the await", () => { t.expect(Promise.resolve(1)).resolves.toBe(2); });
+  ok(await t.__run() === 1, "an un-awaited .resolves failure still fails its test");
+}
+
+console.log("== bun:test mock / spy surface ==");
+{
+  const { t } = bunTestWith();
+  const e = t.expect;
+  const passes = (fn) => { try { fn(); return true; } catch { return false; } };
+  const f = t.mock((x) => x * 2);
+  f(1); f(2, 3);
+  ok(passes(() => e(f).toHaveBeenCalled()) && passes(() => e(f).toHaveBeenCalledTimes(2)), "toHaveBeenCalled / Times");
+  ok(passes(() => e(f).toHaveBeenCalledWith(2, 3)) && !passes(() => e(f).toHaveBeenCalledWith(9)), "toHaveBeenCalledWith compares arguments structurally");
+  ok(passes(() => e(f).toHaveBeenLastCalledWith(2, 3)) && !passes(() => e(f).toHaveBeenLastCalledWith(1)), "toHaveBeenLastCalledWith");
+  ok(passes(() => e(f).toHaveBeenNthCalledWith(1, 1)) && !passes(() => e(f).toHaveBeenNthCalledWith(2, 1)), "toHaveBeenNthCalledWith counts from 1");
+  ok(passes(() => e(f).toHaveReturnedTimes(2)), "toHaveReturnedTimes");
+  ok(!passes(() => e(() => {}).toHaveBeenCalled()), "a plain function is a usage error, not a silent pass");
+  const thrower = t.mock(() => { throw new Error("e"); });
+  try { thrower(); } catch { /* expected */ }
+  ok(thrower.mock.results.map((r) => r.type).join() === "throw", "a throwing mock records {type:'throw'} (it used to record nothing)");
+  ok(!passes(() => e(thrower).toHaveReturned()), "…so toHaveReturned does not count it");
+  const once = t.mock().mockReturnValueOnce(1).mockReturnValue(2);
+  ok(once() === 1 && once() === 2 && once() === 2, "mockReturnValueOnce queues ahead of mockReturnValue");
+  ok(JSON.stringify(once.mock.lastCall) === "[]" && once.mock.calls.length === 3, "mock.lastCall / mock.calls");
+}
+{
+  const { t } = bunTestWith();
+  const obj = { m() { return "real"; } };
+  const proto = { p() { return "proto"; } };
+  const child = Object.create(proto);
+  const s1 = t.spyOn(obj, "m");
+  t.spyOn(child, "p");
+  ok(obj.m() === "real" && s1.mock.calls.length === 1, "a spy calls through to the original by default");
+  t.mock.restore();
+  ok(obj.m() === "real" && s1.mock.calls.length === 1, "mock.restore() puts the original back (it used to be a no-op)");
+  // An inherited method has to be DELETED on restore, not assigned back, or the
+  // object keeps an own-property copy that shadows the prototype forever.
+  ok(!Object.prototype.hasOwnProperty.call(child, "p") && child.p() === "proto", "restoring a spy on an INHERITED method removes the own property");
+  let msg = "";
+  try { t.spyOn(obj, "notAMethod"); } catch (e2) { msg = e2.message; }
+  ok(/does not exist/.test(msg), "spyOn a property that does not exist throws instead of installing a spy nothing calls");
+}
+
+console.log("== bun:test asymmetric matchers + expect.extend ==");
+{
+  const { t } = bunTestWith();
+  const e = t.expect;
+  const passes = (fn) => { try { fn(); return true; } catch { return false; } };
+  ok(passes(() => e({ id: 1, n: "x" }).toEqual({ id: e.any(Number), n: e.any(String) })), "expect.any inside toEqual");
+  // expect.any(String) has to match the primitive as well as the wrapper, which a
+  // bare instanceof does not.
+  ok(passes(() => e("s").toEqual(e.any(String))) && passes(() => e(1n).toEqual(e.any(BigInt))), "expect.any covers primitives and their wrappers");
+  ok(passes(() => e({ a: { b: [2] } }).toEqual({ a: { b: [e.any(Number)] } })), "asymmetric matchers are honoured RECURSIVELY");
+  ok(!passes(() => e({ a: 1, b: 2 }).toEqual({ a: e.any(Number) })), "…and the surrounding comparison still counts keys");
+  ok(passes(() => e({ a: 1, b: 2 }).toEqual(e.objectContaining({ a: 1 }))), "expect.objectContaining");
+  ok(passes(() => e([1, 2, 3]).toEqual(e.arrayContaining([3, 2]))), "expect.arrayContaining");
+  ok(passes(() => e("hello world").toEqual(e.stringContaining("lo wo"))), "expect.stringContaining");
+  ok(passes(() => e("hello").toEqual(e.stringMatching(/^he/))), "expect.stringMatching");
+  ok(passes(() => e({ v: 0.1 + 0.2 }).toEqual({ v: e.closeTo(0.3) })), "expect.closeTo");
+  ok(passes(() => e({ a: 1 }).toEqual(e.not.objectContaining({ b: 1 }))) && !passes(() => e({ b: 1 }).toEqual(e.not.objectContaining({ b: 1 }))), "expect.not.*");
+  ok(passes(() => e({ a: 1 }).toStrictEqual({ a: e.any(Number) })), "…inside toStrictEqual");
+  ok(passes(() => e({ a: 1, b: 2 }).toMatchObject({ a: e.any(Number) })), "…inside toMatchObject");
+  ok(passes(() => e([{ a: 1 }]).toContainEqual({ a: e.any(Number) })), "…inside toContainEqual");
+  ok(passes(() => e(new Map([["k", 1]])).toEqual(new Map([["k", e.any(Number)]]))), "…inside a Map");
+  const m = t.mock(); m({ id: 7 });
+  ok(passes(() => e(m).toHaveBeenCalledWith({ id: e.any(Number) })), "…and inside toHaveBeenCalledWith");
+  // Regression guard: the strict/loose split that Phase 0 fixed must survive the
+  // asymmetric-aware walk, which only replaces Bun.deepEquals when a matcher is
+  // actually present in the expected tree.
+  ok(passes(() => e({ a: 1 }).toEqual({ a: 1, b: undefined })) && !passes(() => e({ a: 1 }).toStrictEqual({ a: 1, b: undefined })), "the loose/strict split is untouched");
+  e.extend({ toBeWithin(received, lo, hi) { return { pass: received >= lo && received <= hi, message: () => `expected ${received} within ${lo}..${hi}` }; } });
+  ok(passes(() => e(5).toBeWithin(1, 10)) && !passes(() => e(50).toBeWithin(1, 10)), "expect.extend registers a matcher");
+  ok(passes(() => e(50).not.toBeWithin(1, 10)), "…and it composes with .not");
+  let extendMsg = "";
+  try { e(50).toBeWithin(1, 10); } catch (e2) { extendMsg = e2.message; }
+  ok(/expected 50 within 1\.\.10/.test(extendMsg), "…and its message() is what the failure prints");
+}
+
+console.log("== bun:test matcher breadth ==");
+{
+  const { t } = bunTestWith();
+  const e = t.expect;
+  const passes = (fn) => { try { fn(); return true; } catch { return false; } };
+  // Jest's rule, and not the obvious one: the tolerance is 10^-digits / 2, and
+  // `digits` defaults to 2 — so toBeCloseTo(1.24, 1) passes for 1.23.
+  ok(passes(() => e(0.1 + 0.2).toBeCloseTo(0.3)) && passes(() => e(0.1 + 0.2).toBeCloseTo(0.3, 5)), "toBeCloseTo");
+  ok(passes(() => e(1.23).toBeCloseTo(1.24, 1)) && !passes(() => e(1.23).toBeCloseTo(1.24, 3)), "…with the digits argument");
+  ok(passes(() => e({ a: { b: [1, 2] } }).toHaveProperty("a.b")) && passes(() => e({ a: { b: [1, 2] } }).toHaveProperty("a.b", [1, 2])), "toHaveProperty with a dotted path");
+  // The array form is the only way to reach a key that contains a dot, so the two
+  // spellings are not interchangeable.
+  ok(passes(() => e({ "a.b": 1 }).toHaveProperty(["a.b"], 1)) && !passes(() => e({ "a.b": 1 }).toHaveProperty("a.b", 1)), "…and the ARRAY form reaches a key containing a dot");
+  ok(passes(() => e({ a: undefined }).toHaveProperty("a")) && passes(() => e({ a: 1 }).not.toHaveProperty("z")), "toHaveProperty finds a present-but-undefined property");
+  ok(passes(() => e([{ a: 1 }]).toContainEqual({ a: 1 })) && !passes(() => e([{ a: 1 }]).toContain({ a: 1 })), "toContainEqual is structural where toContain is identity");
+  ok(passes(() => e([]).toBeEmpty()) && passes(() => e("").toBeEmpty()) && passes(() => e({}).toBeEmpty()) && passes(() => e(new Set()).toBeEmpty()) && !passes(() => e({ a: 1 }).toBeEmpty()), "toBeEmpty");
+  ok(passes(() => e([1]).toBeArray()) && passes(() => e([1]).toBeArrayOfSize(1)) && passes(() => e("s").toBeString()) &&
+    passes(() => e(1).toBeNumber()) && passes(() => e(true).toBeBoolean()) && passes(() => e(() => {}).toBeFunction()) &&
+    passes(() => e({}).toBeObject()) && passes(() => e(null).toBeNil()) && passes(() => e(1).toBeTypeOf("number")) &&
+    passes(() => e(1).toBeInteger()) && passes(() => e(1).toBeFinite()) && passes(() => e(new Date()).toBeDate()), "the type matchers");
+  ok(passes(() => e("abc").toStartWith("ab")) && passes(() => e("abc").toEndWith("bc")) && passes(() => e("abc").toInclude("b")), "the string matchers");
+  ok(passes(() => e(1).toBeOneOf([1, 2])) && passes(() => e(2).toSatisfy((n) => n > 1)), "toBeOneOf / toSatisfy");
+}
+
+console.log("== bun:test snapshots against a real filesystem ==");
+{
+  const fsMod = nodeRequire("node:fs");
+  const osMod = nodeRequire("node:os");
+  const pathMod = nodeRequire("node:path");
+  const dir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), "vv-bun-snap-"));
+  try {
+    const file = pathMod.join(dir, "a.test.js");
+    const snapPath = pathMod.join(dir, "__snapshots__", "a.test.js.snap");
+    const suite = (t) => {
+      t.__setFile(file);
+      t.describe("outer", () => t.describe("inner", () => t.test("nested", () => t.expect({ a: 1 }).toMatchSnapshot())));
+      t.test("twice", () => { t.expect(1).toMatchSnapshot(); t.expect(2).toMatchSnapshot(); });
+      t.test("named", () => t.expect({ z: 1 }).toMatchSnapshot("custom name"));
+    };
+    {
+      const { t } = bunTestWith({}, dir);
+      suite(t);
+      ok(await t.__run() === 0, "a first run creates the snapshots and passes");
+      // These are the bytes real Bun writes for the same suite — and a file with
+      // exactly these bytes was fed back to a real `bun test`, which read it and
+      // passed. Note the KEY: describe blocks are joined by a SPACE here while the
+      // reporter joins them with " > ", and a second snapshot in one test gets a
+      // counter rather than overwriting the first.
+      ok(fsMod.readFileSync(snapPath, "utf8") ===
+        '// Bun Snapshot v1, https://bun.sh/docs/test/snapshots\n\n' +
+        'exports[`named: custom name 1`] = `\n{\n  "z": 1,\n}\n`;\n\n' +
+        'exports[`outer inner nested 1`] = `\n{\n  "a": 1,\n}\n`;\n\n' +
+        'exports[`twice 1`] = `1`;\n\nexports[`twice 2`] = `2`;\n',
+        "…in Bun's exact .snap bytes, keyed the way Bun keys them");
+    }
+    {
+      const { t } = bunTestWith({}, dir);
+      suite(t);
+      ok(await t.__run() === 0, "a second run MATCHES the stored snapshots");
+    }
+    {
+      const { t, report } = bunTestWith({}, dir);
+      t.__setFile(file);
+      t.describe("outer", () => t.describe("inner", () => t.test("nested", () => t.expect({ a: 999 }).toMatchSnapshot())));
+      ok(await t.__run() === 1 && /did not match/.test(report()), "a changed value fails against the stored snapshot");
+    }
+    {
+      // Bun refuses to CREATE a snapshot under CI: the first green build would
+      // otherwise prove nothing, because the run wrote its own expectations.
+      const { t, report } = bunTestWith({ CI: "true" }, dir);
+      t.__setFile(file);
+      t.test("brand new", () => t.expect(1).toMatchSnapshot());
+      ok(await t.__run() === 1 && /disabled in CI environments/.test(report()), "creating a snapshot under CI fails instead of writing one");
+      const { t: t2 } = bunTestWith({ CI: "true" }, dir);
+      t2.__setFile(file);
+      t2.test("brand new", () => t2.expect(1).toMatchSnapshot());
+      ok(await t2.__run({ updateSnapshots: true }) === 0, "…and --update-snapshots overrides the guard");
+    }
+    {
+      const { t, report } = bunTestWith({}, dir);
+      t.__setFile(file);
+      t.test("ok", () => t.expect({ a: 1 }).toMatchInlineSnapshot('\n    {\n      "a": 1,\n    }\n  '));
+      t.test("bad", () => t.expect({ a: 2 }).toMatchInlineSnapshot('\n{\n  "a": 1,\n}\n'));
+      t.test("create", () => t.expect({ a: 1 }).toMatchInlineSnapshot());
+      await t.__run();
+      const r = report();
+      ok(/\u2713 ok/.test(r) && /inline snapshot did not match/.test(r), "an inline snapshot compares (and fails) against the value");
+      // Writing one back means editing the user's source at a position we would
+      // have to take from a stack frame pointing at loader-transformed code.
+      ok(/would have to WRITE the snapshot/.test(r) && /toMatchSnapshot\(\)/.test(r), "…and CREATING one is refused loudly, with the value to paste in");
+    }
+    {
+      const { t } = bunTestWith({}, dir);
+      t.__setFile(file);
+      t.describe("alpha", () => { t.test("one", () => {}); t.test("two", () => { throw new Error("nope"); }); });
+      const outfile = pathMod.join(dir, "junit.xml");
+      await t.__run({ reporter: "junit", reporterOutfile: outfile });
+      const xml = fsMod.readFileSync(outfile, "utf8");
+      ok(/<testsuites name="bun test" tests="2"/.test(xml) && /failures="1"/.test(xml), "--reporter=junit writes a JUnit summary");
+      ok(/classname="alpha"/.test(xml) && /<failure message="nope"/.test(xml), "…with the describe as the classname and the failure message");
+    }
+  } finally {
+    fsMod.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+console.log("== bun:test run options: -t, --bail, --todo ==");
+{
+  const { t, report } = bunTestWith();
+  const ran = [];
+  t.describe("alpha", () => { t.test("one", () => ran.push("a1")); t.test("two", () => ran.push("a2")); });
+  t.test("beta one", () => ran.push("b1"));
+  // -t is a REGEX against the FULL name, describe prefix included and joined with
+  // " > " — so "one$" catches "alpha > one" and "beta one" but not "alpha > two".
+  ok(await t.__run({ testNamePattern: "one$" }) === 0, "-t run exits 0");
+  ok(ran.join(",") === "a1,b1", "-t filters on the full 'describe > test' label (ran: " + ran.join(",") + ")");
+  ok(/1 filtered out/.test(report()), "…and the filtered-out count is reported, not hidden");
+}
+{
+  const { t, report } = bunTestWith();
+  t.test("nothing matches this", () => {});
+  ok(await t.__run({ testNamePattern: "zzz" }) === 1, "a -t that matches nothing exits 1 rather than reporting an empty green run");
+  ok(/matched 0 tests/.test(report()), "…and says so");
+}
+{
+  const { t, report } = bunTestWith();
+  const ran = [];
+  t.test("f1", () => { ran.push(1); throw new Error("a"); });
+  t.test("f2", () => { ran.push(2); throw new Error("b"); });
+  t.test("ok", () => ran.push(3));
+  ok(await t.__run({ bail: 1 }) === 1 && ran.length === 1, "--bail stops at the first failure (ran " + ran.length + " tests)");
+  ok(/Bailed out after 1 failure/.test(report()), "…and says it bailed");
+}
+{
+  const { t } = bunTestWith();
+  const ran = [];
+  t.test.todo("later", () => ran.push("todo"));
+  await t.__run();
+  ok(ran.length === 0, "a todo test does not run by default");
+  const { t: t2 } = bunTestWith();
+  const ran2 = [];
+  t2.test.todo("later", () => ran2.push("todo"));
+  await t2.__run({ todo: true });
+  ok(ran2.length === 1, "--todo runs it");
+}
+{
+  // `--only` asks for the tests marked .only. With none marked, the answer is an
+  // empty run — treating the flag as a no-op would run the whole suite under a
+  // flag asking for the opposite.
+  const { t } = bunTestWith();
+  const ran = [];
+  t.test("plain", () => ran.push("plain"));
+  // Real bun 1.3.6 prints "0 pass / 0 fail" and exits 0 here — unlike a -t that
+  // matches nothing, which is an error. Both were run against the binary.
+  const code = await t.__run({ only: true });
+  ok(ran.length === 0 && code === 0, "--only with nothing marked .only runs nothing, and exits 0 as real Bun does");
+  const { t: t2 } = bunTestWith();
+  const ran2 = [];
+  t2.test("plain", () => ran2.push("plain"));
+  t2.test.only("focused", () => ran2.push("focused"));
+  await t2.__run({ only: true });
+  ok(ran2.length === 1 && ran2[0] === "focused", "…and runs just the marked one when there is one");
+}
+
+console.log("== bun test CLI flags are parsed, not dropped (BUN_PROGRAM as a real process) ==");
+{
+  // Every flag below used to be discarded by `rest.filter(a => a[0] !== '-')`, so
+  // `bun test -t auth` ran the entire suite and exited 0. That is the exact shape
+  // of silent approximation this shim is not allowed to have.
+  const osMod = nodeRequire("node:os");
+  const fsMod = nodeRequire("node:fs");
+  const pathMod = nodeRequire("node:path");
+  const { spawnSync } = nodeRequire("node:child_process");
+  const dir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), "vv-bun-testcli-"));
+  try {
+    const binBun = pathMod.join(dir, "bun-shim.js");
+    fsMod.writeFileSync(binBun, BUN_PROGRAM);
+    fsMod.writeFileSync(pathMod.join(dir, "a.test.js"), "");
+    const bun = (...args) => {
+      const r = spawnSync(process.execPath, [binBun, ...args], { cwd: dir, encoding: "utf8" });
+      return { code: r.status, text: (r.stdout || "") + (r.stderr || "") };
+    };
+    const unknown = bun("test", "--coverage");
+    ok(unknown.code === 1 && /--coverage is not implemented/.test(unknown.text), "an unsupported flag is refused by name");
+    ok(/Supported: -t\/--test-name-pattern/.test(unknown.text), "…and the supported set is listed");
+    const badReporter = bun("test", "--reporter=tap");
+    ok(badReporter.code === 1 && /--reporter=tap is not implemented/.test(badReporter.text), "an unknown reporter is refused");
+    const noOutfile = bun("test", "--reporter=junit");
+    ok(noOutfile.code === 1 && /requires --reporter-outfile/.test(noOutfile.text), "--reporter=junit without an outfile is refused (Bun requires it too)");
+    const noValue = bun("test", "-t");
+    ok(noValue.code === 1 && /-t needs a value/.test(noValue.text), "a flag missing its value is refused");
+    // A positional that matches no file is a FILTER that selected nothing, which is
+    // "no test files found" — not an attempt to require a path that does not exist.
+    const noFiles = bun("test", "definitely-not-a-file");
+    ok(noFiles.code === 1 && /no test files found/.test(noFiles.text), "a filter matching nothing reports no test files");
+    ok(bun("test", "definitely-not-a-file", "--pass-with-no-tests").code === 0, "--pass-with-no-tests makes that exit 0");
   } finally {
     fsMod.rmSync(dir, { recursive: true, force: true });
   }

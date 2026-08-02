@@ -1117,10 +1117,13 @@ console.log("\n== bun run ws-cork.ts (cork really coalesces into one socket writ
 }
 
 // ── the Readable.toWeb defect, which ONLY this tier can catch ────────────────
-// `typeof Readable.toWeb === "function"` is TRUE in the VM and calling it throws
-// ERR_METHOD_NOT_IMPLEMENTED, so the natural feature-detect passes and then
-// explodes. Under host Node (the offline tier) toWeb works, so the offline tier
-// cannot see this at all — which is exactly how it shipped.
+// `typeof Readable.toWeb === "function"` was TRUE in the VM while calling it threw,
+// so the natural feature-detect passed and then exploded. Under host Node (the
+// offline tier) toWeb works, so the offline tier cannot see this at all — which is
+// exactly how it shipped, twice: first as ERR_METHOD_NOT_IMPLEMENTED, then as a
+// TypeError from an adapter that required end-of-stream's module object as if it
+// were the function. So this asserts toWeb WORKS, and that Bun.spawn() streams
+// whether or not it routes through it.
 console.log("\n== bun run spawn-stream.ts (Bun.spawn().stdout is a real ReadableStream in the VM) ==");
 {
   write("spawn-stream.ts", [
@@ -1128,7 +1131,7 @@ console.log("\n== bun run spawn-stream.ts (Bun.spawn().stdout is a real Readable
     "const { Readable } = require('stream');",
     "out.push('toWeb-looks-present:' + (typeof Readable.toWeb === 'function'));",
     "try { Readable.toWeb(Readable.from([Buffer.from('x')])); out.push('toWeb-works:true'); }",
-    "catch (e: any) { out.push('toWeb-throws:' + e.code); }",
+    "catch (e: any) { out.push('toWeb-throws:' + (e && (e.code || e.message))); }",
     "const proc = Bun.spawn(['echo', 'hello-from-spawn']);",
     "out.push('stdout-has-getReader:' + (typeof proc.stdout.getReader === 'function'));",
     "(async () => {",
@@ -1154,7 +1157,7 @@ console.log("\n== bun run spawn-stream.ts (Bun.spawn().stdout is a real Readable
   console.log("  ->", JSON.stringify(got));
   if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 800));
   ok(got.includes("toWeb-looks-present:true"), "Readable.toWeb IS a function in the VM — which is why the `toWeb ? …` guard passed");
-  ok(got.includes("toWeb-throws:ERR_METHOD_NOT_IMPLEMENTED"), "…and calling it throws, so that guard was the bug (offline Node hides this)");
+  ok(got.includes("toWeb-works:true"), "…and calling it returns a stream instead of throwing, so the guard is finally safe");
   ok(got.includes("stdout-has-getReader:true"), "Bun.spawn().stdout is a WHATWG ReadableStream built by hand instead");
   ok(got.includes("stdout-text:hello-from-spawn"), "…and it actually streams the child's output");
   ok(got.includes("exited:0"), "proc.exited still resolves the exit code");
@@ -1230,6 +1233,196 @@ console.log("\n== bun build --compile / bun build (in-VM) ==");
   ok(!kernel.exists(APP + "/buildme"), "…and writes nothing under the executable's name");
   const plain = await kernel.start("bun", ["build", "buildme.ts", "--outfile=buildme.js"], { cwd: APP, env: ENV, capture: true });
   ok(plain.code === 0 && kernel.exists(APP + "/buildme.js"), "an ordinary bun build still transpiles to its --outfile");
+}
+
+// 15) `bun test` CLI flags, in the VM. The offline tier proves the PARSER over a
+// scratch directory with no kernel; this proves the parsed values reach the runner
+// and change which tests run — the seam between /bin/bun.js and the bun:test module
+// only exists inside a process, because __run() is called on the module the guest's
+// own require() returned.
+console.log("\n== bun test flags (-t / --bail / --timeout / --reporter=junit) ==");
+{
+  const TESTDIR = "flags";
+  write(TESTDIR + "/api.test.ts", [
+    "import { test, describe, expect } from 'bun:test';",
+    "describe('auth', () => {",
+    "  test('login', () => { expect(1).toBe(1); });",
+    "  test('logout', () => { expect(2).toBe(2); });",
+    "});",
+    "test('health', () => { expect(3).toBe(3); });",
+  ].join("\n"));
+  write(TESTDIR + "/slow.test.ts", [
+    "import { test } from 'bun:test';",
+    "test('sleeps', async () => { await new Promise((r) => setTimeout(r, 400)); });",
+  ].join("\n"));
+  write(TESTDIR + "/failing.test.ts", [
+    "import { test } from 'bun:test';",
+    "test('f1', () => { throw new Error('one'); });",
+    "test('f2', () => { throw new Error('two'); });",
+    "test('f3', () => {});",
+  ].join("\n"));
+  const runIn = (dir, args) => kernel.start("bun", ["test", ...args], { cwd: APP + "/" + dir, env: ENV, capture: true });
+
+  const filtered = await runIn(TESTDIR, ["api", "-t", "log"]);
+  const fout = (filtered.stdout || "") + (filtered.stderr || "");
+  if (filtered.code !== 0) console.log(fout);
+  // A positional is a FILENAME filter (Bun's semantics), and -t is a regex over
+  // the full "describe > test" label. Both used to be dropped on the floor.
+  ok(filtered.code === 0 && /2 pass/.test(fout), "-t 'log' selects the two auth tests");
+  ok(/1 filtered out/.test(fout), "…and the health test is reported as filtered out, not silently gone");
+  ok(!/api\.test/.test(fout) === false && !/slow\.test/.test(fout), "the positional filtered the FILE set down to api.test.ts");
+
+  const timedOut = await runIn(TESTDIR, ["slow", "--timeout=50"]);
+  const tout = (timedOut.stdout || "") + (timedOut.stderr || "");
+  ok(timedOut.code === 1 && /timed out after 50ms/.test(tout), "--timeout is enforced on a real in-VM async test");
+
+  const bailed = await runIn(TESTDIR, ["failing", "--bail"]);
+  const bout = (bailed.stdout || "") + (bailed.stderr || "");
+  ok(bailed.code === 1 && /Bailed out after 1 failure/.test(bout), "--bail stops the run at the first failure");
+  ok(!/f2/.test(bout), "…and the second failing test never ran");
+
+  const junit = await runIn(TESTDIR, ["api", "--reporter=junit", "--reporter-outfile=out.xml"]);
+  ok(junit.code === 0, "--reporter=junit exits 0");
+  const xml = kernel.exists(APP + "/" + TESTDIR + "/out.xml") ? kernel.readFile(APP + "/" + TESTDIR + "/out.xml") : "";
+  const xmlText = typeof xml === "string" ? xml : Buffer.from(xml || "").toString();
+  ok(/<testsuites name="bun test" tests="3"/.test(xmlText) && /classname="auth"/.test(xmlText),
+    "…and wrote a JUnit file into the VFS");
+
+  const unknown = await runIn(TESTDIR, ["--coverage"]);
+  ok(unknown.code === 1 && /--coverage is not implemented/.test((unknown.stdout || "") + (unknown.stderr || "")),
+    "an unimplemented flag is refused by name rather than dropped");
+}
+
+// 16) mock.module() against the REAL module loader. This cannot be proven offline:
+// it edits `Module._cache` in packages/runtime/module.js, and the thing that has to
+// see the edit is a later `require()`/`import` going through that same loader with
+// its own resolution rules (extensionless specifiers, .ts resolution, the ESM→CJS
+// compile). Node's own loader would answer differently on every one of those.
+console.log("\n== bun test: mock.module over the module loader ==");
+{
+  const D = "mocks";
+  write(D + "/dep.ts", "export const greet = (): string => 'real';\nexport const n: number = 1;\n");
+  write(D + "/uses-dep.ts", "import { greet } from './dep';\nexport const call = (): string => greet();\n");
+  write(D + "/m.test.ts", [
+    "import { test, expect, mock } from 'bun:test';",
+    // The specifier resolves relative to THIS FILE, not the process cwd — which is
+    // why the runner is told which file it is loading. A cwd-relative resolve would
+    // silently mock the wrong module for any test outside the project root, and
+    // `bun test` is normally run from the project root.
+    "mock.module('./dep', () => ({ greet: () => 'mocked', n: 99 }));",
+    "test('a dynamic import sees the mock', async () => {",
+    "  const dep = await import('./dep');",
+    "  expect(dep.greet()).toBe('mocked');",
+    "  expect(dep.n).toBe(99);",
+    "});",
+    // The realistic shape: the module UNDER TEST imports the dependency, and is
+    // itself loaded after the mock is registered.
+    "test('a module loaded afterwards gets the mocked dependency', async () => {",
+    "  const { call } = await import('./uses-dep');",
+    "  expect(call()).toBe('mocked');",
+    "});",
+    "test('a builtin is refused loudly, not silently unmocked', async () => {",
+    "  let msg = '';",
+    "  try { mock.module('node:os', () => ({ platform: () => 'vivari' })); } catch (e) { msg = String(e && e.message); }",
+    "  expect(msg).toContain('cannot mock a builtin');",
+    "  const os = await import('node:os');",
+    "  expect(os.platform()).not.toBe('vivari');",
+    "});",
+    "test('an unresolvable specifier throws naming the file it resolved from', () => {",
+    "  let msg = '';",
+    "  try { mock.module('./no-such-module', () => ({})); } catch (e) { msg = String(e && e.message); }",
+    "  expect(msg).toContain('could not resolve it from');",
+    "  expect(msg).toContain('m.test.ts');",
+    "});",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["test", "m.test.ts"], { cwd: APP + "/" + D, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (r.code !== 0 || LIVE) console.log(o);
+  ok(r.code === 0 && /4 pass/.test(o) && /0 fail/.test(o), "mock.module replaces a module for a later import, and is loud when it cannot");
+}
+
+// 17) File-backed snapshots against the REAL Wasm VFS. The offline tier drives the
+// same code over node:fs; this is the tier that proves the __snapshots__ directory
+// is created and the .snap file written and re-read through the Atomics syscall
+// bridge, and that a second `bun test` process (a fresh runtime, a cold cache)
+// matches what the first one wrote.
+console.log("\n== bun test: file-backed snapshots through the VFS ==");
+{
+  const D = "snaps";
+  write(D + "/s.test.ts", [
+    "import { test, describe, expect } from 'bun:test';",
+    "describe('outer', () => {",
+    "  test('shape', () => { expect({ a: 1, b: ['x'] }).toMatchSnapshot(); });",
+    "});",
+    "test('scalar', () => { expect(42).toMatchSnapshot(); });",
+  ].join("\n"));
+  const first = await kernel.start("bun", ["test", "s.test.ts"], { cwd: APP + "/" + D, env: ENV, capture: true });
+  const fo = (first.stdout || "") + (first.stderr || "");
+  if (first.code !== 0) console.log(fo);
+  ok(first.code === 0 && /snapshots: \+2 added/.test(fo), "the first run creates two snapshots");
+  const snapPath = APP + "/" + D + "/__snapshots__/s.test.ts.snap";
+  ok(kernel.exists(snapPath), "…and the __snapshots__ directory + .snap file really exist in the VFS");
+  // Read defensively: if the write regressed, the whole remaining section should
+  // report failed CHECKS rather than crash the spike on an ENOENT.
+  let raw = null;
+  try { raw = kernel.readFile(snapPath); } catch { /* reported by the checks below */ }
+  const snap = typeof raw === "string" ? raw : Buffer.from(raw || "").toString();
+  // Byte-for-byte what real bun 1.3.6 writes, including the header, the SPACE-joined
+  // describe key and the sorted keys. A file with exactly these bytes was handed to
+  // a real `bun test`, which read it and passed.
+  ok(snap === '// Bun Snapshot v1, https://bun.sh/docs/test/snapshots\n\n' +
+    'exports[`outer shape 1`] = `\n{\n  "a": 1,\n  "b": [\n    "x",\n  ],\n}\n`;\n\n' +
+    'exports[`scalar 1`] = `42`;\n',
+    "…in Bun's exact format\n     got: " + JSON.stringify(snap));
+  const second = await kernel.start("bun", ["test", "s.test.ts"], { cwd: APP + "/" + D, env: ENV, capture: true });
+  const so = (second.stdout || "") + (second.stderr || "");
+  ok(second.code === 0 && !/added/.test(so), "a second process matches the stored snapshots without rewriting them");
+  // Change the value: the stored snapshot must now fail, or a snapshot test proves
+  // nothing at all.
+  write(D + "/s.test.ts", [
+    "import { test, describe, expect } from 'bun:test';",
+    "describe('outer', () => {",
+    "  test('shape', () => { expect({ a: 2, b: ['x'] }).toMatchSnapshot(); });",
+    "});",
+    "test('scalar', () => { expect(42).toMatchSnapshot(); });",
+  ].join("\n"));
+  const changed = await kernel.start("bun", ["test", "s.test.ts"], { cwd: APP + "/" + D, env: ENV, capture: true });
+  const co = (changed.stdout || "") + (changed.stderr || "");
+  ok(changed.code === 1 && /did not match/.test(co), "a changed value fails against the stored snapshot");
+  const updated = await kernel.start("bun", ["test", "s.test.ts", "-u"], { cwd: APP + "/" + D, env: ENV, capture: true });
+  ok(updated.code === 0, "-u rewrites it");
+  // …and the CI guard, which is the whole reason a snapshot run can be trusted.
+  const inCi = await kernel.start("bun", ["test", "s.test.ts", "-t", "scalar"], {
+    cwd: APP + "/" + D, env: { ...ENV, CI: "true" }, capture: true,
+  });
+  ok(inCi.code === 0, "under CI, matching an EXISTING snapshot is fine");
+  write(D + "/new.test.ts", "import { test, expect } from 'bun:test';\ntest('fresh', () => { expect({ q: 1 }).toMatchSnapshot(); });\n");
+  const ciCreate = await kernel.start("bun", ["test", "new.test.ts"], {
+    cwd: APP + "/" + D, env: { ...ENV, CI: "true" }, capture: true,
+  });
+  const cco = (ciCreate.stdout || "") + (ciCreate.stderr || "");
+  ok(ciCreate.code === 1 && /disabled in CI environments/.test(cco), "…but CREATING one under CI fails, exactly as Bun does");
+  ok(!kernel.exists(APP + "/" + D + "/__snapshots__/new.test.ts.snap"), "…and no file is written");
+}
+
+// 18) `.only` under CI, in the VM. The guard has to fire at module LOAD time (that
+// is when a test file registers its cases), so it is the loader path that has to
+// surface it — a throw swallowed there would leave a green run over zero tests,
+// which is the exact failure the guard exists to prevent.
+console.log("\n== bun test: .only is refused under CI ==");
+{
+  const D = "onlyci";
+  write(D + "/o.test.ts", [
+    "import { test } from 'bun:test';",
+    "test.only('focused', () => {});",
+    "test('other', () => {});",
+  ].join("\n"));
+  const inCi = await kernel.start("bun", ["test", "o.test.ts"], { cwd: APP + "/" + D, env: { ...ENV, CI: "true" }, capture: true });
+  const co = (inCi.stdout || "") + (inCi.stderr || "");
+  ok(inCi.code === 1 && /\.only is disabled in CI environments/.test(co), "test.only under CI fails the run instead of narrowing it");
+  const local = await kernel.start("bun", ["test", "o.test.ts"], { cwd: APP + "/" + D, env: ENV, capture: true });
+  const lo = (local.stdout || "") + (local.stderr || "");
+  ok(local.code === 0 && /1 pass/.test(lo), "…and without CI it focuses the run as usual");
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");

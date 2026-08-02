@@ -95,6 +95,34 @@ Bun rather than to itself: `Bun.hash` is checked against Bun's own published
 wyhash digests, and a `Bun.password` hash written in the sandbox verifies under
 real Bun and vice versa.
 
+### `bun test`
+
+The runner covers the surface a real suite uses: `describe`/`test` with the whole
+`.skip`/`.only`/`.todo`/`.each`/`.if`/`.failing` family, per-test `timeout`,
+`retry` and `repeats`, `mock`/`spyOn`/`mock.module()`, the asymmetric matchers
+(`expect.any`, `expect.objectContaining`, `expect.extend`, …), `.resolves`/
+`.rejects` with the full matcher set, and file-backed `toMatchSnapshot()` writing
+Bun's own `.snap` format. On the CLI: `-t`/`--test-name-pattern`, `--bail`,
+`--timeout`, `-u`, `--todo`, `--only` and `--reporter=junit`.
+
+Four divergences, all deliberate:
+
+- **`toMatchInlineSnapshot()` with no argument throws.** Creating one means
+  rewriting your source file, and the position would come from a stack frame
+  pointing at loader-transformed code. The error prints the value to paste in.
+- **A `Map` or `Set` nested inside an object or array cannot be snapshotted.**
+  Real Bun's own bytes for that shape are malformed, so any file written here
+  would fail under a real `bun test`. Snapshot it on its own, or use `toEqual`.
+- **`mock.module()` on a builtin throws.** Real Bun silently leaves the builtin
+  unmocked, which means your test asserts against the real module while believing
+  it is mocked.
+- **`await expect(p).rejects.toThrow()` always returns a promise.** Real Bun
+  returns `undefined` for an already-settled promise, which no browser engine can
+  do. Forgetting the `await` still fails the test here, rather than passing.
+
+`.only` throwing under `$CI`, and a missing snapshot being an error under `$CI`
+rather than something created, are real Bun behaviours and are reproduced.
+
 Start from any template in the Studio's **Bun** category.
 
 [`bcryptjs`]: https://www.npmjs.com/package/bcryptjs

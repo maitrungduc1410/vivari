@@ -13,7 +13,14 @@
 //                            work). NOTE `update`/`up` only — see `upgrade` below.
 //   bun x / bunx <pkg>       run a package bin (delegates to npx)
 //   bun build <entry>        single-file TS/JSX transpile to --outfile/--outdir
-//   bun test [files]         run bun:test suites and report
+//   bun test [filters]       run bun:test suites and report. A positional is a
+//                            FILENAME FILTER (Bun's semantics), and the flags
+//                            -t/--test-name-pattern, --bail[=N], --timeout=<ms>,
+//                            -u/--update-snapshots, --todo, --only,
+//                            --pass-with-no-tests, --reporter=junit|dots and
+//                            --dots are honoured. Every other flag is refused by
+//                            name — they used to be dropped silently, so
+//                            `bun test -t auth` ran the whole suite and passed.
 //   bun --version | -v       print the shim's Bun version
 //   bun --revision           print <version>-vivari (same string as Bun.revision)
 //   bun upgrade              NOT IMPLEMENTED: real `bun upgrade` replaces the Bun
@@ -297,6 +304,66 @@ function findTestFiles(dir, acc) {
   }
   return acc;
 }
+// bun test's flags. Every one of these used to be DROPPED silently (the old
+// implementation was rest.filter(a => a[0] !== '-')), so 'bun test -t auth' ran the
+// whole suite and reported success -- the exact class of quiet approximation this
+// shim is not allowed to make. Anything not listed is now refused by name.
+function parseTestArgs(rest) {
+  const o = { files: [], timeout: null, bail: 0, pattern: null, update: false, todo: false, only: false, reporter: null, outfile: null, passWithNoTests: false };
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a[0] !== '-') { o.files.push(a); continue; }
+    const eq = a.indexOf('=');
+    const name = eq === -1 ? a : a.slice(0, eq);
+    const inline = eq === -1 ? null : a.slice(eq + 1);
+    // A flag's value is either '--flag=value' or the next argument; taking the
+    // next argument advances the loop past it.
+    const value = function () {
+      if (inline !== null) return inline;
+      if (i + 1 >= rest.length) { err('bun test: ' + name + ' needs a value'); process.exit(1); }
+      return rest[++i];
+    };
+    if (name === '--timeout') { o.timeout = parseInt(value(), 10); continue; }
+    if (name === '-t' || name === '--test-name-pattern') { o.pattern = value(); continue; }
+    // --bail with no value means 1, so it never consumes the next argument.
+    if (name === '--bail') { o.bail = inline !== null ? parseInt(inline, 10) : 1; continue; }
+    if (name === '-u' || name === '--update-snapshots') { o.update = true; continue; }
+    if (name === '--todo') { o.todo = true; continue; }
+    if (name === '--only') { o.only = true; continue; }
+    if (name === '--pass-with-no-tests') { o.passWithNoTests = true; continue; }
+    if (name === '--reporter') { o.reporter = value(); continue; }
+    if (name === '--reporter-outfile') { o.outfile = value(); continue; }
+    if (name === '--dots') { o.reporter = 'dots'; continue; }
+    err('bun test: ' + name + ' is not implemented in the Vivari shim.');
+    err('Supported: -t/--test-name-pattern, --bail[=N], --timeout=<ms>, -u/--update-snapshots, --todo, --only, --pass-with-no-tests, --reporter=junit|dots (+ --reporter-outfile), --dots.');
+    process.exit(1);
+  }
+  if (o.reporter && o.reporter !== 'junit' && o.reporter !== 'dots') {
+    err('bun test: --reporter=' + o.reporter + ' is not implemented in the Vivari shim (junit, dots).');
+    process.exit(1);
+  }
+  if (o.reporter === 'junit' && !o.outfile) {
+    err('bun test: --reporter=junit requires --reporter-outfile=<path>');
+    process.exit(1);
+  }
+  return o;
+}
+
+// A positional argument to 'bun test' is a FILENAME FILTER, not a path: real Bun
+// documents 'bun test foo bar' as "all test files with foo or bar in the file
+// name". A path that exists is still honoured, so 'bun test src/a.test.ts' works
+// either way.
+function selectTestFiles(names, discovered, path) {
+  if (!names.length) return discovered;
+  const out = [];
+  for (const n of names) {
+    const abs = path.resolve(cwd, n);
+    if (isFile(abs)) { if (out.indexOf(abs) === -1) out.push(abs); continue; }
+    for (const f of discovered) if (f.indexOf(n) !== -1 && out.indexOf(f) === -1) out.push(f);
+  }
+  return out;
+}
+
 async function doTest(rest) {
   // A test run is Bun's TEST MODE, and that is two documented facts, in this
   // order (https://bun.com/docs/test/runtime-behavior):
@@ -309,16 +376,36 @@ async function doTest(rest) {
   //      why the mode above cannot simply be derived from NODE_ENV.
   installBun(true, 'test');
   if (!process.env.NODE_ENV) process.env.NODE_ENV = 'test';
-  const files = rest.filter((a) => a[0] !== '-');
-  const targets = files.length ? files.map((f) => path.resolve(cwd, f)) : findTestFiles(cwd, []);
-  if (!targets.length) { err('bun test: no test files found'); process.exit(1); }
+  const opts = parseTestArgs(rest);
+  const targets = selectTestFiles(opts.files, findTestFiles(cwd, []), path);
+  if (!targets.length) {
+    if (opts.passWithNoTests) { out('bun test: no test files found'); process.exit(0); }
+    err('bun test: no test files found');
+    process.exit(1);
+  }
   const bunTest = require('bun:test');
+  let loadFailed = false;
   for (const f of targets) {
     out('# ' + path.relative(cwd, f));
-    try { require(f); } catch (e) { err('  failed to load: ' + ((e && e.stack) || e)); }
+    // Tell the runner which file it is loading: a test's file is what a snapshot
+    // path, a mock.module() specifier and the JUnit report are all resolved from.
+    if (typeof bunTest.__setFile === 'function') bunTest.__setFile(f);
+    try { require(f); } catch (e) { loadFailed = true; err('  failed to load: ' + ((e && e.stack) || e)); }
   }
-  const code = await bunTest.__run();
-  process.exit(code | 0);
+  if (typeof bunTest.__setFile === 'function') bunTest.__setFile(null);
+  const code = await bunTest.__run({
+    timeout: opts.timeout,
+    bail: opts.bail,
+    testNamePattern: opts.pattern,
+    updateSnapshots: opts.update,
+    todo: opts.todo,
+    only: opts.only,
+    reporter: opts.reporter,
+    reporterOutfile: opts.outfile ? path.resolve(cwd, opts.outfile) : null,
+  });
+  // A file that failed to LOAD registers no tests, so the run below can report
+  // "0 fail" over a suite that never ran. Exit non-zero regardless.
+  process.exit(loadFailed ? 1 : (code | 0));
 }
 
 // ---- dispatch --------------------------------------------------------------
@@ -333,7 +420,7 @@ function helpText() {
     '  bun install|add|remove   manage dependencies (delegates to npm; writes bun.lock)',
     '  bun x <pkg>              run a package binary (bunx)',
     '  bun build <entry>       transpile a single TS/JSX file',
-    '  bun test [files]        run bun:test suites',
+    '  bun test [filters]      run bun:test suites (-t, --bail, --timeout, -u, --reporter)',
     '  bun --version           print the shim Bun version',
   ].join(NL);
 }

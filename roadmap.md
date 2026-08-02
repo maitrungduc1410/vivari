@@ -5375,3 +5375,181 @@ and the interaction with our own `loop.js` is precisely the thing no Node-side t
 See the AGENTS.md gotchas added with this change: the loader cache eviction, `primordials`
 `BIND_STATICS`, the Web Streams adapters and their loop-liveness contract, the eager-shim
 shadowing rule, the `chmod`/`X_OK` coupling, and the loopback-only `connect()`.
+---
+
+## `bun:test` — runner parity, and the two guards that stop a suite lying (this change)
+
+Phase 5A of the Bun coverage plan. Teams evaluate a sandbox by running their test suite, so this
+is a disproportionate share of first impressions — and it is also the one corner of the shim
+where being *approximately* right is worse than being absent. Every other API fails visibly; a
+wrong matcher reports success. So the whole of `bun:test` moved into a new
+`packages/runtime/builtins/bun-test.js` with a stricter rule than the rest of the shim: **every
+behaviour was checked against a real `bun test` (1.3.6, d530ed99), and the surprising ones are
+reproduced with the observation written at the call site.**
+
+### The written plan was stale; the audit came first
+
+Two of its claims were already false on master: `toStrictEqual` is *not* identical to `toEqual`
+(the loose/strict split was fixed when `Bun.deepEquals` became real), and `toMatchObject` exists
+and is backed by `Bun.deepMatch`. Both were left alone. What was actually missing is below.
+
+### What the runner gained
+
+- **The modifier family, on both `describe` and `test`.** `describe` was a plain function with no
+  properties at all: `.skip`/`.only`/`.todo`/`.each`/`.if`/`.skipIf`/`.todoIf` all died at load
+  with "is not a function". `test` had `.skip`/`.todo`/`.only` and nothing else. Both are now
+  complete, plus `test.failing` — which inverts the verdict and, when the test *passes*, fails it
+  with Bun's own "remove `.failing` if tested behavior now works". A skipped or todo `describe`
+  propagates its mode to everything inside it at registration time.
+- **Per-test timeouts.** The options bag read only `{skip, only}` — which were never Bun's public
+  options anyway. Bun's third argument is `number | {timeout, retry, repeats}`, all three of which
+  now work, with `--timeout` setting the default (Bun's is 5000ms). Note what a timeout can and
+  cannot do: an async body is genuinely abandoned at the deadline, a **synchronous** one cannot be
+  interrupted by anything in JavaScript and is reported as timed out after it finishes. Real Bun
+  behaves identically (a 200ms sync loop under `--timeout 50` runs to completion and is then
+  marked timed out), so this is faithful rather than a shortcut.
+- **`.each` on both, with Bun's title formatter reproduced bug-for-bug** — see the quirks below.
+- **The `toHaveBeenCalled*` / `toHaveReturned*` family**, and a mock surface that records what it
+  should: `mock.results` now records `{type: "throw"}` for a throwing call (it used to record
+  nothing, so `toHaveReturnedTimes` would have counted a throw as a return), plus `contexts`,
+  `instances`, `invocationCallOrder`, `lastCall` and the `*Once` variants.
+- **`spyOn` that can actually be undone.** `mock.restore()` did not exist, and `mockRestore()`
+  assigned the original back — which is wrong for an **inherited** method, because the object
+  keeps an own-property copy that shadows the prototype forever. Restoring now deletes it. And
+  `spyOn(obj, "notAMethod")` throws instead of installing a spy nothing will ever call.
+- **`mock.module()`**, over the loader's require cache, resolved relative to the **test file**
+  (the CLI tells the runner which file it is loading). Resolving against the process cwd would
+  silently mock the wrong module for any test outside the project root, which is most of them.
+- **The asymmetric matchers** — `expect.any`/`anything`/`objectContaining`/`arrayContaining`/
+  `stringContaining`/`stringMatching`/`closeTo`, `expect.not.*` and `expect.extend` — honoured
+  **recursively** inside `toEqual`/`toStrictEqual`/`toMatchObject`/`toContainEqual`/
+  `toHaveBeenCalledWith` and inside a Map. They do **not** replace `Bun.deepEquals`: a cheap
+  pre-pass checks whether the expected tree contains a matcher at all, and only then walks it by
+  hand, so the loose-vs-strict split stays the single implementation for every ordinary compare.
+- **Matcher breadth, chosen rather than padded:** `toBeCloseTo` (with Jest's non-obvious
+  `10^-digits / 2` tolerance and its default of 2 digits), `toHaveProperty` (dotted *and* array
+  path — the array form is the only way to reach a key containing a dot), `toContainEqual`,
+  `toBeEmpty`, `toBeArray`/`toBeArrayOfSize`, `toBeString`/`toBeNumber`/`toBeBoolean`/
+  `toBeFunction`/`toBeObject`/`toBeNil`/`toBeTypeOf`/`toBeInteger`/`toBeFinite`/`toBeDate`,
+  `toStartWith`/`toEndWith`/`toInclude`, `toBeOneOf`, `toSatisfy`, `toThrowError`. A matcher that
+  is absent fails loudly on its own (`… is not a function`), so restraint here is cheap.
+
+### Two matchers that could not fail
+
+- **`toThrow(/regex/) always passed.** The old matcher did
+  `String(err.message).includes(typeof msg === "string" ? msg : "")`, so a RegExp argument became
+  `includes("")` — true for every error. `expect(fn).toThrow(/anything at all/)` was an assertion
+  with no failing case. All four argument forms are now distinct, including the one that
+  surprises people: a **string** is a substring match, but an **Error instance** compares the
+  message for **equality**.
+- **`rejects.toThrow(msg)` ignored both its message and negation.** It ran
+  `assert(false, threw, …)` with the negate flag hard-coded, so any rejection satisfied any
+  expected message and `.rejects.not` did not exist. `.resolves` had exactly two matchers
+  (`toBe`, `toEqual`). Both now expose the **full** matcher set with negation, running against
+  the resolved value or the rejection reason.
+
+### Snapshots: the judgement call, and why file-backed won
+
+The brief left this open — file-backed, inline-only, or a loud not-implemented. **File-backed,
+in Bun's own `.snap` format, byte-for-byte.** Two things made that the right answer rather than a
+guess: the VFS is a real filesystem, so `__snapshots__/x.test.ts.snap` is a real file that
+outlives the process; and a real `bun` binary was available to capture the exact format from,
+which turns "resembles Bun" into a testable claim. It was tested the obvious way — a `.snap` file
+written by this shim was handed to a real `bun test`, which read it and passed.
+
+The serializer reproduces the details a from-scratch version gets wrong: object keys are
+**sorted**, a getter prints as `[native code]` and is **not invoked** (which is also the safe
+choice — a snapshot must not run side effects), `-0` survives, a function prints its **declared**
+name only (`{f: () => {}}` is `[Function]` even though `.name` is `"f"`), a cycle is `[Circular]`,
+a sparse hole is `undefined`, and the snapshot **key** joins describe blocks with a space
+(`outer inner nested 1`) while the reporter joins them with `" > "`.
+
+Two shapes **throw** instead of being serialized: a `Map` or a `Set` **nested inside** a
+container. Bun's own output for those is malformed and not even self-consistent — a nested `Set`
+gains padding the width of the current indent, a nested `Map` at the same depth gains none — so
+there is no rule to encode, and writing tidier bytes would produce a `.snap` file that fails
+under a real `bun test`. Both are fine at the top level, and the error says so.
+
+`toMatchInlineSnapshot(…)` **compares** (with the call-site indentation stripped, as Jest does);
+`toMatchInlineSnapshot()` with no argument **throws**. Creating one means rewriting the user's
+source file at a position we would have to take from a stack frame pointing at
+loader-transformed code (`typescript-transform.js` strips types before compiling), and an
+insertion landing in the wrong place corrupts a test file. The error prints the value to paste.
+
+### The two guards worth reproducing exactly
+
+Both are Bun behaviours that exist for the same reason this file exists, and both were verified
+against the real binary:
+
+- **`.only` throws when `$CI` is truthy** — "disabled in CI environments to prevent accidentally
+  skipping tests" — at *registration*, so the file fails to load rather than reporting a
+  suspiciously small green run. `CI=false`, `CI=0` and an empty `CI` are not CI. This shim's own
+  history is the argument for it: `test.only` used to register an ordinary test and filter
+  nothing, so an `only` run executed the whole suite.
+- **Snapshot creation is refused under CI** unless `--update-snapshots`. A first green build that
+  wrote its own expectations proves nothing.
+
+### One deliberate divergence, in the safe direction
+
+`expect(alreadySettledPromise).rejects.toThrow()` returns **`undefined`** in real Bun: it peeks
+the settled promise synchronously and throws. Nothing in a browser engine exposes that peek —
+it is why `Bun.peek` is in `bun-unsupported.js` — so reproducing it would mean
+`await expect(p).rejects.toThrow()` silently asserting nothing. Ours always returns a real
+Promise, **and** the runner drains outstanding async assertions after each test body, so a
+*forgotten* `await` still fails the test. That is stricter than Bun, and it is the only direction
+worth erring in here.
+
+### The CLI stopped dropping its flags
+
+`doTest` did `rest.filter(a => a[0] !== '-')`. Every flag was discarded, so `bun test -t auth`
+ran the entire suite and exited 0 — the exact silent approximation this project keeps deleting.
+Now parsed: `-t`/`--test-name-pattern` (a regex over the full `describe > test` label),
+`--bail[=N]`, `--timeout=<ms>`, `-u`/`--update-snapshots`, `--todo`, `--only`,
+`--pass-with-no-tests`, `--reporter=junit|dots` with `--reporter-outfile`, and `--dots`.
+**Anything else is refused by name** with the supported set listed. `--only` is honoured rather
+than accepted-and-ignored: with nothing marked `.only` it runs **nothing** and exits 0 (checked
+against the binary), because a flag asking for a narrower run must not produce a wider one. A
+positional argument is a
+**filename filter**, not a path — Bun documents `bun test foo bar` as "all test files with foo or
+bar in the file name" — with an existing path still honoured. A `-t` that matches nothing exits 1
+rather than reporting an empty green run, and a file that fails to *load* now fails the run
+(it used to register no tests and report "0 fail").
+
+The JUnit reporter omits the `line` and `hostname` attributes real Bun writes: there are no
+source positions through the loader's transform and no OS hostname in a tab. Omitted rather than
+filled with something plausible.
+
+### The Bun quirks encoded, with their evidence
+
+Every one of these was observed by running the real binary, not read off a doc page:
+
+- **`.each` titles: `%s` substitutes only STRINGS, `%d`/`%i`/`%f` only NUMBERS.** A `%s` handed a
+  number leaves the literal `"%s"` in the title *and still consumes the argument*, so
+  `test.each([[1,"z"]])("A %s|%s")` is named `A %s|z`. `%i` additionally rejects `1.7` **and
+  `-0`**, which is a JSC representation detail leaking out: `%i` wants an int32 and `-0` is
+  stored as a double. `%j` and `%o` are both `JSON.stringify` (so a Map renders as `{}`), `%p` is
+  pretty-format, `%#` is the row index, and a token with no argument left stays literal.
+- **`.each` `$property` titles swallow one extra character on a miss.** `"$ end"` → `"$end"`,
+  `"$a-b"` → `"$ab"`, `"pre$n.x post"` → `"pre$n.xpost"`. An off-by-one in the upstream scanner.
+  `$` is an identifier character there, so `"$n$n"` parses as the single path `n$n`. `$`
+  substitution is inert for an array row — no character is eaten. Reproduced because the title
+  *is* the identity of a test: `-t` matches it and a snapshot is keyed by it.
+- **`.rejects` refuses a function** (`Expected promise / Received: [Function]`), unlike Jest.
+- **`.only` and snapshot creation are CI-gated**, above.
+- **Snapshot keys join describe blocks with a space**, the reporter with `" > "`.
+
+### Gating
+
+The offline gate goes from **1295 checks to 1455**, the kernel-tier spike from **161 to 182**.
+The new offline sections are ten, and the ones that matter are
+**byte-exact fixtures captured from the real binary** rather than round-trips against our own
+output — the rule AGENTS.md already sets for `Bun.hash` and `Bun.Glob`, and the only kind of test
+that can catch a formatter that is self-consistently wrong. `scripts/spike-bun.mjs` adds four
+kernel-tier sections for the parts where the VM is the point: the CLI flags reaching the runner
+through a real process, `mock.module()` against the real module loader (its resolution rules,
+`.ts` extensions and ESM→CJS compile are not Node's), snapshots written to and re-read from the
+**Wasm VFS across two processes**, and the CI guards firing inside a guest. That last group found
+a VM-only failure the offline tier could not: in an ESM test file `require` is undefined (as in
+real Node), so `mock.module` has to be exercised through `await import()`.
+
+See ARCHITECTURE.md §9.2 and the Bun section of AGENTS.md.

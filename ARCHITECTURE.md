@@ -1100,6 +1100,30 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   handshake + frame codec + `ServerWebSocket` with pub/sub topics), plus **`bun:*` modules**
   (`bun:test` runner + `expect`, with Bun/Jest `test.only` filtering and `beforeEach`/`afterEach`
   that run at the root and inherit into nested `describe`s).
+- `packages/runtime/builtins/bun-test.js` — the whole of **`bun:test`**, split out of `bun.js`.
+  The runner (the full `.skip`/`.only`/`.todo`/`.each`/`.if`/`.skipIf`/`.todoIf` family on both
+  `describe` and `test`, plus `test.failing`; per-test timeouts from Bun's
+  `number | {timeout, retry, repeats}` third argument), `expect` (the asymmetric matchers —
+  `expect.any`/`anything`/`objectContaining`/`arrayContaining`/`stringContaining`/
+  `stringMatching`/`closeTo`/`not.*`/`extend` — honoured **recursively** inside
+  `toEqual`/`toStrictEqual`/`toMatchObject`/`toContainEqual`/`toHaveBeenCalledWith`;
+  `.resolves`/`.rejects` carrying the full matcher set with negation; the
+  `toHaveBeenCalled*`/`toHaveReturned*` family), the mock/spy surface including a restorable
+  `spyOn` and `mock.module()` over the loader's require cache, and **file-backed snapshots in
+  Bun's own `.snap` format**.
+  Three design points matter architecturally. (1) **The pure halves are exported** — the `.each`
+  title formatter, the snapshot serializer, the `.snap` codec and the JUnit writer — so the
+  Wasm-free tier pins them byte-for-byte against output captured from a real `bun test` 1.3.6,
+  the same rule `bun-hash.js` follows; a `.snap` file written by this code was fed back to the
+  real binary and read without complaint, which is what the format claim rests on.
+  (2) **Asymmetric matchers do not replace `Bun.deepEquals`** — a cheap pre-pass checks whether
+  the *expected* tree contains one at all, and only then walks it by hand, so the
+  loose-vs-strict split §9.2 describes stays the single implementation for every ordinary
+  comparison. (3) **`.resolves`/`.rejects` return a real Promise and are also tracked by the
+  runner**, which drains outstanding async assertions after each test body. Real Bun returns
+  `undefined` from them for an already-settled promise (it peeks it synchronously, which no
+  browser engine permits — see `Bun.peek`), so returning a promise is forced; tracking is what
+  stops a *forgotten* `await` from turning a red test green.
 - `packages/runtime/builtins/bun-serve.js` — the **option policy** for `Bun.serve` and the
   **RFC 6455 rules** its handshake and frame reader enforce, kept pure (no sockets, no Node
   builtins) so the Wasm-free spike tier can drive them directly. `Bun.serve` previously accepted
@@ -1473,6 +1497,15 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   writes a database in one process and reads it back in a **different** one, asserting the file
   is in the VFS and starts with SQLite's documented `"SQLite format 3\0"` header. Neither can
   skip: the engine is a committed artifact, and a missing one fails the assertion.
+  `bun:test` follows the `Bun.hash` rule rather than the round-trip one: its formatters are
+  pinned to strings **captured from a real `bun test`**, not to our own output, because a
+  serializer that is self-consistently wrong passes every round-trip. The kernel tier carries
+  the four things a pure-JS run cannot reach — CLI flags arriving through a real process,
+  `mock.module()` against the real loader (whose resolution, `.ts` handling and ESM→CJS compile
+  are not Node's), a `.snap` file written and re-read across **two** processes on the Wasm VFS,
+  and the CI guards firing inside a guest. That split earned itself immediately: `require` is
+  undefined in an ESM test file, so `mock.module` only works through `await import()` there, and
+  no offline check could have shown it.
 
 ### 9.3 Python (Pyodide / CPython→WASM) — a lazy plug-in
 
