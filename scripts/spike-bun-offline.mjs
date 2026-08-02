@@ -72,6 +72,15 @@ import {
   parsePasswordOptions,
 } from "../packages/runtime/builtins/bun-crypto.js";
 import { createCryptoBinding } from "../packages/runtime/node/bindings/crypto.js";
+// Bun.build's pure halves: the option policy, the naming templates, the
+// dependency/define tokenizer and the plugin host. See bun-build.js.
+import {
+  normalizeBuildOptions,
+  applyNaming,
+  scanAndDefine,
+  isExternalSpec,
+  PluginHost,
+} from "../packages/runtime/builtins/bun-build.js";
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -3984,7 +3993,347 @@ console.log("== bun build --compile fails loudly (BUN_PROGRAM as a real process)
     // The real in-VM build is exercised by scripts/spike-bun.mjs.
     const plain = bun("build", "app.ts", "--outfile=out.js");
     ok(!/--compile is not supported/.test(plain.text), "a build without --compile does not hit the guard");
-    ok(/Bun is not defined/.test(plain.text), "…it reaches the transpile path (which needs the Bun global this harness has no kernel to install)");
+    ok(/Bun is not defined/.test(plain.text), "…it reaches Bun.build (which needs the Bun global this harness has no kernel to install)");
+  } finally {
+    fsMod.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5B — Bun.build (a real dependency graph) and Bun.plugin.
+//
+// What this tier can prove and the kernel tier cannot: the OPTION POLICY (every
+// option this bundler will not honour throws, naming itself), the tokenizer that
+// finds dependencies and applies `define`, and the codegen for all three output
+// formats. What it deliberately does NOT prove is that the graph walk survives
+// the real VFS across the syscall bridge — that is scripts/spike-bun.mjs, and it
+// is where the load-bearing "the bundle actually runs and computes the right
+// answer" proof lives, because a bundler is exactly the kind of subsystem that
+// passes over host Node's fs and then trips on the real one.
+//
+// The resolver is NOT stubbed here. `createModuleSystem` (the shipped loader) is
+// driven over host Node's fs and its resolveFilename is what walks the graph —
+// the same seam packages/runtime/index.js hands to createBunRuntime. A bundler
+// tested against a toy resolver would prove nothing about which file ends up in
+// the bundle, which is the only question that matters.
+console.log("== Bun.build: the option policy (nothing is silently ignored) ==");
+{
+  const pathMod = nodeRequire("node:path");
+  const norm = (opts) => normalizeBuildOptions({ entrypoints: ["./a.ts"], ...opts }, { path: pathMod, cwd: "/proj" });
+  const threw = (opts) => { try { norm(opts); return ""; } catch (e) { return String((e && e.message) || e); } };
+
+  // The four that are real compiler work, and the one that is impossible. Each
+  // must name ITSELF in the message: "Bun.build failed" tells an author nothing
+  // about which of their options was the problem.
+  const REJECTED = [
+    ["minify", { minify: true }, "no minifier"],
+    ["minify (partial)", { minify: { whitespace: true } }, "no minifier"],
+    ["splitting", { splitting: true }, "one file per entry point"],
+    ["sourcemap", { sourcemap: "linked" }, "no position mappings"],
+    ["sourcemap:true", { sourcemap: true }, "no position mappings"],
+    ["bytecode", { bytecode: true }, "JavaScriptCore"],
+    ["compile", { compile: true }, "NATIVE executable"],
+    ["publicPath", { publicPath: "/s/" }, "no asset pipeline"],
+    ["loader", { loader: { ".css": "text" } }, "loader plugins"],
+    ["drop", { drop: ["console"] }, "does not reprint the AST"],
+    ["conditions", { conditions: ["custom"] }, "fixed condition set"],
+    ["packages", { packages: "external" }, "list the packages in `external`"],
+    ["env", { env: "inline" }, "define-generation pass"],
+    ["naming.chunk", { naming: { chunk: "[name].js" } }, "emits no chunks"],
+    ["naming.asset", { naming: { asset: "[name].js" } }, "emits no assets"],
+  ];
+  for (const [name, opts, phrase] of REJECTED) {
+    const m = threw(opts);
+    ok(m.includes("Bun.build({"), `${name} throws a Bun.build-shaped message`);
+    ok(m.includes(phrase), `…naming the specific reason (${JSON.stringify(phrase)}) rather than "unsupported"`);
+  }
+  // `sourcemap: "none"` / false are the DEFAULT, so they must not throw — a policy
+  // that rejects the value meaning "I don't want one" would be a bug of its own.
+  ok(threw({ sourcemap: "none" }) === "" && threw({ sourcemap: false }) === "" && threw({ minify: false }) === "", "the falsy/none forms of the rejected options are accepted (they ask for nothing)");
+
+  // Validation that catches a typo before anything is written.
+  ok(/must be one of browser, bun, node/.test(threw({ target: "deno" })), "an unknown target is rejected, listing the ones that exist");
+  ok(/must be one of esm, cjs, iife/.test(threw({ format: "umd" })), "an unknown format is rejected the same way");
+  ok(/non-empty array/.test((() => { try { normalizeBuildOptions({}, { path: pathMod, cwd: "/" }); return ""; } catch (e) { return e.message; } })()), "entrypoints is required");
+  ok(/strings of SOURCE TEXT/.test(threw({ define: { A: 1 } })), "a non-string define value is rejected — Bun's values are source text, and guessing would change the meaning");
+  ok(/identifier or a dotted member path/.test(threw({ define: { "a b": "1" } })), "a define key the tokenizer cannot match is rejected rather than silently never firing");
+
+  // The defaults, which are Bun's.
+  const { config } = norm({});
+  ok(config.target === "browser" && config.format === "esm", "defaults: target browser, format esm (Bun's)");
+  ok(config.entryNaming === "[dir]/[name].[ext]", "…and Bun's default entry naming");
+  ok(config.root === "/proj", "…with `root` defaulting to the entry points' common directory");
+  ok(config.throw === false, `…and \`throw\` defaulting to false, which is Bun ${BUN_VERSION}'s behaviour (later versions flipped it)`);
+  // iife DEGRADES loudly rather than silently dropping the exports.
+  const iife = norm({ format: "iife" });
+  ok(iife.warnings.some((w) => w.key === "format" && /not exposed anywhere/.test(w.message)), "format:'iife' warns that the entry's exports go nowhere");
+}
+
+console.log("== Bun.build: naming templates and `external` matching ==");
+{
+  ok(applyNaming("[dir]/[name].[ext]", { dir: "", name: "index", ext: "js" }) === "index.js", "[dir] of the root collapses away instead of emitting ./index.js");
+  ok(applyNaming("[dir]/[name].[ext]", { dir: "pages", name: "a", ext: "js" }) === "pages/a.js", "[dir] is the entry's path under `root`");
+  ok(applyNaming("[name]-[hash].[ext]", { name: "a", ext: "js", hash: "deadbeef" }) === "a-deadbeef.js", "[hash] expands");
+  ok(isExternalSpec("react", ["react"]), "external matches exactly");
+  ok(isExternalSpec("react/jsx-runtime", ["react"]), "…and covers a subpath of the same package, which is how Bun reads it");
+  ok(!isExternalSpec("react-dom", ["react"]), "…but not a different package that merely starts with the same letters");
+  ok(isExternalSpec("anything", ["*"]), "`*` externalises everything");
+  ok(isExternalSpec("@scope/a", ["@scope/*"]), "a glob is honoured");
+}
+
+console.log("== Bun.build: the dependency tokenizer (no phantoms, no desync) ==");
+{
+  // A phantom dependency is the dangerous direction: it fails to resolve and takes
+  // a working build down. So a require inside a string or a comment must be
+  // invisible, and a regex literal must not desync the scanner (a naive one reads
+  // /["']/ as an unterminated string and then misses everything after it).
+  const src = [
+    'const a = require("./real");',
+    'const s = "require(\'./in-a-string\')";',
+    '// require("./in-a-comment")',
+    '/* require("./in-a-block-comment") */',
+    'const rx = /["\']/; const b = require("./after-a-regex");',
+    'const t = `require("./in-a-template")`;',
+    'const d = obj.require("./a-method-call");',
+    'const dyn = __oc_import("./dynamic");',
+    'const computed = require(someName);',
+  ].join("\n");
+  const { requires } = scanAndDefine(src, {});
+  ok(requires.includes("./real"), "a plain require is found");
+  ok(requires.includes("./after-a-regex"), "…and one that follows a regex literal containing a quote (the classic desync)");
+  ok(requires.includes("./dynamic"), "…and a dynamic import(), which both ESM rewrites turn into __oc_import");
+  ok(!requires.includes("./in-a-string"), "a require inside a string is NOT a dependency");
+  ok(!requires.includes("./in-a-comment") && !requires.includes("./in-a-block-comment"), "…nor one in a comment");
+  ok(!requires.includes("./in-a-template"), "…nor one in a template literal");
+  ok(!requires.includes("./a-method-call"), "…nor a `.require()` method that merely shares the name");
+  ok(requires.length === 3, `exactly the three real specifiers were found (got ${JSON.stringify(requires)})`);
+
+  // `define` substitutes on the same pass, with the same boundaries.
+  const defined = scanAndDefine(
+    ['const x = process.env.NODE_ENV;', 'const y = "process.env.NODE_ENV";', 'const z = a.process.env.NODE_ENV;', 'const w = process.env.NODE_ENV_OTHER;'].join("\n"),
+    { "process.env.NODE_ENV": '"production"' },
+  ).code;
+  ok(/const x = "production";/.test(defined), "define replaces the member path");
+  ok(/const y = "process\.env\.NODE_ENV";/.test(defined), "…and never inside a string literal");
+  ok(/const z = a\.process\.env\.NODE_ENV;/.test(defined), "…and not when it is the tail of a longer property access");
+  ok(/const w = process\.env\.NODE_ENV_OTHER;/.test(defined), "…and not a longer identifier that starts with the key");
+  // A define on a prefix must not eat the trailing access, which would change what
+  // the expression means.
+  const prefix = scanAndDefine("const v = process.env.HOME;", { "process.env": "({})" }).code;
+  ok(prefix === "const v = ({}).HOME;", `a prefix define keeps the trailing member access (got ${JSON.stringify(prefix)})`);
+}
+
+// A real multi-module bundle, driven over host Node's fs with the SHIPPED
+// resolver, run, and checked for the right answer.
+console.log("== Bun.build: a real bundle that runs (multi-file + npm dep + JSON) ==");
+{
+  const os = nodeRequire("node:os");
+  const fsMod = nodeRequire("node:fs");
+  const pathMod = nodeRequire("node:path");
+  const dir = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), "vv-bun-build-"));
+  const w = (rel, s) => {
+    const p = pathMod.join(dir, rel);
+    fsMod.mkdirSync(pathMod.dirname(p), { recursive: true });
+    fsMod.writeFileSync(p, s);
+  };
+  // Evaluate a bundle and hand back its exports. A THROW comes back as a value
+  // rather than escaping: a bundle that lost a module fails inside __vv_ext, and
+  // an uncaught throw here would abort the whole spike with a stack trace instead
+  // of one legible failing check.
+  const run = (code, req) => {
+    const m = { exports: {} };
+    try {
+      new Function("module", "exports", "require", code)(m, m.exports, req || (() => { throw new Error("this bundle should need no host require"); }));
+    } catch (e) {
+      return { __threw: String((e && e.message) || e) };
+    }
+    return m.exports;
+  };
+  try {
+    w("src/index.ts", [
+      'import { shout } from "./greet";',
+      'import cfg from "./cfg.json";',
+      'import { pad } from "leftpad";',
+      "export const answer: string = pad(shout(cfg.who), 12);",
+      "export default answer;",
+    ].join("\n"));
+    w("src/greet.ts", 'export function shout(who: string): string { return ("hi " + who).toUpperCase(); }');
+    w("src/cfg.json", JSON.stringify({ who: "world" }));
+    w("node_modules/leftpad/package.json", JSON.stringify({ name: "leftpad", version: "1.0.0", main: "index.js" }));
+    w("node_modules/leftpad/index.js", 'exports.pad = function (s, n) { while (s.length < n) s = "." + s; return s; };');
+
+    const sys = createModuleSystem({
+      fs: fsMod,
+      path: pathMod,
+      // Enough of a builtin table for the target policy below to have something to
+      // decide about: the bundler asks the RESOLVER whether a specifier is a
+      // builtin, so a resolver with none would make "browser has no node:path"
+      // untestable (it would just be an ordinary unresolved module).
+      builtins: { path: pathMod, "node:path": pathMod, fs: fsMod, "node:fs": fsMod },
+      process,
+      nodeModules: { has: () => false, require: () => ({}), internalBinding: () => ({}) },
+    });
+    const proc = { env: {}, argv: ["bun"], cwd: () => dir, stdout: process.stdout, stderr: process.stderr, stdin: process.stdin };
+    const Bun = createBunRuntime({
+      process: proc,
+      Buffer,
+      require: nodeRequire,
+      resolveFrom: (spec, from) => sys.resolveFilename(spec, from),
+    }).Bun;
+
+    const cjs = await Bun.build({ entrypoints: ["./src/index.ts"], target: "node", format: "cjs", root: "./src" });
+    ok(cjs.success, "a three-module TS graph with an npm dependency and a JSON import bundles");
+    if (!cjs.success) console.log("  logs:", cjs.logs.map(String).join("\n         "));
+    // THE check: the bytes are not Bun's, so the only meaningful assertion is that
+    // the output computes the right thing.
+    ok(run(await cjs.outputs[0].text()).answer === "....HI WORLD", "…and the bundle RUNS, producing the answer all three modules had to agree on");
+    ok(cjs.outputs.length === 1, "one entry point, one output (no splitting)");
+
+    const art = cjs.outputs[0];
+    ok(art.path === "./index.js" && art.kind === "entry-point" && art.loader === "js", "the artifact carries Bun's path/kind/loader");
+    ok(/^[0-9a-f]{16}$/.test(art.hash), "…a content hash");
+    ok(art.size === Buffer.byteLength(await art.text(), "utf8"), "…a size matching its bytes");
+    ok(new TextDecoder().decode(new Uint8Array(await art.arrayBuffer())) === (await art.text()), "…and the Blob read protocol agrees with itself (.arrayBuffer() vs .text())");
+    ok((await art.bytes()) instanceof Uint8Array, "…including .bytes()");
+
+    // ESM output: the entry's named exports and default are re-exported, so the
+    // bundle is importable rather than merely runnable.
+    const esm = await Bun.build({ entrypoints: ["./src/index.ts"], target: "node", root: "./src" });
+    const esmCode = await esm.outputs[0].text();
+    ok(esm.success && /export \{ __vv_e_answer as answer \};/.test(esmCode), "format:'esm' re-exports the entry's named exports");
+    ok(/export default __vv_entry\.default;/.test(esmCode), "…and its default");
+
+    // A dependency graph is only a graph if a cycle terminates. The shape that
+    // matters is the one real code has (yargs' command.js <-> yargs-factory.js): a
+    // hoisted function reached through the cycle, which works because the bundle
+    // links exports through getters exactly as the runtime's ESM rewrite does.
+    w("cyc/a.ts", 'import { fromB } from "./b"; export function tag(s: string) { return "[" + s + "]"; } export const out = fromB();');
+    w("cyc/b.ts", 'import { tag } from "./a"; export function fromB() { return tag("cycle"); }');
+    const cyc = await Bun.build({ entrypoints: ["./cyc/a.ts"], target: "node", format: "cjs", root: "./cyc" });
+    ok(cyc.success, "a circular import bundles instead of recursing forever");
+    ok(run(await cyc.outputs[0].text()).out === "[cycle]", "…and a hoisted function reached across the cycle resolves through the export getters");
+
+    // outdir writes real files, and `naming` decides where.
+    const written = await Bun.build({ entrypoints: ["./src/index.ts"], target: "node", format: "cjs", root: "./src", outdir: "./dist", naming: "[name].[ext]" });
+    ok(written.success && fsMod.existsSync(pathMod.join(dir, "dist/index.js")), "outdir writes the file that naming named");
+    ok(written.outputs[0].path === pathMod.join(dir, "dist/index.js"), "…and the artifact reports where it went");
+
+    // Failures are logs, not throws — Bun 1.1's contract — unless `throw: true`.
+    const missing = await Bun.build({ entrypoints: ["./src/nope.ts"], target: "node" });
+    ok(missing.success === false && missing.outputs.length === 0, "an unresolvable entry gives success:false with no outputs");
+    ok(missing.logs.some((l) => l.level === "error" && /Could not resolve|Could not read/.test(l.message)), "…and an error log saying what could not be resolved");
+    let aggregate = null;
+    try { await Bun.build({ entrypoints: ["./src/nope.ts"], target: "node", throw: true }); } catch (e) { aggregate = e; }
+    ok(aggregate instanceof AggregateError, "throw:true raises an AggregateError instead (Bun's opt-in)");
+
+    // The browser target has no node builtins, and says so at build time rather
+    // than emitting an import that dies in the page.
+    w("src/nodeish.ts", 'import { join } from "node:path"; export const p = join("a", "b");');
+    const browser = await Bun.build({ entrypoints: ["./src/nodeish.ts"], root: "./src" });
+    ok(!browser.success && browser.logs.some((l) => /target "browser"/.test(l.message) && /node:path/.test(l.message)), "target:'browser' refuses a node builtin, naming the module");
+    const external = await Bun.build({ entrypoints: ["./src/nodeish.ts"], root: "./src", external: ["node:path"] });
+    ok(external.success && /^import \* as __vv_x0 from "node:path";/m.test(await external.outputs[0].text()), "…and listing it in `external` emits a real import instead");
+
+    // A file the bundler has no loader for is an error, not an empty module.
+    w("src/styles.css", "body { color: red }");
+    w("src/withcss.ts", 'import "./styles.css"; export const ok = 1;');
+    const css = await Bun.build({ entrypoints: ["./src/withcss.ts"], target: "node", root: "./src" });
+    ok(!css.success && css.logs.some((l) => /No loader for/.test(l.message) && /styles\.css/.test(l.message)), "an unsupported file type is a build error naming the file, not a silently dropped import");
+
+    // Build-time plugins: onResolve into a namespace + onLoad supplying it, and an
+    // onLoad that changes how a real file on disk is read. Both async, because a
+    // build may await (unlike a runtime plugin — see below).
+    w("plug/entry.ts", 'import conf from "virtual:conf"; import raw from "./note.md"; export const out = conf.k + ":" + raw;');
+    w("plug/note.md", "# hi");
+    const plugged = await Bun.build({
+      entrypoints: ["./plug/entry.ts"],
+      target: "node",
+      format: "cjs",
+      root: "./plug",
+      plugins: [
+        {
+          name: "vv-spike",
+          setup(build) {
+            build.onResolve({ filter: /^virtual:/ }, async (args) => ({ path: args.path.slice(8), namespace: "conf" }));
+            build.onLoad({ filter: /.*/, namespace: "conf" }, async () => ({ contents: JSON.stringify({ k: "K" }), loader: "json" }));
+            build.onLoad({ filter: /\.md$/ }, async (args) => ({ contents: "export default " + JSON.stringify(fsMod.readFileSync(args.path, "utf8")), loader: "ts" }));
+          },
+        },
+      ],
+    });
+    ok(plugged.success, "a build plugin with onResolve + onLoad runs");
+    if (!plugged.success) console.log("  logs:", plugged.logs.map(String).join("\n         "));
+    ok(run(await plugged.outputs[0].text()).out === "K:# hi", "…and both hooks actually changed what ended up in the bundle");
+
+    // A namespace nobody loads is a build error: a virtual module has no file, so
+    // "not handled" must not fall through to an fs read of a path that never was.
+    const orphan = await Bun.build({
+      entrypoints: ["./plug/entry.ts"],
+      target: "node",
+      root: "./plug",
+      plugins: [{ name: "resolve-only", setup: (b) => b.onResolve({ filter: /^virtual:/ }, (a) => ({ path: a.path, namespace: "nobody" })) }],
+    });
+    ok(!orphan.success && orphan.logs.some((l) => /No plugin onLoad/.test(l.message)), "a namespace with no onLoad is a build error, not a mysterious ENOENT");
+    ok(/filter/.test((() => { try { new PluginHost({ sync: false }).register({ name: "x", setup: (b) => b.onLoad({ filter: "*.ts" }, () => ({})) }); return ""; } catch (e) { return e.message; } })()), "a string `filter` is rejected — Bun matches with a RegExp, and a string would just never match");
+
+    // Runtime plugins, through the REAL loader. Bun.plugin() rewrites what
+    // require() sees in this process, which is a different lifetime from the
+    // build-time plugins above and shares the same hook shape.
+    Bun.plugin({
+      name: "vv-runtime",
+      setup(build) {
+        build.onResolve({ filter: /^spike:config$/ }, () => ({ path: "/config", namespace: "spike" }));
+        build.onLoad({ filter: /.*/, namespace: "spike" }, () => ({ contents: JSON.stringify({ live: true }), loader: "json" }));
+      },
+    });
+    const req = sys.makeRequire(dir);
+    const tryRequire = (id) => { try { return req(id); } catch (e) { return { __threw: String((e && e.message) || e) }; } };
+    ok(tryRequire("spike:config").live === true, "Bun.plugin() makes require() of a virtual specifier work in the running process");
+    w("plain.js", "module.exports = 7;");
+    ok(tryRequire("./plain.js") === 7, "…without disturbing ordinary resolution");
+    const asyncSetup = (() => { try { Bun.plugin({ name: "async-setup", async setup() {} }); return ""; } catch (e) { return e.message; } })();
+    ok(/synchronous all the way down/.test(asyncSetup) && /Bun\.build/.test(asyncSetup), "an async setup() on a RUNTIME plugin throws, pointing at Bun.build({plugins}) where awaiting is legal");
+    Bun.plugin.clearAll();
+    let cleared = "";
+    try { req("spike:config"); } catch (e) { cleared = String(e.message); }
+    ok(/Cannot find module/.test(cleared), "Bun.plugin.clearAll() really unregisters the hooks");
+  } finally {
+    fsMod.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+console.log("== bun build CLI: flags map onto Bun.build, unknown ones are refused ==");
+{
+  const os = nodeRequire("node:os");
+  const fsMod = nodeRequire("node:fs");
+  const pathMod = nodeRequire("node:path");
+  const { spawnSync } = nodeRequire("node:child_process");
+  const dir = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), "vv-bun-buildcli-"));
+  try {
+    const binBun = pathMod.join(dir, "bun-shim.js");
+    fsMod.writeFileSync(binBun, BUN_PROGRAM);
+    fsMod.writeFileSync(pathMod.join(dir, "app.ts"), "export const x = 1;\n");
+    const bun = (...args) => {
+      const r = spawnSync(process.execPath, [binBun, ...args], { cwd: dir, encoding: "utf8" });
+      return { code: r.status, text: (r.stdout || "") + (r.stderr || "") };
+    };
+    // There is no Bun global in this harness (no kernel to install one), so these
+    // are exactly the failures the CLI can produce BEFORE it reaches Bun.build —
+    // which is the half that lives in the CLI and nowhere else. The build itself
+    // is proven in the VM by scripts/spike-bun.mjs.
+    const unknown = bun("build", "app.ts", "--no-such-flag");
+    ok(unknown.code === 1 && /unknown option --no-such-flag/.test(unknown.text), "an unknown build flag is refused");
+    ok(/silently dropped an option/.test(unknown.text), "…saying why it is refused rather than ignored");
+    const both = bun("build", "app.ts", "--outfile=a.js", "--outdir=out");
+    ok(both.code === 1 && /mutually exclusive/.test(both.text), "--outfile and --outdir together is an error");
+    const many = bun("build", "a.ts", "b.ts", "--outfile=a.js");
+    ok(many.code === 1 && /single entry point/.test(many.text), "--outfile with several entry points is an error (use --outdir)");
+    const none = bun("build");
+    ok(none.code === 1 && /usage: bun build/.test(none.text), "no entry point prints usage");
+    // The rejected options reach Bun.build rather than being handled twice: the CLI
+    // must not grow its own opinion about --minify, or the two front doors drift.
+    const minify = bun("build", "app.ts", "--minify", "--outfile=a.js");
+    ok(!/unknown option/.test(minify.text), "--minify is a known flag, forwarded to Bun.build (which owns the refusal)");
   } finally {
     fsMod.rmSync(dir, { recursive: true, force: true });
   }

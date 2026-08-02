@@ -1409,6 +1409,9 @@ export function createRuntime({
     Buffer,
     require: vvRootRequire,
     makeCwdRequire: () => moduleSystem.makeRequire(process.cwd() || cwd || "/"),
+    // The loader's own resolver, for Bun.build's graph walk — so a bundle contains
+    // what require() would have loaded here (see builtins/bun-build.js).
+    resolveFrom: (specifier, fromDir) => moduleSystem.resolveFilename(specifier, fromDir),
   });
   for (const [name, mod] of Object.entries(bunRuntime.modules)) builtins[name] = mod;
   // `{ dotenv: true }` additionally performs Bun's automatic `.env` loading into

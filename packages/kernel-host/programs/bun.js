@@ -12,7 +12,11 @@
 //                            natively in-browser; npm's proven installer does the
 //                            work). NOTE `update`/`up` only — see `upgrade` below.
 //   bun x / bunx <pkg>       run a package bin (delegates to npx)
-//   bun build <entry>        single-file TS/JSX transpile to --outfile/--outdir
+//   bun build <entry>        BUNDLE (real dependency graph, npm deps included)
+//                            to --outfile/--outdir, through the same engine as
+//                            the programmatic Bun.build. Output is not
+//                            byte-identical to real Bun's — see
+//                            packages/runtime/builtins/bun-build.js.
 //   bun test [filters]       run bun:test suites and report. A positional is a
 //                            FILENAME FILTER (Bun's semantics), and the flags
 //                            -t/--test-name-pattern, --bail[=N], --timeout=<ms>,
@@ -252,14 +256,21 @@ function doExec(rest) {
   child.on('close', (code) => process.exit(code | 0));
 }
 
-// ---- bun build : single-file TS/JSX transpile (no bundling) -----------------
-function doBuild(rest) {
+// ---- bun build : the real bundler, through Bun.build ------------------------
+// One engine, two front doors: this CLI and the programmatic Bun.build() are the
+// same code (packages/runtime/builtins/bun-build.js), so an option cannot be
+// honoured in one and dropped in the other. Every flag below maps onto a
+// Bun.build option and every unsupported one throws from there, naming itself.
+// The output is NOT byte-identical to real Bun's -- see that file's header.
+async function doBuild(rest) {
   installBun(true);
   // --compile asks for a standalone native executable with the Bun runtime
   // embedded. Without this guard we fell through to the transpile path and wrote
   // a JavaScript file under the name the user expected an executable at, then
   // reported success -- the shim's worst failure mode, since the file exists,
-  // looks right, and is not a binary.
+  // looks right, and is not a binary. It stays HERE, ahead of everything, so the
+  // message is about --compile rather than about whatever else the command line
+  // happened to get wrong.
   for (const a of rest) {
     if (a === '--compile' || a.indexOf('--compile=') === 0) {
       err('bun build --compile is not supported in Vivari (browser sandbox): it emits a standalone NATIVE executable with the Bun runtime embedded, and a browser tab can neither produce nor run one.');
@@ -267,28 +278,88 @@ function doBuild(rest) {
       process.exit(1);
     }
   }
-  let entry = null, outfile = null, outdir = null;
-  for (const a of rest) {
-    if (a.indexOf('--outfile=') === 0) outfile = a.slice(10);
-    else if (a.indexOf('--outdir=') === 0) outdir = a.slice(9);
-    else if (a[0] !== '-') entry = a;
+
+  const entries = [];
+  const opts = {};
+  const external = [];
+  const define = {};
+  let outfile = null;
+  // A flag we do not know is NOT dropped: it is very likely a real bun build
+  // option, and quietly ignoring one is the failure this whole subsystem exists
+  // to avoid. Options Bun has and this bundler does not (--minify, --splitting,
+  // --sourcemap) are passed through to Bun.build so that IT produces the message
+  // explaining what is missing and why.
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    const eq = a.indexOf('=');
+    const flag = a[0] === '-' && eq > 0 ? a.slice(0, eq) : a;
+    const value = a[0] === '-' && eq > 0 ? a.slice(eq + 1) : null;
+    const next = () => (value !== null ? value : rest[++i]);
+    if (a[0] !== '-') { entries.push(a); continue; }
+    if (flag === '--outfile') { outfile = next(); continue; }
+    if (flag === '--outdir') { opts.outdir = next(); continue; }
+    if (flag === '--target') { opts.target = next(); continue; }
+    if (flag === '--format') { opts.format = next(); continue; }
+    if (flag === '--root') { opts.root = next(); continue; }
+    if (flag === '--entry-naming') { opts.naming = next(); continue; }
+    if (flag === '--banner') { opts.banner = next(); continue; }
+    if (flag === '--footer') { opts.footer = next(); continue; }
+    if (flag === '--external') { external.push(next()); continue; }
+    if (flag === '--define' || flag === '-d') {
+      const pair = next() || '';
+      const at = pair.indexOf('=');
+      if (at < 0) { err('bun build: --define needs KEY=VALUE, got ' + JSON.stringify(pair)); process.exit(1); }
+      define[pair.slice(0, at)] = pair.slice(at + 1);
+      continue;
+    }
+    if (flag === '--minify' || flag === '--minify-whitespace' || flag === '--minify-identifiers' || flag === '--minify-syntax') { opts.minify = true; continue; }
+    if (flag === '--splitting') { opts.splitting = true; continue; }
+    if (flag === '--sourcemap') { opts.sourcemap = value === null ? 'linked' : value; continue; }
+    if (flag === '--bytecode') { opts.bytecode = true; continue; }
+    if (flag === '--public-path') { opts.publicPath = next(); continue; }
+    if (flag === '--packages') { opts.packages = next(); continue; }
+    if (flag === '--drop') { opts.drop = [next()]; continue; }
+    if (flag === '--conditions') { opts.conditions = [next()]; continue; }
+    err('bun build: unknown option ' + flag + '. It is rejected rather than ignored: a build that silently dropped an option you asked for would report success and hand you the wrong file.');
+    process.exit(1);
   }
-  if (!entry) { err('usage: bun build <entry> --outfile=<file>'); process.exit(1); }
-  const abs = path.resolve(cwd, entry);
-  const src = fs.readFileSync(abs, 'utf8');
-  const t = new Bun.Transpiler({ loader: entry.slice(entry.lastIndexOf('.') + 1) });
-  const js = t.transformSync(src);
-  const dest = outfile ? path.resolve(cwd, outfile)
-    : outdir ? path.resolve(cwd, outdir, path.basename(entry).replace(/[.](ts|tsx|jsx|mts|cts)$/, '.js'))
-    : null;
-  if (dest) {
-    const slash = dest.lastIndexOf('/');
-    if (slash > 0) { try { fs.mkdirSync(dest.slice(0, slash), { recursive: true }); } catch (e) {} }
-    fs.writeFileSync(dest, js);
-    out('bun build: wrote ' + dest + ' (single-file transpile; bundling is not supported by the shim)');
-  } else {
-    process.stdout.write(js + NL);
+  if (!entries.length) { err('usage: bun build <entry> [--outfile=<file> | --outdir=<dir>] [--target=node] [--format=esm]'); process.exit(1); }
+
+  // --outfile names ONE output file, which is a naming template in disguise:
+  // Bun.build only knows outdir + naming, so express it as exactly that rather
+  // than writing the file a second way and risking the two paths diverging.
+  if (outfile) {
+    if (opts.outdir) { err('bun build: --outfile and --outdir are mutually exclusive'); process.exit(1); }
+    if (entries.length > 1) { err('bun build: --outfile takes a single entry point (got ' + entries.length + '); use --outdir for several'); process.exit(1); }
+    const abs = path.resolve(cwd, outfile);
+    opts.outdir = path.dirname(abs);
+    opts.naming = path.basename(abs);
   }
+
+  opts.entrypoints = entries;
+  if (external.length) opts.external = external;
+  if (Object.keys(define).length) opts.define = define;
+
+  let result;
+  try {
+    result = await Bun.build(opts);
+  } catch (e) {
+    // A rejected option (minify/splitting/sourcemap/...) arrives here as the throw
+    // from bun-build.js, which already names the option and the reason.
+    err('bun build: ' + ((e && e.message) || e));
+    process.exit(1);
+    return;
+  }
+  for (const log of result.logs) err('bun build: ' + log.level + ': ' + log.message);
+  if (!result.success) { err('bun build failed'); process.exit(1); }
+  if (!opts.outdir) {
+    // No destination: Bun prints the bundle to stdout.
+    for (const artifact of result.outputs) process.stdout.write(await artifact.text());
+    process.exit(0);
+    return;
+  }
+  for (const artifact of result.outputs) out('bun build: wrote ' + artifact.path + '  (' + artifact.size + ' bytes)');
+  out('Bundled ' + result.outputs.length + ' file(s). NOTE: Vivari bundles with its own bundler, so the bytes are not identical to real bun build.');
   process.exit(0);
 }
 
@@ -419,9 +490,13 @@ function helpText() {
     '  bun run <script|file>    run a package.json script or a file',
     '  bun install|add|remove   manage dependencies (delegates to npm; writes bun.lock)',
     '  bun x <pkg>              run a package binary (bunx)',
-    '  bun build <entry>       transpile a single TS/JSX file',
+    '  bun build <entry>       bundle an entry point and its imports',
     '  bun test [filters]      run bun:test suites (-t, --bail, --timeout, -u, --reporter)',
     '  bun --version           print the shim Bun version',
+    '',
+    "Note: bun build uses Vivari's own bundler, so its output is NOT byte-identical",
+    'to real bun build (no tree shaking, no minifier). --minify/--splitting/--sourcemap',
+    'are refused rather than ignored; use esbuild or rollup when you need them.',
   ].join(NL);
 }
 
@@ -495,6 +570,12 @@ async function main() {
 // visible: without this catch a thrown error is a silent unhandled rejection and
 // the process exits with no diagnostic.
 main().catch((e) => {
+  // process.exit() unwinds by THROWING (packages/runtime/builtins/process.js sets
+  // __processExit on the error), so an async subcommand's ordinary exit arrives
+  // here as a rejection. Re-reporting it printed an "Error: process.exit called"
+  // stack trace to stderr on every SUCCESSFUL bun build / bun test, which reads as
+  // a crash that also happened to work.
+  if (e && e.__processExit !== undefined) return;
   process.stderr.write('bun: ' + ((e && e.stack) || e) + NL);
   process.exit(1);
 });

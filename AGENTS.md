@@ -114,6 +114,17 @@ packages/
                    its handshake and frame reader enforce. Pure — no sockets, no Node
                    builtins — so the offline tier drives it directly; the stateful
                    half (http.Server, ServerWebSocket, pub/sub) stays in bun.js.
+      bun-build.js Bun.build + Bun.plugin: a real dependency-graph bundler written
+                   against the runtime's own resolver, NOT esbuild — so it works
+                   with no bundler in the user's node_modules, the way Bun's does
+                   (rationale in that file's header). Same option policy as
+                   bun-serve.js. Output is deliberately NOT byte-identical to real
+                   Bun's; it is a CJS-shaped wrapper graph with no tree shaking or
+                   minifier, and minify/splitting/sourcemap/bytecode THROW rather
+                   than get dropped. `bun build` (the CLI, in kernel-host/programs/
+                   bun.js) is a front door onto this same engine, so a flag cannot
+                   be honoured in one and ignored in the other. The plugin registry
+                   is module state that module.js reads on every resolve/load.
       bun-test.js  the whole of `bun:test`: the runner (describe/test with the full
                    .skip/.only/.todo/.each/.if/.failing family, per-test timeouts,
                    retry/repeats, -t/--bail/--todo/--reporter), `expect` with the
@@ -887,7 +898,8 @@ unpacked:
 - **`packages/runtime/builtins/bun.js`** — a Node-backed `Bun` global (`version`,
   `main`, `env`, `escapeHTML`, `deepEquals`/`deepMatch`, `hash`/`crc32`, `Glob`,
   `FileSystemRouter`, `randomUUIDv7`, `gzip`/`gunzip`,
-  password `hash`/`verify`, `CryptoHasher`, `Transpiler`, `$`) plus **`Bun.serve`**
+  password `hash`/`verify`, `CryptoHasher`, `Transpiler`, `$`, `build`, `plugin`)
+  plus **`Bun.serve`**
   `randomUUIDv7`, `gzip`/`gunzip`,
   `Transpiler`, `$`) plus **`Bun.serve`**
   (fetch handler; `routes` with static paths, `:params`, `*` wildcards,
@@ -1017,6 +1029,42 @@ unpacked:
   `getBufferedAmount()` are correct but inert here, because the in-VM loopback
   completes every write synchronously and so never builds backpressure (see the
   kernel spike, which pins that).
+- **`packages/runtime/builtins/bun-build.js`** — `Bun.build` and `Bun.plugin`.
+  **It is not esbuild, and that was the decision, not an accident.** `esbuild-wasm`
+  bundles better than this file ever will, but `Bun.build` is part of the Bun binary:
+  it works in a project with an empty `node_modules`, and a `Bun.build` that first
+  demands `bun add esbuild` is a different API wearing the same name. Aliasing
+  `esbuild` → `esbuild-wasm` (the toolchain-shims gotcha below) only helps a project
+  that already depends on esbuild. So the graph walk is written against the runtime's
+  OWN resolver (`resolveFilename`, injected from `index.js`) and its own transforms
+  (`typescript-transform.js` for TS/JSX, `esm.js` for ESM→CJS) — the same code that
+  resolves a `require()` at runtime, which is the only way `Bun.build` and `bun run`
+  can agree about what a specifier means. A project that wants a production bundler
+  should still run esbuild/rollup/Vite; those work in-VM and are the recommendation
+  in the docs page.
+  Consequences worth internalizing before you touch it:
+  - **Output is NOT byte-identical to real Bun's, and never will be.** It is a
+    registry of CJS-shaped module factories behind a tiny prelude, with **no tree
+    shaking and no minifier**. Bundles are bigger and differently ordered. This is
+    stated in the file header, in `sites/docs/docs/bun.md`, and in the `bun build`
+    help text, so nobody opens a diff-noise bug. Assert on *behaviour* (the bundle
+    runs and produces the right value) — never on bytes or on a hash.
+  - **The option policy is `bun-serve.js`'s, applied harder.** `minify`, `splitting`,
+    `sourcemap`, `bytecode` and `--compile` **throw**, naming the option and the
+    reason, because a bundler that reports `success: true` having ignored `minify`
+    ships an unminified bundle to production and says nothing. Degrading loudly is
+    for options where running without them is still faithful; a build artifact is not
+    that. Prefer throwing over dropping when you add one.
+  - **The CLI and the programmatic API are ONE engine.** `bun build` (in
+    `kernel-host/programs/bun.js`) parses flags onto `Bun.build` options and calls it,
+    so a flag cannot be honoured in one door and dropped in the other. `--compile`'s
+    existing refusal is now that same throw.
+  - **`Bun.plugin` is module-level registry state that `module.js` reads on EVERY
+    resolve and load** (`bunPluginsActive()` guards the fast path). Runtime plugins
+    must therefore be **synchronous** — `module.js`'s `resolveFilename`/`compile` are
+    sync all the way down to `require()`, so an async `onLoad` cannot be awaited and
+    throws instead of resolving to a promise nobody unwraps. Build-time plugins
+    (`Bun.build({plugins})`) are async, since that path already is.
 - **`packages/runtime/builtins/bun-unsupported.js`** — the ~20 APIs a browser tab
   cannot provide, and the only file in the Bun shim with no implementation to read:
   it is the catalogue. `Bun.listen`/`connect` (raw TCP), `Bun.udpSocket`,
@@ -1084,6 +1132,8 @@ unpacked:
   delegate to npm/npx, whose environment is not ours to rewrite from a project file).
   `bun test` additionally forces the `test` file set and then defaults `NODE_ENV` to
   `test` if nothing else set it — that order is Bun's and is load-bearing.
+  `bun build` is a thin front door onto `builtins/bun-build.js`: it maps flags to
+  `Bun.build` options and lets that engine own every refusal, including `--compile`.
 - **Zero-config `.ts`/`.tsx`** runs through `packages/runtime/typescript-transform.js`
   (synchronous, dependency-free type-strip + JSX lowering, invoked by `module.js`;
   gated so plain JS is untouched). It strips return-type annotations inside object

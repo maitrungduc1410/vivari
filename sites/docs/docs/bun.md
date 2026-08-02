@@ -43,7 +43,8 @@ A few things are **not implemented rather than impossible**, and the error says
 so in different words, because "stop and redesign" and "send a patch" are not the
 same advice: `Bun.spawn({ terminal: true })` (a pty could be emulated in
 JavaScript; the kernel gives a child plain pipes today), `Bun.SQL`'s SQLite
-adapter (use the `bun:sqlite` module), and `Bun.build` / `Bun.plugin` / Bun
+adapter (use the `bun:sqlite` module), `Bun.build`'s `minify` / `splitting` /
+`sourcemap` options (see [Bundling](#bundling-with-bunbuild) below), and Bun
 macros, which need no capability the sandbox lacks.
 
 Every one of these is **safe to import**. The symbol exists, so
@@ -86,7 +87,8 @@ The shim is not a stub list. `Bun.serve` (with `routes`, `fetch`, an `error`
 handler and server-side WebSockets), `Bun.file`/`Bun.write` and the incremental
 `FileSink`, `Bun.$`, `Bun.spawn`, `Bun.Glob`, `Bun.FileSystemRouter`,
 `Bun.CryptoHasher` and `Bun.password`, `Bun.hash`, `Bun.YAML`/`TOML`/`JSON5`,
-zero-config TypeScript, automatic `.env` loading with Bun's precedence rules, and
+`Bun.build` and `Bun.plugin` (see below), zero-config TypeScript, automatic
+`.env` loading with Bun's precedence rules, and
 the `bun:test` runner all behave as documented — and where they diverge, the
 divergence is written down rather than discovered.
 
@@ -124,6 +126,91 @@ Four divergences, all deliberate:
 rather than something created, are real Bun behaviours and are reproduced.
 
 Start from any template in the Studio's **Bun** category.
+
+## Bundling with `Bun.build`
+
+`Bun.build()` and `bun build` really bundle: a dependency graph across `.ts`,
+`.tsx`, `.js`, `.jsx`, `.json` and `.txt`, including packages from
+`node_modules`, with ESM and CommonJS mixed freely and import cycles handled.
+
+```ts
+const result = await Bun.build({
+  entrypoints: ["./src/index.ts"],
+  outdir: "./dist",
+  target: "browser",
+  format: "esm",
+  external: ["react"],
+  define: { "process.env.NODE_ENV": '"production"' },
+});
+
+if (!result.success) for (const log of result.logs) console.error(log.message);
+for (const artifact of result.outputs) console.log(artifact.path, artifact.hash);
+```
+
+Outputs are Bun's `BuildArtifact`: Blob-like, with `path`, `kind`, `loader`,
+`hash`, `.text()`, `.arrayBuffer()` and `.bytes()`.
+
+:::warning The output bytes are not identical to real Bun's
+
+This is a different bundler, not a port of Bun's. Bun's is a Zig program with its
+own parser, scope hoister, tree shaker and printer; Vivari's emits a registry of
+CommonJS-shaped module factories behind a small prelude. For the same input you
+get a **different file** — different wrapping, different ordering, no tree
+shaking, no renaming, and a larger bundle.
+
+What is promised is that the bundle **runs and computes the same thing**. Please
+do not file a bug about the bytes; please do file one about behaviour.
+:::
+
+Vivari's bundler is written against the runtime's own module resolver rather than
+delegating to esbuild, so that `Bun.build` works in a project with nothing
+installed — as it does under real Bun — and so that a bundle contains exactly
+what `require` would have loaded here. The trade is capability: **`minify`,
+`splitting`, `sourcemap` and `bytecode` throw** rather than being silently
+dropped from a build that then reports success. When you need them, run a real
+bundler; `esbuild`, Rollup, Rspack and Vite all work in-VM, and `esbuild` is
+aliased to `esbuild-wasm` for you.
+
+`target: "browser"` refuses a Node builtin by name instead of emitting a bundle
+that fails on first run — list it in `external` if you are supplying it yourself.
+`bun build --compile` is refused for the reason in the table above.
+
+## Plugins
+
+`Bun.plugin` works in both of its lifetimes.
+
+```ts
+Bun.plugin({
+  name: "build-info",
+  setup(build) {
+    build.onResolve({ filter: /^app:info$/ }, ({ path }) => ({
+      path,
+      namespace: "app",
+    }));
+    build.onLoad({ filter: /.*/, namespace: "app" }, () => ({
+      loader: "json",
+      contents: JSON.stringify({ builtAt: Date.now() }),
+    }));
+  },
+});
+
+import info from "app:info"; // { builtAt: … }
+```
+
+A plugin registered with `Bun.plugin()` is a **runtime** plugin: it changes what
+`require`/`import` see in the process that registered it. One passed as
+`Bun.build({ plugins: [...] })` affects that build only. Both get `onResolve` and
+`onLoad`.
+
+`onLoad` returns `contents` plus a `loader`, one of `js`, `jsx`, `ts`, `tsx`,
+`json`, `text` or `toml`. Bun's `loader: "object"` — which hands back a live
+JavaScript value rather than source text — throws here, naming itself: this
+module system compiles source, so return `contents` with loader `js` instead.
+
+One further divergence: **runtime hooks must be synchronous here.** Vivari's
+module loader is synchronous all the way down, so there is nowhere to await, and
+an async hook throws rather than handing your module a pending promise as its
+exports. Build-time hooks may be async.
 
 [`bcryptjs`]: https://www.npmjs.com/package/bcryptjs
 [`sql.js`]: https://sql.js.org

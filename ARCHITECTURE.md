@@ -1346,14 +1346,57 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   is the opposite of `Bun.resolveSync(id, root)`, whose second argument is already a directory.
   That one used to accept `root` and drop it, resolving every call from the runtime's own base —
   a real absolute path to the wrong file — and now honours it, or throws when no resolver exists.
+- `packages/runtime/builtins/bun-build.js` — **`Bun.build` and `Bun.plugin`**. `bun build` used
+  to be a single-file TS/JSX transpile: it emitted the entry with its `import`s rewritten and
+  no dependency ever followed, so a two-file project produced an output that could not run.
+  This is a real bundler — a graph walk over TS/TSX/JS/JSX/JSON/text, `node_modules` packages
+  included, ESM and CJS mixed in one graph, cycles handled — returning Bun's documented
+  `{success, outputs: BuildArtifact[], logs}`.
+
+  **It is not esbuild, and the choice is the load-bearing part.** esbuild-wasm runs in-VM
+  (§9.x, Bundler Stage 1) and would bundle far better than this file does. But `Bun.build` is
+  *inside the Bun binary*: it works with an empty `node_modules`, and Vivari's `esbuild` →
+  `esbuild-wasm` alias only rewrites a dependency a project already declares. Requiring
+  `bun add esbuild` before `Bun.build` works would be a different API under the same name, and
+  failing when it is absent would be worse. So the walk uses the module loader's own
+  `resolveFilename` (injected as `resolveFrom` from `packages/runtime/index.js`) and the
+  runtime's own transforms — `typescript-transform.js` for TS/JSX, `esm.js` for ESM→CJS. That
+  sharing is also what makes the result trustworthy: the bundler cannot disagree with `bun run`
+  about what a specifier resolves to, because it is the same resolver. Projects wanting a
+  production bundler should still run esbuild, Rollup, Rspack or Vite, all of which work in-VM.
+
+  **The output is NOT byte-identical to real Bun's**, and the docs, the file header and the
+  `bun build --help` text all say so, so that nobody files diff-noise bugs. It is a registry of
+  CJS-shaped module factories behind a small prelude: no tree shaking, no minifier, different
+  ordering, bigger. Tests assert that a bundle *runs and computes the right answer*, never that
+  it matches bytes or a hash.
+
+  The **option policy is `bun-serve.js`'s**, applied more strictly, because a build artifact is
+  not something one can serve "approximately": `entrypoints`, `outdir`, `target`
+  (`bun`/`node`/`browser`, where `browser` refuses a Node builtin by name instead of emitting a
+  bundle that dies at run time), `format` (`esm`/`cjs`/`iife`), `external` (exact, prefix and
+  glob), `define`, `naming` (`[dir]`/`[name]`/`[ext]`/`[hash]`) and `root` are implemented;
+  `minify`, `splitting`, `sourcemap` and `bytecode` **throw**, naming the option and the reason.
+  A bundler that returns `success: true` having quietly dropped `minify` ships an unminified
+  bundle to production and reports nothing — that is the single outcome this policy exists to
+  prevent, and it is why refusing beats degrading here.
+
+  `Bun.plugin` has two tiers. Build-time plugins (`Bun.build({plugins})`) get async
+  `onResolve`/`onLoad`. Runtime plugins — `Bun.plugin({setup})` called by a running program —
+  are registry state that `module.js` consults inside `resolveFilename` and `compile`, behind a
+  `bunPluginsActive()` guard so a process with no plugins pays one boolean per require. They
+  must be **synchronous**: that path is sync down to `require()`, so an async `onLoad` throws
+  rather than resolving to a promise the loader would hand back as the module's exports.
 - `packages/kernel-host/programs/bun.js` — the `bun`/`bunx` CLI (`bun run`, `bunx` → `npx`,
   install delegation). An unrecognised verb reports not-implemented; only a file-shaped argument
   or a `package.json` script name falls through to the run path. `bun upgrade` is not-implemented
   by design — it upgrades the Bun *binary*, which does not exist here — while `bun update`/`up`
-  still map to `npm update`. `bun build --compile` is refused for the same class of reason: it
-  emits a standalone native executable with the Bun runtime embedded, and it used to fall
-  through to the single-file transpile and write JAVASCRIPT under the name the caller expected
-  an executable at, then report success. `bun <file>` hands the file to the loader's `runMain` rather than
+  still map to `npm update`. `bun build` is now a thin front door onto `builtins/bun-build.js`:
+  it parses flags into `Bun.build` options and lets that engine own every refusal, so a flag
+  cannot be honoured by the CLI and dropped by the API (or the reverse). `bun build --compile`
+  is still refused, now as that engine's throw: it emits a standalone native executable with the
+  Bun runtime embedded, and it used to fall through to the single-file transpile and write
+  JAVASCRIPT under the name the caller expected an executable at, then report success. `bun <file>` hands the file to the loader's `runMain` rather than
   `require`ing it, so it becomes the process entry module; with a bare require the launcher
   itself stayed the entry and `require.main === module` / `import.meta.main` were false inside
   the file the user ran.

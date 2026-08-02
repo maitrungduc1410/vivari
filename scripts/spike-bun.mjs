@@ -1425,5 +1425,173 @@ console.log("\n== bun test: .only is refused under CI ==");
   ok(local.code === 0 && /1 pass/.test(lo), "…and without CI it focuses the run as usual");
 }
 
+// 19) Bun.build — a REAL bundle, in the VM, that runs.
+//
+// This is where the load-bearing proof of Phase 5B lives, and the offline tier
+// cannot stand in for it. scripts/spike-bun-offline.mjs drives the same bundler
+// over HOST Node's fs with the shipped resolver, which pins the option policy and
+// the codegen; what only this tier can show is the part that has burned this
+// project before — the graph walk reading the real Wasm VFS across the Atomics
+// bridge, resolving a real node_modules tree, and producing a file that a second
+// real process then EXECUTES and gets the right answer from. A bundler that
+// bundles the wrong files still "succeeds"; running the output is the only check
+// that can tell the difference.
+console.log("\n== bun build: a real multi-module bundle, run in-VM ==");
+{
+  write("bundle/src/index.ts", [
+    'import { shout } from "./greet";',
+    'import cfg from "./cfg.json";',
+    'import { pad } from "leftpad";',
+    'import { VERSION } from "./nested/deep";',
+    "const line: string = pad(shout(cfg.who), 14) + VERSION;",
+    "export const line2 = line;",
+    "console.log('BUNDLED:' + line);",
+  ].join("\n"));
+  write("bundle/src/greet.ts", 'export function shout(who: string): string { return ("hi " + who).toUpperCase(); }');
+  write("bundle/src/nested/deep.ts", 'export const VERSION: string = "-v1";');
+  write("bundle/src/cfg.json", JSON.stringify({ who: "vivari" }));
+  // A genuine npm-shaped dependency in the project's node_modules: package.json
+  // "main", resolved by the runtime's own resolver, not by a special case.
+  write("bundle/node_modules/leftpad/package.json", JSON.stringify({ name: "leftpad", version: "1.0.0", main: "lib/index.js" }));
+  write("bundle/node_modules/leftpad/lib/index.js", 'exports.pad = function (s, n) { while (s.length < n) s = "." + s; return s; };');
+
+  const BUNDLE = APP + "/bundle";
+  const bEnv = { ...ENV, PWD: BUNDLE };
+  const built = await kernel.start(
+    "bun",
+    ["build", "src/index.ts", "--outdir=dist", "--target=node", "--format=cjs", "--root=src"],
+    { cwd: BUNDLE, env: bEnv, capture: true },
+  );
+  if (built.stderr) console.log("  stderr:", built.stderr.trim());
+  ok(built.code === 0, "bun build over the Wasm VFS exits 0");
+  ok(/wrote .*dist\/index\.js/.test(built.stdout || ""), "…reporting the file it wrote");
+  ok(/not identical to real bun build/.test(built.stdout || ""), "…and saying out loud that the bytes are not Bun's");
+  ok(kernel.exists(BUNDLE + "/dist/index.js"), "…and the bundle is a real file in the VFS");
+
+  // The four modules really are in there — a bundler that quietly emitted only the
+  // entry would still have written a file and exited 0.
+  const bundleText = String(kernel.readFile(BUNDLE + "/dist/index.js"));
+  for (const part of ["greet.ts", "cfg.json", "leftpad/lib/index.js", "nested/deep.ts"]) {
+    ok(bundleText.includes(part), `the bundle contains ${part} (the graph was walked, not just the entry)`);
+  }
+
+  // THE check. Delete the sources AND the dependency first, so the run cannot
+  // accidentally succeed by re-reading them: what executes has to be the bundle
+  // and nothing else. (This is not paranoia — a bundler that emitted `require()`
+  // calls instead of inlining the modules would pass every other check here.)
+  for (const gone of [
+    "/src/index.ts", "/src/greet.ts", "/src/cfg.json", "/src/nested/deep.ts",
+    "/node_modules/leftpad/lib/index.js", "/node_modules/leftpad/package.json",
+  ]) kernel.unlink(BUNDLE + gone);
+  const ran = await kernel.start("bun", ["run", "dist/index.js"], { cwd: BUNDLE, env: bEnv, capture: true });
+  if (ran.stderr) console.log("  stderr:", ran.stderr.trim());
+  console.log("  ->", JSON.stringify((ran.stdout || "").trim()));
+  ok(ran.code === 0, "the bundle runs as an ordinary program");
+  // "HI VIVARI" is 9 characters, left-padded to 14, then the nested module's
+  // suffix — a value no single module in the graph could have produced alone.
+  ok(/BUNDLED:\.{5}HI VIVARI-v1/.test(ran.stdout || ""), "…and computes the answer all four modules had to agree on");
+}
+
+console.log("\n== bun build: esm output, and the loud refusals, in-VM ==");
+{
+  const BUNDLE = APP + "/bundle";
+  const bEnv = { ...ENV, PWD: BUNDLE };
+  // ESM output is importable, not merely runnable: a second module in the VM does
+  // a real `import` of it and reads the re-exported binding.
+  write("bundle/src2/lib.ts", 'export const twice = (n: number): number => n * 2;\nexport default "lib";');
+  const esm = await kernel.start("bun", ["build", "src2/lib.ts", "--outdir=dist2", "--root=src2", "--target=node"], { cwd: BUNDLE, env: bEnv, capture: true });
+  if (esm.stderr) console.log("  stderr:", esm.stderr.trim());
+  ok(esm.code === 0 && kernel.exists(BUNDLE + "/dist2/lib.js"), "an esm-format build writes its output");
+  write("bundle/use-esm.ts", [
+    'import lib, { twice } from "./dist2/lib.js";',
+    "console.log('ESM:' + twice(21) + ':' + lib);",
+  ].join("\n"));
+  const used = await kernel.start("bun", ["run", "use-esm.ts"], { cwd: BUNDLE, env: bEnv, capture: true });
+  if (used.stderr) console.log("  stderr:", used.stderr.trim());
+  ok(/ESM:42:lib/.test(used.stdout || ""), "…and another module can import its named + default exports");
+
+  // The refusals, in the VM rather than only as unit-tested strings. `--minify` is
+  // the one that matters most: a build that accepted it, ignored it and reported
+  // success is the single outcome this subsystem exists to prevent.
+  const minified = await kernel.start("bun", ["build", "src2/lib.ts", "--minify", "--outfile=min.js"], { cwd: BUNDLE, env: bEnv, capture: true });
+  const mout = (minified.stdout || "") + (minified.stderr || "");
+  ok(minified.code === 1 && /minify/.test(mout) && /not implemented in the Vivari shim/.test(mout), "bun build --minify fails loudly, naming minify");
+  ok(!kernel.exists(BUNDLE + "/min.js"), "…and writes nothing at all (no half-built artifact under the name you asked for)");
+  const split = await kernel.start("bun", ["build", "src2/lib.ts", "--splitting", "--outdir=d3"], { cwd: BUNDLE, env: bEnv, capture: true });
+  ok(split.code === 1 && /splitting/.test((split.stdout || "") + (split.stderr || "")), "…so does --splitting");
+  const smap = await kernel.start("bun", ["build", "src2/lib.ts", "--sourcemap", "--outdir=d3"], { cwd: BUNDLE, env: bEnv, capture: true });
+  ok(smap.code === 1 && /sourcemap/.test((smap.stdout || "") + (smap.stderr || "")), "…and --sourcemap");
+
+  // No destination: Bun prints the bundle. Proves the artifact's .text() works in
+  // a guest process and that stdout is the fallback rather than a silent no-op.
+  const printed = await kernel.start("bun", ["build", "src2/lib.ts", "--target=node"], { cwd: BUNDLE, env: bEnv, capture: true });
+  ok(printed.code === 0 && /__vv_def\(/.test(printed.stdout || ""), "bun build with no --outfile/--outdir prints the bundle to stdout");
+}
+
+console.log("\n== Bun.build + Bun.plugin from inside a guest process ==");
+{
+  const BUNDLE = APP + "/bundle";
+  const bEnv = { ...ENV, PWD: BUNDLE };
+  // The programmatic API, exercised by real Bun code in a real process: the
+  // artifact shape, a build plugin, and a runtime plugin changing what require()
+  // returns in the very process that registered it.
+  write("bundle/api.ts", [
+    // `export {}` makes this an ES module, which is what licenses the top-level
+    // `await` below: the loader compiles a CJS entry with a plain (non-async)
+    // wrapper, so TLA is an ESM-only affordance here (see module.js).
+    "export {};",
+    "const r: any = {};",
+    'const res = await Bun.build({ entrypoints: ["./src2/lib.ts"], target: "node", format: "cjs", root: "./src2" });',
+    "r.success = res.success;",
+    "r.logs = res.logs.map((l: any) => l.level + ': ' + l.message);",
+    "r.count = res.outputs.length;",
+    "r.path = res.outputs[0] && res.outputs[0].path;",
+    "r.kind = res.outputs[0] && res.outputs[0].kind;",
+    "r.hash = res.outputs[0] && res.outputs[0].hash;",
+    // Blob read protocol over the real runtime (a Uint8Array from a guest realm).
+    "r.text = res.outputs[0] ? (await res.outputs[0].text()).length : 0;",
+    "r.bytesRoundTrip = res.outputs[0] ? new TextDecoder().decode(await res.outputs[0].bytes()) === (await res.outputs[0].text()) : false;",
+    "r.bufferRoundTrip = res.outputs[0] ? new TextDecoder().decode(new Uint8Array(await res.outputs[0].arrayBuffer())) === (await res.outputs[0].text()) : false;",
+    // A build plugin, awaited, inside the VM.
+    "const p = await Bun.build({",
+    '  entrypoints: ["./plugged.ts"], target: "node", format: "cjs",',
+    "  plugins: [{ name: 'vv', setup(b: any) {",
+    "    b.onResolve({ filter: /^cfg$/ }, () => ({ path: '/cfg', namespace: 'v' }));",
+    "    b.onLoad({ filter: /.*/, namespace: 'v' }, async () => ({ contents: JSON.stringify({ n: 5 }), loader: 'json' }));",
+    "  } }],",
+    "});",
+    "r.plugged = p.success;",
+    "r.pluggedText = p.success ? (await p.outputs[0].text()).includes('\"n\":5') : false;",
+    // A rejected option must throw here too, not just from the CLI.
+    "try { await Bun.build({ entrypoints: ['./src2/lib.ts'], minify: true }); r.minify = 'DID NOT THROW'; }",
+    "catch (e: any) { r.minify = String(e.message); }",
+    // Runtime plugin: rewrites require() in this process.
+    "Bun.plugin({ name: 'rt', setup(b: any) {",
+    "  b.onResolve({ filter: /^inline:num$/ }, () => ({ path: '/n', namespace: 'inline' }));",
+    "  b.onLoad({ filter: /.*/, namespace: 'inline' }, () => ({ contents: 'module.exports = 99;', loader: 'js' }));",
+    "} });",
+    // Through a dynamic import (this file is ESM, so it has no `require`), which
+    // still lands in the same Module._load funnel the plugin seam hooks.
+    "r.runtimePlugin = (await import('inline:num')).default;",
+    "console.log('BUILDAPI:' + JSON.stringify(r));",
+  ].join("\n"));
+  write("bundle/plugged.ts", 'import cfg from "cfg"; export const n = cfg.n;');
+
+  const run = await kernel.start("bun", ["run", "api.ts"], { cwd: BUNDLE, env: bEnv, capture: true });
+  if (run.stderr) console.log("  stderr:", run.stderr.trim().slice(0, 800));
+  const m = (run.stdout || "").match(/BUILDAPI:(\{.*\})/);
+  const r = m ? JSON.parse(m[1]) : {};
+  console.log("  ->", JSON.stringify(r).slice(0, 300));
+  ok(run.code === 0 && !!m, "api.ts exits 0 and reports a result");
+  ok(r.success === true, "Bun.build() succeeds inside a guest process");
+  if (r.success !== true) console.log("  build logs:", (r.logs || []).join("\n              "));
+  ok(r.count === 1 && r.path === "./lib.js" && r.kind === "entry-point", "…returning one entry-point artifact at the path naming produced");
+  ok(/^[0-9a-f]{16}$/.test(r.hash || ""), "…with a content hash");
+  ok(r.text > 0 && r.bytesRoundTrip === true && r.bufferRoundTrip === true, "…whose Blob read protocol round-trips inside the guest realm (.bytes()/.arrayBuffer() decode back to .text())");
+  ok(r.plugged === true && r.pluggedText === true, "a build plugin's virtual module really lands in the output, in the VM");
+  ok(/minify/.test(r.minify || "") && /not implemented/.test(r.minify || ""), "a rejected option throws from Bun.build itself, not only from the CLI");
+  ok(r.runtimePlugin === 99, "Bun.plugin() rewires require() inside the running process (the module-loader seam)");
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");
 process.exit(failed ? 1 : 0);

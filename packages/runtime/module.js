@@ -14,6 +14,9 @@ import { maybeTranspileTypeScript } from "./typescript-transform.js";
 // "impossible in a browser, here is what to use instead" catalogue, and that file
 // imports nothing, so the loader pays only for the strings.
 import { nativeAddonError } from "./builtins/bun-unsupported.js";
+// Bun.plugin's RUNTIME hooks. Both seams below are one boolean read until a
+// process actually calls Bun.plugin(), which no plain `node` process does.
+import { bunPluginsActive, bunPluginResolve, bunPluginLoad } from "./builtins/bun-build.js";
 
 // The constructor for `async function () {}` — used to (re)compile an ESM module
 // that uses top-level await (our normal wrapper is a plain, non-async function).
@@ -297,6 +300,13 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
 
   function resolveFilename(request, fromDir) {
     if (request.startsWith("file://")) request = fromFileUrl(request);
+    // Bun.plugin onResolve. It runs BEFORE builtin resolution, which is Bun's
+    // order and the only useful one: a plugin that redirects `node:fs` or shadows
+    // a package name has to be able to win against what is already there.
+    if (bunPluginsActive()) {
+      const hooked = bunPluginResolve(request, fromDir);
+      if (hooked) return { builtin: false, id: hooked };
+    }
     const overridable = request === "@napi-rs/wasm-runtime" && emnapiMajor(fromDir) >= 2;
     if (!overridable) {
       if (hasBuiltin(request)) return { builtin: true, id: request };
@@ -469,7 +479,19 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     // Node project meets in the browser. See builtins/bun-unsupported.js for the
     // message and the substitution map it carries.
     if (path.extname(filename) === ".node") throw nativeAddonError(filename);
-    if (path.extname(filename) === ".json") {
+    // Bun.plugin onLoad. The hook owns the bytes for a path it matches, including
+    // for a virtual module in its own namespace (which has no file behind it at
+    // all). bun-build.js does the Bun loader -> JavaScript conversion, so this
+    // seam keeps exactly one concept: source text for a filename.
+    let pluginLoaded = false;
+    if (providedSource == null && bunPluginsActive()) {
+      const hooked = bunPluginLoad(filename);
+      if (hooked != null) { providedSource = hooked; pluginLoaded = true; }
+    }
+    // A plugin's result is already JavaScript (bun-build.js turned `loader: "json"`
+    // into `module.exports = …`), so it must not be JSON.parse()d a second time
+    // just because the path happens to end in .json.
+    if (!pluginLoaded && path.extname(filename) === ".json") {
       const txt = providedSource != null ? providedSource : fs.readFileSync(filename, "utf8");
       module.exports = JSON.parse(txt);
       return;

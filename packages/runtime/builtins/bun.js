@@ -51,6 +51,14 @@
 // Bun.TOML.parse/stringify, Bun.JSON5.parse/stringify, Bun.JSONL.parse/parseChunk
 // and Bun.semver.satisfies/order (vendored real parsers — see ./bun-formats.js),
 // Bun.Transpiler.transformSync/transform (the loader's own type-stripper),
+// Bun.build — a REAL dependency-graph bundler (multi-file, npm deps, JSON, TS/JSX,
+// ESM+CJS mixed, cycles) written against the loader's own resolver so no bundler
+// need be installed, returning Bun's {success, outputs: BuildArtifact[], logs} with
+// entrypoints/outdir/target/format/external/define/naming/root honoured and
+// minify/splitting/sourcemap refused OUT LOUD; its OUTPUT BYTES ARE NOT IDENTICAL
+// to real Bun's (no tree shaking, no minifier, CJS-shaped wrappers) — assert on
+// behaviour, never on bytes — and Bun.plugin, both build-time (async) and runtime
+// (sync onResolve/onLoad wired into module.js) — see bun-build.js,
 // and the modules bun:test (a runner +
 // expect, with Bun/Jest `test.only` filtering and beforeEach/afterEach that
 // inherit into nested describes, and toEqual/toStrictEqual/toMatchObject backed
@@ -118,9 +126,10 @@
 // `terminal: true` (a pty is a tty device the kernel has no equivalent of, but a
 // JavaScript pty emulation is perfectly possible; pipes are substituted for
 // nobody, because an interactive CLI on a pipe takes its non-interactive branch or
-// hangs); Bun.SQL's SQLite adapter (use the bun:sqlite module); and Bun.build /
-// Bun.plugin / Bun macros, which are ABSENT rather than stubbed — they need no
-// capability the sandbox lacks, only the work. Loud for the same narrower reason
+// hangs); Bun.SQL's SQLite adapter (use the bun:sqlite module); Bun.build's
+// minify / splitting / sourcemap / bytecode options and Bun macros (`with {type:
+// "macro"}`), which THROW naming themselves rather than being dropped from a build
+// that then reports success — see bun-build.js. Loud for the same narrower reason
 // that the shim has not implemented them: Bun.file(fd) and
 // Bun.write(fd, …) (our fd numbers are VFS handles, not OS fds — and anything
 // else that is not a string or a file: URL throws too, rather than being
@@ -265,6 +274,10 @@ import {
 // being readable as exactly that. See its header for the import-safe/call-loud
 // pattern and for why "not supported" and "not implemented" are worded apart.
 import { createBunUnsupported, createBunFfi, assertNoPty } from "./bun-unsupported.js";
+// Bun.build (a real dependency-graph bundler) + Bun.plugin. See its header for
+// why the bundler is ours rather than esbuild-wasm, and for the standing caveat
+// that the output bytes are NOT identical to real Bun's.
+import { createBunBuild } from "./bun-build.js";
 
 // The two documented Bun.hash members we did not port. The message names the
 // algorithm and says why, in the same spirit as the bun:ffi one: a caller who hits
@@ -301,8 +314,13 @@ const TRANSPILER_SCAN_UNSUPPORTED = (method) =>
 // entry in the modules object below. It is a factory rather than a require so it is built
 // at the moment of use and therefore honours a `process.chdir()`, and it is optional so a
 // caller that has only the root require (tests, older embedders) still works.
-export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
+export function createBunRuntime({ process, Buffer, require, makeCwdRequire, resolveFrom }) {
   const lazy = (name) => require(name);
+
+  // Bun.build / Bun.plugin (./bun-build.js). `resolveFrom` is the module loader's
+  // own resolveFilename: the bundler walks the graph with it so a bundle contains
+  // exactly what `require` would have loaded here.
+  const builder = createBunBuild({ lazy, process, warn: (key, message) => serveWarnOnce("build:" + key, message), resolveFrom });
 
   // Text/terminal and bytes/streams member groups (packages/runtime/builtins/
   // bun-text.js, bun-bytes.js). Constructing these is cheap — the vendored Unicode
@@ -1241,6 +1259,9 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
     gc: () => {},
     // A thin Transpiler shim over the same TS transform the loader uses.
     Transpiler: makeTranspilerClass(),
+    // Bundling + plugins (./bun-build.js). Output is NOT byte-identical to Bun's.
+    build: builder.build,
+    plugin: builder.plugin,
     // ---- the surface a browser cannot provide (./bun-unsupported.js) ---------
     // Present as real values so a property read, a destructure or an
     // `import { x } from` still works, and loud on CALL with a message that names

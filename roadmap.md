@@ -5553,3 +5553,114 @@ a VM-only failure the offline tier could not: in an ESM test file `require` is u
 real Node), so `mock.module` has to be exercised through `await import()`.
 
 See ARCHITECTURE.md §9.2 and the Bun section of AGENTS.md.
+
+## `Bun.build` — a real bundler, and `Bun.plugin` (this change)
+
+Phase 5B of the Bun coverage plan. `bun build` was a **single-file transpile wearing a
+bundler's name**: it type-stripped the entry, rewrote that one file's imports, and followed no
+dependency at all, so any project with two files produced an output that could not run — and
+reported success doing it. `Bun.build`, the programmatic API every Bun build script actually
+calls, and `Bun.plugin` were absent from the `Bun` global entirely.
+
+Both now exist, in a new sibling `packages/runtime/builtins/bun-build.js`, with `bun build`
+rewired onto the same engine so the CLI and the API cannot drift apart.
+
+### The bundler is ours, not esbuild — and that was the decision to get right
+
+The plan recommended delegating to esbuild-wasm, which already runs in-VM (Bundler Stage 1) and
+is aliased in lockstep by `runtime/toolchain-shims.js`. It is a far better bundler than the one
+in this change. It was rejected anyway, for four reasons in descending weight:
+
+1. **`Bun.build` takes no dependency.** A Bun project that bundles has no bundler in its
+   `package.json` — that is the entire pitch of a batteries-included runtime. The alias only
+   rewrites `esbuild` for a project that already declares it, so an esbuild-backed `Bun.build`
+   would throw on essentially every real Bun project until the author installed something Bun
+   never asked for. Throwing loudly beats lying, but it loses badly to working.
+2. **Vivari cannot hand esbuild-wasm over for free.** It is ~10 MB of Go/wasm, not in the
+   runtime tree; shipping it means committing 10 MB or fetching from the network the first time
+   somebody calls `Bun.build` in a tab. Neither is something a sandbox should do unasked.
+3. **Resolution would stop matching the runtime's.** The graph here is walked with the module
+   loader's own `resolveFilename` (injected as `resolveFrom` from `packages/runtime/index.js`) —
+   same conditions, same `exports` handling, same `node_modules` walk, same TS/JSX transform —
+   so a bundle contains exactly what `require` would have loaded in this VM. esbuild's resolver
+   is excellent and it is not ours, and a bundle that resolves differently from the runtime it
+   was built in is a debugging trap.
+4. **Testability.** The kernel spike tier is offline, so an esbuild-backed `Bun.build` could
+   only be proven in the network tier — moving the load-bearing proof to the least-run job.
+
+The cost is paid honestly in the option policy below. A project that wants a production bundler
+should still run esbuild, Rollup, Rspack or Vite; all of them work in-VM and the docs page says
+so, next to `Bun.build`.
+
+### The output is NOT byte-identical to real Bun's
+
+Stated in the file header, in `sites/docs/docs/bun.md`, and in `bun build --help`, so nobody
+files diff-noise bugs. Bun's bundler is a Zig program with its own parser, scope hoister, tree
+shaker and printer. This one emits a registry of CommonJS-shaped module factories behind a small
+prelude: different wrapping, different ordering, **no tree shaking, no renaming, no minifier**,
+and output that is bigger than Bun's and never smaller. What it promises is that the bundle
+*runs and computes the same answer* — every test asserts behaviour, never bytes and never a
+hash. Two semantic divergences follow from the design and are documented at the call sites: the
+CJS-shaped wrapping is how the Vivari runtime executes ESM anyway (`esm.js` rewrites
+import/export down to `require` at load time), so a bundle behaves like the same project run
+with `bun <entry>` *here*; and the export getters give the observable behaviour of live
+bindings without Bun's single-scope hoisting.
+
+### Implemented, degraded, refused
+
+`entrypoints`, `outdir`, `target`, `format`, `external`, `define`, `naming` and `root` are
+implemented. `target: "browser"` **refuses a Node builtin by name** rather than emitting a bundle
+that dies on first run; `target: "bun"`/`"node"` leave builtins external. `format` covers
+`esm`/`cjs`/`iife`, with `iife` warning once that a bundle with no module system has nowhere to
+put exports. `external` matches exact, prefix and glob. `naming` expands `[dir]`/`[name]`/
+`[ext]`/`[hash]`, the hash being a wyhash of the content (`bun-hash.js`, already there).
+
+`minify`, `splitting`, `sourcemap` and `bytecode` **throw**, naming the option and pointing at
+esbuild/rolldown. This is the strictest reading of the project's rule and it is deliberate:
+`bun-serve.js` may degrade loudly because serving without `tls` is still serving, but a build
+artifact is not something one can produce approximately. A bundler that returns `success: true`
+having quietly dropped `minify` ships an unminified bundle to production and says nothing. So
+does one that drops `sourcemap` and leaves a team debugging unmapped stack traces. Refusing is
+the only answer that cannot be discovered in production.
+
+`--compile`'s existing refusal is intact — it is now that same engine throw rather than a
+separate check in the CLI, which is a small honesty win: the CLI can no longer accept a flag the
+API rejects, or the reverse, because there is one code path.
+
+### `Bun.plugin`, in two lifetimes
+
+Build plugins (`Bun.build({plugins})`) get async `onResolve`/`onLoad` and affect one build.
+Runtime plugins (`Bun.plugin({setup})` from a running program) are per-realm registry state that
+`module.js` consults inside `resolveFilename` and `compile`, behind a `bunPluginsActive()` guard
+so a process with no plugins pays one boolean per require. Runtime hooks must be **synchronous**
+and a thenable throws rather than being handed back as the module's exports: the loader is sync
+all the way down to `Atomics.wait` (golden rule 3), so there is nowhere to await. That is a real
+divergence from Bun, where a runtime `onLoad` may be async — but the alternative is a module
+whose exports are a pending promise, which is the silently-wrong tier this project keeps
+deleting.
+
+### Gating
+
+The offline gate goes from **1295 checks to 1391**, the kernel tier from **161 to 186**. The
+split follows the usual rule. Offline gets the pure, fast parts: the option policy (every
+refusal asserted for its *specific* reason, not merely for throwing), naming-template expansion,
+`external` matching, the dependency scanner's tokenizer — a `require` inside a string, a
+comment, a template literal or after a regex literal is not a dependency, and a naive regex
+passes every other test in the file — and a full multi-file bundle evaluated in a `new
+Function`.
+
+The kernel tier is where the load-bearing proof lives, because bundling needs real fs, real
+resolution and real `node_modules`: a four-module TS/JSX/JSON graph plus an npm package, built
+inside a guest process on the Wasm VFS, **with the sources deleted afterwards** and then the
+bundle executed — which is the only way to prove the graph really was inlined rather than
+re-read at run time — asserting the computed answer. Alongside it: `format: "esm"` output run as
+a real ESM entry, the CLI's refusals, a build plugin's virtual module landing in the output, and
+a runtime plugin rewiring `require` inside the running process.
+
+Every new check was verified to fail against a deliberately broken implementation (graph walk
+truncated to the entry, tokenizer swapped for a naive regex, the `minify` refusal disabled, the
+`module.js` plugin seam short-circuited, build plugins never consulted, the browser-target
+builtin check removed, the ESM re-export dropped) — eight mutations, each breaking between one
+and ten checks, in both tiers.
+
+See ARCHITECTURE.md §9.2.
