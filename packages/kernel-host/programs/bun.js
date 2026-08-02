@@ -248,6 +248,18 @@ function doExec(rest) {
 // ---- bun build : single-file TS/JSX transpile (no bundling) -----------------
 function doBuild(rest) {
   installBun(true);
+  // --compile asks for a standalone native executable with the Bun runtime
+  // embedded. Without this guard we fell through to the transpile path and wrote
+  // a JavaScript file under the name the user expected an executable at, then
+  // reported success -- the shim's worst failure mode, since the file exists,
+  // looks right, and is not a binary.
+  for (const a of rest) {
+    if (a === '--compile' || a.indexOf('--compile=') === 0) {
+      err('bun build --compile is not supported in Vivari (browser sandbox): it emits a standalone NATIVE executable with the Bun runtime embedded, and a browser tab can neither produce nor run one.');
+      err('Use bun build <entry> --outfile=<file> for the JavaScript output, and run it with bun <file>.');
+      process.exit(1);
+    }
+  }
   let entry = null, outfile = null, outdir = null;
   for (const a of rest) {
     if (a.indexOf('--outfile=') === 0) outfile = a.slice(10);

@@ -23,6 +23,12 @@ import {
   BUN_CLI_VERSION_FALLBACK,
 } from "../packages/kernel-host/programs/bun.js";
 import { importMetaSource, transpileEsm } from "../packages/runtime/esm.js";
+// The infeasible surface (Phase 6) and the native-addon message it carries. The
+// loader is pulled in too: `createModuleSystem` runs over host Node's fs with no
+// kernel, which is what lets the `.node` checks at the end of this file prove the
+// real require() path rather than just the wording of a string.
+import { nativeAddonMessage, nativeAddonError, packageNameFromPath } from "../packages/runtime/builtins/bun-unsupported.js";
+import { createModuleSystem } from "../packages/runtime/module.js";
 import {
   bunEnvMode,
   bunEnvFiles,
@@ -3728,6 +3734,249 @@ console.log("== Bun.password / CryptoHasher against the real Rust crate ==");
     ok(typeof mod.SQLiteError === "function", "…plus SQLiteError");
     ok(typeof mod.constants === "object", "…plus constants");
     ok(mod.__engineInfo() === null, "no engine is loaded until a Database is constructed (lazy)");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — the surface a browser cannot provide, failing loudly and usefully.
+//
+// Every check below asserts the SAME three-part contract, because any one of them
+// alone is worthless:
+//   1. reading the symbol does NOT throw (a load-time throw is the failure this
+//      pattern exists to avoid — one unused import in a dependency would take the
+//      whole project down, and a regression to it would otherwise be silent);
+//   2. CALLING it DOES throw;
+//   3. the message names the API and the reason, and says "not supported in
+//      Vivari (browser sandbox)" for what can never work versus "not implemented
+//      in the Vivari shim" for what merely is not written yet.
+// That last split is the one a reader acts on, so it is asserted per API rather
+// than spot-checked.
+console.log("== infeasible surface: import-safe, call-loud ==");
+{
+  const Bun = freshBun();
+  const msg = (fn) => { try { fn(); return ""; } catch (e) { return String((e && e.message) || e); } };
+  const SANDBOX = "is not supported in Vivari (browser sandbox):";
+  const SHIM = "is not implemented in the Vivari shim:";
+
+  // [property path, how to call it, expected tier, a phrase from the reason that
+  // proves the message is the SPECIFIC one and not a generic "unavailable"]
+  const CASES = [
+    ["listen", () => Bun.listen({ port: 1 }), SANDBOX, "cannot bind or accept a TCP socket"],
+    ["connect", () => Bun.connect({ hostname: "h", port: 1 }), SANDBOX, "cannot open a raw TCP socket"],
+    ["udpSocket", () => Bun.udpSocket({}), SANDBOX, "no UDP in a browser"],
+    ["RedisClient", () => new Bun.RedisClient("redis://x"), SANDBOX, "RESP3"],
+    ["redis.get", () => Bun.redis.get("k"), SANDBOX, "RESP3"],
+    ["redis.publish", () => Bun.redis.publish("t", "m"), SANDBOX, "RESP3"],
+    ["WebView", () => new Bun.WebView(), SANDBOX, "Chrome DevTools Protocol"],
+    ["mmap", () => Bun.mmap("/tmp/x"), SANDBOX, "mmap(2)"],
+    ["peek", () => Bun.peek(Promise.resolve(1)), SANDBOX, "engine's internal"],
+    ["peek.status", () => Bun.peek.status(Promise.resolve(1)), SANDBOX, "engine's internal"],
+    ["secrets.get", () => Bun.secrets.get({ service: "s", name: "n" }), SANDBOX, "keychain"],
+    ["secrets.set", () => Bun.secrets.set({ service: "s", name: "n", value: "v" }), SANDBOX, "keychain"],
+    ["secrets.delete", () => Bun.secrets.delete({ service: "s", name: "n" }), SANDBOX, "keychain"],
+    ["dlopen", () => Bun.dlopen("libc.so", {}), SANDBOX, "dlopen(3)"],
+    // The two NOT-IMPLEMENTED members: possible here, just unwritten. Different
+    // words, deliberately.
+    ["spawn({terminal:true})", () => Bun.spawn({ cmd: ["ls"], terminal: true }), SHIM, "pty"],
+    ["spawnSync({terminal:true})", () => Bun.spawnSync({ cmd: ["ls"], terminal: true }), SHIM, "pty"],
+  ];
+
+  for (const [name, call, tier, phrase] of CASES) {
+    // (1) import-safe: every step of the property path must READ as a real value
+    // without throwing. `Bun.redis.get` has to be a function you can hold before
+    // you call it, the same way `import { dlopen } from "bun:ffi"` has to bind.
+    let read = Bun, readThrew = false;
+    try {
+      for (const key of name.replace(/\(.*$/, "").split(".")) read = read[key];
+    } catch { readThrew = true; }
+    ok(!readThrew && typeof read === "function", "Bun." + name + " can be READ without throwing (import-safe)");
+    // (2) + (3) call-loud, with the right tier and a specific reason.
+    const m = msg(call);
+    ok(m !== "", "Bun." + name + " throws when called");
+    ok(m.indexOf(tier) !== -1, "…as " + (tier === SANDBOX ? "impossible in a browser" : "not implemented yet"));
+    ok(m.indexOf(phrase) !== -1, "…and the message says why: " + JSON.stringify(phrase));
+    // The API has to appear in its own message, or a stack trace from inside a
+    // dependency still leaves you guessing which call it was.
+    ok(/^Bun\.(spawn|spawnSync|listen|connect|udpSocket|redis|secrets|peek|mmap|dlopen|SQL|sql)|^new Bun\./.test(m), "…and names the API it came from");
+  }
+
+  // The two tiers must never blur into each other: a "cannot ever" message that
+  // also says "not implemented" would send someone off to write a patch for
+  // something no patch can fix.
+  ok(msg(() => Bun.udpSocket({})).indexOf(SHIM) === -1, "an impossible API never says 'not implemented' too");
+  ok(msg(() => Bun.spawn({ cmd: ["ls"], terminal: true })).indexOf(SANDBOX) === -1, "a not-implemented API never claims the sandbox forbids it");
+
+  // Bun.spawn without `terminal` must be untouched by that guard.
+  ok(msg(() => Bun.spawn({ cmd: ["true"] })).indexOf("pty") === -1, "Bun.spawn without `terminal` is not affected");
+
+  // Bun.SQL picks its message from the adapter: Postgres and MySQL can never
+  // work, SQLite can and simply is not this module's job. One blanket sentence
+  // would give the SQLite user the wrong next step.
+  const pg = msg(() => new Bun.SQL("postgres://u@h/db"));
+  ok(pg.indexOf(SANDBOX) !== -1 && /PostgreSQL wire protocol/.test(pg), "Bun.SQL(postgres://…) names the Postgres wire protocol as the blocker");
+  ok(/bun:sqlite/.test(pg) && /pglite/.test(pg), "…and points at bun:sqlite plus the wasm Postgres that does run in-VM");
+  const my = msg(() => new Bun.SQL("mysql://u@h/db"));
+  ok(my.indexOf(SANDBOX) !== -1 && /MySQL wire protocol/.test(my), "Bun.SQL(mysql://…) names the MySQL wire protocol");
+  ok(!/pglite/.test(my), "…and does NOT recommend a Postgres engine for a MySQL URL");
+  const lite = msg(() => new Bun.SQL("sqlite://app.db"));
+  ok(lite.indexOf(SHIM) !== -1 && /bun:sqlite/.test(lite), "Bun.SQL(sqlite://…) is not-implemented (SQLite is possible here) and points at bun:sqlite");
+  ok(msg(() => new Bun.SQL()).indexOf(SANDBOX) !== -1, "Bun.SQL() with no argument still fails loudly rather than returning a client");
+  ok(msg(() => Bun.sql`select 1`).indexOf(SANDBOX) !== -1, "Bun.sql`…` (the default tagged-template client) throws on use");
+  ok(msg(() => Bun.sql.begin(() => {})).indexOf(SANDBOX) !== -1, "Bun.sql.begin() throws too");
+}
+
+console.log("== bun:ffi is complete (and import-safe) ==");
+{
+  const proc = { env: {}, argv: ["bun"], cwd: () => "/", stdout: process.stdout, stderr: process.stderr, stdin: process.stdin };
+  const { modules } = createBunRuntime({ process: proc, Buffer, require: nodeRequire });
+  const ffi = modules["bun:ffi"];
+  const msg = (fn) => { try { fn(); return ""; } catch (e) { return String((e && e.message) || e); } };
+
+  // CFunction, linkSymbols and JSCallback were absent entirely: `import
+  // { JSCallback } from "bun:ffi"` bound undefined, and the failure was "not a
+  // constructor" at some later line, which says nothing about FFI or the sandbox.
+  for (const name of ["dlopen", "CFunction", "linkSymbols", "JSCallback", "CString", "ptr", "toArrayBuffer", "cc", "read", "FFIType", "suffix"]) {
+    ok(ffi[name] !== undefined, "bun:ffi exports " + name + " (so importing it cannot crash at load)");
+  }
+  for (const [name, call] of [
+    ["dlopen", () => ffi.dlopen("libc.so", {})],
+    ["CFunction", () => ffi.CFunction({ ptr: 1 })],
+    ["linkSymbols", () => ffi.linkSymbols({})],
+    ["ptr", () => ffi.ptr(new Uint8Array(1))],
+    ["toArrayBuffer", () => ffi.toArrayBuffer(1)],
+    ["cc", () => ffi.cc({ source: "int x(){return 1;}" })],
+    ["read.u8", () => ffi.read.u8(1)],
+    ["JSCallback", () => new ffi.JSCallback(() => {})],
+    // Regression: CString was an empty class, so `new CString(ptr)` SUCCEEDED and
+    // handed back an object with no string in it — a silent wrong answer of
+    // exactly the kind this tier exists to remove.
+    ["CString", () => new ffi.CString(1)],
+  ]) {
+    const m = msg(call);
+    ok(m.indexOf("is not supported in Vivari (browser sandbox):") !== -1, "bun:ffi " + name + " throws the sandbox message on use");
+    ok(/dlopen\(3\)|raw memory addresses/.test(m), "…naming dlopen(3) or the pointer problem, not just 'unavailable'");
+  }
+  ok(typeof ffi.suffix === "string" && typeof ffi.FFIType === "object", "FFIType/suffix stay plain data — code reads them while building a call that then throws at dlopen");
+}
+
+console.log("== native .node addons: the message, and the loader that produces it ==");
+{
+  const msgOf = (fn) => { try { fn(); return ""; } catch (e) { return String((e && e.message) || e); } };
+
+  // The package a `.node` belongs to, which is what the substitution map is keyed
+  // on. The binary almost never sits at the top of the package (bcrypt's is at
+  // lib/binding/napi-v3/…), and a nested copy must be attributed to the INNER
+  // package or the advice is about the wrong library.
+  ok(packageNameFromPath("/app/node_modules/bcrypt/lib/binding/napi-v3/bcrypt_lib.node") === "bcrypt", "package name from a deep binding path");
+  ok(packageNameFromPath("/app/node_modules/a/node_modules/sharp/build/Release/sharp.node") === "sharp", "a nested copy is attributed to the inner package");
+  ok(packageNameFromPath("/app/node_modules/@next/swc-linux-x64-gnu/next-swc.node") === "@next/swc-linux-x64-gnu", "a scoped package keeps its scope");
+  ok(packageNameFromPath("/app/build/Release/addon.node") === "", "a project-local addon has no package name");
+
+  const bcrypt = nativeAddonMessage("/app/node_modules/bcrypt/lib/binding/napi-v3/bcrypt_lib.node");
+  ok(/compiled machine code/.test(bcrypt) && /dlopen\(3\)/.test(bcrypt), "the addon message says what a .node file is and why it cannot load");
+  ok(/`bcrypt` has a substitute that works here: `bcryptjs`/.test(bcrypt), "…and names the verified substitute for the package");
+  ok(/installs it in place of bcrypt automatically/.test(bcrypt), "…including that Vivari normally aliases it at install time");
+
+  // An honest "we do not know" is information too, and is the reason the map is
+  // allowed to be short: a wrong recommendation costs more than a missing one.
+  const sharp = nativeAddonMessage("/app/node_modules/sharp/build/Release/sharp.node");
+  ok(/no substitute is verified in Vivari/.test(sharp), "a package with no verified substitute says so rather than guessing");
+  ok(!/sharp-wasm|jimp|@napi-rs/.test(sharp), "…and does not invent one");
+
+  const swc = nativeAddonMessage("/app/node_modules/@next/swc-linux-x64-gnu/next-swc.node");
+  ok(/@next\/swc-wasm-nodejs/.test(swc), "a per-platform package is matched by prefix (@next/swc-* -> the wasm build)");
+  const unknown = nativeAddonMessage("/app/node_modules/some-random-addon/x.node");
+  ok(/no verified substitute for `some-random-addon`/.test(unknown) && /-wasm/.test(unknown), "an unknown package gets the generic 'look for a wasm build' advice");
+  ok(nativeAddonError("/x/y.node").code === "ERR_DLOPEN_FAILED", "the error carries Node's ERR_DLOPEN_FAILED, so packages that branch on it take their pure-JS fallback");
+
+  // And now the loader itself, with no kernel: createModuleSystem over host Node's
+  // fs. This is the check that matters, because the message is only worth having
+  // if require() actually produces it. Before this change the .node handler on
+  // Module._extensions was never consulted — load() calls compile() directly — so
+  // the binary was read as UTF-8 and the user got `SyntaxError: Invalid or
+  // unexpected token` naming a file that was never source.
+  const os = nodeRequire("node:os");
+  const fsMod = nodeRequire("node:fs");
+  const pathMod = nodeRequire("node:path");
+  const dir = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), "vv-addon-"));
+  try {
+    fsMod.mkdirSync(pathMod.join(dir, "node_modules/bcrypt/lib"), { recursive: true });
+    fsMod.writeFileSync(pathMod.join(dir, "node_modules/bcrypt/package.json"), JSON.stringify({ name: "bcrypt", main: "bcrypt.js" }));
+    fsMod.writeFileSync(pathMod.join(dir, "node_modules/bcrypt/bcrypt.js"), "module.exports = require('./lib/bcrypt_lib.node');\n");
+    // Real ELF magic plus NUL bytes — the thing that used to be parsed as text.
+    fsMod.writeFileSync(pathMod.join(dir, "node_modules/bcrypt/lib/bcrypt_lib.node"), Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0, 0, 0, 0, 0]));
+    fsMod.writeFileSync(pathMod.join(dir, "plain.js"), "module.exports = 42;\n");
+
+    const sys = createModuleSystem({
+      fs: fsMod,
+      path: pathMod,
+      builtins: {},
+      process,
+      nodeModules: { has: () => false, require: () => ({}), internalBinding: () => ({}) },
+    });
+    const req = sys.makeRequire(dir);
+    ok(req("./plain.js") === 42, "the module system under test still loads ordinary JavaScript");
+
+    const direct = msgOf(() => req("./node_modules/bcrypt/lib/bcrypt_lib.node"));
+    ok(/Cannot load the native addon/.test(direct), "require() of a .node file gives the addon message");
+    ok(!/SyntaxError|Invalid or unexpected token/.test(direct), "…and NOT a SyntaxError about a binary file read as UTF-8 (the bug this replaces)");
+
+    // The transitive path is the one real projects hit: nobody requires a .node
+    // directly, their dependency does.
+    const transitive = msgOf(() => req("bcrypt"));
+    ok(/Cannot load the native addon/.test(transitive) && /bcryptjs/.test(transitive), "require('bcrypt') fails through its own JS entry with the substitute named");
+
+    // Registered on the extension table too, pointing at the same compiler, for
+    // tools that read or call require.extensions rather than going through load().
+    ok(typeof sys.Module._extensions[".node"] === "function", "Module._extensions['.node'] is registered (rechoir and friends read these keys)");
+    const viaExt = msgOf(() => sys.Module._extensions[".node"]({ exports: {} }, pathMod.join(dir, "node_modules/bcrypt/lib/bcrypt_lib.node")));
+    ok(/Cannot load the native addon/.test(viaExt), "…and calling it directly gives the identical message");
+
+    // Deliberately NOT resolvable by extension: a package that probes with
+    // require.resolve('./build/foo') before falling back to pure JS must keep
+    // getting "not found", or it takes the native branch and fails.
+    let resolved = "";
+    try { resolved = sys.resolveFilename("./node_modules/bcrypt/lib/bcrypt_lib", dir).id; } catch (e) { resolved = "MODULE_NOT_FOUND"; }
+    ok(resolved === "MODULE_NOT_FOUND", ".node is NOT in the resolver's extension list, so an extensionless probe still finds nothing");
+  } finally {
+    fsMod.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+console.log("== bun build --compile fails loudly (BUN_PROGRAM as a real process) ==");
+{
+  const os = nodeRequire("node:os");
+  const fsMod = nodeRequire("node:fs");
+  const pathMod = nodeRequire("node:path");
+  const { spawnSync } = nodeRequire("node:child_process");
+  const dir = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), "vv-bun-compile-"));
+  try {
+    const binBun = pathMod.join(dir, "bun-shim.js");
+    fsMod.writeFileSync(binBun, BUN_PROGRAM);
+    fsMod.writeFileSync(pathMod.join(dir, "app.ts"), "const x: number = 1; console.log(x);\n");
+    const bun = (...args) => {
+      const r = spawnSync(process.execPath, [binBun, ...args], { cwd: dir, encoding: "utf8" });
+      return { code: r.status, text: (r.stdout || "") + (r.stderr || "") };
+    };
+    // Regression: --compile used to fall through to the transpile path and write
+    // JAVASCRIPT to the path the user expected an executable at, then report
+    // success. A build that "worked" and produced the wrong kind of file is the
+    // worst outcome available.
+    const compiled = bun("build", "app.ts", "--compile", "--outfile=app");
+    ok(compiled.code === 1, "bun build --compile exits non-zero");
+    ok(/--compile is not supported in Vivari \(browser sandbox\)/.test(compiled.text), "…with the sandbox message");
+    ok(/native/i.test(compiled.text) && /--outfile/.test(compiled.text), "…naming what --compile emits and what to use instead");
+    ok(!fsMod.existsSync(pathMod.join(dir, "app")), "…and writes no file at all (it used to write JS under the executable's name)");
+    // The guard must fire for --compile and for nothing else. Off Vivari there is
+    // no Bun global (installBun() is a guarded no-op), so a plain build cannot
+    // finish in this harness — but it must get PAST the guard and fail on the
+    // missing global instead, which is exactly what proves the guard is scoped.
+    // The real in-VM build is exercised by scripts/spike-bun.mjs.
+    const plain = bun("build", "app.ts", "--outfile=out.js");
+    ok(!/--compile is not supported/.test(plain.text), "a build without --compile does not hit the guard");
+    ok(/Bun is not defined/.test(plain.text), "…it reaches the transpile path (which needs the Bun global this harness has no kernel to install)");
+  } finally {
+    fsMod.rmSync(dir, { recursive: true, force: true });
   }
 }
 

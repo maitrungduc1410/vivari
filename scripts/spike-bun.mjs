@@ -1160,5 +1160,77 @@ console.log("\n== bun run spawn-stream.ts (Bun.spawn().stdout is a real Readable
   ok(got.includes("exited:0"), "proc.exited still resolves the exit code");
 }
 
+// 13) The surface a browser cannot provide, inside a real process.
+//
+// scripts/spike-bun-offline.mjs asserts the messages and drives the loader over
+// host Node's fs, but it cannot show the thing that actually matters here: that a
+// real `require()` of a real prebuilt addon, inside a guest process, off the Wasm
+// VFS, produces the message rather than the old `SyntaxError: Invalid or
+// unexpected token`. That is the most common hard failure a Node project meets in
+// the browser, so it is proven on the kernel and not only in a unit test.
+console.log("\n== bun run addon.ts (.node addon + the infeasible Bun members, in-VM) ==");
+{
+  // A package shaped like the real thing: a JS entry that requires its prebuilt
+  // binary, the way bcrypt, sharp and better-sqlite3 all do. The bytes are a
+  // genuine ELF header — this is the file the loader used to read as UTF-8.
+  write("node_modules/bcrypt/package.json", JSON.stringify({ name: "bcrypt", version: "5.1.1", main: "bcrypt.js" }));
+  write("node_modules/bcrypt/bcrypt.js", "module.exports = require('./lib/binding/napi-v3/bcrypt_lib.node');\n");
+  kernel.mkdirp(APP + "/node_modules/bcrypt/lib/binding/napi-v3");
+  kernel.writeFile(
+    APP + "/node_modules/bcrypt/lib/binding/napi-v3/bcrypt_lib.node",
+    new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0x3e, 0]),
+  );
+  write("addon.ts", [
+    "const r: any = {};",
+    "const grab = (fn: () => unknown) => { try { fn(); return 'DID NOT THROW'; } catch (e: any) { return String((e && e.message) || e); } };",
+    // The transitive path: application code requires the package, the package
+    // requires its own binary.
+    "r.transitive = grab(() => require('bcrypt'));",
+    "r.direct = grab(() => require('./node_modules/bcrypt/lib/binding/napi-v3/bcrypt_lib.node'));",
+    // node-gyp-build and friends resolve the path themselves and call this.
+    "r.dlopenType = typeof (process as any).dlopen;",
+    "r.dlopen = grab(() => (process as any).dlopen({ exports: {} }, '/app/node_modules/bcrypt/lib/binding/napi-v3/bcrypt_lib.node'));",
+    // A few of the Bun members, through the global the kernel really installed.
+    "r.udp = grab(() => (Bun as any).udpSocket({}));",
+    "r.connect = grab(() => (Bun as any).connect({ hostname: 'example.com', port: 5432 }));",
+    "r.sql = grab(() => new (Bun as any).SQL('postgres://user@host/db'));",
+    "r.peek = grab(() => (Bun as any).peek(Promise.resolve(1)));",
+    "r.ffi = grab(() => new (require('bun:ffi').JSCallback)(() => {}));",
+    "r.pty = grab(() => (Bun as any).spawn({ cmd: ['echo', 'hi'], terminal: true }));",
+    "console.log('ADDONRESULT:' + JSON.stringify(r));",
+  ].join("\n"));
+  const run = await kernel.start("bun", ["run", "addon.ts"], { cwd: APP, env: ENV, capture: true });
+  if (run.stderr) console.log("  stderr:", run.stderr.trim());
+  const m = (run.stdout || "").match(/ADDONRESULT:(\{.*\})/);
+  const r = m ? JSON.parse(m[1]) : {};
+  console.log("  ->", JSON.stringify((r.transitive || "").slice(0, 120)) + "…", "exit", run.code);
+  ok(run.code === 0 && !!m, "addon.ts exits 0 and reports a result");
+  ok(/Cannot load the native addon/.test(r.transitive || ""), "require('bcrypt') inside a real process reports the native addon, not a parse error");
+  ok(!/SyntaxError|Invalid or unexpected token/.test(r.transitive || ""), "…the binary is no longer read as UTF-8 and compiled (the old symptom)");
+  ok(/bcryptjs/.test(r.transitive || ""), "…and the message names the substitute that works in Vivari");
+  ok(/Cannot load the native addon/.test(r.direct || ""), "requiring the .node file directly says the same thing");
+  ok(r.dlopenType === "function", "process.dlopen exists (node-gyp-build calls it directly instead of require-ing)");
+  ok(/Cannot load the native addon/.test(r.dlopen || ""), "…and throws the same message rather than 'process.dlopen is not a function'");
+  ok(/no UDP in a browser/.test(r.udp || ""), "Bun.udpSocket throws the sandbox message through the really-installed Bun global");
+  ok(/cannot open a raw TCP socket/.test(r.connect || ""), "Bun.connect names raw TCP as the blocker");
+  ok(/PostgreSQL wire protocol/.test(r.sql || "") && /bun:sqlite/.test(r.sql || ""), "Bun.SQL(postgres://…) points at bun:sqlite");
+  ok(/engine's internal/.test(r.peek || ""), "Bun.peek explains that settled-promise state is engine-internal");
+  ok(/dlopen\(3\)/.test(r.ffi || ""), "bun:ffi JSCallback (absent entirely before) throws the FFI message");
+  ok(/not implemented in the Vivari shim/.test(r.pty || ""), "Bun.spawn({terminal:true}) is reported as NOT IMPLEMENTED, not as impossible");
+}
+
+// 14) `bun build --compile` in the VM: it used to write JavaScript under the name
+// the user expected a native executable at, and report success.
+console.log("\n== bun build --compile / bun build (in-VM) ==");
+{
+  write("buildme.ts", "const n: number = 7;\nconsole.log('built ' + n);\n");
+  const compiled = await kernel.start("bun", ["build", "buildme.ts", "--compile", "--outfile=buildme"], { cwd: APP, env: ENV, capture: true });
+  const cout = (compiled.stdout || "") + (compiled.stderr || "");
+  ok(compiled.code === 1 && /--compile is not supported in Vivari/.test(cout), "bun build --compile fails loudly in the VM");
+  ok(!kernel.exists(APP + "/buildme"), "…and writes nothing under the executable's name");
+  const plain = await kernel.start("bun", ["build", "buildme.ts", "--outfile=buildme.js"], { cwd: APP, env: ENV, capture: true });
+  ok(plain.code === 0 && kernel.exists(APP + "/buildme.js"), "an ordinary bun build still transpiles to its --outfile");
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");
 process.exit(failed ? 1 : 0);

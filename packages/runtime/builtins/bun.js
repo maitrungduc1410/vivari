@@ -19,7 +19,7 @@
 // socket, and server-side `websocket` + pub/sub whose ping/pong are real RFC 6455
 // control frames, whose cork() batches into one socket write, and whose
 // handshake validates the version/key and negotiates a subprotocol instead of
-// echoing the client's (see bun-serve.js), Bun.env/argv/main/version,
+// echoing the client's (see bun-serve.js), Bun.env/argv/main/version/revision,
 // Bun.spawn/spawnSync/which,
 // Bun.$ (shell), Bun.sleep/Bun.sleepSync (a real Atomics.wait park, see
 // bun-sleep.js)/nanoseconds, automatic .env/.env.local/.env.{mode}(.local)
@@ -50,6 +50,7 @@
 // Response, no shim code — see bun-bytes.js), the data formats Bun.YAML.parse,
 // Bun.TOML.parse/stringify, Bun.JSON5.parse/stringify, Bun.JSONL.parse/parseChunk
 // and Bun.semver.satisfies/order (vendored real parsers — see ./bun-formats.js),
+// Bun.Transpiler.transformSync/transform (the loader's own type-stripper),
 // and the modules bun:test (a runner +
 // expect, with Bun/Jest `test.only` filtering and beforeEach/afterEach that
 // inherit into nested describes, and toEqual/toStrictEqual/toMatchObject backed
@@ -65,10 +66,44 @@
 // option and a per-Database/per-Statement toggle, so 64-bit ids survive as BigInt
 // instead of silently rounding past 2^53 — see bun-sqlite.js.
 //
-// NOT SUPPORTED (documented, fails loudly rather than silently wrong): bun:ffi /
-// Bun.dlopen (native FFI), native addons, Bun macros, and Bun.build plugins —
-// these require capabilities the browser sandbox does not have. Loud for the
-// narrower reason that the shim has not implemented them: Bun.file(fd) and
+// NOT SUPPORTED — cannot ever work in a browser tab, so every one of these is
+// LOUD ON CALL rather than silently wrong or silently missing. They live in
+// ./bun-unsupported.js, whose header explains the pattern: the symbol EXISTS (so
+// an `import { dlopen } from "bun:ffi"` or a property read still loads — a
+// load-time throw would take down a project over one unused import in a
+// dependency) and throws when CALLED, naming the API, the specific capability the
+// sandbox lacks, and the alternative where one exists. The list: bun:ffi
+// (dlopen/CFunction/linkSymbols/JSCallback/CString/ptr/toArrayBuffer/read.*/cc)
+// and Bun.dlopen — no dlopen(3), no native machine code; native `.node` addons,
+// which the module loader (packages/runtime/module.js) and process.dlopen now
+// reject with a message naming the package and, for the popular ones, a substitute
+// proven to run in-VM (NATIVE_ADDON_SUBSTITUTES) — it used to read the binary as
+// UTF-8 and report `SyntaxError: Invalid or unexpected token`, on what is the most
+// common hard failure a real Node project meets here; Bun.listen/Bun.connect (raw
+// TCP), Bun.udpSocket (no UDP exists in a page at all) and Bun.RedisClient/
+// Bun.redis (RESP3 over TCP) — a page cannot open a raw socket, and traffic that
+// leaves the tab has to be HTTP(S) through fetch; Bun.SQL's Postgres and MySQL
+// adapters, for the same reason, pointing at bun:sqlite; Bun.WebView (drives a
+// native browser process or a CDP socket); Bun.mmap (no mmap(2) — and a
+// read-into-memory copy does not alias like a mapping, which is the reason to call
+// it); Bun.secrets (an OS keychain; localStorage would satisfy the signature while
+// voiding the encryption-at-rest guarantee that IS the API); Bun.peek/
+// Bun.peek.status (a settled promise's value lives in engine-internal state that
+// no engine exposes synchronously to page code — the same wall as the bun:jsc heap
+// helpers, and returning the argument unchanged is right only for a PENDING
+// promise, so there is no honest partial answer); and `bun build --compile`, which
+// emits a native single-file executable (packages/kernel-host/programs/bun.js).
+//
+// NOT IMPLEMENTED — possible here, simply not written, and worded differently on
+// purpose: "stop and redesign" and "send a patch" are not the same advice, and
+// conflating them wastes someone's afternoon. Bun.spawn/spawnSync with
+// `terminal: true` (a pty is a tty device the kernel has no equivalent of, but a
+// JavaScript pty emulation is perfectly possible; pipes are substituted for
+// nobody, because an interactive CLI on a pipe takes its non-interactive branch or
+// hangs); Bun.SQL's SQLite adapter (use the bun:sqlite module); and Bun.build /
+// Bun.plugin / Bun macros, which are ABSENT rather than stubbed — they need no
+// capability the sandbox lacks, only the work. Loud for the same narrower reason
+// that the shim has not implemented them: Bun.file(fd) and
 // Bun.write(fd, …) (our fd numbers are VFS handles, not OS fds — and anything
 // else that is not a string or a file: URL throws too, rather than being
 // String()-ed into a path like "undefined"), reading
@@ -137,7 +172,13 @@
 // really is going to be sent, and reporting it as dropped would be a lie in the
 // other direction. -1 (closed) and the byte count are as documented.
 //
-// COVERED WITH A DOCUMENTED DIVERGENCE: Bun.stdin is a Node Readable, not a
+// COVERED WITH A DOCUMENTED DIVERGENCE: Bun.gc() is a no-op returning undefined
+// (page JavaScript has no GC control; real Bun collects and returns the heap size
+// after). It stays a no-op rather than joining the loud tier above because
+// forcing a collection is advisory by nature — code calls it to be tidy, and
+// failing the call would break a program that is otherwise fine — but a caller
+// that USES the return value gets undefined, so it is recorded here.
+// Bun.stdin is a Node Readable, not a
 // BunFile (see the Bun literal below); Bun.file(…).type omits the
 // `;charset=utf-8` suffix real Bun appends to textual types (bun-file.js); a
 // BunFile is not a platform Blob INSTANCE (Bun's extends Blob), so
@@ -189,6 +230,13 @@ import {
   wsFrameProtocolError,
   WS_GUID,
 } from "./bun-serve.js";
+// The APIs a browser tab cannot provide, plus the `.node` native-addon message.
+// They live in a sibling for the usual reason (this file is long), but also
+// because they are the one group with no implementation to read: the file is the
+// catalogue of what is impossible here and what to use instead, and it is worth
+// being readable as exactly that. See its header for the import-safe/call-loud
+// pattern and for why "not supported" and "not implemented" are worded apart.
+import { createBunUnsupported, createBunFfi, assertNoPty } from "./bun-unsupported.js";
 
 // The two documented Bun.hash members we did not port. The message names the
 // algorithm and says why, in the same spirit as the bun:ffi one: a caller who hits
@@ -910,6 +958,10 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
     let cmd, opts;
     if (Array.isArray(cmdOrOpts)) { cmd = cmdOrOpts; opts = maybeOpts || {}; }
     else { opts = cmdOrOpts || {}; cmd = opts.cmd || []; }
+    // `terminal: true` asks for a pty. We have none, and quietly giving the child
+    // pipes instead is the failure that hangs an interactive CLI — see
+    // ./bun-unsupported.js.
+    assertNoPty("Bun.spawn()", opts);
     const [file, ...args] = cmd;
     const child = cp.spawn(file, args, {
       cwd: opts.cwd || process.cwd(),
@@ -952,6 +1004,7 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
     let cmd, opts;
     if (Array.isArray(cmdOrOpts)) { cmd = cmdOrOpts; opts = maybeOpts || {}; }
     else { opts = cmdOrOpts || {}; cmd = opts.cmd || []; }
+    assertNoPty("Bun.spawnSync()", opts);
     const [file, ...args] = cmd;
     const r = cp.spawnSync(file, args, { cwd: opts.cwd || process.cwd(), env: opts.env || process.env });
     return {
@@ -1079,6 +1132,7 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
 
   // ---- the Bun global --------------------------------------------------------
   const formats = createBunFormats({ process });
+  const unsupported = createBunUnsupported();
   const Bun = {
     version: BUN_VERSION,
     revision: BUN_REVISION,
@@ -1159,15 +1213,31 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire }) {
     gc: () => {},
     // A thin Transpiler shim over the same TS transform the loader uses.
     Transpiler: makeTranspilerClass(),
-    // Native FFI is impossible in the sandbox — fail loudly if reached via Bun.dlopen.
-    dlopen() { throw new Error("Bun.dlopen (native FFI) is not supported in Vivari (browser sandbox)"); },
+    // ---- the surface a browser cannot provide (./bun-unsupported.js) ---------
+    // Present as real values so a property read, a destructure or an
+    // `import { x } from` still works, and loud on CALL with a message that names
+    // the API, the specific missing capability, and the alternative. These were
+    // all simply `undefined` before, which produced "Bun.udpSocket is not a
+    // function" from deep inside a dependency and explained nothing.
+    listen: unsupported.listen,
+    connect: unsupported.connect,
+    udpSocket: unsupported.udpSocket,
+    RedisClient: unsupported.RedisClient,
+    redis: unsupported.redis,
+    SQL: unsupported.SQL,
+    sql: unsupported.sql,
+    WebView: unsupported.WebView,
+    mmap: unsupported.mmap,
+    peek: unsupported.peek,
+    secrets: unsupported.secrets,
+    dlopen: unsupported.dlopen,
   };
 
   // ---- bun:* modules ---------------------------------------------------------
   const modules = {
     "bun:test": makeBunTest({ process }),
     "bun:jsc": makeBunJsc(),
-    "bun:ffi": makeBunFfi(),
+    "bun:ffi": createBunFfi(),
     // Real SQLite on the vendored sqlite3.wasm, over a custom VFS backed by Vivari's
     // synchronous fs — see ./bun-sqlite.js for the whole design, including what is
     // honestly missing (fsync, locking, WAL). Nothing is loaded until the first
@@ -1413,21 +1483,11 @@ function makeBunJsc() {
   };
 }
 
-// bun:ffi — documented as unsupported (native FFI). We export the symbols so an
-// `import { dlopen } from "bun:ffi"` doesn't crash at load, but any actual use
-// throws a clear error rather than corrupting memory.
-function makeBunFfi() {
-  const unsupported = () => { throw new Error("bun:ffi (native FFI) is not supported in Vivari (browser sandbox)"); };
-  return {
-    dlopen: unsupported,
-    CString: class CString {},
-    ptr: unsupported,
-    toArrayBuffer: unsupported,
-    FFIType: {},
-    suffix: "so",
-    read: {},
-  };
-}
+// bun:ffi lives in ./bun-unsupported.js (createBunFfi) alongside the rest of the
+// impossible surface it set the pattern for — import-safe, call-loud. It gained
+// the three members that were missing entirely (CFunction, linkSymbols,
+// JSCallback), a CString that throws instead of constructing an empty object, and
+// a populated `read` table; see that file.
 
 // ---- Bun.randomUUIDv7 -------------------------------------------------------
 // This used to be `crypto.randomUUID()`, which is a v4 — 122 bits of randomness

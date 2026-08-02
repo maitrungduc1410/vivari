@@ -1319,7 +1319,10 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   install delegation). An unrecognised verb reports not-implemented; only a file-shaped argument
   or a `package.json` script name falls through to the run path. `bun upgrade` is not-implemented
   by design — it upgrades the Bun *binary*, which does not exist here — while `bun update`/`up`
-  still map to `npm update`. `bun <file>` hands the file to the loader's `runMain` rather than
+  still map to `npm update`. `bun build --compile` is refused for the same class of reason: it
+  emits a standalone native executable with the Bun runtime embedded, and it used to fall
+  through to the single-file transpile and write JAVASCRIPT under the name the caller expected
+  an executable at, then report success. `bun <file>` hands the file to the loader's `runMain` rather than
   `require`ing it, so it becomes the process entry module; with a bare require the launcher
   itself stayed the entry and `require.main === module` / `import.meta.main` were false inside
   the file the user ran.
@@ -1334,6 +1337,50 @@ pieces are always on PATH (in `COREUTILS`), not lazily unpacked:
   `Bun.Transpiler.scan`/
   `scanImports` (the transform builds no import graph), the `bun:jsc` heap helpers (no engine
   hook). Same import-safe/call-loud tier as `bun:ffi`.
+- **`packages/runtime/builtins/bun-unsupported.js` is the catalogue of what a browser tab
+  cannot do**, and the one file here with no implementation to read. Roughly twenty of Bun's
+  APIs were plain `undefined` — `Bun.listen`/`connect` (raw TCP), `Bun.udpSocket`,
+  `Bun.RedisClient`/`Bun.redis`, `Bun.SQL`'s Postgres and MySQL adapters, `Bun.WebView`,
+  `Bun.mmap`, `Bun.peek`, `Bun.secrets`, and three quarters of `bun:ffi` (`CFunction`,
+  `linkSymbols`, `JSCallback` absent; `CString` an EMPTY CLASS, so `new CString(ptr)` returned
+  an object with no string in it). A dependency calling one produced
+  `TypeError: Bun.udpSocket is not a function` from deep in a stack, with nothing saying that a
+  browser cannot open a UDP socket. They now follow `bun:ffi`'s tier exactly — **the symbol
+  exists so an import or a property read cannot crash a project over one unused import, and the
+  CALL throws**, naming the API, the specific capability that is missing (no raw socket, no
+  `dlopen(3)`, no `mmap(2)`, no OS keychain, no engine hook for promise state) and the
+  alternative: `Bun.serve` for a listener, `fetch` for outbound traffic, `bun:sqlite` for the
+  TCP-bound database and cache clients. **The wording encodes the classification**: "is not
+  supported in Vivari (browser sandbox)" for what can never work, "is not implemented in the
+  Vivari shim" for what merely is not written (`terminal: true` on `Bun.spawn` — a pty is
+  emulable in JavaScript and simply is not emulated; `Bun.SQL`'s SQLite adapter). Those are
+  different instructions to the reader, and conflating them is its own dishonesty.
+  `Bun.peek` is deliberately in the FIRST group even though nothing about the sandbox forbids
+  it: reading a settled promise's value synchronously needs engine-internal state that no
+  JavaScript engine exposes to page code, and the only available fallback — returning the
+  argument — is what real Bun does for a *pending* promise, so it would be silently wrong
+  exactly when the API is being used for its purpose.
+- **The native `.node` addon message is the highest-value one in the shim**, and lives in the
+  same file because `require('bcrypt')` from plain Node code hits the identical wall.
+  Application code rarely calls Node-API, but `bcrypt`, `sharp`, `better-sqlite3`, `canvas` and
+  most database drivers ship prebuilt binaries and hit it transitively at `require()` time.
+  Until now the symptom was `SyntaxError: Invalid or unexpected token`: `compile()` read the
+  binary as UTF-8 and tried to parse it, and `Module._extensions['.node']` — which did throw a
+  one-line message — was never consulted, because `load()` calls `compile()` directly. The
+  check therefore sits at the TOP of `compile()`, with the extension entry pointing at the same
+  compiler; `process.dlopen` throws the same error, because `node-gyp-build`/`bindings`/
+  `node-pre-gyp` resolve the path themselves rather than going through `require`; and the error
+  carries Node's `ERR_DLOPEN_FAILED` code so packages that branch on it take their pure-JS
+  fallback. `.node` stays OUT of the resolver's `EXTS` on purpose — a package that probes
+  `require.resolve` before falling back to pure JS would otherwise conclude a native build
+  exists and take the branch that cannot work. The message names the package and, where Vivari
+  has PROOF, its substitute (`NATIVE_ADDON_SUBSTITUTES`): `bcrypt`→`bcryptjs` (the registry
+  alias in `toolchain-shims.js`), `better-sqlite3`/`sqlite3`→`sql.js`, `pg-native`→
+  `@electric-sql/pglite`, `esbuild`/`rollup`/`lightningcss`→their wasm builds, `@next/swc-*`,
+  `@tailwindcss/oxide` and `@rspack/binding-*`→their wasm siblings — every entry backed by a
+  spike or a shipped template, and named in a comment beside it. Packages with no verified
+  answer (`sharp`, `canvas`, `node-sass`) say so instead of guessing: a wrong recommendation
+  costs more than a missing one.
 - **APIs with an exact answer are ported byte-exact and pinned to an external vector**, because
   the failure mode here is not a missing function but a plausible wrong number. `Bun.hash` is a
   real wyhash (`builtins/bun-hash.js`, alongside xxHash32/64, murmur32v2/v3, murmur64v2 and

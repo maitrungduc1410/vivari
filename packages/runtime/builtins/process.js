@@ -2,6 +2,8 @@
 // injected callbacks; `exit()` throws a sentinel that the runner turns into an
 // exit code.
 
+import { nativeAddonError } from "./bun-unsupported.js";
+
 export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/", stdout, stderr, nextTick, onExit }) {
   let _cwd = cwd || "/";
   // nextTick is owned by the event loop (loop.js): its queue drains ahead of
@@ -199,6 +201,15 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
       const err = new Error("process.exit called");
       err.__processExit = c;
       throw err;
+    },
+    // Node's own entry point for loading a native addon. It did not exist here at
+    // all, which matters because the packages most likely to reach it do NOT go
+    // through require(): node-gyp-build, bindings and node-pre-gyp resolve the
+    // .node path themselves and call process.dlopen(module, path) directly, so
+    // they used to die on "process.dlopen is not a function" — true, and useless.
+    // Same message the loader gives, including the substitution advice.
+    dlopen: (_module, filename) => {
+      throw nativeAddonError(filename);
     },
     nextTick: (fn, ...args) => scheduleTick(fn, ...args),
     hrtime,

@@ -10,6 +10,10 @@
 import { transpileEsm, transpileEsmLive, rewriteCjsDynamicImport } from "./esm.js";
 import { maybePatchEsbuildInProcess } from "./esbuild-inproc-patch.js";
 import { maybeTranspileTypeScript } from "./typescript-transform.js";
+// The native-addon message. It is in builtins/ next to the rest of the
+// "impossible in a browser, here is what to use instead" catalogue, and that file
+// imports nothing, so the loader pays only for the strings.
+import { nativeAddonError } from "./builtins/bun-unsupported.js";
 
 // The constructor for `async function () {}` — used to (re)compile an ESM module
 // that uses top-level await (our normal wrapper is a plain, non-async function).
@@ -426,6 +430,17 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
   }
 
   function compile(module, filename, providedSource) {
+    // A `.node` file is a compiled native addon — machine code, not JavaScript.
+    // The check has to be HERE, at the top of compile(), and not only on
+    // Module._extensions['.node']: `load()` calls compile() directly, so the
+    // extension table is consulted by tools that reach for it but never by our own
+    // require path. Without this, the read below pulled the binary in as UTF-8
+    // text and the wrapper compile reported `SyntaxError: Invalid or unexpected
+    // token` — a parse error about a file that was never source, naming a `.node`
+    // path most people have never heard of, on the most common hard failure a real
+    // Node project meets in the browser. See builtins/bun-unsupported.js for the
+    // message and the substitution map it carries.
+    if (path.extname(filename) === ".node") throw nativeAddonError(filename);
     if (path.extname(filename) === ".json") {
       const txt = providedSource != null ? providedSource : fs.readFileSync(filename, "utf8");
       module.exports = JSON.parse(txt);
@@ -722,9 +737,14 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
   for (const e of [".ts", ".tsx", ".mts", ".cts", ".jsx"]) {
     Module._extensions[e] = (module, filename) => compile(module, filename);
   }
-  Module._extensions[".node"] = () => {
-    throw new Error("Native .node addons are not supported in Vivari");
-  };
+  // `.node` goes through the same compiler as everything else, which is where the
+  // check lives, so a tool that calls `_extensions['.node'](module, filename)`
+  // directly gets the identical message rather than a second, thinner one. NOTE
+  // `.node` is deliberately NOT in EXTS: a package that probes with
+  // require.resolve('./build/foo.node') before falling back to pure JS must keep
+  // getting "not found" for a file that does not exist, or it takes the native
+  // branch and fails here instead of taking the branch that works.
+  Module._extensions[".node"] = (module, filename) => compile(module, filename);
   Module.globalPaths = [];
   Module.wrapper = [
     "(function (exports, require, module, __filename, __dirname) { ",

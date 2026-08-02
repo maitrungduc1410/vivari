@@ -4918,4 +4918,108 @@ wrong symmetrically on both sides. The kernel tier gets everything that only rea
 timers can prove: the idle timeout firing, the 413, `static`, the unix socket, ping/pong round
 trips, cork's write coalescing, the absence of backpressure, and the `Bun.spawn` stream fix.
 
+## Bun — failing loudly and usefully on the APIs a browser cannot provide (this change)
+
+Phase 6 of the Bun coverage plan, and the one that adds no capability at all. It converts
+confusing failures into actionable ones, which is the cheapest trust win available: roughly
+twenty of Bun's APIs genuinely cannot work in a browser tab, and until now most of them were
+simply `undefined` on the `Bun` global. A dependency called one and the user got
+`TypeError: Bun.udpSocket is not a function` from six frames down, with nothing explaining that
+a browser cannot open a UDP socket and no hint about what to do instead.
+
+The pattern is not new — `bun:ffi` has had it since the beginning — it is now applied to the
+whole surface. **Export the symbol so an `import { dlopen } from "bun:ffi"`, a destructure or a
+property read still LOADS, and throw when it is CALLED.** A load-time throw is strictly worse:
+one unused import at the top of a transitive dependency would take down a project that never
+touches the API. Everything lives in a new sibling, `packages/runtime/builtins/bun-unsupported.js`,
+which is the only file in the Bun shim with no implementation to read — it *is* the catalogue of
+what is impossible here and what to use instead.
+
+- **Now loud, and previously `undefined`:** `Bun.listen`/`Bun.connect` (raw TCP),
+  `Bun.udpSocket`, `Bun.RedisClient`/`Bun.redis`, `Bun.SQL` (per adapter), `Bun.WebView`,
+  `Bun.mmap`, `Bun.peek`/`Bun.peek.status`, `Bun.secrets`, and `bun build --compile` in the CLI.
+  `bun:ffi` gained the members it never had: `CFunction`, `linkSymbols` and `JSCallback` were
+  absent entirely, and `CString` was an EMPTY CLASS — `new CString(ptr)` succeeded and returned
+  an object with no string in it, which is the silently-wrong tier this project keeps deleting.
+- **Each message names the API, the specific missing capability, and the alternative.** Not "not
+  available in the browser" but "a page cannot open a raw TCP socket, so no protocol built on one
+  (Postgres, MySQL, Redis, SMTP, AMQP) can reach a server from inside the tab", and then where to
+  go: `Bun.serve` for a listener, `fetch` for outbound traffic, `bun:sqlite` for the TCP-bound
+  database and cache clients. `Bun.SQL` picks its message from the connection string, because a
+  Postgres user and a SQLite user need different next steps.
+- **Two message shapes, and the difference is the deliverable.** "is not supported in Vivari
+  (browser sandbox)" means *cannot ever work here* — stop and redesign. "is not implemented in the
+  Vivari shim" means *possible, unwritten* — send a patch. Conflating them is its own dishonesty,
+  so the split is asserted per API in the spike, and only two things are in the second group:
+  `terminal: true` on `Bun.spawn`/`spawnSync` (a pty is a tty device we have no equivalent of, but
+  a JavaScript pty emulation is perfectly possible here; pipes are substituted for nobody, because
+  an interactive CLI on a pipe takes its non-interactive branch or hangs waiting for a prompt) and
+  `Bun.SQL`'s SQLite adapter, which points at `bun:sqlite`.
+- **`Bun.peek` was the debatable one, and it is in the FIRST group.** Nothing about the sandbox
+  forbids it; what forbids it is that reading whether a promise has settled, synchronously,
+  requires the engine's internal promise state, and no JavaScript engine exposes that to page code
+  — the same wall as the `bun:jsc` heap helpers, in any host, browser or not. Nor is there an
+  honest partial answer: returning the argument unchanged is exactly what real Bun does for a
+  *pending* promise, so a shim that did it would be right by accident and silently wrong precisely
+  when the API is being used for its purpose. It throws for every input, including non-promises,
+  so the failure lands at the first call rather than the first call with real data in it.
+
+### The native `.node` addon message
+
+Application code almost never calls Node-API directly. `bcrypt`, `sharp`, `better-sqlite3`,
+`canvas`, `node-sass` and most database drivers ship prebuilt binaries and hit it transitively at
+`require()` time, which makes it the most common hard failure a real project meets in the browser.
+
+**The symptom was `SyntaxError: Invalid or unexpected token`.** `compile()` read the `.node` file
+as UTF-8 and handed the bytes to the module wrapper, so the user got a parse error about a file
+that was never source. `Module._extensions['.node']` did carry a one-line message, and it was
+never reached: `load()` calls `compile()` directly and never consults the extension table. The
+check therefore sits at the TOP of `compile()`, with the extension entry pointing at the same
+compiler so a tool that calls it directly gets the identical text. `process.dlopen` did not exist
+at all and now throws the same error, because `node-gyp-build`, `bindings` and `node-pre-gyp`
+resolve the path themselves instead of going through `require`. The error carries Node's
+`ERR_DLOPEN_FAILED` code, so packages that branch on it take their pure-JS fallback. `.node` is
+deliberately NOT added to the resolver's `EXTS`: a package that probes with `require.resolve`
+before falling back to pure JS would otherwise conclude a native build exists and take the branch
+that cannot work.
+
+The message names the package and, where we have PROOF, its substitute. The map is evidence-gated
+and each entry carries its evidence in a comment: `bcrypt`→`bcryptjs` (the registry alias in
+`toolchain-shims.js`, gated by `spike-toolchain.mjs`, and applied automatically at install time),
+`better-sqlite3`/`sqlite3`→`sql.js` (`spike-sqlite.mjs` + the shipped SQLite template),
+`pg-native`→`@electric-sql/pglite` (`spike-pglite.mjs` + its template), `esbuild`→`esbuild-wasm`,
+`rollup`/`@rollup/rollup-*`→`@rollup/wasm-node`, `lightningcss`→`lightningcss-wasm`,
+`@next/swc-*`→`@next/swc-wasm-nodejs`, `@tailwindcss/oxide`→`@tailwindcss/oxide-wasm32-wasi`,
+`@rspack/binding-*`→`@rspack/binding-wasm32-wasi`, and `argon2`→`Bun.password`'s real argon2id.
+Packages with **no verified answer say so**: `sharp`, `canvas` and `node-sass` are listed with the
+honest "no substitute is verified in Vivari" rather than a plausible guess, because a wrong
+recommendation sends someone off to rewrite working code against something that fails the same
+way. Being short is the point.
+
+### Bookkeeping and docs
+
+The hand-maintained COVERED / NOT SUPPORTED header in `bun.js` was audited against the code. Its
+real drift: it claimed native addons and `bun:ffi` "fail loudly" while lumping **Bun macros and
+`Bun.build` plugins** into the same sentence — those are absent rather than stubbed, and they need
+no capability the sandbox lacks, so calling them impossible was wrong on both counts; `Bun.gc()`
+appeared nowhere at all despite being a no-op that returns `undefined` where real Bun returns the
+heap size; and `Bun.revision` and `Bun.Transpiler.transformSync` were missing from the covered
+list. The header now separates *cannot ever work* from *not written yet* explicitly. (The
+`bun:sqlite` entry is untouched here — it is being replaced by real work in a parallel change.)
+
+`sites/docs` mentioned Bun **nowhere**, so this change adds `sites/docs/docs/bun.md`: what Bun is
+here and why it is a shim, the table of what cannot work with the alternative for each, the
+native-package substitution table, and what does work. It is the same information the error
+messages carry, which is deliberate — someone who hits the error should find the same answer when
+they search, and the page is the one place a user can read the list BEFORE choosing a dependency.
+
+The offline gate goes from **937 checks to 1083**, the kernel-tier spike from **88 to 104**. The
+offline checks assert all three halves of the contract per API — reading the symbol does not
+throw, calling it does, and the message names the API and the right tier — because any one alone
+is worthless and a regression to a load-time throw would otherwise be silent. They also drive the
+real module loader with no kernel (`createModuleSystem` over host Node's `fs`), which is what
+proves `require('bcrypt')` produces the addon message and not a `SyntaxError`. `scripts/spike-bun.mjs`
+proves the same thing where it actually matters: a real `require()` of a real ELF-headed `.node`
+inside a guest process on the Wasm VFS.
+
 See ARCHITECTURE.md §9.2.

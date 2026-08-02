@@ -114,6 +114,13 @@ packages/
                    its handshake and frame reader enforce. Pure — no sockets, no Node
                    builtins — so the offline tier drives it directly; the stateful
                    half (http.Server, ServerWebSocket, pub/sub) stays in bun.js.
+      bun-unsupported.js  the APIs a browser tab CANNOT provide (raw TCP/UDP, Redis,
+                   Bun.SQL's Postgres/MySQL, bun:ffi, WebView, mmap, peek, secrets),
+                   each import-safe and loud on call, plus the native `.node` addon
+                   message + its substitution map — which module.js and process.js
+                   import too, since require('bcrypt') hits the same wall. It has no
+                   implementation to read: it IS the catalogue of what is impossible
+                   here and what to use instead.
     node/
       lib/         Node's REAL vendored lib/*.js (fs, net, http, stream, ...).
       internal/    Node's REAL internal/* (streams, errors, validators, ...).
@@ -429,6 +436,24 @@ the vendored tree with a JS stub (exit 0, warns), and a `node-gyp` coreutil is
 the PATH fallback. Native compilation is skipped; the package's JS or
 `wasm32-wasi` build is what actually loads. Don't "fix" a node-gyp failure by
 trying to compile — that path is intentionally stubbed.
+
+If a `.node` file is nevertheless `require()`d — a prebuilt binary that shipped in
+the tarball, which is the usual case for `bcrypt`/`sharp`/`better-sqlite3` — the
+loader throws `nativeAddonError` from `builtins/bun-unsupported.js`: it names the
+package, says a browser tab has no `dlopen(3)` and cannot execute machine code,
+and prints the substitute where one is VERIFIED to run in-VM. Two details are
+load-bearing. The check sits at the top of `compile()`, not only on
+`Module._extensions['.node']`, because `load()` calls `compile()` directly and
+never consults the extension table — the binary was otherwise read as UTF-8 and
+reported as `SyntaxError: Invalid or unexpected token`. And `.node` is
+deliberately NOT in the resolver's `EXTS`: a package that probes
+`require.resolve('./build/x')` before falling back to pure JS must keep getting
+"not found", or it takes the native branch and fails. Add to
+`NATIVE_ADDON_SUBSTITUTES` only what a spike or a shipped template proves runs
+here — a wrong recommendation is worse than none, which is why `sharp`, `canvas`
+and `node-sass` are listed as "no verified substitute" rather than guessed at.
+`process.dlopen` throws the same error, because `node-gyp-build`, `bindings` and
+`node-pre-gyp` resolve the path themselves and call it instead of `require`.
 
 ### esbuild/rollup are aliased to their wasm drop-ins — DON'T add per-project overrides
 esbuild and rollup ship no `wasm32` build, and their WASM drop-ins live under a
@@ -960,6 +985,25 @@ unpacked:
   `getBufferedAmount()` are correct but inert here, because the in-VM loopback
   completes every write synchronously and so never builds backpressure (see the
   kernel spike, which pins that).
+- **`packages/runtime/builtins/bun-unsupported.js`** — the ~20 APIs a browser tab
+  cannot provide, and the only file in the Bun shim with no implementation to read:
+  it is the catalogue. `Bun.listen`/`connect` (raw TCP), `Bun.udpSocket`,
+  `Bun.RedisClient`/`Bun.redis`, `Bun.SQL`'s Postgres/MySQL adapters, `Bun.WebView`,
+  `Bun.mmap`, `Bun.peek`, `Bun.secrets`, `Bun.dlopen` and the whole of `bun:ffi`
+  were all simply `undefined` before, so a dependency produced
+  `TypeError: Bun.udpSocket is not a function` from six frames down and explained
+  nothing. **The pattern is `bun:ffi`'s: the symbol EXISTS so importing or reading
+  it cannot crash a project over an unused import, and the CALL throws** — naming
+  the API, the specific missing capability (no raw socket, no `dlopen(3)`, no OS
+  keychain — never a generic "unavailable"), and the alternative. **Two message
+  shapes, and the difference is the point**: "is not supported in Vivari (browser
+  sandbox)" means *cannot ever work here*, "is not implemented in the Vivari shim"
+  means *possible, unwritten* (`terminal: true` on `Bun.spawn`, `Bun.SQL`'s SQLite
+  adapter). Conflating them sends someone to redesign what a patch would fix, or
+  to write a patch for what no patch can fix. The file also owns the `.node`
+  native-addon message and `NATIVE_ADDON_SUBSTITUTES` (see the node-gyp gotcha
+  above) — `module.js` and `process.js` import it, since `require('bcrypt')` from
+  plain Node code hits the identical wall.
 - **`packages/kernel-host/programs/bun.js`** — the `bun`/`bunx` CLI: `bun run`,
   `bunx` (delegates to `npx`), install delegation, and it surfaces require/unhandled-
   rejection errors instead of a silent exit. `bun <file>` runs the file through the
@@ -994,7 +1038,10 @@ diverges in production is a trap. Two rules when touching the Bun shim:
   back a handle on the path `"undefined"`), `Bun.Transpiler.scan()` returned empty
   arrays, and the `bun:jsc` memory helpers returned `0`. All of those now either
   behave correctly or throw naming the API and the reason — the `bun:ffi` tier at
-  `builtins/bun.js` (import-safe, call-loud). An unknown `bun` verb likewise says
+  `builtins/bun-unsupported.js` (import-safe, call-loud). `bun build --compile` was
+  the same bug in the CLI: it fell through to the transpile path and wrote
+  JAVASCRIPT under the name the user expected a native executable at, then reported
+  success. An unknown `bun` verb likewise says
   "not implemented" rather than falling through to "file not found: publish"; only
   a file-shaped argument or a `package.json` script name still runs.
 - **`bun --version`/`--revision` read the Bun global**, which is the one definition

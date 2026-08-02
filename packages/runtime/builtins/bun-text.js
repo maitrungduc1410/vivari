@@ -6,7 +6,8 @@
 // this lands next to two sibling batches that all extend the same object literal;
 // keeping the bodies out of it reduces the wiring in bun.js to an import plus a
 // few purely additive lines. The createBunText() factory shape mirrors the
-// makeBunJsc/makeBunFfi factories that already sit at the bottom of bun.js.
+// makeBunJsc factory that still sits at the bottom of bun.js (bun:ffi's moved out
+// to ./bun-unsupported.js with the rest of the impossible surface).
 //
 // Everything here is pure computation over strings and typed arrays — no VFS, no
 // syscalls, no kernel — which is why all of it is reachable from
