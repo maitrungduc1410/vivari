@@ -10,52 +10,15 @@
 // scripts/spike-bun-install.mjs. The pure-JS transform + Bun API are additionally
 // gated with no kernel at all by scripts/spike-bun-offline.mjs.
 
-import { Kernel } from "../packages/kernel-host/kernel.js";
-import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
-import { httpGet, httpPost } from "./lib/spike-harness.mjs";
-import { Worker, MessageChannel } from "node:worker_threads";
+import { LIVE, bootSpikeKernel, httpGet, httpPost } from "./lib/spike-harness.mjs";
 
-const LIVE = process.env.VV_LIVE === "1";
 let failed = 0;
 const ok = (cond, msg) => {
   console.log((cond ? "  \u2713 " : "  \u2717 ") + msg);
   if (!cond) failed++;
 };
 
-// ── kernel setup (same shape as spike-dep-cache.mjs) ─────────────────────────
-const fsWorker = new Worker(new URL("./fs-worker.mjs", import.meta.url));
-let onKernelFsMessage = () => {};
-await new Promise((resolve) => {
-  fsWorker.on("message", (m) => {
-    if (m.type === "ready") resolve();
-    else onKernelFsMessage(m);
-  });
-});
-const kernelFs = createKernelFs(fsWorker);
-onKernelFsMessage = kernelFs.onMessage;
-
-const spawnWorker = (info) => {
-  const w = new Worker(new URL("./process-worker.mjs", import.meta.url));
-  w.on("message", (m) => { const h = info.on[m.type]; if (h) h(m); });
-  w.on("error", (e) => process.stderr.write(`\n[worker-error pid ${info.pid}] ${(e && e.stack) || e}\n`));
-  const { port1, port2 } = new MessageChannel();
-  fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
-  const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
-  const transfer = [port1];
-  if (info.threadPort) { init.threadPort = info.threadPort; transfer.push(info.threadPort); }
-  w.postMessage(init, transfer);
-  return {
-    terminate: () => { w.terminate(); fsWorker.postMessage({ type: "fs-unregister", client: info.pid }); },
-    postMessage: (m) => w.postMessage(m),
-  };
-};
-
-const out = [];
-const cap = (s) => { out.push(s); if (LIVE) process.stderr.write(s); };
-const listening = new Set();
-const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, stdout: cap, stderr: cap });
-kernel.onListen = (port) => listening.add(port);
-kernel.installCoreutils();
+const { kernel, out, listening } = await bootSpikeKernel();
 
 const APP = "/app";
 kernel.mkdirp(APP);

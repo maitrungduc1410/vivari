@@ -14,7 +14,9 @@
 
 import { bootSpikeKernel, writeProject, defaultEnv, LIVE } from "./lib/spike-harness.mjs";
 
-const h = await bootSpikeKernel();
+// { npm: true }: this spike runs `npm install vitest` itself rather than through
+// the harness's npmInstall(), so it needs the real CLI on PATH from the start.
+const h = await bootSpikeKernel({ npm: true });
 const kernel = h.kernel;
 kernel.mkdirp("/app");
 

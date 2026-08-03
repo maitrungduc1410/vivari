@@ -15,58 +15,19 @@
 //
 // No network: these templates are dependency-free by design, so `install` is a
 // version check rather than a registry fetch. That is what makes them instant in
-// the browser and runnable in this tier. Boots the kernel directly, like
-// spike-bun.mjs (the shared bootSpikeKernel() requires a vendored npm that
-// nothing here needs).
+// the browser and runnable in this tier.
 
-import { Kernel } from "../packages/kernel-host/kernel.js";
-import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
-import { Worker, MessageChannel } from "node:worker_threads";
-import { writeProject, httpGet } from "./lib/spike-harness.mjs";
+import { bootSpikeKernel, writeProject, httpGet } from "./lib/spike-harness.mjs";
 import { readShippedManifests, readShippedTemplates } from "./lib/shipped-templates.mjs";
 import fs from "node:fs";
 
-const LIVE = process.env.VV_LIVE === "1";
 let failed = 0;
 const ok = (cond, msg) => {
   console.log((cond ? "  \u2713 " : "  \u2717 ") + msg);
   if (!cond) failed++;
 };
 
-// ── kernel setup (same shape as spike-bun.mjs) ───────────────────────────────
-const fsWorker = new Worker(new URL("./fs-worker.mjs", import.meta.url));
-let onKernelFsMessage = () => {};
-await new Promise((resolve) => {
-  fsWorker.on("message", (m) => {
-    if (m.type === "ready") resolve();
-    else onKernelFsMessage(m);
-  });
-});
-const kernelFs = createKernelFs(fsWorker);
-onKernelFsMessage = kernelFs.onMessage;
-
-const spawnWorker = (info) => {
-  const w = new Worker(new URL("./process-worker.mjs", import.meta.url));
-  w.on("message", (m) => { const h = info.on[m.type]; if (h) h(m); });
-  w.on("error", (e) => process.stderr.write(`\n[worker-error pid ${info.pid}] ${(e && e.stack) || e}\n`));
-  const { port1, port2 } = new MessageChannel();
-  fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
-  const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
-  const transfer = [port1];
-  if (info.threadPort) { init.threadPort = info.threadPort; transfer.push(info.threadPort); }
-  w.postMessage(init, transfer);
-  return {
-    terminate: () => { w.terminate(); fsWorker.postMessage({ type: "fs-unregister", client: info.pid }); },
-    postMessage: (m) => w.postMessage(m),
-  };
-};
-
-const out = [];
-const cap = (s) => { out.push(s); if (LIVE) process.stderr.write(s); };
-const listening = new Set();
-const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, stdout: cap, stderr: cap });
-kernel.onListen = (port) => listening.add(port);
-kernel.installCoreutils();
+const { kernel, out, listening } = await bootSpikeKernel();
 
 // bun:sqlite pulls its engine from VV_SQLITE_WASM_PATH here; in the browser the
 // kernel sets VV_SQLITE_WASM_URL and the guest fetches the same bytes through the

@@ -17,7 +17,9 @@ const ok = (cond, msg) => {
   if (!cond) failed++;
 };
 
-const h = await bootSpikeKernel();
+// { npm: true }: `bun add` delegates to the real npm CLI via cp.spawn('npm', …),
+// so the vendored tree has to be on PATH before the first bun command.
+const h = await bootSpikeKernel({ npm: true });
 const APP = "/app";
 const readText = (p) => { try { return Buffer.from(h.kernel.readFile(p)).toString(); } catch { return null; } };
 const exists = (p) => { try { h.kernel.readFile(p); return true; } catch { try { h.kernel.readdir(p); return true; } catch { return false; } } };

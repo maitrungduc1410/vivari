@@ -66,6 +66,11 @@ const VENDORS = {
 const SPIKES = [
   // --- offline (no live registry) --------------------------------------------
   { name: "toolchain", file: "spike-toolchain.mjs", net: false, timeout: 60000 },
+  // The tiers themselves: an offline spike that cannot run without the --net
+  // provisioning is a category error, and `http-binary-body` shipped as one —
+  // green here, exit 2 in the verify job. Pure static reads of this file, the
+  // harness and ci.yml, so it costs nothing and runs in the earliest gate.
+  { name: "ci-tiers", file: "spike-ci-tiers.mjs", net: false, timeout: 60000 },
   { name: "http-llhttp", file: "spike-http-llhttp.mjs", net: false, timeout: 60000 },
   // ESM→CJS loader guarantees: top-level-await async retry + circular re-export
   // live bindings (SvelteKit config / astro runtime). Pure parser, no kernel/wasm.

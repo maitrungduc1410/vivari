@@ -297,6 +297,8 @@ scripts/
                        real SAB channel + worker_threads pause→evaluate→resume).
   lib/spike-harness.mjs   shared kernel-boot/install/waitListen/httpGet helper for spikes.
   run-spikes.mjs       CI runner over the spikes (tiers: --offline / --net / --all).
+  spike-ci-tiers.mjs   holds the tiers honest: no `net: false` spike may need the
+                       registry, and every `needsWasm` one must be wired into CI.
   process-worker.mjs / fs-worker.mjs   Node worker_threads entries for headless.
   fixtures/napi-crc32/   vendored @node-rs/crc32 wasm32-wasi N-API addon (verify-node fixture).
 
@@ -702,6 +704,36 @@ string and a bare non-zero exit, with the real error sitting unread in `r.stderr
 That is exactly how a plain `SyntaxError: Unexpected token '<'` in the TS
 transform reached CI as four unexplained failures. **When a captured check can
 fail, print `r.stderr`** (see block 2 of `scripts/spike-bun.mjs`).
+
+### Booting a spike kernel must not need the network — and a hand-rolled boot is the symptom
+`bootSpikeKernel()` used to copy the vendored real npm tree into the VFS at boot,
+and `process.exit(2)` if it was absent. The tree comes from the live registry and
+`run-spikes.mjs` only provisions it for the **`--net`** tier, so every kernel the
+harness produced was quietly a registry-dependent kernel. `http-binary-body` is
+registered `net: false`, tests binary request bodies and installs nothing — and
+it went red on master in the PR-gating `verify` job, exiting 2 before its first
+assertion.
+
+Two things to take from it. First, **the npm load is now lazy**: `npmInstall()`
+pulls it in on demand, a spike that shells out to `npm` itself asks with
+`bootSpikeKernel({ npm: true })` (only `vitest` and `bun-install` do), and the
+"no vendored npm" refusal is unchanged for anything that installs. Until it
+loads, `/bin/npm.js` is a stub that names the missing knob rather than failing as
+`npm: not found` five layers down.
+
+Second, and more useful: **when a spike hand-rolls `new Kernel(...)` instead of
+using the harness, read the comment above it as a bug report.** Three had, to get
+away from this one coupling — `spike-bun-templates.mjs` even said so in a comment
+— so the helper that exists to kill copy-pasted boilerplate was being routed
+around by the spikes it was written for. Those three are back on the harness.
+`diag-liveness` is the one that legitimately is not: it needs a pid→handle map
+and a message hook ahead of the kernel's routing, which is spike-specific, and
+its header says so. `spike-ci-tiers.mjs` (offline, Wasm-free, so it runs in the
+earliest gate) now asserts that no `net: false` spike reaches a
+registry-provisioned artifact, that the vendored path is read in exactly one
+place in the harness — which is what keeps that list of ways complete — and that
+every `needsWasm` offline spike is named in ci.yml's Wasm-VFS step, an invariant
+that until now was a comment enforced by nothing.
 
 ### The 1 MiB SAB window — internalize this one
 `DATA_BYTES = 1 << 20`. **Every syscall request AND response must fit in 1 MiB.**

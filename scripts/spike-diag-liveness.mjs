@@ -21,6 +21,13 @@
 // The bar: a process held open for two DIFFERENT reasons must report two
 // different breakdowns. A field that says "something is alive" is no better than
 // the pid we already had.
+//
+// This one boots the kernel by hand rather than through lib/spike-harness.mjs,
+// and unlike the others it is not a leftover: the spike has to send `proc-mem`
+// to a LIVE process and read the reply, so it needs a pid→handle map and a
+// message hook that runs ahead of the kernel's own routing. The harness's
+// spawnWorker gives neither, and growing it a message-interception seam to serve
+// one caller would move the complexity rather than remove it.
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";

@@ -3,9 +3,26 @@
 // Extracted from the copy-pasted boilerplate in scripts/spike-*.mjs so new spikes
 // (and the CI runner, scripts/run-spikes.mjs) share one implementation.
 //
-// Requires a vendored real npm tree on the host (installs go to the live registry):
+// Booting does NOT require the network. The real npm CLI is a vendored tree on
+// the host, provisioned from the live registry:
+//
 //   rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor \
 //     && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)
+//
+// …and it is loaded LAZILY, at the moment something needs it, rather than at
+// boot. It used to load at boot, which quietly made every kernel a
+// registry-dependent kernel: `spike-http-binary-body` tests binary request
+// bodies and installs nothing, but it is registered `net: false` and so runs in
+// the PR-gating `verify` job, where no vendored npm exists and none should — and
+// it exited 2 before its first assertion. The cost was paid twice over, because
+// the harness exists to kill copy-pasted boot boilerplate and three spikes had
+// already hand-rolled their own boot to escape this one coupling (see the note
+// that used to sit at the top of spike-bun-templates.mjs).
+//
+// So: `npmInstall()` loads it on demand, and a spike that shells out to `npm`
+// itself asks for it up front with `bootSpikeKernel({ npm: true })`. Anything
+// that never installs simply works offline. spike-ci-tiers.mjs holds the tier
+// registry to that.
 //
 // Typical use:
 //   const h = await bootSpikeKernel();
@@ -26,18 +43,17 @@ import path from "node:path";
 export const LIVE = process.env.VV_LIVE === "1";
 export const VFS_NPM = "/usr/lib/node_modules/npm";
 
-/** Boot the kernel + FS worker and load the vendored real npm into the VFS. */
-export async function bootSpikeKernel() {
-  const VENDOR_NPM = process.env.VV_VENDOR_NPM || process.argv[2] || "/tmp/vv-vendor/node_modules/npm";
-  if (!fs.existsSync(path.join(VENDOR_NPM, "bin/npm-cli.js"))) {
-    console.error(`No vendored npm at ${VENDOR_NPM} (expected bin/npm-cli.js).`);
-    console.error(
-      "Vendor it:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor && " +
-        "(cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)",
-    );
-    process.exit(2);
-  }
-
+/**
+ * Boot the kernel + FS worker.
+ *
+ * @param {object}  [opts]
+ * @param {boolean} [opts.npm]     Load the vendored real npm into the VFS now.
+ *   Only needed by spikes that run `npm`/`npx` themselves, or delegate to it
+ *   (`bun add`). `npmInstall()` loads it on demand, so most spikes want neither.
+ *
+ * Guest output lands in `h.out` (and echoes to stderr when VV_LIVE=1).
+ */
+export async function bootSpikeKernel({ npm = false } = {}) {
   const fsWorker = new Worker(new URL("../fs-worker.mjs", import.meta.url));
   let onKernelFsMessage = () => {};
   await new Promise((resolve) => {
@@ -97,30 +113,63 @@ export async function bootSpikeKernel() {
     if (LIVE) process.stderr.write(`  [net ${fetchN}] ${i.cached ? "cache" : "GET"} ${((i.size / 1024) | 0)}k  ${u}\n`);
   };
 
-  let fileCount = 0;
-  const loadDir = (hostDir, vfsDir) => {
-    kernel.mkdirp(vfsDir);
-    for (const entry of fs.readdirSync(hostDir, { withFileTypes: true })) {
-      const hostPath = path.join(hostDir, entry.name);
-      const vfsPath = vfsDir + "/" + entry.name;
-      if (entry.isDirectory()) loadDir(hostPath, vfsPath);
-      else if (entry.isFile()) {
-        kernel.writeFile(vfsPath, fs.readFileSync(hostPath));
-        fileCount++;
-      }
-    }
-  };
-  const t0 = Date.now();
-  loadDir(VENDOR_NPM, VFS_NPM);
-  stubNodeGyp(kernel, VFS_NPM);
-  // Write /bin/npm.js + /bin/npx.js on PATH (VFS_NPM === NPM_VFS_ROOT), so a bare
-  // `npm`/`npx` resolves — e.g. `bun add` delegates via cp.spawn('npm', …).
-  applyRealNpmShims(kernel);
-  console.log(`Loaded real npm into VFS: ${fileCount} files (${Date.now() - t0}ms)`);
   kernel.mkdirp("/home/user");
-  kernel.mkdirp("/tmp/.npm/_logs");
 
-  return { kernel, out, listening, VFS_NPM };
+  // Copy the vendored real npm tree into the VFS and put it on PATH. Idempotent,
+  // and the ONLY thing in this file that touches a registry-provisioned
+  // artifact — keeping it in one function is what makes "did this spike need
+  // the network?" a question with an answer.
+  let loaded = false;
+  const loadRealNpm = () => {
+    if (loaded) return;
+    const VENDOR_NPM = process.env.VV_VENDOR_NPM || process.argv[2] || "/tmp/vv-vendor/node_modules/npm";
+    if (!fs.existsSync(path.join(VENDOR_NPM, "bin/npm-cli.js"))) {
+      console.error(`No vendored npm at ${VENDOR_NPM} (expected bin/npm-cli.js).`);
+      console.error(
+        "Vendor it:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor && " +
+          "(cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)",
+      );
+      process.exit(2);
+    }
+    let fileCount = 0;
+    const loadDir = (hostDir, vfsDir) => {
+      kernel.mkdirp(vfsDir);
+      for (const entry of fs.readdirSync(hostDir, { withFileTypes: true })) {
+        const hostPath = path.join(hostDir, entry.name);
+        const vfsPath = vfsDir + "/" + entry.name;
+        if (entry.isDirectory()) loadDir(hostPath, vfsPath);
+        else if (entry.isFile()) {
+          kernel.writeFile(vfsPath, fs.readFileSync(hostPath));
+          fileCount++;
+        }
+      }
+    };
+    const t0 = Date.now();
+    loadDir(VENDOR_NPM, VFS_NPM);
+    stubNodeGyp(kernel, VFS_NPM);
+    // Write /bin/npm.js + /bin/npx.js on PATH (VFS_NPM === NPM_VFS_ROOT), so a bare
+    // `npm`/`npx` resolves — e.g. `bun add` delegates via cp.spawn('npm', …).
+    applyRealNpmShims(kernel);
+    kernel.mkdirp("/tmp/.npm/_logs");
+    loaded = true;
+    console.log(`Loaded real npm into VFS: ${fileCount} files (${Date.now() - t0}ms)`);
+  };
+
+  // Until then, `npm` on PATH says which knob is missing. Without this a spike
+  // that forgot `{ npm: true }` fails as `npm: not found` several layers deep,
+  // which is a long way from the one-word fix.
+  kernel.writeFile(
+    "/bin/npm.js",
+    "'use strict';\nprocess.stderr.write('npm: this spike booted without the real npm CLI. Pass " +
+      "{ npm: true } to bootSpikeKernel(), or use the npmInstall() helper.' + String.fromCharCode(10));\n" +
+      "process.exit(127);\n",
+  );
+
+  // kernelFs is the FS client the kernel was built on — spike-dep-cache drives
+  // its depCache* methods directly, since those are what it exists to prove.
+  const h = { kernel, kernelFs, out, listening, VFS_NPM, loadRealNpm };
+  if (npm) loadRealNpm();
+  return h;
 }
 
 /** Write a { relPath: contents } project map under `dir`, mkdirp'ing parents. */
@@ -146,6 +195,7 @@ export function defaultEnv(dir) {
 
 /** Run `npm install` in `dir`. Returns the process result ({ code, ... }). */
 export async function npmInstall(h, { dir, env = defaultEnv(dir), extraArgs = [] }) {
+  h.loadRealNpm(); // on demand — see bootSpikeKernel
   const INSTALL_TIMEOUT = Number(process.env.VV_INSTALL_TIMEOUT || 300000);
   const t1 = Date.now();
   let timedOut = false;

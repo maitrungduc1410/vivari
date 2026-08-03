@@ -10,51 +10,12 @@
 // store in scripts/fs-worker.mjs - the pack/restore + VFS logic under test is the
 // same. Run: `node scripts/spike-dep-cache.mjs` (needs the Wasm VFS build).
 
-import { Kernel } from "../packages/kernel-host/kernel.js";
-import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
 import { hashDepKey } from "../packages/kernel-host/dep-cache.js";
-import { Worker, MessageChannel } from "node:worker_threads";
+import { bootSpikeKernel } from "./lib/spike-harness.mjs";
 
 const DIR = "/app";
 
-// kernel setup (same shape as the other studio spikes)
-const fsWorker = new Worker(new URL("./fs-worker.mjs", import.meta.url));
-let onKernelFsMessage = () => {};
-await new Promise((resolve) => {
-  fsWorker.on("message", (m) => {
-    if (m.type === "ready") resolve();
-    else onKernelFsMessage(m);
-  });
-});
-const kernelFs = createKernelFs(fsWorker);
-onKernelFsMessage = kernelFs.onMessage;
-
-const spawnWorker = (info) => {
-  const w = new Worker(new URL("./process-worker.mjs", import.meta.url));
-  w.on("message", (m) => {
-    const h = info.on[m.type];
-    if (h) h(m);
-  });
-  const { port1, port2 } = new MessageChannel();
-  fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
-  const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
-  const transfer = [port1];
-  if (info.threadPort) {
-    init.threadPort = info.threadPort;
-    transfer.push(info.threadPort);
-  }
-  w.postMessage(init, transfer);
-  return {
-    terminate: () => {
-      w.terminate();
-      fsWorker.postMessage({ type: "fs-unregister", client: info.pid });
-    },
-    postMessage: (m) => w.postMessage(m),
-  };
-};
-
-const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker });
-kernel.installCoreutils();
+const { kernel, kernelFs } = await bootSpikeKernel();
 kernel.mkdirp(DIR);
 
 const ENV = { HOME: "/home/user", PATH: "/bin", PWD: DIR };
@@ -130,6 +91,5 @@ await runNode(`require('fs').rmSync('${DIR}/node_modules', { recursive: true, fo
 const restoredAlias = await kernelFs.fs.depCacheRestore(pjKey, DIR);
 gate("restore() via package.json alias", restoredAlias > 0 && kernel.exists(`${DIR}/node_modules/leftpad/index.js`), `${restoredAlias} entries`);
 
-await fsWorker.terminate();
 console.log(`\nRESULT: ${ok ? "PASS - persistent dependency cache save/restore verified" : "FAIL - see gates above"}`);
 process.exit(ok ? 0 : 1);
