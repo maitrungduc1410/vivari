@@ -283,6 +283,17 @@ if (isMainThread) {
     return true;
   }
 
+  // Every window asserted below is enforced by setTimeout, which libuv runs off
+  // the monotonic clock. Date.now() follows the wall clock, and a CI host slewing
+  // one against the other measured a 300ms window as 299ms. Measure on the clock
+  // that decides the outcome, not a different one that merely resembles it.
+  const now = () => performance.now();
+  // libuv caches that clock at integer-millisecond resolution and fires when the
+  // cached value reaches the deadline, so a window can still land one tick short
+  // of its nominal length. One tick is the honest floor; anything more would be
+  // loosening the check rather than fixing the measurement.
+  const TICK_MS = 1;
+
   const spawn = (scenario, arg = null, opts = {}) => {
     const pid = kernel.createProcess(
       { command: "guest", programPath: "/guest.js", args: [scenario, arg], cwd: "/", env: {} },
@@ -294,10 +305,10 @@ if (isMainThread) {
 
   const settled = (pid) =>
     new Promise((resolve, reject) => {
-      const t0 = Date.now();
+      const t0 = now();
       const tick = () => {
         if (exits.has(pid)) return resolve(exits.get(pid));
-        if (Date.now() - t0 > 5000) return reject(new Error(`pid ${pid} never exited`));
+        if (now() - t0 > 5000) return reject(new Error(`pid ${pid} never exited`));
         setTimeout(tick, 5);
       };
       tick();
@@ -319,14 +330,14 @@ if (isMainThread) {
   {
     const pid = spawn("no-listener");
     await waitFor(pid, "READY");
-    const t0 = Date.now();
+    const t0 = now();
     kernel.signal(pid, "SIGTERM");
     const dead = !kernel.procs.has(pid);
     const res = exits.get(pid);
     check(dead, "terminated synchronously inside signal()");
     check(res && res.code === 143, "exit code 143", res && `got ${res.code}`);
     check(res && res.signal === "SIGTERM", "reports signal SIGTERM", res && `got ${res.signal}`);
-    check(Date.now() - t0 < 50, "no grace window was opened");
+    check(now() - t0 < 50, "no grace window was opened");
   }
 
   // 2 ── a listener means the process decides, including its exit code.
@@ -334,11 +345,11 @@ if (isMainThread) {
   {
     const pid = spawn("listener-exit-code");
     await waitFor(pid, "READY");
-    const t0 = Date.now();
+    const t0 = now();
     kernel.signal(pid, "SIGTERM");
     check(kernel.procs.has(pid), "not terminated on the spot");
     const res = await settled(pid);
-    const took = Date.now() - t0;
+    const took = Math.round(now() - t0);
     check((out.get(pid) || "").includes("caught SIGTERM"), "handler ran");
     check(res.code === 7, "exited with ITS OWN code 7, not 143", `got ${res.code}`);
     check(res.signal == null, "reported as a normal exit (signal null)", `got ${res.signal}`);
@@ -400,11 +411,14 @@ if (isMainThread) {
     await waitFor(pid, "BLOCKING");
     await new Promise((r) => setTimeout(r, 40));
     const proc = kernel.procs.get(pid);
-    const t0 = Date.now();
+    const t0 = now();
     kernel.signal(pid, "SIGTERM");
     const res = await settled(pid);
-    const took = Date.now() - t0;
-    check(took >= GRACE_MS && took < GRACE_MS + 500, `forced at the window (${took}ms), not at the end of the park`);
+    const took = Math.round(now() - t0);
+    check(
+      took >= GRACE_MS - TICK_MS && took < GRACE_MS + 500,
+      `forced at the window (${took}ms), not at the end of the park`,
+    );
     check(res.code === 143, "with today's exit code 143", `got ${res.code}`);
     check(!(out.get(pid) || "").includes("caught SIGTERM"), "handler never got a turn (it could not)");
     check(
@@ -418,12 +432,12 @@ if (isMainThread) {
   {
     const pid = spawn("listener-hangs");
     await waitFor(pid, "READY");
-    const t0 = Date.now();
+    const t0 = now();
     kernel.signal(pid, "SIGTERM");
     const res = await settled(pid);
-    const took = Date.now() - t0;
+    const took = Math.round(now() - t0);
     check((out.get(pid) || "").includes("caught SIGTERM, hanging"), "handler ran");
-    check(took >= GRACE_MS, `waited out the ${GRACE_MS}ms grace window (${took}ms)`);
+    check(took >= GRACE_MS - TICK_MS, `waited out the ${GRACE_MS}ms grace window (${took}ms)`);
     check(took < GRACE_MS + 1000, "then forced promptly", `${took}ms`);
     check(res.code === 143, "forced with today's exit code 143", `got ${res.code}`);
     check(res.signal === "SIGTERM", "and today's signal attribution");
@@ -437,9 +451,9 @@ if (isMainThread) {
     await waitFor(pid, "READY");
     kernel.signal(pid, "SIGINT");
     await waitFor(pid, "caught SIGINT");
-    const t0 = Date.now();
+    const t0 = now();
     kernel.signal(pid, "SIGINT");
-    const took = Date.now() - t0;
+    const took = Math.round(now() - t0);
     check(!kernel.procs.has(pid), "second SIGINT terminated it immediately");
     check(took < GRACE_MS, `without waiting out the window (${took}ms)`);
   }
@@ -449,12 +463,12 @@ if (isMainThread) {
   {
     const pid = spawn("sigkill-listener");
     await waitFor(pid, "READY");
-    const t0 = Date.now();
+    const t0 = now();
     kernel.signal(pid, "SIGKILL");
     const dead = !kernel.procs.has(pid);
     const res = exits.get(pid);
     check(dead, "terminated synchronously");
-    check(Date.now() - t0 < 50, "no grace window");
+    check(now() - t0 < 50, "no grace window");
     check(res && res.code === 137, "exit code 137", res && `got ${res.code}`);
     check(!(out.get(pid) || "").includes("caught SIGKILL"), "the handler it registered never ran");
   }
@@ -464,10 +478,10 @@ if (isMainThread) {
   {
     const pid = spawn("listener-hangs");
     await waitFor(pid, "READY");
-    const t0 = Date.now();
+    const t0 = now();
     kernel.stop(pid);
     check(!kernel.procs.has(pid), "terminated synchronously despite a SIGTERM handler");
-    check(Date.now() - t0 < 50, "no grace window");
+    check(now() - t0 < 50, "no grace window");
     check(exits.get(pid) && exits.get(pid).code === 143, "exit code 143");
   }
 
@@ -481,11 +495,11 @@ if (isMainThread) {
     await waitFor(parent, "READY");
     const child = spawn("listener-hangs", null, { parentPid: parent });
     await waitFor(child, "READY");
-    const t0 = Date.now();
+    const t0 = now();
     kernel.signal(parent, "SIGTERM");
     check(!kernel.procs.has(parent), "parent gone");
     check(!kernel.procs.has(child), "child gone in the same synchronous cascade");
-    check(Date.now() - t0 < 50, "no grace window was granted to the child's handler");
+    check(now() - t0 < 50, "no grace window was granted to the child's handler");
     const cres = exits.get(child);
     check(cres && cres.code === 143 && cres.signal === "SIGTERM", "child finalized as before");
     check(!(out.get(child) || "").includes("caught SIGTERM"), "the child's handler never ran");
