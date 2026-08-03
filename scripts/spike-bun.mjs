@@ -1760,5 +1760,51 @@ console.log("\n== the bare `bun` module, top-level await, Bun.stdin, lazy Bun.$ 
   ok(!/not-on-the-terminal/.test((r.stdout || "").replace(/"captured":"[^"]*"/, "")), "…and does NOT also echo it to the terminal");
 }
 
+// Bun.sha / Bun.CSRF / Bun.dns / zstd through a real `bun run`. The offline tier
+// covers the semantics; this tier covers the two things it structurally cannot:
+// the digests come from the Rust/Wasm crypto codec rather than the host's
+// OpenSSL, and blake2b256 — which Bun allows for CSRF and OpenSSL does not know
+// by that name — only exists on this side.
+console.log("\n== bun run crypto-surface.ts (sha, CSRF, dns, zstd) ==");
+{
+  write(
+    "crypto-surface.ts",
+    [
+      // NIST FIPS 180-4's SHA-512/256 example, so the wasm codec is pinned to a
+      // value from outside this repo.
+      'const abc = Bun.sha("abc", "hex");',
+      'const blake = Bun.CSRF.generate("s", { algorithm: "blake2b256", sessionId: "u" });',
+      "const out = {",
+      '  sha: abc,',
+      '  shaBytes: Bun.sha("abc").length,',
+      '  blakeOk: Bun.CSRF.verify(blake, { secret: "s", algorithm: "blake2b256", sessionId: "u" }),',
+      '  blakeWrongSession: Bun.CSRF.verify(blake, { secret: "s", algorithm: "blake2b256", sessionId: "other" }),',
+      '  prefetch: Bun.dns.prefetch("example.com", 443) === undefined,',
+      '  stats: Bun.dns.getCacheStats().size,',
+      "  dnsThrew: (() => { try { Bun.dns.lookup('example.com'); return false; } catch { return true; } })(),",
+      "  zstdThrew: (() => { try { Bun.zstdCompressSync('x'); return false; } catch (e) { return /packages\\/codec/.test(e.message); } })(),",
+      // node:zlib is the other half: the function exists, so a feature detect
+      // takes the branch, and the branch has to explain itself.
+      "  brotli: (() => { try { require('zlib').brotliCompressSync(Buffer.from('x')); return 'compressed'; } catch (e) { return e.message.slice(0, 90); } })(),",
+      "  gzipStillWorks: require('zlib').gunzipSync(require('zlib').gzipSync(Buffer.from('hi'))).toString(),",
+      "};",
+      'console.log("CRYPTO:" + JSON.stringify(out));',
+    ].join("\n"),
+  );
+  const r = await kernel.start("bun", ["run", "crypto-surface.ts"], { cwd: APP, env: ENV, capture: true });
+  const m = /CRYPTO:(\{.*\})/.exec(r.stdout || "");
+  const got = m ? JSON.parse(m[1]) : null;
+  if (!got) console.log("  stderr:", (r.stderr || "").split("\n").slice(0, 4).join(" | "));
+  ok(r.code === 0 && !!got, "the crypto-surface script runs");
+  ok(got && got.sha === "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23", "Bun.sha through the wasm codec matches the NIST SHA-512/256 vector");
+  ok(got && got.shaBytes === 32, "…and is 32 bytes raw");
+  ok(got && got.blakeOk === true && got.blakeWrongSession === false, "CSRF with blake2b256 signs and binds the session (wasm-only algorithm)");
+  ok(got && got.prefetch === true && got.stats === 0, "Bun.dns.prefetch is inert and the cache reports empty");
+  ok(got && got.dnsThrew === true, "Bun.dns.lookup refuses");
+  ok(got && got.zstdThrew === true, "Bun.zstdCompressSync names packages/codec rather than dying on undefined");
+  ok(got && /is not implemented in Vivari/.test(got.brotli), "node:zlib brotli explains itself: " + JSON.stringify((got && got.brotli) || ""));
+  ok(got && got.gzipStillWorks === "hi", "…while gzip round-trips, so the codec itself is fine");
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");
 process.exit(failed ? 1 : 0);

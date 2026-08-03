@@ -6415,3 +6415,84 @@ this repo has now shipped three separate checks that ran in no job at all — a 
 offline spike skipped in the only job that selected it, `probe:node-registry` written and
 never wired, and the PM gate building one crate of the three it needed. A gate that can fall
 out of the pipeline silently is a gate that eventually will.
+
+## Four Bun APIs, and the one that turned out not to exist at all (this change)
+
+An audit of the `Bun` global against Bun's own API index — rather than against our plan, which
+is the mistake the last few rounds kept making — found nine entries missing outright. Four
+looked cheap. This change ships three of them for real, and the fourth is the interesting one.
+
+**`Bun.sha` is SHA-2 512/256, not SHA-512.** Working from the name, or from memory, gives a
+digest that is wrong in the way that costs the most: it *looks* right — 32 bytes, hex, stable —
+and disagrees with every other Bun runtime and with `openssl sha512-256`. The algorithm was
+read off Bun's reference before a line was written, and it is pinned in both tiers to NIST FIPS
+180-4's worked example rather than to our own output, which would pass against any
+self-consistent wrong answer. `sha512-256` was already in the Rust crate and the hasher's
+algorithm table, so the implementation is one call; the research was the work.
+
+**`Bun.CSRF` signs with HMAC over primitives we already had.** Two decisions are written into
+the code rather than left implicit. The session binding goes through the MAC, not the payload,
+so a token cannot be re-pointed at another principal, and — because `""` is a distinct input —
+a token minted without a `sessionId` fails when one is supplied, which is what Bun documents
+and what a security test would check. And the token format is OURS: Bun does not document its
+wire layout, so a token minted here will not verify on a real Bun server. Invisible in one
+runtime, fatal across two, therefore stated in the docs instead of discovered in production.
+
+Two bugs came out of writing the tests, both of which self-verify and so survive any test that
+only round-trips a token against itself:
+
+- **The defaults were the head of each allowed list** — `blake2b256` and `base64`, where Bun
+  specifies `sha256` and `base64url`. `generate` and `verify` agreed with each other perfectly.
+  Only naming the expected default explicitly catches this, so the gate now does.
+- **The expiry windows were inclusive.** `expiresIn: 0` produced a token that verified for
+  exactly as long as the clock took to tick, making "an expired token is rejected" a test that
+  passes or fails on machine speed. Both windows are half-open now, so 0 means 0.
+
+**`Bun.dns` is deliberately not all-or-nothing.** `lookup` cannot work — the browser resolves
+names inside `fetch()` and never hands the answer back, which is a platform privacy boundary
+rather than a missing shim — so it throws and points at DNS-over-HTTPS. But `prefetch` is
+ADVISORY: Bun's own example is a database driver warming a host at startup, it returns `void`,
+and callers do not guard it. Throwing there would take an app down over a hint it never needed,
+so it is an honest no-op and `getCacheStats` reports a cache that genuinely holds nothing.
+Warming DNS with a speculative `fetch` was considered and rejected — it sends real traffic to a
+host the caller only said they might contact.
+
+**The fourth was not cheap, and the reason is a defect we had shipped.** `Bun.zstd*` was
+supposed to be a thin re-export, because `node:zlib` already exports the whole zstd family.
+Probing it in the VM instead of reading the exports showed why that was wrong:
+
+```
+zstd   THREW: binding.ZstdCompress is not a constructor
+brotli THREW: binding.BrotliEncoder is not a constructor
+gzip   OK -> 28 bytes
+```
+
+There is no zstd engine, and no brotli engine either: `packages/codec` is built on flate2,
+which does deflate and gzip. The binding's own comment claimed "brotli/zstd are present so
+lib/zlib.js's module-level range asserts pass, but their handles throw" — the handles did not
+exist, so the throw was a `TypeError` from inside Node's own source, naming a class the caller
+never heard of. Meanwhile `zlib.brotliCompressSync` is a real exported function, so every
+`typeof zlib.brotliCompressSync === "function"` guard in the ecosystem takes the brotli branch
+and dies there. The comment described the intent; nothing implemented it.
+
+So the fourth item ships as honesty rather than capability, which is Phase 6's pattern applied
+one layer down: `Bun.zstd*` and the four zlib handles now throw a sentence naming the missing
+engine, the file it would live in, and the codec that does work. "Not implemented" rather than
+"not supported", deliberately — neither format is browser-hostile, and closing the gap means
+adding a crate to `packages/codec` and rebuilding the Wasm, not writing JavaScript.
+
+**The gate.** The offline tier gets the semantics (the NIST vector, every CSRF rejection path,
+the dns shape, both message wordings) plus the zlib handles, which are pure JS and throw before
+touching wasm. The kernel tier gets the two things offline structurally cannot: digests from
+the Rust/Wasm codec rather than the host's OpenSSL, and `blake2b256` — which Bun allows for
+CSRF and which OpenSSL does not know under that name, so the offline tier cannot exercise it at
+all.
+
+**Still uncovered, and now written down:** `HTMLRewriter`, `new Worker()`, `Bun.markdown`,
+`Bun.Image`, the `Bun.SQL` SQLite adapter, and real zstd/brotli engines. `new Worker()` is the
+one to look at next and is not merely absent: the runtime replaces `WebSocket` and `fetch` on
+the worker's shared `globalThis` but never touches `Worker`, so guest code calling
+`new Worker("./w.ts")` gets the HOST page's constructor, resolves the specifier against the
+Studio's origin instead of the VFS, and builds a worker with no kernel and no filesystem. Node
+has no global `Worker`, so no Node-tier spike can see it — the same blind spot that hid the
+Vite timer.

@@ -29,6 +29,9 @@ import { importMetaSource, transpileEsm } from "../packages/runtime/esm.js";
 // real require() path rather than just the wording of a string.
 import { nativeAddonMessage, nativeAddonError, packageNameFromPath } from "../packages/runtime/builtins/bun-unsupported.js";
 import { createModuleSystem } from "../packages/runtime/module.js";
+// internalBinding('zlib'): pulled in directly so the brotli/zstd handles can be
+// checked without a kernel — they are pure JS and throw before touching wasm.
+import { createZlibBinding } from "../packages/runtime/node/bindings/zlib.js";
 import {
   bunEnvMode,
   bunEnvFiles,
@@ -5157,6 +5160,137 @@ console.log("== the type stripper and module clauses ==");
   for (const name of ["serve", "spawn", "hash", "password", "Glob", "semver", "YAML", "TOML", "Transpiler", "build"])
     ok(typeof mod[name] !== "undefined", "`" + name + "` is reachable through the module");
   ok(rt.modules["bun:test"] && rt.modules["bun:sqlite"], "the bun:* modules are still registered alongside it");
+}
+
+// ---------------------------------------------------------------------------
+// Bun.sha, Bun.CSRF, Bun.dns and the Zstandard names.
+// ---------------------------------------------------------------------------
+{
+  console.log("\n== Bun.sha is SHA-2 512/256 ==");
+  const { Bun } = createBunRuntime({
+    process: { env: {}, argv: ["bun", "/app/x.ts"], cwd: () => "/app" },
+    Buffer,
+    require: nodeRequire,
+  });
+
+  // Pinned to NIST FIPS 180-4's worked SHA-512/256 example rather than to our own
+  // output, which would pass against any self-consistent wrong algorithm. The
+  // second assertion is the one that matters: reading "sha" as SHA-512 and
+  // truncating gives a different digest, and nothing about the shape would say so.
+  const ABC = "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23";
+  ok(Bun.sha("abc", "hex") === ABC, "Bun.sha('abc') matches the NIST SHA-512/256 vector");
+  const sha512Truncated = nodeRequire("crypto").createHash("sha512").update("abc").digest("hex").slice(0, 64);
+  ok(Bun.sha("abc", "hex") !== sha512Truncated, "…and is NOT truncated SHA-512, which the name invites");
+  ok(Bun.sha("abc").length === 32, "no encoding gives 32 raw bytes");
+  ok(Bun.sha(Buffer.from("abc"), "hex") === ABC, "a Buffer hashes the same as the string");
+  ok(Bun.sha("abc", "base64") === Buffer.from(ABC, "hex").toString("base64"), "base64 is the same digest, re-encoded");
+  {
+    const into = new Uint8Array(32);
+    const returned = Bun.sha("abc", into);
+    ok(returned === into && Buffer.from(into).toString("hex") === ABC, "a TypedArray is filled in place and returned");
+    let tooSmall = "";
+    try { Bun.sha("abc", new Uint8Array(31)); } catch (e) { tooSmall = e.message; }
+    ok(/at least 32 bytes/.test(tooSmall), "a short TypedArray is refused, not silently truncated");
+  }
+
+  console.log("\n== Bun.CSRF ==");
+  // The token format is ours (Bun does not document its own), so these checks pin
+  // BEHAVIOUR, not bytes: what verifies, what does not, and which failures are a
+  // false rather than a throw.
+  const token = Bun.CSRF.generate("s3cret", { sessionId: "user-1" });
+  ok(typeof token === "string" && token.length > 0, "generate() returns a string token");
+  ok(Bun.CSRF.verify(token, { secret: "s3cret", sessionId: "user-1" }) === true, "the token verifies with the same secret and session");
+  ok(Bun.CSRF.verify(token, { secret: "s3cret", sessionId: "user-2" }) === false, "a different session does not verify — the binding is real");
+  ok(Bun.CSRF.verify(token, { secret: "wrong", sessionId: "user-1" }) === false, "a different secret does not verify");
+  ok(Bun.CSRF.verify(token, { secret: "s3cret" }) === false, "a session-bound token does not verify unbound");
+  {
+    const bare = Bun.CSRF.generate("s3cret");
+    ok(Bun.CSRF.verify(bare, { secret: "s3cret" }) === true, "an unbound token verifies unbound");
+    ok(Bun.CSRF.verify(bare, { secret: "s3cret", sessionId: "user-1" }) === false, "…and fails when a session IS supplied, as Bun documents");
+  }
+  {
+    // Flip the last character: the MAC must reject it. (Two candidates so the
+    // flip is always a real change.)
+    const tampered = token.slice(0, -1) + (token.endsWith("A") ? "B" : "A");
+    ok(Bun.CSRF.verify(tampered, { secret: "s3cret", sessionId: "user-1" }) === false, "a tampered token does not verify");
+  }
+  ok(Bun.CSRF.verify("not-a-token", { secret: "s3cret" }) === false, "junk is a false, not a throw — it arrives from the network");
+  ok(Bun.CSRF.verify("", { secret: "s3cret" }) === false, "so is an empty token");
+  ok(Bun.CSRF.verify(token + "AA", { secret: "s3cret", sessionId: "user-1" }) === false, "appended bytes do not verify: the length check is exact");
+  // Deterministic because the windows are half-open — see the note in
+  // bun-crypto.js. With an inclusive bound these two pass or fail on clock tick.
+  ok(Bun.CSRF.verify(Bun.CSRF.generate("s3cret", { expiresIn: 0 }), { secret: "s3cret" }) === false, "expiresIn: 0 is expired immediately, every time");
+  ok(Bun.CSRF.verify(Bun.CSRF.generate("s3cret"), { secret: "s3cret", maxAge: 0 }) === false, "maxAge: 0 rejects a brand-new token, every time");
+  {
+    const hex = Bun.CSRF.generate("s3cret", { encoding: "hex", algorithm: "sha512" });
+    ok(/^[0-9a-f]+$/.test(hex), "encoding: hex really is hex");
+    ok(Bun.CSRF.verify(hex, { secret: "s3cret", encoding: "hex", algorithm: "sha512" }) === true, "…and round-trips with the matching options");
+    ok(Bun.CSRF.verify(hex, { secret: "s3cret", algorithm: "sha512" }) === false, "a mismatched encoding does not verify");
+    ok(Bun.CSRF.verify(hex, { secret: "s3cret", encoding: "hex" }) === false, "a mismatched algorithm does not verify");
+  }
+  ok(Bun.CSRF.verify(Bun.CSRF.generate()) === true, "the per-thread default secret round-trips when neither call names one");
+  {
+    // Pins the DEFAULTS, which is where this first went wrong: taking the head of
+    // each allowed list gave blake2b256/base64 instead of Bun's sha256/base64url.
+    // Both still round-trip against themselves, so only naming the expected
+    // default explicitly catches it.
+    const dflt = Bun.CSRF.generate("s3cret");
+    ok(Bun.CSRF.verify(dflt, { secret: "s3cret", algorithm: "sha256", encoding: "base64url" }) === true, "the defaults really are sha256 + base64url");
+    ok(Bun.CSRF.verify(dflt, { secret: "s3cret", algorithm: "sha512" }) === false, "…and not some other algorithm that would also self-verify");
+    ok(!/[+/=]/.test(dflt), "a default token is base64url, so it is URL- and form-safe");
+  }
+  {
+    // An unknown algorithm is a bug in the caller, so it throws on BOTH sides.
+    // Returning false would present a broken deployment as a flood of "invalid
+    // token" — the exact confusion this API is supposed to remove.
+    let g = "", v = "";
+    try { Bun.CSRF.generate("s", { algorithm: "md5" }); } catch (e) { g = e.message; }
+    try { Bun.CSRF.verify(token, { algorithm: "md5" }); } catch (e) { v = e.message; }
+    ok(/algorithm must be one of/.test(g) && /algorithm must be one of/.test(v), "an unsupported algorithm throws on generate and verify");
+  }
+
+  console.log("\n== Bun.dns: one refusal, two honest no-ops ==");
+  ok(Bun.dns.prefetch("example.com", 443) === undefined, "prefetch is inert and returns void — an advisory hint must not throw");
+  {
+    const stats = Bun.dns.getCacheStats();
+    const keys = Object.keys(stats).sort().join(",");
+    ok(keys === "cacheHitsCompleted,cacheHitsInflight,cacheMisses,errors,size,totalCount", "getCacheStats has Bun's exact shape: " + keys);
+    ok(Object.values(stats).every((v) => v === 0), "…reporting a cache that really is empty, not invented numbers");
+  }
+  {
+    let msg = "";
+    try { Bun.dns.lookup("example.com"); } catch (e) { msg = e.message; }
+    ok(/not supported in Vivari \(browser sandbox\)/.test(msg), "lookup uses the CANNOT-EVER wording, not the not-yet one");
+    ok(/DNS-over-HTTPS/.test(msg), "…and names the alternative that does work from a page");
+  }
+
+  console.log("\n== Zstandard is absent, and says so ==");
+  for (const name of ["zstdCompressSync", "zstdDecompressSync", "zstdCompress", "zstdDecompress"]) {
+    ok(typeof Bun[name] === "function", "Bun." + name + " exists, so feature detection sees a function");
+    let msg = "";
+    try { Bun[name]("x"); } catch (e) { msg = e.message; }
+    // The wording distinction is load-bearing (see bun-unsupported.js's header):
+    // zstd is a GAP someone can close, not a wall like Bun.dns.lookup.
+    ok(/is not implemented in the Vivari shim/.test(msg), "Bun." + name + " uses the not-YET wording");
+    ok(/packages\/codec/.test(msg), "…and names where the engine would go");
+  }
+
+  console.log("\n== node:zlib's brotli/zstd handles fail with a sentence, not a TypeError ==");
+  {
+    // The Bun names above are only half the story: lib/zlib.js exports
+    // brotliCompressSync and the zstd family unconditionally, so anything doing
+    // `typeof zlib.brotliCompressSync === "function"` takes that branch. Before
+    // these handles existed the branch died on "binding.BrotliEncoder is not a
+    // constructor" from inside Node's own source.
+    const binding = createZlibBinding({ makeZStream: null, process });
+    for (const [cls, codec] of [["BrotliEncoder", "brotli"], ["BrotliDecoder", "brotli"], ["ZstdCompress", "Zstandard"], ["ZstdDecompress", "Zstandard"]]) {
+      ok(typeof binding[cls] === "function", "the binding exposes " + cls);
+      let msg = "";
+      try { new binding[cls](); } catch (e) { msg = e.message; }
+      ok(msg.indexOf("is not implemented in Vivari") !== -1 && msg.indexOf(codec) !== -1, cls + " names the missing " + codec + " engine");
+      ok(/gzip/.test(msg), "…and points at the codec that does work here");
+    }
+  }
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Bun checks passed");

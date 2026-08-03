@@ -37,6 +37,7 @@ use instead.
 | `Bun.secrets` | A server you reach over HTTPS; `.env` for non-secret config | It stores credentials in the OS keychain. `localStorage` would satisfy the signature and void the encryption-at-rest guarantee that is the entire point |
 | `Bun.peek` / `Bun.peek.status` | `await`, `.then()` | A settled promise's value lives in engine-internal state that no JavaScript engine exposes synchronously to page code |
 | `Bun.WebView` | Drive Vivari's preview `<iframe>` from your host page | It launches a real browser process, or talks to one over the Chrome DevTools Protocol on a TCP port |
+| `Bun.dns.lookup` | A DNS-over-HTTPS endpoint via `fetch()` | A page has no resolver. The browser resolves names inside `fetch()` and never hands the address back — a platform privacy boundary, not a missing shim. `Bun.dns.prefetch` and `getCacheStats` do **not** throw: see below |
 | `bun build --compile` | `bun build <entry> --outfile=<file>` | It emits a standalone native executable with the Bun runtime embedded |
 
 A few things are **not implemented rather than impossible**, and the error says
@@ -46,6 +47,23 @@ JavaScript; the kernel gives a child plain pipes today), `Bun.SQL`'s SQLite
 adapter (use the `bun:sqlite` module), `Bun.build`'s `minify` / `splitting` /
 `sourcemap` options (see [Bundling](#bundling-with-bunbuild) below), and Bun
 macros, which need no capability the sandbox lacks.
+
+**Zstandard and brotli** are in that second group. `Bun.zstdCompressSync` and its
+three siblings throw, and so do `node:zlib`'s `brotli*` and `zstd*` functions:
+Vivari's compression codec is built on flate2, which implements deflate and gzip
+only. Nothing about either format is browser-hostile — closing this means adding
+the engine to the Rust crate. `gzipSync` / `gunzipSync` / `deflateSync` /
+`inflateSync` are real and unaffected, on both the `Bun` global and `node:zlib`.
+
+### Two members that stay quiet on purpose
+
+`Bun.dns.prefetch` and `Bun.dns.getCacheStats` are the deliberate exception to
+"everything unsupported throws". `prefetch` is advisory — Bun's own example is a
+database driver warming a hostname at startup — it returns `void`, and code that
+calls it does not guard it. Throwing would take an app down over a hint it never
+needed, so `prefetch` does nothing and `getCacheStats` reports a cache that
+really is empty. Warming DNS with a speculative `fetch` was considered and
+rejected: it would send real traffic to a host you only said you *might* contact.
 
 Every one of these is **safe to import**. The symbol exists, so
 `import { dlopen } from "bun:ffi"` at the top of a dependency you never call does
@@ -86,7 +104,8 @@ replacement that works, that is a very welcome pull request.
 The shim is not a stub list. `Bun.serve` (with `routes`, `fetch`, an `error`
 handler and server-side WebSockets), `Bun.file`/`Bun.write` and the incremental
 `FileSink`, `Bun.$`, `Bun.spawn`, `Bun.Glob`, `Bun.FileSystemRouter`,
-`Bun.CryptoHasher` and `Bun.password`, `Bun.hash`, `Bun.YAML`/`TOML`/`JSON5`,
+`Bun.CryptoHasher` and `Bun.password`, `Bun.hash`, `Bun.sha`, `Bun.CSRF`,
+`Bun.YAML`/`TOML`/`JSON5`,
 `Bun.build` and `Bun.plugin` (see below), `Bun.Transpiler`, zero-config TypeScript, automatic
 `.env` loading with Bun's precedence rules, and
 the `bun:test` runner all behave as documented — and where they diverge, the
@@ -96,6 +115,38 @@ Where an API has one exact right answer, it is pinned to a value produced by rea
 Bun rather than to itself: `Bun.hash` is checked against Bun's own published
 wyhash digests, and a `Bun.password` hash written in the sandbox verifies under
 real Bun and vice versa.
+
+`Bun.sha` is worth a sentence of its own, because the name is a trap: it is
+**SHA-2 512/256**, not SHA-512 truncated, and the two produce completely
+different digests for the same input. Ours is pinned to NIST FIPS 180-4's worked
+example, so it agrees with real Bun and with `openssl sha512-256`.
+
+### `Bun.CSRF`
+
+`Bun.CSRF.generate` and `Bun.CSRF.verify` work with all of Bun's documented
+options — `expiresIn`, `maxAge`, `encoding`, `algorithm`, `sessionId` — and the
+same defaults (24 hours, `base64url`, `sha256`).
+
+One difference matters if your app spans two runtimes: **the token format is
+Vivari's, not Bun's.** Bun does not document its wire layout, so a token minted
+here will not verify on a real Bun server, or the reverse. Within one runtime
+this is invisible; across two it rejects every request, which is why it is stated
+here rather than left to be discovered. What is portable is the contract — same
+options, same defaults, same `true`/`false`.
+
+As in Bun, pass a `sessionId` to both calls. Without one the token is bound only
+to the secret, so any token you have ever issued verifies for every user:
+
+```ts
+const token = Bun.CSRF.generate(SECRET, { sessionId });
+// ...later, on the POST:
+if (!Bun.CSRF.verify(submitted, { secret: SECRET, sessionId })) return new Response("no", { status: 403 });
+```
+
+A malformed or tampered token is `false`, never a throw — it arrives from the
+network. A *misconfigured* one (an algorithm Bun does not offer) does throw, on
+both calls: that is your bug, and returning `false` would disguise a broken
+deployment as a flood of invalid tokens.
 
 Both spellings of the import work — the `Bun` global, and the bare module Bun's
 own documentation tends to use:

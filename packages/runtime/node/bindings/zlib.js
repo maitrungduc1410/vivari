@@ -187,5 +187,42 @@ export function createZlibBinding({ makeZStream, process }) {
     }
   }
 
-  return { Zlib, crc32 };
+  // The handles lib/zlib.js reaches for when someone calls its brotli or zstd
+  // entry points. They have to EXIST: the module-level code above already admits
+  // the op codes so lib/zlib.js loads, which means `zlib.brotliCompressSync` is a
+  // real function and every `typeof zlib.brotliCompressSync === "function"` guard
+  // in the ecosystem takes the brotli branch. Leaving the classes off did not
+  // prevent that branch — it just made the branch die on
+  // `binding.BrotliEncoder is not a constructor`, thrown from inside Node's own
+  // lib/zlib.js, naming nothing the caller could act on and pointing at a file
+  // they did not write. (The comment above said "their handles throw"; the
+  // handles did not exist, so the throw was a TypeError from the call site.)
+  //
+  // Same trade as builtins/bun-unsupported.js: no capability is added here, one
+  // kind of failure becomes another. "Not implemented" rather than "not
+  // supported", deliberately — neither codec is browser-hostile, both are absent
+  // because the Rust crate does not carry them yet.
+  const missingCodec = (className, apis, codec) => {
+    const C = class {
+      constructor() {
+        throw new Error(
+          `node:zlib ${apis} is not implemented in Vivari: the Rust/Wasm codec ` +
+            `(packages/codec) is built on flate2, which provides deflate and gzip only — ` +
+            `there is no ${codec} engine behind this binding. gzip, deflate, inflate and ` +
+            `unzip all work. If you are choosing an encoding at runtime, prefer gzip here; ` +
+            `if you need ${codec} specifically, it has to be added to packages/codec and ` +
+            `the Wasm rebuilt.`
+        );
+      }
+    };
+    Object.defineProperty(C, "name", { value: className, configurable: true });
+    return C;
+  };
+
+  const BrotliEncoder = missingCodec("BrotliEncoder", "brotliCompress/brotliCompressSync", "brotli");
+  const BrotliDecoder = missingCodec("BrotliDecoder", "brotliDecompress/brotliDecompressSync", "brotli");
+  const ZstdCompress = missingCodec("ZstdCompress", "zstdCompress/zstdCompressSync", "Zstandard");
+  const ZstdDecompress = missingCodec("ZstdDecompress", "zstdDecompress/zstdDecompressSync", "Zstandard");
+
+  return { Zlib, crc32, BrotliEncoder, BrotliDecoder, ZstdCompress, ZstdDecompress };
 }

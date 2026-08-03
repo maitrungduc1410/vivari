@@ -268,11 +268,70 @@ export function createBunUnsupported() {
   // Bun.dlopen is bun:ffi's dlopen re-exported on the global; one message.
   const dlopen = sandboxThrow("Bun.dlopen()", NO_DLOPEN);
 
+  // --- Bun.dns --------------------------------------------------------------
+  // The one member here that is deliberately NOT all-or-nothing, because the
+  // three members fail differently and pretending otherwise would be its own lie.
+  //
+  // `lookup` cannot work: a page has no resolver. The browser resolves names
+  // inside fetch() and never hands back the answer — there is no API that returns
+  // an address for a hostname, which is a privacy decision rather than a gap.
+  //
+  // `prefetch` and `getCacheStats` are the opposite case: they are ADVISORY, and
+  // throwing would be the wrong answer. Bun's own example is a database driver
+  // warming a host at startup; that call is opportunistic, its return value is
+  // `void`, and code that makes it does not expect to have to guard it. Throwing
+  // there would take down an app over a hint it never needed. So `prefetch` is an
+  // honest no-op, and `getCacheStats` reports a cache that genuinely holds
+  // nothing rather than inventing plausible numbers. Warming DNS by firing a
+  // speculative fetch was considered and rejected: it sends real traffic the
+  // caller did not ask for, to a host they only said they MIGHT contact.
+  const dns = {
+    lookup: sandboxThrow(
+      "Bun.dns.lookup()",
+      "a page has no DNS resolver. The browser resolves hostnames inside fetch() " +
+        "and deliberately never exposes the result to JavaScript, so there is no " +
+        "address to return — this is a privacy boundary in the platform, not a " +
+        "missing shim. If you need the IP, ask a DNS-over-HTTPS endpoint with " +
+        "fetch() (Cloudflare and Google both serve one with CORS enabled)."
+    ),
+    // Signature-compatible and intentionally inert: `void` in, `void` out.
+    prefetch: () => {},
+    getCacheStats: () => ({
+      cacheHitsCompleted: 0,
+      cacheHitsInflight: 0,
+      cacheMisses: 0,
+      size: 0,
+      errors: 0,
+      totalCount: 0,
+    }),
+  };
+
+  // --- Zstandard ------------------------------------------------------------
+  // A gap, not a limit — hence shimMessage. Nothing about zstd is browser-hostile;
+  // it is missing because Vivari's codec crate (packages/codec) builds on flate2,
+  // which covers deflate/gzip and nothing else. The same hole is why node:zlib's
+  // brotli and zstd families throw (see packages/runtime/node/bindings/zlib.js),
+  // and it closes in one place: add the engine to the Rust crate.
+  const ZSTD_REASON =
+    "Vivari's compression codec (packages/codec) is built on flate2, which " +
+    "implements deflate and gzip only — there is no Zstandard engine behind it, " +
+    "and node:zlib's zstd family is unimplemented here for the same reason. " +
+    "Bun.gzipSync/gunzipSync/deflateSync/inflateSync are real and work today. " +
+    "Closing this means adding a zstd crate to packages/codec and rebuilding the " +
+    "Wasm, not writing JavaScript.";
+  const zstd = {
+    zstdCompressSync: shimThrow("Bun.zstdCompressSync()", ZSTD_REASON),
+    zstdDecompressSync: shimThrow("Bun.zstdDecompressSync()", ZSTD_REASON),
+    zstdCompress: shimThrow("Bun.zstdCompress()", ZSTD_REASON),
+    zstdDecompress: shimThrow("Bun.zstdDecompress()", ZSTD_REASON),
+  };
+
   return {
     listen, connect, udpSocket,
     RedisClient, redis,
     SQL, sql,
     WebView, mmap, peek, secrets, dlopen,
+    dns, zstd,
   };
 }
 

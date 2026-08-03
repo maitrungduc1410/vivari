@@ -693,6 +693,22 @@ Two rules follow:
    crates built (recorded because the note above correctly flagged itself as
    unverified, and that flag should not outlive the verification).
 
+**Act 3, the same trap one layer down: `node:zlib`'s brotli and zstd.** Both
+families are exported by our vendored `lib/zlib.js` — `typeof
+zlib.brotliCompressSync === "function"` is `true` — and both die on
+`binding.BrotliEncoder is not a constructor`, because `packages/codec` is built on
+flate2 and carries neither engine. Worth reading twice if you are about to trust a
+comment: the binding's header *said* "brotli/zstd are present so lib/zlib.js's
+module-level range asserts pass, but their handles throw", and the handles did not
+exist, so what actually threw was a `TypeError` from inside Node's own source
+naming a class the caller never heard of. The comment documented an intention
+nobody had implemented, and it read as reassurance for however long it sat there.
+The handles now exist and throw a sentence naming the missing engine (the
+`bun-unsupported.js` pattern, applied to a Node builtin). **Two habits follow: run
+the API in the VM rather than reading its export list, and treat a comment
+describing behaviour as a claim to test, not a fact.** An exported function is not
+an implemented one, and neither is a comment.
+
 ### `capture: true` hides a process's stderr from `VV_LIVE=1`
 `kernel.start(cmd, args, { capture: true })` buffers the child's output into
 `r.stdout`/**`r.stderr`** and, on that path, the kernel's `stdout`/`stderr`

@@ -1178,7 +1178,8 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
   // covers Bun's whole documented algorithm family with HMAC keying and Bun's
   // consumed-HMAC semantics, and the password functions are genuine argon2id and
   // bcrypt emitting PHC / modular-crypt strings that round-trip with real Bun.
-  const { CryptoHasher, password } = createBunCrypto({ lazy, Buffer, process });
+  // Bun.sha (SHA-2 512/256, not SHA-512) and Bun.CSRF ride the same primitives.
+  const { CryptoHasher, password, sha, CSRF } = createBunCrypto({ lazy, Buffer, process });
 
   // ---- misc helpers ----------------------------------------------------------
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms instanceof Date ? Math.max(0, ms - Date.now()) : ms));
@@ -1248,7 +1249,9 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     nanoseconds,
     hash: bunHash,
     CryptoHasher,
+    sha,
     password,
+    CSRF,
     deepEquals,
     deepMatch,
     Glob,
@@ -1291,6 +1294,9 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     gunzipSync: zlibSync("gunzipSync"),
     deflateSync: zlibSync("deflateSync"),
     inflateSync: zlibSync("inflateSync"),
+    // Zstandard has no engine here — the four names exist so the failure says so
+    // instead of being `undefined is not a function` (./bun-unsupported.js).
+    ...unsupported.zstd,
     fileURLToPath,
     pathToFileURL,
     resolveSync: (id, root) => bunResolveSync(id, root),
@@ -1330,6 +1336,9 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     // the API, the specific missing capability, and the alternative. These were
     // all simply `undefined` before, which produced "Bun.udpSocket is not a
     // function" from deep inside a dependency and explained nothing.
+    // `dns` is the mixed case: lookup throws, while prefetch and getCacheStats
+    // are honest no-ops, because an advisory hint should not take an app down.
+    dns: unsupported.dns,
     listen: unsupported.listen,
     connect: unsupported.connect,
     udpSocket: unsupported.udpSocket,

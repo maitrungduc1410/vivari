@@ -524,5 +524,146 @@ export function createBunCrypto({ lazy, Buffer, process }) {
     verifySync,
   };
 
-  return { CryptoHasher, password };
+  // ---- Bun.sha ---------------------------------------------------------------
+  // SHA-2 **512/256**, not SHA-512. Bun's short name is the truncated-512
+  // variant: faster than SHA-256 on 64-bit hardware, and immune to the length
+  // extension plain SHA-512 permits. Guessing "sha512" from the name produces a
+  // digest that is wrong in the worst way — it looks right (32 hex bytes if you
+  // truncate, a plausible hash either way) while disagreeing with every other Bun
+  // runtime and with `openssl sha512-256`. Hence the constant, and the comment.
+  //
+  // The overloads are CryptoHasher's, in one shot: no second argument yields raw
+  // bytes, a DigestEncoding string yields that encoding, and a TypedArray is
+  // filled in place — encodeDigest enforces Bun's 32-byte minimum for that case.
+  const SHA_ALGORITHM = "sha512-256";
+  function sha(input, encodingOrArray) {
+    return encodeDigest(
+      rawDigest(SHA_ALGORITHM, toBytes(input)),
+      encodingOrArray,
+      DIGEST_BYTE_LENGTH[SHA_ALGORITHM]
+    );
+  }
+
+  // ---- Bun.CSRF --------------------------------------------------------------
+  // HMAC-signed tokens carrying a nonce and a timestamp, per Bun's documented
+  // options. Two things are worth stating plainly before the code:
+  //
+  // 1. THE TOKEN FORMAT IS OURS, NOT BUN'S. Bun does not document its wire
+  //    layout, so a token minted by real Bun will not verify here and vice versa.
+  //    That is invisible in a single runtime and fatal across two (an app that
+  //    issues tokens in Vivari and verifies them on a real Bun server would
+  //    reject every request), so it is called out in the docs rather than left
+  //    for someone to discover in production. What IS portable is the contract:
+  //    same options, same defaults, same true/false.
+  //
+  // 2. THE SESSION BINDING IS INSIDE THE MAC, NOT THE TOKEN. Bun's own docs are
+  //    blunt that a token bound only to a secret is replayable by any user who
+  //    ever obtained one. Feeding sessionId through the MAC rather than the
+  //    payload means a token cannot be re-pointed at another principal without
+  //    the secret, and — because "" is a distinct input — a token minted without
+  //    a sessionId fails when one is supplied, which is the behaviour Bun spells
+  //    out and the one a security test would check for.
+  const CSRF_ALGORITHMS = ["blake2b256", "blake2b512", "sha256", "sha384", "sha512", "sha512-256"];
+  const CSRF_ENCODINGS = ["base64", "base64url", "hex"];
+  const CSRF_DEFAULT_ALGORITHM = "sha256";
+  const CSRF_DEFAULT_ENCODING = "base64url";
+  const CSRF_DEFAULT_MS = 86400000; // 24 hours — Bun's default for both expiresIn and maxAge
+  const CSRF_NONCE_BYTES = 16;
+  const CSRF_HEADER_BYTES = CSRF_NONCE_BYTES + 16; // nonce + issuedAt(8) + expiresAt(8)
+
+  // Bun generates one random secret per thread when the caller omits it. Same
+  // here, and with the same caveat: it dies with the process, so tokens do not
+  // survive a reload or cross a worker. Lazy, so a process that never touches
+  // CSRF never pulls in crypto.
+  let defaultSecret = null;
+  const secretOrDefault = (secret) => {
+    if (secret != null && secret !== "") return secret;
+    if (defaultSecret == null) defaultSecret = lazy("crypto").randomBytes(32).toString("hex");
+    return defaultSecret;
+  };
+
+  // The default is passed in rather than taken as allowed[0]: Bun's defaults are
+  // sha256 and base64url, neither of which is first in its list, and defaulting
+  // to the head of the array silently picked blake2b256/base64 instead.
+  const csrfOption = (value, allowed, fallback, name) => {
+    if (value == null) return fallback;
+    if (allowed.indexOf(value) === -1) {
+      throw new TypeError(
+        `Bun.CSRF: ${name} must be one of ${allowed.join(", ")} — got ${JSON.stringify(value)}`
+      );
+    }
+    return value;
+  };
+
+  // Milliseconds as two big-endian 32-bit halves rather than a BigInt: exact for
+  // every timestamp below 2^53, and it keeps the token free of a BigInt
+  // dependency in the buffer layer.
+  const writeMs = (buf, offset, ms) => {
+    buf.writeUInt32BE(Math.floor(ms / 0x100000000), offset);
+    buf.writeUInt32BE(ms >>> 0, offset + 4);
+  };
+  const readMs = (buf, offset) => buf.readUInt32BE(offset) * 0x100000000 + buf.readUInt32BE(offset + 4);
+
+  const csrfMac = (algorithm, secret, header, sessionId) =>
+    rawHmac(algorithm, toBytes(secret), Buffer.concat([header, toBytes(String(sessionId == null ? "" : sessionId))]));
+
+  const CSRF = {
+    generate(secret, options) {
+      const opts = options || {};
+      const algorithm = csrfOption(opts.algorithm, CSRF_ALGORITHMS, CSRF_DEFAULT_ALGORITHM, "algorithm");
+      const encoding = csrfOption(opts.encoding, CSRF_ENCODINGS, CSRF_DEFAULT_ENCODING, "encoding");
+      const expiresIn = opts.expiresIn == null ? CSRF_DEFAULT_MS : opts.expiresIn;
+      if (typeof expiresIn !== "number" || !(expiresIn >= 0)) {
+        throw new TypeError(`Bun.CSRF: expiresIn must be a non-negative number of milliseconds — got ${expiresIn}`);
+      }
+      const issuedAt = Date.now();
+      const header = Buffer.alloc(CSRF_HEADER_BYTES);
+      lazy("crypto").randomBytes(CSRF_NONCE_BYTES).copy(header, 0);
+      writeMs(header, CSRF_NONCE_BYTES, issuedAt);
+      writeMs(header, CSRF_NONCE_BYTES + 8, issuedAt + expiresIn);
+      const mac = csrfMac(algorithm, secretOrDefault(secret), header, opts.sessionId);
+      return Buffer.concat([header, mac]).toString(encoding);
+    },
+
+    verify(token, options) {
+      const opts = options || {};
+      // Option validation still throws: a typo'd algorithm is a bug in the
+      // caller, and returning false for it would present a broken deployment as
+      // an endless stream of "invalid token" — the failure mode this API exists
+      // to make legible.
+      const algorithm = csrfOption(opts.algorithm, CSRF_ALGORITHMS, CSRF_DEFAULT_ALGORITHM, "algorithm");
+      const encoding = csrfOption(opts.encoding, CSRF_ENCODINGS, CSRF_DEFAULT_ENCODING, "encoding");
+      const maxAge = opts.maxAge == null ? CSRF_DEFAULT_MS : opts.maxAge;
+      if (typeof token !== "string" || token === "") return false;
+      try {
+        const raw = Buffer.from(token, encoding);
+        const macLength = DIGEST_BYTE_LENGTH[algorithm];
+        // An exact length check, not a minimum: a token with trailing bytes is
+        // not a valid token, and accepting one would let an attacker append.
+        if (raw.length !== CSRF_HEADER_BYTES + macLength) return false;
+        const header = raw.subarray(0, CSRF_HEADER_BYTES);
+        const expected = csrfMac(algorithm, secretOrDefault(opts.secret), header, opts.sessionId);
+        if (!lazy("crypto").timingSafeEqual(raw.subarray(CSRF_HEADER_BYTES), expected)) return false;
+        // Signature first, THEN the clock: comparing timestamps on an unverified
+        // token would answer questions about a payload anyone can forge.
+        // Half-open windows: valid while now < expiresAt and age < maxAge. The
+        // inclusive form looks equivalent and is not — `expiresIn: 0` then
+        // produces a token that verifies for exactly as long as the clock takes
+        // to tick, so a test asserting an expired token is rejected passes or
+        // fails on machine speed. Half-open makes 0 mean 0.
+        const now = Date.now();
+        const issuedAt = readMs(header, CSRF_NONCE_BYTES);
+        const expiresAt = readMs(header, CSRF_NONCE_BYTES + 8);
+        if (now >= expiresAt) return false;
+        if (typeof maxAge === "number" && now - issuedAt >= maxAge) return false;
+        return true;
+      } catch {
+        // A malformed token is a `false`, never a throw: it arrives from the
+        // network, so throwing would turn every junk request into a 500.
+        return false;
+      }
+    },
+  };
+
+  return { CryptoHasher, password, sha, CSRF };
 }
