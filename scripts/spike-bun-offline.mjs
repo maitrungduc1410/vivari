@@ -5209,9 +5209,16 @@ console.log("== the type stripper and module clauses ==");
     ok(Bun.CSRF.verify(bare, { secret: "s3cret", sessionId: "user-1" }) === false, "…and fails when a session IS supplied, as Bun documents");
   }
   {
-    // Flip the last character: the MAC must reject it. (Two candidates so the
-    // flip is always a real change.)
-    const tampered = token.slice(0, -1) + (token.endsWith("A") ? "B" : "A");
+    // Flip a bit the MAC actually covers, and check that it landed. Flipping the
+    // last CHARACTER does not qualify: the token is 64 bytes of base64url, so its
+    // final character carries two significant bits and four that decode to
+    // nothing. `A`→`B` moves only the latter, and one token in four ends in `A`,
+    // which is a check that failed 25% of the time for no reason of the code's.
+    const raw = Buffer.from(token, "base64url");
+    const flipped = Buffer.from(raw);
+    flipped[flipped.length - 1] ^= 1;
+    const tampered = flipped.toString("base64url");
+    ok(!Buffer.from(tampered, "base64url").equals(raw), "the tamper reached the bytes the MAC is over");
     ok(Bun.CSRF.verify(tampered, { secret: "s3cret", sessionId: "user-1" }) === false, "a tampered token does not verify");
   }
   ok(Bun.CSRF.verify("not-a-token", { secret: "s3cret" }) === false, "junk is a false, not a throw — it arrives from the network");
