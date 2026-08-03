@@ -716,6 +716,14 @@ throw that gets swallowed. Rules:
   JSON-stringified — escaping overflows) and are chunked into frames the kernel
   reassembles by `reqId` (`fs-client.respond` + `kernel.handleRespond`).
 - **Downloads** (`OP_FETCH`) stream straight into the VFS, bypassing the window.
+- Large **inbound HTTP request bodies** (an upload to an in-VM server) spill to
+  `/var/run/vv-http/<reqId>.bin` in `kernel._stageInboundBody`; the request
+  carries `bodyPath` instead of `body` and the guest reads it with plain `fs`.
+  Smaller bodies cross inline, binary ones as `{body, bodyEncoding:'base64'}` —
+  the inbox is JSON, so a raw `Buffer` there becomes `{type:'Buffer',data:[…]}`
+  and the guest's `creq.end()` HANGS rather than failing.
+- `respondOk` now throws if a response exceeds the window, naming the size. It
+  used to be a bare `RangeError` out of `Uint8Array.set` that killed the kernel.
 - If you add a syscall that can carry big data, chunk it from day one.
 
 ### The Fetcher strips non-CORS-safelisted request headers — for the REGISTRIES only

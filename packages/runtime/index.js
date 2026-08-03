@@ -771,7 +771,24 @@ export function createRuntime({
       return;
     }
     creq.on("error", fail);
-    const body = req.body;
+    // A binary body (a file upload) crossed the JSON boundary base64-encoded,
+    // exactly as binary responses do in the other direction; rebuild the bytes so
+    // the guest handler sees what the client actually sent.
+    let body;
+    if (req.bodyPath) {
+      // A body too big for the 1 MiB syscall window came through the VFS.
+      try {
+        body = fs.readFileSync(req.bodyPath);
+      } catch (e) {
+        fail(e);
+        return;
+      }
+      try { fs.unlinkSync(req.bodyPath); } catch { /* best effort: it is scratch */ }
+    } else if (req.bodyEncoding === "base64" && typeof req.body === "string") {
+      body = Buffer.from(req.body, "base64");
+    } else {
+      body = req.body;
+    }
     if (body != null && body !== "" && req.method !== "GET" && req.method !== "HEAD") creq.end(body);
     else creq.end();
   };

@@ -31,6 +31,7 @@ import {
   I_OPCODE,
   I_REQ_LEN,
   I_RES_LEN,
+  DATA_BYTES,
   STATE_RESPONSE_OK,
   STATE_RESPONSE_ERR,
   OP_SPAWN,
@@ -63,6 +64,34 @@ function b64ToBytes(b64) {
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
+
+// Encode bytes the way b64ToBytes reads them back.
+function bytesToB64(bytes) {
+  if (typeof Buffer !== "undefined") return Buffer.from(bytes).toString("base64");
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+// Whatever shape the caller used, reduce an inbound body to bytes: a string
+// (utf8), a base64 string carrying the marker, a Buffer/TypedArray/ArrayBuffer
+// from a test or a caller that read the request as bytes.
+function inboundBodyBytes(req) {
+  const body = req && req.body;
+  if (body == null || body === "") return null;
+  if (body instanceof Uint8Array) return body;
+  if (body instanceof ArrayBuffer) return new Uint8Array(body);
+  if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  if (typeof body === "string") {
+    return req.bodyEncoding === "base64" ? b64ToBytes(body) : new TextEncoder().encode(body);
+  }
+  return null;
+}
+
+// The inbox is handed to the process worker as JSON through the 1 MiB syscall
+// window, so a body has to become a string AND has to fit. Leave headroom for
+// the url, headers and framing that share the frame.
+const INBOX_INLINE_MAX = DATA_BYTES - 16 * 1024;
 
 export class Kernel {
   constructor({ fs, spawnWorker, stdout, stderr, fetcher, signalGraceMs }) {
@@ -866,6 +895,11 @@ export class Kernel {
           headers: { "content-type": "text/plain" },
           body: "server process exited\n",
         });
+        // A large body spilled to the VFS for this request never got read (and
+        // unlinked) by the guest. The VFS lives in Wasm RAM, so an upload
+        // abandoned mid-flight would hold onto it for the rest of the session.
+        const spilled = `/var/run/vv-http/${reqId}.bin`;
+        if (this.exists(spilled)) this.unlink(spilled);
         this.pendingHttp.delete(reqId);
       }
     }
@@ -975,6 +1009,16 @@ export class Kernel {
 
   // ---- syscall servicing ----------------------------------------------------
   respondOk(proc, bytes) {
+    // A payload larger than the window used to surface as `RangeError: offset is
+    // out of bounds` from deep inside Uint8Array.set, which killed the kernel and
+    // named neither the syscall nor the size. Anything that can grow must spill
+    // out of band (see _stageInboundBody); this says so when something forgets.
+    if (bytes.length > DATA_BYTES) {
+      throw new Error(
+        `kernel: syscall response of ${bytes.length} bytes exceeds the ${DATA_BYTES}-byte window — ` +
+          "chunk it or pass it through the VFS",
+      );
+    }
     proc.data.set(bytes, 0);
     Atomics.store(proc.ctrl, I_RES_LEN, bytes.length);
     Atomics.store(proc.ctrl, I_STATE, STATE_RESPONSE_OK);
@@ -1166,22 +1210,56 @@ export class Kernel {
     }
   }
 
+  // Prepare an inbound body for the trip to the process worker.
+  //
+  // Two hazards, both of which used to be silent. JSON has no bytes, so a
+  // Buffer body serialised to {type:'Buffer',data:[…]} and the guest's
+  // creq.end() never completed — the request HUNG. And the frame is 1 MiB, so a
+  // large upload overran the window and took the kernel down with a RangeError
+  // out of respondOk.
+  //
+  // Small bodies cross inline, in the {body, bodyEncoding:'base64'} shape the
+  // response direction already uses. Anything bigger goes through the VFS
+  // instead — the same escape hatch fetch bodies use — and the guest reads it
+  // back with plain fs.
+  async _stageInboundBody(req, reqId) {
+    const bytes = inboundBodyBytes(req);
+    if (!bytes) return req;
+    const size = bytes.byteLength;
+    if (size <= INBOX_INLINE_MAX) {
+      const asUtf8 = new TextDecoder().decode(bytes);
+      const roundTrip = new TextEncoder().encode(asUtf8);
+      const lossless = roundTrip.length === size && roundTrip.every((b, i) => b === bytes[i]);
+      // base64 inflates by 4/3, so a body that fits raw may not fit encoded.
+      if (lossless) return { ...req, body: asUtf8, bodyEncoding: undefined };
+      const b64 = bytesToB64(bytes);
+      if (b64.length <= INBOX_INLINE_MAX) return { ...req, body: b64, bodyEncoding: "base64" };
+    }
+    const path = `/var/run/vv-http/${reqId}.bin`;
+    this.mkdirp("/var/run/vv-http");
+    // writeLarge transfers the buffer, so anything read off `bytes` must be
+    // captured first (see the fetch path, which has the same footgun).
+    await this.fs.writeLarge(path, bytes);
+    return { ...req, body: "", bodyEncoding: undefined, bodyPath: path };
+  }
+
   /**
    * Route an inbound HTTP request to the process listening on `port`.
    * Returns a Promise<{status,headers,body}>. This is the kernel's public
    * entry point for the Service Worker (browser) or tests (node).
    */
-  handleHttpRequest(port, req) {
+  async handleHttpRequest(port, req) {
     const pid = this.listeners.get(port | 0);
     if (pid == null || !this.procs.has(pid)) {
-      return Promise.resolve({
+      return {
         status: 502,
         headers: { "content-type": "text/plain" },
         body: `No server listening on port ${port}\n`,
-      });
+      };
     }
     const proc = this.procs.get(pid);
     const reqId = this.nextReqId++;
+    req = await this._stageInboundBody(req, reqId);
     return new Promise((resolve) => {
       this.pendingHttp.set(reqId, { resolve, pid });
       proc.serverInbox.push({ reqId, port: port | 0, req });

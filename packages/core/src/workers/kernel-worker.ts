@@ -17,6 +17,7 @@
 // where the real in-VM file watcher drives HMR (Vite) or a recompile+restart
 // (Nest --watch) exactly like local development.
 
+import { newProgress, onFetch, onOutput, idleClear, stallVerdict, servingPids, shouldReportStall } from "../../terminal-feedback.js";
 import { Kernel } from "../../../kernel-host/kernel.js";
 import { createKernelFs } from "../../../kernel-host/kernel-fs.js";
 import { ensureRealNpm } from "../../../kernel-host/load-real-npm.js";
@@ -916,15 +917,23 @@ function terminalForPid(pid) {
 // with little stdout in between, so an install looks frozen without feedback. We
 // coalesce fetch events into ONE in-place (\r) spinner line per terminal,
 // throttled, and clear it the instant the shell prints real output (below).
-const SPINNER = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"];
-const fetchProg = new Map(); // terminalId -> { count, bytes, last, frame, active }
+const fetchProg = new Map(); // terminalId -> progress state (terminal-feedback.js)
 function clearProgress(tid) {
   const s = fetchProg.get(tid);
-  if (s && s.active) {
-    s.active = false;
-    post("term-out", { terminalId: tid, chunk: "\r\x1b[2K" });
-  }
+  if (!s) return;
+  const chunk = onOutput(s);
+  if (chunk) post("term-out", { terminalId: tid, chunk });
 }
+// A spinner nobody is feeding is just a line that looks stuck. Sweep the idle ones
+// so the indicator ends when the traffic does, rather than freezing on its last
+// frame for as long as the process lives.
+setInterval(() => {
+  const now = Date.now();
+  for (const [tid, s] of fetchProg) {
+    const chunk = idleClear(s, now);
+    if (chunk) post("term-out", { terminalId: tid, chunk });
+  }
+}, 500);
 
 // Open a new interactive shell for a terminal tab. A plain shell opens in a
 // running demo's dir (or "/"). A DEMO shell (`demoId` set — the "Run" button)
@@ -1500,6 +1509,20 @@ async function boot() {
   // ask for it. Remembered per process so each report is a comparison, not a snapshot.
   const stallVfsSeen = new Map<number, number>();
   kernel.onProcStall = async (pid, info) => {
+    // A process that has bound a port got where it was going. It prints nothing
+    // between requests and makes no syscalls while idle, so every signal this
+    // watchdog reads says "silent" — and every report it produces is noise about
+    // a server doing exactly what a server does. Its shell is blocked waiting on
+    // it and is just as quiet, hence the ancestors too.
+    const parentOf = new Map<number, number>();
+    for (const [cpid, proc] of kernel.procs) parentOf.set(cpid, proc.parentPid ?? 0);
+    const serving = servingPids(kernel.listeners, parentOf).has(pid);
+    // …unless requests are waiting on it, which is the one case where a silent
+    // server is worth interrupting somebody about.
+    let pendingRequests = 0;
+    for (const [, pend] of kernel.pendingHttp) if (pend.pid === pid) pendingRequests++;
+    if (!shouldReportStall({ serving, pendingRequests })) return;
+
     const secs = Math.round(info.silentMs / 1000);
     const what = [info.command, ...(info.args || [])].join(" ").slice(0, 80);
     const vfs = await queryVfsMem(1500);
@@ -1508,22 +1531,11 @@ async function boot() {
     if (files !== null) stallVfsSeen.set(pid, files);
     const grew = files !== null && before !== undefined ? files - before : null;
 
-    let verdict: string;
-    if (grew !== null && grew > 0) {
-      verdict =
-        `It IS still working — the filesystem gained ${grew.toLocaleString()} files since the ` +
-        `last check (${files!.toLocaleString()} total). A first install writes tens of thousands.`;
-    } else if (grew !== null && grew === 0 && info.idleMs > 5000) {
-      verdict =
-        `Nothing has changed since the last check (${files!.toLocaleString()} files, no syscall for ` +
-        `${Math.round(info.idleMs / 1000)}s), so it looks stuck rather than slow.`;
-    } else {
-      // First report for this process, or ambiguous — describe, don't diagnose.
-      verdict =
-        `It may just be slow — a first install downloads and writes a lot` +
-        (files !== null ? ` (${files.toLocaleString()} files in the VFS so far)` : "") +
-        ". Watch whether the next check shows progress.";
-    }
+    // Which ports this pid holds: a listening process that is quiet is usually a
+    // server between requests, not a slow install.
+    const ports: number[] = [];
+    for (const [port, owner] of kernel.listeners) if (owner === pid) ports.push(port);
+    const verdict = stallVerdict({ grew, files, idleMs: info.idleMs, ports, pendingRequests });
     const line =
       `  [runtime] PID ${pid} (${what}) has printed nothing for ${secs}s. ${verdict}` +
       (info.workerErrors ? ` (${info.workerErrors} uncaught worker errors so far.)` : "") +
@@ -1677,20 +1689,9 @@ async function boot() {
       });
       return;
     }
-    const s = fetchProg.get(tid) || { count: 0, bytes: 0, last: 0, frame: 0, active: false };
-    s.count++;
-    s.bytes += info.size || 0;
-    const now = Date.now();
-    if (now - s.last >= 80) {
-      s.last = now;
-      s.frame = (s.frame + 1) % SPINNER.length;
-      s.active = true;
-      const mb = (s.bytes / 1048576).toFixed(1);
-      post("term-out", {
-        terminalId: tid,
-        chunk: `\r\x1b[2K\x1b[2m${SPINNER[s.frame]} fetching \u00b7 ${s.count} requests \u00b7 ${mb} MB\x1b[0m`,
-      });
-    }
+    const s = fetchProg.get(tid) || newProgress();
+    const chunk = onFetch(s, info.size, Date.now());
+    if (chunk) post("term-out", { terminalId: tid, chunk });
     fetchProg.set(tid, s);
   };
   // roadmap #19 stage C: a ws frame a process relayed OUT of the VM (Vite's HMR

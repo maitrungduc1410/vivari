@@ -14,6 +14,10 @@
 // globbed via import.meta.glob) so it is bundled reliably and never dragged into
 // the studio's own tsc/eslint pass.
 
+// The S3 template's source is a separate module so its gate (scripts/spike-s3.mjs)
+// can import the very same bytes this ships.
+import { s3AppFiles } from "./s3-app-source.js";
+
 export type Language = "TypeScript" | "JavaScript" | "Python";
 
 // Picker tabs, StackBlitz-style. The order here drives the tab order in the UI.
@@ -1735,6 +1739,35 @@ app.use(router.routes()).use(router.allowedMethods());
 app.listen(port, () => console.log('Koa listening on http://localhost:' + port));
 `,
     },
+  };
+}
+
+// ── Amazon S3 explorer (Node) ────────────────────────────────────────────────
+// The app source lives in ./s3-app-source.js so the template and its gate
+// (scripts/spike-s3.mjs) ship the same bytes — a copy here would drift, and the
+// spike would keep passing against code nobody runs.
+function s3Template(): TemplateDef {
+  return {
+    manifest: {
+      id: "s3",
+      framework: "express",
+      icon: "s3",
+      category: "Backend",
+      name: "Amazon S3",
+      language: "JavaScript",
+      description: "Browse, upload and download an S3 bucket with your own keys",
+      port: 3000,
+      openPath: "/",
+      entry: "src/server.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "node src/server.js",
+      // Gated by scripts/spike-s3.mjs, which drives the app against an in-VM S3
+      // that verifies SigV4 byte for byte — including a 12 MB multipart upload
+      // and a wrong secret it must reject.
+    },
+    files: s3AppFiles(),
   };
 }
 
@@ -9070,6 +9103,7 @@ export const TEMPLATES: TemplateDef[] = [
   nestTemplate(),
   koaTemplate(),
   honoTemplate(),
+  s3Template(),
   h3Template(),
   fastifyTemplate(),
   nitroTemplate(),

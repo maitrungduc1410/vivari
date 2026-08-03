@@ -1089,7 +1089,13 @@ async function handlePreview(event, port, path, keepPrefix) {
   const method = event.request.method;
   if (method !== "GET" && method !== "HEAD") {
     try {
-      body = await event.request.text();
+      // Read bytes, not text. `.text()` UTF-8-decodes, which silently mangles
+      // every non-text upload (an image, a zip, a tarball) into replacement
+      // characters. Hand the bytes over as-is: structured clone carries them
+      // intact, and the kernel decides how they cross to the guest (inline utf8,
+      // inline base64, or spilled to the VFS when they outgrow the syscall
+      // window) — one decision, in one place.
+      body = new Uint8Array(await event.request.arrayBuffer());
     } catch {
       body = "";
     }
@@ -1125,7 +1131,11 @@ async function handlePreview(event, port, path, keepPrefix) {
       clearTimeout(timer);
       resolve(e.data);
     };
-    sink.post({ type: "vv-http", req }, [mc.port2]);
+    // Transfer an upload's buffer rather than copying it: a large file would
+    // otherwise be duplicated on the way to the kernel worker.
+    const transfer = [mc.port2];
+    if (body instanceof Uint8Array && body.byteLength) transfer.push(body.buffer);
+    sink.post({ type: "vv-http", req }, transfer);
   });
 
   const respHeaders = new Headers(resp.headers || {});

@@ -6194,3 +6194,117 @@ them until the browser is simulated deliberately.
 reads the **guest's** env, because `bootProcess` replaces `globalThis.process`. Three
 test seams in a row silently did nothing before that was spotted. Snapshot the real
 env at module load instead.
+
+## An upload could not reach an in-VM server: the request body had no binary path (this change)
+
+Every request body that entered the VM went through `JSON.stringify`. Nothing was written down
+about bytes, so bytes were whatever survived the encoding — and two different things went wrong,
+neither of which produced an error message.
+
+The Service Worker read the incoming request with `.text()`. That UTF-8-decodes, so a PNG, a zip
+or a tarball arrived as replacement characters: the wrong bytes, the right length, no complaint. It
+now reads the bytes and hands them over untouched — transferred rather than copied, so a large
+upload is not duplicated on its way to the kernel worker.
+Driving the kernel directly with a `Buffer` was worse. The inbox crosses to the process worker as
+JSON, the Buffer serialised to `{type:'Buffer',data:[…]}`, the guest handed that to `creq.end()`,
+and the request never completed. Not a rejection, not a 500 — a hang, forever.
+
+Past 1 MiB it stopped being silent and became fatal. The inbox rides the syscall window, and
+`respondOk` did `proc.data.set(bytes, 0)` with no bounds check, so an upload larger than the frame
+took the whole kernel down with `RangeError: offset is out of bounds` thrown from inside
+`Uint8Array.set` — a stack naming neither the syscall nor the size. Uploading an ordinary phone
+photo was enough to do it.
+
+The fix is that the request direction now says what the response direction has said all along:
+small bodies cross inline as `{body, bodyEncoding:'base64'}`, and anything that will not fit the
+frame spills through the VFS — the same escape hatch fetch bodies already use — for the guest to
+read back with plain `fs`. `respondOk` now refuses an oversized payload with a message that names
+the size and the limit, so the next thing to forget this fails legibly instead of crashing.
+
+**Why it lasted.** Every HTTP spike drove the kernel with `body: ""`. The preview was exercised by
+loading pages, never by uploading a file, so the direction that carried bytes into the VM was the
+one direction nothing tested. `spike-http-binary-body` now runs offline on every push: PNG and
+JPEG magic, deliberately invalid UTF-8, 64 KB of random, and 2 MB / 3 MB / 12 MB past the window —
+each checked by SHA-256 against what was sent, with a deadline on every request so a regression to
+the hang shows up as a failure rather than a hung job.
+
+## An S3 template that makes you type your own keys (this change)
+
+A backend template for Amazon S3: connect with an access key and secret, list a bucket, upload
+(multipart past 5 MB), download, presign and delete. `packages/studio/src/vv/s3-app-source.js`,
+registered as the `s3` template and gated by `scripts/spike-s3.mjs`.
+
+The credentials are typed into the page and held in the Node process's memory — never written to
+the VFS, never echoed back (the session endpoint returns a masked key, and the spike asserts the
+secret appears nowhere in the response). They live as long as the process does. That is the honest
+shape for something running entirely on the user's machine: there is no server to keep a secret
+on, so the app does not pretend to keep one.
+
+**What the gate is actually worth.** The spike does not mock the SDK — it boots an in-VM S3 that
+recomputes the SigV4 signature from the request it received and answers 403 `SignatureDoesNotMatch`
+on a mismatch, so a wrong secret is a gated negative control rather than an untested path. The
+12 MB upload really does cross `lib-storage`'s part boundary and get reassembled server-side, and
+the download is compared byte for byte against what went up.
+
+**Two defects surfaced while building it**, both fixed ahead of this change rather than papered
+over in the app: signed requests lost `Authorization` and every `x-amz-*` header in a browser tab
+(the CORS strip was never scoped), and a binary upload could not reach an in-VM server at all —
+it hung under 1 MiB and killed the kernel above it. An example app is a good way to find these
+because it is the first thing to use the platform the way a user does, end to end, instead of one
+subsystem at a time.
+
+**Where this genuinely runs, and where it does not.** Reaching real S3 from a tab needs a CORS
+policy on the bucket that allows the origin plus the `authorization` and `x-amz-*` headers; the
+page says so and the README repeats it, because it is the first thing everyone hits. And like
+every other template spike, `s3` sits in the `spikes-net` tier — scheduled, and
+`continue-on-error: true` — so it is a signal, not a merge blocker. The parts that could regress
+silently are gated where it counts: the header policy by `probe:egress-headers` in
+`toolchain-gate`, and binary request bodies by `spike-http-binary-body` in `verify`.
+## The terminal called a working server a stuck download (this change)
+
+An S3 app finished installing, bound :3000 and started serving. The terminal showed
+`⠴ fetching · 222 requests · 38.7 MB`, climbing, forever — and then reported that the process
+"has printed nothing for 75s. It may just be slow — a first install downloads and writes a lot."
+The install had finished a minute earlier in ten seconds. Nothing was wrong, and everything on
+screen said something was.
+
+Two separate guesses, both wrong about the same thing: a program that goes quiet because it is
+healthy.
+
+The fetch spinner kept one counter per terminal for the terminal's whole life. It was written for
+an install — hundreds of fetches, almost no stdout — and it cleared when the shell printed. But
+clearing only hid the line; the totals stayed. So every request the app itself made afterwards was
+added to the install's numbers and redrawn under the word "fetching". The 222 requests and 38.7 MB
+were the user's own S3 traffic, presented as dependencies still coming down. Worse, the line is
+drawn with `\r` and only ever removed by the next print — and a server has nothing left to print,
+so the last frame sat there looking frozen. The counters now reset when the spinner clears, and an
+idle sweep removes the line once the traffic stops, so the indicator ends when the activity does.
+
+That left a smaller version of the same mistake: a single click in the preview made one request and
+flashed a spinner for a second and a half. The line answers "is this frozen?", and one request never
+raises the question, so it is only drawn once a burst reaches three requests AND has run for 800ms —
+an install crosses both immediately, a button does not. Bursts that stay under the bar reset when
+they go quiet, or six clicks a few seconds apart would eventually add up to a spinner for a click
+that fetched once.
+
+The stall reporter had three verdicts: growing filesystem ("still working"), no syscalls at all
+("looks stuck"), and everything else. A serving process fits none of them, so it fell to the
+catch-all, which talks about first installs.
+
+The first attempt at this only half worked: it described a port-holder as a server *if it was still
+making syscalls*, which an idle one is not. The report came back unchanged. The honest position is
+that an idle server and a wedged server are indistinguishable from the kernel — both hold a port,
+print nothing and make no syscalls — and the only thing that separates them is whether anyone is
+waiting. So a serving process (and the shell blocked waiting on it, hence its ancestors) is not
+reported at all, unless requests are pending against it, and then the report is the useful one:
+"listening on :3000 with 3 requests waiting and no syscall for 30s — it looks stuck inside a
+handler."
+
+"It IS still working" also got a floor. It fired on any growth at all, so a server that touched one
+file was told the filesystem gained 1 file and that "a first install writes tens of thousands".
+
+**This half of the kernel worker only runs in a browser**, which is why it drifted this far without
+anyone noticing. The judgements are now pure functions in `packages/core/terminal-feedback.js`,
+asserted by `npm run probe:terminal-feedback` in `toolchain-gate` — including the exact sequence
+that produced the bad output: install 104 packages, print, then serve, and check the app's first
+request reports one request rather than a hundred and five.

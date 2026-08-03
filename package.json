@@ -30,6 +30,7 @@
     "smoke": "node scripts/smoke-sdk.mjs",
     "probe:node-registry": "node scripts/probe-node-registry.mjs",
     "probe:egress-headers": "node scripts/probe-egress-headers.mjs",
+    "probe:terminal-feedback": "node scripts/probe-terminal-feedback.mjs",
     "probe:http-egress": "node scripts/probe-http-egress.mjs",
     "build:example": "npm run build --workspace @vivari/example-basic",
     "spikes": "node scripts/run-spikes.mjs",

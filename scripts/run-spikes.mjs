@@ -102,6 +102,9 @@ const SPIKES = [
   // the Bun template hang investigation had no way to make. Real Kernel + Workers,
   // no VFS needed.
   { name: "diag-liveness", file: "spike-diag-liveness.mjs", net: false, needsWasm: true, timeout: 60000 },
+  // The inbound HTTP body path. Offline on purpose (plain node:http, no install):
+  // a binary upload used to HANG rather than fail, so this belongs on every push.
+  { name: "http-binary-body", file: "spike-http-binary-body.mjs", net: false, needsWasm: true, timeout: 120000 },
   // Persistent dependency cache (P1): pack node_modules → snapshot → wipe →
   // restore → require, against the real Wasm VFS. Offline + deterministic.
   // `needsWasm`: offline but requires the Node Wasm VFS build (pkg-node), so it
@@ -120,6 +123,9 @@ const SPIKES = [
   // --- network: graduated templates gated here -------------------------------
   { name: "koa", file: "spike-koa.mjs", net: true },
   { name: "hono", file: "spike-hono.mjs", net: true },
+  // The S3 template. Installs the AWS SDK (net), then talks to an in-VM S3 that
+  // verifies SigV4 byte for byte — so the signing is gated, not just the wiring.
+  { name: "s3", file: "spike-s3.mjs", net: true, needsWasm: true, timeout: 300000 },
   { name: "h3", file: "spike-h3.mjs", net: true },
   { name: "fastify", file: "spike-fastify.mjs", net: true },
   { name: "preact", file: "spike-preact.mjs", net: true },
