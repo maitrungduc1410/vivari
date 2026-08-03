@@ -3417,7 +3417,7 @@ function pythonDataScienceTemplate(): TemplateDef {
       reload: false,
       // Prebuilt NumPy/pandas wheels ship with the vendored Pyodide and also
       // auto-load from the script's imports; this makes the install step explicit.
-      install: "python -m pip install -r requirements.txt",
+      install: "pip install -r requirements.txt",
       dev: "python main.py",
       experimental: true,
     },
@@ -3450,7 +3450,7 @@ NumPy and pandas run on **Pyodide** (prebuilt WebAssembly wheels), entirely in
 your browser — no server, no native build.
 
 \`\`\`bash
-python -m pip install -r requirements.txt   # loads the vendored wheels
+pip install -r requirements.txt   # loads the vendored wheels
 python main.py
 \`\`\`
 
@@ -3479,7 +3479,7 @@ function pythonMatplotlibTemplate(): TemplateDef {
       entry: "main.py",
       hmr: false,
       reload: false,
-      install: "python -m pip install -r requirements.txt",
+      install: "pip install -r requirements.txt",
       dev: "python main.py",
       experimental: true,
     },
@@ -3525,8 +3525,8 @@ Matplotlib runs on **Pyodide** (prebuilt WebAssembly wheels), entirely in your
 browser — no server, no native build.
 
 \`\`\`bash
-python -m pip install -r requirements.txt   # loads the vendored wheels
-python main.py                              # renders plot.png
+pip install -r requirements.txt   # loads the vendored wheels
+python main.py                    # renders plot.png
 \`\`\`
 
 The Python process runs in a Web Worker with **no DOM**, so there is no
@@ -3559,7 +3559,7 @@ function fastapiTemplate(): TemplateDef {
       entry: "main.py",
       hmr: false,
       reload: false,
-      install: "python -m pip install -r requirements.txt",
+      install: "pip install -r requirements.txt",
       dev: "uvicorn main:app --port 8000",
       experimental: true,
     },
@@ -3604,8 +3604,8 @@ A real **FastAPI** (ASGI) app running on **CPython compiled to WebAssembly**
 (Pyodide), entirely in your browser.
 
 \`\`\`bash
-python -m pip install -r requirements.txt   # loads FastAPI (vendored/CDN wheels)
-uvicorn main:app --port 8000                # serves the app + opens the preview
+pip install -r requirements.txt   # loads FastAPI (vendored/CDN wheels)
+uvicorn main:app --port 8000      # serves the app + opens the preview
 \`\`\`
 
 Pyodide has no real sockets, so \`uvicorn\` here is a Vivari shim: it boots
@@ -3635,7 +3635,7 @@ function flaskTemplate(): TemplateDef {
       entry: "main.py",
       hmr: false,
       reload: false,
-      install: "python -m pip install -r requirements.txt",
+      install: "pip install -r requirements.txt",
       dev: "flask --app main run --port 8000",
       experimental: true,
     },
@@ -3678,8 +3678,8 @@ A real **Flask** (WSGI) app running on **CPython compiled to WebAssembly**
 (Pyodide), entirely in your browser.
 
 \`\`\`bash
-python -m pip install -r requirements.txt   # installs Flask from PyPI (micropip)
-flask --app main run --port 8000            # serves the app + opens the preview
+pip install -r requirements.txt    # installs Flask from PyPI (micropip)
+flask --app main run --port 8000   # serves the app + opens the preview
 \`\`\`
 
 Flask is not part of Pyodide's prebuilt wheel set, so it is installed from PyPI
@@ -3712,7 +3712,7 @@ function djangoTemplate(): TemplateDef {
       entry: "notes/views.py",
       hmr: false,
       reload: false,
-      install: "python -m pip install -r requirements.txt",
+      install: "pip install -r requirements.txt",
       dev: "gunicorn wsgi:application --bind 0.0.0.0:8000",
       experimental: true,
     },
@@ -4027,7 +4027,7 @@ A real **Django** project — ORM, migrations, the template engine and URL routi
 running on **CPython compiled to WebAssembly** (Pyodide), entirely in your browser.
 
 \`\`\`bash
-python -m pip install -r requirements.txt   # installs Django from PyPI (micropip)
+pip install -r requirements.txt   # installs Django from PyPI (micropip)
 gunicorn wsgi:application --bind 0.0.0.0:8000
 \`\`\`
 
@@ -4106,7 +4106,7 @@ function flaskAppTemplate(): TemplateDef {
       entry: "main.py",
       hmr: false,
       reload: false,
-      install: "python -m pip install -r requirements.txt",
+      install: "pip install -r requirements.txt",
       dev: "flask --app main run --port 8000",
       experimental: true,
     },
@@ -4366,8 +4366,8 @@ persistence and a JSON API — running on **CPython compiled to WebAssembly**
 (Pyodide), entirely in your browser.
 
 \`\`\`bash
-python -m pip install -r requirements.txt   # installs Flask from PyPI (micropip)
-flask --app main run --port 8000            # serves the app + opens the preview
+pip install -r requirements.txt    # installs Flask from PyPI (micropip)
+flask --app main run --port 8000   # serves the app + opens the preview
 \`\`\`
 
 Pyodide has no real sockets, so \`flask run\` is a Vivari shim: it boots Pyodide,
@@ -4418,7 +4418,7 @@ function fastapiCrudTemplate(): TemplateDef {
       entry: "main.py",
       hmr: false,
       reload: false,
-      install: "python -m pip install -r requirements.txt",
+      install: "pip install -r requirements.txt",
       dev: "uvicorn main:app --port 8000",
       experimental: true,
     },
@@ -4569,8 +4569,8 @@ codes and the auto-generated Swagger UI — running on **CPython compiled to
 WebAssembly** (Pyodide), entirely in your browser.
 
 \`\`\`bash
-python -m pip install -r requirements.txt   # loads FastAPI (vendored wheels)
-uvicorn main:app --port 8000                # serves the app + opens the preview
+pip install -r requirements.txt   # loads FastAPI (vendored wheels)
+uvicorn main:app --port 8000      # serves the app + opens the preview
 \`\`\`
 
 Open **\`/docs\`** in the preview and use "Try it out" to exercise every endpoint
@@ -4630,7 +4630,7 @@ function fastapiDashboardTemplate(): TemplateDef {
       entry: "main.py",
       hmr: false,
       reload: false,
-      install: "python -m pip install -r requirements.txt",
+      install: "pip install -r requirements.txt",
       dev: "uvicorn main:app --port 8000",
       experimental: true,
     },
@@ -4830,8 +4830,8 @@ straight into the preview pane as a PNG — all on **CPython compiled to
 WebAssembly** (Pyodide), entirely in your browser.
 
 \`\`\`bash
-python -m pip install -r requirements.txt   # loads the vendored wheels
-uvicorn main:app --port 8000                # serves the app + opens the preview
+pip install -r requirements.txt   # loads the vendored wheels
+uvicorn main:app --port 8000      # serves the app + opens the preview
 \`\`\`
 
 Every package here — FastAPI, pandas, Matplotlib, NumPy — ships in Vivari's
@@ -4880,7 +4880,7 @@ function pythonPytestTemplate(): TemplateDef {
       entry: "tests/test_cart.py",
       hmr: false,
       reload: false,
-      install: "python -m pip install -r requirements.txt",
+      install: "pip install -r requirements.txt",
       dev: "pytest -q",
       experimental: true,
     },
@@ -4997,9 +4997,9 @@ A **pytest** suite running on **CPython compiled to WebAssembly** (Pyodide),
 entirely in your browser.
 
 \`\`\`bash
-python -m pip install -r requirements.txt   # warms the pytest wheel
-pytest -q                                   # run the suite
-pytest -q -k discount                       # run a subset
+pip install -r requirements.txt   # warms the pytest wheel
+pytest -q                         # run the suite
+pytest -q -k discount             # run a subset
 pytest tests/test_cart.py::test_cannot_oversell
 \`\`\`
 
@@ -5216,7 +5216,7 @@ function pythonImagingTemplate(): TemplateDef {
       entry: "main.py",
       hmr: false,
       reload: false,
-      install: "python -m pip install -r requirements.txt",
+      install: "pip install -r requirements.txt",
       dev: "python main.py",
       experimental: true,
     },
@@ -5293,8 +5293,8 @@ Image generation and processing with **Pillow**, on **CPython compiled to
 WebAssembly** (Pyodide).
 
 \`\`\`bash
-python -m pip install -r requirements.txt   # loads the vendored Pillow wheel
-python main.py                              # writes art.png and thumb.png
+pip install -r requirements.txt   # loads the vendored Pillow wheel
+python main.py                    # writes art.png and thumb.png
 \`\`\`
 
 Pillow is already inside Vivari's vendored Pyodide bundle, so its wheel loads

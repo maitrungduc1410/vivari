@@ -6308,3 +6308,69 @@ anyone noticing. The judgements are now pure functions in `packages/core/termina
 asserted by `npm run probe:terminal-feedback` in `toolchain-gate` — including the exact sequence
 that produced the bad output: install 104 packages, print, then serve, and check the app's first
 request reports one request rather than a hundred and five.
+
+## `pip install` that survives the process that ran it (this change)
+
+`pip install X` printed `Installed: X`, and by the next command X was gone. Every `python`
+command is a fresh Pyodide boot, so the install was true of an interpreter that had already
+exited. The last change could only make that honest — it added a paragraph of stderr
+explaining that the thing you just did had not happened. This one makes it true instead, and
+deletes the paragraph.
+
+**A store, not a warm interpreter.** The tempting fix is to keep one interpreter alive across
+commands, and it is the wrong one twice over: measured, a second `loadPyodide()` in the same
+realm is no cheaper than the first (1406 ms vs 1550 ms), so it would buy nothing without also
+keeping a *process* alive across commands — a change to the process model, for one language of
+several. The cheap fix is to move the bytes, not the interpreter. `pip` walks site-packages
+before and after the install and writes the **delta** to
+`<project>/.venv/lib/python3.14/site-packages`; every later interpreter copies it back before
+user code runs. Measured against real wheels: **4 ms out, 37 ms in for 357 KB, against a
+~1400 ms boot**. The alternative — record the install list and replay it — costs ~300 ms per
+process even with the wheel already cached, so the byte snapshot is both simpler and faster.
+
+And it gives `.venv` a meaning. `python -m venv .venv` was `No module named venv`; it is now
+the command that creates the store, which is the one `-m` module that would be meaningless
+without it. `pip list`/`freeze`/`show`/`uninstall`/`check` read `importlib.metadata` out of the
+restored store.
+
+**Three ways this could have been 95% right, and what stops each.**
+
+*Half a store is worse than none.* A store built by an older Pyodide, restored into a newer
+one, gives a site-packages where some of a package is the old build and the rest is missing —
+which fails at an unrelated import, far from the cause. So the store carries a stamp (Python
+version, Pyodide version, format number) and a mismatch discards it **entirely**, with a
+message naming both versions and the one command that rebuilds it. The same reasoning drove
+the size cap inside `persistDelta()` rather than beside it: over the cap it returns having
+written nothing, so "too big changes nothing" is a property of one function instead of the
+order two callers happen to do things in. And it exits non-zero — the packages are in an
+interpreter about to exit, so `pip install X && python main.py` must not walk into an
+ImportError with a success message above it.
+
+*`.venv` is not a virtualenv, and saying so is part of the feature.* There is one interpreter
+per process and no isolation available. `pyvenv.cfg` therefore says
+`include-system-site-packages = true`, because that is simply true, and both the file and the
+docs say in prose that this is a package store with no `bin/activate` and nothing to
+deactivate. Two projects get two stores — the part of a virtualenv people actually want — and
+there is no second Python to switch between. `.venv` also stays in `SKIP_DIRS`: the store has
+to land at the *interpreter's* site-packages path, not at `<cwd>/.venv` where no import would
+look. That looks like the bug and is the fix, so it is commented as such in three places.
+
+*`pip freeze` that is almost `name==version` is worse than no `pip freeze`* — it fails later,
+somewhere else, in a file someone committed. So the formatters are pure functions over dist
+metadata, and `spike-python-offline.mjs` asserts them byte-for-byte against **real pip run on
+the machine doing the check** — dist-info directories synthesised on disk, `pip list --path`
+over them, no network. That is not ceremony: it caught a real bug that reading the code did
+not. An install escapes the project name before naming the directory (PEP 427), so
+`charset-normalizer` lands in `charset_normalizer-3.4.7.dist-info`. The store decided
+membership by rebuilding `${name}-${version}.dist-info`, which matches nothing for a dashed
+name — a `pip freeze` that silently omitted four of `requests`' five dependencies. The
+interpreter now reports the directory it actually found. The bridge tier installs a dashed
+package on purpose so the regression cannot come back.
+
+**The gate.** The offline tier runs the shipped store functions against a stubbed interpreter —
+Pyodide's FS is a handful of calls — so restore, discard-on-mismatch and the transactional cap
+gate every PR. The bridge tier boots **six real interpreters in one run** and keeps the stub
+honest: install into A, restore into B, and an unrestored C that still has nothing; a stamp
+rewritten to an older Python that copies in zero files; a real install refused by a
+deliberately 1 KB cap with the store byte-for-byte unchanged afterwards; and `pip freeze`
+checked against the store's own directory listing as the oracle rather than against itself.

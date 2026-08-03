@@ -14,7 +14,7 @@ interpreter written in JavaScript — the actual reference implementation, versi
 python main.py            # run a script
 python -c "print(1 + 1)"  # run an inline program
 python                    # a REPL
-python -m pip install requests-like-things
+pip install requests-like-things
 ```
 
 The Pyodide runtime is loaded **lazily**, the first time you run `python`. If a
@@ -32,6 +32,7 @@ project never touches Python, it never pays for it.
 | **Web frameworks** | Flask, FastAPI and Django, with a live preview |
 | **pytest** | including real exit codes, so `pytest && …` behaves |
 | **Pure-Python packages from PyPI** | installed at runtime through `micropip` |
+| **`pip install` that persists** | into a per-project `.venv`, with `list`/`freeze`/`show`/`uninstall`/`check` |
 | **Outbound HTTP** | `requests`, or `pyfetch` if you want it async — subject to the target's CORS headers |
 
 Start from any of the templates in the Studio's **Native** tab.
@@ -78,11 +79,52 @@ is used.
 **PyPI, through micropip**, for everything that remains, provided it is pure
 Python. This is how Flask and Django arrive.
 
-Worth knowing: every `python` command starts a **fresh interpreter**, so
-`pip install` does not accumulate state the way it does on your own machine.
-What it actually buys you is a warm browser cache, making the next run faster.
-You rarely need to run it by hand — a script's imports pull what they need, and
-a served app reads its `requirements.txt`.
+## `pip install`, and the `.venv` it writes to
+
+`pip install` persists. What you install stays installed, for this project, and
+every later `python` command in it sees the package:
+
+```bash
+pip install tabulate
+python -c "from tabulate import tabulate; print(tabulate([[1, 2]]))"
+```
+
+The packages live in `.venv/lib/python3.14/site-packages`, which `pip install`
+creates on first use. `python -m venv .venv` makes it up front if you would
+rather, and the usual read-only verbs work off it:
+
+```bash
+python -m venv .venv
+pip list              # Package  Version, as pip prints it
+pip freeze            # name==version, safe to redirect into a file
+pip show tabulate
+pip check
+pip uninstall -y tabulate
+```
+
+**`.venv` here is a package store, not a second interpreter.** This is the one
+place where the familiar name does not carry all of its usual meaning, so it is
+worth being precise. There is no `bin/activate`, nothing to deactivate, and no
+isolation: every `python` command boots one CPython/WASM interpreter and copies
+this directory into it, so a package in the store is a package that interpreter
+has. Two projects get two stores, which is the part of a virtualenv people
+actually want, but there is no second Python to switch between.
+
+Deleting the directory resets it, and so does `python -m venv --clear .venv`.
+
+A few consequences of the way this works:
+
+- **You often do not need it.** Vivari reads your script and loads the packages
+  it recognises before running, so `import numpy` works without installing
+  anything, and a served app reads its `requirements.txt`.
+- **The store is capped at 64 MB**, which fits a scientific stack — SciPy is
+  around 13 MB — but not an unbounded one. An install that would go over is
+  refused outright and the store is left exactly as it was, rather than being
+  grown half way to a package it cannot finish. `pip uninstall` makes room.
+- **It is stamped with the interpreter that built it.** If Vivari updates to a
+  newer Python or Pyodide, a store built by the old one is ignored rather than
+  half-loaded, with a message saying so; `python -m venv --clear .venv` rebuilds
+  it.
 
 ## Talking to the network
 

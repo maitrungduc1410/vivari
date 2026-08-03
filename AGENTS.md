@@ -1948,17 +1948,97 @@ Gotchas:
   `PATH_INFO` is already the split form. The spike checks the scope against Starlette's
   own `Mount`/`get_route_path` and the environ against `wsgiref.validate`, rather than
   against our own idea of the shape.
-- **One Pyodide per process — `pip install` does NOT persist.** Each `python` command is
-  a fresh boot (`:66–68`), so `python -m pip install -r requirements.txt` is a browser
-  cache warm-up, not an install. Scripts get their packages from
-  `loadPackagesFromImports(source)` on the entry file; `serve()` separately reads
-  `requirements.txt`. When testing several templates in one interpreter, `sys.modules`
-  will serve an earlier template's `main` to a later one — boot per case instead.
-  Because of that, a bare `Installed: X` was the argv spelling of a placeholder return
-  value — true of the interpreter that just exited, false of the next one, and the user
-  finds out when their import fails with the successful pip run still on screen. `pip()`
-  now prints the scope on stderr alongside the success line. Do not "clean that up": the
-  line is the honesty, not noise. It goes away when the packages actually persist.
+- **One Pyodide per process, and the `.venv` store is what carries state across them.**
+  Each `python` command is a fresh boot (`:66–68`), so nothing an interpreter installs
+  outlives it by itself. What makes `pip install` real is `builtins/python-store.js`:
+  `pip` walks site-packages before and after the install, and the **delta** is written to
+  `<project>/.venv/lib/python3.14/site-packages`, which `restoreStore()` copies back into
+  every later interpreter (measured: 4 ms out, 37 ms in for 357 KB, against a ~1400 ms
+  boot). Four things about it are load-bearing and none are obvious:
+  - **`.venv` is in `SKIP_DIRS` on purpose.** The store must land at the interpreter's
+    *own* site-packages path, not at `<cwd>/.venv` where no import would look. Mirroring
+    it generally would copy every byte twice, to a place nothing reads. It looks like the
+    bug; it is the fix.
+  - **A stamp mismatch discards the whole store, and must keep doing so.** `pyvenv.cfg`
+    sits beside a `vivari-store.json` recording the Python version, the Pyodide version
+    and a `STORE_FORMAT`. A half-restored site-packages imports half a package and fails
+    somewhere unrelated, so `restoreStore()` copies **nothing** rather than what it can.
+  - **The cap check lives inside `persistDelta()`, not beside it.** Over the cap it
+    returns `{ok:false}` having written nothing, so "too big changes nothing" is a
+    property of one function instead of the order two callers happen to do things in.
+    `pipInstall` then exits **non-zero**: the packages are in an interpreter that is about
+    to exit, so from the user's side the install did not happen, and exiting 0 would let
+    `pip install X && python main.py` walk into an ImportError with a success message
+    above it.
+  - **Do not rebuild a dist-info directory name from `name` + `version`.** An install
+    escapes the project name per PEP 427, so `charset-normalizer` lands in
+    `charset_normalizer-3.4.7.dist-info`; matching on the reconstruction silently drops
+    every dashed package from `pip list`/`freeze`. `DIST_QUERY` reports the directory it
+    actually found. Real pip caught this; reading the code did not.
+
+  Scripts still get their packages from `loadPackagesFromImports(source)` on the entry
+  file, and `serve()` still reads `requirements.txt` — the store is additive to both.
+  When testing several templates in one interpreter, `sys.modules` will serve an earlier
+  template's `main` to a later one — boot per case instead.
+- **`python --version` carries a literal, and it is pinned twice.** Same
+  constraint as `BUN_PROGRAM`/`BUN_VERSION` above: `PYTHON_PROGRAM` is a
+  no-interpolation template literal, so `/bin/python.js` cannot import the
+  version — and `--version` answering without booting Pyodide is worth keeping,
+  so the literal stays. `spike-python-offline.mjs` holds it against
+  `PYODIDE_PYTHON_VERSION` in `builtins/python.js`, and the bridge spike holds
+  that constant against `sys.version` in a real interpreter. Bump the vendored
+  Pyodide and one of the two fails. Print the **full patch version** — it read
+  `Python 3.14` while a script in the same terminal reported `3.14.2`. Note that
+  `pyodide-lock.json`'s `info.python` is the ABI target (`3.14.0`) and not the
+  build, so it is the wrong authority; `sys.version` is the right one.
+- **`loadPackage()` writes to the interpreter's STDOUT unless you hand it a
+  callback**, and that put `Loading packaging` / `Loaded packaging` in front of
+  `pip freeze`'s output — so `pip freeze > requirements.txt` wrote a file whose
+  first two lines pip never printed. Pyodide's package manager keeps its own
+  `stdout`, defaulting to the stream `setStdout` sets, which `bootPyodide` points
+  at `process.stdout`. It is **not** `console.log`: replacing `globalThis.console`
+  before importing `pyodide.mjs` does not intercept it, so do not go looking in
+  `node/lib/console.js`. `{messageCallback}` overrides it for one call only.
+  Every call site in `builtins/python.js` therefore passes `loaderToStderr` or
+  `loaderToStdout` explicitly, and the offline spike fails on any that does not —
+  progress is diagnostics, and the one exception (`pip install`'s requested
+  packages) is stdout because real pip prints `Collecting …` there. The general
+  rule: **a command whose stdout is meant to be piped emits nothing but its
+  payload**, and an assertion that compares a formatter's return value cannot
+  see a second writer on the stream. Gate stdout as a subprocess — see
+  `scripts/lib/pip-stdout-child.mjs`, which runs the real runtime against the
+  stand-in interpreter in `scripts/lib/fake-pyodide.mjs`.
+- **An entrypoint is not shipped until it is on PATH under the name people type.**
+  `python -m pip list` worked for an entire MR while `pip list` said `sh: pip: not
+  found`, and nothing caught it: every spike drove `python -m pip` directly, and the
+  template check — which does assert a command resolves on PATH — reads only the first
+  word of a manifest, which was `python`. So a whole feature was green, browser-tested
+  and unreachable by its own name. Two rules came out of it:
+  - **Add the `-m` handler and the PATH shim together.** `PYTHON_DELEGATES` in
+    `coreutils.js` maps bare command → module and *generates* the six shims, so there is
+    no hand-copied block to forget. `pip3` sits beside `pip` for the same reason
+    `python3` sits beside `python`. `venv` is deliberately absent: CPython ships no
+    `venv` binary, and the spike checks that excuse against the host's real Python rather
+    than believing the comment.
+  - **The gate derives the list, it does not restate it.** `spike-python-offline.mjs`
+    scrapes `if (mod === '…')` out of the launcher itself, so a seventh entrypoint fails
+    the offline tier until it is either put on PATH or excused in writing. A written-out
+    list would have been written when `pip` was added and would have had the same hole.
+
+  Putting `pip` on PATH also puts pip's *top level* in reach — nobody types `python -m
+  pip frobnicate`, but they will typo `pip instal`. Keep the two unknowns apart:
+  `download` is a command real pip **has** and we do not (say so, and name what we do
+  have), whereas `frobnicate` gets real pip's own `ERROR: unknown command "…"`, with its
+  difflib-style suggestion. Calling `download` unknown sends someone hunting for a typo
+  that is not there.
+- **pip's output format is not ours to invent.** `formatPipList`/`Freeze`/`Show`/`Check`
+  are pure functions in `python-store.js` specifically so `spike-python-offline.mjs` can
+  assert them byte-for-byte against **real pip run on this machine** (`scripts/lib/
+  real-pip.mjs` synthesises dist-info directories and runs `pip list --path`, so it needs
+  no network). `pip freeze > requirements.txt` is load-bearing: output that is almost
+  `name==version` fails later, elsewhere, in a file someone committed. Keep the
+  formatting in JS and the *data* in Python — if you move rendering into the interpreter,
+  that gate disappears and the offline tier stops covering it.
 - **Never wire Python's output through Pyodide's `batched` handler.** It fires once per
   *flush* with the trailing newline stripped, so "add the newline back" is right only
   when the flush ended a line — and wrong for every progress renderer, which flushes

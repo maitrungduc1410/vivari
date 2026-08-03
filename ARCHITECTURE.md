@@ -1647,8 +1647,10 @@ interpreter really is WASM (like the Wasm engines above), not a Node-backed shim
 - `packages/runtime/builtins/python.js` — boots Pyodide, mirrors the project dir into
   its FS, runs scripts / `-c` / a REPL (stdout/stderr → terminal), and auto-loads wheels
   the code imports. Exposed to the VM via a Bun-style `globalThis.__ocInstallPython`.
+- `packages/runtime/builtins/python-store.js` — the per-project package store (below),
+  and pip's read-only verbs rendered the way real pip renders them.
 - `packages/kernel-host/programs/python.js` — the `python`/`python3` CLI (arg parse,
-  `-m` module handling incl. `uvicorn`/`flask`/`gunicorn`/`pytest`).
+  `-m` module handling incl. `venv`/`uvicorn`/`flask`/`gunicorn`/`pytest`).
 - `packages/kernel-host/coreutils.js` — `uvicorn`/`flask`/`gunicorn`/`pytest` PATH shims
   (delegate to `python -m …`).
 - `scripts/vendor-pyodide.mjs` — vendors the Pyodide core + selected wheels into
@@ -1659,6 +1661,31 @@ interpreter really is WASM (like the Wasm engines above), not a Node-backed shim
   by `scripts/cloudflare-build.sh`** — the studio's `bun run build` doesn't fire the
   root `prebuild:studio` hook, so this must be listed explicitly or the deployed studio
   ships no `python`.
+
+**Packages persist in a `.venv` store, because interpreters do not.** Every `python`
+command is a fresh Pyodide boot, so an install has nothing to live in. `pip install`
+therefore walks site-packages before and after, and writes the **delta** to
+`<project>/.venv/lib/python3.14/site-packages`; `restoreStore()` copies it back into each
+later interpreter before user code runs (4 ms out, 37 ms in for 357 KB, against a
+~1400 ms boot — the byte snapshot is both simpler and faster than replaying the install
+list, which costs ~300 ms per process even with the wheel cached). `python -m venv .venv`
+creates the same store, and `pip list`/`freeze`/`show`/`uninstall`/`check` read
+`importlib.metadata` out of it.
+
+Three design points, all of which look like mistakes until you know why:
+
+- **`.venv` stays in `SKIP_DIRS`.** The store is restored to the *interpreter's* own
+  site-packages path, not to `<cwd>/.venv` where no import would look, so the general
+  project mirror must keep its hands off it.
+- **The store is version-stamped and discarded whole on a mismatch.** A `vivari-store.json`
+  records the Python version, the Pyodide version and a store-format number. A store
+  built by an older interpreter is ignored entirely rather than partially loaded — a
+  half-restored site-packages fails at an unrelated import, far from the cause.
+- **It is a store, not an environment.** There is one interpreter per process and no
+  isolation available; `pyvenv.cfg` says `include-system-site-packages = true` because
+  that is simply true here, and the docs say the same in prose. Size is capped at 64 MB
+  (SciPy is ~13 MB), and an install that would exceed it is refused with the store left
+  untouched and a non-zero exit.
 
 **Environment masking.** Our runtime masquerades as Node, but Pyodide has two Node
 probes that would each `import("node:module")` (404 in a Worker). Both are masked across

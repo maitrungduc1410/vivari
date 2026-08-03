@@ -36,18 +36,41 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { PYTHON_PROGRAM } from "../packages/kernel-host/programs/python.js";
-import { COREUTILS } from "../packages/kernel-host/coreutils.js";
+import { COREUTILS, PYTHON_DELEGATES } from "../packages/kernel-host/coreutils.js";
 import {
-  PIP_SCOPE_NOTE,
+  PYODIDE_PYTHON_VERSION,
   URLLIB3_REALM_PATCH,
   byteWriter,
   setupSource,
   terminationFromError,
 } from "../packages/runtime/builtins/python.js";
+import {
+  STORE_DIR,
+  STORE_FORMAT,
+  STORE_MAX_BYTES,
+  collectDelta,
+  formatPipCheck,
+  formatPipFreeze,
+  formatPipList,
+  formatPipShow,
+  humanBytes,
+  makeStamp,
+  persistDelta,
+  readStamp,
+  renderPyvenvCfg,
+  restoreStore,
+  stampProblem,
+  storeCapError,
+  storeDists,
+  storePaths,
+  walkHost,
+} from "../packages/runtime/builtins/python-store.js";
+import { CAPTURED, FIXTURE_DISTS, realPipFormat, realPipUnknown, writeFixtureSite } from "./lib/real-pip.mjs";
+import { writeFakeIndex } from "./lib/fake-pyodide.mjs";
 import { readShippedManifests, readShippedTemplates, readTemplatesSource } from "./lib/shipped-templates.mjs";
 import { MODELLED_FRAGMENTS, STANDIN, normalize } from "./lib/urllib3-emscripten.mjs";
 import { CPYTHON_EXITS, UNTRUNCATED, realCPythonExit } from "./lib/cpython-exit.mjs";
-import { drivePython, servedApp } from "./lib/python-drive.mjs";
+import { drivePython, driveShim, servedApp } from "./lib/python-drive.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -95,10 +118,17 @@ console.log("== python CLI dispatch (PYTHON_PROGRAM run as a real process) ==");
   // The rule master codified: an unknown verb says not-implemented and names it.
   r = run("-m", "nosuchmod");
   ok(r.code === 1 && /nosuchmod/.test(r.err) && /not supported/.test(r.err), "python -m <unknown> is not-implemented and names the module");
-  ok(/"pip".*"uvicorn".*"flask".*"gunicorn".*"pytest"/.test(r.err), "…and lists the modules that do work");
+  ok(/"pip".*"venv".*"uvicorn".*"flask".*"gunicorn".*"pytest"/.test(r.err), "…and lists the modules that do work");
 
+  // Two different unknowns, kept apart. Checked in full further down, against
+  // real pip, in the section on reaching these commands by the name users type.
   r = run("-m", "pip", "download", "flask");
-  ok(r.code === 1 && /only the "install" subcommand/.test(r.err), "python -m pip <other> names the one subcommand it has");
+  ok(r.code === 1 && /"download" is a real pip command that this shim does not have/.test(r.err),
+    "python -m pip <a real pip verb we lack> is not-implemented and names the verb");
+  ok(/install, list, freeze, show, uninstall, check/.test(r.err), "…and lists the verbs that do work");
+  r = run("-m", "pip", "frobnicate");
+  ok(r.code === 1 && /unknown command "frobnicate"/.test(r.err),
+    "…while a verb no pip has gets real pip's unknown-command line, which lists nothing, as pip's does not");
 
   // --- gunicorn: honest entrypoint, loud about the process model ------------
   r = run("-m", "gunicorn", "wsgi:app", "-k", "gevent");
@@ -570,21 +600,510 @@ print(json.dumps(out))
 }
 
 // ---------------------------------------------------------------------------
-console.log("\n== pip does not report an install it cannot keep ==");
-// Every python command is a fresh Pyodide boot, so `Installed: X` is true of the
-// interpreter that just exited and false of the next one. The install is real,
-// so the success line and exit 0 stay; what was missing was the scope.
+console.log("\n== pip's output, held against the output of real pip ==");
+// The formatters are pure functions over dist metadata precisely so this check
+// can exist without an interpreter. `pip freeze > requirements.txt` is a
+// load-bearing idiom, and output that is almost `name==version` is worse than
+// none: it fails later, somewhere else, in a file someone committed. So the
+// oracle is real pip run on this machine over the same packages — not our idea
+// of what pip prints.
 // ---------------------------------------------------------------------------
 {
-  const runtime = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
-  ok(/THIS interpreter only/.test(PIP_SCOPE_NOTE), "the note says the install is scoped to this interpreter");
-  ok(/fresh\n\s*Pyodide boot/.test(PIP_SCOPE_NOTE), "…names the reason (a fresh boot per command)");
-  ok(/requirements\.txt/.test(PIP_SCOPE_NOTE) && /imports are auto-loaded/.test(PIP_SCOPE_NOTE),
-    "…and points at the two things that DO work, rather than only saying no");
-  // stderr, so `pip install x > log` still captures the same stdout it always did.
-  const writes = runtime.match(/process\.(stdout|stderr)\.write\(PIP_SCOPE_NOTE\)/g) || [];
-  ok(writes.length === 2, `both install paths print it (${writes.length}/2)`);
-  ok(writes.every((w) => w.includes("stderr")), "…on stderr, leaving stdout as it was");
+  const real = realPipFormat(spawnSync);
+  if (!real) {
+    // Loud, not skipped: a check that quietly does nothing reads as green.
+    console.log("  ! no host python3 -m pip - falling back to the captured pip 25.3 output");
+  } else {
+    ok(true, `re-derived from real ${real.version} on this machine`);
+    for (const k of ["list", "freeze", "emptyList", "emptyFreeze"]) {
+      ok(real[k] === CAPTURED[k], `the captured ${k} fixture still matches what real pip prints`);
+    }
+  }
+  const oracle = real || CAPTURED;
+
+  ok(formatPipList(FIXTURE_DISTS) === oracle.list, "formatPipList is byte-identical to real pip list");
+  ok(formatPipFreeze(FIXTURE_DISTS) === oracle.freeze, "formatPipFreeze is byte-identical to real pip freeze");
+  // The failure this catches: a header row emitted into an empty
+  // requirements.txt, or a stray newline that becomes a blank requirement.
+  ok(formatPipList([]) === oracle.emptyList, "…and an empty environment prints NOTHING, as real pip does");
+  ok(formatPipFreeze([]) === oracle.emptyFreeze, "…for freeze too");
+
+  // Sorting and column width are the two places a hand-rolled table goes wrong.
+  const listed = formatPipList(FIXTURE_DISTS).split("\n");
+  ok(listed[1] === "-".repeat("zzz-wide-name".length) + " " + "-".repeat("0.3.1.dev0".length),
+    "the rule under the header is as wide as the widest entry, not the header");
+  ok(!listed.some((l) => / $/.test(l)), "no row is right-padded (real pip leaves the last column ragged)");
+  // apple before Zebra: pip lowercases before comparing, and a plain ASCII sort
+  // would put every capitalised package first.
+  ok(formatPipFreeze([{ name: "Zebra", version: "1" }, { name: "apple", version: "2" }]) === "apple==2\nZebra==1\n",
+    "sorting is case-insensitive, as pip's is");
+
+  // pip check: both sentences were reproduced against real pip 25.3, one by
+  // removing a dependency and one by rewriting an installed dist-info's Version.
+  ok(formatPipCheck([]) === CAPTURED.checkClean, "a clean check prints real pip's exact sentence");
+  ok(formatPipCheck([{ kind: "missing", name: "requests", version: "2.34.2", dependency: "idna" }])
+    === CAPTURED.checkMissing, "…a missing dependency prints real pip's exact sentence");
+  ok(formatPipCheck([{ kind: "version", name: "requests", version: "2.34.2",
+    requirement: "urllib3<3,>=1.26", dependency: "urllib3", have: "1.0.0" }])
+    === CAPTURED.checkVersion, "…and so does a version conflict");
+
+  // pip show on PEP 621 metadata: no Home-page field, a License-Expression
+  // rather than a License, and an extras-only requirement that must not appear.
+  ok(formatPipShow({
+    name: "tabulate", version: "0.10.0", summary: "Pretty-print tabular data",
+    homePage: "https://github.com/astanin/python-tabulate", author: "",
+    authorEmail: "Sergey Astanin <s.astanin@gmail.com>", licenseExpression: "MIT",
+    requires: [], requiredBy: [],
+  }).replace(/^Location: .*\n/m, "") === CAPTURED.showModern,
+    "formatPipShow matches real pip on PEP 621 metadata (License-Expression replaces License)");
+  ok(/^License: Apache-2\.0$/m.test(formatPipShow({ name: "x", version: "1", license: "Apache-2.0" })),
+    "…and prints License when there is no License-Expression");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the package store: what survives a process, and what must not ==");
+// The store's whole job is to outlive the interpreter that filled it, so every
+// rule about it is a rule about a fresh process reading someone else's bytes.
+// These run against a stub interpreter — Pyodide's FS is a handful of calls, and
+// stubbing them is what lets the restore/discard/cap logic gate every PR.
+// spike-python-bridge.mjs runs the same shipped functions against a real
+// interpreter and real wheels, which is what keeps the stub honest.
+// ---------------------------------------------------------------------------
+{
+  const ENV = { pyTag: "python3.14", pythonVersion: "3.14.2", pyodideVersion: "314.0.3",
+    sitePackages: "/lib/python3.14/site-packages" };
+  // Just enough Pyodide to exercise the real store code: an in-memory FS.
+  const stubPyodide = (files = new Map()) => ({
+    version: ENV.pyodideVersion,
+    runPython: () => JSON.stringify({ pyTag: ENV.pyTag, pythonVersion: ENV.pythonVersion, sitePackages: ENV.sitePackages }),
+    FS: {
+      _f: files,
+      mkdirTree() {},
+      writeFile(p2, data) { files.set(p2, Buffer.from(data)); },
+      readFile(p2) { if (!files.has(p2)) throw new Error("ENOENT " + p2); return files.get(p2); },
+      readdir(dir) {
+        const out = new Set();
+        for (const k of files.keys()) if (k.startsWith(dir + "/")) out.add(k.slice(dir.length + 1).split("/")[0]);
+        return [".", "..", ...out];
+      },
+      stat(p2) { return files.has(p2) ? { mode: 1, size: files.get(p2).length } : { mode: 2, size: 0 }; },
+      isDir: (m) => m === 2,
+      isFile: (m) => m === 1,
+    },
+  });
+
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), "vv-store-offline-"));
+  const paths = storePaths(proj, ENV.pyTag);
+
+  ok(paths.sitePackages === path.join(proj, ".venv/lib/python3.14/site-packages"),
+    "the store is at <project>/.venv/lib/python3.14/site-packages — CPython's own venv layout");
+  ok(paths.cfg.endsWith("/.venv/pyvenv.cfg"), "…next to a pyvenv.cfg, where a Python user looks for one");
+
+  // .venv is in SKIP_DIRS, and that is deliberate: the store has to be restored
+  // to the INTERPRETER's site-packages, not copied to <cwd>/.venv where no
+  // import would look. Guard the comment as well as the code, because the next
+  // reader will see the skip and think it is the bug.
+  const runtimeSrc = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  const skipComment = runtimeSrc.slice(0, runtimeSrc.indexOf("const SKIP_DIRS")).split("\n").slice(-6).join("\n");
+  ok(/\.venv/.test(skipComment) && /site-packages/.test(skipComment),
+    "SKIP_DIRS carries a comment saying why .venv is excluded even though it is now the store");
+
+  // --- the version stamp -----------------------------------------------------
+  const good = { storeFormat: STORE_FORMAT, pyTag: ENV.pyTag, pythonVersion: "3.14.2", pyodideVersion: "314.0.3" };
+  ok(stampProblem(good, ENV) === null, "a matching stamp restores");
+  ok(stampProblem(null, ENV) !== null, "an absent stamp does not");
+  for (const [field, value] of [["pythonVersion", "3.13.0"], ["pyodideVersion", "0.26.0"], ["storeFormat", 99]]) {
+    const problem = stampProblem({ ...good, [field]: value }, ENV);
+    ok(typeof problem === "string" && problem.includes(String(value)),
+      `a ${field} mismatch is refused, and the reason names both versions: "${problem}"`);
+  }
+
+  // --- restore is all-or-nothing ---------------------------------------------
+  fs.mkdirSync(paths.sitePackages, { recursive: true });
+  fs.mkdirSync(path.join(paths.sitePackages, "widget"), { recursive: true });
+  fs.writeFileSync(path.join(paths.sitePackages, "widget/__init__.py"), "VALUE = 1\n");
+  fs.mkdirSync(path.join(paths.sitePackages, "widget-1.0.dist-info"), { recursive: true });
+  fs.writeFileSync(path.join(paths.sitePackages, "widget-1.0.dist-info/METADATA"), "Name: widget\nVersion: 1.0\n");
+  fs.writeFileSync(paths.stamp, JSON.stringify(good));
+
+  const py1 = stubPyodide();
+  const r1 = restoreStore(fs, py1, proj);
+  ok(r1.state === "restored" && r1.files === 2, `a valid store restores every file (${r1.files})`);
+  ok(py1.FS._f.has(ENV.sitePackages + "/widget/__init__.py"),
+    "…into the INTERPRETER's site-packages, which is the only path an import consults");
+
+  fs.writeFileSync(paths.stamp, JSON.stringify({ ...good, pythonVersion: "3.13.0" }));
+  const py2 = stubPyodide();
+  const r2 = restoreStore(fs, py2, proj);
+  ok(r2.state === "discarded", "a stale store is discarded");
+  ok(py2.FS._f.size === 0,
+    "…having copied NOTHING — a half-restored site-packages imports half a package and fails somewhere else");
+  fs.writeFileSync(paths.stamp, JSON.stringify(good));
+
+  // --- the cap is transactional ----------------------------------------------
+  const before = walkHost(fs, paths.sitePackages);
+  const py3 = stubPyodide(new Map([[ENV.sitePackages + "/big/data.bin", Buffer.alloc(4096)]]));
+  const delta = collectDelta(py3, ENV, new Map());
+  ok(delta.size === 1, "collectDelta sees only what appeared since the baseline");
+  const refused = persistDelta(fs, py3, proj, ENV, delta, "cmd", 1024);
+  ok(refused.ok === false && refused.projected > refused.max,
+    `over the cap, persistDelta refuses (${refused.projected} B against ${refused.max} B)`);
+  const after = walkHost(fs, paths.sitePackages);
+  ok(after.size === before.size && [...after].every(([k, v]) => before.get(k) === v),
+    "…and the store on disk is byte-for-byte what it was, not grown half way");
+  ok(persistDelta(fs, py3, proj, ENV, delta, "cmd").ok === true, "under the cap, the same delta writes");
+  fs.rmSync(path.join(paths.sitePackages, "big"), { recursive: true, force: true });
+
+  const capMsg = storeCapError({ projected: 70 * 1024 * 1024, max: STORE_MAX_BYTES }, ["scipy"]);
+  ok(/70\.0 MB/.test(capMsg) && /64\.0 MB/.test(capMsg), "the cap error says how big it got and how big is allowed");
+  ok(/pip uninstall/.test(capMsg) && /venv --clear/.test(capMsg), "…and names both ways out");
+  ok(/nothing was kept/.test(capMsg) && /left exactly as it was/.test(capMsg),
+    "…and is explicit that the install did not survive, rather than leaving the user to find out");
+  ok(STORE_MAX_BYTES >= 32 * 1024 * 1024, `the cap (${humanBytes(STORE_MAX_BYTES)}) leaves room for a real scientific stack — scipy alone is ~13 MB`);
+
+  // --- freeze describes the store, not the interpreter -----------------------
+  const dists = [
+    { name: "widget", version: "1.0", distInfo: "widget-1.0.dist-info" },
+    { name: "micropip", version: "0.11.1", distInfo: "micropip-0.11.1.dist-info" },
+  ];
+  const kept = storeDists(fs, proj, ENV, dists);
+  ok(kept.length === 1 && kept[0].name === "widget",
+    "storeDists keeps what the store holds and drops micropip, which every interpreter has anyway");
+  ok(formatPipFreeze(kept) === "widget==1.0\n", "so freeze describes the project's environment, not this boot's");
+
+  // The bug this catches, found by real pip and not by us: an install escapes
+  // the project name before naming the directory, so charset-normalizer lands in
+  // charset_normalizer-3.4.7.dist-info. Rebuilding `${name}-${version}` instead
+  // of using the reported directory silently drops every dashed package.
+  fs.mkdirSync(path.join(paths.sitePackages, "charset_normalizer-3.4.7.dist-info"), { recursive: true });
+  fs.writeFileSync(path.join(paths.sitePackages, "charset_normalizer-3.4.7.dist-info/METADATA"), "Name: charset-normalizer\n");
+  const dashed = storeDists(fs, proj, ENV, [
+    { name: "charset-normalizer", version: "3.4.7", distInfo: "charset_normalizer-3.4.7.dist-info" },
+  ]);
+  ok(dashed.length === 1, "a dashed project name in an underscored dist-info directory is still found");
+
+  // --- pyvenv.cfg is honest about what this is -------------------------------
+  const cfg = renderPyvenvCfg({ pyTag: ENV.pyTag, pythonVersion: "3.14.2", pyodideVersion: "314.0.3", command: "python -m venv .venv" });
+  ok(/^version = 3\.14\.2$/m.test(cfg) && /^home = /m.test(cfg) && /^command = /m.test(cfg),
+    "pyvenv.cfg carries the keys CPython's venv writes");
+  ok(/^include-system-site-packages = true$/m.test(cfg),
+    "…and says true, because there is one interpreter and no isolation to claim otherwise");
+  ok(/not a second interpreter/.test(cfg) && /no isolation/.test(cfg),
+    "…and states, in the file itself, that this is a store rather than an environment");
+
+  // Writing into a discarded store is the same partial state arrived at from the
+  // other side: a delta merged with bytes this interpreter cannot use, stamped
+  // as though they belonged together. pipInstall must refuse, not merge.
+  const install = runtimeSrc.slice(runtimeSrc.indexOf("async function pipInstall"), runtimeSrc.indexOf("async function pipList"));
+  ok(/restore\.state === "discarded"/.test(install), "pipInstall checks whether the store was discarded before writing to it");
+  ok(install.indexOf('restore.state === "discarded"') < install.indexOf("collectDelta"),
+    "…and does so before computing a delta, so no stale store is ever written into");
+  ok(/venv --clear/.test(install), "…telling the user the one command that clears the way");
+
+  ok(readStamp(fs, proj) !== null && readStamp(fs, path.join(proj, "nope")) === null,
+    "readStamp finds a store, and reports its absence rather than throwing");
+  ok(STORE_DIR === ".venv", "the store lives at .venv, which is where a Python user already looks");
+
+  fs.rmSync(proj, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the store's CLI seams ==");
+// ---------------------------------------------------------------------------
+{
+  const run = (...argv) => drivePython(argv);
+
+  for (const [verb, call] of [["list", "pipList"], ["freeze", "pipFreeze"], ["check", "pipCheck"]]) {
+    const r = run("-m", "pip", verb);
+    ok(r.calls.some((c) => c[0] === call), `python -m pip ${verb} reaches ${call}()`);
+  }
+  let r = run("-m", "pip", "show", "flask");
+  ok(r.calls.some((c) => c[0] === "pipShow" && c[1][0] === "flask"), "python -m pip show names the package");
+
+  // Real pip prompts here. This shim has nowhere to prompt, and assuming the
+  // answer would delete a user's packages on a typo.
+  r = run("-m", "pip", "uninstall", "flask");
+  ok(!r.calls.some((c) => c[0] === "pipUninstall") && /needs -y/.test(r.out),
+    "python -m pip uninstall without -y refuses, and says what real pip would have done");
+  r = run("-m", "pip", "uninstall", "-y", "flask");
+  ok(r.calls.some((c) => c[0] === "pipUninstall" && c[2].yes === true), "…and -y goes through");
+
+  // The escape hatch, refused honestly rather than aliased to something else:
+  // real `pip cache purge` clears pip's download cache, and ours is the
+  // browser's, which nothing in the VM can evict.
+  r = run("-m", "pip", "cache", "purge");
+  ok(r.code === 1 && /no pip cache here/.test(r.out) && /browser/.test(r.out),
+    "python -m pip cache says why there is no cache to purge");
+  ok(/pip uninstall/.test(r.out) && /venv --clear/.test(r.out), "…and names what does free space");
+
+  r = run("-m", "venv", ".venv");
+  ok(r.calls.some((c) => c[0] === "venv" && c[1] === ".venv"), "python -m venv .venv reaches venv()");
+  r = run("-m", "venv", "--clear", ".venv");
+  ok(r.calls.some((c) => c[0] === "venv" && c[2].clear === true), "…and --clear is honoured, since it is the documented rebuild");
+
+  // Same two tiers as the server shims: warn where the job still gets done,
+  // refuse where honouring the flag would mean claiming something untrue.
+  r = run("-m", "venv", "--system-site-packages", ".venv");
+  ok(/--system-site-packages is ignored/.test(r.out) && r.calls.some((c) => c[0] === "venv"),
+    "venv --system-site-packages warns (it is already true) and still creates the store");
+  r = run("-m", "venv", "--without-pip", ".venv");
+  ok(/--without-pip is ignored/.test(r.out), "venv --without-pip warns rather than pretending to isolate pip");
+  r = run("-m", "venv", "--upgrade", ".venv");
+  ok(r.code === 1 && /--upgrade is not supported/.test(r.out) && /--clear/.test(r.out),
+    "venv --upgrade is refused — re-stamping a store built elsewhere is the half-loaded state the stamp prevents");
+  r = run("-m", "venv", "--nope", ".venv");
+  ok(r.code === 1 && /unknown option/.test(r.out), "an unknown venv flag is refused, not ignored");
+
+  const help = drivePython(["--help"]).out;
+  ok(/python -m venv \.venv/.test(help), "the help text lists venv");
+  ok(/pip list/.test(help) && /pip uninstall/.test(help), "…and the pip verbs the store made possible");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== every entrypoint, reachable by the name a user types ==");
+// WHY THIS SECTION EXISTS. The store shipped working and unreachable: every
+// verb above passed, because every assertion drove `python -m pip` — and a user
+// typed `pip list` and got `sh: pip: not found`. The template check did not see
+// it either, since it asserts a manifest's first word is on PATH and every
+// Python manifest begins `python`. So the section above proves the seam works,
+// and this one proves something can get to it.
+//
+// It is deliberately derived rather than listed. A hand-written list of the six
+// entrypoints would have been written when pip was added and would have had the
+// same hole; taking the list from the launcher's own dispatch means adding a
+// seventh `-m` entrypoint fails here until it is either put on PATH or excused
+// in writing, with the excuse checked against a real Python.
+// ---------------------------------------------------------------------------
+{
+  const dispatched = [...PYTHON_PROGRAM.matchAll(/if \(mod === '([a-z0-9_.]+)'\)/g)].map((m) => m[1]);
+  ok(dispatched.length >= 6, `the launcher dispatches ${dispatched.length} -m entrypoints: ${dispatched.join(", ")}`);
+
+  // CPython ships no `venv` executable — `python -m venv` is the only spelling
+  // there has ever been — so this one is excused. Asked of the host rather than
+  // asserted, because "no such binary exists" is a claim about the outside world.
+  const onHost = (name) => spawnSync("sh", ["-c", "command -v " + name], { encoding: "utf8" }).status === 0;
+  const EXCUSED = { venv: "CPython ships no venv binary; python -m venv is the only spelling" };
+
+  for (const mod of dispatched) {
+    const bare = Object.entries(PYTHON_DELEGATES).filter(([, m]) => m === mod).map(([n]) => n);
+    if (EXCUSED[mod]) {
+      ok(bare.length === 0 && !onHost(mod),
+        `${mod} has no bare command, and this host's Python agrees it should not (${EXCUSED[mod]})`);
+    } else {
+      ok(bare.length > 0, `python -m ${mod} is also reachable as: ${bare.join(", ") || "NOTHING — it would ship unreachable"}`);
+    }
+  }
+
+  // pip3 beside pip for the same reason python3 sits beside python: both are
+  // installed on a real machine and scripts pick either.
+  ok(COREUTILS.pip && COREUTILS.pip3, "pip and pip3 are both on PATH");
+  ok(onHost("pip3"), "…which is what this host has too");
+  ok(Object.keys(COREUTILS).includes("python3"), "python3 is on PATH, the pattern pip3 follows");
+
+  // Faithful delegation. A shim that drops a flag is the same lie as a runtime
+  // that drops it, and `pip install -r requirements.txt` is the form every
+  // template README uses, so it is the one worth spelling out.
+  for (const [name, mod] of Object.entries(PYTHON_DELEGATES)) {
+    const argv = ["install", "-r", "requirements.txt", "--no-input"];
+    const r = driveShim(COREUTILS[name], argv);
+    const got = r.spawned;
+    ok(got && got.cmd === "python" && JSON.stringify(got.args) === JSON.stringify(["-m", mod, ...argv]),
+      `${name} spawns python -m ${mod} with argv passed through verbatim`);
+  }
+  ok(driveShim(COREUTILS.uvicorn, ["main:app", "--port", "8000"]).spawned.opts.cwd === "/project",
+    "…in the caller's cwd, so a relative app path resolves the way it reads");
+
+  // Exit codes. `pip install x && python main.py` and `pytest && echo ok` are
+  // both in our own template READMEs; a shim that reported 0 for a failed child
+  // would break the second half of each.
+  ok(driveShim(COREUTILS.pip, ["list"], { exitWith: 2 }).code === 2, "pip forwards the child's exit code");
+  ok(driveShim(COREUTILS.pytest, ["-q"], { exitWith: 1 }).code === 1, "pytest forwards a failing exit code rather than swallowing it");
+  ok(driveShim(COREUTILS.pip, ["list"], { exitWith: 0 }).code === 0, "…and a passing one");
+  const broke = driveShim(COREUTILS.pip, ["list"], { failWith: "spawn ENOENT" });
+  ok(broke.code === 1 && /^pip: spawn ENOENT/.test(broke.out), "a shim that cannot spawn says which command failed, and exits non-zero");
+
+  // Every command the docs and the templates tell a user to type. This is the
+  // check the old template assertion was reaching for, widened past the first
+  // word of a manifest to the commands prose actually shows.
+  const programs = new Set(Object.keys(COREUTILS));
+  const pyDocs = fs.readFileSync(path.join(ROOT, "sites/docs/docs/python.md"), "utf8");
+  const typed = new Set();
+  for (const m of pyDocs.matchAll(/```(?:bash|sh|console|shell)\n([\s\S]*?)```/g)) {
+    for (const line of m[1].split("\n")) {
+      const t = line.trim();
+      if (t && !t.startsWith("#")) typed.add(t.split(/\s+/)[0]);
+    }
+  }
+  const templates = await readShippedManifests(readTemplatesSource());
+  for (const id of NEW_TEMPLATES) {
+    const man = templates[id];
+    if (!man) continue;
+    for (const key of ["install", "dev"]) if (man[key]) typed.add(String(man[key]).split(/\s+/)[0]);
+  }
+  const unreachable = [...typed].filter((w) => !programs.has(w));
+  ok(unreachable.length === 0,
+    unreachable.length
+      ? `the docs and templates tell users to type: ${unreachable.join(", ")} — not on PATH`
+      : `all ${typed.size} commands the docs and templates tell users to type are on PATH: ${[...typed].sort().join(", ")}`);
+
+  // pip's top level, which nobody could reach before the shim: `python -m pip`
+  // with no verb is not a thing people type, and `pip` alone very much is.
+  // Shapes held against real pip, same as the formatters above.
+  const unknown = realPipUnknown(spawnSync, "frobnicate");
+  const suggest = realPipUnknown(spawnSync, "instal");
+  if (!unknown || !suggest) {
+    ok(false, "no usable pip on this machine to re-derive the unknown-command shape from");
+  } else {
+    ok(unknown.text === CAPTURED.unknownCommand && suggest.text === CAPTURED.unknownCommandSuggest,
+      "real pip still prints the unknown-command lines this shim is shaped after");
+  }
+  const oracleUnknown = (unknown || { text: CAPTURED.unknownCommand, status: 1 });
+  const oracleSuggest = (suggest || { text: CAPTURED.unknownCommandSuggest, status: 1 });
+
+  let p = drivePython(["-m", "pip", "frobnicate"]);
+  ok(p.out === oracleUnknown.text && p.code === oracleUnknown.status,
+    "pip <nonsense> prints real pip's line, to the byte, and exits 1");
+  p = drivePython(["-m", "pip", "instal", "flask"]);
+  ok(p.out === oracleSuggest.text, "…and suggests the near miss the way pip's difflib does");
+
+  // The distinction that matters more than either: 'download' is a command real
+  // pip HAS. Calling it unknown would be false and would send someone hunting
+  // for a typo that is not there; the honest answer names it and says what is here.
+  p = drivePython(["-m", "pip", "download", "flask"]);
+  ok(p.code === 1 && /a real pip command that this shim does not have/.test(p.out) && !/unknown command/.test(p.out),
+    "a real pip command we lack is refused as missing, not as a typo");
+  ok(/install, list, freeze, show, uninstall, check/.test(p.out), "…and the refusal names what is here");
+
+  // Bare pip. Real pip prints a usage block and exits 0; this one lists the six
+  // commands it has rather than reprinting a menu of nineteen it does not.
+  const bare = drivePython(["-m", "pip"]);
+  ok(bare.code === 0 && /^\nUsage:/.test(bare.out) && /\n {2}pip <command> \[options\]/.test(bare.out),
+    "bare pip prints usage in pip's shape and exits 0, as real pip does");
+  for (const verb of ["install", "uninstall", "freeze", "list", "show", "check"]) {
+    ok(new RegExp("\\n  " + verb + " {2,}[A-Z]").test(bare.out), `…listing ${verb} in pip's two-column layout`);
+  }
+  ok(!/\n {2}(download|wheel|config|debug) /.test(bare.out), "…and listing nothing it cannot do");
+  ok(drivePython(["-m", "pip", "--help"]).out === bare.out && drivePython(["-m", "pip", "help"]).out === bare.out,
+    "pip --help and pip help print the same block");
+  const ver = drivePython(["-m", "pip", "--version"]);
+  ok(ver.code === 0 && /^pip .* from .* \(python 3\.14\)\n$/.test(ver.out),
+    "pip --version keeps the shape scripts grep for");
+  ok(/Vivari shim/.test(ver.out) && !/^pip \d/.test(ver.out),
+    "…without claiming a pip version number this is not");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== what a pip command actually puts on stdout ==");
+// WHY THIS IS A SUBPROCESS. `pip freeze > requirements.txt` wrote
+//
+//     Loading packaging
+//     Loaded packaging
+//     tabulate==0.10.0
+//
+// and every check above stayed green, because they all compare what
+// formatPipFreeze() *returns*. Nothing that inspects a return value can see a
+// second writer on the same stream. Pyodide's package loader defaults to the
+// interpreter's own stdout — the stream bootPyodide points at process.stdout —
+// so it was printing into pip's payload: the content right, the stream wrong,
+// which is the version that survives the terminal and breaks later inside a
+// committed file.
+//
+// So this runs the real runtime in a real process and trusts only the pipe.
+// The interpreter is a stand-in (scripts/lib/fake-pyodide.mjs); the bug never
+// needed a real one, because it lives entirely in whether a call passes a
+// messageCallback — and the stand-in reproduces exactly that fork. The bridge
+// tier checks the stand-in's claim against real Pyodide.
+// ---------------------------------------------------------------------------
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vv-pipout-"));
+  const proj = path.join(root, "proj");
+  fs.mkdirSync(proj, { recursive: true });
+  const ENV = { pyTag: "python3.14", pythonVersion: "3.14.2", pyodideVersion: "314.0.3" };
+  const paths = storePaths(proj, ENV.pyTag);
+  // Two packages, one of them dashed, so a listing that drops dashed names or
+  // sorts case-sensitively shows up here as well.
+  for (const [dir, name, version] of [
+    ["tabulate-0.10.0.dist-info", "tabulate", "0.10.0"],
+    ["charset_normalizer-3.4.9.dist-info", "charset-normalizer", "3.4.9"],
+  ]) {
+    fs.mkdirSync(path.join(paths.sitePackages, dir), { recursive: true });
+    fs.writeFileSync(
+      path.join(paths.sitePackages, dir, "METADATA"),
+      `Metadata-Version: 2.1\nName: ${name}\nVersion: ${version}\nSummary: fixture\n`,
+    );
+  }
+  fs.writeFileSync(paths.cfg, renderPyvenvCfg({ ...ENV, command: "python -m venv .venv" }));
+  fs.writeFileSync(paths.stamp, JSON.stringify(makeStamp({ ...ENV, files: 2, bytes: 137 })));
+  const indexDir = writeFakeIndex(fs, path, path.join(root, "idx"));
+
+  const runPip = (verb) =>
+    spawnSync(process.execPath, [path.join(ROOT, "scripts/lib/pip-stdout-child.mjs"), verb, proj, indexDir],
+      { encoding: "utf8" });
+
+  const freeze = runPip("freeze");
+  ok(freeze.stdout === "charset-normalizer==3.4.9\ntabulate==0.10.0\n",
+    `pip freeze puts the requirements lines on stdout and nothing else: ${JSON.stringify(freeze.stdout)}`);
+  const list = runPip("list");
+  ok(list.stdout ===
+      "Package            Version\n------------------ -------\ncharset-normalizer 3.4.9\ntabulate           0.10.0\n",
+    "pip list puts the table on stdout and nothing else");
+
+  // The other half of the same assertion, and the one that keeps it honest: the
+  // loader really did run and really did have something to say. Without this,
+  // deleting the loadPackage call would make the two checks above pass.
+  ok(/Loading packaging\nLoaded packaging\n/.test(freeze.stderr),
+    "…while the loader progress it emitted went to stderr, where a redirect leaves it");
+  ok(/Loading packaging/.test(list.stderr), "…same for pip list");
+  ok(freeze.status === 0 && list.status === 0, "both still exit 0");
+
+  // pip install is the deliberate exception: the packages the user asked for
+  // are command output — real pip prints Collecting/Downloading on stdout — and
+  // this shim's own success lines are already there. Our own micropip is not.
+  const install = runPip("install");
+  ok(/^Loading tabulate\nLoaded tabulate\nInstalled: tabulate\n/.test(install.stdout),
+    "pip install keeps progress for the requested package on stdout, as real pip does");
+  ok(/Loading micropip/.test(install.stderr) && !/micropip/.test(install.stdout),
+    "…but loading our own micropip is diagnostics, and stays off stdout");
+
+  fs.rmSync(root, { recursive: true, force: true });
+
+  // The generalisable half. Nothing stops the next call site omitting the
+  // callback again, so require every one of them to say where it wants its
+  // output to go — a check a reviewer would otherwise have to make by eye.
+  const runtimeSrc = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  const callSites = [...runtimeSrc.matchAll(/\.(loadPackage|loadPackagesFromImports)\(([^;]*?)\);/g)];
+  ok(callSites.length >= 8, `${callSites.length} package-loader call sites in the runtime`);
+  const bare = callSites.filter((m) => !/,\s*loaderTo(Stderr|Stdout)\s*\)?$/.test(m[2].trim()));
+  ok(bare.length === 0,
+    bare.length
+      ? `these inherit Pyodide's default, which is the interpreter's stdout: ${bare.map((m) => m[0]).join(" | ")}`
+      : "every package-loader call names the stream it writes to, so none can inherit the default");
+  ok(/loaderToStdout/.test(runtimeSrc) && runtimeSrc.match(/loaderToStdout\b/g).length === 2,
+    "…and exactly one of them opts into stdout (the definition plus its single use)");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the version literal /bin/python.js prints without booting ==");
+// PYTHON_PROGRAM is a no-interpolation template literal, so it cannot import the
+// version and has to carry a copy. Keeping --version boot-free is worth that;
+// leaving the copy unpinned is not. Exactly the BUN_PROGRAM/BUN_VERSION
+// arrangement in AGENTS.md: the literal is held against the constant here, and
+// the constant against a real interpreter's sys.version in the bridge tier.
+// ---------------------------------------------------------------------------
+{
+  const m = PYTHON_PROGRAM.match(/const STATIC_VERSION = '([^']+)'/);
+  ok(m, "STATIC_VERSION is a findable literal in the shipped program");
+  const literal = m ? m[1] : "";
+  ok(literal.includes(PYODIDE_PYTHON_VERSION),
+    `--version prints the vendored Pyodide's Python: ${JSON.stringify(literal)} carries ${PYODIDE_PYTHON_VERSION}`);
+  // Real CPython prints the patch number. Printing 3.14 next to a script that
+  // reports 3.14.2 is a difference a user notices and cannot explain.
+  ok(/^\d+\.\d+\.\d+$/.test(PYODIDE_PYTHON_VERSION), "…and it is a full patch version, as CPython prints");
+  ok(/^Python \d/.test(literal), "…in CPython's own `Python X.Y.Z` shape");
+
+  const r = drivePython(["--version"]);
+  ok(r.code === 0 && r.out === literal + "\n", "python --version prints it");
+  ok(!r.calls.length, "…without booting Pyodide, which is why the literal exists at all");
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +1121,26 @@ console.log("\n== the docs claims this change corrected ==");
   ok(!/not shipping yet/.test(docs), "the asyncio.run() claim no longer says the capability is unshipped");
   ok(/Chrome\s+\n?ships from 137|ships from 137/.test(docs) && /Firefox from 139/.test(docs),
     "…it names the versions that ship JSPI instead");
+
+  // The store's claims. `.venv` is the one place a familiar name does not carry
+  // all of its usual meaning, so the page has to say which parts it does carry.
+  ok(!/pip install` does not accumulate state/.test(docs) && !/warm browser cache, making the next run faster/.test(docs),
+    "the 'pip install does not persist' paragraph is gone — it stopped being true with this change");
+  ok(/## `pip install`, and the `\.venv` it writes to/.test(docs), "…replaced by a section about the store");
+  ok(/package store, not a second interpreter/.test(docs), "the docs say what .venv is here, in those words");
+  ok(/no `bin\/activate`/.test(docs) && /no\s+isolation/.test(docs),
+    "…and what it is not: no activate script, and no isolation to be had from one interpreter per process");
+  ok(/Two projects get two stores/.test(docs), "…while naming the part of a virtualenv it does give you");
+  ok(/capped at 64 MB/.test(docs) && /refused outright/.test(docs) && /left exactly as it was/.test(docs),
+    "the size cap is documented, including that hitting it changes nothing");
+  ok(/ignored rather than\s+half-loaded/.test(docs) && /venv --clear/.test(docs),
+    "…and so is the stale-store rule, with the command that rebuilds it");
+  // Spelled `pip …`, not `python -m pip …`. Both work, but the docs should show
+  // the form a user will actually type — and for a while only the second one
+  // did anything, which is how the missing PATH shim went unnoticed.
+  ok(/\npip freeze/.test(docs) && /\npip uninstall -y/.test(docs),
+    "the verbs the store made possible are shown, uninstall with the -y this shim needs");
+  ok(!/python -m pip/.test(docs), "…and shown as `pip`, since that is now on PATH");
 }
 
 // ---------------------------------------------------------------------------

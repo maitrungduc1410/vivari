@@ -8,6 +8,44 @@ import { NODE_GYP_STUB } from "./node-gyp-stub.js";
 import { BUN_PROGRAM, BUNX_PROGRAM } from "./programs/bun.js";
 import { PYTHON_PROGRAM } from "./programs/python.js";
 
+// The bare-command spellings of the launcher's `-m` entrypoints, as
+// `<command>: <module>`. `pip3` sits beside `pip` the way `python3` sits beside
+// `python`, because real installations ship both and scripts pick either.
+//
+// `venv` is deliberately absent: CPython ships no `venv` executable, so
+// `python -m venv` is the only spelling there has ever been, and inventing a
+// bare `venv` would be a command Vivari had and the outside world did not. The
+// offline spike checks that exception against the host's real Python rather
+// than taking this comment's word for it.
+export const PYTHON_DELEGATES = {
+  pip: "pip",
+  pip3: "pip",
+  uvicorn: "uvicorn",
+  flask: "flask",
+  gunicorn: "gunicorn",
+  pytest: "pytest",
+};
+
+// One program, parameterised. argv is forwarded verbatim — `-r
+// requirements.txt`, `--port 8000`, everything — and the child's exit code is
+// the shim's, so `pytest && echo ok` and `pip install x && python main.py`
+// behave.
+function pythonDelegates() {
+  const out = {};
+  for (const [name, mod] of Object.entries(PYTHON_DELEGATES)) {
+    out[name] = `
+'use strict';
+const cp = require('child_process');
+const child = cp.spawn('python', ['-m', '${mod}'].concat(process.argv.slice(2)), { cwd: process.cwd(), env: process.env });
+if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
+if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
+child.on('exit', (code) => process.exit(code | 0));
+child.on('error', (e) => { process.stderr.write('${name}: ' + ((e && e.message) || e) + String.fromCharCode(10)); process.exit(1); });
+`;
+  }
+  return out;
+}
+
 export const COREUTILS = {
   // bun / bunx — the Bun runtime + package-manager analog. Unlike npm/yarn/pnpm
   // (real vendored JS CLIs), Bun is a native binary with no pure-JS build, so this
@@ -25,48 +63,19 @@ export const COREUTILS = {
   python: PYTHON_PROGRAM,
   python3: PYTHON_PROGRAM,
 
-  // uvicorn / flask / gunicorn / pytest — authentic entrypoints for the Python
-  // templates. They just delegate to the `python` launcher's `-m <mod>` handling
+  // pip / pip3 / uvicorn / flask / gunicorn / pytest — the names a Python user
+  // actually types. Each delegates to the `python` launcher's `-m <mod>` handling
   // (which boots Pyodide and, for the three servers, bridges the WSGI/ASGI app to
   // a guest http server so the preview opens). gunicorn is the generic WSGI
   // entrypoint, so Django, Flask, Bottle and Pyramid all share one seam.
   // See packages/kernel-host/programs/python.js.
-  uvicorn: `
-'use strict';
-const cp = require('child_process');
-const child = cp.spawn('python', ['-m', 'uvicorn'].concat(process.argv.slice(2)), { cwd: process.cwd(), env: process.env });
-if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
-if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
-child.on('exit', (code) => process.exit(code | 0));
-child.on('error', (e) => { process.stderr.write('uvicorn: ' + ((e && e.message) || e) + String.fromCharCode(10)); process.exit(1); });
-`,
-  flask: `
-'use strict';
-const cp = require('child_process');
-const child = cp.spawn('python', ['-m', 'flask'].concat(process.argv.slice(2)), { cwd: process.cwd(), env: process.env });
-if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
-if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
-child.on('exit', (code) => process.exit(code | 0));
-child.on('error', (e) => { process.stderr.write('flask: ' + ((e && e.message) || e) + String.fromCharCode(10)); process.exit(1); });
-`,
-  gunicorn: `
-'use strict';
-const cp = require('child_process');
-const child = cp.spawn('python', ['-m', 'gunicorn'].concat(process.argv.slice(2)), { cwd: process.cwd(), env: process.env });
-if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
-if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
-child.on('exit', (code) => process.exit(code | 0));
-child.on('error', (e) => { process.stderr.write('gunicorn: ' + ((e && e.message) || e) + String.fromCharCode(10)); process.exit(1); });
-`,
-  pytest: `
-'use strict';
-const cp = require('child_process');
-const child = cp.spawn('python', ['-m', 'pytest'].concat(process.argv.slice(2)), { cwd: process.cwd(), env: process.env });
-if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
-if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
-child.on('exit', (code) => process.exit(code | 0));
-child.on('error', (e) => { process.stderr.write('pytest: ' + ((e && e.message) || e) + String.fromCharCode(10)); process.exit(1); });
-`,
+  //
+  // GENERATED rather than written out one by one, because they were four
+  // hand-copied near-identical blocks and `pip` was missing from them for as
+  // long as they existed — `python -m pip list` worked while `pip list` said
+  // `sh: pip: not found`. spike-python-offline.mjs now derives the entrypoint
+  // list from the launcher's own dispatch and requires each one to be reachable.
+  ...pythonDelegates(),
 
   // NOTE: there is no built-in `npm` here anymore. The Turbo-analog installer
   // (packages/kernel-host/programs/npm.js) has been RETIRED from the shipped

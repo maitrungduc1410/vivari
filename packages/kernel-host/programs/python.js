@@ -9,7 +9,8 @@
 //   python <file.py> [args]   run a script (project dir mirrored into Pyodide FS)
 //   python -c "code" [args]   run an inline program
 //   python                    start an interactive REPL
-//   python -m pip install ... install packages (vendored wheel first, else micropip)
+//   python -m pip install ... install into the project's .venv package store
+//   python -m venv .venv     create that store
 //   python -m uvicorn m:app   serve a FastAPI/ASGI app via a guest http bridge
 //   python -m flask run       serve a Flask/WSGI app via a guest http bridge
 //   python -m gunicorn m:app  serve any WSGI app (Django, Flask, ...) the same way
@@ -56,9 +57,16 @@ function inlineValue(a) {
 
 const argv = process.argv.slice(2);
 
-// Kept in sync with the vendored Pyodide (Python 3.14 line). Printed for
-// --version WITHOUT booting Pyodide, so version checks stay instant + lazy.
-const STATIC_VERSION = 'Python 3.14 (Pyodide, Vivari)';
+// Printed for --version WITHOUT booting Pyodide, so a version check stays
+// instant and the interpreter stays lazy. That is worth keeping, and it is why
+// this is a literal: PYTHON_PROGRAM is a no-interpolation template literal, so
+// it cannot import PYODIDE_PYTHON_VERSION from builtins/python.js the way
+// ordinary code would. The number is therefore pinned by test instead of by
+// import — spike-python-offline.mjs holds this literal against that constant,
+// and the bridge spike holds the constant against sys.version in a real
+// interpreter. Bump the vendored Pyodide without bumping both and CI fails.
+// Full patch version, as real CPython prints it: python --version says 3.14.2.
+const STATIC_VERSION = 'Python 3.14.2 (Pyodide, Vivari)';
 
 const HELP = [
   'Vivari python (Pyodide shim)',
@@ -68,7 +76,10 @@ const HELP = [
   '  python <file.py> [args]     run a script file',
   '  python -c "code" [args]     run an inline program',
   '  python                      start an interactive REPL',
-  '  python -m pip install ...   install packages (vendored wheel, else micropip)',
+  '  python -m venv .venv        create the package store this project installs into',
+  '  python -m pip install ...   install into the store (vendored wheel, else micropip)',
+  '  python -m pip list          what the store holds (also: freeze, show, check)',
+  '  python -m pip uninstall -y  remove a package from the store',
   '  python -m uvicorn main:app  serve a FastAPI/ASGI app (opens a preview)',
   '  python -m flask run         serve a Flask/WSGI app (opens a preview)',
   '  python -m gunicorn wsgi:app serve any WSGI app - Django, Flask, ... (opens a preview)',
@@ -105,10 +116,142 @@ function readRequirements(file) {
   return pkgs;
 }
 
+// pip's read-only verbs all take the same shape here: boot, restore the store,
+// read real dist metadata out of it. The store is what makes them meaningful -
+// before it existed there was nothing durable for them to describe.
+const PIP_VERBS = ['install', 'list', 'freeze', 'show', 'uninstall', 'check'];
+
+// Real pip's command list, as bare 'pip' prints it. It is here to keep two
+// different answers apart, which matters now that pip is on PATH and people will
+// type the whole surface at it:
+//   - 'download' is a command pip HAS and we have not. Saying 'unknown command'
+//     about it would be false, and would send someone hunting for a typo.
+//   - 'frobnicate' is a command nobody has, and real pip's exact words for that
+//     are: ERROR: unknown command "frobnicate"
+const PIP_REAL_COMMANDS = [
+  'install', 'lock', 'download', 'uninstall', 'freeze', 'inspect', 'list', 'show',
+  'check', 'config', 'search', 'cache', 'index', 'wheel', 'hash', 'completion',
+  'debug', 'help',
+];
+
+// Real pip suggests when the typo is close, printing: unknown command "instal"
+// - maybe you meant "install". Same shape, over the commands this shim has.
+function nearestVerb(word) {
+  let best = '';
+  let bestScore = 3; // pip uses difflib; two edits is close enough to be a typo
+  for (let i = 0; i < PIP_VERBS.length; i++) {
+    const d = editDistance(String(word), PIP_VERBS[i]);
+    if (d < bestScore) { bestScore = d; best = PIP_VERBS[i]; }
+  }
+  return best;
+}
+
+function editDistance(a, b) {
+  const prev = [];
+  for (let j = 0; j <= b.length; j++) prev.push(j);
+  for (let i = 1; i <= a.length; i++) {
+    let diag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      const cost = a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1;
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + cost);
+      diag = tmp;
+    }
+  }
+  return prev[b.length];
+}
+
+// Bare 'pip', 'pip --help' and 'pip help'. Real pip prints a usage block listing
+// every command with a one-line description, and exits 0; this is the same block
+// over the commands that exist here, so what a user reads is the truth about
+// this pip rather than a copy of another one's menu.
+const PIP_USAGE = [
+  '',
+  'Usage:   ',
+  '  pip <command> [options]',
+  '',
+  'Commands:',
+  "  install                     Install packages into this project's .venv store.",
+  '  uninstall                   Remove packages from the store (needs -y).',
+  '  freeze                      Output installed packages in requirements format.',
+  '  list                        List installed packages.',
+  '  show                        Show information about installed packages.',
+  '  check                       Verify installed packages have compatible dependencies.',
+  '',
+  "This is Vivari's pip, not pip itself: it installs into a per-project package",
+  'store at .venv/ and supports the six commands above. Anything else pip can do',
+  'will say so rather than pretend. See "python --help" for the interpreter.',
+].join(NL);
+
 async function doPip(rest) {
-  if (rest[0] !== 'install') {
-    err('python -m pip: only the "install" subcommand is supported in the Vivari shim.');
+  const verb = rest[0];
+
+  if (!verb || verb === '--help' || verb === '-h' || verb === 'help') {
+    out(PIP_USAGE);
+    process.exit(0);
+    return;
+  }
+  if (verb === '--version' || verb === '-V') {
+    // Real pip prints: pip 25.3 from /path/to/pip (python 3.11). Keeping that
+    // shape means a script grepping it still finds what it looks for; naming a
+    // pip version we do not have would be the lie the shape invites.
+    out('pip (Vivari shim for python -m pip) from /bin/pip.js (python 3.14)');
+    process.exit(0);
+    return;
+  }
+
+  if (PIP_VERBS.indexOf(verb) === -1) {
+    if (verb === 'cache') {
+      // Honest refusal rather than a command that looks familiar and does
+      // something else. Real 'pip cache purge' clears pip's own download cache;
+      // ours is the browser's HTTP cache, which nothing in the VM can evict.
+      err('pip: there is no pip cache here - wheels are cached by the browser,');
+      err('     which the VM cannot clear. To free space in the package store,');
+      err('     use "pip uninstall <package>" or "python -m venv --clear .venv".');
+      process.exit(1);
+      return;
+    }
+    if (PIP_REAL_COMMANDS.indexOf(verb) === -1) {
+      const near = nearestVerb(verb);
+      err('ERROR: unknown command "' + String(verb) + '"' + (near ? ' - maybe you meant "' + near + '"' : ''));
+      process.exit(1);
+      return;
+    }
+    err('pip: "' + String(verb) + '" is a real pip command that this shim does not have (have: ' + PIP_VERBS.join(', ') + ').');
     process.exit(1);
+    return;
+  }
+  const py = getPy();
+  if (verb === 'list') { process.exit((await py.pipList()) | 0); return; }
+  if (verb === 'freeze') { process.exit((await py.pipFreeze()) | 0); return; }
+  if (verb === 'check') { process.exit((await py.pipCheck()) | 0); return; }
+  if (verb === 'show') {
+    const names = rest.slice(1).filter(function (a) { return a.charAt(0) !== '-'; });
+    process.exit((await py.pipShow(names)) | 0);
+    return;
+  }
+  if (verb === 'uninstall') {
+    const names = [];
+    let yes = false;
+    const items2 = rest.slice(1);
+    for (let k = 0; k < items2.length; k++) {
+      const a = items2[k];
+      if (a === '-y' || a === '--yes') { yes = true; }
+      else if (a === '-r' || a === '--requirement') {
+        const f = items2[k + 1]; k++;
+        if (f) { const more = readRequirements(f); for (let j = 0; j < more.length; j++) names.push(more[j]); }
+      } else if (a.charAt(0) !== '-') { names.push(a); }
+    }
+    if (!yes) {
+      // Real pip asks "Proceed (Y/n)?" here. This shim has nowhere to ask, and
+      // assuming the answer would delete a user's packages on a typo.
+      err('pip: uninstall needs -y here. Real pip asks for confirmation at this point,');
+      err('     and this shim has nowhere to ask, so it will not assume the answer.');
+      process.exit(1);
+      return;
+    }
+    process.exit((await py.pipUninstall(names, { yes: yes })) | 0);
     return;
   }
   const items = rest.slice(1);
@@ -125,8 +268,52 @@ async function doPip(rest) {
     }
   }
   if (!pkgs.length) { err('pip: nothing to install'); process.exit(1); return; }
+  const code = await py.pipInstall(pkgs);
+  process.exit(code | 0);
+}
+
+// python -m venv: the one -m module that belongs with the store, because
+// creating the store is the entirety of what it means here. Same two tiers as
+// the server shims for flags: warn when the server still does the job, refuse
+// when honouring it would mean claiming something untrue.
+async function doVenv(rest) {
+  let dir = '';
+  let clear = false;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    const name = flagName(a);
+    if (a.charAt(0) !== '-') { if (!dir) dir = a; continue; }
+    if (name === '--clear') { clear = true; continue; }
+    if (name === '-h' || name === '--help') {
+      out('Usage: python -m venv [--clear] .venv');
+      out('');
+      out('Creates the package store this project installs into. It is a store, not a');
+      out('second interpreter: there is no bin/activate, and nothing to isolate from.');
+      process.exit(0); return;
+    }
+    if (name === '--system-site-packages') {
+      warnIgnored('venv', '--system-site-packages', 'already true - there is one interpreter and it always sees its own site-packages');
+      continue;
+    }
+    if (name === '--without-pip') {
+      warnIgnored('venv', '--without-pip', 'pip here is this shim, which is always present');
+      continue;
+    }
+    if (name === '--copies' || name === '--symlinks') {
+      warnIgnored('venv', name, 'no interpreter is copied or linked - the store holds packages only');
+      continue;
+    }
+    if (name === '--prompt') { if (inlineValue(a) === null) i++; warnIgnored('venv', '--prompt', 'there is no shell to activate, so no prompt to change'); continue; }
+    if (name === '--upgrade' || name === '--upgrade-deps') {
+      refuse('venv', name, 'it would re-stamp a store built by a different interpreter, which is exactly the half-loaded state the stamp exists to prevent - use --clear');
+      return;
+    }
+    refuse('venv', name, 'unknown option');
+    return;
+  }
+  if (!dir) { err('python -m venv: no directory given (try: python -m venv .venv)'); process.exit(1); return; }
   const py = getPy();
-  const code = await py.pip(pkgs);
+  const code = await py.venv(dir, { clear: clear });
   process.exit(code | 0);
 }
 
@@ -300,11 +487,12 @@ async function main() {
     const mod = argv[1];
     const rest = argv.slice(2);
     if (mod === 'pip') { return doPip(rest); }
+    if (mod === 'venv') { return doVenv(rest); }
     if (mod === 'uvicorn') { return doUvicorn(rest); }
     if (mod === 'flask') { return doFlask(rest); }
     if (mod === 'gunicorn') { return doGunicorn(rest); }
     if (mod === 'pytest') { return doPytest(rest); }
-    err('python -m ' + mod + ': running arbitrary modules is not supported in the Vivari shim yet (only "pip", "uvicorn", "flask", "gunicorn", "pytest").');
+    err('python -m ' + mod + ': running arbitrary modules is not supported in the Vivari shim yet (only "pip", "venv", "uvicorn", "flask", "gunicorn", "pytest").');
     process.exit(1);
     return;
   }

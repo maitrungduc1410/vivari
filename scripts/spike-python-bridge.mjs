@@ -17,8 +17,10 @@
 //
 // WHAT IT PROVES: Python-level semantics of all seven templates, the bridge's
 // WSGI/ASGI protocol conversion, preview-prefix URL generation, the argv seams,
-// and — against real urllib3 — that Python's outbound HTTP works once our own
-// Node masquerade stops answering urllib3's realm question for it. It drives the
+// against real urllib3 that Python's outbound HTTP works once our own Node
+// masquerade stops answering urllib3's realm question for it, and — across
+// several real interpreters in one run — that the .venv package store survives
+// the process that filled it. It drives the
 // SHIPPED dispatch source and the SHIPPED patch source (both exported from the
 // runtime) against the SHIPPED template files (read out of templates.ts), so
 // none of them can drift away from what is tested here.
@@ -44,15 +46,34 @@ import { fileURLToPath } from "node:url";
 import { PYTHON_PROGRAM } from "../packages/kernel-host/programs/python.js";
 import { COREUTILS } from "../packages/kernel-host/coreutils.js";
 import {
+  PYODIDE_PYTHON_VERSION,
   byteWriter,
   installUrllib3RealmPatch,
   flushStreams,
   setupSource,
   terminationFromError,
 } from "../packages/runtime/builtins/python.js";
+import {
+  DIST_QUERY,
+  collectDelta,
+  formatPipCheck,
+  formatPipFreeze,
+  formatPipList,
+  formatPipShow,
+  humanBytes,
+  persistDelta,
+  pyEnv,
+  restoreStore,
+  storeDists,
+  storePaths,
+  uninstallSource,
+  walkHost,
+  walkPyodide,
+} from "../packages/runtime/builtins/python-store.js";
 import { readShippedTemplates, readTemplatesSource } from "./lib/shipped-templates.mjs";
 import { CPYTHON_EXITS, UNTRUNCATED } from "./lib/cpython-exit.mjs";
 import { MODELLED_FRAGMENTS, normalize } from "./lib/urllib3-emscripten.mjs";
+import { loaderLines } from "./lib/fake-pyodide.mjs";
 import { DRIVE_ENV, drivePython } from "./lib/python-drive.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -148,6 +169,12 @@ const CASES = {
   "wsgi-environ": { kind: "wsgi-environ", synthetic: true },
   // Python's HTTP, and the Node masquerade that was switching it off.
   "urllib3-realm": { kind: "urllib3-realm", synthetic: true },
+
+  // Where loadPackage writes when you do and do not hand it a callback, which
+  // is what the offline stdout gate models — plus the version literal.
+  "loader-streams": { kind: "loader-streams", synthetic: true },
+
+  "package-store": { kind: "package-store", synthetic: true },
   // sys.exit() raised for real, judged against what real CPython does.
   "termination": { kind: "termination", synthetic: true },
 };
@@ -639,6 +666,223 @@ _out
       try { status = String(await P(code)); } catch (e) { status = String(e.message || e).split("\n").pop(); }
       ok(status === "200", `${label} reaches the network from Python with no patching at all (${status})`);
     }
+  }
+
+
+  // --- where the package loader writes, and which Python this is ------------
+  if (spec.kind === "loader-streams") {
+    // Two claims the offline tier has to take on trust, checked here against the
+    // real thing.
+    //
+    // FIRST: that scripts/lib/fake-pyodide.mjs models the loader honestly. The
+    // offline gate on `pip freeze`'s stdout is only worth anything if the
+    // stand-in emits progress where Pyodide really emits it — a stand-in that
+    // quietly printed nothing would keep passing over the exact bug it exists
+    // to catch. So: the default really does go to the interpreter's stdout
+    // stream (NOT console.log, which is the intuitive guess and is wrong), a
+    // messageCallback really does divert it, and the bytes really are the ones
+    // the stand-in writes.
+    const captured = [];
+    const capture = (tag) => ({ write: (b) => { captured.push(tag + Buffer.from(b).toString("utf8")); return b.length; } });
+    py.setStdout(capture(""));
+    py.setStderr(capture("ERR:"));
+
+    await py.loadPackage("packaging");
+    ok(captured.join("") === "Loading packaging\nLoaded packaging\n",
+      `with no messageCallback, loader progress goes to the interpreter's STDOUT: ${JSON.stringify(captured)}`);
+    ok(!captured.some((c) => c.startsWith("ERR:")), "…and none of it to stderr, which is what put it in front of pip's payload");
+
+    // The exact bytes the offline stand-in claims to produce.
+    ok(captured.join("") === loaderLines(["packaging"]).map((l) => l + "\n").join(""),
+      "…and fake-pyodide.mjs writes those same bytes, so the offline gate is testing the real shape");
+
+    captured.length = 0;
+    const said = [];
+    await py.loadPackage("micropip", { messageCallback: (m) => said.push(m) });
+    ok(said.join("|") === "Loading micropip|Loaded micropip", `a messageCallback receives the progress instead: ${JSON.stringify(said)}`);
+    ok(captured.length === 0, "…and the interpreter's stdout stays clean, which is the whole fix");
+    ok(said.join("|") === loaderLines(["micropip"]).join("|"), "…still the bytes the stand-in models");
+
+    // SECOND: the version literal /bin/python.js prints without booting. The
+    // offline tier pins that literal to PYODIDE_PYTHON_VERSION; only a live
+    // interpreter can say whether the constant is still true. Bump the vendored
+    // Pyodide and this is what notices.
+    const env = pyEnv(py);
+    ok(env.pythonVersion === PYODIDE_PYTHON_VERSION,
+      `the vendored interpreter is Python ${env.pythonVersion}, and PYODIDE_PYTHON_VERSION says ${PYODIDE_PYTHON_VERSION}`);
+    const printed = drivePython(["--version"]).out.trim();
+    ok(printed.includes(env.pythonVersion),
+      `python --version prints "${printed}", which carries the version this interpreter reports`);
+    ok(printed === `Python ${env.pythonVersion} (Pyodide, Vivari)`,
+      "…in full, so it does not disagree with `sys.version` the way `Python 3.14` did");
+  }
+
+  // --- the per-project package store ----------------------------------------
+  if (spec.kind === "package-store") {
+    // Every python command is a fresh Pyodide boot, so an install used to be
+    // gone by the next one. This case is the whole claim end to end, against
+    // real wheels and real interpreters: install into A, restore into B, and
+    // watch an unrestored C not have it. It boots more than one interpreter on
+    // purpose — a store that works within a process would prove nothing, since
+    // that is exactly the case that already worked.
+    //
+    // It drives the SHIPPED store functions (packages/runtime/builtins/
+    // python-store.js) with node:fs where the runtime passes the guest's, which
+    // is what makes spike-python-offline.mjs's stub interpreter honest: the same
+    // functions run there against a fake FS and here against a real one.
+    const OS = await import("node:os");
+    const PROJ = fs.mkdtempSync(path.join(OS.tmpdir(), "vv-store-"));
+    const quiet = { messageCallback: () => {} };
+    const importable = async (interp, mod) => String(await interp.runPythonAsync(
+      "\ntry:\n    import " + mod + "; _o = 'yes'\nexcept BaseException as e:\n    _o = type(e).__name__\n_o\n")) === "yes";
+
+    // -- A: install, then keep the delta --------------------------------------
+    const A = py;
+    await A.loadPackage(["micropip"], quiet);
+    const envA = pyEnv(A);
+    ok(envA.pyTag === "python3.14" && envA.pythonVersion.startsWith("3.14"),
+      `the store's identity comes from the interpreter: ${envA.pyTag}, Python ${envA.pythonVersion}, Pyodide ${envA.pyodideVersion}`);
+    const baseline = walkPyodide(A, envA.sitePackages);
+    // A dashed project name on purpose. An install escapes it before naming the
+    // directory (charset_normalizer-*.dist-info), and matching on
+    // `${name}-${version}` instead of the reported directory drops every such
+    // package from `pip freeze` — found here by real pip, not by inspection.
+    await A.runPythonAsync('import micropip\nawait micropip.install(["tabulate", "charset-normalizer"])');
+    const delta = collectDelta(A, envA, baseline);
+    ok(delta.size > 0, `the install added ${delta.size} files to site-packages`);
+    ok(![...delta.keys()].some((r) => r.startsWith("micropip")),
+      "…and micropip is not among them: it was loaded before the baseline, so our own machinery never lands in a user's store");
+
+    const t0 = Date.now();
+    const wrote = persistDelta(fs, A, PROJ, envA, delta, "python -m pip install tabulate charset-normalizer");
+    ok(wrote.ok, `snapshot: ${wrote.files} files, ${humanBytes(wrote.bytes)}, ${Date.now() - t0} ms`);
+    const paths = storePaths(PROJ, envA.pyTag);
+    ok(fs.existsSync(paths.sitePackages + "/tabulate/__init__.py"),
+      "the bytes are on disk under .venv/lib/python3.14/site-packages, where a Python user would look for them");
+    ok(fs.existsSync(paths.cfg) && /include-system-site-packages = true/.test(fs.readFileSync(paths.cfg, "utf8")),
+      "…beside a pyvenv.cfg that does not claim an isolation this model cannot provide");
+
+    // -- B: a second interpreter, which restores -------------------------------
+    const B = await loadPyodide();
+    ok(!(await importable(B, "tabulate")), "a fresh interpreter starts without the package (this is the problem the store solves)");
+    const t1 = Date.now();
+    const restored = restoreStore(fs, B, PROJ);
+    ok(restored.state === "restored", `restore: ${restored.files} files, ${Date.now() - t1} ms — against a ~1400 ms interpreter boot`);
+    ok(await importable(B, "tabulate"), "and now it imports");
+    ok(String(await B.runPythonAsync(
+      'from tabulate import tabulate\ntabulate([[1,2]], headers=["a","b"]).splitlines()[0].strip()')) === "a    b",
+      "…and runs: the package works, not merely resolves");
+    ok(await importable(B, "charset_normalizer"), "the dashed-name package imports too");
+
+    // -- C: a third interpreter, which does not ---------------------------------
+    const C = await loadPyodide();
+    ok(!(await importable(C, "tabulate")),
+      "a third interpreter that does not restore still has nothing — the store is per-project state, not a global side effect");
+
+    // -- the stamp: discard, never half-load -----------------------------------
+    const good = JSON.parse(fs.readFileSync(paths.stamp, "utf8"));
+    for (const [field, value, why] of [
+      ["pythonVersion", "3.13.0", "a store built by an older Python"],
+      ["pyodideVersion", "0.26.0", "a store built under an older Pyodide"],
+    ]) {
+      fs.writeFileSync(paths.stamp, JSON.stringify({ ...good, [field]: value }));
+      const D = await loadPyodide();
+      const rd = restoreStore(fs, D, PROJ);
+      ok(rd.state === "discarded", `${why} is refused: ${rd.problem}`);
+      ok(!(await importable(D, "tabulate")),
+        "…with nothing copied in at all — the half-restored tree is the outcome this exists to prevent");
+    }
+    fs.writeFileSync(paths.stamp, JSON.stringify(good));
+
+    // -- the cap, and that hitting it changes nothing ---------------------------
+    const beforeCap = walkHost(fs, paths.sitePackages);
+    const E = await loadPyodide();
+    await E.loadPackage(["micropip"], quiet);
+    const envE = pyEnv(E);
+    restoreStore(fs, E, PROJ);
+    const base2 = walkPyodide(E, envE.sitePackages);
+    await E.runPythonAsync('import micropip\nawait micropip.install(["six"])');
+    const delta2 = collectDelta(E, envE, base2);
+    const refused = persistDelta(fs, E, PROJ, envE, delta2, "cmd", 1024);
+    ok(refused.ok === false, `a real install over a deliberately tiny cap is refused (${humanBytes(refused.projected)} against 1.0 KB)`);
+    const afterCap = walkHost(fs, paths.sitePackages);
+    ok(afterCap.size === beforeCap.size && [...afterCap].every(([k, v]) => beforeCap.get(k) === v),
+      `…and the store is byte-for-byte unchanged (${afterCap.size} files), so a too-large install costs the user nothing`);
+    ok(persistDelta(fs, E, PROJ, envE, delta2, "cmd").ok, "…while the same delta under the real cap writes normally");
+
+    // -- pip freeze against the store it claims to describe ---------------------
+    const F = await loadPyodide();
+    await F.loadPackage(["packaging", "micropip"], quiet);
+    const envF = pyEnv(F);
+    restoreStore(fs, F, PROJ);
+    const data = JSON.parse(await F.runPythonAsync(DIST_QUERY));
+    ok(data.requirementsAvailable,
+      "dependency metadata is readable, so Requires and pip check are answers rather than blanks");
+    const dists = storeDists(fs, PROJ, envF, data.dists);
+    const freeze = formatPipFreeze(dists);
+    // The oracle is the store's own directory listing. Escaping runs one way
+    // only (charset-normalizer -> charset_normalizer), so each freeze line is
+    // escaped and looked for, rather than inverting an ambiguous mapping.
+    const onDisk = new Set(fs.readdirSync(paths.sitePackages).filter((n) => n.endsWith(".dist-info")));
+    const lines = freeze.trim().split("\n").filter(Boolean);
+    const claimed = new Set(lines.map((l) => {
+      const [n, v] = l.split("==");
+      return n.replace(/[^A-Za-z0-9.]+/g, "_") + "-" + v + ".dist-info";
+    }));
+    ok(onDisk.size > 0 && onDisk.size === claimed.size && [...onDisk].every((x) => claimed.has(x)),
+      `pip freeze accounts for every distribution in the store and invents none: ${lines.join(" ")}`);
+    ok(!/^(micropip|packaging)==/m.test(freeze),
+      "…and omits micropip and packaging, which this interpreter has and the store does not");
+    ok(lines.every((l) => /^[A-Za-z0-9._-]+==[^=\s]+$/.test(l)),
+      "…in real pip's exact `name==version` form, which is what makes `pip freeze > requirements.txt` mean anything");
+    console.log(formatPipList(dists).replace(/^/gm, "      | ").replace(/\n$/, ""));
+
+    // pip show and pip check over real metadata. The formatters are held against
+    // real pip's bytes in the offline tier; what only a live interpreter can
+    // show is that DIST_QUERY finds anything to format.
+    const shown = formatPipShow(dists.find((d) => d.name === "tabulate"));
+    ok(/^Name: tabulate$/m.test(shown) && /^Version: /m.test(shown) && /^Summary: Pretty-print/m.test(shown),
+      "pip show reads real dist metadata out of the restored store");
+    ok(/^Location: \/lib\/python3\.14\/site-packages$/m.test(shown),
+      "…and reports the interpreter's site-packages as the location, which is where the package really is");
+    ok(formatPipCheck(data.problems.filter((x) => dists.some((d) => d.name === x.name))) === "No broken requirements found.\n",
+      "pip check over a store whose dependencies are all present says so, in real pip's words");
+
+    // -- uninstall, which has to reach the store and not just the interpreter --
+    const G = await loadPyodide();
+    // Captured from STDOUT, and redirected BEFORE micropip is imported.
+    // micropip's handler is a StreamHandler(sys.stdout) built once, on first use,
+    // so it holds whatever sys.stdout was then — capture stderr, or redirect
+    // afterwards, and nothing arrives, which is an assertion that passes for the
+    // wrong reason. Both mistakes were made here before this comment existed.
+    const noise = [];
+    G.setStdout({ write: (b) => { noise.push(Buffer.from(b).toString()); return b.length; } });
+    await G.loadPackage(["micropip"], quiet);
+    const envG = pyEnv(G);
+    restoreStore(fs, G, PROJ);
+    const beforeRm = walkPyodide(G, envG.sitePackages);
+    // Through the SHIPPED uninstall source, so what is measured below is what a
+    // user gets. micropip warns "not found in loadedPackages" for anything it did
+    // not load itself, which for a store-restored package is all of them — a
+    // warning describing the store working, printed beside our success line.
+    noise.length = 0;
+    const realWarn = console.warn;
+    console.warn = (...a) => noise.push(a.join(" "));
+    try { G.runPython(uninstallSource("tabulate")); } finally { console.warn = realWarn; }
+    ok(!/not found in loadedPackages/.test(noise.join("")),
+      "the uninstall does not print micropip's loadedPackages warning, which is guaranteed and meaningless for a stored package");
+    const afterRm = walkPyodide(G, envG.sitePackages);
+    const gone = [...beforeRm.keys()].filter((r) => !afterRm.has(r));
+    ok(gone.length > 0, `micropip.uninstall removed ${gone.length} files from the interpreter`);
+    for (const rel of gone) { try { fs.unlinkSync(paths.sitePackages + "/" + rel); } catch { /* not stored */ } }
+    ok(!fs.existsSync(paths.sitePackages + "/tabulate/__init__.py"),
+      "…and the same files are removed from the STORE — an uninstall that only emptied the interpreter would come back on the next command");
+    const H = await loadPyodide();
+    restoreStore(fs, H, PROJ);
+    ok(!(await importable(H, "tabulate")), "a fresh interpreter restoring the store no longer has it");
+    ok(await importable(H, "charset_normalizer"), "…and still has everything else, so uninstall removed one package rather than the store");
+
+    fs.rmSync(PROJ, { recursive: true, force: true });
   }
 
   console.log(failed ? `CASE ${name}: FAIL (${failed})` : `CASE ${name}: PASS`);

@@ -40,7 +40,33 @@
 // string to stay proxy-safe. v1: buffered request/response (no streaming/SSE/
 // WebSocket), one request at a time.
 
+import {
+  DIST_QUERY,
+  STORE_DIR,
+  collectDelta,
+  formatPipCheck,
+  formatPipFreeze,
+  formatPipList,
+  formatPipShow,
+  humanBytes,
+  persistDelta,
+  pyEnv,
+  readStamp,
+  restoreStore,
+  stampProblem,
+  storeCapError,
+  storeDists,
+  storePaths,
+  uninstallSource,
+  walkPyodide,
+  writeStore,
+} from "./python-store.js";
+
 // Directories we never mirror between the project and Pyodide's FS.
+// `.venv` is in here even though it is now the package store, and that is the
+// point: the store has to land at the interpreter's OWN site-packages path
+// (restoreStore), not at <cwd>/.venv where no import would look. Mirroring it
+// generally would copy every byte a second time, to a place nothing reads.
 const SKIP_DIRS = new Set([
   "node_modules",
   ".git",
@@ -57,6 +83,16 @@ function withTrailingSlash(u) {
   const s = String(u || "");
   return s.endsWith("/") ? s : s + "/";
 }
+
+// The CPython version the vendored Pyodide actually builds — `sys.version` says
+// 3.14.2, not the 3.14.0 that pyodide-lock.json's `info.python` records (that is
+// the ABI target). PYTHON_PROGRAM cannot import this, because it is a
+// no-interpolation template literal, so /bin/python.js carries the same number
+// as a bare literal for its boot-free `--version`. Same arrangement as
+// BUN_PROGRAM/BUN_VERSION: spike-python-offline.mjs pins the literal against
+// this constant, and the bridge spike pins this constant against `sys.version`
+// in a real interpreter. Bump the vendored Pyodide and one of the two fails.
+export const PYODIDE_PYTHON_VERSION = "3.14.2";
 
 
 // Pass Python's bytes through verbatim and let IT decide where its newlines go.
@@ -120,23 +156,6 @@ export function terminationFromError(e) {
   if (value === "False") return { code: 0, report: "" };
   return { code: 1, report: value }; // sys.exit("message")
 }
-
-// `Installed: X` is true of the interpreter that just ran and false of the next
-// one — every python command is a fresh Pyodide boot, so nothing here survives
-// the process. Reporting a bare success for that is the argv spelling of a
-// placeholder return value: the user runs their script, the import fails, and
-// the pip run is still on screen saying it worked. The success line and the exit
-// code stay (the install did happen); what was missing is its scope.
-//
-// Exported so the offline spike asserts the text itself rather than grepping for
-// it, the way resolveServeError is testable without binding a port.
-export const PIP_SCOPE_NOTE =
-  "pip: installed into THIS interpreter only - every python command is a fresh\n" +
-  "     Pyodide boot, so the next one will not see it. What does persist is the\n" +
-  "     browser's cache of the wheels, which makes the next resolve faster.\n" +
-  "     To have a package present when your code runs: import it (a script's\n" +
-  "     imports are auto-loaded before it runs), or name it in requirements.txt,\n" +
-  "     which a served app reads at startup.\n";
 
 // Undo one consequence of our own Node masquerade: it switches Python's HTTP off.
 //
@@ -408,6 +427,39 @@ def _vv_dispatch(req_json):
 export function createPythonRuntime({ process, require, trackHost }) {
   const req = (name) => require(name);
 
+  // WHERE PACKAGE-LOADER PROGRESS GOES, and why it is spelled out at every call
+  // site. Pyodide's package manager keeps its own `stdout`, and it defaults to
+  // the INTERPRETER'S stdout stream — the one `setStdout` sets, which bootPyodide
+  // below points straight at `process.stdout`. Passing a `messageCallback`
+  // overrides it for that one call; omitting it does not. So `pip freeze`
+  // emitted
+  //
+  //     Loading packaging
+  //     Loaded packaging
+  //     tabulate==0.10.0
+  //
+  // and `pip freeze > requirements.txt` wrote all three lines into the file.
+  // The content was right and the stream was wrong, which is the worse of the
+  // two failures: it survives the terminal and breaks later, inside a file
+  // someone committed. Loader progress is diagnostics — stderr keeps it visible
+  // to a human and out of a pipe.
+  //
+  // Never rely on the default. (It is not console.log, which is the intuitive
+  // guess: replacing globalThis.console does not intercept these, because the
+  // manager writes to the Emscripten stream rather than through the console.)
+  const loaderToStderr = {
+    messageCallback: (m) => process.stderr.write(String(m) + "\n"),
+    errorCallback: (m) => process.stderr.write(String(m) + "\n"),
+  };
+  // The one deliberate exception. `pip install` progress is command output, not
+  // diagnostics: real pip prints "Collecting …" and "Downloading …" on stdout,
+  // and this shim's own "Installed: …" / "Stored in .venv/ …" lines are already
+  // there. Warnings still go to stderr, as real pip's do.
+  const loaderToStdout = {
+    messageCallback: (m) => process.stdout.write(String(m) + "\n"),
+    errorCallback: (m) => process.stderr.write(String(m) + "\n"),
+  };
+
   // One Pyodide per process (a fresh process worker = a fresh boot). Cached so a
   // REPL / repeated calls in the same process reuse it.
   let bootPromise = null;
@@ -579,6 +631,12 @@ export function createPythonRuntime({ process, require, trackHost }) {
       } catch {
         /* run anyway from the default home dir */
       }
+      // The project's installed packages, before the script gets to import.
+      try {
+        reportRestore(restoreStore(req("fs"), pyodide, cwd));
+      } catch {
+        /* the script may not need them; a missing import will say so */
+      }
     }
     try {
       pyodide.runPython(`import sys; sys.argv = ${JSON.stringify(argv || [filename])}`);
@@ -587,7 +645,7 @@ export function createPythonRuntime({ process, require, trackHost }) {
     }
     // Auto-load any vendored prebuilt packages the script imports (numpy, …).
     try {
-      await pyodide.loadPackagesFromImports(source);
+      await pyodide.loadPackagesFromImports(source, loaderToStderr);
     } catch {
       /* a missing package surfaces as a Python ImportError below */
     }
@@ -640,39 +698,307 @@ export function createPythonRuntime({ process, require, trackHost }) {
     });
   }
 
-  // ---- pip (best-effort): vendored wheel first, then micropip (network) ------
-  async function pip(indexUrl, names) {
+  // ---- the persistent package store -----------------------------------------
+  // See builtins/python-store.js for what the store is and why it lives at
+  // .venv. This half is the I/O: reading it into an interpreter, and writing
+  // back the delta an install produced.
+
+  // One line, on stderr, only when there is something the user must act on.
+  function reportRestore(r) {
+    if (r.state !== "discarded") return;
+    process.stderr.write(
+      `python: ignoring the package store in ${STORE_DIR}/ - ${r.problem}.\n` +
+        `        Nothing from it was loaded, because a half-restored site-packages\n` +
+        `        breaks in stranger ways than an empty one. Rebuild it with:\n` +
+        `            python -m venv --clear ${STORE_DIR}\n`,
+    );
+  }
+
+  async function pipSession(indexUrl) {
     const pyodide = await bootPyodide(indexUrl);
+    const cwd = process.cwd();
+    const restore = restoreStore(req("fs"), pyodide, cwd);
+    reportRestore(restore);
+    return { pyodide, cwd, env: restore.env, restore };
+  }
+
+  async function queryDists(indexUrl) {
+    const s = await pipSession(indexUrl);
+    try {
+      await s.pyodide.loadPackage("packaging", loaderToStderr);
+    } catch {
+      /* DIST_QUERY reports its absence rather than guessing */
+    }
+    const data = JSON.parse(await s.pyodide.runPythonAsync(DIST_QUERY));
+    return { ...s, data, dists: storeDists(req("fs"), s.cwd, s.env, data.dists) };
+  }
+
+  // ---- pip ------------------------------------------------------------------
+
+  async function pipInstall(indexUrl, names) {
     const list = (names || []).filter(Boolean);
     if (!list.length) {
       process.stderr.write("pip: no packages specified\n");
       return 1;
     }
+    const { pyodide, cwd, env, restore } = await pipSession(indexUrl);
+    // A discarded store must not be written INTO. Restoring it was refused, so
+    // the baseline below would not include it — and the delta would then be
+    // merged with bytes from an interpreter this one cannot use, and stamped as
+    // current. That is the half-loaded store the stamp exists to prevent,
+    // arrived at from the writing side. reportRestore() has already explained
+    // the mismatch; this adds the one line about what it means for an install.
+    if (restore.state === "discarded") {
+      process.stderr.write(
+        `pip: not installing on top of it - the new packages would be mixed with bytes\n` +
+          `     the store already holds, and stamped as though they belonged together.\n` +
+          `     Run 'python -m venv --clear ${STORE_DIR}' first; you will need to install\n` +
+          "     again afterwards.\n",
+      );
+      return 1;
+    }
+    // micropip before the baseline, so our own machinery is never mistaken for
+    // something the user asked to install.
+    try {
+      await pyodide.loadPackage("micropip", loaderToStderr);
+    } catch {
+      /* the install below will report if it is genuinely unavailable */
+    }
+    const baseline = walkPyodide(pyodide, env.sitePackages);
+
+    let how = "";
     try {
       // Resolves per-package from the hybrid lock: vendored wheels load
       // same-origin (offline), the rest from the Pyodide CDN (see scripts/
       // vendor-pyodide.mjs). micropip below handles pure-Python PyPI packages
       // that aren't in Pyodide's distribution at all.
-      await pyodide.loadPackage(list);
-      process.stdout.write(`Installed: ${list.join(", ")}\n`);
-      process.stderr.write(PIP_SCOPE_NOTE);
-      return 0;
+      await pyodide.loadPackage(list, loaderToStdout);
+      how = "Installed";
     } catch {
-      /* not a Pyodide-distributed package — fall through to micropip (PyPI) */
+      try {
+        const micropip = pyodide.pyimport("micropip");
+        await micropip.install(list);
+        how = "Installed via micropip";
+      } catch (e) {
+        process.stderr.write(
+          `pip: could not install ${list.join(", ")}: ${(e && e.message) || e}\n`,
+        );
+        return 1;
+      }
     }
+
+    const delta = collectDelta(pyodide, env, baseline);
+    let total;
     try {
-      await pyodide.loadPackage("micropip");
-      const micropip = pyodide.pyimport("micropip");
-      await micropip.install(list);
-      process.stdout.write(`Installed via micropip: ${list.join(", ")}\n`);
-      process.stderr.write(PIP_SCOPE_NOTE);
-      return 0;
+      total = persistDelta(
+        req("fs"), pyodide, cwd, env, delta,
+        "python -m pip install " + list.join(" "),
+      );
     } catch (e) {
       process.stderr.write(
-        `pip: could not install ${list.join(", ")}: ${(e && e.message) || e}\n`,
+        `pip: installed ${list.join(", ")}, but could not write ${STORE_DIR}/: ` +
+          `${(e && e.message) || e}\n`,
       );
       return 1;
     }
+    if (!total.ok) {
+      // Loud and non-zero: the packages are in this interpreter, which is about
+      // to exit, so from the user's point of view the install did not happen.
+      // Exiting 0 here would let `pip install X && python main.py` walk into an
+      // ImportError with a success message sitting above it.
+      process.stderr.write(storeCapError(total, list));
+      return 1;
+    }
+    process.stdout.write(`${how}: ${list.join(", ")}\n`);
+    process.stdout.write(
+      `Stored in ${STORE_DIR}/ (${total.files} files, ${humanBytes(total.bytes)}) - ` +
+        "every python command in this project will see it.\n",
+    );
+    return 0;
+  }
+
+  async function pipList(indexUrl) {
+    const { dists } = await queryDists(indexUrl);
+    process.stdout.write(formatPipList(dists));
+    return 0;
+  }
+
+  async function pipFreeze(indexUrl) {
+    const { dists } = await queryDists(indexUrl);
+    process.stdout.write(formatPipFreeze(dists));
+    return 0;
+  }
+
+  async function pipShow(indexUrl, names) {
+    const wanted = (names || []).filter(Boolean);
+    if (!wanted.length) {
+      process.stderr.write("ERROR: Please provide a package name or names.\n");
+      return 1;
+    }
+    const { data, dists } = await queryDists(indexUrl);
+    if (!data.requirementsAvailable) {
+      process.stderr.write(
+        "pip: cannot read dependency metadata (the 'packaging' package did not load),\n" +
+          "     so Requires/Required-by would be blank rather than empty. Refusing to\n" +
+          "     print a partial answer.\n",
+      );
+      return 1;
+    }
+    const canon = (s) => String(s).toLowerCase().replace(/[-_.]+/g, "-");
+    const found = [];
+    const missing = [];
+    for (const w of wanted) {
+      const hit = dists.find((d) => canon(d.name) === canon(w));
+      if (hit) found.push(hit);
+      else missing.push(w);
+    }
+    process.stdout.write(found.map(formatPipShow).join("---\n"));
+    if (missing.length) {
+      process.stderr.write(`WARNING: Package(s) not found: ${missing.join(", ")}\n`);
+    }
+    return found.length ? 0 : 1;
+  }
+
+  async function pipCheck(indexUrl) {
+    const { data, dists } = await queryDists(indexUrl);
+    if (!data.requirementsAvailable) {
+      process.stderr.write(
+        "pip: cannot read dependency metadata (the 'packaging' package did not load).\n" +
+          "     Refusing to report a clean bill of health it cannot verify.\n",
+      );
+      return 1;
+    }
+    const inStore = new Set(dists.map((d) => d.name));
+    const problems = data.problems.filter((p) => inStore.has(p.name));
+    process.stdout.write(formatPipCheck(problems));
+    return problems.length ? 1 : 0;
+  }
+
+  async function pipUninstall(indexUrl, names, opts) {
+    const wanted = (names || []).filter(Boolean);
+    if (!wanted.length) {
+      process.stderr.write("ERROR: Please provide a package name or names.\n");
+      return 1;
+    }
+    // The -y policy is argv policy and lives in programs/python.js with the
+    // other flag rules; this is the backstop for any other caller.
+    if (!(opts && opts.yes)) {
+      process.stderr.write("pip: uninstall needs -y.\n");
+      return 1;
+    }
+    const { pyodide, cwd, env, dists } = await queryDists(indexUrl);
+    // micropip does the removal, so it has to be here — queryDists only needs
+    // packaging. Without this the first uninstall reports a failure it invented.
+    try {
+      await pyodide.loadPackage("micropip", loaderToStderr);
+    } catch {
+      /* reported by the per-package error below */
+    }
+    const fs = req("fs");
+    const canon = (s) => String(s).toLowerCase().replace(/[-_.]+/g, "-");
+    let removedAny = false;
+    for (const w of wanted) {
+      const hit = dists.find((d) => canon(d.name) === canon(w));
+      if (!hit) {
+        process.stdout.write(`WARNING: Skipping ${w} as it is not installed.\n`);
+        continue;
+      }
+      process.stdout.write(`Found existing installation: ${hit.name} ${hit.version}\n`);
+      process.stdout.write(`Uninstalling ${hit.name}-${hit.version}:\n`);
+      const before = walkPyodide(pyodide, env.sitePackages);
+      try {
+        pyodide.runPython(uninstallSource(hit.name));
+      } catch (e) {
+        process.stderr.write(`ERROR: Cannot uninstall ${hit.name}: ${(e && e.message) || e}\n`);
+        return 1;
+      }
+      const after = walkPyodide(pyodide, env.sitePackages);
+      const p = storePaths(cwd, env.pyTag);
+      for (const rel of before.keys()) {
+        if (after.has(rel)) continue;
+        try {
+          fs.unlinkSync(p.sitePackages + "/" + rel);
+        } catch {
+          /* not in the store, or already gone */
+        }
+      }
+      process.stdout.write(`  Successfully uninstalled ${hit.name}-${hit.version}\n`);
+      removedAny = true;
+    }
+    if (removedAny) {
+      try {
+        writeStore(req("fs"), cwd, env, new Map(), "python -m pip uninstall " + wanted.join(" "));
+      } catch {
+        /* the files are gone either way; the stamp refresh is bookkeeping */
+      }
+    }
+    return 0;
+  }
+
+  // ---- python -m venv ---------------------------------------------------------
+  async function venv(indexUrl, dir, opts) {
+    const fs = req("fs");
+    const path = req("path");
+    const o = opts || {};
+    const cwd = process.cwd();
+    const target = path.isAbsolute(dir) ? dir : path.join(cwd, dir);
+    // The store's path is derived from the project directory, so a venv
+    // somewhere else would be created and then never looked at again.
+    if (path.resolve(target) !== path.resolve(path.join(cwd, STORE_DIR))) {
+      process.stderr.write(
+        `python -m venv: this shim can only create the store at ./${STORE_DIR}, and you asked\n` +
+          `                for '${dir}'. The path is not cosmetic: every python command in this\n` +
+          `                project looks for ./${STORE_DIR} and nowhere else.\n`,
+      );
+      return 1;
+    }
+    const pyodide = await bootPyodide(indexUrl);
+    const env = pyEnv(pyodide);
+    const p = storePaths(cwd, env.pyTag);
+    const existing = readStamp(req("fs"), cwd);
+
+    if (existing && o.clear) {
+      try {
+        fs.rmSync(p.root, { recursive: true, force: true });
+      } catch (e) {
+        process.stderr.write(`python -m venv: could not clear ${dir}: ${(e && e.message) || e}\n`);
+        return 1;
+      }
+    } else if (existing) {
+      const problem = stampProblem(existing, env);
+      if (problem) {
+        // Refusing beats silently deleting a store the user may still want to
+        // copy something out of.
+        process.stderr.write(
+          `python -m venv: ${dir} already exists but ${problem}, so it cannot be used\n` +
+            "                as it is. Nothing has been changed. To discard it and start over:\n" +
+            `                    python -m venv --clear ${dir}\n`,
+        );
+        return 1;
+      }
+      const total = writeStore(req("fs"), cwd, env, new Map(), "python -m venv " + dir);
+      process.stdout.write(
+        `${dir} already exists (${total.files} files, ${humanBytes(total.bytes)}); refreshed its ` +
+          "configuration.\n",
+      );
+      return 0;
+    }
+
+    try {
+      writeStore(req("fs"), cwd, env, new Map(), "python -m venv " + dir);
+    } catch (e) {
+      process.stderr.write(`python -m venv: could not create ${dir}: ${(e && e.message) || e}\n`);
+      return 1;
+    }
+    // Real venv prints nothing. This is not a real venv, and the difference is
+    // the one thing a user needs to be told once.
+    process.stdout.write(
+      `Created ${dir} - a package store for Python ${env.pythonVersion}.\n` +
+        "pip install writes here, and every python command in this project reads it.\n" +
+        "There is no separate interpreter to activate, and nothing to isolate from:\n" +
+        "each command boots one CPython/WASM interpreter and restores this into it.\n",
+    );
+    return 0;
   }
 
   // ---- interactive REPL ------------------------------------------------------
@@ -750,13 +1076,13 @@ export function createPythonRuntime({ process, require, trackHost }) {
     const names = (list || []).filter(Boolean);
     if (!names.length) return;
     try {
-      await pyodide.loadPackage(names);
+      await pyodide.loadPackage(names, loaderToStderr);
       return;
     } catch {
       /* not all are Pyodide-distributed — try micropip for the rest */
     }
     try {
-      await pyodide.loadPackage("micropip");
+      await pyodide.loadPackage("micropip", loaderToStderr);
       const micropip = pyodide.pyimport("micropip");
       await micropip.install(names);
     } catch {
@@ -799,6 +1125,11 @@ export function createPythonRuntime({ process, require, trackHost }) {
         } catch {
           /* run from default home dir */
         }
+        try {
+          reportRestore(restoreStore(req("fs"), pyodide, workdir));
+        } catch {
+          /* ensurePackages below is the fallback */
+        }
         // Ensure the working dir is importable so `import main` resolves.
         try {
           pyodide.runPython(
@@ -815,7 +1146,7 @@ export function createPythonRuntime({ process, require, trackHost }) {
         try {
           const fs = req("fs");
           const src = fs.readFileSync(req("path").join(workdir, moduleName + ".py"), "utf8");
-          await pyodide.loadPackagesFromImports(src);
+          await pyodide.loadPackagesFromImports(src, loaderToStderr);
         } catch {
           /* module may be a package or unreadable; app import will report */
         }
@@ -923,7 +1254,13 @@ export function createPythonRuntime({ process, require, trackHost }) {
       return {
         runFile: (filePath, args) => runFile(idx, filePath, args),
         runCode: (source, args) => runCode(idx, source, args),
-        pip: (names) => pip(idx, names),
+        pipInstall: (names) => pipInstall(idx, names),
+        pipList: () => pipList(idx),
+        pipFreeze: () => pipFreeze(idx),
+        pipShow: (names) => pipShow(idx, names),
+        pipCheck: () => pipCheck(idx),
+        pipUninstall: (names, opts) => pipUninstall(idx, names, opts),
+        venv: (dir, opts) => venv(idx, dir, opts),
         repl: () => repl(idx),
         serve: (opts) => serve(idx, opts),
       };
