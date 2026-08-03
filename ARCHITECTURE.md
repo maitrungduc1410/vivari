@@ -1665,7 +1665,10 @@ interpreter really is WASM (like the Wasm engines above), not a Node-backed shim
   best-effort (a corporate-proxy TLS failure warns, never aborts the build). **Run in CI
   by `scripts/cloudflare-build.sh`** — the studio's `bun run build` doesn't fire the
   root `prebuild:studio` hook, so this must be listed explicitly or the deployed studio
-  ships no `python`.
+  ships no `python`. jedi is in Pyodide's own lock; **black is not**, so it and its
+  closure (`mypy-extensions`, `pathspec`, `pytokens`, and the lock-resident `click` and
+  `platformdirs`) are downloaded from PyPI, pinned, and injected into the lock. An
+  editor feature that only formats when the network is up is not the feature.
 
 **Packages persist in a `.venv` store, because interpreters do not.** Every `python`
 command is a fresh Pyodide boot, so an install has nothing to live in. `pip install`
@@ -1691,6 +1694,51 @@ Three design points, all of which look like mistakes until you know why:
   that is simply true here, and the docs say the same in prose. Size is capped at 64 MB
   (SciPy is ~13 MB), and an install that would exceed it is refused with the store left
   untouched and a non-zero exit.
+
+**The editor's language service — a SECOND, long-lived interpreter.** Completion,
+hover, signature help, go-to-definition and formatting come from jedi and black, which
+are Python and therefore need an interpreter. They cannot use the one above: it boots
+per process and dies with it, so a REPL exiting would take completion down, and a
+language-service boot would appear in `ps` as a process nobody started.
+
+- `packages/core/src/workers/python-lsp-worker.ts` — a plain `new Worker`, owned by the
+  kernel worker and **deliberately outside the process table**. It is not spawned through
+  `createProcess`, so it has no PID, does not appear in `ps` or `diagnostics()`, and no
+  `kill` can reach it. It boots on the FIRST language request, never at studio start:
+  editing a `.ts` file must not download an interpreter. Concurrent first requests await
+  one boot promise rather than racing two interpreters. black loads only on the first
+  format — jedi answers keystrokes, black answers a command, and paying for both up front
+  would slow the one people wait on.
+- `packages/runtime/builtins/python-lsp.js` — the Python driver (JSON in, JSON out) and
+  the Monaco providers. Plain JS, not TypeScript, so the offline tier can import it
+  without a build step; `packages/studio/src/vv/python-language.ts` is the typed wrapper.
+- The studio imports that module **dynamically**, on the first Python model
+  (`controller.ts: ensurePythonLanguage`), so a TypeScript-only session never loads it.
+
+Four points worth knowing:
+
+- **jedi must be given an `InterpreterEnvironment`.** Its default environment discovery
+  runs `sys.executable` in a subprocess to read the version. We set `sys.executable =
+  "python"` so `runpy`'s errors read correctly, and Pyodide answers the exec with
+  `OSError(138)` — so the default path raises `InvalidPythonEnvironment` and nothing
+  works. `InterpreterEnvironment` introspects the *running* interpreter instead. The
+  bridge spike asserts the failure still happens, so the reason for the line stays
+  visible.
+- **Requests serialise, and stale ones are dropped.** One interpreter, no threads, and
+  keystrokes outrun it. `createRequestQueue` keeps at most one in-flight and one waiting
+  request *per kind* — a newer keystroke replaces the waiting one and the replaced caller
+  resolves `null` rather than being left pending. Monaco's `CancellationToken` is checked
+  again when the answer comes back, since it can fire while the interpreter is busy.
+- **The project is copied in, including the `.venv` store.** `collectPython()` in the
+  kernel worker walks the project for `.py`/`.pyi` plus the package store, and the store's
+  contents are remapped onto the interpreter's own `site-packages` — the same trick
+  `restoreStore()` uses, for the same reason. That is what makes `pip install tabulate`
+  followed by `tabulate.` work. Buffer text is passed per-request, so completion sees
+  unsaved edits.
+- **Failure is never an empty list.** jedi unavailable, black unable to parse, a
+  definition outside the project — each reports through the status bar with its reason.
+  An empty popup means jedi had no suggestions, and black returning no `text` field at
+  all is what stops a parse failure from being written over the buffer.
 
 **Environment masking.** Our runtime masquerades as Node, but Pyodide has two Node
 probes that would each `import("node:module")` (404 in a Worker). Both are masked across

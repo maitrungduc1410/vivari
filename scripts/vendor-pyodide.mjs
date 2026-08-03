@@ -55,7 +55,32 @@ const CORE_FILES = [
 // fastapi (+ its closure: starlette, pydantic, pydantic-core, anyio, …) is
 // vendored so the FastAPI template serves offline. Flask is NOT in Pyodide's
 // distribution, so it installs from PyPI via micropip at runtime (needs network).
-const DEFAULT_PACKAGES = ["numpy", "pandas", "matplotlib", "fastapi", "micropip"];
+// jedi backs the editor's Python completion/hover/signatures/go-to-definition
+// (see builtins/python-lsp.js). It IS in Pyodide's distribution, so it costs a
+// same-origin wheel and nothing else; black is not, and is handled by
+// PYPI_PACKAGES below.
+const DEFAULT_PACKAGES = ["numpy", "pandas", "matplotlib", "fastapi", "micropip", "jedi"];
+
+// Wheels Pyodide does NOT distribute, fetched from PyPI and INJECTED into the
+// lockfile so `loadPackage("black")` resolves them same-origin like any other.
+//
+// Why not leave black to micropip at runtime: micropip needs the network, and
+// "format on save works when you are online" is not the feature. Every one of
+// these is a pure-Python py3-none-any wheel — nothing is being cross-compiled
+// here, it is a zip of .py files that Pyodide's loader can already unpack.
+//
+// Versions are PINNED. An unpinned editor formatter would reformat a whole
+// codebase differently the day upstream changed a default, and the person it
+// happened to would have no way to know why. The bridge spike checks these
+// against the same versions run under the host's own CPython.
+const PYPI_PACKAGES = [
+  { name: "black", version: "26.5.1", imports: ["black", "blib2to3"], depends: ["click", "mypy-extensions", "packaging", "pathspec", "platformdirs", "pytokens"] },
+  // black's three dependencies that Pyodide does not ship either. (click,
+  // packaging and platformdirs ARE in the lock, so they are ordinary depends.)
+  { name: "mypy-extensions", version: "1.1.0", imports: ["mypy_extensions"], depends: [] },
+  { name: "pathspec", version: "1.1.1", imports: ["pathspec"], depends: [] },
+  { name: "pytokens", version: "0.4.1", imports: ["pytokens"], depends: [] },
+];
 const PACKAGES = (process.env.VV_PYODIDE_PACKAGES || DEFAULT_PACKAGES.join(","))
   .split(",")
   .map((s) => s.trim())
@@ -71,7 +96,7 @@ const LOCK_FORMAT = 2;
 // rebuilds, but a repeat build with the SAME set + format is a no-op. Keyed on
 // the sorted requested set.
 const MARKER = path.join(OUT_DIR, ".vendor-manifest.json");
-const requestedKey = [...PACKAGES].sort().join(",");
+const requestedKey = [...PACKAGES, ...PYPI_PACKAGES.map((p) => p.name + "@" + p.version)].sort().join(",");
 
 function log(msg) {
   process.stderr.write(`[vendor-pyodide] ${msg}\n`);
@@ -169,6 +194,20 @@ function addWithDeps(name) {
   for (const dep of allPackages[key].depends || []) addWithDeps(dep);
 }
 for (const p of PACKAGES) addWithDeps(p);
+// A PyPI package's dependencies that DO live in the lock have to join the
+// closure here, before the download loop — injecting the lock entry later (3b)
+// is too late to get their wheels fetched. black depends on click, packaging and
+// platformdirs, none of which any other vendored package pulls in, so without
+// this `loadPackage("black")` resolves to a lock entry whose dependency wheels
+// are not on disk and falls back to the CDN: a formatter that needs the network,
+// which is the whole thing being avoided. Derived from the pins rather than
+// listed again, so adding a dependency to PYPI_PACKAGES cannot forget this.
+const fromPyPI = new Set(PYPI_PACKAGES.map((s) => normName(s.name)));
+for (const spec of PYPI_PACKAGES) {
+  for (const dep of spec.depends) {
+    if (!fromPyPI.has(normName(dep))) addWithDeps(dep);
+  }
+}
 if (missing.length) log(`WARNING: packages not in lockfile, skipped: ${missing.join(", ")}`);
 log(`vendoring ${closure.size} package wheels (closure of: ${PACKAGES.join(", ")})`);
 
@@ -213,6 +252,68 @@ for (const key of closure) {
 }
 const okCount = vendored.size;
 log(`downloaded ${okCount}/${closure.size} wheels from ${CDN_BASE}`);
+
+// 3b) Fetch the PyPI-only wheels and add them to the lock as first-class
+// packages. Same best-effort contract as the CDN wheels above: a network failure
+// warns and ships the rest, because a studio that boots without a formatter is
+// far better than a build that will not finish.
+async function vendorFromPyPI(spec) {
+  const key = normName(spec.name);
+  const url = `https://pypi.org/pypi/${encodeURIComponent(spec.name)}/${encodeURIComponent(spec.version)}/json`;
+  const meta = await fetch(url);
+  if (!meta.ok) {
+    log(`  ! PyPI metadata for ${spec.name} ${spec.version} (HTTP ${meta.status})`);
+    return false;
+  }
+  const body = await meta.json();
+  // py3-none-any only. Anything else would be a compiled artifact built for a
+  // platform that is not wasm32-emscripten, and Pyodide could not load it.
+  const wheel = (body.urls || []).find(
+    (u) => u.packagetype === "bdist_wheel" && /-py3-none-any\.whl$|-py2\.py3-none-any\.whl$/.test(u.filename),
+  );
+  if (!wheel) {
+    log(`  ! ${spec.name} ${spec.version} has no pure-Python wheel — skipped`);
+    return false;
+  }
+  const dest = path.join(OUT_DIR, wheel.filename);
+  if (!fs.existsSync(dest) || force) {
+    const res = await fetch(wheel.url);
+    if (!res.ok) {
+      log(`  ! failed ${wheel.filename} (HTTP ${res.status})`);
+      return false;
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    fs.writeFileSync(dest, buf);
+    log(`  + ${wheel.filename} (${(buf.length / 1048576).toFixed(2)} MB, from PyPI)`);
+  }
+  allPackages[key] = {
+    name: key,
+    version: spec.version,
+    file_name: wheel.filename, // relative -> resolved same-origin, never the CDN
+    install_dir: "site",
+    package_type: "package",
+    sha256: (wheel.digests && wheel.digests.sha256) || "",
+    imports: spec.imports,
+    depends: spec.depends,
+    unvendored_tests: false,
+  };
+  vendored.add(key);
+  return true;
+}
+
+let pypiOk = 0;
+for (const spec of PYPI_PACKAGES) {
+  try {
+    // eslint-disable-next-line no-await-in-loop
+    if (await vendorFromPyPI(spec)) pypiOk++;
+  } catch (e) {
+    log(`  ! failed ${spec.name}: ${(e && e.cause && e.cause.code) || (e && e.message) || e}`);
+  }
+}
+log(`vendored ${pypiOk}/${PYPI_PACKAGES.length} wheels from PyPI (the editor's formatter)`);
+if (pypiOk < PYPI_PACKAGES.length) {
+  log("NOTE: black is incomplete — Format Document will report itself unavailable rather than no-op.");
+}
 
 // 4) Rewrite the lockfile so EVERY package Pyodide knows stays loadable, with a
 // hybrid resolution: wheels we vendored keep their relative file_name (Pyodide

@@ -20,6 +20,7 @@ import { KernelBridge, resetVfs } from "./kernel";
 import { DebugSession } from "./debug-session";
 import { ScmSession } from "./scm-session";
 import { EditorStatus } from "./editor-status";
+import { stateLabel } from "../../../runtime/builtins/python-lsp.js";
 import { StatusMessage } from "./status-message";
 import { getTemplate, type TemplateManifest } from "./templates";
 import { createZip, encodeShare, decodeShare } from "../../../kernel-host/archive.js";
@@ -454,9 +455,10 @@ function languageFor(path: string): string {
   if (/\.(html?|vue|svelte)$/.test(path)) return "html";
   if (/\.json[5c]?$/.test(path)) return "json";
   if (/\.md$/.test(path)) return "markdown";
-  // Python: Monaco's bundled Monarch grammar highlights on the main thread — no
-  // dedicated worker/language service (we don't ship a python.worker). Same for
-  // every language below: Monarch highlighting only, no language service.
+  // Python: Monarch highlights on the main thread, and — unlike every language
+  // below it — a real language service, from jedi and black running on a
+  // long-lived Pyodide. Registered lazily, on the first Python model: see
+  // ensurePythonLanguage(). Everything after this line is Monarch only.
   if (/\.pyi?$/.test(path)) return "python";
   if (/\.ya?ml$/.test(path)) return "yaml";
   if (/\.(sh|bash|zsh|ksh)$/.test(path)) return "shell";
@@ -1288,6 +1290,53 @@ export class IdeController {
     }
   }
 
+  // The Python language service, brought up the first time a Python file exists
+  // in the editor and not before. Pyodide is ~30 MB; a session spent in .ts must
+  // not fetch it, so both the provider module and the worker behind it are
+  // dynamic imports off this path.
+  private pythonLanguageOff: (() => void) | null = null;
+  private pythonServiceState = "";
+
+  private ensurePythonLanguage(abs: string) {
+    if (this.pythonLanguageOff || !this.monaco) return;
+    if (languageFor(abs) !== "python") return;
+    const monaco = this.monaco;
+    this.pythonLanguageOff = () => {}; // claim the slot before the await
+    void import("./python-language").then(({ registerPythonLanguage }) => {
+      this.pythonLanguageOff = registerPythonLanguage(monaco, {
+        request: async (root, req) => {
+          const m = await this.bridge.request("vv-py-lsp", { root, req });
+          return { ok: !!m.ok, result: m.result ?? null, error: String(m.error ?? "") };
+        },
+        // The workspace folder the file sits in — jedi resolves `import helper`
+        // relative to it. Longest match, so a root nested inside another wins.
+        rootFor: (path: string) => {
+          let best = "";
+          for (const f of this.snap.workspaceFolders) {
+            const r = f.rootPath.replace(/\/+$/, "");
+            if ((path === r || path.startsWith(r + "/")) && r.length > best.length) best = r;
+          }
+          return best || "/";
+        },
+        notify: (message: string) => this.statusMessage.show(message),
+        openFileAt: (path: string, line: number, column: number) => void this.openFileAt(path, line, column),
+        setState: (state: string, detail?: string) => this.setPythonServiceState(state, detail),
+      });
+    });
+    // The boot itself is reported by the worker over the bridge, not guessed at
+    // here — the studio does not know how far along a 30 MB fetch is.
+    this.bridge.on("py-lsp-state", (m: Record<string, unknown>) =>
+      this.setPythonServiceState(String(m.state ?? ""), String(m.detail ?? "")),
+    );
+  }
+
+  private setPythonServiceState(state: string, detail?: string) {
+    const label = stateLabel(state, detail);
+    if (label === this.pythonServiceState) return;
+    this.pythonServiceState = label ?? "";
+    this.editorStatus.set({ pythonService: label });
+  }
+
   private async seedModel(abs: string) {
     if (!this.monaco || this.models.has(abs)) return;
     const monaco = this.monaco;
@@ -1297,6 +1346,7 @@ export class IdeController {
     // The file may have been opened (→ has a real model) while we awaited the read.
     if (this.models.has(abs) || monaco.editor.getModel(uri)) return;
     monaco.editor.createModel(text, languageFor(abs), uri);
+    this.ensurePythonLanguage(abs);
   }
 
   // Debounced load of dependency type declarations (node_modules **/*.d.ts +
@@ -1395,6 +1445,10 @@ export class IdeController {
     if (existing && existing.getLanguageId() !== language) {
       monaco.editor.setModelLanguage(existing, language);
     }
+    // Opening a Python file is what brings the language service up. Also called
+    // from seedModel, so a background model counts too: by the time someone
+    // clicks the tab, the interpreter has had a head start.
+    if (language === "python") this.ensurePythonLanguage(abs);
     model.onDidChangeContent(() => {
       const changed = model.getValue() !== (this.localFiles[abs] ?? "");
       const isDirty = this.snap.dirty.includes(abs);

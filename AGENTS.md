@@ -3057,6 +3057,53 @@ a **second SAB** the paused worker parks on. Load-bearing details:
 
 ---
 
+### The Python language service runs on its OWN interpreter, and it is not a process
+
+jedi and black need an interpreter, and the one `python foo.py` uses is the wrong one:
+it boots per process and dies with it. Completion cannot share a fate with a REPL the
+user quits. So `packages/core/src/workers/python-lsp-worker.ts` is a second Pyodide,
+started by the kernel worker as a plain `new Worker` and **never through
+`createProcess`** — it has no PID, is absent from `ps` and `diagnostics()`, and `kill`
+cannot reach it. If you find yourself giving it a PID "for consistency", you have just
+made a language-service boot look like a process the user started.
+
+It boots on the FIRST language request, not at studio start, and the studio's
+`import("./python-language")` is dynamic for the same reason: someone editing
+TypeScript must not download an interpreter. Both are gated in the offline tier.
+
+### jedi needs `InterpreterEnvironment`, because we set `sys.executable`
+
+`jedi.Script(...)` without an explicit environment runs `sys.executable` in a subprocess
+to read its version. We set `sys.executable = "python"` (so `runpy`'s `-m` errors read as
+CPython's), Pyodide answers the exec with `OSError(138)`, and jedi raises
+`InvalidPythonEnvironment` — every request fails, at the library's own entry point.
+`InterpreterEnvironment()` introspects the running interpreter and never spawns anything.
+The bridge spike asserts that the *default* path still fails, so the reason this line
+exists cannot quietly become untrue.
+
+### An empty completion list must mean "nothing to suggest"
+
+The house rule about lying stubs has a specific shape here. A provider that returns `[]`
+when jedi failed to load is indistinguishable from one with no suggestions, and the user
+concludes the feature is broken rather than that something went wrong. Every failure path
+reports through the status bar with its reason.
+
+Formatting has the sharper version: if black cannot parse the buffer, the driver returns
+**no `text` field at all**. Returning the input unchanged would render as "already
+formatted" and quietly hide a syntax error; returning partial output would mangle the
+file. The bridge spike mutation-tests both.
+
+### black is NOT in Pyodide's lock — jedi is
+
+Check before assuming. jedi ships in Pyodide's bundled set; black does not, and neither
+do `pathspec` or `pytokens`. `scripts/vendor-pyodide.mjs` downloads them from PyPI and
+injects them into the lock, and it must also pull each PyPI package's **lock-resident**
+dependencies into the download closure — `click` and `platformdirs` are in the lock but
+were not being downloaded, because black's entry was added *after* closure resolution, so
+formatting worked online and failed offline. Pin the versions to what micropip actually
+resolves (`pathspec` 1.1.1, not the 0.12.1 an older pin suggested): an unpinned formatter
+reformats a codebase differently the day upstream changes a default.
+
 ## Testing & verification
 
 The runtime runs headless under Node `worker_threads`, so validate without a

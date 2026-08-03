@@ -6567,3 +6567,65 @@ SQLite commit, and the tracking hooks firing in real Pyodide — that last one b
 the offline mirror gate from being a test of a fiction. Every new assertion was mutation-tested,
 which is how the `Connection: close` header turned out to be defended by a comment claiming it
 prevented a hang it does not prevent; the header stays, the claim is now what is true.
+
+## Python language support in the editor (jedi + black)
+
+**The gap.** TypeScript files got Monaco's real language service — compiler options,
+semantic diagnostics, `setExtraLibs` fed from the VFS. Python files got a file icon.
+What a user saw was Monaco's default word-based suggestions: strings scraped out of the
+open buffer, which will offer a word from a comment and has never heard of
+`requests.get`. In a product whose Python story now includes a package store and a
+served-app preview, the editor was the part that had not moved.
+
+**What shipped.** jedi for completion, hover, signature help and go-to-definition; black
+for formatting. **Not mypy** — diagnostics are a different problem, needing scheduling
+care and third-party stubs before they say anything useful, and the docs are explicit
+that type errors have not arrived so nobody reads this as more than it is.
+
+**The lifecycle was the design question, not the libraries.** Pyodide boots per process
+and dies with it, which is wrong twice over for an editor feature: a REPL exiting would
+take completion down, and a boot would show up in `ps` as a process nobody started. So
+the service gets its own interpreter, in a worker the kernel owns and deliberately keeps
+out of the process table — no PID, absent from `ps` and `diagnostics()`, unkillable by
+the user. It boots on the first language request and not before, and the studio's import
+of the provider module is dynamic, so a TypeScript session pays nothing. The status bar
+says `Python: starting…` while it happens, because a popup that does nothing for eight
+seconds is worse than one that admits it is not ready.
+
+**Completions see what the user thinks they see.** The buffer's unsaved text, the
+project's own modules — including a file in a subdirectory importing something top-level,
+which is what an explicit project root buys and what jedi's inferred root would miss —
+and the per-project `.venv` package store, remapped onto the interpreter's site-packages
+the same way `restoreStore()` does it. Someone who runs `pip install tabulate` and gets
+no completions for it concludes the feature is broken, so that case is a test.
+
+**Staleness, not queueing.** One interpreter, no threads, and keystrokes outrun it. At
+most one in-flight and one waiting request per kind; a newer keystroke replaces the
+waiting one and the replaced caller resolves rather than being left pending. Monaco's
+token is re-checked when the answer arrives, since it can fire mid-flight.
+
+**Two things had to be found out rather than assumed.** jedi is in Pyodide's lock; black
+is not, so it and its closure are vendored from PyPI and pinned — an editor feature that
+only works when the network does is not the same feature. And jedi's default environment
+discovery *runs* `sys.executable` in a subprocess, which Pyodide refuses with
+`OSError(138)`; because the `-m` work sets `sys.executable = "python"`, every request
+would have failed at jedi's own entry point. `InterpreterEnvironment` fixes it, and the
+bridge tier asserts the default path still fails so the reason stays visible.
+
+**The gate, and the oracle.** Interpreter-free checks run per PR: provider registration,
+the request contract, cancellation and supersession, the path mapping, and every failure
+path. Those queue assertions are bounded, because the first mutation run revealed that a
+queue which stops resolving superseded work would **hang** the spike rather than fail it,
+and a CI job that never finishes is worse than one that goes red. The bridge tier runs the
+*shipped driver* under real Pyodide and under the host's own CPython with jedi and black
+pinned to the same versions, and requires them to agree — two interpreters, one program,
+no expectation table written by the same person who wrote the feature. Formatting is
+byte-exact on both. Where the two interpreters legitimately differ (CPython 3.11 here
+against Pyodide's 3.14) the comparison is scoped to buffer-local and project code, and
+stdlib checks assert presence instead. One blind spot needed closing deliberately: since
+both sides run the same driver, a change to black's Mode moves both answers together and
+they still agree — so the samples are *also* compared against black's own command line,
+with no driver in the way, which is the promise the feature actually makes. Every
+assertion was mutation-tested; that is how the missing project-root case turned up, since
+jedi infers a root from the file path and a fixture with the file at the top level cannot
+tell the two apart.

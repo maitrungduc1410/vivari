@@ -40,7 +40,7 @@ export function StatusBar() {
     (repos.length === 1 ? repos[0] : undefined);
   const branch = repo ? (repo.currentBranch ?? "(detached)") : null;
 
-  const { cursor, indent, language } = editor;
+  const { cursor, indent, language, pythonService } = editor;
 
   return (
     <>
@@ -84,6 +84,11 @@ export function StatusBar() {
           <StatusItem label="Select Language Mode" onClick={() => setPicker("language")}>
             {languageLabel(language)}
           </StatusItem>
+        )}
+        {/* Python's language service, once one has been asked for. A boot is
+            seconds of nothing on the first .py file; this is what says so. */}
+        {pythonService && (
+          <StatusItem label="Python language service (jedi, black)">{pythonService}</StatusItem>
         )}
       </div>
       <StatusBarPickers open={picker} onClose={() => setPicker(null)} />

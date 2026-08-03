@@ -35,6 +35,7 @@ project never touches Python, it never pays for it.
 | **Pure-Python packages from PyPI** | installed at runtime through `micropip` |
 | **`pip install` that persists** | into a per-project `.venv`, with `list`/`freeze`/`show`/`uninstall`/`check` |
 | **Outbound HTTP** | `requests`, or `pyfetch` if you want it async — subject to the target's CORS headers |
+| **Editor intelligence** | completion, hover, signature help, go-to-definition and formatting, from jedi and black |
 
 Start from any of the templates in the Studio's **Native** tab.
 
@@ -191,6 +192,62 @@ the studio's cross-origin isolation (a `Cross-Origin-Resource-Policy`, or CORS).
 An API that sends no CORS headers cannot be read from Python here — and moving
 the call to JavaScript does not help, because it is the same restriction. This
 one is not something Vivari can lift.
+
+## In the editor
+
+Python files get completion, hover, signature help, go-to-definition and
+formatting. These come from [jedi](https://jedi.readthedocs.io/) and
+[black](https://black.readthedocs.io/) — the same libraries you would run
+locally, at the same versions, shipped with the app rather than fetched.
+
+**What is not here is type checking.** No red squiggles, no `error:` list, no
+mypy. Completion knowing what `requests.get` returns and a type checker telling
+you that you passed it an `int` are different features, and only the first one
+has arrived. Nothing in the editor will tell you a Python file is wrong before
+you run it.
+
+### What completion can see
+
+- **The buffer you are typing in**, unsaved. A class you defined thirty seconds
+  ago and have not saved is completed.
+- **The rest of the project** — your own modules, including from a file in a
+  subdirectory importing something at the top level.
+- **Packages you installed.** `pip install tabulate` and then `tabulate.` offers
+  its members, because the language service reads the same per-project `.venv`
+  store that `pip` writes to.
+- **The standard library**, at the interpreter's own version.
+
+What it cannot see is anything outside the project directory, and go-to-definition
+says so rather than doing nothing: a definition inside the standard library or a
+package reports where it lives instead of opening a file the editor has no copy
+of.
+
+### Formatting
+
+`black`, with its defaults, so the result is byte-for-byte what running
+`black yourfile.py` at a terminal produces. If black cannot parse the file, the
+buffer is **left exactly as it was** and the error says where — a file with a
+syntax error is not silently reported as already formatted, and never gets
+partially rewritten.
+
+### The first request is slow, and says so
+
+The language service runs on its own Python interpreter, separate from anything
+you run. It does not exist until you open a Python file, because someone editing
+TypeScript should not download an interpreter. The first completion in a session
+therefore waits for it to start, and the editor's status bar says `Python:
+starting…` while that happens. It is a few seconds, once. After that the
+interpreter stays up: it is not tied to any process you run, so quitting the
+REPL or a crashing script leaves completion working.
+
+If it cannot start — or if jedi fails on some particular file — the status bar
+says so with the reason. An empty completion popup here always means jedi had
+nothing to suggest, never that something broke quietly.
+
+Requests are answered one at a time, because the interpreter is single-threaded.
+Typing faster than it can answer is fine: superseded requests are dropped rather
+than queued, so what you get is an answer for where the cursor is now, not a
+backlog of answers for where it used to be.
 
 ## Limits
 

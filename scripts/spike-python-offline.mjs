@@ -74,6 +74,19 @@ import { MODELLED_FRAGMENTS, STANDIN, normalize } from "./lib/urllib3-emscripten
 import { CPYTHON_EXITS, UNTRUNCATED, realCPythonExit } from "./lib/cpython-exit.mjs";
 import { drivePython, driveShim, servedApp } from "./lib/python-drive.mjs";
 import { fsDirective, get, hostRead, mirrorRuntime, scratchPort } from "./lib/python-mirror-drive.mjs";
+import { makeFakeMonaco, makeHost, makeModel, makeToken } from "./lib/fake-monaco.mjs";
+import {
+  LSP_DRIVER_SOURCE,
+  LSP_STATE,
+  MONACO_KIND,
+  completionKind,
+  createRequestQueue,
+  formatFailureMessage,
+  hostPathFor,
+  registerPythonLanguage,
+  stateLabel,
+  toJediPosition,
+} from "../packages/runtime/builtins/python-lsp.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -1435,6 +1448,446 @@ console.log("\n== a served app's writes land while it is still serving ==");
 
   await get(port, "/delete/upload.txt");
   ok(hostRead(path.join(dir, "upload.txt")) === null, "a file the app deletes is deleted on the host");
+}
+
+
+// ---------------------------------------------------------------------------
+console.log("\n== the Python language service: what gets registered ==");
+// Python files used to get file icons and Monaco's default word-based
+// suggestions — strings scraped out of the open buffer, which will offer a word
+// from a comment and has never heard of requests.get. Five providers replace
+// that. This is interpreter-free because Monaco is a parameter of
+// registerPythonLanguage rather than an import of it.
+// ---------------------------------------------------------------------------
+{
+  const monaco = makeFakeMonaco();
+  const host = makeHost();
+  const off = registerPythonLanguage(monaco, host);
+
+  for (const kind of ["completion", "hover", "signature", "definition", "formatting"]) {
+    const regs = monaco.registered[kind];
+    ok(regs.length === 1, `a ${kind} provider is registered`);
+    ok(regs[0] && regs[0].language === "python", `…for the "python" language id, which is what languageFor() gives a .py file`);
+  }
+
+  // "." is the one trigger character that matters. Without it Monaco only asks
+  // after a word character, so `json.` — the single most common thing anyone
+  // types before wanting a completion — produces nothing until another keypress.
+  const comp = monaco.registered.completion[0].provider;
+  ok((comp.triggerCharacters || []).includes("."), "completion triggers on \".\", not only on word characters");
+  const sig = monaco.registered.signature[0].provider;
+  ok((sig.signatureHelpTriggerCharacters || []).includes("("), "signature help triggers on \"(\"");
+  ok((sig.signatureHelpTriggerCharacters || []).includes(","), "…and on \",\", so it follows you across arguments");
+  ok(typeof comp.resolveCompletionItem === "function", "completion resolves lazily, so a docstring costs one lookup and not one per item");
+
+  // Registering twice would double every request. The disposer has to work.
+  off();
+  ok(monaco.disposed.length === 5, "the disposer removes all five providers");
+
+  // Nothing here may be registered for any other language: this service speaks
+  // Python, and claiming .ts would fight the TypeScript service.
+  const langs = new Set(Object.values(monaco.registered).flat().map((r) => r.language));
+  ok(langs.size === 1 && langs.has("python"), "no provider is registered for any language other than python");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the request contract, and the off-by-one in the middle of it ==");
+// ---------------------------------------------------------------------------
+{
+  // Monaco counts columns from 1. jedi counts them from 0. Get this wrong and
+  // every completion is for the character before the cursor — which mostly
+  // still returns something, which is what makes it worth a test.
+  ok(toJediPosition({ lineNumber: 3, column: 1 }).column === 0, "Monaco column 1 is jedi column 0");
+  ok(toJediPosition({ lineNumber: 3, column: 7 }).column === 6, "…and column 7 is column 6");
+  ok(toJediPosition({ lineNumber: 3, column: 7 }).line === 3, "lines agree at 1 and are passed through");
+  ok(toJediPosition({ lineNumber: 1, column: 0 }).column === 0, "a column below 1 clamps rather than going negative");
+
+  // The kind numbers are held against the SHIPPED enum, not a copy: a Monaco
+  // upgrade that renumbers CompletionItemKind should fail here rather than draw
+  // a Class icon for every function.
+  const dts = path.join(ROOT, "packages/studio/node_modules/monaco-editor/esm/vs/editor/editor.api.d.ts");
+  if (fs.existsSync(dts)) {
+    const src = fs.readFileSync(dts, "utf8");
+    const block = /export enum CompletionItemKind \{([\s\S]*?)\}/.exec(src);
+    ok(!!block, "monaco-editor still declares CompletionItemKind where this check reads it");
+    const real = {};
+    for (const m of block[1].matchAll(/(\w+)\s*=\s*(\d+)/g)) real[m[1].toUpperCase()] = Number(m[2]);
+    let agreed = 0;
+    for (const [name, value] of Object.entries(MONACO_KIND)) {
+      ok(real[name] === value, `MONACO_KIND.${name} is ${value}, which is what monaco-editor says`);
+      agreed++;
+    }
+    ok(agreed >= 10, `${agreed} kind numbers checked against the real enum`);
+  }
+
+  // jedi's type vocabulary is fixed and short (api/classes.py).
+  ok(completionKind("function") === MONACO_KIND.FUNCTION, "a jedi function is a Monaco Function");
+  ok(completionKind("class") === MONACO_KIND.CLASS, "a class is a Class");
+  ok(completionKind("module") === MONACO_KIND.MODULE, "a module is a Module");
+  ok(completionKind("keyword") === MONACO_KIND.KEYWORD, "a keyword is a Keyword");
+  ok(completionKind("instance") === MONACO_KIND.VARIABLE, "an instance is a Variable");
+  // An unknown type must not be dressed up as something specific: a confident
+  // wrong icon is worse than a neutral one.
+  ok(completionKind("something-new") === MONACO_KIND.VALUE, "a type this map has not been taught falls back to Value");
+  ok(completionKind(undefined) === MONACO_KIND.VALUE, "…and so does a missing type");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== where a definition lives, and whether it can be opened ==");
+// Three kinds of answer come back from jedi and only one is a file the editor
+// can open. Pretending otherwise means ctrl-click opening a blank tab.
+// ---------------------------------------------------------------------------
+{
+  const inProject = hostPathFor("/project/helper.py", "/project");
+  ok(inProject.openable && inProject.path === "/project/helper.py", "a project file is already a host path");
+
+  // An installed package resolves inside the interpreter, but the bytes exist on
+  // the host under the store — so this one is openable after a rewrite.
+  const inPkg = hostPathFor("/lib/python3.14/site-packages/tabulate/__init__.py", "/project");
+  ok(inPkg.openable, "a definition inside an installed package is openable");
+  ok(
+    inPkg.path === "/project/.venv/lib/python3.14/site-packages/tabulate/__init__.py",
+    `…rewritten onto the package store: ${inPkg.path}`,
+  );
+
+  // The stdlib is a zip inside the WASM build. There is no host file at all.
+  const inStd = hostPathFor("/lib/python314.zip/json/__init__.py", "/project");
+  ok(!inStd.openable, "a stdlib definition is NOT openable");
+  ok(/standard library/.test(inStd.reason), `…and says why: ${JSON.stringify(inStd.reason)}`);
+  ok(!hostPathFor("", "/project").openable, "no path at all is not openable either");
+  ok(!hostPathFor("/somewhere/else.py", "/project").openable, "and neither is a file outside the project");
+
+  // The two halves of the mapping live in different packages and have to agree.
+  const kw = fs.readFileSync(path.join(ROOT, "packages/core/src/workers/kernel-worker.ts"), "utf8");
+  const rel = /const PY_STORE_REL = "([^"]+)"/.exec(kw);
+  const interp = /const PY_INTERP_SITE = "([^"]+)"/.exec(kw);
+  ok(!!rel && !!interp, "the kernel worker declares both halves of the store path mapping");
+  ok(
+    inPkg.path === "/project/" + rel[1] + "/tabulate/__init__.py",
+    "the path the editor opens is the one the kernel worker copied FROM",
+  );
+  ok(interp[1] === "/lib/python3.14/site-packages", "…and the path it copied TO is the interpreter's own site-packages");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== keystrokes outrun the interpreter, so stale work is dropped ==");
+// Pyodide has no threads: language requests serialise whether or not there is a
+// queue. What the queue adds is DROPPING. A round trip is ~15 ms warm and nobody
+// types slower than that, so without this the eighth keystroke waits behind seven
+// answers nobody will read — which is what "feels broken" actually is.
+// ---------------------------------------------------------------------------
+{
+  let inFlight = 0;
+  let peak = 0;
+  const seen = [];
+  let release;
+  const gate = () => new Promise((r) => { release = r; });
+  let pending = gate();
+  const q = createRequestQueue(async (job) => {
+    inFlight++;
+    peak = Math.max(peak, inFlight);
+    seen.push(job.n);
+    await pending;
+    inFlight--;
+    return { answered: job.n };
+  });
+
+  // Every await below is bounded. A queue that stops resolving superseded work
+  // would otherwise HANG this spike rather than fail it, and a CI job that never
+  // finishes is worse than one that goes red — it costs a timeout to find out.
+  const settled = (p, ms = 2000) =>
+    Promise.race([p, new Promise((r) => setTimeout(() => r("TIMED-OUT"), ms))]);
+
+  // Eight keystrokes while the interpreter is busy with the first.
+  const results = [];
+  for (let n = 1; n <= 8; n++) results.push(q.submit("complete", { n }));
+  await new Promise((r) => setTimeout(r, 5));
+  ok(peak === 1, "only one request is ever handed to the interpreter at a time");
+  const first = release; first();
+  pending = gate();
+  await new Promise((r) => setTimeout(r, 5));
+  release();
+  const answers = await settled(Promise.all(results));
+
+  ok(answers !== "TIMED-OUT", "every one of the 8 keystrokes settles — a superseded request must not be left pending forever");
+  ok(seen.length === 2, `8 keystrokes reached the interpreter twice, not 8 times (${seen.join(",")})`);
+  ok(seen[0] === 1 && seen[1] === 8, "…the one that was already running, and the LATEST — not the queue in order");
+  ok(answers !== "TIMED-OUT" && answers[7] && answers[7].answered === 8, "the last keystroke gets a real answer");
+  ok(answers !== "TIMED-OUT" && answers.slice(1, 7).every((a) => a === null), "the six superseded ones resolve null rather than hanging");
+
+  // Different kinds must not evict each other: a hover that supersedes a pending
+  // format would silently cancel a key the user pressed on purpose.
+  const q2 = createRequestQueue(async (job) => ({ op: job.op }));
+  const both = await settled(Promise.all([q2.submit("hover", { op: "hover" }), q2.submit("format", { op: "format" })]));
+  ok(both !== "TIMED-OUT" && both[0] && both[1], "a hover and a format are both answered — different kinds do not supersede each other");
+
+  // A token that fires WHILE the interpreter is busy still suppresses the answer:
+  // the position it answered for is not where the cursor is any more, so the
+  // answer is wrong rather than merely late.
+  let go;
+  const slow = new Promise((r) => { go = r; });
+  const q3 = createRequestQueue(async () => { await slow; return { late: true }; });
+  const tok = makeToken();
+  const p3 = q3.submit("complete", {}, () => tok.isCancellationRequested);
+  await new Promise((r) => setTimeout(r, 5));
+  tok.cancel();
+  go();
+  ok((await settled(p3)) === null, "an answer whose token fired mid-flight is discarded, not delivered late");
+
+  // And a request cancelled before it starts must never reach the interpreter.
+  let reached = 0;
+  const q4 = createRequestQueue(async () => { reached++; return {}; });
+  const dead = makeToken();
+  dead.cancel();
+  ok((await settled(q4.submit("complete", {}, () => dead.isCancellationRequested))) === null, "an already-cancelled request resolves null");
+  ok(reached === 0, "…and never reaches the interpreter at all");
+
+  // A throwing transport is an error, not a hang.
+  const q5 = createRequestQueue(async () => { throw new Error("worker gone"); });
+  const boom = await settled(q5.submit("complete", {}));
+  ok(boom && boom.error === "raised" && /worker gone/.test(boom.message), "a transport failure resolves as an error rather than hanging");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the providers, driven end to end against a stand-in interpreter ==");
+// ---------------------------------------------------------------------------
+{
+  const monaco = makeFakeMonaco();
+  const host = makeHost({
+    complete: { items: [{ i: 0, label: "dumps", type: "function", detail: "def dumps" }] },
+    hover: { items: [{ signature: "def dumps", doc: "Serialize obj to JSON.", type: "function" }] },
+    signature: { items: [{ label: "dumps(obj)", params: [{ label: "obj", detail: "param obj" }], active: 0 }] },
+    goto: { items: [{ path: "/project/helper.py", line: 4, column: 5, name: "helper_fn" }] },
+    format: { text: "x = 1\n", changed: true },
+  });
+  registerPythonLanguage(monaco, host);
+  const model = makeModel("/project/main.py", "import json\njson.du\n");
+  const at = { lineNumber: 2, column: 8 };
+  const P = monaco.registered;
+
+  const list = await P.completion[0].provider.provideCompletionItems(model, at, {}, makeToken());
+  ok(list.suggestions.length === 1 && list.suggestions[0].label === "dumps", "a completion comes back with jedi's label");
+  ok(list.suggestions[0].kind === MONACO_KIND.FUNCTION, "…carrying the mapped kind");
+  ok(list.suggestions[0].detail === "def dumps", "…and jedi's one-line description as the detail");
+  // The range has to cover the word already typed. Without it Monaco guesses and
+  // guesses wrong after a dot — `json.du` + `dumps` becomes `json.dudumps`.
+  const r = list.suggestions[0].range;
+  ok(r.startColumn === 6 && r.endColumn === 8, `the insert range replaces the typed "du" (cols ${r.startColumn}-${r.endColumn})`);
+  ok(list.suggestions[0].insertText === "dumps", "…with the full name, so the result is json.dumps");
+
+  // The buffer, not the file on disk. This is what makes completions describe
+  // what is on screen rather than what was last saved.
+  const sent = host.calls[host.calls.length - 1].req;
+  ok(sent.code === "import json\njson.du\n", "the request carries the model's CURRENT text, unsaved edits included");
+  ok(sent.path === "/project/main.py" && sent.root === "/project", "…plus the path and the project root, so jedi can resolve siblings");
+  ok(sent.line === 2 && sent.column === 7, "…at the jedi-converted position");
+
+  const hover = await P.hover[0].provider.provideHover(model, at, makeToken());
+  ok(hover && hover.contents.length === 2, "hover returns the signature and the docstring");
+  ok(/```python/.test(hover.contents[0].value), "…with the signature fenced as Python, so it renders as code");
+
+  const help = await P.signature[0].provider.provideSignatureHelp(model, at, makeToken());
+  ok(help.value.signatures[0].label === "dumps(obj)", "signature help returns jedi's rendering");
+  ok(help.value.activeParameter === 0, "…and which parameter the cursor is in");
+
+  const defs = await P.definition[0].provider.provideDefinition(model, at, makeToken());
+  ok(defs.length === 1 && defs[0].uri.path === "/project/helper.py", "go-to-definition returns the project file");
+  ok(defs[0].range.startLineNumber === 4, "…at jedi's line");
+
+  const edits = await P.formatting[0].provider.provideDocumentFormattingEdits(model, {}, makeToken());
+  ok(edits.length === 1 && edits[0].text === "x = 1\n", "formatting returns black's output as a whole-document edit");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== silence is the bug: every failure says something ==");
+// A provider that returns an empty list when the service is missing is
+// indistinguishable from "no suggestions" — the lying stub the house rule is
+// about. Formatting is worse, because it is a key the user pressed on purpose.
+// ---------------------------------------------------------------------------
+{
+  ok(/could not parse/i.test(formatFailureMessage({ error: "parse", message: "Cannot parse: 3:10" })), "a file black cannot parse is reported as such");
+  ok(/3:10/.test(formatFailureMessage({ error: "parse", message: "Cannot parse: 3:10" })), "…including black's own line and column");
+  ok(/discarded/.test(formatFailureMessage({ error: "unsafe", message: "" })), "output that does not match the source is reported as DISCARDED, not applied");
+  ok(/black failed/.test(formatFailureMessage({ error: "raised", message: "boom" })), "an unexpected failure is reported");
+  ok(!!formatFailureMessage(null), "even a missing response produces a message rather than silence");
+  for (const kind of ["parse", "unsafe", "raised", null]) {
+    const msg = formatFailureMessage(kind ? { error: kind, message: "x" } : null);
+    ok(typeof msg === "string" && msg.length > 12, `the ${kind || "empty"} failure message is a sentence, not a code`);
+  }
+
+  // The service being down must reach the status bar, and formatting must say so.
+  const monaco = makeFakeMonaco();
+  const host = makeHost();
+  host.responder = () => Promise.resolve({ ok: false, result: null, error: "Pyodide failed to load" });
+  registerPythonLanguage(monaco, host);
+  const model = makeModel("/project/main.py", "x=1\n");
+
+  const list = await monaco.registered.completion[0].provider.provideCompletionItems(model, { lineNumber: 1, column: 2 }, {}, makeToken());
+  ok(list.suggestions.length === 0, "a broken service offers no completions (there are none to offer)");
+  ok(
+    host.states.some(([s, d]) => s === LSP_STATE.FAILED && /Pyodide failed to load/.test(d)),
+    "…but the failure reaches the status bar with the reason, so it is not silence",
+  );
+
+  const edits = await monaco.registered.formatting[0].provider.provideDocumentFormattingEdits(model, {}, makeToken());
+  ok(edits.length === 0, "a broken service makes no edit");
+  ok(host.notices.some((n) => /unavailable/.test(n)), `…and says so: ${JSON.stringify(host.notices[host.notices.length - 1])}`);
+
+  // "Already formatted" and "formatting is broken" must not look the same.
+  const m2 = makeFakeMonaco();
+  const h2 = makeHost({ format: { text: "x = 1\n", changed: false } });
+  registerPythonLanguage(m2, h2);
+  const none = await m2.registered.formatting[0].provider.provideDocumentFormattingEdits(makeModel("/project/a.py", "x = 1\n"), {}, makeToken());
+  ok(none.length === 0 && h2.notices.some((n) => /already formatted/.test(n)), "an already-formatted file says so, rather than looking like a failure");
+
+  // black refusing to parse must not overwrite the buffer with anything.
+  const m3 = makeFakeMonaco();
+  const h3 = makeHost({ format: { error: "parse", message: "Cannot parse: 1:6" } });
+  registerPythonLanguage(m3, h3);
+  const bad = await m3.registered.formatting[0].provider.provideDocumentFormattingEdits(makeModel("/project/b.py", "def f(:\n"), {}, makeToken());
+  ok(bad.length === 0, "a file black cannot parse produces NO edit — the buffer is left alone");
+  ok(h3.notices.some((n) => /1:6/.test(n)), "…and the user is told where the syntax error is");
+
+  // A definition jedi found but the editor cannot open has to explain itself.
+  const m4 = makeFakeMonaco();
+  const h4 = makeHost({ goto: { items: [{ path: "/lib/python314.zip/json/__init__.py", line: 185, column: 5, name: "dumps" }] } });
+  registerPythonLanguage(m4, h4);
+  const std = await m4.registered.definition[0].provider.provideDefinition(makeModel("/project/c.py", "x\n"), { lineNumber: 1, column: 1 }, makeToken());
+  ok(std.length === 0, "a stdlib definition opens nothing");
+  ok(h4.notices.some((n) => /standard library/.test(n)), "…and explains why, instead of a ctrl-click that does nothing");
+
+  // The status readouts a user actually sees.
+  ok(/starting/.test(stateLabel(LSP_STATE.STARTING)), "a boot in progress says it is starting");
+  ok(stateLabel(LSP_STATE.READY) === "Python: jedi", "a ready service names what is answering");
+  ok(/unavailable/.test(stateLabel(LSP_STATE.FAILED)), "a failed service says unavailable");
+  ok(/no wheel/.test(stateLabel(LSP_STATE.FAILED, "no wheel")), "…and carries the detail");
+  ok(stateLabel("off") === null, "and nothing is shown before Python has been opened at all");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the jedi/black driver is valid Python, checked by a real one ==");
+// The driver is a string until an interpreter reads it, so a typo in it is a
+// runtime error in a worker with no terminal. Compiling it here is free and
+// needs no jedi: compile() resolves no imports.
+// ---------------------------------------------------------------------------
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-lsp-src-"));
+  const f = path.join(dir, "driver.py");
+  fs.writeFileSync(f, LSP_DRIVER_SOURCE);
+  const r = spawnSync("python3", ["-c", `compile(open(${JSON.stringify(f)}).read(), "driver", "exec")`], { encoding: "utf8" });
+  ok(r.status === 0, `the driver compiles under the CPython on this host${r.status ? ": " + (r.stderr || "").trim().split("\n").pop() : ""}`);
+
+  // Every op the providers ask for has to exist in the dispatch table, or the
+  // failure is a string mismatch found by a user.
+  const table = /_VV_OPS = \{([\s\S]*?)\n\}/.exec(LSP_DRIVER_SOURCE);
+  ok(!!table, "the driver has an op table where this check reads it");
+  const ops = [...table[1].matchAll(/"(\w+)":/g)].map((m) => m[1]);
+  for (const op of ["complete", "resolve", "hover", "signature", "goto", "format"]) {
+    ok(ops.includes(op), `the driver implements "${op}"`);
+  }
+  // …and the providers ask for exactly those.
+  const asked = new Set([...fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python-lsp.js"), "utf8")
+    .matchAll(/op: "(\w+)"/g)].map((m) => m[1]));
+  for (const op of asked) ok(ops.includes(op), `…and "${op}", which a provider asks for, is one of them`);
+
+  // The line that makes any of this work in Pyodide at all.
+  ok(
+    /environment=_VV_ENV/.test(LSP_DRIVER_SOURCE) && /InterpreterEnvironment\(\)/.test(LSP_DRIVER_SOURCE),
+    "jedi is given an InterpreterEnvironment — its default discovery runs sys.executable in a SUBPROCESS, which Pyodide answers with OSError(138)",
+  );
+  // black's safety check is not optional: format_str does not run it, and what
+  // it catches is black changing what the code means.
+  ok(/assert_equivalent/.test(LSP_DRIVER_SOURCE), "black's --safe equivalence check is run before any text is returned");
+  ok(!/except\s*:\s*\n\s*pass/.test(LSP_DRIVER_SOURCE), "the driver never swallows an exception into a bare pass");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the interpreter behind it is not a process, and not eager ==");
+// Two properties that are the whole lifecycle decision, and both are the kind of
+// thing a later change breaks without noticing.
+// ---------------------------------------------------------------------------
+{
+  const kw = fs.readFileSync(path.join(ROOT, "packages/core/src/workers/kernel-worker.ts"), "utf8");
+  const lspWorker = fs.readFileSync(path.join(ROOT, "packages/core/src/workers/python-lsp-worker.ts"), "utf8");
+
+  ok(/new Worker\(new URL\("\.\/python-lsp-worker\.ts"/.test(kw), "the language service is a nested worker of the kernel");
+  // A process is anything that goes through createProcess/kernel.launch. This one
+  // must not: it would show up in ps and diagnostics(), and a user tidying up
+  // their jobs could kill their own editor's completions.
+  const fn = /function pythonLspWorker\(\)[\s\S]*?\n\}/.exec(kw);
+  ok(!!fn, "pythonLspWorker() is where the worker is created");
+  ok(!/createProcess|kernel\.launch|spawnProcess/.test(fn[0]), "…and it never goes through createProcess, so it is absent from ps and diagnostics()");
+
+  // Lazy: created on first use, not at boot. Pyodide is ~30 MB and someone
+  // editing a .ts file must not pay for it.
+  const bootFn = /async function boot\(\)[\s\S]*?\n\}/.exec(kw);
+  if (bootFn) ok(!/pythonLspWorker\(/.test(bootFn[0]), "the kernel's boot() does not create it — it is not paid for until a .py file is opened");
+  const created = [...kw.matchAll(/pythonLspWorker\(\)/g)].length;
+  ok(created >= 2, `pythonLspWorker() is called from its own definition and from the request path (${created} sites)`);
+  ok(/if \(pyLspWorker\) return pyLspWorker;/.test(kw), "…and returns the existing worker rather than booting a second interpreter");
+
+  // The studio side must be lazy too, or the bundle carries the worker anyway.
+  const ctl = fs.readFileSync(path.join(ROOT, "packages/studio/src/vv/controller.ts"), "utf8");
+  ok(/import\("\.\/python-language"\)/.test(ctl), "the studio imports the provider module dynamically, so a TypeScript session never loads it");
+  ok(/ensurePythonLanguage\(/.test(ctl), "…behind a guard called when a Python model appears");
+
+  // One boot, not one per caller: two 30 MB boots racing is how a slow feature
+  // becomes an out-of-memory one.
+  ok(/if \(booting\) return booting;/.test(lspWorker), "concurrent first requests await ONE boot rather than starting two interpreters");
+  ok(/booting = null;/.test(lspWorker), "…and a failed boot is retryable, since the network may come back");
+  // black is four wheels nobody needs until they press the key.
+  ok(/async function ensureBlack\(\)/.test(lspWorker), "black loads on the first format, not at boot");
+  ok(/loadPackage\(JEDI_PACKAGES/.test(lspWorker), "…while jedi loads at boot, because it is what makes the editor feel alive");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== jedi and black are shipped, not fetched when someone types ==");
+// An editor feature that only works when the network does, in a product whose
+// pitch is running in the browser, is a different feature.
+// ---------------------------------------------------------------------------
+{
+  const vend = fs.readFileSync(path.join(ROOT, "scripts/vendor-pyodide.mjs"), "utf8");
+  ok(/DEFAULT_PACKAGES = \[[^\]]*"jedi"/.test(vend), "jedi is vendored (it IS in Pyodide's lock, so it costs one same-origin wheel)");
+
+  const pypi = /const PYPI_PACKAGES = \[([\s\S]*?)\n\];/.exec(vend);
+  ok(!!pypi, "black's wheels are declared for vendoring, since Pyodide does not distribute it");
+  const pinned = [...pypi[1].matchAll(/name: "([^"]+)", version: "([^"]+)"/g)];
+  ok(pinned.length >= 4, `${pinned.length} PyPI wheels are vendored for the formatter`);
+  for (const [, name, version] of pinned) {
+    ok(/^\d+\.\d+/.test(version), `${name} is pinned to ${version} — an unpinned formatter reformats a codebase differently the day upstream changes a default`);
+  }
+
+  // The bug this catches, which a network-enabled test would not have: black's
+  // dependencies that live in the Pyodide lock (click, packaging, platformdirs)
+  // are not in any other vendored package's closure, so without an explicit pull
+  // their wheels are never downloaded and loadPackage("black") silently falls
+  // back to the CDN.
+  ok(
+    /for \(const spec of PYPI_PACKAGES\) \{\s*\n\s*for \(const dep of spec\.depends\)/.test(vend),
+    "a PyPI package's lock-resident dependencies are pulled into the download closure",
+  );
+  const blackSpec = /name: "black"[^}]*depends: \[([^\]]*)\]/.exec(vend);
+  ok(!!blackSpec, "black declares its dependencies");
+  for (const dep of ["click", "packaging", "platformdirs", "pathspec", "mypy-extensions", "pytokens"]) {
+    ok(blackSpec[1].includes('"' + dep + '"'), `…including ${dep}`);
+  }
+  // Changing a pin must invalidate the vendor marker, or a re-run is a no-op.
+  ok(/PYPI_PACKAGES\.map\(\(p\) => p\.name \+ "@" \+ p\.version\)/.test(vend), "the vendor marker covers the pins, so changing one actually re-vendors");
+
+  // If the tree is present in this checkout, the wheels really are on disk.
+  const out = path.join(ROOT, "packages/studio/public/vendor/pyodide");
+  if (fs.existsSync(out)) {
+    const names = fs.readdirSync(out);
+    for (const want of ["jedi", "parso", "black", "pathspec", "pytokens", "mypy_extensions", "click", "platformdirs"]) {
+      ok(names.some((n) => n.startsWith(want) && n.endsWith(".whl")), `${want}'s wheel is on disk in the vendored tree`);
+    }
+    const lock = JSON.parse(fs.readFileSync(path.join(out, "pyodide-lock.json"), "utf8"));
+    for (const want of ["black", "pathspec", "pytokens", "mypy-extensions"]) {
+      const e = lock.packages[want];
+      ok(!!e, `${want} was injected into the lock, so loadPackage resolves it`);
+      ok(e && !e.file_name.includes("://"), `…with a RELATIVE file_name, which is what makes it same-origin rather than the CDN`);
+    }
+  }
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Python checks passed");

@@ -27,6 +27,11 @@ export interface EditorStatusSnapshot {
   indent: IndentState | null;
   language: string | null; // monaco language id of the active model
   lineCount: number; // active model's line count (Go to Line validation hint)
+  // The Python language service, when there is one to report. Boot takes seconds
+  // the first time (Pyodide is ~30 MB), and a completion popup that silently does
+  // nothing for that long reads as broken — so the state goes somewhere the user
+  // is already looking. null when no Python file has been opened.
+  pythonService: string | null;
 }
 
 const EMPTY: EditorStatusSnapshot = {
@@ -34,6 +39,7 @@ const EMPTY: EditorStatusSnapshot = {
   indent: null,
   language: null,
   lineCount: 0,
+  pythonService: null,
 };
 
 export class EditorStatus {
@@ -54,7 +60,8 @@ export class EditorStatus {
       sameCursor(next.cursor, this.snap.cursor) &&
       sameIndent(next.indent, this.snap.indent) &&
       next.language === this.snap.language &&
-      next.lineCount === this.snap.lineCount
+      next.lineCount === this.snap.lineCount &&
+      next.pythonService === this.snap.pythonService
     ) {
       return;
     }
@@ -62,9 +69,12 @@ export class EditorStatus {
     for (const l of this.listeners) l();
   }
 
-  /** No text model attached — the status bar hides the cursor/indent/language items. */
+  /** No text model attached — the status bar hides the cursor/indent/language items.
+   * pythonService is deliberately preserved: the interpreter outlives the tab
+   * that woke it, so a readout that vanished on tab close would be reporting
+   * something untrue. */
   clear() {
-    this.set(EMPTY);
+    this.set({ ...EMPTY, pythonService: this.snap.pythonService });
   }
 }
 

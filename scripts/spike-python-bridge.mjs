@@ -40,11 +40,14 @@
 import { execSync } from "node:child_process";
 import { fork } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { PYTHON_PROGRAM } from "../packages/kernel-host/programs/python.js";
 import { COREUTILS } from "../packages/kernel-host/coreutils.js";
+import { LSP_DRIVER_SOURCE, hostPathFor } from "../packages/runtime/builtins/python-lsp.js";
+import { askHost, blackCli, ensureOracle, lockVersion, oracleVersions, vendoredPyPIPins } from "./lib/python-lsp-oracle.mjs";
 import {
   PYODIDE_PYTHON_VERSION,
   PYTHON_EXECUTABLE,
@@ -185,6 +188,10 @@ const CASES = {
   // What a served app writes, including a SQLite database, reaching the host —
   // and the FS tracking hooks the offline mirror gate is built on.
   "serve-persist": { kind: "serve-persist", synthetic: true },
+
+  // jedi and black on a real interpreter, judged against the SAME driver run
+  // under the CPython on this host.
+  "language-service": { kind: "language-service", synthetic: true },
 
   "package-store": { kind: "package-store", synthetic: true },
   // sys.exit() raised for real, judged against what real CPython does.
@@ -721,6 +728,286 @@ str(sorted(f for f in os.listdir('/w') if f.startswith('tx.db')))
 `);
     ok(/tx\.db-journal/.test(mid),
       `an open transaction leaves a journal on disk (${mid}) — so a mid-transaction copy carries its own rollback`);
+  }
+
+  // --- the editor's language service, against the host's own CPython ---------
+  if (spec.kind === "language-service") {
+    // Two interpreters, ONE driver. Everything below runs the shipped
+    // LSP_DRIVER_SOURCE in Pyodide and the identical string under python3 on
+    // this machine, with jedi and black pinned to the same versions, and
+    // requires them to agree. An expectation table written here would have
+    // agreed with the implementation by construction; this cannot.
+    const scratch = path.join(SCRATCH, "lsp-oracle");
+    const jediVersion = lockVersion(path.join(SCRATCH, "node_modules/pyodide/pyodide-lock.json"), "jedi");
+    const pins = [
+      { name: "jedi", version: jediVersion },
+      ...vendoredPyPIPins(path.join(ROOT, "scripts/vendor-pyodide.mjs")).filter((p) => p.name === "black"),
+    ].filter((p) => p.version);
+    ok(pins.length === 2, `the oracle's pins are read from the shipping config, not restated (${pins.map((p) => p.name + "==" + p.version).join(", ")})`);
+
+    const oracle = ensureOracle(scratch, pins);
+    // A comparison that did not run must not look like one that agreed.
+    ok(!oracle.error, oracle.error || "the host oracle installed the same jedi and black the browser gets");
+    const versions = oracle.dir ? oracleVersions(oracle.dir) : null;
+
+    // Boot the service the way the worker does.
+    await ensure(["jedi"]);
+    await ensure(["black"]);
+    py.runPython(`import sys; sys.executable = ${JSON.stringify(PYTHON_EXECUTABLE)}`);
+
+    // FIRST: prove the line the whole driver turns on. jedi's DEFAULT
+    // environment discovery runs sys.executable in a subprocess to read its
+    // version; Pyodide answers that with OSError(138). This is not hypothetical
+    // — sys.executable is "python" precisely because builtins/python.js sets it
+    // so runpy's errors read correctly.
+    const defaultEnv = py.runPython(`
+import jedi
+try:
+    s = jedi.Script(code="import json\\njson.", path="/x.py")
+    s.complete(2, 5)
+    r = "no error"
+except Exception as e:
+    r = type(e).__name__ + ": " + str(e)[:80]
+r
+`);
+    ok(
+      /InvalidPythonEnvironment/.test(defaultEnv),
+      `jedi's default environment discovery really does fail here (${defaultEnv}) — which is why the driver passes InterpreterEnvironment`,
+    );
+
+    py.runPython(LSP_DRIVER_SOURCE);
+    const dispatch = py.globals.get("_vv_lsp");
+    ok(!!dispatch, "the shipped driver loads on a real interpreter and defines _vv_lsp");
+
+    // A project on disk, mirrored into BOTH interpreters at the same paths, so
+    // jedi resolves the same imports on each side.
+    const projDir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-lsp-proj-"));
+    const FILES = {
+      "helper.py":
+        "def project_helper(alpha, beta=2):\n" +
+        '    """A helper that lives in the project."""\n' +
+        "    return alpha * beta\n",
+      "pkg/__init__.py": "",
+      "pkg/mod.py": "class ProjectClass:\n    def method_here(self):\n        return 1\n",
+    };
+    for (const [rel, text] of Object.entries(FILES)) {
+      const full = path.join(projDir, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, text);
+      const inPy = projDir + "/" + rel;
+      py.FS.mkdirTree(path.dirname(inPy));
+      py.FS.writeFile(inPy, new TextEncoder().encode(text));
+    }
+    const ask = (req) => {
+      const full = { root: projDir, path: projDir + "/main.py", ...req };
+      const mine = JSON.parse(dispatch(JSON.stringify(full)));
+      const theirs = oracle.dir ? askHost(oracle.dir, LSP_DRIVER_SOURCE, full, projDir) : null;
+      return { mine, theirs };
+    };
+
+    // ── black: same version both sides, so the comparison is byte-exact ──────
+    // This is the strongest oracle available anywhere in this file: formatting is
+    // deterministic, and the two interpreters run the identical black.
+    const SAMPLES = [
+      ["reindent and space", "x  =  1\ndef f( a,b ):\n  return   a+b\n"],
+      ["already formatted", "x = 1\n"],
+      ["magic trailing comma", "foo(\n    a,\n)\n"],
+      ["long line wrapping", "result = some_function(argument_one, argument_two, argument_three, argument_four, argument_five)\n"],
+      ["string normalisation", "s = 'single'\n"],
+      ["blank lines around defs", "import os\ndef a():\n    pass\ndef b():\n    pass\n"],
+      ["nested data", "d={'a':1,'b':[1,2,3],'c':{'d':4}}\n"],
+    ];
+    for (const [label, code] of SAMPLES) {
+      const { mine, theirs } = ask({ op: "format", code });
+      ok(!mine.error, `black formats "${label}" without error`);
+      if (theirs && !theirs.error) {
+        ok(
+          mine.text === theirs.text,
+          `"${label}": byte-identical to black on the host${mine.text === theirs.text ? "" : `\n      browser: ${JSON.stringify(mine.text)}\n      host:    ${JSON.stringify(theirs.text)}`}`,
+        );
+      }
+    }
+    // …and the same samples against black's own COMMAND LINE, with no driver on
+    // either side. The comparisons above run the shipped driver twice, so a
+    // change to the driver's Mode would move both answers together and still
+    // agree; this is what notices the editor formatting differently from
+    // `black yourfile.py`, which is the promise being made.
+    if (oracle.dir) {
+      for (const [label, code] of SAMPLES) {
+        const cli = blackCli(oracle.dir, code);
+        const { mine } = ask({ op: "format", code });
+        if (cli.error) continue;
+        ok(
+          mine.text === cli.text,
+          `"${label}": identical to running black on the command line${mine.text === cli.text ? "" : `\n      editor: ${JSON.stringify(mine.text)}\n      CLI:    ${JSON.stringify(cli.text)}`}`,
+        );
+      }
+    }
+
+    // The `changed` flag is what the editor uses to decide between an edit and
+    // "already formatted", so it has to be right in both directions.
+    ok(ask({ op: "format", code: "x = 1\n" }).mine.changed === false, "an already-formatted file reports changed: false");
+    ok(ask({ op: "format", code: "x=1\n" }).mine.changed === true, "…and one that needed work reports changed: true");
+
+    // Bad syntax: an error with black's own position, and NO text field — the
+    // provider keys off that to leave the buffer alone.
+    for (const bad of ["def broken(:\n", "x = (\n", "class C\n    pass\n"]) {
+      const { mine, theirs } = ask({ op: "format", code: bad });
+      ok(mine.error === "parse", `black refuses ${JSON.stringify(bad.slice(0, 12))} with error "parse"`);
+      ok(mine.text === undefined, "…and returns NO text, so there is nothing to write over the buffer with");
+      ok(/Cannot parse: \d+:\d+/.test(mine.message), `…carrying black's own position: ${JSON.stringify(mine.message)}`);
+      if (theirs && theirs.error === "parse") {
+        ok(mine.message === theirs.message, `…the same message black gives on the host: ${JSON.stringify(theirs.message)}`);
+      }
+    }
+
+    // ── jedi: buffer-local code, where the stdlib version cannot differ ──────
+    // The host runs CPython 3.11 and Pyodide runs 3.14, so a stdlib completion
+    // list is legitimately different on the two. Code defined in the buffer or
+    // in the project is not: same jedi, same input, same answer required.
+    const LOCAL = [
+      [
+        "signature of a project function",
+        { op: "signature", code: "import helper\nhelper.project_helper(", line: 2, column: 22 },
+      ],
+      [
+        "completion of a buffer-local name",
+        { op: "complete", code: "def local_function(q):\n    pass\nlocal_", line: 3, column: 6, token: "t" },
+      ],
+      [
+        "completion of a project module's members",
+        { op: "complete", code: "import helper\nhelper.", line: 2, column: 7, token: "t" },
+      ],
+      [
+        "completion inside a project subpackage",
+        { op: "complete", code: "from pkg import mod\nmod.ProjectClass.", line: 2, column: 17, token: "t" },
+      ],
+      ["goto a project definition", { op: "goto", code: "import helper\nhelper.project_helper", line: 2, column: 10 }],
+      ["goto a buffer-local definition", { op: "goto", code: "def foo():\n    pass\nfoo()", line: 3, column: 1 }],
+      ["hover over a project function", { op: "hover", code: "import helper\nhelper.project_helper", line: 2, column: 10 }],
+    ];
+    for (const [label, req] of LOCAL) {
+      const { mine, theirs } = ask(req);
+      ok(!mine.error, `${label}: answered without error`);
+      ok((mine.items || []).length > 0, `${label}: found something`);
+      if (theirs && !theirs.error) {
+        ok(
+          JSON.stringify(mine) === JSON.stringify(theirs),
+          `${label}: identical to jedi on the host${JSON.stringify(mine) === JSON.stringify(theirs) ? "" : `\n      browser: ${JSON.stringify(mine).slice(0, 240)}\n      host:    ${JSON.stringify(theirs).slice(0, 240)}`}`,
+        );
+      }
+    }
+
+    // The details the providers actually render, spelled out rather than only
+    // compared — so a change that breaks BOTH sides identically still fails.
+    const sig = ask({ op: "signature", code: "import helper\nhelper.project_helper(", line: 2, column: 22 }).mine;
+    ok(sig.items[0].label === "project_helper(alpha, beta=2)", `the signature renders defaults: ${sig.items[0].label}`);
+    ok(sig.items[0].params.map((p) => p.label).join(",") === "alpha,beta", "…and names its parameters in order");
+    ok(sig.items[0].active === 0, "…and reports which parameter the cursor is in");
+
+    const goto = ask({ op: "goto", code: "import helper\nhelper.project_helper", line: 2, column: 10 }).mine;
+    ok(goto.items[0].path === projDir + "/helper.py", "goto reports the project file's real path");
+    ok(goto.items[0].line === 1, "…and its line");
+    // The column contract, from the other end: the driver adds 1 so the editor
+    // gets a Monaco column back.
+    ok(goto.items[0].column === 5, `…as a 1-based column for Monaco (got ${goto.items[0].column})`);
+    ok(hostPathFor(goto.items[0].path, projDir).openable, "…and the path mapper agrees the editor can open it");
+
+    const hover = ask({ op: "hover", code: "import helper\nhelper.project_helper", line: 2, column: 10 }).mine;
+    ok(/A helper that lives in the project/.test(hover.items[0].doc), "hover carries the real docstring");
+
+    // ── the stdlib and installed packages: presence, not the whole list ──────
+    // A user's actual complaint is "requests.get is not offered", so what is
+    // checked is that the right names ARE there.
+    const std = ask({ op: "complete", code: "import json\njson.", line: 2, column: 5, token: "t" }).mine;
+    const names = (std.items || []).map((i) => i.label);
+    for (const want of ["dumps", "loads", "dump", "load"]) {
+      ok(names.includes(want), `stdlib completion offers json.${want}`);
+    }
+    ok(std.items.find((i) => i.label === "dumps").type === "function", "…typed as a function, so the icon is right");
+
+    // The requirement in one test: something pip installed, completed. Without
+    // this a user who ran `pip install tabulate` gets nothing and concludes the
+    // feature is broken.
+    await ensure(["micropip"]);
+    await py.pyimport("micropip").install("tabulate");
+    const inst = ask({ op: "complete", code: "import tabulate\ntabulate.", line: 2, column: 9, token: "t" }).mine;
+    ok(
+      (inst.items || []).some((i) => i.label === "tabulate"),
+      "a package installed at runtime is completed — this is the pip install case",
+    );
+    const instGoto = ask({ op: "goto", code: "import tabulate\ntabulate.tabulate", line: 2, column: 12 }).mine;
+    ok(
+      instGoto.items[0].path.startsWith("/lib/python3.14/site-packages/"),
+      `…and its definition resolves inside site-packages (${instGoto.items[0].path})`,
+    );
+    const mapped = hostPathFor(instGoto.items[0].path, "/project");
+    ok(mapped.openable && mapped.path.startsWith("/project/.venv/"), `…which maps onto the project's package store: ${mapped.path}`);
+
+    // A file in a SUBDIRECTORY importing a top-level project module. This is the
+    // case that distinguishes an explicit project root from the one jedi would
+    // infer by walking up from the file: without the root we pass, sys.path gets
+    // the subdirectory and `import helper` resolves to nothing. It is also an
+    // entirely ordinary layout — tests/ importing the package it tests.
+    fs.mkdirSync(path.join(projDir, "sub"), { recursive: true });
+    const deepCode = "import helper\nhelper.project_helper";
+    const deep = JSON.parse(
+      dispatch(JSON.stringify({ root: projDir, path: projDir + "/sub/deep.py", op: "goto", code: deepCode, line: 2, column: 10 })),
+    );
+    ok(
+      (deep.items || []).length > 0 && deep.items[0].path === projDir + "/helper.py",
+      `a file in a subdirectory resolves a top-level project import (${JSON.stringify((deep.items || [])[0] || deep)})`,
+    );
+    const deepComplete = JSON.parse(
+      dispatch(JSON.stringify({ root: projDir, path: projDir + "/sub/deep.py", op: "complete", code: "import helper\nhelper.", line: 2, column: 7, token: "t" })),
+    );
+    ok(
+      (deepComplete.items || []).some((i) => i.label === "project_helper"),
+      "…and completes its members, so the project root is genuinely on jedi's path",
+    );
+
+    // ── unsaved buffer state ────────────────────────────────────────────────
+    // "Complete against what is on screen, not what was last written to disk."
+    // Nothing named brand_new_symbol exists in any file.
+    const unsaved = ask({
+      op: "complete",
+      code: "class BrandNewClass:\n    def brand_new_method(self):\n        pass\n\nBrandNewClass().brand_",
+      line: 5,
+      column: 22,
+      token: "t",
+    }).mine;
+    ok(
+      (unsaved.items || []).some((i) => i.label === "brand_new_method"),
+      "a symbol that exists only in the unsaved buffer is completed",
+    );
+
+    // ── resolve, and the staleness guard on it ──────────────────────────────
+    const first = ask({ op: "complete", code: "import helper\nhelper.", line: 2, column: 7, token: "tok-A" }).mine;
+    const idx = first.items.findIndex((i) => i.label === "project_helper");
+    const doc = JSON.parse(dispatch(JSON.stringify({ op: "resolve", token: "tok-A", index: idx })));
+    ok(/A helper that lives in the project/.test(doc.doc || ""), "resolving a completion item fetches its docstring");
+    const stale = JSON.parse(dispatch(JSON.stringify({ op: "resolve", token: "tok-OLD", index: 0 })));
+    ok(stale.stale === true, "…and a token from a superseded list is refused, rather than documenting the wrong symbol");
+    const oob = JSON.parse(dispatch(JSON.stringify({ op: "resolve", token: "tok-A", index: 9999 })));
+    ok(oob.stale === true, "…as is an index past the end of the list");
+
+    // ── failure, on a real interpreter ──────────────────────────────────────
+    const raised = ask({ op: "complete", code: "x", line: 9999, column: 0, token: "t" }).mine;
+    ok(raised.error === "raised", "a jedi crash is reported as this request failing");
+    ok(/ValueError/.test(raised.message), `…with the real exception: ${JSON.stringify(raised.message)}`);
+    const after = ask({ op: "complete", code: "import json\njson.", line: 2, column: 5, token: "t" }).mine;
+    ok(!after.error && after.items.length > 0, "…and the NEXT request still works — one bad keystroke does not take the service down");
+    ok(JSON.parse(dispatch(JSON.stringify({ op: "nonsense" }))).error === "op", "an unknown op is named as such rather than crashing");
+
+    if (versions) {
+      ok(
+        versions.jedi === jediVersion,
+        `the oracle ran jedi ${versions.jedi} against the browser's ${jediVersion}`,
+      );
+      // Worth stating in the output: the ONE thing the two sides do not share,
+      // and the reason the stdlib comparisons above are presence checks.
+      console.log(`      (oracle CPython ${versions.python} vs Pyodide ${PYODIDE_PYTHON_VERSION} — why stdlib lists are not compared verbatim)`);
+    }
   }
 
   // --- SystemExit end to end: real Pyodide in, real CPython's answer out ----

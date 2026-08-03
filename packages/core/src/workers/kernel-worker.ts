@@ -2086,6 +2086,145 @@ function typesPackageName(dep) {
   return dep[0] === "@" ? dep.slice(1).replace("/", "__") : dep;
 }
 
+// ── Python language service (jedi/black) ─────────────────────────────────────
+// A long-lived interpreter for the editor, in the same category as the FS and
+// fetcher workers: a nested Worker created here, NEVER through createProcess, so
+// it is absent from kernel.procs and therefore from `ps` and diagnostics(). See
+// workers/python-lsp-worker.ts for why it cannot be a process.
+//
+// Created on the FIRST request rather than at boot. Pyodide is ~30 MB and the
+// overwhelming majority of sessions never open a .py file; the worker module
+// itself is a dynamic import so its bundle is not in the boot path either.
+
+// jedi reads .py and .pyi; nothing else in a project or a wheel affects what it
+// can answer. Skipping the rest is not an optimisation so much as the difference
+// between shipping a package's source and shipping its compiled artifacts.
+const PY_SOURCE_RE = /\.pyi?$/;
+const PY_SKIP_DIRS = new Set(["node_modules", ".git", "__pycache__", ".pytest_cache", "dist", "build", ".mypy_cache"]);
+// A project plus its installed packages. numpy alone is ~400 files; a scientific
+// stack with a few libraries is the case this has to hold without becoming the
+// reason the editor is slow.
+const PY_MAX_FILES = 20_000;
+const PY_MAX_BYTES = 40_000_000;
+// The store's path inside the project, and where the interpreter expects to find
+// it. Kept in step with builtins/python-lsp.js, which maps definitions back the
+// other way; the offline spike holds the two together.
+const PY_STORE_REL = ".venv/lib/python3.14/site-packages";
+const PY_INTERP_SITE = "/lib/python3.14/site-packages";
+
+let pyLspWorker = null;
+let pyLspSeq = 1;
+const pyLspPending = new Map();
+// path -> length, so a re-send only carries what changed. Length rather than a
+// hash because reading the file to hash it is the cost being avoided.
+const pyLspSent = new Map();
+
+function pythonLspWorker() {
+  if (pyLspWorker) return pyLspWorker;
+  pyLspWorker = new Worker(new URL("./python-lsp-worker.ts", import.meta.url), {
+    type: "module",
+    name: "Python Language Service",
+  });
+  pyLspWorker.onmessage = (event) => {
+    const m = event.data;
+    if (m.type === "state") {
+      // Not a reply to anything — the editor subscribes to this so the status bar
+      // can say "starting…" during a boot nobody explicitly asked for.
+      post("py-lsp-state", { state: m.state, detail: m.detail || "" });
+      return;
+    }
+    if (m.type !== "py-lsp-reply") return;
+    const pending = pyLspPending.get(m.id);
+    if (!pending) return;
+    pyLspPending.delete(m.id);
+    pending(m);
+  };
+  pyLspWorker.onerror = (e) => {
+    // A worker that died takes its interpreter with it. Say so, and let the next
+    // request build a new one rather than hanging on a worker that is gone.
+    post("py-lsp-state", { state: "failed", detail: (e && e.message) || "the language service worker stopped" });
+    for (const [, pending] of pyLspPending) pending({ ok: false, error: "the language service worker stopped" });
+    pyLspPending.clear();
+    pyLspWorker = null;
+    pyLspSent.clear();
+  };
+  return pyLspWorker;
+}
+
+/**
+ * The project's Python sources, plus the .py/.pyi inside its package store,
+ * addressed as the INTERPRETER will see them. Only what changed since the last
+ * call is returned: re-sending a tree per keystroke costs the same as no cache.
+ *
+ * The store is remapped to the interpreter's own site-packages, which is where
+ * an import looks — the same move builtins/python-store.js makes for a process,
+ * and the inverse of hostPathFor() in builtins/python-lsp.js, which turns a
+ * definition back into a file the editor can open.
+ */
+function collectPython(root) {
+  const files = [];
+  const seen = new Set();
+  let bytes = 0;
+  let truncated = false;
+  const rootClean = String(root || "").replace(/\/+$/, "");
+  if (!kernel || !rootClean) return { files, removed: [], truncated };
+
+  const take = (hostPath, interpPath) => {
+    if (truncated || seen.has(interpPath)) return;
+    let size = 0;
+    try { size = kernel.stat(hostPath).size | 0; } catch { return; }
+    seen.add(interpPath);
+    if (pyLspSent.get(interpPath) === size) return; // unchanged — do not read it
+    let content;
+    try { content = kernel.readFile(hostPath); } catch { return; }
+    if (typeof content !== "string") return;
+    files.push([interpPath, content]);
+    pyLspSent.set(interpPath, size);
+    bytes += content.length;
+    if (files.length >= PY_MAX_FILES || bytes >= PY_MAX_BYTES) truncated = true;
+  };
+
+  const walk = (hostDir, interpDir, depth) => {
+    if (truncated || depth > 24) return;
+    let names;
+    try { names = kernel.readdir(hostDir); } catch { return; }
+    for (const name of names) {
+      if (PY_SKIP_DIRS.has(name)) continue;
+      const host = hostDir + "/" + name;
+      const interp = interpDir + "/" + name;
+      let kind;
+      try { kind = kernel.stat(host).kind; } catch { continue; }
+      if (kind === "dir") {
+        // .venv is walked SEPARATELY, remapped onto site-packages. Walking it
+        // here as well would put every wheel at a path no import resolves, and
+        // pay for the bytes twice.
+        if (depth === 0 && name === ".venv") continue;
+        walk(host, interp, depth + 1);
+      } else if (PY_SOURCE_RE.test(name)) {
+        take(host, interp);
+      }
+    }
+  };
+
+  walk(rootClean, rootClean, 0);
+  try {
+    if (kernel.exists(rootClean + "/" + PY_STORE_REL)) {
+      walk(rootClean + "/" + PY_STORE_REL, PY_INTERP_SITE, 1);
+    }
+  } catch { /* no store yet — the common case before a first pip install */ }
+
+  // Anything previously sent that is no longer there. Without this, deleting a
+  // module leaves jedi completing against a file the user has removed.
+  const removed = [];
+  for (const interpPath of pyLspSent.keys()) {
+    if (!seen.has(interpPath)) {
+      removed.push(interpPath);
+      pyLspSent.delete(interpPath);
+    }
+  }
+  return { files, removed, truncated };
+}
+
 async function collectDts(root, prevSig) {
   const out = [];
   const seen = new Set();
@@ -2605,6 +2744,49 @@ self.onmessage = async (event) => {
     collectDts(m.root, m.sig || "")
       .then((r) => post("vv-reply", { reqId: m.reqId, ok: true, files: r.files, truncated: r.truncated, sig: r.sig, unchanged: r.unchanged }))
       .catch((err) => post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) }));
+    return;
+  }
+
+  // ── Python language service ────────────────────────────────────────────────
+  // One request, one reply. The worker is created on the first of these and then
+  // kept — see pythonLspWorker(). Superseded requests are dropped on the STUDIO
+  // side (builtins/python-lsp.js createRequestQueue): Pyodide cannot be
+  // interrupted mid-call, so cancellation here would only mean discarding an
+  // answer, which is exactly what the queue already does closer to the keystroke.
+  if (m.type === "vv-py-lsp") {
+    if (!kernel) { replyNotReady(m.reqId); return; }
+    try {
+      const worker = pythonLspWorker();
+      const id = pyLspSeq++;
+      pyLspPending.set(id, (reply) => {
+        post("vv-reply", {
+          reqId: m.reqId,
+          ok: !!reply.ok,
+          result: reply.result ?? null,
+          error: reply.error || "",
+        });
+      });
+      // Fresh project state rides along with the request. The editor sends the
+      // ACTIVE buffer's text inside req.code, so unsaved edits to the file being
+      // typed in are always seen; this is for its siblings and its packages.
+      const { files, removed, truncated } = collectPython(m.root || "");
+      worker.postMessage({
+        type: "py-lsp-request",
+        id,
+        req: m.req,
+        indexUrl: vendorUrl("vendor/pyodide/"),
+        files,
+        removed,
+      });
+      if (truncated) {
+        post("py-lsp-state", {
+          state: "ready",
+          detail: "project too large to index fully; completions may be incomplete",
+        });
+      }
+    } catch (err) {
+      post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+    }
     return;
   }
 
