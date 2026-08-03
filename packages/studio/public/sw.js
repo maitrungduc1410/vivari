@@ -1138,7 +1138,20 @@ async function handlePreview(event, port, path, keepPrefix) {
     sink.post({ type: "vv-http", req }, transfer);
   });
 
-  const respHeaders = new Headers(resp.headers || {});
+  // `new Headers({...})` stringifies an array value, and Node keeps `set-cookie`
+  // as an array — so two cookies became ONE comma-joined header, and since an
+  // `Expires=Wed, 21 Oct ...` contains a comma itself, nothing downstream could
+  // split them back apart. Append each entry instead: the header list holds
+  // multiple `Set-Cookie` values, which is the whole reason `getSetCookie()`
+  // exists. (The kernel keeps its own jar for the in-VM server — see
+  // kernel-host/cookie-jar.js — because a synthesised Response never reaches the
+  // browser's cookie store. Passing them on anyway costs nothing and means a
+  // browser that DOES store one stays in sync.)
+  const respHeaders = new Headers();
+  for (const [k, v] of Object.entries(resp.headers || {})) {
+    if (Array.isArray(v)) for (const one of v) respHeaders.append(k, one);
+    else if (v != null) respHeaders.append(k, v);
+  }
   if (sink.cross) {
     // Mode B: the preview is a DIFFERENT origin from the IDE. Let its subresources
     // be embedded cross-origin (CORP) and keep the preview cross-origin isolated

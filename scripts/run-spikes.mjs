@@ -126,6 +126,10 @@ const SPIKES = [
   // bytes AND the encoding chosen for them — utf8 text that starts crossing as
   // base64 is a silent 33% inflation on every dev-server response.
   { name: "http-response-bytes", file: "spike-http-response-bytes.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // A login that survives to the next request. The seam dropped cookies both
+  // ways, so every session flow in Node was silently unusable; the jar that fixes
+  // it lives in the kernel, and this drives it through a real in-VM server.
+  { name: "cookie-session", file: "spike-cookie-session.mjs", net: false, needsWasm: true, timeout: 120000 },
   // Persistent dependency cache (P1): pack node_modules → snapshot → wipe →
   // restore → require, against the real Wasm VFS. Offline + deterministic.
   // `needsWasm`: offline but requires the Node Wasm VFS build (pkg-node), so it
@@ -147,6 +151,11 @@ const SPIKES = [
   // The S3 template. Installs the AWS SDK (net), then talks to an in-VM S3 that
   // verifies SigV4 byte for byte — so the signing is gated, not just the wiring.
   { name: "s3", file: "spike-s3.mjs", net: true, needsWasm: true, timeout: 300000 },
+  // The shipped session template on real express-session. The offline
+  // cookie-session spike gates the jar itself; this one exists for what a
+  // hand-written server cannot check — a SIGNED, url-encoded `connect.sid` that
+  // express-session parses back, and regenerate() rotating it on login.
+  { name: "session-studio", file: "spike-session-studio.mjs", net: true, needsWasm: true, timeout: 300000 },
   { name: "h3", file: "spike-h3.mjs", net: true },
   { name: "fastify", file: "spike-fastify.mjs", net: true },
   { name: "preact", file: "spike-preact.mjs", net: true },

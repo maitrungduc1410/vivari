@@ -1771,6 +1771,199 @@ function s3Template(): TemplateDef {
   };
 }
 
+// ── Login & sessions (Node) ──────────────────────────────────────────────────
+// The template that could not have worked before the kernel kept a cookie jar
+// (packages/kernel-host/cookie-jar.js): the preview seam dropped `Set-Cookie` on
+// the way out and could not forward `Cookie` on the way in, so a login returned
+// 200 and the next request arrived anonymous. `express-session` is deliberately
+// the real thing rather than a hand-rolled cookie, because a signed
+// `connect.sid` is what an actual app ships and what actually has to survive.
+//
+// No regex literals in the source below, on purpose: a backslash inside a
+// template literal belongs to the OUTER literal first, which is how the S3
+// template once shipped a SyntaxError. See spike-template-syntax.mjs.
+function sessionTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "session-login",
+      framework: "express",
+      icon: "session",
+      category: "Backend",
+      name: "Login & sessions",
+      language: "JavaScript",
+      description: "Cookie sessions with express-session — log in, stay logged in, log out",
+      port: 3000,
+      openPath: "/",
+      entry: "src/server.js",
+      hmr: false,
+      reload: false,
+      install: "npm install",
+      dev: "node src/server.js",
+      // The platform half is gated offline by scripts/spike-cookie-session.mjs
+      // and scripts/probe-cookie-jar.mjs.
+    },
+    files: {
+      "package.json": `{
+  "name": "session-login",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "express-session": "^1.18.0"
+  }
+}
+`,
+      "src/server.js": `const express = require('express');
+const session = require('express-session');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Two demo accounts. A real app hashes passwords (bcrypt/argon2) and stores them
+// in a database — the point here is the cookie, not the credential store.
+const USERS = { duc: 'vivari', guest: 'guest' };
+
+app.use(express.urlencoded({ extended: false }));
+app.use(
+  session({
+    name: 'sid',
+    secret: 'change-me-in-production',
+    resave: false,
+    saveUninitialized: false,
+    // The preview is reached through a Service Worker rather than the network,
+    // so there is no TLS to gate on: Secure would drop the cookie for nothing.
+    cookie: { httpOnly: true, sameSite: 'lax', maxAge: 1000 * 60 * 30 },
+  })
+);
+
+// Before the routes, or it would never run for them: Express matches middleware
+// and handlers in registration order, so a counter mounted after GET / silently
+// counts nothing.
+app.use((req, res, next) => {
+  if (req.session.user) req.session.views = (req.session.views || 0) + 1;
+  next();
+});
+
+// Every URL this app emits has to carry the preview's path prefix. Vivari serves
+// a preview at <origin>/preview/<port>/ and the Service Worker strips that before
+// the request reaches us, passing it back as x-forwarded-prefix — the same thing
+// FastAPI reads as root_path and Flask as SCRIPT_NAME.
+//
+// It matters for NAVIGATIONS specifically. A fetch('/api/x') from the page is
+// routed to us by the worker on the strength of the iframe that issued it, but a
+// form POST or a redirect is a top-level navigation, and the worker deliberately
+// leaves those alone (proxying the studio's own document made it hang). So
+// action="/login" leaves the preview entirely and 404s against the studio itself.
+// On a wildcard per-port origin there is no prefix, the header is absent, and this
+// is the empty string — which is exactly right there.
+const base = (req) => req.headers['x-forwarded-prefix'] || '';
+
+const page = (body) =>
+  '<!doctype html><meta charset="utf-8"><title>Login &amp; sessions</title>' +
+  '<style>' +
+  'body{font:15px/1.6 system-ui,sans-serif;max-width:34rem;margin:3rem auto;padding:0 1rem;color:#111}' +
+  'h1{font-size:1.4rem}label{display:block;margin:.6rem 0 .2rem;font-weight:600}' +
+  'input{width:100%;padding:.5rem;border:1px solid #ccc;border-radius:6px;font:inherit}' +
+  'button{margin-top:1rem;padding:.55rem 1.1rem;border:0;border-radius:6px;background:#2563eb;color:#fff;font:inherit;cursor:pointer}' +
+  'code{background:#f3f4f6;padding:.1rem .35rem;border-radius:4px}' +
+  '.err{color:#b91c1c}.muted{color:#6b7280;font-size:.9rem}' +
+  '</style>' +
+  body;
+
+app.get('/', (req, res) => {
+  if (req.session.user) {
+    res.send(
+      page(
+        '<h1>Hello, ' + req.session.user + '</h1>' +
+          '<p>You have loaded this page <strong>' + req.session.views + '</strong> time(s) in this session.</p>' +
+          '<p class="muted">The session id lives in an HttpOnly <code>sid</code> cookie. ' +
+          'Reload the page: the counter keeps going, which means the cookie made the round trip.</p>' +
+          '<form method="post" action="' + base(req) + '/logout"><button>Log out</button></form>'
+      )
+    );
+    return;
+  }
+  res.send(
+    page(
+      '<h1>Log in</h1>' +
+        (req.query.bad ? '<p class="err">Wrong username or password.</p>' : '') +
+        '<form method="post" action="' + base(req) + '/login">' +
+        '<label for="u">Username</label><input id="u" name="username" value="duc" autocomplete="username">' +
+        '<label for="p">Password</label><input id="p" name="password" type="password" value="vivari" autocomplete="current-password">' +
+        '<button>Log in</button></form>' +
+        '<p class="muted">Demo accounts: <code>duc</code> / <code>vivari</code> and <code>guest</code> / <code>guest</code>.</p>'
+    )
+  );
+});
+
+app.post('/login', (req, res) => {
+  const { username, password } = req.body;
+  if (!username || USERS[username] !== password) {
+    res.redirect(base(req) + '/?bad=1');
+    return;
+  }
+  // Rotate the session id on login so a pre-login cookie cannot be replayed
+  // afterwards (session fixation).
+  req.session.regenerate((err) => {
+    if (err) {
+      res.status(500).send('session error');
+      return;
+    }
+    req.session.user = username;
+    req.session.views = 0;
+    res.redirect(base(req) + '/');
+  });
+});
+
+app.post('/logout', (req, res) => {
+  req.session.destroy(() => {
+    res.clearCookie('sid');
+    res.redirect(base(req) + '/');
+  });
+});
+
+// The quickest way to see the jar is real: it echoes the raw Cookie header the
+// server received, which was empty on every request before the kernel kept one.
+app.get('/whoami', (req, res) => {
+  res.json({ user: req.session.user || null, cookie: req.headers.cookie || null });
+});
+
+app.listen(PORT, () => console.log('Login demo listening on http://localhost:' + PORT));
+`,
+      "README.md": `# Login & sessions
+
+A minimal \`express-session\` app: log in, reload, stay logged in, log out.
+
+    npm install
+    node src/server.js
+
+Demo accounts are \`duc\` / \`vivari\` and \`guest\` / \`guest\`.
+
+## Why this is worth a template
+
+On a real machine the browser keeps the cookie jar. In Vivari the preview is
+answered by a Service Worker from a server that exists only in memory, and the
+browser will not keep cookies for it: a \`Set-Cookie\` on a response the worker
+synthesises never enters the cookie store, and the \`Cookie\` request header is
+added by the network layer *after* the worker, so the worker can neither read nor
+forward it.
+
+The kernel therefore keeps the jar itself, one per port — the same granularity a
+real machine gives you, where \`localhost:3000\` and \`localhost:5173\` have
+separate jars. \`Path\`, \`Max-Age\`, \`Expires\` and deletion all behave as
+RFC 6265 describes; \`Domain\`, \`Secure\` and \`SameSite\` are parsed and ignored,
+because there is one host, no scheme, and no cross-site request to distinguish.
+
+\`GET /whoami\` returns the raw \`Cookie\` header the server received, which is the
+quickest way to see that any of this is real.
+`,
+    },
+  };
+}
+
 // ── Hono (Node) ──────────────────────────────────────────────────────────────
 function honoTemplate(): TemplateDef {
   return {
@@ -9157,6 +9350,7 @@ export const TEMPLATES: TemplateDef[] = [
   koaTemplate(),
   honoTemplate(),
   s3Template(),
+  sessionTemplate(),
   h3Template(),
   fastifyTemplate(),
   nitroTemplate(),

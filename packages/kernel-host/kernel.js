@@ -53,6 +53,7 @@ import {
 } from "../protocol/syscall.js";
 import { DBG_SAB_BYTES, makeDebugViews, writeDebugCommand } from "../protocol/debug.js";
 import { COREUTILS } from "./coreutils.js";
+import { CookieJar } from "./cookie-jar.js";
 
 const EMPTY = new Uint8Array(0);
 
@@ -124,6 +125,10 @@ export class Kernel {
     // ---- virtual network (brick 5) ----
     this.listeners = new Map(); // port -> pid of the server process
     this.pendingHttp = new Map(); // reqId -> { resolve, pid }
+    // One cookie jar per listening port: on a real machine localhost:3000 and
+    // localhost:5173 are separate origins with separate jars, and sharing one
+    // would leak an API's session into a frontend.
+    this.cookieJars = new Map(); // port -> CookieJar
     this.nextReqId = 1;
     this.onListen = null; // optional observer (port, pid) — e.g. wire a preview
     this.onClose = null; // optional observer (port, pid) — the mirror of onListen
@@ -1297,6 +1302,47 @@ export class Kernel {
     return { ...req, body: "", bodyEncoding: undefined, bodyPath: path };
   }
 
+  /** The jar for a port, created on first use (most ports never set a cookie). */
+  _jarFor(port) {
+    let jar = this.cookieJars.get(port);
+    if (!jar) this.cookieJars.set(port, (jar = new CookieJar()));
+    return jar;
+  }
+
+  /**
+   * Put the port's cookies on an inbound request. Nothing else in the stack can:
+   * the browser adds `Cookie` after the Service Worker, so the SW never sees one
+   * to forward, and a `Set-Cookie` the SW synthesised never entered the browser's
+   * store to begin with. Without this a login's very next request arrives with no
+   * cookie at all and the app answers 401 while looking perfectly correct.
+   */
+  _attachCookies(port, req) {
+    const jar = this.cookieJars.get(port);
+    if (!jar || jar.size === 0) return req;
+    // A caller that sent its own `Cookie` is the authority on that request, and the
+    // jar stays out of it entirely. Merging instead was the first attempt, and
+    // spike-bun.mjs caught what is wrong with it: a driver that hands over an
+    // explicit `Cookie: a=1; b=2` is describing one client, and quietly adding a
+    // session another client left in the jar cross-contaminates them. This costs
+    // nothing on the real path — the browser attaches `Cookie` after the Service
+    // Worker, so a request from the preview never arrives with one.
+    const headers = req.headers || {};
+    if (Object.keys(headers).some((k) => k.toLowerCase() === "cookie")) return req;
+    const value = jar.header(req.url || "/");
+    if (!value) return req;
+    return { ...req, headers: { ...headers, cookie: value } };
+  }
+
+  /** Take the response's Set-Cookie into the port's jar. */
+  _harvestCookies(port, requestUrl, resp) {
+    const headers = resp && resp.headers;
+    if (!headers) return;
+    const key = Object.keys(headers).find((k) => k.toLowerCase() === "set-cookie");
+    if (!key) return;
+    const path = String(requestUrl || "/").split("?")[0] || "/";
+    this._jarFor(port).store(headers[key], path);
+  }
+
   /**
    * Route an inbound HTTP request to the process listening on `port`.
    * Returns a Promise<{status,headers,body}>. This is the kernel's public
@@ -1314,8 +1360,15 @@ export class Kernel {
     const proc = this.procs.get(pid);
     const reqId = this.nextReqId++;
     req = await this._stageInboundBody(req, reqId);
+    req = this._attachCookies(port | 0, req);
     return new Promise((resolve) => {
-      this.pendingHttp.set(reqId, { resolve, pid });
+      this.pendingHttp.set(reqId, {
+        resolve: (resp) => {
+          this._harvestCookies(port | 0, req.url, resp);
+          resolve(resp);
+        },
+        pid,
+      });
       proc.serverInbox.push({ reqId, port: port | 0, req });
       // Nudge the process's event loop (Phase 2 #5). It wakes, drains the inbox
       // via non-blocking accept, and replies through OP_RESPOND.

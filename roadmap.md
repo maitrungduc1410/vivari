@@ -6766,3 +6766,100 @@ hang was one of the bugs. Both `bun` and `node` guests are covered, since the lo
 a fix reaching only one of them would be a coincidence.
 
 **A spike that had stopped running, fixed on master instead.** While measuring here, `ci-tiers` turned out to be red on master: `796ed0a` deleted the `http-response-bytes` registration from run-spikes.mjs while adding `studio-types`, so that spike stopped running everywhere while ci.yml still named it — exactly the drift `spike-ci-tiers.mjs` exists to catch. This branch restored the line, and a separate MR (`b6f92a7`) landed the same restoration first, together with a wasm-pack pin; this defers to it. Worth noting for its own sake: the sync that dropped the line changed no behaviour anyone would notice, and the only thing that noticed was the tier-drift check.
+## Every login was broken, and nothing reported it (this change)
+
+`express-session`, Passport, a CSRF token, "remember me" — none of it worked, ever. Login
+returned 200. The next request arrived with no `Cookie` header at all, the app answered 401,
+and no log line anywhere said anything, because from each component's point of view nothing
+had gone wrong: the server set a cookie, and the client simply never sent one back.
+
+The client is the problem. On a real machine the browser keeps the jar; here the "client" is a
+preview iframe whose requests a Service Worker answers from a server that exists only in
+memory, and that seam drops cookies in **both** directions for reasons that are correct in
+isolation. Outbound, a `Set-Cookie` on a Response the SW synthesises never enters the cookie
+store — the store is filled by network fetches, and this response never touched the network.
+Inbound, the browser appends `Cookie` during the network step, which is *after* the Service
+Worker, so the SW cannot read the header and cannot forward it. Two reasonable behaviours,
+one dead feature.
+
+*The break is provable without a browser, which is why it is now gated.* I expected to need a
+real page to confirm any of this and did not: the client side of the seam is whoever calls
+`kernel.handleHttpRequest`, so a plain Node script sees exactly what the iframe sees. Two
+requests — `/login` then `/me` — reproduce it in a second, and that is the shape the gate took.
+
+**The jar lives in the kernel, one per port.** Per port because that is the granularity the
+platform emulates: `localhost:3000` and `localhost:5173` are separate origins with separate
+jars on a real machine, and a single shared jar would hand an API's session to a frontend.
+The RFC 6265 parts that matter are the ones where being *nearly* right is worse than being
+absent — a cookie's identity is (name, path) rather than name, a `Path`-less cookie is scoped
+to the *directory* of the request that set it (so `POST /api/login` does not scope a session
+to `/`), path-match needs its boundary check or `/foo` leaks to `/foobar`, `Max-Age` beats
+`Expires`, and `Max-Age=0` is a delete because that is what `res.clearCookie()` sends. None
+of those failures would look like a bug; they would look like someone else's bug.
+`Domain`, `Secure`, `SameSite` and `HttpOnly` are parsed and deliberately ignored: one host,
+no scheme, no cross-site request, and nothing in this jar is reachable from page JavaScript.
+
+*A second, smaller bug in the same area.* `sw.js` built its response headers with
+`new Headers(resp.headers)`, and `Headers` stringifies an array while Node keeps `set-cookie`
+as one — so two cookies became a single comma-joined header, and because an
+`Expires=Wed, 21 Oct 2026 ...` contains a comma itself, no layer downstream could ever split
+them back. It appends entries one at a time now.
+
+**Three gates, because they catch different things.** `probe-cookie-jar.mjs` pins the
+semantics as pure functions, and it is the only one that catches `/foo` matching `/foobar` —
+mutating path-match to a naive `startsWith` leaves the end-to-end spike green.
+`spike-cookie-session.mjs` drives a real in-VM server offline on every push: login, logout,
+path scoping, per-port isolation, a base64 value with `=` in it, and cookies alongside a
+request body. `spike-session-studio.mjs` installs real `express-session` in the net tier,
+because that signs and url-encodes the cookie (`sid=s%3A<id>.<hmac>`) and reads it back
+through its own parser — if the jar mangled a `%` or dropped the signature, a hand-written
+server would never notice and every real app would.
+
+*One of the gates immediately earned its keep.* The jar's first version merged its cookies
+into a `Cookie` header the caller had already set, on the theory that a real browser cookie is
+the more authoritative copy and jar-only names should still flow. `spike-bun.mjs` went red:
+its `Bun.CookieMap` check hands the server an explicit `Cookie: a=1; b=2` and expects the
+handler to see exactly two, and the jar was quietly adding a session left over from an earlier
+request in the same run. That is not a test being fussy — it is two simulated clients
+contaminating each other. A request that carries its own `Cookie` now owns it and the jar
+stays out, which is simpler, predictable for anything driving the kernel, and free on the real
+path, where a preview request never arrives with a `Cookie` header at all.
+
+**And a template, so the capability is visible**: "Login & sessions", on real
+`express-session`, with `regenerate()` on login against session fixation and a view counter
+that proves the same session came back rather than a fresh one per request. Writing it turned
+up a bug in itself that no gate would have caught: the counter middleware was mounted *after*
+`GET /`, and Express matches in registration order, so it counted nothing. Fixed before it
+shipped, and it is a reminder that a template parsing is not a template working — the syntax
+gate says nothing about semantics, which is exactly why the studio spike drives the shipped
+bytes rather than a copy.
+
+### The first click still 404'd: absolute URLs escape a path-routed preview
+
+The template worked in every gate and failed on the first click in the studio. `POST /login`
+went to `http://localhost:5173/login` — the studio's own origin — and 404'd.
+
+Nothing to do with cookies. A preview under path routing lives at `<origin>/preview/<port>/`,
+and `action="/login"` is root-absolute, so it resolves against the origin root and never enters
+the preview. What makes it a trap rather than an obvious mistake is that the *same* absolute
+path works from JavaScript: `fetch('/api/session')` is a subresource, and the SW resolves it
+via `routeByClient` from the iframe that issued it. That is why the S3 template, which is all
+`fetch`, never hit this. A form POST, a link and a redirect are top-level **navigations**, and
+`sw.js` returns early for `mode === "navigate"` deliberately — proxying the studio's own
+document once left the page loading forever. So navigations are precisely the URLs a guest must
+get right itself, and the platform already hands it what it needs in `x-forwarded-prefix`, the
+header the Python bridge reads as `SCRIPT_NAME`/`root_path`.
+
+*Every gate passed because every gate drove the kernel directly*, which puts the app at the
+root, where an absolute `/login` happens to be correct. The fix is not only the template's
+`base(req)` — it is that `spike-session-studio.mjs` now drives it the way the Service Worker
+does, with the prefix header set, and asserts the emitted form actions and redirect
+`Location`s stay inside the preview. Reverting the template turns exactly three of those red.
+It also checks the no-header case, since a wildcard per-port origin serves at the root and the
+empty prefix is right there — a "fix" that hardcoded the prefix would break mode C silently.
+
+*And the syntax gate paid for itself again on the way.* The comment explaining all this went
+inside the template's source, which lives in a template literal, and it contained a backtick.
+That ends the literal. `spike-template-syntax.mjs` refused the tree immediately, at the parse,
+with the line in hand — the same class of failure as the backslash it was written for, on the
+first day it could have shipped one.

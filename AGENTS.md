@@ -787,6 +787,70 @@ throw that gets swallowed. Rules:
   `spike-http-response-bytes.mjs` (response), which assert the encoding chosen as
   well as the bytes — text that starts arriving base64 is a silent 33% inflation.
 
+### A guest that emits root-absolute NAVIGATION URLs escapes the preview
+Under path routing (modes A/B) a preview lives at `<origin>/preview/<port>/`, and
+the SW strips that prefix before the kernel sees the request, handing it back as
+**`x-forwarded-prefix`** — Python's bridge reads it as WSGI `SCRIPT_NAME` / ASGI
+`root_path`. A Node guest has to do it by hand:
+`const base = (req) => req.headers['x-forwarded-prefix'] || ''`.
+
+The distinction that catches people is **navigation vs subresource**. A
+`fetch('/api/x')` from the preview page survives a missing prefix, because
+`routeByClient` resolves it from the iframe that issued it. A form POST, a plain
+link and a `res.redirect('/')` are top-level navigations, and `sw.js` returns
+early for `mode === "navigate"` on purpose (proxying the studio's own document
+left the page loading forever). So `action="/login"` does not reach the guest at
+all — it goes to the network and 404s against the studio itself, which is exactly
+how the session template shipped and broke on the first click.
+
+An absent header means a wildcard per-port origin (mode C), which serves at the
+root, so the empty string is the right answer there. `spike-session-studio.mjs`
+drives the shipped template both ways.
+
+### The kernel keeps the cookie jar, because the browser will not
+`packages/kernel-host/cookie-jar.js`, wired into `kernel.handleHttpRequest` as
+`_attachCookies` (in) and `_harvestCookies` (out). **One jar per listening port**,
+because that is what a real machine gives you — `localhost:3000` and
+`localhost:5173` are separate origins with separate jars, and one shared jar would
+leak an API's session into a frontend.
+
+It is not an optimisation; without it no session works at all. The preview seam
+drops cookies in BOTH directions and neither is an error anyone can see:
+- **out**: a `Set-Cookie` on a Response the Service Worker synthesises never
+  enters the browser's cookie store — the store is filled by network fetches, and
+  this response never touched the network.
+- **in**: the browser appends `Cookie` during the network step, which happens
+  AFTER the Service Worker, so the SW cannot read it and cannot forward it.
+
+So `express-session`, Passport, a CSRF cookie: login returned 200, the next
+request arrived with no `Cookie` header at all, the app answered 401, and nothing
+logged anything, because nothing was wrong — the client simply never sent it back.
+
+Implemented from RFC 6265 and worth knowing: a cookie's identity is
+**(name, path)**, not name (a server may hold `sid` for `/admin` and another for
+`/`); a `Path`-less cookie gets the **default-path** — the *directory* of the
+request, so one set by `POST /api/login` must NOT reach `/`; path-match needs the
+boundary check, since `/foo` must not match `/foobar`; `Max-Age` beats `Expires`,
+and `Max-Age=0` is a delete (that is what `res.clearCookie()` sends). `Domain`,
+`Secure`, `SameSite` and `HttpOnly` are parsed and ignored on purpose — one host,
+no scheme, no cross-site request, and nothing here is reachable from page JS.
+
+**A request that already carries a `Cookie` owns it** — the jar stays out entirely
+rather than merging. Merging was the first version, and `spike-bun.mjs` caught why
+it is wrong: a driver handing over an explicit `Cookie: a=1; b=2` describes one
+client, and adding a session another client left in the jar cross-contaminates
+them. It costs nothing on the real path, where a preview request never arrives
+with a `Cookie` header at all.
+
+Also: `new Headers({...})` **stringifies an array**, and Node keeps `set-cookie`
+as an array — so `sw.js` turned two cookies into one comma-joined header, which an
+`Expires=Wed, 21 Oct ...` makes unsplittable. Append entries one at a time.
+
+Gated by `probe:cookie-jar` (semantics, pure), `spike-cookie-session.mjs`
+(offline, end to end through a real in-VM server) and `spike-session-studio.mjs`
+(net: real `express-session`, which signs and url-encodes the cookie a
+hand-written server would never notice being mangled).
+
 ### The Fetcher strips non-CORS-safelisted request headers — for the REGISTRIES only
 `packages/runtime/egress-header-policy.js` decides what the browser Fetcher Worker
 puts on a `fetch()`. For a package registry it keeps ONLY the CORS-safelisted

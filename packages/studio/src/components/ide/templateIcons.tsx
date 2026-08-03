@@ -375,6 +375,7 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   sqlite: (p) => <SqliteIcon className={p.className} />,
   postgres: Badge({ text: "Pg", bg: "#336791" }),
   s3: Badge({ text: "S3", bg: "#569a31" }),
+  session: Badge({ text: "Sid", bg: "#7c3aed" }),
   // Top-3 additions
   tailwind: TailwindIcon,
   tanstack: ImgIcon(tanstackLogo, "TanStack"),

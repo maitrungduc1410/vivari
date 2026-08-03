@@ -50,6 +50,10 @@ jobs:
       # that quietly succeeds anonymously.
       - run: npm run probe:egress-headers
       - run: npm run probe:terminal-feedback
+      # The cookie jar's RFC 6265 subset. Pure logic on purpose: a path rule that
+      # is slightly too generous hands one route's session to another, and neither
+      # that nor an over-eager expiry shows up as an error anywhere.
+      - run: npm run probe:cookie-jar
 
   # SDK packaging + public-API contract guard (offline, no Wasm, no browser).
   # Also regression-checks the shipped preview sw.js branding + examples/basic.
@@ -98,7 +102,7 @@ jobs:
       # but missing here runs nowhere at all: skipped in toolchain-gate for want of
       # the crates, and never selected in the only job that has them.
       - name: offline spikes that need the Wasm VFS
-        run: node scripts/run-spikes.mjs --offline dep-cache bun http-binary-body http-response-bytes diag-liveness fatal-errors
+        run: node scripts/run-spikes.mjs --offline dep-cache bun http-binary-body http-response-bytes cookie-session diag-liveness fatal-errors
       - run: npm run verify
 
   # --- package-manager gate: the North Star, gated on its own ----------------
