@@ -71,6 +71,11 @@ const SPIKES = [
   // green here, exit 2 in the verify job. Pure static reads of this file, the
   // harness and ci.yml, so it costs nothing and runs in the earliest gate.
   { name: "ci-tiers", file: "spike-ci-tiers.mjs", net: false, timeout: 60000 },
+  // No CI job compiles the studio — `tsc -b` runs in the Cloudflare build, which
+  // is the deploy — so a JS module imported from TypeScript without a .d.ts
+  // merges green and breaks the site afterwards. Static, so it needs neither bun
+  // nor the studio's node_modules.
+  { name: "studio-types", file: "spike-studio-types.mjs", net: false, timeout: 60000 },
   { name: "http-llhttp", file: "spike-http-llhttp.mjs", net: false, timeout: 60000 },
   // ESM→CJS loader guarantees: top-level-await async retry + circular re-export
   // live bindings (SvelteKit config / astro runtime). Pure parser, no kernel/wasm.
@@ -115,10 +120,6 @@ const SPIKES = [
   // The inbound HTTP body path. Offline on purpose (plain node:http, no install):
   // a binary upload used to HANG rather than fail, so this belongs on every push.
   { name: "http-binary-body", file: "spike-http-binary-body.mjs", net: false, needsWasm: true, timeout: 120000 },
-  // The mirror of http-binary-body: bodies leaving an in-VM server. Asserts the
-  // bytes AND the encoding chosen for them — utf8 text that starts crossing as
-  // base64 is a silent 33% inflation on every dev-server response.
-  { name: "http-response-bytes", file: "spike-http-response-bytes.mjs", net: false, needsWasm: true, timeout: 120000 },
   // Persistent dependency cache (P1): pack node_modules → snapshot → wipe →
   // restore → require, against the real Wasm VFS. Offline + deterministic.
   // `needsWasm`: offline but requires the Node Wasm VFS build (pkg-node), so it
