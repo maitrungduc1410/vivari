@@ -145,5 +145,32 @@ console.log("\n== the Wasm-VFS offline spikes are wired into the one job that ca
   }
 }
 
+// ---------------------------------------------------------------------------
+console.log("\n== the Wasm build pins its wasm-pack ==");
+// ---------------------------------------------------------------------------
+// `version: latest` is not the newest release — it is whatever the action
+// resolves, and it resolved to wasm-pack 0.10.3, which fetches binaryen 90.
+// Binaryen 90 predates multi-table support, and wasm-bindgen emits two tables,
+// so wasm-opt died with "Only 1 table definition allowed in MVP" and took the
+// whole `verify` job with it. No commit caused that and no commit can fix it:
+// the version has to be a version.
+{
+  const MIN = [0, 13, 1]; // 0.13.1 fetches binaryen 117, which parses two tables.
+  const cmp = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+  for (const wf of ["ci.yml", "publish.yml"]) {
+    const uses = [...read(`.github/workflows/${wf}`)
+      .matchAll(/jetli\/wasm-pack-action@[^\n]*\n\s+with:\n\s+version:\s*(\S+)/g)].map((m) => m[1]);
+    ok(uses.length > 0, `${wf}: installs wasm-pack in ${uses.length} job(s)`);
+    for (const v of uses) {
+      const parts = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(v);
+      ok(!!parts, `${wf}: pinned to a concrete version, not a moving target (got '${v}')`);
+      if (parts) {
+        ok(cmp(parts.slice(1).map(Number), MIN) >= 0,
+          `${wf}: ${v} is >= 0.13.1, so its wasm-opt can parse a two-table module`);
+      }
+    }
+  }
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: the spike tiers match what CI can give them");
 process.exit(failed ? 1 : 0);

@@ -120,6 +120,10 @@ const SPIKES = [
   // The inbound HTTP body path. Offline on purpose (plain node:http, no install):
   // a binary upload used to HANG rather than fail, so this belongs on every push.
   { name: "http-binary-body", file: "spike-http-binary-body.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // The mirror of http-binary-body: bodies leaving an in-VM server. Asserts the
+  // bytes AND the encoding chosen for them — utf8 text that starts crossing as
+  // base64 is a silent 33% inflation on every dev-server response.
+  { name: "http-response-bytes", file: "spike-http-response-bytes.mjs", net: false, needsWasm: true, timeout: 120000 },
   // Persistent dependency cache (P1): pack node_modules → snapshot → wipe →
   // restore → require, against the real Wasm VFS. Offline + deterministic.
   // `needsWasm`: offline but requires the Node Wasm VFS build (pkg-node), so it
