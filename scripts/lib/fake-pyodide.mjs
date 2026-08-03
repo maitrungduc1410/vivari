@@ -49,6 +49,13 @@ function memFS() {
   return {
     files,
     dirs,
+    // Emscripten calls these hooks from inside the real FS operations, which is
+    // how the runtime knows which files Python touched. Modelling them here
+    // rather than leaving the object empty is the whole point of the fake: a
+    // mirror that relies on them can then be gated with no Wasm, and
+    // spike-python-bridge separately holds REAL Pyodide to firing them.
+    trackingDelegate: {},
+    cwd: "/",
     mkdirTree(p) {
       const parts = norm(p).split("/").filter(Boolean);
       let cur = "";
@@ -57,10 +64,34 @@ function memFS() {
         dirs.add(cur);
       }
     },
+    chdir(p) {
+      const n = norm(p);
+      if (!dirs.has(n)) throw new Error("ENOENT: " + p);
+      this.cwd = n;
+    },
+    analyzePath(p) {
+      const n = norm(p);
+      return { exists: dirs.has(n) || files.has(n) };
+    },
     writeFile(p, data) {
       const n = norm(p);
       this.mkdirTree(n.slice(0, n.lastIndexOf("/")) || "/");
       files.set(n, data instanceof Uint8Array ? data : new TextEncoder().encode(String(data)));
+      this.trackingDelegate.onWriteToFile?.(n);
+    },
+    unlink(p) {
+      const n = norm(p);
+      if (!files.delete(n)) throw new Error("ENOENT: " + p);
+      this.trackingDelegate.onDeletePath?.(n);
+    },
+    rename(from, to) {
+      const a = norm(from);
+      const b = norm(to);
+      const d = files.get(a);
+      if (!d) throw new Error("ENOENT: " + from);
+      files.delete(a);
+      files.set(b, d);
+      this.trackingDelegate.onMovePath?.(a, b);
     },
     readFile(p) {
       const d = files.get(norm(p));
@@ -134,7 +165,27 @@ export function makeFakePyodide({ pythonVersion = "3.14.2", pyodideVersion = "31
   FS.mkdirTree(sitePackages);
   const loaded = [];
 
+  // The fake's instruction set. It cannot execute Python, so a test that needs
+  // "and then the script wrote these files" says so in the source it hands over:
+  //
+  //   # VVFS {"write": {"/proj/a.txt": "hi"}, "delete": ["/proj/b.txt"]}
+  //
+  // The writes go through FS.writeFile/unlink, so they fire the tracking hooks
+  // exactly as a real interpreter's writes would — which is what lets the
+  // mirroring be gated with no Wasm.
+  const applyFsDirective = (code) => {
+    const m = /^#\s*VVFS\s+(\{.*\})\s*$/m.exec(code);
+    if (!m) return;
+    const spec = JSON.parse(m[1]);
+    for (const [p, contents] of Object.entries(spec.write || {})) FS.writeFile(p, String(contents));
+    for (const p of spec.delete || []) {
+      try { FS.unlink(p); } catch { /* already gone */ }
+    }
+    for (const [from, to] of spec.rename || []) FS.rename(from, to);
+  };
+
   const answer = (code) => {
+    applyFsDirective(code);
     // DIST_QUERY first: it calls sysconfig.get_path() too, so matching pyEnv's
     // probe on that alone answers this one with the wrong payload — silently,
     // since both are JSON.
@@ -169,6 +220,33 @@ export function makeFakePyodide({ pythonVersion = "3.14.2", pyodideVersion = "31
     pyimport: () => ({ install: async () => {} }),
     runPython: (code) => answer(String(code)),
     runPythonAsync: async (code) => answer(String(code)),
+    // serve() runs setupSource() and then reads _vv_dispatch out of globals.
+    // The stand-in app writes and deletes files on request, because "did a file
+    // a request produced reach the host?" is the question serve() has to answer.
+    globals: {
+      get: (name) => {
+        if (name !== "_vv_dispatch") return undefined;
+        return (reqJson) => {
+          const r = JSON.parse(reqJson);
+          const seg = r.path.split("/").filter(Boolean);
+          const here = FS.cwd === "/" ? "" : FS.cwd;
+          let body = "ok";
+          if (seg[0] === "write") FS.writeFile(`${here}/${seg[1]}`, decodeURIComponent(seg[2] || ""));
+          else if (seg[0] === "delete") { try { FS.unlink(`${here}/${seg[1]}`); } catch { /* gone */ } }
+          else if (seg[0] === "boom") {
+            // Write first, THEN fail: the point of persisting on a 500 is that
+            // whatever reached the filesystem before the error is not lost.
+            FS.writeFile(`${here}/${seg[1]}`, "half");
+            throw new Error("the app raised");
+          }
+          return JSON.stringify({
+            status: 200,
+            headers: [["content-type", "text/plain"]],
+            body_b64: Buffer.from(body).toString("base64"),
+          });
+        };
+      },
+    },
     // The fidelity point. See the header: no messageCallback means the
     // interpreter's own stdout stream, which is the whole bug.
     loadPackage(names, options) {

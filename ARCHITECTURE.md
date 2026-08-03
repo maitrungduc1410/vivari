@@ -1650,9 +1650,14 @@ interpreter really is WASM (like the Wasm engines above), not a Node-backed shim
 - `packages/runtime/builtins/python-store.js` — the per-project package store (below),
   and pip's read-only verbs rendered the way real pip renders them.
 - `packages/kernel-host/programs/python.js` — the `python`/`python3` CLI (arg parse,
-  `-m` module handling incl. `venv`/`uvicorn`/`flask`/`gunicorn`/`pytest`).
-- `packages/kernel-host/coreutils.js` — `uvicorn`/`flask`/`gunicorn`/`pytest` PATH shims
-  (delegate to `python -m …`).
+  `-m` dispatch). `-m` is a passthrough to CPython's `runpy`, with seams only where
+  runpy cannot reach what the module needs: `pip`/`venv` (the store),
+  `uvicorn`/`flask`/`gunicorn` (the bridge), `pytest` (exit codes) and `http.server`
+  (a socket). Socket-only modules — `smtplib`, `ftplib`, `poplib`, `imaplib`,
+  `socketserver`, `wsgiref.simple_server`, `xmlrpc.server` — are refused by name with
+  the reason, because Pyodide's socket connects and binds and then carries no bytes.
+- `packages/kernel-host/coreutils.js` — `pip`/`uvicorn`/`flask`/`gunicorn`/`pytest`
+  PATH shims (delegate to `python -m …`).
 - `scripts/vendor-pyodide.mjs` — vendors the Pyodide core + selected wheels into
   `packages/studio/public/vendor/pyodide/` and writes a **hybrid `pyodide-lock.json`**:
   successfully vendored packages get relative paths; the rest keep absolute CDN URLs so

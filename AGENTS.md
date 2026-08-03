@@ -1923,10 +1923,30 @@ same thing `__ocImport` in `index.js` already does for bare specifiers.
 Unlike the Node-backed Bun shim, `python`/`python3` boots **real CPython compiled to
 WASM (Pyodide)** the first time a python process runs (nothing at studio boot). Pieces:
 `packages/runtime/builtins/python.js` (boot + FS mirror + exec + `serve`),
-`packages/kernel-host/programs/python.js` (CLI + `-m uvicorn`/`-m flask`/`-m gunicorn`/
-`-m pytest`), the `uvicorn`/`flask`/`gunicorn`/`pytest` PATH shims in `coreutils.js`, and
+`packages/kernel-host/programs/python.js` (CLI + `-m` dispatch), the
+`pip`/`uvicorn`/`flask`/`gunicorn`/`pytest` PATH shims in `coreutils.js`, and
 `scripts/vendor-pyodide.mjs`. Gated by **two** spikes — see the CI gate gotcha below.
 Gotchas:
+- **`-m` is a passthrough with seven exceptions, not an allowlist.** It was an
+  allowlist of six, which made a dispatch gap read as a capability gap: `python -m
+  unittest` answered "arbitrary modules are not supported" for a runner sitting in
+  the stdlib the interpreter had already loaded. Now `runModule()` hands the name to
+  CPython's `runpy._run_module_as_main`, so the module resolution, the argv contract
+  and the errors are CPython's rather than ours. Only intercept a module when runpy
+  genuinely cannot reach what it needs: the package store (`pip`, `venv`), the
+  WSGI/ASGI bridge (`uvicorn`, `flask`, `gunicorn`), the exit-code seam (`pytest`),
+  or a socket (`http.server`). Adding a seam for anything else re-creates the bug.
+- **`sys.executable` is set to `"python"` at boot, and it is not cosmetic.** runpy
+  formats its own failures as `"%s: %s" % (sys.executable, exc)`. Left alone in
+  Pyodide it is the host path of whatever `.mjs` booted the interpreter, so a missing
+  module reports `/app/node_modules/.../kernel.mjs: No module named foo`. Both spikes
+  hold the message against real CPython, which is why the prefix has to be a name.
+- **Refuse a socket-bound module rather than letting it run.** Pyodide *has* a
+  `socket`, and that is worse than not having one: `connect()`, `bind()` and
+  `listen()` all succeed and then no bytes move (proven in the bridge spike, which
+  times out on the `recv`). So `smtplib` and friends would print a banner, look
+  started, and hang. `SOCKET_MODULES` in `programs/python.js` names each one and its
+  reason; the offline spike scrapes that table rather than keeping a copy.
 - **CI gate: `spike-python-offline.mjs` is the one that runs per-PR.** Pyodide is ~30 MB
   that is neither committed (`public/vendor` is gitignored) nor installed by CI (no job
   runs `npm ci`), so the interpreter-backed `spike-python-bridge.mjs` has to be `net: true`
@@ -2038,6 +2058,24 @@ Gotchas:
   file, and `serve()` still reads `requirements.txt` — the store is additive to both.
   When testing several templates in one interpreter, `sys.modules` will serve an earlier
   template's `main` to a later one — boot per case instead.
+- **A served app's writes persist at the end of each request, not on shutdown.**
+  `serve()` mirrored the project IN and never back, so a Flask app's uploads and its
+  SQLite database died with the process. Shutdown-only would not have fixed it —
+  people close tabs, and a preview that is killed is the normal way one ends. The end
+  of a request is the one boundary where "what the app has written" is a complete
+  answer: the handler has returned, and Pyodide has no threads, so nothing is
+  mid-write. `mirrorBack()` still runs on close as a reconciling pass, which makes a
+  tracking miss cost a delay rather than the data.
+- **Mirroring is driven by `FS.trackingDelegate`, because a size diff is not enough.**
+  The original walk skipped a file whose size matched the snapshot, which silently
+  drops every same-size rewrite — a fixed-width record, a counter that did not change
+  digits. Deletes matter as much: sqlite3 removes its journal on commit, and copying
+  the journal out without ever removing it leaves a hot journal beside a committed
+  database, which the next process rolls back. `.venv` is excluded from mirroring in
+  both directions (`mirrorable()` re-checks `SKIP_DIRS`, since the tracker reports
+  paths the inbound walk never descended into) — the store owns it, and a second
+  writer would copy every wheel out again and could leave a half-written store
+  looking valid.
 - **`python --version` carries a literal, and it is pinned twice.** Same
   constraint as `BUN_PROGRAM`/`BUN_VERSION` above: `PYTHON_PROGRAM` is a
   no-interpolation template literal, so `/bin/python.js` cannot import the

@@ -32,6 +32,8 @@ export function drivePython(argv, env = DRIVE_ENV) {
     pipCheck: async () => { calls.push(["pipCheck"]); return 0; },
     pipUninstall: async (n, o) => { calls.push(["pipUninstall", n, o]); return 0; },
     venv: async (d, o) => { calls.push(["venv", d, o]); return 0; },
+    runModule: async (m, a, c) => { calls.push(["runModule", m, a, c]); return 0; },
+    serveStatic: async (o) => { calls.push(["serveStatic", o]); },
   };
   const fn = new Function("require", "module", "process", "globalThis", PYTHON_PROGRAM);
   try { fn(() => ({}), { exports: {} }, proc, { __ocInstallPython: () => py }); }

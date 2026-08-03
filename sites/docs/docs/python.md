@@ -31,6 +31,7 @@ project never touches Python, it never pays for it.
 | **`sqlite3`** | compiled into the interpreter; databases are real files |
 | **Web frameworks** | Flask, FastAPI and Django, with a live preview |
 | **pytest** | including real exit codes, so `pytest && …` behaves |
+| **`python -m <module>`** | any importable module, through CPython's own `runpy` — `unittest`, `http.server`, `json.tool` |
 | **Pure-Python packages from PyPI** | installed at runtime through `micropip` |
 | **`pip install` that persists** | into a per-project `.venv`, with `list`/`freeze`/`show`/`uninstall`/`check` |
 | **Outbound HTTP** | `requests`, or `pyfetch` if you want it async — subject to the target's CORS headers |
@@ -61,6 +62,35 @@ than hardcoding them** — `url_for()`, `reverse()`, `{% url %}`,
 `request.url_for()`. The bridge tells your framework which prefix it is mounted
 under, so generated URLs stay inside the preview. A hardcoded `/about` will
 escape it.
+
+## Running a module with `-m`
+
+`python -m <module>` runs whatever you name, through CPython's own `runpy` — the
+same code path the interpreter on your laptop uses. So the stdlib runners work
+as written:
+
+```bash
+python -m unittest discover      # the stdlib test runner, alongside pytest
+python -m http.server 8000       # a static server, with a preview tab
+python -m json.tool data.json    # and anything else that is importable
+```
+
+`python -m unittest` discovers and runs tests against your project directory,
+and exits non-zero when they fail. `python -m http.server` is CPython's own
+`SimpleHTTPRequestHandler` — the real directory listings, the real MIME types,
+the real 404 — served over the same bridge as Flask and FastAPI rather than a
+socket, so `--directory` and `--bind` behave and a preview tab opens. `--cgi`
+does not, because it needs a subprocess.
+
+A handful of modules are refused up front, with the reason: `smtplib`, `ftplib`,
+`poplib`, `imaplib`, `socketserver`, `wsgiref.simple_server` and
+`xmlrpc.server`. Each of them is a socket and nothing else. This is a refusal
+rather than a failure because of a trap — Pyodide *has* a `socket` module, and
+`connect()` and `bind()` on it succeed, so these would print their banner, look
+like they had started, and then wait forever for bytes that never move.
+
+Anything else that is missing gets CPython's error, not ours:
+`python: No module named nosuchthing`, exit 1.
 
 ## Packages
 
@@ -223,6 +253,12 @@ advance which ones will not start:
 None of these are near misses. Each needs something the browser does not hand
 out, so there is no version of Vivari that runs them.
 
-**Files written by a served app stay in the VM.** Files written by
-`python script.py` are mirrored back into the editor; files a running Flask or
-Django app writes — its SQLite database, say — are not.
+**Editor edits do not reach a running server.** Files written by your code —
+by `python script.py`, and by a running Flask, FastAPI or Django app — are
+mirrored back into the editor. A served app's writes land at the end of each
+request, so an upload or a SQLite commit is on disk and visible while the server
+is still running, and survives closing the tab rather than needing a clean
+shutdown. The reverse direction is the gap: the project is copied in when the
+server starts, so editing a file afterwards will not be seen until you restart
+it. There is no `--reload` to do that for you, since it would need a file
+watcher and a subprocess.

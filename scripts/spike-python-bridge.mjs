@@ -47,6 +47,8 @@ import { PYTHON_PROGRAM } from "../packages/kernel-host/programs/python.js";
 import { COREUTILS } from "../packages/kernel-host/coreutils.js";
 import {
   PYODIDE_PYTHON_VERSION,
+  PYTHON_EXECUTABLE,
+  STATIC_SERVER_SOURCE,
   byteWriter,
   installUrllib3RealmPatch,
   flushStreams,
@@ -173,6 +175,16 @@ const CASES = {
   // Where loadPackage writes when you do and do not hand it a callback, which
   // is what the offline stdout gate models — plus the version literal.
   "loader-streams": { kind: "loader-streams", synthetic: true },
+
+  // `python -m <module>` through CPython's own runpy: unittest discovering and
+  // running tests off the mirrored VFS, and the error a missing module gets.
+  "m-surface": { kind: "m-surface", synthetic: true },
+  // `python -m http.server` driven off the shipped handler source, and the
+  // socket evidence that says why it cannot be the real HTTPServer.
+  "http-server": { kind: "http-server", synthetic: true },
+  // What a served app writes, including a SQLite database, reaching the host —
+  // and the FS tracking hooks the offline mirror gate is built on.
+  "serve-persist": { kind: "serve-persist", synthetic: true },
 
   "package-store": { kind: "package-store", synthetic: true },
   // sys.exit() raised for real, judged against what real CPython does.
@@ -438,6 +450,277 @@ if (process.env.VV_SPIKE_CASE) {
     s = await captured(probeSrc, "");
     ok(s.path === "/static/app.css" && s.root_path === "" && s.sub_route_path === "/app.css",
       "no prefix: path, root_path and the mount's route path all agree (mode C is untouched)");
+  }
+
+  // --- python -m, through CPython's own runpy -------------------------------
+  if (spec.kind === "m-surface") {
+    // The offline tier proves the shim ROUTES an arbitrary module to runpy. It
+    // cannot prove the routing lands anywhere useful, because that depends on a
+    // real interpreter with a real stdlib. This is that half.
+    py.runPython(`import sys; sys.executable = ${JSON.stringify(PYTHON_EXECUTABLE)}`);
+
+    // The source runModule() builds, so what runs here is the shipped shape.
+    const runModule = async (mod, args) => {
+      out.length = 0;
+      const src = [
+        "import runpy, sys",
+        `sys.argv = ${JSON.stringify([mod, ...args])}`,
+        `runpy._run_module_as_main(${JSON.stringify(mod)})`,
+      ].join("\n");
+      try {
+        await py.runPythonAsync(src);
+        flushStreams(py);
+        return { code: 0, report: "", out: out.join("") };
+      } catch (e) {
+        flushStreams(py);
+        const t = terminationFromError(e);
+        return { ...t, out: out.join("") };
+      }
+    };
+
+    // 1. unittest, discovering off the mirrored VFS. This is the headline: we
+    //    ship pytest, so a repo that arrives with stdlib tests had no runner.
+    mirrorIn({
+      "tests/__init__.py": "",
+      "tests/test_math.py":
+        "import unittest\n" +
+        "class T(unittest.TestCase):\n" +
+        "    def test_ok(self): self.assertEqual(2 + 2, 4)\n" +
+        "    def test_also_ok(self): self.assertIn('a', 'cat')\n",
+      "test_toplevel.py":
+        "import unittest\n" +
+        "class Top(unittest.TestCase):\n" +
+        "    def test_top(self): self.assertTrue(True)\n",
+    });
+    let r = await runModule("unittest", ["discover", "-v"]);
+    ok(r.code === 0, `python -m unittest discover exits 0 when the tests pass (got ${r.code})`);
+    ok(/Ran 3 tests/.test(r.out), "…having found all three: two in tests/ and one at the top level");
+    ok(/test_ok \(tests\.test_math/.test(r.out), "…discovery reached the package under the mirrored tree");
+    ok(/\nOK\b/.test(r.out), "…and reported OK");
+
+    // 2. A failing test must FAIL. Without this the check above passes for a
+    //    runner that discovers nothing and reports success.
+    py.FS.writeFile(
+      DIR + "/tests/test_bad.py",
+      new TextEncoder().encode(
+        "import unittest\n" +
+        "class B(unittest.TestCase):\n" +
+        "    def test_bad(self): self.assertEqual(1, 2)\n",
+      ),
+    );
+    r = await runModule("unittest", ["discover"]);
+    ok(r.code === 1, `a failing test makes python -m unittest exit 1 (got ${r.code})`);
+    ok(/FAILED \(failures=1\)/.test(r.out), "…and says which and how many");
+    py.FS.unlink(DIR + "/tests/test_bad.py");
+
+    // 3. Other stdlib modules, to show this is a passthrough and not a second
+    //    allowlist with unittest added to it.
+    r = await runModule("base64", ["-e"]);
+    ok(r.code === 0, "python -m base64 runs (an arbitrary stdlib module, no special case)");
+    r = await runModule("calendar", ["2026", "8"]);
+    ok(r.code === 0 && /August 2026/.test(r.out), "python -m calendar 2026 8 prints the month");
+
+    // 4. The missing-module error. The whole reason for using runpy rather than
+    //    resolving modules ourselves: this string is CPython's, formatted by
+    //    CPython, prefixed with sys.executable.
+    r = await runModule("definitely_not_a_module", []);
+    ok(r.code === 1, `a missing module exits 1 (got ${r.code})`);
+    ok(
+      r.report === "python: No module named definitely_not_a_module",
+      `…with CPython's own message: ${JSON.stringify(r.report)}`,
+    );
+    const host = execSync("python3 -m definitely_not_a_module 2>&1; true", { encoding: "utf8" }).trim();
+    ok(
+      host.replace(/^\S+:/, "python:") === r.report,
+      `…identical to real CPython on this host, modulo sys.executable (${JSON.stringify(host)})`,
+    );
+    // A package with no __main__ is a DIFFERENT error, and also CPython's. Not
+    // `json`: 3.14 gave it a __main__ (it is json.tool now), which is a neat
+    // reminder that this list belongs to the stdlib and not to us — the only
+    // safe thing to assert is that we relay whatever it says.
+    r = await runModule("email", []);
+    ok(
+      r.code === 1 && /No module named email\.__main__; 'email' is a package and cannot be directly executed/.test(r.report),
+      `…and a package without __main__ gets its own message: ${JSON.stringify(r.report)}`,
+    );
+    const hostPkg = execSync("python3 -m email 2>&1; true", { encoding: "utf8" }).trim();
+    ok(
+      hostPkg.replace(/^\S+:/, "python:") === r.report,
+      `…which the CPython on this host words identically (${JSON.stringify(hostPkg)})`,
+    );
+  }
+
+  // --- python -m http.server: the real handler, without a socket ------------
+  if (spec.kind === "http-server") {
+    // FIRST, the evidence for the design. Reimplementing a static server would
+    // be wrong, but so would running the real HTTPServer: Pyodide HAS a socket
+    // module, and it is worse than not having one.
+    const sock = (expr) => {
+      try { py.runPython(expr); return "ok"; }
+      catch (e) { return String(e.message).trim().split("\n").filter(Boolean).pop(); }
+    };
+    ok(sock("import socket; socket.socket().bind(('', 8099))") === "ok",
+      "a Pyodide socket BINDS without complaint — so http.server would report itself serving");
+    ok(sock("import socket\ns = socket.socket()\ns.connect(('example.com', 80))") === "ok",
+      "…and CONNECTS without complaint");
+    const moved = py.runPython(`
+import socket
+s = socket.socket(); s.settimeout(0.5)
+s.connect(('example.com', 80))
+try:
+    s.sendall(b'GET / HTTP/1.0\\r\\n\\r\\n')
+    r = s.recv(16)
+except Exception as e:
+    r = type(e).__name__
+str(r)
+`);
+    ok(/TimeoutError|timed out/.test(moved), `…and then carries no bytes (${moved}) — the failure is a hang, not an error`);
+
+    // SECOND, the handler. Driven off STATIC_SERVER_SOURCE, the shipped string,
+    // so the spike cannot pass against a copy that has drifted.
+    py.runPython(STATIC_SERVER_SOURCE);
+    const handle = py.globals.get("_vv_static");
+    py.FS.mkdirTree("/site/sub");
+    py.FS.writeFile("/site/hello.txt", new TextEncoder().encode("hello from the stdlib\n"));
+    py.FS.writeFile("/site/data.json", new TextEncoder().encode('{"k": 1}'));
+    py.FS.writeFile("/site/sub/deep.txt", new TextEncoder().encode("deep"));
+
+    const req = (line) =>
+      new Uint8Array(Buffer.from(`${line}\r\nHost: localhost:8000\r\nConnection: close\r\n\r\n`, "latin1"));
+    const call = (line, root = "/site") => {
+      const proxy = handle(req(line), root, 8000, "HTTP/1.0");
+      const raw = Buffer.from(proxy.toJs());
+      proxy.destroy();
+      const i = raw.indexOf("\r\n\r\n");
+      const head = raw.slice(0, i).toString("latin1");
+      return {
+        status: parseInt(head.split("\r\n")[0].split(" ")[1], 10),
+        head,
+        body: raw.slice(i + 4).toString("utf8"),
+      };
+    };
+
+    let res = call("GET /hello.txt HTTP/1.1");
+    ok(res.status === 200 && res.body === "hello from the stdlib\n", "a file is served, byte for byte");
+    ok(/Content-type: text\/plain/i.test(res.head), "…with the stdlib's own mimetypes answer for .txt");
+    ok(/Server: SimpleHTTP\//i.test(res.head), "…and its own Server header, because it IS SimpleHTTPRequestHandler");
+
+    res = call("GET /data.json HTTP/1.1");
+    ok(/Content-type: application\/json/i.test(res.head), "…and application/json for .json, which we never had to map");
+
+    res = call("GET /sub/ HTTP/1.1");
+    ok(res.status === 200 && /Directory listing for \/sub\//.test(res.body),
+      "a directory gets the stdlib's real listing page");
+    ok(/deep\.txt/.test(res.body), "…naming the files in it");
+
+    res = call("GET /sub HTTP/1.1");
+    ok(res.status === 301 && /Location: \/sub\//.test(res.head),
+      "…and a directory without a trailing slash gets the real 301, not a 404");
+
+    res = call("GET /nope.txt HTTP/1.1");
+    ok(res.status === 404 && /File not found/.test(res.body), "a missing file gets the stdlib's real 404");
+
+    res = call("HEAD /hello.txt HTTP/1.1");
+    ok(res.status === 200 && res.body === "", "HEAD returns the headers and no body");
+
+    // Serving a subdirectory must not serve its parent: -d is a boundary, not a
+    // hint. Without this, --directory would be decoration.
+    res = call("GET /hello.txt HTTP/1.1", "/site/sub");
+    ok(res.status === 404, "-d scopes the root: a file outside it is 404, not served");
+    res = call("GET /../hello.txt HTTP/1.1", "/site/sub");
+    ok(res.status !== 200, "…and .. does not climb out of it");
+
+    // One buffered request must yield exactly one response. BaseHTTPRequestHandler
+    // loops until close_connection, so a keep-alive request against a stream
+    // that kept producing bytes would answer twice into the same buffer and
+    // hand Node a second response glued to the first.
+    const keepalive = handle(
+      new Uint8Array(Buffer.from("GET /hello.txt HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n", "latin1")),
+      "/site",
+      8000,
+      "HTTP/1.1",
+    );
+    const kaText = Buffer.from(keepalive.toJs()).toString("latin1");
+    keepalive.destroy();
+    ok(
+      (kaText.match(/^HTTP\/1\.[01] \d{3}/gm) || []).length === 1,
+      "an explicit keep-alive request still produces exactly one response",
+    );
+  }
+
+  // --- a served app's writes reach the host ---------------------------------
+  if (spec.kind === "serve-persist") {
+    // The offline tier gates the mirroring against a stand-in FS. That is only
+    // worth something if REAL Pyodide reports writes the way the stand-in does,
+    // so check the hooks here — this is the load-bearing claim underneath the
+    // whole offline mirror gate.
+    const writes = new Set();
+    const deletes = new Set();
+    py.FS.trackingDelegate.onWriteToFile = (p) => { writes.add(p); deletes.delete(p); };
+    py.FS.trackingDelegate.onDeletePath = (p) => { writes.delete(p); deletes.add(p); };
+    py.FS.trackingDelegate.onMovePath = (a, b) => { deletes.add(a); writes.add(b); };
+
+    py.FS.mkdirTree("/w");
+    await py.runPythonAsync(`
+import os, shutil
+open('/w/plain.txt','w').write('a')
+shutil.copy('/w/plain.txt', '/w/copied.txt')
+with open('/w/appended.txt','a') as f: f.write('b')
+os.rename('/w/plain.txt', '/w/moved.txt')
+os.remove('/w/copied.txt')
+`);
+    ok(writes.has("/w/appended.txt"), "real Pyodide reports a write through the tracking delegate");
+    ok(writes.has("/w/moved.txt") && deletes.has("/w/plain.txt"), "…a rename as a delete plus a write");
+    ok(deletes.has("/w/copied.txt"), "…and a delete");
+
+    // The same-size rewrite: the case the old size heuristic dropped, and the
+    // reason tracking is a correctness fix rather than a speed one.
+    py.FS.writeFile("/w/same.txt", new TextEncoder().encode("aaaa"));
+    const before = py.FS.stat("/w/same.txt");
+    writes.clear();
+    await py.runPythonAsync(`open('/w/same.txt','w').write('bbbb')`);
+    const after = py.FS.stat("/w/same.txt");
+    ok(before.size === after.size, "a same-size rewrite leaves the size identical — a size diff cannot see it");
+    ok(writes.has("/w/same.txt"), "…and the tracking delegate reports it anyway");
+    ok(new TextDecoder().decode(py.FS.readFile("/w/same.txt")) === "bbbb", "…the contents really did change");
+
+    // sqlite3 is the case that made deletes non-optional: it writes a journal
+    // beside the database and REMOVES it on commit. Mirroring the journal out
+    // and never removing it leaves a hot journal next to a committed database.
+    writes.clear();
+    deletes.clear();
+    await py.runPythonAsync(`
+import sqlite3
+con = sqlite3.connect('/w/app.db')
+con.execute('create table t (v text)')
+con.execute("insert into t values ('from a request')")
+con.commit()
+con.close()
+`);
+    ok(writes.has("/w/app.db"), "sqlite3's writes are reported too, though they happen in C");
+    ok(deletes.has("/w/app.db-journal"), "…and the journal it removes on commit is reported as a delete");
+    ok(!writes.has("/w/app.db-journal"), "…and is no longer pending as a write, so it will not be resurrected");
+
+    // The database is real, and re-readable: the point is a file that survives.
+    const rows = py.runPython(`
+import sqlite3
+con = sqlite3.connect('/w/app.db')
+v = con.execute('select v from t').fetchall()
+con.close()
+str(v)
+`);
+    ok(/from a request/.test(rows), `the committed row is in the database (${rows})`);
+    // Mid-transaction, the journal EXISTS — which is what makes copying both
+    // files the recoverable choice and copying only the database the corrupt one.
+    const mid = py.runPython(`
+import os, sqlite3
+con = sqlite3.connect('/w/tx.db')
+con.execute('create table t (v text)'); con.commit()
+con.execute('begin'); con.execute("insert into t values ('uncommitted')")
+str(sorted(f for f in os.listdir('/w') if f.startswith('tx.db')))
+`);
+    ok(/tx\.db-journal/.test(mid),
+      `an open transaction leaves a journal on disk (${mid}) — so a mid-transaction copy carries its own rollback`);
   }
 
   // --- SystemExit end to end: real Pyodide in, real CPython's answer out ----
@@ -923,8 +1206,13 @@ console.log("== python -m argv seams (no Pyodide needed) ==");
   ok(r.calls[0]?.[0] === "runCode", "pytest goes through the ordinary script path");
   ok(r.calls[0]?.[1]?.includes('sys.exit(int(pytest.main(["-q","tests"])))'), "pytest forwards argv and propagates the exit code");
 
+  // `-m numpy` used to be rejected by an allowlist. numpy is a module the
+  // interpreter can import, so it goes to runpy now — and runpy is what decides
+  // whether it has a __main__, which is CPython's answer rather than ours.
   r = drive(["-m", "numpy"], ENV);
-  ok(/not supported/.test(r.out) && /gunicorn/.test(r.out) && /pytest/.test(r.out), "an unknown -m module is still rejected, and lists the new ones");
+  ok(r.calls[0]?.[0] === "runModule" && r.calls[0]?.[1] === "numpy", "an ordinary -m module is handed to runpy, not refused");
+  r = drive(["-m", "smtplib"], ENV);
+  ok(r.calls.length === 0 && /TCP socket/.test(r.out), "…but a socket-bound one is refused, with the reason");
 
   ok(typeof COREUTILS.gunicorn === "string" && COREUTILS.gunicorn.includes("'-m', 'gunicorn'"), "gunicorn is on PATH");
   ok(typeof COREUTILS.pytest === "string" && COREUTILS.pytest.includes("'-m', 'pytest'"), "pytest is on PATH");

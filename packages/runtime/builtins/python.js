@@ -277,6 +277,91 @@ if _vv_loaded is not None:
 // should show what the user defined, not our plumbing. The functions keep the
 // dict alive through their __globals__, which is what the meta_path finder needs
 // to still resolve them at import time, long after this returns.
+// What the interpreter calls itself. Pyodide leaves `sys.executable` pointing at
+// whatever JS entry booted it — under Node that is the .mjs file, which is both
+// wrong and a leak of the host. It matters beyond tidiness because CPython's own
+// runpy formats the -m failure as `"%s: %s" % (sys.executable, exc)`, so this
+// string IS the prefix of `python -m nosuchthing`. `python` is the name the user
+// typed and the name every other error in the shim uses.
+export const PYTHON_EXECUTABLE = "python";
+
+export function setExecutable(pyodide) {
+  try {
+    pyodide.runPython(`import sys; sys.executable = ${JSON.stringify(PYTHON_EXECUTABLE)}`);
+  } catch {
+    /* a wrong sys.executable is cosmetic next to a boot failure */
+  }
+}
+
+// `python -m http.server`, running CPython's OWN SimpleHTTPRequestHandler.
+//
+// The module wants a socket and Pyodide has none — and worse than none: a
+// Pyodide socket `connect()`s and `bind()`s without complaint and then carries
+// no bytes, so the real module would bind port 8000, report itself serving, and
+// accept() forever. Reimplementing a static file server is the other obvious
+// move and also wrong: the value of `-m http.server` is that it is the same
+// directory listing, the same mimetypes table, the same Range and If-Modified-
+// Since handling and the same 404 that everyone already knows.
+//
+// So keep the handler and remove the socket. BaseHTTPRequestHandler does all of
+// its I/O through `self.rfile` / `self.wfile`, which `StreamRequestHandler.setup`
+// builds from `self.connection` — so an object with `makefile()` and `sendall()`
+// is a complete substitute. Feed it the raw request bytes, collect the raw
+// response bytes, and let the guest-Node http server carry them, which is the
+// same bridge the WSGI and ASGI seams already use.
+//
+// Exported so the spikes drive the shipped source rather than a copy of it.
+export const STATIC_SERVER_SOURCE = `
+import io, sys, posixpath
+from http.server import SimpleHTTPRequestHandler
+
+class _VvConn:
+    """Everything StreamRequestHandler.setup() asks of a socket, and no more."""
+    def __init__(self, data):
+        self._data = data
+        self.out = bytearray()
+    def makefile(self, mode="rb", bufsize=-1, *a, **k):
+        # 'rb' is the request; BaseHTTPRequestHandler sets wbufsize = 0, so the
+        # write side goes through sendall() instead of a file object.
+        return io.BytesIO(self._data) if "r" in mode else io.BytesIO()
+    def sendall(self, b):
+        self.out += bytes(b)
+    def settimeout(self, t):
+        pass
+    def setsockopt(self, *a):
+        pass
+    def shutdown(self, *a):
+        pass
+    def close(self):
+        pass
+
+class _VvServer:
+    """Stands in for HTTPServer for the two attributes the handler reads."""
+    def __init__(self, port):
+        self.server_name = "localhost"
+        self.server_port = port
+
+def _vv_static(raw, directory, port, protocol):
+    # A Uint8Array handed over from JS arrives as a JsProxy, not as bytes.
+    # Accepting both keeps this callable with plain bytes from a test.
+    if not isinstance(raw, (bytes, bytearray)):
+        raw = raw.to_bytes()
+    conn = _VvConn(raw)
+
+    class _Handler(SimpleHTTPRequestHandler):
+        protocol_version = protocol
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=directory, **k)
+        def log_message(self, fmt, *args):
+            # Real http.server logs every request to stderr. Keep that — it is
+            # what tells someone their request arrived — but drop the timestamp,
+            # which the terminal already carries.
+            sys.stderr.write("%s - %s\\n" % (self.address_string(), fmt % args))
+
+    _Handler(conn, ("127.0.0.1", 0), _VvServer(port))
+    return bytes(conn.out)
+`;
+
 export function installUrllib3RealmPatch(pyodide) {
   const ns = pyodide.toPy({});
   try {
@@ -503,6 +588,7 @@ export function createPythonRuntime({ process, require, trackHost }) {
         // costs one import of sys/importlib and touches nothing else, so a
         // process that never uses urllib3 pays nothing for it.
         installUrllib3RealmPatch(pyodide);
+        setExecutable(pyodide);
         return pyodide;
       } finally {
         restoreEnv();
@@ -574,9 +660,115 @@ export function createPythonRuntime({ process, require, trackHost }) {
     return snapshot;
   }
 
-  function mirrorBack(pyodide, cwd, snapshot) {
+  // Is `full` a path we are willing to copy back out to the host? Same rules the
+  // inbound walk applies, restated for a path we did not reach by walking.
+  function mirrorable(cwd, full) {
+    if (full !== cwd && !full.startsWith(cwd === "/" ? "/" : cwd + "/")) return false;
+    const rel = full.slice(cwd === "/" ? 1 : cwd.length + 1);
+    for (const seg of rel.split("/").slice(0, -1)) if (SKIP_DIRS.has(seg)) return false;
+    return true;
+  }
+
+  // Record every path Python writes, moves or deletes, so mirroring back is a
+  // list of files rather than a search for them.
+  //
+  // Emscripten calls these on the way through the real FS ops, so they see what
+  // a diff cannot. Two things forced this. A same-size rewrite —
+  // `open(p,'w').write('bbbb')` over `'aaaa'` — is invisible to BOTH size and
+  // mtime (MEMFS stamps mtime in whole milliseconds, and the two writes land in
+  // the same one), so the old size heuristic silently dropped it. And a served
+  // app must mirror after every request, where walking the project tree each
+  // time is the thing that makes per-request persistence too expensive to do.
+  //
+  // Deletes are propagated, which is not merely symmetry: sqlite3 writes
+  // `app.db-journal` and REMOVES it on commit. Copying the journal out and never
+  // removing it leaves a hot journal beside a committed database, and the next
+  // process to open it rolls back work that was committed. Mirroring writes
+  // without deletes would corrupt exactly the file this change exists to save.
+  function trackWrites(pyodide) {
+    const writes = new Set();
+    const deletes = new Set();
+    const d = pyodide.FS && pyodide.FS.trackingDelegate;
+    if (!d) return { pyodide, writes, deletes, ok: false };
+    d.onWriteToFile = (p) => {
+      writes.add(p);
+      deletes.delete(p);
+    };
+    d.onDeletePath = (p) => {
+      writes.delete(p);
+      deletes.add(p);
+    };
+    d.onMovePath = (from, to) => {
+      writes.delete(from);
+      deletes.add(from);
+      writes.add(to);
+      deletes.delete(to);
+    };
+    return { pyodide, writes, deletes, ok: true };
+  }
+
+  // Copy one Pyodide file out to the host. Returns true if anything happened.
+  function writeOutOne(pyodide, full) {
     const fs = req("fs");
     const path = req("path");
+    let st;
+    try {
+      st = pyodide.FS.stat(full);
+    } catch {
+      return false;
+    }
+    if (!pyodide.FS.isFile(st.mode) || st.size > MAX_MIRROR_FILE) return false;
+    let data;
+    try {
+      data = pyodide.FS.readFile(full);
+    } catch {
+      return false;
+    }
+    try {
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, globalThis.Buffer.from(data));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function deleteOne(full) {
+    const fs = req("fs");
+    try {
+      fs.rmSync(full, { force: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Just the tracked paths — no tree walk. This is what a served app runs after
+  // every request, so it has to cost nothing when the request wrote nothing.
+  function mirrorTracked(cwd, tracker) {
+    if (!tracker) return 0;
+    let n = 0;
+    for (const full of tracker.deletes) {
+      if (!mirrorable(cwd, full)) continue;
+      if (deleteOne(full)) n++;
+    }
+    tracker.deletes.clear();
+    for (const full of tracker.writes) {
+      if (!mirrorable(cwd, full)) continue;
+      if (writeOutOne(tracker.pyodide, full)) n++;
+    }
+    tracker.writes.clear();
+    return n;
+  }
+
+  // The full reconciliation: every tracked path, PLUS a walk that catches
+  // anything whose size moved. The union is deliberate — tracking is precise
+  // where the diff is blind (same-size rewrites), and the diff is the safety net
+  // if a Pyodide bump ever stops the delegate firing, so the failure mode is the
+  // old behaviour rather than no behaviour. spike-python-bridge asserts the
+  // delegate DOES fire, so that net going live is loud rather than silent.
+  function mirrorBack(pyodide, cwd, snapshot, tracker) {
+    const tracked = tracker && tracker.writes;
     const walk = (dir) => {
       let names;
       try {
@@ -597,36 +789,34 @@ export function createPythonRuntime({ process, require, trackHost }) {
           if (SKIP_DIRS.has(name)) continue;
           walk(full);
         } else if (pyodide.FS.isFile(st.mode)) {
-          // Only write files the script created or resized (cheap heuristic that
-          // avoids re-writing the whole tree every run).
-          if (snapshot.get(full) === st.size) continue;
-          let data;
-          try {
-            data = pyodide.FS.readFile(full);
-          } catch {
-            continue;
-          }
-          try {
-            fs.mkdirSync(path.dirname(full), { recursive: true });
-            fs.writeFileSync(full, globalThis.Buffer.from(data));
-          } catch {
-            /* skip unwritable path */
-          }
+          if (!(tracked && tracked.has(full)) && snapshot.get(full) === st.size) continue;
+          writeOutOne(pyodide, full);
+          if (tracked) tracked.delete(full);
         }
       }
     };
     walk(cwd);
+    // Tracked paths the walk could not reach (its directory is gone, say).
+    if (tracker) {
+      for (const full of tracker.writes) if (mirrorable(cwd, full)) writeOutOne(pyodide, full);
+      tracker.writes.clear();
+      for (const full of tracker.deletes) if (mirrorable(cwd, full)) deleteOne(full);
+      tracker.deletes.clear();
+    }
   }
 
   // ---- execution -------------------------------------------------------------
 
   async function runSource(indexUrl, source, opts) {
-    const { filename = "<stdin>", argv, cwd } = opts || {};
+    const { filename = "<stdin>", argv, cwd, importSource } = opts || {};
     const pyodide = await bootPyodide(indexUrl);
     let snapshot = null;
+    let tracker = null;
     if (cwd) {
       try {
         snapshot = mirrorIn(pyodide, cwd);
+        // After mirrorIn, so the copy in is not itself reported as user writes.
+        tracker = trackWrites(pyodide);
         pyodide.FS.chdir(cwd);
       } catch {
         /* run anyway from the default home dir */
@@ -644,8 +834,10 @@ export function createPythonRuntime({ process, require, trackHost }) {
       /* non-fatal */
     }
     // Auto-load any vendored prebuilt packages the script imports (numpy, …).
+    // `importSource` is for callers whose real source imports nothing useful —
+    // `python -m X` runs a runpy call, so the imports to scan for are X's.
     try {
-      await pyodide.loadPackagesFromImports(source, loaderToStderr);
+      await pyodide.loadPackagesFromImports(importSource || source, loaderToStderr);
     } catch {
       /* a missing package surfaces as a Python ImportError below */
     }
@@ -663,7 +855,7 @@ export function createPythonRuntime({ process, require, trackHost }) {
     } finally {
       if (cwd && snapshot) {
         try {
-          mirrorBack(pyodide, cwd, snapshot);
+          mirrorBack(pyodide, cwd, snapshot, tracker);
         } catch {
           /* best-effort */
         }
@@ -695,6 +887,32 @@ export function createPythonRuntime({ process, require, trackHost }) {
       filename: "<string>",
       argv: ["-c", ...(args || [])],
       cwd: process.cwd(),
+    });
+  }
+
+  // `python -m <module>` for everything the shim does not special-case.
+  //
+  // This is CPython's own entry point, not an imitation of it:
+  // `runpy._run_module_as_main` is the function `Modules/main.c` calls for -m,
+  // so module resolution, `__main__` naming, `sys.argv[0]` rewriting and the
+  // error text all come from the stdlib. A module that is missing raises
+  // `SystemExit("<sys.executable>: No module named X")` from inside runpy — the
+  // same string real CPython prints — and the shim's existing CPython-faithful
+  // SystemExit handling turns that into exit 1 with the message on stderr. There
+  // is nothing for us to format, which is the point: an invented "not supported"
+  // line would be a claim about Vivari for something that is just a typo.
+  async function runModule(indexUrl, mod, args, cwd) {
+    const src = [
+      "import runpy, sys",
+      `sys.argv = ${JSON.stringify([mod, ...(args || [])])}`,
+      `runpy._run_module_as_main(${JSON.stringify(mod)})`,
+    ].join("\n");
+    return runSource(indexUrl, src, {
+      filename: "<module>",
+      argv: [mod, ...(args || [])],
+      cwd: cwd || process.cwd(),
+      // Scan the TARGET module's imports for wheels to preload, not runpy's.
+      importSource: `import ${String(mod).split(".")[0]}`,
     });
   }
 
@@ -1105,6 +1323,146 @@ export function createPythonRuntime({ process, require, trackHost }) {
   }
 
 
+  // Write out whatever the last request touched. Never throws: a server that
+  // dies because a file could not be mirrored would be a worse bug than the one
+  // this fixes.
+  function persist(workdir, tracker) {
+    try {
+      mirrorTracked(workdir, tracker);
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  // `python -m http.server [port]` — CPython's SimpleHTTPRequestHandler, driven
+  // over the guest-Node bridge instead of a socket. See STATIC_SERVER_SOURCE for
+  // why the handler is the real one and the socket is not.
+  function serveStatic(indexUrl, opts) {
+    const { port, directory, cwd, protocol } = opts || {};
+    const bindPort = port | 0;
+
+    return new Promise((resolve, reject) => {
+      bootPyodide(indexUrl).then(async (pyodide) => {
+        const workdir = cwd || process.cwd();
+        const root = directory
+          ? req("path").resolve(workdir, directory)
+          : workdir;
+        try {
+          mirrorIn(pyodide, workdir);
+          pyodide.FS.chdir(workdir);
+        } catch {
+          /* serve from the default home dir */
+        }
+        if (!pyodide.FS.analyzePath(root).exists) {
+          reject(new Error(`python -m http.server: ${directory}: No such directory`));
+          return;
+        }
+
+        let handle;
+        try {
+          pyodide.runPython(STATIC_SERVER_SOURCE);
+          handle = pyodide.globals.get("_vv_static");
+        } catch (e) {
+          reject(new Error(`failed to set up http.server: ${(e && e.message) || e}`));
+          return;
+        }
+
+        const http = req("http");
+        const server = http.createServer((sreq, sres) => {
+          const chunks = [];
+          sreq.on("data", (c) => chunks.push(c));
+          sreq.on("end", () => {
+            try {
+              // Rebuild the request the handler would have read off the wire.
+              // The incoming Connection header is dropped and `close` sent in
+              // its place: the buffer holds exactly one request, and saying so
+              // is what sets close_connection on the first pass. handle() would
+              // in fact stop anyway — the BytesIO comes up empty and a short
+              // read ends the loop — but that is termination by accident of the
+              // transport, and Node upstream is keeping its own connection
+              // alive regardless of what this handler is told.
+              const raw = sreq.rawHeaders || [];
+              let prefix = "";
+              const lines = [`${sreq.method || "GET"} ${sreq.url || "/"} HTTP/1.1`];
+              for (let i = 0; i + 1 < raw.length; i += 2) {
+                if (raw[i].toLowerCase() === "connection") continue;
+                if (raw[i].toLowerCase() === "x-forwarded-prefix") prefix = raw[i + 1];
+                lines.push(`${raw[i]}: ${raw[i + 1]}`);
+              }
+              lines.push("Connection: close", "", "");
+              const wire = globalThis.Buffer.concat([
+                globalThis.Buffer.from(lines.join("\r\n"), "latin1"),
+                globalThis.Buffer.concat(chunks),
+              ]);
+
+              // A plain Uint8Array, not the Buffer: Pyodide refuses a Buffer
+              // with "Unknown typed array type". Python `bytes` comes back as a
+              // PyProxy, so toJs() to get at the array.
+              const result = handle(
+                new Uint8Array(wire.buffer, wire.byteOffset, wire.byteLength),
+                root,
+                bindPort,
+                protocol || "HTTP/1.0",
+              );
+              const outBytes = globalThis.Buffer.from(result.toJs());
+              result.destroy();
+              flushStreams(pyodide);
+
+              const split = outBytes.indexOf("\r\n\r\n");
+              const head = outBytes.slice(0, split === -1 ? outBytes.length : split).toString("latin1");
+              const body = split === -1 ? globalThis.Buffer.alloc(0) : outBytes.slice(split + 4);
+              const headLines = head.split("\r\n");
+              const status = parseInt((headLines[0] || "").split(" ")[1], 10) || 200;
+              const outHeaders = {};
+              for (const line of headLines.slice(1)) {
+                const c = line.indexOf(":");
+                if (c === -1) continue;
+                const k = line.slice(0, c).trim();
+                let v = line.slice(c + 1).trim();
+                // The tunnel strips /preview/<port> before the handler sees the
+                // path, so the redirect it emits for a directory without a
+                // trailing slash would point outside the preview. Put the prefix
+                // back, the same way the WSGI seam hands over root_path.
+                if (prefix && k.toLowerCase() === "location" && v.startsWith("/")) v = prefix + v;
+                outHeaders[k] = v;
+              }
+              delete outHeaders["Content-Length"];
+              delete outHeaders["content-length"];
+              sres.writeHead(status, outHeaders);
+              sres.end(sreq.method === "HEAD" ? undefined : body);
+            } catch (e) {
+              const msg = "Internal Server Error\n\n" + ((e && e.stack) || e) + "\n";
+              try {
+                sres.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+              } catch {
+                /* headers already sent */
+              }
+              sres.end(msg);
+              process.stderr.write(msg);
+            }
+          });
+          sreq.on("error", () => {
+            try {
+              sres.writeHead(400);
+              sres.end();
+            } catch {
+              /* ignore */
+            }
+          });
+        });
+        server.on("error", (e) => reject(e));
+        server.listen(bindPort, () => {
+          process.stdout.write(
+            `Serving HTTP on 0.0.0.0 port ${bindPort} (http://0.0.0.0:${bindPort}/) ...\n`,
+          );
+        });
+        server.on("close", () => resolve(0));
+      }, (e) => {
+        reject(new Error(`failed to start Pyodide: ${(e && e.message) || e}`));
+      });
+    });
+  }
+
   // Long-running: boot Pyodide, import the WSGI/ASGI app, then stand up a guest
   // Node http server on `port`. Resolves only when the server closes/errors, so
   // the listening handle keeps the process alive (like Express's app.listen).
@@ -1119,8 +1477,11 @@ export function createPythonRuntime({ process, require, trackHost }) {
     return new Promise((resolve, reject) => {
       bootPyodide(indexUrl).then(async (pyodide) => {
         const workdir = cwd || process.cwd();
+        let snapshot = null;
+        let tracker = null;
         try {
-          mirrorIn(pyodide, workdir);
+          snapshot = mirrorIn(pyodide, workdir);
+          tracker = trackWrites(pyodide);
           pyodide.FS.chdir(workdir);
         } catch {
           /* run from default home dir */
@@ -1209,6 +1570,14 @@ export function createPythonRuntime({ process, require, trackHost }) {
               delete outHeaders["Transfer-Encoding"];
               sres.writeHead(out.status || 200, outHeaders);
               sres.end(bodyOut);
+              // A view that wrote a file — an upload, a SQLite commit — has
+              // finished writing by now: the handler returned, and Pyodide has no
+              // threads, so nothing else is mid-write. That makes the end of a
+              // request the one boundary where "what the app has written so far"
+              // is a complete answer, which is why persistence happens here and
+              // not on a timer. It is off the response path (the bytes are
+              // already out) and costs nothing when the request wrote nothing.
+              persist(workdir, tracker);
             } catch (e) {
               const msg = "Internal Server Error\n\n" + ((e && e.stack) || e) + "\n";
               try {
@@ -1218,6 +1587,9 @@ export function createPythonRuntime({ process, require, trackHost }) {
               }
               sres.end(msg);
               process.stderr.write(msg);
+              // A 500 is exactly when a half-finished write is most likely, and
+              // exactly when the user most wants to see what got as far as disk.
+              persist(workdir, tracker);
             }
           });
           sreq.on("error", () => {
@@ -1240,7 +1612,18 @@ export function createPythonRuntime({ process, require, trackHost }) {
             `${kind} server (${moduleName}:${attrName}) running on http://localhost:${bindPort}\n`,
           );
         });
-        server.on("close", () => resolve(0));
+        server.on("close", () => {
+          // The reconciling pass: everything tracked, plus a size diff over the
+          // tree. Per-request mirroring should already have written all of it —
+          // this is what makes a tracking regression cost a delay rather than
+          // the data.
+          try {
+            if (snapshot) mirrorBack(pyodide, workdir, snapshot, tracker);
+          } catch {
+            /* best-effort */
+          }
+          resolve(0);
+        });
       }, (e) => {
         reject(new Error(`failed to start Pyodide: ${(e && e.message) || e}`));
       });
@@ -1254,6 +1637,8 @@ export function createPythonRuntime({ process, require, trackHost }) {
       return {
         runFile: (filePath, args) => runFile(idx, filePath, args),
         runCode: (source, args) => runCode(idx, source, args),
+        runModule: (mod, args, cwd) => runModule(idx, mod, args, cwd),
+        serveStatic: (o) => serveStatic(idx, o),
         pipInstall: (names) => pipInstall(idx, names),
         pipList: () => pipList(idx),
         pipFreeze: () => pipFreeze(idx),

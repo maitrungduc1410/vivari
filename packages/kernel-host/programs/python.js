@@ -84,6 +84,9 @@ const HELP = [
   '  python -m flask run         serve a Flask/WSGI app (opens a preview)',
   '  python -m gunicorn wsgi:app serve any WSGI app - Django, Flask, ... (opens a preview)',
   '  python -m pytest [args]     run a pytest suite',
+  '  python -m unittest ...      run the stdlib test runner (discover, -v, ...)',
+  '  python -m http.server [port] serve the current directory (opens a preview)',
+  '  python -m <module> [args]   run any other importable module, as CPython does',
   '  python --version            print the interpreter version',
 ].join(NL);
 
@@ -469,6 +472,79 @@ async function doPytest(rest) {
   process.exit(rc | 0);
 }
 
+// Stdlib modules whose __main__ is a network client or server. These are not
+// refused because they are unimplemented — they import fine, and that is the
+// problem. Pyodide's socket layer accepts connect(), bind() and listen() and
+// then moves no bytes, so each of these would print its banner and hang rather
+// than fail. An honest refusal names the reason; per the shim-honesty rule a
+// silent nothing is the one outcome not allowed.
+const SOCKET_MODULES = {
+  smtplib: 'this is an SMTP client, and sending mail needs a TCP socket.',
+  ftplib: 'this is an FTP client, and it needs a TCP socket.',
+  poplib: 'this is a POP3 client, and it needs a TCP socket.',
+  imaplib: 'this is an IMAP client, and it needs a TCP socket.',
+  socketserver: 'this serves a TCP socket, and there is nothing to accept a connection from.',
+  'wsgiref.simple_server': 'this binds a TCP socket. Use "python -m flask run" or "python -m uvicorn", which serve through the Vivari preview bridge.',
+  'xmlrpc.server': 'this binds a TCP socket.',
+};
+
+// python -m http.server [-b ADDR] [-d DIR] [-p VERSION] [--cgi] [port]
+// The flag set is CPython's own (see its argparse), so a command copied out of
+// a tutorial parses the same way here. --cgi is refused rather than ignored:
+// it means "run these files as programs", and we have no subprocess to run them
+// in, so honouring the flag silently would serve the source of a script that
+// was meant to execute.
+async function doHttpServer(rest) {
+  let port = 8000;
+  let directory = null;
+  let protocol = 'HTTP/1.0';
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '-h' || a === '--help') {
+      out('usage: python -m http.server [-h] [-b ADDRESS] [-d DIRECTORY] [-p VERSION] [port]');
+      out('');
+      out('positional arguments:');
+      out('  port                  bind to this port (default: 8000)');
+      out('');
+      out('options:');
+      out('  -h, --help            show this help message and exit');
+      out('  -b, --bind ADDRESS    accepted and ignored: every port is bound inside the VM');
+      out('  -d, --directory DIR   serve this directory (default: current directory)');
+      out('  -p, --protocol VER    conform to this HTTP version (default: HTTP/1.0)');
+      process.exit(0); return;
+    }
+    if (a === '--cgi') {
+      err('python -m http.server: --cgi is not supported: running a CGI script needs a subprocess, and there is none in the browser.');
+      process.exit(1); return;
+    }
+    if (a === '-b' || a === '--bind') { warnIgnored('http.server', a, 'the port is bound inside the VM and reached through the preview'); i++; continue; }
+    if (a.indexOf('--bind=') === 0) { warnIgnored('http.server', '--bind', 'the port is bound inside the VM and reached through the preview'); continue; }
+    if (a === '-d' || a === '--directory') { directory = rest[++i]; continue; }
+    if (a.indexOf('--directory=') === 0) { directory = a.slice(12); continue; }
+    if (a === '-p' || a === '--protocol') { protocol = rest[++i]; continue; }
+    if (a.indexOf('--protocol=') === 0) { protocol = a.slice(11); continue; }
+    if (a.indexOf('--tls') === 0) {
+      err('python -m http.server: ' + a + ' is not supported: the ssl module is a stub in Pyodide, so there is no TLS to configure.');
+      process.exit(1); return;
+    }
+    if (a.charAt(0) === '-' && a !== '-') { err('python -m http.server: unrecognized argument: ' + a); process.exit(2); return; }
+    const n = parseInt(a, 10);
+    if (!(n > 0)) { err('python -m http.server: invalid port: ' + a); process.exit(2); return; }
+    port = n;
+  }
+  const py = getPy();
+  await py.serveStatic({ port: port, directory: directory, cwd: process.cwd(), protocol: protocol });
+  process.exit(0);
+}
+
+// Everything else: CPython's own runpy, so module resolution and the error for
+// a module that is not there are the stdlib's rather than ours.
+async function doModule(mod, rest) {
+  const py = getPy();
+  const rc = await py.runModule(mod, rest, process.cwd());
+  process.exit(rc | 0);
+}
+
 async function main() {
   const first = argv[0];
 
@@ -486,15 +562,26 @@ async function main() {
   if (first === '-m') {
     const mod = argv[1];
     const rest = argv.slice(2);
+    if (!mod) { err('Argument expected for the -m option'); process.exit(2); return; }
+    // The modules the shim has to intercept, each because it needs something a
+    // plain runpy passthrough cannot reach: the package store (pip, venv), the
+    // WSGI/ASGI bridge (uvicorn, flask, gunicorn), the exit-code seam (pytest),
+    // or a socket we do not have (http.server). Everything else is an ordinary
+    // module the interpreter can already import, and goes through runpy.
     if (mod === 'pip') { return doPip(rest); }
     if (mod === 'venv') { return doVenv(rest); }
     if (mod === 'uvicorn') { return doUvicorn(rest); }
     if (mod === 'flask') { return doFlask(rest); }
     if (mod === 'gunicorn') { return doGunicorn(rest); }
     if (mod === 'pytest') { return doPytest(rest); }
-    err('python -m ' + mod + ': running arbitrary modules is not supported in the Vivari shim yet (only "pip", "venv", "uvicorn", "flask", "gunicorn", "pytest").');
-    process.exit(1);
-    return;
+    if (mod === 'http.server') { return doHttpServer(rest); }
+    if (SOCKET_MODULES[mod]) {
+      err('python -m ' + mod + ': ' + SOCKET_MODULES[mod]);
+      err('There is no TCP socket in the browser. the Pyodide socket connects and binds without error and then carries no bytes, so this would look like it was working and never answer.');
+      process.exit(1);
+      return;
+    }
+    return doModule(mod, rest);
   }
 
   if (!first) {

@@ -6496,3 +6496,74 @@ the worker's shared `globalThis` but never touches `Worker`, so guest code calli
 Studio's origin instead of the VFS, and builds a worker with no kernel and no filesystem. Node
 has no global `Worker`, so no Node-tier spike can see it — the same blind spot that hid the
 Vite timer.
+## `python -m` stops being an allowlist, and served apps stop losing their files (this change)
+
+Two defects, both of which read to a user as "Python here is a toy".
+
+**`python -m` knew six modules.** Anything else got *"running arbitrary modules is not
+supported in the Vivari shim yet"* — a sentence that describes a `switch` statement, not an
+interpreter. The interpreter had `unittest` loaded the whole time. That is the worst shape a
+limitation can take: a dispatch gap wearing a capability gap's clothes, so the honest-sounding
+message is the lie. `runModule()` now hands the name to CPython's `runpy._run_module_as_main`,
+which means module resolution, the `sys.argv` contract and the failure text are CPython's
+rather than ours. `python -m unittest discover` runs the tests in a mirrored project and exits
+non-zero when they fail; `python -m json.tool`, `python -m calendar`, `python -m base64` work
+because nothing is stopping them any more.
+
+A module is intercepted only where runpy cannot reach what it needs — the package store
+(`pip`, `venv`), the WSGI/ASGI bridge (`uvicorn`, `flask`, `gunicorn`), the exit-code seam
+(`pytest`), a socket (`http.server`). Seven more are refused by name, and the reason is worth
+stating because the trap is not the obvious one: Pyodide **has** a `socket` module, and
+`connect()`, `bind()` and `listen()` on it all succeed. `smtplib` would print its banner, look
+like it had started, and wait forever. A refusal that says "this is an SMTP client, and sending
+mail needs a TCP socket" costs a user a minute; a hang costs an afternoon. The bridge spike
+proves the premise rather than asserting it — it connects to a real host, sends, and times out
+on the `recv`.
+
+Missing modules now get CPython's own error, which turned up a detail worth keeping: runpy
+formats failures as `"%s: %s" % (sys.executable, exc)`, and `sys.executable` in Pyodide is the
+host path of whatever booted the interpreter. `python -m nosuchthing` would have reported
+`/app/node_modules/…/kernel.mjs: No module named nosuchthing`, which is both wrong and a leak.
+Setting it to `python` at boot makes the message the one CPython prints, and both spikes hold
+it against the CPython on the machine running them.
+
+**`python -m http.server` runs the stdlib's own handler.** Writing a static server is an
+afternoon; getting its directory listings, MIME table, 301-on-missing-slash and `Range`
+handling to match CPython's is not, and every divergence is a bug report. `SimpleHTTPRequestHandler`
+only ever touches its socket through `makefile()` and `sendall()`, so it is given a `BytesIO`
+of the request and a `bytearray` to write into, and the guest-Node bridge that already serves
+Flask carries the bytes. What is shipped is CPython's server, not an impression of it.
+
+**A served app's writes went nowhere.** `serve()` mirrored the project in and never back, so a
+Flask app's uploads and its SQLite database died with the process — silently, which is the
+part that makes it a data-loss bug rather than a missing feature. Shutdown-only persistence
+would not have fixed it: closing the tab *is* how a preview normally ends. Writes land at the
+end of each request instead. That boundary is not a compromise, it is the only complete one —
+the handler has returned, and Pyodide has no threads, so nothing is mid-write. It is off the
+response path and free when a request wrote nothing. `mirrorBack()` still runs on close as a
+reconciling pass, so a tracking miss costs a delay rather than the data.
+
+Getting there meant replacing the change detector. The old walk skipped any file whose size
+matched the snapshot, which drops every same-size rewrite — a fixed-width record, a counter
+that did not change digits — and there is no mtime resolution that rescues it inside one
+millisecond. Emscripten's `FS.trackingDelegate` reports the writes instead, and the deletes
+matter as much as the writes: sqlite3 removes its journal on commit, so copying the journal
+out and never removing it leaves a hot journal beside a committed database and the next
+process rolls the committed work back. Mid-transaction is the case that looks alarming and is
+not — an open transaction has its journal on disk, so a copy taken then carries its own
+rollback and recovers. `.venv` is excluded in both directions, and the exclusion is re-checked
+against the tracker rather than only the walk, since the tracker reports paths the inbound walk
+never descended into: the package store owns that directory, and a second writer would copy
+every wheel out again and could leave a half-written store looking valid to the next boot.
+
+**The gate.** The offline tier is where this has to bite, since it is what runs per PR: the
+dispatch table, the argv contract, the refusal reasons scraped from the shipped table rather
+than copied, and the mirroring driven against a stand-in FS — including a served app whose
+file is asserted present on the host *while the server is still running*, which is the bug
+stated as a test. `-m` failures are held against the real CPython on the host, the way
+`lib/cpython-exit.mjs` already does. The bridge tier supplies what a stand-in cannot: real
+`unittest` discovery over a mirrored tree, the stdlib's real 404 and real listing, a real
+SQLite commit, and the tracking hooks firing in real Pyodide — that last one being what stops
+the offline mirror gate from being a test of a fiction. Every new assertion was mutation-tested,
+which is how the `Connection: close` header turned out to be defended by a comment claiming it
+prevented a hang it does not prevent; the header stays, the claim is now what is true.

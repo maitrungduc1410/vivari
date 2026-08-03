@@ -39,8 +39,10 @@ import { PYTHON_PROGRAM } from "../packages/kernel-host/programs/python.js";
 import { COREUTILS, PYTHON_DELEGATES } from "../packages/kernel-host/coreutils.js";
 import {
   PYODIDE_PYTHON_VERSION,
+  PYTHON_EXECUTABLE,
   URLLIB3_REALM_PATCH,
   byteWriter,
+  setExecutable,
   setupSource,
   terminationFromError,
 } from "../packages/runtime/builtins/python.js";
@@ -71,6 +73,7 @@ import { readShippedManifests, readShippedTemplates, readTemplatesSource } from 
 import { MODELLED_FRAGMENTS, STANDIN, normalize } from "./lib/urllib3-emscripten.mjs";
 import { CPYTHON_EXITS, UNTRUNCATED, realCPythonExit } from "./lib/cpython-exit.mjs";
 import { drivePython, driveShim, servedApp } from "./lib/python-drive.mjs";
+import { fsDirective, get, hostRead, mirrorRuntime, scratchPort } from "./lib/python-mirror-drive.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -115,10 +118,14 @@ console.log("== python CLI dispatch (PYTHON_PROGRAM run as a real process) ==");
   let r = run("--version");
   ok(r.code === 0 && /Python 3\.14/.test(r.out), "--version prints a version without booting Pyodide");
 
-  // The rule master codified: an unknown verb says not-implemented and names it.
+  // `-m` used to answer an unknown module with a Vivari refusal listing the six
+  // it knew. It now hands the name to runpy, so off Vivari (no runtime bound)
+  // the run stops at the stated reason for that instead — and, importantly, NOT
+  // at a claim about which modules exist. The passing case is checked against
+  // real CPython further down.
   r = run("-m", "nosuchmod");
-  ok(r.code === 1 && /nosuchmod/.test(r.err) && /not supported/.test(r.err), "python -m <unknown> is not-implemented and names the module");
-  ok(/"pip".*"venv".*"uvicorn".*"flask".*"gunicorn".*"pytest"/.test(r.err), "…and lists the modules that do work");
+  ok(!/not supported in the Vivari shim/.test(r.err), "python -m <unknown> no longer claims arbitrary modules are unsupported");
+  ok(/Pyodide runtime is unavailable/.test(r.err), "…it reaches the interpreter, and says so when there is not one");
 
   // Two different unknowns, kept apart. Checked in full further down, against
   // real pip, in the section on reaching these commands by the name users type.
@@ -882,7 +889,10 @@ console.log("\n== every entrypoint, reachable by the name a user types ==");
   // there has ever been — so this one is excused. Asked of the host rather than
   // asserted, because "no such binary exists" is a claim about the outside world.
   const onHost = (name) => spawnSync("sh", ["-c", "command -v " + name], { encoding: "utf8" }).status === 0;
-  const EXCUSED = { venv: "CPython ships no venv binary; python -m venv is the only spelling" };
+  const EXCUSED = {
+    venv: "CPython ships no venv binary; python -m venv is the only spelling",
+    "http.server": "a dotted module name is not a command; python -m http.server is the only spelling",
+  };
 
   for (const mod of dispatched) {
     const bare = Object.entries(PYTHON_DELEGATES).filter(([, m]) => m === mod).map(([n]) => n);
@@ -1162,6 +1172,269 @@ console.log("\n== the Python spikes are actually wired into CI ==");
   // and Wasm-free runs there on every push and PR.
   const unfiltered = ci.split("\n").some((l) => /run-spikes\.mjs --offline\s*$/.test(l.trim()));
   ok(unfiltered, "a CI job runs the offline spike tier unfiltered (that is what gates this file on every PR)");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== python -m: what the shim intercepts, and what it hands to runpy ==");
+// `-m` used to be an allowlist of six modules and a refusal for everything else,
+// which made a dispatch gap look like a capability gap: `python -m unittest`
+// reported that arbitrary modules "are not supported" for a runner sitting in
+// the stdlib the interpreter had already loaded. The six are still intercepted,
+// and each has a reason that runpy cannot supply. Everything else goes through.
+// ---------------------------------------------------------------------------
+{
+  // The interceptions, and what each one must reach instead of runpy.
+  const SEAMS = [
+    [["-m", "pip", "list"], "pipList", "the package store"],
+    [["-m", "venv", ".venv"], "venv", "the package store"],
+    [["-m", "uvicorn", "main:app"], "serve", "the ASGI bridge"],
+    [["-m", "flask", "run"], "serve", "the WSGI bridge"],
+    [["-m", "gunicorn", "wsgi:app"], "serve", "the WSGI bridge"],
+    [["-m", "pytest", "-q"], "runCode", "the exit-code seam"],
+    [["-m", "http.server"], "serveStatic", "a socket we do not have"],
+  ];
+  for (const [argv, verb, why] of SEAMS) {
+    const r = drivePython(argv);
+    const got = r.calls.length ? r.calls[0][0] : "(nothing)";
+    ok(got === verb, `python ${argv.join(" ")} -> ${verb}() — intercepted, because it needs ${why}`);
+  }
+
+  // …and everything else reaches runpy, with argv and cwd passed through.
+  for (const [argv, mod, rest] of [
+    [["-m", "unittest"], "unittest", []],
+    [["-m", "unittest", "discover", "-v"], "unittest", ["discover", "-v"]],
+    [["-m", "json.tool", "in.json", "out.json"], "json.tool", ["in.json", "out.json"]],
+    [["-m", "calendar", "2026", "8"], "calendar", ["2026", "8"]],
+    [["-m", "this"], "this", []],
+    // Not a real module. It still has to reach runpy: deciding here that a name
+    // does not exist is how the old allowlist got the error wrong.
+    [["-m", "nosuchthing"], "nosuchthing", []],
+  ]) {
+    const r = drivePython(argv);
+    const c = r.calls[0];
+    ok(
+      c && c[0] === "runModule" && c[1] === mod && JSON.stringify(c[2]) === JSON.stringify(rest) && c[3] === "/project",
+      `python ${argv.join(" ")} -> runModule(${JSON.stringify(mod)}, ${JSON.stringify(rest)}, cwd)`,
+    );
+  }
+
+  // The allowlist refusal is gone. A module name must never produce it again.
+  const gone = drivePython(["-m", "unittest"]);
+  ok(
+    !/not supported in the Vivari shim/.test(gone.out),
+    "…and no module gets the old \"arbitrary modules are not supported\" line",
+  );
+
+  // runModule builds the runpy call the interpreter will execute. The argv it
+  // hands over is CPython's: sys.argv[0] is the module, not the -m flag.
+  const built = drivePython(["-m", "unittest", "discover"]);
+  ok(built.calls[0][2].length === 1, "the module's own args are forwarded, and the module name is not one of them");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the -m failures, against real CPython on this host ==");
+// The oracle rule, same as lib/cpython-exit.mjs: once arbitrary modules run, a
+// Vivari-flavoured error for a missing one is a lie about what happened. These
+// messages are CPython's because they come OUT of CPython — runpy raises
+// SystemExit("%s: %s" % (sys.executable, exc)) and the shim's existing
+// SystemExit handling prints it. So what is checkable here is the shape, and
+// the shape is checked against the interpreter on this machine.
+// ---------------------------------------------------------------------------
+{
+  const real = (args) => {
+    const r = spawnSync("python3", args, { encoding: "utf8" });
+    return r.error ? null : { code: r.status, err: (r.stderr || "").trimEnd(), out: (r.stdout || "").trimEnd() };
+  };
+  const probe = real(["-c", "print(1)"]);
+  ok(probe && probe.code === 0, "a real CPython is on PATH to be the oracle for the messages below");
+
+  if (probe) {
+    // 1. A module that is not there.
+    const miss = real(["-m", "definitely_not_a_module"]);
+    ok(miss.code === 1, `real CPython exits 1 for a missing -m module (got ${miss.code})`);
+    ok(
+      /^\S+: No module named definitely_not_a_module$/.test(miss.err),
+      `…printing "<sys.executable>: No module named X" (got ${JSON.stringify(miss.err)})`,
+    );
+    // The shim produces that string by letting runpy produce it, so what the
+    // spike can pin here is that it does not produce a DIFFERENT one, and that
+    // the prefix it will carry is a name rather than a host path.
+    ok(
+      PYTHON_EXECUTABLE === "python" && !PYTHON_EXECUTABLE.includes("/"),
+      `sys.executable is set to ${JSON.stringify(PYTHON_EXECUTABLE)} — the prefix runpy puts on that message`,
+    );
+    ok(
+      /sys\.executable = /.test(String(setExecutable)),
+      "…and setExecutable() is what assigns it, at boot",
+    );
+
+    // 2. -m with no module at all. This one the shim answers itself, because
+    // there is no module name to hand runpy.
+    const bare = real(["-m"]);
+    const ours = drivePython(["-m"]);
+    ok(bare.code === 2 && ours.code === 2, `python -m with no argument exits 2, as CPython does (got ${ours.code})`);
+    ok(
+      ours.out.trim().split("\n")[0] === bare.err.split("\n")[0],
+      `…with CPython's first line verbatim: ${JSON.stringify(bare.err.split("\n")[0])}`,
+    );
+
+    // 3. The flags http.server really has, so a command copied from a tutorial
+    // parses the same way here. Read them off the real module rather than a
+    // list kept in this file.
+    const help = real(["-m", "http.server", "--help"]);
+    const flags = [...(help.out || "").matchAll(/(?:^|\s)(--[a-z-]+)/g)].map((m) => m[1]);
+    for (const f of ["--bind", "--directory", "--protocol", "--cgi"]) {
+      ok(flags.includes(f), `real http.server has ${f}, so the shim has to answer for it`);
+    }
+    for (const [argv, expect] of [
+      [["-m", "http.server"], { port: 8000, directory: null }],
+      [["-m", "http.server", "8080"], { port: 8080, directory: null }],
+      [["-m", "http.server", "-d", "public"], { port: 8000, directory: "public" }],
+      [["-m", "http.server", "--directory=public", "9000"], { port: 9000, directory: "public" }],
+    ]) {
+      const c = drivePython(argv).calls[0];
+      ok(
+        c && c[0] === "serveStatic" && c[1].port === expect.port && c[1].directory === expect.directory,
+        `python ${argv.join(" ")} -> port ${expect.port}, directory ${JSON.stringify(expect.directory)}`,
+      );
+    }
+    // A flag that changes what the server DOES cannot be quietly dropped.
+    const cgi = drivePython(["-m", "http.server", "--cgi"]);
+    ok(cgi.code === 1 && /needs a subprocess/.test(cgi.out), "--cgi is refused with the reason, not ignored (it would serve source instead of running it)");
+    const tls = drivePython(["-m", "http.server", "--tls-cert", "x.pem"]);
+    ok(tls.code === 1 && /ssl module is a stub/.test(tls.out), "--tls-cert is refused with the reason");
+    // …and one that does not change the answer is ignored OUT LOUD.
+    const bind = drivePython(["-m", "http.server", "-b", "0.0.0.0", "8080"]);
+    ok(bind.calls[0][1].port === 8080 && /-b is ignored here/.test(bind.out), "-b is ignored out loud, and does not eat the port");
+    // Bad input gets CPython's exit code for a usage error.
+    ok(drivePython(["-m", "http.server", "nope"]).code === 2, "an unparseable port exits 2");
+    ok(drivePython(["-m", "http.server", "--bogus"]).code === 2, "an unknown flag exits 2 rather than being swallowed");
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the modules that cannot work here say why ==");
+// Pyodide has a socket module, and that is the problem rather than the relief:
+// connect(), bind() and listen() all succeed and then no bytes move (proven in
+// the bridge spike). A module whose whole job is a socket would therefore print
+// its banner and hang. The shim-honesty rule says name the reason.
+// ---------------------------------------------------------------------------
+{
+  // Read the shipped list out of PYTHON_PROGRAM: a copy here would let the two
+  // drift, and the drift would read as a passing test.
+  const block = /const SOCKET_MODULES = \{([\s\S]*?)\n\};/.exec(PYTHON_PROGRAM);
+  ok(!!block, "the refusal table is where this check expects to read it");
+  const REFUSALS = [...block[1].matchAll(/^\s*'?([\w.]+)'?:\s*'((?:[^'\\]|\\.)*)'/gm)]
+    .map((m) => [m[1], m[2].replace(/\\'/g, "'")]);
+  const SOCKET_MODULES = REFUSALS.map(([m]) => m);
+  ok(SOCKET_MODULES.length >= 5, `${SOCKET_MODULES.length} socket-bound modules are refused by name`);
+
+  for (const [mod, reason] of REFUSALS) {
+    const r = drivePython(["-m", mod]);
+    ok(r.code === 1, `python -m ${mod} fails rather than hanging`);
+    // The module's OWN reason, not just the shared note underneath it. "not
+    // supported" next to a paragraph about sockets still leaves the reader
+    // guessing which of the two applies to the command they typed.
+    ok(r.out.includes(mod) && r.out.includes(reason), `…with its own reason: ${reason.slice(0, 52)}…`);
+    ok(!r.calls.length, `…and never reaches the interpreter`);
+  }
+  // The refusal has to explain the trap, not just assert it: a reader who knows
+  // Pyodide has `socket` needs to be told it is the connecting that is fake.
+  const r = drivePython(["-m", "smtplib"]);
+  ok(
+    /connects and binds without error and then carries no bytes/.test(r.out),
+    "…and explains that the socket is the lie, not the absence of one",
+  );
+  // Nothing in the refusal list may also be a seam: it would be unreachable.
+  const seams = ["pip", "venv", "uvicorn", "flask", "gunicorn", "pytest", "http.server"];
+  ok(!seams.some((s) => SOCKET_MODULES.includes(s)), "no module is both intercepted and refused");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== what a program writes still exists afterwards ==");
+// The mirroring is plain JavaScript over an FS-shaped object, so it can be
+// gated here rather than only where a real interpreter boots. The stand-in
+// interpreter supplies Emscripten's tracking hooks; spike-python-bridge holds
+// REAL Pyodide to firing them, which is what stops this being a test of a
+// fiction. See scripts/lib/python-mirror-drive.mjs.
+// ---------------------------------------------------------------------------
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-py-mirror-"));
+  fs.writeFileSync(path.join(dir, "data.txt"), "aaaa");
+  fs.writeFileSync(path.join(dir, "app.db"), "sqlite-ish");
+  fs.writeFileSync(path.join(dir, "app.db-journal"), "hot");
+  fs.mkdirSync(path.join(dir, ".venv/lib/python3.14/site-packages"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".venv/marker"), "store");
+
+  const { api } = mirrorRuntime(dir);
+  const rc = await api.runCode(
+    fsDirective({
+      // Same LENGTH as what is there. This is the case the old size heuristic
+      // dropped, and it is not exotic: it is every fixed-width record, every
+      // status flag, every counter that has not changed digits.
+      write: { [path.join(dir, "data.txt")]: "bbbb", [path.join(dir, "made.txt")]: "new" },
+      // sqlite3 removes its journal on commit. Copying the journal out and
+      // never removing it leaves a hot journal beside a committed database,
+      // and the next process to open it rolls back committed work.
+      delete: [path.join(dir, "app.db-journal")],
+    }),
+    [],
+  );
+  ok(rc === 0, "the script path runs and mirrors back");
+  ok(hostRead(path.join(dir, "data.txt")) === "bbbb", "a same-size rewrite reaches the host (a size diff alone loses this)");
+  ok(hostRead(path.join(dir, "made.txt")) === "new", "…so does a newly created file");
+  ok(hostRead(path.join(dir, "app.db-journal")) === null, "…and a deleted sqlite journal is deleted on the host, not left behind");
+
+  // The store and the mirror must not both own .venv. persistDelta() is the
+  // only thing allowed to write there — it puts an install's delta at the
+  // interpreter's site-packages path. If the mirror wrote there too, a project
+  // with packages would copy every wheel out a second time on every run, and a
+  // half-written store would look to the next boot like a real one. So the
+  // interpreter writing into .venv has to be dropped on the way out, and the
+  // tracker makes that a live question: it reports the path whether or not the
+  // inbound walk ever descended into the directory.
+  const injected = path.join(dir, ".venv/lib/python3.14/site-packages/injected.py");
+  await api.runCode(fsDirective({ write: { [injected]: "print('from the interpreter')" } }), []);
+  ok(hostRead(injected) === null, "a write INTO .venv is dropped rather than mirrored — the package store owns that directory");
+  ok(hostRead(path.join(dir, ".venv/marker")) === "store", "…and the store's own files are untouched");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== a served app's writes land while it is still serving ==");
+// The defect: serve() mirrored IN and never back, so a Flask app that took an
+// upload or wrote a SQLite row lost it when the server stopped, and the editor
+// could not see it before then. Waiting for shutdown is not a fix — people
+// close tabs. Writes land at the end of each request.
+// ---------------------------------------------------------------------------
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-py-serve-"));
+  const port = scratchPort(1);
+  const { api } = mirrorRuntime(dir);
+  const closed = api.serve({ app: "main:app", mode: "wsgi", port, cwd: dir });
+  closed.catch(() => {});
+  for (let i = 0; i < 100 && !fs.existsSync(path.join(dir, ".fake-pyodide")); i++) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  await new Promise((r) => setTimeout(r, 200));
+
+  const first = await get(port, "/write/upload.txt/from-a-request");
+  ok(first.status === 200, "the served app answers");
+  ok(
+    hostRead(path.join(dir, "upload.txt")) === "from-a-request",
+    "a file written by a request is on the host WHILE THE SERVER IS STILL RUNNING (this is the bug)",
+  );
+  await get(port, "/write/upload.txt/second-write");
+  ok(hostRead(path.join(dir, "upload.txt")) === "second-write", "…and a later request's overwrite lands too, at the same length");
+
+  const boom = await get(port, "/boom/half.txt");
+  ok(boom.status === 500, "an app that raises still returns 500");
+  ok(
+    hostRead(path.join(dir, "half.txt")) === "half",
+    "…and what it wrote before raising is persisted, rather than lost with the exception",
+  );
+
+  await get(port, "/delete/upload.txt");
+  ok(hostRead(path.join(dir, "upload.txt")) === null, "a file the app deletes is deleted on the host");
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Python checks passed");
