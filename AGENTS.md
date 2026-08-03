@@ -1041,6 +1041,16 @@ map. Rules that bite if ignored:
   legacy DEMOS still use the fixed-port `demoForPort` path; keep them separate.
 - **Templates live in `src/vv/templates.ts`** (manifest + full source, inline) — not a
   scaffolder run in-VM. Creation writes them in ONE `writeFilesBatch` via `vv-create-project`.
+- **A backslash inside a template's source belongs to the OUTER literal first.** Template
+  source lives in template literals, so `/^https?:\/\//i` reaches the generated project as
+  `/^https?:///i` — the `//` opens a comment, the statement never closes, and the app dies at
+  boot with a `SyntaxError` pointing at the *next* line. Prefer string methods
+  (`startsWith`) over regex literals in template source; if a regex is unavoidable, double
+  the backslashes and check the emitted bytes, not the source you typed. `spike-template-syntax.mjs`
+  runs `node --check` over every shipped template on every push and catches exactly this —
+  it was written after the S3 template shipped the bug above with a green network-tier spike.
+  If a template's source outgrows a literal, move it to a sibling `.js` module the way
+  `s3-app-source.js` does, so the gate and the template read the same bytes.
 
 ### Full-text search runs in the kernel worker — keep it non-blocking
 The VFS is synchronous ONLY inside the kernel worker (the sole VFS holder), so full-text

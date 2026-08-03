@@ -6374,3 +6374,44 @@ honest: install into A, restore into B, and an unrestored C that still has nothi
 rewritten to an older Python that copies in zero files; a real install refused by a
 deliberately 1 KB cap with the store byte-for-byte unchanged afterwards; and `pip freeze`
 checked against the store's own directory listing as the oracle rather than against itself.
+## 59 template files, and nothing checked that any of them parsed (this change)
+
+The S3 template shipped a `SyntaxError`. Not a subtle one — the app died on boot, on the
+first line the user would ever run, with `Unexpected token 'const'` pointing at a statement
+that was perfectly fine. Its own spike was green the whole time.
+
+The bug is a property of *how* templates are stored rather than of anything in the template.
+Template source lives inside template literals in `templates.ts`, and a backslash there
+belongs to the outer literal first. `/^https?:\/\//i` is a correct regex in the file you are
+reading and arrives in the generated project as `/^https?:///i`, where `//` opens a comment,
+the `if` never closes its paren, and the error surfaces two lines later. Nothing warns: the
+TypeScript compiles, the file is valid, and the damage happens at string-interpolation time.
+
+*The gate that existed was in the tier that gates nothing.* `spike-s3.mjs` drives the real app
+against an in-VM S3 with byte-exact SigV4 — a genuinely strong proof — and it lives in
+`spikes-net`, which is schedule-only and `continue-on-error: true`. Strength of a check and
+whether the check can block a merge are unrelated properties, and it is easy to buy the first
+and assume the second. Meanwhile 75 templates carried 59 JavaScript files and 98 JSON files,
+and no job anywhere asked whether they parsed.
+
+`spike-template-syntax.mjs` asks only that. It writes each template to a temp dir — whole,
+including its `package.json`, so `node --check` resolves the module goal the same way the
+guest will, ESM or CJS by `"type"` and extension rather than by guess — and checks every
+`.js`/`.mjs`/`.cjs` file, `JSON.parse`s every `.json`, and verifies each manifest's `entry`
+is a file the template actually ships. No kernel, no Wasm, no network, about a second for
+all 75, so it sits in the unfiltered offline tier and runs on every push. It is deliberately
+not a linter or a type-checker: it answers the cheapest question, the one that is most
+embarrassing to get wrong.
+
+*Both directions were verified, not assumed.* Re-introducing the original regex turns the gate
+red with the exact production error (`s3 src/server.js — SyntaxError: Unexpected token
+'const'`); pointing a manifest at a file that does not exist turns it red too; the tree as
+shipped is 75/75 green. TypeScript and JSX are explicitly out of scope, and the code says so
+where a future reader would otherwise "fix" it — `node --check` does not strip types, so it
+rejects every valid `.ts` file, and checking those needs a real parser and a heavier gate.
+
+The spike also asserts its own registration with `net: false`. That guard is not paranoia:
+this repo has now shipped three separate checks that ran in no job at all — a `needsWasm`
+offline spike skipped in the only job that selected it, `probe:node-registry` written and
+never wired, and the PM gate building one crate of the three it needed. A gate that can fall
+out of the pipeline silently is a gate that eventually will.

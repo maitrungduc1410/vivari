@@ -96,6 +96,11 @@ const SPIKES = [
   // `net` (see "python" below) — everything provable without it lives here so
   // that Python, like Bun, is gated on every PR rather than nightly.
   { name: "python-offline", file: "spike-python-offline.mjs", net: false, timeout: 60000 },
+  // Every shipped template's JavaScript parses. Templates are source stored in
+  // template literals, where a backslash belongs to the OUTER literal first — a
+  // regex can arrive in the generated project as a comment. No kernel, no Wasm,
+  // no network: `node --check` per file, so it runs on every push.
+  { name: "template-syntax", file: "spike-template-syntax.mjs", net: false, timeout: 120000 },
   // Signal delivery: the real Kernel, real Workers, a real SharedArrayBuffer and a
   // real Atomics.wait park — so it proves the mid-syscall path (the one a
   // postMessage cannot reach) as well as the default action, the grace window and
