@@ -6667,3 +6667,48 @@ the principle in both directions — `application/wasm` whose magic bytes happen
 utf8 crosses as text and skips base64, while the same body with one high byte in it does not.
 Reverting each fix separately turns exactly the expected cases red: the BOM pair for one, and
 seven latin-1/invalid-utf8 cases for the other.
+
+## `new Worker()`: closing a leak, not filling a gap (this change)
+
+The previous entry ended by naming `new Worker()` as the next thing to look at and predicting
+what was wrong with it. That prediction was checked before anything was built, by planting a
+sentinel constructor on the process worker's `globalThis` ahead of boot and having guest code
+call `new Worker("./w.ts")`: the guest got the sentinel, holding the raw specifier. So the
+starting position was confirmed — guest code was reaching the HOST's constructor, which in a
+browser resolves against the Studio's origin over HTTP rather than against the VFS. Not a
+missing feature; a wrong one.
+
+**The fix has two halves, and they disagree on purpose.** The runtime now deletes the inherited
+`Worker` before running the entry, so a `node` guest sees `undefined` exactly as real Node does.
+The `bun` launcher then installs Bun's own, because Bun *does* define one. It sits on
+node:worker_threads, which was already real here, and each worker boots `/bin/bun.js run <entry>`
+rather than the file directly — one indirection that buys the Bun global, Bun's script semantics
+and zero-config TypeScript inside the thread without a second implementation to keep in step.
+
+**A message listener is what keeps a worker alive.** Both Bun and Node document it, and the
+first version of the worker-side globals attached one eagerly at install so that `onmessage`
+would work. Every worker was therefore immortal, and so was every parent waiting on one: a
+one-line worker that only printed hung the process. The listener is now wired on first use of
+`onmessage` or `addEventListener("message")`. Nothing in the API surface hints at this, which is
+why the laziness carries a comment rather than looking like an optimisation.
+
+**Two things that could not be honoured, refused differently.** `preload` throws: the launcher
+has no `--preload`, and faking it with a generated wrapper would make the wrapper the entry
+module, so `import.meta.main` would be wrong inside the worker — a wrong answer about which file
+is running is worse than no answer, and the workaround is one import line. `smol` is ignored: it
+sets a JavaScriptCore heap size and nothing observable depends on it. The rule is the same one
+`Bun.build` follows for `minify` — refuse what changes behaviour, ignore what cannot.
+
+**A gap found on the way, and left open deliberately.** Bun emits `error` on the Worker when the
+worker's own code throws. A relay for that was written first — post the crash over the channel
+from a `process.on('uncaughtException')` handler — and it never fired. Measuring rather than
+assuming showed why: the guest's `uncaughtException` is never dispatched at all in this runtime,
+for any program (an async throw does not even set a non-zero exit code). That is a real defect
+worth its own change; it is not this one. The dead relay was removed rather than left looking
+load-bearing, and a worker that throws arrives as `close` with a non-zero code, which the docs
+now say.
+
+**A flaky assertion from the previous change — fixed on master, not here.** This branch also caught the CSRF spike's tamper check failing about a quarter of the time: it flipped the token's LAST base64url character, whose low bits are surplus in an 86-character token, so the "tampered" value was often byte-identical and verified correctly. A fix landed independently on master (`fe6b042`) while this was open, and it is the better one — it decodes, flips a byte, and then asserts the tamper reached the bytes the MAC covers, so the check can no longer pass for the wrong reason. This branch defers to it; the lesson is in AGENTS.md.
+
+**Still uncovered:** `HTMLRewriter`, `Bun.markdown`, `Bun.Image`, the `Bun.SQL` SQLite adapter,
+real zstd/brotli engines, and — newly — the guest's `uncaughtException`, which nothing dispatches.

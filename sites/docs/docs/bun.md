@@ -105,7 +105,7 @@ The shim is not a stub list. `Bun.serve` (with `routes`, `fetch`, an `error`
 handler and server-side WebSockets), `Bun.file`/`Bun.write` and the incremental
 `FileSink`, `Bun.$`, `Bun.spawn`, `Bun.Glob`, `Bun.FileSystemRouter`,
 `Bun.CryptoHasher` and `Bun.password`, `Bun.hash`, `Bun.sha`, `Bun.CSRF`,
-`Bun.YAML`/`TOML`/`JSON5`,
+`Bun.YAML`/`TOML`/`JSON5`, `new Worker()` on real threads,
 `Bun.build` and `Bun.plugin` (see below), `Bun.Transpiler`, zero-config TypeScript, automatic
 `.env` loading with Bun's precedence rules, and
 the `bun:test` runner all behave as documented — and where they diverge, the
@@ -170,7 +170,59 @@ project, so none is marked experimental:
 | SQLite | `bun:sqlite` — a CRUD API over a real database file that survives a reload |
 | shell | `Bun.$` — pipes, redirects, exit codes, per-command `env` and `cwd` |
 | bundler | `Bun.build` — a multi-module bundle, a plugin, `define`, `external` |
-| API tour | hashing, `Bun.password`, YAML/TOML, `Glob`, `semver`, `stringWidth`, `Bun.Transpiler` |
+| API tour | hashing, `Bun.password`, YAML/TOML, `Glob`, `semver`, `stringWidth`, `Bun.Transpiler`, and a `Worker` on a second thread |
+
+### Workers are real threads
+
+`new Worker("./worker.ts")` runs on an actual thread, not a simulated one: a
+second JavaScript realm with its own event loop, its own `Bun` global, and
+zero-config TypeScript, talking over a structured-clone message channel. The
+worker-side surface is Bun's — `self`, `postMessage`, `onmessage`,
+`addEventListener` — and `Bun.isMainThread` tells the two sides apart.
+
+```ts
+const worker = new Worker("./hash.worker.ts");
+worker.postMessage({ n: 21 });          // queued if the worker is not up yet
+worker.onmessage = event => console.log(event.data);
+worker.addEventListener("close", event => console.log("exit", event.code));
+await worker.terminate();
+```
+
+The specifier resolves against **your project**, which is the whole point of the
+distinction below. `postMessage`, `terminate()`, `ref()`/`unref()`, `threadId`,
+the `open` / `message` / `error` / `close` events and the `env`, `argv` and `ref`
+options all behave as documented, and messages sent before the worker is ready
+are queued rather than dropped.
+
+Three differences are worth knowing:
+
+- **A worker that throws reaches you as `close` with a non-zero code, not as an
+  `error` event.** Bun gives you the `Error` itself; the thread plumbing here
+  carries only start and exit, so the stack prints to the terminal and the code
+  comes back through `close`. `error` *does* fire when the script fails to
+  resolve. If a crash must not pass silently, listen for both.
+- **`blob:` URLs and `preload` are refused, by name.** A worker here is started
+  by the kernel from a file, and the constructor is synchronous, so a `blob:`
+  URL's bytes have nowhere to land on the way past; `preload` would require
+  booting a generated wrapper, which would then claim to be the entry module and
+  make `import.meta.main` lie. Import the module at the top of the worker file
+  instead.
+- **`smol` is accepted and ignored.** It sets a JavaScriptCore heap size, and
+  nothing a program can observe depends on it — unlike `preload`, ignoring it
+  changes no behaviour, so it does not throw.
+
+A worker's `console.log` goes to the terminal, like any other process output, not
+into the parent's captured stdout.
+
+#### If you are used to the browser's `Worker`
+
+They are not the same constructor, and the difference is deliberate. Inside
+Vivari, the page's own `Worker` used to be visible to your code, which meant
+`new Worker("./worker.ts")` resolved that path against the *studio's* origin and
+fetched it over HTTP — producing a worker with no filesystem, no kernel and no
+relation to your project, or a 404. Guest code now gets a `Worker` that resolves
+against the VM's filesystem. Under `node` there is no global `Worker` at all,
+exactly as in real Node; use `node:worker_threads` there.
 
 ### Scripting with `Bun.$`
 

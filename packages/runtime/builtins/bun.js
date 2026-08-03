@@ -259,6 +259,7 @@ import { loadBunEnvFiles } from "./bun-env.js";
 import { Cookie, CookieMap, attachRequestCookies, pendingSetCookies } from "./bun-cookie.js";
 import { createBunFile } from "./bun-file.js";
 import { createBunCrypto } from "./bun-crypto.js";
+import { createBunWorker } from "./bun-worker.js";
 import { createBunSqlite, createVivariSqliteHost } from "./bun-sqlite.js";
 import { createBunTest } from "./bun-test.js";
 import {
@@ -1178,6 +1179,11 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
   // covers Bun's whole documented algorithm family with HMAC keying and Bun's
   // consumed-HMAC semantics, and the password functions are genuine argon2id and
   // bcrypt emitting PHC / modular-crypt strings that round-trip with real Bun.
+  // Bun's web-flavoured Worker, over the real node:worker_threads (./bun-worker.js).
+  // `installWorkerGlobals` is the worker SIDE (self/postMessage/onmessage); index.js
+  // calls it only in a thread.
+  const worker = createBunWorker({ lazy, process });
+
   // Bun.sha (SHA-2 512/256, not SHA-512) and Bun.CSRF ride the same primitives.
   const { CryptoHasher, password, sha, CSRF } = createBunCrypto({ lazy, Buffer, process });
 
@@ -1247,6 +1253,12 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     sleep,
     sleepSync,
     nanoseconds,
+    // Bun.isMainThread — a getter so that owning a Bun global does not, by itself,
+    // load worker_threads (and with it the thread host) in a process that never
+    // spawns one.
+    get isMainThread() {
+      try { return lazy("worker_threads").isMainThread !== false; } catch { return true; }
+    },
     hash: bunHash,
     CryptoHasher,
     sha,
@@ -1403,7 +1415,7 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     return dotenvLoaded;
   }
 
-  return { Bun, modules, loadDotenv };
+  return { Bun, modules, loadDotenv, Worker: worker.Worker, installWorkerGlobals: worker.installWorkerGlobals };
 }
 
 // ---- bun:test ---------------------------------------------------------------

@@ -1464,6 +1464,12 @@ export function createRuntime({
   // `bun test` needs (it chooses the `test` set before NODE_ENV is defaulted).
   globalThis.__ocInstallBun = (options) => {
     globalThis.Bun = bunRuntime.Bun;
+    // Bun puts `Worker` on the global; Node does not. This assignment also
+    // OVERWRITES the host page's nested-Worker constructor, which is the actual
+    // bug being fixed here — see builtins/bun-worker.js. In a thread, the worker
+    // side of the API (self / postMessage / onmessage) goes on too.
+    globalThis.Worker = bunRuntime.Worker;
+    bunRuntime.installWorkerGlobals(globalThis);
     if (options && options.dotenv) bunRuntime.loadDotenv(options.mode);
     return bunRuntime.Bun;
   };
@@ -1643,6 +1649,21 @@ export function createRuntime({
       // was written for — is armed from an async connect AFTER the entry starts, so
       // it slips past this entirely; loop.js unrefs that one by its creation frame.
       loop.disownExistingHandles();
+
+      // The host's own globals are visible to the guest — this worker's global
+      // object is shared with whatever the page loaded into it. `fetch` and
+      // `WebSocket` are replaced above; `Worker` never was, so a browser's
+      // nested-Worker constructor reached guest code and resolved specifiers
+      // against the STUDIO's origin instead of the VFS. Real Node has no global
+      // `Worker`, so undefined is the faithful value for a node guest, and
+      // `new Worker(...)` now fails exactly as it would outside the sandbox. The
+      // `bun` launcher installs Bun's own Worker over the top of this
+      // (__ocInstallBun), because Bun does define one.
+      try {
+        delete globalThis.Worker;
+      } catch {
+        globalThis.Worker = undefined;
+      }
       let started;
       try {
         // Runs the entry's synchronous body now (may throw the process.exit

@@ -119,6 +119,15 @@ const EXPECT = {
       "Glob.scan walked the actual filesystem": /scan\('\.'\) :.*tour\.ts/,
       "stringWidth counts columns, not code units": /width of '日本語'  : 6/,
       "the transpiler reported the import graph": /"path":"node:fs\/promises"/,
+      // Section 10. All three jobs must come back, each from the SAME real thread,
+      // and the thread id must not be the main thread's 0 — a Worker that silently
+      // ran on the main thread would still print three lines.
+      "all three jobs came back from a worker thread": (t) => {
+        const threads = [...t.matchAll(/job \d -> [0-9a-f]{16} \(thread (\d+)\)/g)].map((m) => m[1]);
+        return threads.length === 3 && new Set(threads).size === 1 && threads[0] !== "0";
+      },
+      "the tour itself stayed on the main thread": /this thread is the main one: true/,
+      "terminate() closed the worker cleanly": /worker closed with code: 0/,
     },
   },
   "bun-test": {

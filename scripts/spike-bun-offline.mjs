@@ -5167,7 +5167,7 @@ console.log("== the type stripper and module clauses ==");
 // ---------------------------------------------------------------------------
 {
   console.log("\n== Bun.sha is SHA-2 512/256 ==");
-  const { Bun } = createBunRuntime({
+  const { Bun, Worker: BunWorker } = createBunRuntime({
     process: { env: {}, argv: ["bun", "/app/x.ts"], cwd: () => "/app" },
     Buffer,
     require: nodeRequire,
@@ -5254,6 +5254,34 @@ console.log("== the type stripper and module clauses ==");
     try { Bun.CSRF.generate("s", { algorithm: "md5" }); } catch (e) { g = e.message; }
     try { Bun.CSRF.verify(token, { algorithm: "md5" }); } catch (e) { v = e.message; }
     ok(/algorithm must be one of/.test(g) && /algorithm must be one of/.test(v), "an unsupported algorithm throws on generate and verify");
+  }
+
+  console.log("\n== Worker: what can be judged without a thread host ==");
+  // The Worker itself needs a kernel, so the round trip lives in the kernel tier.
+  // What belongs HERE is the part that is decided before any thread is spawned:
+  // which specifiers are refused, and with which of the two vocabularies.
+  {
+    ok(typeof Bun.isMainThread === "boolean", "Bun.isMainThread is a boolean");
+    ok(Bun.isMainThread === true, "…and true on the main thread");
+    const refuse = (spec) => {
+      try { new BunWorker(spec); return "no throw"; } catch (e) { return e.message; }
+    };
+    const blob = refuse("blob:0f8b");
+    ok(/is not implemented in the Vivari shim/.test(blob), "blob: uses the not-YET wording: materialising the bytes to a temp file would close it");
+    // Guards the REASON, not just the refusal. The first version of this message
+    // blamed a missing URL.createObjectURL; guest code turns out to have one, so
+    // the message named a cause that was not true.
+    ok(/started by the kernel from a file/.test(blob), "…and gives the real reason: a worker is spawned from a file");
+    const http = refuse("https://example.com/w.js");
+    ok(/is not supported in Vivari \(browser sandbox\)/.test(http), "an http: URL uses the CANNOT-EVER wording: a worker here runs a file, not a URL");
+    // `smol` and `preload` are the two options that cannot be honoured. They are
+    // treated differently ON PURPOSE: smol is a JSC heap-size hint with no
+    // observable semantics, so ignoring it changes nothing a program can detect,
+    // while preload changes WHICH CODE RUNS and so must not be quietly dropped.
+    let pre = "";
+    try { new BunWorker("./w.ts", { preload: "./x.js" }); } catch (e) { pre = e.message; }
+    ok(/preload.*is not implemented in the Vivari shim/.test(pre), "preload is refused rather than dropped: " + JSON.stringify(pre.slice(0, 48)));
+    ok(/import the module at the top/i.test(pre), "…and the refusal names the one-line workaround");
   }
 
   console.log("\n== Bun.dns: one refusal, two honest no-ops ==");

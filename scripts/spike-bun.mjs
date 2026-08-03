@@ -1806,5 +1806,107 @@ console.log("\n== bun run crypto-surface.ts (sha, CSRF, dns, zstd) ==");
   ok(got && got.gzipStillWorks === "hi", "…while gzip round-trips, so the codec itself is fine");
 }
 
+// ---------------------------------------------------------------------------
+// Bun's Worker. Kernel tier only, and necessarily so: this needs a real thread
+// host, and — more to the point — the bug it was written for is invisible
+// without one. Guest code was getting the HOST's Worker constructor, which in a
+// browser resolves the specifier against the Studio's origin instead of the VFS.
+// The Node tier cannot see that, because Node has no global Worker for anything
+// to leak; only a check on what the GUEST sees catches it.
+// ---------------------------------------------------------------------------
+console.log("\n== new Worker(): threads, messages and lifetimes ==");
+{
+  write("echo.worker.ts", [
+    // TypeScript, `self`, and a bare `postMessage` — the shape Bun's own docs use.
+    "declare var self: any;",
+    "self.onmessage = (event: MessageEvent) => {",
+    "  const n = (event.data as { n: number }).n;",
+    "  postMessage({ doubled: n * 2, inWorker: Bun.isMainThread === false });",
+    "};",
+  ].join("\n"));
+  write("quick.worker.ts", "postMessage('bye');\n");
+  write("exit3.worker.ts", "process.exit(3);\n");
+  write("boom.worker.ts", "throw new Error('worker blew up');\n");
+
+  write("worker-surface.ts", [
+    "const closeCode = (spec: string) => new Promise((resolve) => {",
+    "  const wk = new Worker(spec);",
+    "  wk.addEventListener('close', (e: any) => resolve(e.code));",
+    "});",
+    "const events: string[] = [];",
+    "const worker = new Worker('./echo.worker.ts');",
+    "worker.addEventListener('open', () => events.push('open'));",
+    "worker.addEventListener('close', () => events.push('close'));",
+    // Posted before 'open'. Bun promises these are queued, not dropped.
+    "worker.postMessage({ n: 21 });",
+    "const reply: any = await new Promise((r) => { worker.onmessage = (e: any) => r(e.data); });",
+    "const threadId = worker.threadId;",
+    "await worker.terminate();",
+    "await new Promise((r) => setTimeout(r, 200));",
+    // The file: URL form, straight out of Bun's documentation.
+    "const viaUrl = new Worker(new URL('echo.worker.ts', 'file://' + import.meta.dir + '/').href);",
+    "viaUrl.postMessage({ n: 5 });",
+    "const urlReply: any = await new Promise((r) => { viaUrl.onmessage = (e: any) => r(e.data); });",
+    "const terminated = await new Promise((r) => { viaUrl.addEventListener('close', (e: any) => r(e.code)); viaUrl.terminate(); });",
+    "const missing: any = await new Promise((r) => { const bad = new Worker('./nope.ts'); bad.addEventListener('error', r); });",
+    "const refuse = (spec: string) => { try { new Worker(spec); return 'no throw'; } catch (e: any) { return e.message; } };",
+    "const out = {",
+    "  doubled: reply.doubled,",
+    "  inWorker: reply.inWorker,",
+    "  mainIsMain: Bun.isMainThread,",
+    "  threadId: threadId > 0,",
+    "  events: events.join(','),",
+    "  urlForm: urlReply.doubled,",
+    "  terminated,",
+    "  natural: await closeCode('./quick.worker.ts'),",
+    "  exited: await closeCode('./exit3.worker.ts'),",
+    "  threw: await closeCode('./boom.worker.ts'),",
+    "  missing: missing.message,",
+    "  blob: refuse('blob:whatever'),",
+    "  http: refuse('https://example.com/w.js'),",
+    "};",
+    'console.log("WORKER:" + JSON.stringify(out));',
+  ].join("\n"));
+
+  const r = await kernel.start("bun", ["run", "worker-surface.ts"], { cwd: APP, env: ENV, capture: true });
+  const m = /WORKER:(\{.*\})/.exec(r.stdout || "");
+  const got = m ? JSON.parse(m[1]) : null;
+  if (!got) console.log("  stderr:", (r.stderr || "").split("\n").slice(0, 4).join(" | "));
+  ok(r.code === 0 && !!got, "the worker-surface script runs to completion");
+  // The whole point: a real thread ran a TypeScript file FROM THE VFS. If the
+  // host constructor were still in play there would be no reply at all.
+  ok(got && got.doubled === 42, "a worker receives a message and replies");
+  ok(got && got.inWorker === true && got.mainIsMain === true, "Bun.isMainThread is false inside the worker and true outside");
+  ok(got && got.threadId === true, "the worker reports a real threadId");
+  ok(got && got.events === "open,close", "'open' then 'close' both fire, in that order");
+  // Asserting the REPLY, not merely that nothing threw: a dropped pre-open
+  // message would leave the promise pending and time out instead of failing here.
+  ok(got && got.urlForm === 10, "the new URL(…, import.meta.url) form resolves against the VFS");
+  ok(got && got.natural === 0, "a worker that just finishes closes with 0");
+  ok(got && got.exited === 3, "process.exit(3) inside a worker arrives as close code 3");
+  ok(got && got.threw === 1, "a worker that throws arrives as close code 1 (Bun would also emit 'error'; see bun-worker.js)");
+  ok(got && got.terminated === 0, "terminate() reports 0, not the kernel's SIGTERM code");
+  ok(got && /Worker script not found/.test(got.missing), "a script that fails to resolve emits 'error' rather than hanging");
+  ok(got && /not implemented in the Vivari shim/.test(got.blob), "a blob: URL is refused by name: " + JSON.stringify((got && got.blob || "").slice(0, 60)));
+  ok(got && /not supported in Vivari/.test(got.http), "an http: URL is refused as impossible, not merely missing");
+
+  // unref() must actually release the parent: a ref'd worker with a live message
+  // listener would hang this process, and the spike would time out rather than fail.
+  write("unref.ts", [
+    "const w = new Worker('./echo.worker.ts');",
+    "w.unref();",
+    'console.log("UNREF:done");',
+  ].join("\n"));
+  const u = await kernel.start("bun", ["run", "unref.ts"], { cwd: APP, env: ENV, capture: true });
+  ok(u.code === 0 && /UNREF:done/.test(u.stdout || ""), "unref() lets the parent exit while a worker is still listening");
+
+  // The leak this change closes, stated from the guest's side. Node has no global
+  // Worker, so a `node` guest seeing one means the host's has leaked in.
+  write("node-side.js", 'console.log("NODEWORKER:" + typeof Worker);');
+  const n = await kernel.start("node", ["node-side.js"], { cwd: APP, env: ENV, capture: true });
+  ok(/NODEWORKER:undefined/.test(n.stdout || ""), "a node guest sees no global Worker, as in real Node — the host's does not leak through");
+}
+
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all bun spike checks passed");
 process.exit(failed ? 1 : 0);

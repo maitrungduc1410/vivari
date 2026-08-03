@@ -3257,6 +3257,52 @@ the gap can't silently regress.
 
 ---
 
+### The guest shares a `globalThis` with the host, so check what leaks
+
+The Process Worker's global object belongs to the page as much as to the guest. The runtime
+replaces `fetch`, `WebSocket` and the timers for that reason, but the list was never exhaustive:
+`Worker` sat there untouched for as long as it existed, so guest code calling
+`new Worker("./w.ts")` got the browser's constructor and resolved the path against the Studio's
+origin instead of the VFS. It did not throw. It produced a worker with no kernel.
+
+Two things to take from it. First, when adding a global, ask what the host already put under
+that name. Second, **no Node-tier spike can catch this class of bug**, because Node's worker has
+no such global to leak — the same blind spot that hid Vite's HMR timer for so long. The way to
+test it is to assert what the GUEST sees (`typeof Worker` from inside a guest program), and, if
+you want the browser's side of it, to plant a sentinel on `globalThis` before boot and check the
+guest gets yours rather than the sentinel.
+
+### A `message` listener keeps a worker alive — wire it lazily
+
+Both Bun and Node document that attaching a `message` listener on a port holds the thread's
+event loop open; that is the mechanism by which a worker stays up to serve requests. So a shim
+that attaches one eagerly to implement `onmessage` makes every worker immortal, and every parent
+waiting on one hangs with it. `builtins/bun-worker.js` wires the `parentPort` listener on the
+first use of `onmessage` or `addEventListener("message")`. If you touch that file, do not
+"simplify" it back.
+
+### `process.on('uncaughtException')` never fires in a guest
+
+Measured, not inferred: a guest that registers the handler and then throws — synchronously or
+from a timer — never sees it called. The handlers in `packages/runtime/index.js` are on the
+HOST realm's process (they exist to catch the exit sentinel), and nothing dispatches the guest's.
+An async throw does not even produce a non-zero exit code. Anything built on that hook is dead
+code; a crash relay for `Worker` was written on it before this was noticed. Fixing it properly is
+an open item.
+
+### Base64 tails: flipping the last character may change nothing
+
+A test that "tampers" with a base64 token by changing its final character can be a no-op. Only
+the bits the payload actually needs are significant, and the tail character's low bits are often
+surplus, so several distinct characters decode to identical bytes — the CSRF spike failed that
+way about a quarter of the time, on an assertion ostensibly about the MAC.
+
+Decode, flip a byte, re-encode — and then assert the tamper LANDED
+(`!Buffer.from(tampered, "base64url").equals(raw)`), which is what
+`scripts/spike-bun-offline.mjs` now does. Without that second assertion the check can still pass
+for the wrong reason: a tamper that quietly did nothing looks exactly like a MAC that quietly
+accepted it.
+
 ## Where to look next
 
 - **How it works** → [`ARCHITECTURE.md`](./ARCHITECTURE.md)

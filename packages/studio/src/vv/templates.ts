@@ -2603,7 +2603,7 @@ function bunApisTemplate(): TemplateDef {
       category: "Bun",
       name: "API tour",
       language: "TypeScript",
-      description: "A tour of Bun's standard library: files, hashing, passwords, YAML/TOML, Glob, semver, Transpiler",
+      description: "A tour of Bun's standard library: files, hashing, passwords, YAML/TOML, Glob, semver, Transpiler, Workers",
       // No server: this one prints a tour and exits.
       port: 3000,
       openPath: "/",
@@ -2635,6 +2635,28 @@ function bunApisTemplate(): TemplateDef {
     "skipLibCheck": true
   }
 }
+`,
+      // A second entry point, run on a REAL thread by section 10 of the tour. It is
+      // a plain TypeScript file with no build step: the thread boots it through the
+      // same `bun run` path the main script took, so it has its own Bun global.
+      "hash.worker.ts": `declare var self: any;
+
+// Deliberately slow work - the kind that would freeze a UI if it ran on the main
+// thread. Here it runs beside it.
+function expensiveDigest(text: string): string {
+  let digest = text;
+  for (let i = 0; i < 500; i++) digest = Bun.sha(digest, "hex");
+  return digest;
+}
+
+self.onmessage = (event: MessageEvent) => {
+  const job = event.data;
+  postMessage({
+    id: job.id,
+    digest: expensiveDigest(job.text).slice(0, 16),
+    thread: require("worker_threads").threadId,
+  });
+};
 `,
       "config.yaml": `service: checkout
 replicas: 3
@@ -2735,6 +2757,37 @@ rule("9. timing");
 const t0 = nanoseconds();
 for (let i = 0; i < 1e5; i++) Math.sqrt(i);
 console.log("100k sqrt took", ((nanoseconds() - t0) / 1e6).toFixed(2), "ms");
+
+rule("10. threads");
+// Bun's Worker, not the browser's. The specifier resolves against THIS project's
+// files rather than the page's origin, and the thread is a real one: it runs
+// TypeScript, gets its own Bun global, and hashes on a second core while the main
+// thread stays free.
+const worker = new Worker("./hash.worker.ts");
+const pending = new Map();
+worker.onmessage = (event: MessageEvent) => {
+  const reply = event.data;
+  const resolve = pending.get(reply.id);
+  if (resolve) resolve(reply);
+};
+const hashOn = (id: number, text: string) =>
+  new Promise((resolve) => {
+    pending.set(id, resolve);
+    // Sent before the worker reports "open" - messages are queued, not dropped.
+    worker.postMessage({ id, text });
+  });
+
+const replies: any[] = await Promise.all([hashOn(1, "alpha"), hashOn(2, "beta"), hashOn(3, "gamma")]);
+for (const reply of replies) {
+  console.log("job " + reply.id + " -> " + reply.digest + " (thread " + reply.thread + ")");
+}
+console.log("this thread is the main one:", Bun.isMainThread);
+// A worker holding a message listener stays alive until it is told otherwise.
+const closeCode = await new Promise((resolve) => {
+  worker.addEventListener("close", (event: any) => resolve(event.code));
+  worker.terminate();
+});
+console.log("worker closed with code:", closeCode);
 
 console.log("\\nTOUR COMPLETE — every API above ran inside your browser.");
 `,
