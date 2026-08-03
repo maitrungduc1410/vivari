@@ -259,7 +259,11 @@ export function takePendingSignals(ctrl) {
 }
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+// `ignoreBOM` because the default strips a leading U+FEFF, and a decoder that
+// silently eats bytes is a corruption source: an HTTP body served from a
+// BOM-prefixed file crossed this seam three bytes shorter than it left. Frames
+// are machine-generated, so nothing here ever carries a BOM it wants removed.
+const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 /** Build the two typed-array views over a shared buffer. */
 export function makeViews(sab) {

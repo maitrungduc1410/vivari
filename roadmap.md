@@ -6629,3 +6629,41 @@ with no driver in the way, which is the promise the feature actually makes. Ever
 assertion was mutation-tested; that is how the missing project-root case turned up, since
 jedi infers a root from the file path and a fixture with the file at the top level cannot
 tell the two apart.
+
+## The Content-Type was believed, so latin-1 came back as question marks (this change)
+
+Fixing the upload direction made the download direction worth reading, and it was the
+broken one. Bodies cross the kernel seam as JSON, so binary is base64-encoded and flagged
+`bodyEncoding:'base64'`. Deciding *which* bodies were binary is where it went wrong: the
+runtime asked the Content-Type, and kept a "fast path" that decoded any declared-textual
+response as utf8 without checking whether it was.
+
+A Content-Type is a claim about how to *interpret* bytes. It is not a promise that they are
+utf8, and `text/html; charset=iso-8859-1` is explicitly a promise that they are not. Decoding
+it as utf8 anyway replaces every high byte with U+FFFD. A latin-1 page, a CSV a spreadsheet
+exported, `text/plain` carrying arbitrary bytes — all corrupted, all with a 200 and a body
+that looks plausible until someone reads it. The gate now measures the damage: 1,572,864
+bytes of latin-1 come back as 4,620,292 bytes of replacement characters, almost three times
+the size, which is a useful reminder that "lossy" is not a small word here.
+
+*The second bug was in the decoder nobody was looking at.* `decodeBytes` in
+`protocol/syscall.js` ran a stock `TextDecoder`, whose default `ignoreBOM: false` does not
+ignore the BOM — it **strips** it. Any body from a BOM-prefixed file, which is whatever
+Windows wrote, crossed three bytes shorter than it left. Nothing could have caught it
+downstream: every byte was valid utf8, the round-trip check the binary path already ran
+passed, and the loss happened after it.
+
+Both are now one rule, in one place: the bytes decide. `bridgeHttp` decodes with `fatal:
+true, ignoreBOM: true` and base64s only when that throws. It is a single pass that returns
+the string it just validated — cheaper than the round-trip encode-and-compare it replaces,
+and it deletes the content-type table entirely rather than fixing it.
+
+*The gate asserts the encoding, not just the bytes.* Byte-exactness alone would be satisfied
+by base64-ing everything, which is a silent 33% inflation on every dev-server response, so
+`spike-http-response-bytes.mjs` pins the choice per case: 20 bodies across declared-text,
+declared-binary, BOM, invalid utf8, lone surrogates, empty, and three payloads over the 1 MiB
+window so the multi-frame reassembly has a seam to lose a byte at. Two cases exist to state
+the principle in both directions — `application/wasm` whose magic bytes happen to be valid
+utf8 crosses as text and skips base64, while the same body with one high byte in it does not.
+Reverting each fix separately turns exactly the expected cases red: the BOM pair for one, and
+seven latin-1/invalid-utf8 cases for the other.

@@ -684,22 +684,20 @@ export function createRuntime({
   // Vite dev server serves these) go base64-encoded with `bodyEncoding:'base64'`
   // so the Service Worker can reconstruct the exact bytes (roadmap #19 stage A).
   const HOP_BY_HOP = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"];
-  // Content types we can safely carry as a utf8 string. Everything else is
-  // treated as binary and base64-encoded. `charset=utf-8` types are textual.
-  const isTextualContentType = (ct) => {
-    if (!ct) return false;
-    const t = String(ct).toLowerCase();
-    if (t.startsWith("text/")) return true;
-    if (t.includes("charset=utf-8") || t.includes("charset=utf8")) return true;
-    return (
-      t.includes("javascript") ||
-      t.includes("json") ||
-      t.includes("xml") ||
-      t.includes("+json") ||
-      t.includes("ecmascript") ||
-      t.includes("image/svg") ||
-      t.includes("application/manifest")
-    );
+  // Can these bytes cross as a utf8 string and come back identical? That is the
+  // only question that matters, and the bytes answer it — the Content-Type does
+  // not. A header saying `text/html; charset=iso-8859-1` is a promise about how
+  // to *interpret* the bytes, not a promise that they are utf8, and decoding
+  // them as utf8 anyway replaces every high byte with U+FFFD. `fatal` makes the
+  // decoder throw instead of substituting; `ignoreBOM` keeps a leading U+FEFF in
+  // the string instead of eating it (a stripped BOM is three lost bytes).
+  // One pass, and it hands back the string it just validated.
+  const asLosslessUtf8 = (buf) => {
+    try {
+      return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buf);
+    } catch {
+      return null;
+    }
   };
   const pickHeaders = (src, drop) => {
     const out = {};
@@ -744,22 +742,18 @@ export function createRuntime({
           cres.on("end", () => {
             const buf = Buffer.concat(chunks);
             const headers = pickHeaders(cres.headers, ["content-length"]);
-            const ct = cres.headers && (cres.headers["content-type"] || cres.headers["Content-Type"]);
             const resp = { status: cres.statusCode || 200, headers };
-            if (isTextualContentType(ct)) {
-              // Fast path: a declared-textual type crosses as utf8.
-              resp.body = buf.toString("utf8");
+            // Every response takes the same test, whatever it calls itself: utf8 if
+            // the bytes survive the trip, base64 if they don't. There used to be a
+            // "fast path" here that trusted a textual Content-Type and skipped the
+            // check — it silently corrupted every latin-1 page and CSV an in-VM
+            // server produced.
+            const text = asLosslessUtf8(buf);
+            if (text !== null) {
+              resp.body = text;
             } else {
-              // Unknown/omitted type (e.g. res.end('...') with no content-type) or a
-              // binary type: only base64 when the bytes aren't losslessly utf8, so
-              // plain-text responses stay strings and real binary is preserved.
-              const asUtf8 = buf.toString("utf8");
-              if (Buffer.from(asUtf8, "utf8").equals(buf)) {
-                resp.body = asUtf8;
-              } else {
-                resp.body = buf.toString("base64");
-                resp.bodyEncoding = "base64";
-              }
+              resp.body = buf.toString("base64");
+              resp.bodyEncoding = "base64";
             }
             reply(resp);
           });

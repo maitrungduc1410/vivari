@@ -773,6 +773,19 @@ throw that gets swallowed. Rules:
 - `respondOk` now throws if a response exceeds the window, naming the size. It
   used to be a bare `RangeError` out of `Uint8Array.set` that killed the kernel.
 - If you add a syscall that can carry big data, chunk it from day one.
+- **Whether a body crosses as utf8 or base64 is decided by the BYTES, never by
+  the Content-Type.** `bridgeHttp` decodes with `TextDecoder('utf-8', {fatal:
+  true, ignoreBOM: true})` and falls back to base64 when that throws. A header is
+  a claim about how to *interpret* bytes, not a promise that they are utf8 —
+  `text/html; charset=iso-8859-1` promises the opposite. Trusting it turned every
+  high byte into U+FFFD (a 1.5 MiB latin-1 page came back 4.6 MB of replacement
+  characters, status 200, no error anywhere). `ignoreBOM` matters for the same
+  reason in reverse: the default STRIPS a leading U+FEFF, so bodies from
+  BOM-prefixed files silently lost three bytes on a path where everything was
+  valid utf8. The shared `decodeBytes` in `protocol/syscall.js` sets it too.
+  Gated both directions by `spike-http-binary-body.mjs` (request) and
+  `spike-http-response-bytes.mjs` (response), which assert the encoding chosen as
+  well as the bytes — text that starts arriving base64 is a silent 33% inflation.
 
 ### The Fetcher strips non-CORS-safelisted request headers — for the REGISTRIES only
 `packages/runtime/egress-header-policy.js` decides what the browser Fetcher Worker
