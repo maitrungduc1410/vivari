@@ -114,19 +114,94 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
     }
   };
 
+  // An error nobody caught, handled the way Node handles one.
+  //
+  // WHAT THIS REPLACED, AND WHY IT MATTERED: the old code called reportError and
+  // carried on. The stack reached stderr, so the failure was visible — and the
+  // process still exited 0. `setTimeout(() => { throw new Error("boom") })` was a
+  // SUCCESS as far as any caller could tell, which means a test script, a build
+  // step or a CI command that died in a callback reported that it had passed. A
+  // wrong exit code is worse than a silent one: it is a lie the shell believes.
+  // It also meant `process.on('uncaughtException')` never fired for anything,
+  // because nothing ever emitted it.
+  //
+  // Node's contract, which this implements:
+  //   - listeners on the event  -> emit, and KEEP RUNNING (that is the point of
+  //     the hook: a server logs the error and stays up);
+  //   - no listeners            -> print the stack and exit 1.
+  //
+  // `origin` distinguishes the two entry points, because an unhandled rejection
+  // that falls through to here must be reported as one.
+  const raise = (e, origin = "uncaughtException") => {
+    // process.exit() from inside a callback is not an error, it is an exit.
+    if (e && e.__processExit !== undefined) {
+      if (!exiting) {
+        exiting = true;
+        exitCode = e.__processExit;
+      }
+      return;
+    }
+    let delivered = false;
+    try {
+      if (typeof process.listenerCount === "function" && process.listenerCount("uncaughtException") > 0) {
+        delivered = true;
+        process.emit("uncaughtException", e, origin);
+      }
+    } catch (inner) {
+      // A handler that throws is fatal in Node, and both errors are worth seeing:
+      // the original explains what went wrong, the second explains why the
+      // handler did not save you.
+      reportError(e);
+      reportError(inner);
+      delivered = false;
+      e = null;
+    }
+    if (delivered) return;
+    if (e !== null) reportError(e);
+    if (!exiting) {
+      exiting = true;
+      exitCode = 1;
+    }
+    wake();
+  };
+
+  // A promise that rejected with nobody to catch it. Node's default since v15 is
+  // `--unhandled-rejections=throw`: emit 'unhandledRejection' if that hook is set,
+  // otherwise raise it as an uncaught exception. So a process with neither hook
+  // prints and exits 1 — where here it did something worse than exit 0, it HUNG.
+  // The rejection escaped into the host realm, whose handler rethrew it, and the
+  // guest's loop went on waiting for work that was never coming while the kernel
+  // waited for an exit that never arrived.
+  const raiseRejection = (reason, promise) => {
+    if (reason && reason.__processExit !== undefined) {
+      if (!exiting) {
+        exiting = true;
+        exitCode = reason.__processExit;
+      }
+      wake();
+      return;
+    }
+    try {
+      if (typeof process.listenerCount === "function" && process.listenerCount("unhandledRejection") > 0) {
+        process.emit("unhandledRejection", reason, promise);
+        return;
+      }
+    } catch (inner) {
+      reportError(reason);
+      raise(inner, "unhandledRejection");
+      return;
+    }
+    raise(reason, "unhandledRejection");
+  };
+
   // Run a user callback, honouring process.exit() (thrown sentinel) by stopping
-  // the loop with that code, and surviving ordinary throws (Node reports them).
+  // the loop with that code, and reporting anything else as an uncaught exception.
   const runCallback = (fn, args) => {
     if (exiting) return;
     try {
       fn(...args);
     } catch (e) {
-      if (e && e.__processExit !== undefined) {
-        exiting = true;
-        exitCode = e.__processExit;
-        return;
-      }
-      reportError(e);
+      raise(e);
     }
   };
 
@@ -387,6 +462,11 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
     // Stop the loop with `code` and wake any idle wait so drive() returns promptly.
     // Used by process.exit() so it works even when its throw-sentinel escapes the
     // loop (e.g. called from a raw Promise microtask, outside runCallback).
+    // The two ways a guest error arrives from outside a loop callback: the host
+    // realm's uncaughtException/unhandledRejection hooks (see index.js), and a
+    // rejected top-level-await entry.
+    raiseUncaught: (err, origin) => raise(err, origin),
+    raiseUnhandledRejection: (reason, promise) => raiseRejection(reason, promise),
     requestExit: (code) => {
       if (!exiting) {
         exiting = true;

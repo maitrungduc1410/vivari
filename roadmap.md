@@ -6712,3 +6712,57 @@ now say.
 
 **Still uncovered:** `HTMLRewriter`, `Bun.markdown`, `Bun.Image`, the `Bun.SQL` SQLite adapter,
 real zstd/brotli engines, and — newly — the guest's `uncaughtException`, which nothing dispatches.
+
+
+## Two ways a failing program said it had succeeded (this change)
+
+Both of these were found by measuring, while auditing what was left to do for Bun, and neither
+is Bun-specific: they sat in the event loop and the kernel, under every guest.
+
+**An uncaught error exited 0.** `setTimeout(() => { throw new Error("boom") })` printed its stack
+and the process reported SUCCESS. The stack was never the problem — it was always there, which is
+why this survived so long. The exit code was. A test script, a build step or a CI command that
+died in a callback told the shell it had passed, and the shell believed it. The cause was one
+line: the loop's `runCallback` caught the error, called `reportError`, and carried on. Nothing
+ever emitted `uncaughtException` either, so `process.on('uncaughtException')` was dead for every
+program in the VM — which is how a crash relay written against that hook for `new Worker()` came
+to be written and never fire.
+
+**An unhandled rejection HUNG.** Worse than a wrong code: `Promise.reject(new Error("x"))` never
+exited at all. Guest promises are host promises, so the rejection surfaced on the host realm,
+where the handler rethrew it "for default reporting" — into the host's `uncaughtException`
+handler, which rethrew again. The guest's loop then had nothing to do, the kernel waited for an
+exit that was never coming, and the process sat there for ever.
+
+Both now follow Node's contract, which is not "always exit": a hook, if the guest set one, gets
+the error and the process KEEPS RUNNING — that is the point of the hook, and a server that logs
+and stays up depends on it. With no hook, the stack is printed and the process exits 1. A
+rejection with no `unhandledRejection` hook falls through to `uncaughtException` carrying
+`origin: 'unhandledRejection'`, as Node's default `--unhandled-rejections=throw` mode does. The
+`process.exit()` sentinel travels the same path and still means "exit with this code", not
+"fail" — pinned by a check, because that is the regression this change could most easily cause.
+
+**A guest could kill the kernel.** `Bun.spawn()` with no arguments sent `undefined` as the
+command; `resolveProgram` called `.includes()` on it; the TypeError was thrown INSIDE the kernel
+and escaped through the worker's message handler. In a browser that is not one process failing,
+it is the whole VM — every process, the VFS session, the preview — gone because a guest script
+had a typo. Fixed at both layers, deliberately:
+
+- The kernel no longer trusts the field (a non-string command is an ENOENT), and the whole
+  syscall dispatch is wrapped so any unanticipated throw becomes an errno to the caller instead
+  of a dead kernel. Releasing the caller matters as much as surviving: the guest is parked in
+  `Atomics.wait`, so a handler that dies without answering leaves it hung for ever. The guard
+  also covers rejections, because the three async handlers (`handleSpawn`, `handleSpawnAsync`,
+  `handleFetch`) fail after an `await` — which is exactly how the original crash arrived, as an
+  unhandled rejection rather than a catchable throw.
+- `Bun.spawn`/`spawnSync` validate the command and throw a `TypeError` synchronously, as real
+  Bun does. Before, all four shapes of "no command" appeared to SUCCEED and surfaced an ENOENT
+  later, asynchronously, from a child that never existed.
+
+**The gate.** A new offline spike, `scripts/spike-fatal-errors.mjs`, asserts exit codes and
+kernel survival rather than stderr text — a check on the stack would have passed against every
+one of these bugs. It bounds every case with a timeout and reports a hang as a failure, because a
+hang was one of the bugs. Both `bun` and `node` guests are covered, since the loop is shared and
+a fix reaching only one of them would be a coincidence.
+
+**A spike that had stopped running, fixed on master instead.** While measuring here, `ci-tiers` turned out to be red on master: `796ed0a` deleted the `http-response-bytes` registration from run-spikes.mjs while adding `studio-types`, so that spike stopped running everywhere while ci.yml still named it — exactly the drift `spike-ci-tiers.mjs` exists to catch. This branch restored the line, and a separate MR (`b6f92a7`) landed the same restoration first, together with a wasm-pack pin; this defers to it. Worth noting for its own sake: the sync that dropped the line changed no behaviour anyone would notice, and the only thing that noticed was the tier-drift check.

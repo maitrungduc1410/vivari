@@ -32,6 +32,7 @@ import {
   I_REQ_LEN,
   I_RES_LEN,
   DATA_BYTES,
+  STATE_REQUEST,
   STATE_RESPONSE_OK,
   STATE_RESPONSE_ERR,
   OP_SPAWN,
@@ -408,6 +409,13 @@ export class Kernel {
 
   /** Resolve a command name to a program file in the VFS (PATH = /bin). */
   resolveProgram(command, cwd, env = {}) {
+    // The command arrives from a guest, so it is not necessarily a string.
+    // `Bun.spawn()` with no arguments sent `undefined` and this method called
+    // .includes() on it — a TypeError thrown inside the KERNEL, which in the
+    // browser kills the kernel worker and with it every process, the VFS session
+    // and the preview. An unresolvable command is an ENOENT to the caller, which
+    // is what a non-string is.
+    if (typeof command !== "string" || command === "") return null;
     const candidates = [];
     if (command.includes("/")) {
       const abs = this.resolvePath(cwd, command);
@@ -1043,15 +1051,61 @@ export class Kernel {
     proc.syscalls++;
     proc.booted = true;
     const opcode = Atomics.load(proc.ctrl, I_OPCODE);
+    // EVERY field below was chosen by the guest. A handler that throws on a
+    // malformed one used to take the kernel with it: `Bun.spawn()` with no
+    // arguments reached resolveProgram as `undefined` and the TypeError escaped
+    // through this method into the worker's message handler. In the browser that
+    // is the whole VM — all processes, the VFS session, the preview — lost to one
+    // typo in a guest script. The kernel is a trust boundary; a bad request has to
+    // come back as an errno.
+    try {
+      const pending = this.dispatchSyscall(proc, opcode);
+      // handleSpawn/handleSpawnAsync/handleFetch are async, so their failures
+      // arrive as rejections and the try/catch above cannot see them. This is not
+      // hypothetical: the spawn crash happened AFTER an await, which is why it
+      // surfaced as an unhandled rejection rather than a caught throw.
+      if (pending && typeof pending.then === "function") {
+        pending.then(undefined, (err) => this.failSyscall(proc, opcode, err));
+      }
+    } catch (err) {
+      this.failSyscall(proc, opcode, err);
+    }
+  }
+
+  /**
+   * Report a syscall that failed for a reason the handler did not anticipate, and
+   * release the caller. Releasing matters as much as reporting: the guest is
+   * parked in Atomics.wait on its own SAB, so a handler that dies without
+   * answering leaves that process hung for ever.
+   *
+   * Only answers if nothing else has — a handler may well have responded and then
+   * thrown, and a second write into the data region would be read as the answer to
+   * whatever syscall the guest makes next.
+   */
+  failSyscall(proc, opcode, err) {
+    const detail = (err && err.stack) || String(err);
+    try {
+      this.stderr("[kernel] syscall " + opcode + " from pid " + proc.pid + " failed: " + detail + "\n", proc.pid);
+    } catch {
+      /* the sink is gone; the response below still matters */
+    }
+    try {
+      if (Atomics.load(proc.ctrl, I_STATE) === STATE_REQUEST) this.respondErr(proc, "EINVAL");
+    } catch {
+      /* the process is gone, so nobody is waiting */
+    }
+  }
+
+  dispatchSyscall(proc, opcode) {
     const { fields } = decodeRequest(
       proc.data.slice(0, Atomics.load(proc.ctrl, I_REQ_LEN)),
     );
     if (opcode === OP_SPAWN) {
-      this.handleSpawn(proc, JSON.parse(decodeBytes(fields[0])));
+      return this.handleSpawn(proc, JSON.parse(decodeBytes(fields[0])));
       return; // response is deferred until the child exits
     }
     if (opcode === OP_SPAWN_ASYNC) {
-      this.handleSpawnAsync(proc, JSON.parse(decodeBytes(fields[0])));
+      return this.handleSpawnAsync(proc, JSON.parse(decodeBytes(fields[0])));
       return; // responds immediately with {pid}; stdio/exit stream via postMessage
     }
     if (opcode === OP_KILL) {
@@ -1075,7 +1129,7 @@ export class Kernel {
       return;
     }
     if (opcode === OP_FETCH) {
-      this.handleFetch(proc, JSON.parse(decodeBytes(fields[0])));
+      return this.handleFetch(proc, JSON.parse(decodeBytes(fields[0])));
       return; // deferred until the network fetch resolves
     }
     if (opcode === OP_FETCH_ASYNC) {

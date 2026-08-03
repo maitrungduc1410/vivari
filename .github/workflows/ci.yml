@@ -98,7 +98,7 @@ jobs:
       # but missing here runs nowhere at all: skipped in toolchain-gate for want of
       # the crates, and never selected in the only job that has them.
       - name: offline spikes that need the Wasm VFS
-        run: node scripts/run-spikes.mjs --offline dep-cache bun http-binary-body http-response-bytes diag-liveness
+        run: node scripts/run-spikes.mjs --offline dep-cache bun http-binary-body http-response-bytes diag-liveness fatal-errors
       - run: npm run verify
 
   # --- package-manager gate: the North Star, gated on its own ----------------

@@ -1129,29 +1129,42 @@ export function createRuntime({
   // just keep the escaped sentinel from taking the whole worker down. Genuine
   // errors are left untouched.
   const isExitSentinel = (v) => v && typeof v === "object" && v.__processExit !== undefined;
+  // These hooks are the ONLY place a guest error that escaped the loop can be
+  // caught: guest promises are host promises, so a rejection nobody handled
+  // surfaces on the host realm, not in any of our own try/catches.
+  //
+  // They used to rethrow, and the comments claimed that produced "default
+  // reporting". It did not. Rethrowing from inside a host unhandledRejection
+  // handler escalated to the host's uncaughtException handler, which rethrew
+  // again, and `Promise.reject(new Error("x"))` in a guest script then HUNG FOR
+  // EVER — the guest's loop still had nothing to do and the kernel was still
+  // waiting for an exit. Measured, twice, before it was believed. Routing into the
+  // loop instead gives Node's actual behaviour: the guest's hooks get a chance,
+  // and with no hooks the stack is printed and the process exits 1.
   if (hostRealmProcess && typeof hostRealmProcess.on === "function") {
-    hostRealmProcess.on("unhandledRejection", (reason) => {
+    hostRealmProcess.on("unhandledRejection", (reason, promise) => {
       if (isExitSentinel(reason)) loop.requestExit(reason.__processExit);
-      else throw reason; // escalate a genuine rejection to uncaughtException (default reporting)
+      else loop.raiseUnhandledRejection(reason, promise);
     });
     hostRealmProcess.on("uncaughtException", (err) => {
       if (isExitSentinel(err)) loop.requestExit(err.__processExit);
-      else throw err; // preserve normal crash reporting for real errors
+      else loop.raiseUncaught(err);
     });
   } else if (typeof globalThis.addEventListener === "function") {
     globalThis.addEventListener("unhandledrejection", (ev) => {
       const r = ev && ev.reason;
-      if (isExitSentinel(r)) {
-        ev.preventDefault?.();
-        loop.requestExit(r.__processExit);
-      }
+      ev.preventDefault?.();
+      if (isExitSentinel(r)) loop.requestExit(r.__processExit);
+      else loop.raiseUnhandledRejection(r, ev && ev.promise);
     });
     globalThis.addEventListener("error", (ev) => {
       const r = ev && (ev.error ?? ev.reason);
-      if (isExitSentinel(r)) {
-        ev.preventDefault?.();
-        loop.requestExit(r.__processExit);
-      }
+      ev.preventDefault?.();
+      if (isExitSentinel(r)) loop.requestExit(r.__processExit);
+      // An 'error' event with no error object carries nothing to report and no way
+      // to tell a guest fault from the host's, so it is left alone rather than
+      // turned into an invented failure.
+      else if (r) loop.raiseUncaught(r);
     });
   }
   // Route user-facing timers through our event loop so ordering is Node-correct
@@ -1682,12 +1695,11 @@ export function createRuntime({
           if (err && err.__processExit !== undefined) {
             loop.requestExit(err.__processExit);
           } else {
-            try {
-              process.stderr.write(String((err && err.stack) || err) + "\n");
-            } catch {
-              /* ignore */
-            }
-            loop.requestExit(1);
+            // A rejected top-level await IS an unhandled rejection, so it goes
+            // through the same path as any other. Unhandled it still prints and
+            // exits 1, as it did when this printed by hand; the difference is that
+            // a guest hook now gets to see it first.
+            loop.raiseUnhandledRejection(err, started);
           }
         });
       }

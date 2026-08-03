@@ -3303,6 +3303,45 @@ Decode, flip a byte, re-encode — and then assert the tamper LANDED
 for the wrong reason: a tamper that quietly did nothing looks exactly like a MAC that quietly
 accepted it.
 
+### A failing guest must FAIL: exit codes, not stack traces
+
+Two bugs lived here for as long as the loop did, and both were invisible to anyone reading
+stderr, because the stack was always printed correctly:
+
+- an uncaught error in a callback exited **0**, so a test or build command that died reported
+  success;
+- an unhandled rejection **hung for ever**, because it escaped to the host realm whose handler
+  rethrew it, leaving the guest idle and the kernel waiting for an exit.
+
+`packages/runtime/loop.js` now implements Node's contract in `raise`/`raiseRejection`, and the
+host-realm hooks in `index.js` route into it instead of rethrowing. The contract is not "always
+exit": if the guest registered `uncaughtException`/`unhandledRejection`, it is emitted and the
+process KEEPS RUNNING; with no hook, print and exit 1. The `process.exit()` sentinel shares that
+path and must keep meaning "exit with this code" — `scripts/spike-fatal-errors.mjs` pins it,
+because that is the easiest thing to break here.
+
+**When testing this class of bug, assert the exit code.** Every one of these produced perfect
+stderr output. A spike that greps a stack passes against all of them.
+
+### The kernel is a trust boundary: never let a guest field throw inside it
+
+`Bun.spawn()` with no arguments sent `undefined` as the command, `resolveProgram` called
+`.includes()` on it, and the TypeError escaped through the kernel's message handler. In a browser
+that costs the whole VM — every process, the VFS session, the preview — because one guest script
+had a typo. `serviceSyscall` now wraps the entire dispatch and converts an unanticipated failure
+into an errno for the caller.
+
+Two things that are easy to get wrong if you touch it:
+
+- **Release the caller, always.** The guest is parked in `Atomics.wait` on its own SAB. A handler
+  that dies without answering leaves that process hung for ever, so the guard responds — but only
+  when `I_STATE` is still `STATE_REQUEST`, since a handler may have answered and *then* thrown,
+  and a second write would be read as the answer to the guest's next syscall.
+- **Cover rejections, not just throws.** `handleSpawn`, `handleSpawnAsync` and `handleFetch` are
+  async, so a failure after their first `await` is a rejected promise that a `try`/`catch` around
+  the call cannot see. That is precisely how the spawn crash arrived. `dispatchSyscall` returns
+  their promises so the guard can attach to them.
+
 ## Where to look next
 
 - **How it works** → [`ARCHITECTURE.md`](./ARCHITECTURE.md)

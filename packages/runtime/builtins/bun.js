@@ -1048,6 +1048,35 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
   }
 
   // ---- Bun.spawn / spawnSync / which ----------------------------------------
+
+  /**
+   * Both spawns accept either an array or an options object, so "no command" can
+   * arrive four ways: no argument at all, `{}`, `[]`, or a non-string first
+   * element. All four used to pass straight through to the kernel, which called
+   * .includes() on `undefined` — a TypeError thrown INSIDE the kernel, taking the
+   * whole VM down (every process, the VFS session, the preview) over a typo in a
+   * guest script. The kernel no longer trusts the field (see
+   * kernel-host/kernel.js), but a guest that asks for nothing deserves the answer
+   * real Bun gives: a TypeError, synchronously, at the call.
+   *
+   * Before this it was worse than a bad message — the call APPEARED to succeed and
+   * an ENOENT surfaced later, asynchronously, from a child that never existed.
+   */
+  const requireCommand = (api, cmd) => {
+    if (!Array.isArray(cmd) || cmd.length === 0) {
+      throw new TypeError(
+        api + ": cmd must be a non-empty array of strings, e.g. " + api.replace("()", "") + '(["echo", "hi"]) — got ' +
+          (cmd === undefined ? "nothing" : JSON.stringify(cmd))
+      );
+    }
+    if (typeof cmd[0] !== "string" || cmd[0] === "") {
+      throw new TypeError(
+        api + ": the command to run must be a non-empty string — got " + JSON.stringify(cmd[0])
+      );
+    }
+    return cmd;
+  };
+
   function bunSpawn(cmdOrOpts, maybeOpts) {
     const cp = lazy("child_process");
     let cmd, opts;
@@ -1057,6 +1086,7 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     // pipes instead is the failure that hangs an interactive CLI — see
     // ./bun-unsupported.js.
     assertNoPty("Bun.spawn()", opts);
+    requireCommand("Bun.spawn()", cmd);
     const [file, ...args] = cmd;
     const child = cp.spawn(file, args, {
       cwd: opts.cwd || process.cwd(),
@@ -1103,6 +1133,7 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     if (Array.isArray(cmdOrOpts)) { cmd = cmdOrOpts; opts = maybeOpts || {}; }
     else { opts = cmdOrOpts || {}; cmd = opts.cmd || []; }
     assertNoPty("Bun.spawnSync()", opts);
+    requireCommand("Bun.spawnSync()", cmd);
     const [file, ...args] = cmd;
     const r = cp.spawnSync(file, args, { cwd: opts.cwd || process.cwd(), env: opts.env || process.env });
     return {
