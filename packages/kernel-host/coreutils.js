@@ -494,6 +494,20 @@ function runSimple(tokens) {
   }
   if (cmd === ':' || cmd === 'true') return Promise.resolve(0);
   if (cmd === 'false') return Promise.resolve(1);
+  // \`exit\` is a builtin in every sh, and it was missing here: \`sh -c 'exit 3'\`
+  // went looking for a program called exit and reported 127 — a "not found" for
+  // something that is not a program. Anything Bun.\$ runs comes through here, so
+  // \`await \$\`exit 3\`\` saw the same wrong code.
+  if (cmd === 'exit') {
+    var wanted = args.length ? Number(args[0]) : 0;
+    // POSIX: a non-numeric argument is an error, and the code is masked to 8 bits.
+    if (args.length && !Number.isFinite(wanted)) {
+      process.stderr.write('exit: ' + args[0] + ': numeric argument required\\n');
+      wanted = 2;
+    }
+    process.exit(((wanted | 0) % 256 + 256) % 256);
+    return Promise.resolve(0);
+  }
   // \`history\` lists the interactive command history (bash-style, 1-indexed).
   // Like cd/pwd it is a builtin, so it only works standalone — inside a pipeline
   // it would be looked up on PATH (/bin/history.js, which doesn't exist).

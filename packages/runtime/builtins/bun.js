@@ -260,6 +260,7 @@ import { Cookie, CookieMap, attachRequestCookies, pendingSetCookies } from "./bu
 import { createBunFile } from "./bun-file.js";
 import { createBunCrypto } from "./bun-crypto.js";
 import { createBunWorker } from "./bun-worker.js";
+import { createHTMLRewriter } from "./bun-html-rewriter.js";
 import { createBunSqlite, createVivariSqliteHost } from "./bun-sqlite.js";
 import { createBunTest } from "./bun-test.js";
 import {
@@ -277,7 +278,7 @@ import {
 // catalogue of what is impossible here and what to use instead, and it is worth
 // being readable as exactly that. See its header for the import-safe/call-loud
 // pattern and for why "not supported" and "not implemented" are worded apart.
-import { createBunUnsupported, createBunFfi, assertNoPty } from "./bun-unsupported.js";
+import { createBunUnsupported, createBunFfi, assertNoPty, shimMessage, sandboxMessage } from "./bun-unsupported.js";
 // Bun.build (a real dependency-graph bundler) + Bun.plugin. See its header for
 // why the bundler is ours rather than esbuild-wasm, and for the standing caveat
 // that the output bytes are NOT identical to real Bun's.
@@ -287,6 +288,24 @@ import { createBunBuild } from "./bun-build.js";
 // bundler above already owns, and the two methods report DIFFERENT sets (see
 // that file's header — it is Bun's behaviour, not ours).
 import { makeTranspilerClass } from "./bun-transpiler.js";
+import { serialize as bunSerialize, deserialize as bunDeserialize } from "./bun-serialize.js";
+import { createBunSockets } from "./bun-socket.js";
+import {
+  IPC_PATH_ENV,
+  IPC_MODE_ENV,
+  JSON_MODE,
+  attachChannel,
+  encodeMessage,
+  generateChannelPath,
+  normalizeMode,
+  requireMessage,
+} from "./bun-ipc.js";
+// Bun.Archive. Read its header before changing anything: the surface is narrower
+// than the name (tar and tar.gz only — a zip throws), the writer ignores the
+// extension, and four shapes real Bun answers with an empty archive are refused
+// here instead.
+import { createBunArchive } from "./bun-archive.js";
+import { createBunS3 } from "./bun-s3.js";
 
 // The two documented Bun.hash members we did not port. The message names the
 // algorithm and says why, in the same spirit as the bun:ffi one: a caller who hits
@@ -961,6 +980,10 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
   // time, so under the eager version they could not have worked at all, which is
   // why they were simply absent.
   function makeShell() {
+    // Defaults every command inherits, which is what `$.cwd(dir)` / `$.env(vars)` /
+    // `$.nothrow()` set. A per-command modifier still wins, because it is applied
+    // to the command's own state after this is copied into it.
+    const defaults = { cwd: null, env: null, nothrow: false };
     const run = (strings, exprs, opts) => {
       const cp = lazy("child_process");
       let cmd = "";
@@ -969,10 +992,10 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
         if (i < exprs.length) cmd += shellEscape(exprs[i]);
       }
       const state = {
-        nothrow: !!(opts && opts.nothrow),
+        nothrow: !!(opts && opts.nothrow) || defaults.nothrow,
         quiet: !!(opts && opts.quiet),
-        env: null, // null -> inherit process.env, read at spawn time
-        cwd: null, // null -> inherit process.cwd()
+        env: defaults.env, // null -> inherit process.env, read at spawn time
+        cwd: defaults.cwd, // null -> inherit process.cwd()
       };
       const exec = () =>
         new Promise((resolve, reject) => {
@@ -996,7 +1019,7 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
               json: () => JSON.parse(stdout.toString("utf8")),
             };
             if (code !== 0 && !state.nothrow) {
-              const e = new Error("Command failed with exit code " + code + ": " + cmd);
+              const e = new ShellError("Command failed with exit code " + code + ": " + cmd);
               Object.assign(e, result);
               reject(e);
             } else resolve(result);
@@ -1041,11 +1064,35 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
       };
       return api;
     };
-    const $ = (strings, ...exprs) => run(strings, exprs, {});
-    $.braces = (s) => [s];
-    $.escape = shellEscape;
-    return $;
+    const makeDollar = () => {
+      const $ = (strings, ...exprs) => run(strings, exprs, {});
+      $.braces = (s) => [s];
+      $.escape = shellEscape;
+      // The same four names the per-command chain has, at shell level: they set the
+      // default for every command that follows rather than for one. Bun's return
+      // value here is the shell itself, so `$.cwd("/tmp").env({})` chains.
+      $.cwd = (dir) => { defaults.cwd = dir == null ? null : lazy("path").resolve(process.cwd(), dir); return $; };
+      $.env = (vars) => { defaults.env = vars == null ? null : vars; return $; };
+      $.nothrow = () => { defaults.nothrow = true; return $; };
+      $.throws = (shouldThrow) => { defaults.nothrow = !shouldThrow; return $; };
+      // `new $.Shell()` is a fresh shell with its own defaults, which is the point
+      // of it: a library that sets $.cwd() should not move the caller's shell.
+      $.Shell = function Shell() { return makeShell(); };
+      $.ShellError = ShellError;
+      $.ShellPromise = ShellPromise;
+      return $;
+    };
+    return makeDollar();
   }
+
+  // Named so `catch (e) { if (e instanceof $.ShellError) }` — which is how Bun's
+  // docs suggest handling a failed command — can work at all. The thrown object
+  // already carried exitCode/stdout/stderr; it was a plain Error, so the check
+  // that reads it silently took the other branch.
+  class ShellError extends Error {}
+  // Bun exposes the class of what `$\`…\`` returns. It is not constructed by user
+  // code — the shell builds it — so the export exists for `instanceof`.
+  class ShellPromise {}
 
   // ---- Bun.spawn / spawnSync / which ----------------------------------------
 
@@ -1077,6 +1124,123 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     return cmd;
   };
 
+  // ---- Bun.spawn({ ipc }) — the parent's end of the channel -------------------
+  // The parent is the server: it registers an unguessable socket path with the
+  // kernel BEFORE the child exists (net.Server.listen on a pipe path is
+  // synchronous all the way down to the OP_PIPE_LISTEN syscall, so the listener is
+  // live by the time spawn() returns), then hands the child the path in its
+  // environment. Everything after that is symmetric — see bun-ipc.js.
+  const channelNonce = () => {
+    const bytes = new Uint8Array(16);
+    const webcrypto = globalThis.crypto;
+    // The path is the only thing standing between this channel and any other
+    // process in the VM, which is why it is random rather than derived from the
+    // pid. Math.random is a weaker guess and a deliberate one: a realm with no
+    // crypto at all should still get a working channel, not a throw.
+    if (webcrypto && typeof webcrypto.getRandomValues === "function") webcrypto.getRandomValues(bytes);
+    else for (let i = 0; i < bytes.length; i++) bytes[i] = (Math.random() * 256) | 0;
+    let hex = "";
+    for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+    return hex;
+  };
+
+  function openIpcChannel(mode) {
+    const net = lazy("net");
+    const path = generateChannelPath(process.pid, channelNonce());
+    const server = net.createServer();
+    let peer = null; // the wired channel, once the child dials in
+    let pending = []; // frames written before it did
+    let live = true;
+    const api = {
+      path,
+      // Assigned once the Subprocess object exists — Bun's handler is called with
+      // it as the second argument, so the two are mutually recursive.
+      onMessage: null,
+      get connected() {
+        return live;
+      },
+      send(value) {
+        // Encoded now, not when it drains: an unclonable value must throw at the
+        // call site, and a message must carry what it held at send() time.
+        const frame = encodeMessage(value, mode);
+        if (peer) return peer.write(frame);
+        pending.push(frame);
+        return true;
+      },
+      close() {
+        if (!live) return;
+        live = false;
+        pending = [];
+        if (peer) peer.close();
+        try {
+          server.close();
+        } catch {
+          /* never listened */
+        }
+      },
+    };
+    server.on("connection", (socket) => {
+      // One channel, one child. A second dial is either a grandchild that somehow
+      // kept the path or another process that guessed it; either way, accepting it
+      // would interleave two senders' frames into one stream.
+      if (peer || !live) {
+        socket.destroy();
+        return;
+      }
+      socket.unref();
+      peer = attachChannel({
+        socket,
+        mode,
+        onMessage: (message) => {
+          if (api.onMessage) api.onMessage(message);
+        },
+        onClose: () => {
+          live = false;
+          try {
+            server.close();
+          } catch {
+            /* already closed */
+          }
+        },
+      });
+      for (const frame of pending) peer.write(frame);
+      pending = [];
+    });
+    server.on("error", () => api.close());
+    server.listen(path);
+    // A channel nobody is talking on must not hold this process open. The child
+    // itself already refs the loop for as long as it runs (child_process's
+    // liveness), so unref'ing here costs a live parent nothing and is what lets an
+    // idle parent exit once the child is gone.
+    server.unref();
+    return api;
+  }
+
+  // Bun's own rule is that a NODE child needs `serialization: "json"`, because
+  // node's "advanced" mode is v8.serialize and Bun's is a JSC structured clone;
+  // measured, a node child's messages simply never arrive at a Bun parent
+  // otherwise. Here both ends are the same runtime, so "advanced" works with a
+  // node child too — which means the sandbox is LOOSER than production, the one
+  // direction this project tries never to be. It cannot be made stricter without
+  // faking a failure, so it is announced instead.
+  let warnedNodeChild = false;
+  const warnNodeChildSerialization = (file, mode) => {
+    if (warnedNodeChild || mode === JSON_MODE) return;
+    if (String(file).replace(/^.*\//, "").replace(/\.(js|mjs|cjs|exe)$/, "") !== "node") return;
+    warnedNodeChild = true;
+    try {
+      console.warn(
+        "[vivari] Bun.spawn({ ipc }) with a node child is using the default " +
+          'serialization: "advanced". That works here because both processes run the ' +
+          "same runtime, but under real bun the child's messages never arrive — node's " +
+          'advanced mode is v8.serialize, Bun\'s is a structured clone. Pass serialization: "json" ' +
+          "if this code also has to run on a real bun.",
+      );
+    } catch {
+      /* no console */
+    }
+  };
+
   function bunSpawn(cmdOrOpts, maybeOpts) {
     const cp = lazy("child_process");
     let cmd, opts;
@@ -1087,10 +1251,22 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     // ./bun-unsupported.js.
     assertNoPty("Bun.spawn()", opts);
     requireCommand("Bun.spawn()", cmd);
+    requireExecutable("Bun.spawn()", cmd[0]);
     const [file, ...args] = cmd;
+    // The channel is opened BEFORE the spawn, because the child dials it while it
+    // boots: the listener has to already be in the kernel's pipe table.
+    const ipcHandler = typeof opts.ipc === "function" ? opts.ipc : null;
+    const ipcMode = normalizeMode(opts.serialization);
+    let ipc = null;
+    let childEnv = opts.env || process.env;
+    if (ipcHandler) {
+      warnNodeChildSerialization(file, ipcMode);
+      ipc = openIpcChannel(ipcMode);
+      childEnv = { ...childEnv, [IPC_PATH_ENV]: ipc.path, [IPC_MODE_ENV]: ipcMode };
+    }
     const child = cp.spawn(file, args, {
       cwd: opts.cwd || process.cwd(),
-      env: opts.env || process.env,
+      env: childEnv,
     });
     // Bun types `.stdout`/`.stderr` as ReadableStream, so we do have to adapt the
     // Node stream. This adapts by hand rather than calling `Readable.toWeb`.
@@ -1118,14 +1294,101 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
         cancel() { try { nodeStream.destroy(); } catch {} },
       });
     };
-    return {
+    // Bun's Subprocess is 19 members; this returned 6, and the missing one people
+    // actually reach for is `exitCode` — `await p.exited; if (p.exitCode !== 0)`
+    // read `undefined !== 0` and took the failure branch on every successful run.
+    // The semantics below were read off the 1.3 binary, and two of them are not
+    // what you would guess:
+    //
+    //   exitCode    null until exit, and STILL null when the process was killed by
+    //               a signal — the code lives in signalCode then, so treating
+    //               `exitCode` as a number is wrong exactly when it matters.
+    //   killed      true after ANY exit, not only after kill(). Bun sets it when
+    //               the handle is done with the process.
+    const sub = {
       pid: child.pid,
       stdout: web(child.stdout),
       stderr: web(child.stderr),
       stdin: child.stdin,
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      // A pty was refused above, so this is null rather than absent.
+      terminal: null,
+      readable: null,
+      writable: child.stdin || null,
+      stdio: [child.stdin || null, child.stdout || null, child.stderr || null],
       kill: (sig) => child.kill(sig),
-      exited: new Promise((resolve) => child.on("close", (code) => resolve(code | 0))),
+      // The event loop's hold on the child, which is what lets a script start a
+      // background process and still exit.
+      ref: () => { if (typeof child.ref === "function") child.ref(); },
+      unref: () => { if (typeof child.unref === "function") child.unref(); },
+      resourceUsage: () => {
+        // Bun reads getrusage(2). There is no rusage in a browser tab and no
+        // plausible number to invent — a zeroed struct would be read as a
+        // measurement, so this refuses instead.
+        throw new Error(
+          sandboxMessage(
+            "Subprocess.resourceUsage()",
+            "it reports getrusage(2) — peak RSS, context switches, CPU time — which " +
+              "the kernel measures and a page cannot see. Time the work yourself with " +
+              "performance.now() if a duration is what you need."
+          )
+        );
+      },
+      // IPC: `Bun.spawn({ ipc })` runs over the kernel's cross-process pipe (see
+      // bun-ipc.js). Without the option there is no channel at all, and the three
+      // members below say so in the binary's own words rather than accepting a
+      // message and dropping it — which is how a parent waits forever for a reply.
+      get connected() {
+        // `killed` is set after ANY exit, and a dead child is reported as exited
+        // before it is reported as disconnected. Reading it here also closes the
+        // window between the child's last breath and the kernel's pipe teardown.
+        return !!ipc && !sub.killed && ipc.connected;
+      },
+      send: (message) => {
+        // These two sentences are Bun's, and the ORDER is Bun's: an exited child is
+        // reported as exited even though its channel is also closed, and both are
+        // checked before the message itself. Someone will search for these strings.
+        if (sub.killed) {
+          throw new Error("Subprocess.send() cannot be used after the process has exited.");
+        }
+        if (!ipc || !ipc.connected) {
+          throw new Error("Subprocess.send() can only be used if an IPC channel is open.");
+        }
+        requireMessage(message);
+        return ipc.send(message);
+      },
+      // A no-op when there is no channel, and idempotent when there is — measured
+      // both ways: calling disconnect() twice, or on a subprocess spawned without
+      // `ipc`, is not an error under bun.
+      disconnect: () => {
+        if (ipc) ipc.close();
+      },
     };
+    if (ipc) {
+      // Bun calls the handler with (message, subprocess). The subprocess argument
+      // is what makes a reply possible from inside the handler, which is the shape
+      // every request/response use of this API takes.
+      ipc.onMessage = (message) => ipcHandler(message, sub);
+    }
+    child.on("exit", (code, signal) => {
+      // Both are reported here, and only one of them is ever non-null.
+      sub.exitCode = code === null ? null : code | 0;
+      sub.signalCode = signal || null;
+      sub.killed = true;
+    });
+    sub.exited = new Promise((resolve) =>
+      child.on("close", (code) => {
+        // Closed here rather than on 'exit' so any message the child sent just
+        // before dying has already been relayed and delivered. The kernel tears
+        // the pipe down on its own when a process dies; this is what stops the
+        // parent from holding a listener for a child that is never coming back.
+        if (ipc) ipc.close();
+        resolve(code | 0);
+      }),
+    );
+    return sub;
   }
   function bunSpawnSync(cmdOrOpts, maybeOpts) {
     const cp = lazy("child_process");
@@ -1134,6 +1397,9 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     else { opts = cmdOrOpts || {}; cmd = opts.cmd || []; }
     assertNoPty("Bun.spawnSync()", opts);
     requireCommand("Bun.spawnSync()", cmd);
+    // Same sentence and the same ENOENT as the async spawn — verified against the
+    // binary, which throws from both.
+    requireExecutable("Bun.spawnSync()", cmd[0]);
     const [file, ...args] = cmd;
     const r = cp.spawnSync(file, args, { cwd: opts.cwd || process.cwd(), env: opts.env || process.env });
     return {
@@ -1144,6 +1410,30 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
       stderr: r.stderr ? toBuf(r.stderr, Buffer) : Buffer.alloc(0),
     };
   }
+  // A command that is not on PATH must be reported to the CALLER, and this has to
+  // happen before the spawn to do that at all.
+  //
+  // child_process.spawn is right not to throw — Node's contract is an async `error`
+  // event — but nothing was listening, and an `error` with no listener is rethrown
+  // by EventEmitter, which killed the calling guest outright: a typo in a command
+  // name took down the program that typed it, with a stack pointing into the
+  // runtime. Real Bun throws from `Bun.spawn` synchronously, so the fix and the
+  // fidelity are the same change. The message and the ENOENT code are the binary's.
+  function requireExecutable(api, cmd) {
+    const file = String(cmd);
+    const fs = lazy("fs");
+    // A path (not a bare name) is not a PATH lookup: check it where it points.
+    if (file.includes("/")) {
+      try { if (fs.statSync(file).isFile()) return; } catch {}
+    } else if (bunWhich(file)) {
+      return;
+    }
+    const e = new Error('Executable not found in $PATH: "' + file + '"');
+    e.code = "ENOENT";
+    e.syscall = api;
+    throw e;
+  }
+
   function bunWhich(cmd, opts) {
     const fs = lazy("fs");
     const dirs = String((opts && opts.PATH) || process.env.PATH || "/bin").split(":").filter(Boolean);
@@ -1216,7 +1506,15 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
   const worker = createBunWorker({ lazy, process });
 
   // Bun.sha (SHA-2 512/256, not SHA-512) and Bun.CSRF ride the same primitives.
-  const { CryptoHasher, password, sha, CSRF } = createBunCrypto({ lazy, Buffer, process });
+  // isFileBlob: so the hash classes can refuse a Bun.file() with Bun's own message
+  // rather than the generic one. Bun refuses it too — a file blob is a path, not
+  // bytes — and this is the case most likely to be tried.
+  const { CryptoHasher, password, sha, CSRF, hashClasses } = createBunCrypto({
+    lazy,
+    Buffer,
+    process,
+    isFileBlob: (v) => v instanceof files.BunFile,
+  });
 
   // ---- misc helpers ----------------------------------------------------------
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms instanceof Date ? Math.max(0, ms - Date.now()) : ms));
@@ -1268,14 +1566,28 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
   // ---- the Bun global --------------------------------------------------------
   const formats = createBunFormats({ process });
   const unsupported = createBunUnsupported();
+  const sockets = createBunSockets({ require, Buffer, shimMessage });
+  // `lazy` rather than an eager require: zlib is only needed for a gzipped
+  // archive, so a guest that never opens one does not pull the codec in.
+  const { Archive } = createBunArchive({ lazy, Buffer });
+  // Bun.S3Client / Bun.s3 over fetch + SigV4 (./bun-s3.js). `fetch` is read at
+  // call time inside that module rather than captured here, because in a browser
+  // the guest's fetch IS the page's own.
+  const s3api = createBunS3({ lazy, Buffer, process, shimMessage });
   const Bun = {
     version: BUN_VERSION,
     revision: BUN_REVISION,
     get env() { return process.env; },
     get argv() { return process.argv; },
     get main() { return process.argv && process.argv[1] ? process.argv[1] : ""; },
-    file: bunFile,
-    write: bunWrite,
+    // `s3://bucket/key` is a path Bun.file and Bun.write both accept, and it
+    // routes to the DEFAULT client (the one built from the environment) — checked
+    // against the binary, where `Bun.file("s3://b/k").bucket === "b"`. Anything
+    // else is an ordinary file, so a project that never touches S3 pays one
+    // string test per call.
+    file: (path, options) => (s3api.isS3Path(path) ? s3api.s3.file(path, options) : bunFile(path, options)),
+    write: (dest, data, options) =>
+      s3api.isS3Path(dest) ? s3api.s3.write(dest, data, options) : bunWrite(dest, data, options),
     serve: bunServe,
     $: makeShell(),
     spawn: bunSpawn,
@@ -1312,6 +1624,9 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     TOML: formats.TOML,
     JSON5: formats.JSON5,
     JSONL: formats.JSONL,
+    // JSON with comments — tsconfig.json's actual format. Not JSON5 underneath:
+    // Bun rejects NaN, Infinity and unquoted keys, which JSON5 accepts.
+    JSONC: formats.JSONC,
     semver: formats.semver,
     // Bun.inspect keeps delegating to util.inspect, but is now a function object
     // carrying .table and .custom (see bun-text.js).
@@ -1345,6 +1660,24 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     resolveSync: (id, root) => bunResolveSync(id, root),
     resolve: async (id, root) => bunResolveSync(id, root),
     randomUUIDv7: (encoding, timestamp) => randomUUIDv7(lazy("crypto"), Buffer, encoding, timestamp),
+    randomUUIDv5: (name, namespace, encoding) => randomUUIDv5(lazy("crypto"), Buffer, name, namespace, encoding),
+    // One class per algorithm — Bun.SHA256 and friends. See ./bun-crypto.js for
+    // why they are not CryptoHasher subclasses (they are consumed by digest()).
+    ...hashClasses,
+    // A standalone executable embeds its assets and lists them here. Nothing is
+    // ever compiled in this sandbox, so the honest value is the empty array Bun
+    // itself returns from a plain `bun run` — one shared, mutable array, which is
+    // what Bun has (`Bun.embeddedFiles === Bun.embeddedFiles`, and a push sticks).
+    embeddedFiles: [],
+    // Bun decides this once at startup from NO_COLOR / FORCE_COLOR / isatty, in
+    // that order of precedence (measured). A getter rather than a constant because
+    // this runtime's stdout can acquire a TTY after the module is built.
+    get enableANSIColors() {
+      if (process.env.NO_COLOR) return false;
+      if (process.env.FORCE_COLOR) return true;
+      return Boolean(process.stdout && process.stdout.isTTY);
+    },
+    unsafe: makeBunUnsafe(Buffer, process),
     // Bun.stdin stays the Node stream this shim has always returned, rather than
     // becoming a BunFile: guest code here reads stdin with .on("data") / async
     // iteration off the SAB-backed stream, and swapping in a wrapper would take
@@ -1373,6 +1706,10 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     // Bundling + plugins (./bun-build.js). Output is NOT byte-identical to Bun's.
     build: builder.build,
     plugin: builder.plugin,
+    // tar and gzipped tar, read and written (./bun-archive.js). Deliberately NOT
+    // a superset: a .zip throws `Unrecognized archive format`, because real Bun
+    // cannot read one and a shim that could would pass here and fail there.
+    Archive,
     // ---- the surface a browser cannot provide (./bun-unsupported.js) ---------
     // Present as real values so a property read, a destructure or an
     // `import { x } from` still works, and loud on CALL with a message that names
@@ -1382,8 +1719,10 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     // `dns` is the mixed case: lookup throws, while prefetch and getCacheStats
     // are honest no-ops, because an advisory hint should not take an app down.
     dns: unsupported.dns,
-    listen: unsupported.listen,
-    connect: unsupported.connect,
+    // TCP inside the VM, over the same loopback network node:net uses. Only the
+    // destination is refused now, not the API — see bun-socket.js.
+    listen: sockets.listen,
+    connect: sockets.connect,
     udpSocket: unsupported.udpSocket,
     RedisClient: unsupported.RedisClient,
     redis: unsupported.redis,
@@ -1394,6 +1733,42 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     peek: unsupported.peek,
     secrets: unsupported.secrets,
     dlopen: unsupported.dlopen,
+    generateHeapSnapshot: unsupported.generateHeapSnapshot,
+    openInEditor: unsupported.openInEditor,
+    // Named rather than absent. `Bun.postgres` and the rest used to be `undefined`,
+    // so the failure was "not a function" from wherever the dependency called it.
+    postgres: unsupported.postgres,
+    Terminal: unsupported.Terminal,
+    registerMacro: unsupported.registerMacro,
+    // Real, over fetch + SigV4 (./bun-s3.js). The signer is pinned to AWS's own
+    // published test vectors AND to Authorization headers captured off the
+    // binary; what a browser adds to the picture is CORS, which lives in that
+    // file's error path.
+    S3Client: s3api.S3Client,
+    s3: s3api.s3,
+    // The bun:ffi module, reachable off the global as Bun.FFI, as in Bun.
+    FFI: unsupported.FFI,
+
+    // ---- the small real ones that were simply missing ------------------------
+    // Cheap to provide and wrong to omit: each one silently read as `undefined`,
+    // which is a value, so nothing threw at the read and the mistake surfaced
+    // somewhere else entirely.
+    get cwd() { return process.cwd(); },
+    // "" in real Bun unless the process is a server that set it — including WHILE
+    // Bun.serve is running, which is worth knowing before copying its value into a
+    // URL. Checked against 1.3.6 rather than assumed.
+    origin: "",
+    version_with_sha: "v" + BUN_VERSION + " (" + BUN_REVISION + ")",
+    // Bun's own fetch: the platform one, plus `.preconnect`. It is NOT `=== fetch`
+    // in Bun either, so a wrapper is the faithful shape.
+    fetch: makeBunFetch(),
+    // Bun.jest(path) hands back the bun:test module bound to a file. Same module
+    // object here; the file binding is what __setFile already does.
+    jest: () => modules["bun:test"],
+    // A GC hint. Bun returns undefined; a page has no way to ask the collector for
+    // anything, so this is honestly a no-op rather than a refusal — an advisory
+    // call should not take an app down (the same rule as Bun.dns.prefetch).
+    shrink: () => undefined,
   };
 
   // ---- bun:* modules ---------------------------------------------------------
@@ -1446,7 +1821,15 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     return dotenvLoaded;
   }
 
-  return { Bun, modules, loadDotenv, Worker: worker.Worker, installWorkerGlobals: worker.installWorkerGlobals };
+  // HTMLRewriter is a GLOBAL in Bun, not a member of `Bun` — see ./bun-html-rewriter.js.
+  return {
+    Bun,
+    modules,
+    loadDotenv,
+    Worker: worker.Worker,
+    installWorkerGlobals: worker.installWorkerGlobals,
+    HTMLRewriter: createHTMLRewriter(),
+  };
 }
 
 // ---- bun:test ---------------------------------------------------------------
@@ -1499,13 +1882,60 @@ function makeBunJsc() {
         "JavaScript engine exposes no heap-introspection hook to page code."
     );
   };
-  return {
-    serialize: (v) => new Uint8Array(Buffer.from(JSON.stringify(v), "utf8")),
-    deserialize: (b) => JSON.parse(Buffer.from(b).toString("utf8")),
+  // bun:jsc is mostly a hatch into JavaScriptCore's internals: GC control, the DFG
+  // and FTL compilers, the sampling profiler. None of that is reachable from page
+  // code in any engine, and there is no partial version — so the whole family gets
+  // one honest refusal each, rather than being absent (a call reads as "not a
+  // function", which sounds like a typo) or a silent no-op (worse: a test that
+  // calls fullGC() and then measures memory would report nonsense).
+  const noEngineHook = (name) => () => {
+    throw new Error(
+      "bun:jsc." + name + "() is not supported in Vivari (browser sandbox): it drives " +
+        "JavaScriptCore internals — the collector, the JIT tiers, the sampling profiler " +
+        "— which no engine exposes to page code."
+    );
+  };
+  const jsc = {
+    serialize: bunSerialize,
+    deserialize: bunDeserialize,
     estimateShallowMemoryUsageOf: noHeapIntrospection("estimateShallowMemoryUsageOf"),
     heapSize: noHeapIntrospection("heapSize"),
     memoryUsage: noHeapIntrospection("memoryUsage"),
+    // Two that ARE possible, and the reason to go through the list rather than
+    // refusing it wholesale.
+    //
+    // Draining the microtask queue is just awaiting one turn — the queue is the
+    // engine's, but emptying it needs no privilege.
+    drainMicrotasks: () => {
+      let done = false;
+      Promise.resolve().then(() => { done = true; });
+      // Bun's is synchronous; this cannot be, so it returns a promise. Awaiting it
+      // is the faithful use here, and a bare call still queues the drain.
+      return Promise.resolve().then(() => done);
+    },
+    // Really changes the zone: Node re-reads process.env.TZ and resets its cached
+    // offset, so Date and Intl follow, which is what the API is for (testing a
+    // date-dependent path without a container).
+    setTimeZone: (tz) => {
+      if (typeof tz !== "string" || tz === "") throw new TypeError("Expected a time zone string");
+      process.env.TZ = tz;
+      return tz;
+    },
   };
+  // Bun spells it both ways and both work.
+  jsc.setTimezone = jsc.setTimeZone;
+  for (const name of [
+    "callerSourceOrigin", "codeCoverageForFile", "describe", "describeArray", "edenGC", "fullGC",
+    "gcAndSweep", "generateHeapSnapshotForDebugging", "getProtectedObjects", "getRandomSeed",
+    "heapStats", "isRope", "jscDescribe", "jscDescribeArray", "noFTL", "noInline",
+    "noOSRExitFuzzing", "numberOfDFGCompiles", "optimizeNextInvocation",
+    "percentAvailableMemoryInUse", "profile", "releaseWeakRefs", "reoptimizationRetryCount",
+    "samplingProfilerStackTraces", "setRandomSeed", "startRemoteDebugger",
+    "startSamplingProfiler", "totalCompileTime",
+  ]) {
+    if (!jsc[name]) jsc[name] = noEngineHook(name);
+  }
+  return jsc;
 }
 
 // bun:ffi lives in ./bun-unsupported.js (createBunFfi) alongside the rest of the
@@ -1597,6 +2027,125 @@ function randomUUIDv7(crypto, Buffer, encoding, timestamp) {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
+// ---- Bun.unsafe -------------------------------------------------------------
+// Three members, and only one of them does anything anywhere: `arrayBufferToString`
+// is a pure decode and works exactly as documented — 8-bit views decode as latin1
+// (so 0xff stays U+00FF rather than becoming a replacement character) and a
+// Uint16Array decodes as UTF-16, both checked against bun-1.3.14.
+//
+// The other two are allocator controls with nothing to control here. Rather than
+// throw — these are called for their side effect, in code that must keep running
+// — `gcAggressionLevel` REMEMBERS the level so get-after-set is coherent (Bun
+// returns the previous level, which this does too), and `mimallocDump` says once
+// that there is no mimalloc heap in this engine instead of printing a fake one.
+function makeBunUnsafe(Buffer, process) {
+  let aggression = 0;
+  let dumped = false;
+  return {
+    arrayBufferToString(buffer) {
+      if (buffer instanceof Uint16Array) {
+        let out = "";
+        for (let i = 0; i < buffer.length; i++) out += String.fromCharCode(buffer[i]);
+        return out;
+      }
+      if (buffer instanceof ArrayBuffer) return Buffer.from(new Uint8Array(buffer)).toString("latin1");
+      if (ArrayBuffer.isView(buffer)) {
+        return Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength).toString("latin1");
+      }
+      throw new TypeError("Expected an ArrayBuffer");
+    },
+    gcAggressionLevel(level) {
+      const previous = aggression;
+      if (level != null) aggression = level | 0;
+      return previous;
+    },
+    mimallocDump() {
+      if (dumped) return;
+      dumped = true;
+      try {
+        process.stderr.write(
+          "Bun.unsafe.mimallocDump(): Vivari runs on a JavaScript engine's own heap, not mimalloc, " +
+            "so there is no allocator dump to print.\n"
+        );
+      } catch {
+        /* stderr gone — a diagnostic must never be the thing that fails */
+      }
+    },
+  };
+}
+
+// ---- Bun.randomUUIDv5 -------------------------------------------------------
+// The name-based counterpart to v7: same name plus same namespace gives the same
+// UUID for ever, on any machine, which is why it is used for stable ids derived
+// from a URL, a DNS name or a path. RFC 9562 §5.5: SHA-1 over
+// (namespace bytes || name bytes), first 16 bytes, version nibble 5, variant 0b10.
+//
+// The four documented namespaces are the RFC's own constants, and the aliases are
+// matched case-insensitively ("DNS" works under Bun). Anything else must be a
+// dashed 8-4-4-4-12 UUID or exactly 16 raw bytes — Bun rejects `urn:uuid:…`,
+// braces and an undashed hex string, all measured against bun-1.3.14, along with
+// each error string reproduced below.
+//
+// Verified against that binary AND against an implementation nobody here wrote,
+// Python's `uuid.uuid5`, which agrees on every vector:
+//
+//   ("www.example.com", dns) -> 2ed6657d-e927-568b-95e1-2665a8aea6a2
+//   ("python.org",      dns) -> 886313e1-3b8a-5372-9b90-0c9aee199e5d
+//   ("www.example.com", url) -> b63cdfa4-3df9-568e-97ae-006c5b8fd652
+//
+// Round-tripping our own output would prove nothing here: a wrong-but-consistent
+// hash input (namespace and name swapped, say) is self-consistent too, and the
+// ids only stop matching once they meet a system that did it right.
+const UUID_NAMESPACES = {
+  dns: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+  url: "6ba7b811-9dad-11d1-80b4-00c04fd430c8",
+  oid: "6ba7b812-9dad-11d1-80b4-00c04fd430c8",
+  x500: "6ba7b814-9dad-11d1-80b4-00c04fd430c8",
+};
+const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function uuidNamespaceBytes(Buffer, namespace) {
+  if (namespace == null) throw new TypeError('The "namespace" argument must be specified');
+  if (typeof namespace === "string") {
+    const named = UUID_NAMESPACES[namespace.toLowerCase()];
+    const text = named || namespace.toLowerCase();
+    if (!UUID_TEXT.test(text)) throw new TypeError("Invalid UUID format for namespace");
+    return Buffer.from(text.replace(/-/g, ""), "hex");
+  }
+  if (namespace instanceof ArrayBuffer || ArrayBuffer.isView(namespace)) {
+    const bytes = Buffer.isBuffer(namespace)
+      ? namespace
+      : namespace instanceof ArrayBuffer
+        ? Buffer.from(new Uint8Array(namespace))
+        : Buffer.from(namespace.buffer, namespace.byteOffset, namespace.byteLength);
+    if (bytes.length !== 16) throw new TypeError("Namespace must be exactly 16 bytes");
+    return bytes;
+  }
+  throw new TypeError("Invalid UUID format for namespace");
+}
+
+function randomUUIDv5(crypto, Buffer, name, namespace, encoding) {
+  const ns = uuidNamespaceBytes(Buffer, namespace);
+  let nameBytes;
+  if (typeof name === "string") nameBytes = Buffer.from(name, "utf8");
+  else if (name instanceof ArrayBuffer) nameBytes = Buffer.from(new Uint8Array(name));
+  else if (ArrayBuffer.isView(name)) nameBytes = Buffer.from(name.buffer, name.byteOffset, name.byteLength);
+  else throw new TypeError('The "name" argument must be of type string or BufferSource');
+
+  const digest = crypto.createHash("sha1").update(Buffer.concat([ns, nameBytes])).digest();
+  const bytes = Buffer.from(digest.subarray(0, 16));
+  bytes[6] = 0x50 | (bytes[6] & 0x0f); // version 5
+  bytes[8] = 0x80 | (bytes[8] & 0x3f); // variant 0b10
+
+  const enc = encoding == null ? "hex" : encoding;
+  if (enc === "buffer") return bytes;
+  if (enc === "base64") return bytes.toString("base64");
+  if (enc === "base64url") return bytes.toString("base64url");
+  if (enc !== "hex") throw new TypeError("Encoding must be one of base64, base64url, hex, or buffer");
+  const h = bytes.toString("hex");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
 // ---- Bun.deepEquals / Bun.deepMatch -----------------------------------------
 // This used to be a key-count plus recursive compare that ACCEPTED the `strict`
 // argument and ignored it. That is worse than it sounds, because `strict` is not
@@ -1615,6 +2164,20 @@ function randomUUIDv7(crypto, Buffer, encoding, timestamp) {
 // Everything else below applies in both modes and was simply missing before: the
 // old version had no Map/Set/Date/RegExp/TypedArray handling, said NaN !== NaN,
 // and compared `[1, 2]` equal to `{0: 1, 1: 2}` because it only counted keys.
+// `Bun.fetch` is the platform fetch with `.preconnect` hanging off it. Real Bun's
+// is not identical to the global (`Bun.fetch === fetch` is false there too), so a
+// wrapper is the faithful shape rather than a shortcut.
+function makeBunFetch() {
+  const bunFetch = function fetch(...args) {
+    return globalThis.fetch(...args);
+  };
+  // Warms DNS and the TCP handshake for a host. A page cannot do either — both
+  // happen inside the browser's network stack, out of reach — and it is advisory,
+  // so it is a no-op here rather than a refusal, exactly like Bun.dns.prefetch.
+  bunFetch.preconnect = () => undefined;
+  return bunFetch;
+}
+
 export function bunDeepEquals(a, b, strict) {
   if (a === b) return true;
   // NaN is the one primitive where === is not the right answer: Bun.deepEquals

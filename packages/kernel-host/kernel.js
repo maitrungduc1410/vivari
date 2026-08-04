@@ -1209,6 +1209,7 @@ export class Kernel {
   // cross-process pipe connections. Forward the message verbatim to the OTHER end
   // (client<->server), keyed by connId. On close, drop the connection record.
   handlePipeRelay(fromPid, m) {
+    if (!m || typeof m !== "object") return;
     const conn = this.pipeConns.get(m.connId);
     if (!conn) return;
     const otherPid = fromPid === conn.clientPid ? conn.serverPid : conn.clientPid;
@@ -1427,6 +1428,7 @@ export class Kernel {
 
   // A process relayed a ws frame outward ({connId, sub:'open'|'msg'|'close', ...}).
   handleWsOut(pid, m) {
+    if (!m || typeof m !== "object") return;
     if (m.sub === "close") this.wsConns.delete(m.connId);
     if (this.onWsSend) this.onWsSend(m);
   }
@@ -1471,11 +1473,16 @@ export class Kernel {
   // A process relayed an SSE stream chunk outward ({connId, sub:'open'|'chunk'|
   // 'close', ...}).
   handleSseOut(pid, m) {
+    if (!m || typeof m !== "object") return;
     if (m.sub === "close") this.sseConns.delete(m.connId);
     if (this.onSseSend) this.onSseSend(m);
   }
 
   async handleSpawn(parent, spec) {
+    if (!spec || typeof spec !== "object") {
+      this.respondErr(parent, "EINVAL");
+      return;
+    }
     const cwd = spec.cwd || "/";
     // On-demand: if this command is a lazily-registered heavy tool, materialize
     // it (fetch + unpack into the VFS) before resolving. The parent stays parked
@@ -1512,6 +1519,10 @@ export class Kernel {
   // running its event loop. The child streams stdout/stderr to the parent worker
   // (proc.stream) and, on exit, we post {type:'child-exit'} to the parent handle.
   async handleSpawnAsync(parent, spec) {
+    if (!spec || typeof spec !== "object") {
+      this.respondErr(parent, "EINVAL");
+      return;
+    }
     const cwd = spec.cwd || "/";
     // On-demand load of heavy tools before resolving (see handleSpawn). The {pid}
     // ack simply arrives once the tool is materialized on PATH. Pass the parent's
@@ -1556,6 +1567,7 @@ export class Kernel {
   // don't verify parentage — the pid came from a ChildProcess this parent holds —
   // but only deliver to live procs.
   handleChildStdin(parentPid, m) {
+    if (!m || typeof m !== "object") return;
     const childPid = m.childPid | 0;
     if (this.procs.has(childPid)) this.sendStdin(childPid, m.chunk == null ? null : m.chunk);
   }
@@ -1662,6 +1674,14 @@ export class Kernel {
   handleThreadSpawn(parentPid, data) {
     const parent = this.procs.get(parentPid);
     if (!parent) return;
+    // Every handler reached from the worker message table starts with a shape
+    // check, because the message is only as trustworthy as the process it came
+    // from — which, in a browser, means guest code could have posted it. A message
+    // that carries nothing to act on is DROPPED rather than answered: there is no
+    // caller parked on a reply here (unlike a syscall), so silence is the whole
+    // correct response. This one used to throw on a bare `{}`, and the throw took
+    // the kernel with it.
+    if (!data || typeof data !== "object" || !data.spec || typeof data.spec !== "object") return;
     const { reqId, spec, port } = data;
     const cwd = spec.cwd || "/";
     const programPath = this.resolvePath(cwd, spec.programPath || "");

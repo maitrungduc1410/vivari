@@ -1,0 +1,627 @@
+{
+ "recordedFrom": "bun 1.3.14",
+ "results": {
+  "T:passthrough": "<P CLASS='a'   data-x=1 >hi</P >",
+  "T:setAttribute": "<p x=\"1\">hi</p>",
+  "T:setAttribute quoting": "<a href=/x title=\"a&quot;b<c&d\">t</a>",
+  "T:preserve other attrs": "<b x='1' y=\"2\">t</b>",
+  "T:removeAttribute": "<a href='/x'>t</a>",
+  "T:set tagName": "<section>x</section>",
+  "T:before/after text": "A&lt;i&gt;&amp;<b>x</b>B",
+  "T:before/after html": "<i>A</i><b>x</b>",
+  "T:prepend/append": "<b>[x]</b>",
+  "T:replace": "<hr>",
+  "T:remove": "ac",
+  "T:removeAndKeepContent": "ax<i>y</i>c",
+  "T:setInnerContent": "<b>Z</b>",
+  "T:setInnerContent html": "<b><i>Z</i></b>",
+  "T:remove then append": "Z",
+  "T:onEndTag before": "<b>x!</b>",
+  "T:onEndTag remove": "<b>x",
+  "T:onEndTag rename": "<b>x</i>",
+  "T:append to void": "<img src=x>",
+  "T:unclosed append": "<div>x",
+  "T:malformed": "<p><b z=\"1\">x</p>",
+  "T:nested same": "<div n=\"1\"><div n=\"1\">x</div></div>",
+  "T:text replace": "<p>YO</p>",
+  "T:text before+remove": "<p>[</p>",
+  "T:comment set": "<p><!--d--></p>",
+  "T:comment remove": "<p>x</p>",
+  "T:doc end append": "<p>x</p><!--end-->",
+  "T:doctype remove": "<p>x</p>",
+  "T:script untouched": "<script>if (a<b) {}</script><p z=\"1\">x</p>",
+  "T:style text": "<style>/*gone*/</style>",
+  "T:svg child": "<svg><rect fill=\"red\" /></svg>",
+  "T:entities kept": "<p z=\"1\">a&amp;b&#65;</p>",
+  "T:p self closing": "<p z=\"1\" />x",
+  "T:utf8": "<p z=\"é\">café 你好</p>",
+  "T:multiple rules": "<p a=\"1\" b=\"2\">x</p>",
+  "T:attr selector": "<p data-x='1' hit=\"1\">a</p><p>b</p>",
+  "T:class selector": "<p class='a b' hit=\"1\">x</p><p class='c'>y</p>",
+  "T:id selector": "<p id=i hit=\"1\">x</p><p>y</p>",
+  "T:descendant": "<div><span><i hit=\"1\">x</i></span></div><i>y</i>",
+  "T:child combinator": "<div><p hit=\"1\">a</p><span><p>b</p></span></div>",
+  "T:not": "<div><p>a</p><span hit=\"1\">b</span></div>",
+  "T:nth-child": "<ul><li>1</li><li hit=\"1\">2</li><li>3</li></ul>",
+  "T:first-child": "<ul><li hit=\"1\">1</li><li>2</li></ul>",
+  "T:comma list": "<p hit=\"1\">a</p><span hit=\"1\">b</span><i>c</i>",
+  "T:star": "<div hit=\"1\"><p hit=\"1\">x</p></div>",
+  "T:attr prefix op": "<p data-x='foobar' hit=\"1\">a</p><p data-x='barfoo'>b</p>",
+  "T:attr contains op": "<p class='xy' hit=\"1\">a</p><p class='zz'>b</p>",
+  "T:tilde op": "<p class='a b' hit=\"1\">x</p>",
+  "O:text chunks": [
+   [
+    "hello ",
+    false
+   ],
+   [
+    "",
+    true
+   ],
+   [
+    "x",
+    false
+   ],
+   [
+    "",
+    true
+   ],
+   [
+    " world",
+    false
+   ],
+   [
+    "",
+    true
+   ]
+  ],
+  "O:doc text": [
+   "a",
+   "",
+   "b",
+   "",
+   "c",
+   ""
+  ],
+  "O:tagName seen": [
+   "div"
+  ],
+  "O:attributes list": [
+   [
+    [
+     "href",
+     "/x"
+    ],
+    [
+     "data-y",
+     "2"
+    ]
+   ]
+  ],
+  "O:attributes after set": [
+   [
+    [
+     "x",
+     "1"
+    ],
+    [
+     "y",
+     "2"
+    ]
+   ]
+  ],
+  "O:flags": [
+   [
+    "img",
+    false,
+    false,
+    "http://www.w3.org/1999/xhtml"
+   ],
+   [
+    "br",
+    true,
+    false,
+    "http://www.w3.org/1999/xhtml"
+   ],
+   [
+    "p",
+    true,
+    true,
+    "http://www.w3.org/1999/xhtml"
+   ],
+   [
+    "div",
+    false,
+    true,
+    "http://www.w3.org/1999/xhtml"
+   ]
+  ],
+  "O:svg ns": [
+   [
+    "svg",
+    "http://www.w3.org/2000/svg",
+    true
+   ],
+   [
+    "rect",
+    "http://www.w3.org/2000/svg",
+    false
+   ]
+  ],
+  "O:removed flag": [
+   true
+  ],
+  "O:comment text": [
+   " c "
+  ],
+  "O:doctype fields": [
+   [
+    "html",
+    null,
+    null
+   ]
+  ],
+  "O:doctype public": [
+   [
+    "html",
+    "-//W3C//DTD HTML 4.01//EN",
+    "http://www.w3.org/TR/html4/strict.dtd"
+   ]
+  ],
+  "O:handler in removed": [
+   "span ran"
+  ],
+  "O:order doc vs el": [
+   "el",
+   "doc",
+   "el",
+   "doc"
+  ],
+  "O:getAttribute case": [
+   [
+    "/x",
+    true,
+    null
+   ]
+  ],
+  "O:nested hits": [
+   "hit",
+   "hit"
+  ],
+  "O:duplicate attrs": [
+   [
+    [
+     "x",
+     "1"
+    ],
+    [
+     "x",
+     "2"
+    ]
+   ]
+  ],
+  "P:page passthrough": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n</head>\n<body class=\"home  dark\" data-env='prod'>\n  <!-- nav -->\n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"/a\">A</a></li><li class=item><a href='/b'>B</a></li></ul></nav>\n  <main>\n    <h1>Hello <em>world</em>!</h1>\n    <p>Text with <b>bold</b> and <i>italic</i> &amp; an entity.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    <script>var a = \"<p>not a tag</p>\"; if (1 < 2) {}</script>\n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1'/><circle r=\".5\"/></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  </main>\n  <footer><!--f--><p>&copy; 2026</p></footer>\n</body>\n</html>",
+  "P:page rewrite links": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n</head>\n<body class=\"home  dark\" data-env='prod'>\n  <!-- nav -->\n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"https://cdn//a\">A</a></li><li class=item><a href=\"https://cdn//b\">B</a></li></ul></nav>\n  <main>\n    <h1>Hello <em>world</em>!</h1>\n    <p>Text with <b>bold</b> and <i>italic</i> &amp; an entity.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    <script>var a = \"<p>not a tag</p>\"; if (1 < 2) {}</script>\n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1'/><circle r=\".5\"/></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  </main>\n  <footer><!--f--><p>&copy; 2026</p></footer>\n</body>\n</html>",
+  "P:page inject head": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n<meta name=x></head>\n<body class=\"home  dark\" data-env='prod'>\n  <!-- nav -->\n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"/a\">A</a></li><li class=item><a href='/b'>B</a></li></ul></nav>\n  <main>\n    <h1>Hello <em>world</em>!</h1>\n    <p>Text with <b>bold</b> and <i>italic</i> &amp; an entity.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    <script>var a = \"<p>not a tag</p>\"; if (1 < 2) {}</script>\n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1'/><circle r=\".5\"/></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  </main>\n  <footer><!--f--><p>&copy; 2026</p></footer>\n</body>\n</html>",
+  "P:page strip scripts": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n</head>\n<body class=\"home  dark\" data-env='prod'>\n  <!-- nav -->\n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"/a\">A</a></li><li class=item><a href='/b'>B</a></li></ul></nav>\n  <main>\n    <h1>Hello <em>world</em>!</h1>\n    <p>Text with <b>bold</b> and <i>italic</i> &amp; an entity.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    \n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1'/><circle r=\".5\"/></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  </main>\n  <footer><!--f--><p>&copy; 2026</p></footer>\n</body>\n</html>",
+  "P:page rewrite text": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n</head>\n<body class=\"home  dark\" data-env='prod'>\n  <!-- nav -->\n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"/a\">A</a></li><li class=item><a href='/b'>B</a></li></ul></nav>\n  <main>\n    <h1>Hello <em>world</em>!</h1>\n    <p>Text with <b>bold</b> and <i>italic</i> &amp;AMP; AN ENTITY.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    <script>var a = \"<p>not a tag</p>\"; if (1 < 2) {}</script>\n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1'/><circle r=\".5\"/></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  </main>\n  <footer><!--f--><p>&copy; 2026</p></footer>\n</body>\n</html>",
+  "P:page comments out": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n</head>\n<body class=\"home  dark\" data-env='prod'>\n  \n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"/a\">A</a></li><li class=item><a href='/b'>B</a></li></ul></nav>\n  <main>\n    <h1>Hello <em>world</em>!</h1>\n    <p>Text with <b>bold</b> and <i>italic</i> &amp; an entity.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    <script>var a = \"<p>not a tag</p>\"; if (1 < 2) {}</script>\n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1'/><circle r=\".5\"/></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  </main>\n  <footer><p>&copy; 2026</p></footer>\n</body>\n</html>",
+  "P:page class add": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n</head>\n<body class=\"home  dark js\" data-env='prod'>\n  <!-- nav -->\n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"/a\">A</a></li><li class=item><a href='/b'>B</a></li></ul></nav>\n  <main>\n    <h1>Hello <em>world</em>!</h1>\n    <p>Text with <b>bold</b> and <i>italic</i> &amp; an entity.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    <script>var a = \"<p>not a tag</p>\"; if (1 < 2) {}</script>\n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1'/><circle r=\".5\"/></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  </main>\n  <footer><!--f--><p>&copy; 2026</p></footer>\n</body>\n</html>",
+  "P:page nested removeAndKeep": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n</head>\n<body class=\"home  dark\" data-env='prod'>\n  <!-- nav -->\n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"/a\">A</a></li><li class=item><a href='/b'>B</a></li></ul></nav>\n  <main>\n    <h1>Hello world!</h1>\n    <p>Text with bold and italic &amp; an entity.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    <script>var a = \"<p>not a tag</p>\"; if (1 < 2) {}</script>\n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1'/><circle r=\".5\"/></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  </main>\n  <footer><!--f--><p>&copy; 2026</p></footer>\n</body>\n</html>",
+  "P:page nth li": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n</head>\n<body class=\"home  dark\" data-env='prod'>\n  <!-- nav -->\n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"/a\">A</a></li><li class=item second=\"\"><a href='/b'>B</a></li></ul></nav>\n  <main>\n    <h1>Hello <em>world</em>!</h1>\n    <p>Text with <b>bold</b> and <i>italic</i> &amp; an entity.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    <script>var a = \"<p>not a tag</p>\"; if (1 < 2) {}</script>\n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1'/><circle r=\".5\"/></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  </main>\n  <footer><!--f--><p>&copy; 2026</p></footer>\n</body>\n</html>",
+  "P:page not-class": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n</head>\n<body class=\"home  dark\" data-env='prod'>\n  <!-- nav -->\n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"/a\">A</a></li><li class=item off=\"1\"><a href='/b'>B</a></li></ul></nav>\n  <main>\n    <h1>Hello <em>world</em>!</h1>\n    <p>Text with <b>bold</b> and <i>italic</i> &amp; an entity.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    <script>var a = \"<p>not a tag</p>\"; if (1 < 2) {}</script>\n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1'/><circle r=\".5\"/></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  </main>\n  <footer><!--f--><p>&copy; 2026</p></footer>\n</body>\n</html>",
+  "P:page svg only": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n</head>\n<body class=\"home  dark\" data-env='prod'>\n  <!-- nav -->\n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"/a\">A</a></li><li class=item><a href='/b'>B</a></li></ul></nav>\n  <main>\n    <h1>Hello <em>world</em>!</h1>\n    <p>Text with <b>bold</b> and <i>italic</i> &amp; an entity.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    <script>var a = \"<p>not a tag</p>\"; if (1 < 2) {}</script>\n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1' ns=\"http://www.w3.org/2000/svg\" /><circle r=\".5\" ns=\"http://www.w3.org/2000/svg\" /></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  </main>\n  <footer><!--f--><p>&copy; 2026</p></footer>\n</body>\n</html>",
+  "P:page end tag hook": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n</head>\n<body class=\"home  dark\" data-env='prod'>\n  <!-- nav -->\n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"/a\">A</a></li><li class=item><a href='/b'>B</a></li></ul></nav>\n  <main>\n    <h1>Hello <em>world</em>!</h1>\n    <p>Text with <b>bold</b> and <i>italic</i> &amp; an entity.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    <script>var a = \"<p>not a tag</p>\"; if (1 < 2) {}</script>\n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1'/><circle r=\".5\"/></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  &lt;!--/main--&gt;</main>\n  <footer><!--f--><p>&copy; 2026</p></footer>\n</body>\n</html>",
+  "P:page doc end": "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=utf-8><title>T &amp; T</title>\n<link rel=stylesheet href='/a.css'>\n<style>body { color: #333 }</style>\n</head>\n<body class=\"home  dark\" data-env='prod'>\n  <!-- nav -->\n  <nav id=\"top\"><ul><li class=\"item on\"><a href=\"/a\">A</a></li><li class=item><a href='/b'>B</a></li></ul></nav>\n  <main>\n    <h1>Hello <em>world</em>!</h1>\n    <p>Text with <b>bold</b> and <i>italic</i> &amp; an entity.</p>\n    <img src=\"/x.png\" alt=\"an image\">\n    <br/>\n    <script>var a = \"<p>not a tag</p>\"; if (1 < 2) {}</script>\n    <svg viewBox=\"0 0 1 1\"><rect width='1' height='1'/><circle r=\".5\"/></svg>\n    <table><tr><td>1</td><td>2</td></tr></table>\n  </main>\n  <footer><!--f--><p>&copy; 2026</p></footer>\n</body>\n</html>\n<!-- built -->",
+  "P:uppercase tags": "<DIV CLASS=A><SPAN hit=\"1\">x</SPAN></DIV>",
+  "P:valueless attrs": "<input disabled required name=q hit=\"1\">",
+  "P:slash in unquoted": "<a href=/a/b hit=\"1\">x</a>",
+  "P:equals in value": "<a href='?a=1&b=2' hit=\"1\">x</a>",
+  "P:quote in value": "<a title=\"it's\" hit=\"1\">x</a>",
+  "P:end tag with space": "<p hit=\"1\">x</p >",
+  "P:bogus comment": "<!bogus><p hit=\"1\">x</p>",
+  "P:unclosed comment": "<p hit=\"1\">x</p><!-- never",
+  "P:processing instr": "<?xml version='1'?><p hit=\"1\">x</p>",
+  "P:stray end tag": "</p><p hit=\"1\">x</p></div>",
+  "P:deep nesting": "<a><b><c><d><e deep=\"1\">x</e></d></c></b></a>",
+  "P:textarea raw": "<textarea><p>x</p></textarea>",
+  "P:nth 2n+1": "<ul><li odd=\"\">1<li odd=\"\">2<li odd=\"\">3<li odd=\"\">4</ul>",
+  "P:multiple mutations": "B<p id=\"i\">[x]</p>A",
+  "P:replace nested": "<div><h1>y</h1></div>",
+  "P:remove outer keep inner handler": "",
+  "P:setInnerContent nested": "<div>Z</div>",
+  "P:comment inside removed": "",
+  "P:two elements one rule": "<p>a!</p><p>b!</p>",
+  "P:attr case in selector": "<p DATA-X='1' hit=\"1\">a</p>",
+  "P:empty element": "<p>in</p>",
+  "P:text at root": "HELLO <b>X</b> BYE",
+  "Q:page all tags": [
+   "html",
+   "head",
+   "meta",
+   "title",
+   "link",
+   "style",
+   "body",
+   "nav",
+   "ul",
+   "li",
+   "a",
+   "li",
+   "a",
+   "main",
+   "h1",
+   "em",
+   "p",
+   "b",
+   "i",
+   "img",
+   "br",
+   "script",
+   "svg",
+   "rect",
+   "circle",
+   "table",
+   "tr",
+   "td",
+   "td",
+   "footer",
+   "p"
+  ],
+  "Q:page text runs": [
+   "T &amp; T",
+   "body { color: #333 }",
+   "A",
+   "B",
+   "Hello",
+   "world",
+   "!",
+   "Text with",
+   "bold",
+   "and",
+   "italic",
+   "&amp; an entity.",
+   "var a = \"",
+   "<",
+   "p>not a tag",
+   "</p",
+   ">\"; if (1",
+   "<",
+   "2) {}",
+   "1",
+   "2",
+   "&copy; 2026"
+  ],
+  "Q:page comments": [
+   " nav ",
+   "f"
+  ],
+  "Q:page attrs of body": [
+   [
+    [
+     "class",
+     "home  dark"
+    ],
+    [
+     "data-env",
+     "prod"
+    ]
+   ]
+  ],
+  "Q:nested text ownership": [
+   "a",
+   "",
+   "c",
+   "",
+   "d",
+   ""
+  ],
+  "Q:b-only text": [
+   "c",
+   ""
+  ],
+  "Q:comment subtree": [
+   "x"
+  ],
+  "Q:li indexes": [
+   "li",
+   "li",
+   "li"
+  ],
+  "Q:svg flags": [
+   [
+    "svg",
+    "http://www.w3.org/2000/svg",
+    true,
+    false
+   ],
+   [
+    "rect",
+    "http://www.w3.org/2000/svg",
+    false,
+    true
+   ],
+   [
+    "g",
+    "http://www.w3.org/2000/svg",
+    true,
+    false
+   ],
+   [
+    "circle",
+    "http://www.w3.org/2000/svg",
+    false,
+    true
+   ]
+  ],
+  "Q:table flags": [
+   [
+    "table",
+    true
+   ],
+   [
+    "tr",
+    true
+   ],
+   [
+    "td",
+    true
+   ]
+  ],
+  "Q:input flags": [
+   [
+    "input",
+    false,
+    false
+   ],
+   [
+    "hr",
+    false,
+    false
+   ],
+   [
+    "wbr",
+    false,
+    false
+   ]
+  ],
+  "S:\"\"": "THROWS: The selector is empty.",
+  "S:\"   \"": "THROWS: The selector is empty.",
+  "S:\"p, \"": "THROWS: The selector is empty.",
+  "S:\"p::before\"": "THROWS: Unsupported pseudo-class or pseudo-element in selector.",
+  "S:\"a:hover\"": "THROWS: Unsupported pseudo-class or pseudo-element in selector.",
+  "S:\"[data-x=1]\"": "THROWS: Unexpected token in the attribute selector.",
+  "S:\":nth-child(\"": "THROWS: Unexpected end of selector.",
+  "S:\"p:unknown-thing\"": "THROWS: Unsupported pseudo-class or pseudo-element in selector.",
+  "S:\"p >\"": "THROWS: Dangling combinator in selector.",
+  "S:\"> p\"": "THROWS: The selector is empty.",
+  "S:\"..\"": "THROWS: Invalid or unescaped class name in selector.",
+  "S:\"#\"": "THROWS: The selector is empty.",
+  "S:\"[\"": "THROWS: Unexpected end of selector.",
+  "S:\"[]\"": "THROWS: Unexpected end of selector.",
+  "S:\"p[\"": "THROWS: Unexpected end of selector.",
+  "S:\":not()\"": "THROWS: The selector is empty.",
+  "S:\":not(p\"": "ACCEPTED",
+  "S:\"p ~ span\"": "THROWS: Unsupported combinator `~` in selector.",
+  "S:\"p + span\"": "THROWS: Unsupported combinator `+` in selector.",
+  "S:\"::first-line\"": "THROWS: Unsupported pseudo-class or pseudo-element in selector.",
+  "S:\"p:nth-of-type(1)\"": "ACCEPTED",
+  "R:body": "<p z=\"1\">x</p>",
+  "R:meta": [
+   201,
+   "1"
+  ],
+  "R:async": "<p async=\"yes\">x</p>",
+  "R:blob": "THROWS: Expected Response or Body",
+  "R:bytes": [
+   "[object ArrayBuffer]",
+   "<p z=\"1\">x</p>"
+  ],
+  "FUZZ": [
+   "<div id=\"\" title='a' data-seen=\"1\">text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>text</div><i><strong id='a b' rel='b'>text</strong>plain text<strong href=\"a&b\">text</strong></i>",
+   "<div id=\"\" title='a'>text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>text</div>",
+   "<div id=\"\" title='a'>text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>TEXT</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i>",
+   "<div id=\"\" title='a'>text</div><i><em id='a b' rel='b'>text</em>plain text<em href=\"a&b\">text</em></i><!--E-->",
+   "<div id=\"\" title='a' k=\"div\">text</div><i k=\"i\"><em id='a b' rel='b' k=\"em\">text</em>plain text<em href=\"a&b\" k=\"em\">text</em></i>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1' data-seen=\"1\">text</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p id='1'>text</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1'>text</p>",
+   "<mark><span rel=\"a&b\" title='x-y'>text</span></mark><p class=\"x-y\" id='1'>text</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1'>[text]</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1'>text</p>",
+   "text<p class=\"x-y\" id='1'>text</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1'>text</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1'>TEXT</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1'>text</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1'>text</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1'>text</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1'>text</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1'>text</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1'>text</p>",
+   "<span rel=\"a&b\" title='x-y'>text</span><p class=\"x-y\" id='1'>text</p><!--E-->",
+   "<span rel=\"a&b\" title='x-y' k=\"span\">text</span><p class=\"x-y\" id='1' k=\"p\">text</p>",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  ",
+   "tail  spaced  <!--E-->",
+   "tail  spaced  ",
+   "<em><section data-x=a><a data-seen=\"1\">text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></em><td rel=\"\" rel=\"b\">plain text<a id=b class='a b' data-seen=\"1\">tail<p rel=\"1\" class=\"a&b\" data-seen=\"1\">text</p></a><!--c--></td><p data-seen=\"1\">text</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></em><td rel=\"\" rel=\"b\">plain text<a id=b>tail<p rel=\"1\">text</p></a><!--c--></td><p>text</p>",
+   "<strong><section data-x=a><a>text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></strong><td rel=\"\" rel=\"b\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">text</p></a><!--c--></td><p>text</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/><mark><span href=\"it's\">text</span></mark></section></section></em><td rel=\"\" rel=\"b\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">text</p></a><!--c--></td><p>text</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></em><td rel=\"\" rel=\"b\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">[text]</p></a><!--c--></td><p>[text]</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></em><p>text</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/>text</section></section></em><td rel=\"\" rel=\"b\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">text</p></a><!--c--></td><p>text</p>",
+   "<em><section data-x=a>Z&lt;x&gt;</section></em><td rel=\"\" rel=\"b\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">text</p></a><!--c--></td><p>text</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></em><td rel=\"\" rel=\"b\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">TEXT</p></a><!--c--></td><p>TEXT</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></em><td rel=\"\" rel=\"b\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">text</p></a><!--[c]--></td><p>text</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></em><td rel=\"\" rel=\"b\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">text</p></a><!--c--></td><p>text</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></em><td rel=\"\" rel=\"b\" n=\"1\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">text</p></a><!--c--></td><p>text</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></em><td rel=\"\" rel=\"b\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">text</p></a><!--c--></td><p>text</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></em><td rel=\"\" rel=\"b\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">text</p></a><!--c--></td><p>text</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></em><td rel=\"\" rel=\"b\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">text</p></a><!--c--></td><p>text</p>",
+   "<em><section data-x=a><a>text</a><img title=x><section><br title=x/><span href=\"it's\">text</span></section></section></em><td rel=\"\" rel=\"b\">plain text<a id=b class='a b'>tail<p rel=\"1\" class=\"a&b\">text</p></a><!--c--></td><p>text</p><!--E-->",
+   "<em k=\"em\"><section data-x=a k=\"section\"><a k=\"a\">text</a><img title=x k=\"img\"><section k=\"section\"><br title=x/ k=\"br\"><span href=\"it's\" k=\"span\">text</span></section></section></em><td rel=\"\" rel=\"b\" k=\"td\">plain text<a id=b class='a b' k=\"a\"><p rel=\"1\" class=\"a&b\" k=\"p\">text</p></a><!--c--></td><p k=\"p\">text</p>",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1>Z&lt;x&gt;</h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1><!--[x-y]--></h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé",
+   "<h1><!--x-y--></h1>a & bcafé<!--E-->",
+   "<h1 k=\"h1\"><!--x-y--></h1>a & bcafé",
+   "<div rel='1' data-seen=\"1\">text</div><span>text</span>tail",
+   "<div rel='1'>text</div><span>text</span>tail",
+   "<div rel='1'>text</div><span>text</span>tail",
+   "<div rel='1'>text</div><mark><span>text</span></mark>tail",
+   "<div rel='1'>text</div><span>text</span>tail",
+   "<div rel='1'>text</div><span>text</span>tail",
+   "<div rel='1'>text</div>texttail",
+   "<div rel='1'>text</div><span>text</span>tail",
+   "<div rel='1'>TEXT</div><span>text</span>tail",
+   "<div rel='1'>text</div><span>text</span>tail",
+   "<div rel='1'>text</div><span>text</span>tail",
+   "<div rel='1'>text</div><span>text</span>tail",
+   "<div rel='1'>text</div><span>text</span>tail",
+   "<div rel='1'>text</div><span>text</span>tail",
+   "<div rel='1'>text</div><span>text</span>tail",
+   "<div rel='1'>text</div><span>text</span>tail<!--E-->",
+   "<div rel='1' k=\"div\">text</div><span k=\"span\">text</span>tail",
+   "<!--c--><a id=\"\" data-seen=\"1\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\" data-seen=\"1\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>text</h1><li data-x=\"1\" data-seen=\"1\">text</li><td>text</td></i></td></a><p data-seen=\"1\">a & b<div data-x='it' s' data-seen=\"1\"><td><li href='foo bar' data-x=\"a\" data-seen=\"1\">text</li><span name='b'>text</span></td><br rel=x><input><li rel='' data-seen=\"1\">text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b'><i id=\"foo bar\">text</i><li data-x=\"a\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table>text</table></ul><i><h1>text</h1><li data-x=\"1\">text</li><td>text</td></i></td></a><p>a & b<div data-x='it's'><td><li href='foo bar' data-x=\"a\">text</li><span name='b'>text</span></td><br rel=x><input><li rel=''>text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>text</h1><li data-x=\"1\">text</li><td>text</td></i></td></a><p>a & b<div data-x='it's'><td><li href='foo bar' data-x=\"a\">text</li><span name='b'>text</span></td><br rel=x><input><li rel=''>text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>text</h1><li data-x=\"1\">text</li><td>text</td></i></td></a><p>a & b<div data-x='it's'><td><li href='foo bar' data-x=\"a\">text</li><mark><span name='b'>text</span></mark></td><br rel=x><input><li rel=''>text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\">[<table>text</table>café]</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>text</h1><li data-x=\"1\">[text]</li><td>text</td></i></td></a><p>[a & b<div data-x='it's'><td><li href='foo bar' data-x=\"a\">[text]</li><span name='b'>text</span></td><br rel=x><input><li rel=''>[text]</li></div>]</p>",
+   "<!--c--><a id=\"\"></a><p>a & b<div data-x='it's'><br rel=x><input><li rel=''>text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>text</h1><li data-x=\"1\">text</li><td>text</td></i></td></a><p>a & b<div data-x='it's'><td><li href='foo bar' data-x=\"a\">text</li>text</td><br rel=x><input><li rel=''>text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>Z&lt;x&gt;</h1><li data-x=\"1\">text</li><td>text</td></i></td></a><p>a & b<div data-x='it's'><td><li href='foo bar' data-x=\"a\">text</li><span name='b'>text</span></td><br rel=x><input><li rel=''>text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>text</h1><li data-x=\"1\">text</li><td>text</td></i></td></a><p>A &amp; B<div data-x='it's'><td><li href='foo bar' data-x=\"a\">TEXT</li><span name='b'>TEXT</span></td><br rel=x><input><li rel=''>TEXT</li></div></p>",
+   "<!--[c]--><a id=\"\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>text</h1><li data-x=\"1\">text</li><td>text</td></i></td></a><p>a & b<div data-x='it's'><td><li href='foo bar' data-x=\"a\">text</li><span name='b'>text</span></td><br rel=x><input><li rel=''>text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\"><table>text&lt;!--/--&gt;</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text&lt;!--/--&gt;</table>&lt;!--/--&gt;</ul><i class=\"\"><h1>text</h1><li data-x=\"1\">text</li><td>text</td></i></td></a><p>a & b<div data-x='it's'><td><li href='foo bar' data-x=\"a\">text</li><span name='b'>text</span></td><br rel=x><input><li rel=''>text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b' n=\"1\"><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\" n=\"1\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>text</h1><li data-x=\"1\" n=\"1\">text</li><td n=\"1\">text</td></i></td></a><p>a & b<div data-x='it's'><td n=\"1\"><li href='foo bar' data-x=\"a\">text</li><span name='b'>text</span></td><br rel=x><input><li rel=''>text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>text</h1><li data-x=\"1\">text</li><td>text</td></i></td></a><p>a & b<div data-x='it's'><td q=\"1\"><li href='foo bar' data-x=\"a\" q=\"1\">text</li><span name='b'>text</span></td><br rel=x q=\"1\"><input q=\"1\"><li rel='' q=\"1\">text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>text</h1><li data-x=\"1\">text</li><td>text</td></i></td></a><p>a & b<div data-x='it's'><td><li href='foo bar' data-x=\"a\">text</li><span name='b'>text</span></td><br rel=x><input><li rel=''>text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>text</h1><li data-x=\"1\">text</li><td>text</td></i></td></a><p>a & b<div data-x='it's'><td><li href='foo bar' data-x=\"a\">text</li><span name='b'>text</span></td><br rel=x><input><li rel=''>text</li></div></p>",
+   "<!--c--><a id=\"\"><td name='foo bar' rel='a&b'><i class=x-y id=\"foo bar\">text</i><li data-x=\"a\"><table>text</table>café</li><ul rel=\"foo bar\" rel=it's><i>text</i>a & b<table class=\"it's\">text</table></ul><i class=\"\"><h1>text</h1><li data-x=\"1\">text</li><td>text</td></i></td></a><p>a & b<div data-x='it's'><td><li href='foo bar' data-x=\"a\">text</li><span name='b'>text</span></td><br rel=x><input><li rel=''>text</li></div></p><!--E-->",
+   "<!--c--><a id=\"\" k=\"a\"><td name='foo bar' rel='a&b' k=\"td\"><i class=x-y id=\"foo bar\" k=\"i\">text</i><li data-x=\"a\" k=\"li\"><table k=\"table\">text</table>café</li><ul rel=\"foo bar\" rel=it's k=\"ul\"><i k=\"i\">text</i>a & b<table class=\"it's\" k=\"table\">text</table></ul><i class=\"\" k=\"i\"><h1 k=\"h1\">text</h1><li data-x=\"1\" k=\"li\">text</li><td k=\"td\">text</td></i></td></a><p k=\"p\">a & b<div data-x='it' s' k=\"div\"><td k=\"td\"><li href='foo bar' data-x=\"a\" k=\"li\">text</li><span name='b' k=\"span\">text</span></td><br rel=x k=\"br\"><input k=\"input\"><li rel='' k=\"li\">text</li></div></p>",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's data-seen=\"1\"><span title=''>text</span></div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\" data-seen=\"1\"><div data-seen=\"1\">text</div><i name=\"it's\">text</i><table>text</table></p><a data-x=a data-seen=\"1\"><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\" data-seen=\"1\">text</div></a></i><b>text</b></table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><span title=''>text</span></div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>text</div><i name=\"it's\">text</i><table>text</table></p><a data-x=a><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\">text</div></a></i><b>text</b></table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<strong><strong data-x=\"foo bar\" title=\"b\">text</strong><div data-x=\"\" href=it's><span title=''>text</span></div></strong></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>text</div><i name=\"it's\">text</i><table>text</table></p><a data-x=a><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\">text</div></a></i><strong>text</strong></table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><mark><span rel=\"x-y\">a & b</span></mark>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><mark><span title=''>text</span></mark></div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>text</div><i name=\"it's\">text</i><table>text</table></p><a data-x=a><i id=x-y>text</i><mark><span rel='foo bar'>text</span></mark><div id='x-y' href=\"\">text</div></a></i><b>text</b></table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><span title=''>text</span></div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\">[<div>text</div><i name=\"it's\">text</i><table>text</table>]</p><a data-x=a><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\">text</div></a></i><b>text</b></table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><span title=''>text</span></div></em></ul><table name='a b'>tail  spaced  <b>text</b></table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul>a & btail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's>text</div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>text</div><i name=\"it's\">text</i><table>text</table></p><a data-x=a><i id=x-y>text</i>text<div id='x-y' href=\"\">text</div></a></i>text</table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><span title=''>text</span></div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>text</div><i name=\"it's\">text</i><table>text</table></p><a data-x=a><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\">text</div></a></i><b>text</b></table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><span title=''>TEXT</span></div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>TEXT</div><i name=\"it's\">TEXT</i><table>TEXT</table></p><a data-x=a><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\">TEXT</div></a></i><b>text</b></table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><span title=''>text</span></div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>text</div><i name=\"it's\">text</i><table>text</table></p><a data-x=a><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\">text</div></a></i><b>text</b></table><!--[ spaced ]-->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text&lt;!--/--&gt;</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><span title=''>text</span></div></em>&lt;!--/--&gt;</ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>text</div><i name=\"it's\">text</i><table>text&lt;!--/--&gt;</table></p><a data-x=a><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\">text</div></a></i><b>text</b>&lt;!--/--&gt;</table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><span title=''>text</span></div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>text</div><i name=\"it's\">text</i><table>text</table></p><a data-x=a><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\">text</div></a></i><b>text</b></table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><span title=''>text</span></div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>text</div><i name=\"it's\">text</i><table>text</table></p><a data-x=a><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\">text</div></a></i><b>text</b></table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><span title=''>text</span></div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>text</div><i name=\"it's\">text</i><table>text</table></p><a data-x=a><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\">text</div></a></i><b>text</b></table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><span title=''>text</span></div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>text</div><i name=\"it's\">text</i><table>text</table></p><a data-x=a><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\">text</div></a></i><b>text</b></table><!-- spaced -->a & b",
+   "<ul data-x='foo bar' name=\"foo bar\"><ul title=\"1\" data-x=\"it's\">text</ul><span rel=\"x-y\">a & b</span>tail<em><em data-x=\"foo bar\" title=\"b\">text</em><div data-x=\"\" href=it's><span title=''>text</span></div></em></ul><table name='a b'>tail  spaced  <i rel=\"\"><p name=\"a&b\"><div>text</div><i name=\"it's\">text</i><table>text</table></p><a data-x=a><i id=x-y>text</i><span rel='foo bar'>text</span><div id='x-y' href=\"\">text</div></a></i><b>text</b></table><!-- spaced -->a & b<!--E-->",
+   "<ul data-x='foo bar' name=\"foo bar\" k=\"ul\"><ul title=\"1\" data-x=\"it's\" k=\"ul\">text</ul><span rel=\"x-y\" k=\"span\">a & b</span><em k=\"em\"><em data-x=\"foo bar\" title=\"b\" k=\"em\">text</em><div data-x=\"\" href=it's k=\"div\"><span title='' k=\"span\">text</span></div></em></ul><table name='a b' k=\"table\">tail  spaced  <i rel=\"\" k=\"i\"><p name=\"a&b\" k=\"p\"><div k=\"div\">text</div><i name=\"it's\" k=\"i\">text</i><table k=\"table\">text</table></p><a data-x=a k=\"a\"><i id=x-y k=\"i\">text</i><span rel='foo bar' k=\"span\">text</span><div id='x-y' href=\"\" k=\"div\">text</div></a></i><b k=\"b\">text</b></table><!-- spaced -->a & b",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--x-y--><div data-seen=\"1\"><section>text</section><td href=\"\" name=''>tail<div href=it's data-seen=\"1\">text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\" data-seen=\"1\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--x-y--><div><section>text</section><td href=\"\" name=''>tail<div href=it's>text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table>",
+   "<strong id=\"\" name=b><table><h1 rel='it's'><strong href='foo bar' name='foo bar'>text</strong></h1></table><!--x-y--><div><section>text</section><td href=\"\" name=''>tail<div href=it's>text</div></td></div>a & b</strong><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--x-y--><div><section>text</section><td href=\"\" name=''>tail<div href=it's>text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--x-y--><div><section>text</section><td href=\"\" name=''>tail<div href=it's>text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--x-y--><div><section>text</section></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><table id=\"foo bar\">plain texttail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--x-y--><div><section>text</section><td href=\"\" name=''>tail<div href=it's>text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'>Z&lt;x&gt;</h1></table><!--x-y--><div><section>Z&lt;x&gt;</section><td href=\"\" name=''>tail<div href=it's>text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--x-y--><div><section>TEXT</section><td href=\"\" name=''>TAIL<div href=it's>TEXT</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--[x-y]--><div><section>text</section><td href=\"\" name=''>tail<div href=it's>text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1>&lt;!--/--&gt;</table><!--x-y--><div><section>text</section><td href=\"\" name=''>tail<div href=it's>text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail&lt;!--/--&gt;</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail&lt;!--/--&gt;</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--x-y--><div><section>text</section><td href=\"\" name='' n=\"1\">tail<div href=it's>text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it' s' n=\"1\">caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\" n=\"1\">text</td>tail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--x-y--><div><section q=\"1\">text</section><td href=\"\" name='' q=\"1\">tail<div href=it's q=\"1\">text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--x-y--><div><section>text</section><td href=\"\" name=''>tail<div href=it's>text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--x-y--><div><section>text</section><td href=\"\" name=''>tail<div href=it's>text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table>",
+   "<em id=\"\" name=b><table><h1 rel='it's'><em href='foo bar' name='foo bar'>text</em></h1></table><!--x-y--><div><section>text</section><td href=\"\" name=''>tail<div href=it's>text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\">a & btail</table><td title=it's name='it's'>caféplain textcafé<a id=\"\">tail</a></td><table id=\"foo bar\">plain text<td name='1' rel=\"1\">text</td>tail</table><!--E-->",
+   "<em id=\"\" name=b k=\"em\"><table k=\"table\"><h1 rel='it' s' k=\"h1\"><em href='foo bar' name='foo bar' k=\"em\">text</em></h1></table><!--x-y--><div k=\"div\"><section k=\"section\">text</section><td href=\"\" name='' k=\"td\"><div href=it's k=\"div\">text</div></td></div>a & b</em><table name=\"a b\" href=\"foo bar\" k=\"table\">a & btail</table><td title=it's name='it' s' k=\"td\">caféplain textcafé<a id=\"\" k=\"a\"></a></td><table id=\"foo bar\" k=\"table\">plain text<td name='1' rel=\"1\" k=\"td\">text</td></table>",
+   "café<table class='a&b' rel=\"a b\">tail<div data-seen=\"1\">text</div></table><td>text</td><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table rel=\"a b\">tail<div>text</div></table><td>text</td><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div></table><td>text</td><strong data-x=\"\" title=\"b\">  spaced  </strong>",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div></table><td>text</td><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div></table><td>text</td><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div></table><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div></table><td>text</td>  spaced  ",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div></table><td>text</td><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table class='a&b' rel=\"a b\">tail<div>TEXT</div></table><td>text</td><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div></table><td>text</td><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div>&lt;!--/--&gt;</table><td>text</td><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div></table><td n=\"1\">text</td><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div></table><td>text</td><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div></table><td>text</td><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div></table><td>text</td><b data-x=\"\" title=\"b\">  spaced  </b>",
+   "café<table class='a&b' rel=\"a b\">tail<div>text</div></table><td>text</td><b data-x=\"\" title=\"b\">  spaced  </b><!--E-->",
+   "café<table class='a&b' rel=\"a b\" k=\"table\"><div k=\"div\">text</div></table><td k=\"td\">text</td><b data-x=\"\" title=\"b\" k=\"b\">  spaced  </b>",
+   "<div data-seen=\"1\"><h1>text</h1><div data-seen=\"1\">text</div><input><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>text</h1><td href=\"\">text</td><td title=\"a\" id='x-y'>text</td><td id=\"a\" class=\"foo bar\">text</td></section><div data-x=a rel=\"it's\" data-seen=\"1\">text</div><h1 href='' class=\"\"><span>text</span></h1><i><a title=\"a&b\" data-seen=\"1\">text</a></i></span></div><table><h1><a id=1 data-seen=\"1\"><h1 class=a&b>text</h1></a><p href=it's data-seen=\"1\">tail</p><!--x-y--></h1><p data-seen=\"1\">plain text<b href='1' rel=x-y><td class=\"\" id=x-y>text</td><p title=x-y data-seen=\"1\">text</p><ul>text</ul></b>tail</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\" data-seen=\"1\">text</div></ul><a class=\"foo bar\" href=\"1\" data-seen=\"1\"><span rel=\"b\">text</span></a><!-- spaced --></i><br/></table><input>  spaced  ",
+   "<div><h1>text</h1><div>text</div><input><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>text</h1><td href=\"\">text</td><td title=\"a\" id='x-y'>text</td><td id=\"a\">text</td></section><div data-x=a rel=\"it's\">text</div><h1 href=''><span>text</span></h1><i><a title=\"a&b\">text</a></i></span></div><table><h1><a id=1><h1>text</h1></a><p href=it's>tail</p><!--x-y--></h1><p>plain text<b href='1' rel=x-y><td id=x-y>text</td><p title=x-y>text</p><ul>text</ul></b>tail</p><i><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\">text</div></ul><a href=\"1\"><span rel=\"b\">text</span></a><!-- spaced --></i><br/></table><input>  spaced  ",
+   "<div><h1>text</h1><div>text</div><input><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>text</h1><td href=\"\">text</td><td title=\"a\" id='x-y'>text</td><td id=\"a\" class=\"foo bar\">text</td></section><div data-x=a rel=\"it's\">text</div><h1 href='' class=\"\"><span>text</span></h1><i><a title=\"a&b\">text</a></i></span></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>tail</p><!--x-y--></h1><p>plain text<strong href='1' rel=x-y><td class=\"\" id=x-y>text</td><p title=x-y>text</p><ul>text</ul></strong>tail</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\">text</div></ul><a class=\"foo bar\" href=\"1\"><span rel=\"b\">text</span></a><!-- spaced --></i><br/></table><input>  spaced  ",
+   "<div><h1>text</h1><div>text</div><input><mark><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>text</h1><td href=\"\">text</td><td title=\"a\" id='x-y'>text</td><td id=\"a\" class=\"foo bar\">text</td></section><div data-x=a rel=\"it's\">text</div><h1 href='' class=\"\"><mark><span>text</span></mark></h1><i><a title=\"a&b\">text</a></i></span></mark></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>tail</p><!--x-y--></h1><p>plain text<b href='1' rel=x-y><td class=\"\" id=x-y>text</td><p title=x-y>text</p><ul>text</ul></b>tail</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\">text</div></ul><a class=\"foo bar\" href=\"1\"><mark><span rel=\"b\">text</span></mark></a><!-- spaced --></i><br/></table><input>  spaced  ",
+   "<div><h1>text</h1><div>text</div><input><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>text</h1><td href=\"\">text</td><td title=\"a\" id='x-y'>text</td><td id=\"a\" class=\"foo bar\">text</td></section><div data-x=a rel=\"it's\">text</div><h1 href='' class=\"\"><span>text</span></h1><i><a title=\"a&b\">text</a></i></span></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>[tail]</p><!--x-y--></h1><p>[plain text<b href='1' rel=x-y><td class=\"\" id=x-y>text</td><p title=x-y>[text]</p><ul>text</ul></b>tail]</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\">text</div></ul><a class=\"foo bar\" href=\"1\"><span rel=\"b\">text</span></a><!-- spaced --></i><br/></table><input>  spaced  ",
+   "<div><h1>text</h1><div>text</div><input><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>text</h1></section><div data-x=a rel=\"it's\">text</div><h1 href='' class=\"\"><span>text</span></h1></span></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>tail</p><!--x-y--></h1><p>plain text<b href='1' rel=x-y><p title=x-y>text</p><ul>text</ul></b>tail</p><br/></table><input>  spaced  ",
+   "<div><h1>text</h1><div>text</div><input><section title='it's' href=\"foo bar\"><h1 title=''>text</h1><td href=\"\">text</td><td title=\"a\" id='x-y'>text</td><td id=\"a\" class=\"foo bar\">text</td></section><div data-x=a rel=\"it's\">text</div><h1 href='' class=\"\">text</h1><i><a title=\"a&b\">text</a></i></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>tail</p><!--x-y--></h1><p>plain text<td class=\"\" id=x-y>text</td><p title=x-y>text</p><ul>text</ul>tail</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\">text</div></ul><a class=\"foo bar\" href=\"1\">text</a><!-- spaced --></i><br/></table><input>  spaced  ",
+   "<div><h1>Z&lt;x&gt;</h1><div>text</div><input><span rel=\"\"><section title='it's' href=\"foo bar\">Z&lt;x&gt;</section><div data-x=a rel=\"it's\">text</div><h1 href='' class=\"\">Z&lt;x&gt;</h1><i><a title=\"a&b\">text</a></i></span></div><table><h1>Z&lt;x&gt;</h1><p>plain text<b href='1' rel=x-y><td class=\"\" id=x-y>text</td><p title=x-y>text</p><ul>text</ul></b>tail</p><i class=it's><section>Z&lt;x&gt;</section><ul>  spaced  <div href=\"foo bar\" class=\"\">text</div></ul><a class=\"foo bar\" href=\"1\"><span rel=\"b\">text</span></a><!-- spaced --></i><br/></table><input>  spaced  ",
+   "<div><h1>TEXT</h1><div>TEXT</div><input><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>TEXT</h1><td href=\"\">TEXT</td><td title=\"a\" id='x-y'>TEXT</td><td id=\"a\" class=\"foo bar\">TEXT</td></section><div data-x=a rel=\"it's\">TEXT</div><h1 href='' class=\"\"><span>TEXT</span></h1><i><a title=\"a&b\">TEXT</a></i></span></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>TAIL</p><!--x-y--></h1><p>PLAIN TEXT<b href='1' rel=x-y><td class=\"\" id=x-y>TEXT</td><p title=x-y>TEXT</p><ul>TEXT</ul></b>TAIL</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\">TEXT</div></ul><a class=\"foo bar\" href=\"1\"><span rel=\"b\">text</span></a><!-- spaced --></i><br/></table><input>  spaced  ",
+   "<div><h1>text</h1><div>text</div><input><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>text</h1><td href=\"\">text</td><td title=\"a\" id='x-y'>text</td><td id=\"a\" class=\"foo bar\">text</td></section><div data-x=a rel=\"it's\">text</div><h1 href='' class=\"\"><span>text</span></h1><i><a title=\"a&b\">text</a></i></span></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>tail</p><!--[x-y]--></h1><p>plain text<b href='1' rel=x-y><td class=\"\" id=x-y>text</td><p title=x-y>text</p><ul>text</ul></b>tail</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\">text</div></ul><a class=\"foo bar\" href=\"1\"><span rel=\"b\">text</span></a><!--[ spaced ]--></i><br/></table><input>  spaced  ",
+   "<div><h1>text</h1><div>text</div><input><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>text</h1><td href=\"\">text</td><td title=\"a\" id='x-y'>text</td><td id=\"a\" class=\"foo bar\">text</td></section><div data-x=a rel=\"it's\">text</div><h1 href='' class=\"\"><span>text</span></h1><i><a title=\"a&b\">text</a></i></span></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>tail</p><!--x-y--></h1><p>plain text<b href='1' rel=x-y><td class=\"\" id=x-y>text</td><p title=x-y>text</p><ul>text&lt;!--/--&gt;</ul></b>tail</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\">text</div>&lt;!--/--&gt;</ul><a class=\"foo bar\" href=\"1\"><span rel=\"b\">text</span></a><!-- spaced --></i><br/>&lt;!--/--&gt;</table><input>  spaced  ",
+   "<div><h1>text</h1><div>text</div><input><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>text</h1><td href=\"\" n=\"1\">text</td><td title=\"a\" id='x-y'>text</td><td id=\"a\" class=\"foo bar\">text</td></section><div data-x=a rel=\"it's\">text</div><h1 href='' class=\"\"><span>text</span></h1><i><a title=\"a&b\">text</a></i></span></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>tail</p><!--x-y--></h1><p>plain text<b href='1' rel=x-y><td class=\"\" id=x-y n=\"1\">text</td><p title=x-y>text</p><ul>text</ul></b>tail</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\">text</div></ul><a class=\"foo bar\" href=\"1\"><span rel=\"b\">text</span></a><!-- spaced --></i><br/></table><input>  spaced  ",
+   "<div><h1 q=\"1\">text</h1><div q=\"1\">text</div><input q=\"1\"><span rel=\"\"><section title='it' s' href=\"foo bar\" q=\"1\"><h1 title='' q=\"1\">text</h1><td href=\"\" q=\"1\">text</td><td title=\"a\" id='x-y' q=\"1\">text</td><td id=\"a\" class=\"foo bar\" q=\"1\">text</td></section><div data-x=a rel=\"it's\" q=\"1\">text</div><h1 href='' class=\"\" q=\"1\"><span>text</span></h1><i q=\"1\"><a title=\"a&b\" q=\"1\">text</a></i></span></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>tail</p><!--x-y--></h1><p>plain text<b href='1' rel=x-y><td class=\"\" id=x-y>text</td><p title=x-y>text</p><ul>text</ul></b>tail</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\">text</div></ul><a class=\"foo bar\" href=\"1\"><span rel=\"b\">text</span></a><!-- spaced --></i><br/></table><input>  spaced  ",
+   "<div><h1>text</h1><div>text</div><input><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>text</h1><td href=\"\">text</td><td title=\"a\" id='x-y'>text</td><td id=\"a\" class=\"foo bar\">text</td></section><div data-x=a rel=\"it's\">text</div><h1 href='' class=\"\"><span>text</span></h1><i><a title=\"a&b\">text</a></i></span></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>tail</p><!--x-y--></h1><p>plain text<b href='1' rel=x-y><td class=\"\" id=x-y>text</td><p title=x-y>text</p><ul>text</ul></b>tail</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\">text</div></ul><a class=\"foo bar\" href=\"1\"><span rel=\"b\">text</span></a><!-- spaced --></i><br/></table><input>  spaced  ",
+   "<div><h1>text</h1><div>text</div><input><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>text</h1><td href=\"\">text</td><td title=\"a\" id='x-y'>text</td><td id=\"a\" class=\"foo bar\">text</td></section><div data-x=a rel=\"it's\">text</div><h1 href='' class=\"\"><span>text</span></h1><i><a title=\"a&b\">text</a></i></span></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>tail</p><!--x-y--></h1><p>plain text<b href='1' rel=x-y><td class=\"\" id=x-y>text</td><p title=x-y>text</p><ul>text</ul></b>tail</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\">text</div></ul><a class=\"foo bar\" href=\"1\"><span rel=\"b\">text</span></a><!-- spaced --></i><br/></table><input>  spaced  ",
+   "<div><h1>text</h1><div>text</div><input><span rel=\"\"><section title='it's' href=\"foo bar\"><h1 title=''>text</h1><td href=\"\">text</td><td title=\"a\" id='x-y'>text</td><td id=\"a\" class=\"foo bar\">text</td></section><div data-x=a rel=\"it's\">text</div><h1 href='' class=\"\"><span>text</span></h1><i><a title=\"a&b\">text</a></i></span></div><table><h1><a id=1><h1 class=a&b>text</h1></a><p href=it's>tail</p><!--x-y--></h1><p>plain text<b href='1' rel=x-y><td class=\"\" id=x-y>text</td><p title=x-y>text</p><ul>text</ul></b>tail</p><i class=it's><section><section>text</section></section><ul>  spaced  <div href=\"foo bar\" class=\"\">text</div></ul><a class=\"foo bar\" href=\"1\"><span rel=\"b\">text</span></a><!-- spaced --></i><br/></table><input>  spaced  <!--E-->",
+   "<div k=\"div\"><h1 k=\"h1\">text</h1><div k=\"div\">text</div><input k=\"input\"><span rel=\"\" k=\"span\"><section title='it' s' href=\"foo bar\" k=\"section\"><h1 title='' k=\"h1\">text</h1><td href=\"\" k=\"td\">text</td><td title=\"a\" id='x-y' k=\"td\">text</td><td id=\"a\" class=\"foo bar\" k=\"td\">text</td></section><div data-x=a rel=\"it's\" k=\"div\">text</div><h1 href='' class=\"\" k=\"h1\"><span k=\"span\">text</span></h1><i k=\"i\"><a title=\"a&b\" k=\"a\">text</a></i></span></div><table k=\"table\"><h1 k=\"h1\"><a id=1 k=\"a\"><h1 class=a&b k=\"h1\">text</h1></a><p href=it's k=\"p\"></p><!--x-y--></h1><p k=\"p\">plain text<b href='1' rel=x-y k=\"b\"><td class=\"\" id=x-y k=\"td\">text</td><p title=x-y k=\"p\">text</p><ul k=\"ul\">text</ul></b></p><i class=it's k=\"i\"><section k=\"section\"><section k=\"section\">text</section></section><ul k=\"ul\">  spaced  <div href=\"foo bar\" class=\"\" k=\"div\">text</div></ul><a class=\"foo bar\" href=\"1\" k=\"a\"><span rel=\"b\" k=\"span\">text</span></a><!-- spaced --></i><br k=\"br\" /></table><input k=\"input\">  spaced  ",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b>",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b>",
+   "<strong><h1 name=\"1\" name='b'><strong id=\"a\"><h1>text</h1></strong>plain textcafé</h1></strong>",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b>",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b>",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b>",
+   "<h1 name=\"1\" name='b'><h1>text</h1>plain textcafé</h1>",
+   "<b><h1 name=\"1\" name='b'>Z&lt;x&gt;</h1></b>",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b>",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b>",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b>",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b>",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b>",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b>",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b>",
+   "<b><h1 name=\"1\" name='b'><b id=\"a\"><h1>text</h1></b>plain textcafé</h1></b><!--E-->",
+   "<b k=\"b\"><h1 name=\"1\" name='b' k=\"h1\"><b id=\"a\" k=\"b\"><h1 k=\"h1\">text</h1></b>plain textcafé</h1></b>"
+  ]
+ }
+}

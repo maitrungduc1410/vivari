@@ -279,7 +279,7 @@ export function parsePasswordOptions(opts) {
 
 // ---- factory ----------------------------------------------------------------
 
-export function createBunCrypto({ lazy, Buffer, process }) {
+export function createBunCrypto({ lazy, Buffer, process, isFileBlob }) {
   // The wasm crypto codec, reached through the same internalBinding('crypto')
   // seam node:crypto uses (packages/runtime/node/bindings/crypto.js). Resolved
   // lazily and cached: a process that never hashes never touches it.
@@ -457,6 +457,115 @@ export function createBunCrypto({ lazy, Buffer, process }) {
     }
     if (encodingOrArray === "buffer") return out;
     return out.toString(encodingOrArray);
+  }
+
+  // ---- Bun.MD4 / MD5 / SHA1 / SHA224 / SHA256 / SHA384 / SHA512 / SHA512_256 -
+  //
+  // One class per algorithm, the shape most Bun snippets reach for
+  // (`Bun.SHA256.hash(x, "hex")`) rather than the algorithm-by-string
+  // `CryptoHasher`. They share this file's digest path, so the bytes cannot
+  // disagree with `CryptoHasher` or `Bun.sha`.
+  //
+  // They do NOT share its lifecycle, and that is the whole reason this is a
+  // separate class rather than a subclass. Checked against bun-1.3.14 on linux-x64:
+  //
+  //   const h = new Bun.SHA256(); h.update("hello"); h.digest("hex");
+  //   h.update("hello")  ->  SHA256 hasher already digested, create a new instance to update
+  //   h.digest("hex")    ->  SHA256 hasher already digested, create a new instance to digest again
+  //
+  // A plain `CryptoHasher` RESETS on digest and is reusable; these are consumed,
+  // like the HMAC path. Inheriting the reset would have been the natural mistake
+  // and the dangerous one: reuse would keep working here and throw on the first
+  // real `bun` run. Same reason the class name is interpolated into the message —
+  // that is the string a user will search for.
+  //
+  // Also measured, against the same binary: `constructor()` ignores arguments;
+  // `update` returns `this` and rejects anything that is not a blob/string/buffer
+  // with "expected blob or string or buffer"; `digest()` with no argument returns
+  // a Uint8Array; `byteLength` exists on both the class and the instance (the
+  // published types declare only the static one); an empty hasher digests the
+  // empty-input hash rather than throwing; and a short `hashInto` throws
+  // "TypedArray must be at least N bytes", which encodeDigest above already says.
+  const HASH_CLASS_ALGORITHMS = {
+    MD4: "md4",
+    MD5: "md5",
+    SHA1: "sha1",
+    SHA224: "sha224",
+    SHA256: "sha256",
+    SHA384: "sha384",
+    SHA512: "sha512",
+    SHA512_256: "sha512-256",
+  };
+
+  function makeHashClass(className, algorithm) {
+    const size = DIGEST_BYTE_LENGTH[algorithm];
+    const consumed = (verb) =>
+      new Error(`${className} hasher already digested, create a new instance to ${verb}`);
+
+    const Hasher = {
+      // An object literal so the class gets its real name for free (`SHA256`,
+      // not `Hasher`), which shows up in stacks and in `constructor.name`.
+      [className]: class {
+        constructor() {
+          this._chunks = [];
+          this._done = false;
+        }
+
+        get byteLength() {
+          return size;
+        }
+
+        update(data) {
+          if (this._done) throw consumed("update");
+          this._chunks.push(hashInput(data));
+          return this;
+        }
+
+        digest(encodingOrArray) {
+          if (this._done) throw consumed("digest again");
+          const input = this._chunks.length === 1 ? this._chunks[0] : Buffer.concat(this._chunks);
+          this._done = true;
+          this._chunks = null;
+          return encodeDigest(rawDigest(algorithm, input), encodingOrArray, size);
+        }
+      },
+    }[className];
+
+    Object.defineProperty(Hasher, "byteLength", { value: size, writable: false, enumerable: false });
+    Hasher.hash = (input, encodingOrArray) =>
+      encodeDigest(rawDigest(algorithm, hashInput(input)), encodingOrArray, size);
+    return Hasher;
+  }
+
+  // Bun's accepted input, measured rather than assumed, because the two Blob cases
+  // go opposite ways: `new Blob(["hello"])` hashes fine, while `Bun.file(path)`
+  // throws "File blob cannot be used here" — a file blob has no bytes in hand.
+  // A memory Blob is the case this realm cannot follow: it only yields its bytes
+  // through a promise here, where Bun reads them inline. Refusing it keeps the
+  // sandbox STRICTER than Bun (code that runs here runs there), and says how to
+  // get the bytes; hashing "no bytes" instead would be a plausible-looking digest
+  // of nothing.
+  function hashInput(data) {
+    if (typeof data === "string" || Buffer.isBuffer(data) || data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+      return toBytes(data);
+    }
+    if (typeof isFileBlob === "function" && isFileBlob(data)) {
+      throw new Error("File blob cannot be used here"); // Bun's wording, verbatim
+    }
+    if (typeof Blob === "function" && data instanceof Blob) {
+      throw new TypeError(
+        "Vivari cannot hash a Blob inline: a Blob only yields its bytes through a promise here, " +
+          "where Bun reads them synchronously. Hash the bytes instead — " +
+          "`hasher.update(await blob.bytes())`."
+      );
+    }
+    // Bun's own wording for everything else.
+    throw new TypeError("expected blob or string or buffer");
+  }
+
+  const hashClasses = {};
+  for (const [className, algorithm] of Object.entries(HASH_CLASS_ALGORITHMS)) {
+    hashClasses[className] = makeHashClass(className, algorithm);
   }
 
   CryptoHasher.hash = (algorithm, input, encodingOrArray) =>
@@ -665,5 +774,5 @@ export function createBunCrypto({ lazy, Buffer, process }) {
     },
   };
 
-  return { CryptoHasher, password, sha, CSRF };
+  return { CryptoHasher, password, sha, CSRF, hashClasses };
 }

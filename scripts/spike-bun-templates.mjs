@@ -27,6 +27,29 @@ const ok = (cond, msg) => {
   if (!cond) failed++;
 };
 
+/**
+ * One request against the in-VM server, from an `also` probe.
+ *
+ * Deliberately not the harness's httpGet: that one retries a 404 for a minute
+ * (a warm-up loop for real dev servers, which is wrong when the 404 IS the
+ * assertion) and drops the response headers, which is where a redirect's
+ * Location lives.
+ */
+const request = async (kernel, port, probe) => {
+  const r = await kernel.handleHttpRequest(port, {
+    port,
+    method: probe.method || "GET",
+    url: probe.path,
+    headers: { host: "127.0.0.1:" + port, ...(probe.headers || {}) },
+    body: probe.send || "",
+  });
+  return {
+    status: r.status,
+    headers: r.headers || {},
+    body: typeof r.body === "string" ? r.body : Buffer.from(r.body || "").toString(),
+  };
+};
+
 const { kernel, out, listening } = await bootSpikeKernel();
 
 // bun:sqlite pulls its engine from VV_SQLITE_WASM_PATH here; in the browser the
@@ -48,6 +71,20 @@ const BUN_IDS = Object.values(manifests).filter((m) => m.category === "Bun").map
 // `also` is a second assertion: another path for a server, another marker for a
 // terminal run — the point being to check the template's POINT, not just that a
 // process exited 0. A `bun test` template that ran zero tests exits 0 too.
+//
+// A server template's `also` entry is either a function of the first response's
+// body, or a REQUEST: `{ method, path, headers, send, status, body, location }`,
+// defaulting to `GET path` expecting 200. That is what lets a template whose
+// point is a form post — or a rewrite that only happens behind the preview's
+// `x-forwarded-prefix` — be gated declaratively rather than in a special case.
+// Entries run in source order, so a mutation may be followed by a read of it.
+//
+// `tests` runs the project's own `bun test` before the server starts. `min` is a
+// floor rather than an equality so adding a test does not fail the gate, and a
+// zero fail count is asserted separately because an empty suite exits 0.
+const FORM = { "content-type": "application/x-www-form-urlencoded" };
+const PREVIEW = { "x-forwarded-prefix": "/preview/3000" };
+
 const EXPECT = {
   bun: { kind: "server", path: "/api/hello", body: /"runtime"\s*:\s*"bun"/, also: { "serves its HTML page": { path: "/", body: /<html|<!doctype/i } } },
   "bun-routes": { kind: "server", path: "/api/users/42", body: /42/ },
@@ -75,6 +112,103 @@ const EXPECT = {
     path: "/api/notes",
     body: /"Rows survive a reload"/,
     also: { "the planner uses the index we created": { path: "/api/notes", body: /notes_created_at|USING INDEX/i } },
+  },
+  // The full-stack one. Three APIs have to cooperate for a single response —
+  // Bun.serve routes it, bun:sqlite answers it, HTMLRewriter renders it — so the
+  // assertions below are deliberately about the SEAMS between them rather than
+  // about any one API, which spike-bun.mjs already covers.
+  "bun-fullstack": {
+    kind: "server",
+    path: "/",
+    body: /Ship the HTMLRewriter demo/,
+    also: {
+      // The reason to use a rewriter instead of a string template: the file it
+      // was handed comes back untouched apart from the slots. This exact line is
+      // what a parse-and-serialize renderer would quietly reformat.
+      "the shell's untouched markup survives byte for byte": (b) =>
+        b.includes('<meta name="viewport" content="width=device-width, initial-scale=1.0" />'),
+      "…while the comments meant for whoever edits the file do not ship": (b) => !b.includes("<!--"),
+      "the <title> carries a number that came from SQL": /<title>\d+ open · Issue board<\/title>/,
+      "all four tab counters were filled by the one handler": (b) =>
+        (b.match(/data-count="\w+">\d+</g) || []).length === 4,
+      "the active tab is marked, and only that one": (b) => (b.match(/aria-current="page"/g) || []).length === 1,
+      "the empty-state placeholder was removed, because there are rows": (b) => !b.includes("Nothing on this tab yet"),
+      "the many-to-many join reached the page as label chips": /class="pill label">bug</,
+      "?status=done narrows the board through the indexed column": {
+        path: "/?status=done",
+        body: /Index the status column/,
+      },
+      "an issue page renders one row of that same join": {
+        path: "/issue/1",
+        body: /#1 Preview pane forgets its scroll position/,
+      },
+      "…with the status form pointed at that issue rather than the file's placeholder": {
+        path: "/issue/1",
+        body: /action="\/api\/issues\/1\/status"/,
+      },
+      "a missing issue 404s instead of rendering a page full of blanks": {
+        path: "/issue/9999",
+        status: 404,
+        body: /not found/,
+      },
+      // A BunFile is not a platform Blob here, so `new Response(Bun.file(p))`
+      // serves the string "[object Object]" with a 200. The template uses
+      // `.stream()` for exactly that reason and this is the assertion that
+      // notices if it ever gets "simplified" back.
+      "the stylesheet is streamed, not stringified": { path: "/app.css", body: /color-scheme: dark/ },
+
+      // The preview-prefix pass. Root-absolute NAVIGATION URLs escape the preview
+      // (see AGENTS.md), so both directions matter: no header means no rewrite.
+      "served at the root, the links stay root-absolute": (b) => b.includes('href="/issue/'),
+      "behind the preview prefix, every navigation URL is rebased": {
+        path: "/",
+        headers: PREVIEW,
+        body: /href="\/preview\/3000\/issue\/\d+"/,
+      },
+      "…including the form action, which is the one a POST needs": {
+        path: "/",
+        headers: PREVIEW,
+        body: /action="\/preview\/3000\/api\/issues"/,
+      },
+      // The subresource too, so the page is styled either way. (That the pass
+      // leaves `https://`, `#anchor` and `./relative` alone is the template's own
+      // src/render.test.ts, which the `tests` gate above runs — the board page
+      // has no such URL to check here, and asserting one it cannot produce would
+      // be a green tick for nothing.)
+      "…and the stylesheet link, so the page is styled behind the prefix too": {
+        path: "/",
+        headers: PREVIEW,
+        body: /<link rel="stylesheet" href="\/preview\/3000\/app\.css" \/>/,
+      },
+
+      // Post/redirect/get, the flow a user actually performs.
+      "a form post inserts a row and redirects back inside the preview": {
+        method: "POST",
+        path: "/api/issues",
+        headers: { ...FORM, ...PREVIEW },
+        send: "title=Added+by+the+spike&labels=spike",
+        status: 303,
+        location: "/preview/3000/",
+      },
+      "…and the next GET shows it, so the write reached SQLite": { path: "/", body: /Added by the spike/ },
+      "moving it redirects to the issue": {
+        method: "POST",
+        path: "/api/issues/1/status",
+        headers: FORM,
+        send: "status=done",
+        status: 303,
+        location: "/issue/1",
+      },
+      "a blank title is refused rather than stored": {
+        method: "POST",
+        path: "/api/issues",
+        headers: FORM,
+        send: "title=+++",
+        status: 400,
+      },
+    },
+    // 48 today. The floor is what stops the suite silently emptying out.
+    tests: { min: 40 },
   },
   "bun-shell": {
     kind: "terminal",
@@ -190,6 +324,22 @@ const runTemplate = async (id) => {
       (runtimeDeps.length ? ` — found ${runtimeDeps.join(", ")}` : ""),
   );
 
+  // The project's own test suite, before anything binds a port. A template that
+  // ships tests is claiming they pass in the Studio's terminal; this is that
+  // claim, run from the shipped bytes.
+  if (expect.tests) {
+    const t = await kernel.start("bun", ["test"], { cwd: dir, env, capture: true });
+    const text = (t.stdout || "") + (t.stderr || "");
+    const counted = text.match(/(\d+) pass,\s*(\d+) fail/);
+    console.log("  -> bun test:", counted ? counted[0] : JSON.stringify(text.trim().slice(-200)));
+    if (t.code !== 0) console.log("  test output tail:\n          " + text.trim().split("\n").slice(-14).join("\n          "));
+    ok(t.code === 0, `${id}: \`bun test\` exits 0`);
+    ok(
+      !!counted && Number(counted[1]) >= expect.tests.min && Number(counted[2]) === 0,
+      `${id}: at least ${expect.tests.min} tests pass and none fail`,
+    );
+  }
+
   const [dcmd, ...dargs] = manifest.dev.split(" ");
 
   if (expect.kind === "terminal") {
@@ -224,13 +374,20 @@ const runTemplate = async (id) => {
     ok(expect.body.test(String(r.body)), `${id}: the response is this template's own`);
     for (const [label, probe] of Object.entries(expect.also || {})) {
       // A function asserts something about the response already fetched; an object
-      // is a second request to a different path.
+      // is a request of its own (see the EXPECT header).
       if (typeof probe === "function") {
         ok(probe(String(r.body)), `${id}: ${label}`);
         continue;
       }
-      const r2 = await httpGet(kernel, manifest.port, probe.path);
-      ok(r2.status === 200 && probe.body.test(String(r2.body)), `${id}: ${label}`);
+      const r2 = await request(kernel, manifest.port, probe);
+      const why = [];
+      const want = probe.status ?? 200;
+      if (r2.status !== want) why.push(`status ${r2.status}, wanted ${want}`);
+      if (probe.body && !probe.body.test(String(r2.body))) why.push(`body did not match ${probe.body}`);
+      if (probe.location && r2.headers.location !== probe.location) {
+        why.push(`location '${r2.headers.location}', wanted '${probe.location}'`);
+      }
+      ok(why.length === 0, `${id}: ${label}${why.length ? ` — ${why.join("; ")}` : ""}`);
     }
   }
   for (const pid of kernel.procs.keys()) if (!before.has(pid)) kernel.stop(pid);

@@ -14,7 +14,22 @@ import { createWebSocket } from "./websocket.js";
 import { rewriteDynamicImportToGlobal } from "./esm.js";
 import { isEsbuildInprocActive, esbuildWasmBytes } from "./esbuild-inproc-patch.js";
 import { createBunRuntime } from "./builtins/bun.js";
+import {
+  IPC_PATH_ENV,
+  IPC_MODE_ENV,
+  attachChannel,
+  encodeMessage,
+  normalizeMode,
+  requireMessage,
+} from "./builtins/bun-ipc.js";
 import { createPythonRuntime } from "./builtins/python.js";
+import { captureHostRealm, sealGuestRealm, installBunRealm } from "./realm.js";
+
+// The host realm as it was before a single line of ours ran. Taken at module
+// load, which is the last moment the answer is knowable: every global the runtime
+// installs from here on is indistinguishable, afterwards, from one the browser
+// put there. `realm.js` explains what is done with it and why.
+const HOST_REALM = captureHostRealm(globalThis);
 
 function createConsole(process, util, passthrough) {
   // In dev, Vite injects @vite/client into every module worker; its HMR banners
@@ -464,6 +479,107 @@ export function createRuntime({
       return true;
     };
     process.disconnect = doDisconnect;
+  } else if (env && env[IPC_PATH_ENV]) {
+    // ---- Bun.spawn({ ipc }) channel (child side) -----------------------------
+    // A child spawned with an IPC channel is a separate PROCESS, not a thread, so
+    // there is no MessagePort to hand it. Its channel is a UNIX socket on a path
+    // the parent generated and passed in the environment (builtins/bun-ipc.js
+    // records why a path and not the fd real bun inherits), and the surface it
+    // gets is the one the binary gives: Node's fork surface, not a Bun-specific
+    // name. That is measured — a child under `Bun.spawn({ipc})` sees
+    // `process.send`, `process.on("message")`, `process.connected`,
+    // `process.channel` and `process.disconnect`, and nothing on the Bun global.
+    const channelPath = String(env[IPC_PATH_ENV]);
+    const mode = normalizeMode(env[IPC_MODE_ENV]);
+    // Delete before anything else can read them. Not for tidiness: `env` is what
+    // this process passes on when IT spawns something, and an inherited channel
+    // path would send a GRANDCHILD dialling our parent's server, where it would
+    // be accepted as the child and interleave its frames with ours. bun and node
+    // both erase their NODE_CHANNEL_FD before the first guest line for the same
+    // reason, which is why neither is visible to a child that looks for it.
+    delete env[IPC_PATH_ENV];
+    delete env[IPC_MODE_ENV];
+
+    const socket = net.connect(channelPath);
+    // An open channel must not be what keeps this process running. Under real bun
+    // a child that never touches the channel exits the moment its script ends,
+    // while a child holding a 'message' listener stays up until someone
+    // disconnects — measured both ways. `unref` here plus the ref-on-first-
+    // listener below is that rule; see the message-listener gotcha in AGENTS.md,
+    // which this project has already paid for once.
+    socket.unref();
+
+    process.connected = true;
+    let msgListeners = 0;
+    let ipcRefed = false;
+    const ipcRetain = () => {
+      if (ipcRefed || !process.connected) return;
+      ipcRefed = true;
+      socket.ref();
+      loop.wakeNet();
+    };
+    const ipcRelease = () => {
+      if (!ipcRefed) return;
+      ipcRefed = false;
+      socket.unref();
+      loop.wakeNet();
+    };
+    // Both ends can hang up, and the far end hanging up is not an error: the
+    // parent may call disconnect(), or simply exit, and the kernel closes the
+    // relay under us either way.
+    const markDisconnected = () => {
+      if (!process.connected) return;
+      process.connected = false;
+      process.channel = null;
+      ipcRelease();
+      loop.nextTick(() => process.emit("disconnect"));
+      loop.wakeNet();
+    };
+
+    const channel = attachChannel({
+      socket,
+      mode,
+      onMessage: (message) => {
+        // Deliver on a loop turn, like the fork path above, so a process.exit()
+        // from the handler is honoured and microtasks flush after it. nextTick is
+        // FIFO, so several messages that arrived in one chunk stay in order.
+        loop.nextTick(() => process.emit("message", message));
+        loop.wakeNet();
+      },
+      onClose: markDisconnected,
+    });
+
+    process.channel = { ref: ipcRetain, unref: ipcRelease, hasRef: () => ipcRefed };
+    process.on("newListener", (name) => { if (name === "message" && msgListeners++ === 0) ipcRetain(); });
+    process.on("removeListener", (name) => { if (name === "message" && msgListeners > 0 && --msgListeners === 0) ipcRelease(); });
+
+    process.send = (msg, sendHandle, options, cb) => {
+      if (typeof sendHandle === "function") cb = sendHandle;
+      else if (typeof options === "function") cb = options;
+      // Refused before serialization, and with Bun's sentence, because this is the
+      // mistake a caller makes when a value they expected turned out undefined.
+      requireMessage(msg);
+      if (!process.connected || !channel.open) {
+        // Bun's child returns false here and stays quiet — measured, and it is the
+        // opposite of the fork path above, which follows Node and emits. We do not
+        // emit either: `process.emit('error')` with no listener throws, and a
+        // channel closing under a program that never asked for an error handler
+        // would turn an orderly disconnect into a crash.
+        const err = new Error("Channel closed");
+        err.code = "ERR_IPC_CHANNEL_CLOSED";
+        if (cb) loop.nextTick(() => cb(err));
+        return false;
+      }
+      // Encoded here rather than on the way out, so an unclonable value throws a
+      // DataCloneError at the call site (real bun's behaviour) and so the message
+      // is captured as it was at send() rather than as it is when it drains.
+      const wrote = channel.write(encodeMessage(msg, mode));
+      if (cb) loop.nextTick(() => cb(null));
+      return wrote;
+    };
+    // close() runs markDisconnected through onClose, and is itself a no-op on an
+    // already-closed channel, so calling disconnect() twice is safe.
+    process.disconnect = () => channel.close();
   }
 
   // ---- legacy process.binding(name) shim ------------------------------------
@@ -1047,7 +1163,10 @@ export function createRuntime({
   // locally. Headless (no browser realm) has no location and no-ops.
   const HOST_ALIAS = "host.vivari.internal";
   const rewriteHostAlias = (input) => {
-    const host = globalThis.location && globalThis.location.hostname;
+    // Read from the captured location, not the global one: this runs long after
+    // the realm sweep hid `location` from the guest (realm.js).
+    const loc = HOST_REALM.held.get("location");
+    const host = loc && loc.hostname;
     if (!host) return input;
     const rewriteStr = (s) => {
       try {
@@ -1070,11 +1189,60 @@ export function createRuntime({
     }
     return input;
   };
+  // The exact sentences a browser uses when a fetch never reached the network.
+  // Chrome, Firefox, Safari and undici each have their own, and all four are
+  // deliberately contentless: the spec forbids telling page code WHY, because the
+  // difference between "no such host" and "that host refused your origin" is
+  // itself information about a network the page cannot see.
+  const OPAQUE_FETCH_FAILURES = [
+    "Failed to fetch",
+    "NetworkError when attempting to fetch resource",
+    "Load failed",
+    "fetch failed",
+  ];
+  // A guest's `fetch` IS the tab's own fetch (wrapped just below), so a request to
+  // an origin without a CORS policy fails in the BROWSER and never reaches the
+  // kernel. What the guest saw was `TypeError: Failed to fetch` and nothing else —
+  // which reads as a bug in the guest's code, and is the single most common way a
+  // program that works under a real `bun` appears broken here. The browser will not
+  // say which cause it was, so neither does this: it names both, and says who made
+  // the decision.
+  const explainFetchFailure = (input, err) => {
+    const msg = String((err && err.message) || "");
+    if (!OPAQUE_FETCH_FAILURES.some((m) => msg === m || msg.startsWith(m))) return err;
+    let url = "";
+    try {
+      url = typeof input === "string" ? input : input && (input.url || input.href) ? input.url || input.href : "";
+    } catch {}
+    let origin = "this page";
+    try {
+      if (typeof location !== "undefined" && location && location.origin) origin = location.origin;
+    } catch {}
+    const e = new TypeError(
+      msg +
+        " — the request was made from a browser tab" +
+        (url ? " to " + url : "") +
+        ", so the browser decided it could not be sent and there is no HTTP status to report. Two causes look " +
+        "identical from here, and the browser will not say which: the host is unreachable, or it did not send " +
+        "an Access-Control-Allow-Origin for " +
+        origin +
+        " (any request carrying a custom header is preflighted with OPTIONS first). A URL that works from curl " +
+        "or from a real bun process can fail here for the second reason alone.",
+      { cause: err }
+    );
+    // Still a TypeError, because that is what fetch rejects with and what callers
+    // branch on.
+    return e;
+  };
   if (typeof globalThis.fetch === "function") {
     const hostFetch = globalThis.fetch;
     if (!hostFetch.__ocHostWrapped) {
       const wrappedFetch = function (input, init) {
-        return trackHost(hostFetch.call(this, rewriteHostAlias(input), init));
+        return trackHost(
+          hostFetch.call(this, rewriteHostAlias(input), init).catch((err) => {
+            throw explainFetchFailure(input, err);
+          })
+        );
       };
       wrappedFetch.__ocHostWrapped = true;
       globalThis.fetch = wrappedFetch;
@@ -1482,7 +1650,14 @@ export function createRuntime({
     // bug being fixed here — see builtins/bun-worker.js. In a thread, the worker
     // side of the API (self / postMessage / onmessage) goes on too.
     globalThis.Worker = bunRuntime.Worker;
+    // Bun's other main-thread globals — the inert `postMessage`/`onmessage`/
+    // listener trio, `reportError`, and a `navigator` that says Bun — over the
+    // hole the realm sweep left where the browser's versions used to be.
+    installBunRealm(globalThis, HOST_REALM);
     bunRuntime.installWorkerGlobals(globalThis);
+    // HTMLRewriter is a bare global in Bun too, not a member of `Bun`, and that
+    // is how every snippet reaches it: `new HTMLRewriter().on(...)`.
+    globalThis.HTMLRewriter = bunRuntime.HTMLRewriter;
     if (options && options.dotenv) bunRuntime.loadDotenv(options.mode);
     return bunRuntime.Bun;
   };
@@ -1493,7 +1668,16 @@ export function createRuntime({
   // vendored index only when a `python` process actually runs, so a plain node
   // process pays nothing. See packages/runtime/builtins/python.js.
   const pythonRuntime = createPythonRuntime({ process, require: vvRootRequire, trackHost });
-  globalThis.__ocInstallPython = (indexUrl) => pythonRuntime.install(indexUrl);
+  globalThis.__ocInstallPython = (indexUrl) => {
+    // Pyodide's urllib bridge asks the realm for synchronous HTTP —
+    // `hasattr(js, "XMLHttpRequest")` — and the realm sweep took XMLHttpRequest
+    // away, because it is the one way out of this sandbox that never passes the
+    // Fetcher Worker. Hand it back to the realm a python guest runs in, and only
+    // there: a node or bun guest still has no unmetered egress.
+    const xhr = HOST_REALM.held.get("XMLHttpRequest");
+    if (xhr && globalThis.XMLHttpRequest === undefined) globalThis.XMLHttpRequest = xhr;
+    return pythonRuntime.install(indexUrl);
+  };
 
   return {
     fs,
@@ -1664,18 +1848,32 @@ export function createRuntime({
       loop.disownExistingHandles();
 
       // The host's own globals are visible to the guest — this worker's global
-      // object is shared with whatever the page loaded into it. `fetch` and
-      // `WebSocket` are replaced above; `Worker` never was, so a browser's
-      // nested-Worker constructor reached guest code and resolved specifiers
-      // against the STUDIO's origin instead of the VFS. Real Node has no global
-      // `Worker`, so undefined is the faithful value for a node guest, and
-      // `new Worker(...)` now fails exactly as it would outside the sandbox. The
-      // `bun` launcher installs Bun's own Worker over the top of this
-      // (__ocInstallBun), because Bun does define one.
-      try {
-        delete globalThis.Worker;
-      } catch {
-        globalThis.Worker = undefined;
+      // object is shared with whatever the page loaded into it, and in a browser
+      // that is a DedicatedWorkerGlobalScope: 228 names a real Node or Bun process
+      // does not have, including `importScripts`, the origin's IndexedDB and OPFS,
+      // network egress that never passes the Fetcher Worker, and the kernel's own
+      // message channel to this process. `fetch` and `WebSocket` are replaced
+      // above; `Worker` was fixed one name at a time, which does not scale and
+      // never found the rest.
+      //
+      //
+      // One of those names is not merely inaccurate, it is a CAPABILITY, and it is
+      // why this sweep is a security fix and not a tidy-up: in a browser Worker
+      // `postMessage` posts to the worker's creator, which for a Process Worker is
+      // the KERNEL. Guest code could post `{type:'thread-spawn'}` — or anything else
+      // in the kernel's handler table — with a payload of its choosing, and five of
+      // those handlers threw on a malformed message. The kernel side is guarded
+      // independently (kernel.js, kernel-worker.ts), because neither half should
+      // depend on the other being right.
+      // Sweep them all, against a list of what a real node has (realm.js). A bun
+      // guest gets Bun's extra globals when its launcher runs __ocInstallBun.
+      const realmHidden = sealGuestRealm(globalThis, HOST_REALM);
+      // Which names went is the first question to ask when a dependency that
+      // worked yesterday cannot find a global today.
+      if (process.env.VV_REALM_DEBUG) {
+        process.stderr.write(
+          "[realm] hid " + realmHidden.length + " host globals: " + realmHidden.join(" ") + "\n",
+        );
       }
       let started;
       try {

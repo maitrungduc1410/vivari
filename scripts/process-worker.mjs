@@ -4,7 +4,41 @@
 import { parentPort, markAsUntransferable } from "node:worker_threads";
 import { createRequire } from "node:module";
 import * as hostAsyncHooks from "node:async_hooks";
-import { bootProcess } from "../packages/runtime/boot.js";
+
+// A browser realm, planted on purpose (spike-realm sets the variable), BEFORE the
+// runtime is imported — its capture of "what was here before us" happens at module
+// load, so anything planted after would look like ours and never be swept.
+//
+// In a browser this worker's global is a DedicatedWorkerGlobalScope carrying
+// `importScripts`, the origin's storage, and the kernel's own message channel; a
+// Node worker has none of them, so nothing here could tell a working sweep from a
+// sweep that never ran. This gives it something to find. The shapes are the
+// measured ones — some own, some inherited, some accessors — because those are
+// what decide whether hiding a name works at all (see packages/runtime/realm.js).
+if (process.env.VV_PLANT_BROWSER_REALM) {
+  const proto = Object.create(Object.getPrototypeOf(globalThis));
+  for (const name of ["addEventListener", "removeEventListener", "importScripts", "close"]) {
+    Object.defineProperty(proto, name, { value: () => "host:" + name, writable: true, configurable: true });
+  }
+  for (const name of ["location", "indexedDB", "caches", "origin", "crossOriginIsolated"]) {
+    Object.defineProperty(proto, name, { get: () => "host:" + name, configurable: true });
+  }
+  Object.setPrototypeOf(globalThis, proto);
+  for (const name of ["XMLHttpRequest", "OffscreenCanvas", "FileReader", "postMessage"]) {
+    Object.defineProperty(globalThis, name, { value: () => "host:" + name, writable: true, configurable: true });
+  }
+}
+
+const { bootProcess } = await import("../packages/runtime/boot.js");
+
+// A browser hazard, planted on purpose (spike-fatal-errors sets the variable).
+// In a browser this worker HAS a global `postMessage`, wired to the kernel, so guest
+// code could post into the kernel's handler table; a Node worker has no such global,
+// which is why nothing here could tell whether the runtime removes the guest's
+// access or whether the name was simply never there. This gives it something to
+// remove. Env-gated, so no ordinary run has a stray global postMessage for a
+// feature-detecting dependency to find.
+if (process.env.VV_PLANT_KERNEL_MAILBOX) globalThis.postMessage = () => "guest reached the kernel";
 
 // Native codecs (Phase 2 #11 zlib, #12 crypto): the Rust/Wasm cores. nodejs
 // target loads synchronously via require (which also compiles the wasm), so we

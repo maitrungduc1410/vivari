@@ -1392,7 +1392,23 @@ async function boot() {
       }
       sawMessage = true;
       const handler = info.on[event.data.type];
-      if (handler) handler(event.data);
+      if (!handler) return;
+      // These payloads are only as trustworthy as the process that sent them, which
+      // in a browser means the GUEST: `globalThis.postMessage` inside a Process
+      // Worker posts straight here, so guest code could aim any entry in this
+      // handler table at a payload of its choosing. Five of these handlers threw on
+      // a malformed message (measured; `thread-spawn` died on a bare `{}`), and an
+      // unguarded throw here escapes into onmessage and kills the kernel — every
+      // process, the VFS session and the preview, over one bad message.
+      //
+      // The guest's access to this channel is removed at the other end too (see
+      // packages/runtime/index.js); this is the half that does not depend on
+      // getting that right.
+      try {
+        handler(event.data);
+      } catch (err) {
+        console.error(`[kernel] message '${event.data.type}' from pid ${info.pid} failed:`, err);
+      }
     };
     // A worker that fails to BOOT never sends 'exit', so without these handlers the
     // kernel never finalizes it and every waiter hangs forever — the terminal keeps

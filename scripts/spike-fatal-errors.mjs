@@ -204,5 +204,96 @@ console.log("\n== a guest cannot take the kernel with it ==");
   ok(typeof kernel.resolveProgram("echo", "/", { PATH: "/bin" }) === "string", "…while a real command still resolves");
 }
 
+console.log("\n== the kernel's other door: messages, not syscalls ==");
+{
+  // A Process Worker's messages reach a handler TABLE in the kernel, and in a
+  // browser `globalThis.postMessage` inside that worker posts straight to it — so
+  // those payloads are only as trustworthy as the guest. Five of these nine threw
+  // on a malformed message (`thread-spawn` on a bare `{}`), and the dispatch had no
+  // guard, so the throw escaped into the kernel's onmessage and ended the VM: every
+  // process, the VFS session, the preview.
+  //
+  // Called directly rather than posted, deliberately. The Node tier has no global
+  // postMessage for a guest to reach — which is exactly why this went unnoticed —
+  // so the tier-independent claim worth pinning is that no handler throws on junk.
+  kernel.writeFile(APP + "/sleeper.ts", "setTimeout(() => {}, 3000);\n");
+  const sleeper = kernel.start("bun", ["run", "sleeper.ts"], { cwd: APP, env: ENV, capture: true });
+  await new Promise((r) => setTimeout(r, 500));
+  const pid = [...kernel.procs.keys()].pop();
+
+  const handlers = [
+    "handleThreadSpawn", "handleThreadTerminate", "handleChildStdin", "handleSignalListen",
+    "handleWsOut", "handleSseOut", "handlePipeRelay", "handleDebugEvent", "handleWorkerError",
+  ];
+  const junk = [undefined, null, {}, { type: "nonsense" }, { spec: null }, { connId: "no-such" }, 7, "string"];
+  const threw = [];
+  for (const name of handlers) {
+    for (const payload of junk) {
+      try {
+        kernel[name](pid, payload);
+      } catch {
+        threw.push(name);
+        break;
+      }
+    }
+  }
+  ok(threw.length === 0, "no kernel message handler throws on a malformed payload" + (threw.length ? " — threw: " + threw.join(", ") : ""));
+  // A shape check invites the opposite failure, so this pins that the live process
+  // was not collateral damage of the junk above.
+  ok(kernel.procs.has(pid), "…and the process that was running is untouched");
+  await sleeper;
+}
+
+console.log("\n== a guest cannot reach the kernel's mailbox ==");
+{
+  // The same fix at the runtime end. A Node worker has no global postMessage, so an
+  // assertion that the guest sees none would pass without the fix — vacuous. The
+  // worker entry therefore plants one when VV_PLANT_KERNEL_MAILBOX is set (see
+  // scripts/process-worker.mjs), standing in for the browser's kernel channel.
+  //
+  // What is pinned is that the guest cannot REACH the kernel through it, which is
+  // not the same as the name being absent: a bun guest gets a `postMessage` back
+  // (Bun's main thread has one), inert and bound to nothing. The plant returns a
+  // sentinel string, so calling it is what tells the two apart — checking only
+  // `typeof` would call the Bun-faithful replacement a failure, and would call a
+  // re-leaked channel a success.
+  kernel.writeFile(APP + "/echo.worker.ts", "self.onmessage = (e: any) => postMessage('echo:' + e.data);\n");
+  kernel.writeFile(
+    APP + "/mailbox.ts",
+    [
+      "const pm = (globalThis as any).postMessage;",
+      "const seen = {",
+      "  postMessage: typeof pm,",
+      // The sentinel the plant returns. `undefined` here means whatever this is,
+      // it is not the channel to the kernel's handler table.
+      "  reached: typeof pm === 'function' ? String(pm({ type: 'thread-spawn' })) : 'no-op',",
+      "  Worker: typeof (globalThis as any).Worker,",
+      "};",
+      // Proof the runtime's OWN channel survived the removal: this output, the exit
+      // code and the worker round trip all travel it. If the worker shell had kept
+      // reading the global lazily instead of capturing it, every one of them would
+      // be gone.
+      "const w = new Worker('./echo.worker.ts');",
+      "w.postMessage('hi');",
+      "const reply = await new Promise((r) => { w.onmessage = (e: any) => r(e.data); });",
+      "await w.terminate();",
+      'console.log("MAILBOX:" + JSON.stringify({ ...seen, reply }));',
+    ].join("\n") + "\n"
+  );
+  // Read when the worker module loads, so it has to be set before this start.
+  process.env.VV_PLANT_KERNEL_MAILBOX = "1";
+  const m = await kernel.start("bun", ["run", "mailbox.ts"], { cwd: APP, env: ENV, capture: true });
+  delete process.env.VV_PLANT_KERNEL_MAILBOX;
+  const found = /MAILBOX:(\{.*\})/.exec(m.stdout || "");
+  const got = found ? JSON.parse(found[1]) : null;
+  if (!got) console.log("  stderr:", (m.stderr || "").split("\n").slice(0, 3).join(" | "));
+  ok(m.code === 0 && !!got, "the mailbox script runs");
+  ok(got && got.reached !== "guest reached the kernel", "the planted kernel channel is gone before guest code runs, so a guest cannot post into the kernel's handler table");
+  ok(got && got.reached === "undefined", "…and what a bun guest has instead is inert, returning undefined as Bun's does");
+  ok(got && got.postMessage === "function", "…while the NAME is still there, because Bun's main thread has one");
+  ok(got && got.Worker === "function", "…and Bun's Worker survives the realm sweep that removed the rest");
+  ok(got && got.reply === "echo:hi", "…and a worker still exchanges messages, so the runtime's own channel is intact");
+}
+
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all fatal-error checks passed");
 process.exit(failed ? 1 : 0);

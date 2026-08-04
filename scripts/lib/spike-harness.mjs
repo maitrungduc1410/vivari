@@ -69,7 +69,16 @@ export async function bootSpikeKernel({ npm = false } = {}) {
     const w = new Worker(new URL("../process-worker.mjs", import.meta.url));
     w.on("message", (m) => {
       const handler = info.on[m.type];
-      if (handler) handler(m);
+      if (!handler) return;
+      // A handler that throws must not take the kernel with it — the same guard the
+      // browser kernel has, for the same reason (see kernel-worker.ts): these
+      // payloads are only as trustworthy as the process that sent them, and five of
+      // these handlers used to throw on a malformed one.
+      try {
+        handler(m);
+      } catch (err) {
+        process.stderr.write(`\n[kernel] message '${m.type}' from pid ${info.pid} failed: ${(err && err.stack) || err}\n`);
+      }
     });
     w.on("error", (e) => {
       process.stderr.write(`\n[worker-error pid ${info.pid}] ${(e && e.stack) || e}\n`);

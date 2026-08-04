@@ -77,6 +77,20 @@ const SPIKES = [
   // nor the studio's node_modules.
   { name: "studio-types", file: "spike-studio-types.mjs", net: false, timeout: 60000 },
   { name: "http-llhttp", file: "spike-http-llhttp.mjs", net: false, timeout: 60000 },
+  // The guest realm sweep. Node's own global object is the wrong thing to test a
+  // browser sweep against, so this rebuilds a Chrome worker global from a
+  // recording (scripts/fixtures/realm-globals.json) and sweeps that. Pure
+  // property work, no kernel/wasm.
+  { name: "realm", file: "spike-realm.mjs", net: false, timeout: 60000 },
+  // bun:jsc serialize/deserialize, compared case by case against a recording from
+  // a real bun binary. Pure JS, no kernel/wasm.
+  { name: "serialize", file: "spike-serialize.mjs", net: false, timeout: 60000 },
+  // Bun.listen/Bun.connect over the VM's loopback network: two real processes on
+  // one socket, so it needs the kernel and the Wasm VFS.
+  { name: "bun-socket", file: "spike-bun-socket.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // bun init / bun pm as real processes: they write and read files in the VFS, so
+  // they need the kernel and the Wasm VFS.
+  { name: "bun-cli", file: "spike-bun-cli.mjs", net: false, needsWasm: true, timeout: 120000 },
   // ESM→CJS loader guarantees: top-level-await async retry + circular re-export
   // live bindings (SvelteKit config / astro runtime). Pure parser, no kernel/wasm.
   { name: "esm", file: "spike-esm.mjs", net: false, timeout: 60000 },
@@ -94,6 +108,7 @@ const SPIKES = [
   // API surface, the bun:test runner, and the /bin/bun.js CLI source — all proven
   // with no kernel/wasm, so this runs in the Wasm-free toolchain-gate.
   { name: "bun-offline", file: "spike-bun-offline.mjs", net: false, timeout: 60000 },
+  { name: "html-rewriter", file: "spike-html-rewriter.mjs", net: false, timeout: 60000 },
   // Python (pure-JS tier): the python/gunicorn/uvicorn/flask argv seams run as
   // real Node subprocesses, CPython-faithful SystemExit, the generated bridge
   // dispatch source, and template-registry integrity. Pyodide itself is neither
@@ -138,6 +153,10 @@ const SPIKES = [
   // Bun runtime on the real kernel (offline): bun --version, zero-config `bun run
   // app.ts` (TS strip + Bun global), Bun.serve preview through the http bridge,
   // and `bun test`. Needs the Node Wasm VFS build → runs in the verify job.
+  // bun:test's matcher table against the one recorded from the binary. Offline and
+  // Wasm-free: it builds bun:test directly, because the thing being checked is the
+  // table, not the kernel.
+  { name: "bun-test-matchers", file: "spike-bun-test-matchers.mjs", net: false, timeout: 60000 },
   { name: "bun", file: "spike-bun.mjs", net: false, needsWasm: true, timeout: 120000 },
   // Every template in the studio's "Bun" tab, run from its SHIPPED bytes: the file
   // map and manifest are read out of templates.ts and the manifest's own `dev`

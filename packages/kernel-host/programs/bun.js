@@ -30,9 +30,19 @@
 //   bun upgrade              NOT IMPLEMENTED: real `bun upgrade` replaces the Bun
 //                            binary, which does not exist here. It used to be an
 //                            alias for `npm update`, which is a different action.
-//   bun init|create|pm|link|unlink|<unknown verb>   NOT IMPLEMENTED, exit 1. An
-//                            argument that names a file or a package.json script
-//                            still runs (that is real `bun <file>` / `bun <script>`).
+//   bun init [folder]        scaffold Bun's own project template (package.json,
+//                            index.ts, tsconfig.json, README.md, .gitignore —
+//                            byte-identical to the binary's), then install.
+//   bun pm ls|bin|pkg|why|cache|pack   package-manager utilities, over the same
+//                            node_modules npm just wrote. whoami/view/scan need a
+//                            registry session and are refused by name.
+//   bun create <template>    scaffold through the generator package, i.e.
+//                            'bun create vite app' -> 'bunx create-vite app'. A
+//                            <user/repo> template needs git and is refused.
+//   bun link|unlink          npm link / npm unlink, over the same node_modules.
+//   bun <unknown verb>       NOT IMPLEMENTED, exit 1. An argument that names a
+//                            file or a package.json script still runs (that is
+//                            real bun <file> / bun <script>).
 //
 // Authoring note: like programs/npm.js this source is embedded as a template
 // string, so it deliberately uses NO backticks, NO ${...} and NO backslashes.
@@ -200,6 +210,17 @@ function mapInstallArgs(sub, rest) {
   return { npmSub: npmSub, args: [npmSub, ...pkgs, ...flags] };
 }
 
+// One place that runs the real npm CLI for a bun subcommand that maps onto it,
+// with the same PATH the install path uses (node_modules/.bin first).
+function runNpm(args) {
+  const env = Object.assign({}, process.env, { PATH: binPath(process.cwd()) });
+  const child = cp.spawn('npm', args, { cwd: process.cwd(), env: env });
+  if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
+  if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
+  child.on('error', (e) => { err('bun: npm delegation failed: ' + ((e && e.message) || e)); process.exit(127); });
+  child.on('close', (code) => process.exit(code | 0));
+}
+
 function doInstall(sub, rest) {
   const mapped = mapInstallArgs(sub, rest);
   const env = Object.assign({}, process.env, { PATH: binPath(cwd) });
@@ -247,6 +268,34 @@ function writeBunLock() {
 }
 
 // ---- bun x / bunx : delegate to npx ----------------------------------------
+// bun exec <command> and bun x <package> are DIFFERENT commands, and this file
+// used to send both to npx. Real bun runs "bun exec 'echo hi && pwd'" through Bun
+// Shell, so aiming it at npx made it look for a package literally named
+// "echo hi && pwd" -- a confusing 404 for a line that is not a package name at all.
+// Checked against the 1.3 binary, which prints the shell output and honours &&.
+function doShellExec(rest) {
+  if (rest.length === 0) {
+    err('usage: bun exec <command>');
+    err('Runs a command with Bun Shell. To run a package binary, use "bun x <package>".');
+    process.exit(1);
+    return;
+  }
+  installBun(true);
+  // Bun joins the arguments into one shell line, so "bun exec echo a b" and
+  // "bun exec 'echo a b'" are the same command.
+  var line = rest.join(' ');
+  var runtime = require('bun');
+  runtime.$(Object.assign([line], { raw: [line] }))
+    .then(function (r) { process.exit((r && r.exitCode) | 0); })
+    .catch(function (e) {
+      // A non-zero exit is reported by Bun Shell as a rejection carrying the code;
+      // it is the command's verdict, not an error in the CLI, so no extra noise.
+      if (e && typeof e.exitCode === 'number') process.exit(e.exitCode);
+      err('bun exec: ' + ((e && e.message) || e));
+      process.exit(1);
+    });
+}
+
 function doExec(rest) {
   const env = Object.assign({}, process.env, { PATH: binPath(cwd) });
   const child = cp.spawn('npx', rest, { cwd: cwd, env: env });
@@ -520,6 +569,290 @@ function isScriptName(a) {
   return Object.prototype.hasOwnProperty.call(scripts, a);
 }
 
+// ---- bun init ---------------------------------------------------------------
+// The files and the wording are real bun's, byte for byte where they are constant
+// (recorded from the 1.3.14 binary), because a template people copy from is a
+// contract: someone diffing a Vivari-created project against a bun-created one
+// should find nothing. That includes the two typos in Bun's own .gitignore
+// ('_.log', 'report.[0-9]_...'), which are in the binary's template and are
+// therefore in ours — fixing them here would be the drift.
+function initFiles(name) {
+  const TICK3 = String.fromCharCode(96, 96, 96);
+  const pkg = {
+    name: name,
+    module: 'index.ts',
+    type: 'module',
+    private: true,
+    devDependencies: { '@types/bun': 'latest' },
+    peerDependencies: { typescript: '^5' },
+  };
+  const gitignore = [
+    '# dependencies (bun install)', 'node_modules', '',
+    '# output', 'out', 'dist', '*.tgz', '',
+    '# code coverage', 'coverage', '*.lcov', '',
+    '# logs', 'logs', '_.log', 'report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json', '',
+    '# dotenv environment variable files', '.env', '.env.development.local',
+    '.env.test.local', '.env.production.local', '.env.local', '',
+    '# caches', '.eslintcache', '.cache', '*.tsbuildinfo', '',
+    '# IntelliJ based IDEs', '.idea', '',
+    '# Finder (MacOS) folder config', '.DS_Store', '',
+  ].join(NL);
+  const tsconfig = [
+    '{', '  "compilerOptions": {',
+    '    // Environment setup & latest features',
+    '    "lib": ["ESNext"],', '    "target": "ESNext",', '    "module": "Preserve",',
+    '    "moduleDetection": "force",', '    "jsx": "react-jsx",', '    "allowJs": true,',
+    '    "types": ["bun"],', '',
+    '    // Bundler mode',
+    '    "moduleResolution": "bundler",', '    "allowImportingTsExtensions": true,',
+    '    "verbatimModuleSyntax": true,', '    "noEmit": true,', '',
+    '    // Best practices',
+    '    "strict": true,', '    "skipLibCheck": true,',
+    '    "noFallthroughCasesInSwitch": true,', '    "noUncheckedIndexedAccess": true,',
+    '    "noImplicitOverride": true,', '',
+    '    // Some stricter flags (disabled by default)',
+    '    "noUnusedLocals": false,', '    "noUnusedParameters": false,',
+    '    "noPropertyAccessFromIndexSignature": false', '  }', '}', '',
+  ].join(NL);
+  const readme = [
+    '# ' + name, '', 'To install dependencies:', '', TICK3 + 'bash', 'bun install', TICK3, '',
+    'To run:', '', TICK3 + 'bash', 'bun run index.ts', TICK3, '',
+    'This project was created using ' + String.fromCharCode(96) + 'bun init' + String.fromCharCode(96) +
+      ' in bun v' + bunIdent().version + '. [Bun](https://bun.com) is a fast all-in-one JavaScript runtime.', '',
+  ].join(NL);
+  return [
+    ['package.json', JSON.stringify(pkg, null, 2) + NL],
+    ['.gitignore', gitignore],
+    ['index.ts', 'console.log("Hello via Bun!");'],
+    ['tsconfig.json', tsconfig],
+    ['README.md', readme],
+  ];
+}
+
+function doInit(args) {
+  let folder = '';
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-y' || a === '--yes' || a === '-m' || a === '--minimal') continue;
+    if (a === '-r' || a === '--react' || a.indexOf('--react=') === 0) {
+      // The React templates pull a whole scaffold (and, for shadcn, a generator)
+      // rather than writing five files. bun x reaches the same generators here.
+      err('bun init ' + a + ' is not implemented in the Vivari shim: the React templates scaffold from a generator package rather than from files bundled in the binary.');
+      err('Use "bun x create-vite@latest . --template react-ts" (or the React template in the New Project menu), then "bun install".');
+      process.exit(1);
+      return;
+    }
+    if (a.charAt(0) === '-') { err('bun init: unknown flag ' + a); process.exit(1); return; }
+    folder = a;
+  }
+  const dir = folder ? path.resolve(process.cwd(), folder) : process.cwd();
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* already there */ }
+  const name = path.basename(dir) || 'project';
+  // Real bun only reports the files it CREATES, and never overwrites one that is
+  // already there — running init twice in a project must not clobber its entry.
+  const created = [];
+  const files = initFiles(name);
+  for (let i = 0; i < files.length; i++) {
+    const target = path.join(dir, files[i][0]);
+    if (fs.existsSync(target)) continue;
+    fs.writeFileSync(target, files[i][1]);
+    created.push(files[i][0]);
+  }
+  for (let i = 0; i < created.length; i++) {
+    const label = created[i] === 'tsconfig.json' ? 'tsconfig.json (for editor autocomplete)' : created[i];
+    if (created[i] !== 'package.json') out(' + ' + label);
+  }
+  out('');
+  out('To get started, run:');
+  out('');
+  out('    bun run index.ts');
+  out('');
+  // Then install, as real bun init does. The dependencies it writes (@types/bun,
+  // typescript) are what make the tsconfig above mean anything in the editor.
+  const prevCwd = process.cwd();
+  if (dir !== prevCwd) process.chdir(dir);
+  return doInstall('install', []);
+}
+
+// ---- bun pm -----------------------------------------------------------------
+// Bun's package-manager utilities read the SAME node_modules and package.json npm
+// just wrote (bun install delegates to npm here), so most of these are a question
+// about the project on disk rather than about Bun. Those are answered directly;
+// the ones that need a registry session are refused by name.
+function readPkgJson(dir) {
+  const file = path.join(dir, 'package.json');
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
+}
+
+function pmList(all) {
+  const dir = process.cwd();
+  const modules = path.join(dir, 'node_modules');
+  if (!fs.existsSync(modules)) { err('error: no node_modules directory here — run "bun install" first'); process.exit(1); return; }
+  const names = [];
+  const entries = fs.readdirSync(modules);
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.charAt(0) === '.') continue;
+    if (e.charAt(0) === '@') {
+      const scoped = fs.readdirSync(path.join(modules, e));
+      for (let j = 0; j < scoped.length; j++) names.push(e + '/' + scoped[j]);
+    } else names.push(e);
+  }
+  names.sort();
+  const pkg = readPkgJson(dir) || {};
+  const direct = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies, pkg.peerDependencies);
+  const shown = all ? names : names.filter(function (n) { return Object.prototype.hasOwnProperty.call(direct, n); });
+  out(dir + ' node_modules (' + names.length + ')');
+  for (let i = 0; i < shown.length; i++) {
+    const child = readPkgJson(path.join(modules, shown[i]));
+    const branch = i === shown.length - 1 ? '└── ' : '├── ';
+    out(branch + shown[i] + '@' + ((child && child.version) || '?'));
+  }
+}
+
+// bun pm pkg get|set|delete reads and writes package.json by dotted path, and
+// its set() parses a JSON value when it can — 'private=true' is a boolean there,
+// not the string "true".
+function pkgPath(object, dotted) {
+  const parts = dotted.split('.');
+  let node = object;
+  for (let i = 0; i < parts.length; i++) {
+    if (node === undefined || node === null) return undefined;
+    node = node[parts[i]];
+  }
+  return node;
+}
+
+function pkgSetPath(object, dotted, value) {
+  const parts = dotted.split('.');
+  let node = object;
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (typeof node[parts[i]] !== 'object' || node[parts[i]] === null) node[parts[i]] = {};
+    node = node[parts[i]];
+  }
+  node[parts[parts.length - 1]] = value;
+}
+
+function pkgDeletePath(object, dotted) {
+  const parts = dotted.split('.');
+  let node = object;
+  for (let i = 0; i < parts.length - 1; i++) {
+    node = node[parts[i]];
+    if (typeof node !== 'object' || node === null) return;
+  }
+  delete node[parts[parts.length - 1]];
+}
+
+function doPmPkg(args) {
+  const dir = process.cwd();
+  const file = path.join(dir, 'package.json');
+  const pkg = readPkgJson(dir);
+  if (!pkg) { err('error: no package.json in ' + dir); process.exit(1); return; }
+  const action = args[0];
+  const rest = args.slice(1);
+  if (action === 'get') {
+    if (rest.length === 0) { out(JSON.stringify(pkg, null, 2)); return; }
+    if (rest.length === 1) { out(JSON.stringify(pkgPath(pkg, rest[0]), null, 2)); return; }
+    const picked = {};
+    for (let i = 0; i < rest.length; i++) picked[rest[i]] = pkgPath(pkg, rest[i]);
+    out(JSON.stringify(picked, null, 2));
+    return;
+  }
+  if (action === 'set') {
+    for (let i = 0; i < rest.length; i++) {
+      const eq = rest[i].indexOf('=');
+      if (eq < 0) { err('error: expected key=value, got ' + rest[i]); process.exit(1); return; }
+      const key = rest[i].slice(0, eq);
+      const raw = rest[i].slice(eq + 1);
+      let value = raw;
+      try { value = JSON.parse(raw); } catch (e) { value = raw; }
+      pkgSetPath(pkg, key, value);
+    }
+    fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + NL);
+    return;
+  }
+  if (action === 'delete' || action === 'rm') {
+    for (let i = 0; i < rest.length; i++) pkgDeletePath(pkg, rest[i]);
+    fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + NL);
+    return;
+  }
+  err('bun pm pkg: expected get, set or delete (got ' + String(action) + ')');
+  process.exit(1);
+}
+
+function doPm(args) {
+  const sub = args[0];
+  const rest = args.slice(1);
+  if (!sub) {
+    out('Usage: bun pm [flags] [<command>]');
+    out('');
+    out('  Run package manager utilities.');
+    out('');
+    out('Commands:');
+    out('  bun pm ls                 list the dependencies in node_modules (--all for every one)');
+    out('  bun pm bin                print the path to the bin folder');
+    out('  bun pm pkg get|set|delete manage data in package.json');
+    out('  bun pm why <pkg>          show which dependency pulled a package in');
+    out('  bun pm cache [rm]         print or clear the package cache');
+    out('  bun pm pack               create a tarball of this package');
+    return;
+  }
+  if (sub === 'ls' || sub === 'list') return pmList(rest.indexOf('--all') >= 0);
+  if (sub === 'bin') {
+    if (rest.indexOf('-g') >= 0 || rest.indexOf('--global') >= 0) { out('/usr/local/bin'); return; }
+    out(path.join(process.cwd(), 'node_modules', '.bin'));
+    return;
+  }
+  if (sub === 'pkg') return doPmPkg(rest);
+  if (sub === 'why') {
+    if (!rest[0]) { err('bun pm why: expected a package name'); process.exit(1); return; }
+    // npm explain answers exactly this question, from the tree npm installed.
+    return runNpm(['explain'].concat(rest));
+  }
+  if (sub === 'cache') {
+    if (rest[0] === 'rm' || rest[0] === 'clean') return runNpm(['cache', 'clean', '--force']);
+    return runNpm(['config', 'get', 'cache']);
+  }
+  if (sub === 'pack') return runNpm(['pack'].concat(rest));
+  if (sub === 'whoami' || sub === 'view' || sub === 'scan') {
+    err('bun pm ' + sub + ' is not supported in Vivari (browser sandbox): it needs an authenticated registry session, and the sandbox has no credential store to hold one and no way to prompt for a login.');
+    err('Run it outside the sandbox, or use "bun x npm ' + (sub === 'view' ? 'view' : sub) + '" with a registry that accepts anonymous requests.');
+    process.exit(1);
+    return;
+  }
+  err('bun pm ' + sub + ' is not implemented in the Vivari shim yet.');
+  process.exit(1);
+}
+
+// bun link / bun unlink are npm's, over the same node_modules: the shim's
+// installs are npm's, so its link semantics are the ones already in this VFS.
+function doLink(which, args) {
+  return runNpm([which === 'link' ? 'link' : 'unlink'].concat(args));
+}
+
+// bun create <template> scaffolds from a generator package, which is what
+// npx/bunx already do here: "bun create vite app" is "bunx create-vite app".
+function doCreate(args) {
+  if (!args.length) {
+    err('bun create: expected a template, e.g. "bun create vite my-app"');
+    process.exit(1);
+    return;
+  }
+  const template = args[0];
+  const rest = args.slice(1);
+  const isPath = template.indexOf('/') >= 0 && template.indexOf('@') !== 0;
+  if (isPath && template.indexOf('github.com') < 0 && template.split('/').length === 2 && template.indexOf('.') < 0) {
+    // "bun create user/repo" clones a GitHub template. Nothing in the sandbox can
+    // clone (no git transport), so say which half is missing.
+    err('bun create <user/repo> is not supported in Vivari (browser sandbox): it clones a GitHub repository over git, and the sandbox has no git transport.');
+    err('Use a generator package instead ("bun create vite my-app"), or the New Project menu in the studio.');
+    process.exit(1);
+    return;
+  }
+  const pkgName = template.indexOf('create-') === 0 || template.charAt(0) === '@' ? template : 'create-' + template;
+  return doExec([pkgName].concat(rest));
+}
+
 async function main() {
   const first = argv[0];
   if (!first || first === '--help' || first === '-h' || first === 'help') { out(helpText()); process.exit(0); }
@@ -541,7 +874,8 @@ async function main() {
     case 'remove': case 'rm': case 'uninstall': return doInstall('remove', rest);
     case 'update': case 'up': return doInstall('update', rest);
     case 'ci': return doInstall('ci', rest);
-    case 'x': case 'exec': return doExec(rest);
+    case 'x': case 'bunx': return doExec(rest);
+    case 'exec': return doShellExec(rest);
     case 'build': return doBuild(rest);
     case 'test': return doTest(rest);
     case 'upgrade':
@@ -552,8 +886,30 @@ async function main() {
       err('Did you mean "bun update" (update the dependencies in package.json)?');
       process.exit(1);
       return;
-    case 'init': case 'create': case 'pm': case 'link': case 'unlink':
-      err('bun ' + first + ' is not implemented in the Vivari shim yet.');
+    case 'init': return doInit(rest);
+    case 'create': return doCreate(rest);
+    case 'pm': return doPm(rest);
+    case 'link': case 'unlink': return doLink(first, rest);
+    // Registry verbs. npm is already the install path here, so these are the same
+    // question asked of the same registry — delegating is more honest than a second
+    // implementation that could disagree with the one doing the installing.
+    case 'why': return runNpm(['explain'].concat(rest));
+    case 'outdated': return runNpm(['outdated'].concat(rest));
+    case 'info': case 'view': return runNpm(['view'].concat(rest));
+    case 'audit': return runNpm(['audit'].concat(rest));
+    case 'publish':
+      err('bun publish is not supported in Vivari (browser sandbox): publishing needs an authenticated npm session, and the sandbox has no credential store and no way to prove who you are to a registry.');
+      err('Run it outside the VM, or use "bun pm pack" here and upload the tarball yourself.');
+      process.exit(1);
+      return;
+    case 'patch': case 'patch-commit':
+      err('bun patch is not implemented in the Vivari shim: it needs git to produce and apply the diff, and there is no git transport in the sandbox.');
+      err('Edit the file in node_modules directly, or vendor the package into your source tree.');
+      process.exit(1);
+      return;
+    case 'repl':
+      err('bun repl is not implemented in the Vivari shim: the REPL wants a tty for line editing and history, and the sandbox has pipes rather than a terminal device.');
+      err('Use "bun run <file>" or "bun -e <code>" instead.');
       process.exit(1);
       return;
     default:

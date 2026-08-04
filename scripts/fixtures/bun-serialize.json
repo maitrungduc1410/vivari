@@ -1,0 +1,233 @@
+{
+ "recordedFrom": "bun 1.3.14",
+ "results": {
+  "number": {
+   "tag": "Number",
+   "value": "42",
+   "boxed": "42"
+  },
+  "negative-zero": {
+   "tag": "Number",
+   "value": "-0",
+   "boxed": "0"
+  },
+  "nan": {
+   "tag": "Number",
+   "value": "NaN",
+   "boxed": "NaN"
+  },
+  "infinity": {
+   "tag": "Number",
+   "value": "-Infinity",
+   "boxed": "-Infinity"
+  },
+  "string": {
+   "tag": "String",
+   "value": "héllo 😀",
+   "boxed": "héllo 😀"
+  },
+  "empty-string": {
+   "tag": "String",
+   "value": "",
+   "boxed": ""
+  },
+  "true": {
+   "tag": "Boolean",
+   "value": "true",
+   "boxed": "true"
+  },
+  "null": {
+   "tag": "Null",
+   "value": "null"
+  },
+  "undefined": {
+   "tag": "Undefined",
+   "value": "undefined"
+  },
+  "bigint": {
+   "tag": "BigInt",
+   "value": "123456789012345678901234567890"
+  },
+  "bigint-negative": {
+   "tag": "BigInt",
+   "value": "-7"
+  },
+  "date": {
+   "tag": "Date",
+   "time": "1700000000000"
+  },
+  "invalid-date": {
+   "tag": "Date",
+   "time": "NaN"
+  },
+  "regexp": {
+   "tag": "RegExp",
+   "re": "ab+c/gi"
+  },
+  "map": {
+   "tag": "Map",
+   "entries": [
+    [
+     "string:a",
+     "number:1"
+    ],
+    [
+     "string:b",
+     "Object[\"x\"]"
+    ]
+   ]
+  },
+  "map-nested": {
+   "tag": "Map",
+   "entries": [
+    [
+     "string:k",
+     "Set[]"
+    ]
+   ]
+  },
+  "set": {
+   "tag": "Set",
+   "values": [
+    "number:1",
+    "string:two",
+    "Object[\"three\"]"
+   ]
+  },
+  "error": {
+   "tag": "Error",
+   "name": "TypeError",
+   "message": "bad",
+   "hasStack": true,
+   "cause": "dropped"
+  },
+  "error-cause": {
+   "tag": "Error",
+   "name": "Error",
+   "message": "with cause",
+   "hasStack": true,
+   "cause": "dropped"
+  },
+  "uint8": {
+   "tag": "Uint8Array",
+   "kind": "Uint8Array",
+   "byteOffset": 0,
+   "byteLength": 3,
+   "contents": "1,2,3"
+  },
+  "float64": {
+   "tag": "Float64Array",
+   "kind": "Float64Array",
+   "byteOffset": 0,
+   "byteLength": 16,
+   "contents": "0,0,0,0,0,0,248,63,0,0,0,0,0,0,208,191"
+  },
+  "bigint64": {
+   "tag": "BigInt64Array",
+   "kind": "BigInt64Array",
+   "byteOffset": 0,
+   "byteLength": 16,
+   "contents": "1,0,0,0,0,0,0,0,254,255,255,255,255,255,255,255"
+  },
+  "dataview": {
+   "tag": "DataView",
+   "kind": "DataView",
+   "byteOffset": 0,
+   "byteLength": 3,
+   "contents": "9,8,7"
+  },
+  "arraybuffer": {
+   "tag": "ArrayBuffer",
+   "contents": "7,7"
+  },
+  "two-views-one-buffer": {
+   "tag": "Object",
+   "keys": [
+    "a",
+    "b"
+   ],
+   "hasUndefinedProps": [],
+   "sharedBuffer": "preserved"
+  },
+  "sparse": {
+   "tag": "Array",
+   "length": 3,
+   "holes": "vhv",
+   "named": []
+  },
+  "array-with-props": {
+   "tag": "Array",
+   "length": 2,
+   "holes": "vv",
+   "named": [
+    "note=string:extra"
+   ]
+  },
+  "nested-plain": {
+   "tag": "Object",
+   "keys": [
+    "a",
+    "c"
+   ],
+   "hasUndefinedProps": []
+  },
+  "cyclic": {
+   "tag": "Object",
+   "keys": [
+    "name",
+    "self"
+   ],
+   "hasUndefinedProps": [],
+   "cycle": "preserved"
+  },
+  "shared-identity": {
+   "tag": "Object",
+   "keys": [
+    "x",
+    "y"
+   ],
+   "hasUndefinedProps": [],
+   "identity": "preserved"
+  },
+  "boxed-string": {
+   "tag": "String",
+   "boxed": "boxed"
+  },
+  "boxed-number": {
+   "tag": "Number",
+   "boxed": "3"
+  },
+  "undefined-property": {
+   "tag": "Object",
+   "keys": [
+    "present"
+   ],
+   "hasUndefinedProps": [
+    "present"
+   ]
+  },
+  "empty-object": {
+   "tag": "Object",
+   "keys": [],
+   "hasUndefinedProps": []
+  },
+  "empty-array": {
+   "tag": "Array",
+   "length": 0,
+   "holes": "",
+   "named": []
+  }
+ },
+ "refusals": {
+  "function": "DOMException: The object can not be cloned.",
+  "symbol": "DOMException: The object can not be cloned.",
+  "weakmap": "DOMException: The object can not be cloned.",
+  "promise": "DOMException: The object can not be cloned."
+ },
+ "corrupt": {
+  "garbage": "TypeError: Unable to deserialize data.",
+  "truncated": "TypeError: Unable to deserialize data.",
+  "empty": "returned null",
+  "not-a-buffer": "TypeError: First argument must be an ArrayBuffer"
+ }
+}

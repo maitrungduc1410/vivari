@@ -92,6 +92,11 @@ packages/
                    compileRoutes/matchRoute, deliberately not a generalisation of it.
       bun-env.js   Bun's automatic .env loading: the file set + precedence, a port of
                    Bun's own parser, and $VAR expansion. `bun` processes only.
+      bun-ipc.js   the Bun.spawn({ipc}) channel: length-prefixed framing, the two
+                   serialization modes, and the socket wiring both ends share. It
+                   rides the kernel's EXISTING cross-process pipe (OP_PIPE_*), so
+                   there is no IPC opcode to look for. The framing half is pure on
+                   purpose — see the one-write-one-read gotcha below.
       bun-sleep.js Bun.sleepSync as a real Atomics.wait park (packages/protocol/
                    syscall.js `parkFor`/`canPark`), with the spin as a fallback.
                    Bun's dialect is not minimatch's (see the Bun section below).
@@ -806,6 +811,15 @@ how the session template shipped and broke on the first click.
 An absent header means a wildcard per-port origin (mode C), which serves at the
 root, so the empty string is the right answer there. `spike-session-studio.mjs`
 drives the shipped template both ways.
+
+**For an app that emits HTML, do it in one place with `HTMLRewriter` rather than at
+every call site.** Concatenating the prefix onto each URL as you build it is a thing to
+forget in one branch out of nine, and the symptom (one link out of the preview) looks
+nothing like the cause. A pass over the finished page — `a[href], link[href],
+form[action]`, prefix anything starting `/` but not `//` — is a dozen lines, knows
+nothing about the app, and is the shape the `bun-fullstack` template ships;
+`spike-bun-templates.mjs` gates both directions, since "no header means no rewrite" is
+the half that rots quietly. A redirect `Location` still needs doing by hand.
 
 ### The kernel keeps the cookie jar, because the browser will not
 `packages/kernel-host/cookie-jar.js`, wired into `kernel.handleHttpRequest` as
@@ -1904,6 +1918,30 @@ unpacked:
   applies inside single quotes. It is **not** shared with the `--env-file` reader in
   `coreutils.js`: that one implements Node's smaller `--env-file` language and lives
   inside a template literal, so there is no module to import.
+- **`packages/runtime/builtins/bun-ipc.js`** — the channel behind
+  `Bun.spawn({ ipc })`. It adds **no kernel opcode**: the transport is the pipe the
+  kernel already relays for UNIX sockets (`OP_PIPE_LISTEN`/`OP_PIPE_CONNECT` +
+  `pipe-data`), so the parent listens on a generated path before it spawns and the
+  child dials it while it boots. Four facts came off the binary and none of them
+  are in the docs. The child gets **Node's** fork surface (`process.send`,
+  `process.on("message")`, `process.connected`, `process.channel`,
+  `process.disconnect()`) and nothing on the `Bun` global. The carrier —
+  `NODE_CHANNEL_FD` there, a socket path here — is **deleted from the child's env
+  before its first line**, and that is load-bearing rather than tidy: `env` is what
+  a process passes on when it spawns, so an inherited address would put a
+  GRANDCHILD on its grandparent's channel, accepted as the child and interleaving
+  frames into someone else's stream. The default mode is `"advanced"` = a
+  structured clone, so this reuses `bun-serialize.js` (including its
+  `DataCloneError`, which is already Bun's exact sentence); `"json"` is JSON and
+  loses Map/Date/BigInt/cycles. And a **node** child needs `serialization: "json"`
+  under real bun — node's advanced mode is `v8.serialize`, Bun's is a JSC
+  structured clone, so the child's messages silently never arrive. Here both ends
+  are our runtime, so `"advanced"` works with a node child too: the sandbox is
+  LOOSER than production, which is why `bun.js` warns once rather than pretending.
+  Two behaviours to preserve if you touch it: the child's socket is `unref`'d until
+  a `message` listener exists (see the listener gotcha), and `send()` refuses with
+  Bun's two DIFFERENT sentences in Bun's order — an exited child is reported as
+  exited, not as a closed channel.
 - **`packages/runtime/builtins/bun-sleep.js`** — `Bun.sleepSync` parks on
   `Atomics.wait` (`parkFor` in `packages/protocol/syscall.js`) instead of spinning.
   `Atomics.wait` is illegal on a browser MAIN thread, so `parkFor` reports its
@@ -3533,6 +3571,36 @@ test it is to assert what the GUEST sees (`typeof Worker` from inside a guest pr
 you want the browser's side of it, to plant a sentinel on `globalThis` before boot and check the
 guest gets yours rather than the sentinel.
 
+`Worker` was one name found by hand, and hand-searching does not scale: a Chrome 143
+DedicatedWorkerGlobalScope has 367 names, of which **228 exist in neither node nor bun**. Among
+them are `importScripts`, the origin's IndexedDB / Cache Storage / OPFS, `XMLHttpRequest` and
+`EventSource` (egress that never passes the Fetcher Worker, so no rewrite and no cookie jar),
+`USB`/`HID`/`Serial`, and `close()`. `packages/runtime/realm.js` now sweeps the lot against a
+recorded list of what a real node has, immediately before the entry module runs. Three rules
+come out of building it:
+
+- **Shadow, never `delete`.** 35 of those names live on the prototype chain, where
+  `delete globalThis.x` removes nothing and returns true, and 17 of them are accessors, where
+  assigning `undefined` throws. An own, writable, non-enumerable data property is the only form
+  that works for all of them. It also leaves the original in place for the runtime, which is
+  what makes the next point possible.
+- **The kernel's channel is the guest's too, in BOTH directions.** `self.onmessage` in
+  `process-worker.ts` is the kernel's link to this process, and a guest
+  `addEventListener("message")` reads every stdin chunk, fetch result and signal on it.
+  Shadowing the name fixes it precisely because shadowing is not removal: verified in a real
+  Chrome worker, a message after the sweep still reached the ORIGINAL handler, while a guest's
+  assignment to `onmessage` landed in the shadow property and was never called.
+- **Allowlist, not denylist.** The sweep keeps what a real node has (recorded by
+  `scripts/record-realm-globals.mjs`) and hides everything else, so a global Chrome ships next
+  year is hidden by default rather than leaking until someone notices.
+
+Testing it needs the same trick as `Worker`, scaled up: `scripts/process-worker.mjs` plants a
+browser-shaped realm under `VV_PLANT_BROWSER_REALM` — own AND inherited names, accessors
+included — before importing the runtime, and `scripts/spike-bun.mjs` asserts from inside a
+running guest that none of them survived. `scripts/spike-realm.mjs` rebuilds the whole recorded
+worker global offline and sweeps that. Plant before the import: the capture of "what was here
+before us" happens at the runtime's module load, so anything planted later looks like ours.
+
 ### A `message` listener keeps a worker alive — wire it lazily
 
 Both Bun and Node document that attaching a `message` listener on a port holds the thread's
@@ -3541,6 +3609,38 @@ that attaches one eagerly to implement `onmessage` makes every worker immortal, 
 waiting on one hangs with it. `builtins/bun-worker.js` wires the `parentPort` listener on the
 first use of `onmessage` or `addEventListener("message")`. If you touch that file, do not
 "simplify" it back.
+
+**The same rule governs a `Bun.spawn({ipc})` child, and the binary confirms it from the other
+side.** The very first probe written against the real `bun` hung for twenty seconds, and the probe
+was correct: a child holding `process.on("message")` stays up until somebody disconnects, while a
+child that never attaches one exits the moment its script ends. So the child's channel socket in
+`packages/runtime/index.js` is `unref()`d as soon as it connects and `ref()`d on the FIRST
+`message` listener (counted via `newListener`/`removeListener`, the same way the fork path does
+it). Wire it the obvious way instead and every ipc child becomes immortal — and its parent, which
+is almost always sitting in `await proc.exited`, hangs behind it. The parent's listening server is
+`unref()`d for the mirror-image reason: the child already refs the parent's loop for as long as it
+runs, so the channel must not be a second, longer-lived reason to stay up.
+
+### One socket write is one `data` event here — so the kernel tier cannot catch a framing bug
+
+A `net.Socket` is a byte stream, and its contract allows the runtime to split one `write()` across
+several `data` events or to coalesce several writes into one. **This VM does neither.** Each write
+becomes one `pipe-data` message, the kernel relays it verbatim, and `bindings/net.js` hands the
+reader exactly one chunk — so a 1:1 relationship holds that nothing has promised.
+
+That was measured the expensive way. The `Bun.spawn({ipc})` framing was deleted on purpose — no
+length prefix, every chunk treated as a whole message — and `scripts/spike-bun.mjs` stayed
+completely green, including 200 messages sent in one tick and a 400 KB payload. A kernel-tier spike
+cannot distinguish a framed stream from an unframed one.
+
+Two things follow. **Do not delete framing because a spike passes without it**: the guarantee is
+the transport's current implementation, not the API's contract, and anything that later makes the
+relay chunk (the SAB path already chunks at 1 MiB) breaks every unframed reader at once. And when
+you write something that parses a stream, **pin it where the stream can misbehave** — keep the
+parser pure and feed it the splits and coalesces directly, as `scripts/spike-bun-offline.mjs` does
+for `FrameReader` (five frames in one chunk, one frame across forty thousand chunks, a length
+prefix split down the middle). That block fails on its first assertion with the framing reverted;
+the kernel one does not fail at all.
 
 ### `process.on('uncaughtException')` never fires in a guest
 
@@ -3602,6 +3702,73 @@ Two things that are easy to get wrong if you touch it:
   async, so a failure after their first `await` is a rejected promise that a `try`/`catch` around
   the call cannot see. That is precisely how the spawn crash arrived. `dispatchSyscall` returns
   their promises so the guard can attach to them.
+
+### Before shimming a Bun API, run the real one
+
+A `bun` binary is one download away and settles in seconds what the docs and the
+published types leave open:
+
+```bash
+curl -fsSL https://github.com/oven-sh/bun/releases/latest/download/bun-linux-x64.zip -o /tmp/bun.zip
+cd /tmp && unzip -q bun.zip && ./bun-linux-x64/bun run probe.ts
+```
+
+Check `bun --version` first — some environments already have one on `PATH`, and the
+download is the fallback, not the ritual.
+
+`npm pack bun-types` is the companion for exact signatures. Neither is a substitute for
+the other, and the gap between them is where the bugs live: the types for the
+per-algorithm hashers declare no lifecycle at all, while the binary shows the instance
+is **consumed** by `digest()` — the opposite of `CryptoHasher`, which resets. Shipping
+the reasonable guess would have made reuse work here and throw on the first real `bun`
+run, and nothing in this repo could have caught it.
+
+Two habits that come out of that:
+
+- **Probe the edges, not the happy path.** What does it do with a `Blob`, with a number,
+  with a short output buffer, after being used once, with a bad encoding name? That is
+  where a shim diverges, and the error STRINGS are part of the API — someone will
+  search for them.
+- **When the sandbox cannot match Bun, be stricter, never looser.** Refusing something
+  Bun allows costs a user a workaround; allowing something Bun refuses costs them a
+  green test suite and a red CI. `Bun.file()` hashing is the current example: Bun
+  refuses it, so this does too, with Bun's own words.
+### The kernel has a second door, and it is wider: `postMessage`, not syscalls
+
+Syscalls are not the only way in. A Process Worker also posts messages to a handler *table*
+(`info.on`), and in a browser `globalThis.postMessage` inside that worker posts **straight to the
+kernel** — so guest code could aim any entry in that table at a payload of its choosing. Fuzzing
+the nine handlers with `undefined`, `{}`, `7` and friends, five of them threw (`thread-spawn` on a
+bare `{}`), and neither dispatch — browser worker or Node harness — had a guard, so the throw
+escaped into `onmessage` and ended the VM. Both halves are now closed:
+
+- **Validate, then drop.** Every handler reached from that table starts with a shape check and
+  ignores a message it cannot act on. Unlike a syscall there is nobody parked on a reply, so
+  silence is the correct answer — the thing you must not do is answer with an exception.
+- **Guard the dispatch anyway**, in `kernel-worker.ts` *and* `scripts/lib/spike-harness.mjs`. The
+  per-handler checks are the fix; the guard is what keeps the next handler's oversight cheap.
+- **Take the capability away too.** `packages/runtime/index.js` removes `postMessage` from the
+  guest's global next to `Worker`. That means the worker shell must capture its own reference
+  first (`const toKernel = self.postMessage.bind(self)` in `process-worker.ts`) — read the property
+  lazily and the removal silently kills every stdout byte, exit code and syscall wake the process
+  sends.
+
+Two traps worth knowing before you touch this:
+
+- **Nothing in the Node tier proves the removal by itself**, because a Node worker has no global
+  `postMessage` to begin with — the same blind spot that hid the `Worker` leak, and an assertion
+  that "a guest sees none" passes with the fix reverted. `scripts/process-worker.mjs` therefore
+  plants one under `VV_PLANT_KERNEL_MAILBOX` so the spike has something to watch get removed.
+  Always check a new guard fails with its fix reverted; two of these did not, at first.
+- **Do not "shadow" it with a throwing stub.** `packages/runtime/node/vendor/napi-wasm-runtime.js`
+  picks a transport with `typeof postMessage === "function"`, so a stub would be *selected* —
+  worse than absent. `undefined` is also the faithful value for a node guest: no such global
+  exists in Node. That vendored runtime only consults the global when it is instantiated with
+  `childThread`, which `packages/runtime/node/loader.js` never does, and otherwise prefers
+  `worker_threads.parentPort`, so emptying the name costs the napi/wasm addons nothing.
+  A **bun** guest is the exception and gets a real function back (`installBunRealm` in
+  `packages/runtime/realm.js`), because Bun's main thread has one — inert, bound to nothing,
+  returning `undefined`, which is what Bun's does.
 
 ## Where to look next
 

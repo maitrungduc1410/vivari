@@ -3356,6 +3356,1149 @@ console.log("Rows are in notes.sqlite — open the file explorer, or reload and 
   };
 }
 
+// ── Bun (full-stack) ─────────────────────────────────────────────────────────
+// The three headline Bun APIs in one app, doing one job each: Bun.serve routes
+// the pages, bun:sqlite holds the data across three tables, and HTMLRewriter
+// pours the query results into plain .html files on the way out. There is no
+// client-side JavaScript in it and no template language — public/index.html is a
+// file you can open straight from the explorer and it renders.
+//
+// The rewriter earns its place twice. Once for the data, and once as a reverse
+// proxy: Vivari serves a preview under /preview/<port>/, and a root-absolute
+// <a href="/issue/3"> is a NAVIGATION, so without a rebase it leaves the preview
+// and 404s against the studio. A second HTMLRewriter pass prefixes every URL the
+// page emits, which is what makes a multi-page server-rendered app clickable in
+// the preview pane at all. See AGENTS.md, "root-absolute NAVIGATION URLs".
+//
+// It ships its own `bun test` suite too (src/*.test.ts) against the very modules
+// the server imports. Every route is a plain function of its inputs, so the
+// tests drive real Request objects and never bind a port — a test that starts a
+// server is a test that can hang. https://bun.com/docs/api/html-rewriter
+function bunFullstackTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "bun-fullstack",
+      framework: "bun",
+      icon: "bun",
+      category: "Bun",
+      name: "full-stack",
+      language: "TypeScript",
+      description: "Bun.serve + bun:sqlite + HTMLRewriter: a server-rendered issue board with no client JavaScript, and a bun test suite",
+      port: 3000,
+      openPath: "/",
+      entry: "src/render.ts",
+      hmr: false,
+      reload: false,
+      install: "bun install",
+      dev: "bun run src/server.ts",
+      // Both halves are gated by scripts/spike-bun-templates.mjs: it serves every
+      // page from these exact bytes, with and without the preview prefix, and
+      // runs the `bun test` suite in the same project.
+    },
+    files: {
+      "package.json": `{
+  "name": "bun-fullstack-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "module": "src/server.ts",
+  "scripts": { "start": "bun run src/server.ts", "dev": "bun run src/server.ts", "test": "bun test" },
+  "devDependencies": { "@types/bun": "latest" }
+}
+`,
+      "tsconfig.json": `{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true
+  }
+}
+`,
+      "src/db.ts": `// The data layer: real SQLite, three tables, one join.
+//
+// \`bun:sqlite\` here is sqlite.org's own WebAssembly build over Vivari's
+// synchronous filesystem, so \`board.sqlite\` is an actual file you can see in the
+// explorer and it is still there after a reload. Docs: https://bun.com/docs/api/sqlite
+//
+// Everything is behind \`createStore(path)\` rather than a module-level database.
+// That is what lets \`bun test\` open a \`:memory:\` copy per run — a test suite that
+// shares the server's file is a test suite that deletes your data.
+import { Database } from "bun:sqlite";
+
+export type Status = "open" | "doing" | "done";
+export const STATUSES: Status[] = ["open", "doing", "done"];
+
+export interface Issue {
+  id: number;
+  title: string;
+  body: string;
+  status: Status;
+  /** 1 = high, 3 = low. */
+  priority: number;
+  created_at: string;
+  labels: string[];
+}
+
+export interface Counts {
+  all: number;
+  open: number;
+  doing: number;
+  done: number;
+}
+
+/** A row as SQLite hands it back: labels arrive as one group_concat string. */
+interface IssueRow extends Omit<Issue, "labels"> {
+  labels: string | null;
+}
+
+const SCHEMA = \`
+CREATE TABLE IF NOT EXISTS issues (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  title      TEXT    NOT NULL CHECK (length(trim(title)) > 0),
+  body       TEXT    NOT NULL DEFAULT '',
+  status     TEXT    NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'doing', 'done')),
+  priority   INTEGER NOT NULL DEFAULT 2 CHECK (priority BETWEEN 1 AND 3),
+  created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS labels (
+  id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT    NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS issue_labels (
+  issue_id INTEGER NOT NULL REFERENCES issues (id) ON DELETE CASCADE,
+  label_id INTEGER NOT NULL REFERENCES labels (id) ON DELETE CASCADE,
+  PRIMARY KEY (issue_id, label_id)
+);
+
+CREATE INDEX IF NOT EXISTS issues_status ON issues (status, priority);
+\`;
+
+// One query for the list and one for a single issue would drift apart, so there
+// is one SELECT with an optional filter. \`group_concat\` folds the many-to-many
+// join back into a single row per issue.
+const SELECT_ISSUES = \`
+SELECT i.id, i.title, i.body, i.status, i.priority, i.created_at,
+       group_concat(l.name, ',') AS labels
+  FROM issues i
+  LEFT JOIN issue_labels il ON il.issue_id = i.id
+  LEFT JOIN labels       l  ON l.id = il.label_id
+ WHERE (?1 IS NULL OR i.status = ?1)
+   AND (?2 IS NULL OR i.id = ?2)
+ GROUP BY i.id
+ ORDER BY i.priority ASC, i.id DESC
+\`;
+
+const SEED: Array<[string, string, Status, number, string[]]> = [
+  ["Preview pane forgets its scroll position", "Reloading the iframe jumps back to the top.", "open", 2, ["bug", "preview"]],
+  ["Ship the HTMLRewriter demo", "Server-render the board with no client JavaScript.", "doing", 1, ["feature"]],
+  ["Index the status column", "The board query was doing a full scan on every request.", "done", 3, ["perf", "sql"]],
+  ["Labels should be reusable", "Adding 'bug' twice must not create two rows.", "open", 1, ["bug", "sql"]],
+];
+
+export interface Store {
+  /** The underlying handle, for the things a wrapper should not hide. */
+  readonly db: Database;
+  listIssues(status?: Status | null): Issue[];
+  getIssue(id: number): Issue | null;
+  counts(): Counts;
+  addIssue(title: string, labels?: string[], body?: string, priority?: number): number;
+  setStatus(id: number, status: Status): boolean;
+  deleteIssue(id: number): boolean;
+  labelNames(): string[];
+  seedIfEmpty(): number;
+  reset(): void;
+  close(): void;
+}
+
+export function createStore(path: string): Store {
+  const db = new Database(path);
+
+  // Off by default in SQLite, and the ON DELETE CASCADE above is inert without
+  // it — deleting an issue would leave its rows in issue_labels forever.
+  db.run("PRAGMA foreign_keys = ON");
+  db.run(SCHEMA);
+
+  // Prepared once and re-bound per call: SQLite compiles each of these a single
+  // time, however many requests the server handles.
+  const selectIssues = db.query<IssueRow, [string | null, number | null]>(SELECT_ISSUES);
+  const selectCounts = db.query<{ status: Status; n: number }, []>("SELECT status, COUNT(*) AS n FROM issues GROUP BY status");
+  const insertIssue = db.prepare("INSERT INTO issues (title, body, status, priority) VALUES (?, ?, ?, ?) RETURNING id");
+  const insertLabel = db.prepare("INSERT INTO labels (name) VALUES (?) ON CONFLICT (name) DO NOTHING");
+  const selectLabel = db.query<{ id: number }, [string]>("SELECT id FROM labels WHERE name = ?");
+  const linkLabel = db.prepare("INSERT INTO issue_labels (issue_id, label_id) VALUES (?, ?) ON CONFLICT DO NOTHING");
+  const updateStatus = db.prepare("UPDATE issues SET status = ? WHERE id = ?");
+  const removeIssue = db.prepare("DELETE FROM issues WHERE id = ?");
+  const allLabels = db.query<{ name: string }, []>("SELECT name FROM labels ORDER BY name");
+
+  const hydrate = (row: IssueRow): Issue => ({
+    ...row,
+    labels: row.labels ? row.labels.split(",") : [],
+  });
+
+  // Everything inside runs in one transaction: if any statement throws — a blank
+  // title tripping the CHECK constraint, say — the issue and its labels are both
+  // rolled back, and you never get an issue with half its labels attached.
+  const insertWithLabels = db.transaction(
+    (title: string, labels: string[], body: string, priority: number): number => {
+      const { id } = insertIssue.get(title, body, "open", priority) as { id: number };
+      for (const raw of labels) {
+        const name = raw.trim().toLowerCase();
+        if (!name) continue;
+        insertLabel.run(name);
+        linkLabel.run(id, selectLabel.get(name)!.id);
+      }
+      return id;
+    },
+  );
+
+  const seed = db.transaction((): number => {
+    for (const [title, body, status, priority, labels] of SEED) {
+      const id = insertWithLabels(title, labels, body, priority);
+      if (status !== "open") updateStatus.run(status, id);
+    }
+    return SEED.length;
+  });
+
+  return {
+    db,
+
+    listIssues(status = null) {
+      return selectIssues.all(status, null).map(hydrate);
+    },
+
+    getIssue(id) {
+      const row = selectIssues.get(null, id);
+      return row ? hydrate(row) : null;
+    },
+
+    counts() {
+      const out: Counts = { all: 0, open: 0, doing: 0, done: 0 };
+      for (const { status, n } of selectCounts.all()) {
+        out[status] = n;
+        out.all += n;
+      }
+      return out;
+    },
+
+    addIssue(title, labels = [], body = "", priority = 2) {
+      return insertWithLabels(title, labels, body, priority);
+    },
+
+    // \`.run()\` reports how many rows it touched, which is the difference between
+    // "moved it" and "there is no issue 99" — worth a 404 rather than a silent 303.
+    setStatus(id, status) {
+      return updateStatus.run(status, id).changes > 0;
+    },
+
+    deleteIssue(id) {
+      return removeIssue.run(id).changes > 0;
+    },
+
+    labelNames() {
+      return allLabels.all().map((r) => r.name);
+    },
+
+    seedIfEmpty() {
+      const row = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM issues").get()!;
+      return row.n > 0 ? 0 : seed();
+    },
+
+    reset() {
+      db.run("DELETE FROM issue_labels");
+      db.run("DELETE FROM issues");
+      db.run("DELETE FROM labels");
+    },
+
+    close() {
+      db.close();
+    },
+  };
+}
+`,
+      "src/render.ts": `// The view layer — and there is no template language in it.
+//
+// \`public/index.html\` and \`public/issue.html\` are plain HTML files. You can open
+// either one straight from the file explorer and it renders; nothing in them is
+// \`{{ }}\` or \`<% %>\`. The server pours data into them with \`HTMLRewriter\`, the
+// streaming transformer Bun exposes as a global (Cloudflare Workers run the same
+// engine), matching CSS selectors against the document as it goes.
+//
+// The reason that is worth doing rather than concatenating strings: HTMLRewriter
+// copies everything it was not asked to change through BYTE FOR BYTE. Your
+// markup is never reformatted, your comments are never dropped, and a designer
+// can keep editing the .html file without knowing the server exists.
+import type { Counts, Issue, Status } from "./db";
+
+const escape = (s: string) => Bun.escapeHTML(s);
+
+/** The one HTML string this app builds by hand — the rest lives in the .html files. */
+export function issueRowsHtml(issues: Issue[]): string {
+  return issues
+    .map((issue) => {
+      const labels = issue.labels
+        .map((name) => '<span class="pill label">' + escape(name) + "</span>")
+        .join("");
+      return (
+        "<li>" +
+        '<span class="pill s-' + issue.status + '">' + issue.status + "</span>" +
+        '<span class="title"><a href="/issue/' + issue.id + '">' + escape(issue.title) + "</a></span>" +
+        '<span class="labels">' + labels + "</span>" +
+        (issue.priority === 1 ? '<span class="pill p-1">P1</span>' : "") +
+        "</li>"
+      );
+    })
+    .join("");
+}
+
+export interface BoardView {
+  issues: Issue[];
+  counts: Counts;
+  /** Which filter tab is active — \`null\` is the unfiltered "All" tab. */
+  status: Status | null;
+  footnote: string;
+}
+
+/**
+ * The board. Six handlers, each doing one job the .html file left a slot for.
+ *
+ * \`transform()\` is handed a Response rather than a string on purpose: that path
+ * also awaits async handlers, so a slot backed by a \`fetch\` needs no rewrite of
+ * anything here.
+ */
+export function renderBoard(shell: string, view: BoardView): Response {
+  const empty = view.issues.length === 0;
+
+  return new HTMLRewriter()
+    // A text handler sees the text node, not the element. Guarding on \`t.text\`
+    // skips the empty final chunk the tokenizer emits at the end of a run.
+    .on("title", {
+      text(t) {
+        if (t.text) t.replace(escape(view.counts.open + " open · Issue board"));
+      },
+    })
+    // The rows. \`{ html: true }\` is what makes this markup rather than text —
+    // without it the <li> tags would arrive on the page as visible angle brackets.
+    .on("[data-slot='issues']", {
+      element(e) {
+        if (empty) e.remove();
+        else e.setInnerContent(issueRowsHtml(view.issues), { html: true });
+      },
+    })
+    // Conditional rendering by deletion: the placeholder is IN the file, and the
+    // server takes it out when there is something to show.
+    .on("[data-when='empty']", {
+      element(e) {
+        if (!empty) e.remove();
+      },
+    })
+    // One handler fills all four tab counters, because the selector matches all four.
+    .on("[data-count]", {
+      element(e) {
+        const key = e.getAttribute("data-count") as keyof Counts;
+        e.setInnerContent(String(view.counts[key] ?? 0));
+      },
+    })
+    .on(".tabs a[data-tab]", {
+      element(e) {
+        if (e.getAttribute("data-tab") === (view.status ?? "all")) e.setAttribute("aria-current", "page");
+      },
+    })
+    .on("[data-slot='footnote']", {
+      element(e) {
+        e.setInnerContent(view.footnote);
+      },
+    })
+    // Comments are for whoever edits the file, not for whoever loads the page.
+    .onDocument({
+      comments(c) {
+        c.remove();
+      },
+    })
+    .transform(html(shell));
+}
+
+export interface IssueView {
+  issue: Issue;
+  footnote: string;
+}
+
+export function renderIssue(shell: string, view: IssueView): Response {
+  const { issue } = view;
+
+  return new HTMLRewriter()
+    .on("title", {
+      text(t) {
+        if (t.text) t.replace(escape("#" + issue.id + " " + issue.title));
+      },
+    })
+    .on("[data-slot='title']", { element: (e) => e.setInnerContent("#" + issue.id + " " + issue.title) })
+    .on("[data-slot='status']", {
+      element(e) {
+        e.setInnerContent(issue.status);
+        // The class carries the colour, so it has to move with the value.
+        e.setAttribute("class", "pill s-" + issue.status);
+      },
+    })
+    .on("[data-slot='priority']", { element: (e) => e.setInnerContent("P" + issue.priority) })
+    .on("[data-slot='labels']", {
+      element(e) {
+        e.setInnerContent(
+          issue.labels.map((n) => '<span class="pill label">' + escape(n) + "</span>").join(" "),
+          { html: true },
+        );
+      },
+    })
+    .on("[data-slot='body']", { element: (e) => e.setInnerContent(issue.body || "No description.") })
+    .on("[data-slot='footnote']", { element: (e) => e.setInnerContent(view.footnote) })
+    // The form in the file points at issue 0. Give it the real one.
+    .on("form[action$='/status']", { element: (e) => e.setAttribute("action", "/api/issues/" + issue.id + "/status") })
+    .onDocument({ comments: (c) => c.remove() })
+    .transform(html(shell));
+}
+
+// ---- the proxy pass ---------------------------------------------------------
+// Vivari serves a preview at \`<origin>/preview/<port>/\`, and the Service Worker
+// hands the app the prefix it stripped as \`x-forwarded-prefix\`. Subresources are
+// fine without it, but a NAVIGATION — a link, a form post, a redirect — is not:
+// \`/issue/3\` leaves the preview entirely and 404s against the Studio.
+//
+// So every root-absolute URL the page emits has to be rebased. Doing it as a
+// separate HTMLRewriter pass, rather than inside the handlers above, is the
+// point: this is a reverse proxy's job and it knows nothing about issues. It is
+// the same rewrite Cloudflare's own examples use HTMLRewriter for.
+
+/** Which attribute carries a URL, per element. */
+const URL_ATTRS: Record<string, string> = { a: "href", link: "href", form: "action", img: "src", script: "src" };
+
+export function rebase(response: Response, prefix: string): Response {
+  // Mode C gives every port its own origin, served at the root, so there is
+  // nothing to rebase — and this returns the very same Response, unread.
+  if (!prefix) return response;
+
+  return new HTMLRewriter()
+    .on("a[href], link[href], form[action], img[src], script[src]", {
+      element(e) {
+        const attr = URL_ATTRS[e.tagName];
+        const value = attr && e.getAttribute(attr);
+        // Only root-absolute paths. \`https://…\`, \`#anchor\`, \`mailto:\` and a
+        // relative \`./x\` all already resolve correctly, and prefixing them
+        // would break them. \`//host/x\` is protocol-relative, not root-absolute.
+        if (value && value.startsWith("/") && !value.startsWith("//")) e.setAttribute(attr, prefix + value);
+      },
+    })
+    .transform(response);
+}
+
+const html = (body: string) =>
+  new Response(body, { headers: { "content-type": "text/html; charset=utf-8" } });
+`,
+      "src/app.ts": `// The HTTP layer. Each route is a plain function of its inputs, and \`createApp\`
+// is the only thing that knows about Bun.serve — which is what lets src/app.test.ts
+// exercise the real handlers without binding a port. A test that starts a server
+// is a test that can hang, and a hung \`bun test\` looks exactly like a slow one.
+import type { Status, Store } from "./db";
+import { STATUSES } from "./db";
+import { rebase, renderBoard, renderIssue } from "./render";
+
+export interface AppDeps {
+  store: Store;
+  /** The two .html files, read once at boot. */
+  shells: { board: string; issue: string };
+  /** Called after every mutation. The server logs; the tests assert. */
+  onChange?: (event: { type: "created" | "moved"; id: number }) => void;
+}
+
+/** The prefix the preview Service Worker stripped, or "" when served at the root. */
+export const prefixOf = (req: Request): string => req.headers.get("x-forwarded-prefix") ?? "";
+
+const isStatus = (v: string): v is Status => (STATUSES as string[]).includes(v);
+
+const redirect = (to: string) => new Response(null, { status: 303, headers: { location: to } });
+
+const notFound = (what: string) =>
+  new Response(what + " not found\\n", { status: 404, headers: { "content-type": "text/plain; charset=utf-8" } });
+
+export function boardPage(deps: AppDeps, req: Request): Response {
+  const wanted = new URL(req.url).searchParams.get("status");
+  const status = wanted && isStatus(wanted) ? wanted : null;
+  const issues = deps.store.listIssues(status);
+  const page = renderBoard(deps.shells.board, {
+    issues,
+    counts: deps.store.counts(),
+    status,
+    footnote:
+      issues.length +
+      " row(s) from board.sqlite, rendered into public/index.html by HTMLRewriter. " +
+      "Run \`bun test\` in the terminal to exercise the same modules.",
+  });
+  return rebase(page, prefixOf(req));
+}
+
+export function issuePage(deps: AppDeps, req: Request, rawId: string): Response {
+  const issue = deps.store.getIssue(Number(rawId));
+  if (!issue) return notFound("Issue " + rawId);
+  const page = renderIssue(deps.shells.issue, {
+    issue,
+    footnote: "Opened " + issue.created_at + " · one row, three tables, one LEFT JOIN.",
+  });
+  return rebase(page, prefixOf(req));
+}
+
+export async function createIssue(deps: AppDeps, req: Request): Promise<Response> {
+  const form = await req.formData();
+  const title = String(form.get("title") ?? "").trim();
+  if (!title) return new Response("A title is required\\n", { status: 400 });
+
+  const labels = String(form.get("labels") ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const id = deps.store.addIssue(title, labels);
+  deps.onChange?.({ type: "created", id });
+  // Post/redirect/get, so a reload does not add the issue a second time.
+  return redirect(prefixOf(req) + "/");
+}
+
+export async function moveIssue(deps: AppDeps, req: Request, rawId: string): Promise<Response> {
+  const form = await req.formData();
+  const status = String(form.get("status") ?? "");
+  if (!isStatus(status)) return new Response("Unknown status: " + status + "\\n", { status: 400 });
+
+  const id = Number(rawId);
+  if (!deps.store.setStatus(id, status)) return notFound("Issue " + rawId);
+  deps.onChange?.({ type: "moved", id });
+  return redirect(prefixOf(req) + "/issue/" + id);
+}
+
+/**
+ * The Bun.serve options object. Routes are matched by specificity — an exact
+ * path beats a \`:param\`, which beats a \`*\` — and anything unmatched falls
+ * through to \`fetch\`. Docs: https://bun.com/docs/runtime/http/routing
+ */
+export function createApp(deps: AppDeps, assetDir: string) {
+  return {
+    routes: {
+      "/": (req: Request) => boardPage(deps, req),
+      "/issue/:id": (req: Request & { params: { id: string } }) => issuePage(deps, req, req.params.id),
+      "/app.css": () => {
+        // Bun.file is lazy: no file is opened until the body is consumed.
+        //
+        // Bun's own idiom is \`new Response(Bun.file(path))\`. Don't write that
+        // here — a BunFile is not a platform Blob in Vivari, so the Response
+        // stringifies it and serves \`[object Object]\` with a cheerful 200. Hand
+        // over the stream and the type instead; that spelling is portable both
+        // ways. See the Bun page in the Vivari docs.
+        const css = Bun.file(assetDir + "/app.css");
+        return new Response(css.stream(), { headers: { "content-type": css.type } });
+      },
+      "/api/issues": { POST: (req: Request) => createIssue(deps, req) },
+      "/api/issues/:id/status": {
+        POST: (req: Request & { params: { id: string } }) => moveIssue(deps, req, req.params.id),
+      },
+    },
+    fetch: (req: Request) => notFound(new URL(req.url).pathname),
+    error: (err: Error) => new Response("Server error: " + err.message + "\\n", { status: 500 }),
+  };
+}
+`,
+      "src/server.ts": `// The entry point: read the two HTML shells once, open the database, serve.
+import { createApp } from "./app";
+import { createStore } from "./db";
+
+const store = createStore("board.sqlite");
+const seeded = store.seedIfEmpty();
+if (seeded > 0) console.log("Seeded " + seeded + " issues (the table was empty).");
+
+const shells = {
+  board: await Bun.file("public/index.html").text(),
+  issue: await Bun.file("public/issue.html").text(),
+};
+
+const app = createApp(
+  {
+    store,
+    shells,
+    onChange: (event) => console.log("  " + event.type + " issue #" + event.id),
+  },
+  "public",
+);
+
+const server = Bun.serve({ port: Number(process.env.PORT ?? 3000), ...app });
+
+console.log("Issue board on http://localhost:" + server.port);
+console.log("  " + store.counts().all + " issues in board.sqlite — the file is in the explorer, and it survives a reload.");
+console.log("  Nothing on the page is client-side: every list is SQL, poured into public/*.html by HTMLRewriter.");
+console.log("  Run \`bun test\` in another terminal to exercise the same modules.");
+`,
+      "src/db.test.ts": `// The data layer, against a real SQLite database held in memory.
+//
+//   bun test                         run everything
+//   bun test -t "cascade"            only tests whose name matches
+//   bun test --bail                  stop at the first failure
+//
+// Docs: https://bun.com/docs/cli/test
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { createStore, type Store } from "./db";
+
+let store: Store;
+
+// One database for the whole file (opening SQLite per test is wasteful) …
+beforeAll(() => {
+  store = createStore(":memory:");
+});
+afterAll(() => {
+  store.close();
+});
+
+// … and a fresh, identical dataset for each test, so no test can be polluted by
+// the one before it. \`:memory:\` means this costs nothing and touches no file.
+beforeEach(() => {
+  store.seedIfEmpty();
+});
+afterEach(() => {
+  store.reset();
+});
+
+describe("the seed", () => {
+  test("puts four issues in, across three statuses", () => {
+    expect(store.listIssues()).toHaveLength(4);
+    expect(store.counts()).toEqual({ all: 4, open: 2, doing: 1, done: 1 });
+  });
+
+  test("only seeds an empty table", () => {
+    expect(store.seedIfEmpty()).toBe(0);
+    expect(store.listIssues()).toHaveLength(4);
+  });
+
+  test("a row has the shape the view layer expects", () => {
+    const [first] = store.listIssues();
+    expect(first).toEqual(
+      expect.objectContaining({
+        id: expect.any(Number),
+        title: expect.any(String),
+        status: expect.any(String),
+        labels: expect.any(Array),
+        created_at: expect.stringMatching(/^\\d{4}-\\d{2}-\\d{2} /),
+      }),
+    );
+  });
+});
+
+describe("queries", () => {
+  test("filtering by status uses the indexed column", () => {
+    expect(store.listIssues("open")).toHaveLength(2);
+    expect(store.listIssues("done").map((i) => i.status)).toEqual(["done"]);
+  });
+
+  test("labels come back as an array, joined from two other tables", () => {
+    const issue = store.listIssues().find((i) => i.title.startsWith("Preview pane"))!;
+    expect(issue.labels).toEqual(expect.arrayContaining(["bug", "preview"]));
+  });
+
+  test("an issue with no labels gets an empty array, not a null", () => {
+    const id = store.addIssue("No labels here");
+    expect(store.getIssue(id)!.labels).toEqual([]);
+  });
+
+  test("getIssue answers null for an id that does not exist", () => {
+    expect(store.getIssue(9999)).toBeNull();
+  });
+
+  // P1 first, then newest first inside a priority — one case per row.
+  test.each([
+    ["highest priority sorts first", 0, 1],
+    ["…then the rest", 3, 3],
+  ])("%s", (_name, index, priority) => {
+    expect(store.listIssues()[index]!.priority).toBe(priority);
+  });
+});
+
+describe("writes", () => {
+  test("adding an issue returns its new id and lands in the list", () => {
+    const id = store.addIssue("Something is broken", ["bug"]);
+    expect(id).toBeGreaterThan(0);
+    expect(store.getIssue(id)).toMatchObject({ id, title: "Something is broken", status: "open" });
+    expect(store.counts().all).toBe(5);
+  });
+
+  test("a label is reused rather than duplicated", () => {
+    const before = store.labelNames();
+    expect(before).toContain("bug");
+    store.addIssue("Another bug", ["bug", "BUG", " bug "]);
+    expect(store.labelNames()).toEqual(before);
+  });
+
+  test("setStatus reports whether it actually moved anything", () => {
+    const [issue] = store.listIssues("open");
+    expect(store.setStatus(issue!.id, "done")).toBe(true);
+    expect(store.setStatus(9999, "done")).toBe(false);
+    expect(store.counts()).toMatchObject({ open: 1, done: 2 });
+  });
+
+  test("deleting an issue cascades to its labels", () => {
+    const [issue] = store.listIssues();
+    const links = () => store.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM issue_labels").get()!.n;
+    const before = links();
+    expect(store.deleteIssue(issue!.id)).toBe(true);
+    // The link rows went with it — that is PRAGMA foreign_keys = ON doing its job.
+    expect(links()).toBeLessThan(before);
+    expect(store.getIssue(issue!.id)).toBeNull();
+  });
+});
+
+describe("constraints", () => {
+  test("a blank title is refused by SQLite, not by us", () => {
+    expect(() => store.addIssue("   ")).toThrow(/CHECK constraint/);
+  });
+
+  test("an unknown status cannot be written", () => {
+    const [issue] = store.listIssues();
+    // @ts-expect-error — the type says this is impossible; the database agrees.
+    expect(() => store.setStatus(issue!.id, "wontfix")).toThrow(/CHECK constraint/);
+  });
+
+  test("a refused insert rolls the whole transaction back", () => {
+    const before = store.counts().all;
+    expect(() => store.addIssue("", ["orphan-label"])).toThrow();
+    expect(store.counts().all).toBe(before);
+    // …and the label the failed insert would have created is not there either.
+    expect(store.labelNames()).not.toContain("orphan-label");
+  });
+});
+`,
+      "src/render.test.ts": `// The view layer. These are the assertions that make HTMLRewriter worth using:
+// the slots get filled, and everything else comes back untouched.
+import { beforeAll, describe, expect, test } from "bun:test";
+import type { Counts, Issue } from "./db";
+import { issueRowsHtml, rebase, renderBoard, renderIssue } from "./render";
+
+let boardShell: string;
+let issueShell: string;
+
+beforeAll(async () => {
+  boardShell = await Bun.file("public/index.html").text();
+  issueShell = await Bun.file("public/issue.html").text();
+});
+
+const issue = (over: Partial<Issue> = {}): Issue => ({
+  id: 1,
+  title: "Preview pane forgets its scroll position",
+  body: "Reloading the iframe jumps back to the top.",
+  status: "open",
+  priority: 2,
+  created_at: "2026-01-01 00:00:00",
+  labels: ["bug", "preview"],
+  ...over,
+});
+
+const counts = (over: Partial<Counts> = {}): Counts => ({ all: 4, open: 2, doing: 1, done: 1, ...over });
+
+const board = (issues: Issue[], over: Partial<Parameters<typeof renderBoard>[1]> = {}) =>
+  renderBoard(boardShell, { issues, counts: counts(), status: null, footnote: "footnote", ...over }).text();
+
+describe("the board", () => {
+  test("renders one row per issue, linking to its page", async () => {
+    const html = await board([issue({ id: 7 }), issue({ id: 8, title: "Second" })]);
+    expect(html).toContain('<a href="/issue/7">');
+    expect(html).toContain("Second");
+    expect(html.match(/<li>/g)).toHaveLength(2);
+  });
+
+  test("leaves the rest of the file alone, byte for byte", async () => {
+    const html = await board([issue()]);
+    // The exact spelling of a line nobody asked it to touch — spacing, quote
+    // style and all. A parse-and-serialize renderer fails this line.
+    expect(html).toContain('<meta name="viewport" content="width=device-width, initial-scale=1.0" />');
+    expect(html).toContain('<link rel="stylesheet" href="/app.css" />');
+    expect(html.startsWith("<!doctype html>")).toBe(true);
+  });
+
+  test("puts the open count in the <title>", async () => {
+    const html = await board([issue()], { counts: counts({ open: 9 }) });
+    expect(html).toContain("<title>9 open · Issue board</title>");
+  });
+
+  test("fills every tab counter from one handler", async () => {
+    const html = await board([issue()]);
+    expect(html).toContain('<span class="pill" data-count="all">4</span>');
+    expect(html).toContain('<span class="pill" data-count="done">1</span>');
+  });
+
+  test("marks the active tab, and only that one", async () => {
+    const html = await board([issue()], { status: "doing" });
+    expect(html.match(/aria-current="page"/g)).toHaveLength(1);
+    expect(html).toContain('data-tab="doing" aria-current="page"');
+  });
+
+  test("swaps the list for the placeholder when there is nothing to show", async () => {
+    const empty = await board([]);
+    expect(empty).not.toContain('data-slot="issues"');
+    expect(empty).toContain("Nothing on this tab yet");
+
+    const full = await board([issue()]);
+    expect(full).toContain('data-slot="issues"');
+    expect(full).not.toContain("Nothing on this tab yet");
+  });
+
+  test("strips the comments meant for whoever edits the file", async () => {
+    expect(boardShell).toContain("<!--");
+    expect(await board([issue()])).not.toContain("<!--");
+  });
+
+  test("escapes a title instead of trusting it", async () => {
+    const html = await board([issue({ title: '<script>alert("xss")</script>' })]);
+    expect(html).not.toContain("<script>alert");
+    expect(html).toContain("&lt;script&gt;");
+  });
+});
+
+describe("an issue page", () => {
+  test("fills the slots and points the form at this issue", async () => {
+    const html = await renderIssue(issueShell, { issue: issue({ id: 42, status: "doing" }), footnote: "note" }).text();
+    expect(html).toContain("#42 Preview pane forgets its scroll position");
+    expect(html).toContain('action="/api/issues/42/status"');
+    // The status class moves with the value, or every issue is yellow.
+    expect(html).toContain('<span class="pill s-doing" data-slot="status">doing</span>');
+  });
+
+  test("says so when there is no description", async () => {
+    const html = await renderIssue(issueShell, { issue: issue({ body: "" }), footnote: "" }).text();
+    expect(html).toContain("No description.");
+  });
+});
+
+describe("issueRowsHtml", () => {
+  test("is the only HTML this app builds by hand", () => {
+    expect(issueRowsHtml([issue({ id: 3, priority: 1 })])).toBe(
+      '<li><span class="pill s-open">open</span><span class="title">' +
+        '<a href="/issue/3">Preview pane forgets its scroll position</a></span>' +
+        '<span class="labels"><span class="pill label">bug</span><span class="pill label">preview</span></span>' +
+        '<span class="pill p-1">P1</span></li>',
+    );
+  });
+
+  test("renders nothing for no issues", () => {
+    expect(issueRowsHtml([])).toBe("");
+  });
+});
+
+describe("rebase", () => {
+  const under = (html: string, prefix = "/preview/3000") =>
+    rebase(new Response(html, { headers: { "content-type": "text/html" } }), prefix).text();
+
+  test("prefixes the root-absolute URLs a navigation needs", async () => {
+    const out = await under('<a href="/issue/3">x</a><form action="/api/issues"></form><link href="/app.css">');
+    expect(out).toContain('href="/preview/3000/issue/3"');
+    expect(out).toContain('action="/preview/3000/api/issues"');
+    expect(out).toContain('href="/preview/3000/app.css"');
+  });
+
+  test("leaves alone every URL that already resolves", async () => {
+    const source =
+      '<a href="https://bun.com">a</a><a href="#top">b</a><a href="mailto:x@y.z">c</a>' +
+      '<a href="./relative">d</a><a href="//cdn.example/x">e</a>';
+    expect(await under(source)).toBe(source);
+  });
+
+  test("does nothing at all — not even a parse — when there is no prefix", () => {
+    const response = new Response("<a href='/x'>x</a>");
+    expect(rebase(response, "")).toBe(response);
+  });
+});
+`,
+      "src/app.test.ts": `// The HTTP layer, driven with real Request objects and no server. \`bun test\`
+// gives us the mocking to go with it: \`mock()\` for the collaborator this app
+// takes as a dependency, \`spyOn()\` for one it does not.
+import { afterEach, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { boardPage, createIssue, createApp, issuePage, moveIssue, prefixOf, type AppDeps } from "./app";
+import { createStore, type Store } from "./db";
+
+let store: Store;
+let shells: AppDeps["shells"];
+let onChange: ReturnType<typeof mock>;
+let deps: AppDeps;
+
+beforeAll(async () => {
+  store = createStore(":memory:");
+  shells = {
+    board: await Bun.file("public/index.html").text(),
+    issue: await Bun.file("public/issue.html").text(),
+  };
+});
+
+beforeEach(() => {
+  store.seedIfEmpty();
+  onChange = mock(() => {});
+  deps = { store, shells, onChange };
+});
+
+afterEach(() => {
+  store.reset();
+  onChange.mockClear();
+});
+
+/** A form post, exactly as a browser sends one. */
+const form = (fields: Record<string, string>, headers: Record<string, string> = {}) =>
+  new Request("http://localhost:3000/api/issues", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", ...headers },
+    body: new URLSearchParams(fields).toString(),
+  });
+
+const get = (path: string, headers: Record<string, string> = {}) =>
+  new Request("http://localhost:3000" + path, { headers });
+
+describe("prefixOf", () => {
+  test("reads the header the preview Service Worker sets", () => {
+    expect(prefixOf(get("/", { "x-forwarded-prefix": "/preview/3000" }))).toBe("/preview/3000");
+  });
+
+  test("is empty when the app is served at the root", () => {
+    expect(prefixOf(get("/"))).toBe("");
+  });
+});
+
+describe("GET /", () => {
+  test("serves HTML with the seeded rows", async () => {
+    const res = boardPage(deps, get("/"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(await res.text()).toContain("Ship the HTMLRewriter demo");
+  });
+
+  test("?status=done narrows it, and the store is what does the narrowing", async () => {
+    const spy = spyOn(store, "listIssues");
+    const html = await boardPage(deps, get("/?status=done")).text();
+    expect(spy).toHaveBeenCalledWith("done");
+    expect(html).not.toContain("Ship the HTMLRewriter demo");
+    spy.mockRestore();
+  });
+
+  test("an unknown ?status= falls back to everything rather than 400ing", async () => {
+    const spy = spyOn(store, "listIssues");
+    await boardPage(deps, get("/?status=nonsense")).text();
+    expect(spy).toHaveBeenCalledWith(null);
+    spy.mockRestore();
+  });
+
+  test("links are rebased when the request came through the preview", async () => {
+    const html = await boardPage(deps, get("/", { "x-forwarded-prefix": "/preview/3000" })).text();
+    expect(html).toContain('href="/preview/3000/issue/');
+    expect(html).toContain('action="/preview/3000/api/issues"');
+  });
+});
+
+describe("GET /issue/:id", () => {
+  test("renders the issue", async () => {
+    const [first] = store.listIssues();
+    const res = issuePage(deps, get("/issue/" + first!.id), String(first!.id));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("#" + first!.id);
+  });
+
+  test("404s for an id that is not there, instead of rendering an empty page", async () => {
+    const res = issuePage(deps, get("/issue/9999"), "9999");
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("not found");
+  });
+});
+
+describe("POST /api/issues", () => {
+  test("adds the issue, then redirects so a reload cannot add it twice", async () => {
+    const res = await createIssue(deps, form({ title: "Nothing renders", labels: "bug, ui" }));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+    expect(store.counts().all).toBe(5);
+    expect(store.labelNames()).toContain("ui");
+  });
+
+  test("sends the browser back inside the preview when there is a prefix", async () => {
+    const res = await createIssue(deps, form({ title: "x" }, { "x-forwarded-prefix": "/preview/3000" }));
+    expect(res.headers.get("location")).toBe("/preview/3000/");
+  });
+
+  test("tells the app it changed — once, with the new id", async () => {
+    await createIssue(deps, form({ title: "Notify me" }));
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith({ type: "created", id: expect.any(Number) });
+  });
+
+  test("refuses a blank title, and says nothing changed", async () => {
+    const res = await createIssue(deps, form({ title: "   " }));
+    expect(res.status).toBe(400);
+    expect(store.counts().all).toBe(4);
+    expect(onChange).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/issues/:id/status", () => {
+  test("moves it and redirects to the issue", async () => {
+    const [first] = store.listIssues("open");
+    const res = await moveIssue(deps, form({ status: "done" }), String(first!.id));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/issue/" + first!.id);
+    expect(store.getIssue(first!.id)!.status).toBe("done");
+    expect(onChange).toHaveBeenCalledWith({ type: "moved", id: first!.id });
+  });
+
+  test("refuses a status the database would refuse anyway", async () => {
+    const [first] = store.listIssues();
+    const res = await moveIssue(deps, form({ status: "wontfix" }), String(first!.id));
+    expect(res.status).toBe(400);
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  test("404s for a missing issue without pretending it worked", async () => {
+    const res = await moveIssue(deps, form({ status: "done" }), "9999");
+    expect(res.status).toBe(404);
+    expect(onChange).not.toHaveBeenCalled();
+  });
+});
+
+describe("the Bun.serve options", () => {
+  test("declare every route the pages link to", () => {
+    const app = createApp(deps, "public");
+    expect(Object.keys(app.routes)).toEqual([
+      "/",
+      "/issue/:id",
+      "/app.css",
+      "/api/issues",
+      "/api/issues/:id/status",
+    ]);
+    expect(app.fetch).toBeInstanceOf(Function);
+  });
+
+  test("the fallback 404s rather than 500ing", async () => {
+    const app = createApp(deps, "public");
+    const res = app.fetch(get("/nope"));
+    expect(res.status).toBe(404);
+  });
+});
+`,
+      "public/index.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- The server rewrites this title. What you see on disk is what a browser would show if it did not. -->
+    <title>Issue board</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Vivari · Bun.serve + bun:sqlite + HTMLRewriter</p>
+      <h1>Issue board</h1>
+      <p class="sub">
+        No client-side JavaScript at all: every list is a SQL query against <code>board.sqlite</code>,
+        poured into this file by <code>HTMLRewriter</code> on the way out.
+      </p>
+
+      <nav class="tabs" aria-label="Filter by status">
+        <a href="/" data-tab="all">All <span class="pill" data-count="all">0</span></a>
+        <a href="/?status=open" data-tab="open">Open <span class="pill" data-count="open">0</span></a>
+        <a href="/?status=doing" data-tab="doing">Doing <span class="pill" data-count="doing">0</span></a>
+        <a href="/?status=done" data-tab="done">Done <span class="pill" data-count="done">0</span></a>
+      </nav>
+
+      <ul class="issues" data-slot="issues"></ul>
+      <p class="empty" data-when="empty">Nothing on this tab yet. Add an issue below.</p>
+
+      <form class="card" method="post" action="/api/issues">
+        <h2>New issue</h2>
+        <label for="title">Title</label>
+        <input id="title" name="title" required maxlength="120" placeholder="Preview pane forgets its scroll position" />
+        <label for="labels">Labels, comma separated</label>
+        <input id="labels" name="labels" placeholder="bug, preview" />
+        <button type="submit">Add issue</button>
+      </form>
+
+      <p class="footnote" data-slot="footnote"></p>
+    </main>
+  </body>
+</html>
+`,
+      "public/issue.html": `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Issue</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow"><a href="/">&larr; back to the board</a></p>
+      <h1 data-slot="title">Issue</h1>
+      <p class="sub">
+        <span class="pill" data-slot="status">status</span>
+        <span class="pill" data-slot="priority">priority</span>
+        <span data-slot="labels"></span>
+      </p>
+
+      <div class="card">
+        <h2>Description</h2>
+        <p data-slot="body"></p>
+      </div>
+
+      <!-- The action below is a placeholder: the server points it at this issue. -->
+      <form class="card" method="post" action="/api/issues/0/status">
+        <h2>Move it</h2>
+        <p class="sub">A plain form post, then a redirect. Watch the counts on the board change.</p>
+        <button type="submit" name="status" value="open">open</button>
+        <button type="submit" name="status" value="doing">doing</button>
+        <button type="submit" name="status" value="done">done</button>
+      </form>
+
+      <p class="footnote" data-slot="footnote"></p>
+    </main>
+  </body>
+</html>
+`,
+      "public/app.css": `${bunPageStyles()}
+
+/* The board: a longer page than the other Bun demos, so it starts at the top. */
+body { align-items: flex-start; }
+main { max-width: 720px; }
+a { color: #93b4ff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.tabs { display: flex; gap: .4rem; margin-bottom: 1rem; flex-wrap: wrap; }
+.tabs a { display: inline-flex; align-items: center; gap: .4rem; padding: .4rem .75rem; border-radius: 999px;
+  border: 1px solid #232a36; background: #10131a; color: #cbd5e1; font-size: .85rem; }
+.tabs a:hover { border-color: #3b5cf0; text-decoration: none; }
+.tabs a[aria-current="page"] { background: linear-gradient(180deg, #4f7cff, #3b5cf0); border-color: transparent; color: #fff; }
+
+.pill { display: inline-block; padding: .1rem .45rem; border-radius: 999px; background: #1b212c;
+  color: #9ca3af; font-size: .72rem; font-weight: 600; }
+.tabs a[aria-current="page"] .pill { background: rgba(0, 0, 0, .28); color: #e8eeff; }
+
+.issues { list-style: none; padding: 0; margin: 0 0 1rem; }
+.issues li { background: #10131a; border: 1px solid #232a36; border-radius: 12px;
+  padding: .7rem .9rem; margin-bottom: .5rem; display: flex; align-items: center; gap: .6rem; }
+.issues .title { flex: 1; font-size: .95rem; }
+.issues .labels { display: flex; gap: .3rem; flex-wrap: wrap; }
+.issues .label { background: #182238; color: #93b4ff; }
+
+.s-open { background: #3f2a12; color: #fbbf24; }
+.s-doing { background: #102f3a; color: #38bdf8; }
+.s-done { background: #12321f; color: #4ade80; }
+.p-1 { background: #3a1220; color: #fb7185; }
+
+.empty { color: #6b7280; font-size: .88rem; margin: 0 0 1rem; padding: .9rem;
+  border: 1px dashed #232a36; border-radius: 12px; text-align: center; }
+
+form.card button { margin-right: .4rem; }
+.footnote { color: #6b7280; font-size: .8rem; line-height: 1.6; margin: 1rem 0 0; }
+`,
+    },
+  };
+}
+
 function bunTestTemplate(): TemplateDef {
   return {
     manifest: {
@@ -9363,6 +10506,7 @@ export const TEMPLATES: TemplateDef[] = [
   bunReactTemplate(),
   bunTestTemplate(),
   bunSqliteTemplate(),
+  bunFullstackTemplate(),
   bunShellTemplate(),
   bunBuildTemplate(),
   bunApisTemplate(),

@@ -203,8 +203,166 @@ export function createBunFormats({ process }) {
       stringify: (value, replacer, space) => json5().stringify(value, replacer, space),
     },
     JSONL: jsonl,
+    JSONC: { parse: jsoncParse },
     semver: bunSemver,
   };
+}
+
+// ---- Bun.JSONC --------------------------------------------------------------
+// JSON with comments, which is what tsconfig.json and most editor config files
+// actually are. Not JSON5, and not reducible to it: the two overlap on comments,
+// trailing commas, single quotes and hex, but JSON5 also accepts `NaN`,
+// `Infinity`, unquoted keys and a leading `+`, all of which real Bun REJECTS.
+// Delegating to the vendored JSON5 would therefore have accepted files Bun calls
+// invalid — the wrong direction to be wrong in for a config parser.
+//
+// Every rule below was read off the 1.3 binary, including two it is worth being
+// deliberately STRICTER than:
+//
+//   {a:1}     Bun returns {"": 1} — an unquoted key parses as the empty string,
+//             silently discarding the name. This throws instead.
+//   {} {}     Bun returns the first value and ignores the rest of the file. This
+//             throws, because a config file with a second root is a mistake and
+//             quietly reading half of it is how it survives to production.
+//
+// Both divergences reject input Bun accepts; neither accepts input Bun rejects.
+function jsoncParse(text) {
+  const src = String(text);
+  // "" is {} in Bun — an empty config file is an empty config, not a syntax error.
+  // Whitespace or a lone comment is NOT: those are "unexpected end of file".
+  if (src === "") return {};
+  let i = 0;
+
+  const fail = (message) => {
+    throw new SyntaxError(message + " in JSONC at position " + i);
+  };
+
+  const skip = () => {
+    for (;;) {
+      while (i < src.length && (src[i] === " " || src[i] === "\t" || src[i] === "\n" || src[i] === "\r")) i++;
+      if (src[i] === "/" && src[i + 1] === "/") {
+        while (i < src.length && src[i] !== "\n") i++;
+        continue;
+      }
+      if (src[i] === "/" && src[i + 1] === "*") {
+        const end = src.indexOf("*/", i + 2);
+        // Bun's own words: an unterminated block comment names what is missing.
+        if (end < 0) fail('Expected "*/" to terminate multi-line comment');
+        i = end + 2;
+        continue;
+      }
+      return;
+    }
+  };
+
+  const string = (quote) => {
+    i++;
+    let out = "";
+    for (;;) {
+      if (i >= src.length) fail("Unterminated string");
+      const c = src[i];
+      if (c === quote) { i++; return out; }
+      if (c === "\\") {
+        const e = src[++i];
+        i++;
+        if (e === "n") out += "\n";
+        else if (e === "t") out += "\t";
+        else if (e === "r") out += "\r";
+        else if (e === "b") out += "\b";
+        else if (e === "f") out += "\f";
+        else if (e === "u") { out += String.fromCharCode(parseInt(src.slice(i, i + 4), 16)); i += 4; }
+        else out += e;
+        continue;
+      }
+      out += c;
+      i++;
+    }
+  };
+
+  const number = () => {
+    const start = i;
+    if (src[i] === "-") i++;
+    // Hex, which Bun accepts and JSON does not. A leading `+` is NOT accepted,
+    // there or here.
+    if (src[i] === "0" && (src[i + 1] === "x" || src[i + 1] === "X")) {
+      i += 2;
+      while (i < src.length && /[0-9a-fA-F]/.test(src[i])) i++;
+      return Number(src.slice(start, i));
+    }
+    while (i < src.length && /[0-9eE+\-.]/.test(src[i])) i++;
+    const raw = src.slice(start, i);
+    const n = Number(raw);
+    if (raw === "" || Number.isNaN(n)) fail("Unexpected " + JSON.stringify(raw));
+    return n;
+  };
+
+  const value = () => {
+    skip();
+    if (i >= src.length) fail("Unexpected end of file");
+    const c = src[i];
+    if (c === "{") {
+      i++;
+      const out = {};
+      skip();
+      if (src[i] === "}") { i++; return out; }
+      for (;;) {
+        skip();
+        if (src[i] !== '"' && src[i] !== "'") {
+          // Where Bun would return {"": value}. See the header.
+          fail("Expected a quoted property name");
+        }
+        const key = string(src[i]);
+        skip();
+        if (src[i] !== ":") fail("Expected ':' after property name");
+        i++;
+        out[key] = value();
+        skip();
+        if (src[i] === ",") {
+          i++;
+          skip();
+          // The trailing comma JSON forbids and every editor writes.
+          if (src[i] === "}") { i++; return out; }
+          continue;
+        }
+        if (src[i] === "}") { i++; return out; }
+        fail("Expected ',' or '}'");
+      }
+    }
+    if (c === "[") {
+      i++;
+      const out = [];
+      skip();
+      if (src[i] === "]") { i++; return out; }
+      for (;;) {
+        out.push(value());
+        skip();
+        if (src[i] === ",") {
+          i++;
+          skip();
+          if (src[i] === "]") { i++; return out; }
+          continue;
+        }
+        if (src[i] === "]") { i++; return out; }
+        fail("Expected ',' or ']'");
+      }
+    }
+    if (c === '"' || c === "'") return string(c);
+    if (src.startsWith("true", i)) { i += 4; return true; }
+    if (src.startsWith("false", i)) { i += 5; return false; }
+    if (src.startsWith("null", i)) { i += 4; return null; }
+    // Bun rejects these two by name, and so does this — a config that says
+    // Infinity almost certainly meant a number.
+    if (src.startsWith("NaN", i)) fail("Unexpected NaN");
+    if (src.startsWith("Infinity", i)) fail("Unexpected Infinity");
+    if (c === "-" || (c >= "0" && c <= "9")) return number();
+    fail("Unexpected " + JSON.stringify(c));
+  };
+
+  const out = value();
+  skip();
+  // Where Bun would stop reading and return what it had. See the header.
+  if (i < src.length) fail("Unexpected trailing content");
+  return out;
 }
 
 // ---- JSONL scanner ----------------------------------------------------------

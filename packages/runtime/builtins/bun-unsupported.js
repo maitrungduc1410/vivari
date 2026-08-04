@@ -73,6 +73,17 @@ const sandboxClass = (name, api, reason) => {
   return C;
 };
 
+// The SHIM-tier twin of sandboxClass: a gap, not a wall.
+const shimClass = (name, api, reason) => {
+  const C = class {
+    constructor() {
+      throw new Error(shimMessage(api, reason));
+    }
+  };
+  Object.defineProperty(C, "name", { value: name, configurable: true });
+  return C;
+};
+
 // ---- the reasons ------------------------------------------------------------
 // Written out once each, because several APIs share one and the wording is the
 // part under review. Every one names the specific missing capability — "no raw
@@ -214,6 +225,45 @@ export function createBunUnsupported() {
     sql[m] = sandboxThrow("Bun.sql." + m + "()", SQL_PG);
   }
 
+  // --- named, so the failure is not `undefined is not a function` -----------
+  // These seven were absent entirely, which is the failure mode this whole file
+  // exists to prevent: a property read gives `undefined`, the call reports
+  // "Bun.postgres is not a function" from inside a dependency, and nothing says
+  // whether the sandbox forbids it or nobody has written it yet.
+  const postgres = sandboxThrow(
+    "Bun.postgres",
+    "the Postgres wire protocol runs over a raw TCP socket, which a page cannot " +
+      "open. Use bun:sqlite for SQL inside the VM, or @electric-sql/pglite for a " +
+      "real Postgres compiled to WebAssembly."
+  );
+  const Terminal = sandboxClass(
+    "Terminal",
+    "new Bun.Terminal()",
+    "it allocates a pseudo-terminal with openpty(3) and drives a child process " +
+      "through it. There is no pty device in a browser — the same wall as " +
+      "Bun.spawn({ terminal: true }). Pipe stdio instead: the streams are real, " +
+      "only the tty is not."
+  );
+  // SHIM-tier: nothing about a page prevents it, it is simply unwritten. Saying
+  // "not supported" would send someone off to redesign around a wall that is not
+  // there. `Bun.Archive` used to be here and has graduated — it is real now, in
+  // builtins/bun-archive.js, for the reason this comment gives.
+  const registerMacro = shimThrow(
+    "Bun.registerMacro()",
+    "macros run at BUNDLE time inside the bundler's own module graph, and this " +
+      "shim's Bun.build does not host one. Import the function and call it at " +
+      "runtime, or precompute the value into your source."
+  );
+  // `Bun.S3Client`/`Bun.s3` used to live here, refused for "a SigV4 signer plus a
+  // CORS policy". Both are now real (./bun-s3.js): the signer is written and
+  // pinned to AWS's published vectors, and CORS moved from a reason to refuse the
+  // API into the error path, where a blocked request is explained instead of
+  // surfacing as `TypeError: Failed to fetch`. What is still refused there is
+  // multipart, and it is refused in that file, next to the code that would do it.
+  // Bun.FFI is the same module bun:ffi exports, reachable off the global. It is
+  // built by createBunFfi(); this is only the name.
+  const FFI = createBunFfi();
+
   // --- everything else ------------------------------------------------------
   const WebView = sandboxClass(
     "WebView",
@@ -326,12 +376,31 @@ export function createBunUnsupported() {
     zstdDecompress: shimThrow("Bun.zstdDecompress()", ZSTD_REASON),
   };
 
+  // Two engine/host hooks that are present in every Bun program's namespace and
+  // do something real there, so being absent here reads as "old Bun" rather than
+  // "different host". Both are call-loud for the same reason as the rest.
+  const generateHeapSnapshot = sandboxThrow(
+    "Bun.generateHeapSnapshot()",
+    "it walks JavaScriptCore's heap through an engine hook that no browser exposes " +
+      "to page code — the same wall as bun:jsc's heapSize() and memoryUsage(). The " +
+      "studio's own \"Measure Memory\" reports a process's heap from the outside, " +
+      "which is as close as this sandbox gets."
+  );
+  const openInEditor = sandboxThrow(
+    "Bun.openInEditor()",
+    "it launches your editor as a child process (code/subl and friends), and a page " +
+      "cannot start one. Vivari's editor is the studio around this VM, not a program " +
+      "the guest can reach; there is no channel from guest code to it."
+  );
+
   return {
     listen, connect, udpSocket,
     RedisClient, redis,
-    SQL, sql,
+    SQL, sql, postgres,
     WebView, mmap, peek, secrets, dlopen,
     dns, zstd,
+    generateHeapSnapshot, openInEditor,
+    Terminal, registerMacro, FFI,
   };
 }
 

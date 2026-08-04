@@ -66,6 +66,10 @@ import {
   WS_GUID,
 } from "../packages/runtime/builtins/bun-serve.js";
 import { canPark, parkFor } from "../packages/protocol/syscall.js";
+// Bun.Archive's tar codec, exported because it is a pure function of bytes: the
+// offline tier drives the real reader and the real writer with no kernel, against
+// archives recorded from a real bun binary and archives the host `tar` produced.
+import { writeTar as archiveWriteTar, parseTar as archiveParseTar, splitName as archiveSplitName } from "../packages/runtime/builtins/bun-archive.js";
 // Bun.CryptoHasher / Bun.password pure helpers, plus the internalBinding('crypto')
 // adapter, so the crypto checks at the end of this file can drive the real Rust
 // crate without a kernel. See the header of bun-crypto.js.
@@ -87,6 +91,28 @@ import {
   isExternalSpec,
   PluginHost,
 } from "../packages/runtime/builtins/bun-build.js";
+// The Bun.spawn({ ipc }) channel's pure halves: the framing and the two
+// serialization modes. See the framing block at the bottom of this file for why
+// they are pinned here rather than only in the kernel spike.
+import {
+  FrameReader,
+  encodeMessage,
+  decodeMessage,
+  normalizeMode,
+  requireMessage,
+} from "../packages/runtime/builtins/bun-ipc.js";
+// Bun.S3Client's signer and request builder, exported as pure functions so this
+// tier can pin them to AWS's published SigV4 vectors and to Authorization headers
+// captured off a real bun binary — neither of which needs a bucket. See bun-s3.js.
+import {
+  sigv4,
+  createSigv4Hashers,
+  awsUriEncode,
+  buildS3Request,
+  presignS3Url,
+  resolveS3Config,
+  SHA256_EMPTY,
+} from "../packages/runtime/builtins/bun-s3.js";
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -1194,8 +1220,13 @@ console.log("== bun CLI dispatch (BUN_PROGRAM run as a real process) ==");
     ok(upgrade.text.indexOf("npm update") === -1, "bun upgrade does not delegate to npm");
 
     // Regression: unknown verbs fell through to doRun and said "file not found".
+    // `publish` used to be the example here, and is now a verb with a reason of its
+    // own, so this needs a name Bun does not have at all.
+    const unknown = bun("frobnicate");
+    ok(unknown.code === 1 && /bun frobnicate is not implemented/.test(unknown.text), "unknown verb reports not-implemented");
     const publish = bun("publish");
-    ok(publish.code === 1 && /bun publish is not implemented/.test(publish.text), "unknown verb reports not-implemented");
+    ok(publish.code === 1 && /authenticated npm session/.test(publish.text),
+      "bun publish says which capability is missing rather than 'unknown command'");
     ok(publish.text.indexOf("file not found") === -1, "unknown verb no longer claims a missing file");
     const watch = bun("--watch", "index.ts");
     ok(watch.code === 1 && /bun --watch is not implemented/.test(watch.text), "an unsupported flag reports not-implemented too");
@@ -3793,8 +3824,6 @@ console.log("== infeasible surface: import-safe, call-loud ==");
   // [property path, how to call it, expected tier, a phrase from the reason that
   // proves the message is the SPECIFIC one and not a generic "unavailable"]
   const CASES = [
-    ["listen", () => Bun.listen({ port: 1 }), SANDBOX, "cannot bind or accept a TCP socket"],
-    ["connect", () => Bun.connect({ hostname: "h", port: 1 }), SANDBOX, "cannot open a raw TCP socket"],
     ["udpSocket", () => Bun.udpSocket({}), SANDBOX, "no UDP in a browser"],
     ["RedisClient", () => new Bun.RedisClient("redis://x"), SANDBOX, "RESP3"],
     ["redis.get", () => Bun.redis.get("k"), SANDBOX, "RESP3"],
@@ -3829,7 +3858,32 @@ console.log("== infeasible surface: import-safe, call-loud ==");
     ok(m.indexOf(phrase) !== -1, "…and the message says why: " + JSON.stringify(phrase));
     // The API has to appear in its own message, or a stack trace from inside a
     // dependency still leaves you guessing which call it was.
-    ok(/^Bun\.(spawn|spawnSync|listen|connect|udpSocket|redis|secrets|peek|mmap|dlopen|SQL|sql)|^new Bun\./.test(m), "…and names the API it came from");
+    ok(/^Bun\.(spawn|spawnSync|udpSocket|redis|secrets|peek|mmap|dlopen|SQL|sql)|^new Bun\./.test(m), "…and names the API it came from");
+  }
+
+  // Bun.listen/Bun.connect are NOT on that list any more, and the shape of what
+  // they refuse is the reason to check them separately: the API works, the
+  // DESTINATION is what the sandbox forbids. A blanket refusal reinstated by
+  // accident would sail past a test that only asks "does it throw".
+  {
+    const outside = msg(() => Bun.listen({ hostname: "example.com", port: 1, socket: {} }));
+    ok(outside.indexOf("cannot bind") !== -1, "Bun.listen refuses a non-loopback bind");
+    ok(outside.indexOf("Bind localhost/127.0.0.1") !== -1, "…and says what does work instead");
+    const tls = msg(() => Bun.listen({ port: 1, tls: {}, socket: {} }));
+    ok(tls.indexOf(SHIM) !== -1 && tls.indexOf("nothing to negotiate") !== -1, "Bun.listen({ tls }) refuses, with the reason");
+    // connect() is a promise in Bun, so its refusal is a rejection rather than a
+    // throw — asserting it as a throw is how this would silently pass.
+    let sync = "";
+    let rejected = "";
+    try {
+      const p = Bun.connect({ hostname: "example.com", port: 1, socket: {} });
+      rejected = await p.then(() => "", (e) => String((e && e.message) || e));
+    } catch (e) {
+      sync = String((e && e.message) || e);
+    }
+    ok(sync === "", "Bun.connect does not throw synchronously — it returns a promise, as in Bun");
+    ok(rejected.indexOf("cannot reach") !== -1, "…and rejects for an outside host");
+    ok(rejected.indexOf("loopback") !== -1, "…naming the one network there is");
   }
 
   // The two tiers must never blur into each other: a "cannot ever" message that
@@ -5327,6 +5381,1646 @@ console.log("== the type stripper and module clauses ==");
     }
   }
 }
+
+console.log("== Bun.MD4/MD5/SHA1/SHA224/SHA256/SHA384/SHA512/SHA512_256 ==");
+{
+  // Every expected value here was produced by bun-1.3.14 on linux-x64, not by this
+  // code: a digest that only agrees with itself is exactly what a broken hasher
+  // also produces. The lifecycle assertions matter as much as the bytes — these
+  // classes are CONSUMED by digest() where CryptoHasher resets, and inheriting the
+  // reset would have been invisible here and fatal on the first real bun run.
+  const Bun = freshBun();
+
+  const HELLO = {
+    MD4: "866437cb7a794bce2b727acc0362ee27",
+    MD5: "5d41402abc4b2a76b9719d911017c592",
+    SHA1: "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
+    SHA224: "ea09ae9cc6768c50fcee903ed054556e5bfc8347907f12598aa24193",
+    SHA256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+    SHA384: "59e1748777448c69de6b800d7a33bbfb9ff1b463e44354c3553bcdb9c666fa90125a3c79f90397bdf5f6a13de828684f",
+    SHA512: "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043",
+    SHA512_256: "e30d87cfa2a75db545eac4d61baf970366a8357c7f72fa95b52d0accb698f13a",
+  };
+  const BYTE_LENGTH = { MD4: 16, MD5: 16, SHA1: 20, SHA224: 28, SHA256: 32, SHA384: 48, SHA512: 64, SHA512_256: 32 };
+
+  // This tier has no Wasm codec, so the digests come from the HOST's OpenSSL, and a
+  // modern one refuses md4 outright ("digital envelope routines::unsupported").
+  // Vivari's own codec does implement it (packages/crypto, RustCrypto's md4 crate),
+  // so the vector is checked in the kernel tier instead of being quietly dropped —
+  // skipping in silence is how an algorithm ends up untested everywhere.
+  const hostHashes = new Set(nodeRequire("crypto").getHashes());
+  const HOST_ALGO = { MD4: "md4", MD5: "md5", SHA1: "sha1", SHA224: "sha224", SHA256: "sha256", SHA384: "sha384", SHA512: "sha512", SHA512_256: "sha512-256" };
+
+  for (const [name, expected] of Object.entries(HELLO)) {
+    const Cls = Bun[name];
+    ok(typeof Cls === "function", `Bun.${name} exists`);
+    if (typeof Cls !== "function") continue;
+    if (!hostHashes.has(HOST_ALGO[name])) {
+      console.log(`  ~ Bun.${name}: no ${HOST_ALGO[name]} in this host's OpenSSL — bytes checked in the kernel tier (spike-bun)`);
+      ok(Cls.byteLength === BYTE_LENGTH[name], `Bun.${name}.byteLength is ${BYTE_LENGTH[name]}`);
+      ok(Cls.name === name, `the class is named ${name}, not a factory-local name`);
+      continue;
+    }
+    ok(Cls.hash("hello", "hex") === expected, `Bun.${name}.hash("hello","hex") matches bun-1.3.14`);
+    ok(new Cls().update("hello").digest("hex") === expected, `…and the instance path agrees`);
+    ok(Cls.byteLength === BYTE_LENGTH[name], `Bun.${name}.byteLength is ${BYTE_LENGTH[name]}`);
+    ok(new Cls().byteLength === BYTE_LENGTH[name], `…and the instance reports it too (undeclared in the types, real in the binary)`);
+    ok(Cls.name === name, `the class is named ${name}, not a factory-local name`);
+  }
+
+  // Split updates must equal one update: this is the property the buffering
+  // implementation could break without any single-shot vector noticing.
+  const split = new Bun.SHA256();
+  split.update("he");
+  split.update("llo");
+  ok(split.digest("hex") === HELLO.SHA256, "two updates hash the same as one");
+
+  ok(new Bun.SHA256().digest("hex") === "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "an untouched hasher digests the empty input rather than throwing");
+  ok(Object.prototype.toString.call(new Bun.SHA256().update("x").digest()) === "[object Uint8Array]",
+    "digest() with no argument returns a Uint8Array");
+  const chained = new Bun.SHA256();
+  ok(chained.update("a") === chained, "update() returns this");
+
+  // The lifecycle, with Bun's own two messages.
+  const spent = new Bun.SHA256();
+  spent.update("hello");
+  spent.digest("hex");
+  let updateErr = "";
+  try { spent.update("hello"); } catch (e) { updateErr = e.message; }
+  ok(updateErr === "SHA256 hasher already digested, create a new instance to update",
+    "update after digest throws Bun's message, naming the class");
+  let digestErr = "";
+  try { spent.digest("hex"); } catch (e) { digestErr = e.message; }
+  ok(digestErr === "SHA256 hasher already digested, create a new instance to digest again",
+    "…and so does a second digest");
+  // The trap this guards: CryptoHasher DOES reset, and these must not.
+  const reusable = new Bun.CryptoHasher("sha256");
+  reusable.update("hello");
+  reusable.digest("hex");
+  ok(reusable.update("hello").digest("hex") === HELLO.SHA256,
+    "…while a plain CryptoHasher still resets and is reusable (the two differ on purpose)");
+
+  // Input handling, all measured against the binary.
+  ok(Bun.SHA256.hash(new TextEncoder().encode("hello"), "hex") === HELLO.SHA256, "a typed array hashes");
+  ok(Bun.SHA256.hash(new TextEncoder().encode("hello").buffer, "hex") === HELLO.SHA256, "an ArrayBuffer hashes");
+  ok(Bun.SHA256.hash(Buffer.from("hello"), "hex") === HELLO.SHA256, "a Buffer hashes");
+  let badInput = "";
+  try { new Bun.SHA256().update(42); } catch (e) { badInput = e.message; }
+  ok(badInput === "expected blob or string or buffer", "a number is refused with Bun's wording");
+  let shortInto = "";
+  try { Bun.SHA256.hash("hello", new Uint8Array(4)); } catch (e) { shortInto = e.message; }
+  ok(shortInto === "TypedArray must be at least 32 bytes", "a short hashInto is refused with Bun's wording");
+  const into = new Uint8Array(32);
+  Bun.SHA256.hash("hello", into);
+  ok(Buffer.from(into).toString("hex") === HELLO.SHA256, "hashInto is filled in place");
+  ok(new Bun.SHA256().update("hello").digest("base64url") === "LPJNul-wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ",
+    "digest('base64url') matches the binary");
+}
+
+console.log("== Bun.randomUUIDv5 is a real RFC 9562 v5 ==");
+{
+  // Two independent oracles agree on these: bun-1.3.14, and Python's uuid.uuid5
+  // (an implementation nobody here wrote). Self-consistency would prove nothing —
+  // swapping the namespace and name hashes just as deterministically, and the ids
+  // only stop matching once they meet a system that did it right.
+  const Bun = freshBun();
+  ok(Bun.randomUUIDv5("www.example.com", "dns") === "2ed6657d-e927-568b-95e1-2665a8aea6a2", "dns namespace vector");
+  ok(Bun.randomUUIDv5("python.org", "dns") === "886313e1-3b8a-5372-9b90-0c9aee199e5d", "…and a second dns vector");
+  ok(Bun.randomUUIDv5("www.example.com", "url") === "b63cdfa4-3df9-568e-97ae-006c5b8fd652", "url namespace vector");
+  ok(Bun.randomUUIDv5("1.3.6.1", "oid") === "1447fa61-5277-5fef-a9b3-fbc6e44f4af3", "oid namespace vector");
+  ok(Bun.randomUUIDv5("CN=x", "x500") === "955bb643-faf8-5f69-a3de-891b89fea215", "x500 namespace vector");
+  ok(Bun.randomUUIDv5("", "dns") === "4ebd0208-8328-5d69-8c44-ec50939c0967", "the empty name is a name");
+
+  const id = Bun.randomUUIDv5("x", "dns");
+  ok(id[14] === "5", "the version nibble is 5");
+  ok("89ab".includes(id[19]), "the variant is RFC 4122");
+  ok(Bun.randomUUIDv5("a", "dns") === Bun.randomUUIDv5("a", "dns"), "same name + namespace is the same id, always");
+  ok(Bun.randomUUIDv5("a", "dns") !== Bun.randomUUIDv5("a", "url"), "…and the namespace actually participates");
+
+  ok(Bun.randomUUIDv5("x", "6ba7b810-9dad-11d1-80b4-00c04fd430c8") === "05b16a01-46c6-56dd-bd6e-c6dfb4a1427a",
+    "an explicit namespace UUID works");
+  ok(Bun.randomUUIDv5("x", "6BA7B810-9DAD-11D1-80B4-00C04FD430C8") === "05b16a01-46c6-56dd-bd6e-c6dfb4a1427a",
+    "…case-insensitively");
+  ok(Bun.randomUUIDv5("x", "DNS") === "05b16a01-46c6-56dd-bd6e-c6dfb4a1427a", "the aliases are case-insensitive too");
+  ok(Bun.randomUUIDv5("www.example.com", "dns", "base64") === "LtZlfeknVouV4SZlqK6mog==", "base64 encoding");
+  ok(Bun.randomUUIDv5("www.example.com", "dns", "base64url") === "LtZlfeknVouV4SZlqK6mog", "base64url encoding");
+  const buf = Bun.randomUUIDv5("www.example.com", "dns", "buffer");
+  ok(Buffer.isBuffer(buf) && buf.length === 16 && buf.toString("hex") === "2ed6657de927568b95e12665a8aea6a2",
+    "buffer encoding gives the same 16 bytes");
+  ok(Bun.randomUUIDv5(new TextEncoder().encode("www.example.com"), "dns") === "2ed6657d-e927-568b-95e1-2665a8aea6a2",
+    "the name may be bytes");
+  ok(Bun.randomUUIDv5("x", new Uint8Array(16).fill(1)) === "8ac90834-7dbc-53b0-b3c0-089c9265830f",
+    "…and the namespace may be 16 raw bytes");
+
+  // Bun's exact refusals: a caller who trips one should be able to search for it.
+  const refuses = (label, fn, expected) => {
+    let msg = "";
+    try { fn(); } catch (e) { msg = e.message; }
+    ok(msg === expected, `${label} -> "${expected}"` + (msg === expected ? "" : ` (got "${msg}")`));
+  };
+  refuses("no namespace", () => Bun.randomUUIDv5("x"), 'The "namespace" argument must be specified');
+  refuses("a namespace that is not a uuid", () => Bun.randomUUIDv5("x", "nope"), "Invalid UUID format for namespace");
+  refuses("urn:uuid: prefix", () => Bun.randomUUIDv5("x", "urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8"), "Invalid UUID format for namespace");
+  refuses("undashed hex", () => Bun.randomUUIDv5("x", "6ba7b8109dad11d180b400c04fd430c8"), "Invalid UUID format for namespace");
+  refuses("15 raw bytes", () => Bun.randomUUIDv5("x", new Uint8Array(15)), "Namespace must be exactly 16 bytes");
+  refuses("a numeric name", () => Bun.randomUUIDv5(123, "dns"), 'The "name" argument must be of type string or BufferSource');
+  refuses("a bogus encoding", () => Bun.randomUUIDv5("x", "dns", "rot13"), "Encoding must be one of base64, base64url, hex, or buffer");
+}
+
+console.log("== Bun.embeddedFiles / enableANSIColors / unsafe, and two loud refusals ==");
+{
+  const Bun = freshBun();
+  ok(Array.isArray(Bun.embeddedFiles) && Bun.embeddedFiles.length === 0,
+    "Bun.embeddedFiles is the empty array a non-compiled run has");
+  ok(Bun.embeddedFiles === Bun.embeddedFiles, "…one shared array, as in the binary (not a fresh one per read)");
+
+  // NO_COLOR beats FORCE_COLOR beats isatty — the order the binary applies.
+  const colorBun = (env, isTTY) =>
+    createBunRuntime({
+      process: { env, argv: ["bun"], cwd: () => "/", stdout: { isTTY }, stderr: process.stderr, stdin: process.stdin },
+      Buffer,
+      require: nodeRequire,
+    }).Bun;
+  ok(colorBun({}, false).enableANSIColors === false, "no tty, no env: colours off");
+  ok(colorBun({}, true).enableANSIColors === true, "a tty turns them on");
+  ok(colorBun({ FORCE_COLOR: "1" }, false).enableANSIColors === true, "FORCE_COLOR turns them on without a tty");
+  ok(colorBun({ NO_COLOR: "1", FORCE_COLOR: "1" }, true).enableANSIColors === false, "NO_COLOR wins over both");
+
+  ok(Bun.unsafe.arrayBufferToString(new Uint8Array([104, 101, 108, 108, 111])) === "hello",
+    "unsafe.arrayBufferToString decodes 8-bit views");
+  ok(Bun.unsafe.arrayBufferToString(new Uint8Array([0xff, 0xfe, 0x41])) === "\u00ff\u00feA",
+    "…as latin1, so a high byte stays one character instead of becoming U+FFFD");
+  ok(Bun.unsafe.arrayBufferToString(new Uint16Array([104, 105])) === "hi", "…and a Uint16Array decodes as UTF-16");
+  ok(Bun.unsafe.arrayBufferToString(new TextEncoder().encode("hey").buffer) === "hey", "…an ArrayBuffer works too");
+  let notBuffer = "";
+  try { Bun.unsafe.arrayBufferToString("hey"); } catch (e) { notBuffer = e.message; }
+  ok(notBuffer === "Expected an ArrayBuffer", "…and a string is refused with Bun's wording");
+  ok(Bun.unsafe.gcAggressionLevel(2) === 0 && Bun.unsafe.gcAggressionLevel() === 2,
+    "gcAggressionLevel returns the previous level and remembers the new one");
+
+  for (const [name, needle] of [["generateHeapSnapshot", "heap"], ["openInEditor", "editor"]]) {
+    ok(typeof Bun[name] === "function", `Bun.${name} is present, so a destructure still works`);
+    let msg = "";
+    try { Bun[name]("/tmp/x"); } catch (e) { msg = e.message; }
+    ok(msg.includes(name) && msg.toLowerCase().includes(needle),
+      `…and loud on call, naming the API and what is missing`);
+  }
+}
+
+console.log("== the names that were absent entirely ==");
+{
+  // Thirteen properties real Bun has were not on our object at all, so a read gave
+  // `undefined` — a VALUE, which nothing throws on. The mistake surfaced later and
+  // somewhere else. Six of them are cheap and real; the rest belong to the
+  // import-safe/call-loud catalogue and were skipping it.
+  const Bun = freshBun();
+  ok(typeof Bun.cwd === "string" && Bun.cwd.length > 0, "Bun.cwd is the working directory: " + JSON.stringify(Bun.cwd));
+  // "" even while a server is running — checked against 1.3.6 rather than assumed,
+  // because the plausible guess (the server's URL) is wrong.
+  ok(Bun.origin === "", "Bun.origin is the empty string, as in a real bun process");
+  ok(/^v\d+\.\d+\.\d+ \(.+\)$/.test(Bun.version_with_sha), "Bun.version_with_sha has Bun's shape: " + Bun.version_with_sha);
+  ok(typeof Bun.fetch === "function" && Bun.fetch.name === "fetch", "Bun.fetch is a fetch function");
+  ok(Bun.fetch !== globalThis.fetch, "…and is not identical to the global one, which is also true in Bun");
+  ok(typeof Bun.fetch.preconnect === "function" && Bun.fetch.preconnect("https://x") === undefined,
+    "…carrying preconnect, an advisory no-op here rather than a refusal");
+  ok(typeof Bun.jest === "function" && typeof Bun.jest("f.test.ts").expect === "function", "Bun.jest(path) hands back the bun:test module");
+  ok(Bun.shrink() === undefined, "Bun.shrink() is a no-op that returns undefined, as Bun's does");
+
+  const msg = (fn) => { try { fn(); return ""; } catch (e) { return String((e && e.message) || e); } };
+  const SANDBOX = "is not supported in Vivari (browser sandbox):";
+  const SHIM = "is not implemented in the Vivari shim:";
+  // The tier is the claim being made, and getting it wrong wastes real time: a pty
+  // never can work here, while an Archive is only unwritten. S3 used to be on this
+  // list at the SHIM tier for want of "a SigV4 signer plus a CORS policy" — it is
+  // now real, and the sections at the end of this file are what replaced these
+  // three rows.
+  for (const [name, call, tier, phrase] of [
+    ["postgres", () => Bun.postgres("postgres://x"), SANDBOX, "raw TCP socket"],
+    ["Terminal", () => new Bun.Terminal(), SANDBOX, "pseudo-terminal"],
+    // Bun.Archive was in this list and has graduated out of it — it is a real tar
+    // codec now (builtins/bun-archive.js), gated by the sections at the end of
+    // this file.
+    ["registerMacro", () => Bun.registerMacro(1, () => {}), SHIM, "BUNDLE time"],
+  ]) {
+    let read = Bun, readThrew = false;
+    try { for (const key of name.split(".")) read = read[key]; } catch { readThrew = true; }
+    ok(!readThrew && typeof read === "function", "Bun." + name + " can be READ without throwing");
+    const m = msg(call);
+    ok(m.indexOf(tier) !== -1, "Bun." + name + " refuses at the right tier" + (m ? "" : " — IT DID NOT THROW"));
+    ok(m.indexOf(phrase) !== -1, "…and says why: " + JSON.stringify(phrase));
+  }
+  ok(typeof Bun.FFI === "object" && typeof Bun.FFI.dlopen === "function", "Bun.FFI is the bun:ffi module, reachable off the global as it is in Bun");
+}
+
+console.log("== Bun.JSONC: JSON with comments, and NOT JSON5 ==");
+{
+  const Bun = freshBun();
+  // Every expectation here was read off the 1.3 binary. The interesting ones are
+  // the REFUSALS: JSON5 accepts NaN, Infinity, a leading + and unquoted keys, so
+  // delegating this to the vendored JSON5 parser — the cheap implementation —
+  // would have accepted files real Bun calls invalid.
+  const parse = (src) => { try { return JSON.stringify(Bun.JSONC.parse(src)); } catch (e) { return "ERR:" + e.message; } };
+  for (const [src, want, why] of [
+    ['{ /*c*/ "a": 1, // line\n "b": [2,], }', '{"a":1,"b":[2]}', "comments and a trailing comma, which is what tsconfig.json is"],
+    ["", "{}", "an empty file is an empty config, as in Bun — not a syntax error"],
+    ['{"a":"// not a comment"}', '{"a":"// not a comment"}', "a comment marker inside a string is data"],
+    ['{"a":0x10}', '{"a":16}', "hex, which Bun accepts and JSON does not"],
+    ["{'a':'x'}", '{"a":"x"}', "single quotes"],
+    ["42", "42", "a bare scalar is a document"],
+  ]) {
+    ok(parse(src) === want, "JSONC: " + why + " — " + JSON.stringify(src.slice(0, 34)));
+  }
+  for (const [src, phrase, why] of [
+    ['{"a":NaN}', "Unexpected NaN", "NaN is rejected, though JSON5 would take it"],
+    ['{"a":+1}', 'Unexpected "+"', "a leading + is rejected, though JSON5 would take it"],
+    ["[1,,]", 'Unexpected ","', "a hole is not a trailing comma"],
+    ['{"a":1} /*', 'Expected "*/"', "an unterminated block comment names what is missing"],
+    ["   ", "Unexpected end of file", "whitespace alone is not an empty file"],
+    ["// nothing", "Unexpected end of file", "nor is a lone comment"],
+  ]) {
+    const got = parse(src);
+    ok(got.startsWith("ERR:") && got.indexOf(phrase) !== -1, "JSONC rejects: " + why + " — " + JSON.stringify(got.slice(4, 48)));
+  }
+  // Two places this is deliberately STRICTER than Bun, which are the only two
+  // divergences and both reject input rather than accepting more.
+  ok(parse("{a:1}").startsWith("ERR:"), "an unquoted key throws, where Bun silently returns {\"\": 1} and drops the name");
+  ok(parse("{} {}").startsWith("ERR:"), "a second root throws, where Bun returns the first and ignores the rest of the file");
+}
+
+console.log("== bun:jsc: two that work, and honest refusals for the engine hatch ==");
+{
+  const { modules } = createBunRuntime({ process: { env: {}, argv: ["bun"], cwd: () => "/", stdout: process.stdout, stderr: process.stderr, stdin: process.stdin }, Buffer, require: nodeRequire });
+  const jsc = modules["bun:jsc"];
+  // Really changes the zone: Node re-reads TZ and drops its cached offset, so this
+  // is the API doing its job rather than a stub that remembers a string.
+  const before = new Date(0).getTimezoneOffset();
+  jsc.setTimeZone("Asia/Tokyo");
+  const tokyo = new Date(0).getTimezoneOffset();
+  jsc.setTimezone("UTC");
+  const utc = new Date(0).getTimezoneOffset();
+  ok(tokyo === -540, "bun:jsc.setTimeZone('Asia/Tokyo') moves Date by nine hours (offset " + tokyo + ")");
+  ok(utc === 0, "…and the lowercase spelling Bun also accepts works too");
+  ok(typeof before === "number", "…starting from whatever the host had");
+  ok((await jsc.drainMicrotasks()) === true, "bun:jsc.drainMicrotasks() drains the queue");
+  for (const name of ["fullGC", "heapStats", "startSamplingProfiler", "noInline"]) {
+    let m = "";
+    try { jsc[name](); } catch (e) { m = String(e.message || e); }
+    ok(m.indexOf("is not supported in Vivari (browser sandbox)") !== -1 && m.indexOf("JavaScriptCore internals") !== -1,
+      "bun:jsc." + name + " refuses rather than being absent: " + JSON.stringify(m.slice(0, 48)));
+  }
+}
+
+console.log("== bun:test's compat spellings ==");
+{
+  const { t } = freshBunTest();
+  for (const n of ["xit", "xtest", "xdescribe", "setDefaultTimeout", "onTestFinished", "expectTypeOf"]) {
+    ok(typeof t[n] === "function", "bun:test exports " + n);
+  }
+  ok(t.vi && typeof t.vi.fn === "function" && typeof t.vi.spyOn === "function", "…and vi, with the mocking half wired to the same functions");
+  // A type-level assertion evaporates at run time in Bun too; what it must not do
+  // is throw, however long the chain.
+  ok(t.expectTypeOf(1).toEqualTypeOf().not.toBeString() !== undefined, "expectTypeOf chains without throwing");
+  // Fake timers, which used to be the half that did not exist. Both names drive
+  // the same queue, so this checks vi and jest reach one clock.
+  let m = "";
+  try { t.vi.advanceTimersByTime(1000); } catch (e) { m = String(e.message || e); }
+  ok(m === "Fake timers are not active. Call useFakeTimers() first.", "advancing without useFakeTimers() is Bun's own error: " + JSON.stringify(m.slice(0, 50)));
+  let outside = "";
+  try { t.onTestFinished(() => {}); } catch (e) { outside = String(e.message || e); }
+  ok(outside.indexOf("inside a test body") !== -1, "onTestFinished outside a test is an error, not a dropped callback");
+}
+
+// ---- 27) the clock seam: fake timers and setSystemTime ----------------------
+// Both were refused for "there is no clock seam". For the event LOOP that was
+// true; for a test it never was, since the code under test reads a global. The
+// semantics below were read off the 1.3 binary and two of them are worth naming:
+// setSystemTime FREEZES the clock rather than offsetting it, and fake timers
+// leave Date alone, so the two features do not interact at all.
+{
+  const { t } = freshBunTest();
+  const RealDate = Date;
+
+  t.setSystemTime(new Date("2020-01-01T00:00:00Z"));
+  ok(new Date().toISOString() === "2020-01-01T00:00:00.000Z", "setSystemTime moves what new Date() reports");
+  ok(Date.now() === 1577836800000, "…and Date.now() with it");
+  const before = Date.now();
+  await new Promise((r) => RealDate && setTimeout(r, 15));
+  ok(Date.now() === before, "…frozen, not offset: real time passing does not move it");
+  ok(new Date() instanceof Date && Date.name === "Date", "…still a Date, still named Date");
+  ok(new Date("1999-05-05").getFullYear() === 1999, "…and an explicit argument is untouched");
+  t.setSystemTime();
+  ok(new Date().getFullYear() >= 2025, "setSystemTime() with no argument restores the real clock");
+
+  const j = t.jest;
+  const order = [];
+  j.useFakeTimers();
+  setTimeout(() => order.push("t100"), 100);
+  const iv = setInterval(() => order.push("i30"), 30);
+  ok(j.getTimerCount() === 2, "getTimerCount sees both queued timers");
+  j.advanceTimersByTime(100);
+  // Due order, and for a tie the order they were scheduled — which is what puts
+  // three interval firings before a timeout that was registered first.
+  ok(JSON.stringify(order) === '["i30","i30","i30","t100"]', "advanceTimersByTime fires in due order: " + JSON.stringify(order));
+  clearInterval(iv);
+  ok(j.getTimerCount() === 0, "clearInterval removes a fake timer");
+
+  order.length = 0;
+  setTimeout(() => order.push("a"), 10);
+  setTimeout(() => order.push("b"), 20);
+  j.advanceTimersToNextTimer();
+  ok(JSON.stringify(order) === '["a"]', "advanceTimersToNextTimer stops at the next one");
+  j.runAllTimers();
+  ok(JSON.stringify(order) === '["a","b"]', "runAllTimers drains the rest");
+
+  let spun = "";
+  setInterval(() => {}, 5);
+  try { j.runAllTimers(); } catch (e) { spun = String(e.message || e); }
+  // The one deliberate divergence: real Bun spins here forever.
+  ok(spun.indexOf("Aborting after running 100000 timers") === 0, "runAllTimers on a live interval stops instead of hanging: " + JSON.stringify(spun.slice(0, 40)));
+  j.clearAllTimers();
+  ok(j.getTimerCount() === 0, "clearAllTimers empties the queue");
+
+  ok(t.vi.isFakeTimers() === true, "vi and jest are the same clock");
+  ok(new Date().getFullYear() >= 2025, "fake timers leave Date alone, as in Bun");
+  j.useRealTimers();
+  ok(t.vi.isFakeTimers() === false, "useRealTimers puts the globals back");
+  let fired = false;
+  setTimeout(() => { fired = true; }, 1);
+  await new Promise((r) => setTimeout(r, 20));
+  ok(fired, "…and a real timer fires again afterwards");
+
+  // A test that installs fake timers and never restores them must not freeze the
+  // next file, nor the runner's own per-test timeout.
+  j.useFakeTimers();
+  t.setSystemTime(new Date("2000-01-01T00:00:00Z"));
+  t.__setFile("next.test.ts");
+  ok(t.vi.isFakeTimers() === false && new Date().getFullYear() >= 2025, "a leaked fake clock is reset at the next file");
+}
+
+// ---- 28) the shells and the file body ---------------------------------------
+// Bun's `$` carries seven names this did not: four that set defaults for every
+// command that follows, and three classes that exist so `catch (e) { e
+// instanceof $.ShellError }` — the handling Bun's own docs suggest — can work.
+{
+  // The host's own process, not the stub: these commands really run, so they need
+  // a real cwd and a PATH to find `pwd` on.
+  const B = createBunRuntime({ process, Buffer, require: nodeRequire }).Bun;
+  for (const n of ["cwd", "env", "nothrow", "throws", "Shell", "ShellError", "ShellPromise"]) {
+    ok(typeof B.$[n] === "function", "Bun.$." + n + " exists");
+  }
+  B.$.cwd("/tmp");
+  ok((await B.$`pwd`.text()).trim() === "/tmp", "$.cwd() sets the directory for the commands after it");
+  B.$.env({ VV_SHELL_DEFAULT: "yes", PATH: process.env.PATH });
+  ok((await B.$`printenv VV_SHELL_DEFAULT`.text()).trim() === "yes", "$.env() sets the environment for them too");
+  B.$.nothrow();
+  ok((await B.$`exit 3`).exitCode === 3, "$.nothrow() turns a failing command into a result");
+  B.$.throws(true);
+  let shellErr = null;
+  try { await B.$`exit 4`; } catch (e) { shellErr = e; }
+  ok(shellErr instanceof B.$.ShellError && shellErr.exitCode === 4, "$.throws(true) throws a ShellError carrying the code");
+  // The point of the class: a library that sets $.cwd() must not move the
+  // caller's shell.
+  const isolated = new B.$.Shell();
+  ok((await isolated`pwd`.text()).trim() === process.cwd(), "new $.Shell() starts from the real cwd, not the other shell's default");
+}
+
+{
+  const B = freshBun();
+  const fs = await import("node:fs");
+  const path = "/tmp/vv-spike-form.txt";
+  fs.writeFileSync(path, "a=1&b=two");
+  // Bun refuses a body it cannot classify rather than returning an empty
+  // FormData: nothing in the bytes says urlencoded or multipart.
+  let noType = "";
+  try { await B.file(path).formData(); } catch (e) { noType = String(e.message || e); }
+  ok(noType === "Invalid encoding", "BunFile.formData() without a type is Bun's 'Invalid encoding': " + JSON.stringify(noType));
+  const fd = await B.file(path, { type: "application/x-www-form-urlencoded" }).formData();
+  ok(JSON.stringify([...fd.entries()]) === '[["a","1"],["b","two"]]', "…and parses the form when the type says how");
+  const boundary = "X";
+  fs.writeFileSync(path, "--X\r\nContent-Disposition: form-data; name=\"k\"\r\n\r\nv\r\n--X--\r\n");
+  const mp = await B.file(path, { type: "multipart/form-data; boundary=" + boundary }).formData();
+  ok(mp.get("k") === "v", "…multipart too");
+  fs.unlinkSync(path);
+}
+
+// ---- Bun.spawn({ ipc }) framing ---------------------------------------------
+// The framing lives here, and NOT only in the kernel spike, for a measured
+// reason: in this VM one socket write is delivered as exactly one `data` event —
+// each write becomes one `pipe-data` message, the kernel relays it verbatim, and
+// the net binding hands it to the reader whole. So the kernel tier cannot tell a
+// length-prefixed stream from a naive one. Deleting the length prefix entirely
+// and treating every chunk as a message leaves scripts/spike-bun.mjs completely
+// green — that was tried, deliberately, before writing this block.
+//
+// A node net.Socket is a byte stream all the same, and nothing in its contract
+// promises the 1:1 this transport happens to give. So the split and the coalesce
+// are fed to the reader directly, which is what FrameReader is a pure class for.
+console.log("\n== Bun.spawn({ ipc }) framing ==");
+{
+  const chunksOf = (bytes, size) => {
+    const out = [];
+    for (let i = 0; i < bytes.length; i += size) out.push(bytes.subarray(i, i + size));
+    return out;
+  };
+  const drain = (reader, chunks) => {
+    const messages = [];
+    for (const chunk of chunks) {
+      for (const frame of reader.push(chunk)) messages.push(decodeMessage(frame, "advanced"));
+    }
+    return messages;
+  };
+  const join = (frames) => {
+    const total = frames.reduce((n, f) => n + f.length, 0);
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const f of frames) {
+      out.set(f, at);
+      at += f.length;
+    }
+    return out;
+  };
+
+  // Five messages written back-to-back in one tick, arriving as ONE chunk. An
+  // unframed reader delivers this as a single message, or as one that fails to
+  // decode; either way four messages are gone with no error anywhere.
+  const five = [0, 1, 2, 3, 4].map((i) => encodeMessage({ i, tag: "m" + i }, "advanced"));
+  const coalesced = drain(new FrameReader(), [join(five)]);
+  ok(coalesced.length === 5, "five frames coalesced into one chunk are read back as five messages, not one: got " + coalesced.length);
+  ok(
+    coalesced.every((m, i) => m.i === i && m.tag === "m" + i),
+    "…in order and with their contents intact",
+  );
+
+  // One message split across many chunks, INCLUDING a split inside the 4-byte
+  // length prefix itself — the case a reader that peeks at the prefix before
+  // checking it has arrived gets wrong.
+  const big = encodeMessage({ payload: "z".repeat(300000), when: new Date(5) }, "advanced");
+  const split = drain(new FrameReader(), chunksOf(big, 7));
+  ok(split.length === 1, "a message split across " + Math.ceil(big.length / 7) + " chunks is reassembled into exactly one message: got " + split.length);
+  ok(split[0] && split[0].payload.length === 300000 && split[0].when instanceof Date, "…with all 300000 bytes and its Date");
+  const byteAtATime = drain(new FrameReader(), chunksOf(encodeMessage({ a: 1 }, "advanced"), 1));
+  ok(byteAtATime.length === 1 && byteAtATime[0].a === 1, "…and one byte at a time works too, so a split length prefix is not read early");
+
+  // The realistic mixture: a partial frame trailing a complete one, finished by
+  // the next chunk. A reader that discards its remainder loses the second half.
+  const [a, b] = [encodeMessage({ n: "first" }, "advanced"), encodeMessage({ n: "second" }, "advanced")];
+  const reader = new FrameReader();
+  const firstPass = reader.push(join([a, b.subarray(0, 5)])).map((f) => decodeMessage(f, "advanced"));
+  const secondPass = reader.push(b.subarray(5)).map((f) => decodeMessage(f, "advanced"));
+  ok(firstPass.length === 1 && firstPass[0].n === "first", "a complete frame followed by half of the next yields only the complete one");
+  ok(secondPass.length === 1 && secondPass[0].n === "second", "…and the remainder is kept, so the next chunk completes it");
+
+  // A length a peer controls is a request to allocate. It is capped, and the cap
+  // is enforced before anything is read, so a corrupt stream fails loudly here
+  // rather than by growing until the tab dies.
+  const bogus = new Uint8Array(8);
+  new DataView(bogus.buffer).setUint32(0, 0xfffffff0, true);
+  let capped = "";
+  try {
+    new FrameReader().push(bogus);
+  } catch (e) {
+    capped = String(e.message || e);
+  }
+  ok(/exceeds the .* limit/.test(capped), "a frame length past the cap is refused instead of allocated: " + JSON.stringify(capped));
+
+  // The two modes, and the difference between them, without a process in sight.
+  const clone = decodeMessage(encodeMessage({ m: new Map([["k", 1]]), d: new Date(7) }, "advanced").subarray(4), "advanced");
+  ok(clone.m instanceof Map && clone.d instanceof Date, "the default 'advanced' mode round-trips a Map and a Date");
+  const asJson = decodeMessage(encodeMessage({ m: new Map([["k", 1]]), d: new Date(7) }, "json").subarray(4), "json");
+  ok(!(asJson.m instanceof Map) && typeof asJson.d === "string", "…and 'json' mode flattens both, which is the whole cost of that mode");
+  ok(normalizeMode(undefined) === "advanced" && normalizeMode("json") === "json", "an unspecified serialization mode is 'advanced', as it is in bun");
+
+  let bare = "";
+  try {
+    requireMessage(undefined);
+  } catch (e) {
+    bare = e.name + ": " + e.message;
+  }
+  ok(bare === 'TypeError: The "message" argument must be specified', "send(undefined) is refused with bun's sentence: " + JSON.stringify(bare));
+}
+
+// ---- Bun.Archive -------------------------------------------------------------
+// Bun.Archive was a refusal ("bytes in, bytes out, nobody has written it") and is
+// now a real tar codec. The bug class these sections are aimed at: an archive
+// writer that only ever round-trips against its own reader. That passes forever
+// while agreeing with nothing — the Bun.hash trap in a different costume — so the
+// bytes on the left of every comparison below came out of the real 1.3.6 binary,
+// recorded by scripts/record-bun-archive.mjs into scripts/fixtures/bun-archive.json.
+const ARCHIVE_FIXTURE = JSON.parse(
+  nodeRequire("node:fs").readFileSync(new URL("./fixtures/bun-archive.json", import.meta.url), "utf8")
+);
+const unb64 = (s) => new Uint8Array(Buffer.from(s, "base64"));
+
+console.log("== Bun.Archive reads bytes a real bun wrote ==");
+{
+  // Four archives, each shaped to break a plausible shortcut in the reader: a
+  // plain one (including a zero-length entry), a name too long for a ustar header
+  // (Bun writes a pax `x` header — NOT the GNU `L` extension GNU tar would), a
+  // name that splits across the ustar `prefix` field, and one past the
+  // 10240-byte record boundary.
+  const B = freshBun();
+  for (const [name, recorded] of Object.entries(ARCHIVE_FIXTURE.archives)) {
+    const want = recorded.entries;
+    for (const [label, bytes] of [["tar", unb64(recorded.tar)], ["tar.gz", unb64(recorded.gzip)]]) {
+      const files = await new B.Archive(bytes).files();
+      const got = Object.fromEntries([...files].map(([k, v]) => [k, v.size]));
+      ok(
+        JSON.stringify(got) === JSON.stringify(want),
+        `${name} (${label}) read back from real Bun's bytes: ${JSON.stringify(Object.keys(got))}`
+      );
+    }
+  }
+  // The gzip half is not a formality: a gzipped archive is what `bun` writes with
+  // { compress: "gzip" }, and detection is by the 1f 8b magic rather than by any
+  // filename, since these bytes arrive with no name attached.
+  ok(unb64(ARCHIVE_FIXTURE.archives.plain.gzip)[0] === 0x1f, "the recorded .gzip fixtures really are gzip streams");
+  // Bun's own padding rule, which a writer that stops at the two zero blocks gets
+  // wrong: every archive is rounded up to a multiple of 10240, so even {} is 10240
+  // bytes and a 20000-byte payload lands on 30720.
+  ok(unb64(ARCHIVE_FIXTURE.archives.multiRecord.tar).length === 30720, "a real 20000-byte archive is 30720 bytes (three records)");
+}
+
+console.log("== Bun.Archive writes tar a real bun (and GNU tar) can read ==");
+{
+  // Our writer's bytes, read back by our reader, would prove nothing on its own.
+  // What makes this a real check is that the same entry sets were written by the
+  // binary above, so the header LAYOUT is pinned: field-for-field agreement is
+  // asserted here, and the round-trip is asserted through it.
+  const B = freshBun();
+  for (const [name, recorded] of Object.entries(ARCHIVE_FIXTURE.archives)) {
+    const spec = Object.fromEntries(Object.entries(recorded.entries).map(([k, len]) => [k, "z".repeat(len)]));
+    const mine = await new B.Archive(spec).bytes();
+    const theirs = unb64(recorded.tar);
+    ok(mine.length === theirs.length, `${name}: our archive is the same length as Bun's (${mine.length})`);
+    // Everything except mtime (which is "now" in both) and the checksum that
+    // covers it. Comparing whole blocks would fail on the clock alone.
+    const fields = [[0, 100, "name"], [100, 8, "mode"], [108, 8, "uid"], [116, 8, "gid"],
+      [124, 12, "size"], [156, 1, "typeflag"], [257, 8, "magic+version"], [265, 32, "uname"],
+      [297, 32, "gname"], [329, 8, "devmajor"], [345, 155, "prefix"]];
+    // Walk HEADER blocks only: the data blocks in between are payload, and
+    // striding a flat 512 through them compares content against content and
+    // reports a difference that is not one.
+    let differing = "";
+    let headers = 0;
+    for (let off = 0; off + 512 <= theirs.length && !differing; ) {
+      if (theirs.subarray(off, off + 512).every((b) => b === 0)) break;
+      headers++;
+      for (const [at, len, label] of fields) {
+        const a = Buffer.from(mine.subarray(off + at, off + at + len)).toString("latin1");
+        const b = Buffer.from(theirs.subarray(off + at, off + at + len)).toString("latin1");
+        if (a !== b) { differing = `${label}@${off}: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`; break; }
+      }
+      const size = parseInt(Buffer.from(theirs.subarray(off + 124, off + 136)).toString("latin1").trim(), 8) || 0;
+      off += 512 + Math.ceil(size / 512) * 512;
+    }
+    ok(!differing, `${name}: every field of all ${headers} ustar headers matches Bun's byte for byte${differing ? " — " + differing : ""}`);
+  }
+  // The checksum is the one field a reader validates, so it has to be right in our
+  // OWN bytes rather than merely equal to Bun's — hence the independent recompute.
+  const bytes = await new B.Archive({ "a.txt": "hello" }).bytes();
+  let sum = 0;
+  for (let i = 0; i < 512; i++) sum += i >= 148 && i < 156 ? 32 : bytes[i];
+  ok(
+    Buffer.from(bytes.subarray(148, 156)).toString("latin1") === sum.toString(8).padStart(6, "0") + "\0 ",
+    "the octal header checksum we write is the checksum of the block we wrote"
+  );
+}
+
+console.log("== Bun.Archive round-trips create -> bytes -> read ==");
+{
+  const B = freshBun();
+  const payload = new Uint8Array(5000);
+  for (let i = 0; i < payload.length; i++) payload[i] = (i * 31) & 0xff;
+  const archive = new B.Archive({
+    "text.txt": "hello world",
+    "nested/deep/bin.dat": payload,
+    "from-buffer.dat": new Uint8Array([1, 2, 3, 4]).buffer,
+    "from-blob.txt": new Blob(["blob contents"]),
+    "empty.txt": "",
+  });
+  const files = await new B.Archive(await archive.bytes()).files();
+  ok(files instanceof Map, "files() resolves to a Map, not a plain object");
+  ok([...files.values()].every((v) => v instanceof Blob), "…whose values are Blobs");
+  ok(typeof archive.files().then === "function", "…and files() is a Promise, so it has to be awaited");
+  ok(await files.get("text.txt").text() === "hello world", "a string entry survives the round trip");
+  ok(files.get("nested/deep/bin.dat").size === 5000, "a 5000-byte binary entry keeps its length");
+  const back = new Uint8Array(await files.get("nested/deep/bin.dat").arrayBuffer());
+  ok(back.every((b, i) => b === payload[i]), "…and every byte of it, across the 512-byte block padding");
+  ok(await files.get("from-buffer.dat").text() === "\u0001\u0002\u0003\u0004", "an ArrayBuffer entry survives");
+  ok(await files.get("from-blob.txt").text() === "blob contents", "a Blob entry is read for its bytes");
+  ok(files.has("empty.txt") && files.get("empty.txt").size === 0, "a zero-length entry is kept, not dropped");
+  ok([...files.keys()].join(",") === "text.txt,nested/deep/bin.dat,from-buffer.dat,from-blob.txt,empty.txt",
+    "entry order is the object's key order, as Bun's is");
+  // Bun's own encoding for a value that is not bytes: String(), which is why
+  // `null` is four bytes and not a refusal.
+  const odd = await new B.Archive({ n: 42, nul: null, u: undefined, o: { a: 1 }, arr: [1, 2] }).files();
+  const shown = {};
+  for (const [k, v] of odd) shown[k] = await v.text();
+  ok(JSON.stringify(shown) === '{"n":"42","nul":"null","u":"undefined","o":"[object Object]","arr":"1,2"}',
+    "a non-binary value is String()d, which is what the binary stores: " + JSON.stringify(shown));
+}
+
+console.log("== Bun.Archive reads what the host's own tar wrote ==");
+{
+  // A second implementation entirely, and the one whose extensions differ: GNU tar
+  // uses its `L` long-name entry where Bun uses pax, emits real directory and
+  // symlink entries (Bun's writer emits neither), and can be asked for pax or v7.
+  // These fixtures are built at spike time by the host `tar`, so the reader is
+  // gated against bytes nobody in this repo produced.
+  const fs = nodeRequire("node:fs");
+  const os = nodeRequire("node:os");
+  const path = nodeRequire("node:path");
+  const cp = nodeRequire("node:child_process");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-bunarc-tar-"));
+  const src = path.join(dir, "src");
+  const longName = "verylong/" + "seg/".repeat(30) + "leaf.txt";
+  fs.mkdirSync(path.join(src, path.dirname(longName)), { recursive: true });
+  fs.mkdirSync(path.join(src, "dir/nested"), { recursive: true });
+  fs.writeFileSync(path.join(src, "a.txt"), "alpha contents\n");
+  fs.writeFileSync(path.join(src, "dir/b.txt"), "beta\n");
+  fs.writeFileSync(path.join(src, "dir/nested/c.txt"), "deep\n");
+  fs.writeFileSync(path.join(src, longName), "longname\n");
+  try { fs.symlinkSync("a.txt", path.join(src, "link.txt")); } catch {}
+  const tar = (args) => {
+    try { cp.execFileSync("tar", args, { cwd: src, stdio: ["ignore", "ignore", "pipe"] }); return true; }
+    catch { return false; }
+  };
+  const have = tar(["--version"]);
+  if (!have) {
+    // A missing `tar` must be reported as a skip, not pass quietly — the ok-flag
+    // rule in AGENTS.md. There is no `ok()` here on purpose: nothing was proven.
+    console.log("  (skipped: no `tar` on this host)");
+  } else {
+    const cases = [
+      ["gnu.tar", ["--format=gnu", "-cf", "gnu.tar", "a.txt", "dir", longName], ["a.txt", "dir/b.txt", "dir/nested/c.txt", longName],
+        "GNU format, whose long names use the `L` entry Bun never writes"],
+      ["pax.tar", ["--format=pax", "-cf", "pax.tar", "a.txt", "dir", longName], ["a.txt", "dir/b.txt", "dir/nested/c.txt", longName],
+        "pax format, whose long names arrive as a `path=` record"],
+      ["v7.tar", ["--format=v7", "-cf", "v7.tar", "a.txt"], ["a.txt"],
+        "v7 format, which carries no `ustar` magic at all — only the checksum identifies it"],
+      ["gz.tar.gz", ["--format=gnu", "-czf", "gz.tar.gz", "a.txt", "dir"], ["a.txt", "dir/b.txt", "dir/nested/c.txt"],
+        "gzipped, detected by magic because these bytes have no filename"],
+      ["sym.tar", ["--format=gnu", "-cf", "sym.tar", "a.txt", "link.txt", "dir"], ["a.txt", "dir/b.txt", "dir/nested/c.txt"],
+        "with a symlink and directory entries, which files() drops as Bun's does"],
+    ];
+    const B = freshBun();
+    for (const [file, args, want, why] of cases) {
+      ok(tar(args), `host tar produced ${file}`);
+      const files = await new B.Archive(fs.readFileSync(path.join(src, file))).files();
+      ok(JSON.stringify([...files.keys()].sort()) === JSON.stringify([...want].sort()),
+        `${file}: ${why} — ${JSON.stringify([...files.keys()].map((k) => k.slice(0, 24)))}`);
+    }
+    ok(await (await new B.Archive(fs.readFileSync(path.join(src, "gnu.tar"))).files()).get("a.txt").text() === "alpha contents\n",
+      "…and the CONTENTS come back, not just the names");
+    // The reverse direction: GNU tar reading what we wrote, including the pax
+    // header our writer emits for a name it cannot split.
+    const mine = path.join(src, "ours.tar");
+    fs.writeFileSync(mine, await new B.Archive({ "a.txt": "ours", ["N".repeat(120)]: "pax path" }).bytes());
+    let listed = "";
+    try { listed = cp.execFileSync("tar", ["-tf", mine], { cwd: src }).toString(); } catch (e) { listed = "ERR " + e; }
+    ok(listed.includes("a.txt") && listed.includes("N".repeat(120)),
+      "GNU tar lists both entries of an archive we wrote, pax long name included");
+    // A real, multi-entry, DEFLATED zip — over 512 bytes, so it reaches the header
+    // check rather than being turned away on length. The committed fixture zip is
+    // 175 bytes and cannot test that path.
+    let zipped = false;
+    try { cp.execFileSync("zip", ["-q", "-r", "big.zip", "a.txt", "dir", longName], { cwd: src, stdio: "ignore" }); zipped = true; } catch {}
+    if (!zipped) {
+      console.log("  (skipped: no `zip` on this host)");
+    } else {
+      const bytes = fs.readFileSync(path.join(src, "big.zip"));
+      let message = "";
+      try { await new B.Archive(bytes).files(); } catch (e) { message = String(e.message || e); }
+      ok(bytes.length > 512, `the host's zip is ${bytes.length} bytes, past the one-block shortcut`);
+      ok(message === "Unrecognized archive format",
+        "…and a real multi-entry zip is refused in Bun's words, because Bun cannot read one either");
+    }
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log("== Bun.Archive.extract writes into a directory ==");
+{
+  const fs = nodeRequire("node:fs");
+  const os = nodeRequire("node:os");
+  const path = nodeRequire("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-bunarc-x-"));
+  const B = createBunRuntime({
+    process: { env: {}, argv: ["bun"], cwd: () => dir, stdout: process.stdout, stderr: process.stderr, stdin: process.stdin },
+    Buffer,
+    require: nodeRequire,
+  }).Bun;
+  const dest = path.join(dir, "out");
+  const count = await new B.Archive({ "a.txt": "hello", "dir/b.txt": "world", "dir/nested/c.bin": new Uint8Array([7, 8]) }).extract(dest);
+  ok(count === 3, "extract() resolves to the number of entries, as Bun's does: " + count);
+  ok(fs.readFileSync(path.join(dest, "a.txt"), "utf8") === "hello", "a top-level entry is written");
+  ok(fs.readFileSync(path.join(dest, "dir/b.txt"), "utf8") === "world", "…and a nested one, with its directories created on the way");
+  ok(fs.readFileSync(path.join(dest, "dir/nested/c.bin"))[1] === 8, "…binary content included");
+  // Bun creates the destination itself, several levels deep if it has to.
+  const deep = path.join(dir, "a/b/c");
+  ok(await new B.Archive({ "x.txt": "x" }).extract(deep) === 1 && fs.existsSync(path.join(deep, "x.txt")),
+    "extract() creates a destination that does not exist yet");
+  // Extracting the same archive twice must overwrite rather than throw: this is
+  // what an unpack-then-rebuild loop does every time.
+  ok(await new B.Archive({ "a.txt": "second" }).extract(dest) === 1 && fs.readFileSync(path.join(dest, "a.txt"), "utf8") === "second",
+    "extracting again overwrites the file instead of failing");
+  // A tar.gz extracts too — the same decompression path files() uses.
+  const gz = await new B.Archive({ "z.txt": "zipped" }, { compress: "gzip" }).bytes();
+  ok(gz[0] === 0x1f && gz[1] === 0x8b, "{ compress: 'gzip' } really produces a gzip stream (1f 8b)");
+  ok(await new B.Archive(gz).extract(path.join(dir, "fromgz")) === 1, "…and a gzipped archive extracts");
+  ok(fs.readFileSync(path.join(dir, "fromgz/z.txt"), "utf8") === "zipped", "…with the right contents");
+
+  // Path traversal. `../` in an entry name is the classic tar attack, and real Bun
+  // strips it rather than escaping — the recorded fixture says where each of these
+  // lands, so this is Bun's answer and not our opinion of a safe one.
+  for (const [key, recorded] of Object.entries(ARCHIVE_FIXTURE.observed.traversal)) {
+    const box = fs.mkdtempSync(path.join(dir, "trav-"));
+    const inner = path.join(box, "sub");
+    const count2 = await new B.Archive({ [key]: "T" }).extract(inner);
+    const found = fs.existsSync(inner) ? fs.readdirSync(inner, { recursive: true }).sort() : [];
+    ok(count2 === recorded.count, `extract(${JSON.stringify(key)}) counts ${recorded.count} entries, as the binary does`);
+    ok(JSON.stringify(found) === JSON.stringify(recorded.files),
+      `…and lands at ${JSON.stringify(recorded.files)} — inside the destination, never above it`);
+    ok(!fs.existsSync(path.join(box, "escaped.txt")) && !fs.existsSync(path.join(box, "b.txt")),
+      `…nothing was written into ${JSON.stringify("sub")}'s parent`);
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log("== Bun.Archive.write always emits tar, whatever the path says ==");
+{
+  const fs = nodeRequire("node:fs");
+  const os = nodeRequire("node:os");
+  const path = nodeRequire("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-bunarc-w-"));
+  const B = freshBun();
+  ok(B.Archive.write.length === 2, "Archive.write.length is 2, as the binary reports, though it takes options as a third argument");
+  // The quirk this section exists for: the extension is decoration. `out.zip` gets
+  // 10240 bytes of ustar, and so does `{ format: "zip" }`. Reproduced rather than
+  // improved, because a shim that wrote a real zip to a .zip path would produce a
+  // file real Bun cannot read back.
+  for (const [ext, recorded] of Object.entries(ARCHIVE_FIXTURE.observed.writeIgnoresExtension)) {
+    if (ext === "formatZipOption") continue;
+    const p = path.join(dir, "out." + ext);
+    await B.Archive.write(p, { "x.txt": "x" });
+    const bytes = fs.readFileSync(p);
+    ok(bytes.length === recorded.length && bytes.subarray(257, 262).toString("latin1") === recorded.magic,
+      `write("out.${ext}") is ${recorded.length} bytes of ${JSON.stringify(recorded.magic)}, exactly as the binary writes it`);
+  }
+  const fmt = path.join(dir, "fmt.tar");
+  await B.Archive.write(fmt, { "x.txt": "x" }, { format: "zip" });
+  ok(fs.readFileSync(fmt).subarray(257, 262).toString("latin1") === ARCHIVE_FIXTURE.observed.writeIgnoresExtension.formatZipOption.magic,
+    "{ format: 'zip' } is accepted and ignored, which is also what the binary does");
+  // Compression is the one option that changes the bytes.
+  const gzPath = path.join(dir, "c.tar.gz");
+  await B.Archive.write(gzPath, { "a.txt": "hello" }, { compress: "gzip" });
+  const gz = fs.readFileSync(gzPath);
+  ok(gz[0] === 0x1f && gz[1] === 0x8b, "{ compress: 'gzip' } writes a real gzip (1f 8b), not a tar with a .gz name");
+  ok(gz.length < 10240, "…and it is smaller than the tar inside it: " + gz.length);
+  ok((await (await new B.Archive(gz).files()).get("a.txt").text()) === "hello", "…and reads back through the gzip path");
+  // The three second-argument forms that are not a plain object. Raw bytes are
+  // written VERBATIM — Bun does not re-tar them, so three garbage bytes really do
+  // produce a three-byte file.
+  const arcPath = path.join(dir, "from-archive.tar");
+  await B.Archive.write(arcPath, new B.Archive({ "z.txt": "zz" }));
+  ok([...(await new B.Archive(fs.readFileSync(arcPath)).files()).keys()].join() === "z.txt",
+    "write(path, archive) writes that archive's contents");
+  const rawPath = path.join(dir, "raw.bin");
+  await B.Archive.write(rawPath, new Uint8Array([1, 2, 3]));
+  ok(fs.readFileSync(rawPath).length === 3, "write(path, bytes) copies the bytes through without re-tarring them");
+  const blobPath = path.join(dir, "blob.tar");
+  await B.Archive.write(blobPath, new Blob([await new B.Archive({ "b.txt": "bb" }).bytes()]));
+  ok([...(await new B.Archive(fs.readFileSync(blobPath)).files()).keys()].join() === "b.txt", "write(path, Blob) writes the Blob's bytes");
+  // Bun's write() has already touched the disk by the time it hands back its
+  // promise. A guest that forgets to await it still finds the file, and losing
+  // that would be a silent behaviour change.
+  const eager = path.join(dir, "eager.tar");
+  const pending = B.Archive.write(eager, { "e.txt": "e" });
+  ok(fs.existsSync(eager), "write() has written the file before its promise settles, as the binary has");
+  await pending;
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log("== Bun.Archive refuses what Bun refuses, in Bun's words ==");
+{
+  // The error strings are API: someone will paste one into a search box, and a
+  // `catch` that compares them has to keep working under the real binary. Each
+  // expectation here is the message the 1.3.6 binary produced, not a paraphrase.
+  const B = freshBun();
+  const R = ARCHIVE_FIXTURE.refusals;
+  const caught = async (fn) => {
+    try { await fn(); return null; } catch (e) { return { name: e?.constructor?.name ?? null, message: String(e?.message ?? e), code: e?.code ?? null }; }
+  };
+  const zip = unb64(ARCHIVE_FIXTURE.zip);
+  const truncated = (await new B.Archive({ "a.txt": "hello" }).bytes()).subarray(0, 512);
+  // The same deterministic bytes record-bun-archive.mjs handed the binary.
+  const bigBinary = new Uint8Array(4096);
+  for (let i = 0; i < bigBinary.length; i++) bigBinary[i] = (i * 37 + 11) & 0xff;
+  for (const [key, fn, why] of [
+    ["ctorString", () => new B.Archive("hello"), "a string is not an archive — it is the mistake the types invite"],
+    ["ctorNumber", () => new B.Archive(7), "nor is a number"],
+    ["ctorNothing", () => new B.Archive(), "nor is nothing at all"],
+    ["nonAsciiName", () => new B.Archive({ "ü.txt": "x" }).bytes(), "a non-ASCII entry name: libarchive will not encode one in a ustar header, and does not fall back to pax for it"],
+    ["writeNoArgs", () => B.Archive.write(), "write() with no path"],
+    ["writeNumberPath", () => B.Archive.write(7, { "a.txt": "x" }), "write() with a number for a path"],
+    ["writeNoFiles", () => B.Archive.write("/tmp/vv-arc-none.tar"), "write() with nothing to write — note the message names Archive too, unlike the constructor's"],
+    ["writeStringFiles", () => B.Archive.write("/tmp/vv-arc-none.tar", "str"), "write() handed a string instead of entries"],
+    ["optionsNotObject", () => B.Archive.write("/tmp/vv-arc-none.tar", { a: "b" }, "gzip"), "the compression passed where the options go"],
+    ["compressNotString", () => B.Archive.write("/tmp/vv-arc-none.tar", { a: "b" }, { compress: true }), "compress: true — a different message from a wrong string, because it is a different mistake"],
+    ["compressNotGzip", () => B.Archive.write("/tmp/vv-arc-none.tar", { a: "b" }, { compress: "gz" }), "compress: 'gz', which is not the spelling Bun accepts"],
+    ["extractNoPath", () => new B.Archive({ "a.txt": "x" }).extract(), "extract() with no destination"],
+    ["extractNumberPath", () => new B.Archive({ "a.txt": "x" }).extract(7), "extract() with a number for a destination"],
+    ["readZip", () => new B.Archive(zip).files(), "A REAL ZIP. Bun cannot read one, so neither may this — being a superset is how code passes here and throws in production"],
+    ["readGarbage", () => new B.Archive(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8])).files(), "eight bytes of garbage, which get the same words as the zip"],
+    ["readEmpty", () => new B.Archive(new Uint8Array(0)).files(), "zero bytes"],
+    ["readText", () => new B.Archive(new TextEncoder().encode("hello world, not an archive")).files(), "a text file"],
+    // These three are the ones that actually exercise the header check. Everything
+    // above is shorter than one 512-byte block and is refused on length alone, so a
+    // reader with NO validation passes every short case and then reads garbage
+    // entries out of a 4 KB file — which is exactly what happened when this
+    // assertion was missing.
+    ["readBigBinary", () => new B.Archive(bigBinary).files(), "4096 bytes of binary that is not a tar — longer than a block, so only the header checksum can reject it"],
+    ["readLongText", () => new B.Archive(new TextEncoder().encode("A".repeat(1024))).files(), "1024 printable bytes"],
+    ["readLongJson", () => new B.Archive(new TextEncoder().encode(JSON.stringify({ note: "not an archive", filler: "v".repeat(2000) }))).files(), "a 2 KB JSON file"],
+    ["readTruncated", () => new B.Archive(truncated).files(), "a header whose payload was cut off — a DIFFERENT message from unrecognized, and the distinction is worth keeping"],
+    ["extractGarbage", () => new B.Archive(new Uint8Array([1, 2, 3])).extract("/tmp/vv-arc-x"), "a corrupt archive through extract(), which reports Bun's unhelpful `ReadError` rather than the reader's message"],
+    ["notAnArchive", () => B.Archive.prototype.files.call({}), "files() called on something that is not an Archive"],
+  ]) {
+    const got = await caught(fn);
+    ok(got !== null, `${key}: throws at all — ${why}`);
+    ok(got && got.message === R[key].message, `…with the binary's exact words: ${JSON.stringify(R[key].message)}${got && got.message !== R[key].message ? " (got " + JSON.stringify(got.message) + ")" : ""}`);
+    ok(got && got.name === R[key].name && got.code === R[key].code,
+      `…and its ${R[key].name}/${R[key].code} typing, which code branching on err.code depends on`);
+  }
+  // Reading is LAZY: bytes() and blob() hand back whatever they were given and
+  // validate nothing, so only files()/extract() ever reject a format. A shim that
+  // validated in the constructor would throw where Bun returns three bytes.
+  const junk = new B.Archive(new Uint8Array([1, 2, 3]));
+  ok((await junk.bytes()).length === 3, "bytes() on an unreadable archive returns its 3 bytes rather than throwing, as Bun's does");
+  ok((await junk.blob()).size === 3, "…and so does blob()");
+  // 512 zero bytes is a valid EMPTY tar, not garbage — the one input that looks
+  // like nothing and is legal.
+  ok((await new B.Archive(new Uint8Array(512)).files()).size === 0, "512 zero bytes reads as an empty archive, not as an unrecognized one");
+}
+
+console.log("== Bun.Archive refuses the four shapes real Bun silently empties ==");
+{
+  // The only place this implementation is deliberately stricter than the binary,
+  // and the reason is in the fixture: `silentlyEmpty` was recorded by running each
+  // of these under real 1.3.6, and every one came back with ZERO entries and no
+  // error. `new Archive(await other.files())` is the dangerous one, because
+  // files() hands back exactly the Map that loses everything. The Bun.JSONC
+  // precedent applies: stricter is a workaround, looser is a corrupt artifact
+  // nobody is told about.
+  const B = freshBun();
+  const E = ARCHIVE_FIXTURE.silentlyEmpty;
+  ok(E.fromMap === 0 && E.fromSet === 0 && E.fromArchive === 0 && E.bunFileValueSize === 0,
+    "the recorded binary really does produce empty archives for all four (that is what we refuse)");
+  const caught = async (fn) => { try { await fn(); return ""; } catch (e) { return String(e?.message ?? e); } };
+  const map = new Map([["a.txt", "hello"], ["b.txt", "world"]]);
+  for (const [label, fn, needle] of [
+    ["new Archive(map)", () => new B.Archive(map), "Object.fromEntries(map)"],
+    ["Archive.write(path, map)", () => B.Archive.write("/tmp/vv-arc-map.tar", map), "Object.fromEntries(map)"],
+    ["new Archive(set)", () => new B.Archive(new Set(["a.txt"])), "a plain object"],
+    ["new Archive(archive)", () => new B.Archive(new B.Archive({ "a.txt": "x" })), "Bun.Archive.write(path, archive)"],
+  ]) {
+    const message = await caught(fn);
+    ok(message.includes("Bun.Archive"), `${label} is refused, naming the API`);
+    ok(message.includes("EMPTY archive"), "…saying that real Bun would have written an empty archive");
+    ok(message.includes(needle), `…and pointing at the fix: ${JSON.stringify(needle)}`);
+  }
+  // A BunFile as a VALUE is the fourth, and the most inviting: it looks exactly
+  // like the obvious way to archive a file, and real Bun stores nothing.
+  const bunFileMessage = await caught(() => new B.Archive({ "a.txt": B.file("/tmp/vv-arc-src.txt") }).bytes());
+  ok(bunFileMessage.includes("await Bun.file(path).bytes()"), "a BunFile entry value is refused, naming the read that fixes it");
+  ok(bunFileMessage.includes("ZERO bytes"), "…and saying what real Bun would have stored instead");
+  // Each message must name the shape that was actually passed, through the door it
+  // was passed to. A single shared string got this wrong and told a Set caller
+  // about a Map.
+  ok((await caught(() => new B.Archive(new Set(["a"])))).includes("a Set"), "the Set refusal says Set, not Map");
+  ok((await caught(() => new B.Archive(map))).includes("new Bun.Archive(map)"), "the constructor refusal quotes the constructor call");
+  ok((await caught(() => B.Archive.write("/tmp/vv-arc-map.tar", map))).includes("Bun.Archive.write(path, map)"),
+    "…and the write refusal quotes the write call");
+  // The refusals must not spread: the round-trip Bun DOES support has to work.
+  ok([...(await new B.Archive(Object.fromEntries(map)).files()).keys()].join() === "a.txt,b.txt",
+    "the fix the message recommends actually works: Object.fromEntries(map) archives both entries");
+  ok((await (await new B.Archive(await new B.Archive({ "a.txt": "hi" }).bytes()).files()).get("a.txt").text()) === "hi",
+    "…and new Archive(await other.bytes()) copies an archive, which is the other recommendation");
+}
+
+console.log("== Bun.Archive's smaller observable shapes ==");
+{
+  const B = freshBun();
+  const O = ARCHIVE_FIXTURE.observed;
+  const archive = new B.Archive({ "a.txt": "hello" });
+  const bytes = await archive.bytes();
+  ok(Buffer.isBuffer(bytes) === O.bytesIsBuffer, "bytes() resolves to a Buffer, not a bare Uint8Array, matching the binary");
+  ok(bytes instanceof Uint8Array, "…which is still a Uint8Array, so either check passes");
+  const blob = await archive.blob();
+  ok(blob instanceof Blob && blob.type === "", "blob() resolves to a Blob with no type, as Bun's does");
+  ok(blob.size === bytes.length, "…covering the same bytes");
+  ok((await new B.Archive({}).bytes()).length === O.emptyArchiveLength,
+    `an empty archive is still ${O.emptyArchiveLength} bytes — tar's 20-block record, which surprises everyone once`);
+  ok(Object.prototype.toString.call(archive) === O.toStringTag, `Object.prototype.toString.call(archive) is ${JSON.stringify(O.toStringTag)}`);
+  ok((await new B.Archive([]).files()).size === 0, "an array is an object, so Bun accepts one — empty here");
+  ok([...(await new B.Archive(["x", "y"]).files()).keys()].join() === "0,1", "…and archives its members under the keys \"0\" and \"1\"");
+  // The constructor's second argument is not in the published types and
+  // Archive.length hides it, so it is easy to drop from a shim entirely.
+  const compressed = await new B.Archive({ "a.txt": "hello" }, { compress: "gzip" }).bytes();
+  ok(compressed[0] === 0x1f && compressed[1] === 0x8b, "new Archive(spec, { compress: 'gzip' }) gzips what bytes() returns");
+  ok([...(await new B.Archive({ "a.txt": "hello" }, { compress: "gzip" }).files()).keys()].join() === "a.txt",
+    "…and files() still reads it, because the tar is what gets parsed");
+  // Read mode: bytes() is the input AS SUPPLIED, so a gzipped archive hands the
+  // gzip back rather than the tar it holds.
+  const gz = await new B.Archive({ "a.txt": "hello" }, { compress: "gzip" }).bytes();
+  const reread = await new B.Archive(gz).bytes();
+  ok(reread[0] === 0x1f && Buffer.compare(Buffer.from(reread), Buffer.from(gz)) === 0,
+    "bytes() on a gzipped archive returns the gzip it was given, not the tar inside");
+  // Every call is a fresh object in Bun, so nothing can be cached and handed out
+  // twice — a caller that mutates the Buffer must not corrupt the archive.
+  ok((await archive.bytes()) !== (await archive.bytes()), "bytes() hands back a fresh Buffer each call");
+  ok((await archive.files()) !== (await archive.files()), "…and files() a fresh Map");
+  // Argument validation throws SYNCHRONOUSLY in Bun even though these methods
+  // return promises, so `write(...).catch(h)` never reaches `h` for a bad path —
+  // it takes the process down. Rejecting instead would look kinder and silently
+  // change which handler runs.
+  const throwsSync = (fn) => {
+    try { const r = fn(); if (r && typeof r.then === "function") { r.catch(() => {}); return false; } return false; }
+    catch { return true; }
+  };
+  ok(throwsSync(() => B.Archive.write(7, { a: "b" })), "Archive.write() throws a bad path synchronously, not as a rejection");
+  ok(throwsSync(() => B.Archive.write("/tmp/vv-arc-sync.tar", "str")), "…and bad entries synchronously");
+  ok(throwsSync(() => new B.Archive({ a: "b" }).extract()), "extract() throws a missing path synchronously");
+  ok(throwsSync(() => new B.Archive({ "ü": "x" }).bytes()), "…and bytes() throws a non-ASCII name synchronously, as the binary does");
+  ok(!throwsSync(() => new B.Archive(new Uint8Array([1, 2, 3])).files()), "while an unreadable FORMAT rejects rather than throwing, which is also Bun's split");
+  // Shapes Bun accepts that a plain `typeof x === "object"` check would refuse.
+  // Each archives its own enumerable properties, which is usually none.
+  for (const [label, value] of [["a function", () => {}], ["a Date", new Date()], ["a RegExp", /x/]]) {
+    ok((await new B.Archive(value).files()).size === 0, `${label} is accepted and archives nothing, as in Bun`);
+  }
+  // A NUL typeflag (v7) and '7' (POSIX contiguous) are regular files. Dropping
+  // either would lose an entry with no error — the failure this file is full of.
+  const withFlag = async (flag) => {
+    const t = new Uint8Array(await new B.Archive({ "c.txt": "contig" }).bytes());
+    t[156] = flag;
+    let sum = 0;
+    for (let i = 0; i < 512; i++) sum += i >= 148 && i < 156 ? 32 : t[i];
+    const ck = sum.toString(8).padStart(6, "0") + "\0 ";
+    for (let i = 0; i < 8; i++) t[148 + i] = ck.charCodeAt(i);
+    return [...(await new B.Archive(t).files()).keys()].join();
+  };
+  ok((await withFlag("7".charCodeAt(0))) === "c.txt", "typeflag '7' (contiguous) reads as a regular file, as it does in Bun");
+  ok((await withFlag(0)) === "c.txt", "…and so does a NUL typeflag, which is what a v7 tar writes");
+  // Bun's own name/prefix split rule, which decides what goes on disk. The last
+  // fitting `/` — not the first — and a pax header when none fits. Driven through
+  // the exported writer so the header bytes themselves are the assertion.
+  const split = (name) => {
+    const b = archiveWriteTar([{ name, bytes: new TextEncoder().encode("X") }]);
+    return {
+      typeflag: String.fromCharCode(b[156]),
+      name: Buffer.from(b.subarray(0, 100)).toString("latin1").replace(/\0+$/, "").length,
+      prefix: Buffer.from(b.subarray(345, 500)).toString("latin1").replace(/\0+$/, "").length,
+    };
+  };
+  for (const [name, want, why] of [
+    ["x/y/z/" + "l".repeat(100), { typeflag: "0", name: 100, prefix: 5 }, "the last slash leaves exactly 100 in the name field"],
+    ["s".repeat(50) + "/" + "t".repeat(50) + "/" + "u".repeat(50), { typeflag: "0", name: 50, prefix: 101 }, "the LAST fitting slash, not the first — the two disagree here"],
+    ["p".repeat(100) + "/" + "q".repeat(60) + "/" + "r".repeat(5), { typeflag: "0", name: 66, prefix: 100 }, "an earlier slash when the last one overflows the 155-byte prefix"],
+    ["a/" + "b".repeat(120), { typeflag: "x", name: 99, prefix: 0 }, "a pax header when no slash can split it, its label keeping the directory part"],
+    ["L".repeat(120), { typeflag: "x", name: 97, prefix: 0 }, "…and a bare `PaxHeader/` label when there is no directory part"],
+    ["p".repeat(160) + "/" + "q".repeat(90), { typeflag: "x", name: 97, prefix: 0 }, "…and a directory over 155 bytes dropped from the label entirely"],
+  ]) {
+    const got = split(name);
+    ok(JSON.stringify(got) === JSON.stringify(want), `a ${name.length}-byte name: ${why} — ${JSON.stringify(got)}`);
+    ok([...(await new B.Archive({ [name]: "X" }).files()).keys()][0] === name, `…and the ${name.length}-byte name round-trips exactly`);
+  }
+}
+
+// ---- 29) SigV4 against AWS's own published test suite ------------------------
+// The signer is the part of an S3 client that cannot be checked by using it: a
+// wrong signature comes back as 403 SignatureDoesNotMatch, which looks exactly
+// like wrong credentials, and there are no credentials here to be right or wrong.
+// So it is pinned to AWS's "Signature Version 4 Test Suite" — the fixture set AWS
+// publishes for exactly this purpose, mirrored in awslabs/aws-c-auth under
+// tests/aws-signing-test-suite/v4. Each case fixes the key, the date and the
+// request, so the canonical-request / string-to-sign / signature triple is a
+// constant. The lesson is the one from Bun.hash above: a signer that only agrees
+// with itself is worth nothing, and looks identical to one that works.
+{
+  const crypto = nodeRequire("node:crypto");
+  const H = createSigv4Hashers(crypto);
+  // Every case in the suite shares these, and `service` is deliberately the
+  // suite's literal "service" rather than "s3" — the point is the algorithm.
+  const SUITE = {
+    accessKeyId: "AKIDEXAMPLE",
+    secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+    region: "us-east-1",
+    service: "service",
+    amzDate: "20150830T123600Z",
+    dateStamp: "20150830",
+    // sign_body is false throughout the suite, so the payload hash is SHA-256 of
+    // the empty string — the one place this file needs SHA256_EMPTY.
+    payloadHash: SHA256_EMPTY,
+    hashers: H,
+  };
+  const sign = (over) => sigv4({ ...SUITE, ...over });
+  const lines = (...l) => l.join("\n");
+
+  // get-vanilla: GET / with nothing but a Host header. If this one is wrong,
+  // nothing else can be right.
+  const vanilla = sign({
+    method: "GET",
+    canonicalUri: "/",
+    query: [],
+    headers: { Host: "example.amazonaws.com", "X-Amz-Date": "20150830T123600Z" },
+  });
+  ok(
+    vanilla.canonicalRequest ===
+      lines("GET", "/", "", "host:example.amazonaws.com", "x-amz-date:20150830T123600Z", "", "host;x-amz-date", SHA256_EMPTY),
+    "get-vanilla canonical request matches AWS's byte for byte"
+  );
+  ok(
+    vanilla.stringToSign ===
+      lines("AWS4-HMAC-SHA256", "20150830T123600Z", "20150830/us-east-1/service/aws4_request", "bb579772317eb040ac9ed261061d46c1f17a8133879d6129b6e1c25292927e63"),
+    "…and so does the string to sign, hash of the canonical request included"
+  );
+  ok(vanilla.signature === "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31", "…and the signature AWS publishes for it");
+
+  // get-header-value-trim: sequential spaces inside a header value collapse, and
+  // the value is trimmed. Getting this wrong breaks only requests with odd
+  // headers, which is the kind of bug that ships.
+  const trimmed = sign({
+    method: "GET",
+    canonicalUri: "/",
+    query: [],
+    headers: {
+      Host: "example.amazonaws.com",
+      "My-Header1": " value1 ",
+      "My-Header2": ' "a   b   c" ',
+      "X-Amz-Date": "20150830T123600Z",
+    },
+  });
+  ok(
+    /\nmy-header2:"a b c"\n/.test(trimmed.canonicalRequest),
+    "get-header-value-trim collapses runs of spaces in a header value: " + JSON.stringify(/my-header2:.*/.exec(trimmed.canonicalRequest)[0])
+  );
+  ok(trimmed.signature === "acc3ed3afb60bb290fc8d2dd0098b9911fcaa05412b367055dee359757a9c736", "…to AWS's published signature");
+
+  // get-utf8: the path is percent-encoded per RFC 3986 before it is signed, which
+  // is the same encoder every object key goes through.
+  const utf8 = sign({
+    method: "GET",
+    canonicalUri: awsUriEncode("/\u1234", false),
+    query: [],
+    headers: { Host: "example.amazonaws.com", "X-Amz-Date": "20150830T123600Z" },
+  });
+  ok(utf8.canonicalRequest.split("\n")[1] === "/%E1%88%B4", "get-utf8 signs the percent-encoded path: " + utf8.canonicalRequest.split("\n")[1]);
+  ok(utf8.signature === "8318018e0b0f223aa2bbf98705b62bb787dc9c0e678f255a891fd03141be5d85", "…to AWS's published signature");
+
+  // get-vanilla-query-order-key-case: query parameters are sorted by encoded name
+  // before signing, whatever order the caller wrote them in. `list` depends on
+  // this — it sends four of them.
+  const ordered = sign({
+    method: "GET",
+    canonicalUri: "/",
+    query: [
+      ["Param2", "value2"],
+      ["Param1", "value1"],
+    ],
+    headers: { Host: "example.amazonaws.com", "X-Amz-Date": "20150830T123600Z" },
+  });
+  ok(ordered.canonicalRequest.split("\n")[2] === "Param1=value1&Param2=value2", "query parameters are sorted, not passed through: " + ordered.canonicalRequest.split("\n")[2]);
+  ok(ordered.signature === "b97d918cfa904a5beff61c982a1b6f458b799221646efd99d3219ec94cdf2500", "…to AWS's published signature");
+
+  // The query (presigned) flavour of the same suite case: the credential material
+  // moves into the query string and x-amz-date leaves the header block, so this
+  // exercises the path `presign` takes rather than the header path above.
+  const presigned = sign({
+    method: "GET",
+    canonicalUri: "/",
+    query: [
+      ["Param1", "value1"],
+      ["Param2", "value2"],
+      ["X-Amz-Algorithm", "AWS4-HMAC-SHA256"],
+      ["X-Amz-Credential", "AKIDEXAMPLE/20150830/us-east-1/service/aws4_request"],
+      ["X-Amz-Date", "20150830T123600Z"],
+      ["X-Amz-Expires", "3600"],
+      ["X-Amz-SignedHeaders", "host"],
+    ],
+    headers: { Host: "example.amazonaws.com" },
+  });
+  ok(presigned.signature === "86012e2c9ad4d77369f5d81c11f75158aae4f895a085212cc6d3f923d300bed5", "the query-string flavour matches AWS's published query signature too");
+
+  // post-vanilla-query: the method really is part of the canonical request.
+  const posted = sign({
+    method: "POST",
+    canonicalUri: "/",
+    query: [["Param1", "value1"]],
+    headers: { Host: "example.amazonaws.com", "X-Amz-Date": "20150830T123600Z" },
+  });
+  ok(posted.signature === "28038455d6de14eafc1f9222cf5aa6f1a96197d7deb8263271d420d138af7f11", "post-vanilla-query matches AWS's published signature (the verb is signed)");
+  ok(posted.signature !== ordered.signature, "…and a POST does not sign like a GET");
+}
+
+// ---- 30) the requests this client actually puts on the wire ------------------
+// Vector-correct signing over the wrong request is still the wrong request. These
+// are frozen against a real `bun` 1.3.6 talking to a local HTTP server that
+// recorded what arrived: same credentials, same clock (the date is injected), so
+// the Authorization header is comparable byte for byte. Two measured details are
+// asserted because they are the kind a from-scratch signer gets wrong in the safe
+// direction: Bun sends `x-amz-content-sha256: UNSIGNED-PAYLOAD` on every request
+// including PUT, and it signs ONLY host and the x-amz-* headers — Range and
+// Content-Type go on the wire unsigned.
+{
+  const crypto = nodeRequire("node:crypto");
+  const H = createSigv4Hashers(crypto);
+  const config = resolveS3Config(
+    {
+      accessKeyId: "AKIAIOSFODNN7EXAMPLE",
+      secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      region: "us-east-1",
+      bucket: "bkt",
+      endpoint: "http://127.0.0.1:9111",
+    },
+    {}
+  );
+  const DATE = Date.parse("2026-08-04T08:20:01Z");
+  const build = (over) => buildS3Request({ config, date: DATE, hashers: H, ...over });
+  const sigOf = (r) => /Signature=([a-f0-9]+)/.exec(r.headers.authorization)[1];
+  const signedHeadersOf = (r) => /SignedHeaders=([^,]+)/.exec(r.headers.authorization)[1];
+
+  const get = build({ method: "GET", key: "hello.txt" });
+  ok(
+    get.headers.authorization ===
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260804/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=3aa9ebdd141d5a98340c2d6e4dd1931db457a1fef7831be86804bf932d9afbde",
+    "a GET's whole Authorization header is the one bun 1.3.6 sent for the same request and clock"
+  );
+  ok(get.url === "http://127.0.0.1:9111/bkt/hello.txt", "…to the path-style URL: " + get.url);
+  ok(get.headers["x-amz-content-sha256"] === "UNSIGNED-PAYLOAD", "…with UNSIGNED-PAYLOAD, which is what the binary sends");
+  ok(sigOf(build({ method: "HEAD", key: "hello.txt" })) === "580d2012ce432f8797d2ef4299ce00fd7abfdf22494a9ad59e389800b2546dc0", "HEAD (exists/stat/size) matches the binary");
+  ok(sigOf(build({ method: "PUT", key: "out.txt" })) === "690e89d32f25afc831b77fac780bfb016e7c4ce6acf12095fbb409329b3b0efe", "PUT matches the binary — the body is NOT hashed into the signature");
+  ok(sigOf(build({ method: "DELETE", key: "gone.txt" })) === "e743c26530ba0cbeb147867d86ed8086302f97d6d9cab88793e257ea39f40aa1", "DELETE matches the binary");
+
+  const list = build({
+    method: "GET",
+    key: null,
+    query: [
+      ["list-type", "2"],
+      ["prefix", "p/"],
+      ["max-keys", "100"],
+      ["delimiter", "/"],
+    ],
+  });
+  ok(list.url === "http://127.0.0.1:9111/bkt/?delimiter=%2F&list-type=2&max-keys=100&prefix=p%2F", "list sorts and encodes its query: " + list.url);
+  ok(sigOf(list) === "dc58364e75148c38178172a3ac7399eadebae27bbd9bd91cd69c6231c954891b", "…and signs it the way the binary did");
+
+  // The header partition. `x-amz-*` in, everything else out — measured, not
+  // chosen: a signature over Range breaks the moment anything between the page
+  // and S3 rewrites it, and the binary does not take that risk either.
+  const ranged = build({ method: "GET", key: "hello.txt", extraHeaders: { range: "bytes=0-4" } });
+  ok(ranged.headers.range === "bytes=0-4", "a Range header goes on the wire");
+  ok(signedHeadersOf(ranged) === "host;x-amz-content-sha256;x-amz-date", "…and stays out of SignedHeaders, like the binary: " + signedHeadersOf(ranged));
+  ok(sigOf(ranged) === sigOf(get), "…so a ranged GET signs exactly like the whole-object GET");
+  const acl = build({ method: "PUT", key: "acl.txt", extraHeaders: { "x-amz-acl": "public-read", "x-amz-storage-class": "GLACIER" } });
+  ok(signedHeadersOf(acl) === "host;x-amz-acl;x-amz-content-sha256;x-amz-date;x-amz-storage-class", "x-amz-* headers ARE signed, sorted: " + signedHeadersOf(acl));
+  const token = buildS3Request({ config: { ...config, sessionToken: "SESSIONTOKEN123" }, method: "PUT", key: "tok.txt", date: DATE, hashers: H });
+  ok(signedHeadersOf(token) === "host;x-amz-content-sha256;x-amz-date;x-amz-security-token", "a session token rides as a signed x-amz-security-token: " + signedHeadersOf(token));
+
+  // Endpoint styles. Virtual-hosted moves the bucket into the Host header, which
+  // means it is signed there and NOT in the path — signing both is a classic way
+  // to get a 403 that looks like bad credentials.
+  // Key parsing, every case read off the binary. The surprises: Bun strips ANY
+  // `<scheme>://` prefix, not just `s3://`, so `file("https://host/x")` is the KEY
+  // `host/x` and not a URL fetch; nothing is normalised, so `..` stays in the key
+  // because S3 treats it as a name; and the first segment becomes the bucket only
+  // when none is configured. Guessing any of these produces a client that reads
+  // and writes the wrong object.
+  const B = freshBun();
+  const keyed = new B.S3Client({ accessKeyId: "A", secretAccessKey: "B", bucket: "b" });
+  const bucketless = new B.S3Client({ accessKeyId: "A", secretAccessKey: "B" });
+  const target = (client, key) => {
+    try { return decodeURIComponent(client.presign(key).split("?")[0].replace("https://s3.us-east-1.amazonaws.com/", "")); } catch (e) { return e.code; }
+  };
+  for (const [key, want, why] of [
+    ["https://example.com/x", "b/example.com/x", "an https:// URL is a key, scheme stripped — not a fetch"],
+    ["s3://other/k", "b/other/k", "an s3:// bucket is ignored when the client has one"],
+    ["gs://x/y", "b/x/y", "any scheme is stripped, not just s3://"],
+    ["file:///a/b", "b/a/b", "…and the extra slashes with it"],
+    ["/leading", "b/leading", "a leading slash is dropped"],
+    ["a//b", "b/a//b", "an interior empty segment is kept, because S3 keeps it"],
+    ["a/../b", "b/a/../b", "`..` is a key segment, not a path to resolve"],
+    ["", "ERR_S3_INVALID_PATH", "an empty key is refused"],
+  ]) {
+    ok(target(keyed, key) === want, "key " + JSON.stringify(key) + ": " + why + " (" + target(keyed, key) + ")");
+  }
+  ok(target(bucketless, "s3://bk/k") === "bk/k", "with no bucket configured, the first segment becomes the bucket");
+  ok(target(bucketless, "single") === "ERR_S3_INVALID_PATH", "…so a single-segment key has nowhere to go and is refused");
+
+  const vhost = buildS3Request({ config: resolveS3Config({ ...config, endpoint: undefined, virtualHostedStyle: true }, {}), method: "GET", key: "k", date: DATE, hashers: H });
+  ok(vhost.host === "bkt.s3.us-east-1.amazonaws.com" && vhost.path === "/k", "virtualHostedStyle puts the bucket in Host and drops it from the path: " + vhost.host + vhost.path);
+  ok(vhost.signed.canonicalRequest.split("\n")[1] === "/k", "…and signs the path without it");
+}
+
+// ---- 31) presign, independently recomputed -----------------------------------
+// A presigned URL is the one thing here a user can hand to somebody else, so it
+// is checked twice: against a URL a real bun printed, and against a SigV4 chain
+// written out longhand below over node:crypto. The longhand version shares no
+// code with the implementation, which is the only reason it is worth running.
+{
+  const crypto = nodeRequire("node:crypto");
+  const H = createSigv4Hashers(crypto);
+  const P = Date.parse("2026-08-04T08:19:18Z");
+  const cfg = resolveS3Config({ accessKeyId: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", region: "us-east-1", bucket: "examplebucket" }, {});
+  const url = presignS3Url({ config: cfg, key: "test.txt", expiresIn: 86400, date: P, hashers: H }).url;
+  ok(
+    url ===
+      "https://s3.us-east-1.amazonaws.com/examplebucket/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20260804%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260804T081918Z&X-Amz-Expires=86400&X-Amz-Signature=63cf5e3846368f52e09b90da572dd7fb829fe0ed9caa93994b17f880caa32382&X-Amz-SignedHeaders=host",
+    "presign reproduces the URL bun 1.3.6 printed for the same key, expiry and clock"
+  );
+
+  const q = new URL(url).searchParams;
+  ok(q.get("X-Amz-Algorithm") === "AWS4-HMAC-SHA256", "the URL carries X-Amz-Algorithm");
+  ok(q.get("X-Amz-Credential") === "AKIAIOSFODNN7EXAMPLE/20260804/us-east-1/s3/aws4_request", "…X-Amz-Credential with the full scope");
+  ok(q.get("X-Amz-Date") === "20260804T081918Z" && q.get("X-Amz-Expires") === "86400", "…X-Amz-Date and X-Amz-Expires");
+  ok(q.get("X-Amz-SignedHeaders") === "host", "…X-Amz-SignedHeaders=host, so the URL needs no headers to be usable");
+  ok(!/x-amz-content-sha256/i.test(url), "…and no content hash, which is header-signing only");
+  const params = [...q.keys()];
+  ok(JSON.stringify(params) === JSON.stringify([...params].sort()), "the query is in sorted order, as the canonical request requires: " + params.join(","));
+
+  // The independent chain: RFC-4 by hand, sharing nothing with bun-s3.js.
+  const hmac = (key, data) => crypto.createHmac("sha256", key).update(data, "utf8").digest();
+  const sha256hex = (data) => crypto.createHash("sha256").update(data, "utf8").digest("hex");
+  const canonicalQuery = [...q.entries()]
+    .filter(([k]) => k !== "X-Amz-Signature")
+    .map(([k, v]) => [encodeURIComponent(k), encodeURIComponent(v).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase())])
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([k, v]) => k + "=" + v)
+    .join("&");
+  const canonicalRequest = ["GET", "/examplebucket/test.txt", canonicalQuery, "host:s3.us-east-1.amazonaws.com", "", "host", "UNSIGNED-PAYLOAD"].join("\n");
+  const stringToSign = ["AWS4-HMAC-SHA256", "20260804T081918Z", "20260804/us-east-1/s3/aws4_request", sha256hex(canonicalRequest)].join("\n");
+  let signingKey = hmac("AWS4wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "20260804");
+  for (const part of ["us-east-1", "s3", "aws4_request"]) signingKey = hmac(signingKey, part);
+  const independent = crypto.createHmac("sha256", signingKey).update(stringToSign, "utf8").digest("hex");
+  ok(independent === q.get("X-Amz-Signature"), "a SigV4 chain written out longhand here signs the same URL identically: " + independent.slice(0, 16) + "…");
+
+  // Options that change the URL rather than only the signature.
+  const abcfg = resolveS3Config({ accessKeyId: "A", secretAccessKey: "B", bucket: "bkt" }, {});
+  ok(new URL(presignS3Url({ config: abcfg, key: "k", date: P, hashers: H }).url).searchParams.get("X-Amz-Expires") === "86400", "the default expiry is Bun's 86400 seconds");
+  const put = presignS3Url({ config: abcfg, key: "k", method: "PUT", expiresIn: 60, acl: "public-read", date: P, hashers: H }).url;
+  ok(new URL(put).searchParams.get("X-Amz-Acl") === "public-read", "presign('k', { acl }) signs the ACL into the URL");
+  ok(
+    put ===
+      "https://s3.us-east-1.amazonaws.com/bkt/k?X-Amz-Acl=public-read&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=A%2F20260804%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260804T081918Z&X-Amz-Expires=60&X-Amz-Signature=af5b3abb9179a001718a2fb67ef855b7142e2fa9303f96464c475bb606aacbca&X-Amz-SignedHeaders=host",
+    "…and the whole PUT URL is the binary's, ACL included"
+  );
+  ok(
+    presignS3Url({ config: resolveS3Config({ accessKeyId: "A", secretAccessKey: "B", bucket: "bkt", endpoint: "http://127.0.0.1:9000" }, {}), key: "k", date: P, hashers: H }).url.indexOf("%2Fauto%2Fs3%2F") !== -1,
+    "a custom endpoint with no region signs for region 'auto', which is what the binary does"
+  );
+
+  // The validation Bun does before signing, and it is fussier than it looks. Each
+  // of these was read off 1.3.6, including the misspelling and the fact that POST
+  // signs fine despite every message claiming four methods.
+  const B = freshBun();
+  const client = new B.S3Client({ accessKeyId: "A", secretAccessKey: "B", bucket: "bkt" });
+  const failure = (fn) => { try { fn(); return "ok"; } catch (e) { return e.code + ": " + e.message; } };
+  ok(failure(() => client.presign("k", { method: "POST" })) === "ok", "presign accepts POST, which the binary signs even though its error text lists four methods");
+  ok(failure(() => client.presign("k", { method: "get" })) === "ok", "…and a lowercase method, which it upper-cases");
+  ok(client.presign("k", { method: "" }) === client.presign("k"), "…and an empty method, which means GET");
+  ok(
+    failure(() => client.presign("k", { method: "PATCH" })) === "ERR_S3_INVALID_METHOD: Method must be GET, PUT, DELETE or HEAD when using s3:// protocol",
+    "a real HTTP method S3 has no use for is ERR_S3_INVALID_METHOD: " + failure(() => client.presign("k", { method: "PATCH" }))
+  );
+  ok(
+    failure(() => client.presign("k", { method: "GETX" })) === "ERR_INVALID_ARG_TYPE: method must be GET, PUT, DELETE or HEAD when using s3 protocol",
+    "…while a token that is not a method at all is ERR_INVALID_ARG_TYPE, with the lowercase wording: " + failure(() => client.presign("k", { method: "GETX" }))
+  );
+  for (const bad of [-1, 0, "abc"]) {
+    ok(
+      failure(() => client.presign("k", { expiresIn: bad })) === "ERR_INVALID_ARG_TYPE: expiresIn must be greather than 0",
+      "expiresIn " + JSON.stringify(bad) + " is refused in Bun's words, misspelling included"
+    );
+  }
+}
+
+// ---- 32) the browser is not the Bun binary: CORS and S3 errors ---------------
+// The failure this section exists for: in a page, a bucket with no CORS policy
+// makes fetch() reject with a bare `TypeError: Failed to fetch`. No status, no
+// body, nothing to log — it reads as a bug in the caller's own code, and the
+// caller cannot know that the fix is a bucket setting rather than their key. It
+// must not be confused with the other failure, a bucket that answered and said
+// no: that one has a status and an S3 error code, and this asserts both paths.
+{
+  const B = freshBun();
+  const client = new B.S3Client({ accessKeyId: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", region: "us-east-1", bucket: "bkt" });
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  const reply = (status, body, headers) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    headers: new Headers(headers || {}),
+    text: async () => body || "",
+    arrayBuffer: async () => new TextEncoder().encode(body || "").buffer,
+    json: async () => JSON.parse(body),
+  });
+  const stub = (handler) => {
+    seen.length = 0;
+    globalThis.fetch = async (url, init) => {
+      seen.push({ url, ...init });
+      return handler(url, init);
+    };
+  };
+
+  try {
+    // The blocked case. `TypeError: Failed to fetch` is Chrome's wording; Firefox
+    // says "NetworkError when attempting to fetch resource" and Safari something
+    // else again, so the rethrow is driven by the fetch REJECTING, not by the text.
+    stub(() => {
+      throw new TypeError("Failed to fetch");
+    });
+    let blocked = null;
+    try { await client.file("hello.txt").text(); } catch (e) { blocked = e; }
+    ok(blocked && blocked.code === "ERR_S3_REQUEST_BLOCKED", "a rejected fetch becomes ERR_S3_REQUEST_BLOCKED, not a bare TypeError: " + (blocked && blocked.code));
+    ok(/\bCORS\b/.test(blocked.message), "…and the message says CORS");
+    ok(/browser/i.test(blocked.message), "…and says the request came from a browser");
+    ok(/preflight/.test(blocked.message), "…and warns that x-amz-* headers trigger a preflight");
+    ok(/x-amz-content-sha256/.test(blocked.message) && /authorization/.test(blocked.message), "…and names the headers the policy has to allow");
+    ok(/no HTTP status to report/.test(blocked.message), "…and says plainly that nothing answered");
+    ok(/AccessDenied/.test(blocked.message), "…contrasting it with the S3 codes a bucket that DID answer would return");
+    ok(blocked.cause instanceof TypeError, "…keeping the original TypeError as `cause` for anyone who wants it");
+    ok(blocked.name === "S3Error", "…under the name Bun uses for its own S3 errors");
+
+    // The answered case. Same shape as Bun's: name, code from the XML, status, path.
+    stub(() => reply(403, '<?xml version="1.0" encoding="UTF-8"?><Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided.</Message></Error>'));
+    let denied = null;
+    try { await client.file("hello.txt").text(); } catch (e) { denied = e; }
+    ok(denied && denied.code === "SignatureDoesNotMatch", "a bucket that answers 403 gives S3's own error code: " + (denied && denied.code));
+    ok(denied.status === 403 && denied.path === "hello.txt", "…with the HTTP status and the key");
+    ok(!/CORS/.test(denied.message), "…and does NOT mention CORS, because the request plainly arrived");
+    ok(denied.message === "The request signature we calculated does not match the signature you provided.", "…using S3's Message verbatim: " + JSON.stringify(denied.message));
+
+    // A status with no usable body still has to say something. 404 is the one to
+    // check because `exists()` treats it as an answer rather than an error.
+    stub(() => reply(404, ""));
+    let missing = null;
+    try { await client.stat("nope.txt"); } catch (e) { missing = e; }
+    ok(missing && missing.code === "NoSuchKey" && missing.message === "The specified key does not exist.", "a bodyless 404 is still NoSuchKey with Bun's message: " + (missing && missing.code));
+    ok((await client.exists("nope.txt")) === false, "…while exists() reads that same 404 as false, not as a failure");
+
+    // The requests themselves, driven through the public API this time.
+    stub(() => reply(200, "hello world", { "content-type": "text/plain", "content-length": "11", etag: '"9a0364b9e99bb480dd25e1f0284c8555"', "last-modified": "Tue, 02 Jan 2024 03:04:05 GMT" }));
+    ok((await client.file("hello.txt").text()) === "hello world", "file().text() returns the body S3 sent");
+    ok(seen[0].method === "GET" && seen[0].url === "https://s3.us-east-1.amazonaws.com/bkt/hello.txt", "…from a GET to the path-style URL: " + seen[0].url);
+    ok(seen[0].headers.host === "s3.us-east-1.amazonaws.com", "…with an explicit Host header, the one thing SigV4 always signs");
+
+    stub(() => reply(206, "hello", { "content-range": "bytes 0-4/11" }));
+    ok((await client.file("hello.txt").slice(0, 5).text()) === "hello", "file().slice() reads a window");
+    ok(seen[0].headers.range === "bytes=0-4", "…as a Range header, so a slice of a large object transfers the slice: " + seen[0].headers.range);
+    ok(seen.length === 1, "…and slice() itself fetched nothing until something read it");
+
+    stub(() => reply(200, ""));
+    ok((await client.write("out.txt", "hello world")) === 11, "write() returns the number of bytes it sent");
+    ok(seen[0].method === "PUT" && seen[0].body.length === 11, "…as a single PUT carrying the body");
+    ok(seen[0].headers["content-type"] === "application/octet-stream", "…typed application/octet-stream like the binary, even for a string: " + seen[0].headers["content-type"]);
+    ok((await client.write("out.txt", "x", { type: "text/csv" })) === 1, "write(…, { type }) still returns the byte count");
+    ok(seen[1].headers["content-type"] === "text/csv", "…and sends the type the caller asked for");
+
+    stub(() => reply(200, ""));
+    ok((await client.delete("gone.txt")) === true, "delete() resolves true");
+    ok(seen[0].method === "DELETE", "…from a DELETE");
+
+    stub(() => reply(200, "", { "content-length": "11", etag: '"deadbeef"', "content-type": "text/plain", "last-modified": "Tue, 02 Jan 2024 03:04:05 GMT" }));
+    const stat = await client.stat("hello.txt");
+    ok(seen[0].method === "HEAD", "stat() is a HEAD, so it moves no bytes");
+    ok(stat.size === 11 && stat.etag === '"deadbeef"' && stat.type === "text/plain", "…and reports size, etag and type off the headers");
+    ok(stat.lastModified instanceof Date && stat.lastModified.toISOString() === "2024-01-02T03:04:05.000Z", "…with lastModified as a Date, which is Bun's shape");
+    ok((await client.size("hello.txt")) === 11, "size() is the same HEAD, reduced to the number");
+
+    // The second CORS trap, and the quiet one. A cross-origin response only shows
+    // script the headers the bucket lists in ExposeHeaders, so a HEAD can succeed
+    // with Content-Length and ETag invisible. stat() reports what it can see;
+    // size(), whose whole job is a number, refuses rather than returning null —
+    // null becomes 0 in arithmetic and the object looks empty.
+    stub(() => reply(200, "", { "content-type": "text/plain" }));
+    const hidden = await client.stat("hello.txt");
+    ok(hidden.size === null && hidden.etag === undefined, "with nothing exposed, stat() reports size null rather than inventing a number");
+    let hiddenErr = null;
+    try { await client.size("hello.txt"); } catch (e) { hiddenErr = e; }
+    ok(hiddenErr && hiddenErr.code === "ERR_S3_HEADER_NOT_EXPOSED", "…and size() throws instead of handing back null: " + (hiddenErr && hiddenErr.code));
+    ok(/ExposeHeaders/.test(hiddenErr.message) && /Content-Length/.test(hiddenErr.message), "…naming the CORS setting that fixes it");
+    ok(/browser rule, not an S3 one/.test(hiddenErr.message), "…and saying whose rule it is, since the same call works in the binary");
+
+    stub(() => reply(200, '<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>bkt</Name><Prefix>p/</Prefix><KeyCount>1</KeyCount><MaxKeys>100</MaxKeys><IsTruncated>true</IsTruncated><NextContinuationToken>tok</NextContinuationToken><Contents><Key>p/a.txt</Key><LastModified>2024-01-02T03:04:05.000Z</LastModified><ETag>&quot;abc123&quot;</ETag><Size>11</Size><StorageClass>STANDARD</StorageClass><Owner><ID>oid</ID><DisplayName>od</DisplayName></Owner></Contents><CommonPrefixes><Prefix>p/sub/</Prefix></CommonPrefixes></ListBucketResult>'));
+    const listed = await client.list({ prefix: "p/", maxKeys: 100, delimiter: "/" });
+    ok(seen[0].url === "https://s3.us-east-1.amazonaws.com/bkt/?delimiter=%2F&list-type=2&max-keys=100&prefix=p%2F", "list() asks for ListObjectsV2 with a sorted query: " + seen[0].url);
+    ok(listed.contents[0].key === "p/a.txt" && listed.contents[0].size === 11 && listed.contents[0].eTag === '"abc123"', "…and parses Contents into Bun's camelCase shape");
+    // stat() hands back a Date and list() hands back the raw ISO string. That is
+    // Bun, measured both ways, and it is the kind of inconsistency a shim
+    // "tidies up" into a bug: `list()` results that suddenly have Date methods.
+    ok(listed.contents[0].lastModified === "2024-01-02T03:04:05.000Z", "…with lastModified left as the string S3 sent, which is what list() does in Bun");
+    ok(listed.commonPrefixes[0].prefix === "p/sub/" && listed.isTruncated === true && listed.nextContinuationToken === "tok", "…plus commonPrefixes and the truncation cursor");
+    // The whole object, against what `bun run` printed for the same XML. Key order
+    // included: it is visible in a log and in JSON.stringify, and a field Bun omits
+    // when S3 omits it is different from one that is present and undefined.
+    ok(
+      JSON.stringify(listed) ===
+        '{"name":"bkt","prefix":"p/","nextContinuationToken":"tok","isTruncated":true,"keyCount":1,"maxKeys":100,"contents":[{"key":"p/a.txt","eTag":"\\"abc123\\"","lastModified":"2024-01-02T03:04:05.000Z","size":11,"storageClass":"STANDARD","owner":{"id":"oid","displayName":"od"}}],"commonPrefixes":[{"prefix":"p/sub/"}]}',
+      "…and the whole result serialises exactly as the binary's did, fields in Bun's order"
+    );
+    // Bun's own misspelling. `checksumAlgorithme` is the name callers destructure,
+    // so correcting it would break them; it is copied, not fixed.
+    stub(() => reply(200, '<?xml version="1.0"?><ListBucketResult><Name>bkt</Name><Prefix>p/</Prefix><Delimiter>/</Delimiter><KeyCount>1</KeyCount><MaxKeys>100</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>a</Key><LastModified>2024-01-02T03:04:06.000Z</LastModified><ETag>&quot;e2&quot;</ETag><Size>2</Size><StorageClass>GLACIER</StorageClass><ChecksumAlgorithm>CRC32</ChecksumAlgorithm></Contents></ListBucketResult>'));
+    const checksummed = await client.list({ delimiter: "/" });
+    ok(checksummed.contents[0].checksumAlgorithme === "CRC32", "a ChecksumAlgorithm arrives under Bun's misspelled `checksumAlgorithme`");
+    ok(checksummed.delimiter === "/" && checksummed.commonPrefixes === undefined, "…and a delimiter with no common prefixes leaves commonPrefixes off the result entirely");
+
+    // Bun.file()/Bun.write() route an s3:// path to the default client. With no
+    // credentials in this process that has to be the credentials error, which is
+    // also proof the routing happened at all.
+    let routed = "";
+    try { B.file("s3://bkt/k"); } catch (e) { routed = e.code || ""; }
+    ok(routed === "ERR_S3_MISSING_CREDENTIALS", "Bun.file('s3://…') goes to the S3 client, not the filesystem: " + routed);
+    ok(B.file("S3://bkt/k").name === "S3://bkt/k", "…while 'S3://' uppercase is a LOCAL file, as it is under bun — the test is case-sensitive there");
+
+    // A file remembers which bucket it came from. This is the bug that made it
+    // worth asserting: an S3File used to ask the client again through an
+    // `s3://bucket/key` string, and a client with a bucket of its own parsed that
+    // bucket a SECOND time — `client.file("s3://other/k")` on a client for `bkt`
+    // signed `/bkt/bkt/other/k`. Bun ignores the bucket in the URL when the client
+    // has one, so the key is `other/k` in `bkt`, and `name` keeps the whole
+    // scheme-stripped string it was given.
+    const embedded = client.file("s3://other/k");
+    ok(embedded.name === "other/k" && embedded.bucket === "bkt", "a bucket inside the path is ignored when the client has one: " + embedded.bucket + "/" + embedded.name);
+    ok(embedded.presign().indexOf("/bkt/other/k?") !== -1, "…and the presigned URL names that bucket once: " + embedded.presign().split("?")[0]);
+    ok(client.file("k").slice(0, 5).name === "k", "slice() keeps the name it was sliced from");
+
+    // The S3File surface, against the binary's prototype. The two sentinels are the
+    // interesting part: an unread S3File reports `size: NaN` (not 0, not null) and
+    // `lastModified: 2^52-1`, because answering either honestly would need a HEAD,
+    // and a getter that fires a network request is not something a caller can see.
+    const handle = client.file("k");
+    for (const m of ["text", "json", "arrayBuffer", "bytes", "formData", "slice", "stream", "exists", "stat", "delete", "unlink", "write", "presign", "writer"]) {
+      ok(typeof handle[m] === "function", "S3File." + m + "() exists, as it does on the binary's S3File");
+    }
+    ok(Number.isNaN(handle.size), "an unread S3File reports size NaN, which is the binary's sentinel: " + handle.size);
+    ok(handle.lastModified === 4503599627370495, "…and lastModified 2^52-1, WebKit's Blob placeholder: " + handle.lastModified);
+    ok(handle.type === "" && client.file("k", { type: "text/csv" }).type === "text/csv", "type is empty until given, and kept when given");
+    ok(handle.bucket === "bkt", "…and the file knows its bucket");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// ---- 33) the default client is the environment -------------------------------
+// `Bun.s3` is not a class, it is a client already built from process.env, and the
+// variable names and their precedence are part of the API: code written against a
+// deploy that sets AWS_* must not silently get an unconfigured client here. The
+// precedence below is measured — S3_* wins, and AWS_DEFAULT_REGION is not read at
+// all, which is worth pinning because every AWS SDK does read it.
+{
+  const withEnv = (env) => createBunRuntime({ process: { env, argv: ["bun"], cwd: () => "/" }, Buffer, require: nodeRequire }).Bun;
+  const scopeOf = (url) => decodeURIComponent(new URL(url).searchParams.get("X-Amz-Credential"));
+
+  const s3 = withEnv({ S3_ACCESS_KEY_ID: "AKID", S3_SECRET_ACCESS_KEY: "SECRET", S3_BUCKET: "from-env", S3_REGION: "eu-west-1" }).s3;
+  ok(typeof s3 === "object" && typeof s3.file === "function", "Bun.s3 is an object with the client methods on it, not a class");
+  const url = s3.presign("k");
+  ok(url.startsWith("https://s3.eu-west-1.amazonaws.com/from-env/k?"), "…pointed at the bucket and region from S3_*: " + url.split("?")[0]);
+  ok(scopeOf(url) === "AKID/" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "/eu-west-1/s3/aws4_request", "…signed with the S3_ACCESS_KEY_ID from the environment: " + scopeOf(url));
+
+  const aws = withEnv({ AWS_ACCESS_KEY_ID: "AWSKID", AWS_SECRET_ACCESS_KEY: "AWSSECRET", AWS_BUCKET: "aws-bucket", AWS_REGION: "ap-south-1" }).s3;
+  ok(aws.presign("k").startsWith("https://s3.ap-south-1.amazonaws.com/aws-bucket/k?"), "the AWS_* spellings work on their own: " + aws.presign("k").split("?")[0]);
+  const both = withEnv({ S3_ACCESS_KEY_ID: "S3KID", S3_SECRET_ACCESS_KEY: "S3SECRET", S3_REGION: "us-west-1", AWS_ACCESS_KEY_ID: "AWSKID", AWS_SECRET_ACCESS_KEY: "AWSSECRET", AWS_REGION: "ap-south-1", S3_BUCKET: "b" }).s3;
+  ok(scopeOf(both.presign("k")).startsWith("S3KID/"), "S3_* wins over AWS_* when both are set: " + scopeOf(both.presign("k")));
+  ok(scopeOf(both.presign("k")).indexOf("/us-west-1/") !== -1, "…for the region too");
+  const dflt = withEnv({ S3_ACCESS_KEY_ID: "A", S3_SECRET_ACCESS_KEY: "B", S3_BUCKET: "b", AWS_DEFAULT_REGION: "sa-east-1" }).s3;
+  ok(scopeOf(dflt.presign("k")).indexOf("/us-east-1/") !== -1, "AWS_DEFAULT_REGION is ignored, exactly as the binary ignores it: " + scopeOf(dflt.presign("k")));
+
+  // The two names that are easy to leave out and impossible to notice missing:
+  // without the session token an STS credential signs and is refused, and without
+  // the endpoint every request quietly goes to AWS instead of MinIO or R2.
+  const base = { S3_ACCESS_KEY_ID: "A", S3_SECRET_ACCESS_KEY: "B", S3_BUCKET: "b" };
+  for (const name of ["S3_SESSION_TOKEN", "AWS_SESSION_TOKEN"]) {
+    const url = withEnv({ ...base, [name]: "TOK" }).s3.presign("k");
+    ok(new URL(url).searchParams.get("X-Amz-Security-Token") === "TOK", name + " becomes X-Amz-Security-Token");
+  }
+  for (const name of ["S3_ENDPOINT", "AWS_ENDPOINT"]) {
+    const url = withEnv({ ...base, [name]: "http://127.0.0.1:9000" }).s3.presign("k");
+    ok(url.startsWith("http://127.0.0.1:9000/b/k?"), name + " redirects the client at an S3-compatible server: " + url.split("?")[0]);
+    ok(scopeOf(url).indexOf("/auto/") !== -1, "…signing for region 'auto' when no region is set, as the binary does");
+  }
+  ok(
+    withEnv({ ...base, S3_ENDPOINT: "http://s3e:1", AWS_ENDPOINT: "http://awse:1" }).s3.presign("k").startsWith("http://s3e:1/"),
+    "S3_ENDPOINT wins over AWS_ENDPOINT, like every other pair"
+  );
+
+  // No credentials. This must be an error and not a client that builds URLs
+  // nobody can use — and it must arrive on use, not on import, because reading
+  // `Bun.s3` at module scope has to stay safe.
+  const bare = withEnv({});
+  ok(typeof bare.s3 === "object", "an unconfigured Bun.s3 still exists rather than throwing on access");
+  for (const call of [() => bare.s3.presign("k"), () => bare.s3.file("k"), () => bare.s3.list({}), () => bare.s3.write("k", "v"), () => bare.s3.delete("k")]) {
+    let code = "";
+    let message = "";
+    try { const r = call(); if (r && typeof r.catch === "function") await r.catch((e) => { throw e; }); } catch (e) { code = e.code || ""; message = String(e.message || e); }
+    ok(code === "ERR_S3_MISSING_CREDENTIALS", "…and every call on it is ERR_S3_MISSING_CREDENTIALS: " + code);
+    ok(message === "Missing S3 credentials. 'accessKeyId', 'secretAccessKey', 'bucket', and 'endpoint' are required", "…in Bun's exact words: " + JSON.stringify(message.slice(0, 30)));
+  }
+  // Credentials but nowhere to put the object: a different error, in Bun's order.
+  // The binary reports the missing credentials FIRST when both are missing, so
+  // this only appears once the keys are there.
+  let noBucket = "";
+  try { new (withEnv({}).S3Client)({ accessKeyId: "A", secretAccessKey: "B" }).presign("k"); } catch (e) { noBucket = e.code + ": " + e.message; }
+  ok(noBucket === "ERR_S3_INVALID_PATH: Invalid S3 bucket, key combination", "credentials with no bucket is Bun's ERR_S3_INVALID_PATH: " + noBucket);
+  ok(new (withEnv({}).S3Client)({ accessKeyId: "A", secretAccessKey: "B" }).presign("s3://named/k").startsWith("https://s3.us-east-1.amazonaws.com/named/k?"), "…unless the path names the bucket, which s3:// URLs do");
+
+  // The statics take the credentials as their last argument, so a one-off call
+  // needs no client. They must not read the environment of the client they don't
+  // have.
+  let staticCode = "";
+  try { withEnv({}).S3Client.presign("k"); } catch (e) { staticCode = e.code || ""; }
+  ok(staticCode === "ERR_S3_MISSING_CREDENTIALS", "S3Client.presign('k') with no credentials argument refuses: " + staticCode);
+  ok(withEnv({}).S3Client.presign("k", { accessKeyId: "A", secretAccessKey: "B", bucket: "b" }).startsWith("https://s3.us-east-1.amazonaws.com/b/k?"), "…and signs when the call carries them");
+
+  // A secret in an enumerable field is a secret in every log line. Bun's client
+  // has no own properties; so does this one.
+  const client = new (withEnv({}).S3Client)({ accessKeyId: "A", secretAccessKey: "SECRETVALUE", bucket: "b" });
+  ok(Object.getOwnPropertyNames(client).length === 0, "an S3Client has no own properties, like Bun's: " + JSON.stringify(Object.getOwnPropertyNames(client)));
+  ok(JSON.stringify(client) === "{}" && !JSON.stringify(client).includes("SECRETVALUE"), "…so JSON.stringify(client) cannot leak the secret key");
+  const file = new (withEnv({}).S3Client)({ accessKeyId: "A", secretAccessKey: "SECRETVALUE", bucket: "b" }).file("k");
+  ok(Object.getOwnPropertyNames(file).length === 0 && !JSON.stringify(file).includes("SECRETVALUE"), "…and neither can stringifying a file handle from it");
+}
+
+// ---- 34) what a page cannot do, refused by name -----------------------------
+// Everything above is what works. These are the edges where the browser or an
+// unwritten piece stops the shim, and the point of the section is that each one
+// says so instead of half-working: a partial upload is worse than a refused one,
+// because it leaves an object behind.
+{
+  const B = freshBun();
+  const client = new B.S3Client({ accessKeyId: "A", secretAccessKey: "B", bucket: "bkt" });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, status: 200, headers: new Headers(), text: async () => "", arrayBuffer: async () => new ArrayBuffer(0) });
+  try {
+    // writer(): a real FileSink below the part size, a refusal above it. Bun
+    // switches to a multipart upload there; this cannot, and multipart from a page
+    // additionally needs the bucket to expose ETag to script.
+    const sink = client.file("small.bin").writer();
+    sink.write("chunk one");
+    sink.write(new Uint8Array([1, 2, 3]));
+    ok((await sink.end()) === 12, "writer() buffers and flushes as one PUT, returning the byte count");
+    let big = "";
+    try { client.file("big.bin").writer().write(new Uint8Array(6 * 1024 * 1024)); } catch (e) { big = String(e.message || e); }
+    ok(/multipart/i.test(big), "past 5 MiB it names multipart as the thing it will not do: " + JSON.stringify(big.slice(0, 60)));
+    ok(/not implemented in the Vivari shim/.test(big), "…at the SHIM tier, which is this repo's word for unwritten rather than impossible");
+    ok(/ETag/.test(big), "…and names the CORS setting multipart would need, so the refusal is actionable");
+
+    // A stream body is drained before the PUT. Bun 1.3.6 has a bug here — it
+    // stringifies the stream and uploads "[object ReadableStream]" — and this
+    // deliberately does not reproduce it, because reproducing it corrupts data.
+    let sent = null;
+    globalThis.fetch = async (url, init) => {
+      sent = init;
+      return { ok: true, status: 200, headers: new Headers(), text: async () => "" };
+    };
+    await client.write("s.txt", new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("streamed")); c.close(); } }));
+    ok(Buffer.from(sent.body).toString() === "streamed", "a ReadableStream body is drained into the PUT, not stringified: " + JSON.stringify(Buffer.from(sent.body).toString()));
+    ok(sent.headers["content-length"] === undefined || Number(sent.headers["content-length"]) === 8, "…with a length the browser can send, since fetch() cannot stream a request body here");
+
+    // A key containing `?` is the other place the binary loses data quietly: it
+    // truncates the key there and operates on a DIFFERENT object.
+    let q = "";
+    try { client.presign("report?v=2.csv"); } catch (e) { q = String(e.message || e); }
+    ok(/truncates a key at the first/.test(q), "a key containing '?' is refused with the binary's behaviour spelled out");
+    ok(/report/.test(q) && q.indexOf('"report"') !== -1, "…naming the key Bun would have used instead: " + JSON.stringify(q.slice(-90)));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// ---- 35) two failures that pointed at the wrong culprit ----------------------
+// Both of these reported a problem in a way that blamed the guest's code, which
+// is the expensive kind of wrong: the user goes looking in the wrong file.
+{
+  const B = freshBun();
+
+  // A missing command used to KILL THE CALLING GUEST. child_process.spawn is
+  // right not to throw (Node's contract is an async `error` event) but nothing
+  // listened, and an `error` with no listener is rethrown by EventEmitter, so a
+  // typo in a command name ended the program that typed it with a stack pointing
+  // into the runtime. Real Bun throws synchronously; both are now that.
+  for (const api of ["spawn", "spawnSync"]) {
+    let e = null;
+    try { B[api](["no-such-cmd-xyz"]); } catch (err) { e = err; }
+    ok(e !== null, "Bun." + api + "() throws for a command that is not on PATH, instead of killing the caller later");
+    ok(e && e.message === 'Executable not found in $PATH: "no-such-cmd-xyz"', "…in the binary's own words: " + JSON.stringify(e && e.message));
+    ok(e && e.code === "ENOENT", "…with the binary's ENOENT code, which callers branch on");
+  }
+  // A real path still spawns; the check must not become a PATH-only check.
+  const okRun = B.spawnSync(["/bin/sh", "-c", "exit 0"]);
+  ok(okRun && okRun.exitCode === 0, "…and an absolute path is still spawned, since it is not a PATH lookup");
+}
+
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Bun checks passed");
 process.exit(failed ? 1 : 0);

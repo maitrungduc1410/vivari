@@ -327,6 +327,18 @@ export function createBunFile({ lazy, Buffer, process }) {
     async blob() {
       return new Blob([this._read()], { type: this._type });
     }
+    // Parses the file as a form body. The type has to come from the file — Bun
+    // throws "Invalid encoding" for a Bun.file() with no content-type, because
+    // there is nothing in the bytes that says whether they are urlencoded or a
+    // multipart body, and guessing wrong silently returns an empty FormData.
+    // Give it one with Bun.file(path, { type }).
+    async formData() {
+      const type = this._type;
+      if (!type || !/^(multipart\/form-data|application\/x-www-form-urlencoded)\b/i.test(type)) {
+        throw new TypeError("Invalid encoding");
+      }
+      return new Response(this._read(), { headers: { "content-type": type } }).formData();
+    }
 
     // Bun returns a WHATWG ReadableStream. This builds one directly out of fd
     // reads rather than the obvious `Readable.toWeb(fs.createReadStream(...))`.

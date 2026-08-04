@@ -7190,3 +7190,718 @@ it 114px off centre, still fully inside the usable band.
 survives re-renders and a `flatVisible` change from expanding another folder; the ancestor rows
 still park at `depth * ROW_H` with the shallowest winning; the drag-over tint still fires; and the
 new-file input still lands 2px inside the band, which is the MR !158 fix it was written for.
+
+## Filling the cheap gaps, with the binary open beside us
+
+Eight per-algorithm hashers (`Bun.MD4` through `Bun.SHA512_256`), `Bun.randomUUIDv5`,
+`Bun.embeddedFiles`, `Bun.enableANSIColors`, `Bun.unsafe`, and loud refusals for
+`Bun.generateHeapSnapshot` and `Bun.openInEditor`. Individually small; the reason they
+are worth writing down is how they were checked.
+
+**A real `bun` binary is an oracle, and it changed two answers.** Everything here was
+run against bun-1.3.14 on linux-x64 before it was implemented, and twice the measured
+behaviour contradicted the reasonable guess:
+
+- The per-algorithm classes are **consumed** by `digest()` — `SHA256 hasher already
+  digested, create a new instance to update` — where `Bun.CryptoHasher` resets and is
+  reusable. Implementing them as CryptoHasher subclasses, the obvious move, would have
+  made reuse work in the sandbox and throw on the first real `bun` run. That is the
+  worst direction for a shim to be wrong in, and no amount of reading the published
+  types would have caught it: the types describe neither lifecycle.
+- `Bun.SHA256.hash(Bun.file(x))` **throws** in real Bun (`File blob cannot be used
+  here`), so the sync-VFS read that was half-written to support it was deleted. A
+  memory `Blob` does work there and cannot here — a Blob only yields bytes through a
+  promise in this realm — so that one is refused with a message that says how to get
+  the bytes. Strictness in the safe direction: what runs here runs there.
+
+Every digest and UUID in the spikes is a value that binary printed, and the UUID
+vectors agree with Python's `uuid.uuid5` as well — an implementation nobody here wrote.
+Round-tripping our own output would have proved nothing: a wrong-but-consistent hash
+input is self-consistent too, and only stops matching when it meets a system that did
+it right.
+
+**One algorithm has to be tested in the kernel tier.** A modern host OpenSSL refuses
+md4 (`digital envelope routines::unsupported`), so the offline tier says so out loud
+and skips that vector; Vivari's own Rust/Wasm codec does implement md4, and the kernel
+spike pins it there. Skipping in silence is how an algorithm ends up tested nowhere.
+## HTMLRewriter: 10,200 documents that had to come out identical
+
+Bun's `HTMLRewriter` is lol-html, the Rust engine Cloudflare Workers run, and the
+property people depend on is not the handler API — it is that a document you did not
+rewrite comes back **byte for byte**. Rewrite one attribute in a 200 KB page and the
+other 199 KB are unchanged: comments, odd quoting, stray whitespace, all of it.
+
+That single sentence rules out the obvious implementation. Parse to a tree, mutate,
+serialize, and every page you touch is silently reformatted — quotes normalized,
+whitespace collapsed, `<P CLASS='a'   data-x=1 >` returned as `<p class="a" data-x="1">`.
+It passes any test you would think to write and corrupts every real document. So this
+is a rewriter over the source text: tokens carry `[start, end)` offsets, untouched
+tokens are re-emitted as the original slice, and only a tag someone actually modified
+is rebuilt — keeping the other attributes' original spelling and quote style.
+
+**Verification is the interesting part.** An HTML rewriter that agrees with itself is
+trivial to write and impossible to trust, because its output always looks like
+plausible HTML. So the whole thing was built against a real bun-1.3.14 binary:
+
+- 136 hand-written cases (a realistic page, malformed markup, raw-text elements,
+  foreign content, every mutation, every selector form, every error string).
+- A deterministic fuzz cross-product: generated documents × rewrite recipes. Locally
+  **10,200 of 10,200** outputs are byte-identical to Bun's; 204 of them are committed
+  as a fixture so CI checks the same thing without the binary.
+
+The fuzz half paid for itself in one run. It found that a `<td>` at the top level of a
+document still has a sibling position, so `td:first-of-type` matched it in Bun and not
+here — every hand-written case had its elements nested inside something. The recorded
+corpus also settled a dozen questions no amount of reading would have: `<SPAN>` keeps
+its case when you add an attribute, `</p   >` is never reformatted, a self-closing tag
+is rebuilt as `<br a="1" />` with the space, `:nth-of-type` is supported but
+`:last-child` is not, `[data-x=1]` is a syntax error while `[data-x=b]` is not, and
+`transform(Blob)` throws despite being in the published types.
+
+**The one deliberate divergence** is `async` handlers on the string path. Bun drains
+them; JavaScript cannot, and silently dropping everything a handler does after its
+first `await` is the worst possible failure. That path throws and names the fix
+(`transform(new Response(html))`), which is awaited properly.
+
+## A full-stack Bun app with no client-side JavaScript (this change)
+
+The Bun tab could show you `Bun.serve`, `bun:sqlite` and (as of the change above)
+`HTMLRewriter`, one per template. What it could not show you was the three of them
+being an application, which is the only form in which anyone actually meets them. So
+the tenth template is a small issue board: `Bun.serve` routes it, `bun:sqlite` answers
+it out of three tables and a `LEFT JOIN`, and `HTMLRewriter` pours the rows into
+`public/index.html` on the way out.
+
+**There is no template language in it, and no client-side JavaScript at all.**
+`public/index.html` is a file you can open straight from the explorer and it renders —
+nothing in it is `{{ }}` or `<% %>`, just `data-slot` attributes on ordinary elements.
+That is the argument for a rewriter over a string template, and it is only worth
+anything because of the property the previous change was built around: everything the
+handlers were not pointed at comes back byte for byte. A designer can keep editing the
+`.html` file without knowing the server exists.
+
+**The second rewriter pass is the interesting one, and it is not about rendering.**
+Vivari serves a preview under `/preview/<port>/` and the Service Worker strips that
+prefix before the guest sees it. Subresources survive a missing prefix; a *navigation*
+does not, so `<a href="/issue/3">` leaves the preview and 404s against the Studio —
+the failure that shipped the session template broken on its first click. Every
+server-rendered app hits this, and the fix has always been "remember to concatenate
+`x-forwarded-prefix` onto every URL you emit", which is a thing to forget in one place
+out of nine. Here it is twelve lines of `HTMLRewriter` that run over the finished page
+and know nothing about issues: `a[href], link[href], form[action]`, skip anything that
+already resolves, prefix the rest. It is the same rewrite Cloudflare's own examples use
+the engine for, and it is what makes a multi-page server-rendered app clickable in the
+preview pane at all. `sites/docs/docs/bun.md` now says so, with the snippet, because
+this is sandbox-specific knowledge nobody can derive from Bun's documentation.
+
+**The tests ship inside the app rather than beside it.** 48 of them across three files
+— the SQL layer against `:memory:`, the rewriter against the real shells, the routes
+against real `Request` objects — using all four lifecycle hooks, the asymmetric
+matchers, `test.each`, `mock()` and `spyOn()`. Every route is a plain function of its
+inputs and `createApp` is the only thing that knows `Bun.serve` exists, so the suite
+never binds a port. That is deliberate: a test that starts a server is a test that can
+hang, and this repo has been hung by exactly that before. A second toy `bun test`
+template was considered and dropped — the existing one already covers the runner, and
+what was missing was tests against code worth testing.
+
+**Verified against the binary, not against itself.** Every page the template serves was
+captured from bun-1.3.14 on linux-x64 and then from Vivari, and diffed: the board, the
+filtered board, an issue page, and both of those again behind the preview prefix are
+**byte for byte identical**, modulo the `created_at` wall clock. `bun test` reports
+48 pass / 0 fail in both runtimes. `spike-bun-templates.mjs` now gates all of it from
+the shipped bytes — 26 assertions for this template, including the post/redirect/get
+flow and the prefix rewrite in both directions, because "no header means no rewrite" is
+half the contract and the half that would rot silently.
+
+**What writing it found.** `new Response(Bun.file(path))` — the first line anyone writes
+to serve a static asset — returns a `200` whose body is the string `[object Object]`.
+It is a *known* divergence (a `BunFile` here implements the Blob read protocol but is
+not a `Blob` instance, and neither available fix is portable across both tiers), it was
+pinned in the offline spike, and it was written down in the header of `bun-file.js` — in
+other words it was known everywhere except the one place a user looks. It is in the Bun
+docs page now, with the two spellings that work. Nothing about it changed in the
+runtime; the only new thing is that you can find out before it happens to you.
+
+The spike grew two capabilities on the way, both of which the next template gets for
+free: an `also` probe can now be a whole request (`method`, `headers`, `send`, expected
+`status` and `Location`) rather than a GET expecting 200, and a template can declare
+`tests`, which runs its own `bun test` from the shipped bytes and refuses a suite that
+discovered nothing — a floor on the pass count, and a separate assertion that the fail
+count is zero, because `0 pass, 0 fail` exits 0 too.
+
+## The realm a guest wakes up in: 228 globals that were never Bun's
+
+`new Worker("./w.ts")` reaching the *studio's* origin instead of the VFS was fixed by removing one
+name. The question that fix did not ask was how many other names were sitting there. The answer,
+measured rather than guessed: a Chrome 143 `DedicatedWorkerGlobalScope` has 332 own properties and
+35 more on its prototype chain, and **228 of them exist in neither a real `node` (141 globals) nor
+a real `bun` (168)**. All 228 were visible to guest code.
+
+Most were merely false — `WebGLRenderingContext` in a Node process is a lie a feature detection
+will believe, and believing it sends a library down its browser path inside a Bun program. A dozen
+were worse, because they were *capabilities that route around the kernel*: `importScripts`,
+IndexedDB and Cache Storage on the studio's origin, `FileSystemSyncAccessHandle` (the OPFS a
+persisted VFS lives in), `XMLHttpRequest`/`EventSource`/`WebTransport` — egress that never passes
+the Fetcher Worker, so no alias rewrite, no cookie jar, no record — plus `USB`, `HID`, `Serial`,
+`Notification`, and a `close()` that ends the worker under the kernel's feet.
+
+And one that was a channel rather than a capability. `process-worker.ts` does `self.onmessage = …`;
+that is the kernel's link to this process. A guest `addEventListener("message")` reads it: every
+stdin chunk, every fetch result, every signal the kernel delivers. The write half of that door was
+closed when the guest's `postMessage` was removed; this is the read half.
+
+**Shadowing, not deleting — and the difference is the fix.** 35 of the names are inherited, where
+`delete globalThis.x` finds no own property, removes nothing, and returns `true`; 17 of those are
+accessors, where assigning `undefined` throws instead. An own, writable, non-enumerable data
+property is the only form that works on all of them. It also happens to be exactly what the message
+channel needs: driven through a real headless Chrome, a message sent *after* the sweep still reached
+the ORIGINAL `onmessage` handler, while a guest assignment to `onmessage` landed in the shadow
+property and was never called. The kernel keeps its channel; the guest cannot see it, take it over,
+or listen on it.
+
+**The list is an allowlist, and it is a recording.** `packages/runtime/realm.js` keeps what a real
+node has and hides everything else, so a global Chrome ships next year is hidden by default instead
+of leaking until someone notices. `scripts/record-realm-globals.mjs` produces all three lists —
+`--node` and `--bun` from the binaries, `--browser` by driving a headless Chrome that loads a page,
+spawns a Worker, and has the worker report its own property table back. A spike asserts the copy
+embedded in the runtime still matches the recording, because the two can drift and only one of them
+runs.
+
+Two things had to be kept back from the sweep, and both are named at the point they are used rather
+than left as exceptions in a list. `os.hostname()` and the `host.vivari.internal` alias read
+`location.hostname` lazily — that is, after the sweep — so the value is captured at boot. Pyodide's
+`urllib` bridge feature-detects `XMLHttpRequest` and uses synchronous XHR, so `__ocInstallPython`
+hands it back to the realm a python guest runs in, and only there.
+
+The Bun side is not just absence. Bun's main thread *has* `postMessage`, `onmessage`,
+`addEventListener` and friends even with nobody on the other end, so those shapes exist for a bun
+guest — as a guest-local `EventTarget` nothing dispatches to, and a `postMessage` that takes
+anything and returns `undefined` (measured against the binary, along with `navigator.userAgent`
+being `Bun/x.y.z` and `reportError` printing without exiting). `alert`/`confirm`/`prompt` are the
+one honest gap: all three block on a line of stdin, and stdin arrives as kernel messages that cannot
+be delivered while a synchronous call is parked. They throw, naming the reason and the async
+alternative. Making them real needs a deferred stdin syscall — the kernel already parks `OP_ACCEPT`
+that way — which is a change to the protocol and belongs in its own pass.
+
+**Testing it needed the hazard to exist.** Node's global object has none of these names, so a sweep
+that never ran would have passed every check. `scripts/process-worker.mjs` therefore plants a
+browser-shaped realm under `VV_PLANT_BROWSER_REALM` — own and inherited, data and accessor — before
+the runtime is imported, and `scripts/spike-bun.mjs` asserts from inside a running bun and node
+guest that none of it survived, while `scripts/spike-realm.mjs` rebuilds the entire recorded worker
+global offline and sweeps that. Reverting `realm.js` turns both red.
+
+## `bun:jsc.serialize` was JSON, and JSON is a different problem
+
+`serialize`/`deserialize` are supposed to be structured clone. What was here was
+`JSON.stringify`/`JSON.parse`, which is not a weaker version of that — it is an encoding of a
+different value space. A `Map` came back `{}`. A `Date` came back a string. `{a: undefined}` came
+back `{}`. `-0` came back `0`. A BigInt and any cycle threw. Only the last two were loud; the rest
+handed back something that looked like the value and was not, which is the failure mode this
+codebase treats as the worst one.
+
+The bytes could not be matched — JSC's format is engine-internal and Bun's own documentation says
+the output is not portable — so the format here is Vivari's own, and everything *observable* is
+matched instead, recorded from bun 1.3.14: 35 round-trip cases, 4 refusals, 4 corrupt-input cases.
+Map, Set, Date, RegExp, BigInt, boxed primitives, TypedArrays, DataView, ArrayBuffer, Errors
+(name, message, stack) all survive; cycles survive; `{x: o, y: o}` comes back with `x === y`; two
+views onto one buffer come back as two views onto one buffer; a hole in a sparse array stays a
+hole; `-0` stays `-0`.
+
+Four details came out of the binary rather than out of the docs, and all four are now pinned:
+`serialize` returns a **SharedArrayBuffer** (not a Uint8Array); Error `cause` is **dropped** by
+real Bun, so it is dropped here rather than "improved"; `deserialize(new ArrayBuffer(0))` returns
+**null** rather than throwing; and a non-buffer argument gets a different sentence from corrupt
+bytes — `First argument must be an ArrayBuffer` versus `Unable to deserialize data.` The first run
+of the comparison matched 41 of 43 cases; those last two were the misses.
+
+Functions, symbols, WeakMaps and Promises are refused with a `DOMException` — the same type and
+sentence Bun and the browser both use — instead of being turned into `{}`.
+
+## `Bun.listen` was refused for a wall it never hit
+
+`Bun.listen` and `Bun.connect` threw "there is no raw TCP in a browser". Half of that is true — a
+tab cannot open a socket to the internet, and nothing here changes it — and the half that is false
+had been false for a long time: the VM has its own kernel-routed loopback network, `node:net` has
+been using it since `Bun.serve` worked, and two processes in the sandbox talking over TCP was never
+the impossible part. A Bun program that starts a server and connects to it was being refused for a
+limitation it never reached.
+
+The refusal moved from the API to the destination. Loopback works; an outside host throws a message
+that names the host you asked for and points at `fetch()`; binding a non-loopback interface throws
+one that points at `Bun.serve()`. TLS is refused rather than faked — there is no certificate
+authority on a virtual network, and a socket answering `authorized: true` about a plaintext link is
+a lie with security consequences, which is exactly the kind of comforting default this codebase
+treats as a bug.
+
+The surface came from the binary: `listen()` is synchronous and its listener has a real `.port`
+immediately, handlers get `(socket, Uint8Array)`, the socket carries a writable `.data`, and a
+refused connection **both** rejects the promise and calls `connectError` — code in the wild
+registers only one of the two, so doing only one would strand it.
+
+One thing did not survive the first run, and it is worth writing down: `server.listen(port, host)`
+leaves `address()` reporting port 0 for `port: 0` in this net stack, so the listener came back with
+a port nobody could connect to. Passing the port alone fixes it — the VM has exactly one loopback
+interface, and the hostname's real job is deciding whether the bind is allowed at all.
+
+`scripts/spike-bun-socket.mjs` proves it with two real processes on one socket, not just a server
+and client in the same program: the cross-process case is the one that exercises the kernel's
+routing rather than a loopback shortcut.
+
+## `bun init` printed "not implemented" — which is the first command in Bun's docs
+
+Five verbs — `init`, `create`, `pm`, `link`, `unlink` — shared one line in the CLI that printed
+"not implemented in the Vivari shim yet" and exited 1. The first of them is the first command on
+Bun's own getting-started page, so the shim's answer to "start a Bun project" was a refusal.
+
+`bun init` now writes Bun's template: `package.json` (name from the folder, `module`, `type`,
+`private`, `@types/bun` as a devDependency and `typescript` as a peer), `index.ts`,
+`tsconfig.json` **with its comments**, `README.md` and `.gitignore`, then installs. The files are
+byte-for-byte the binary's, recorded from a real `bun init -y`, including the two typos in Bun's
+own `.gitignore` (`_.log`, `report.[0-9]_...`). Matching a template people copy from is the whole
+job; "fixing" it here would be the drift, and the spike asserts the typo on purpose. Running init
+twice leaves existing files alone and does not report them as created.
+
+`bun pm` turned out to be mostly a question about the project on disk rather than about Bun, and
+the installs here are npm's, so the answers were already in the VFS: `ls` (direct by default,
+`--all` for the tree), `bin`, `pkg get|set|delete` by dotted path — with `set` parsing a JSON
+value, so `private=true` is a boolean and not the string — `why` through `npm explain`, `cache`
+and `pack`. The three that need a registry session (`whoami`, `view`, `scan`) are refused by name:
+there is no credential store in a sandbox and no way to prompt for a login.
+
+`bun create vite my-app` is `bunx create-vite my-app`, which already worked — the verb just never
+reached it. `bun create <user/repo>` clones over git and says so.
+
+The two `--react` templates are refused rather than approximated: they scaffold from a generator
+rather than from files in the binary, and pointing at `bun x create-vite` is more honest than
+writing a different React project and calling it Bun's.
+
+## 34 matchers that were a TypeError, not a failure
+
+`bun:test` had 53 of the 87 matchers real Bun's `expect()` exposes. The missing
+34 were not an inconvenience: a suite written against Bun that calls
+`expect(n).toBeOdd()` did not fail here, it crashed with "toBeOdd is not a
+function" — which sends the reader to their own code rather than to the runner.
+Ten of them were the Jest spellings (`toBeCalledWith`, `lastCalledWith`,
+`nthReturnedWith`) that any suite ported from Jest uses on its first line.
+
+The table is now recorded from the binary (`scripts/record-bun-test-api.mjs` →
+`scripts/fixtures/bun-test-api.json`) and a spike compares the two, so the next
+matcher Bun adds arrives as a failing check instead of as a crash in somebody's
+suite.
+
+Probing beat guessing twice. `toBeWithin` is half-open — `expect(2).toBeWithin(1, 2)`
+fails — and `toBeEmptyObject` accepts an empty ARRAY, a class instance, a
+null-prototype object and a function, while refusing `new Set()`, `new Date()`
+and `""`. What separates those is the internal slot rather than the key count, so
+the implementation checks the tag; a from-first-principles version gets the array
+wrong in both directions.
+
+`expect.assertions(n)` needed a counter, and the obvious place for it was wrong.
+Counting inside the matcher counts each assertion several times, because one
+`expect(x)` builds `.not`, `.resolves` and `.rejects` tables alongside the plain
+one. Bun's own report says "N expect() calls", which is the hint: the count
+belongs at `expect()`. It is verified by running four real tests through the
+runner and reading the report, since a counter checked by calling the function
+that sets it proves nothing.
+
+One refusal is a copy of Bun's: `expect.addSnapshotSerializer()` throws
+`Not implemented` in Bun 1.3 too. Accepting a serializer and then ignoring it
+would quietly change what snapshots contain, which is worse than saying no.
+
+## The kernel's other door: a message table a guest could post to
+
+Hardening the syscall path invited the obvious next question — is that the only way in? It is not.
+A Process Worker also posts messages to a handler table in the kernel, and in a browser
+`globalThis.postMessage` inside that worker posts *straight to the kernel*, because the kernel is
+the worker's creator. Guest code could therefore aim any entry in that table at a payload of its
+choosing, and fuzzing the nine handlers showed five that threw on a malformed one (`thread-spawn`
+died on a bare `{}`). Neither dispatch had a guard, so that throw escaped into `onmessage` and took
+the VM with it: every process, the VFS session, the preview.
+
+- **The handlers validate and drop.** A message with nothing to act on is ignored. Unlike a syscall
+  there is no caller parked on a reply, so silence is the whole correct response — what a handler
+  must never do is answer with an exception.
+- **Both dispatches are guarded**, the browser's and the Node harness's, so the next handler that
+  forgets a check costs a log line instead of a session.
+- **The capability is gone as well.** The runtime removes `postMessage` from the guest's global,
+  next to `Worker`. This is the same shape of bug as that leak — a host global visible to the guest
+  because they share one realm — except `Worker` was merely *wrong* while this one was *reachable*.
+
+**What made this awkward to prove.** The Node tier has no global `postMessage` for a guest to
+reach, which is precisely why it went unnoticed for so long, and it means the obvious assertion
+("a guest sees none") passes with the fix reverted. The worker entry now plants a browser-shaped
+one under an env flag so the spike watches it actually get removed; both new checks were run
+against reverted fixes to confirm they fail. The removal also forced the browser worker to capture
+`self.postMessage` at load: read it lazily and taking the global away would have silently killed
+every stdout byte and exit code, in the browser only, where no spike would have seen it. The
+vendored napi/wasm runtime turned out to select a transport by `typeof postMessage === "function"`
+— which rules out shadowing it with a throwing stub, and is why deletion (the value Node itself
+has) is the only safe form.
+
+
+## Reading the whole surface, instead of adding APIs one request at a time
+
+Every previous batch answered a question someone had already asked. This one
+enumerated `Bun`, `bun:jsc`, `bun:ffi` and `bun:test` from a real binary and
+diffed the lists, which found things nobody had thought to ask about.
+
+**Thirteen `Bun.*` names were absent, not refused.** That is the failure this
+project has a whole file (`bun-unsupported.js`) devoted to preventing: an absent
+property reads as `undefined`, which is a VALUE, so the read succeeds and the
+mistake surfaces later and elsewhere. Six were cheap and real — `cwd`, `origin`,
+`version_with_sha`, `fetch` (with `preconnect`), `jest`, `shrink` — and the rest
+joined the catalogue with a tier and a reason. The tier is the part worth
+getting right: `Bun.postgres` needs a raw TCP socket and never will work, while
+`Bun.S3Client` is HTTPS plus an unwritten SigV4 signer, so telling someone the
+wrong one costs them an afternoon.
+
+Two of the six looked obvious and were not. `Bun.origin` is `""` even while
+`Bun.serve` is running, and `Bun.fetch !== globalThis.fetch` in real Bun too, so
+the faithful shape is a wrapper rather than an alias. Both were read off the
+binary.
+
+**`Bun.JSONC` is not JSON5 with a different name.** The cheap implementation was
+right there — the vendored JSON5 parser handles comments, trailing commas,
+single quotes and hex — and it would have been wrong in the dangerous direction:
+JSON5 also accepts `NaN`, `Infinity`, a leading `+` and unquoted keys, all of
+which real Bun rejects. A config parser that accepts more than the real one is
+how a file works locally and fails in CI. Hand-written instead, and stricter
+than Bun in exactly two places, both refusals: an unquoted key (Bun returns
+`{"": 1}`, silently dropping the name) and a second root (Bun returns the first
+value and ignores the rest of the file).
+
+**`bun exec` was running the wrong thing entirely.** `bun x <package>` runs a
+package binary and `bun exec <command>` runs a shell command; both were wired to
+npx, so `bun exec 'echo hi && pwd'` searched the registry for a package named
+after the line. Fixing it surfaced a second gap one layer down: the VM's `sh`
+had no `exit` builtin, so `sh -c 'exit 3'` reported 127 — "not found", for
+something that is not a program — and everything through `Bun.$` saw the same
+wrong code.
+
+**`bun:jsc` had two members hiding in a list of impossible ones.** Most of it is
+a hatch into JavaScriptCore — the collector, the JIT tiers, the sampling
+profiler — and none of that is reachable from page code. But `setTimeZone` is
+just `process.env.TZ`, which Node re-reads, so it really does move `Date`; and
+draining the microtask queue needs no privilege at all. Refusing the family
+wholesale would have thrown those away.
+
+## The clock seam that was refused for the wrong reason
+
+`vi.useFakeTimers()` and `setSystemTime()` were refused here with a stated
+reason: the runtime's timers are the event loop's own, and there is no clock
+seam to swap out. That was a true sentence about `loop.js` and the wrong
+sentence about a test. The code under test does not call the loop; it calls the
+global `setTimeout`, and swapping the global IS the seam. Nothing in the loop
+changed — it keeps its own timers — and both features fell out of about a
+hundred lines. A refusal is a claim, and this one had never been re-read after
+the thing it described stopped being the obstacle.
+
+The binary decided the semantics, and two of them are not what you would guess.
+`setSystemTime` FREEZES the clock rather than offsetting it, so a duration
+measured across it is zero. And fake timers leave `Date` completely alone: the
+two features share a namespace and nothing else, so a test can use either
+without the other.
+
+One deliberate divergence, found by running it: `runAllTimers()` with a live
+`setInterval` never returns in real Bun — the probe had to be killed. Draining a
+queue that refills itself has no end. Ours stops after 100,000 firings and names
+the call that did it, because a hung test run reports nothing at all.
+
+## `Subprocess` was 6 of 19 members, and the missing one was `exitCode`
+
+Enumerating the prototypes of Bun's live objects — `Server`, `Subprocess`,
+`BunFile`, `Database`, `$` — turned up a gap that no refusal covered, because
+nothing had refused: `Bun.spawn()` returned an object with six properties, and
+`exitCode` was not among them. The idiom in Bun's own docs is `await p.exited;
+if (p.exitCode !== 0)`, which here compared `undefined !== 0` and took the
+failure branch after every SUCCESSFUL run. A missing API throws and you find it;
+a missing property reads as `undefined` and quietly inverts a branch.
+
+Two of the semantics are worth writing down, since guessing them wrong is what
+this class of bug is made of. `exitCode` stays `null` when a signal killed the
+process — the code lives in `signalCode` then — so treating it as a number is
+wrong exactly in the case you are checking for. And `killed` is true after ANY
+exit, not only after `kill()`.
+
+The same pass gave `$` its seven missing names — `cwd`/`env`/`nothrow`/`throws`
+set defaults for every command after them, and `ShellError` is what makes the
+`instanceof` check in Bun's docs work at all rather than silently taking the
+other branch — and `Bun.file().formData()`, which refuses a body with no
+content-type in Bun's own words rather than returning an empty `FormData`.
+
+## `Bun.spawn({ ipc })`: a channel the kernel had already built
+
+Three of `Subprocess`'s nineteen members were refusals: `send()` threw, `connected`
+was permanently false, and `disconnect()` did nothing. The refusal text said the
+VM's `child_process` has no `ipc` stdio, which was true and was also the wrong
+thing to be looking at. Nothing about this needed an fd.
+
+The kernel has had a full cross-process pipe for as long as `node:net`'s UNIX
+sockets have worked: `OP_PIPE_LISTEN` registers a socket path, `OP_PIPE_CONNECT`
+resolves it to a connection, and `pipe-data`/`pipe-shutdown`/`pipe-close` are
+relayed verbatim between the two ends by connId. `Bun.listen`/`Bun.connect` and
+Nuxt's dev worker both already run on it. So an IPC channel is a socket on a
+generated path: the parent listens before it spawns — `net.Server.listen` on a
+pipe path is synchronous all the way down to the syscall, so the listener is in
+the kernel's table by the time `Bun.spawn` returns — and the child dials it while
+it boots. No new opcode, no protocol change, no kernel edit at all.
+
+What the binary taught us was the shape, and most of it was not guessable. The
+child gets **Node's** fork surface, not a Bun one: `process.send`,
+`process.on("message")`, `process.connected`, `process.channel`,
+`process.disconnect()`, and nothing on the `Bun` global. The parent passes
+`NODE_CHANNEL_FD=3` — an AF_UNIX socket, not a FIFO — alongside
+`NODE_CHANNEL_SERIALIZATION_MODE`, and **both are already gone from
+`process.env` when the child's first line runs**. That deletion is not tidiness.
+`env` is what a process passes on when it spawns something itself, so an
+inherited channel address would send a grandchild dialling its grandparent's
+server, where it would be accepted as the child and interleave its frames into
+someone else's stream. We cannot inherit a descriptor — a Worker has none — so
+the socket path travels under a name of our own and is deleted just as early.
+
+The serialization was the part most likely to be got wrong by reading the docs.
+Bun's default mode is `"advanced"`, and advanced is a structured clone: a Map, a
+Set, a Date, a RegExp, a BigInt, a TypedArray and a cycle all survive it. This
+repo already had a structured clone, written for `bun:jsc.serialize` after that
+one turned out to be `JSON.stringify` wearing the wrong name, so the channel
+reuses it — including the `DataCloneError: The object can not be cloned.` it
+already threw, which is the exact sentence the binary throws for a function.
+
+Three surprises, in the order they arrived.
+
+The first: a child holding a `message` listener **does not exit**. The very first
+probe hung for twenty seconds, and the reason was not a bug in the probe — under
+real bun, an attached listener holds the child open until somebody disconnects,
+and a child that never attaches one exits the moment its script ends. That is the
+same rule as the `message`-listener gotcha this project has already been bitten
+by, arriving from the opposite direction, and it is implemented the same way: the
+socket is `unref()`d at boot and `ref()`d on the first `message` listener.
+
+The second: `Bun.spawn(["node", …], { ipc })` does not work under real bun unless
+you pass `serialization: "json"`. Node's advanced mode is `v8.serialize` and
+Bun's is a JSC structured clone, so the node child's messages simply never
+arrive — no error, no warning, nothing. Here both processes run the same runtime,
+so `"advanced"` works with a node child too, which makes the sandbox **looser**
+than production in a direction that costs someone a green suite and a red CI. It
+cannot be made stricter without faking a failure, so it warns once instead.
+
+The third came from trying to break the framing on purpose. A byte stream needs
+length-prefixed frames, so the frames were written; then the prefix was deleted
+and every chunk treated as a whole message, and `scripts/spike-bun.mjs` stayed
+completely green — two hundred messages in one tick, a 400 KB payload and all.
+In this VM one `socket.write()` becomes one `pipe-data` message, is relayed
+verbatim, and is handed to the reader as exactly one `data` event, so the kernel
+tier cannot tell a framed stream from an unframed one. A `net.Socket` is a byte
+stream regardless and promises none of that, so the framing stays — but it is now
+pinned where it can actually fail, in `scripts/spike-bun-offline.mjs`, by feeding
+the reader the splits and coalesces a stream is allowed to produce: five frames in
+one chunk, one frame across forty thousand chunks, a length prefix split down the
+middle, and a length past the cap. Reverting the framing fails that block on its
+first assertion. The kernel-tier claims were reworded to say only what they show.
+
+One thing was found and deliberately not fixed here, because it is older than this
+change and not about IPC: `Bun.spawn(["no-such-program"])` kills the calling guest.
+`child_process.spawn` correctly declines to throw and reports the failure as an
+`error` event instead — which is Node's contract — but nothing listens for it, and
+an `error` emitted on an EventEmitter with no listener is rethrown. Real Bun throws
+synchronously from `Bun.spawn` instead. It is an open item; the case was dropped
+from the ipc spike rather than left there testing somebody else's bug. It did leave
+one thing behind: the spike's "ran to completion" check used to be `!result.fatal`,
+which passes when the guest dies before reaching its own catch. It asserts a
+positive marker now, which is the same lesson as the ok-flag rule in AGENTS.md.
+
+## `Bun.Archive`: the name promises more than the binary does (this change)
+
+`Bun.Archive` was a SHIM-tier refusal whose message said the obvious thing — tar,
+zip, and the compression around them are bytes in and bytes out, nothing about
+them is browser-hostile. That was right about the capability and wrong about the
+scope, which only running the binary showed.
+
+**Reading a zip throws `Unrecognized archive format` in real Bun.** Not a
+subset-of-zip limitation: no zip at all, from a class named `Archive`. This is the
+kind of finding that changes what "done" means. Adding zip here was maybe fifty
+lines with the inflate the runtime already has, and it would have made every
+project that used it work in Vivari and fail on the deployment target — a shim
+that is a superset is a trap laid for the guest, not a favour. So a zip is refused
+in Bun's words, and the reason is written down where someone will look for it
+rather than left as a puzzle.
+
+**The writer ignores the extension.** `Bun.Archive.write("dist.zip", files)`
+produces 10240 bytes of tar named `dist.zip`. Only `{ compress: "gzip" }` changes
+anything. Matched, because a guest that reads those bytes back with the same API
+never notices and one that shells out to `unzip` fails identically on both
+runtimes — but documented in both places, since it is the sort of thing that gets
+diagnosed as a Vivari bug.
+
+**The Map quirk is real data loss.** `Bun.Archive.write(path, new Map([...]))`
+writes a valid, empty, 10240-byte tar and returns without complaint. A `Map` keeps
+its entries in internal slots, not enumerable own properties, so the object walk
+finds nothing and there is no error anywhere in the path. `new Map` is also
+exactly what you reach for after `files()` handed you one — the round trip
+`write(p, await archive.files())` loses every file. That is refused here with a
+message naming the shape, on the `Bun.JSONC` precedent: strictness is only safe in
+a refusal, and this one turns a silent empty archive into a stack trace on the
+guilty line. Three more shapes fail the same way and are refused with it — a
+`Set`, another `Archive` instance, and `Bun.file()` used as a value (which writes
+the entry with zero bytes, so the name survives and the contents do not).
+
+**What the tar format cost.** The reader was the easy half — the repo already had
+two copies of a ustar reader in kernel-host, and runtime builtins cannot import
+from there, so a third minimal one lives in the builtin. The writer had no prior
+art anywhere in the repo, and matching libarchive's header layout took more
+probing than expected. `ustar` splits a long path across `prefix` and `name` at a
+`/`; when it cannot, libarchive emits a pax extension header, and the rules for
+what goes in the pax record versus the real header (the basename truncated to 87
+bytes in one and 98 in the other) are not something to guess at. They were read
+off archives the binary produced. Verification runs both directions: entries the
+binary wrote are read here, and GNU `tar -tf` lists what this writes, pax long
+name included.
+
+Four tar variations turned up that a hand-built fixture would never have
+contained: GNU `L` long-name entries, pax `x` records overriding the path, a v7
+header whose typeflag is NUL rather than `'0'`, and typeflag `'7'` (contiguous
+file). The last two are regular files that an exact-match `=== "0"` check drops on
+the floor, so the archive reads as valid and short — which is how they were found.
+
+Verification is `node scripts/spike-bun-offline.mjs`, against fixtures recorded
+from bun 1.3.6 by `scripts/record-bun-archive.mjs` and archives generated by the
+host's `tar` and `zip`. The negative cases are the ones worth keeping honest: the
+first draft of them was every non-archive shorter than one 512-byte block, all of
+which the length check alone rejects. Deleting the header checksum validation
+entirely still passed the whole suite. The suite now feeds it a 4 KB non-tar, a
+1 KB text file and a real multi-entry deflated zip, and that same deletion breaks
+ten assertions.
+## `Bun.S3Client` from a browser tab — a signer, and a client that is not Bun's (this change)
+
+`Bun.S3Client` and `Bun.s3` were SHIM-tier refusals whose message named the two missing
+pieces: a SigV4 signer, and a bucket CORS policy. The first was work. The second turned out
+not to be a reason to refuse the API at all — it is a failure mode the API has to explain,
+which is a different job and the more interesting half of this change.
+
+**What the binary taught.** Reading `bun` 1.3.6 rather than AWS's documentation changed six
+decisions, and every one of them would have been wrong the other way:
+
+1. **Bun signs `x-amz-content-sha256: UNSIGNED-PAYLOAD` on every request, including `PUT`.**
+   The body is never hashed into the signature. Hashing it — the thing the AWS docs describe —
+   produces a request AWS rejects with `SignatureDoesNotMatch`, which reads as bad credentials.
+2. **Only `host` and the `x-amz-*` headers are signed.** `Range` and `Content-Type` go on the
+   wire outside the signature. That is legal (SigV4 requires only `host`) and it is the safer
+   choice: a signature covering headers a proxy may rewrite is a signature that breaks in
+   transit. A local HTTP server recording what the binary actually sent is what showed this;
+   the SignedHeaders list is `host;x-amz-content-sha256;x-amz-date` even for a ranged GET.
+3. **`Content-Type` defaults to `application/octet-stream` for everything** — including a
+   string body, and including a `Blob` that carries its own type, which Bun ignores. The
+   plausible guess (`text/plain;charset=utf-8` for strings) puts a different type on the
+   object than the binary does.
+4. **Missing credentials outrank a missing bucket.** With an empty environment,
+   `Bun.s3.presign("k")` is `ERR_S3_MISSING_CREDENTIALS`; the bucket complaint only appears
+   once the keys are there. Two things are wrong and the error names the first.
+5. **`presign` accepts `POST`** despite every one of its error messages listing four methods,
+   and it has *two* rejection paths: a real HTTP method S3 has no use for (`PATCH`) is
+   `ERR_S3_INVALID_METHOD` with a capitalised message, while a token that is not a method at
+   all (`GETX`, a number) is `ERR_INVALID_ARG_TYPE` with a lowercase one.
+6. **Two of the names callers destructure are misspelled in Bun.** `list()` returns
+   `checksumAlgorithme`, and a bad expiry says `expiresIn must be greather than 0`. Both are
+   copied. An error message is API surface — someone will paste it into a search box — and a
+   corrected field name is a silent `undefined` at the call site.
+
+`list()` also returns `lastModified` as the raw ISO string while `stat()` returns a `Date`.
+That inconsistency is Bun's, measured both ways. Tidying it up would give `list()` results
+`Date` methods they do not have on a real Bun run.
+
+**Why a client-side S3 client is a different object.** In the binary, `S3Client` owns its
+socket. Here the request is issued by the browser on the page's behalf, and the browser has
+three rules Bun does not:
+
+- **The request may never be made.** A signed request carries `authorization` and two
+  `x-amz-*` headers, none of them CORS-safelisted, so every call is preceded by a preflight
+  `OPTIONS` the bucket has to answer. When it does not, `fetch()` rejects with
+  `TypeError: Failed to fetch` — no status, no body, nothing to log, and it reads as a bug in
+  the caller's own code. That rejection is now caught and rethrown as
+  `ERR_S3_REQUEST_BLOCKED`, whose message says the request came from a browser tab, that the
+  bucket needs a policy allowing this origin and these named headers, that `x-amz-*` triggers
+  a preflight, and — the part that matters most — that this is **not** what a bucket refusing
+  you looks like. A refusal has an HTTP status and an S3 code; this has neither, and the
+  message says so in those words.
+- **The response may be unreadable.** Cross-origin JavaScript only sees the response headers
+  a bucket lists in `ExposeHeaders`. `stat()` therefore reports what it can see and `null`
+  for what it cannot, but `size()` — whose entire contract is a number — throws
+  `ERR_S3_HEADER_NOT_EXPOSED` naming the setting, because a `null` size becomes `0` in
+  arithmetic and an object looks empty.
+- **A request body cannot be streamed.** Browser `fetch()` has no duplex request stream on
+  the paths available here, so a `ReadableStream` body is drained and sent as one `PUT`.
+
+This only works at all because of the earlier egress fix: while the Fetcher Worker stripped
+non-safelisted headers from every host, a signed request went out **anonymous** and a public
+bucket answered `200` with the wrong bytes. That strip is scoped to the package registries
+now, which is what makes header-signed S3 possible from a tab. `presign()` is the one part of
+the surface that needs no policy whatsoever — the credential material is in the query string,
+no headers are sent, and an `<img src>` or a download link is not a page reading a response.
+
+**Validating the signer.** The `Bun.hash` lesson applies here more sharply than anywhere else:
+a wrong signature comes back as `403 SignatureDoesNotMatch`, indistinguishable from a wrong
+key, and there are no keys here to be right or wrong. A self-consistent signer would look
+exactly like a working one. So the signer is pinned to AWS's published **Signature Version 4
+Test Suite** (the fixture set mirrored in `awslabs/aws-c-auth` under
+`tests/aws-signing-test-suite/v4`): five cases — `get-vanilla`, `get-header-value-trim`,
+`get-utf8`, `get-vanilla-query-order-key-case`, `post-vanilla-query` — asserted as full
+canonical-request, string-to-sign and signature triples, in both the header and query-string
+flavours. On top of that, the requests the client builds are frozen against `Authorization`
+headers and presigned URLs captured off the binary with the clock injected, and the spike
+recomputes one presigned URL's signature with a SigV4 chain written out longhand over
+`node:crypto`, sharing no code with the implementation.
+
+**What is refused, and at which tier.** Multipart upload is **SHIM** — possible here,
+unwritten. `S3File.writer()` buffers and flushes a single `PUT`, which is what Bun does below
+its part size, and past 5 MiB it throws instead of starting an upload it cannot finish: a
+half-done multipart leaves an incomplete object and a bill, and completing one from a page
+needs `ExposeHeaders: ["ETag"]` so each part's tag is readable by script. Writing that against
+a policy nobody has tested would fail deep inside an upload rather than at the first call.
+Incremental request streaming is **SANDBOX**. And one refusal is aimed at the binary rather
+than the browser: a key containing `?` throws, because Bun truncates the key there and
+operates on a *different object* without a word — `presign("report?v=2.csv")` signs
+`/bucket/report`. Bun 1.3.6 has the matching bug for stream bodies, uploading the string
+`[object ReadableStream]`; that one is not reproduced either. Copying a data-loss bug for
+fidelity's sake is fidelity to the wrong thing.
+
+The credentials live in a `WeakMap` rather than on the instance, which is also what the binary
+looks like — `Object.getOwnPropertyNames(client)` is empty on both. An enumerable field
+holding a secret access key means `console.log(client)` prints it, and a file handle is the
+thing a debugging session logs.
+
+## Two failures that pointed at the wrong file (this change)
+
+Both of these were found while merging the work above, and neither is an API gap.
+They are the same bug in two costumes: a failure reported in a way that blames the
+caller's code.
+
+**A missing command killed the calling guest.** `Bun.spawn(["no-such-cmd"])` went
+to `child_process.spawn`, which correctly declines to throw — Node's contract is
+an asynchronous `error` event — and nothing listened for it. An `error` emitted on
+an EventEmitter with no listener is rethrown, so a typo in a command name ended
+the program that typed it, with a stack pointing into the runtime rather than at
+the typo. Real Bun throws from `Bun.spawn` synchronously, so fidelity and the fix
+turned out to be the same change: look the executable up before spawning and throw
+the binary's own `Executable not found in $PATH: "…"` with its `ENOENT`. An
+absolute path is still checked where it points rather than on PATH, because that
+is not a PATH lookup.
+
+**A CORS-blocked fetch said `TypeError: Failed to fetch` and nothing else.** A
+guest's `fetch` IS the tab's own, so a request to an origin with no CORS policy
+fails in the browser and never reaches the kernel. The message a browser gives
+page code is deliberately contentless — the difference between "no such host" and
+"that host refused your origin" is information about a network the page is not
+allowed to see — and read literally it looks like a bug in the guest. This is
+probably the single most common way a program that works under a real `bun` looks
+broken in Vivari, and it had no explanation anywhere: `bun.md` did not mention CORS
+once, despite `fetch` being listed as working.
+
+The rejection is now rewritten to name who made the decision, the URL, the
+`Access-Control-Allow-Origin` the target would need, and the preflight that a
+custom header triggers — while explicitly naming the unreachable-host case too,
+because the runtime cannot tell which of the two it was and inventing a diagnosis
+would be worse than the silence. It stays a `TypeError` with the browser's error as
+`cause`, since that is what callers branch on. The test for it is in the kernel
+tier and refuses a connection to prove it, since a refused connection produces the
+same opaque failure as a CORS block — which is exactly why one can stand in for
+the other.

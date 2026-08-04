@@ -113,6 +113,21 @@ function buildCodecs(codecModule, cryptoModule) {
 
 let selfPid = -1;
 
+// The ONLY way this worker talks back to the kernel — captured once, at load,
+// before any guest code exists.
+//
+// It has to be captured rather than read off `self` at each use, because the runtime
+// removes `postMessage` from the global the guest can see (see
+// packages/runtime/index.js). In a browser Worker that global is a real channel to
+// this worker's creator, which is the KERNEL: guest code could post
+// `{type:'thread-spawn'}` straight into the kernel's handler table, and several of
+// those handlers threw on a malformed message — taking the whole VM down, since the
+// dispatch had no guard. Removing the guest's access closes that door; this binding
+// is what keeps ours open. Reading the property lazily instead would mean the
+// removal silently killed every stdout byte, exit code and syscall wake this process
+// ever sends.
+const toKernel: (msg: unknown, transfer?: Transferable[]) => void = self.postMessage.bind(self);
+
 self.onmessage = async (event) => {
   const { type, sab, spec, fsPort, threadPort, codecModule, cryptoModule, debugSab } = event.data;
   if (type === "init") {
@@ -124,8 +139,8 @@ self.onmessage = async (event) => {
       fsPort, // #14: fs syscalls ring the File System Worker over this port
       threadPort, // #16 stage 2b: our parentPort, if we are a spawned thread
       debugSab, // breakpoint debugger command channel (present under a debug session)
-      postRaw: (msg, transfer) => self.postMessage(msg, transfer || []),
-      send: (msgType, extra) => self.postMessage({ type: msgType, ...extra }),
+      postRaw: (msg, transfer) => toKernel(msg, transfer || []),
+      send: (msgType, extra) => toKernel({ type: msgType, ...extra }),
       onReady: (c) => {
         control = c;
         flushBeforeReady(c);
@@ -147,7 +162,7 @@ self.onmessage = async (event) => {
       /* not available in this engine */
     }
     const stats = control && control.memStats ? control.memStats() : { modules: -1, esbuildInproc: false };
-    self.postMessage({ type: "proc-mem-reply", id: event.data.id, pid: selfPid, heap, ...stats });
+    toKernel({ type: "proc-mem-reply", id: event.data.id, pid: selfPid, heap, ...stats });
     return;
   }
   // Kernel nudge: a network request is queued for us — wake the event loop.

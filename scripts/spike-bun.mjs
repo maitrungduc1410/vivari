@@ -556,6 +556,74 @@ console.log("\n== bun run crypto.ts (CryptoHasher + password on the real runtime
   ok(got.includes("rt=true,false"), "…which verifies the right password and rejects the wrong one");
 }
 
+// 12b) The per-algorithm hash classes, on the same real wiring.
+//
+// The offline tier checks these against bun-1.3.14's vectors, but over the HOST's
+// OpenSSL — which refuses md4 outright on a modern build, so that one algorithm is
+// only ever exercised here, where the digest comes from Vivari's own Rust/Wasm
+// codec (packages/crypto). Two classes are enough to prove the wiring; md4 is here
+// because nothing else can prove it at all.
+console.log("\n== Bun.MD4 / Bun.SHA256 through the Wasm crypto codec ==");
+{
+  write("hashclasses.ts", [
+    "const out: string[] = [];",
+    "out.push('md4=' + Bun.MD4.hash('hello', 'hex'));",
+    "out.push('sha256=' + Bun.SHA256.hash('hello', 'hex'));",
+    "out.push('sha512_256=' + Bun.SHA512_256.hash('hello', 'hex'));",
+    "const h = new Bun.SHA256(); h.update('he'); h.update('llo');",
+    "out.push('split=' + h.digest('hex'));",
+    "try { h.update('more'); out.push('reuse=nothrow'); } catch (e: any) { out.push('reuse=' + e.message); }",
+    "out.push('uuid5=' + Bun.randomUUIDv5('www.example.com', 'dns'));",
+    "console.log('HASHCLASSES:' + JSON.stringify(out));",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "hashclasses.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  const m = o.match(/HASHCLASSES:(\[.*\])/);
+  const got = m ? JSON.parse(m[1]) : [];
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().split("\n")[0]);
+  ok(r.code === 0, "hashclasses.ts exits 0");
+  ok(got.includes("md4=866437cb7a794bce2b727acc0362ee27"),
+    "Bun.MD4 matches bun-1.3.14 — the algorithm the offline tier's OpenSSL cannot do");
+  ok(got.includes("sha256=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"), "Bun.SHA256 through the codec");
+  ok(got.includes("sha512_256=e30d87cfa2a75db545eac4d61baf970366a8357c7f72fa95b52d0accb698f13a"), "Bun.SHA512_256 through the codec");
+  ok(got.includes("split=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"), "two updates hash as one, in a real process");
+  ok(got.some((x) => x.startsWith("reuse=SHA256 hasher already digested")), "a digested hasher is consumed, in a real process");
+  ok(got.includes("uuid5=2ed6657d-e927-568b-95e1-2665a8aea6a2"), "Bun.randomUUIDv5 through the real crypto path");
+}
+
+// 12c) HTMLRewriter, in a real guest process.
+//
+// scripts/spike-html-rewriter.mjs pins the engine against 136 recorded answers
+// from a real bun binary, but it constructs the class directly. This is the part
+// that can only be proven here: that `HTMLRewriter` is a GLOBAL inside a bun
+// process — no import, no `Bun.` prefix — which is how every snippet on the
+// internet reaches it, and that it survives the trip through the loader.
+console.log("\n== HTMLRewriter as a global in a real bun process ==");
+{
+  write("rewrite.ts", [
+    "const page = `<!DOCTYPE html><html><head><title>old</title></head>" +
+      "<body><a href='/a'>A</a><a href='/b'>B</a><!--x--></body></html>`;",
+    "const out = new HTMLRewriter()",
+    "  .on('a[href]', { element(e) { e.setAttribute('href', 'https://cdn' + e.getAttribute('href')); } })",
+    "  .on('title', { text(t) { if (t.text) t.replace('new'); } })",
+    "  .onDocument({ comments(c) { c.remove(); } })",
+    "  .transform(page);",
+    "console.log('REWRITTEN:' + out);",
+    "const res = await new HTMLRewriter().on('p', { async element(e) { await Bun.sleep(1); e.setAttribute('async', 'ok'); } })",
+    "  .transform(new Response('<p>x</p>')).text();",
+    "console.log('RESPONSE:' + res);",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "rewrite.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (!/REWRITTEN:/.test(o) && r.stderr) console.log("  stderr:", r.stderr.trim().split("\n")[0]);
+  ok(r.code === 0, "rewrite.ts exits 0");
+  ok(o.includes("REWRITTEN:<!DOCTYPE html><html><head><title>new</title></head>"),
+    "the global rewrote the title and left the doctype and the untouched markup alone");
+  ok(o.includes(`<a href="https://cdn/a">A</a><a href="https://cdn/b">B</a></body>`),
+    "…rewrote both links and dropped the comment");
+  ok(o.includes(`RESPONSE:<p async="ok">x</p>`), "…and awaited an async handler on the Response path, inside the VM");
+}
+
 // N) bun:sqlite on the REAL Wasm VFS, in real processes.
 //
 // This is the end-to-end proof the offline tier cannot give: the offline spike drives
@@ -1143,6 +1211,353 @@ console.log("\n== bun run spawn-stream.ts (Readable.toWeb + Bun.spawn().stdout i
   ok(got.includes("exited:0"), "proc.exited still resolves the exit code");
 }
 
+// 12d) Bun's Subprocess is 19 members and ours was 6. The one that mattered is
+// `exitCode`: `await p.exited; if (p.exitCode !== 0)` read `undefined !== 0` and
+// took the failure branch after every SUCCESSFUL run. Two of the semantics here
+// are not what you would guess, and both were read off the 1.3 binary: exitCode
+// stays null when a signal killed the process (the code is in signalCode then),
+// and `killed` is true after ANY exit, not only after kill().
+console.log("\n== bun run subprocess.ts (Bun.spawn's Subprocess surface) ==");
+{
+  write("subprocess.ts", [
+    "const out: string[] = [];",
+    "(async () => {",
+    "  const p: any = Bun.spawn(['sh', '-c', 'exit 7']);",
+    "  out.push('before-exitCode:' + JSON.stringify(p.exitCode));",
+    "  out.push('before-killed:' + p.killed);",
+    "  try { p.send('x'); out.push('nochannel:returned'); } catch (e: any) { out.push('nochannel:' + e.message); }",
+    "  try { p.disconnect(); out.push('disconnect-nochannel:ok'); } catch (e: any) { out.push('disconnect-nochannel:' + e.message); }",
+    "  await p.exited;",
+    "  out.push('after-exitCode:' + p.exitCode);",
+    "  out.push('after-signalCode:' + JSON.stringify(p.signalCode));",
+    "  out.push('after-killed:' + p.killed);",
+    "  out.push('stdio-len:' + (Array.isArray(p.stdio) ? p.stdio.length : 'none'));",
+    "  out.push('terminal:' + JSON.stringify(p.terminal));",
+    "  out.push('ref-callable:' + (typeof p.ref === 'function' && typeof p.unref === 'function'));",
+    "  try { p.resourceUsage(); out.push('rusage:returned'); } catch (e: any) { out.push('rusage:' + String(e.message).slice(0, 130)); }",
+    "  try { p.send('x'); out.push('send:returned'); } catch (e: any) { out.push('send:' + e.message); }",
+    "  out.push('connected:' + p.connected);",
+    "  console.log('SUBPROCRESULT:' + JSON.stringify(out));",
+    "  process.exit(0);",
+    "})();",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "subprocess.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (LIVE) console.log(o);
+  const m = o.match(/SUBPROCRESULT:(\[.*\])/);
+  const got = m ? JSON.parse(m[1]) : [];
+  console.log("  ->", JSON.stringify(got));
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 800));
+  ok(got.includes("before-exitCode:null"), "Subprocess.exitCode is null while the process runs");
+  ok(got.includes("before-killed:false"), "…and killed is false until it is done");
+  ok(got.includes("after-exitCode:7"), "…and carries the real code after exit, which is the property scripts branch on");
+  ok(got.includes("after-signalCode:null"), "…with signalCode null when no signal was involved");
+  ok(got.includes("after-killed:true"), "…and killed true after any exit, as in Bun");
+  ok(got.includes("stdio-len:3"), "Subprocess.stdio is the three streams");
+  ok(got.includes("terminal:null"), "…terminal is null, since a pty was refused rather than faked");
+  ok(got.includes("ref-callable:true"), "…ref/unref exist so background-process code does not crash on them");
+  const rusage = got.find((s) => typeof s === "string" && s.startsWith("rusage:")) || "";
+  // The distinction the two tiers draw: this one is impossible in a page, not
+  // merely unwritten, so it must read as SANDBOX rather than SHIM.
+  ok(rusage.includes("not supported") && rusage.includes("getrusage"), "resourceUsage() refuses instead of inventing a zeroed getrusage: " + JSON.stringify(rusage));
+  // A Subprocess spawned WITHOUT `ipc` has no channel, and the two ways of saying
+  // so are different sentences in bun — the exited one wins even though the
+  // channel is also closed. Both were read off the 1.3.6 binary, and both are
+  // asserted verbatim because people search for an error string.
+  const noChannel = got.find((s) => typeof s === "string" && s.startsWith("nochannel:")) || "";
+  ok(
+    noChannel === "nochannel:Subprocess.send() can only be used if an IPC channel is open.",
+    "send() on a subprocess spawned without ipc refuses in Bun's words rather than dropping the message: " + JSON.stringify(noChannel),
+  );
+  ok(got.includes("disconnect-nochannel:ok"), "…while disconnect() on that same subprocess is a no-op, not a throw");
+  const send = got.find((s) => typeof s === "string" && s.startsWith("send:")) || "";
+  ok(
+    send === "send:Subprocess.send() cannot be used after the process has exited.",
+    "…and once it has exited, send() reports the EXIT rather than the closed channel, as bun does: " + JSON.stringify(send),
+  );
+  ok(got.includes("connected:false"), "…and connected reports no channel");
+}
+
+// 12e) Bun.spawn({ ipc }) — a real channel between two real processes.
+//
+// This one HAS to run here rather than in the offline tier: the whole subject is
+// two processes, each in its own worker, and the offline tier has neither. The
+// transport is the kernel's existing cross-process pipe (OP_PIPE_LISTEN /
+// OP_PIPE_CONNECT + the pipe-data relay), so the parent listens on a generated
+// socket path before it spawns and the child dials it while it boots.
+//
+// What this tier can and cannot show is worth being precise about. It shows the
+// surface, the lifecycle and what survives the crossing: 200 sends in one tick
+// arriving as 200 messages in order, a 400 KB message arriving whole, a Map and a
+// cycle still being a Map and a cycle, and a child that never reads its channel
+// still exiting instead of hanging its parent.
+//
+// It does NOT show that the length-prefix framing works, and it cannot: in this
+// VM one socket write is delivered as exactly one `data` event, so a reader that
+// ignored the prefix entirely would pass everything below. Deleting the framing
+// and re-running this file was tried; it stayed green. The framing is pinned in
+// scripts/spike-bun-offline.mjs instead, by feeding the reader the splits and
+// coalesces a byte stream is allowed to produce.
+console.log("\n== bun run ipc-parent.ts (Bun.spawn({ ipc }) across two processes) ==");
+{
+  write("ipc-child.ts", [
+    "import { writeFileSync } from 'node:fs';",
+    "const seen: any = {",
+    "  connectedAtStart: process.connected,",
+    "  sendType: typeof process.send,",
+    "  hasChannel: !!process.channel,",
+    "  disconnectType: typeof process.disconnect,",
+    // If either of these survived into the child's environment, everything the
+    // child spawns would inherit the parent's channel address and dial it.
+    "  envChannelGone: process.env.VV_IPC_CHANNEL === undefined,",
+    "  envModeGone: process.env.NODE_CHANNEL_SERIALIZATION_MODE === undefined,",
+    "};",
+    "process.on('message', (m: any) => {",
+    "  if (m.kind === 'echo') process.send({ kind: 'echoed', text: m.text });",
+    "  else if (m.kind === 'burst') { for (let i = 0; i < m.n; i++) process.send({ kind: 'n', i }); }",
+    "  else if (m.kind === 'big') process.send({ kind: 'big-back', len: m.payload.length, shape: /^\\[x+\\]$/.test(m.payload) });",
+    "  else if (m.kind === 'big-please') process.send({ kind: 'big-down', payload: '[' + 'y'.repeat(m.n) + ']' });",
+    "  else if (m.kind === 'clone') {",
+    "    process.send({ kind: 'clone-back', map: m.map, when: m.when, bytes: m.bytes, huge: m.huge, re: m.re,",
+    "      cycleHeld: m.cyc.self === m.cyc, mapIsMap: m.map instanceof Map, dateIsDate: m.when instanceof Date });",
+    "  }",
+    "  else if (m.kind === 'quit') process.send({ kind: 'bye' });",
+    "});",
+    // Everything the child can only observe AFTER the parent hangs up goes to a
+    // file, because by then there is no channel left to report it on.
+    "process.on('disconnect', () => {",
+    "  seen.connectedAfterDisconnect = process.connected;",
+    "  seen.lateSendReturned = process.send({ late: true });",
+    "  seen.disconnectEventFired = true;",
+    "  writeFileSync('/app/child-view.json', JSON.stringify(seen));",
+    "});",
+    "process.send({ kind: 'ready', seen });",
+  ].join("\n"));
+
+  // A child that gets a channel and never touches it. Under real bun this exits
+  // the instant its script ends; a channel wired eagerly makes it immortal and
+  // hangs the parent with it.
+  write("ipc-quiet.ts", [
+    "process.send({ kind: 'quiet-hello', connected: process.connected });",
+  ].join("\n"));
+
+  // A NODE child, not a bun one. It works here because both processes run this
+  // same runtime — under real bun it would need serialization: 'json', which is
+  // the divergence the warning below exists to announce.
+  write("ipc-node-child.js", [
+    "process.send({ from: 'node-child', when: new Date(86400000), connected: process.connected });",
+  ].join("\n"));
+
+  write("ipc-parent.ts", [
+    "const r: any = {};",
+    "const BIG = 400000;", // far larger than any single relay chunk
+    "const deadline = (label: string, ms: number) => new Promise((_, rej) => setTimeout(() => rej(new Error('timed out waiting for ' + label)), ms));",
+    "(async () => {",
+    "  // --- the main channel ---------------------------------------------------",
+    "  const got: any[] = [];",
+    "  const waiters = new Map<string, (m: any) => void>();",
+    "  const next = (kind: string, ms = 20000) =>",
+    "    Promise.race([new Promise<any>((res) => waiters.set(kind, res)), deadline(kind, ms)]);",
+    "  const proc: any = Bun.spawn(['bun', 'run', 'ipc-child.ts'], {",
+    "    ipc(message: any, subprocess: any) {",
+    "      got.push(message);",
+    "      r.handlerSecondArgIsSubprocess = subprocess === proc;",
+    "      const w = waiters.get(message.kind);",
+    "      if (w) { waiters.delete(message.kind); w(message); }",
+    "    },",
+    "  });",
+    "  r.connectedImmediately = proc.connected;",
+    "  const ready = await next('ready');",
+    "  r.childSeen = ready.seen;",
+    "",
+    "  // --- parent -> child -> parent -----------------------------------------",
+    "  r.sendReturned = proc.send({ kind: 'echo', text: 'ping' });",
+    "  r.echoed = (await next('echoed')).text;",
+    "",
+    "  // --- 200 sends in one tick, in order and all present --------------------",
+    "  proc.send({ kind: 'burst', n: 200 });",
+    "  const numbers: number[] = [];",
+    "  await Promise.race([",
+    "    new Promise<void>((res) => { waiters.set('n', function push(m: any) { numbers.push(m.i); if (numbers.length === 200) res(); else waiters.set('n', push); }); }),",
+    "    deadline('the 200-message burst', 30000),",
+    "  ]);",
+    "  r.burstCount = numbers.length;",
+    "  r.burstInOrder = numbers.every((v, i) => v === i);",
+    "",
+    "  // --- one message bigger than a relay chunk, both directions -------------",
+    "  proc.send({ kind: 'big', payload: '[' + 'x'.repeat(BIG) + ']' });",
+    "  const bigBack = await next('big-back');",
+    "  r.bigUpLen = bigBack.len;",
+    "  r.bigUpIntact = bigBack.shape && bigBack.len === BIG + 2;",
+    "  proc.send({ kind: 'big-please', n: BIG });",
+    "  const bigDown = await next('big-down');",
+    "  r.bigDownIntact = /^\\[y+\\]$/.test(bigDown.payload) && bigDown.payload.length === BIG + 2;",
+    "",
+    "  // --- what survives: the default mode is a structured clone, not JSON ----",
+    "  const cyc: any = { name: 'cyc' }; cyc.self = cyc;",
+    "  proc.send({ kind: 'clone', map: new Map([['a', 1]]), when: new Date(86400000), bytes: new Uint8Array([1, 2, 250]), huge: 2n ** 70n, re: /ab+c/gi, cyc });",
+    "  const back = await next('clone-back');",
+    "  r.mapSurvived = back.mapIsMap && back.map instanceof Map && back.map.get('a') === 1;",
+    "  r.dateSurvived = back.dateIsDate && back.when instanceof Date && back.when.getTime() === 86400000;",
+    "  r.bytesSurvived = back.bytes instanceof Uint8Array && back.bytes[2] === 250;",
+    "  r.bigintSurvived = typeof back.huge === 'bigint' && back.huge === 2n ** 70n;",
+    "  r.regexpSurvived = back.re instanceof RegExp && back.re.source === 'ab+c' && back.re.flags === 'gi';",
+    "  r.cycleSurvived = back.cycleHeld;",
+    "  try { proc.send({ fn: () => 1 }); r.unclonable = 'accepted'; } catch (e: any) { r.unclonable = e.name + ': ' + e.message; }",
+    "  try { proc.send(undefined); r.bareUndefined = 'accepted'; } catch (e: any) { r.bareUndefined = e.name + ': ' + e.message; }",
+    "",
+    "  // --- disconnect() closes both ends --------------------------------------",
+    "  proc.send({ kind: 'quit' });",
+    "  await next('bye');",
+    "  proc.disconnect();",
+    "  r.connectedAfterDisconnect = proc.connected;",
+    "  try { proc.send({ kind: 'echo', text: 'too late' }); r.sendAfterDisconnect = 'accepted'; } catch (e: any) { r.sendAfterDisconnect = e.message; }",
+    "  proc.disconnect();", // must be idempotent
+    "  r.doubleDisconnect = 'ok';",
+    "  r.exitCode = await Promise.race([proc.exited, deadline('the child to exit after disconnect', 30000)]);",
+    "  r.connectedAfterExit = proc.connected;",
+    "  try { proc.send({ kind: 'echo' }); r.sendAfterExit = 'accepted'; } catch (e: any) { r.sendAfterExit = e.message; }",
+    "  try { r.childView = JSON.parse(await Bun.file('/app/child-view.json').text()); } catch (e: any) { r.childView = 'unreadable: ' + e.message; }",
+    "",
+    "  // --- a child that never reads the channel must still exit ---------------",
+    "  const quietSeen: any[] = [];",
+    "  const quiet: any = Bun.spawn(['bun', 'run', 'ipc-quiet.ts'], { ipc(m: any) { quietSeen.push(m); } });",
+    "  r.quietExit = await Promise.race([quiet.exited, deadline('a child that never reads its channel to exit', 30000)]);",
+    "  r.quietGot = quietSeen.length === 1 && quietSeen[0].kind === 'quiet-hello' && quietSeen[0].connected === true;",
+    "  r.quietConnectedAfterExit = quiet.connected;",
+    "",
+    "  // --- a node child gets the same channel, and the gap is announced -------",
+    "  const nodeSeen: any[] = [];",
+    "  const np: any = Bun.spawn(['node', 'ipc-node-child.js'], { ipc(m: any) { nodeSeen.push(m); } });",
+    "  r.nodeExit = await Promise.race([np.exited, deadline('a node child', 30000)]);",
+    "  r.nodeGot = nodeSeen.length === 1 && nodeSeen[0].from === 'node-child' && nodeSeen[0].connected === true;",
+    "  r.nodeKeptDate = nodeSeen.length === 1 && nodeSeen[0].when instanceof Date;",
+    "",
+    "  // --- serialization: 'json' is the other mode, and it loses all of that ---",
+    "  const jsonSeen: any[] = [];",
+    "  const jp: any = Bun.spawn(['bun', 'run', 'ipc-child.ts'], { serialization: 'json', ipc(m: any) { jsonSeen.push(m); } });",
+    "  await Promise.race([new Promise<void>((res) => { const t = setInterval(() => { if (jsonSeen.length) { clearInterval(t); res(); } }, 20); }), deadline('the json-mode child', 20000)]);",
+    "  jp.send({ kind: 'clone', map: new Map([['a', 1]]), when: new Date(86400000), bytes: new Uint8Array([1, 2, 250]), huge: 7, re: /x/, cyc: { self: null } });",
+    "  const jsonBack = await Promise.race([new Promise<any>((res) => { const t = setInterval(() => { const hit = jsonSeen.find((m) => m.kind === 'clone-back'); if (hit) { clearInterval(t); res(hit); } }, 20); }), deadline('the json-mode reply', 20000)]);",
+    "  r.jsonMapIsPlain = !(jsonBack.map instanceof Map) && typeof jsonBack.map === 'object';",
+    "  r.jsonDateIsString = typeof jsonBack.when === 'string';",
+    "  jp.kill();",
+    "  await jp.exited;",
+    "",
+    // An explicit marker, because the guest can die without reaching the catch
+    // below (an uncaught 'error' emit does exactly that), and an absent `fatal`
+    // would then read as success.
+    "  r.completed = true;",
+    "  console.log('IPCRESULT:' + JSON.stringify(r));",
+    "  process.exit(0);",
+    "})().catch((e) => { console.log('IPCRESULT:' + JSON.stringify({ ...r, fatal: String(e && e.message || e) })); process.exit(1); });",
+  ].join("\n"));
+
+  const run = await kernel.start("bun", ["run", "ipc-parent.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (run.stdout || "") + (run.stderr || "");
+  if (LIVE) console.log(o);
+  const m = o.match(/IPCRESULT:(\{.*\})/);
+  const r = m ? JSON.parse(m[1]) : {};
+  if (!m && run.stderr) console.log("  stderr:", run.stderr.trim().slice(0, 1200));
+  console.log("  ->", JSON.stringify(r).slice(0, 700));
+  ok(r.completed === true, "the ipc parent ran every case to completion" + (r.fatal ? ": " + r.fatal : ""));
+
+  const childSeen = r.childSeen || {};
+  ok(r.connectedImmediately === true, "Subprocess.connected is true as soon as Bun.spawn({ipc}) returns, before the child has dialled in");
+  ok(childSeen.connectedAtStart === true && childSeen.sendType === "function", "the child sees process.send and process.connected — Node's fork surface, which is what the bun binary hands a child");
+  ok(childSeen.hasChannel === true && childSeen.disconnectType === "function", "…along with process.channel and process.disconnect()");
+  ok(
+    childSeen.envChannelGone === true && childSeen.envModeGone === true,
+    "the channel address is gone from the child's env before its first line, so a GRANDCHILD cannot inherit it and dial the parent's server",
+  );
+  ok(r.handlerSecondArgIsSubprocess === true, "the ipc handler's second argument is the Subprocess, which is what lets a handler reply");
+  ok(r.sendReturned === true && r.echoed === "ping", "a message goes parent -> child and an answer comes back child -> parent");
+  ok(r.burstCount === 200, "all 200 messages sent in ONE tick cross the process boundary — none coalesced away, none dropped");
+  ok(r.burstInOrder === true, "…and they arrive in the order they were sent");
+  ok(r.bigUpIntact === true, "a 400002-byte message crosses parent -> child whole, well past anything the relay was built for: len=" + r.bigUpLen);
+  ok(r.bigDownIntact === true, "…and child -> parent too");
+  ok(r.mapSurvived === true, "a Map arrives as a Map — the default mode is a structured clone, and JSON would have delivered {}");
+  ok(r.dateSurvived === true, "…a Date as a Date, not as an ISO string");
+  ok(r.bytesSurvived === true, "…a Uint8Array with its bytes");
+  ok(r.bigintSurvived === true, "…a BigInt, which JSON cannot even encode");
+  ok(r.regexpSurvived === true, "…and a RegExp with its flags");
+  ok(r.cycleSurvived === true, "a cycle survives with its identity intact, where JSON.stringify would have thrown");
+  ok(
+    r.unclonable === "DataCloneError: The object can not be cloned.",
+    "an unclonable value is refused at the send() call in the binary's own words, not dropped: " + JSON.stringify(r.unclonable),
+  );
+  ok(
+    r.bareUndefined === 'TypeError: The "message" argument must be specified',
+    "…and send(undefined) says so, which is the mistake behind a value that turned out not to exist: " + JSON.stringify(r.bareUndefined),
+  );
+  ok(r.connectedAfterDisconnect === false, "disconnect() flips connected to false on the parent");
+  ok(
+    r.sendAfterDisconnect === "Subprocess.send() can only be used if an IPC channel is open.",
+    "…and send() then refuses rather than queueing into a channel nobody will read: " + JSON.stringify(r.sendAfterDisconnect),
+  );
+  ok(r.doubleDisconnect === "ok", "…and calling disconnect() twice is not an error");
+  const childView = r.childView || {};
+  ok(childView.disconnectEventFired === true, "the CHILD gets a 'disconnect' event when the parent hangs up, instead of waiting on a dead socket");
+  ok(childView.connectedAfterDisconnect === false, "…its process.connected goes false");
+  ok(childView.lateSendReturned === false, "…and its process.send() returns false rather than throwing, which is what the binary does");
+  ok(r.exitCode === 0, "the child exits cleanly once the channel is closed, instead of being held open by its own message listener");
+  ok(r.connectedAfterExit === false, "a child that has exited reports connected === false");
+  ok(
+    r.sendAfterExit === "Subprocess.send() cannot be used after the process has exited.",
+    "…and send() names the EXIT rather than the closed channel, as bun does: " + JSON.stringify(r.sendAfterExit),
+  );
+  ok(r.quietGot === true, "a child that never attaches a message listener can still send");
+  ok(r.quietExit === 0, "…and still exits on its own, so an unread channel does not make every child immortal and hang the parent");
+  ok(r.quietConnectedAfterExit === false, "…leaving the parent's connected false");
+  ok(r.nodeGot === true && r.nodeExit === 0, "a NODE child gets the same channel and the same process.send, since both ends are this one runtime");
+  ok(r.nodeKeptDate === true, "…and its Date survives, which under real bun it would not without serialization: 'json'");
+  // Working where bun does not is the one direction this project treats as a bug:
+  // it is a green suite here and a silent failure in production. It cannot be made
+  // stricter without faking a failure, so it has to be said out loud.
+  ok(
+    /Bun\.spawn\(\{ ipc \}\) with a node child/.test(o) && /v8\.serialize/.test(o),
+    "…and Vivari warns once that real bun needs serialization: 'json' there, rather than letting the sandbox be quietly looser than production",
+  );
+  ok(r.jsonMapIsPlain === true, "serialization: 'json' really is JSON: a Map arrives as a plain object");
+  ok(r.jsonDateIsString === true, "…and a Date as a string, which is the cost of the mode that talks to a node child");
+}
+
+// 12e) A fetch that never reached the network. The guest's `fetch` IS the host
+// realm's own (wrapped in packages/runtime/index.js), so a CORS-blocked request
+// fails in the BROWSER and never reaches the kernel: what the guest saw was
+// `TypeError: Failed to fetch` and nothing else. That reads as a bug in the
+// guest's own code, and it is the commonest way a program that works under a real
+// bun looks broken here. The runtime cannot say WHICH cause it was — the spec
+// forbids the browser from telling it — so the subject of this test is that both
+// causes are named and neither is claimed. A refused connection is the same
+// opaque failure as a CORS block, which is exactly why it can stand in for one.
+console.log("\n== bun run fetch-blocked.ts (an opaque network failure explains itself) ==");
+{
+  write("fetch-blocked.ts", [
+    "const out: any = {};",
+    "(async () => {",
+    "  try { await fetch('http://127.0.0.1:1/nope'); out.threw = false; }",
+    "  catch (e: any) { out.threw = true; out.name = e.constructor.name; out.msg = String(e.message); out.cause = e.cause ? String(e.cause.message || e.cause) : null; }",
+    "  console.log('FETCHFAIL:' + JSON.stringify(out));",
+    "  process.exit(0);",
+    "})();",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "fetch-blocked.ts"], { cwd: APP, env: ENV, capture: true });
+  const o = (r.stdout || "") + (r.stderr || "");
+  if (LIVE) console.log(o);
+  const m = o.match(/FETCHFAIL:(\{.*\})/);
+  const got = m ? JSON.parse(m[1]) : {};
+  console.log("  ->", JSON.stringify(got).slice(0, 300));
+  if (!m && r.stderr) console.log("  stderr:", r.stderr.trim().slice(0, 800));
+  ok(got.threw === true, "a fetch that cannot be sent rejects");
+  ok(got.name === "TypeError", "…still as a TypeError, which is what fetch's callers branch on: " + got.name);
+  ok(/browser tab/.test(got.msg || ""), "…and the message says who made the decision, rather than leaving two words of nothing");
+  ok(/Access-Control-Allow-Origin/.test(got.msg || ""), "…names the CORS header the origin would have to send");
+  ok(/host is unreachable/.test(got.msg || ""), "…and names the other cause too, since the browser will not say which it was");
+  ok(/127\.0\.0\.1:1/.test(got.msg || ""), "…and quotes the URL, so the line is actionable without a debugger");
+  ok(got.cause !== null, "…keeping the browser's own error as `cause` for anyone who wants the original");
+}
+
 // 13) The surface a browser cannot provide, inside a real process.
 //
 // scripts/spike-bun-offline.mjs asserts the messages and drives the loader over
@@ -1175,12 +1590,15 @@ console.log("\n== bun run addon.ts (.node addon + the infeasible Bun members, in
     "r.dlopen = grab(() => (process as any).dlopen({ exports: {} }, '/app/node_modules/bcrypt/lib/binding/napi-v3/bcrypt_lib.node'));",
     // A few of the Bun members, through the global the kernel really installed.
     "r.udp = grab(() => (Bun as any).udpSocket({}));",
-    "r.connect = grab(() => (Bun as any).connect({ hostname: 'example.com', port: 5432 }));",
+    // Bun.connect returns a promise (in Bun too), so the refusal arrives as a
+    // rejection rather than a throw. No top-level await: this file requires, so it
+    // compiles as CommonJS, where a TLA is a syntax error.
+    "const connectRefusal = (Bun as any).connect({ hostname: 'example.com', port: 5432 }).then(() => 'DID NOT REJECT', (e: any) => String((e && e.message) || e));",
     "r.sql = grab(() => new (Bun as any).SQL('postgres://user@host/db'));",
     "r.peek = grab(() => (Bun as any).peek(Promise.resolve(1)));",
     "r.ffi = grab(() => new (require('bun:ffi').JSCallback)(() => {}));",
     "r.pty = grab(() => (Bun as any).spawn({ cmd: ['echo', 'hi'], terminal: true }));",
-    "console.log('ADDONRESULT:' + JSON.stringify(r));",
+    "connectRefusal.then((msg: string) => { r.connect = msg; console.log('ADDONRESULT:' + JSON.stringify(r)); });",
   ].join("\n"));
   const run = await kernel.start("bun", ["run", "addon.ts"], { cwd: APP, env: ENV, capture: true });
   if (run.stderr) console.log("  stderr:", run.stderr.trim());
@@ -1195,7 +1613,10 @@ console.log("\n== bun run addon.ts (.node addon + the infeasible Bun members, in
   ok(r.dlopenType === "function", "process.dlopen exists (node-gyp-build calls it directly instead of require-ing)");
   ok(/Cannot load the native addon/.test(r.dlopen || ""), "…and throws the same message rather than 'process.dlopen is not a function'");
   ok(/no UDP in a browser/.test(r.udp || ""), "Bun.udpSocket throws the sandbox message through the really-installed Bun global");
-  ok(/cannot open a raw TCP socket/.test(r.connect || ""), "Bun.connect names raw TCP as the blocker");
+  // Bun.connect no longer refuses the API, only the destination: an outside host
+  // is impossible, a host inside the VM is ordinary (spike-bun-socket covers the
+  // working half with two real processes).
+  ok(/no raw TCP to the outside world/.test(r.connect || ""), "Bun.connect refuses an OUTSIDE host, naming the wall: " + JSON.stringify((r.connect || "").slice(0, 60)));
   ok(/PostgreSQL wire protocol/.test(r.sql || "") && /bun:sqlite/.test(r.sql || ""), "Bun.SQL(postgres://…) points at bun:sqlite");
   ok(/engine's internal/.test(r.peek || ""), "Bun.peek explains that settled-promise state is engine-internal");
   ok(/dlopen\(3\)/.test(r.ffi || ""), "bun:ffi JSCallback (absent entirely before) throws the FFI message");
@@ -1902,9 +2323,77 @@ console.log("\n== new Worker(): threads, messages and lifetimes ==");
 
   // The leak this change closes, stated from the guest's side. Node has no global
   // Worker, so a `node` guest seeing one means the host's has leaked in.
+  // bun:jsc through a real guest: the round-trip is proved offline against a
+  // recording of the binary, but the module has to LOAD inside the VM too, and
+  // the value has to survive a real Bun global rather than a test harness.
+  write("jsc.ts", [
+    'import { serialize, deserialize } from "bun:jsc";',
+    "const cyc: any = { n: 1 }; cyc.self = cyc;",
+    "const back: any = deserialize(serialize({ m: new Map([['k', new Date(1700000000000)]]), c: cyc, big: 7n }));",
+    "console.log('JSC:' + [back.m instanceof Map, back.m.get('k').getTime(), back.c.self === back.c, back.big === 7n].join(','));",
+    "console.log('SAB:' + Object.prototype.toString.call(serialize(1)));",
+  ].join("\n"));
+  const jsc = await kernel.start("bun", ["run", "jsc.ts"], { cwd: APP, env: ENV, capture: true });
+  ok(/JSC:true,1700000000000,true,true/.test(jsc.stdout || ""), "bun:jsc round-trips a Map, a cycle and a BigInt inside the VM: " + ((jsc.stdout || "").match(/JSC:.*/) || [""])[0]);
+  ok(/SAB:\[object SharedArrayBuffer\]/.test(jsc.stdout || ""), "and hands back a SharedArrayBuffer, as Bun does");
+
   write("node-side.js", 'console.log("NODEWORKER:" + typeof Worker);');
   const n = await kernel.start("node", ["node-side.js"], { cwd: APP, env: ENV, capture: true });
   ok(/NODEWORKER:undefined/.test(n.stdout || ""), "a node guest sees no global Worker, as in real Node — the host's does not leak through");
+}
+
+// ---------------------------------------------------------------------------
+// 19) the realm the guest is handed, in a real process
+//
+// `Worker` above was one name, found by hand. This is the rest of the same
+// problem — a browser Worker's global carries 228 names no Node or Bun process
+// has, several of them capabilities — and it is asserted from INSIDE a running
+// guest, which is the only place the answer counts.
+//
+// Node's global has none of those names, so this would pass on an empty sweep.
+// scripts/process-worker.mjs plants them first (VV_PLANT_BROWSER_REALM), shaped
+// like the browser's: some own, some inherited, some accessors. Reverting
+// packages/runtime/realm.js turns every check below red.
+// ---------------------------------------------------------------------------
+{
+  process.env.VV_PLANT_BROWSER_REALM = "1";
+  const planted = ["importScripts", "indexedDB", "caches", "XMLHttpRequest", "location", "close", "OffscreenCanvas", "FileReader", "origin", "crossOriginIsolated", "addEventListener", "postMessage"];
+  write("realm.ts", [
+    // Bun HAS `addEventListener` and `postMessage`, so their absence is not the
+    // question for a bun guest — whose they are is, and the two checks below ask
+    // that directly. The planted host versions return "host:<name>".
+    "const planted = " + JSON.stringify(planted.filter((n) => n !== "addEventListener" && n !== "postMessage")) + ";",
+    "const seen = planted.filter((n) => typeof (globalThis as any)[n] !== 'undefined');",
+    "console.log('LEAKED:' + JSON.stringify(seen));",
+    "console.log('UA:' + navigator.userAgent);",
+    "console.log('POST:' + typeof postMessage + ':' + JSON.stringify(postMessage('x')));",
+    "console.log('LISTEN:' + typeof addEventListener + ':' + JSON.stringify(addEventListener('message', () => {})));",
+    "let alerted = ''; try { alert('hi'); } catch (e) { alerted = (e as Error).message; }",
+    "console.log('ALERT:' + alerted);",
+    "console.log('KEPT:' + [typeof fetch, typeof crypto, typeof structuredClone, typeof self].join(','));",
+  ].join("\n"));
+  const r = await kernel.start("bun", ["run", "realm.ts"], { cwd: APP, env: ENV, capture: true });
+  const out = r.stdout || "";
+  ok(/LEAKED:\[\]/.test(out), "a bun guest sees none of the planted browser globals: " + (out.match(/LEAKED:.*/) || [""])[0]);
+  ok(/UA:Bun\//.test(out), "navigator says Bun, not Chrome: " + (out.match(/UA:.*/) || [""])[0]);
+  // Bun HAS these on its main thread; they must exist and do nothing, rather than
+  // being the kernel's channel to this process.
+  ok(/POST:function:undefined/.test(out), "postMessage is Bun's inert one, not the kernel's mailbox: " + (out.match(/POST:.*/) || [""])[0]);
+  ok(/LISTEN:function:undefined/.test(out), "addEventListener is the guest's own, not the host's channel: " + (out.match(/LISTEN:.*/) || [""])[0]);
+  ok(/ALERT:.*not implemented in the Vivari shim/.test(out), "alert() refuses by name instead of silently returning");
+  ok(/KEPT:function,object,function,object/.test(out), "fetch/crypto/structuredClone/self survive the sweep: " + (out.match(/KEPT:.*/) || [""])[0]);
+
+  write("realm-node.js", [
+    "console.log('LEAKED:' + JSON.stringify(" + JSON.stringify(planted) + ".filter((n) => typeof globalThis[n] !== 'undefined')));",
+    "console.log('UA:' + navigator.userAgent);",
+    "console.log('BUNGLOBALS:' + [typeof postMessage, typeof addEventListener, typeof alert].join(','));",
+  ].join("\n"));
+  const rn = await kernel.start("node", ["realm-node.js"], { cwd: APP, env: ENV, capture: true });
+  const outN = rn.stdout || "";
+  ok(/LEAKED:\[\]/.test(outN), "a node guest sees none of them either: " + (outN.match(/LEAKED:.*/) || [""])[0]);
+  ok(/UA:Node\.js\//.test(outN), "and its navigator says Node: " + (outN.match(/UA:.*/) || [""])[0]);
+  ok(/BUNGLOBALS:undefined,undefined,undefined/.test(outN), "Bun's main-thread globals are Bun's alone — a node guest has none");
+  delete process.env.VV_PLANT_BROWSER_REALM;
 }
 
 

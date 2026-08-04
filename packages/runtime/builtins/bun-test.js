@@ -49,6 +49,18 @@ const ASYMMETRIC = Symbol.for("jest.asymmetricMatcher");
 // Bun's default per-test timeout (`bun test --help`: "default is 5000").
 export const BUN_DEFAULT_TEST_TIMEOUT = 5000;
 
+// `expectTypeOf(x).toEqualTypeOf<Y>()` is checked by the TYPE CHECKER and does
+// nothing at run time — in Bun as well. What it must not do is throw, so every
+// property is the same chainable object and any chain anyone writes is valid.
+const TYPE_CHAIN = new Proxy(function chain() {}, {
+  get: (_t, prop) => (prop === "then" ? undefined : TYPE_CHAIN),
+  apply: () => TYPE_CHAIN,
+  construct: () => TYPE_CHAIN,
+});
+function makeExpectTypeOf() {
+  return TYPE_CHAIN;
+}
+
 // The header real Bun writes at the top of a .snap file. We emit the identical
 // one, and that is a deliberate compatibility claim: the serializer below is
 // byte-exact against Bun 1.3.6 for every shape it agrees to serialize, and it
@@ -638,8 +650,18 @@ export function createBunTest({ process, lazy, deepEquals, deepMatch }) {
   // the test rather than passing silently, which is the whole risk of the async
   // matchers.
   let asyncAssertions = [];
+  let testFinishers = [];
+  // `expect.assertions(n)` / `expect.hasAssertions()` need to know how many
+  // assertions the CURRENT test made, which means counting where Bun counts:
+  // its own report says "N expect() calls".
+  let assertionCount = 0;
+  let expectedAssertions = null;
 
   function expect(received) {
+    // Counted here, not per matcher: one `expect(x)` builds several matcher tables
+    // (`.not`, `.resolves`, `.rejects`), so counting deeper counts each assertion
+    // more than once.
+    assertionCount++;
     const api = buildMatchers(received, false, null);
     api.not = buildMatchers(received, true, null);
     api.resolves = buildAsync(received, false, "resolves");
@@ -801,10 +823,138 @@ export function createBunTest({ process, lazy, deepEquals, deepMatch }) {
     toInclude: (c, s) => c.assert(typeof c.received === "string" && c.received.includes(s), `expected ${fmt(c.received)} to include ${fmt(s)}`),
     toBeOneOf: (c, list) => c.assert(Array.isArray(list) && list.some((v) => equals(c.received, v, false)), `expected ${fmt(c.received)} to be one of ${fmt(list)}`),
     toSatisfy: (c, pred) => c.assert(!!pred(c.received), `expected ${fmt(c.received)} to satisfy the predicate`),
+    // ---- the rest of Bun's matcher table --------------------------------------
+    // Bun's expect has 87 matchers; this file had 53 of them, and the ones below
+    // were the difference. That is not a stylistic gap: a suite written against
+    // Bun that calls `expect(n).toBeOdd()` did not fail here, it CRASHED with
+    // "toBeOdd is not a function", which reads as a broken test rather than a
+    // missing feature. The list is recorded from the 1.3 binary
+    // (scripts/fixtures/bun-test-api.json) and a spike compares the two, so the
+    // next matcher Bun adds shows up as a failing check instead of a crash in
+    // somebody's suite.
+    //
+    // Number shape. Bun refuses a non-number receiver rather than answering
+    // "false" — `expect("3").toBeOdd()` is a mistake in the test, not a fact
+    // about the string.
+    toBeEven: (c) => c.assert(typeof c.received === "number" && Number.isInteger(c.received) && c.received % 2 === 0, `expected ${fmt(c.received)} to be an even number`),
+    toBeOdd: (c) => c.assert(typeof c.received === "number" && Number.isInteger(c.received) && Math.abs(c.received % 2) === 1, `expected ${fmt(c.received)} to be an odd number`),
+    toBePositive: (c) => c.assert(typeof c.received === "number" && c.received > 0, `expected ${fmt(c.received)} to be a positive number`),
+    toBeNegative: (c) => c.assert(typeof c.received === "number" && c.received < 0, `expected ${fmt(c.received)} to be a negative number`),
+    // Bun's range is [start, end) — half-open, so toBeWithin(1, 2) rejects 2.
+    toBeWithin: (c, start, end) => c.assert(typeof c.received === "number" && c.received >= start && c.received < end, `expected ${fmt(c.received)} to be within [${fmt(start)}, ${fmt(end)})`),
+    // Value shape.
+    toBeTrue: (c) => c.assert(c.received === true, `expected ${fmt(c.received)} to be true`),
+    toBeFalse: (c) => c.assert(c.received === false, `expected ${fmt(c.received)} to be false`),
+    toBeSymbol: (c) => c.assert(typeof c.received === "symbol", `expected ${fmt(c.received)} to be a symbol`),
+    toBeValidDate: (c) => c.assert(c.received instanceof Date && !Number.isNaN(c.received.getTime()), `expected ${fmt(c.received)} to be a valid Date`),
+    // Bun's rule, probed rather than guessed: `[]`, a class instance, a null-proto
+    // object and a function all count as empty objects; `new Set()`, `new Date()`
+    // and `""` do not. What separates them is the internal slot, so the tag is what
+    // gets checked — an empty Set is not "an object with no keys", it is a Set.
+    toBeEmptyObject: (c) => {
+      const v = c.received;
+      const kind = v === null || v === undefined ? "" : Object.prototype.toString.call(v);
+      const shaped = kind === "[object Object]" || kind === "[object Array]" || kind === "[object Function]";
+      c.assert(shaped && Object.keys(v).length === 0, `expected ${fmt(v)} to be an empty object`);
+    },
+    // Strings.
+    toEqualIgnoringWhitespace: (c, expected) => {
+      const strip = (v) => String(v).replace(/\s+/g, "");
+      c.assert(typeof c.received === "string" && strip(c.received) === strip(expected), `expected ${fmt(c.received)} to equal ${fmt(expected)} ignoring whitespace`);
+    },
+    toIncludeRepeated: (c, substring, times) => {
+      const text = String(c.received);
+      let count = 0;
+      let at = text.indexOf(substring);
+      // Non-overlapping, which is what Bun counts: "aaa" contains "aa" once.
+      while (at >= 0 && substring.length > 0) { count++; at = text.indexOf(substring, at + substring.length); }
+      c.assert(count === times, `expected ${fmt(c.received)} to contain ${fmt(substring)} exactly ${times} time(s), found ${count}`);
+    },
+    // Object keys and values. `toContainKeys` is "all of these"; the Any variants
+    // are "at least one"; the All variants additionally require nothing else.
+    toContainKey: (c, key) => c.assert(!!c.received && Object.prototype.hasOwnProperty.call(c.received, key), `expected ${fmt(c.received)} to contain the key ${fmt(key)}`),
+    toContainKeys: (c, keys) => c.assert(!!c.received && keys.every((k) => Object.prototype.hasOwnProperty.call(c.received, k)), `expected ${fmt(c.received)} to contain the keys ${fmt(keys)}`),
+    toContainAllKeys: (c, keys) => {
+      const own = c.received ? Object.keys(c.received) : [];
+      c.assert(own.length === keys.length && keys.every((k) => own.includes(k)), `expected ${fmt(c.received)} to contain exactly the keys ${fmt(keys)}`);
+    },
+    toContainAnyKeys: (c, keys) => c.assert(!!c.received && keys.some((k) => Object.prototype.hasOwnProperty.call(c.received, k)), `expected ${fmt(c.received)} to contain any of the keys ${fmt(keys)}`),
+    toContainValue: (c, value) => c.assert(!!c.received && Object.values(c.received).some((v) => equals(v, value, false)), `expected ${fmt(c.received)} to contain the value ${fmt(value)}`),
+    toContainValues: (c, values) => c.assert(!!c.received && values.every((want) => Object.values(c.received).some((v) => equals(v, want, false))), `expected ${fmt(c.received)} to contain the values ${fmt(values)}`),
+    toContainAllValues: (c, values) => {
+      const own = c.received ? Object.values(c.received) : [];
+      c.assert(own.length === values.length && values.every((want) => own.some((v) => equals(v, want, false))), `expected ${fmt(c.received)} to contain exactly the values ${fmt(values)}`);
+    },
+    toContainAnyValues: (c, values) => c.assert(!!c.received && values.some((want) => Object.values(c.received).some((v) => equals(v, want, false))), `expected ${fmt(c.received)} to contain any of the values ${fmt(values)}`),
+    // Mock return values.
+    toHaveReturnedWith: (c, value) => {
+      const m = mockOf(c.received);
+      c.assert(m.results.some((r) => r.type === "return" && equals(r.value, value, false)), `expected mock to have returned ${fmt(value)}`);
+    },
+    toHaveLastReturnedWith: (c, value) => {
+      const m = mockOf(c.received);
+      const last = m.results[m.results.length - 1];
+      c.assert(!!last && last.type === "return" && equals(last.value, value, false), `expected the last return to be ${fmt(value)}, was ${fmt(last && last.value)}`);
+    },
+    toHaveNthReturnedWith: (c, n, value) => {
+      const m = mockOf(c.received);
+      const at = m.results[n - 1];
+      c.assert(!!at && at.type === "return" && equals(at.value, value, false), `expected return #${n} to be ${fmt(value)}, was ${fmt(at && at.value)}`);
+    },
+    toHaveBeenCalledOnce: (c) => {
+      const m = mockOf(c.received);
+      c.assert(m.calls.length === 1, `expected mock to have been called once, called ${m.calls.length} times`);
+    },
+    // The two that ignore their receiver entirely: `expect().pass()` marks a branch
+    // as reached, `expect().fail()` marks one as unreachable. Under `.not` they
+    // swap, which assert already handles.
+    pass: (c, message) => c.assert(true, message || "expected the assertion to fail"),
+    fail: (c, message) => c.assert(false, message || "failed"),
     // ---- snapshots -----------------------------------------------------------
     toMatchSnapshot: (c, ...args) => snapshotMatch(c, args),
     toMatchInlineSnapshot: (c, ...args) => inlineSnapshotMatch(c, args),
+    // The throwing pair: take the thrown message and snapshot THAT. Sharing the
+    // snapshot machinery matters — an inline snapshot has to rewrite the source
+    // file, and a second implementation of that would rot separately.
+    toThrowErrorMatchingSnapshot: (c, ...args) => snapshotMatch(thrownMessageContext(c, "toThrowErrorMatchingSnapshot"), args),
+    toThrowErrorMatchingInlineSnapshot: (c, ...args) => inlineSnapshotMatch(thrownMessageContext(c, "toThrowErrorMatchingInlineSnapshot"), args),
   };
+
+  // Jest's older spellings, which Bun keeps. A suite ported from jest calls these
+  // by name, and an alias that is merely absent is a TypeError inside the test
+  // rather than an assertion failure — the difference between "my code is wrong"
+  // and "this runner is missing something".
+  for (const [from, to] of [
+    ["toBeCalled", "toHaveBeenCalled"],
+    ["toBeCalledTimes", "toHaveBeenCalledTimes"],
+    ["toBeCalledWith", "toHaveBeenCalledWith"],
+    ["lastCalledWith", "toHaveBeenLastCalledWith"],
+    ["nthCalledWith", "toHaveBeenNthCalledWith"],
+    ["toReturn", "toHaveReturned"],
+    ["toReturnTimes", "toHaveReturnedTimes"],
+    ["toReturnWith", "toHaveReturnedWith"],
+    ["lastReturnedWith", "toHaveLastReturnedWith"],
+    ["nthReturnedWith", "toHaveNthReturnedWith"],
+  ]) {
+    if (!MATCHERS[from] && MATCHERS[to]) MATCHERS[from] = MATCHERS[to];
+  }
+
+  // `toThrowErrorMatchingSnapshot` snapshots the MESSAGE of what was thrown, not
+  // the thrown value, so it needs a context whose `received` is that message. A
+  // receiver that does not throw is a failure here, not an empty snapshot.
+  function thrownMessageContext(c, name) {
+    if (typeof c.received !== "function") {
+      throw new TypeError(`expect(received).${name}(): received value must be a function, got ${typeOf(c.received)}`);
+    }
+    let message = null;
+    try {
+      c.received();
+    } catch (e) {
+      message = e && e.message !== undefined ? String(e.message) : String(e);
+    }
+    if (message === null) c.assert(false, "expected the function to throw, it did not");
+    return Object.assign(Object.create(Object.getPrototypeOf(c) || Object.prototype), c, { received: message });
+  }
 
   function toThrowImpl(c, expected) {
     let threw = false;
@@ -965,6 +1115,54 @@ export function createBunTest({ process, lazy, deepEquals, deepMatch }) {
     new AsymmetricMatcher("StringMatching", (actual) => typeof actual === "string" && (typeof re === "string" ? actual.includes(re) : re.test(actual)));
   expect.closeTo = (n, digits) =>
     new AsymmetricMatcher("CloseTo", (actual) => typeof actual === "number" && Math.abs(actual - n) < Math.pow(10, -(digits === undefined ? 2 : digits)) / 2);
+  function checkExpectedAssertions() {
+    if (expectedAssertions === null) return;
+    const want = expectedAssertions;
+    expectedAssertions = null;
+    if (want === "some") {
+      if (assertionCount === 0) {
+        throw new Error(`received ${assertionCount} assertions, but expected at least one assertion to be called`);
+      }
+      return;
+    }
+    if (assertionCount !== want) {
+      throw new Error(`expected ${want} assertions, but test ended with ${assertionCount} assertion${assertionCount === 1 ? "" : "s"}`);
+    }
+  }
+
+  // Bun's wording, verbatim, because these two failures are read far more often
+  // than they are triggered and a paraphrase is one more thing to reconcile.
+  expect.assertions = (n) => { expectedAssertions = n; };
+  expect.hasAssertions = () => { expectedAssertions = "some"; };
+  // A plain Error, and an Error argument passes straight through.
+  expect.unreachable = (message) => {
+    if (message instanceof Error) throw message;
+    throw new Error(message === undefined ? "reached unreachable code" : String(message));
+  };
+  // Real Bun 1.3 throws "Not implemented" here. Matching that is the honest
+  // answer: a serializer accepted and then ignored would silently change what
+  // snapshots contain, which is worse than a refusal.
+  expect.addSnapshotSerializer = () => { throw new Error("Not implemented"); };
+  // `expect.resolvesTo` / `expect.rejectsTo` are namespaces of ASYNC asymmetric
+  // matchers, and asymmetric matchers are consulted from inside deepEquals, which
+  // is synchronous here as it is in Bun. They exist so the name is not a bare
+  // TypeError, and they say what to write instead.
+  const asyncAsymmetric = (which) => {
+    const target = {};
+    const refuse = () => {
+      throw new Error(
+        `expect.${which} is not supported: an async asymmetric matcher has to be awaited from inside the comparison, ` +
+          `which runs synchronously. Await the promise first: await expect(promise).${which === "resolvesTo" ? "resolves" : "rejects"}.toEqual(value).`
+      );
+    };
+    for (const name of ["any", "anything", "arrayContaining", "closeTo", "objectContaining", "stringContaining", "stringMatching"]) {
+      target[name] = refuse;
+    }
+    return target;
+  };
+  expect.resolvesTo = asyncAsymmetric("resolvesTo");
+  expect.rejectsTo = asyncAsymmetric("rejectsTo");
+
   expect.not = {
     objectContaining: (subset) => negated(expect.objectContaining(subset)),
     arrayContaining: (list) => negated(expect.arrayContaining(list)),
@@ -1084,11 +1282,186 @@ export function createBunTest({ process, lazy, deepEquals, deepMatch }) {
   mock.restore = () => { while (spies.length) spies.pop().restore(); };
   mock.clearAllMocks = () => { for (const f of mockFns) f.mockClear(); };
 
+  // Vitest's `vi`. The mocking half is this file's own; the timer half is the
+  // clock seam above, so `vi.useFakeTimers()` and `jest.useFakeTimers()` are the
+  // same queue under two names.
+  // ---- the clock seam -------------------------------------------------------
+  //
+  // Fake timers and setSystemTime were refused here for the same stated reason:
+  // "the runtime's timers are the event loop's own and there is no clock seam".
+  // That was true of the loop and irrelevant to the test runner — a test's
+  // setTimeout is a GLOBAL, and swapping the global is the whole seam. Nothing in
+  // loop.js has to change; the loop keeps its own timers, and this only changes
+  // what the code under test is handed.
+  //
+  // Two independent things, as in Bun: setSystemTime freezes what Date reports and
+  // leaves timers alone, and useFakeTimers stops timers from firing on their own
+  // and leaves Date alone. A test can use either without the other.
+  const realTimers = {
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+    setInterval: globalThis.setInterval,
+    clearInterval: globalThis.clearInterval,
+  };
+  const RealDate = globalThis.Date;
+
+  function makeClock() {
+    let fake = null; // { at, seq, timers: Map<id, {due, fn, args, every}> }
+    let frozenAt = null;
+
+    // The runner's own timeouts must keep working while a test's timers are fake,
+    // so everything internal goes through this rather than the global.
+    const realSetTimeout = (fn, ms) => realTimers.setTimeout.call(globalThis, fn, ms);
+
+    const install = () => {
+      if (fake) return;
+      fake = { at: 0, seq: 0, timers: new Map() };
+      const add = (fn, ms, args, every) => {
+        const id = ++fake.seq;
+        fake.timers.set(id, { due: fake.at + (Number(ms) || 0), fn, args, every, seq: id });
+        // Node hands back an object with unref/ref; code that calls them on a fake
+        // timer should not crash on a number.
+        return { id, unref() { return this; }, ref() { return this; }, __fake: true };
+      };
+      const drop = (h) => { if (h) fake.timers.delete(typeof h === "object" ? h.id : h); };
+      globalThis.setTimeout = (fn, ms, ...args) => add(fn, ms, args, null);
+      globalThis.setInterval = (fn, ms, ...args) => add(fn, ms, args, Math.max(1, Number(ms) || 1));
+      globalThis.clearTimeout = drop;
+      globalThis.clearInterval = drop;
+    };
+
+    const uninstall = () => {
+      if (!fake) return;
+      Object.assign(globalThis, realTimers);
+      fake = null;
+    };
+
+    // Runs everything due at or before `until`, in due order and, for a tie, in the
+    // order they were scheduled — which is what makes an interval at 30ms fire
+    // three times before a timeout at 100ms rather than after it.
+    const fireUntil = (until) => {
+      let fired = 0;
+      for (;;) {
+        let next = null;
+        for (const t of fake.timers.values()) {
+          if (t.due > until) continue;
+          if (!next || t.due < next.due || (t.due === next.due && t.seq < next.seq)) next = t;
+        }
+        if (!next) break;
+        fake.at = next.due;
+        if (next.every) next.due = fake.at + next.every;
+        else fake.timers.delete(next.seq);
+        next.fn(...(next.args || []));
+        // A deliberate divergence, and the one place this is not Bun: real Bun
+        // spins here forever, because runAllTimers() on a live setInterval has no
+        // end — the binary had to be killed. A test runner that hangs tells you
+        // nothing, so this stops and says which call did it.
+        if (++fired > 100000) {
+          throw new Error(
+            "Aborting after running 100000 timers, assuming an infinite loop: an " +
+              "interval that reschedules itself never drains. Use " +
+              "advanceTimersByTime(ms), or clear the interval first."
+          );
+        }
+      }
+      fake.at = until;
+      return fired;
+    };
+
+    // Bun's own wording, verified against the binary.
+    const needFake = () => {
+      if (!fake) throw new Error("Fake timers are not active. Call useFakeTimers() first.");
+    };
+
+    const api = {
+      useFakeTimers() { install(); return api; },
+      useRealTimers() { uninstall(); api.setSystemTime(); return api; },
+      isFakeTimers: () => !!fake,
+      advanceTimersByTime(ms) { needFake(); fireUntil(fake.at + (Number(ms) || 0)); return api; },
+      advanceTimersToNextTimer(steps = 1) {
+        needFake();
+        for (let i = 0; i < steps; i++) {
+          let soonest = null;
+          for (const t of fake.timers.values()) if (soonest === null || t.due < soonest) soonest = t.due;
+          if (soonest === null) break;
+          fireUntil(soonest);
+        }
+        return api;
+      },
+      runAllTimers() { needFake(); fireUntil(Infinity); return api; },
+      // Only what is queued NOW: an interval that reschedules past this point is
+      // left for the next call, which is the difference from runAllTimers.
+      runOnlyPendingTimers() {
+        needFake();
+        let latest = fake.at;
+        for (const t of fake.timers.values()) if (t.due > latest) latest = t.due;
+        fireUntil(latest);
+        return api;
+      },
+      clearAllTimers() { needFake(); fake.timers.clear(); return api; },
+      getTimerCount: () => (fake ? fake.timers.size : 0),
+      now: () => (fake ? fake.at : RealDate.now()),
+      // Freezes the clock: Bun reports the same instant until it is set again, so
+      // a test that measures a duration across it sees zero, not a drift.
+      setSystemTime(date) {
+        if (date === undefined || date === null) {
+          frozenAt = null;
+          globalThis.Date = RealDate;
+          return api;
+        }
+        const at = date instanceof RealDate ? date.getTime() : Number(date);
+        if (!Number.isFinite(at)) throw new TypeError("setSystemTime() expects a Date or a timestamp");
+        frozenAt = at;
+        // A subclass, so instanceof Date and every method still hold; only "what
+        // time is it" changes, and only for the no-argument case.
+        class FrozenDate extends RealDate {
+          constructor(...args) { super(...(args.length ? args : [frozenAt])); }
+          static now() { return frozenAt; }
+        }
+        Object.defineProperty(FrozenDate, "name", { value: "Date" });
+        globalThis.Date = FrozenDate;
+        return api;
+      },
+      // Called between files and at the end of a run: a test that installs fake
+      // timers and throws before restoring them must not leave the next file — or
+      // the runner's own timeouts — frozen.
+      __reset() { uninstall(); api.setSystemTime(); },
+      __realSetTimeout: realSetTimeout,
+    };
+    return api;
+  }
+  const clock = makeClock();
+
+  function makeVi() {
+    const vi = {
+      fn: (impl) => makeMockFn(impl),
+      mock: mockModule,
+      spyOn,
+      restoreAllMocks: () => mock.restore(),
+      resetAllMocks: () => mock.clearAllMocks(),
+      clearAllMocks: () => mock.clearAllMocks(),
+    };
+    for (const name of [
+      "useFakeTimers", "useRealTimers", "advanceTimersToNextTimer", "advanceTimersByTime",
+      "runOnlyPendingTimers", "runAllTimers", "getTimerCount", "clearAllTimers", "isFakeTimers",
+      "setSystemTime", "now",
+    ]) {
+      vi[name] = (...args) => clock[name](...args);
+    }
+    return vi;
+  }
+
   // ---- the run --------------------------------------------------------------
   async function runOne(t, label) {
     const started = now();
     const timeout = t.timeout != null ? t.timeout : runOptions.timeout;
     currentTest = { label, file: t.file };
+    assertionCount = 0;
+    expectedAssertions = null;
+    // onTestFinished callbacks are registered from inside the body and belong to
+    // THIS test only, so the list is per-run rather than per-suite. They run after
+    // the body and before afterEach, which is the order Bun's does.
+    testFinishers = [];
     let error = null;
     try {
       const r = t.fn();
@@ -1106,11 +1479,27 @@ export function createBunTest({ process, lazy, deepEquals, deepMatch }) {
       // test made; failing it here is what stops a missing `await` from turning a
       // red test green.
       await Promise.all(drained);
+      // Checked after the body and after the async assertions settle, because a
+      // `.resolves` awaited late still counts — an earlier check would answer
+      // before the test finished asserting.
+      checkExpectedAssertions();
     } catch (e) {
       error = e;
       asyncAssertions = [];
     } finally {
       currentTest = null;
+      // A finisher runs whether the test passed or threw — that is the point of
+      // registering one — and its own failure must not be swallowed, or a cleanup
+      // that silently stopped working looks like a clean suite.
+      const finishers = testFinishers;
+      testFinishers = [];
+      for (const fn of finishers) {
+        try {
+          await fn();
+        } catch (e) {
+          if (!error) error = e;
+        }
+      }
     }
     const elapsed = now() - started;
     if (!error && elapsed > timeout) error = new Error(`this test timed out after ${timeout}ms.`);
@@ -1119,7 +1508,9 @@ export function createBunTest({ process, lazy, deepEquals, deepMatch }) {
 
   function timeoutPromise(ms, label) {
     return new Promise((_, reject) => {
-      const timer = setTimeout(() => reject(new Error(`this test timed out after ${ms}ms.`)), ms);
+      // The real one on purpose: a test that installs fake timers must not also
+      // freeze the runner's timeout and hang the whole file.
+      const timer = clock.__realSetTimeout(() => reject(new Error(`this test timed out after ${ms}ms.`)), ms);
       if (timer && typeof timer.unref === "function") timer.unref();
     });
   }
@@ -1128,6 +1519,14 @@ export function createBunTest({ process, lazy, deepEquals, deepMatch }) {
   let runOptions = { timeout: BUN_DEFAULT_TEST_TIMEOUT };
 
   async function run(options) {
+    try {
+      return await runAll(options);
+    } finally {
+      clock.__reset();
+    }
+  }
+
+  async function runAll(options) {
     const opts = options || {};
     runOptions = { timeout: typeof opts.timeout === "number" ? opts.timeout : BUN_DEFAULT_TEST_TIMEOUT };
     snapshotOptions = { update: !!opts.updateSnapshots, ci: ciEnabled(process.env) };
@@ -1270,22 +1669,61 @@ export function createBunTest({ process, lazy, deepEquals, deepMatch }) {
     beforeAll: hook("beforeAll"), afterAll: hook("afterAll"),
     beforeEach: hook("beforeEach"), afterEach: hook("afterEach"),
     mock, spyOn,
+    // The compat spellings Bun exports. Absent, they are a TypeError in the middle
+    // of a ported suite rather than a missing feature — the same failure mode as
+    // the missing matchers, and the fix is the same: export the name.
+    //
+    // NOT aliases of test.skip/describe.skip in Bun (the identities differ there
+    // too), but the behaviour is the same and duplicating it would just be a second
+    // thing to keep in step.
+    xit: test.skip, xtest: test.skip, xdescribe: describe.skip,
+    setDefaultTimeout: (ms) => {
+      if (typeof ms !== "number" || !(ms >= 0)) throw new TypeError("Expected a non-negative number of milliseconds");
+      runOptions = { ...runOptions, timeout: ms };
+    },
+    onTestFinished: (fn) => {
+      if (typeof fn !== "function") throw new TypeError("Expected a function");
+      if (!currentTest) {
+        // Outside a test there is no test to finish, and quietly dropping the
+        // callback would look like cleanup that ran.
+        throw new Error("onTestFinished() can only be called inside a test body");
+      }
+      testFinishers.push(fn);
+    },
+    // Vitest's namespace, which Bun also exports so a vitest suite runs unchanged.
+    // The mocking half maps onto the same functions; the fake-timer half does not
+    // exist here, and each of those names says so rather than being absent.
+    vi: makeVi(),
+    // A TYPE-level assertion: it does nothing at runtime in Bun either, and exists
+    // so `expectTypeOf(x).toEqualTypeOf<Y>()` type-checks and then evaporates.
+    // Every member returns the same chainable object, so any chain is valid.
+    expectTypeOf: makeExpectTypeOf,
     jest: {
       fn: (impl) => makeMockFn(impl),
       spyOn,
       restoreAllMocks: () => mock.restore(),
       clearAllMocks: () => mock.clearAllMocks(),
+      useFakeTimers: (...a) => clock.useFakeTimers(...a),
+      useRealTimers: (...a) => clock.useRealTimers(...a),
+      advanceTimersByTime: (...a) => clock.advanceTimersByTime(...a),
+      advanceTimersToNextTimer: (...a) => clock.advanceTimersToNextTimer(...a),
+      runAllTimers: (...a) => clock.runAllTimers(...a),
+      runOnlyPendingTimers: (...a) => clock.runOnlyPendingTimers(...a),
+      clearAllTimers: (...a) => clock.clearAllTimers(...a),
+      getTimerCount: () => clock.getTimerCount(),
+      now: () => clock.now(),
+      setSystemTime: (...a) => clock.setSystemTime(...a),
     },
-    setSystemTime: () => {
-      throw new Error(
-        "bun:test setSystemTime() is not implemented in the Vivari shim: the runtime " +
-          "has no clock seam to override (Date and performance.now come straight from " +
-          "the host worker). Inject a clock, or stub Date.now with spyOn(Date, 'now')."
-      );
-    },
+    setSystemTime: (...a) => clock.setSystemTime(...a),
     // Told by `bun test` which file it is about to load, so a test can be traced
     // back to its file for snapshots, mock.module resolution and JUnit output.
-    __setFile(file) { currentFile = file; },
+    __setFile(file) {
+      currentFile = file;
+      // A file that installed fake timers and never restored them must not freeze
+      // the next one — nor the runner, whose per-test timeout is a real timer only
+      // because it deliberately bypasses the swap.
+      clock.__reset();
+    },
     __run: run,
   };
 
