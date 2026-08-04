@@ -6863,3 +6863,82 @@ inside the template's source, which lives in a template literal, and it containe
 That ends the literal. `spike-template-syntax.mjs` refused the tree immediately, at the parse,
 with the line in hand — the same class of failure as the backslash it was written for, on the
 first day it could have shipped one.
+
+## The Explorer's sticky headers — and the flex child that was never a scrollport (this change)
+
+VS Code parity for the file tree, in three parts. The first arrived as a cosmetic request and
+turned out to be a real layout bug underneath it.
+
+**What was actually being seen.** The complaint was that the Workspace header scrolls away and the
+tree is cut off. The header was never the problem — it lives outside the scroll area. The cut-off
+half was `<ScrollArea className="flex-1">` in `Explorer.tsx`: a flex item's automatic minimum size
+is its CONTENT size, so the ScrollArea grew to the height of the whole expanded tree rather than
+being capped by the sidebar. Nothing overflowed, so Radix's viewport was not a scrollport at all —
+there was no scrollbar to reach the rows past the bottom of the sidebar, and `position: sticky` had
+nowhere to travel. `min-h-0` is the entire fix, and it had to land first, because until it did no
+sticky behaviour could even be observed.
+
+**Ancestor rows now park in a stack.** Each folder row sticks at `top: depth * ROW_H` with a
+`zIndex` that *decreases* with depth, so as a subtree scrolls out the shallower ancestor stays on
+top of the deeper one. Two constraints fell out of that: the offsets only sum correctly while every
+row is exactly `ROW_H` (24px) tall, so the root row (11px uppercase) and the folder rows (`text-sm`)
+now SET their height instead of inheriting whatever their font metrics give; and the sticky style
+has to live on the `ContextMenuTrigger` rather than the row `<div>` inside it, because a sticky box
+can only travel within its own containing block and only the trigger's wrapper — which also holds
+the subtree — is taller than one row. Parked rows carry an opaque `bg-sidebar` so the rows sliding
+underneath don't bleed through.
+
+**One file type, one icon.** `fileIcon.tsx` makes the extension the source of truth and drops the
+per-name special cases: `.d.ts` reads as TypeScript, `package.json`/`tsconfig.json` read as JSON,
+and a name only earns a `BY_NAME` entry when its extension says nothing useful (`bun.lock` is JSON;
+`.eslintrc`, `LICENSE` and `.npmrc`/`.npmignore` have no extension to read). Filling the extension
+table out is most of the change — yaml/toml/ini/xml/sql, scss/sass/less as themselves instead of
+all three as CSS, java/php/go/rust/wasm/shell, text/svg/image — because an unmapped extension
+falling through to the generic document icon is what made the tree look unfinished.
+
+**Verified in a real studio page**, on a Starlight project deepened to five nested levels from the
+integrated terminal: seven ancestor rows parked at the top of the viewport while their files scrolled
+under them, the bottom of the tree reachable (it was not, before `min-h-0`), and the context menu and
+click-to-collapse still working on a PARKED row under injected clicks — sticky takes a row out of
+normal flow, which is exactly where a hit-testing regression would hide. The drag-over ring reaches a
+parked row too, though that one rests on a synthetic `DragEvent`, which bypasses hit-testing: it shows
+the handlers and the ring class are still wired, not that a real drag would land there. Injected
+element clicks work in this sandbox, but the low-level mouse-drag stage does not — it dies on a CDP
+`Input.dispatchMouseEvent` protocol error — so nothing here ever grabbed the scrollbar thumb or
+performed an OS-level drag, and every claim about where such a gesture *would* land is
+`elementFromPoint`. Row height was measured at exactly 24.00 px for all 88 rows of an expanded 6-level
+tree, so the offset ladder is arithmetically sound rather than merely plausible.
+
+**Review caught two consequences of "positioned" that the implementation never looked at**, both
+measured rather than argued, and both belonging to the same blind spot: a sticky row is a *positioned*
+row, and positioning has effects far away from the row.
+
+*It outranked the scrollbar.* `ScrollArea.Root` is `position: relative; z-index: auto` — not a
+stacking context — and Base UI's scrollbar inside it is `position: absolute; z-index: auto`, so a row
+carrying `z-index: 1…20` simply paints over it. This was never limited to parked rows, because a
+sticky box is positioned whether or not it is currently stuck. Measured at `scrollTop 30`,
+`elementFromPoint` down the scrollbar's centre-x returned Explorer rows for the top 139 px of the
+264 px track, burying ~116 px of the thumb; a `mousedown` in that band would reach the project-root
+row, whose handler collapses the project. The fix belongs to the component, not the call site — the
+scrollbar overlays the content it scrolls, for every consumer — so `scroll-area.tsx` now pins it at
+`z-30`, above any content ramp and below the app's z-40/z-50 overlays. After: the first hit-test
+sample, 1 px into the track, is the scrollbar.
+
+*And nothing that reveals a row knew the stack existed.* `scrollIntoView({block: "nearest"})` and
+`focus()` both align their target with the scrollport's top edge — precisely the band the ancestors
+occupy — and browsers do not account for sticky boxes. So clicking the editor tab for a file above the
+current scroll position scrolled its row to `y = 0` and left it 100% behind the parked root row:
+revealing the active file reliably revealed nothing. The same mechanism hid the inline New File /
+New Folder input, which the review flagged as unmeasured and which turned out to be real — an A/B on
+the same mounted input put it at `y = 0` under `starlight-ts-app` with the old unpadded scroll, and at
+`y = 168` (its own depth × `ROW_H`, clear of a 7-row stack) with the new one. Both now go through
+`revealRow`, which sets `scroll-padding-top` to the stack height above the target before scrolling;
+`NameInput` additionally focuses with `preventScroll` so the browser cannot do its own unpadded scroll
+first. `scroll-padding-top` is set per call rather than once on the viewport because the reserved
+height depends on the target's depth.
+
+**The area drag-over tint became an overlay.** The opaque `bg-sidebar` that parked rows require was
+punching the `bg-accent/30` empty-area highlight into stripes, so the tint now paints *above* the rows
+(`z-[25]`, `pointer-events-none`) instead of behind them. Confirmed by diffing the sidebar before and
+after a synthetic area `dragover`: every one of the 14 row bands changes, where previously only the
+gaps between rows could.

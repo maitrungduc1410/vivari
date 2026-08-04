@@ -1145,6 +1145,47 @@ map. Rules that bite if ignored:
   If a template's source outgrows a literal, move it to a sibling `.js` module the way
   `s3-app-source.js` does, so the gate and the template read the same bytes.
 
+### A sticky row needs a capped scrollport, the right containing block, and a z-index budget
+Four independent traps, none of them visible in the DOM, all hit while pinning the Explorer's
+folder rows (`Explorer.tsx`):
+- **`flex-1` alone does not make a scrollport — the flex child also needs `min-h-0`.** A flex
+  item's automatic minimum size is its CONTENT size, so `<ScrollArea className="flex-1">` grew
+  to the height of the whole expanded tree instead of being capped by the sidebar. Nothing
+  overflowed, so Radix's viewport never scrolled, the rows past the bottom of the sidebar were
+  simply unreachable, and `position: sticky` had zero distance to travel. It presents as "the
+  tree is cut off", which sends you looking at the tree. Any scrollable child of a flex column
+  here needs `min-h-0`.
+- **The sticky style must sit on the element whose containing block is TALL.** A sticky box can
+  only move within its own containing block, so putting it on the row `<div>` inside
+  `ContextMenuTrigger` does nothing — that block is exactly one row high. It belongs on the
+  `ContextMenuTrigger`, whose parent wrapper also holds the subtree. A parked row also needs an
+  opaque background (`bg-sidebar`) or the rows sliding under it show through.
+- **A positioned row outranks the ScrollArea's own scrollbar.** `ScrollArea.Root` is
+  `position: relative; z-index: auto` — so NOT a stacking context — and Base UI's scrollbar
+  inside it is `position: absolute; z-index: auto`. The moment any row in the viewport takes a
+  z-index it paints over the scrollbar *and* becomes the hit-test target for the pointer events
+  meant for the thumb: measured, `elementFromPoint` down the track's centre-x returned Explorer
+  rows for the top 139 px of a 264 px track, so a `mousedown` there **would** reach the
+  project-root row, whose handler collapses the project. (That last step is inferred, not
+  observed: no grab of the thumb was ever dispatched, because the probe's mouse-drag stage dies
+  on a CDP `Input.dispatchMouseEvent` protocol error in this sandbox. The hit-test is the
+  evidence, and it is at least what the browser itself uses to pick an event target.)
+  Note it hits every sticky row, not just parked ones — a sticky box is positioned whether or
+  not it is currently stuck. `scroll-area.tsx` therefore pins the scrollbar at `z-30`: above any
+  content ramp, below the app's z-40/z-50 overlays. Keep new z-indexes inside a ScrollArea
+  under 30.
+- **Nothing that scrolls a row into view knows the stack is there.** `scrollIntoView` and
+  `focus()` both align their target with the scrollport's *top* edge, which is exactly where the
+  parked rows live, so "reveal the active file" and the inline new-file input each revealed a row
+  that was 100% behind them. Reserve the band with `scroll-padding-top` = the stack height above
+  the target (`depth * ROW_H`) — that is what `revealRow` does, per call, since the height
+  depends on the target's depth — and pass `preventScroll` to `focus()` so the browser doesn't
+  get its own unpadded scroll in first.
+
+The stack offsets (`top: depth * ROW_H`) only add up while every row in the stack is exactly
+`ROW_H` tall, which is why the root row and the folder rows now SET their height instead of
+inheriting it from their different font sizes.
+
 ### Full-text search runs in the kernel worker — keep it non-blocking
 The VFS is synchronous ONLY inside the kernel worker (the sole VFS holder), so full-text
 search/replace lives there (`vv-search`/`vv-replace` in `packages/core/src/workers/kernel-worker.ts`), NOT on the
