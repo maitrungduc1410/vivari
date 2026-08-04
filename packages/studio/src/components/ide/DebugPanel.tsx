@@ -39,6 +39,9 @@ export function DebugPanel() {
         <button
           role="switch"
           aria-checked={snap.enabled}
+          // The "Debug mode on/off" text is a sibling, not a child, so the switch
+          // itself had no name. `aria-checked` already carries the on/off part.
+          aria-label="Debug mode"
           onClick={() => dbg.setEnabled(!snap.enabled)}
           className={cn(
             "relative h-5 w-9 rounded-full transition-colors",
@@ -132,6 +135,7 @@ function CtrlBtn({
       <TooltipTrigger
         onClick={onClick}
         disabled={disabled}
+        aria-label={label}
         className={cn(
           "flex size-7 items-center justify-center rounded text-foreground transition-colors hover:bg-accent",
           disabled && "cursor-not-allowed opacity-40 hover:bg-transparent",
@@ -232,7 +236,11 @@ function VarNode({ v, depth }: { v: DebugScopeVar; depth: number }) {
   return (
     <div>
       <div
-        className="flex cursor-default items-center gap-1 py-0.5 pr-2 text-xs hover:bg-accent"
+        className={cn(
+          "flex items-center gap-1 py-0.5 pr-2 text-xs hover:bg-accent",
+          // Only an expandable node does anything on click — `toggle` bails otherwise.
+          v.expandable && v.objectId ? "cursor-pointer" : "cursor-default",
+        )}
         style={{ paddingLeft: 12 + depth * 12 }}
         onClick={toggle}
       >

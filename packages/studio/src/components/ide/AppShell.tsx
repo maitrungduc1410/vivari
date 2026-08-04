@@ -36,7 +36,10 @@ export function AppShell() {
       const mod = e.metaKey || e.ctrlKey;
       if (!mod) return;
       const k = e.key.toLowerCase();
-      if (e.shiftKey && k === "f") {
+      if (e.shiftKey && k === "e") {
+        e.preventDefault();
+        c.setActiveView("explorer");
+      } else if (e.shiftKey && k === "f") {
         e.preventDefault();
         c.setActiveView("search");
       } else if (e.shiftKey && k === "g") {
@@ -51,6 +54,13 @@ export function AppShell() {
       } else if (k === "`") {
         e.preventDefault();
         c.togglePanel();
+      } else if (e.altKey && (k === "b" || e.code === "KeyB")) {
+        // VS Code's secondary side bar shortcut, mapped to the preview. Matched on
+        // `code` as well as `key` because holding Option on macOS can compose the
+        // character (⌥B → "∫"), which would otherwise miss and fall through to the
+        // plain ⌘B branch below and toggle the wrong panel.
+        e.preventDefault();
+        c.togglePreview();
       } else if (k === "b") {
         e.preventDefault();
         c.toggleSidebar();
@@ -121,10 +131,14 @@ export function AppShell() {
               )}
             </ResizablePanelGroup>
           </ResizablePanel>
-          <ResizableHandle />
-          <ResizablePanel id="preview" defaultSize="32%">
-            <PreviewPanel />
-          </ResizablePanel>
+          {!snap.previewCollapsed && (
+            <>
+              <ResizableHandle />
+              <ResizablePanel id="preview" defaultSize="32%">
+                <PreviewPanel />
+              </ResizablePanel>
+            </>
+          )}
         </ResizablePanelGroup>
       </div>
       <StatusBar />

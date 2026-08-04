@@ -6942,3 +6942,251 @@ punching the `bg-accent/30` empty-area highlight into stripes, so the tint now p
 (`z-[25]`, `pointer-events-none`) instead of behind them. Confirmed by diffing the sidebar before and
 after a synthetic area `dragover`: every one of the 14 row bands changes, where previously only the
 gaps between rows could.
+
+## Everything clickable stopped saying so (this change)
+
+**Tailwind v4's Preflight dropped `button { cursor: pointer }`, and nobody put it back.** v3 shipped
+that rule; v4 removed it deliberately, reverting buttons to the UA default `cursor: default`. There
+is no deprecation and no error — the app simply stops signalling that its buttons are buttons, and it
+does so everywhere at once, which is why the report ("files, buttons, and …") had no pattern to it.
+Confirmed rather than assumed: `node_modules/tailwindcss/preflight.css` at v4.3.2 contains no
+`cursor` declaration at all, its only occurrence of the word being a comment about Safari's spin
+buttons, and `index.css`'s `@layer base` never re-added it. So the fix is one base-layer rule, not
+`cursor-pointer` sprinkled across forty components: it covers components nobody has written yet, and
+it cannot drift out of sync. Disabled controls are excluded via `:not(:disabled, [aria-disabled])`,
+and because the rule lives in `@layer base`, every existing `cursor-not-allowed`, `cursor-text` and
+`cursor-col-resize` utility still outranks it.
+
+**The audit was run, not eyeballed.** Walking every laid-out element, reading its handlers off the
+React fiber (`__reactProps$…`) and flagging anything with a click handler or an interactive role whose
+computed cursor was non-interactive, across 21 stages from the Home template picker through the
+context menu, command palette, dialogs and toasts: **34 kinds of control before, 2 after** (768 and
+23 occurrences respectively — the same control is re-counted on every stage it appears on, so the
+raw totals overstate how many distinct things were broken). The 2 are both correct to leave: the
+status bar's diagnostics readout, which renders a `<span>`
+precisely because it has no `onClick` (its handlers are Base UI's tooltip internals), and cmdk's
+1×1 px clipped screen-reader `<label>` for the palette input. A static JSX pass covered what the
+driver could not reach — Search and Source Control render no rows without data — and confirmed every
+clickable element in those panels is already a `<button>`.
+
+**What a base rule cannot reach got it explicitly.** The Explorer's file, folder and workspace-root
+rows are `<div>`s with `onClick`, never buttons, and accounted for 194 of the flagged elements on
+their own; the editor, terminal and preview tabs and the Source Control rows already had
+`cursor-pointer` and were left alone. The resize handles needed measuring directly rather than
+trusting the handler sweep, since they are dragged rather than clicked and react-resizable-panels
+binds native listeners instead of React props: all four sat at `cursor: auto`, and now declare
+`col-resize` (vertical) and `row-resize` (horizontal). Note the declaration covers the wider
+`::after` grab strip but the pointer does not always reach it — on the two vertical handles the
+neighbouring panel (Monaco's margin overlays, the preview's `inset-0` layer) paints over the outer
+half, so about 3 px of the 4 px strip actually hit-tests to the handle. That was equally true before
+this change; widening the grab area is a separate fix.
+
+**Menu items now use the pointer, against the shadcn default.** `dropdown-menu`, `context-menu`,
+`select` and `command` all ship `cursor-default` on their items, which is the native-menu convention.
+This app imitates VS Code, so the question is what VS Code does — and VS Code is in `node_modules`:
+`monaco-editor`'s own stylesheets say `.monaco-menu .monaco-action-bar .action-item { cursor: pointer }`,
+`.action-item.disabled { cursor: default }`, and `.monaco-list.mouse-support .monaco-list-row
+{ cursor: pointer }`. Menu items, toolbar items and tree rows are all pointer there, so all four
+primitives were changed together. Two exceptions kept `cursor-default` deliberately: `select`'s
+scroll-up/down buttons, which auto-scroll on hover rather than invoking anything, and a debug
+variable row that is only expandable sometimes — it now mirrors its own `toggle` guard, pointer when
+there is something to expand and default when clicking is a no-op.
+
+## Three layout toggles, and the panel that could not be closed (this change)
+
+**VS Code's three corner buttons, added to the title bar.** Sidebar, bottom panel and preview, as
+icon-only toggles at the far right edge. Two of them only needed wiring: `toggleSidebar` and
+`togglePanel` already existed on the controller behind ⌘B and ⌘J. The third did not exist at all —
+`AppShell` rendered `<PreviewPanel/>` unconditionally, so the preview was the one region of the
+workspace with no way to get rid of it. It now has `previewCollapsed` and a `togglePreview(force?)`
+built to the same shape as its two siblings, `force` meaning *visible* exactly as it does there, so
+all three answer to the same three routes: the button, the keybinding, and the command palette.
+
+**⌥⌘B for the preview**, which is what VS Code binds its secondary side bar to, and nothing else in
+the app claimed it — the only other `altKey` in the codebase is an xterm handler that explicitly
+requires `!altKey`. The new branch is matched on `e.code === "KeyB"` as well as `e.key`, because
+holding Option on macOS can compose the character (⌥B → "∫"); had it matched on `key` alone it would
+have missed and fallen through to the plain ⌘B branch, toggling the sidebar instead of the preview.
+That is a precaution rather than a repair: this is a Linux sandbox and the composing case was never
+reproduced here.
+
+**The trap was the resize handle, not the panel.** The sidebar and the bottom panel each wrap their
+`ResizableHandle` and `ResizablePanel` in one fragment, so the handle leaves with the panel. The
+preview's handle was a bare sibling, and hiding only the panel would have left a live 4 px draggable
+divider pinned to the right edge of the window with nothing on the other side of it. Moving it into
+the fragment fixes it; verified structurally in all eight visible/hidden combinations — every handle
+present has a `resizable-panel` immediately either side of it, and a hit-test down the last 8 px of
+the window returns no handle whenever the preview is hidden. Handle counts read 0/1/2/3/4 across
+those combinations rather than the 0/1/1/2 you might expect, because the terminal panel contains a
+nested split of its own (`term-content | term-list`) that arrives with it.
+
+**The icons carry the state.** lucide ships a solid-divider and a dashed-divider glyph for each edge
+and aliases the dashed one `-inactive`, which is the pack's own answer to this and closer to hand
+than inventing a filled variant: `panel-left` when the sidebar is showing, `panel-left-dashed` when
+it is not. VS Code distinguishes the two states by filling the sub-panel region instead, and no
+lucide glyph does that — every body in the pack is `fill="none"`. The dashed rule is a fine
+distinction at 16 px, so the foreground carries it too, muted when hidden and full contrast when
+shown, matching what the activity bar already does for the selected view. `aria-pressed` carries it
+for anything not looking at pixels.
+
+**`New` is gone, and it never made anything.** `Home` and `New` sat side by side in the corner both
+calling `c.goHome()`, which only sets `view: "home"` — so `New`'s `title="New project"` promised a
+creation step that did not exist, and the two buttons were the same navigation under different
+labels. `Home` is the accurate one and it stays; the Home screen is still where a project gets
+created, exactly one click away as it always was. The brand button on the left also goes home, so
+that route survives twice over.
+
+**Verified by driving it.** All three toggles round-trip in both directions through all three routes
+and agree with each other; the bottom panel's own "Hide panel" chevron moves the title-bar toggle
+with it, since everything reads the snapshot rather than local state. Panel sizes survive a
+collapse/restore round trip, including a preview dragged 120 px wider beforehand. The bar stays a
+single 40 px row with no overflow from 1400 px down to 420 px, the layout cluster holding 186 px
+while the centred project title truncates from 1067 px to 87 px. And the new buttons take
+`cursor: pointer` from the base rule added in this branch's first commit, without needing a class.
+## A UI review that mostly said "already right" (this change)
+
+**An open-ended survey, driven rather than read.** The ask was whether anything in the Studio's UI
+could be better. Eight areas were walked in the running app — tabs, empty states, keyboard, focus,
+overflow, feedback, consistency, the status and title bars — and most came back clean, which is the
+result rather than a failure to look hard enough. The editor tab strip already has italic preview
+tabs that replace rather than accumulate, a dirty dot that swaps to an ✕ on hover, drag-to-reorder
+with a drop-side indicator, and a five-item context menu with the inapplicable entries disabled. All
+five empty states are written, not blank, and SCM's offers an `Initialize Repository` button.
+Deleting a file confirms with "This cannot be undone". Nothing overflows between 1400 px and 500 px.
+Light/dark parity holds. Seven things were worth fixing; the ranked list, including what was left
+and why, is in the review document.
+
+**The active tab was never scrolled into view.** Past roughly seven open files the strip overflows,
+and activating a tab from anywhere but the strip itself — an Explorer click, ⌘P, a diff opening —
+left it off-screen: measured `scrollLeft` stayed at 0 with `scrollWidth` 1950 against a 702 px
+viewport, both for a tab created at x=1854 and for one activated 1700 px to the left. The editor
+content changed while no visible tab looked active, which reads as the file not having opened. A ref
+on the active tab plus `scrollIntoView({ block: "nearest", inline: "nearest" })` keyed on
+`snap.activeTab` — the same thing the Explorer's `revealRow` already does. The scroll chevrons and
+tab-list dropdown VS Code also has when overflowing are deliberately not part of this; they need
+scroll-position state and belong in their own change.
+
+**Middle-click closes a tab**, as it does in VS Code, where before it did nothing at all. It goes
+through the same `processQueue` as the ✕ and the context menu, so a dirty file still gets its
+Save/Don't save/Cancel prompt — verified on a dirty tab, not just a clean one.
+
+**A truncated filename could not be read at all.** Tree rows ellipsize and the Explorer viewport
+does not scroll sideways (`scrollWidth === clientWidth`), so a long name — or any name at depth 8,
+where `paddingLeft: 8 + depth * 12 + 16` eats 120 px of a 216 px sidebar — was simply unreachable:
+no tooltip, no horizontal scroll, nothing but widening the sidebar. The three row types now carry a
+`title`, which the editor tabs already did. Real horizontal scrolling in the tree is the better fix
+and is not attempted here — it lands directly on the sticky headers and the `revealRow` scroll
+padding, and deserves its own verification pass.
+
+**Five helpers had no accessible name between them, covering 25 icon-only buttons.** `ActBtn` (4
+call sites), `HeaderBtn` (4), `IconBtn` (7), `ToolButton` (5) and `CtrlBtn` (5) each pass their label
+to a `TooltipContent` and nothing else, so the activity bar announced as four anonymous buttons and
+the preview and debug toolbars as five each. `aria-label={label}` on all five, plus two one-offs: the
+inline New-browser-tab trigger, and the debug enable switch, whose "Debug mode on/off" text is a
+sibling rather than a child so the switch itself had no name at all (`aria-checked` already carries
+the on/off part). `LayoutToggle` in this branch's previous commit already did this, so the change
+makes the codebase agree with itself rather than introducing a convention. Side effect worth having:
+`getByRole("button", { name: "Search" })` now resolves, where it used to time out.
+
+**The count came from enumerating statically, after a driven audit under-reported it.** Walking the
+live DOM found nine buttons across three helpers, and missed `ToolButton` and `CtrlBtn` completely:
+the preview toolbar renders only once a preview tab is active and the debug controls only once debug
+mode is on, and the audit ran with "No preview open" and no session, so ten of those buttons did not
+exist to be counted. A scan of every `TooltipTrigger`, `<button>` and `role=button|switch|tab|menuitem` in
+`src` is state-independent by construction; it was validated against the two earlier commits, where
+the answer was already known, before its zero was believed here. Then driven for real — a preview tab
+opened and debug mode switched on — to confirm the ten previously unreachable controls resolve
+through the accessibility tree. One trap worth knowing if you write that scan: JSX attributes here
+carry `//` comments containing apostrophes, and a quote-tracking parser that does not skip comments
+opens a string on one and swallows the rest of the file. `PreviewPanel`'s `<iframe>` ate 8.4 kB that
+way and hid all five `ToolButton` call sites behind a clean-looking result.
+
+**`StatusBar` cells deliberately get no `aria-label`.** They were never part of the problem: every
+clickable cell wraps a *value* in an action label, so `label="Select Indentation"` over `Spaces: 2`
+would replace the value with the action and announce "Select Indentation, button" — the number the
+user wanted becomes unreachable, and WCAG 2.5.3 Label in Name breaks, so "click Spaces" stops
+matching for voice control. The tooltip is the right home for the action and the visible text is the
+right accessible name. `SourceControlPanel`'s branch picker has the identical shape and is left
+alone for the identical reason.
+
+**The command palette taught no shortcuts.** Zero of fourteen rows showed a key, while the
+Explorer's *context* menu has shown ⌘C/⌘X/⌘V all along — so the palette was inconsistent with the
+app, not merely spare. The four commands that genuinely have a global binding now show it
+(⇧⌘C, ⌘J, ⌘B, ⌥⌘B), right-aligned in the same `ml-auto text-xs text-muted-foreground` the file rows
+already use for their path. Only those four: a key printed beside a command that does not answer to
+it is worse than no key, so `keys` is optional and the ten unbound commands stay bare.
+
+**⇧⌘E opens the Explorer.** ⇧⌘F and ⇧⌘G were already wired to Search and Source Control, which made
+the missing third the conspicuous one rather than an absent feature. `setActiveView` un-collapses the
+sidebar on its own, so the branch is three lines beside its two siblings and needed no new state.
+
+**The splitters were 3 px wide and grabbable from one side only.** Documented in the previous commit,
+measured properly here: hit-testing across each handle at 1 px steps returned the handle at offsets
+−3, −2 and −1 and nothing at 0 or beyond, because the separator is a 1 px element whose 4 px `::after`
+overhangs its neighbours, and at `z-index: auto` it loses to Monaco's `margin-view-overlays` on one
+handle and the preview's `absolute inset-0` on the other. `relative z-10` restores the full strip on
+both sides. The number is bounded on both ends: it has to beat sibling panel content but stay under
+the ScrollArea scrollbar's `z-30` from this branch's first commit, and both were checked by
+hit-test — the scrollbar still wins, and the editor body still takes its own clicks.
+
+**Verified by driving all of it**, 29 assertions: the active tab revealed from both the left and the
+right of an overflowing strip; middle-click closing exactly one tab and still prompting on a dirty
+one; no unlabelled icon-only button left, and each new name resolving by role; a title on all three
+row types; exactly four palette keys and the right four; ⇧⌘E working without breaking ⇧⌘F or ⇧⌘G; and
+every on-screen handle dragging from its neighbour's side at +1 px, re-measured between drags because
+the handle moves with the pointer. Nothing here adds controller state or changes an interaction
+model; the items that would — the Explorer's keyboard accessibility above all — are listed in the
+review document instead.
+## The Explorer revealed the active file, and parked it at the bottom (this change)
+
+**"Nhiều lúc nó ở mãi bên dưới."** Switching between open files did scroll the Explorer to the
+active one — a `revealRow` helper added in MR !158 — but it kept landing flush against the bottom
+edge of the list, with nothing visible below it. The cause is one word: `revealRow` ended in
+`el.scrollIntoView({ block: "nearest" })`, and `nearest` is specified as the *minimum* scrolling
+that puts the element inside the scrollport. Revealing a row from below therefore parks it on the
+bottom edge by definition — not a bug, and not one that presents as a bug either, which is why it
+survived the original change and its review. `block: "center"` is now used for the active-file
+reveal.
+
+**Centring composes with the sticky stack rather than fighting it, and both claims were measured.**
+`scroll-padding-top` (the band reserved for the parked ancestor rows) shrinks the *optimal viewing
+region* per CSSOM-View, and `center` centres within the reduced band: with `padTop` at 48 the row
+landed on the band centre and therefore exactly 24px — `padTop / 2` — below the raw viewport
+centre, which is the arithmetic proof that the padding was honoured rather than ignored. The browser
+also clamps the resulting offset, so "càng gần giữa càng tốt" at the ends of the list needs no
+arithmetic here: a target near the top settles at `scrollTop: 0` and 198px above centre, one near
+the bottom at `maxScroll` and 86px below it, each off-centre by exactly what the scroll range
+denies. All three routes — clicking a tab, ⌘P, clicking a file — agree to the pixel.
+
+**One row of clearance decides "already in view", and the threshold is the point.** Centring
+unconditionally would lurch the tree on every tab switch, including when the file was already
+sitting in plain sight. So the reveal is skipped when the row has `ROW_H` of clearance inside the
+usable band on both sides, and fires otherwise. The clearance cannot be zero: a strictly-visible
+test passes a row one pixel inside the bottom edge, which is precisely the case reported, so the
+complaint would have survived the fix. One row is the smallest defensible value that also means
+something — there is always a sibling visible on whichever side the row is nearest, so its place in
+the tree is readable. Verified both ways: a row parked one pixel inside the bottom edge is
+re-centred, and switching to an adjacent file already comfortably in view does not move the list at
+all.
+
+**The deep-row case at the top of the scroll range is safe, and structurally so.** This is where
+clamping and the sticky band could collide — clamping prevents centring, so the row could come to
+rest inside the band where the ancestors are parked. Driven at five starting scroll offsets against
+a 7-deep chain, the row landed exactly at the band's top edge (`topInBand: 0`) every time, fully
+visible, with nothing painted over it. It holds by construction rather than by luck: the clamp only
+bites when the row is near the top of the *content*, which means few rows precede it, which means
+the parked stack cannot be taller than the row's own ancestor chain — and that is exactly the height
+`scroll-padding-top` reserves.
+
+**The rename / new-file input deliberately keeps `nearest`.** It is the second `revealRow` call site
+and it was not allowed to inherit the change. That input has just been spawned beside a row the user
+clicked, so it is already where they are looking; the job there is only to get it out from behind
+the parked ancestors, and moving the list the minimum amount to do that is less disorienting than
+yanking it to the middle under a pointer that has not moved. Confirmed by driving it with the list
+964px scrollable — so centring would visibly have moved it — where `nearest` moved it 0px and left
+it 114px off centre, still fully inside the usable band.
+
+**Also verified unchanged:** the reveal still fires once per tab, so scrolling away deliberately
+survives re-renders and a `flatVisible` change from expanding another folder; the ancestor rows
+still park at `depth * ROW_H` with the shallowest winning; the drag-over tint still fires; and the
+new-file input still lands 2px inside the band, which is the MR !158 fix it was written for.

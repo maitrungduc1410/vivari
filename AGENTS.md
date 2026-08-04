@@ -1186,6 +1186,162 @@ The stack offsets (`top: depth * ROW_H`) only add up while every row in the stac
 `ROW_H` tall, which is why the root row and the folder rows now SET their height instead of
 inheriting it from their different font sizes.
 
+### `scrollIntoView({ block: "nearest" })` is *minimum* scroll, so the row parks on the edge
+
+Reserving the band is only half of "reveal a row"; the other half is the alignment, and `nearest`
+is the wrong default for an active-file reveal. It is specified as the least scrolling that puts the
+element inside the scrollport, so revealing a row from below leaves it flush against the **bottom
+edge, every time** — with no context under it and nowhere to look next. It is not a bug and it will
+not present as one: it reads as "the tree keeps dumping the file at the bottom", which is what the
+user reported. `block: "center"` is the fix, and two things about it are worth knowing because they
+save writing arithmetic (both measured here, not assumed):
+
+- **It honours `scroll-padding-top`.** Per CSSOM-View the padding shrinks the *optimal viewing
+  region*, and `center` centres within the reduced band — so it composes with the sticky-stack
+  reservation above rather than fighting it. Measured with `padTop` 48: the row landed exactly on
+  the band centre and therefore 24px (`padTop / 2`) below the raw viewport centre.
+- **The browser clamps the result**, so "as close to the middle as possible" at the ends of the
+  list is free. A target near the top settles at `scrollTop: 0`, one near the bottom at
+  `maxScroll`, both off-centre by exactly the amount the scroll range denies.
+
+Two judgement calls that are easy to get wrong. **Do not centre unconditionally** — that lurches
+the tree on every tab switch, including when the row was already in plain sight. Skip the scroll
+when the row has real clearance inside the band; a strict "is it visible" test is not enough,
+because a row one pixel inside the bottom edge passes it and stays parked, which is the original
+complaint intact. And **alignment is per-call, not global**: the active-file reveal wants centring,
+but the inline rename / new-file input has just appeared next to a row the user clicked, so it
+wants minimum scroll — just clear of the parked stack, without yanking the list under a pointer
+that has not moved.
+
+`monaco-editor` ships `vs/base/browser/ui/list`, whose `reveal(index, relativeTop, paddingTop)` has
+both behaviours — fractional positioning clamped by `setScrollTop`, or a minimum-scroll branch when
+`relativeTop` is omitted — and folds `paddingTop` into the arithmetic exactly as the sticky-scroll
+controller passes it in `abstractTree.js`. Useful for the semantics. It does **not** settle policy:
+`monaco-editor` ships no `vs/workbench` at all, so which alignment the Explorer should use, and when
+it should reveal, cannot be confirmed from `node_modules` and has to be argued on its own merits.
+
+### A collapsible panel must take its `ResizableHandle` with it
+
+In `AppShell.tsx` a panel and the handle that splits it from its neighbour are two sibling
+elements, and only the panel is interesting to look at — so the natural way to make one
+collapsible is to wrap the `ResizablePanel` in `{!collapsed && …}` and leave the handle alone.
+That leaves a **live 4 px draggable divider with nothing on the other side of it**, pinned to
+the edge of the window. It is nearly invisible (1 px of border, a wider transparent `::after`
+grab strip) and it still drags, so it reads as the UI being broken rather than as a stray
+element. The preview panel shipped without a collapse state for exactly this reason — it was
+the only one of the three whose handle was a bare sibling instead of being wrapped with its
+panel in a fragment.
+
+Put both in one fragment, which is what the sidebar and the bottom panel already do:
+
+```tsx
+{!snap.previewCollapsed && (
+  <>
+    <ResizableHandle />
+    <ResizablePanel id="preview" defaultSize="32%"><PreviewPanel /></ResizablePanel>
+  </>
+)}
+```
+
+Check it structurally rather than by eye — every handle should have a `resizable-panel`
+immediately before and after it in its group, in every combination of collapsed panels. Note
+that the handle count will not match the number of visible panels: `TerminalPanel` brings a
+nested `term-content | term-list` split of its own, so the totals run 0/1/2/3/4 across the eight
+combinations, not 0/1/1/2. One of those handles also lives in a hidden `0x0` subtree whenever the
+bottom panel is showing CONSOLE rather than TERMINAL, so it hit-tests to nothing — expect it, and
+exclude it, instead of reading it as a regression.
+
+### A `ResizableHandle` needs `z-index` or the neighbour eats its grab strip
+
+The separator is a **1 px** element between two panels; the thing you actually grab is a 4 px
+transparent `::after` centred on it, so half of it overhangs each neighbour. At `z-index: auto` the
+separator loses to any neighbour that establishes its own stacking content, and the overhang becomes
+undraggable. Measured here: only offsets **−3, −2, −1** hit-tested to the handle, so the strip was
+3 px and grabbable from *one side only* — you had to approach the splitter from the correct
+direction. Monaco's `margin-view-overlays` blocked one handle and the preview's `absolute inset-0`
+blocked the other.
+
+`relative z-10` on the separator fixes it (4–5 px, both sides). Pick the number deliberately: it has
+to beat sibling panel content but stay under the ScrollArea scrollbar's `z-30` and the app's
+`z-40`/`z-50` overlays, or the splitter starts stealing scrollbar drags. Verify by dragging from the
+*neighbour's* side, at `+1 px`, not from the centre — a centre-grab passes even when the bug is
+present, and remember the handle moves with the drag, so re-measure before a second one.
+
+### A tooltip is not an accessible name
+
+Five helpers here wrap a `TooltipTrigger` around a bare icon and pass the human-readable string to
+`TooltipContent` and nowhere else: `ActBtn` (`ActivityBar.tsx`), `HeaderBtn` (`Explorer.tsx`),
+`IconBtn` (`SourceControlPanel.tsx`), `ToolButton` (`PreviewPanel.tsx`) and `CtrlBtn`
+(`DebugPanel.tsx`). That looks complete, and for a sighted user it is, so the omission survives
+review: a Base UI tooltip is `aria-describedby` at best and only while it is open, so the button's
+accessible name stays **empty**. Pass `aria-label={label}` as well as the tooltip; the string is
+already in scope. Worth catching rather than filing as an a11y nicety, because it also silently
+breaks the way this repo verifies its own UI — `page.getByRole("button", { name: "Search" })` times
+out, which reads as a broken selector rather than a missing label, and the tempting workaround is a
+class selector.
+
+**But do not label a control whose visible text is the value.** `aria-label` *replaces* the
+content, so the reflex of "add the label prop everywhere" is a regression on any control that
+already reads correctly. Every clickable `StatusBar` cell wraps a value in an action label —
+`label="Select Indentation"` around `Spaces: 2`, `"Current branch"` around the branch name,
+`"Go to Line/Column"` around `Ln 1, Col 1` — so labelling them turns "master, button" into
+"Current branch, button" and the value the user wanted becomes unreachable. It also breaks WCAG
+2.5.3 Label in Name: voice control says "click Spaces" and no longer matches. The same trap sits on
+`SourceControlPanel`'s branch picker. Leave both alone; the tooltip is the right home for the
+action, and the text is the right accessible name. An `aria-label` on a non-interactive `<span>`
+(the diagnostics readout) is not a fix either — with no role, screen readers largely ignore it.
+
+**A rendered-DOM audit enumerates only what the current state renders.** This is the part that has
+now cost two commits. Walking the live DOM found four helpers and missed `ToolButton` and `CtrlBtn`
+entirely, because the preview toolbar renders only once a preview tab is active and the debug
+controls only once debug mode is on — the audit ran with "No preview open" and no session, so those
+buttons did not exist to be counted. The cursor pass hit the identical trap with `SearchPane` and
+`SourceControlPanel` and needed a static-JSX backstop for exactly this reason. So: **drive the app
+to measure behaviour, but enumerate statically.** For accessible names, scan every
+`TooltipTrigger`, `<button>` and `role=button|switch|tab|menuitem` in `src` and sort them into
+three buckets — carries a name attribute; renders its own text; renders `{children}`. The third is
+not evidence either way and has to be resolved at the *call sites*, which is precisely where
+`ToolButton`'s five icons and `StatusItem`'s six text values part company.
+
+One booby trap if you write that scan: JSX attributes in this repo contain `//` comments, and those
+comments contain apostrophes. A scanner that tracks quotes without first skipping comments opens a
+string on `doesn't` and swallows the rest of the file — `PreviewPanel`'s `<iframe>` ate 8.4 kB and
+hid all five `ToolButton` call sites, reporting a clean result. Validate any such scan against a
+commit where you *know* the answer before trusting a zero.
+
+### Tailwind v4's Preflight stopped giving `button` a pointer cursor
+
+v3's Preflight set `button, [role="button"] { cursor: pointer }`. **v4 deliberately dropped it**,
+so buttons fall back to the UA default `cursor: default` — silently, with no deprecation and no
+error. Verify it in the installed copy rather than from memory: `node_modules/tailwindcss/preflight.css`
+at v4.3.2 has no `cursor` declaration anywhere. It cost this app every button affordance in the UI
+at once, which reads as a scatter of unrelated papercuts rather than one regression.
+
+`index.css`'s `@layer base` now restores it once, and that is where it belongs — a rule per
+component drifts, and a base rule also covers components that don't exist yet. Two things a blanket
+rule must get right, both already handled there:
+
+- **Exclude disabled controls** (`:not(:disabled, [aria-disabled="true"])`). This matches VS Code,
+  which uses `cursor: default` — not `not-allowed` — for a disabled action item.
+- **Keep it in `@layer base`.** Utilities outrank base, so a deliberate `cursor-text`,
+  `cursor-not-allowed` or `cursor-col-resize` at a call site still wins. Put the same rule in
+  `@layer components` or unlayered and it would start overriding them instead.
+
+A base rule reaches only real `<button>`s and `[role="button"]`s. The clickable `<div>`s — Explorer
+rows, editor/terminal/preview tabs, SCM rows — each need their own `cursor-pointer`, and drag
+handles need `col-resize`/`row-resize` (they are dragged, not clicked, and react-resizable-panels
+binds native listeners, so a React-props audit will not flag them as clickable — check them by
+hand). And when you check, hit-test with `elementFromPoint` rather than reading
+`getComputedStyle(el, "::after").cursor`: the latter reports the declaration, not what the pointer
+lands on, and a neighbouring panel can paint over the outer half of a widened `::after` grab strip
+— which is exactly what Monaco's margin overlays and the preview's `inset-0` layer did here, until
+`resizable.tsx` got the `z-10` described below.
+**When in doubt about a cursor
+convention, `node_modules/monaco-editor` is VS Code's own CSS** and settles it locally:
+`.monaco-menu .monaco-action-bar .action-item { cursor: pointer }` is why this repo's menu
+primitives override shadcn's `cursor-default`, and `.monaco-list.mouse-support .monaco-list-row
+{ cursor: pointer }` is why tree rows do.
+
 ### Full-text search runs in the kernel worker — keep it non-blocking
 The VFS is synchronous ONLY inside the kernel worker (the sole VFS holder), so full-text
 search/replace lives there (`vv-search`/`vv-replace` in `packages/core/src/workers/kernel-worker.ts`), NOT on the

@@ -4,6 +4,7 @@ import Play from "~icons/lucide/play";
 import Home from "~icons/lucide/house";
 import TerminalIcon from "~icons/lucide/terminal";
 import PanelLeft from "~icons/lucide/panel-left";
+import PanelRight from "~icons/lucide/panel-right";
 import Eraser from "~icons/lucide/eraser";
 import RefreshCw from "~icons/lucide/refresh-cw";
 import RotateCcw from "~icons/lucide/rotate-ccw";
@@ -37,17 +38,22 @@ export function CommandPalette() {
     if (snap.paletteOpen) setRaw("");
   }, [snap.paletteOpen, snap.paletteMode]);
 
-  const commands = useMemo(
+  // `keys` is the palette's only way to teach a shortcut, so it must stay honest:
+  // only commands with a binding in AppShell's global handler carry one.
+  const commands = useMemo<
+    { label: string; icon: React.ComponentType; keys?: string; run: () => void }[]
+  >(
     () => [
       { label: "Go Home / New Project", icon: Home, run: () => c.goHome() },
-      { label: "New Terminal", icon: Plus, run: () => c.newShellTerminal() },
+      { label: "New Terminal", icon: Plus, keys: "⇧⌘C", run: () => c.newShellTerminal() },
       { label: "Run Project", icon: Play, run: () => c.runActiveFolder() },
       { label: "Import Folder as Project", icon: FolderInput, run: () => c.importFolderViaPicker() },
       { label: "Import from GitHub or npm", icon: Github, run: () => c.openImportRemote() },
       { label: "Export Project as Zip", icon: FileArchive, run: () => c.exportActiveFolder() },
       { label: "Share Project (copy link)", icon: Share2, run: () => c.shareActiveFolder() },
-      { label: "Toggle Terminal Panel", icon: TerminalIcon, run: () => c.togglePanel() },
-      { label: "Toggle Sidebar", icon: PanelLeft, run: () => c.toggleSidebar() },
+      { label: "Toggle Terminal Panel", icon: TerminalIcon, keys: "⌘J", run: () => c.togglePanel() },
+      { label: "Toggle Sidebar", icon: PanelLeft, keys: "⌘B", run: () => c.toggleSidebar() },
+      { label: "Toggle Preview Panel", icon: PanelRight, keys: "⌥⌘B", run: () => c.togglePreview() },
       { label: "Clear Active Terminal", icon: Eraser, run: () => c.clearActiveTerminal() },
       { label: "Reload Preview", icon: RefreshCw, run: () => c.reloadPreview() },
       { label: "Measure Memory", icon: Gauge, run: () => void c.measureMemory() },
@@ -101,6 +107,9 @@ export function CommandPalette() {
               {commands.map((cmd) => (
                 <CommandItem key={cmd.label} value={cmd.label} onSelect={() => run(cmd.run)}>
                   <cmd.icon /> {cmd.label}
+                  {cmd.keys && (
+                    <span className="ml-auto text-xs text-muted-foreground">{cmd.keys}</span>
+                  )}
                 </CommandItem>
               ))}
             </CommandGroup>

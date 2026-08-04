@@ -503,6 +503,7 @@ function IconBtn({
       <TooltipTrigger
         onClick={(e) => { e.stopPropagation(); onClick(); }}
         disabled={disabled}
+        aria-label={label}
         className="flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-40"
       >
         {children}

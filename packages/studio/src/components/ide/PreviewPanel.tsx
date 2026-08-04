@@ -28,6 +28,7 @@ function ToolButton({
       <TooltipTrigger
         onClick={onClick}
         disabled={disabled}
+        aria-label={label}
         className="flex size-7 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
       >
         {children}
@@ -160,6 +161,7 @@ export function PreviewPanel() {
         <Tooltip>
           <TooltipTrigger
             onClick={() => c.addPreviewTab()}
+            aria-label="New browser tab"
             className="flex w-8 shrink-0 items-center justify-center border-l text-muted-foreground hover:bg-accent hover:text-foreground"
           >
             <Plus className="size-4" />

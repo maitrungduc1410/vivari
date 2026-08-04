@@ -202,6 +202,7 @@ export interface IdeSnapshot {
   activeView: "explorer" | "search" | "debug" | "scm";
   sidebarCollapsed: boolean;
   panelCollapsed: boolean;
+  previewCollapsed: boolean;
   panelTab: "console" | "terminal" | "ports";
   clipboard: Clipboard | null;
   paletteOpen: boolean;
@@ -580,6 +581,7 @@ export class IdeController {
     activeView: "explorer",
     sidebarCollapsed: false,
     panelCollapsed: true,
+    previewCollapsed: false,
     panelTab: "console",
     clipboard: null,
     paletteOpen: false,
@@ -2591,7 +2593,11 @@ export class IdeController {
     }
     const id = "pv" + ++this.previewSeq;
     const tab: PreviewTab = { id, url: `localhost:${port}`, port, path: "/", nonce: 1 };
-    this.set({ previewTabs: [...this.snap.previewTabs, tab], activePreviewId: id });
+    // Reveal the preview the way spawning a terminal reveals the bottom panel: this
+    // is the one path that can add a tab while the panel is hidden, and a dev server
+    // coming up with nothing to show for it is a dead end. Only for a genuinely new
+    // port — a restart on a port we already mirror takes the branch above.
+    this.set({ previewTabs: [...this.snap.previewTabs, tab], activePreviewId: id, previewCollapsed: false });
   }
 
   // Push the set of in-VM ports that serve UNDER the /preview/<port>/ prefix
@@ -2916,6 +2922,10 @@ export class IdeController {
   toggleSidebar(force?: boolean) {
     const collapsed = force === undefined ? !this.snap.sidebarCollapsed : !force;
     this.set({ sidebarCollapsed: collapsed });
+  }
+  togglePreview(force?: boolean) {
+    const collapsed = force === undefined ? !this.snap.previewCollapsed : !force;
+    this.set({ previewCollapsed: collapsed });
   }
   openPalette(mode: "command" | "file") {
     this.set({ paletteOpen: true, paletteMode: mode });

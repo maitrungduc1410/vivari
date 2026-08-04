@@ -38,6 +38,15 @@ export function EditorGroup() {
     [c],
   );
 
+  // Keep the active tab on screen. Past ~7 open files the strip overflows, and
+  // activating a tab from anywhere but the strip itself (Explorer click, ⌘P, a
+  // diff opening) leaves the selected tab scrolled out of sight — the editor
+  // changes under you while no visible tab looks active.
+  const activeTabRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    activeTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [snap.activeTab, snap.openTabs.length]);
+
   // Drop zone over the whole editor area. We use capture-phase native listeners
   // (not React props) so we intercept the drop before Monaco's own DOM handlers,
   // and read the DataTransfer synchronously (its item list dies after we yield).
@@ -117,10 +126,18 @@ export function EditorGroup() {
             <ContextMenu key={rel}>
               <ContextMenuTrigger className="contents">
                 <div
+                  ref={active ? activeTabRef : undefined}
                   title={isDiff ? diffTargetOf(rel) : rel}
                   draggable
                   onClick={() => c.openFile(rel, { preview: isPreview })}
                   onDoubleClick={() => c.pinTab(rel)}
+                  // Middle-click closes the tab, as it does in VS Code. Goes through
+                  // the same queue as the ✕ so a dirty file still gets its prompt.
+                  onAuxClick={(e) => {
+                    if (e.button !== 1) return;
+                    e.preventDefault();
+                    processQueue([rel]);
+                  }}
                   onDragStart={(e) => {
                     e.dataTransfer.setData(VV_TAB_MIME, rel);
                     e.dataTransfer.effectAllowed = "move";

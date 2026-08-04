@@ -132,6 +132,16 @@
     margin: 0;
     overflow: hidden;
   }
+  /* Tailwind v4's Preflight dropped the `button { cursor: pointer }` that v3 shipped,
+     so every button in the app silently fell back to the UA default `cursor: default`.
+     Restore it once here rather than per component: it also covers components not
+     written yet, and a `cursor-*` utility still wins because utilities outrank base.
+     Disabled controls are excluded and keep the default cursor — the same thing VS
+     Code does (`.monaco-action-bar .action-item.disabled { cursor: default }`). */
+  button:not(:disabled, [aria-disabled="true"]),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
 }
 
 /* VS Code-style thin horizontal scrollbar for the editor tab strip. */

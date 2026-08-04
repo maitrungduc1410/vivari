@@ -44,18 +44,47 @@ const ROW_H = 24;
 const STICKY_Z = 20;
 const stickyStyle = (depth: number) => ({ top: depth * ROW_H, zIndex: Math.max(1, STICKY_Z - depth) });
 
-// Scroll a row into view PAST the parked stack. `scrollIntoView` and `focus()` both
-// align their target with the scrollport's top edge — which is exactly where the sticky
-// ancestors sit — so left alone they "reveal" a row that is completely behind them.
+// Vertical clearance required before a row counts as "already in view". Zero would
+// re-create the bug this is meant to fix: a row one pixel inside the bottom edge is
+// technically visible, so it would be left parked down there. One row means there is
+// always a sibling visible on whichever side the row is nearest, which is what makes
+// its position in the tree readable.
+const REVEAL_CLEARANCE = ROW_H;
+
+// Scroll a row into view PAST the parked stack, and — for `align: "center"` — near the
+// middle rather than wherever is closest.
+//
+// Two separate things are going on here. First, `scrollIntoView` and `focus()` both
+// align their target with the scrollport's top edge, which is exactly where the sticky
+// ancestors sit, so left alone they "reveal" a row that is completely behind them.
 // `scroll-padding-top` is how you tell the scroll machinery that a band at the top of
 // the scrollport is not usable; the stack above a row at `depth` is its own ancestor
 // chain, i.e. `depth` rows. Set per-call because the height depends on the target.
 // The selector is a real dependency on `ui/scroll-area.tsx`, which says so at that end too.
-const revealRow = (el: HTMLElement | null, depth: number) => {
+//
+// Second, the alignment. `block: "nearest"` is *minimum* scrolling by definition, so
+// revealing a row from below parks it flush against the bottom edge every time — which
+// is what "it keeps ending up right at the bottom" was. `"center"` puts it mid-viewport
+// (mid-*usable*-band, since scroll-padding shrinks the optimal viewing region), and the
+// browser clamps the resulting scroll offset, so a target near either end of the list
+// lands as close to the middle as the scroll range permits with no arithmetic here.
+//
+// Centring unconditionally would lurch the tree on every tab switch, including when the
+// row was already sitting in plain sight, so a row with `REVEAL_CLEARANCE` on both sides
+// is left exactly where it is.
+const revealRow = (el: HTMLElement | null, depth: number, align: "center" | "nearest" = "center") => {
   if (!el) return;
   const viewport = el.closest<HTMLElement>('[data-slot="scroll-area-viewport"]');
-  if (viewport) viewport.style.scrollPaddingTop = `${depth * ROW_H}px`;
-  el.scrollIntoView({ block: "nearest" });
+  const padTop = depth * ROW_H;
+  if (viewport) viewport.style.scrollPaddingTop = `${padTop}px`;
+  if (align === "center" && viewport) {
+    const vp = viewport.getBoundingClientRect();
+    const row = el.getBoundingClientRect();
+    if (row.top >= vp.top + padTop + REVEAL_CLEARANCE && row.bottom <= vp.bottom - REVEAL_CLEARANCE) {
+      return;
+    }
+  }
+  el.scrollIntoView({ block: align });
 };
 
 // A pending inline "new file" / "new folder" input.
@@ -376,10 +405,14 @@ export function Explorer() {
           onOpen={() => toggle(abs)} onRename={() => startRename(abs)} onDelete={() => setConfirmDelete(effective(abs))}
           onNewFile={() => startCreate(abs, "file")} onNewFolder={() => startCreate(abs, "folder")}>
           <div
+            // Rows truncate with an ellipsis and the tree does not scroll sideways, so
+            // without this a long name — or any name at depth, where the indent eats
+            // the width — cannot be read at all.
+            title={name}
             {...dragProps(abs)}
             {...dropProps(abs, abs)}
             className={cn(
-              "flex w-full items-center gap-1 text-left text-sm",
+              "flex w-full cursor-pointer items-center gap-1 text-left text-sm",
               dragOver === abs
                 ? "bg-accent/80 text-foreground ring-1 ring-inset ring-primary"
                 : selection.has(abs) ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
@@ -407,10 +440,11 @@ export function Explorer() {
         onNewFile={() => startCreate(parentDir(abs), "file")} onNewFolder={() => startCreate(parentDir(abs), "folder")}>
         <div
           ref={snap.activeTab === abs ? (el) => { activeRowRef.current = el; activeRowDepth.current = depth; } : undefined}
+          title={name}
           {...dragProps(abs)}
           {...dropProps(parentDir(abs), abs)}
           className={cn(
-            "flex w-full items-center gap-1.5 py-0.5 text-left text-sm",
+            "flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-sm",
             dragOver === abs
               ? "bg-accent/80 text-foreground ring-1 ring-inset ring-primary"
               : selection.has(abs) || snap.activeTab === abs ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50",
@@ -480,9 +514,10 @@ export function Explorer() {
                     onOpen={() => toggle(f.rootPath)} onRename={() => { /* roots aren't renamed */ }} onDelete={() => c.closeFolder(f.id)}
                     onNewFile={() => startCreate(f.rootPath, "file")} onNewFolder={() => startCreate(f.rootPath, "folder")}>
                     <div
+                      title={f.name}
                       {...dropProps(f.rootPath, f.id)}
                       className={cn(
-                        "flex w-full items-center gap-1 pl-2 text-left text-[11px] font-semibold uppercase tracking-wide",
+                        "flex w-full cursor-pointer items-center gap-1 pl-2 text-left text-[11px] font-semibold uppercase tracking-wide",
                         dragOver === f.id
                           ? "bg-accent/80 text-foreground ring-1 ring-inset ring-primary"
                           : snap.activeFolderId === f.id ? "text-foreground" : "text-muted-foreground hover:text-foreground",
@@ -547,8 +582,14 @@ function NameInput({ value, onChange, commit, cancel, depth }: {
     // `preventScroll`, then reveal by hand: the browser's own focus scroll would put
     // this input flush against the top of the scrollport, i.e. behind the parked
     // ancestor rows, which is where a new file's name field used to disappear to.
+    //
+    // Deliberately `nearest`, unlike the active-file reveal: this input has just been
+    // spawned next to a row the user clicked, so it is already where they are looking.
+    // The job is only to get it out from behind the sticky stack, and moving the list
+    // the minimum amount to do that is less disorienting than yanking it to the middle
+    // under a pointer that has not moved yet.
     el.focus({ preventScroll: true });
-    revealRow(el, depth);
+    revealRow(el, depth, "nearest");
     const dot = el.value.indexOf(".");
     el.setSelectionRange(0, dot > 0 ? dot : el.value.length);
     // Run once on mount only — never re-select on subsequent renders.
@@ -579,6 +620,7 @@ function HeaderBtn({ label, onClick, disabled, children }: {
       <TooltipTrigger
         onClick={onClick}
         disabled={disabled}
+        aria-label={label}
         className="flex size-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-40"
       >
         {children}

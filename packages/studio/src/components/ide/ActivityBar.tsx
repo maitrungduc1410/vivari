@@ -27,6 +27,9 @@ function ActBtn({
     <Tooltip>
       <TooltipTrigger
         onClick={onClick}
+        // A tooltip is not an accessible name: without this the activity bar is four
+        // buttons that announce as "button".
+        aria-label={label}
         className={cn(
           "flex h-12 w-12 items-center justify-center border-l-2 border-transparent text-muted-foreground transition-colors hover:text-foreground",
           active && "border-l-primary text-foreground",
