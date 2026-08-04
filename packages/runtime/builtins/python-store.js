@@ -48,7 +48,149 @@ export function storePaths(cwd, pyTag) {
     // Mirrors CPython's own venv layout, so the path a user sees is the path
     // they would see anywhere else.
     sitePackages: root + "/lib/" + pyTag + "/site-packages",
+    // Where a real venv puts console scripts, and where ours puts the shims for
+    // them. On PATH for processes started in this project, so an installed
+    // package's command is spelled the way its README spells it.
+    bin: root + "/bin",
   };
+}
+
+// ---------------------------------------------------------------------------
+// Console scripts
+// ---------------------------------------------------------------------------
+// `pip install rich` puts a `rich` command on PATH everywhere else, and the
+// metadata that says so is already in the store: every wheel that declares one
+// ships `<dist>.dist-info/entry_points.txt`. Without this, `pip install httpie`
+// succeeds, `httpie` says "not found", and the only way to run the thing you
+// installed is to know the module name it hides behind.
+
+/**
+ * The `[console_scripts]` section of an entry_points.txt, as {name: "mod:attr"}.
+ * Other sections are ignored: `gui_scripts` has nowhere to go here, and the
+ * plugin sections (pytest11 and friends) are not commands at all.
+ */
+export function parseEntryPoints(text) {
+  const out = {};
+  let inSection = false;
+  for (const raw of String(text || "").split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (line.startsWith("[")) {
+      inSection = line.toLowerCase() === "[console_scripts]";
+      continue;
+    }
+    if (!inSection) continue;
+    const eq = line.indexOf("=");
+    if (eq < 0) continue;
+    const name = line.slice(0, eq).trim();
+    // "pkg.module:func [extra]" — the extras marker selects optional
+    // dependencies and is not part of what to import.
+    const target = line.slice(eq + 1).trim().replace(/\s*\[.*\]$/, "");
+    if (name && target && !name.includes("/")) out[name] = target;
+  }
+  return out;
+}
+
+/**
+ * The program a console script becomes here: a JS shim, like every other thing
+ * on PATH, that spawns the interpreter and calls the entry point.
+ *
+ * The loader is what a real console script does — set argv[0] to the command
+ * name, import, call, exit with the return value — because tools read all three.
+ * argv[0] matters more than it looks: argparse prints it in usage, so getting it
+ * wrong makes `rich --help` explain how to use `-c`.
+ */
+export function consoleScriptSource(name, target) {
+  const [module, attr] = String(target).split(":");
+  const loader = [
+    "import sys, importlib",
+    `sys.argv[0] = ${JSON.stringify(name)}`,
+    `_t = importlib.import_module(${JSON.stringify(module)})`,
+    ...(attr ? [`for _p in ${JSON.stringify(attr)}.split("."): _t = getattr(_t, _p)`] : []),
+    // A console script's return value IS its exit code (None means 0), which is
+    // how `mytool && echo ok` works anywhere else.
+    attr ? "sys.exit(_t())" : "sys.exit(0)",
+  ].join("\n");
+  return `
+'use strict';
+const cp = require('child_process');
+const child = cp.spawn('python', ['-c', ${JSON.stringify(loader)}].concat(process.argv.slice(2)), { cwd: process.cwd(), env: process.env });
+if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
+if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
+child.on('exit', (code) => process.exit(code | 0));
+child.on('error', (e) => { process.stderr.write(${JSON.stringify(name)} + ': ' + ((e && e.message) || e) + String.fromCharCode(10)); process.exit(1); });
+`;
+}
+
+/**
+ * Commands a generated shim must never take over.
+ *
+ * .venv/bin comes BEFORE /bin on PATH, which is correct — a project's own tools
+ * should win — but the /bin entries for these are not merely another way to
+ * reach the same module. Each is a seam: `pytest` goes through the launcher arm
+ * that turns pytest's exit code into the process's, `pip` is the package store
+ * itself, `uvicorn`/`flask`/`gunicorn` are the WSGI/ASGI bridge that exists
+ * because there are no sockets. Installing pytest and getting a shim that calls
+ * console_main directly would quietly undo the seam, and `pytest && deploy`
+ * would start lying again.
+ *
+ * spike-python-offline.mjs checks this set against the delegate table, so
+ * putting a new seam on PATH without protecting it fails there.
+ */
+export const RESERVED_COMMANDS = new Set([
+  "python", "python3", "pip", "pip3", "uvicorn", "flask", "gunicorn", "pytest", "black", "mypy",
+  // ruff matters more than the rest: `pip install ruff` succeeds and installs a
+  // console script that execs a Rust binary which cannot run here at all. Left
+  // unprotected it would replace a working ruff with one that cannot start.
+  "ruff",
+]);
+
+/**
+ * Bring .venv/bin into line with what the store currently holds — writing the
+ * shims for what is installed and removing the ones for what is not.
+ *
+ * Regenerating rather than appending is what makes uninstall work: `pip
+ * uninstall rich` deletes the package, and a `rich` command left behind on PATH
+ * would spawn an interpreter to fail at the import.
+ */
+export function writeConsoleScripts(fs, cwd, env) {
+  const p = storePaths(cwd, env.pyTag);
+  const wanted = new Map();
+  for (const rel of walkHost(fs, p.sitePackages).keys()) {
+    if (!/(^|\/)[^/]+\.dist-info\/entry_points\.txt$/.test(rel)) continue;
+    let text = "";
+    try {
+      text = String(fs.readFileSync(p.sitePackages + "/" + rel));
+    } catch {
+      continue; // unreadable metadata is not worth failing an install over
+    }
+    for (const [name, target] of Object.entries(parseEntryPoints(text))) {
+      if (RESERVED_COMMANDS.has(name)) continue;
+      wanted.set(name, target);
+    }
+  }
+
+  fs.mkdirSync(p.bin, { recursive: true });
+  let existing = [];
+  try {
+    existing = fs.readdirSync(p.bin);
+  } catch {
+    /* just created; nothing there */
+  }
+  for (const file of existing) {
+    const name = String(file).replace(/\.js$/, "");
+    if (!wanted.has(name)) {
+      try {
+        fs.unlinkSync(p.bin + "/" + file);
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+  for (const [name, target] of wanted) {
+    fs.writeFileSync(p.bin + "/" + name + ".js", consoleScriptSource(name, target));
+  }
+  return [...wanted.keys()].sort();
 }
 
 // CPython's venv writes this file and keys several behaviours off it, so we
@@ -289,6 +431,7 @@ export function writeStore(fs, cwd, env, additions, command) {
     fs.mkdirSync(target.slice(0, target.lastIndexOf("/")), { recursive: true });
     fs.writeFileSync(target, globalThis.Buffer.from(data));
   }
+  const scripts = writeConsoleScripts(fs, cwd, env);
   const now = walkHost(fs, p.sitePackages);
   let bytes = 0;
   for (const size of now.values()) bytes += size;
@@ -315,7 +458,7 @@ export function writeStore(fs, cwd, env, additions, command) {
       2,
     ) + "\n",
   );
-  return { files: now.size, bytes };
+  return { files: now.size, bytes, scripts };
 }
 
 // Only what the STORE holds. A fresh interpreter always has micropip, and

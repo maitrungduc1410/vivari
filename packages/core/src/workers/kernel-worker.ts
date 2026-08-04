@@ -949,7 +949,10 @@ setInterval(() => {
 // like typing it in a studio terminal.
 function baseProcEnv(dir) {
   return {
-    PATH: dir + "/node_modules/.bin:/bin",
+    // .venv/bin is where a pip-installed package's console script lands, the
+    // same as any other venv — so `pip install rich` is followed by `rich`
+    // working, not by "command not found" for the thing that just installed.
+    PATH: dir + "/node_modules/.bin:" + dir + "/.venv/bin:/bin",
     HOME: "/",
     // Real npm needs a writable cache (+ _logs) dir; created at boot. Without
     // this it defaults to $HOME/.npm and can trip on the read-only-ish root.
@@ -1014,6 +1017,11 @@ function baseProcEnv(dir) {
     // this is not gated on a launcher, because bun:sqlite is a builtin any process can
     // require; the laziness lives in the module instead.
     VV_SQLITE_WASM_URL: vendorUrl("vendor/sqlite/sqlite3.wasm"),
+    // Same-origin base URL of the vendored ruff. Read by /bin/ruff.js when a
+    // `ruff` process runs. Gated on the launcher like Pyodide, and unlike
+    // Pyodide it stays out of the interpreter entirely: linting a project never
+    // boots CPython. See packages/kernel-host/programs/ruff.js.
+    VV_RUFF_URL: vendorUrl("vendor/ruff/"),
   };
 }
 
@@ -1460,7 +1468,11 @@ async function boot() {
     // Breakpoint debugger: a debug target also receives its debug-command SAB. A
     // SharedArrayBuffer is shared by reference (never transferred), so it just rides
     // along in the init payload.
-    if (info.debugSab) init.debugSab = info.debugSab;
+    if (info.debugSab) {
+      init.debugSab = info.debugSab;
+      // …and which of the two backends is meant to read it.
+      init.debugLang = info.debugLang || "js";
+    }
     const transfer = [port1];
     if (info.threadPort) {
       init.threadPort = info.threadPort;
@@ -2791,6 +2803,9 @@ self.onmessage = async (event) => {
         id,
         req: m.req,
         indexUrl: vendorUrl("vendor/pyodide/"),
+        // For the `lint` op, which is answered by ruff's wasm and never reaches
+        // the interpreter the indexUrl above points at.
+        ruffUrl: vendorUrl("vendor/ruff/"),
         files,
         removed,
       });

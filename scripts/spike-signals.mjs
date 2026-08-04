@@ -157,6 +157,17 @@ if (!isMainThread) {
       ready();
       break;
 
+    // Catches SIGINT, deals with it, and is deliberately still here — a Python
+    // REPL taking a KeyboardInterrupt back to its prompt. Standing the window
+    // down is the claim that makes that legal.
+    case "sigint-stands-down":
+      process_.on("SIGINT", (name) => {
+        say(`caught ${name}\n`);
+        signals.standDown(name);
+      });
+      ready();
+      break;
+
     // Catches SIGINT but never exits — the parent sends it twice.
     case "sigint-hangs":
       process_.on("SIGINT", (name) => say(`caught ${name}\n`));
@@ -383,6 +394,33 @@ if (isMainThread) {
     check(text.includes("caught SIGTERM"), "handler ran once the syscall returned and the loop turned");
     check(res.code === 9, "exited with its own code 9", `got ${res.code}`);
     check(Atomics.load(proc.ctrl, I_SIGNAL) === 0, "pending set was cleared by the guest");
+  }
+
+  // 4b ── handled, and staying. Ctrl-C at a Python REPL raises KeyboardInterrupt
+  //       and gives a fresh prompt: the process is alive on purpose, and the
+  //       force-kill window has to be standable-down or it would be killed a few
+  //       seconds after every interrupt.
+  section("SIGINT handled by a process that is deliberately still running");
+  {
+    const pid = spawn("sigint-stands-down");
+    await waitFor(pid, "READY");
+    kernel.signal(pid, "SIGINT");
+    await new Promise((r) => setTimeout(r, GRACE_MS + 150));
+    check(kernel.procs.has(pid), "outlived the grace window it stood down");
+    check((out.get(pid) || "").includes("caught SIGINT"), "handler ran");
+    const proc = kernel.procs.get(pid);
+    check(proc && proc.graceTimer == null, "the force-kill timer really was cleared");
+    check(proc && proc.sigUnhandled == null, "…and the signal is no longer outstanding");
+
+    // The escalation rule still has to work, but it is about a process that is
+    // NOT answering. This one is, so a second Ctrl-C is a second interrupt.
+    kernel.signal(pid, "SIGINT");
+    await new Promise((r) => setTimeout(r, 150));
+    check(kernel.procs.has(pid), "a second Ctrl-C at a prompt that answers is not a kill");
+    const hits = (out.get(pid) || "").split("caught SIGINT").length - 1;
+    check(hits === 2, `the handler ran for both interrupts (${hits})`);
+    kernel.signal(pid, "SIGKILL");
+    await settled(pid);
   }
 
   // 5 ── same, with the postMessage path unhooked: the SAB carries it alone.

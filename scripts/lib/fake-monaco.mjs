@@ -21,6 +21,10 @@ export function makeFakeMonaco() {
     formatting: [],
   };
   const disposed = [];
+  // Markers are pushed, not returned from a provider, so the stand-in has to
+  // keep them the way Monaco does: per model, per owner, last write wins.
+  const markers = new Map(); // "owner\u0000uri" -> marker[]
+  const modelWatchers = [];
   const track = (bucket, language, provider) => {
     registered[bucket].push({ language, provider });
     const d = { disposed: false, dispose() { this.disposed = true; disposed.push(bucket); } };
@@ -29,6 +33,24 @@ export function makeFakeMonaco() {
   return {
     registered,
     disposed,
+    markers,
+    // Real Monaco's numbering (monaco.MarkerSeverity), not an invention: 8 is
+    // Error and 4 is Warning. The offline spike checks these against the shipped
+    // monaco-editor the same way it checks the completion kinds.
+    MarkerSeverity: { Hint: 1, Info: 2, Warning: 4, Error: 8 },
+    editor: {
+      setModelMarkers: (model, owner, list) => {
+        markers.set(owner + "\u0000" + model.uri.toString(), list);
+      },
+      markersFor: (model, owner) => markers.get(owner + "\u0000" + model.uri.toString()) || null,
+      getModels: () => [],
+      onDidCreateModel: (fn) => {
+        modelWatchers.push(fn);
+        return { dispose() {} };
+      },
+      // Test-side: announce a model the way Monaco does when a file is opened.
+      openModel: (model) => { for (const fn of modelWatchers) fn(model); },
+    },
     Uri: { file: (p) => ({ path: p, scheme: "file", toString: () => "file://" + p }) },
     languages: {
       registerCompletionItemProvider: (l, p) => track("completion", l, p),
@@ -41,9 +63,25 @@ export function makeFakeMonaco() {
 }
 
 /** A text model over a string, with the few methods the providers call. */
-export function makeModel(path, text) {
+export function makeModel(path, text, language = "python") {
+  const contentWatchers = [];
+  let disposedFlag = false;
   return {
-    uri: { path, scheme: "file" },
+    uri: { path, scheme: "file", toString: () => "file://" + path },
+    getLanguageId: () => language,
+    isDisposed: () => disposedFlag,
+    onDidChangeContent: (fn) => {
+      contentWatchers.push(fn);
+      // Monaco's listener disposable really does unsubscribe. A no-op here would
+      // make a leaked listener look like a clean teardown.
+      return { dispose() {
+        const i = contentWatchers.indexOf(fn);
+        if (i >= 0) contentWatchers.splice(i, 1);
+      } };
+    },
+    // Test-side: edit the buffer and fire the event, as typing would.
+    setValue: (next) => { text = next; for (const fn of contentWatchers) fn({}); },
+    dispose: () => { disposedFlag = true; },
     getValue: () => text,
     getFullModelRange: () => {
       const lines = text.split("\n");

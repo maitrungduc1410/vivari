@@ -47,6 +47,7 @@ import {
   OP_PIPE_LISTEN,
   OP_PIPE_CONNECT,
   OP_PIPE_CLOSE_SERVER,
+  OP_READ_STDIN,
   postSignal,
   isCatchableSignal,
   defaultSignalExitCode,
@@ -56,6 +57,16 @@ import { COREUTILS } from "./coreutils.js";
 import { CookieJar } from "./cookie-jar.js";
 
 const EMPTY = new Uint8Array(0);
+
+// A stdin chunk on its way to a parked reader. It arrives as a string from a
+// terminal and as bytes from a parent writing to a child's stdin, and the reader
+// gets bytes either way — the same rule the flowing path follows, for the same
+// reason: stringifying here would mangle binary stdin.
+function stdinBytes(chunk) {
+  if (chunk == null) return EMPTY;
+  if (typeof chunk === "string") return encodeString(chunk);
+  return chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+}
 
 // Decode a base64 request body (from the http/https client shim) to bytes,
 // working in both the Node kernel host (Buffer) and a browser main thread (atob).
@@ -505,6 +516,7 @@ export class Kernel {
       sigHandlers: new Set(),
       graceTimer: null, // armed while a caught signal is being given time to work
       gracePending: null, // which signal that window belongs to
+      sigUnhandled: null, // a delivered signal the guest has not answered yet
       serverInbox: [], // queued { reqId, port, req } drained by non-blocking accept
       // #16 stage 2b: reqId -> child pid for worker_threads this process spawned.
       threads: null,
@@ -517,16 +529,20 @@ export class Kernel {
     // processes (so a dev server launched by the run shell inherits it), but the
     // shell wrapper + package managers themselves aren't interesting to debug — skip
     // them so auto-attach lands on the user's actual program, not `sh`/`npm`.
-    // `python`/`python3` are also skipped: our `python` is a Node shim that runs the
-    // real program inside Pyodide (CPython/Wasm), so the `.py` source never passes
-    // through the JS module loader and can't be instrumented — treating it as a debug
-    // target only yields a bogus target + start-gate latency + a needlessly
-    // instrumented shim. (Bun is deliberately NOT skipped: `bun <file>` runs the entry
-    // through the JS module loader, so its breakpoints bind like `node`.)
+    // (Bun is deliberately NOT skipped: `bun <file>` runs the entry through the JS
+    // module loader, so its breakpoints bind like `node`.)
+    //
+    // `python`/`python3` ARE targets, but of the other backend. Our `python` is a
+    // Node shim that runs the real program inside Pyodide, so the `.py` source
+    // never passes through the JS module loader and instrumenting the shim would
+    // debug the wrong program. The interpreter has its own debugging interface,
+    // so the language rides along with the SAB and the runtime attaches
+    // builtins/python-debugger.js instead of the JS one.
     const env = spec.env || {};
     const wantsDebug = this.debugMode || env.VV_DEBUG === "1" || env.VV_DEBUG === "true";
     const cmd = String(spec.command || "");
-    const skipDebug = /^(sh|bash|dash|zsh|npm|npx|yarn|pnpm|corepack|node-gyp|tsc|tsgo|python|python3)$/.test(cmd);
+    const skipDebug = /^(sh|bash|dash|zsh|npm|npx|yarn|pnpm|corepack|node-gyp|tsc|tsgo)$/.test(cmd);
+    const debugLang = /^python3?$/.test(cmd) ? "python" : "js";
     const debugEnabled = wantsDebug && !skipDebug;
     let debugSab = null;
     if (debugEnabled) {
@@ -546,6 +562,7 @@ export class Kernel {
       pid,
       sab,
       debugSab,
+      debugLang,
       spec: { ...spec, pid, ppid: parentPid ?? 0 },
       // #16 stage 2b: a spawned thread gets its creator's MessageChannel end as a
       // transferable, delivered to the worker as parentPort at init.
@@ -573,6 +590,7 @@ export class Kernel {
         // The guest gained or lost a `process.on('SIGTERM'|…)` listener, which is
         // what decides whether a signal is posted to it or applied to it.
         "signal-listen": (m) => this.handleSignalListen(pid, m),
+        "signal-handled": (m) => this.handleSignalHandled(pid, m),
         // #19 stage C: this process relays a ws frame outward (in-VM ws server ->
         // browser preview) for a tunneled connection.
         "ws-out": (m) => this.handleWsOut(pid, m),
@@ -1141,6 +1159,10 @@ export class Kernel {
       this.handleFetchAsync(proc, JSON.parse(decodeBytes(fields[0])));
       return; // acks immediately; the result streams back via postMessage
     }
+    if (opcode === OP_READ_STDIN) {
+      this.handleReadStdin(proc);
+      return; // deferred until somebody types, unless input is already waiting
+    }
     // Since #14, fs opcodes are serviced by the File System Worker directly over
     // the process's SAB — they never reach the kernel. Anything else here is a bug.
     this.respondErr(proc, "ENOSYS");
@@ -1552,6 +1574,42 @@ export class Kernel {
     this.respondOk(parent, encodeString(JSON.stringify({ pid: childPid })));
   }
 
+  // ---- blocking stdin (OP_READ_STDIN) ----------------------------------------
+  //
+  // A process that reads stdin synchronously cannot receive a postMessage: its
+  // thread is parked on Atomics.wait, so its message queue is not being drained.
+  // The bytes have to arrive the same way a file's do — written into the SAB and
+  // notified. That is all this is.
+  //
+  // Making the first such call also switches this process's stdin from "post it
+  // and let the runtime deliver it on a loop turn" to "hold it here until asked".
+  // Without that switch, anything typed between two reads would be delivered to
+  // the flowing stream, where the synchronous reader will never look for it, and
+  // a line typed a moment early would simply vanish.
+  handleReadStdin(proc) {
+    proc.syncStdin = true;
+    if (proc.stdinQueue && proc.stdinQueue.length) {
+      this.respondOk(proc, stdinBytes(proc.stdinQueue.shift()));
+      return;
+    }
+    // Once input has ended it stays ended: a reader that parked here would never
+    // be woken by anything, which is a hung tab rather than an EOFError.
+    if (proc.stdinEnded) {
+      this.respondOk(proc, EMPTY);
+      return;
+    }
+    // A captured process has no way to be typed at — it is the shape used by
+    // `spawnSync` and by internal `kernel.start` calls, where the only party who
+    // could send stdin is itself parked waiting for this one to exit. Parking
+    // would be a guaranteed deadlock, so it reads as end of input, exactly like
+    // running a script with its stdin closed.
+    if (proc.capture) {
+      this.respondOk(proc, EMPTY);
+      return;
+    }
+    proc.stdinWaiting = true;
+  }
+
   // Push a stdin chunk into a running process' own process.stdin. `chunk` is a
   // string (host terminal / a live shell) OR a Uint8Array/Buffer (binary-safe
   // parent -> child piping via handleChildStdin), or null for EOF. Bytes pass
@@ -1559,6 +1617,20 @@ export class Kernel {
   // must NOT stringify, or binary stdin would be mangled. No-op if the process
   // is gone.
   sendStdin(pid, chunk) {
+    const proc = this.procs.get(pid | 0);
+    // A synchronous reader (see handleReadStdin) takes delivery through the SAB,
+    // parked or not — queued if it is between reads, handed over directly if it
+    // is waiting for exactly this.
+    if (proc && proc.syncStdin) {
+      if (chunk == null) proc.stdinEnded = true;
+      if (proc.stdinWaiting) {
+        proc.stdinWaiting = false;
+        this.respondOk(proc, chunk == null ? EMPTY : stdinBytes(chunk));
+      } else {
+        (proc.stdinQueue || (proc.stdinQueue = [])).push(chunk);
+      }
+      return true;
+    }
     return this.postToProc(pid | 0, { type: "stdin", chunk: chunk == null ? null : chunk });
   }
 
@@ -1581,6 +1653,24 @@ export class Kernel {
     if (!proc || !m || !isCatchableSignal(m.signal)) return;
     if (m.active) proc.sigHandlers.add(m.signal);
     else proc.sigHandlers.delete(m.signal);
+  }
+
+  // The guest ran its handler and is still here on purpose. Stand the force-kill
+  // window down: it exists to catch a process that took a catchable signal and
+  // then did nothing, not one that answered. A Python REPL that turns Ctrl-C
+  // into a KeyboardInterrupt and prints a fresh prompt is answering.
+  //
+  // The next same signal is therefore a NEW one rather than an escalation, which
+  // is what makes two deliberate Ctrl-Cs at a live prompt two interrupts.
+  handleSignalHandled(pid, m) {
+    const proc = this.procs.get(pid);
+    if (!proc || !m || !m.signal) return;
+    if (proc.sigUnhandled === m.signal) proc.sigUnhandled = null;
+    if (proc.graceTimer != null && proc.gracePending === m.signal) {
+      clearTimeout(proc.graceTimer);
+      proc.graceTimer = null;
+      proc.gracePending = null;
+    }
   }
 
   /**
@@ -1609,18 +1699,25 @@ export class Kernel {
       return true;
     }
 
-    // Repeating a signal whose grace window is still open escalates to a
+    // Repeating a signal the guest has not answered yet escalates to a
     // force-kill. This is not POSIX — a second SIGTERM would just run the
     // handler again — but it is what a person hammering Ctrl-C in the shell
     // means, and it cannot be worse than today, where the FIRST one already
     // killed outright.
-    if (proc.graceTimer != null && proc.gracePending === sig) {
+    //
+    // "Not answered yet" rather than "grace window still open", because a guest
+    // that handled the signal and legitimately carried on (a Python REPL taking
+    // a KeyboardInterrupt back to its prompt) stands the window down — and two
+    // deliberate Ctrl-Cs at a prompt that is answering them are two interrupts,
+    // not an execution.
+    if (proc.sigUnhandled === sig) {
       this.finalize(pid, defaultSignalExitCode(sig), sig);
       return true;
     }
 
     postSignal(proc.ctrl, sig);
     this.postToProc(pid, { type: "signal", signal: sig });
+    proc.sigUnhandled = sig;
 
     if (proc.graceTimer == null) {
       proc.gracePending = sig;

@@ -32,6 +32,8 @@ import {
   BLACK_PACKAGES,
   JEDI_PACKAGES,
   LSP_DRIVER_SOURCE,
+  MYPY_PACKAGES,
+  ruffMarkersFrom,
 } from "../../../runtime/builtins/python-lsp.js";
 
 // Progress goes to the host as `state` messages, never to stdout: this worker has
@@ -45,6 +47,10 @@ let dispatch = null; // the _vv_lsp callable
 let booting = null;
 let blackLoaded = false;
 let blackError = null;
+let mypyLoaded = false;
+let mypyError = null;
+let ruff = null; // the ruff Workspace, once its wasm is in
+let ruffError = null;
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 const errText = (e) => (e && e.message) || String(e);
@@ -102,6 +108,71 @@ async function ensureBlack() {
   }
 }
 
+/**
+ * mypy, on the same terms as black and for a stronger reason: it is the biggest
+ * wheel the studio can pull, and it is only wanted once someone has written
+ * enough to be worth checking. A failure is remembered rather than retried,
+ * because the check runs on a timer and a retry loop would be a fetch per pause.
+ */
+async function ensureMypy() {
+  if (mypyLoaded) return;
+  if (mypyError) throw new Error(mypyError);
+  try {
+    await pyodide.loadPackage(MYPY_PACKAGES, quiet);
+    mypyLoaded = true;
+  } catch (e) {
+    mypyError = errText(e);
+    throw new Error(mypyError);
+  }
+}
+
+/**
+ * ruff, which is not Python and therefore not loaded like any of the above.
+ *
+ * It is a WebAssembly module of its own (scripts/vendor-ruff.mjs), so this needs
+ * no interpreter, no wheel and no lock — and the caller below deliberately does
+ * NOT boot Pyodide for a lint. That is the whole reason ruff is worth having in
+ * the editor as well as at a prompt: opening a .py file puts its markers up in
+ * the time it takes to fetch 11 MB, while the ~30 MB interpreter that answers
+ * "is this a type error" is still starting.
+ *
+ * Its wasm is fetched with the browser's own fetch, not the blocking syscall the
+ * `ruff` command uses: this worker is host code with a network of its own,
+ * whereas that one is a guest process behind the kernel.
+ */
+async function ensureRuff(ruffUrl) {
+  if (ruff) return ruff;
+  if (ruffError) throw new Error(ruffError);
+  try {
+    if (!ruffUrl) throw new Error("no vendored ruff (VV_RUFF_URL is unset for this build)");
+    const [mod, wasm] = await Promise.all([
+      import(/* @vite-ignore */ ruffUrl + "ruff_wasm.js"),
+      fetch(ruffUrl + "ruff_wasm_bg.wasm").then((r) => {
+        if (!r.ok) throw new Error("fetching the ruff wasm returned HTTP " + r.status);
+        return r.arrayBuffer();
+      }),
+    ]);
+    await mod.default({ module_or_path: wasm });
+    // Defaults, matching the command. A [tool.ruff] table is not read there and
+    // is not read here either, and for the same reason — one place where the
+    // editor and the prompt disagreeing would be worse than either behaviour.
+    ruff = new mod.Workspace(mod.Workspace.defaultSettings());
+    return ruff;
+  } catch (e) {
+    ruffError = errText(e);
+    throw new Error(ruffError);
+  }
+}
+
+/**
+ * One lint. The mapping lives in the runtime module next to the provider that
+ * consumes it (ruffMarkersFrom), so both spike tiers can check it without a
+ * worker; this is only the call.
+ */
+function ruffLint(source) {
+  return ruffMarkersFrom(ruff.check(source));
+}
+
 // ── the project mirror ───────────────────────────────────────────────────────
 // jedi resolves `import helper` by looking at files, so the project has to exist
 // in this interpreter's filesystem. The host sends contents; this worker writes
@@ -143,11 +214,19 @@ self.onmessage = async (event) => {
   }
 
   if (m.type !== "py-lsp-request") return;
-  const { id, req, indexUrl } = m;
+  const { id, req, indexUrl, ruffUrl } = m;
   try {
+    // Before the boot, on purpose: a lint must not be what drags 30 MB of
+    // CPython in, and must not queue behind it once it is here.
+    if (req.op === "lint") {
+      await ensureRuff(ruffUrl);
+      post("py-lsp-reply", { id, ok: true, result: ruffLint(req.code || "") });
+      return;
+    }
     if (!pyodide) await boot(indexUrl);
     syncFiles(m.files, m.removed);
     if (req.op === "format") await ensureBlack();
+    if (req.op === "check") await ensureMypy();
     // One string in, one string out: a PyProxy per field would have to be
     // destroyed by hand, and a leak here would be per-keystroke.
     const answer = dispatch(JSON.stringify(req));

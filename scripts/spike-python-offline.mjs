@@ -40,12 +40,34 @@ import { COREUTILS, PYTHON_DELEGATES } from "../packages/kernel-host/coreutils.j
 import {
   PYODIDE_PYTHON_VERSION,
   PYTHON_EXECUTABLE,
+  BLOCKING_PATCH_SOURCE,
+  MPL_BACKEND,
+  MPL_SHOW_SOURCE,
   URLLIB3_REALM_PATCH,
   byteWriter,
+  dataPackagesFor,
+  installMatplotlibShow,
+  installStdin,
+  makeLineReader,
+  readSnapshot,
+  writeSnapshot,
+  discardSnapshot,
+  restoredOk,
+  snapshotsEnabled,
+  SNAPSHOT_BIN,
+  SNAPSHOT_META,
+  BYTECODE_DIR,
+  PYCACHE_PREFIX,
+  bytecodeEnabled,
+  installBytecodeCache,
+  readBytecodeIndex,
+  restoreBytecode,
+  harvestBytecode,
   setExecutable,
   setupSource,
   terminationFromError,
 } from "../packages/runtime/builtins/python.js";
+import { PY_DEBUG_SOURCE, createPythonDebugger } from "../packages/runtime/builtins/python-debugger.js";
 import {
   STORE_DIR,
   STORE_FORMAT,
@@ -66,8 +88,13 @@ import {
   storeDists,
   storePaths,
   walkHost,
+  parseEntryPoints,
+  consoleScriptSource,
+  writeConsoleScripts,
+  RESERVED_COMMANDS,
 } from "../packages/runtime/builtins/python-store.js";
 import { CAPTURED, FIXTURE_DISTS, realPipFormat, realPipUnknown, writeFixtureSite } from "./lib/real-pip.mjs";
+import { driveRuff } from "./lib/python-drive.mjs";
 import { writeFakeIndex } from "./lib/fake-pyodide.mjs";
 import { readShippedManifests, readShippedTemplates, readTemplatesSource } from "./lib/shipped-templates.mjs";
 import { MODELLED_FRAGMENTS, STANDIN, normalize } from "./lib/urllib3-emscripten.mjs";
@@ -84,6 +111,13 @@ import {
   formatFailureMessage,
   hostPathFor,
   registerPythonLanguage,
+  MARKER_OWNER,
+  RUFF_MARKER_OWNER,
+  CHECK_DEBOUNCE_MS,
+  LINT_DEBOUNCE_MS,
+  ruffMarkersFrom,
+  TYPE_STUBS,
+  MYPY_PACKAGES,
   stateLabel,
   toJediPosition,
 } from "../packages/runtime/builtins/python-lsp.js";
@@ -952,7 +986,15 @@ console.log("\n== every entrypoint, reachable by the name a user types ==");
   const pyDocs = fs.readFileSync(path.join(ROOT, "sites/docs/docs/python.md"), "utf8");
   const typed = new Set();
   for (const m of pyDocs.matchAll(/```(?:bash|sh|console|shell)\n([\s\S]*?)```/g)) {
-    for (const line of m[1].split("\n")) {
+    const block = m[1];
+    // A block that installs something is allowed to then USE what it installed.
+    // That is the console-scripts feature: `pip install httpie` and then `http`
+    // is a command that exists, just not until the line above it ran. Blocks
+    // that install nothing stay strict, which is what this check is for — the
+    // bug it catches is prose telling someone to type a command Vivari does not
+    // have, and a demonstrated install is the difference.
+    if (/^\s*pip\s+install\s+\S/m.test(block)) continue;
+    for (const line of block.split("\n")) {
       const t = line.trim();
       if (t && !t.startsWith("#")) typed.add(t.split(/\s+/)[0]);
     }
@@ -1359,8 +1401,98 @@ console.log("\n== the modules that cannot work here say why ==");
     "…and explains that the socket is the lie, not the absence of one",
   );
   // Nothing in the refusal list may also be a seam: it would be unreachable.
-  const seams = ["pip", "venv", "uvicorn", "flask", "gunicorn", "pytest", "http.server"];
+  const seams = ["pip", "venv", "uvicorn", "flask", "gunicorn", "pytest", "mypy", "http.server"];
   ok(!seams.some((s) => SOCKET_MODULES.includes(s)), "no module is both intercepted and refused");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the checkers, and the Django command that would hang ==");
+// ---------------------------------------------------------------------------
+{
+  // mypy and black are the two tools a Python user runs over their own code,
+  // and they reach the interpreter by deliberately different routes. black is
+  // an ordinary module: runpy runs it and nothing here needs to know anything
+  // about black. mypy cannot be, because it ends by calling os._exit(), which
+  // under Emscripten tears down the interpreter — the diagnostics print and
+  // then the exit code is lost, so `mypy && deploy` would deploy. The bridge
+  // tier proves that against the real thing; this holds the shape in place.
+  let r = drivePython(["-m", "black", "src/"]);
+  const blackCall = r.calls.find((c) => c[0] === "runModule");
+  ok(blackCall && blackCall[1] === "black" && JSON.stringify(blackCall[2]) === '["src/"]',
+    "python -m black goes through plain runpy, argv intact");
+  ok(!r.calls.some((c) => c[0] === "runCode"), "…with no seam of its own in the way");
+
+  r = drivePython(["-m", "mypy", "--strict", "app.py"]);
+  const mypyCall = r.calls.find((c) => c[0] === "runCode");
+  ok(!!mypyCall, "python -m mypy runs a synthesised program instead");
+  ok(mypyCall && /from mypy import api/.test(mypyCall[1]) && /api\.run\(/.test(mypyCall[1]),
+    "…which goes in through mypy.api.run(), the entrypoint that skips the os._exit() path");
+  ok(mypyCall && mypyCall[1].includes(JSON.stringify(["--strict", "app.py"])),
+    "…forwarding argv verbatim, so mypy's own flags reach mypy");
+  ok(mypyCall && /sys\.exit\(code\)/.test(mypyCall[1]), "…and mypy's exit status becomes the process's");
+  // No invented default: mypy with no target has its own usage error, and a
+  // silent "." here would check a different thing than the command it imitates.
+  r = drivePython(["-m", "mypy"]);
+  const bare = r.calls.find((c) => c[0] === "runCode");
+  ok(bare && /api\.run\(\[\]\)/.test(bare[1]), "python -m mypy with no target forwards no target, rather than guessing one");
+
+  // Both have to be reachable by the name people type. The generic check above
+  // covers mypy (it is a -m seam); black is not, so it needs saying here.
+  ok(PYTHON_DELEGATES.black === "black" && COREUTILS.black, "black is on PATH, not only reachable as python -m black");
+  ok(PYTHON_DELEGATES.mypy === "mypy" && COREUTILS.mypy, "mypy is on PATH too");
+
+  // --- manage.py runserver --------------------------------------------------
+  // The socket refusals are keyed on -m module names, and runserver arrives as
+  // a script path, so it slipped past all of them. Vivari ships a Django
+  // template, which makes this the most likely command in the whole surface.
+  r = drivePython(["manage.py", "runserver"]);
+  ok(r.code === 1, "python manage.py runserver fails instead of hanging");
+  ok(/binds a TCP socket/.test(r.out), "…saying that the dev server wants a socket");
+  ok(/never answer/.test(r.out), "…and that the failure mode would have been silence, not an error");
+  ok(/gunicorn wsgi:application/.test(r.out), "…and naming the command that does work, which the template already uses");
+  ok(!r.calls.length, "…without booting an interpreter to find out");
+
+  // The refusal must be narrow. Everything else about manage.py still works,
+  // and a refusal standing in front of `migrate` would be its own bug.
+  for (const sub of ["migrate", "makemigrations", "shell", "createsuperuser", "collectstatic"]) {
+    const m = drivePython(["manage.py", sub]);
+    ok(m.calls.some((c) => c[0] === "runFile"), `python manage.py ${sub} still reaches the interpreter`);
+  }
+  ok(drivePython(["manage.py", "runserver", "--help"]).calls.some((c) => c[0] === "runFile"),
+    "…as does runserver --help, which binds nothing and prints Django's own help");
+  ok(drivePython(["serve.py", "runserver"]).calls.some((c) => c[0] === "runFile"),
+    "…and a script that merely has 'runserver' in its argv is not second-guessed");
+  ok(drivePython(["app/manage.py", "runserver"]).code === 1,
+    "…while manage.py in a subdirectory is still caught");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== mypy is actually vendored, or the command is a promise we break ==");
+// ---------------------------------------------------------------------------
+{
+  // The seam above is inert without the wheel. Pyodide's lockfile declares mypy
+  // as depending on librt alone, but a checked file imports typing_extensions,
+  // then mypy_extensions, then pathspec — each surfacing only once the previous
+  // is satisfied. loadPackage() succeeds either way, so an under-declared dep
+  // fails in front of the user rather than at build time.
+  const src = fs.readFileSync(path.join(ROOT, "scripts/vendor-pyodide.mjs"), "utf8");
+  const defaults = /const DEFAULT_PACKAGES = \[([^\]]*)\]/.exec(src);
+  ok(defaults && /"mypy"/.test(defaults[1]), "mypy is in the vendored package set, so `mypy` works offline");
+
+  const fixups = /const DEPENDS_FIXUPS = \{([\s\S]*?)\n\};/.exec(src);
+  ok(!!fixups, "the under-declared-dependency table is where this check reads it");
+  const mypyFix = fixups && /mypy:\s*\[([^\]]*)\]/.exec(fixups[1]);
+  ok(!!mypyFix, "…and it has an entry for mypy");
+  for (const dep of ["typing-extensions", "mypy-extensions", "pathspec"]) {
+    ok(mypyFix && mypyFix[1].includes(`"${dep}"`), `…naming ${dep}, which mypy imports but the lock does not declare`);
+  }
+  // Two of the three come from the PyPI pins black already needed. If someone
+  // drops black's pins, mypy loses them too, and the failure would look like a
+  // mypy bug rather than a vendoring one.
+  const pypi = /const PYPI_PACKAGES = \[([\s\S]*?)\n\];/.exec(src);
+  for (const dep of ["mypy-extensions", "pathspec"]) {
+    ok(pypi && pypi[1].includes(`name: "${dep}"`), `${dep} is still pinned from PyPI (Pyodide ships neither)`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1785,10 +1917,25 @@ console.log("\n== the jedi/black driver is valid Python, checked by a real one =
   for (const op of ["complete", "resolve", "hover", "signature", "goto", "format"]) {
     ok(ops.includes(op), `the driver implements "${op}"`);
   }
-  // …and the providers ask for exactly those.
+  // …and the providers ask for exactly those, with ONE exception: "lint" is
+  // answered by ruff's wasm in the worker and never reaches Python at all. That
+  // is not a hole in the table, so it is named here — and the reason is checked
+  // rather than asserted, because a lint that fell through to the interpreter
+  // would boot 30 MB of CPython to run a tool that does not need it.
+  const workerSrc = fs.readFileSync(path.join(ROOT, "packages/core/src/workers/python-lsp-worker.ts"), "utf8");
+  const lintBranch = workerSrc.indexOf('req.op === "lint"');
+  const bootCall = workerSrc.indexOf("if (!pyodide) await boot(indexUrl)");
+  ok(lintBranch > 0 && bootCall > 0 && lintBranch < bootCall,
+    "the worker answers a lint BEFORE it would boot an interpreter, which is the point of ruff being wasm of its own");
+  ok(/ruffUrl/.test(fs.readFileSync(path.join(ROOT, "packages/core/src/workers/kernel-worker.ts"), "utf8")),
+    "…and the host tells it where the vendored ruff is");
+
   const asked = new Set([...fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python-lsp.js"), "utf8")
     .matchAll(/op: "(\w+)"/g)].map((m) => m[1]));
-  for (const op of asked) ok(ops.includes(op), `…and "${op}", which a provider asks for, is one of them`);
+  for (const op of asked) {
+    if (op === "lint") continue;
+    ok(ops.includes(op), `…and "${op}", which a provider asks for, is one of them`);
+  }
 
   // The line that makes any of this work in Pyodide at all.
   ok(
@@ -1888,6 +2035,1173 @@ console.log("\n== jedi and black are shipped, not fetched when someone types =="
       ok(e && !e.file_name.includes("://"), `…with a RELATIVE file_name, which is what makes it same-origin rather than the CDN`);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== type errors reach the editor as markers, on a pause ==");
+// The diagnostics path is pushed rather than pulled: no Monaco provider asks for
+// it, so nothing else in this file would notice it breaking. What is gated here
+// is everything that does not need mypy — the debounce, the supersession, the
+// marker geometry and the two ways it can fail. The bridge tier runs the real
+// checker and compares it to the host's.
+// ---------------------------------------------------------------------------
+{
+  const DIAG = {
+    items: [
+      { line: 5, column: 12, endLine: 5, endColumn: 21, severity: "error", message: 'Incompatible return value type (got "int", expected "str")', code: "return-value" },
+      { line: 8, column: 5, endLine: 8, endColumn: 11, severity: "warning", message: "unused thing", code: "unused-awaitable" },
+    ],
+  };
+  const settle = (ms = CHECK_DEBOUNCE_MS + 60) => new Promise((r) => setTimeout(r, ms));
+
+  const monaco = makeFakeMonaco();
+  const host = makeHost({ check: DIAG });
+  const off = registerPythonLanguage(monaco, host);
+  const model = makeModel("/project/app.py", "x = 1\n");
+  monaco.editor.openModel(model);
+
+  // Nothing yet: the check is on a timer, and a file opened and immediately
+  // closed must not have paid for an interpreter.
+  ok(monaco.editor.markersFor(model, MARKER_OWNER) === null, "opening a file does not check it immediately");
+  await settle();
+  const marks = monaco.editor.markersFor(model, MARKER_OWNER);
+  ok(Array.isArray(marks) && marks.length === 2, `after the pause, ${marks ? marks.length : 0} markers are published`);
+
+  // The geometry is the whole point of a squiggle: mypy's end column is
+  // inclusive and Monaco's is exclusive, so a marker that copied it straight
+  // through would stop one character short of the code it is about.
+  const first = marks && marks[0];
+  ok(first && first.startLineNumber === 5 && first.startColumn === 12, "the marker starts where mypy said");
+  ok(first && first.endColumn === 21, "…and ends one past mypy's inclusive end, which is what Monaco means by endColumn");
+  ok(first && first.severity === monaco.MarkerSeverity.Error, "an error is an Error");
+  ok(marks && marks[1].severity === monaco.MarkerSeverity.Warning, "…and a warning is a Warning, not everything-is-an-error");
+  ok(first && first.code === "return-value", "the error code rides along, so a type: ignore[...] can be written from it");
+  ok(first && first.source === "mypy", "…and the marker says who produced it");
+
+  // The request the worker will see.
+  const checkCalls = host.calls.filter((c) => c.req.op === "check");
+  ok(checkCalls.length === 1, `one check was asked for, not one per event (${checkCalls.length})`);
+  ok(checkCalls[0].req.code === "x = 1\n", "…carrying the BUFFER, since mypy reads files and the file is behind");
+  ok(checkCalls[0].req.path === "/project/app.py", "…and the path it is about");
+
+  // Typing must coalesce. Three edits inside the window are one check, or every
+  // keystroke would queue 0.35s of interpreter time behind the cursor.
+  const before = host.calls.filter((c) => c.req.op === "check").length;
+  model.setValue("x = 2\n");
+  model.setValue("x = 3\n");
+  model.setValue("x = 4\n");
+  await settle();
+  const added = host.calls.filter((c) => c.req.op === "check").length - before;
+  ok(added === 1, `three edits inside the window cost one check, not three (${added})`);
+  ok(host.calls.filter((c) => c.req.op === "check").pop().req.code === "x = 4\n", "…and it checks the latest text, not the first");
+
+  off();
+  // A disposed registration must not leave a timer that fires into a dead editor.
+  const quietBefore = host.calls.length;
+  model.setValue("x = 5\n");
+  await settle();
+  ok(host.calls.length === quietBefore, "after dispose, editing checks nothing");
+}
+
+{
+  const settle = (ms = CHECK_DEBOUNCE_MS + 60) => new Promise((r) => setTimeout(r, ms));
+
+  // A file that is not Python is not checked, whatever else is open.
+  const monaco = makeFakeMonaco();
+  const host = makeHost({ check: { items: [] } });
+  const off = registerPythonLanguage(monaco, host);
+  const ts = makeModel("/project/app.ts", "const x = 1", "typescript");
+  monaco.editor.openModel(ts);
+  await settle();
+  ok(host.calls.filter((c) => c.req.op === "check").length === 0, "a TypeScript model is never sent to mypy");
+  off();
+}
+
+{
+  const settle = (ms = CHECK_DEBOUNCE_MS + 60) => new Promise((r) => setTimeout(r, ms));
+
+  // Failure wording, both kinds. A config error is not about the code, so it is
+  // said once and draws nothing; a service that is down leaves the last markers
+  // alone rather than claiming the file became clean.
+  const monaco = makeFakeMonaco();
+  const host = makeHost({ check: { error: "config", message: "mypy.ini: [mypy] section not found" } });
+  const off = registerPythonLanguage(monaco, host);
+  const model = makeModel("/project/app.py", "x = 1\n");
+  monaco.editor.openModel(model);
+  await settle();
+  ok(host.notices.some((n) => /mypy: .*section not found/.test(n)), `a mypy configuration error is reported as itself: ${host.notices[0] || "(nothing)"}`);
+  ok((monaco.editor.markersFor(model, MARKER_OWNER) || []).length === 0, "…and draws no squiggles, because it is not about the code");
+  off();
+
+  const monaco2 = makeFakeMonaco();
+  const host2 = makeHost({ check: { items: [{ line: 1, column: 1, endLine: 1, endColumn: 2, severity: "error", message: "boom", code: "x" }] } });
+  const off2 = registerPythonLanguage(monaco2, host2);
+  const model2 = makeModel("/project/app.py", "x = 1\n");
+  monaco2.editor.openModel(model2);
+  await settle();
+  ok((monaco2.editor.markersFor(model2, MARKER_OWNER) || []).length === 1, "a marker is published while the service is up");
+  host2.responder = () => Promise.resolve({ ok: false, result: null, error: "worker gone" });
+  model2.setValue("x = 2\n");
+  await settle();
+  ok((monaco2.editor.markersFor(model2, MARKER_OWNER) || []).length === 1,
+    "…and when the service dies the markers STAY, because clearing them would claim the file is clean");
+  off2();
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the check op is real Python, and mypy is loaded only for it ==");
+// ---------------------------------------------------------------------------
+{
+  ok(/"check": _vv_check/.test(LSP_DRIVER_SOURCE), "the driver dispatches a check op");
+  // The flags are the feature. Without --show-column-numbers every marker would
+  // underline a whole line; without --show-error-end it would underline one
+  // character; without --follow-imports=silent it would report errors in files
+  // the editor is not showing, which have nowhere to be drawn.
+  for (const flag of ["--show-column-numbers", "--show-error-end", "--follow-imports=silent", "--no-error-summary"]) {
+    ok(LSP_DRIVER_SOURCE.includes(flag), `…passing ${flag}, without which the markers would be wrong`);
+  }
+  ok(/--cache-dir=/.test(LSP_DRIVER_SOURCE), "…and an incremental cache, which is the difference between 2s and 0.35s a check");
+  ok(/from mypy import api/.test(LSP_DRIVER_SOURCE), "…and goes in through the API, not the command line that calls os._exit()");
+
+  const worker = fs.readFileSync(path.join(ROOT, "packages/core/src/workers/python-lsp-worker.ts"), "utf8");
+  ok(/if \(req\.op === "check"\) await ensureMypy\(\)/.test(worker), "the worker loads mypy on the first check");
+  ok(!new RegExp("loadPackage\\(MYPY_PACKAGES[\\s\\S]{0,200}?post\\(\"state\", \\{ state: \"ready\"").test(worker),
+    "…and not at boot, where it would put the biggest wheel in front of the first completion");
+  ok(/mypyError = errText\(e\)/.test(worker), "a failed mypy load is remembered, not refetched on every pause");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== a package you install brings its command with it ==");
+// `pip install <thing>` that is followed by "<thing>: command not found" is the
+// shape of bug this feature is about: the metadata was always in the store, and
+// nothing read it.
+// ---------------------------------------------------------------------------
+{
+  const eps = parseEntryPoints([
+    "[console_scripts]",
+    "httpie = httpie.__main__:main",
+    "http = httpie.cli:program [extra]",
+    "deep = pkg.mod:obj.attr",
+    "",
+    "# a comment",
+    "[gui_scripts]",
+    "notme = pkg:gui",
+    "",
+    "[pytest11]",
+    "alsonotme = plugin",
+  ].join("\n"));
+  ok(Object.keys(eps).length === 3, `only the console_scripts section becomes commands (${Object.keys(eps).join(", ")})`);
+  ok(eps.httpie === "httpie.__main__:main", "a plain entry point is read");
+  ok(eps.http === "httpie.cli:program", "…an extras marker is stripped, since it selects dependencies and is not part of the import");
+  ok(eps.deep === "pkg.mod:obj.attr", "…and a dotted attribute survives");
+  ok(!("notme" in eps) && !("alsonotme" in eps), "gui_scripts and plugin sections are not commands here");
+
+  const src = consoleScriptSource("httpie", "httpie.__main__:main");
+  ok(/cp\.spawn\('python', \['-c'/.test(src), "the shim runs the interpreter");
+  ok(/sys\.argv\[0\] = \\"httpie\\"/.test(src), "…with argv[0] set to the command name, which is what argparse prints in its usage line");
+  ok(/importlib\.import_module\(\\"httpie\.__main__\\"\)/.test(src), "…imports the module the entry point names");
+  ok(/sys\.exit\(_t\(\)\)/.test(src), "…and exits with what the entry point returns, so `tool && next` works");
+  ok(/concat\(process\.argv\.slice\(2\)\)/.test(src), "…forwarding argv verbatim");
+
+  const deep = consoleScriptSource("deep", "pkg.mod:obj.attr");
+  ok(/\\"obj\.attr\\"\.split/.test(deep), "a dotted attribute is walked rather than imported as a name that does not exist");
+}
+
+{
+  // The real thing, over a real filesystem: install, then uninstall.
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), "vv-scripts-"));
+  const ENV2 = { pyTag: "python3.14", pythonVersion: "3.14.0", pyodideVersion: "0.28.0", sitePackages: "/lib/python3.14/site-packages" };
+  const paths = storePaths(proj, ENV2.pyTag);
+  const dist = (name, version, body) => {
+    const d = path.join(paths.sitePackages, `${name}-${version}.dist-info`);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "entry_points.txt"), body);
+  };
+  dist("httpie", "3.2.4", "[console_scripts]\nhttpie = httpie.__main__:main\nhttp = httpie.core:main\n");
+  dist("rich", "14.0.0", "[console_scripts]\nrich = rich.__main__:main\n");
+
+  const names = writeConsoleScripts(fs, proj, ENV2);
+  ok(names.join(",") === "http,httpie,rich", `every console script in the store becomes a command (${names.join(", ")})`);
+  ok(fs.existsSync(path.join(paths.bin, "httpie.js")), "…written into .venv/bin, where a venv puts them");
+  ok(paths.bin === path.join(proj, ".venv/bin"), `…which is ${paths.bin.replace(proj, "<project>")}`);
+
+  // Uninstall. The store loses the package; PATH has to lose the command, or it
+  // spawns an interpreter to fail at the import.
+  fs.rmSync(path.join(paths.sitePackages, "httpie-3.2.4.dist-info"), { recursive: true, force: true });
+  const after = writeConsoleScripts(fs, proj, ENV2);
+  ok(after.join(",") === "rich", `uninstalling takes the command away too (${after.join(", ") || "none"})`);
+  ok(!fs.existsSync(path.join(paths.bin, "httpie.js")), "…the shim is deleted, not left behind to fail at an import");
+  ok(fs.existsSync(path.join(paths.bin, "rich.js")), "…and the other package's command is untouched");
+
+  // A package that declares a command we already own must not shadow the seam.
+  dist("pytest", "8.0.0", "[console_scripts]\npytest = pytest:console_main\npy.test = pytest:console_main\n");
+  const guarded = writeConsoleScripts(fs, proj, ENV2);
+  ok(!guarded.includes("pytest"), "installing pytest does NOT overwrite the pytest on PATH, which carries the exit-code seam");
+  ok(guarded.includes("py.test"), "…while its other, unclaimed alias is still installed");
+
+  fs.rmSync(proj, { recursive: true, force: true });
+}
+
+{
+  // Drift guard: every seam that lives on PATH has to be in the reserved set, or
+  // a pip install can quietly replace it.
+  const delegates = Object.keys(PYTHON_DELEGATES);
+  for (const name of delegates) {
+    ok(RESERVED_COMMANDS.has(name), `${name} is a /bin seam and is protected from being shadowed by an installed console script`);
+  }
+  ok(RESERVED_COMMANDS.has("python") && RESERVED_COMMANDS.has("python3"), "…as is the interpreter itself");
+
+  // And the PATH that makes any of it reachable.
+  const kw = fs.readFileSync(path.join(ROOT, "packages/core/src/workers/kernel-worker.ts"), "utf8");
+  const m = /PATH: ([^\n]+),/.exec(kw);
+  ok(!!m && /\.venv\/bin/.test(m[1]), `.venv/bin is on the default PATH: ${m ? m[1].trim() : "(not found)"}`);
+  ok(!!m && m[1].indexOf(".venv/bin") < m[1].indexOf('"/bin"') + m[1].length && /\.venv\/bin[^:]*:\/bin/.test(m[1].replace(/" \+ dir \+ "/g, "").replace(/"/g, "")),
+    "…before /bin, so a project's own tools win — which is why the seams above are reserved rather than merely first");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== pip install -e . reaches the editable path, not the package list ==");
+// The first line of most Python projects' READMEs. Before this, `-e` fell into
+// the ignore-unknown-flags arm and `.` was taken for a package name, so the
+// command failed with "could not install .".
+// ---------------------------------------------------------------------------
+{
+  const drive = drivePython;
+
+  let r = drive(["-m", "pip", "install", "-e", "."]);
+  ok(r.calls.some(([f, a]) => f === "pipInstallEditable" && a === "."),
+    `pip install -e . asks for an editable install of "." (${JSON.stringify(r.calls)})`);
+  ok(!r.calls.some(([f]) => f === "pipInstall"), "…and does not also try to install a package called \".\"");
+
+  r = drive(["-m", "pip", "install", "--editable", "./libs/core"]);
+  ok(r.calls.some(([f, a]) => f === "pipInstallEditable" && a === "./libs/core"), "--editable takes a path too");
+
+  // Mixed, which real pip allows.
+  r = drive(["-m", "pip", "install", "-e", ".", "requests"]);
+  ok(r.calls.some(([f, a]) => f === "pipInstallEditable" && a === "."), "a mixed command does the editable part");
+  // The launcher awaits the editable install before starting the ordinary one,
+  // and this driver is synchronous — so the second call lands a tick later.
+  await new Promise((res) => setTimeout(res, 10));
+  ok(r.calls.some(([f, a]) => f === "pipInstall" && a.join() === "requests"), "…and still installs the ordinary packages, rather than dropping them");
+
+  // The refusals, read off the implementation: each names what is missing and
+  // what to do, because "could not install ." taught nobody anything.
+  const src = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  const fn = src.slice(src.indexOf("async function pipInstallEditable"), src.indexOf("async function pipInstall(indexUrl, names)"));
+  ok(/no pyproject\.toml in/.test(fn), "a project without a pyproject.toml is refused by name");
+  ok(/There is a setup\.py, but running it needs a build backend/.test(fn),
+    "…and a setup.py-only project is told why it specifically cannot work, since it looks installable");
+  ok(/tool\.poetry/.test(fn) && /add a \[project\] table/.test(fn), "…as is a Poetry project with no [project] table");
+  ok(/no static version/.test(fn) && /it is declared dynamic/.test(fn), "…and a dynamic version, which would have to be computed by a backend");
+  ok(/tomllib\.loads/.test(fn) && /fs\.readFileSync\(pyprojectPath\)/.test(fn),
+    "the TOML is read through the host filesystem and parsed by the stdlib, so it does not depend on the project being mirrored yet");
+  ok(/Dependencies are NOT installed by -e here/.test(fn),
+    "…and dependencies are declared un-installed rather than half-resolved in silence");
+  ok(/\[console_scripts\]/.test(fn), "[project.scripts] is written as console_scripts, which is what the shim generator reads");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the wheels a template needs are the wheels that are vendored ==");
+// ---------------------------------------------------------------------------
+{
+  const vend = fs.readFileSync(path.join(ROOT, "scripts/vendor-pyodide.mjs"), "utf8");
+  const defaults = /DEFAULT_PACKAGES = \[([\s\S]*?)\n\];/.exec(vend);
+  const names = defaults ? [...defaults[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]) : [];
+  for (const want of ["sqlalchemy", "rich", "httpx"]) {
+    ok(names.includes(want), `${want} is vendored, so the template that uses it runs with the network off`);
+  }
+
+  // rich's lock entry declares no dependencies at all and it imports both of
+  // these lazily, so the failure lands on the line that highlights something
+  // rather than on the import at the top.
+  const fixups = /const DEPENDS_FIXUPS = \{([\s\S]*?)\n\};/.exec(vend);
+  const richFix = fixups && /rich:\s*\[([^\]]*)\]/.exec(fixups[1]);
+  ok(!!richFix, "rich has a depends fixup, because its lock entry declares none");
+  for (const dep of ["pygments", "markdown-it-py"]) {
+    ok(richFix && richFix[1].includes(`"${dep}"`), `…naming ${dep}, which rich imports lazily and the lock does not mention`);
+  }
+  // markdown-it-py is not in Pyodide's index at all, so a fixup alone would
+  // point at a wheel that does not exist.
+  ok(/name: "markdown-it-py"/.test(vend), "markdown-it-py is vendored from PyPI, since Pyodide does not distribute it");
+  ok(/name: "mdurl"/.test(vend), "…along with mdurl, which it needs");
+
+  // And the bridge tier, which runs against a STOCK lock, has to load the same
+  // names by hand — so the two lists cannot drift apart unnoticed.
+  const bridge = fs.readFileSync(path.join(ROOT, "scripts/spike-python-bridge.mjs"), "utf8");
+  const richCase = /"python-rich": \{([\s\S]*?)\n  \},/.exec(bridge);
+  ok(!!richCase && /packages: \["rich", "pygments", "markdown-it-py"\]/.test(richCase[1]),
+    "the python-rich case loads exactly the packages the fixup adds, so the tier proves the fixup is the right one");
+}
+
+// ---------------------------------------------------------------------------
+// ruff: the linter that is not a Python package
+//
+// Everything here is about the program AROUND the wasm, which is where a linter
+// gets dangerous: what it decides to read, what it refuses, and whether a
+// refusal can still write to someone's source. The wasm itself is stubbed (see
+// driveRuff); the real one runs on the bridge tier.
+{
+  console.log("\n== ruff: a linter that never boots the interpreter ==");
+
+  const DIRTY = "import os\n\n\ndef f():\n    pass\n";
+  const oneDiagnostic = [{
+    code: "F401", message: "`os` imported but unused", tags: ["unnecessary"],
+    start_location: { row: 1, column: 8 }, end_location: { row: 1, column: 10 },
+    fix: { message: "Remove unused import", edits: [{ location: { row: 1, column: 1 }, end_location: { row: 2, column: 1 }, content: null }] },
+  }];
+
+  // --version before anything else: it is the one path that must not pay for
+  // the wasm, and the only way to see that is that init never ran.
+  const version = await driveRuff(["--version"], {});
+  ok(/ruff 9\.9\.9/.test(version.out), "ruff --version reports the vendored version");
+  ok(version.seen.init === 0, "…without loading 11 MB of wasm to answer it");
+  ok(version.code === 0, "…and exits 0");
+
+  // Which files a bare `ruff check` decides are the user's own.
+  const walk = await driveRuff(["check"], {
+    diagnostics: [],
+    files: {
+      "main.py": "x = 1\n",
+      "pkg/mod.py": "y = 2\n",
+      "typed.pyi": "def f() -> int: ...\n",
+      "notes.txt": "not python\n",
+      "node_modules/dep/setup.py": "raise SystemExit\n",
+      ".venv/lib/site.py": "raise SystemExit\n",
+      "__pycache__/main.cpython-313.py": "raise SystemExit\n",
+    },
+  });
+  ok(walk.seen.checked.length === 3, "ruff check walks the project for .py and .pyi files");
+  ok(walk.seen.checked.includes("y = 2\n"), "…including subdirectories");
+  ok(!walk.seen.checked.includes("raise SystemExit\n"),
+    "…and never node_modules, .venv or __pycache__, whose contents the user cannot edit");
+  ok(/All checks passed!/.test(walk.out) && walk.code === 0, "a clean project says so and exits 0");
+
+  // A finding has to reach the shell as a failure, or `ruff check && deploy`
+  // deploys code that did not pass.
+  const dirty = await driveRuff(["check"], { diagnostics: oneDiagnostic, files: { "main.py": DIRTY } });
+  ok(/main\.py:1:8: F401 /.test(dirty.out), "a finding is printed as path:line:column: CODE message");
+  ok(dirty.code === 1, "…and exits 1, so `ruff check && deploy` stops");
+  ok(dirty.read("main.py") === DIRTY, "…and check never writes to the file it is reading");
+
+  // --fix: refused, and the refusal must not be a refusal that wrote first.
+  const fix = await driveRuff(["check", "--fix"], { diagnostics: oneDiagnostic, files: { "main.py": DIRTY } });
+  ok(/--fix cannot be honoured here/.test(fix.out), "--fix is refused rather than quietly applied");
+  ok(/does not mark which fixes are safe/.test(fix.out), "…naming the reason: the wasm does not say which fixes are safe");
+  ok(fix.read("main.py") === DIRTY, "…and the file is untouched, which is the entire point of refusing");
+  ok(fix.code === 2, "…exiting 2, the code the real CLI uses for a usage error");
+  ok(fix.seen.init === 0, "…and it is refused before the wasm is even loaded");
+
+  // format writes; --check and --diff report. A CI gate that silently rewrote
+  // the tree would pass and leave a dirty checkout behind.
+  const messy = "x=1\n";
+  const tidy = "x = 1\n";
+  const fmt = await driveRuff(["format"], { formatted: tidy, files: { "main.py": messy } });
+  ok(fmt.read("main.py") === tidy, "ruff format rewrites the file");
+  ok(/1 file reformatted/.test(fmt.out) && fmt.code === 0, "…reports what it did and exits 0");
+
+  const fmtCheck = await driveRuff(["format", "--check"], { formatted: tidy, files: { "main.py": messy } });
+  ok(fmtCheck.read("main.py") === messy, "ruff format --check does NOT write");
+  ok(/would be reformatted/.test(fmtCheck.out), "…says what it would do");
+  ok(fmtCheck.code === 1, "…and exits 1 so it can gate CI");
+
+  // Flags that map onto ruff's own settings keys, and flags that do not.
+  const selected = await driveRuff(["check", "--select", "E,F", "--line-length", "120"], { files: { "main.py": "x = 1\n" } });
+  ok(selected.seen.settings && selected.seen.settings["line-length"] === 120,
+    "--line-length is passed to ruff as its own setting, not reimplemented");
+  ok(selected.seen.settings && Array.isArray(selected.seen.settings.lint?.select) &&
+    selected.seen.settings.lint.select.join(",") === "E,F", "--select likewise");
+
+  const bogus = await driveRuff(["check", "--statistics"], { files: { "main.py": "x = 1\n" } });
+  ok(/--statistics is not supported here/.test(bogus.out) && bogus.code === 2,
+    "an unsupported flag is refused by name rather than ignored");
+  ok(bogus.seen.checked.length === 0, "…before linting anything, so the refusal is not a half-run");
+
+  const sub = await driveRuff(["server"], { files: { "main.py": "x = 1\n" } });
+  ok(/"server" is not available here/.test(sub.out) && sub.code === 2, "a real ruff subcommand we do not have is named in its own refusal");
+
+  // Config we do not read is a difference the user has to hear about, once.
+  const configured = await driveRuff(["check"], {
+    files: { "main.py": "x = 1\n", "pyproject.toml": "[tool.ruff]\nline-length = 100\n" },
+  });
+  ok(/\[tool\.ruff\] table in pyproject\.toml is not being applied/.test(configured.out),
+    "a [tool.ruff] table is reported as not applied, because it is not");
+  const unconfigured = await driveRuff(["check"], { files: { "main.py": "x = 1\n" } });
+  ok(!/not being applied/.test(unconfigured.out), "…and a project without one hears nothing about config");
+
+  // The seams around it: on PATH, and protected from being replaced by a
+  // `pip install ruff` that installs a Rust binary which cannot run here.
+  ok(typeof COREUTILS.ruff === "string" && COREUTILS.ruff.includes("VV_RUFF_URL"),
+    "ruff is installed on PATH as an ordinary program");
+  ok(RESERVED_COMMANDS.has("ruff"),
+    "…and reserved, so `pip install ruff` cannot shadow it with a binary that cannot start");
+  const kernelWorker = fs.readFileSync(path.join(ROOT, "packages/core/src/workers/kernel-worker.ts"), "utf8");
+  ok(/VV_RUFF_URL: vendorUrl\("vendor\/ruff\/"\)/.test(kernelWorker), "the kernel points it at the vendored copy");
+
+  // The vendor step, which is the only reason any of the above can run offline.
+  const vendorRuff = fs.readFileSync(path.join(ROOT, "scripts/vendor-ruff.mjs"), "utf8");
+  ok(/const VERSION = "\d+\.\d+\.\d+"/.test(vendorRuff), "the vendored ruff version is pinned, so a lint result cannot change on its own");
+  for (const file of ["ruff_wasm.js", "ruff_wasm_bg.wasm", "LICENSE"]) {
+    ok(vendorRuff.includes(`"${file}"`), `the vendor step copies ${file}`);
+  }
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+  ok(/vendor:ruff/.test(pkg.scripts.prebuild || pkg.scripts["prebuild:studio"] || ""),
+    "…and runs as part of the studio build, so a shipped build always has it");
+}
+
+// ---------------------------------------------------------------------------
+// The three things a Python user hits before they hit anything else: a chart
+// that never appears, a coroutine that will not run, and a timezone that does
+// not exist. None of these needed an interpreter to get wrong, so none of them
+// need one to check.
+{
+  console.log("\n== plt.show(), asyncio.run(), input(), ZoneInfo ==");
+
+  // A fake Pyodide is enough here: what matters is which backend the boot
+  // chooses, and that a backend the USER chose is left alone.
+  const fakePyodide = () => {
+    const calls = { dirs: [], files: {}, python: [] };
+    return [calls, {
+      FS: {
+        mkdirTree: (d) => calls.dirs.push(d),
+        writeFile: (p, body) => { calls.files[p] = body; },
+      },
+      runPython: (src) => { calls.python.push(src); },
+    }];
+  };
+
+  const [plain, py1] = fakePyodide();
+  ok(installMatplotlibShow(py1, {}) === true, "the matplotlib backend installs at boot");
+  ok(Object.keys(plain.files).some((f) => f.endsWith("/vv_mpl.py")), "…writing its module somewhere importable");
+  ok(!Object.keys(plain.files).some((f) => f.includes("site-packages")),
+    "…and NOT into site-packages, which belongs to the package store");
+  ok(plain.python.join("").includes(`os.environ["MPLBACKEND"] = "${MPL_BACKEND}"`),
+    "…selected through MPLBACKEND, so nothing imports matplotlib to arrange it");
+
+  const [chosen, py2] = fakePyodide();
+  installMatplotlibShow(py2, { MPLBACKEND: "Agg" });
+  ok(chosen.python.join("").includes('os.environ["MPLBACKEND"] = "Agg"'),
+    "a backend the user set themselves is passed through, not overruled");
+
+  // The backend's own contract with matplotlib, which is the part that silently
+  // stops working if a name is wrong.
+  ok(/^\s*def show\(/m.test(MPL_SHOW_SOURCE), "the backend defines show(), which is what plt.show() calls");
+  ok(/class FigureCanvas\(FigureCanvasAgg\)/.test(MPL_SHOW_SOURCE), "…and FigureCanvas, which is how matplotlib finds it");
+  ok(/manager_class = FigureManager/.test(MPL_SHOW_SOURCE),
+    "…wired through manager_class, or figure.show() would warn that Agg cannot be shown");
+  ok(/savefig\(/.test(MPL_SHOW_SOURCE) && /print\(/.test(MPL_SHOW_SOURCE),
+    "…and it both writes the file and says where, since a chart nobody mentions is a chart nobody finds");
+  ok(/_vv_plot_name/.test(MPL_SHOW_SOURCE) && /figure\._vv_plot_name = name/.test(MPL_SHOW_SOURCE),
+    "the name is remembered on the figure, so a second chart cannot overwrite the first");
+
+  // asyncio.run rewrites a message; the message IS the feature. (input() used to
+  // be rewritten alongside it and is not any more — see the stdin section below,
+  // which checks that its refusal is gone rather than reworded.)
+  ok(/_vv_asyncio\.run = _vv_run/.test(BLOCKING_PATCH_SOURCE), "asyncio.run is wrapped");
+  ok(/return _vv_real_run\(main, \*\*kwargs\)/.test(BLOCKING_PATCH_SOURCE),
+    "…by trying the real one first, so a browser with JSPI is left alone");
+  ok(/if "stack switching" not in str\(exc\):\n\s+raise/.test(BLOCKING_PATCH_SOURCE),
+    "…and only its own failure is rewritten - every other RuntimeError is the user's");
+  ok(/await main\(\)/.test(BLOCKING_PATCH_SOURCE), "…pointing at top-level await, which this runtime actually supports");
+
+  // tzdata is loaded by matching the source, because no import statement names it.
+  ok(dataPackagesFor("from zoneinfo import ZoneInfo").includes("tzdata"),
+    "code that imports zoneinfo pulls tzdata in, which nothing else would");
+  ok(dataPackagesFor("import zoneinfo").includes("tzdata"), "…however it is spelled");
+  ok(dataPackagesFor("import datetime\nprint(datetime.datetime.now())").length === 0,
+    "…and code that does not mention it pays nothing");
+  const vendorSrc = fs.readFileSync(path.join(ROOT, "scripts/vendor-pyodide.mjs"), "utf8");
+  ok(/"tzdata"/.test(vendorSrc), "tzdata is vendored, so timezones do not depend on the network");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== ruff's markers, which arrive before the interpreter does ==");
+// The claim under test is not "ruff works" — the bridge tier holds the wasm to
+// the real CLI for that. It is that the editor asks for a lint separately from a
+// check, quickly, and publishes it under its own owner, so the two tools cannot
+// erase each other.
+// ---------------------------------------------------------------------------
+{
+  // Shapes recorded from the vendored wasm, so this tier tests the mapping the
+  // worker actually runs. The bridge tier re-records them against the binary.
+  const RUFF_OUT = [
+    { code: "F401", message: "`os` imported but unused", start_location: { row: 1, column: 8 }, end_location: { row: 1, column: 10 } },
+    { code: "I001", message: "Import block is un-sorted or un-formatted", start_location: { row: 1, column: 1 }, end_location: { row: 2, column: 11 } },
+    // What a half-written line looks like. ruff reports it as a diagnostic like
+    // any other, which is why dropping it has to be deliberate.
+    { code: "invalid-syntax", message: "Expected an expression", start_location: { row: 3, column: 5 }, end_location: { row: 4, column: 1 } },
+  ];
+  const LINT = ruffMarkersFrom(RUFF_OUT);
+  ok(LINT.items.length === 2, `the mapping drops the invalid-syntax finding and keeps the two real ones (${LINT.items.length})`);
+  ok(!LINT.items.some((i) => i.code === "invalid-syntax"),
+    "…so a pause in the middle of typing `x = ` does not put a red squiggle under the cursor");
+  ok(ruffMarkersFrom([]).items.length === 0 && ruffMarkersFrom(null).items.length === 0,
+    "a clean file and a missing answer both map to no markers, not to a crash");
+  const monaco = makeFakeMonaco();
+  const host = makeHost({ lint: LINT, check: { items: [] } });
+  const off = registerPythonLanguage(monaco, host);
+  const model = makeModel("/project/app.py", "import os\n");
+  monaco.editor.openModel(model);
+
+  // Fast enough to have answered before mypy's window has even opened, which is
+  // the property that makes it worth running on top of mypy rather than instead.
+  ok(LINT_DEBOUNCE_MS < CHECK_DEBOUNCE_MS, `the lint waits ${LINT_DEBOUNCE_MS}ms against the check's ${CHECK_DEBOUNCE_MS}ms`);
+  await new Promise((r) => setTimeout(r, LINT_DEBOUNCE_MS + 60));
+  const early = monaco.editor.markersFor(model, RUFF_MARKER_OWNER);
+  ok(Array.isArray(early) && early.length === 2, `ruff's markers are up ${LINT_DEBOUNCE_MS}ms in, while mypy is still waiting`);
+  ok(monaco.editor.markersFor(model, MARKER_OWNER) === null, "…and mypy has not run yet, so the two are genuinely independent");
+
+  const [unused, unsorted] = early;
+  ok(unused.startLineNumber === 1 && unused.startColumn === 8 && unused.endColumn === 10,
+    "the marker is placed on ruff's own columns, which are 1-based with an exclusive end like Monaco's");
+  ok(unused.severity === monaco.MarkerSeverity.Warning, "a lint finding is a Warning - the file still runs");
+  ok(unsorted.severity === monaco.MarkerSeverity.Warning, "…every one of them, since the class that stops it running is dropped upstream");
+  ok(unsorted.endLineNumber === 2, "a finding that spans lines keeps its end line, so the whole import block is underlined");
+  ok(unused.code === "F401", "the rule id rides along, so a `# noqa: F401` can be written from it");
+  ok(unused.source === "ruff", "…and the marker says ruff produced it, not mypy");
+
+  const lintCalls = host.calls.filter((c) => c.req.op === "lint");
+  ok(lintCalls.length === 1, `one lint was asked for (${lintCalls.length})`);
+  ok(lintCalls[0].req.code === "import os\n", "…carrying the buffer, so an unsaved edit is what gets linted");
+
+  // Typing coalesces here too, and the two timers do not interfere.
+  const beforeLint = host.calls.filter((c) => c.req.op === "lint").length;
+  model.setValue("import os\nimport sys\n");
+  model.setValue("import os\nimport sys\nimport json\n");
+  await new Promise((r) => setTimeout(r, CHECK_DEBOUNCE_MS + 120));
+  const afterLint = host.calls.filter((c) => c.req.op === "lint").length;
+  ok(afterLint === beforeLint + 1, `two edits inside the window are one lint (${afterLint - beforeLint})`);
+  ok(monaco.editor.markersFor(model, MARKER_OWNER) !== null, "…and by now mypy has run too, on its own timer");
+
+  // Both owners survive each other: mypy publishing an empty list is mypy saying
+  // the types are fine, not ruff's findings being withdrawn.
+  ok((monaco.editor.markersFor(model, RUFF_MARKER_OWNER) || []).length === 2,
+    "ruff's markers are still there after mypy published its own");
+  ok(RUFF_MARKER_OWNER !== MARKER_OWNER, "…which is only true because they are separate marker owners");
+
+  // A ruff that cannot start is reported once, and does not clear what it said
+  // before. There is nothing the user can do about it, so a squiggle is wrong.
+  const m2 = makeFakeMonaco();
+  const h2 = makeHost({ lint: { error: "boom", message: "no vendored ruff" }, check: { items: [] } });
+  registerPythonLanguage(m2, h2);
+  const model2 = makeModel("/project/b.py", "import os\n");
+  m2.editor.openModel(model2);
+  await new Promise((r) => setTimeout(r, LINT_DEBOUNCE_MS + 60));
+  model2.setValue("import os\nimport sys\n");
+  await new Promise((r) => setTimeout(r, LINT_DEBOUNCE_MS + 60));
+  const ruffNotices = h2.notices.filter((n) => /^ruff: /.test(n));
+  ok(ruffNotices.length === 1, `a ruff that cannot load says so exactly once, by name, across edits (${ruffNotices.length})`);
+  ok(m2.editor.markersFor(model2, RUFF_MARKER_OWNER) === null, "…and publishes no markers at all rather than an all-clear");
+
+  off();
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== stubs, so mypy's first message is about the user's code ==");
+// ---------------------------------------------------------------------------
+{
+  ok(TYPE_STUBS.includes("types-requests"), "requests has stubs, because requests ships none of its own");
+  ok(TYPE_STUBS.includes("pandas-stubs"), "…and so does pandas");
+  for (const stub of TYPE_STUBS) {
+    ok(MYPY_PACKAGES.includes(stub), `${stub} is loaded with mypy, or the stubs would be vendored and never read`);
+  }
+  const vendorSrc = fs.readFileSync(path.join(ROOT, "scripts/vendor-pyodide.mjs"), "utf8");
+  for (const stub of TYPE_STUBS) {
+    ok(new RegExp(`name: "${stub}", version: "[0-9.]+"`).test(vendorSrc),
+      `${stub} is vendored at a pinned version, so the editor's advice cannot change under the user`);
+    ok(new RegExp(`name: "${stub}"[^}]*imports: \\[\\]`).test(vendorSrc),
+      `…with no imports declared, so a script's interpreter never loads a stub package it cannot use`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the interpreter snapshot, which is a cache and so must be able to be wrong ==");
+// The bridge tier proves a restored interpreter works. What is gated here is
+// everything around it: that a stale, truncated, foreign or switched-off cache
+// is IGNORED rather than restored, because each of those would otherwise hand a
+// user a broken CPython that they cannot connect to anything they did.
+// ---------------------------------------------------------------------------
+{
+  // A filesystem small enough to reason about, with the same surface the boot
+  // path uses. Buffers, because that is what the guest's fs returns.
+  const fakeFs = () => {
+    const files = new Map();
+    return {
+      files,
+      readFileSync(p, enc) {
+        if (!files.has(p)) { const e = new Error("ENOENT: " + p); e.code = "ENOENT"; throw e; }
+        const b = files.get(p);
+        return enc === "utf8" ? b.toString("utf8") : b;
+      },
+      writeFileSync: (p, data) => files.set(p, Buffer.from(data)),
+      mkdirSync: () => {},
+      rmSync: (p) => files.delete(p),
+    };
+  };
+  const BYTES = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  const fakePy = { version: "0.29.0", makeMemorySnapshot: () => BYTES };
+  const URL_A = "/vendor/pyodide/";
+
+  const fs1 = fakeFs();
+  ok(readSnapshot(fs1, URL_A, {}) === null, "the first command of a session finds no cache, and says so quietly");
+
+  writeSnapshot(fs1, fakePy, URL_A);
+  ok(fs1.files.has(SNAPSHOT_BIN) && fs1.files.has(SNAPSHOT_META), "…and leaves one behind for the next command");
+  const got = readSnapshot(fs1, URL_A, {});
+  ok(got && got.length === 8 && got[0] === 1 && got[7] === 8, "the next command gets the same bytes back");
+
+  // A different interpreter build. The bytes are only meaningful to the one that
+  // produced them, and restoring them into another is the failure this guards.
+  ok(readSnapshot(fs1, "/vendor/pyodide-3.13/", {}) === null,
+    "a snapshot from a different interpreter build is not used");
+
+  // A half-written cache: the sidecar is the commit record, so bytes that do not
+  // match it are not trusted.
+  fs1.files.set(SNAPSHOT_BIN, Buffer.from([1, 2, 3]));
+  ok(readSnapshot(fs1, URL_A, {}) === null, "a truncated cache is ignored rather than restored");
+  const fs2 = fakeFs();
+  writeSnapshot(fs2, fakePy, URL_A);
+  fs2.files.set(SNAPSHOT_META, Buffer.from("{not json"));
+  ok(readSnapshot(fs2, URL_A, {}) === null, "…as is one whose sidecar is corrupt");
+
+  // The switch, and that it turns off BOTH halves — a session that will not read
+  // a snapshot must not spend 31 MB writing one either.
+  ok(snapshotsEnabled({}) === true && snapshotsEnabled({ VV_PYTHON_SNAPSHOT: "1" }) === true,
+    "snapshots are on unless someone turns them off");
+  ok(snapshotsEnabled({ VV_PYTHON_SNAPSHOT: "0" }) === false, "VV_PYTHON_SNAPSHOT=0 turns them off");
+  const fs3 = fakeFs();
+  writeSnapshot(fs3, fakePy, URL_A);
+  ok(readSnapshot(fs3, URL_A, { VV_PYTHON_SNAPSHOT: "0" }) === null, "…and a switched-off session reads no cache");
+
+  // Discarding has to be complete: a bin left behind with no sidecar is 31 MB of
+  // a session's memory that nothing will ever read.
+  discardSnapshot(fs3);
+  ok(!fs3.files.has(SNAPSHOT_BIN) && !fs3.files.has(SNAPSHOT_META), "discarding removes both halves, not just the record");
+  discardSnapshot(fs3);
+  ok(true, "…and discarding a cache that is already gone is not an error");
+
+  // A filesystem that refuses to write must cost the next command time, not this
+  // command its run.
+  const readonly = { readFileSync: () => { throw new Error("EROFS"); }, writeFileSync: () => { throw new Error("EROFS"); }, mkdirSync: () => {}, rmSync: () => {} };
+  writeSnapshot(readonly, fakePy, URL_A);
+  ok(true, "a cache that cannot be written does not fail the command that tried");
+  ok(readSnapshot(readonly, URL_A, {}) === null, "…and a cache that cannot be read is simply absent");
+
+  // The self-check, which is what makes a bad restore cost one cold boot.
+  ok(restoredOk({ runPython: () => "[3, 2]" }) === true, "a restored interpreter that can import and format passes the check");
+  ok(restoredOk({ runPython: () => "nonsense" }) === false, "one that answers wrongly fails it");
+  ok(restoredOk({ runPython: () => { throw new Error("wasm trap"); } }) === false, "…and one that traps fails it rather than taking the command down");
+
+  // The boot path has to use all of this in the right order, and in particular
+  // must not restore a snapshot it then fails to check.
+  const src = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  const iRead = src.indexOf("readSnapshot(snapFs");
+  const iRestore = src.indexOf("_loadSnapshot: cached");
+  const iCheck = src.indexOf("restoredOk(restored)");
+  const iMake = src.indexOf("_makeSnapshot: making");
+  ok(iRead > 0 && iRead < iRestore && iRestore < iCheck, "the boot reads the cache, restores from it, then checks the result");
+  ok(iCheck < iMake, "…and only boots cold when that fails, rather than the other way round");
+  const iPatch = src.indexOf("installMatplotlibShow(pyodide, process.env)");
+  ok(iMake < iPatch,
+    "the snapshot is taken BEFORE the per-process patches, since those read this process's environment");
+  ok(/VV_PYTHON_SNAPSHOT/.test(src), "and the switch is reachable from the boot path");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the bytecode a run compiled, kept for the run after it ==");
+// The bridge tier proves the saving is real under a real interpreter. What is
+// gated here is the bookkeeping around it, all of which can be wrong quietly:
+// an entry from another CPython, a half-written one, a cache that is never
+// consulted because the calls sit in the wrong order.
+// ---------------------------------------------------------------------------
+{
+  const fakeFs = () => {
+    const files = new Map();
+    return {
+      files,
+      readFileSync(p, enc) {
+        if (!files.has(p)) { const e = new Error("ENOENT: " + p); e.code = "ENOENT"; throw e; }
+        const b = files.get(p);
+        return enc === "utf8" ? b.toString("utf8") : b;
+      },
+      writeFileSync: (p, data) => files.set(p, Buffer.from(data)),
+      readdirSync(p) {
+        if (p !== BYTECODE_DIR) { const e = new Error("ENOENT: " + p); e.code = "ENOENT"; throw e; }
+        return [...files.keys()].filter((f) => f.startsWith(p + "/")).map((f) => f.slice(p.length + 1));
+      },
+      statSync(p) {
+        if (!files.has(p)) { const e = new Error("ENOENT: " + p); e.code = "ENOENT"; throw e; }
+        return { size: files.get(p).length };
+      },
+      mkdirSync: () => {},
+      rmSync: (p) => files.delete(p),
+    };
+  };
+  const MAGIC = "cb0d0d0a";
+  // An interpreter that records what it was asked to do, so that ordering and
+  // the shape of the generated Python can both be asserted on.
+  const fakePy = (over) => {
+    const calls = [];
+    return {
+      calls,
+      runPython(code) {
+        calls.push(["runPython", code]);
+        if (/MAGIC_NUMBER\.hex\(\)$/.test(code.trim())) return MAGIC;
+        if (code.includes("_vv_keys.append")) return JSON.stringify({ magic: MAGIC, keys: (over && over.installed) || [] });
+        if (code.includes("_vv_made")) return JSON.stringify({ magic: MAGIC, made: (over && over.made) || {} });
+        return "";
+      },
+      FS: {
+        mkdirTree: (p) => calls.push(["mkdirTree", p]),
+        writeFile: (p) => calls.push(["writeFile", p]),
+        readFile: (p) => { calls.push(["readFile", p]); return new Uint8Array([9, 9, 9]); },
+        unlink: (p) => calls.push(["unlink", p]),
+      },
+    };
+  };
+
+  ok(bytecodeEnabled({}) === true && bytecodeEnabled({ VV_PYTHON_BYTECODE: "1" }) === true,
+    "the bytecode cache is on unless someone turns it off");
+  ok(bytecodeEnabled({ VV_PYTHON_BYTECODE: "0" }) === false, "VV_PYTHON_BYTECODE=0 turns it off");
+
+  // The ordering that decides whether ANY bytecode is written at all: CPython
+  // walks up from the .pyc looking for a directory that exists, and if the
+  // prefix root is not there when the first import happens it silently writes
+  // nothing. Measured: 0 files cached, no error, no clue.
+  const boot = fakePy();
+  installBytecodeCache(boot, {});
+  const iMkdir = boot.calls.findIndex((c) => c[0] === "mkdirTree" && c[1] === PYCACHE_PREFIX);
+  const iSet = boot.calls.findIndex((c) => c[0] === "runPython" && c[1].includes("pycache_prefix"));
+  ok(iMkdir >= 0 && iSet > iMkdir, "the prefix directory is created BEFORE it is set, or nothing is ever cached");
+  const setCode = boot.calls[iSet][1];
+  ok(/sys\.dont_write_bytecode = False/.test(setCode), "…bytecode writing is turned back on, which Pyodide turns off");
+  ok(setCode.includes(JSON.stringify(PYCACHE_PREFIX)),
+    "…and it is directed at a tree of its own, so no __pycache__ appears in the user's project");
+  const off = fakePy();
+  ok(installBytecodeCache(off, { VV_PYTHON_BYTECODE: "0" }) === false && off.calls.length === 0,
+    "a switched-off session does not touch the interpreter at all");
+
+  // What counts as an entry. Each of these is a cache that would produce
+  // wrong-looking imports rather than slow ones.
+  const fs1 = fakeFs();
+  ok(readBytecodeIndex(fs1, MAGIC).size === 0, "the first command of a session finds no entries, quietly");
+  const put = (f, key, meta, tarLen) => {
+    f.files.set(BYTECODE_DIR + "/" + key + ".tar", Buffer.alloc(tarLen === undefined ? meta.bytes : tarLen));
+    f.files.set(BYTECODE_DIR + "/" + key + ".json", Buffer.from(JSON.stringify(meta)));
+  };
+  put(fs1, "numpy-2.4.3", { bytes: 100, count: 89, magic: MAGIC });
+  ok(readBytecodeIndex(fs1, MAGIC).get("numpy-2.4.3").count === 89, "a complete entry is one, and remembers how much it holds");
+  put(fs1, "pandas-3.0.2", { bytes: 200, count: 250, magic: "0a0d0dcb" });
+  ok(!readBytecodeIndex(fs1, MAGIC).has("pandas-3.0.2"),
+    "bytecode from a different CPython is not bytecode, and is not used");
+  put(fs1, "six-1.17.0", { bytes: 300, count: 1, magic: MAGIC }, 12);
+  ok(!readBytecodeIndex(fs1, MAGIC).has("six-1.17.0"),
+    "…nor is a tar that disagrees with the sidecar written after it, which is a half-written cache");
+  fs1.files.set(BYTECODE_DIR + "/pytz-2026.1.json", Buffer.from("{not json"));
+  ok(!readBytecodeIndex(fs1, MAGIC).has("pytz-2026.1"), "…nor one whose record cannot be read");
+
+  // Restoring: only what is BOTH installed and cached, because a tar for a
+  // package this process does not have is bytes moved for nothing.
+  const py1 = fakePy({ installed: ["numpy-2.4.3", "pandas-3.0.2"] });
+  const res = restoreBytecode(fs1, py1, {});
+  ok(res.keys.join() === "numpy-2.4.3", "only the installed packages the cache actually has are restored");
+  const extract = py1.calls.filter((c) => c[0] === "runPython").pop()[1];
+  ok(extract.includes("/tmp/vv-pyc-numpy-2.4.3.tar") && extract.includes(JSON.stringify(PYCACHE_PREFIX)),
+    "…and they are unpacked into the prefix the interpreter was pointed at");
+  ok(/finally:\s*\n\s*os\.remove/.test(extract), "…and the copy is removed afterwards, whatever the unpack did");
+  const py2 = fakePy({ installed: ["numpy-2.4.3"] });
+  ok(restoreBytecode(fs1, py2, { VV_PYTHON_BYTECODE: "0" }) === null && py2.calls.length === 0,
+    "a switched-off session reads no entries");
+  ok(restoreBytecode(fakeFs(), fakePy({ installed: ["numpy-2.4.3"] }), {}).restored === 0,
+    "…and an empty cache restores nothing rather than failing");
+
+  // Harvesting, which has to be told what is already held so that a package
+  // imported more deeply this time replaces a thinner entry.
+  const fs2 = fakeFs();
+  put(fs2, "numpy-2.4.3", { bytes: 100, count: 89, magic: MAGIC });
+  const py3 = fakePy({ made: { "pandas-3.0.2": ["/tmp/vv-pyc-pandas-3.0.2.tar", 250] } });
+  const saved = harvestBytecode(fs2, py3, {});
+  const harvestCode = py3.calls.filter((c) => c[0] === "runPython" && c[1].includes("_vv_made"))[0][1];
+  const told = JSON.parse(JSON.parse(harvestCode.match(/_vv_known = json\.loads\((".*")\)/)[1]));
+  ok(told["numpy-2.4.3"] === 89, "the harvest is told what the cache already holds, and how much of it");
+  ok(/len\(_vv_members\) <= _vv_known\.get\(_vv_key, -1\)/.test(harvestCode),
+    "…so a package imported more deeply than last time replaces its entry rather than being skipped");
+  ok(/int\.from_bytes\(_vv_raw\[4:8\], "little"\) == 0/.test(harvestCode),
+    "…and only a timestamp-based header is rewritten, since a restored one is already hash-based");
+  ok(harvestCode.includes("(1).to_bytes(4, \"little\")"),
+    "the rewritten header is hash-based and unchecked, which is what survives a wheel unpacked at a new mtime");
+  ok(saved.saved.join() === "pandas-3.0.2", "what the run compiled is kept");
+  const meta = JSON.parse(fs2.files.get(BYTECODE_DIR + "/pandas-3.0.2.json").toString("utf8"));
+  ok(meta.count === 250 && meta.magic === MAGIC && meta.bytes === 3,
+    "…with a record of how much it holds, and which CPython compiled it");
+  ok(py3.calls.some((c) => c[0] === "unlink" && c[1] === "/tmp/vv-pyc-pandas-3.0.2.tar"),
+    "…and the interpreter-side copy is not left behind");
+
+  // Failure has to cost the next command time, never this command its run.
+  const readonly = {
+    readFileSync: () => { throw new Error("EROFS"); },
+    writeFileSync: () => { throw new Error("EROFS"); },
+    readdirSync: () => { throw new Error("EROFS"); },
+    statSync: () => { throw new Error("EROFS"); },
+    mkdirSync: () => {},
+  };
+  harvestBytecode(readonly, fakePy({ made: { "numpy-2.4.3": ["/tmp/x.tar", 89] } }), {});
+  ok(true, "a cache that cannot be written does not fail the command that tried");
+  ok(restoreBytecode(readonly, fakePy({ installed: ["numpy-2.4.3"] }), {}).restored === 0,
+    "…and one that cannot be read is simply absent");
+  const broken = { runPython: () => { throw new Error("wasm trap"); }, FS: {} };
+  ok(harvestBytecode(fakeFs(), broken, {}) === null && restoreBytecode(fakeFs(), broken, {}) === null,
+    "…as is an interpreter that will not answer, rather than taking the run down with it");
+
+  // The order in the run path, which is what makes any of it apply.
+  const pysrc = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  const iInstall = pysrc.indexOf("installBytecodeCache(pyodide, process.env)");
+  const iSnap = pysrc.indexOf("_makeSnapshot: making");
+  ok(iSnap < iInstall, "the setting is applied per process, after the snapshot, like the other patches");
+  const iLoad = pysrc.indexOf("loadPackagesFromImports(importSource || source");
+  const iRestore = pysrc.indexOf("restoreBytecode(req(\"fs\"), pyodide, process.env)");
+  const iRun = pysrc.indexOf("runPythonAsync(source, { filename })");
+  const iHarvest = pysrc.indexOf("harvestBytecode(req(\"fs\"), pyodide, process.env)");
+  ok(iLoad < iRestore && iRestore < iRun,
+    "the cache is put back after the packages are unpacked and before the first import, which is the point of it");
+  ok(iRun < iHarvest, "…and collected after the run, when everything it imported has been imported");
+  ok(/finally \{[\s\S]{0,600}harvestBytecode/.test(pysrc),
+    "…in the finally, so a script that raises still leaves its bytecode for the next command");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== Ctrl-C interrupts Python instead of killing it ==");
+// The interrupt itself is measured next door against a real interpreter in a
+// real worker. What is gated here is the exit code it becomes, and the wiring
+// that decides when Vivari is entitled to take Ctrl-C away from the kernel.
+// ---------------------------------------------------------------------------
+{
+  ok(terminationFromError({ type: "KeyboardInterrupt", message: "KeyboardInterrupt" }).code === 130,
+    "an interrupted run exits 130, which is 128+SIGINT and what a shell reports");
+  ok(/KeyboardInterrupt/.test(terminationFromError({ type: "KeyboardInterrupt", message: "Traceback…\nKeyboardInterrupt" }).report),
+    "…and still prints the traceback, so you can see where it was when you stopped it");
+  ok(terminationFromError({ type: "ValueError", message: "ValueError: nope" }).code === 1,
+    "…while an ordinary exception is still a plain failure");
+  ok(terminationFromError({ type: "SystemExit", message: "SystemExit: 3" }).code === 3,
+    "…and sys.exit(3) is still 3, not swallowed by the new branch");
+
+  const pySrc = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  ok(/pyodide\.setInterruptBuffer\(interrupt\)/.test(pySrc),
+    "the interpreter is handed the byte it polls, which is the only route into a busy interpreter");
+  ok(/interrupt\[0\] = 0;\s*\n\s*process\.on\("SIGINT", onSigint\)/.test(pySrc),
+    "arming clears the byte first, so a Ctrl-C nobody was running to receive cannot fire on the next thing typed");
+  ok(/disarmInterrupts[\s\S]{0,200}removeListener\("SIGINT", onSigint\)/.test(pySrc),
+    "…and the handler is removed again afterwards");
+  ok(/signalHandled\("SIGINT"\)/.test(pySrc),
+    "the handler stands the kernel's force-kill window down, since the process is alive on purpose");
+  ok(/withInterruptsSync\(\(\) => console_\.push\(line\)\)/.test(pySrc),
+    "the REPL arms it around each statement, which is where a runaway loop gets typed");
+  ok(/interrupted \? "KeyboardInterrupt"/.test(pySrc),
+    "…and an interrupted statement prints the name and gives a fresh prompt, as CPython does");
+  const iArm = pySrc.indexOf("async function withInterrupts(");
+  ok(iArm > 0 && /return await fn\(\)/.test(pySrc.slice(iArm, iArm + 260)),
+    "the async arm AWAITS the run, or it would disarm while the interpreter was still going");
+
+  // WHY THE STAND-DOWN IS OPT-IN. Making it automatic would have been one line
+  // and would have quietly removed the only thing stopping a guest that catches
+  // a signal and ignores it from living forever.
+  const sigSrc = fs.readFileSync(path.join(ROOT, "packages/runtime/signals.js"), "utf8");
+  ok(/const standDown = \(name\)/.test(sigSrc) && /"signal-handled"/.test(sigSrc),
+    "a guest can tell the kernel it handled a signal and is staying");
+  const drain = sigSrc.slice(sigSrc.indexOf("drain: () =>"));
+  ok(!/standDown/.test(drain),
+    "…but running a handler does NOT do it by itself: a handler that hangs must still be force-killed");
+
+  const kernelSrc = fs.readFileSync(path.join(ROOT, "packages/kernel-host/kernel.js"), "utf8");
+  ok(/if \(proc\.sigUnhandled === sig\) \{[\s\S]{0,120}finalize/.test(kernelSrc),
+    "hammering Ctrl-C at a process that is NOT answering still escalates to a kill");
+  ok(/handleSignalHandled\(pid, m\) \{[\s\S]{0,400}clearTimeout\(proc\.graceTimer\)/.test(kernelSrc),
+    "…and answering clears the window, so the escalation is about silence rather than repetition");
+
+  const runtimeSrc = fs.readFileSync(path.join(ROOT, "packages/runtime/index.js"), "utf8");
+  ok(/interrupt: ctrl && ctrl\.buffer \? interruptView\(ctrl\.buffer\) : null/.test(runtimeSrc),
+    "the byte is a window onto the process's own syscall SAB, so no new channel was needed");
+  const protoSrc = fs.readFileSync(path.join(ROOT, "packages/protocol/syscall.js"), "utf8");
+  ok(/if \(name === "SIGINT"\) interruptView\(ctrl\.buffer\)\[0\] = INTERRUPT_SIGINT;/.test(protoSrc),
+    "only SIGINT is mirrored into it — the byte is not a second signal channel");
+  ok(/I_INTERRUPT_BYTE = 20/.test(protoSrc) && /little-endian/.test(protoSrc),
+    "…at a named offset, with the byte-order assumption written down rather than implied");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== breakpoints in a .py file, in the debug UI that already existed ==");
+// The bridge tier stops a real interpreter on a real line and steps through it.
+// What is gated here is everything that decides whether that backend is ever
+// reached at all — which of the two debuggers a process gets, and the protocol
+// bookkeeping a frontend is entitled to assume.
+// ---------------------------------------------------------------------------
+{
+  // A Pyodide stand-in that records what Python was asked, and answers the way
+  // the real _vv_dbg would.
+  const fakePy = (over) => {
+    const asked = [];
+    const dbgObj = {
+      start: (cb, roots) => asked.push(["start", roots]),
+      stop: () => asked.push(["stop"]),
+      set_breakpoints: (pairs) => asked.push(["set_breakpoints", pairs]),
+      set_active: (on) => asked.push(["set_active", on]),
+      request_pause: () => asked.push(["request_pause"]),
+      breakable: () => JSON.stringify((over && over.breakable) || [1, 4, 5, 6]),
+      scope: (i, kind) => JSON.stringify([{ name: kind + i, value: { type: "number", value: 1 } }]),
+      props: (handle) => JSON.stringify([{ name: "from:" + handle, value: { type: "number", value: 2 } }]),
+      evaluate: (i, expr) => JSON.stringify({ result: { type: "string", value: "eval:" + expr } }),
+    };
+    return {
+      asked,
+      runPython: () => dbgObj,
+      FS: { readFile: () => "print(1)\n" },
+    };
+  };
+  const harness = (over) => {
+    const sent = [];
+    const py = fakePy(over);
+    const dbg = createPythonDebugger({
+      pyodide: py,
+      roots: ["/projects/"],
+      send: (m) => sent.push(m),
+      // The real transport (readDebugCommandBlocking) parks on the debug SAB for
+      // up to `timeoutMs` and answers null only when that runs out. A stand-in
+      // that returns null instantly would make a gate look instant when it is
+      // not, so this waits the same way.
+      waitForCommand: (timeoutMs) => {
+        const next = over && over.commands && over.commands.shift();
+        if (next) return next;
+        if (timeoutMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, timeoutMs);
+        return null;
+      },
+    });
+    let seq = 0;
+    const cmd = (method, params) => {
+      const id = ++seq;
+      dbg.onCommand({ id, method, params: params || {} });
+      return sent.find((m) => m.id === id);
+    };
+    return { dbg, sent, py, cmd };
+  };
+
+  // The Python half. These are claims about the source because the behaviour
+  // they describe is measured next door, under an interpreter.
+  ok(/sys\.monitoring/.test(PY_DEBUG_SOURCE) && !/sys\.settrace/.test(PY_DEBUG_SOURCE),
+    "the engine is sys.monitoring, not settrace — 23ms against 217ms on the same loop");
+  ok(/return sys\.monitoring\.DISABLE/.test(PY_DEBUG_SOURCE),
+    "…and a line that is not a breakpoint retires itself, which is where the 23ms comes from");
+  ok(/if not self\._mine\(filename\)[\s\S]{0,120}DISABLE/.test(PY_DEBUG_SOURCE),
+    "library code is dropped on the first line of it, so importing pandas under a breakpoint is not traced");
+  ok(/restart_events/.test(PY_DEBUG_SOURCE),
+    "…and stepping re-arms the locations that retired, or the step after a pause would run to the end");
+  ok(/_HIDDEN = frozenset/.test(PY_DEBUG_SOURCE) && /__builtins__/.test(PY_DEBUG_SOURCE),
+    "__builtins__ is kept out of the Variables panel, being 3 kB of dict in every module frame");
+  ok(/action = "resume"[\s\S]{0,200}except Exception/.test(PY_DEBUG_SOURCE),
+    "a frontend that disappears mid-pause resumes the program rather than wedging it");
+
+  // Scripts, and the line a breakpoint actually lands on.
+  {
+    const { dbg, sent, py, cmd } = harness();
+    cmd("Debugger.enable");
+    dbg.registerScript("/projects/demo/main.py");
+    const parsed = sent.find((m) => m.method === "Debugger.scriptParsed");
+    ok(parsed && parsed.params.url === "file:///projects/demo/main.py",
+      "a script is announced by file:// url, which is how the studio maps it back to the editor");
+    ok(parsed.params.endLine === 6, "…with its last breakable line, so the frontend knows how far it goes");
+
+    const onReal = cmd("Debugger.setBreakpointByUrl", { url: "file:///projects/demo/main.py", lineNumber: 3 });
+    ok(onReal.result.locations[0].lineNumber === 3, "a breakpoint on a line that exists binds to that line");
+    const onBlank = cmd("Debugger.setBreakpointByUrl", { url: "file:///projects/demo/main.py", lineNumber: 1 });
+    ok(onBlank.result.locations[0].lineNumber === 3,
+      "…and one on a blank line or a comment binds to the next line that exists, rather than never firing");
+    const pairs = py.asked.filter((a) => a[0] === "set_breakpoints").pop()[1];
+    ok(pairs.length === 2 && pairs.every((p) => p[0] === "/projects/demo/main.py" && p[1] === 4),
+      `…and both reached the interpreter as resolved (file, line) pairs (${JSON.stringify(pairs)})`);
+  }
+
+  // Which commands are answered while the program is running, and which are not.
+  {
+    const { cmd } = harness();
+    ok(cmd("Debugger.setBreakpointsActive", { active: false }), "breakpoints can be switched off without detaching");
+    ok(cmd("Debugger.pause"), "…a pause can be requested of a program that is running");
+    ok(cmd("Runtime.enable") && cmd("Debugger.setPauseOnExceptions", { state: "none" }),
+      "…and the domain setup a frontend sends on attach is answered rather than ignored");
+    const props = cmd("Runtime.getProperties", { objectId: "py:7" });
+    ok(props.result.result[0].name === "from:py:7",
+      "an objectId that is not a scope is looked up in the interpreter's own table");
+  }
+
+  // The start gate, which is what makes a breakpoint on line 1 of a fast script
+  // work at all.
+  {
+    const commands = [{ id: 99, method: "Runtime.runIfWaitingForDebugger" }];
+    const { dbg } = harness({ commands });
+    const t0 = Date.now();
+    dbg.waitForStart(2000);
+    ok(Date.now() - t0 < 1500, "the gate opens as soon as the frontend says to run");
+    const late = harness({ commands: [] });
+    const t1 = Date.now();
+    late.dbg.waitForStart(120);
+    ok(Date.now() - t1 >= 100, "…and a debug session nobody is watching runs anyway, after a bounded wait");
+
+    // The kernel starts a debug target in SAB-routing mode, because until the
+    // gate opens the SAB is the only channel with a reader. It flips back on
+    // `Debugger.resumed`. Without that, everything sent while the program runs —
+    // a breakpoint set after it started — queues where nothing drains it.
+    const gated = harness({ commands: [{ id: 1, method: "Runtime.runIfWaitingForDebugger" }] });
+    gated.dbg.waitForStart(500);
+    ok(gated.sent.some((m) => m.method === "Debugger.resumed"),
+      "opening the gate tells the kernel to route commands by postMessage again");
+    // A gate that never heard from anyone has to say the same thing, or an
+    // unattended debug run leaves the kernel talking into the SAB forever.
+    const silent = harness({ commands: [] });
+    silent.dbg.waitForStart(50);
+    ok(silent.sent.some((m) => m.method === "Debugger.resumed"),
+      "…and so does one that timed out waiting for a frontend that never came");
+  }
+
+  // THE NAME THE SCRIPT RUNS UNDER. `python main.py` is how people run things,
+  // and it used to reach the interpreter as the relative "main.py" — which is
+  // the name every code object gets, and therefore the name a breakpoint has to
+  // match. The editor's breakpoints are on VFS paths, which are absolute, so
+  // nothing ever matched and the debugger did nothing at all. It did not look
+  // broken: the target appeared, the script ran, the target went away.
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-pyrel-"));
+    fs.writeFileSync(path.join(dir, "main.py"), "print('hi')\n");
+    const { api } = mirrorRuntime(dir);
+    await api.runFile("main.py", []);
+    const ran = (globalThis.__vvFakePyodide && globalThis.__vvFakePyodide.ran) || [];
+    const script = ran.find((r) => r.source.includes("print('hi')"));
+    ok(script && script.filename === path.join(dir, "main.py"),
+      `a script run by a relative name still compiles under its absolute path (${script && script.filename})`);
+    ok(script && script.filename.startsWith("/"),
+      "…which is the only form a breakpoint set in the editor can match");
+    const argvLine = ran.find((r) => r.source.includes("sys.argv ="));
+    ok(argvLine && /sys\.argv = \["main\.py"\]/.test(argvLine.source),
+      `…while sys.argv keeps the name as typed, which is what CPython does and what scripts print (${argvLine && argvLine.source})`);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  // WHICH BACKEND. Getting this wrong does not fail loudly: it instruments a
+  // 2500-line launcher shim and offers the user breakpoints in it.
+  const kernelSrc = fs.readFileSync(path.join(ROOT, "packages/kernel-host/kernel.js"), "utf8");
+  const skip = kernelSrc.match(/const skipDebug = \/\^\(([^)]*)\)/);
+  ok(skip && !/python/.test(skip[1]),
+    "the kernel no longer refuses to debug python, since there is now something to debug it with");
+  ok(/const debugLang = \/\^python3\?\$\/\.test\(cmd\) \? "python" : "js"/.test(kernelSrc),
+    "…it labels the target by language instead, which rides along with the SAB");
+  ok(/^(sh|bash|npm)/.test("sh") && /\bsh\|bash\b/.test(skip[1]),
+    "…and the shell and package managers are still skipped, so auto-attach lands on the program");
+
+  const runtimeSrc = fs.readFileSync(path.join(ROOT, "packages/runtime/index.js"), "utf8");
+  ok(/debugIsPython = !!\(debug && debug\.sab && debug\.lang === "python"\)/.test(runtimeSrc),
+    "the runtime reads that label");
+  ok(/const debugEnabled = !!\(debug && debug\.sab\) && !debugIsPython/.test(runtimeSrc),
+    "…and exactly one of the two backends attaches, never both");
+  ok(/debug: debugIsPython \? debug : null/.test(runtimeSrc),
+    "…with the python runtime given the channel only when it is the one that should have it");
+  const bootSrc = fs.readFileSync(path.join(ROOT, "packages/runtime/boot.js"), "utf8");
+  ok(/lang: debugLang/.test(bootSrc), "and the label survives the trip through the worker boot");
+
+  const pySrc = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  ok(/if \(!debug \|\| !debug\.sab \|\| dbg\) return;/.test(pySrc),
+    "a python process with no debug channel attaches nothing, which is every ordinary run");
+  const iAttach = pySrc.indexOf("attachDebugger(pyodide)");
+  const iStdin = pySrc.indexOf("installStdin(pyodide)");
+  ok(iStdin < iAttach, "the debugger is armed after the boot patches, so a breakpoint cannot land inside one");
+  const iRegister = pySrc.indexOf("dbg.registerScript(filename)");
+  const iGate = pySrc.indexOf("dbg.waitForStart()");
+  const iRun = pySrc.indexOf("runPythonAsync(source, { filename })");
+  ok(iRegister > 0 && iRegister < iGate && iGate < iRun,
+    "…and the file is announced, then the gate waits, then the program runs — in that order or breakpoints miss");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== input() waits, because stdin got a syscall ==");
+// The syscall itself is proven in scripts/verify-node.mjs, against the real
+// kernel and a real parked process worker. The interpreter half is proven in the
+// bridge tier, under real CPython. What is left for here is the join: that the
+// callback handed to Pyodide turns the syscall's answers into what Python
+// expects, and that the refusal it replaces is actually gone.
+// ---------------------------------------------------------------------------
+{
+  const fakePyodide = () => {
+    const set = [];
+    return { set, setStdin: (o) => set.push(o) };
+  };
+
+  const py = fakePyodide();
+  const asked = [];
+  const queue = ["duc\n", "42\n", null];
+  ok(installStdin(py, () => { asked.push(1); return queue.shift(); }) === true, "the interpreter gets a stdin");
+  const cb = py.set[0];
+  ok(cb.isatty === true, "…that says it is a terminal, which is what pdb and input()'s prompt check");
+  ok(cb.stdin() === "duc\n", "a line comes through with its newline, which is how Python knows it is a line");
+  ok(cb.stdin() === "42\n", "…and the next call gets the next one");
+  ok(cb.stdin() === null, "end of input is null, which Python turns into the EOFError it would give any closed stdin");
+  ok(asked.length === 3, "one syscall per read, with no polling in between");
+
+  // The syscall returns null for end of input; a defensive empty string has to
+  // mean the same thing, or Python would read it as an infinitely empty line.
+  const py2 = fakePyodide();
+  installStdin(py2, () => "");
+  ok(py2.set[0].stdin() === null, "an empty answer is end of input, not an empty line that repeats forever");
+
+  // A runtime with no such syscall (an older host, or a non-process context)
+  // must leave stdin alone rather than install a callback that throws.
+  const py3 = fakePyodide();
+  const hadGlobal = globalThis.__ocReadStdin;
+  delete globalThis.__ocReadStdin;
+  ok(installStdin(py3) === false && py3.set.length === 0,
+    "without the syscall, stdin is left exactly as Pyodide had it");
+  if (hadGlobal) globalThis.__ocReadStdin = hadGlobal;
+
+  // The old refusal is gone, not reworded — and the one next to it, which is
+  // still true, is still there.
+  ok(!/input\(\) cannot wait/.test(BLOCKING_PATCH_SOURCE) && !/_vv_builtins\.input\s*=/.test(BLOCKING_PATCH_SOURCE),
+    "builtins.input is no longer replaced, since the reason it was has been fixed");
+  ok(/stack switching/.test(BLOCKING_PATCH_SOURCE),
+    "…while asyncio.run's message stays, because blocking on a coroutine still needs something the browser lacks");
+
+  // The wiring, in the three files it has to exist in at once.
+  const protocolSrc = fs.readFileSync(path.join(ROOT, "packages/protocol/syscall.js"), "utf8");
+  const opcodes = [...protocolSrc.matchAll(/export const (OP_\w+) = (\d+);/g)].map((m) => [m[1], +m[2]]);
+  const readStdin = opcodes.find(([n]) => n === "OP_READ_STDIN");
+  ok(!!readStdin, "the protocol has an opcode for it");
+  ok(opcodes.filter(([, v]) => v === readStdin[1]).length === 1,
+    `…and ${readStdin[1]} is not already some other syscall, which would route stdin into it`);
+  const kernelSrc = fs.readFileSync(path.join(ROOT, "packages/kernel-host/kernel.js"), "utf8");
+  ok(/opcode === OP_READ_STDIN/.test(kernelSrc) && /handleReadStdin/.test(kernelSrc), "the kernel dispatches it");
+  ok(/proc\.syncStdin/.test(kernelSrc) && /stdinQueue/.test(kernelSrc),
+    "…and buffers a synchronous reader's stdin, so a line typed between two reads is not delivered to a stream nobody reads");
+  const handlerBody = kernelSrc.slice(kernelSrc.indexOf("handleReadStdin(proc) {"), kernelSrc.indexOf("sendStdin(pid, chunk)"));
+  ok(/if \(proc\.capture\)/.test(handlerBody),
+    "…and answers end-of-input to a process nobody can type at, rather than parking it forever");
+  // The REPL reads through the same door, which is the whole reason it changed:
+  // two readers of one stdin in one process is two readers too many.
+  const lines = [];
+  const chunks = ["print(", "1 +", " 1)\nx = 2\r\n", "input()\n", "half"];
+  const read = makeLineReader(() => (chunks.length ? chunks.shift() : null));
+  for (let i = 0; i < 5; i++) lines.push(read());
+  ok(lines[0] === "print(1 + 1)", `a line spread over three reads is assembled (${JSON.stringify(lines[0])})`);
+  ok(lines[1] === "x = 2", "…a CRLF line loses its carriage return, which a Python parser would choke on");
+  ok(lines[2] === "input()", "…and a chunk holding a whole line does not wait for another read");
+  ok(lines[3] === "half", "text typed without a newline before Ctrl-D is still a line, as it is in CPython");
+  ok(lines[4] === null, "…and then the session ends");
+  ok(makeLineReader(() => null)() === null, "a stdin that is closed from the start ends immediately");
+
+  const pySrc = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  const replBody = pySrc.slice(pySrc.indexOf("function repl(indexUrl)"), pySrc.indexOf("web server bridge"));
+  ok(/makeLineReader\(\)/.test(replBody), "the REPL takes its lines from the blocking reader");
+  // Comments stripped, or this matches the comment explaining the change.
+  const replCode = replBody.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+  ok(!/stdin\.on\(/.test(replCode) && !/process\.stdin/.test(replCode),
+    "…and no longer listens to the flowing stream, which input() would have taken from under it");
+
+  const runtimeSrc = fs.readFileSync(path.join(ROOT, "packages/runtime/index.js"), "utf8");
+  ok(/__ocReadStdin/.test(runtimeSrc), "the runtime exposes it to the guest");
+  ok(!/process\.stdin[\s\S]{0,200}readStdin/.test(runtimeSrc),
+    "…and does NOT wire it into process.stdin, which would let a Node program park its own event loop");
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Python checks passed");

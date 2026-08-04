@@ -401,7 +401,7 @@ still block via `Atomics.wait`. Key ideas (`loop.js`):
 - Each turn also drains queued HTTP requests, async child events, worker_threads
   events, and fs.watch events (`doNet`/`doChildren`/`doThreads`/`doWatch`).
 
-### 7.2 Breakpoint debugger (Node guests)
+### 7.2 Breakpoint debugger (Node guests, and Python — §7.2.1)
 
 A full pause / step / inspect / evaluate debugger for guest Node processes, speaking
 the **Chrome DevTools Protocol** (`Debugger`/`Runtime` domains). There is no V8
@@ -441,7 +441,74 @@ flowchart TD
 A **running** (not-yet-paused) process receives commands via `postMessage` instead of
 the SAB; a `--inspect-brk`-style start gate (`waitForStart` in `index.js`) keeps short
 scripts from finishing before the frontend attaches. The run shell + package managers
-are skipped as debug targets so auto-attach lands on the user's program. The CDP shape
+are skipped as debug targets so auto-attach lands on the user's program.
+
+#### 7.1.1 Ctrl-C into a running interpreter
+
+The pending-signal bitmask (§4.3, `control[4]`) is only ever observed by JS: at a
+syscall park, or on an event-loop turn. A guest running CPython/Wasm is doing neither
+— the worker thread is inside the interpreter's eval loop and will not return to JS
+until the Python code finishes — so the kernel's only option for `python` used to be
+the one it takes for any guest with no handler: terminate it.
+
+CPython's Emscripten build already solves its half, by polling a byte of shared memory
+(`Py_EmscriptenSignalBuffer`, armed with `pyodide.setInterruptBuffer`) and raising
+`KeyboardInterrupt` at the next bytecode boundary. So `postSignal` mirrors **SIGINT
+only** into the first byte of `control[5]` (previously reserved padding; Wasm is
+little-endian by specification, so that is byte 20 everywhere this runs). The
+interpreter clears the byte itself when it acts. Measured latency is ~5ms.
+
+Two consequences shaped the design:
+
+- **The handler is registered only while the interpreter is running user code.**
+  Registering it is what tells the kernel not to kill this process on Ctrl-C, and that
+  is a promise only keepable while there is an interpreter running to take the
+  interrupt. Idle — a REPL at its prompt, parked in the blocking stdin syscall —
+  Ctrl-C keeps its old meaning, because interrupting a park needs the read itself to
+  return EINTR, which it does not do yet.
+- **A guest can stand the force-kill window down** (`signal-handled` →
+  `Kernel#handleSignalHandled`). The window exists for a process that catches a signal
+  and then never leaves, and a REPL back at its prompt is the opposite of that. It is
+  **opt-in**, and the Python runtime is the only caller: making it automatic on "a
+  handler ran" would have silently removed the only thing stopping a signal-swallowing
+  guest from living forever. Escalation on a repeated signal is now keyed on
+  `proc.sigUnhandled` — silence, not repetition — so hammering Ctrl-C at an
+  unresponsive process still kills it on the second press.
+
+#### 7.2.1 The second backend: Python
+
+`packages/runtime/builtins/python-debugger.js` gives `.py` files the same UI over the
+same protocol and the same SAB. **The studio is unchanged** — it speaks CDP, keeps
+breakpoints per VFS path, and never had a reason to know what language was on the
+other end.
+
+Two things differ from the Node backend, both because CPython already has what the JS
+backend had to build:
+
+- **No instrumentation.** Frames are real, so there is no acorn, no probe weaving, and
+  no shadow call stack. What is left is the protocol and the transport, and those are
+  reused as-is.
+- **PEP 669 monitoring, not `sys.settrace`.** A `settrace` hook is called on every line
+  of every function: 22ms → 217ms on a 300k-iteration loop, which is a debugger you
+  have to remember to turn off. `sys.monitoring` (3.12+; the interpreter is 3.14) lets
+  the callback answer `DISABLE`, permanently retiring that bytecode location, so a
+  non-breakpoint line costs nothing on its second execution — 23ms against a 22ms
+  baseline. The price is that stepping must `restart_events()` to un-retire what it
+  disabled. Code outside the user's roots is dropped on its first line, which is what
+  keeps `import pandas` under a breakpoint from being traced at all.
+
+The hot path stays in Python (a set lookup per candidate line); JS is only involved
+once a pause is decided, and then runs the whole CDP conversation, calling **back into**
+the interpreter for frames, scopes, reprs and `eval`. That re-entrancy — JS inside a
+Python call, calling Python again — is the same shape as the blocking stdin syscall
+(§7.10).
+
+Which backend attaches is the kernel's decision, not a guess: `python`/`python3` were
+previously on the debug skip-list, and are now labelled `debugLang: "python"`, carried
+alongside the SAB through `kernel-worker.ts` → `process-worker.ts` → `boot.js` →
+`createRuntime`. Exactly one of the two attaches. Without that label the JS backend
+would instrument our own 2500-line launcher shim and offer breakpoints in it, which is
+the wrong program. The CDP shape
 is shared so the same backend can later also feed the chii Sources panel — distinct
 from §8.5, which debugs preview **browser** JS via chobitsu.
 
@@ -1652,12 +1719,29 @@ interpreter really is WASM (like the Wasm engines above), not a Node-backed shim
 - `packages/kernel-host/programs/python.js` — the `python`/`python3` CLI (arg parse,
   `-m` dispatch). `-m` is a passthrough to CPython's `runpy`, with seams only where
   runpy cannot reach what the module needs: `pip`/`venv` (the store),
-  `uvicorn`/`flask`/`gunicorn` (the bridge), `pytest` (exit codes) and `http.server`
-  (a socket). Socket-only modules — `smtplib`, `ftplib`, `poplib`, `imaplib`,
-  `socketserver`, `wsgiref.simple_server`, `xmlrpc.server` — are refused by name with
-  the reason, because Pyodide's socket connects and binds and then carries no bytes.
-- `packages/kernel-host/coreutils.js` — `pip`/`uvicorn`/`flask`/`gunicorn`/`pytest`
-  PATH shims (delegate to `python -m …`).
+  `uvicorn`/`flask`/`gunicorn` (the bridge), `pytest` and `mypy` (exit codes) and
+  `http.server` (a socket). Socket-only modules — `smtplib`, `ftplib`, `poplib`,
+  `imaplib`, `socketserver`, `wsgiref.simple_server`, `xmlrpc.server` — are refused by
+  name with the reason, because Pyodide's socket connects and binds and then carries no
+  bytes. `manage.py runserver` is refused for that same reason on the script path, which
+  the `-m` table cannot see.
+- `packages/kernel-host/coreutils.js` — `pip`/`uvicorn`/`flask`/`gunicorn`/`pytest`/
+  `black`/`mypy` PATH shims (delegate to `python -m …`), plus `ruff`, which is the one
+  Python command that is not a delegate and cannot be (below).
+- `packages/kernel-host/programs/ruff.js` + `scripts/vendor-ruff.mjs` — **ruff, which
+  never boots the interpreter.** It is Rust compiled to WebAssembly, vendored same-origin
+  at a pinned version (11 MB, fetched through the blocking `__ocfetch` syscall only when a
+  `ruff` process runs) and loaded by dynamic `import()` of `VV_RUFF_URL`, the same shape
+  as Pyodide's index URL. Because it is outside CPython, `ruff check` costs no Pyodide
+  boot and no wheels — which is also what would let it run on every keystroke in the
+  editor. Two deliberate refusals: `--fix` (the wasm reports edits without saying whether
+  a fix is safe, so applying them would be `--unsafe-fixes` unasked, and multi-fix edits
+  computed against one original text overlap and corrupt the file — observed, not
+  theorised) and `[tool.ruff]` config (misreading someone's lint config silently is worse
+  than saying it is not read). `ruff` is in `RESERVED_COMMANDS`, or `pip install ruff`
+  would shadow a working ruff with a console script for a Rust binary that cannot start.
+  The bridge tier holds it to the real `ruff` CLI at the same pinned version: findings by
+  line and column, exit code, and formatting byte for byte.
 - `scripts/vendor-pyodide.mjs` — vendors the Pyodide core + selected wheels into
   `packages/studio/public/vendor/pyodide/` and writes a **hybrid `pyodide-lock.json`**:
   successfully vendored packages get relative paths; the rest keep absolute CDN URLs so
@@ -1669,6 +1753,90 @@ interpreter really is WASM (like the Wasm engines above), not a Node-backed shim
   closure (`mypy-extensions`, `pathspec`, `pytokens`, and the lock-resident `click` and
   `platformdirs`) are downloaded from PyPI, pinned, and injected into the lock. An
   editor feature that only formats when the network is up is not the feature.
+
+**Three things are patched into every interpreter at boot**, each one line of Python on
+`sys.path` or in `os.environ`, so a process that never uses them pays nothing.
+`installMatplotlibShow` selects a `module://` backend through `MPLBACKEND` (an MPLBACKEND
+the user set is passed through), turning `plt.show()` from Agg's documented no-op into a
+PNG in the project plus a line saying where — named per figure, or a script drawing two
+charts silently overwrites the first. `installBlockingPatch` rewrites the one remaining failure
+that reports itself in terms of WebAssembly rather than Python: `asyncio.run()` (tried
+for real first, so a browser with JSPI is untouched; otherwise pointed at top-level
+`await`, which works because files run under `runPythonAsync`). It used to rewrite
+`input()` too and no longer does — `installStdin` gives the interpreter a stdin that
+waits (below), so that call does what it says. And `dataPackagesFor` loads wheels that are **data**: tzdata
+is named by no import statement, so `loadPackagesFromImports` structurally cannot find it,
+and source mentioning `zoneinfo` pulls it in by text match — there is no async left to
+fetch a wheel once `zoneinfo` is being imported.
+
+**`input()`, pdb and the REPL read stdin through a syscall of their own** (`OP_READ_STDIN`;
+`installStdin` in `builtins/python.js`). Pyodide asks for input through a callback that must
+return a string synchronously — it is called from inside CPython's own read, several frames
+down in WASM — so the flowing stdin every other program here uses cannot serve it: receiving
+a postMessage needs a loop turn, and there is no loop turn to be had inside that call. The
+opcode is a deferred syscall shaped like `OP_FETCH`: the process parks on `Atomics.wait`, the
+kernel registers it as the waiter, and a keystroke (or a parent writing to a child's stdin)
+wakes it with the bytes in the SAB. Making the call also switches that process's stdin from
+"post it" to "hold it here until asked", or a line typed between two reads would be delivered
+to a stream the synchronous reader never looks at. A `capture: true` process — `spawnSync`,
+internal `kernel.start` — reads end of input immediately instead of parking, because the only
+party who could type at it is itself parked waiting for it to exit. **The REPL reads the same
+way**, which is not tidiness: a python process has one stdin, and leaving the REPL on the
+flowing stream meant the first `input()` at a `>>>` prompt took stdin away from it for good.
+The cost is that the process's event loop does not turn while a prompt waits, which is what
+CPython does at a `>>>` as well.
+
+**The first interpreter of a session is snapshotted, and the rest resume from it.** Booting
+CPython costs ~1.8s and this runtime pays it per command, which was the single biggest thing
+wrong with Python here. Pyodide can serialise a just-booted interpreter's linear memory and
+start another from it (`_makeSnapshot`/`_loadSnapshot`, experimental). Measured on the
+vendored build: 1673ms cold, 176ms to restore, 61ms to write the 31 MB and 49ms to read it —
+so ~0.25s per command after the first. The bytes live at `/var/cache/vv-python/` because
+processes share exactly one thing, the VFS, and `/var/cache` is already the kernel's place for
+transient caches and is on fs-worker's OPFS `IGNORE` list (31 MB that is only valid for one
+interpreter build has no business being persisted). A sidecar JSON is written after the bytes
+and read before them, so it is the commit record: a cache whose length or index URL disagrees
+with it is ignored rather than restored. The snapshot is taken **before** the boot patches
+above, since those read the process's environment, and they are re-applied to every restored
+interpreter. Restoring in a realm other than the one that made it is the load-bearing
+assumption and is tested rather than hoped — `spike-python-bridge.mjs --only snapshot` makes
+one in a worker_thread and restores it in two others, then imports, loads packages, writes
+files and raises a traceback in each.
+
+**The bytecode a run compiles is kept, because the next run would compile the same bytes.**
+The snapshot removes the interpreter's start-up; what remains is larger. `import pandas`
+costs 2349ms, `import matplotlib.pyplot` 1948ms and `import numpy` 495ms, and essentially
+none of it is the package doing anything — it is CPython compiling ~1000 `.py` files, which
+it would ordinarily do once into `__pycache__`. It does not here for one reason: Pyodide sets
+`sys.dont_write_bytecode`. Unsetting it costs an import nothing measurable (423ms against
+420ms for numpy), so there is **no compile step** in this feature — only keeping what an
+import already produced. Measured across two worker realms: 2550ms of importing cold against
+639ms warm, 114ms to harvest and 13ms for a run that adds nothing.
+
+Three things make it correct rather than merely fast:
+
+- **The headers are rewritten to PEP 552 unchecked-hash.** A `.pyc` records its source's
+  mtime, and `loadPackage` unpacks the wheel afresh into every interpreter, so those mtimes
+  are the time of the unpack — every cached file would be stale on arrival. Converting a
+  header is byte surgery on 16 bytes, not compilation; the marshalled code object is
+  untouched. `check_source=0` because re-reading and re-hashing each source on import is
+  most of the I/O being avoided, and the claim it substitutes — that a wheel's files do not
+  change while its version does not — is the one pip makes.
+- **`sys.pycache_prefix` keeps it out of the project.** Bytecode written next to the source
+  would appear in the file explorer and be mirrored back into the VFS as the script's own
+  work. The prefix's root **must exist before the first import**: CPython builds the tree
+  below it by walking up from the `.pyc` until it finds a directory that exists, and if that
+  walk runs off the top it creates directories relative to the cwd instead, silently, and
+  nothing is ever cached.
+- **Only site-packages is persisted, keyed on `name-version` and the interpreter's magic
+  number.** The user's own modules are compiled too, but their bytecode stays in the
+  per-process prefix under CPython's ordinary mtime checking, because their files change and
+  a released package's do not. Entries carry a file count, so a package imported more deeply
+  than last time replaces a thinner entry instead of being skipped for the session.
+
+`spike-python-bridge.mjs --only bytecode` harvests in one worker realm and restores in
+another, with a third whose bytecode is deliberately unreadable: it must produce the same
+answers by the slow path (2480ms), or the speed-up being measured is not the cache.
 
 **Packages persist in a `.venv` store, because interpreters do not.** Every `python`
 command is a fresh Pyodide boot, so an install has nothing to live in. `pip install`
@@ -1694,10 +1862,29 @@ Three design points, all of which look like mistakes until you know why:
   that is simply true here, and the docs say the same in prose. Size is capped at 64 MB
   (SciPy is ~13 MB), and an install that would exceed it is refused with the store left
   untouched and a non-zero exit.
+- **Console scripts are generated from the store, into `.venv/bin`.** Every wheel that
+  declares one ships `<dist>.dist-info/entry_points.txt`, which the store already holds;
+  `writeConsoleScripts()` turns each `[console_scripts]` entry into a JS shim that spawns
+  `python -c` with a loader (import the module, walk the attribute, `sys.exit(fn())`,
+  `argv[0]` set to the command name so argparse's usage line is right). `.venv/bin` is on
+  `PATH` ahead of `/bin`. It is regenerated rather than appended to, so an uninstall takes
+  the command away — a shim left behind would spawn an interpreter to fail at an import.
+  `RESERVED_COMMANDS` protects the `/bin` seams (`pytest`'s exit code, the WSGI/ASGI
+  bridge, `pip` itself) from being shadowed by an installed package of the same name; the
+  offline tier checks that set against `PYTHON_DELEGATES` so a new seam cannot be added
+  unprotected.
+- **`pip install -e .` writes the metadata rather than building it.** There is no PEP 660
+  backend here — running one needs a subprocess — so `pipInstallEditable()` reads a static
+  `[project]` table out of `pyproject.toml` (bytes via the host fs, parsed by `tomllib`, so
+  it does not depend on the project having been mirrored) and writes a `.pth`, a
+  `dist-info` with `METADATA`/`direct_url.json`, and `[project.scripts]` as
+  `entry_points.txt` — which the generator above then turns into commands. Anything that
+  would have to be *computed* (a dynamic version, a `setup.py`, a Poetry-only table) is
+  refused with the reason and the fix, rather than installed under an invented name.
 
 **The editor's language service — a SECOND, long-lived interpreter.** Completion,
-hover, signature help, go-to-definition and formatting come from jedi and black, which
-are Python and therefore need an interpreter. They cannot use the one above: it boots
+hover, signature help, go-to-definition, formatting and type diagnostics come from jedi,
+black and mypy, which are Python and therefore need an interpreter. They cannot use the one above: it boots
 per process and dies with it, so a REPL exiting would take completion down, and a
 language-service boot would appear in `ps` as a process nobody started.
 
@@ -1707,13 +1894,49 @@ language-service boot would appear in `ps` as a process nobody started.
   `kill` can reach it. It boots on the FIRST language request, never at studio start:
   editing a `.ts` file must not download an interpreter. Concurrent first requests await
   one boot promise rather than racing two interpreters. black loads only on the first
-  format — jedi answers keystrokes, black answers a command, and paying for both up front
-  would slow the one people wait on.
+  format, and mypy only on the first check, for the same reason and more of it: mypy is
+  the largest wheel the studio ships. jedi answers keystrokes; the other two answer
+  something the user asked for and can wait a moment. **`lint` is answered before that
+  worker would boot anything**: it is ruff's wasm, not a Python package, so the handler
+  sits above the `if (!pyodide) await boot(...)` line and a lint costs ~2ms and no
+  interpreter. That is what puts markers on a file while the 30 MB CPython behind
+  completion is still starting.
+- **Two marker owners, on two clocks.** mypy publishes under `mypy` on a 700ms pause
+  (one single-threaded interpreter shared with completion: a check that is running is a
+  completion that is waiting). ruff publishes under `ruff` on 150ms, because it shares
+  nothing with either. Separate owners is the whole mechanism — the slow one arriving
+  never erases what the fast one said, and either can be down without blanking the other.
+  ruff's `invalid-syntax` findings are dropped in `ruffMarkersFrom` rather than drawn: at
+  150ms, `x = ` is the normal state of a line being typed, and mypy still reports a file
+  it cannot parse on its longer pause. The mapping lives in the runtime module (not the
+  worker) so the offline tier can drive it with recorded shapes and the bridge tier with
+  what the real wasm returns.
+- **Stubs are loaded with mypy** (`TYPE_STUBS`), for the same reason mypy is loaded at all:
+  without them its first message about a file importing `requests` is about packaging, on
+  line 1, and the untyped import makes the module `Any` so the real error goes unreported.
+  Only `types-requests` and `pandas-stubs` — measured, not guessed: everything else the
+  runtime vendors ships a `py.typed`.
 - `packages/runtime/builtins/python-lsp.js` — the Python driver (JSON in, JSON out) and
   the Monaco providers. Plain JS, not TypeScript, so the offline tier can import it
   without a build step; `packages/studio/src/vv/python-language.ts` is the typed wrapper.
 - The studio imports that module **dynamically**, on the first Python model
   (`controller.ts: ensurePythonLanguage`), so a TypeScript-only session never loads it.
+
+**Diagnostics are pushed, not pulled, and run on a pause.** Monaco has no "diagnostics
+provider" to register: the `check` op writes the buffer to the mirrored project, runs
+mypy through its API (`--show-column-numbers --show-error-end --follow-imports=silent`)
+and the result is published with `setModelMarkers`. Three decisions are load-bearing:
+
+- **A debounce, not a keystroke.** One interpreter is shared with completion, so a check
+  that is running is a completion that is waiting. Measured on this interpreter: ~2.1s the
+  first time a project is seen, ~0.35s per edit after that with an incremental cache. The
+  first number is why it is lazy; the second is why 700ms of quiet is the trigger.
+- **`--show-error-end`, and a +1.** mypy's end column is inclusive and Monaco's is not, so
+  a marker that copied it through would stop one character short of the code it is about.
+- **mypy's paths are relative to the working directory**, not to the absolute path it was
+  given. An exact-match filter on the requested path silently drops every diagnostic; the
+  comparison is `realpath`-based. This was caught by the bridge tier and would have passed
+  every offline test, because a stubbed reply cannot get its own paths wrong.
 
 Four points worth knowing:
 
@@ -1792,6 +2015,17 @@ synthesises `sys.exit(int(pytest.main([...])))` and runs it down the ordinary sc
 which gets wheel auto-loading and exit-code propagation for free. That last part is why
 `terminationFromError` reports `SystemExit` the way CPython does (silent for an integer or
 bare exit, message-only for `sys.exit("text")`) instead of dumping a WASM traceback.
+
+**`doMypy` exists because mypy exits the wrong way.** black needs no seam — `python -m
+black` is plain `runpy`, and the wheel the editor already vendors is the one it runs. mypy
+cannot be, because its command line finishes with `os._exit()` to skip interpreter
+teardown, and under Emscripten that tears down the whole runtime: the diagnostics print
+and the exit code is lost, so `mypy && deploy` would deploy on a failed check. The seam
+calls `mypy.api.run()`, upstream's embedding entrypoint, which runs `main()` with
+`clean_exit=True` — precisely the flag that skips `os._exit` — and returns
+`(stdout, stderr, status)`. Output is therefore buffered to the end of the run rather than
+streamed. Argv is forwarded verbatim including the empty case, so `mypy` with no target
+gives mypy's own usage error rather than a default this repo invented.
 
 **Django is WSGI-only.** Its ASGI path goes through `asgiref`, which starts a
 `ThreadPoolExecutor` for every request even when the views are `async def`, and the WASM

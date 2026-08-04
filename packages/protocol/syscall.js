@@ -169,6 +169,30 @@ export const OP_PIPE_LISTEN = 31;
 export const OP_PIPE_CONNECT = 32;
 export const OP_PIPE_CLOSE_SERVER = 33;
 
+// BLOCKING read of this process's stdin. A *deferred* syscall like OP_SPAWN and
+// OP_FETCH: the caller parks on Atomics.wait and the kernel wakes it when a
+// chunk arrives — from a terminal's keystrokes, or from a parent writing to a
+// child's stdin.
+//   OP_READ_STDIN  field0 = JSON {} -> OK raw bytes, or OK EMPTY for end of input
+//
+// WHY THIS EXISTS WHEN STDIN ALREADY WORKS. Everywhere else stdin is a flowing
+// stream: the kernel postMessages chunks in and the runtime delivers them on a
+// loop turn, which is what Node wants and what a `node` REPL uses. But a
+// synchronous reader cannot turn the loop — it has to have the bytes when it
+// returns. CPython under WebAssembly is exactly that: `input()` is a C-level
+// read, so is pdb's prompt, and Pyodide asks for them through a callback that
+// must return a string THERE AND THEN. Without this opcode the only honest
+// answer was end-of-input, which is why `input()` used to refuse.
+//
+// Zero bytes means end of input, as a read(2) of zero does; the caller turns it
+// into whatever its language calls that (an EOFError, for Python).
+//
+// The kernel starts buffering a process's stdin the first time it makes this
+// call, rather than posting it into the flowing stream — otherwise anything
+// typed between two reads would be delivered to a stream nobody is reading and
+// lost. A process that never makes this call is completely unaffected.
+export const OP_READ_STDIN = 34;
+
 // request flags (bitmask)
 export const FLAG_RECURSIVE = 1; // mkdir -p
 
@@ -193,6 +217,26 @@ export const I_OPCODE = 1;
 export const I_REQ_LEN = 2;
 export const I_RES_LEN = 3;
 export const I_SIGNAL = 4;
+// control[5]'s FIRST BYTE, aliased. The pending-signal bitmask above is only
+// observed by JS — at a syscall park, or on an event-loop turn — and a guest
+// running CPython/Wasm is doing neither: the worker thread is inside the
+// interpreter's eval loop, which will not return to JS until the Python code
+// finishes. That is why Ctrl-C used to be able to do nothing but kill a python
+// process outright.
+//
+// CPython's Emscripten build polls a byte of shared memory for exactly this
+// reason (`Py_EmscriptenSignalBuffer`, driven by `pyodide.setInterruptBuffer`):
+// the value 2 means SIGINT, and the interpreter raises `KeyboardInterrupt` at
+// the next bytecode boundary and clears the byte itself. So SIGINT is *also*
+// mirrored here as a byte, in the one format a running interpreter can see.
+//
+// Byte order is not a portability question here: Wasm is little-endian by
+// specification, so the low byte of slot 5 is byte 20 everywhere this runs.
+// A guest with no interpreter never reads it, and writing it costs one store.
+export const I_INTERRUPT_BYTE = 20;
+// The value CPython understands. Not our SIGINT bit, which happens to be the
+// same number today — that is a coincidence, and they mean different things.
+export const INTERRUPT_SIGINT = 2;
 
 // ---- signals ---------------------------------------------------------------
 // A catchable signal has to reach a guest that may be parked in `Atomics.wait`
@@ -239,8 +283,21 @@ export function postSignal(ctrl, name) {
   const bit = SIGNAL_BITS[name];
   if (!bit) return false;
   Atomics.or(ctrl, I_SIGNAL, bit);
+  // …and, for SIGINT, in the byte a busy interpreter polls. Both, because the
+  // two are read by different things at different times: the interpreter reacts
+  // to the byte within milliseconds, and the guest's own JS still gets the
+  // signal event on its next turn.
+  if (name === "SIGINT") interruptView(ctrl.buffer)[0] = INTERRUPT_SIGINT;
   Atomics.notify(ctrl, I_STATE);
   return true;
+}
+
+/**
+ * The one-byte window CPython polls, over an existing syscall SAB. Handed to
+ * `pyodide.setInterruptBuffer`; the interpreter clears it when it acts on it.
+ */
+export function interruptView(sab) {
+  return new Uint8Array(sab, I_INTERRUPT_BYTE, 1);
 }
 
 /**

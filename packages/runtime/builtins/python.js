@@ -61,6 +61,8 @@ import {
   walkPyodide,
   writeStore,
 } from "./python-store.js";
+import { PY_DEBUG_SOURCE, createPythonDebugger } from "./python-debugger.js";
+import { makeDebugViews, readDebugCommandBlocking } from "../../protocol/debug.js";
 
 // Directories we never mirror between the project and Pyodide's FS.
 // `.venv` is in here even though it is now the package store, and that is the
@@ -139,6 +141,12 @@ export function flushStreams(pyodide) {
 export function terminationFromError(e) {
   const msg = (e && e.message) || String(e);
   const last = msg.trimEnd().split("\n").pop().trim();
+  // Ctrl-C. CPython prints the traceback like any other exception and exits
+  // 128+SIGINT, and a shell that reports 130 is how a script author tells an
+  // interrupted run from a failed one.
+  if ((e && e.type === "KeyboardInterrupt") || /^KeyboardInterrupt\b/.test(last)) {
+    return { code: 130, report: msg };
+  }
   const isExit = (e && e.type === "SystemExit") || /^SystemExit\b/.test(last);
   if (!isExit) return { code: 1, report: msg };
   const m = /^SystemExit:\s*([\s\S]*)$/.exec(last);
@@ -372,6 +380,606 @@ export function installUrllib3RealmPatch(pyodide) {
   }
 }
 
+// Where our own importable Python lives. Not site-packages: that path is the
+// persistent store's, and a module we put there would look to the store like
+// something pip installed.
+export const VV_PY_DIR = "/lib/vivari";
+
+// `plt.show()`, which otherwise draws nothing at all.
+//
+// Pyodide's matplotlib defaults to Agg, whose show() is a documented no-op. So
+// the last line of every matplotlib tutorial runs, exits 0, and produces
+// silence: no window, no file, no message, no error to search for. Of all the
+// ways this runtime can disappoint someone, a successful no-op is the worst.
+//
+// There is no window to give them, but there is a file. Everything Python
+// writes under the project is mirrored back out, so a PNG saved here lands in
+// the tree and opens in the editor - which is the same thing the matplotlib
+// templates already do by hand with savefig(). show() does it for them and says
+// where it went.
+//
+// Naming took two tries. Figure number is the obvious key and it is wrong: a
+// script that plots, shows, plots again and shows again gets figure 1 twice,
+// so the second chart quietly overwrites the first and the user is never told
+// they lost it. The name is therefore assigned once per figure and remembered
+// on the figure, which keeps re-showing the same one idempotent while never
+// reusing a name for different pictures.
+//
+// The figures are closed afterwards, as closing a window would: show() displays
+// every open figure, so leaving them open makes each call rewrite and re-announce
+// all of its predecessors.
+//
+// This is a module:// backend - matplotlib's own extension point - so
+// `matplotlib.use("Agg")` still wins wherever code already says it, and the
+// templates that write their own PNGs are untouched.
+export const MPL_BACKEND = "module://vv_mpl";
+export const MPL_SHOW_SOURCE = `
+import os
+
+# matplotlib resolves a backend by importing this module and reading these two
+# names off it. FigureCanvas is the Agg one unchanged: the drawing was never the
+# problem, only what happens after it.
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.backend_bases import FigureManagerBase
+from matplotlib._pylab_helpers import Gcf
+
+
+_vv_written = [0]
+
+
+def _vv_plot_name(figure):
+    name = getattr(figure, "_vv_plot_name", None)
+    if name is None:
+        _vv_written[0] += 1
+        name = "plot.png" if _vv_written[0] == 1 else "plot-%d.png" % _vv_written[0]
+        figure._vv_plot_name = name
+    return name
+
+
+def _vv_save(figure):
+    name = _vv_plot_name(figure)
+    figure.savefig(name)
+    print(
+        "plt.show(): a browser tab has no plot window, so this figure was "
+        "written to %s" % os.path.basename(name),
+        flush=True,
+    )
+
+
+# figure.show() reaches the manager, not this module's show(). Left alone it
+# warns that an Agg canvas "is non-interactive and thus cannot be shown" - true
+# of Agg, but not of what we do with it here. matplotlib finds the manager
+# through the canvas rather than by name, hence manager_class.
+class FigureManager(FigureManagerBase):
+    def show(self):
+        _vv_save(self.canvas.figure)
+
+
+class FigureCanvas(FigureCanvasAgg):
+    manager_class = FigureManager
+
+
+def show(*args, **kwargs):
+    for manager in Gcf.get_all_fig_managers():
+        _vv_save(manager.canvas.figure)
+    Gcf.destroy_all()
+`;
+
+// MPLBACKEND is how matplotlib is told this without importing it, which matters:
+// a process that never plots must not pay for a matplotlib import, and one that
+// plots must not have to opt in. An MPLBACKEND the user set themselves is passed
+// through untouched - they have named a backend, and it is not our business to
+// overrule them.
+// ---- the interpreter snapshot ----------------------------------------------
+//
+// Booting CPython costs ~1.8s, and this runtime pays it PER COMMAND: a fresh
+// process worker is a fresh interpreter, so `python a.py && python b.py` boots
+// twice and a REPL that exits throws the whole thing away. That is the single
+// biggest thing wrong with Python here, and it is not a slow import — it is
+// the interpreter initialising itself, which produces the same bytes every
+// time.
+//
+// So the first boot of a session keeps those bytes. Pyodide can serialise a
+// just-booted interpreter's linear memory and start another one from it
+// (`_makeSnapshot` / `_loadSnapshot`, experimental, hence the guards below).
+// Measured on this vendored build: 1843ms to boot, 205ms to restore, 71ms to
+// write the 31 MB and 47ms to read it back through the VFS. Call it 1.8s
+// against 0.25s, on every command after the first.
+//
+// WHY THE FILESYSTEM AND NOT MEMORY. The snapshot has to outlive the process
+// that made it and be visible to the next one, and processes here share
+// exactly one thing: the VFS. /var/cache is where the kernel already keeps
+// transient caches, and fs-worker's IGNORE list excludes it from OPFS — which
+// is what we want. A snapshot is only valid for the interpreter build that
+// made it, and it is 31 MB; persisting it across reloads would trade a real
+// storage cost for a saving on one command per session.
+//
+// WHY IT IS SAFE TO SHARE ACROSS PROCESSES. Restoring in a different realm
+// from the one that made it is the load-bearing assumption, and it is tested
+// rather than hoped: the bridge tier makes a snapshot in one worker_thread and
+// restores it in two others, then imports, loads packages, writes files and
+// raises a traceback in each. Two Web Workers are two realms in the same way.
+export const SNAPSHOT_DIR = "/var/cache/vv-python";
+export const SNAPSHOT_BIN = SNAPSHOT_DIR + "/interpreter.snapshot";
+// Written after the bytes and read before them, so it is the commit record: a
+// half-written cache is one whose sidecar does not agree with it, and is
+// ignored rather than restored.
+export const SNAPSHOT_META = SNAPSHOT_DIR + "/interpreter.json";
+
+export function snapshotsEnabled(env) {
+  // One switch, off by setting it to 0, for the person whose interpreter is
+  // behaving strangely and who needs to know whether the cache is why.
+  return String((env && env.VV_PYTHON_SNAPSHOT) || "") !== "0";
+}
+
+export function readSnapshot(fs, indexUrl, env) {
+  if (!snapshotsEnabled(env)) return null;
+  try {
+    const meta = JSON.parse(fs.readFileSync(SNAPSHOT_META, "utf8"));
+    // Same interpreter, or it is not ours. Within a session the vendored build
+    // cannot change under us; across one, /var/cache is already gone.
+    if (meta.indexUrl !== indexUrl) return null;
+    const buf = fs.readFileSync(SNAPSHOT_BIN);
+    if (buf.length !== meta.bytes) return null;
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  } catch {
+    return null; // no cache yet is the common case, not an error
+  }
+}
+
+export function writeSnapshot(fs, pyodide, indexUrl) {
+  try {
+    const bytes = pyodide.makeMemorySnapshot();
+    fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+    fs.writeFileSync(SNAPSHOT_BIN, globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+    fs.writeFileSync(SNAPSHOT_META, JSON.stringify({ indexUrl, bytes: bytes.byteLength, version: pyodide.version }));
+  } catch {
+    // A cache that cannot be written is a slow next command, not a failure of
+    // this one. Silent on purpose: nobody asked for a snapshot.
+  }
+}
+
+export function discardSnapshot(fs) {
+  try {
+    fs.rmSync(SNAPSHOT_META, { force: true });
+    fs.rmSync(SNAPSHOT_BIN, { force: true });
+  } catch {
+    /* the next boot will overwrite it anyway */
+  }
+}
+
+/**
+ * Is this restored interpreter actually an interpreter?
+ *
+ * Cheap (~1ms) and deliberately not a "2+2" — it imports from the frozen
+ * stdlib and formats a string, which is the machinery a bad restore would
+ * take out. It cannot prove subtle corruption is absent; what it does buy is
+ * that a snapshot which is wrong in an obvious way costs one cold boot rather
+ * than a confusing failure inside the user's own program.
+ */
+export function restoredOk(pyodide) {
+  try {
+    return pyodide.runPython("__import__('json').dumps([__import__('sys').version_info[0], 1 + 1])") === "[3, 2]";
+  } catch {
+    return false;
+  }
+}
+
+
+// ---- bytecode cache ---------------------------------------------------------
+//
+// The snapshot above removed the interpreter's own start-up. What it could not
+// touch is the next thing that happens, which is bigger: `import pandas` costs
+// 2.3s, `import matplotlib.pyplot` 1.9s, `import numpy` 0.5s, and they cost it
+// on every command. Almost none of that is the package doing anything - it is
+// CPython compiling ~1000 .py files to bytecode, again, having compiled the
+// same files to the same bytecode a moment ago.
+//
+// CPython already solves this with __pycache__, and the reason it does not
+// solve it here is one line: Pyodide sets sys.dont_write_bytecode. Unsetting it
+// costs an import nothing measurable (423ms against 420ms for numpy) and the
+// bytecode falls out as a side effect of the import that was happening anyway.
+// So there is no compile step in any of this. There is only keeping what an
+// import already produced, and putting it back.
+//
+// WHY THE HEADERS ARE REWRITTEN. A .pyc records the mtime of the source it came
+// from and is ignored if the source's mtime has moved. loadPackage unpacks the
+// wheel afresh into a new interpreter every time, so those mtimes are the time
+// of the unpack - different on every run, which would make every cached file
+// stale on arrival. PEP 552 has the answer: a hash-based .pyc, which is what an
+// installer writes for exactly this reason. Converting one is header surgery,
+// not compilation - the marshalled code object is byte-identical, so the whole
+// harvest of numpy and pandas is 115ms.
+//
+// WHY UNCHECKED. The alternative, check_source=1, re-reads and re-hashes the
+// source on every import, which is most of the I/O this is here to avoid. The
+// claim being made instead is that a wheel's files do not change while its
+// version stays the same. That is the same claim pip makes.
+//
+// WHY THE BYTECODE DOES NOT LAND NEXT TO THE SOURCE. sys.pycache_prefix puts it
+// in a tree of its own, which keeps __pycache__ directories out of the user's
+// project - they would otherwise appear in the file explorer and be mirrored
+// back into the VFS as if the script had written them. It also means only one
+// tree has to be walked to collect anything. Note that the prefix's root has to
+// exist before the first import: CPython builds the tree below it by walking UP
+// from the .pyc's directory until it finds something that is already a
+// directory, and if that walk runs off the top it starts creating directories
+// relative to the cwd instead, silently, and no bytecode is ever written.
+//
+// WHAT IS PERSISTED IS ONLY site-packages. The user's own modules get bytecode
+// too - it is the same interpreter setting - but theirs stays in the prefix,
+// which dies with the process, and keeps CPython's ordinary mtime checking.
+// Their files change; a released package's do not. The cache is keyed on
+// name-version for that reason, and on the interpreter's magic number, because
+// bytecode from another CPython is not bytecode.
+export const BYTECODE_DIR = SNAPSHOT_DIR + "/bytecode";
+// Inside Pyodide's filesystem, not the VFS: this is where the interpreter puts
+// bytecode while it runs, and it is per-process and thrown away with it.
+export const PYCACHE_PREFIX = "/vv-pycache";
+
+export function bytecodeEnabled(env) {
+  return String((env && env.VV_PYTHON_BYTECODE) || "") !== "0";
+}
+
+/**
+ * Turn bytecode writing on, and point it somewhere harmless.
+ *
+ * Runs on every boot, restored or cold - it is a property of the process, and
+ * the snapshot is deliberately taken before anything has been set in it.
+ */
+export function installBytecodeCache(pyodide, env) {
+  if (!bytecodeEnabled(env)) return false;
+  try {
+    // Before the setting, not after: see the note above about the prefix root.
+    pyodide.FS.mkdirTree(PYCACHE_PREFIX);
+    pyodide.runPython(
+      `import sys\nsys.dont_write_bytecode = False\nsys.pycache_prefix = ${JSON.stringify(PYCACHE_PREFIX)}\n`,
+    );
+    return true;
+  } catch {
+    return false; // slower imports, nothing worse
+  }
+}
+
+// The distributions present in site-packages, which is both what may have a
+// cache entry and what may deserve one. dist-info is the only thing that knows
+// a version, and RECORD the only thing that knows which files are whose.
+const BYTECODE_SCAN_SOURCE = `
+import glob, json, os, sysconfig, importlib.util
+_vv_sp = sysconfig.get_path("purelib")
+_vv_keys = []
+for _vv_di in glob.glob(os.path.join(_vv_sp, "*.dist-info")):
+    _vv_base = os.path.basename(_vv_di)[: -len(".dist-info")]
+    _vv_name, _, _vv_version = _vv_base.rpartition("-")
+    if _vv_name and _vv_version:
+        _vv_keys.append(_vv_name + "-" + _vv_version)
+json.dumps({"magic": importlib.util.MAGIC_NUMBER.hex(), "keys": _vv_keys})
+`;
+
+function extractSource(paths) {
+  return (
+    `import tarfile, os\n` +
+    `for _vv_p in ${JSON.stringify(paths)}:\n` +
+    `    try:\n` +
+    `        with tarfile.open(_vv_p) as _vv_tf: _vv_tf.extractall(${JSON.stringify(PYCACHE_PREFIX)})\n` +
+    `    finally:\n` +
+    `        os.remove(_vv_p)\n`
+  );
+}
+
+// `known` is key -> how many files the cache already holds for it, so that a
+// package which was imported more deeply this time replaces a thinner entry
+// rather than being skipped for the rest of the session.
+function harvestSource(known) {
+  return `
+import glob, json, os, sysconfig, tarfile, importlib.util
+_vv_known = json.loads(${JSON.stringify(JSON.stringify(known))})
+_vv_sp = sysconfig.get_path("purelib")
+_vv_made = {}
+for _vv_di in glob.glob(os.path.join(_vv_sp, "*.dist-info")):
+    _vv_base = os.path.basename(_vv_di)[: -len(".dist-info")]
+    _vv_name, _, _vv_version = _vv_base.rpartition("-")
+    _vv_record = os.path.join(_vv_di, "RECORD")
+    if not (_vv_name and _vv_version) or not os.path.exists(_vv_record):
+        continue
+    _vv_key = _vv_name + "-" + _vv_version
+    _vv_members = []
+    with open(_vv_record, encoding="utf-8", errors="replace") as _vv_fh:
+        for _vv_line in _vv_fh:
+            _vv_rel = _vv_line.split(",")[0].strip()
+            if not _vv_rel.endswith(".py"):
+                continue
+            _vv_src = os.path.normpath(os.path.join(_vv_sp, _vv_rel))
+            _vv_pyc = importlib.util.cache_from_source(_vv_src)
+            if os.path.exists(_vv_pyc):
+                _vv_members.append((_vv_src, _vv_pyc))
+    if not _vv_members or len(_vv_members) <= _vv_known.get(_vv_key, -1):
+        continue
+    for _vv_src, _vv_pyc in _vv_members:
+        with open(_vv_pyc, "rb") as _vv_fh:
+            _vv_raw = _vv_fh.read()
+        # Only a timestamp-based header needs converting; a restored one is
+        # already hash-based, and re-reading its source is the cost being saved.
+        if len(_vv_raw) > 16 and int.from_bytes(_vv_raw[4:8], "little") == 0:
+            with open(_vv_src, "rb") as _vv_fh:
+                _vv_hash = importlib.util.source_hash(_vv_fh.read())
+            with open(_vv_pyc, "wb") as _vv_fh:
+                _vv_fh.write(_vv_raw[:4] + (1).to_bytes(4, "little") + _vv_hash + _vv_raw[16:])
+    _vv_tar = "/tmp/vv-pyc-" + _vv_key + ".tar"
+    with tarfile.open(_vv_tar, "w") as _vv_tf:
+        for _vv_src, _vv_pyc in _vv_members:
+            _vv_tf.add(_vv_pyc, arcname=os.path.relpath(_vv_pyc, ${JSON.stringify(PYCACHE_PREFIX)}))
+    _vv_made[_vv_key] = [_vv_tar, len(_vv_members)]
+json.dumps({"magic": importlib.util.MAGIC_NUMBER.hex(), "made": _vv_made})
+`;
+}
+
+/**
+ * Which cache entries are readable, for this interpreter's bytecode format.
+ *
+ * The sidecar is written after the tar and read before it, the same commit
+ * record the snapshot uses: an entry whose tar does not match the size its
+ * sidecar claims was interrupted, and is not an entry.
+ */
+export function readBytecodeIndex(fs, magic) {
+  const out = new Map();
+  let names;
+  try {
+    names = fs.readdirSync(BYTECODE_DIR);
+  } catch {
+    return out; // no cache yet is the common case, not an error
+  }
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const key = name.slice(0, -".json".length);
+    try {
+      const meta = JSON.parse(fs.readFileSync(BYTECODE_DIR + "/" + name, "utf8"));
+      if (meta.magic !== magic) continue;
+      if (fs.statSync(BYTECODE_DIR + "/" + key + ".tar").size !== meta.bytes) continue;
+      out.set(key, meta);
+    } catch {
+      /* an entry that cannot be read is an entry that is not there */
+    }
+  }
+  return out;
+}
+
+/** Put back the bytecode of every installed package the cache has. */
+export function restoreBytecode(fs, pyodide, env) {
+  if (!bytecodeEnabled(env)) return null;
+  try {
+    const scan = JSON.parse(pyodide.runPython(BYTECODE_SCAN_SOURCE));
+    const index = readBytecodeIndex(fs, scan.magic);
+    const paths = [];
+    const keys = [];
+    for (const key of scan.keys) {
+      if (!index.has(key)) continue;
+      try {
+        const buf = fs.readFileSync(BYTECODE_DIR + "/" + key + ".tar");
+        const to = "/tmp/vv-pyc-" + key + ".tar";
+        pyodide.FS.writeFile(to, new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+        paths.push(to);
+        keys.push(key);
+      } catch {
+        /* skip this one; the other packages are still worth restoring */
+      }
+    }
+    if (!paths.length) return { restored: 0, keys: [] };
+    pyodide.runPython(extractSource(paths));
+    return { restored: keys.length, keys };
+  } catch {
+    return null; // a cache that cannot be read is a slow import, not a failure
+  }
+}
+
+/** Keep what this run's imports compiled, for the commands after it. */
+export function harvestBytecode(fs, pyodide, env) {
+  if (!bytecodeEnabled(env)) return null;
+  try {
+    const magic = pyodide.runPython("import importlib.util; importlib.util.MAGIC_NUMBER.hex()");
+    const index = readBytecodeIndex(fs, magic);
+    const known = {};
+    for (const [key, meta] of index) known[key] = meta.count;
+    const { made } = JSON.parse(pyodide.runPython(harvestSource(known)));
+    const saved = [];
+    for (const [key, [tar, count]] of Object.entries(made)) {
+      try {
+        const bytes = pyodide.FS.readFile(tar);
+        fs.mkdirSync(BYTECODE_DIR, { recursive: true });
+        fs.writeFileSync(
+          BYTECODE_DIR + "/" + key + ".tar",
+          globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+        );
+        fs.writeFileSync(
+          BYTECODE_DIR + "/" + key + ".json",
+          JSON.stringify({ bytes: bytes.byteLength, count, magic }),
+        );
+        saved.push(key);
+      } catch {
+        /* out of space or unwritable: the next command compiles, as today */
+      }
+      try {
+        pyodide.FS.unlink(tar);
+      } catch {
+        /* the whole filesystem goes when the process does */
+      }
+    }
+    return { saved };
+  } catch {
+    return null;
+  }
+}
+
+export function installMatplotlibShow(pyodide, env) {
+  const chosen = (env && env.MPLBACKEND) || MPL_BACKEND;
+  try {
+    pyodide.FS.mkdirTree(VV_PY_DIR);
+    pyodide.FS.writeFile(VV_PY_DIR + "/vv_mpl.py", MPL_SHOW_SOURCE);
+    pyodide.runPython(
+      `import sys, os\n` +
+        `sys.path.append(${JSON.stringify(VV_PY_DIR)})\n` +
+        `os.environ["MPLBACKEND"] = ${JSON.stringify(chosen)}\n`,
+    );
+    return true;
+  } catch {
+    return false; // no charts is bad; failing to boot over charts is worse
+  }
+}
+
+// The two failures a Python user is most likely to hit first, both of which
+// currently report themselves in terms of this runtime's internals rather than
+// in terms of anything they can act on.
+//
+// asyncio.run() blocks until the coroutine finishes, and blocking inside Wasm
+// needs stack switching (JSPI). Where the browser has it, this works and we
+// stay out of the way - so the real call is tried first and only its specific
+// failure is rewritten. Where it does not, CPython's own message is
+// "WebAssembly stack switching not supported in this JavaScript runtime",
+// which names a Wasm proposal and no way forward. There is a way forward:
+// files here run under runPythonAsync, so `await main()` at the top level is
+// valid Python in this runtime and does the same thing.
+//
+// input() used to be here for the same reason and no longer is. The argument was
+// that a keystroke could only be delivered after input() had returned, which was
+// true of a stdin that arrives as a message: the thread has to reach its event
+// loop to receive one. It is not true of a stdin that arrives through shared
+// memory, and the kernel now has that (OP_READ_STDIN) — so input() waits, pdb
+// has a prompt, and the shim is gone rather than reworded. See installStdin.
+export const BLOCKING_PATCH_SOURCE = `
+import asyncio as _vv_asyncio
+
+_vv_real_run = _vv_asyncio.run
+
+# input() used to be replaced here too, with an EOFError explaining that a
+# keystroke could not arrive until after it had returned. That is no longer true:
+# stdin now has a syscall that parks this whole worker until the kernel has
+# something to give it (OP_READ_STDIN), so builtins.input is left alone and does
+# what it says. asyncio.run is a different problem and still cannot be fixed —
+# blocking on a coroutine needs the interpreter to yield to the browser, which is
+# stack switching, which is not the same thing as parking a thread.
+
+
+def _vv_run(main, **kwargs):
+    try:
+        return _vv_real_run(main, **kwargs)
+    except RuntimeError as exc:
+        if "stack switching" not in str(exc):
+            raise
+        raise RuntimeError(
+            "asyncio.run() has to block until the coroutine finishes, and this "
+            "browser cannot block inside WebAssembly (it has no JSPI).\\n"
+            "Your file already runs where top-level await is allowed, so drop "
+            "the wrapper and write:\\n"
+            "    await main()\\n"
+            "create_task, gather, sleep and the rest of asyncio work normally."
+        ) from None
+
+
+_vv_asyncio.run = _vv_run
+`;
+
+// Packages that are data rather than code, which is why nothing else finds them.
+//
+// loadPackagesFromImports works by reading the import statements, so it can only
+// load what the source names. tzdata is named by nobody: `zoneinfo` is stdlib,
+// and the timezone database it reads is a separate wheel it locates through
+// importlib at call time. So the import scan sees a stdlib import, loads
+// nothing, and ZoneInfo("Europe/Berlin") raises for every key on earth.
+//
+// Matching the text rather than the parsed imports is deliberate - by the time
+// zoneinfo is imported there is no async left to load a wheel in, so this has
+// to happen before the first line runs. A string that merely mentions zoneinfo
+// costs a 350 KB same-origin load and nothing else.
+export const DATA_PACKAGES = [{ name: "tzdata", when: /(^|[^\w.])zoneinfo\b/ }];
+
+export function dataPackagesFor(source) {
+  return DATA_PACKAGES.filter((p) => p.when.test(source || "")).map((p) => p.name);
+}
+
+/**
+ * Assemble lines out of a blocking stdin.
+ *
+ * The syscall returns whatever the kernel had, which is what was typed and not
+ * what was asked for: one call can bring three lines (a paste) or half of one
+ * (a keystroke). The REPL wants exactly one line per prompt, so the remainder
+ * has to be kept for the next one.
+ *
+ * Returns null at end of input — but a part-typed line without its newline is
+ * still a line, as it is in CPython when you type something and press Ctrl-D.
+ */
+export function makeLineReader(read) {
+  const readChunk = read || (() => (globalThis.__ocReadStdin ? globalThis.__ocReadStdin() : null));
+  let buf = "";
+  return () => {
+    for (;;) {
+      const nl = buf.indexOf("\n");
+      if (nl >= 0) {
+        const line = buf.slice(0, nl).replace(/\r$/, "");
+        buf = buf.slice(nl + 1);
+        return line;
+      }
+      const chunk = readChunk();
+      if (chunk == null) {
+        if (buf.length) {
+          const line = buf;
+          buf = "";
+          return line;
+        }
+        return null;
+      }
+      buf += chunk;
+    }
+  };
+}
+
+/**
+ * Give this interpreter a stdin that waits.
+ *
+ * Pyodide asks for input through a callback that must return a string
+ * SYNCHRONOUSLY — it is called from inside CPython's own read, several frames
+ * down in WebAssembly. There is no promise to await and no loop to turn, so the
+ * only way to answer is to park the whole worker until the bytes are there,
+ * which is what __ocReadStdin does (see OP_READ_STDIN in the syscall protocol).
+ *
+ * Returning null is end of input, and Python turns that into the EOFError it
+ * would give a script whose stdin was closed. A process with nowhere to read
+ * from — one started by spawnSync, or a captured internal run — gets that
+ * answer immediately rather than parking, so a script that calls input() where
+ * nobody can type still ends, with the error it would end with anywhere else.
+ *
+ * Pyodide does the line buffering: a chunk with three lines in it satisfies
+ * three calls to input(), and the remainder is kept for the next one. That
+ * matters because a terminal hands over what was typed, not what was asked for.
+ */
+export function installStdin(pyodide, readStdin) {
+  const read = readStdin || globalThis.__ocReadStdin;
+  if (typeof read !== "function") return false;
+  try {
+    pyodide.setStdin({
+      stdin: () => {
+        const chunk = read();
+        return chunk == null || chunk === "" ? null : chunk;
+      },
+      // A terminal, as far as Python is concerned: this is what makes
+      // sys.stdin.isatty() true, and what pdb and input()'s prompt handling
+      // check before deciding they have a person on the other end.
+      isatty: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function installBlockingPatch(pyodide) {
+  try {
+    pyodide.runPython(BLOCKING_PATCH_SOURCE, { globals: pyodide.toPy({}) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Python side of the bridge. Imports the user's app once and defines a single
 // dispatch function per protocol. Requests/responses cross as JSON strings with
 // base64 bodies (JS strings convert to Python str cleanly; PyProxy/typed-array
@@ -509,8 +1117,20 @@ def _vv_dispatch(req_json):
   );
 }
 
-export function createPythonRuntime({ process, require, trackHost }) {
+export function createPythonRuntime({
+  process,
+  require,
+  trackHost,
+  debug = null,
+  interrupt = null,
+  signalHandled = () => {},
+}) {
   const req = (name) => require(name);
+
+  // The breakpoint debugger, when the kernel decided this process is a target.
+  // Null in every ordinary python process, which is what keeps sys.monitoring
+  // and the CDP backend out of a run nobody is debugging.
+  let dbg = null;
 
   // WHERE PACKAGE-LOADER PROGRESS GOES, and why it is spelled out at every call
   // site. Pyodide's package manager keeps its own `stdout`, and it defaults to
@@ -581,7 +1201,34 @@ export function createPythonRuntime({ process, require, trackHost }) {
         process.browser = true;
         process.type = "renderer";
         const mod = await import(/* @vite-ignore */ url + "pyodide.mjs");
-        const pyodide = await mod.loadPyodide({ indexURL: url });
+
+        // The fast path, when an earlier command in this session left one.
+        let pyodide = null;
+        const snapFs = req("fs");
+        const cached = readSnapshot(snapFs, url, process.env);
+        if (cached) {
+          try {
+            const restored = await mod.loadPyodide({ indexURL: url, _loadSnapshot: cached });
+            if (restoredOk(restored)) pyodide = restored;
+            else discardSnapshot(snapFs);
+          } catch {
+            // A snapshot this build cannot read is worse than no snapshot, and
+            // it would fail identically for every later command until something
+            // removed it. So it is removed here, and this boot pays full price.
+            discardSnapshot(snapFs);
+          }
+        }
+
+        if (!pyodide) {
+          // _makeSnapshot has to be asked for BEFORE the boot, and the snapshot
+          // taken before anything has run in it — the patches below read this
+          // process's environment, so they are deliberately outside it and are
+          // re-applied to every restored interpreter.
+          const making = snapshotsEnabled(process.env);
+          pyodide = await mod.loadPyodide({ indexURL: url, _makeSnapshot: making });
+          if (making) writeSnapshot(snapFs, pyodide, url);
+        }
+
         pyodide.setStdout(byteWriter(process.stdout));
         pyodide.setStderr(byteWriter(process.stderr));
         // Before any user code can import requests. Installing a meta_path hook
@@ -589,6 +1236,29 @@ export function createPythonRuntime({ process, require, trackHost }) {
         // process that never uses urllib3 pays nothing for it.
         installUrllib3RealmPatch(pyodide);
         setExecutable(pyodide);
+        // Same reasoning: a name on sys.path and one environment variable, so
+        // nothing here imports matplotlib or costs a process that never plots.
+        installMatplotlibShow(pyodide, process.env);
+        installBlockingPatch(pyodide);
+        // input(), pdb and anything else that reads a line. One syscall's worth
+        // of wiring; the interpreter is unmodified.
+        installStdin(pyodide);
+        // Two settings, so that the imports this process is about to do leave
+        // their bytecode somewhere it can be collected from afterwards.
+        installBytecodeCache(pyodide, process.env);
+        // Hand CPython the byte it polls for SIGINT. Arming it costs nothing
+        // until something writes to it; without it Ctrl-C can only kill.
+        if (interrupt) {
+          try {
+            pyodide.setInterruptBuffer(interrupt);
+          } catch {
+            /* an interpreter without it just keeps the old Ctrl-C behaviour */
+          }
+        }
+        // Last, because it is the only one that can stop the interpreter, and
+        // arming it before the patches above would let a breakpoint land inside
+        // one of them.
+        attachDebugger(pyodide);
         return pyodide;
       } finally {
         restoreEnv();
@@ -607,6 +1277,129 @@ export function createPythonRuntime({ process, require, trackHost }) {
     // host-liveness ref until the boot promise settles closes that race.
     if (typeof trackHost === "function") trackHost(bootPromise);
     return bootPromise;
+  }
+
+  // ---- Ctrl-C ------------------------------------------------------------------
+  //
+  // Ctrl-C used to kill a python process outright, because that is what the
+  // kernel does to a guest with no handler for a catchable signal — and this
+  // guest could not have one that worked: while CPython is running, the worker
+  // thread is inside the interpreter and no JS handler can be reached.
+  //
+  // CPython solves its half already. Its Emscripten build polls a byte of shared
+  // memory and raises `KeyboardInterrupt` at the next bytecode boundary, which is
+  // what `interrupt` is: a one-byte window onto the process's own syscall SAB
+  // that the kernel sets on SIGINT (protocol/syscall.js). Measured, the interrupt
+  // lands about 3ms after the keystroke in a busy loop.
+  //
+  // The handler is registered ONLY while the interpreter is running user code,
+  // and that is deliberate rather than an optimisation. Registering it tells the
+  // kernel not to kill this process on Ctrl-C — a promise we can only keep while
+  // there is an interpreter running to take the interrupt. Idle (a REPL waiting
+  // at its prompt, a pip download), Ctrl-C means exactly what it has always
+  // meant, which is better than a Ctrl-C that is quietly swallowed.
+  let interruptDepth = 0;
+  const onSigint = () => {
+    // There is nothing to DO here: the interpreter already raised
+    // KeyboardInterrupt, and this event is only arriving now because JS could
+    // not run until it did. What this handler is for is the two things only a
+    // registered handler can say. First, to the kernel at registration time:
+    // do not kill this process on Ctrl-C. Second, here: the interrupt was taken,
+    // so stand the force-kill window down — a REPL back at its prompt, or a
+    // script that caught KeyboardInterrupt and meant it, is alive on purpose.
+    signalHandled("SIGINT");
+  };
+  function armInterrupts() {
+    if (!interrupt) return false;
+    if (interruptDepth++ === 0) {
+      // Anything left armed from an interrupt nobody was running to receive —
+      // a Ctrl-C at an idle prompt — must not fire on the next thing typed.
+      interrupt[0] = 0;
+      process.on("SIGINT", onSigint);
+    }
+    return true;
+  }
+  function disarmInterrupts(armed) {
+    if (!armed || --interruptDepth > 0) return;
+    process.removeListener("SIGINT", onSigint);
+    interrupt[0] = 0;
+  }
+  async function withInterrupts(fn) {
+    const armed = armInterrupts();
+    try {
+      return await fn();
+    } finally {
+      disarmInterrupts(armed);
+    }
+  }
+  /** The REPL's statements run synchronously, so they need the sync arm. */
+  function withInterruptsSync(fn) {
+    const armed = armInterrupts();
+    try {
+      return fn();
+    } finally {
+      disarmInterrupts(armed);
+    }
+  }
+
+  // ---- the breakpoint debugger ------------------------------------------------
+  //
+  // Only reached when the kernel handed this process a debug SAB, which it only
+  // does for `python`/`python3` under a debug session. Everything below is inert
+  // otherwise: no monitoring tool is registered, so an ordinary run is not paying
+  // for a debugger nobody asked for.
+  function attachDebugger(pyodide) {
+    if (!debug || !debug.sab || dbg) return;
+    let cwdRoot = "";
+    try {
+      cwdRoot = process.cwd();
+    } catch {
+      /* no cwd worth trusting; the two fixed roots still apply */
+    }
+    try {
+      const views = makeDebugViews(debug.sab);
+      pyodide.runPython(PY_DEBUG_SOURCE);
+      dbg = createPythonDebugger({
+        pyodide,
+        send: (msg) => {
+          try {
+            debug.send(JSON.stringify(msg));
+          } catch {
+            /* transport gone */
+          }
+        },
+        waitForCommand: (timeoutMs) => {
+          try {
+            const s = readDebugCommandBlocking(views, timeoutMs);
+            return s == null ? null : JSON.parse(s);
+          } catch {
+            return null;
+          }
+        },
+        // What counts as the user's code. Everything else — the stdlib under
+        // /lib, every installed package — is never line-traced, which is both
+        // what keeps a debugged program fast and what keeps `import pandas` out
+        // of the call stack the user is reading. `/` is excluded deliberately:
+        // a process started from the root would otherwise make the whole
+        // interpreter user code, which is the slow mode with none of the point.
+        roots: ["/projects", "/home"].concat(
+          cwdRoot && cwdRoot !== "/" && !cwdRoot.startsWith("/lib") ? [cwdRoot] : [],
+        ),
+      });
+      dbg.attach();
+    } catch (e) {
+      try {
+        process.stderr.write("[vv-debug] python debugger did not attach: " + ((e && e.message) || e) + "\n");
+      } catch {
+        /* nothing to report to */
+      }
+      dbg = null;
+    }
+  }
+
+  /** Forward a command that arrived while the program was running. */
+  function dispatchDebugCommand(cmd) {
+    if (dbg) dbg.onCommand(cmd);
   }
 
   // ---- project <-> Pyodide FS mirroring --------------------------------------
@@ -807,6 +1600,17 @@ export function createPythonRuntime({ process, require, trackHost }) {
 
   // ---- execution -------------------------------------------------------------
 
+  /** A script path as the VFS knows it, whatever the user typed to get here. */
+  function absPath(p) {
+    const s = String(p || "");
+    if (s.startsWith("/")) return s;
+    try {
+      return req("path").resolve(process.cwd(), s);
+    } catch {
+      return s;
+    }
+  }
+
   async function runSource(indexUrl, source, opts) {
     const { filename = "<stdin>", argv, cwd, importSource } = opts || {};
     const pyodide = await bootPyodide(indexUrl);
@@ -838,12 +1642,32 @@ export function createPythonRuntime({ process, require, trackHost }) {
     // `python -m X` runs a runpy call, so the imports to scan for are X's.
     try {
       await pyodide.loadPackagesFromImports(importSource || source, loaderToStderr);
+      const data = dataPackagesFor(importSource || source);
+      if (data.length) await pyodide.loadPackage(data, loaderToStderr);
     } catch {
       /* a missing package surfaces as a Python ImportError below */
     }
+    // After the packages are unpacked, because what is installed is what may
+    // have bytecode worth putting back, and before the first import, which is
+    // the thing being made faster.
+    restoreBytecode(req("fs"), pyodide, process.env);
+    // A real file on disk — not `<stdin>`, which is what `-c` and the REPL run
+    // as, and which has no lines for the editor to put a breakpoint next to.
+    if (dbg && filename.startsWith("/")) {
+      // The frontend cannot bind a breakpoint to a file it has not been told
+      // about, and it cannot be told before the interpreter can say which of the
+      // file's lines are real. Then the gate: a script that finishes in 3ms would
+      // otherwise be over before the first breakpoint arrived.
+      try {
+        dbg.registerScript(filename);
+      } catch {
+        /* an unreadable file will fail more usefully in a moment */
+      }
+      dbg.waitForStart();
+    }
     let code = 0;
     try {
-      await pyodide.runPythonAsync(source, { filename });
+      await withInterrupts(() => pyodide.runPythonAsync(source, { filename }));
       flushStreams(pyodide);
     } catch (e) {
       // Before our own report, so the script's output stays ahead of the error
@@ -860,15 +1684,20 @@ export function createPythonRuntime({ process, require, trackHost }) {
           /* best-effort */
         }
       }
+      // Now, rather than before the run, because what the imports produced is
+      // only all there once they have all happened. Costs nothing when the
+      // cache already holds everything this process imported.
+      harvestBytecode(req("fs"), pyodide, process.env);
     }
     return code;
   }
 
   async function runFile(indexUrl, filePath, args) {
     const fs = req("fs");
+    const abs = absPath(filePath);
     let source;
     try {
-      source = fs.readFileSync(filePath, "utf8");
+      source = fs.readFileSync(abs, "utf8");
     } catch (e) {
       process.stderr.write(
         `python: can't open file '${filePath}': ${(e && e.code) || (e && e.message) || e}\n`,
@@ -876,7 +1705,15 @@ export function createPythonRuntime({ process, require, trackHost }) {
       return 2;
     }
     return runSource(indexUrl, source, {
-      filename: filePath,
+      // ABSOLUTE, even when the user typed `python main.py`. This is the name
+      // the interpreter puts in every code object it compiles from this file
+      // (`co_filename`), and therefore the only name the debugger can match a
+      // breakpoint against — and the editor sets breakpoints on VFS paths, which
+      // are absolute. A relative name here is not a worse label, it is a
+      // breakpoint that silently never binds.
+      filename: abs,
+      // argv is left exactly as typed. CPython does not rewrite sys.argv[0], and
+      // scripts print it.
       argv: [filePath, ...(args || [])],
       cwd: process.cwd(),
     });
@@ -952,6 +1789,146 @@ export function createPythonRuntime({ process, require, trackHost }) {
   }
 
   // ---- pip ------------------------------------------------------------------
+
+  // `pip install -e .` — the line at the top of most Python projects' READMEs.
+  //
+  // WHAT AN EDITABLE INSTALL IS, once the build machinery is set aside: the
+  // project's own source directory on sys.path, plus enough metadata for `pip
+  // list` to admit it is there. Real pip gets that by asking a build backend
+  // (PEP 660) to produce a wheel that drops a .pth file in. There is no backend
+  // here — setuptools and hatchling are not vendored, and running one would mean
+  // executing a build in an interpreter with no subprocesses — so this writes
+  // the .pth and the metadata directly.
+  //
+  // The consequence, and the reason this refuses rather than guesses below: the
+  // metadata has to be READ, not built. A pyproject.toml with a static
+  // [project] table can be read. A dynamic version, or a setup.py that computes
+  // its own name, cannot — and inventing one would put a package under a name
+  // nothing else agrees with.
+  async function pipInstallEditable(indexUrl, target) {
+    const { pyodide, cwd, env, restore } = await pipSession(indexUrl);
+    if (restore && restore.state === "discarded") {
+      process.stderr.write(`pip: not installing into a store this interpreter cannot use.\n`);
+      return 1;
+    }
+    const fs = req("fs");
+    const path = req("path");
+    const projectDir = path.resolve(cwd, target || ".");
+    const pyprojectPath = projectDir + "/pyproject.toml";
+
+    if (!fs.existsSync(pyprojectPath)) {
+      const hasSetupPy = fs.existsSync(projectDir + "/setup.py");
+      process.stderr.write(
+        `pip: cannot install ${target} in editable mode: no pyproject.toml in ${projectDir}\n`,
+      );
+      if (hasSetupPy) {
+        // Being specific about WHY, because a setup.py project looks installable
+        // and the difference is invisible from the outside.
+        process.stderr.write(
+          "     There is a setup.py, but running it needs a build backend and a\n" +
+          "     subprocess, and this interpreter has neither. Add a [project]\n" +
+          "     table to a pyproject.toml and this will work.\n",
+        );
+      }
+      return 1;
+    }
+
+    // tomllib is in the standard library from 3.11, so reading this costs no
+    // wheel. The parse happens in Python rather than here because a TOML parser
+    // written in JS for this one file is a second thing to be wrong — but the
+    // BYTES are read here, through the host filesystem, so this does not depend
+    // on the project having been mirrored into the interpreter yet.
+    let tomlText;
+    try {
+      tomlText = String(fs.readFileSync(pyprojectPath));
+    } catch (e) {
+      process.stderr.write(`pip: could not read ${pyprojectPath}: ${(e && e.message) || e}\n`);
+      return 1;
+    }
+    let metaJson;
+    try {
+      metaJson = pyodide.runPython(`
+import json, tomllib
+_d = tomllib.loads(${JSON.stringify(tomlText)})
+_p = _d.get("project") or {}
+json.dumps({
+    "name": _p.get("name"),
+    "version": _p.get("version"),
+    "dynamic": _p.get("dynamic") or [],
+    "scripts": _p.get("scripts") or {},
+    "dependencies": _p.get("dependencies") or [],
+    "hasPoetry": bool(((_d.get("tool") or {}).get("poetry")) or {}),
+})
+`);
+    } catch (e) {
+      // A malformed pyproject.toml is the user's file being wrong, and tomllib's
+      // message says which line — so pass it on rather than replacing it.
+      process.stderr.write(`pip: ${pyprojectPath} is not valid TOML: ${String((e && e.message) || e).split("\n").pop()}\n`);
+      return 1;
+    }
+    const meta = JSON.parse(metaJson);
+
+    if (!meta.name) {
+      process.stderr.write(`pip: ${pyprojectPath} has no [project] name.\n`);
+      if (meta.hasPoetry) {
+        process.stderr.write(
+          "     This looks like a Poetry project ([tool.poetry]). Poetry's own\n" +
+          "     table is not read here; add a [project] table with name and\n" +
+          "     version, which Poetry 2 writes by default.\n",
+        );
+      }
+      return 1;
+    }
+    if (!meta.version) {
+      process.stderr.write(
+        `pip: ${meta.name} has no static version` +
+          (meta.dynamic.includes("version") ? " (it is declared dynamic)" : "") + ".\n" +
+          "     Working one out means running the build backend, which is not\n" +
+          "     possible here. Put `version = \"...\"` in [project] instead.\n",
+      );
+      return 1;
+    }
+
+    // The .pth: one line, an absolute path, which is exactly what site.py reads
+    // at startup. Nothing is copied, so an edit to the source is live — which is
+    // the whole point of -e.
+    const p = storePaths(cwd, env.pyTag);
+    const distInfo = `${p.sitePackages}/${meta.name.replace(/[-.]+/g, "_")}-${meta.version}.dist-info`;
+    fs.mkdirSync(distInfo, { recursive: true });
+    fs.writeFileSync(`${p.sitePackages}/__editable__.${meta.name.replace(/[-.]+/g, "_")}.pth`, projectDir + "\n");
+    fs.writeFileSync(
+      `${distInfo}/METADATA`,
+      `Metadata-Version: 2.1\nName: ${meta.name}\nVersion: ${meta.version}\n` +
+        meta.dependencies.map((d) => `Requires-Dist: ${d}\n`).join(""),
+    );
+    // pip records the install mode here; `pip list` in real pip reads it to
+    // print the "Editable project location" column.
+    fs.writeFileSync(`${distInfo}/direct_url.json`, JSON.stringify({ url: "file://" + projectDir, dir_info: { editable: true } }) + "\n");
+    fs.writeFileSync(`${distInfo}/INSTALLER`, "vivari-pip\n");
+    if (Object.keys(meta.scripts).length) {
+      // [project.scripts] is the pyproject spelling of console_scripts, and the
+      // store's shim generator reads the latter — so write what it reads.
+      fs.writeFileSync(
+        `${distInfo}/entry_points.txt`,
+        "[console_scripts]\n" + Object.entries(meta.scripts).map(([k, v]) => `${k} = ${v}\n`).join(""),
+      );
+    }
+
+    const total = writeStore(fs, cwd, env, new Map(), "python -m pip install -e " + target);
+    process.stdout.write(`Installed ${meta.name}-${meta.version} in editable mode from ${projectDir}\n`);
+    if (total.scripts && total.scripts.length) {
+      process.stdout.write(`Console scripts on PATH: ${total.scripts.join(", ")}\n`);
+    }
+    if (meta.dependencies.length) {
+      // Deliberately not installed. Resolving them means a solver and a network,
+      // and doing half of it silently would leave an import to fail later.
+      process.stdout.write(
+        `Dependencies are NOT installed by -e here: ${meta.dependencies.join(", ")}\n` +
+        `Run: pip install ${meta.dependencies.join(" ")}\n`,
+      );
+    }
+    return 0;
+  }
 
   async function pipInstall(indexUrl, names) {
     const list = (names || []).filter(Boolean);
@@ -1238,10 +2215,6 @@ export function createPythonRuntime({ process, require, trackHost }) {
 
         let more = false;
         const prompt = () => process.stdout.write(more ? "... " : ">>> ");
-        prompt();
-
-        const stdin = process.stdin;
-        let buf = "";
         const finish = (codeVal) => {
           try {
             console_.destroy && console_.destroy();
@@ -1250,13 +2223,20 @@ export function createPythonRuntime({ process, require, trackHost }) {
           }
           resolve(codeVal | 0);
         };
-
         const feed = (line) => {
           try {
             // InteractiveConsole.push returns True when more input is needed.
-            more = !!console_.push(line);
+            more = !!withInterruptsSync(() => console_.push(line));
           } catch (e) {
-            process.stderr.write(((e && e.message) || String(e)) + "\n");
+            // Ctrl-C during a statement. CPython prints the name alone and gives
+            // a fresh top-level prompt, abandoning any half-typed block — the
+            // session survives, which is the whole point of interrupting it.
+            const interrupted =
+              (e && e.type === "KeyboardInterrupt") ||
+              /KeyboardInterrupt\s*$/.test(String((e && e.message) || e).trimEnd());
+            process.stderr.write(
+              (interrupted ? "KeyboardInterrupt" : (e && e.message) || String(e)) + "\n",
+            );
             more = false;
           }
           // The statement's own output has to land before the next prompt, or
@@ -1265,19 +2245,35 @@ export function createPythonRuntime({ process, require, trackHost }) {
           prompt();
         };
 
-        if (stdin.setEncoding) stdin.setEncoding("utf8");
-        if (stdin.resume) stdin.resume();
-        stdin.on("data", (chunk) => {
-          buf += typeof chunk === "string" ? chunk : String(chunk);
-          let idx;
-          while ((idx = buf.indexOf("\n")) >= 0) {
-            const line = buf.slice(0, idx).replace(/\r$/, "");
-            buf = buf.slice(idx + 1);
-            feed(line);
+        // Lines come from the blocking stdin syscall, the same one input() uses,
+        // and NOT from the flowing process.stdin this loop used to listen to.
+        //
+        // Not a tidy-up. A python process has one stdin and now has two things
+        // that want to read it: this loop, and the interpreter itself the moment
+        // somebody types `name = input()` at the prompt. The kernel routes a
+        // process's stdin to whichever mechanism it asked for (see OP_READ_STDIN
+        // in the syscall protocol), so leaving the loop on the flowing stream
+        // would mean that first input() took stdin away from the REPL and every
+        // keystroke after it went somewhere the REPL never looks. One reader.
+        //
+        // The cost is that this process's event loop does not turn while the
+        // prompt waits, which is what CPython does at a `>>>` too.
+        const readLine = makeLineReader();
+
+        // One statement per macrotask rather than a `while` loop, so timers and
+        // the process's own exit path get their turn between lines.
+        const step = () => {
+          const line = readLine();
+          if (line === null) {
+            process.stdout.write("\n");
+            finish(0);
+            return;
           }
-        });
-        stdin.on("end", () => finish(0));
-        stdin.on("close", () => finish(0));
+          feed(line);
+          setTimeout(step, 0);
+        };
+        prompt();
+        step();
       }, (e) => {
         process.stderr.write(`python: failed to start Pyodide: ${(e && e.message) || e}\n`);
         resolve(1);
@@ -1508,9 +2504,14 @@ export function createPythonRuntime({ process, require, trackHost }) {
           const fs = req("fs");
           const src = fs.readFileSync(req("path").join(workdir, moduleName + ".py"), "utf8");
           await pyodide.loadPackagesFromImports(src, loaderToStderr);
+          const data = dataPackagesFor(src);
+          if (data.length) await pyodide.loadPackage(data, loaderToStderr);
         } catch {
           /* module may be a package or unreadable; app import will report */
         }
+        // Importing flask or fastapi costs what importing pandas does. A server
+        // only restores: it does not end, so it has no moment to harvest at.
+        restoreBytecode(req("fs"), pyodide, process.env);
 
         let dispatch;
         try {
@@ -1631,6 +2632,10 @@ export function createPythonRuntime({ process, require, trackHost }) {
   }
 
   return {
+    // A CDP command that arrived while the program was running rather than
+    // stopped. The runtime routes these here for a python target the way it
+    // routes them to the JS backend for a node one.
+    dispatchDebugCommand,
     // Bound to a resolved same-origin indexURL by the launcher.
     install(indexUrl) {
       const idx = withTrailingSlash(indexUrl);
@@ -1640,6 +2645,7 @@ export function createPythonRuntime({ process, require, trackHost }) {
         runModule: (mod, args, cwd) => runModule(idx, mod, args, cwd),
         serveStatic: (o) => serveStatic(idx, o),
         pipInstall: (names) => pipInstall(idx, names),
+        pipInstallEditable: (target) => pipInstallEditable(idx, target),
         pipList: () => pipList(idx),
         pipFreeze: () => pipFreeze(idx),
         pipShow: (names) => pipShow(idx, names),

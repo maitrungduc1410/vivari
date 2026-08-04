@@ -1814,6 +1814,84 @@ console.log('BUF_OK ' + (buf.length === big.length && buf[buf.length - 1] === 68
     "fs: readFileSync (utf8 + buffer) handles a file larger than the shared window",
   );
 
+  // === blocking stdin — a process that parks until somebody types ============
+  //
+  // Every other stdin path here is a flowing stream: the kernel posts a chunk and
+  // the runtime delivers it on a loop turn. That cannot serve a reader that has
+  // to have the bytes before it returns — a synchronous C-level read, which is
+  // what CPython's input() is under WebAssembly. OP_READ_STDIN is the answer, and
+  // this is the part of it that no stub can check: the process really parks, the
+  // keystroke really arrives through shared memory, and the kernel really holds
+  // what was typed early instead of dropping it into a stream nobody is reading.
+  {
+    kernel.mkdirp("/stdin");
+    // Results go to files, not stdout: a process that can park is a process that
+    // is not `capture: true`, so there is nothing collecting its output here.
+    kernel.writeFile(
+      "/stdin/ask.js",
+      `const fs = require('fs');
+fs.writeFileSync('/stdin/ready.txt', 'up');
+const first = globalThis.__ocReadStdin();
+fs.writeFileSync('/stdin/first.json', JSON.stringify(first));
+const rest = [globalThis.__ocReadStdin(), globalThis.__ocReadStdin(), globalThis.__ocReadStdin()];
+fs.writeFileSync('/stdin/rest.json', JSON.stringify(rest));
+`,
+    );
+    const pid = kernel.launch("node", ["/stdin/ask.js"], { cwd: "/stdin" });
+    await waitFor(() => kernel.exists("/stdin/ready.txt"), "the stdin reader never started");
+
+    // Nothing has been typed, so it must still be inside that call. If this ever
+    // became "returns EOF immediately" the feature would look like it worked
+    // while quietly making input() unusable.
+    await sleep(150);
+    assert(!kernel.exists("/stdin/first.json"),
+      "a synchronous read of stdin parks the process instead of returning nothing");
+    assert(kernel.procs.get(pid)?.stdinWaiting === true,
+      "…and the kernel knows which process is waiting, rather than the process polling");
+
+    kernel.sendStdin(pid, "hello\n");
+    await waitFor(() => kernel.exists("/stdin/first.json"), "a typed line never reached the parked reader");
+    assert(kernel.readFile("/stdin/first.json") === JSON.stringify("hello\n"),
+      "the line arrives through shared memory, newline and all");
+
+    // Typed while it is NOT waiting — between two reads. On the flowing path
+    // these would be delivered to a stream this process never reads, and lost.
+    kernel.sendStdin(pid, "second\n");
+    kernel.sendStdin(pid, "third\n");
+    kernel.sendStdin(pid, null); // end of input
+    await waitFor(() => kernel.exists("/stdin/rest.json"), "the reader never finished");
+    assert(kernel.readFile("/stdin/rest.json") === JSON.stringify(["second\n", "third\n", null]),
+      "type-ahead is kept in order and end of input arrives as null, which is what a reader turns into EOF");
+
+    // A process nobody can type at must not park: `capture: true` is the shape
+    // spawnSync uses, where the only party who could send stdin is itself parked
+    // waiting for this one to exit.
+    kernel.writeFile("/stdin/closed.js",
+      `const t = Date.now();
+const got = globalThis.__ocReadStdin();
+console.log(JSON.stringify({ got, quick: Date.now() - t < 500 }));
+`);
+    const closed = await kernel.start("node", ["/stdin/closed.js"], { cwd: "/stdin", capture: true });
+    assert(closed.code === 0 && closed.stdout.includes('"got":null') && closed.stdout.includes('"quick":true'),
+      "a captured process reads end-of-input at once rather than deadlocking on a keystroke that cannot come");
+
+    // And none of this may disturb the flowing path every other program uses.
+    kernel.writeFile("/stdin/flow.js",
+      `const fs = require('fs');
+const chunks = [];
+process.stdin.on('data', (c) => chunks.push(c.toString()));
+process.stdin.on('end', () => { fs.writeFileSync('/stdin/flow.txt', chunks.join('')); });
+fs.writeFileSync('/stdin/flow-ready.txt', 'up');
+`);
+    const flowPid = kernel.launch("node", ["/stdin/flow.js"], { cwd: "/stdin" });
+    await waitFor(() => kernel.exists("/stdin/flow-ready.txt"), "the flowing reader never started");
+    kernel.sendStdin(flowPid, "streamed\n");
+    kernel.sendStdin(flowPid, null);
+    await waitFor(() => kernel.exists("/stdin/flow.txt"), "a process that never made the syscall stopped receiving stdin");
+    assert(kernel.readFile("/stdin/flow.txt") === "streamed\n",
+      "a process that never reads synchronously still gets stdin the way it always did");
+  }
+
   // === #15: async child_process.spawn — streaming stdio + exit + kill =========
   // A child that prints across timers proves output STREAMS live (arrives as
   // multiple 'data' events while the child runs its own loop), not buffered until

@@ -7,6 +7,7 @@
 import { NODE_GYP_STUB } from "./node-gyp-stub.js";
 import { BUN_PROGRAM, BUNX_PROGRAM } from "./programs/bun.js";
 import { PYTHON_PROGRAM } from "./programs/python.js";
+import { RUFF_PROGRAM } from "./programs/ruff.js";
 
 // The bare-command spellings of the launcher's `-m` entrypoints, as
 // `<command>: <module>`. `pip3` sits beside `pip` the way `python3` sits beside
@@ -24,6 +25,12 @@ export const PYTHON_DELEGATES = {
   flask: "flask",
   gunicorn: "gunicorn",
   pytest: "pytest",
+  // black and mypy reach the interpreter through plain runpy rather than a
+  // dispatch arm — they need nothing a `-m` seam provides — so these two lines
+  // are the whole of their CLI. Without them the wheels are vendored, the editor
+  // formats on save, and `black .` at a prompt still answers "not found".
+  black: "black",
+  mypy: "mypy",
 };
 
 // One program, parameterised. argv is forwarded verbatim — `-r
@@ -76,6 +83,13 @@ export const COREUTILS = {
   // `sh: pip: not found`. spike-python-offline.mjs now derives the entrypoint
   // list from the launcher's own dispatch and requires each one to be reachable.
   ...pythonDelegates(),
+
+  // ruff — the linter and formatter, and the only Python tool here that never
+  // touches the interpreter: it is Rust compiled to wasm, so it is not one of
+  // the `-m` delegates above and cannot be. That is also its point, since a
+  // check that does not boot Pyodide is fast enough to run while someone types.
+  // See packages/kernel-host/programs/ruff.js + scripts/vendor-ruff.mjs.
+  ruff: RUFF_PROGRAM,
 
   // NOTE: there is no built-in `npm` here anymore. The Turbo-analog installer
   // (packages/kernel-host/programs/npm.js) has been RETIRED from the shipped

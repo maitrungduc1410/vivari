@@ -122,12 +122,96 @@ print(json.dumps({"jedi": jedi.__version__, "black": black.__version__, "python"
  * formatting differently from `black yourfile.py` on the command line, which is
  * the promise the feature is actually making.
  */
+/**
+ * mypy's own CLI, on real files, under host CPython.
+ *
+ * The seam in the launcher does not run mypy's command line — it calls
+ * mypy.api.run(), because the command line ends in os._exit() and that takes
+ * Emscripten down with it. So the thing worth checking is that going in through
+ * the API still produces what the command line would: same diagnostics, same
+ * error codes, same exit status. Only the host can say what that is.
+ */
+export function mypyCli(oracleDir, files, cwd) {
+  const r = spawnSync(
+    "python3",
+    ["-m", "mypy", "--no-incremental", "--no-color-output", "--no-error-summary", ...files],
+    { encoding: "utf8", cwd, env: { ...process.env, PYTHONPATH: oracleDir } },
+  );
+  // 0 = clean, 1 = errors found, 2 = a usage error. Anything else means the
+  // oracle itself failed to run, which is not a verdict about the code.
+  if (r.status !== 0 && r.status !== 1 && r.status !== 2) {
+    return { error: (r.stderr || r.stdout || "").trim().split("\n").pop() };
+  }
+  return { status: r.status, text: (r.stdout || "").trim() };
+}
+
 export function blackCli(oracleDir, source) {
   const r = spawnSync("python3", ["-m", "black", "--quiet", "-"], {
     input: source,
     encoding: "utf8",
     env: { ...process.env, PYTHONPATH: oracleDir },
   });
+  if (r.status !== 0) return { error: (r.stderr || "").trim().split("\n")[0] };
+  return { text: r.stdout };
+}
+/**
+ * Run the REAL ruff CLI over a directory and return its findings and its
+ * formatting, so the wasm build can be held to them.
+ *
+ * Pinned to the same version scripts/vendor-ruff.mjs vendors — comparing
+ * against a different ruff would produce disagreements that are upstream's
+ * changelog rather than our bug. Installed with pip like the other oracles
+ * (ruff ships a wheel with the binary in it), and a missing one is reported as
+ * a skipped comparison rather than a pass.
+ */
+export function ensureRuffOracle(dir, version) {
+  const marker = path.join(dir, ".ruff-" + version);
+  // Debian's pip puts a --prefix install under <prefix>/local/bin, everyone
+  // else under <prefix>/bin. Looking in both beats guessing which host this is.
+  const findBin = () => [path.join(dir, "bin", "ruff"), path.join(dir, "local", "bin", "ruff")].find((p) => fs.existsSync(p));
+  const existing = findBin();
+  if (fs.existsSync(marker) && existing) return { bin: existing };
+  fs.mkdirSync(dir, { recursive: true });
+  const r = spawnSync(
+    "python3",
+    // --ignore-installed because a ruff already on this machine makes pip skip
+    // the install and leave the prefix empty, which reads as a broken oracle.
+    ["-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--ignore-installed", "--prefix", dir, `ruff==${version}`],
+    { encoding: "utf8" },
+  );
+  const bin = findBin();
+  if (r.status !== 0 || !bin) {
+    return { error: `pip install ruff==${version} failed: ${(r.stderr || "").trim().split("\n").pop() || "installed no ruff binary"}` };
+  }
+  fs.writeFileSync(marker, version);
+  return { bin };
+}
+
+/** `ruff check`, as "path:row:col: CODE message" lines, sorted for comparison. */
+export function ruffCheckCli(bin, cwd, args = []) {
+  // --color never, not NO_COLOR: this ruff colourises regardless of the
+  // environment variable, and a comparison against escape codes would be a
+  // comparison of terminal styling. The strip below is the belt to that brace.
+  const r = spawnSync(bin, ["check", "--no-cache", "--color", "never", "--output-format", "concise", ...args, "."], {
+    cwd,
+    encoding: "utf8",
+  });
+  const lines = (r.stdout || "")
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .split("\n")
+    .map((l) => l.trim())
+    // The concise format tags a fixable finding with "[*]". Ours does not, on
+    // purpose: --fix is refused here, so advertising a fix flag that answers
+    // with a refusal would be the wrong kind of faithful. Dropped so the
+    // comparison is about the finding, which is the part that must match.
+    .map((l) => l.replace(/^(.*?:\d+:\d+: [A-Z]+\d+) \[\*\] /, "$1 "))
+    .filter((l) => /^[^\s].*:\d+:\d+: /.test(l));
+  return { status: r.status, lines: lines.sort() };
+}
+
+/** `ruff format -` on one source string. */
+export function ruffFormatCli(bin, source) {
+  const r = spawnSync(bin, ["format", "--no-cache", "-"], { input: source, encoding: "utf8" });
   if (r.status !== 0) return { error: (r.stderr || "").trim().split("\n")[0] };
   return { text: r.stdout };
 }

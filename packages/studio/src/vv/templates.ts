@@ -6587,6 +6587,318 @@ refreshed. Deleting \`library.db\` before re-running avoids the question entirel
   };
 }
 
+// ── Native: Python ORM (SQLAlchemy) ──────────────────────────────────────────
+// The ORM half of the story python-sqlite tells with the stdlib. SQLAlchemy is
+// pure Python and vendored, so this runs offline like the rest — and the
+// database it writes is a real file the editor can open.
+function pythonOrmTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "python-orm",
+      framework: "python",
+      icon: "sqlalchemy",
+      category: "Native",
+      name: "SQLAlchemy",
+      language: "Python",
+      description: "SQLAlchemy 2.0 ORM over a real SQLite file — models, relationships and queries, offline",
+      port: 8000,
+      openPath: "/",
+      entry: "main.py",
+      hmr: false,
+      reload: false,
+      install: "python --version",
+      dev: "python main.py",
+      experimental: true,
+    },
+    files: {
+      "main.py": `# SQLAlchemy 2.0 against a real SQLite file, on CPython/WASM (Pyodide).
+#
+# Nothing here is fetched at run time: SQLAlchemy is pure Python and ships inside
+# the vendored Pyodide distribution, and sqlite3 is compiled into the
+# interpreter. The .db file this writes is mirrored back into the editor, so you
+# can open it in the explorer when the run finishes.
+#
+# This is the typed, modern style (2.0): DeclarativeBase + Mapped annotations,
+# and select() rather than the legacy Query API.
+from __future__ import annotations
+
+from sqlalchemy import ForeignKey, String, create_engine, func, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
+
+DB_PATH = "library.db"
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Author(Base):
+    __tablename__ = "authors"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), unique=True)
+    # back_populates keeps both sides in step in memory, without a second query.
+    books: Mapped[list[Book]] = relationship(back_populates="author", cascade="all, delete-orphan")
+
+    def __repr__(self) -> str:
+        return f"Author({self.name!r})"
+
+
+class Book(Base):
+    __tablename__ = "books"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    year: Mapped[int]
+    author_id: Mapped[int] = mapped_column(ForeignKey("authors.id"))
+    author: Mapped[Author] = relationship(back_populates="books")
+
+    def __repr__(self) -> str:
+        return f"Book({self.title!r}, {self.year})"
+
+
+def seed(session: Session) -> None:
+    """Insert the authors and their books in one flush.
+
+    Because the books are attached to the Author objects rather than given an
+    author_id, SQLAlchemy works out the insert order and fills the foreign keys
+    in itself — which is most of the reason to use an ORM at all.
+    """
+    session.add_all(
+        [
+            Author(
+                name="Ursula K. Le Guin",
+                books=[
+                    Book(title="A Wizard of Earthsea", year=1968),
+                    Book(title="The Left Hand of Darkness", year=1969),
+                    Book(title="The Dispossessed", year=1974),
+                ],
+            ),
+            Author(name="Octavia E. Butler", books=[Book(title="Kindred", year=1979)]),
+            Author(name="Italo Calvino", books=[Book(title="Invisible Cities", year=1972)]),
+        ]
+    )
+    session.commit()
+
+
+def main() -> None:
+    # echo=False keeps the SQL out of the way; flip it to True to watch every
+    # statement the ORM emits, which is the fastest way to learn what it does.
+    engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        seed(session)
+
+        print("Books per author")
+        # A GROUP BY through the ORM: the join is inferred from the relationship.
+        rows = session.execute(
+            select(Author.name, func.count(Book.id), func.min(Book.year))
+            .join(Author.books)
+            .group_by(Author.id)
+            .order_by(func.count(Book.id).desc(), Author.name)
+        ).all()
+        for name, count, earliest in rows:
+            print(f"  {name:<20} {count} book(s), earliest {earliest}")
+
+        # Objects, not rows. le_guin.books is loaded on demand from the
+        # relationship above.
+        le_guin = session.scalars(select(Author).where(Author.name.like("Ursula%"))).one()
+        print(f"\\n{le_guin.name} wrote:")
+        for book in sorted(le_guin.books, key=lambda b: b.year):
+            print(f"  {book.year}  {book.title}")
+
+        # An UPDATE through an attribute: change the object, commit the session.
+        kindred = session.scalars(select(Book).where(Book.title == "Kindred")).one()
+        kindred.title = "Kindred (1979)"
+        session.commit()
+        print(f"\\nRenamed: {kindred.title}")
+
+        total = session.scalar(select(func.count()).select_from(Book))
+        before_1970 = session.scalar(select(func.count()).select_from(Book).where(Book.year < 1970))
+        print(f"{before_1970} of {total} books were published before 1970")
+
+    print(f"\\nWrote {DB_PATH} — open it from the explorer")
+
+
+if __name__ == "__main__":
+    main()
+`,
+      "README.md": `# SQLAlchemy on Vivari
+
+SQLAlchemy 2.0 talking to a real SQLite file, entirely in the browser.
+
+\`\`\`bash
+python main.py
+\`\`\`
+
+## What is worth knowing
+
+- **No network.** SQLAlchemy is pure Python and ships inside Vivari's Pyodide
+  distribution; \`sqlite3\` is compiled into the interpreter. Nothing is fetched.
+- **The database is a file.** \`library.db\` appears in the explorer after a run,
+  and survives a reload like any other file in the project.
+- **This is the 2.0 style.** \`DeclarativeBase\` with \`Mapped[...]\` annotations,
+  and \`select()\` instead of the legacy \`Query\`. Those annotations are also what
+  the editor's type checking reads — try changing \`year: Mapped[int]\` to
+  \`Mapped[str]\` and watch the assignment below it get a squiggle.
+
+## Only a database engine, not a server
+
+Postgres and MySQL need a TCP socket, which a browser tab does not have. SQLite
+is the engine that works here, and \`create_engine("sqlite:///...")\` is the URL
+to use.
+`,
+    },
+  };
+}
+
+// ── Native: Python terminal UI (rich) ────────────────────────────────────────
+// rich is the library that makes a Python CLI look like its README, and Vivari's
+// terminal is a real xterm — so tables, colour, progress and syntax highlighting
+// all render. Vendored, with the two dependencies its lock entry forgets.
+function pythonRichTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "python-rich",
+      framework: "python",
+      icon: "rich",
+      category: "Native",
+      name: "Rich",
+      language: "Python",
+      description: "rich terminal output — tables, colour, trees, progress and syntax highlighting in a real xterm",
+      port: 8000,
+      openPath: "/",
+      entry: "main.py",
+      hmr: false,
+      reload: false,
+      install: "python --version",
+      dev: "python main.py",
+      experimental: true,
+    },
+    files: {
+      "main.py": `# rich, in Vivari's terminal.
+#
+# The terminal below is a real xterm, so everything rich emits — 24-bit colour,
+# box-drawing characters, cursor movement for progress bars — arrives as itself.
+#
+# force_terminal=True is the one line worth explaining. rich asks the stream
+# whether it is a TTY before it decides to use colour, and a Pyodide stdout says
+# no, so without this you would get correct but grey output. The terminal really
+# can render it; only the detection is wrong.
+import time
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.tree import Tree
+
+console = Console(force_terminal=True)
+
+console.print(Panel.fit("[bold cyan]rich[/] on [bold]Vivari[/] — CPython in the browser", border_style="cyan"))
+
+# ── a table ──────────────────────────────────────────────────────────────────
+table = Table(title="Vendored Python packages", title_style="bold")
+table.add_column("Package", style="cyan", no_wrap=True)
+table.add_column("Why it is here")
+table.add_column("Size", justify="right", style="green")
+table.add_row("numpy", "arrays, and the base of everything below", "6.2 MB")
+table.add_row("pandas", "dataframes", "12.0 MB")
+table.add_row("matplotlib", "charts, written out as PNGs", "8.5 MB")
+table.add_row("sqlalchemy", "ORM over the built-in SQLite", "2.1 MB")
+table.add_row("rich", "this", "0.6 MB")
+console.print(table)
+
+# ── a tree ───────────────────────────────────────────────────────────────────
+tree = Tree("[bold]project[/]")
+src = tree.add("src")
+src.add("main.py")
+src.add("helpers.py")
+tests = tree.add("tests")
+tests.add("test_main.py")
+tree.add("[dim]library.db[/]")
+console.print(tree)
+
+# ── syntax highlighting ──────────────────────────────────────────────────────
+# rich.syntax needs pygments, which rich's Pyodide metadata does not declare.
+# Vivari vendors it anyway, so this line works offline instead of raising
+# ModuleNotFoundError at exactly the moment you try to use it.
+code = '''def fib(n: int) -> int:
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+'''
+console.print(Panel(Syntax(code, "python", theme="monokai", line_numbers=True), title="syntax", border_style="dim"))
+
+# ── a progress bar ───────────────────────────────────────────────────────────
+# Progress redraws in place using cursor movement, which is the clearest proof
+# that this is a terminal and not a log pane.
+#
+# auto_refresh=False is REQUIRED here, and is the one thing in this file you
+# would not write on a laptop. By default rich keeps the bar animated from a
+# background thread, and Pyodide has no threads at all — the default raises
+# RuntimeError: can't start new thread the moment the bar starts. Refreshing by
+# hand after each step draws the same bar from the one thread there is.
+with Progress(
+    SpinnerColumn(),
+    TextColumn("[progress.description]{task.description}"),
+    BarColumn(),
+    TextColumn("{task.completed}/{task.total}"),
+    console=console,
+    transient=False,
+    auto_refresh=False,
+) as progress:
+    task = progress.add_task("crunching", total=40)
+    for _ in range(40):
+        time.sleep(0.02)
+        progress.advance(task)
+        progress.refresh()
+
+console.print("\\n[bold green]done[/] — everything above rendered offline")
+`,
+      "README.md": `# rich on Vivari
+
+\`\`\`bash
+python main.py
+\`\`\`
+
+Tables, trees, colour, progress bars and syntax highlighting, in a terminal that
+is a real xterm rather than a log pane.
+
+## Two things that are specific to running here
+
+- **\`force_terminal=True\`.** rich decides whether to use colour by asking the
+  stream if it is a TTY, and Pyodide's stdout says no. The terminal can render
+  it; only the detection is wrong, so tell rich directly.
+- **\`rich.syntax\` and \`rich.markdown\` work.** rich imports pygments and
+  markdown-it-py lazily and its Pyodide metadata declares neither, so on a stock
+  Pyodide those two modules raise \`ModuleNotFoundError\` the first time you use
+  them. Vivari vendors both, including markdown-it-py, which is not in Pyodide's
+  index at all.
+
+## What cannot work: anything that animates itself
+
+There are no threads in the browser's Python, and rich's live displays refresh
+from one. So:
+
+- \`Progress(...)\` needs \`auto_refresh=False\` and a \`progress.refresh()\` in your
+  loop, as \`main.py\` does. The bar looks identical.
+- \`Live(...)\` needs \`auto_refresh=False\` for the same reason, and \`live.refresh()\`
+  when you change what it shows.
+- \`console.status("...")\` cannot work at all — the spinner IS the thread, and
+  there is no argument that turns it off. Print a line instead.
+
+Anything that draws once — tables, panels, trees, syntax, markdown, colour — has
+no such problem.
+`,
+    },
+  };
+}
+
 // ── Native: Python imaging (Pillow) ──────────────────────────────────────────
 // Pillow is already inside the vendored Pyodide closure (0 MB marginal cost), so
 // this runs offline. No DOM in the worker, so it writes PNGs the editor renders.
@@ -10523,6 +10835,8 @@ export const TEMPLATES: TemplateDef[] = [
   pythonPytestTemplate(),
   pythonSqliteTemplate(),
   pythonImagingTemplate(),
+  pythonOrmTemplate(),
+  pythonRichTemplate(),
   // Fullstack
   nextTemplate(true),
   nextTemplate(false),

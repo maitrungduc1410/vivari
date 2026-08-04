@@ -59,7 +59,29 @@ const CORE_FILES = [
 // (see builtins/python-lsp.js). It IS in Pyodide's distribution, so it costs a
 // same-origin wheel and nothing else; black is not, and is handled by
 // PYPI_PACKAGES below.
-const DEFAULT_PACKAGES = ["numpy", "pandas", "matplotlib", "fastapi", "micropip", "jedi"];
+// mypy is the type checker behind `mypy` / `python -m mypy` — the one thing the
+// editor's language services cannot do, since jedi infers types but does not
+// check them. Also in Pyodide's distribution, and the largest single wheel here
+// (~6.6 MB), which is why it is fetched only when something imports it.
+// httpx is the modern HTTP client, and Pyodide's build of it defaults to a
+// JavascriptFetchTransport — so unlike requests it needed no realm patch, only
+// to be here rather than a CDN fetch away. requests is vendored for the same
+// reason: "talking to an API" should not be the one thing that needs the network
+// twice.
+const DEFAULT_PACKAGES = [
+  "numpy", "pandas", "matplotlib", "fastapi", "micropip", "jedi", "mypy", "httpx", "requests",
+  // sqlalchemy is the ORM half of the sqlite story the runtime already tells,
+  // and rich is what makes a terminal program look like the READMEs do. Both are
+  // pure Python and small; between them they cost about 6 MB.
+  "sqlalchemy", "rich",
+  // Without tzdata there is not one timezone on this machine: no /usr/share/
+  // zoneinfo under Emscripten, so ZoneInfo("Asia/Tokyo") raises for every key
+  // anyone would type. datetime.now() works, which is what makes it a trap -
+  // the aware half of the datetime API is the half that silently isn't there.
+  // Pyodide's own error says to loadPackage it, which needs the network; this
+  // is a 350 KB zip of text files, so vendoring it retires the question.
+  "tzdata",
+];
 
 // Wheels Pyodide does NOT distribute, fetched from PyPI and INJECTED into the
 // lockfile so `loadPackage("black")` resolves them same-origin like any other.
@@ -80,7 +102,41 @@ const PYPI_PACKAGES = [
   { name: "mypy-extensions", version: "1.1.0", imports: ["mypy_extensions"], depends: [] },
   { name: "pathspec", version: "1.1.1", imports: ["pathspec"], depends: [] },
   { name: "pytokens", version: "0.4.1", imports: ["pytokens"], depends: [] },
+  // rich.markdown's dependency, which is not in Pyodide's index at ALL — so
+  // without these two wheels that module is simply missing, whatever the lock
+  // says. Pure Python, ~120 KB the pair.
+  { name: "markdown-it-py", version: "4.0.0", imports: ["markdown_it"], depends: ["mdurl"] },
+  { name: "mdurl", version: "0.1.2", imports: ["mdurl"], depends: [] },
+  // Type stubs for the two vendored libraries that ship no types of their own
+  // (checked, not assumed: everything else here has a py.typed). These are read
+  // by mypy off the filesystem and never imported, so `imports` is empty — an
+  // entry there would have loadPackagesFromImports pull a stub package into a
+  // script's interpreter, where it is dead weight. Their own dependencies are
+  // runtime dependencies of the libraries they describe, which are already here.
+  { name: "types-requests", version: "2.33.0.20260508", imports: [], depends: [] },
+  { name: "pandas-stubs", version: "3.0.5.260730", imports: [], depends: [] },
 ];
+
+// Packages the lockfile under-declares: names they import at runtime that their
+// `depends` does not list. Pyodide's mypy entry depends on `librt` alone, but a
+// checked file raises ModuleNotFoundError for typing_extensions, then
+// mypy_extensions, then pathspec — one at a time, each only once the previous is
+// satisfied. That class of bug survives vendoring precisely because
+// loadPackage() succeeds: the wheel is there, and the import fails later, in
+// front of the user. Naming the missing deps here fixes both halves at once —
+// the closure below fetches their wheels, and the lock Pyodide reads pulls them
+// in. mypy_extensions and pathspec cost nothing extra; black already vendors them.
+const DEPENDS_FIXUPS = {
+  mypy: ["typing-extensions", "mypy-extensions", "pathspec"],
+  // rich's lock entry declares NO dependencies at all, and rich imports both of
+  // these lazily — so `import rich` succeeds, `rich.syntax` raises
+  // ModuleNotFoundError: pygments, and the failure arrives at the one line of a
+  // program that highlights something. Same class of bug as mypy's, found the
+  // same way: by importing every submodule rather than the package.
+  rich: ["pygments", "markdown-it-py"],
+  "markdown-it-py": ["mdurl"],
+};
+
 const PACKAGES = (process.env.VV_PYODIDE_PACKAGES || DEFAULT_PACKAGES.join(","))
   .split(",")
   .map((s) => s.trim())
@@ -208,6 +264,15 @@ for (const spec of PYPI_PACKAGES) {
     if (!fromPyPI.has(normName(dep))) addWithDeps(dep);
   }
 }
+// The under-declared deps join the closure on the same terms, so a fixup name
+// that lives in the lock (typing-extensions) gets its wheel here, and one that
+// comes from PyPI (mypy-extensions, pathspec) is left to 3b.
+for (const target of Object.keys(DEPENDS_FIXUPS)) {
+  if (!closure.has(findKey(target))) continue;
+  for (const dep of DEPENDS_FIXUPS[target]) {
+    if (!fromPyPI.has(normName(dep))) addWithDeps(dep);
+  }
+}
 if (missing.length) log(`WARNING: packages not in lockfile, skipped: ${missing.join(", ")}`);
 log(`vendoring ${closure.size} package wheels (closure of: ${PACKAGES.join(", ")})`);
 
@@ -313,6 +378,28 @@ for (const spec of PYPI_PACKAGES) {
 log(`vendored ${pypiOk}/${PYPI_PACKAGES.length} wheels from PyPI (the editor's formatter)`);
 if (pypiOk < PYPI_PACKAGES.length) {
   log("NOTE: black is incomplete — Format Document will report itself unavailable rather than no-op.");
+}
+
+// 3c) Record the under-declared deps in the lock the browser reads, now that 3b
+// has put the PyPI-sourced ones in it. After this, `loadPackage("mypy")` — and
+// so `loadPackagesFromImports` on any file that imports mypy — pulls the whole
+// set, instead of loading mypy and failing on its first import.
+for (const [target, extras] of Object.entries(DEPENDS_FIXUPS)) {
+  const key = findKey(target);
+  if (!key) continue;
+  const pkg = allPackages[key];
+  const have = new Set((pkg.depends || []).map(normName));
+  for (const dep of extras) {
+    if (have.has(normName(dep))) continue;
+    const depKey = findKey(dep);
+    if (!depKey) {
+      log(`  ! ${key}: dependency ${dep} is not in the lock — mypy will fail on import`);
+      continue;
+    }
+    pkg.depends = [...(pkg.depends || []), depKey];
+    have.add(normName(dep));
+  }
+  log(`depends fixup: ${key} -> ${(pkg.depends || []).join(", ")}`);
 }
 
 // 4) Rewrite the lockfile so EVERY package Pyodide knows stays loadable, with a

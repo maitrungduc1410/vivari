@@ -7905,3 +7905,446 @@ would be worse than the silence. It stays a `TypeError` with the browser's error
 tier and refuses a connection to prove it, since a refused connection produces the
 same opaque failure as a CORS block — which is exactly why one can stand in for
 the other.
+---
+
+## Python: the two checkers, and the Django command that pretended to work
+
+Three gaps, all found by asking rather than assuming, and all in the same category: things a
+Python user types on day one that Vivari either did not answer or answered dishonestly.
+
+**Type checking, which the docs had been admitting was missing.** The editor gives completion,
+hover and signatures from jedi, and `python.md` said outright that nothing tells you a file is
+wrong before you run it. mypy turns out to be entirely available: it is in Pyodide's distribution,
+it loads in about four seconds, and it produced the same diagnostics — error codes included — as
+the mypy on this machine. So `mypy` is now a command, pinned to the version the lock names, and
+the bridge spike compares its output to the host's rather than to a table written here.
+
+**mypy needed a seam, and black did not — which was worth finding out before writing either.**
+The obvious implementation is plain `runpy`, the way every other module goes. black works that
+way and needed nothing but a line in `PYTHON_DELEGATES`; it reuses the wheel the editor already
+vendors for Format Document. mypy through `runpy` printed its diagnostics correctly and then
+killed the interpreter: its command line ends in `os._exit()` to skip teardown, which under
+Emscripten takes the whole runtime with it, so the output lands and the exit code does not.
+`mypy && deploy` would have deployed on a failed check. `mypy.api.run()` is upstream's own way in
+for embedders and runs `main()` with `clean_exit=True`, the flag that skips exactly that path.
+
+**A vendored wheel is not a working wheel.** Pyodide's lockfile declares mypy as depending on
+`librt` and nothing else, but a checked file raises `ModuleNotFoundError` for `typing_extensions`,
+then `mypy_extensions`, then `pathspec` — each surfacing only once the previous is satisfied. The
+failure mode is nasty because `loadPackage()` succeeds either way: the wheel is there, and the
+import fails later, in front of the user. `DEPENDS_FIXUPS` names the missing deps once, and the
+vendor script uses it twice — to pull their wheels into the download closure, and to amend the
+lock the browser reads. Two of the three cost nothing; black already pinned them. The bridge spike
+asserts the under-declaration is still real, so if upstream ever fixes the metadata the fixup is
+reported as dead weight instead of quietly staying forever.
+
+**`python manage.py runserver`, which hung.** The socket refusals are keyed on `-m` module names,
+and runserver arrives as a script path, so it went straight past all of them — and Vivari ships a
+Django template, which makes it the single most likely command on the whole surface. Measured
+rather than assumed: in Pyodide `bind()` and `listen()` both return without error, `TCPServer`
+constructs even with Django's `allow_reuse_address`, `select()` never reports the socket readable,
+and `handle_request()` times out with nothing arriving. So it prints its banner and answers
+nothing, forever — the exact outcome `SOCKET_MODULES` calls the worst one. It now refuses and
+names the `gunicorn` line the template already uses. The refusal is deliberately narrow: `migrate`,
+`makemigrations`, `shell`, `createsuperuser` and `collectstatic` are checked to still run, and so
+is `runserver --help`, which binds nothing and is more useful as Django's own help.
+
+**Still uncovered:** ruff (a Rust binary, not in Pyodide's index at all), notebooks, and editor
+squiggles for the type errors `mypy` now finds — the checker runs at a prompt, not as you type.
+
+## Python: squiggles, the commands packages bring, and two libraries that only half-worked (this change)
+
+Five things people expect from Python, done together because they kept turning out to be the same
+question: what does the metadata claim, and is it true?
+
+**Type errors as you edit.** The previous change left `mypy` as a command and said so in the docs;
+this wires the same checker into the editor. It is not a Monaco provider — there is nothing to
+register, diagnostics are pushed — so the `check` op writes the buffer down, runs mypy through the
+API and the answer goes out with `setModelMarkers`.
+
+The design question was when to run it, and it was settled by measuring rather than picking a
+number. One interpreter serves both completion and checking, so a check that is running is a
+completion that is waiting: ~2.1s the first time a project is seen, ~0.35s per edit after that with
+an incremental cache. That makes a pause affordable and a keystroke not, so it runs 700ms after
+typing stops, under its own queue kind, and mypy loads on the first check rather than at boot.
+
+Two details are the difference between a marker and a wrong marker. mypy's end column is inclusive
+and Monaco's is not, so `--show-error-end` needs a +1 or every squiggle stops one character short.
+And mypy reports paths *relative to the working directory*, not as the absolute path it was handed
+— so the filter that keeps other files' diagnostics out dropped all of them instead, and the
+feature returned a confident, permanent "no errors". The offline tier could not have caught that:
+it drives the marker code against a reply we wrote, and a reply we wrote has the paths we expect.
+The bridge tier runs real mypy and compares against the host's, which is what found it.
+
+**`pip install <thing>` now leaves you with `<thing>`.** Every wheel that declares a command ships
+`entry_points.txt`, and the store already held it; nothing read it, so the command a package's
+README tells you to run answered "not found". Shims are generated into `.venv/bin` — where a real
+venv puts them — and regenerated from the store each time, so an uninstall removes the command
+instead of leaving one that spawns an interpreter to fail at an import.
+
+The part worth arguing about is what a shim must NOT take over. `.venv/bin` sits ahead of `/bin`,
+which is right, but `/bin/pytest` is not merely another way to reach the module: it is the seam
+that turns pytest's exit code into the process's. Installing pytest would have silently undone it
+and made `pytest && deploy` a lie again. `RESERVED_COMMANDS` protects the seams, and the offline
+tier checks that set against `PYTHON_DELEGATES`, so adding a seam without protecting it fails.
+
+**`pip install -e .`** was parsed as a request to install a package named `.`. It is now an
+editable install: a `.pth`, a `dist-info`, and `[project.scripts]` written as `console_scripts` so
+the generator above turns them into commands. What it will not do is guess. There is no PEP 660
+backend here and running one needs a subprocess, so the metadata has to be *read*: a static
+`[project]` name and version is enough, and a dynamic version, a `setup.py`, or a Poetry-only table
+is refused with the reason and the fix rather than installed under an invented name. Dependencies
+are listed and explicitly not installed, because resolving half of them silently leaves an
+`ImportError` for later.
+
+**httpx works, aiohttp cannot, and neither was documented.** Measured, not assumed. Pyodide's httpx
+defaults to a `JavascriptFetchTransport` and its no-JSPI fallback is a synchronous
+`XMLHttpRequest` — the same browser capability that makes `requests` work — and, unlike urllib3, it
+has no `is_in_node` branch to be wrong about, so it needed no patch, only vendoring. aiohttp goes
+to a real connector and dies at DNS. Being in Pyodide's index reads like being supported, so the
+spike asserts both outcomes and the docs name the failure.
+
+**Two templates, and a library that was half-broken in a way nobody would have reported.** rich's
+lock entry declares *no* dependencies, and rich imports pygments and markdown-it-py lazily — so
+`import rich` succeeds and `rich.syntax` raises `ModuleNotFoundError` at the one line that
+highlights something. markdown-it-py is not in Pyodide's index at all and is now vendored from
+PyPI. This is the same class of bug as mypy's under-declared deps, found the same way: import the
+submodules, not the package. The rich template also has to pass `auto_refresh=False`, because
+rich's progress bars animate from a background thread and there are none — the default raises
+`RuntimeError: can't start new thread` the moment the bar starts. The SQLAlchemy template needed no
+such caveat: the 2.0 ORM over the built-in SQLite works exactly as written.
+
+**Still uncovered:** ruff (a Rust binary, not in Pyodide's index at all — see batch three, where
+this turned out to be the wrong conclusion from a true premise), notebooks, and
+scikit-learn as a template — it and SciPy would add ~25 MB to a 45 MB vendored distribution, which
+is a size decision rather than a technical one, and it still works from the CDN today.
+
+## Python, batch three: the first five minutes, and a linter that is not a Python package
+
+The previous batches made real projects work. This one is about what happens before anyone has a
+project — the lines people type first, which turned out to be the lines least well served.
+
+**`plt.show()` drew nothing and said nothing.** Pyodide's matplotlib defaults to Agg, whose `show()`
+is a documented no-op, so the last line of every matplotlib tutorial ran, exited 0, and produced
+silence. Of all the ways this runtime can disappoint someone, a successful no-op is the worst: there
+is no error to search for and nothing to suspect. There is no window to give them, but there is a
+file, and files written under the project already mirror back out — so `show()` now saves each open
+figure and says where it went, through a `module://` backend, which is matplotlib's own extension
+point rather than a monkeypatch. Two attempts at naming: keying the file by figure *number* is the
+obvious choice and quietly destroys work, because a script that plots, shows, plots, shows gets
+figure 1 twice and the second chart overwrites the first with no indication. The name is assigned
+once per figure and remembered on it. `figure.show()` needed separate wiring — it reaches the
+manager, not the module, and left alone it warns that an Agg canvas cannot be shown.
+
+**`asyncio.run()` answered with a WebAssembly proposal.** `RuntimeError: WebAssembly stack switching
+not supported in this JavaScript runtime` is accurate and useless: it names a Wasm feature and no
+way forward. There is a way forward — files here run under `runPythonAsync`, so top-level `await` is
+valid — and now the error says so. The real `asyncio.run` is tried first and only its specific
+failure is rewritten, so a browser with JSPI (Chrome 137+, Firefox 139+) is left entirely alone;
+every other `RuntimeError` is still the user's. The bridge case asserts the advice *runs*, because
+advice that rots is worse than none.
+
+**`input()` was a bare `EOFError`,** which reads as "your input ended" rather than "this was never
+possible". It still raises `EOFError`, so `except EOFError` keeps working, but now says that Python
+is on the worker's only thread and a keystroke can only arrive after the call has returned. This one
+is a genuine shim rather than a fix: making `input()` block needs a stdin syscall in the kernel —
+the current syscall layer is strictly request/immediate-response, and stdin arrives as async
+messages, so there is nothing to park on. Named here as the honest gap it is.
+
+**`zoneinfo` could not find a single timezone,** including UTC, because the WASM build ships no
+system tz database. tzdata is now vendored. The interesting part is the loading: it is *data*, so no
+`import` statement names it, and `loadPackagesFromImports` — which works by reading imports — was
+structurally unable to find it. Any source mentioning `zoneinfo` now pulls it in. That is text
+matching rather than parsing, deliberately: by the time `zoneinfo` is imported there is no async
+left to fetch a wheel in.
+
+**ruff, which this file wrote off two batches ago.** "A Rust binary, not in Pyodide's index at all"
+was true and irrelevant: Astral publish it compiled to WebAssembly, so it is a module this runtime
+loads directly and it never enters the interpreter. That is the point rather than a detail — `ruff
+check` on a cold project pays no Pyodide start and loads no wheels. It is vendored same-origin
+(11 MB, fetched only when something asks for it) and pinned, and the bridge tier holds it to the
+*real* ruff CLI at the same version: every finding matched by line and column, the exit code
+matched, and formatting compared byte for byte.
+
+Two things it will not do, both refusals rather than gaps:
+
+- **`--fix` is refused, after being implemented and taken back out.** It worked, in the sense that
+  it ran and reported success — and turned a valid file into `n a+b`, because several fixes for one
+  file are computed against the same original text, so an unused-import deletion and an import-sort
+  rewrite overlap and shred each other. The real CLI applies one, re-lints, and repeats. That is
+  fixable; the other half is not. The wasm build reports a fix as a message and a list of edits and
+  does *not* say whether it is safe, so applying them is real ruff's `--unsafe-fixes` — allowed to
+  change what the code does — under a flag the user did not type.
+- **`[tool.ruff]` is not read.** Parsing TOML well enough to be trusted with someone's lint config is
+  a bigger thing than this, and misreading it silently is the same failure as above. When config is
+  present, ruff says on stderr that it is running with defaults. `--select`, `--ignore` and
+  `--line-length` on the command line do work, and go through as ruff's own settings keys.
+
+The offline tier caught the bug that mattered most here, and it was in the plumbing rather than the
+linter: the runtime's `process.exit()` throws the event loop's exit sentinel, so calling it inside an
+async program lands in that program's own `catch` — every clean `ruff check` printed `ruff: exit` on
+stderr and could have exited 1. Status now travels as a thrown value of our own that the catch can
+tell apart. A stub linter was enough to find it, which is the argument for the tier: what a linter
+gets dangerous about — which files it reads, what it refuses, whether a refusal writes anyway — is
+all outside the wasm.
+
+## Python, batch four — the interpreter itself
+
+Three of these are about the two things a person notices first (how long a command takes, and
+whether the editor is telling them something useful), and the fourth is the one that had been on
+the "still uncovered" list since the beginning.
+
+**Stubs, so the first squiggle is about your code.** `import requests` used to make mypy's first
+message `Library stubs not installed for "requests"` on line 1 — a complaint about packaging,
+naming a `pip install` that needs a network, on a line nobody wrote. And it is worse than noise:
+the untyped import makes the module `Any`, so `r.jsonn()` two lines down goes unreported. Which
+libraries need this was measured rather than guessed — a probe checked every vendored package for
+a `py.typed`, and exactly two lack one. `types-requests` and `pandas-stubs` are now vendored and
+loaded with mypy, and that same typo becomes `"Response" has no attribute "jsonn"; maybe "json"?`.
+
+**ruff in the editor, at 150ms.** The wasm was already vendored for the CLI, so this was the
+wiring the last entry predicted. The one decision worth recording is that the `lint` handler sits
+*above* the worker's `if (!pyodide) await boot(...)` — ruff is not a Python package, so a lint
+costs 2ms and no interpreter, and markers land on a freshly opened file while the 30 MB CPython
+behind completion is still starting. Its findings publish under their own marker owner, so mypy
+arriving 550ms later does not erase them and neither tool being down blanks the other.
+
+The judgement call: **ruff's `invalid-syntax` findings are dropped.** ruff reports an unparseable
+file as ordinary diagnostics rather than by failing, so `x = ` — a line anyone is in the middle of
+writing — comes back as "Expected an expression". At 150ms that is a red squiggle appearing under
+the cursor during a pause for thought, which is the classic reason people turn linting off. mypy
+still reports a file it cannot parse, on its longer pause.
+
+**The interpreter is snapshotted, and every command after the first resumes from it.** This was the
+biggest thing wrong with Python here and it was never a Python problem: a fresh process is a fresh
+interpreter, ~1.8s of CPython initialising itself to produce the same bytes it produced last time.
+Pyodide can serialise a booted interpreter's memory and start another from it. Measured end to end
+through the real kernel: 1673ms cold, 176ms to restore, 61ms to write the 31 MB into the VFS and
+49ms to read it back — about 0.25s per command instead of 1.8s, for the REPL, pytest, pip and
+everything else.
+
+The assumption worth being nervous about is that a snapshot made in one process can be restored by
+another, which is a different JS realm. That is not provable with a stub and getting it wrong ships
+a broken CPython to everyone, so the bridge tier makes one in a worker_thread and restores it in two
+others, then imports, loads a package, writes a file and raises a traceback in each. The cache lives
+in `/var/cache` — the kernel's existing place for transient caches, and on the OPFS ignore list,
+because 31 MB that is only valid for one interpreter build has no business surviving a reload — with
+a sidecar written after the bytes and read before them, so a half-written cache is one that disagrees
+with its own record and is ignored.
+
+**And stdin got a syscall, so `input()` waits.** The old refusal was honest and correct about the
+mechanism: stdin arrived as a postMessage, receiving one needs a loop turn, and there is no loop turn
+to be had inside CPython's read — so a keystroke could only arrive after `input()` had given up. What
+was wrong was the conclusion. Blocking on shared memory is what every fs call here already does; stdin
+just did not have an opcode. `OP_READ_STDIN` is shaped like `OP_FETCH`: the process parks on
+`Atomics.wait`, the kernel registers it as the waiter, and a keystroke wakes it with the bytes in the
+SAB. `input()`, `breakpoint()`, `pdb`, `getpass`, anything that asks a question.
+
+Three things fell out of building it that were not in the plan:
+
+- **Making the call has to switch that process's stdin routing**, or type-ahead is lost — a line typed
+  between two reads would be posted to a flowing stream the synchronous reader never looks at.
+- **A process nobody can type at must not park.** `capture: true` is the shape `spawnSync` uses, where
+  the only party who could send stdin is itself parked waiting for this process to exit; it reads end
+  of input at once, which is what `python x.py < /dev/null` does.
+- **The REPL had to move to the same door.** It read the flowing stream, which was fine until stdin had
+  two readers in one process: the first `input()` typed at a `>>>` prompt would have taken stdin away
+  from the REPL permanently. One reader per process. The cost is that the process's event loop does not
+  turn while a prompt waits, which is what CPython does at a `>>>` anyway.
+
+The kernel half is proven in `verify-node.mjs` rather than the Python spikes, because that is the tier
+that can run the real kernel: a real process really parks, stays parked through 150ms of silence, takes
+a line through shared memory, keeps what was typed early, and a process that never makes the syscall
+still gets stdin exactly as it did.
+
+**Still uncovered:** notebooks, and scikit-learn as a template — still a size decision rather than a
+technical one.
+
+## Python, batch five — the other 4.7 seconds
+
+The last batch cached the interpreter and called the start-up problem solved. It was not solved;
+it was measured wrong. Booting CPython is 1.8s of a data-science script's wait, and the wait is
+about six seconds. Where the rest goes, measured rather than assumed: `loadPackage` for numpy,
+pandas and Matplotlib is 1283ms, and **importing** those three is 4691ms — `import pandas` alone
+is 2349ms.
+
+Almost none of that is pandas doing anything. It is CPython compiling about a thousand `.py`
+files to bytecode, which is exactly the problem `__pycache__` has solved since 1994. The reason
+it was not solving it here turned out to be one line in Pyodide: `sys.dont_write_bytecode`. There
+were 0 `.pyc` files next to numpy after importing numpy.
+
+So this feature has **no compile step in it**. Unsetting that flag costs an import nothing
+measurable — 423ms against 420ms for numpy, which is noise — and the bytecode falls out as a side
+effect of the import that was happening anyway. All that is left is keeping it and putting it
+back. Across two real worker realms: 2550ms of importing cold, 639ms warm, 114ms to harvest, and
+13ms for a run that adds nothing new.
+
+Two things were load-bearing and neither was obvious:
+
+- **A `.pyc` names its source's mtime, and every run gets new mtimes.** `loadPackage` unpacks the
+  wheel afresh into each interpreter, so cached bytecode is stale on arrival — the first version
+  of this cached 12 MB that CPython then ignored, at full price. PEP 552 hash-based `.pyc` is the
+  format installers use for this exact reason, and converting one is 16 bytes of header surgery,
+  not a recompile: the marshalled code object is byte-identical. `check_source=0`, because
+  re-hashing every source on import is most of the I/O being avoided, and the claim that replaces
+  it — a wheel's files do not change while its version does not — is the claim pip already makes.
+- **`sys.pycache_prefix` needs its root to exist before the first import.** Without it the
+  bytecode lands next to the source, and `__pycache__` directories appear in the user's file
+  explorer and get mirrored back into the VFS as the script's own work. With it, and without the
+  directory, CPython writes *nothing at all*: it builds the tree by walking up from the `.pyc`
+  until it finds a directory that exists, and when that walk runs off the top it starts creating
+  directories relative to the cwd instead. No error, no bytecode, and a probe that reports the
+  feature simply not working.
+
+Only packages are persisted, keyed on `name-version` and the interpreter's magic number. The
+user's own modules are compiled too, but their bytecode stays in the per-process prefix under
+CPython's ordinary mtime checking — their files change, and a file edited a second ago must never
+run as a stale copy. Entries record a file count so that a package imported more deeply than last
+time replaces a thinner entry rather than being skipped for the rest of the session.
+
+The bridge tier harvests in one worker realm and restores in another, and then does it a third
+time with the bytecode deliberately unreadable: that realm has to produce the same answers by the
+slow path (2480ms against 639ms), because a cache test that only measures the fast case is
+measuring whether the machinery ran, not whether it did anything.
+
+**What was ruled out:** snapshotting an interpreter that already has pandas loaded, which would
+skip the imports rather than speed them up. Pyodide validates the JS reference table against the
+one it had at boot, and a single `loadPackage` is enough to fail it with `Unexpected hiwire entry
+at index 6`. That is upstream's design, not a bug to work around.
+
+**Still uncovered:** notebooks, and scikit-learn as a template.
+
+## Python, batch six — breakpoints, in the panel that already existed
+
+Every batch so far made Python *run* better. This one is about the part of the day spent
+finding out why it did not: until now, debugging a `.py` file here meant `print()` or
+`pdb` at a terminal, while the JavaScript next to it had gutter breakpoints, a call
+stack, a variables tree and an expression box.
+
+The interesting finding was how little needed building. The studio's debugger
+(`debug-session.ts`, `DebugPanel.tsx`) speaks CDP, stores breakpoints per VFS path, and
+has no opinion about language — **it did not change at all**. Neither did the transport:
+the debug SAB and the park-the-worker-on-`Atomics.wait` trick were already there. What
+was missing was a second backend on the other end of it.
+
+And the Node backend's hardest part does not apply. It exists because a Web Worker has
+no V8 inspector, so it parses the guest with acorn and weaves probes into every
+statement to fake a call stack. CPython has had a debugging interface for thirty years
+and the frames are real, so `python-debugger.js` is the protocol and the bookkeeping,
+with the interpreter answering the questions only it can answer.
+
+**`sys.settrace` is the obvious way to do this and it is the wrong one.** It is what
+`pdb` uses, and it is called on every line of every function: 22ms → 217ms on a
+300k-iteration loop, a debugger that changes the program it is measuring. PEP 669
+monitoring (3.12+; this interpreter is 3.14) lets the callback answer `DISABLE`, which
+retires that bytecode location for good — so a line that is not a breakpoint is asked
+about exactly once, and the same loop is **23ms against a 22ms baseline**. A breakpoint
+on the hot line itself is 83ms, on a line you are about to stop on anyway. Code outside
+the project is dropped on first sight, so `import numpy` under a live breakpoint is
+461ms — unchanged.
+
+Three things were load-bearing and none was obvious:
+
+- **`DISABLE` is permanent, and stepping needs those lines back.** A location that
+  retired never fires again until `sys.monitoring.restart_events()`. Without that call,
+  the first Step Over after a pause runs to the end of the program instead of moving one
+  line — the breakpoint works, the debugger looks broken.
+- **A module frame's locals open with three kilobytes of `__builtins__`.** `f_locals` at
+  module level contains the entire builtins dict, whose `repr` is the whole thing. A
+  Variables panel that shows it is unreadable, so the module dunders are filtered and
+  every value is capped and expanded on demand rather than described up front.
+- **`python` was on the kernel's debug skip-list, for a good reason that stopped being
+  true.** `python` is a Node shim, so instrumenting it debugs our launcher rather than
+  the user's script. Deleting the skip would have done exactly that. The fix is that the
+  kernel now labels the target `debugLang: "python"` and the runtime attaches one backend
+  or the other — never both, and never the wrong one.
+
+The bridge tier runs a real interpreter through a scripted frontend: stop at a
+breakpoint inside a function, read the locals, evaluate `acc + rows[2]['n']` in that
+frame, Step Into, Step Over, Step Out, expand a dict two round trips deep, resume, and
+confirm the program still printed its answer. That also exercises the one thing that
+cannot be faked — JS calling back **into** the interpreter while the interpreter is
+inside a call out to JS, the same re-entrancy the blocking stdin syscall relies on.
+
+**Ruled out for now:** pausing on uncaught exceptions, and conditional breakpoints.
+Both are small additions to this backend, but neither is worth shipping untested, and
+the honest version of each needs its own bridge case.
+
+**Still uncovered:** notebooks, `Ctrl-C` raising `KeyboardInterrupt` rather than killing
+the process (Pyodide's `setInterruptBuffer` is not wired up), and scikit-learn as a
+template.
+
+## Python, batch seven — Ctrl-C (this change)
+
+The debugger can stop Python on a line you chose. This is the other half: stopping it
+on a line you did not choose, because it is in a loop that is never coming back.
+
+Until now Ctrl-C killed a python process outright, and it had to: the kernel terminates
+a guest that has no handler for a catchable signal, and this guest could not have one
+that worked. While CPython runs, the worker thread is inside the interpreter, so the
+pending-signal bitmask nobody is looking at stays unlooked-at, and no JS handler is
+reachable. The process was not ignoring Ctrl-C; it could not hear it.
+
+CPython solves its half already — its Emscripten build polls a byte of shared memory
+and raises `KeyboardInterrupt` at the next bytecode boundary. So SIGINT is mirrored
+into a byte of the process's **existing** syscall SAB (`control[5]`, until now reserved
+padding), which needed no new channel and no new plumbing. Measured across a real
+thread boundary: the interrupt lands **5ms** after the signal is sent, the interpreter
+clears the byte itself, and it is still a working interpreter afterwards.
+
+The two hard parts were both about honesty rather than mechanism:
+
+- **The handler is registered only while the interpreter is running user code.** That
+  looks like an optimisation and is not. Registering a SIGINT handler is what tells the
+  kernel not to kill this process — a promise that can only be kept while there is an
+  interpreter running to take the interrupt. At an idle REPL prompt the process is
+  parked in the blocking stdin syscall and cannot run any handler at all, so Ctrl-C
+  keeps its old meaning there. A Ctrl-C that is quietly swallowed would be worse than
+  one that kills.
+- **A process that handles a signal and carries on was force-killed five seconds
+  later.** A REPL taking a KeyboardInterrupt back to its prompt is alive on purpose,
+  and the kernel had no way to be told that. It does now — but *opt-in*. The one-line
+  version, standing the window down whenever a handler ran, passed everything and
+  would have removed the only thing stopping a guest that catches SIGTERM and ignores
+  it from wedging the kernel; `scripts/spike-signals.mjs` has a scenario for exactly
+  that guest, and it is the reason the automatic version did not survive. Escalation is
+  now keyed on whether the guest **answered**, not on whether the signal repeated, so
+  hammering Ctrl-C at something unresponsive still kills it while two deliberate
+  Ctrl-Cs at a live prompt are two interrupts.
+
+Tested where each claim lives: the interpreter half in the bridge tier, with a real
+Pyodide in a real worker signalled by the real `postSignal` — including the negative
+control that SIGTERM does **not** interrupt it, so the test cannot pass on a byte that
+means nothing. The kernel half in `spike-signals.mjs`, against the real `Kernel` and
+real worker threads: a guest that stands down outlives its grace window, its timer is
+really cleared, and a second Ctrl-C is delivered rather than escalated.
+
+**Two bugs this shook out, found by running it rather than by testing it.** Both were
+invisible in the tiers above because both spikes named their own files absolutely and
+drove the backend directly:
+
+- **`python main.py` compiled the script as `main.py`.** That relative name becomes
+  `co_filename` on every code object, and it is the only name a breakpoint can be
+  matched against — while the editor's breakpoints are VFS paths, which are absolute.
+  So nothing ever matched. It did not present as broken: the target appeared, the
+  script ran, the target went away. The script is now resolved against the process cwd
+  before it is compiled, and `sys.argv` is left as typed, which is what CPython does.
+- **The start gate never told the kernel it had opened.** A debug target starts in
+  SAB-routing mode, because until the gate opens the SAB is the only channel with a
+  reader, and the kernel flips back to postMessage when it sees `Debugger.resumed` —
+  which the Node backend emits and this one did not. Anything sent after the program
+  started therefore queued where nothing would drain it until the next pause.
+
+Both are now covered where they would have been caught: the offline tier drives the
+real runtime through `runFile("main.py")` against the stand-in interpreter and asserts
+the name it compiles under, and the gate is asserted to announce itself on both routes
+out of it — the frontend saying run, and the timeout for a frontend that never came.
+The stand-in transport was also made to honour its timeout, since one that answered
+instantly made a bounded wait look instant.
+
+**Still uncovered:** Ctrl-C at an idle prompt, which needs the blocking stdin read to
+return EINTR and the kernel to cancel a parked reader — a change to the syscall channel
+that deserves its own batch rather than a rushed corner of this one. Also notebooks,
+scikit-learn as a template, and the debugger's pause-on-exception and conditional
+breakpoints, which stay deferred: the studio sends neither `setPauseOnExceptions` nor a
+condition today, so both would be backend code no UI can reach.

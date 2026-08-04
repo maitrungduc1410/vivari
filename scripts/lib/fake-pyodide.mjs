@@ -210,16 +210,29 @@ export function makeFakePyodide({ pythonVersion = "3.14.2", pyodideVersion = "31
   let stdoutStream = { write: (b) => process.stdout.write(b) };
   let stderrStream = { write: (b) => process.stderr.write(b) };
 
+  // What was executed, and under what name. See runPythonAsync below.
+  const ran = [];
+
   return {
     FS,
     loaded,
+    ran,
     version: pyodideVersion,
     setStdout(s) { stdoutStream = s; },
     setStderr(s) { stderrStream = s; },
     toPy: (v) => v,
     pyimport: () => ({ install: async () => {} }),
-    runPython: (code) => answer(String(code)),
-    runPythonAsync: async (code) => answer(String(code)),
+    runPython: (code) => {
+      ran.push({ source: String(code), filename: null });
+      return answer(String(code));
+    },
+    // The second argument is not decoration: `filename` becomes co_filename on
+    // every code object compiled from this source, which is the name a debugger
+    // matches breakpoints against. Recorded so a caller can be held to it.
+    runPythonAsync: async (code, opts) => {
+      ran.push({ source: String(code), filename: opts && opts.filename });
+      return answer(String(code));
+    },
     // serve() runs setupSource() and then reads _vv_dispatch out of globals.
     // The stand-in app writes and deletes files on request, because "did a file
     // a request produced reach the host?" is the question serve() has to answer.
@@ -272,7 +285,9 @@ export function writeFakeIndex(fs, path, dir, opts = {}) {
   fs.writeFileSync(
     path.join(dir, "pyodide.mjs"),
     `import { makeFakePyodide } from ${JSON.stringify(here)};\n` +
-      `export const loadPyodide = async () => makeFakePyodide(${JSON.stringify(opts)});\n`,
+      // The runtime boots its own interpreter and does not hand it back, so the
+      // instance is parked where a test can reach it and ask what it was told.
+      `export const loadPyodide = async () => (globalThis.__vvFakePyodide = makeFakePyodide(${JSON.stringify(opts)}));\n`,
   );
   return dir;
 }

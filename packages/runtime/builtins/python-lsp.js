@@ -33,6 +33,24 @@
 // running in the browser, is a different feature.
 export const JEDI_PACKAGES = ["jedi"];
 export const BLACK_PACKAGES = ["black"];
+// Stubs for the vendored libraries that carry no type information of their own.
+// Without them mypy's FIRST message about a file that imports requests is
+// `Library stubs not installed for "requests"` on line 1 — a complaint about
+// packaging, pointing at a `pip install` that needs a network and a subprocess,
+// on a line the user did not write. And it is worse than noise: the untyped
+// import makes the module Any, so the mistake two lines down that mypy exists to
+// catch goes unreported. With the stubs present, `r.jsonn()` becomes
+// `"Response" has no attribute "jsonn"; maybe "json"?`.
+//
+// Only the two that need it. Everything else this runtime vendors — fastapi,
+// httpx, matplotlib, numpy, rich, sqlalchemy — ships py.typed and needs nothing.
+export const TYPE_STUBS = ["types-requests", "pandas-stubs"];
+// mypy, for the squiggles. Loaded on the first check and not before: it is the
+// largest wheel the studio can pull (~6.6 MB) and nobody who never saves a
+// Python file should fetch it. Its own dependencies come from the lock, which
+// scripts/vendor-pyodide.mjs amends — Pyodide's entry for mypy under-declares
+// them, so `loadPackage("mypy")` alone loads something that cannot import.
+export const MYPY_PACKAGES = ["mypy", ...TYPE_STUBS];
 
 // The interpreter's own site-packages, and where the project's copy of it lives.
 // A definition inside an installed package resolves to the first; the file that
@@ -58,7 +76,7 @@ export const STORE_SITE_PACKAGES = ".venv/lib/python3.14/site-packages";
 // completions see whatever the store restored into this interpreter, which is
 // what makes `pip install tabulate` visible to the editor.
 export const LSP_DRIVER_SOURCE = `
-import json, os, sys
+import json, os, re, sys
 
 import jedi
 from jedi.api.environment import InterpreterEnvironment
@@ -188,7 +206,82 @@ def _vv_format(req):
     return {"text": dst, "changed": dst != src}
 
 
+_VV_CHECK_LINE = re.compile(
+    r"^(?P<path>.+?):(?P<line>\\d+):(?P<col>\\d+):(?P<eline>\\d+):(?P<ecol>\\d+): "
+    r"(?P<sev>error|warning|note): (?P<msg>.*?)(?:  \\[(?P<code>[a-z-]+)\\])?$"
+)
+
+
+def _vv_check(req):
+    # The buffer, not the file. Everything else in this driver reads req["code"]
+    # because the editor's copy is ahead of the disk; mypy only reads files, so
+    # the buffer is written down first. The project mirror already put the rest
+    # of the tree here, at the same absolute paths, which is what makes an
+    # import of a sibling module resolve.
+    from mypy import api
+
+    path = req["path"]
+    with open(path, "w", encoding="utf8") as fh:
+        fh.write(req["code"])
+
+    args = [
+        "--no-color-output",
+        "--no-error-summary",
+        "--no-pretty",
+        # Positions Monaco can place a squiggle on. Without these mypy reports a
+        # line and nothing else, and every marker would underline the whole line.
+        "--show-column-numbers",
+        "--show-error-end",
+        # Type information from imported modules, but diagnostics only for the
+        # file being edited: errors in a file the user is not looking at cannot
+        # be shown anywhere, and would otherwise be silently discarded below.
+        "--follow-imports=silent",
+        # Incremental is the difference between 2s and 0.35s per check. The cache
+        # lives beside the project's package store rather than inside it, so pip
+        # freeze and the store's size accounting do not see it.
+        "--cache-dir=" + req.get("cacheDir", "/tmp/vv-mypy-cache"),
+        path,
+    ]
+    out, errs, code = api.run(args)
+    if code not in (0, 1):
+        # 2 is a usage or configuration error — a bad mypy.ini, say. That is worth
+        # showing as itself rather than as an empty, clean-looking result.
+        detail = (errs or out or "").strip().split(chr(10))
+        return {"error": "config", "message": detail[0] if detail else "mypy exited " + str(code)}
+
+    items = []
+    for line in (out or "").split(chr(10)):
+        m = _VV_CHECK_LINE.match(line.strip())
+        if m is None:
+            continue
+        # mypy reports the path the way it was reached, which is relative to the
+        # working directory when that is where the file lives — so an exact
+        # comparison against the absolute path silently drops every diagnostic.
+        reported = os.path.realpath(os.path.join(os.getcwd(), m.group("path")))
+        if reported != os.path.realpath(path):
+            continue
+        if m.group("sev") == "note":
+            # A note explains the diagnostic above it (mypy emits them as
+            # separate lines). Folding it in keeps the explanation without
+            # putting a second squiggle under the same code.
+            if items:
+                items[-1]["message"] += chr(10) + m.group("msg")
+            continue
+        items.append({
+            "line": int(m.group("line")),
+            "column": int(m.group("col")),
+            "endLine": int(m.group("eline")),
+            # mypy's end column is INCLUSIVE and Monaco's is not.
+            "endColumn": int(m.group("ecol")) + 1,
+            "severity": m.group("sev"),
+            "message": m.group("msg"),
+            "code": m.group("code") or "",
+        })
+    return {"items": items}
+
+
 _VV_OPS = {
+    "check": _vv_check,
     "complete": _vv_complete,
     "resolve": _vv_resolve,
     "hover": _vv_hover,
@@ -425,6 +518,61 @@ export function createRequestQueue(send) {
 
 let completionToken = 0;
 
+// Whose markers these are. Monaco keys markers by owner, so anything else
+// putting markers on a Python model (a linter added later) can coexist, and
+// clearing ours never clears theirs.
+export const MARKER_OWNER = "mypy";
+// Long enough that it does not fire mid-word, short enough to feel like it
+// answered the edit you just made. See the note at the call site for why this
+// is a pause and not a keystroke.
+export const CHECK_DEBOUNCE_MS = 700;
+
+// ruff's markers are a separate owner, which is the mechanism the note above
+// anticipated: the two tools disagree about nothing and clear each other never.
+export const RUFF_MARKER_OWNER = "ruff";
+// A fifth of mypy's wait, because ruff costs a fifth of a tenth of what mypy
+// costs and shares nothing with it. It is WebAssembly of its own (not a Python
+// package — see programs/ruff.js), so a lint neither waits for the interpreter
+// nor blocks the completion that is using it. That is also why the first lint
+// of a session lands while Pyodide is still starting.
+export const LINT_DEBOUNCE_MS = 150;
+
+/**
+ * ruff's own diagnostics, as the marker fields the editor wants.
+ *
+ * Here rather than in the worker so both spike tiers can hold it to the real
+ * shapes: the offline tier feeds it recorded ones, the bridge tier feeds it what
+ * the vendored wasm actually returns today.
+ *
+ * ruff counts rows and columns from 1 and its end column is EXCLUSIVE, which is
+ * what Monaco means too — unlike mypy, whose inclusive end has to be corrected
+ * by one. Not assumed: the bridge tier slices the source with these numbers and
+ * checks the result is the token being complained about.
+ *
+ * SYNTAX ERRORS ARE DROPPED, and that is the one real judgement in this file.
+ * ruff reports an unparseable file as ordinary diagnostics coded invalid-syntax
+ * rather than by failing, so `x = ` — a line anyone is in the middle of writing
+ * — comes back as "Expected an expression". At a 150ms debounce that is a red
+ * squiggle appearing under the cursor during a pause for thought, which is the
+ * classic reason people switch linting off. The 700ms checker still reports a
+ * file it cannot parse, so nothing is lost but the flicker.
+ */
+export function ruffMarkersFrom(diagnostics) {
+  const items = [];
+  for (const d of diagnostics || []) {
+    if (d.code === "invalid-syntax" || !d.code) continue;
+    items.push({
+      line: d.start_location.row,
+      column: d.start_location.column,
+      endLine: d.end_location.row,
+      endColumn: d.end_location.column,
+      message: d.message,
+      code: d.code,
+    });
+  }
+  return { items };
+}
+
 export function registerPythonLanguage(monaco, host) {
   const disposables = [];
 
@@ -603,7 +751,132 @@ export function registerPythonLanguage(monaco, host) {
     }),
   );
 
+  // ── type checking (mypy) ───────────────────────────────────────────────────
+  // Not a Monaco "provider": diagnostics are pushed, not pulled, so this owns a
+  // timer rather than answering a callback.
+  //
+  // WHY ON A PAUSE AND NOT PER KEYSTROKE. The interpreter is single-threaded and
+  // shared with completion, so a check that is running is a completion that is
+  // waiting. Measured on this interpreter, a check costs ~2.1s the first time it
+  // sees a project and ~0.35s per edit after that. 0.35s is cheap enough to
+  // spend when someone has stopped typing and far too expensive to spend between
+  // two characters, which is what the delay below buys — and why the check
+  // submits under its own queue kind, so a pending one is superseded by the next
+  // pause instead of queueing up behind the cursor.
+  const timers = new Map();
+  let stopped = false;
+  const checkModel = async (model) => {
+    if (stopped || model.isDisposed?.()) return;
+    const result = await ask("check", model, { op: "check" });
+    if (model.isDisposed?.()) return;
+    // null = superseded or the service is down. Leaving the previous markers up
+    // is right for both: they described the last state anyone actually checked,
+    // and clearing them would claim the file is clean.
+    if (!result) return;
+    if (result.error) {
+      // A broken mypy.ini fails every check the same way, so say it once rather
+      // than drawing squiggles that are not about the code.
+      host.notify("mypy: " + (result.message || result.error));
+      monaco.editor.setModelMarkers(model, MARKER_OWNER, []);
+      return;
+    }
+    monaco.editor.setModelMarkers(model, MARKER_OWNER, (result.items || []).map((d) => ({
+      severity: d.severity === "warning" ? monaco.MarkerSeverity.Warning : monaco.MarkerSeverity.Error,
+      startLineNumber: d.line,
+      startColumn: d.column,
+      endLineNumber: d.endLine,
+      endColumn: d.endColumn,
+      message: d.message,
+      // Shown in the marker as the thing you would put in a `type: ignore[...]`.
+      code: d.code || undefined,
+      source: "mypy",
+    })));
+  };
+
+  // ── linting (ruff) ─────────────────────────────────────────────────────────
+  // Same push model as the check above and deliberately not folded into it: the
+  // two find different things (an unused import and a misspelled name are not
+  // type errors, and ruff has no opinion about types at all), they cost two
+  // orders of magnitude apart, and one of them can answer without an
+  // interpreter. Separate owners mean the slow one arriving does not erase what
+  // the fast one already said.
+  let lintFailureSaid = false;
+  const lintModel = async (model) => {
+    if (stopped || model.isDisposed?.()) return;
+    const result = await ask("lint", model, { op: "lint" });
+    if (model.isDisposed?.() || !result) return;
+    if (result.error) {
+      // Once, literally: unlike a broken mypy.ini, nothing the user types can
+      // fix a ruff that will not load, so repeating it every pause would be a
+      // notification per keystroke about a thing they cannot act on. The markers
+      // are left alone rather than cleared into a false all-clear.
+      if (!lintFailureSaid) {
+        lintFailureSaid = true;
+        host.notify("ruff: " + (result.message || result.error));
+      }
+      return;
+    }
+    monaco.editor.setModelMarkers(model, RUFF_MARKER_OWNER, (result.items || []).map((d) => ({
+      // Warnings, not errors: everything ruff reports is style or a smell that
+      // the file still runs with. The one class of finding that does stop it
+      // running — a file it cannot parse — is dropped before it gets here, and
+      // is mypy's to report. See ruffMarkersFrom.
+      severity: monaco.MarkerSeverity.Warning,
+      startLineNumber: d.line,
+      startColumn: d.column,
+      endLineNumber: d.endLine,
+      endColumn: d.endColumn,
+      message: d.message,
+      // The rule id, which is what a `# noqa: F401` would name.
+      code: d.code || undefined,
+      source: "ruff",
+    })));
+  };
+
+  const lintTimers = new Map();
+  const scheduleLint = (model) => {
+    if (stopped || model.getLanguageId?.() !== "python") return;
+    const key = model.uri.toString();
+    clearTimeout(lintTimers.get(key));
+    lintTimers.set(key, setTimeout(() => {
+      lintTimers.delete(key);
+      void lintModel(model);
+    }, LINT_DEBOUNCE_MS));
+  };
+
+  const scheduleCheck = (model) => {
+    // An event that was already in flight when the registration was torn down
+    // must not start a check into a disposed editor.
+    if (stopped || model.getLanguageId?.() !== "python") return;
+    const key = model.uri.toString();
+    clearTimeout(timers.get(key));
+    timers.set(key, setTimeout(() => {
+      timers.delete(key);
+      void checkModel(model);
+    }, CHECK_DEBOUNCE_MS));
+  };
+
+  const watch = (model) => {
+    if (model.getLanguageId?.() !== "python") return;
+    disposables.push(model.onDidChangeContent(() => {
+      scheduleCheck(model);
+      scheduleLint(model);
+    }));
+    // Both on open, and the lint is the one that lands: an already-wrong file
+    // should say so before it is touched, and ruff can say it seconds before
+    // there is an interpreter to ask about types.
+    scheduleCheck(model);
+    scheduleLint(model);
+  };
+  for (const model of monaco.editor.getModels?.() || []) watch(model);
+  disposables.push(monaco.editor.onDidCreateModel?.(watch) || { dispose() {} });
+
   return () => {
+    stopped = true;
+    for (const t of timers.values()) clearTimeout(t);
+    timers.clear();
+    for (const t of lintTimers.values()) clearTimeout(t);
+    lintTimers.clear();
     for (const d of disposables) d.dispose();
     disposables.length = 0;
   };

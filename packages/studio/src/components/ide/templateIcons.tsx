@@ -373,6 +373,8 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   trpc: Badge({ text: "tR", bg: "#398ccb" }),
   monorepo: (p) => <PnpmIcon className={p.className} />,
   sqlite: (p) => <SqliteIcon className={p.className} />,
+  sqlalchemy: Badge({ text: "SA", bg: "#bb2222" }),
+  rich: Badge({ text: "ri", bg: "#7f5af0" }),
   postgres: Badge({ text: "Pg", bg: "#336791" }),
   s3: Badge({ text: "S3", bg: "#569a31" }),
   session: Badge({ text: "Sid", bg: "#7c3aed" }),

@@ -129,7 +129,7 @@ let selfPid = -1;
 const toKernel: (msg: unknown, transfer?: Transferable[]) => void = self.postMessage.bind(self);
 
 self.onmessage = async (event) => {
-  const { type, sab, spec, fsPort, threadPort, codecModule, cryptoModule, debugSab } = event.data;
+  const { type, sab, spec, fsPort, threadPort, codecModule, cryptoModule, debugSab, debugLang } = event.data;
   if (type === "init") {
     selfPid = (spec && spec.pid) | 0;
     const { makeZStream, cryptoCodec } = buildCodecs(codecModule, cryptoModule);
@@ -139,6 +139,7 @@ self.onmessage = async (event) => {
       fsPort, // #14: fs syscalls ring the File System Worker over this port
       threadPort, // #16 stage 2b: our parentPort, if we are a spawned thread
       debugSab, // breakpoint debugger command channel (present under a debug session)
+      debugLang, // which backend attaches to it: "js" (instrumented) or "python"
       postRaw: (msg, transfer) => toKernel(msg, transfer || []),
       send: (msgType, extra) => toKernel({ type: msgType, ...extra }),
       onReady: (c) => {

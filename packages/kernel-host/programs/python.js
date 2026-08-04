@@ -15,6 +15,8 @@
 //   python -m flask run       serve a Flask/WSGI app via a guest http bridge
 //   python -m gunicorn m:app  serve any WSGI app (Django, Flask, ...) the same way
 //   python -m pytest [args]   run a pytest suite and propagate its exit code
+//   python -m mypy [args]     type-check, propagating mypy's exit code
+//   python -m black [args]    format — plain runpy, on the wheel the editor uses
 //   python --version          print the interpreter version (does NOT boot Pyodide)
 //
 // The heavy Pyodide bundle is fetched from the same-origin vendored index
@@ -259,16 +261,32 @@ async function doPip(rest) {
   }
   const items = rest.slice(1);
   const pkgs = [];
+  const editable = [];
   for (let i = 0; i < items.length; i++) {
     const a = items[i];
     if (a === '-r' || a === '--requirement') {
       const f = items[i + 1]; i++;
       if (f) { const more = readRequirements(f); for (let j = 0; j < more.length; j++) pkgs.push(more[j]); }
+    } else if (a === '-e' || a === '--editable') {
+      // Without this, -e fell into the ignore-unknown-flags arm below and the
+      // dot was taken for a package name, so the line at the top of most Python
+      // READMEs failed with "could not install .".
+      const t = items[i + 1]; i++;
+      if (t) { editable.push(t); }
     } else if (a.charAt(0) === '-') {
       // ignore pip-only flags (quiet, no-cache-dir, upgrade, ...)
     } else {
       pkgs.push(a);
     }
+  }
+  if (editable.length) {
+    for (let i = 0; i < editable.length; i++) {
+      const code = await py.pipInstallEditable(editable[i]);
+      if (code) { process.exit(code | 0); return; }
+    }
+    // "pip install -e . requests" is legal, so the ordinary packages still go
+    // through afterwards rather than being dropped.
+    if (!pkgs.length) { process.exit(0); return; }
   }
   if (!pkgs.length) { err('pip: nothing to install'); process.exit(1); return; }
   const code = await py.pipInstall(pkgs);
@@ -472,6 +490,36 @@ async function doPytest(rest) {
   process.exit(rc | 0);
 }
 
+// mypy is the one checker that cannot go through plain runpy. black does, and
+// so does everything else that is simply a module with a __main__ — but mypy
+// finishes by calling os._exit() to skip interpreter teardown, and under
+// Emscripten that tears down the whole Pyodide runtime. The diagnostics land and
+// then the process dies as a crash instead of carrying an exit code, so
+// "mypy foo.py && echo clean" would print clean after a failed check.
+//
+// mypy.api.run() is upstream's own entrypoint for embedding: it calls main()
+// with clean_exit=True, which is precisely the flag that skips the os._exit
+// path, and hands back (stdout, stderr, status). The cost is that output is
+// buffered to the end of the run rather than streamed, which for a checker that
+// prints its findings at the end anyway is not a difference a user can see.
+//
+// Args are forwarded verbatim, including none at all: mypy with no target has
+// its own usage error, and inventing a default here would be a command that
+// behaved differently from the one being imitated.
+async function doMypy(rest) {
+  const src = [
+    'import sys',
+    'from mypy import api',
+    'out, errs, code = api.run(' + JSON.stringify(rest) + ')',
+    'sys.stdout.write(out)',
+    'sys.stderr.write(errs)',
+    'sys.exit(code)',
+  ].join(NL);
+  const py = getPy();
+  const rc = await py.runCode(src, rest);
+  process.exit(rc | 0);
+}
+
 // Stdlib modules whose __main__ is a network client or server. These are not
 // refused because they are unimplemented — they import fine, and that is the
 // problem. Pyodide's socket layer accepts connect(), bind() and listen() and
@@ -487,6 +535,29 @@ const SOCKET_MODULES = {
   'wsgiref.simple_server': 'this binds a TCP socket. Use "python -m flask run" or "python -m uvicorn", which serve through the Vivari preview bridge.',
   'xmlrpc.server': 'this binds a TCP socket.',
 };
+
+// The same socket problem, arriving by a route SOCKET_MODULES cannot see:
+// runserver is a management command on a script path, not a -m module. It gets
+// its own arm because Vivari ships a Django template, which makes this both the
+// first command a Django user reaches for and the worst-behaved one here.
+// Pyodide accepts bind() and listen(), and select() then never reports the
+// socket readable, so runserver prints its startup banner and answers nothing,
+// for as long as it is left running. The template already serves the same app
+// through the preview bridge, so there is a real command to point at.
+//
+// --help is let through on purpose: it binds nothing, and Django printing its
+// own help is more useful than a refusal standing in front of it.
+function refuseRunserver(file, rest) {
+  const base = String(file).split('/').pop();
+  if (base !== 'manage.py') return false;
+  if (rest.indexOf('runserver') === -1) return false;
+  if (rest.indexOf('--help') !== -1 || rest.indexOf('-h') !== -1) return false;
+  err('manage.py runserver: the Django development server binds a TCP socket, and there is none in the browser.');
+  err('Pyodide accepts bind() and listen() and then never reports a connection, so this would print "Starting development server at http://127.0.0.1:8000/" and never answer.');
+  err('Serve the same app through the Vivari preview bridge instead:');
+  err('  gunicorn wsgi:application --bind 0.0.0.0:8000');
+  return true;
+}
 
 // python -m http.server [-b ADDR] [-d DIR] [-p VERSION] [--cgi] [port]
 // The flag set is CPython's own (see its argparse), so a command copied out of
@@ -574,6 +645,7 @@ async function main() {
     if (mod === 'flask') { return doFlask(rest); }
     if (mod === 'gunicorn') { return doGunicorn(rest); }
     if (mod === 'pytest') { return doPytest(rest); }
+    if (mod === 'mypy') { return doMypy(rest); }
     if (mod === 'http.server') { return doHttpServer(rest); }
     if (SOCKET_MODULES[mod]) {
       err('python -m ' + mod + ': ' + SOCKET_MODULES[mod]);
@@ -596,6 +668,7 @@ async function main() {
   while (i < argv.length && argv[i].length > 0 && argv[i].charAt(0) === '-' && argv[i] !== '-') i++;
   const file = argv[i];
   if (!file) { err('python: no script provided'); process.exit(1); return; }
+  if (refuseRunserver(file, argv.slice(i + 1))) { process.exit(1); return; }
   const py = getPy();
   const rc = await py.runFile(file, argv.slice(i + 1));
   process.exit(rc | 0);

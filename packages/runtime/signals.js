@@ -53,6 +53,24 @@ export function createSignalDelivery({ process, loop, postRaw = null }) {
     }
   };
 
+  // "I took that signal, dealt with it, and I am staying" — which is a different
+  // claim from "my handler ran", and only the guest can make it.
+  //
+  // Running a handler is NOT enough to earn this: the force-kill window exists
+  // precisely for the process that catches a signal and then never gets around
+  // to leaving, and standing it down automatically would remove the only thing
+  // stopping such a process wedging the kernel. So it is opt-in, and the one
+  // caller is the Python runtime, where a KeyboardInterrupt legitimately returns
+  // the interpreter to its prompt with the process still alive and wanted.
+  const standDown = (name) => {
+    if (!postRaw || !isCatchableSignal(name)) return;
+    try {
+      postRaw({ type: "signal-handled", signal: name });
+    } catch {
+      /* kernel gone */
+    }
+  };
+
   // 'newListener' fires BEFORE the listener is added (so count 0 = this is the
   // first one); 'removeListener' fires after (count 0 = that was the last).
   process.on("newListener", (name) => {
@@ -71,6 +89,7 @@ export function createSignalDelivery({ process, loop, postRaw = null }) {
   });
 
   return {
+    standDown,
     /** Kernel postMessage: { type:'signal', signal }. */
     dispatch: (msg) => {
       if (msg && msg.signal) enqueue(msg.signal);

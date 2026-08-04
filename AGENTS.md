@@ -3416,6 +3416,92 @@ formatting worked online and failed offline. Pin the versions to what micropip a
 resolves (`pathspec` 1.1.1, not the 0.12.1 an older pin suggested): an unpinned formatter
 reformats a codebase differently the day upstream changes a default.
 
+### A lockfile's `depends` can be thinner than what the package imports
+
+`loadPackage("mypy")` succeeds and then `from mypy import api` raises
+`ModuleNotFoundError: typing_extensions` — and once that is satisfied, `mypy_extensions`,
+and then `pathspec`, one at a time. Pyodide's entry for mypy declares `librt` alone. This
+class of bug survives vendoring precisely because the *load* is fine: the wheel is on
+disk, and the failure lands in front of the user the first time the feature runs. Do not
+trust a lock's `depends` for anything you are about to ship a command for — import it in a
+real interpreter and run it once. `DEPENDS_FIXUPS` in `scripts/vendor-pyodide.mjs` is the
+one place the missing names live, feeding both the download closure and the emitted lock.
+
+### A tool that ends in `os._exit()` takes Pyodide with it
+
+mypy's command line finishes with `os._exit()` to skip interpreter teardown. Under
+Emscripten that is not an exit code, it is the runtime being torn down: the diagnostics
+print, and then the process dies as a crash with the status lost — so `mypy && deploy`
+deploys on a failed check. Plain `runpy` is right for almost everything (black goes that
+way and needs no seam), so the way to find the exception is to run the candidate once and
+look at what comes back, not to reason about it. Where a tool ships an embedding API
+(`mypy.api.run()`, `pytest.main()`), prefer it: those exist for this, and they hand back a
+status instead of exiting. The cost is buffered output, which is worth stating in the docs.
+
+### A package's lazy imports are the ones the lock forgets
+
+The same trap as mypy's, one level further in. `rich`'s Pyodide entry declares **no**
+dependencies at all, and rich imports pygments and markdown-it-py *lazily* — so `import
+rich` works, tables and panels work, and `rich.syntax` raises `ModuleNotFoundError` at the
+one line in a program that highlights something. markdown-it-py is not in Pyodide's index
+at all, so a `depends` fixup alone would point at a wheel that does not exist; it has to
+come from PyPI like black's closure. When adding a library, import its **submodules** in a
+real interpreter, not the package — the package importing cleanly is what hides this.
+
+### A tool's own output positions are not the editor's
+
+mypy reports an inclusive end column and Monaco's `endColumn` is exclusive, so a marker
+built from the raw numbers underlines one character less than the error. Worse, mypy
+prints paths **relative to the working directory** when the file is under it, not the
+absolute path it was given — so filtering diagnostics by comparing to the requested path
+drops every one of them, and the feature reports a clean file forever. Both were invisible
+to the offline tier, which drives the marker code against a reply written by the test: a
+stub cannot get its own paths wrong. When a feature converts another tool's coordinates,
+the test that matters runs the real tool and slices the source with the numbers that come
+out.
+
+### `.venv/bin` ahead of `/bin` is correct, and dangerous
+
+Generating console scripts from installed packages means a project's own tools shadow the
+built-ins, which is what a venv is for. But several `/bin` entries here are **seams**, not
+conveniences: `pytest` exists to turn pytest's exit code into the process's, `uvicorn` and
+`gunicorn` are the socket-free server bridge. `pip install pytest` would have replaced the
+seam with a shim that calls `console_main` directly and quietly undone it. Anything that
+generates PATH entries from user-controlled metadata needs a reserved list, and that list
+needs a test tying it to the real set of seams — otherwise the next seam is added
+unprotected and nothing says so.
+
+### `process.exit()` throws, so an async program must not exit through its own catch
+
+The runtime's `process.exit()` throws the event loop's exit sentinel. In a synchronous
+program that unwinds and is the end of it; in an `async main().catch(...)` it lands in
+that catch, which then reports a successful exit as a crash — every clean `ruff check`
+printed `ruff: exit` on stderr and could have exited 1 instead of 0. Any program built as
+a promise chain has to carry its status as a value the bottom handler can recognise, or
+not use `process.exit()` inside the chain at all. A drive harness that models exit as a
+throw finds this; one that records a code and returns does not.
+
+### A fix without an applicability flag is not a fix you can apply
+
+ruff's wasm build reports a fix as a message plus edits, and — unlike the CLI — says
+nothing about whether it is *safe*. Applying them anyway is the real tool's
+`--unsafe-fixes`, which may change what the code does, under a flag nobody typed. The
+second half is worse and easier to miss: several fixes for one file are all computed
+against the same original text, so an unused-import deletion and an import-sort rewrite
+overlap and shred each other. Applying edits back-to-front does not save you; the real CLI
+applies one, re-lints, and repeats. This shipped as "Fixed 4 errors. All checks passed!"
+over a file that no longer parsed. When porting a tool's write path, check that the port
+exposes what the tool's own safety decision is made from.
+
+### "Not in the index" is a fact about the index, not about the tool
+
+roadmap.md recorded ruff as out of reach because it is a Rust binary that Pyodide does not
+distribute. Both halves true, conclusion wrong: it is published compiled to WebAssembly,
+which this runtime loads directly, and not being a Python package turned out to be the
+best thing about it — a linter outside CPython costs no interpreter boot. Before writing a
+capability off because the obvious delivery channel does not carry it, check whether the
+thing ships in a form the host can load on its own.
+
 ## Testing & verification
 
 The runtime runs headless under Node `worker_threads`, so validate without a
@@ -3769,6 +3855,68 @@ Two traps worth knowing before you touch this:
   A **bun** guest is the exception and gets a real function back (`installBunRealm` in
   `packages/runtime/realm.js`), because Bun's main thread has one — inert, bound to nothing,
   returning `undefined`, which is what Bun's does.
+## "It cannot be done" is usually a fact about the mechanism you tried
+
+Two of the Python refusals in `roadmap.md` were argued carefully, held for months, and were wrong
+in the same way. `ruff` was written off because it is Rust and not in Pyodide's index — both true,
+and irrelevant, because it ships as WebAssembly that this runtime can load directly. `input()` was
+written off because a keystroke arrives as a postMessage and receiving one needs a loop turn that
+CPython's read does not allow — also true, also irrelevant, because blocking on shared memory is
+what every `fs` call here already does and stdin simply had no opcode.
+
+Both refusals were correct about the mechanism in front of them and drew a conclusion about the
+capability. When you are about to write "X is impossible here", check that the sentence names the
+capability and not the one route you tried to reach it by.
+
+Two smaller ones from the same batch, both worth knowing before you touch these files:
+
+- **A cache that ships to a browser must be made where it is restored.** Pyodide snapshots are
+  bytes of linear memory plus JS references, and a snapshot made in Node and restored in a browser
+  is a claim no test here can check. Making it at runtime, in the same environment, costs one slow
+  boot per session and is provable — the cross-realm part is tested with worker_threads, which is
+  the same boundary two Web Workers have.
+- **When a feature adds a second reader of something there was one of, the old reader is part of
+  the change.** The blocking stdin syscall worked on the first try; what it broke was the REPL,
+  which had been reading the flowing stream perfectly happily until an `input()` at a `>>>` prompt
+  could take stdin away from it.
+- **A skip-list entry is a recorded reason, not a rule.** `python` was excluded from debug targets
+  because instrumenting a Node shim debugs the shim. Deleting the entry to add Python debugging
+  would have done exactly the thing the comment warned about — and done it silently, offering
+  breakpoints in our own launcher. The reason had not stopped being true; it had stopped being the
+  only option. Read what the exclusion is protecting against before assuming it is stale.
+- **A spike that supplies its own inputs cannot find the bug in how real inputs arrive.**
+  The Python debugger passed an offline tier and a bridge tier against a real
+  interpreter, and did nothing at all the first time a person used it: both spikes named
+  their test file absolutely, and `python main.py` compiles the script as `main.py` —
+  the one name an editor breakpoint can never match. The tiers proved the backend; the
+  path from what the user typed to what the backend was handed had no test in it at all.
+  For anything with a UI, walk the real entry point once before calling it done.
+- **A safety net you are about to widen is protecting against something. Find the test
+  that proves it.** Standing the kernel's force-kill window down whenever a signal
+  handler ran was one line, read as obviously correct, and would have let any guest that
+  catches SIGTERM and ignores it live forever. `spike-signals.mjs` already had that exact
+  guest, written by someone who had thought about it — so the shortcut failed loudly
+  instead of shipping. The fix was to make the stand-down opt-in and let the one caller
+  that has earned it ask.
+- **Check whether the standard way is the fast way before building on it.** `sys.settrace` is how
+  `pdb` does this and would have worked, at 10x on any loop — slow enough that the debugger would
+  need a warning in its own documentation. `sys.monitoring` was four years old, in this exact
+  interpreter, and costs nothing. One probe, before any code was written, was the difference.
+
+**Measure the whole wait, not the part you just fixed.** The interpreter snapshot was written up
+here as removing "the biggest thing wrong with Python", on the strength of a real 1.8s saving. It
+was 1.8s of a six-second wait: importing numpy, pandas and Matplotlib was 4691ms of the same
+script's start-up, and nobody had timed it because the boot was the thing being worked on. A
+speed-up that is real and a speed-up that matters are different claims, and only the second one
+needs the end-to-end number.
+
+**A cache's failure mode is doing nothing, quietly.** Two versions of the bytecode cache
+"worked" — files were produced, the code ran, no errors anywhere — and saved nothing. Once
+because the `.pyc` files recorded mtimes that a fresh wheel unpack invalidated, so CPython
+ignored all 12 MB; once because `sys.pycache_prefix` writes nothing at all when its root
+directory does not exist. Both were caught by timing the import, and neither would have been
+caught by checking that the cache had contents. Test a cache by measuring the thing it is
+supposed to make faster, with a control whose contents are deliberately unusable.
 
 ## Where to look next
 
