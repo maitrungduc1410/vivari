@@ -1792,6 +1792,31 @@ flowing stream meant the first `input()` at a `>>>` prompt took stdin away from 
 The cost is that the process's event loop does not turn while a prompt waits, which is what
 CPython does at a `>>>` as well.
 
+**The REPL also echoes, because in this system the reader of a line is what shows it.** There
+is no cooked-mode line discipline below the guest — `process.stdin.setRawMode` records the
+mode and nothing more, and `sh` echoes the keystrokes *it* reads while handing a foreground
+child raw bytes so the child can drive its own display. So `sh` echoes at its prompt and
+`repl()` echoes at a `>>>`, through the same `makeLineReader`, which with an echo sink also
+applies what a canonical terminal would: DEL leaves the character neither in the line nor on
+the screen, and a control byte is shown as `^X` (echo an arrow key's `ESC [ A` verbatim and it
+steers the terminal's cursor into output printed earlier). It writes to **stderr** — an echo
+goes to the terminal, not into this process's stdout, which may be a pipe — and only when
+`VV_TTY=1` says a terminal is attached, so captured and scripted runs are unchanged.
+Deliberately *not* in `installStdin`, one layer down: that is every read the interpreter makes,
+`getpass()` included, and Python cannot opt out here because Emscripten's tty reports ECHO
+already clear and accepts a `tcsetattr` it ignores — getpass would print no warning and the
+password would be on screen. The cost of that choice is that `input()` typed at a prompt still
+shows nothing.
+
+**`exit()` ends the session with its exit code.** `exit`/`quit`/`sys.exit` raise `SystemExit`,
+and `code.InteractiveInterpreter.runcode` re-raises it rather than reporting it, for the loop
+above to act on; the loop reads it with the same `terminationFromError` a script's top-level
+exception goes through (it names the ending — `exit`, `interrupt`, `error` — so the REPL needs
+no SystemExit parser of its own), so `exit()`/`exit(0)` leave 0, `exit(3)` leaves 3 and
+`exit("bye")` prints `bye` to stderr and leaves 1. Ctrl-D is a newline and 0. A
+`KeyboardInterrupt` is the one that must *not* end it: it prints its name and returns to a
+fresh top-level prompt, abandoning any half-typed block.
+
 **The first interpreter of a session is snapshotted, and the rest resume from it.** Booting
 CPython costs ~1.8s and this runtime pays it per command, which was the single biggest thing
 wrong with Python here. Pyodide can serialise a just-booted interpreter's linear memory and

@@ -143,6 +143,12 @@ export function flushStreams(pyodide) {
 // integer, prints just that argument and exits 1. We used to dump the whole
 // WASM traceback for every sys.exit(), which meant a clean `sys.exit(0)` — what
 // `python -m pytest` does on every green run — looked like a crash.
+//
+// `kind` names WHICH of the three this was, because the interactive REPL has to
+// tell them apart and must not grow a second SystemExit parser to do it: an
+// `exit()` typed at a `>>>` ends the session with this code, a Ctrl-C returns to
+// a fresh prompt, and anything else is one statement's error in a session that
+// carries on. A script needs none of that distinction and ignores the field.
 export function terminationFromError(e) {
   const msg = (e && e.message) || String(e);
   const last = msg.trimEnd().split("\n").pop().trim();
@@ -150,14 +156,14 @@ export function terminationFromError(e) {
   // 128+SIGINT, and a shell that reports 130 is how a script author tells an
   // interrupted run from a failed one.
   if ((e && e.type === "KeyboardInterrupt") || /^KeyboardInterrupt\b/.test(last)) {
-    return { code: 130, report: msg };
+    return { kind: "interrupt", code: 130, report: msg };
   }
   const isExit = (e && e.type === "SystemExit") || /^SystemExit\b/.test(last);
-  if (!isExit) return { code: 1, report: msg };
+  if (!isExit) return { kind: "error", code: 1, report: msg };
   const m = /^SystemExit:\s*([\s\S]*)$/.exec(last);
   const value = m ? m[1].trim() : "";
-  if (!value || value === "None") return { code: 0, report: "" }; // bare sys.exit()
-  if (/^-?\d+$/.test(value)) return { code: Number(value) | 0, report: "" };
+  if (!value || value === "None") return { kind: "exit", code: 0, report: "" }; // bare sys.exit()
+  if (/^-?\d+$/.test(value)) return { kind: "exit", code: Number(value) | 0, report: "" };
   // Bools ARE ints in Python: sys.exit(True) exits 1 and sys.exit(False) exits
   // 0, printing nothing either way. The traceback spells both as
   // "SystemExit: True"/"False" — indistinguishable from sys.exit("True"), so
@@ -165,9 +171,9 @@ export function terminationFromError(e) {
   // `sys.exit(not ok)` is a common idiom; exiting with the literal string
   // "False" is not. It is also the reading that keeps a *successful* run
   // reporting success, which the string reading got backwards.
-  if (value === "True") return { code: 1, report: "" };
-  if (value === "False") return { code: 0, report: "" };
-  return { code: 1, report: value }; // sys.exit("message")
+  if (value === "True") return { kind: "exit", code: 1, report: "" };
+  if (value === "False") return { kind: "exit", code: 0, report: "" };
+  return { kind: "exit", code: 1, report: value }; // sys.exit("message")
 }
 
 // Undo one consequence of our own Node masquerade: it switches Python's HTTP off.
@@ -911,8 +917,13 @@ export function dataPackagesFor(source) {
  *
  * Returns null at end of input — but a part-typed line without its newline is
  * still a line, as it is in CPython when you type something and press Ctrl-D.
+ *
+ * With an `echo` sink this also becomes the line discipline a canonical-mode
+ * terminal would provide, because nothing under it does: it shows each character
+ * as it arrives and lets DEL rub one out. Only the interactive REPL passes one —
+ * see repl(), which also decides when echoing is right at all.
  */
-export function makeLineReader(read) {
+export function makeLineReader(read, echo) {
   const readChunk = read || (() => (globalThis.__ocReadStdin ? globalThis.__ocReadStdin() : null));
   let buf = "";
   return () => {
@@ -932,7 +943,33 @@ export function makeLineReader(read) {
         }
         return null;
       }
-      buf += chunk;
+      if (!echo) {
+        buf += chunk;
+        continue;
+      }
+      for (const ch of chunk) {
+        if (ch === "\x7f" || ch === "\b") {
+          // Erase within the line being typed only: a DEL at a fresh prompt must
+          // rub out neither the prompt that invited it nor a line already queued
+          // behind this one (a paste arrives as one chunk of several lines).
+          if (buf && !buf.endsWith("\n")) {
+            buf = buf.slice(0, -1);
+            echo("\b \b");
+          }
+          continue;
+        }
+        buf += ch;
+        // Control characters go on the screen as ^X, which is what a terminal
+        // with ECHOCTL does and is here for a sharper reason than fidelity: an
+        // arrow key arrives as the three bytes ESC [ A, and echoing those
+        // verbatim would move the terminal's cursor into output printed earlier
+        // and type the rest of the line there. Newline and tab are excluded
+        // because their effect on the screen is the point of them.
+        const code = ch.charCodeAt(0);
+        echo(code < 0x20 && ch !== "\n" && ch !== "\r" && ch !== "\t"
+          ? "^" + String.fromCharCode(code + 64)
+          : ch);
+      }
     }
   };
 }
@@ -2278,8 +2315,10 @@ json.dumps({
         const console_ = pyodide.globals.get("_vv_console");
 
         let more = false;
+        let ended = false;
         const prompt = () => process.stdout.write(more ? "... " : ">>> ");
         const finish = (codeVal) => {
+          ended = true;
           try {
             console_.destroy && console_.destroy();
           } catch {
@@ -2292,6 +2331,25 @@ json.dumps({
             // InteractiveConsole.push returns True when more input is needed.
             more = !!withInterruptsSync(() => console_.push(line));
           } catch (e) {
+            const t = terminationFromError(e);
+            // exit(), quit(), sys.exit(): CPython's InteractiveInterpreter.runcode
+            // re-raises SystemExit instead of reporting it (Lib/code.py) precisely
+            // so that the loop driving it can end the session — and this is that
+            // loop. Treated as a printable error, as it used to be, `exit()`
+            // answered with a traceback and a fresh prompt: a crash report for
+            // the one line every user of a REPL knows how to type.
+            //
+            // The code and the message are the same reading a script's top-level
+            // SystemExit gets, from the same parser: exit()/exit(0) leave 0,
+            // exit(3) leaves 3, exit("bye") prints bye and leaves 1.
+            if (t.kind === "exit") {
+              flushStreams(pyodide);
+              if (t.report) {
+                process.stderr.write(t.report.endsWith("\n") ? t.report : t.report + "\n");
+              }
+              finish(t.code);
+              return;
+            }
             // Ctrl-C during a statement. CPython prints the name alone and gives
             // a fresh top-level prompt, abandoning any half-typed block — the
             // session survives, which is the whole point of interrupting it.
@@ -2322,7 +2380,29 @@ json.dumps({
         //
         // The cost is that this process's event loop does not turn while the
         // prompt waits, which is what CPython does at a `>>>` too.
-        const readLine = makeLineReader();
+        //
+        // And it echoes, because in this system nobody else can. On a real
+        // terminal the keystroke a person types is shown by the line discipline
+        // in the kernel's tty layer, and there is none here: process.stdin
+        // records setRawMode and nothing more (packages/runtime/index.js), and
+        // the shell hands its foreground child raw keystrokes without echoing
+        // them (coreutils.js) exactly so the child can drive its own display.
+        // So the reader of a line is the thing that must show it, which is why
+        // the shell echoes at its own prompt and why this loop must at a `>>>`.
+        //
+        // Not one layer lower, in installStdin: that would echo every read the
+        // interpreter makes, including `getpass()`, and Python could not turn it
+        // off — Emscripten's tty answers tcgetattr with ECHO already clear and
+        // accepts a tcsetattr it then ignores, so getpass believes echo is off,
+        // prints no warning, and the password would go up on the screen.
+        //
+        // To stderr, not stdout, because echo is a write to the terminal and not
+        // part of what this process produces: `cat script.py | python > out` must
+        // not find the typed source in out. And only with a terminal attached
+        // (VV_TTY, the shell's own marker — the same one `ls` colours on), so a
+        // captured or scripted run stays byte-for-byte what it was.
+        const echo = process.env.VV_TTY === "1" ? (text) => process.stderr.write(text) : null;
+        const readLine = makeLineReader(null, echo);
 
         // One statement per macrotask rather than a `while` loop, so timers and
         // the process's own exit path get their turn between lines.
@@ -2334,6 +2414,9 @@ json.dumps({
             return;
           }
           feed(line);
+          // An `exit()` on that line ended the session. Reading again would park
+          // this process on a stdin nobody is going to type into.
+          if (ended) return;
           setTimeout(step, 0);
         };
         prompt();

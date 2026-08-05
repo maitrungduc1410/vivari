@@ -3356,7 +3356,7 @@ console.log("\n== input() waits, because stdin got a syscall ==");
 
   const pySrc = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
   const replBody = pySrc.slice(pySrc.indexOf("function repl(indexUrl)"), pySrc.indexOf("web server bridge"));
-  ok(/makeLineReader\(\)/.test(replBody), "the REPL takes its lines from the blocking reader");
+  ok(/makeLineReader\(null, echo\)/.test(replBody), "the REPL takes its lines from the blocking reader");
   // Comments stripped, or this matches the comment explaining the change.
   const replCode = replBody.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
   ok(!/stdin\.on\(/.test(replCode) && !/process\.stdin/.test(replCode),
@@ -3366,6 +3366,99 @@ console.log("\n== input() waits, because stdin got a syscall ==");
   ok(/__ocReadStdin/.test(runtimeSrc), "the runtime exposes it to the guest");
   ok(!/process\.stdin[\s\S]{0,200}readStdin/.test(runtimeSrc),
     "…and does NOT wire it into process.stdin, which would let a Node program park its own event loop");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the >>> prompt: seeing what you type, and leaving ==");
+// One session produced both of these: the person's keystrokes never appeared, so
+// the only thing on screen was the output of the print() statements they were
+// typing blind, and `exit()` answered with a SystemExit traceback and another
+// prompt. Neither is reachable from here in full — repl() needs a booted
+// interpreter and a person at a terminal — so the parts are checked where they
+// live: the line discipline as a function, the classification as a function, and
+// the wiring between them as source. The interpreter half (that a typed exit()
+// really does raise out of InteractiveConsole.push, and that the exit code is the
+// one a real REPL leaves) is the bridge tier's `termination` case.
+// ---------------------------------------------------------------------------
+{
+  // Type `chunks` at a reader that echoes, and report what was shown and what
+  // Python would have been handed.
+  const typed = (chunks) => {
+    const shown = [];
+    const lines = [];
+    const read = makeLineReader(() => (chunks.length ? chunks.shift() : null), (t) => shown.push(t));
+    for (let line; (line = read()) !== null; ) lines.push(line);
+    return { shown: shown.join(""), lines };
+  };
+
+  const keystrokes = typed(["p", "r", "i", "n", "t", "(", "1", ")", "\n"]);
+  ok(keystrokes.shown === "print(1)\n", `each keystroke appears as it is typed (${JSON.stringify(keystrokes.shown)})`);
+  ok(keystrokes.lines.length === 1 && keystrokes.lines[0] === "print(1)",
+    "…and the interpreter still gets one line, not one line per keystroke");
+
+  const pasted = typed(["x = 1\ny = 2\n"]);
+  ok(pasted.shown === "x = 1\ny = 2\n", "a paste is shown whole, because a terminal echoes what arrives");
+  ok(pasted.lines.join("|") === "x = 1|y = 2", "…and is still the two lines it is");
+
+  // Erase. Without it the echo makes things worse than silence: the typo stays in
+  // the source for the parser AND is now on the screen.
+  const corrected = typed(["pritn", "\x7f\x7f", "nt", "(1)\n"]);
+  ok(corrected.lines[0] === "print(1)", `DEL takes the character out of the line (${corrected.lines[0]})`);
+  ok(corrected.shown === "pritn\b \b\b \bnt(1)\n", "…and off the screen, the way a cooked terminal does");
+
+  const atPrompt = typed(["\x7f", "1\n"]);
+  ok(atPrompt.shown === "1\n" && atPrompt.lines[0] === "1",
+    "a DEL at a fresh prompt rubs out nothing — what is to its left is the prompt, not a character");
+
+  // The newline is what submitted the line before it; erasing through it would
+  // splice two statements into one.
+  const acrossLines = typed(["a\n\x7fb\n"]);
+  ok(acrossLines.lines.join("|") === "a|b", `DEL does not reach back into the line already submitted (${acrossLines.lines.join("|")})`);
+
+  // An arrow key is ESC [ A. Echoed verbatim it would drive the terminal's cursor
+  // up into output printed earlier and put the rest of the line there, so control
+  // characters are shown the way a terminal with ECHOCTL shows them.
+  const arrow = typed(["\x1b[A", "\n"]);
+  ok(arrow.shown === "^[[A\n", `an arrow key is shown as ^[[A rather than steering the cursor (${JSON.stringify(arrow.shown)})`);
+  ok(arrow.lines[0] === "\x1b[A", "…while the bytes still reach Python, which is what a REPL with no readline gets anywhere");
+  ok(typed(["if x:\n\tpass\n"]).shown === "if x:\n\tpass\n",
+    "…but a tab is a tab, since indenting a block is the point of typing one");
+
+  // And with no echo sink the reader is the plain assembler it was, so nothing
+  // that reads stdin without a person at the other end changes behaviour.
+  ok(makeLineReader(() => "a\x7f\n")() === "a\x7f",
+    "without an echo sink, nothing is cooked and nothing is written");
+
+  // ---- which ending is which -------------------------------------------------
+  const kind = (type, message) => terminationFromError({ type, message }).kind;
+  ok(kind("SystemExit", "SystemExit: None") === "exit",
+    "a SystemExit is named as an exit, so the REPL can act on it without a second parser");
+  ok(kind("KeyboardInterrupt", "KeyboardInterrupt") === "interrupt",
+    "…a Ctrl-C as an interrupt, which a REPL survives");
+  ok(kind("ValueError", "ValueError: nope") === "error",
+    "…and everything else as one statement's error, which is the only one that prints a traceback");
+
+  // ---- the wiring ------------------------------------------------------------
+  const pySrc = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  const replBody = pySrc.slice(pySrc.indexOf("function repl(indexUrl)"), pySrc.indexOf("web server bridge"));
+  const replCode = replBody.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+  ok(/process\.env\.VV_TTY === "1"/.test(replCode),
+    "the REPL echoes only with a terminal attached, so a captured or piped run is byte-for-byte what it was");
+  ok(/process\.stderr\.write\(text\)/.test(replCode),
+    "…to the terminal rather than into its own stdout, which may be a pipe or a redirect");
+  ok(/terminationFromError\(e\)/.test(replCode) && /kind === "exit"/.test(replCode) && !/SystemExit/.test(replCode),
+    "exit() is recognised by this file's one SystemExit parser, not by a second copy of it");
+  ok(/if \(ended\) return;/.test(replCode),
+    "…and the loop stops after it, rather than parking on a stdin nobody will type into");
+  ok(/KeyboardInterrupt/.test(replCode) && /more = false;/.test(replCode),
+    "a Ctrl-C still prints the name and goes back to a fresh prompt");
+
+  // The layer decision, as an assertion: echoing inside the interpreter's own
+  // stdin would echo getpass() too, and Python could not turn it off — Emscripten
+  // answers tcgetattr with ECHO already clear and accepts a tcsetattr it ignores,
+  // so getpass would print no warning and the password would be on the screen.
+  const stdinBody = pySrc.slice(pySrc.indexOf("export function installStdin"), pySrc.indexOf("export function installBlockingPatch"));
+  ok(!/write\(/.test(stdinBody), "the interpreter's own stdin does not echo, because getpass() could not switch it off");
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Python checks passed");

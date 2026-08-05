@@ -9262,3 +9262,110 @@ itself is modelled in `scripts/lib/pyodide-runtime-env.mjs` and pinned from both
 ends the way `urllib3-emscripten.mjs` is: the offline tier asserts the model still
 contains every fragment, the bridge tier asserts every fragment is still in the
 real `pyodide.mjs.map` and `pyodide.asm.mjs`.
+
+## Typing at the `>>>` prompt showed nothing (this change)
+
+One session, two bugs, and the transcript reads as if the interpreter had lost its
+mind:
+
+    python-py-app$ python
+    Python 3.14.2 (Pyodide) on Vivari
+    >>> 1
+    >>> 2
+    >>> Traceback (most recent call last):
+      File "/lib/python314.zip/code.py", line 324, in push
+    SystemExit: None
+
+The `1` and the `2` are the *output* of `print(1)` and `print(2)`. Nothing the
+person typed was ever on the screen, so they were typing blind and reading only
+their own results back. (The traceback is the second bug, in the entry below.)
+
+**The echo was lost by the change that gave `input()` a stdin.** The REPL used to
+read the flowing `process.stdin`, and moving it onto the blocking stdin syscall was
+correct and remains correct — one process, one stdin, one reader — but it also
+moved the loop out from under the only thing that had been showing the keystrokes.
+Not the terminal: xterm does not echo, and never did. The shell. `sh` echoes the
+characters *it* reads, and hands a foreground child raw keystrokes without echoing
+them, deliberately, so a program that draws its own display is not fighting a
+second writer. `process.stdin.setRawMode` records the mode and does nothing else,
+because there is no cooked-mode line discipline anywhere below the guest. So in
+this system the rule is: **whoever reads a line is the thing that has to show it**,
+which is why `sh` does it at its own prompt and why `repl()` now does it at a
+`>>>`.
+
+The line reader gained the rest of what a canonical-mode terminal does, because
+echo alone would have made two things worse than silence. DEL now rubs a character
+out of the line as well as off the screen — otherwise the typo stayed in the source
+for the parser *and* was visible. And a control byte is shown as `^X` rather than
+sent on: an arrow key is the three bytes `ESC [ A`, and echoing those verbatim
+drives the terminal's cursor up into output printed earlier and types the rest of
+the line there. Both are what a terminal with ECHOCTL does, and the bytes still
+reach Python, which is what a REPL with no readline gets anywhere.
+
+**Echoing one layer down, in `installStdin`, is the version of this fix that leaks a
+password.** That callback is every read the interpreter makes, `getpass()` included,
+and Python cannot switch it off here: Emscripten's tty answers `tcgetattr` with the
+ECHO bit already clear and accepts a `tcsetattr` that it then ignores, both measured
+against the real interpreter. `getpass` therefore believes echo is already off,
+prints none of the warnings it has for the case where it cannot control the
+terminal, and would read the password onto the screen. So the echo lives in the loop
+that knows the line it is reading is source code meant to be seen, and `input()` at
+a prompt is deliberately still silent — a real gap, and the honest one to leave
+until there is a way for Python to say "not this read".
+
+It writes to **stderr**, not stdout, because an echo is a write to the terminal and
+not part of what the process produces: `cat x.py | python > out` must not find the
+typed source in `out`. (CPython puts its own `>>>` prompts on stderr for the same
+reason; ours are still on stdout, which is a separate and much smaller wrong.) And
+only with `VV_TTY=1` — the marker the interactive `sh` sets and children inherit,
+the same one colours `ls` — so a captured or scripted run is byte-for-byte what it
+was.
+
+**What is proven, and what one pass in a browser still has to confirm.** The offline
+tier holds the line discipline as a function: keystrokes, a paste, DEL, DEL at a
+fresh prompt, DEL that must not reach back through a submitted newline, an arrow
+key, a tab. `repl()` itself is not runnable in any tier — it needs a booted
+interpreter *and* a person at a terminal — so the loop's own sequencing is checked
+by reading it. Worth knowing before that pass: `sh` forwards a Ctrl-D to a
+foreground child as the raw byte `0x04` rather than ending its stdin, so the REPL's
+end-of-input path is reached when the terminal closes and not by that key. It now
+shows `^D` instead of nothing, which is at least visible. That is a shell bug, not
+this one, and it has no test that can run here.
+
+## …and `exit()` answered with a traceback instead of leaving (this change)
+
+The second half of the same session, and the one with the tidier cause: `exit()` was
+a message to the loop that the loop read as an error.
+
+CPython's `code.InteractiveInterpreter.runcode` re-raises `SystemExit` instead of
+reporting it, precisely so that the loop driving the console can end the session —
+that re-raise is the whole mechanism by which a REPL quits. Ours wrapped `push()` in
+a try/catch that treated every exception as printable text and prompted again, so the
+one line every user of a REPL knows how to type produced a WASM traceback ending in
+`SystemExit: None` and then a fresh `>>>`.
+
+**The fix reuses the SystemExit reading this file already had for scripts rather than
+growing a second one.** `terminationFromError` had all of the rules — a bare
+`sys.exit()` is 0, an integer is itself, a string prints and is 1, and bools are ints
+so `sys.exit(not ok)` reports success on success — and the only thing the REPL needed
+that a script does not is *which* of the three endings it is looking at. So the
+helper now names it (`exit`, `interrupt`, `error`) and the loop acts on the name: an
+`exit` flushes, prints the message if there is one, and resolves with the code, which
+`programs/python.js` already turns into the process's exit status. `exit()`/`exit(0)`
+leave 0, `exit(3)` leaves 3, `exit("bye")` prints `bye` to stderr and leaves 1.
+
+Two neighbours a change like this is most likely to break, and neither did. Ctrl-D is
+still a newline and 0 — a different path entirely (`readLine()` returning null).
+A Ctrl-C must *not* end the session: it still prints `KeyboardInterrupt` alone and
+returns to a fresh top-level prompt, abandoning any half-typed block, because the
+interrupt is classified before the exit is and the loop only leaves on the latter.
+The loop also stops reading once it has finished, or the process would park on the
+stdin syscall waiting for a line nobody is going to type while its own exit unwinds.
+
+**The oracle is a real REPL, not our reading of one.** The bridge tier types each of
+those lines at a real `code.InteractiveConsole` in real Pyodide, asserts that the
+`SystemExit` genuinely comes back out of `push()` — the claim the whole fix rests on
+— and requires the verdict to equal what the CPython on the machine does when the
+same lines are piped into `python3 -q -i`. That is a second oracle in
+`scripts/lib/cpython-exit.mjs` next to the script one that was already there, because
+the two paths reach the exit differently and only one of them was ever measured.

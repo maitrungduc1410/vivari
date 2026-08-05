@@ -2561,6 +2561,17 @@ Gotchas:
   `sys.exit(pytest.main(...))` on every run. Note Pyodide's WebLoop *also* re-raises
   SystemExit as a second, unhandled rejection — harmless in a browser, but Node aborts on
   it, so headless harnesses must swallow it.
+- **The interactive REPL is a second SystemExit path, and it echoes.** `exit()` typed at a
+  `>>>` comes back OUT of `code.InteractiveConsole.push` — CPython's `runcode` re-raises
+  `SystemExit` for the loop above it to act on — so `repl()` ends the session there, with
+  the code `terminationFromError` reads (it now names the ending: `exit`/`interrupt`/
+  `error`, so there is still one parser). A `KeyboardInterrupt` must NOT end it: name
+  printed, fresh top-level prompt. And the loop echoes what it reads, to **stderr** and only
+  under `VV_TTY=1`, because nothing below the guest cooks a terminal (see the shell/stdin
+  section). Do not move that echo into `installStdin`: it would cover `getpass()`, which
+  cannot turn it off — Emscripten's tty reports ECHO already clear and ignores `tcsetattr`,
+  so no warning is printed and the password is on the screen. `input()` echo is therefore
+  still missing, on purpose.
 - **Django works, but only on WSGI**, and only with `DJANGO_ALLOW_ASYNC_UNSAFE=1` and
   `tzdata`. Its ASGI path goes through `asgiref`, which starts a `ThreadPoolExecutor` per
   request even for `async def` views — the existing `anyio` patch does not help, that is a
@@ -3492,7 +3503,13 @@ runtime's `drainStdin` normalizes strings vs bytes to a Buffer). The host termin
 The interactive line editor (echo, backspace, Ctrl+C→SIGINT the whole foreground
 job — every stage of a pipeline via `currentKill`, with keystrokes forwarded to
 the pipeline's first stage) lives in the `sh` coreutil, not in a TTY line
-discipline — there's nothing cooked below it. It also does **↑/↓ history recall**
+discipline — there's nothing cooked below it. **The consequence for any other
+program that reads lines: whoever reads a line has to show it.** `sh` echoes only
+what *it* reads and forwards raw keystrokes to a foreground child on purpose, and
+`process.stdin.setRawMode` merely records the mode, so a child that reads and does
+not echo (which is what the Python REPL did) leaves the person typing blind. Echo
+belongs in that program's own read loop — see `repl()` in `builtins/python.js`,
+which echoes to stderr under `VV_TTY` for the reasons in the Python section. It also does **↑/↓ history recall**
 (a module-scoped `commandHistory` array shared with the `history` builtin, which
 lists it bash-style 1-indexed) and **Tab completion** (first token → builtins +
 PATH programs; later tokens → the VFS, dirs suffixed `/`; unique match inserts +
@@ -4196,6 +4213,26 @@ Two smaller ones from the same batch, both worth knowing before you touch these 
   the change.** The blocking stdin syscall worked on the first try; what it broke was the REPL,
   which had been reading the flowing stream perfectly happily until an `input()` at a `>>>` prompt
   could take stdin away from it.
+- **Moving a reader moves it out from under whatever was quietly serving it.** The same move cost
+  the REPL its echo, and it took a user session to notice: nothing the person typed appeared, so
+  the only thing on screen was the output of the `print()` calls they were typing blind. Nothing
+  in this system echoes on a program's behalf — xterm does not, `process.stdin.setRawMode` only
+  records the mode, and `sh` echoes what *it* reads and forwards raw bytes to a foreground child
+  deliberately. Ask what the layer you are leaving was doing for you besides the thing you came
+  for.
+- **The layer that is easiest to echo from is the one that leaks the password.** Echoing inside
+  `installStdin` — the interpreter's own stdin callback — would have covered `input()` too, and
+  `getpass()` could not have switched it off: Emscripten's tty answers `tcgetattr` with ECHO
+  already clear and accepts a `tcsetattr` it ignores, so getpass prints none of its "cannot
+  control the terminal" warnings and reads the password onto the screen. Both facts were measured
+  against the real interpreter before the layer was chosen. Echo therefore sits in the REPL loop,
+  which knows its line is source meant to be seen, and `input()` echo stays an open gap.
+- **A `SystemExit` that CPython re-raises is a message to the loop above it.**
+  `code.InteractiveInterpreter.runcode` re-raises it instead of reporting it *because* the driving
+  loop is supposed to end the session; a `catch` that treats every exception as printable text
+  turns `exit()` into a traceback plus another prompt. When you find yourself parsing one, check
+  whether the file already has a parser — `terminationFromError` did, and now reports which of
+  `exit`/`interrupt`/`error` it found so the REPL can act without a second copy of the rules.
 - **A skip-list entry is a recorded reason, not a rule.** `python` was excluded from debug targets
   because instrumenting a Node shim debugs the shim. Deleting the entry to add Python debugging
   would have done exactly the thing the comment warned about — and done it silently, offering

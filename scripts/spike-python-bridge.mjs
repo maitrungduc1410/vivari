@@ -84,7 +84,7 @@ import {
   walkPyodide,
 } from "../packages/runtime/builtins/python-store.js";
 import { readShippedTemplates, readTemplatesSource } from "./lib/shipped-templates.mjs";
-import { CPYTHON_EXITS, UNTRUNCATED } from "./lib/cpython-exit.mjs";
+import { CPYTHON_EXITS, CPYTHON_REPL_EXITS, UNTRUNCATED, realCPythonReplExit } from "./lib/cpython-exit.mjs";
 import { MODELLED_FRAGMENTS, normalize } from "./lib/urllib3-emscripten.mjs";
 import {
   ASM_FRAGMENTS as ENV_ASM_FRAGMENTS,
@@ -2251,6 +2251,38 @@ r
       ok(/Traceback/.test(t.report) && /ValueError: nope/.test(t.report),
         "…and keeps its whole traceback, rather than being quietly swallowed");
     }
+
+    // The same exit, typed at a `>>>`. A different route entirely: the REPL runs
+    // Python's own code.InteractiveConsole, whose runcode re-raises SystemExit
+    // for the loop above it to act on — so this asserts that the exception really
+    // does come back OUT of push() (it used to be reported as a printable error,
+    // which is how `exit()` answered with a traceback and another prompt), and
+    // that the verdict drawn from it is the one a real REPL gives.
+    py.runPython("import code as _vv_probe_code");
+    for (const row of CPYTHON_REPL_EXITS) {
+      // A console per row: the exception leaves the session, so the next row is
+      // the next session, exactly as it is for a person who typed exit().
+      const console_ = py.runPython("_vv_probe_code.InteractiveConsole()");
+      let t = { code: "<no exception>", report: "" };
+      try {
+        for (const line of row.lines) console_.push(line);
+      } catch (e) {
+        ok(e.type === "SystemExit", `typing ${JSON.stringify(row.lines.join(" / "))} raises SystemExit out of push() (${e.type})`);
+        t = terminationFromError(e);
+      }
+      console_.destroy();
+      ok(t.kind === "exit" && t.code === row.code && t.report === row.report,
+        `…and the REPL reads it as exit ${t.code}, printing ${JSON.stringify(t.report)}`);
+      const real = realCPythonReplExit(row.lines, spawnSync);
+      if (real === null) ok(false, "no python3 on PATH to check the REPL exits against");
+      else ok(real.code === row.code && real.report === row.report,
+        `…which is what a real REPL does: exit ${real.code}, printing ${JSON.stringify(real.report)}`);
+    }
+
+    // The neighbour that must NOT end the session. A REPL that exited on
+    // KeyboardInterrupt would lose the whole session to a fat-fingered Ctrl-C.
+    ok(terminationFromError({ type: "KeyboardInterrupt", message: "KeyboardInterrupt" }).kind === "interrupt",
+      "a Ctrl-C is classified as an interrupt, which the REPL survives rather than exits on");
   }
 
   // --- the WSGI environ, against CPython's own PEP 3333 validator -----------
