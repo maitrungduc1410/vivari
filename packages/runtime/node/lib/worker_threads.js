@@ -39,6 +39,9 @@ export default function (exports, require, module, process) {
   // straight on ports returned by `new MessageChannel()`, so bridge the
   // EventEmitter surface onto the platform prototype. The ports stay real (and
   // therefore transferable in a transferList); we only add methods.
+  // Both assigned by patchMessagePortPrototype, which owns the port bookkeeping.
+  let duringInternalSetup = false;
+  let internalPortSetup = (fn) => fn();
   patchMessagePortPrototype(g.MessagePort);
 
   // ---- a single event queue drained inside a loop turn (like #15) -----------
@@ -74,8 +77,10 @@ export default function (exports, require, module, process) {
     let refs = 0;
     const retain = () => { if (refs++ === 0 && host) host.retain(); };
     const release = () => { if (refs > 0 && --refs === 0 && host) host.release(); };
-    raw.onmessage = (e) => enqueue(ee, "message", [e.data]);
-    try { raw.start && raw.start(); } catch { /* onmessage auto-starts */ }
+    internalPortSetup(() => {
+      raw.onmessage = (e) => enqueue(ee, "message", [e.data]);
+      try { raw.start && raw.start(); } catch { /* onmessage auto-starts */ }
+    });
     ee.postMessage = (value, transferList) => raw.postMessage(value, transferList || []);
     ee.start = () => {};
     ee.close = () => { try { raw.close(); } catch { /* ignore */ } if (refs > 0) { refs = 0; host && host.release(); } };
@@ -195,10 +200,16 @@ export default function (exports, require, module, process) {
       this._exited = false;
       this._exitCode = null;
       this._refed = true;
+      this._msgRefs = 0;
+      this._portHeld = false;
+      this.on("newListener", (name) => { if (name === "message") this._msgRetain(); });
+      this.on("removeListener", (name) => { if (name === "message") this._msgRelease(); });
 
       const { port1, port2 } = new g.MessageChannel();
       this._port = port1;
-      port1.onmessage = (e) => enqueue(this, "message", [e.data]);
+      internalPortSetup(() => {
+        port1.onmessage = (e) => enqueue(this, "message", [e.data]);
+      });
       try { port1.start && port1.start(); } catch { /* auto-starts */ }
 
       workers.set(reqId, this);
@@ -234,8 +245,53 @@ export default function (exports, require, module, process) {
       return Promise.resolve(this._exitCode | 0);
     }
 
-    ref() { if (!this._refed && !this._exited) { this._refed = true; host && host.retain(); } }
-    unref() { if (this._refed && !this._exited) { this._refed = false; host && host.release(); } }
+    // A Worker holds the parent's loop open TWICE: once for the thread handle,
+    // and once for the public MessagePort underneath `worker.on('message')`.
+    // ref()/unref() move both, and the port can be re-taken afterwards, which
+    // makes the observable behaviour depend on the ORDER of the two calls. On
+    // real Node:
+    //
+    //   w.unref(); w.on('message', …)   → parent waits, and hears the reply
+    //   w.on('message', …); w.unref()   → parent exits, reply never arrives
+    //
+    // because listening on a port start()s it, and starting refs it — so a
+    // listener added AFTER unref() takes a fresh hold, while one added before is
+    // dropped along with everything else. (Both were measured on Node 22, at a
+    // 1.5s reply, after an earlier version of this modelled only the first line
+    // and broke the second.)
+    //
+    // Neither line is a curiosity. The first is @napi-rs/wasm-runtime (rolldown's
+    // wasm32-wasi binding, which vitest 4 pulls in through Vite 8): it unrefs each
+    // pool worker the moment it spawns one and then awaits the reply. Modelling
+    // unref() as the only hold, our loop went idle between "spawn" and "reply" and
+    // the process exited — no error, no output, exit 0, which is the worst way to
+    // fail a test run. The second is what unref() is FOR: a parent that should not
+    // be held open by a listener it left attached to a background worker.
+    ref() {
+      if (!this._refed && !this._exited) { this._refed = true; host && host.retain(); }
+      if (this._msgRefs > 0) this._portRef();
+    }
+    unref() {
+      if (this._refed && !this._exited) { this._refed = false; host && host.release(); }
+      this._portRelease();
+    }
+
+    // The port half. `_msgRefs` counts 'message' listeners; `_portHeld` is whether
+    // the port is currently holding the loop, which unref() can drop while
+    // listeners remain and a later listener can take back.
+    _portRef() {
+      if (!this._portHeld && !this._exited && host) { this._portHeld = true; host.retain(); }
+    }
+    _portRelease() {
+      if (this._portHeld && host) { this._portHeld = false; host.release(); }
+    }
+    _msgRetain() {
+      this._msgRefs++;
+      this._portRef();
+    }
+    _msgRelease() {
+      if (this._msgRefs > 0 && --this._msgRefs === 0) this._portRelease();
+    }
 
     // The child's real stdout/stderr already flow through the kernel to the
     // parent, so we don't re-pipe bytes here. But pool libraries (vitest/tinypool
@@ -266,6 +322,10 @@ export default function (exports, require, module, process) {
       // never drains this event.
       enqueue(w, "exit", [msg.code | 0], () => {
         if (w._refed && host) host.release();
+        // The port's hold ends with the thread: there is nothing left that could
+        // send a message, so listeners still attached must not pin the loop.
+        w._msgRefs = 0;
+        w._portRelease();
       });
     }
   }
@@ -345,6 +405,56 @@ export default function (exports, require, module, process) {
     const LISTENERS = Symbol("vvPortListeners");
     const bag = (port) => port[LISTENERS] || (port[LISTENERS] = new Map());
     const dataEvents = new Set(["message", "messageerror"]);
+
+    // A listening port keeps the process alive, which is the whole reason a
+    // channel handed to someone else is usable: you listen, they reply later,
+    // and Node is still running when they do. The platform MessagePort has no
+    // such notion — the host worker's loop is not ours — so the hold is ours to
+    // model, on the same counter every other handle uses.
+    //
+    // Without it, `const { port1, port2 } = new MessageChannel()` plus
+    // `port1.on('message', …)` was a promise waiting on an event loop that had
+    // already decided it had nothing to do. That is how `vitest run` exited 0
+    // having run nothing: rolldown's wasm binding (@napi-rs/wasm-runtime, via
+    // Vite 8) spawns its wasi worker, hands it a channel, and awaits the reply.
+    // The reply was on its way; the process was not there to receive it.
+    //
+    // ref()/unref() move the hold without touching the listener count, so the
+    // Node ordering holds: unref() then on('message') listens and waits,
+    // on('message') then unref() lets the process go.
+    const HELD = Symbol("vvPortHeld");
+    const MSG_REFS = Symbol("vvPortMsgRefs");
+    // Which ports are the GUEST's. A port becomes one by being created through
+    // the guest's MessageChannel or by the guest listening on it; the runtime's
+    // own plumbing ports never are, so their ref() stays purely the platform's.
+    // Assigning `port.onmessage` refs the port — Node's own EventTarget
+    // bookkeeping calls ref() from the newListener hook — and the runtime does
+    // that on its OWN ports: the Worker's half of the parent<->child channel, and
+    // the raw port behind parentPort. Those are plumbing, not the guest's loop, so
+    // the ref that comes back through here during our setup must not hold the
+    // guest open. Held it once and every worker spawn hung: the parent waited on a
+    // child whose own runtime port was keeping it alive for ever.
+    internalPortSetup = (fn) => {
+      const prev = duringInternalSetup;
+      duringInternalSetup = true;
+      try {
+        return fn();
+      } finally {
+        duringInternalSetup = prev;
+      }
+    };
+    const portRef = (port) => {
+      if (!port[HELD] && host) {
+        port[HELD] = true;
+        host.retain();
+      }
+    };
+    const portRelease = (port) => {
+      if (port[HELD] && host) {
+        port[HELD] = false;
+        host.release();
+      }
+    };
     proto.addListener = proto.on = function on(type, listener) {
       const wrapped = dataEvents.has(type) ? (e) => listener(e.data) : (e) => listener(e);
       const b = bag(this);
@@ -358,6 +468,8 @@ export default function (exports, require, module, process) {
         } catch {
           /* onmessage/addEventListener already auto-started it */
         }
+        this[MSG_REFS] = (this[MSG_REFS] || 0) + 1;
+        portRef(this);
       }
       return this;
     };
@@ -375,6 +487,7 @@ export default function (exports, require, module, process) {
       if (wrapped) {
         this.removeEventListener(type, wrapped);
         byType.delete(listener);
+        if (type === "message" && this[MSG_REFS] > 0 && --this[MSG_REFS] === 0) portRelease(this);
       }
       return this;
     };
@@ -384,6 +497,10 @@ export default function (exports, require, module, process) {
         const byType = b.get(t);
         if (byType) for (const w of byType.values()) this.removeEventListener(t, w);
         b.delete(t);
+        if (t === "message") {
+          this[MSG_REFS] = 0;
+          portRelease(this);
+        }
       }
       return this;
     };
@@ -403,8 +520,44 @@ export default function (exports, require, module, process) {
       const byType = bag(this).get(type);
       return byType ? byType.size : 0;
     };
-    if (!proto.ref) proto.ref = function ref() { return this; };
-    if (!proto.unref) proto.unref = function unref() { return this; };
+    // ref() takes the hold with no listener required, and that is not a detail:
+    // it is the whole mechanism @emnapi/runtime uses to keep Node alive while a
+    // native async request is outstanding — `new MessageChannel().port1`, ref()
+    // on the way in, unref() on the way out, nothing ever listening. rolldown's
+    // wasm binding is built on it, so a ref() that quietly required a listener
+    // was a process exiting in the middle of napi work it had been asked to wait
+    // for.
+    //
+    // These WRAP the platform's ref/unref/close rather than replacing them, and
+    // only add the guest hold for a port the guest owns (GUEST below). Headless,
+    // the platform MessagePort is the host's own Node MessagePort and the runtime
+    // shares its realm, so this prototype is also the one the process worker's fs
+    // and thread plumbing runs on — and Node's internal listener bookkeeping
+    // calls port.ref() itself. Replacing ref() outright pointed those internal
+    // calls at OUR counter, which held a guest loop open on a port the guest had
+    // never heard of: every worker spawn hung, one layer below anything a guest
+    // could see.
+    const rawRef = proto.ref;
+    const rawUnref = proto.unref;
+    const rawClose = proto.close;
+    proto.ref = function ref() {
+      if (!duringInternalSetup) portRef(this);
+      if (rawRef) rawRef.call(this);
+      return this;
+    };
+    proto.unref = function unref() {
+      portRelease(this);
+      if (rawUnref) rawUnref.call(this);
+      return this;
+    };
+    // A closed port can deliver nothing, so it must stop holding the loop —
+    // otherwise close() on the last channel would hang the process instead of
+    // ending it.
+    proto.close = function close(...args) {
+      this[MSG_REFS] = 0;
+      portRelease(this);
+      return rawClose ? rawClose.apply(this, args) : undefined;
+    };
     if (!proto.setMaxListeners) proto.setMaxListeners = function setMaxListeners() { return this; };
     if (!proto.getMaxListeners) proto.getMaxListeners = function getMaxListeners() { return 0; };
   }

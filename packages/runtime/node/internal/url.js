@@ -56,6 +56,16 @@ export default function (exports, require, module, process, internalBinding, pri
 
   module.exports = {
     URL,
+    // Node's non-throwing parse: a URL, or null when the input is not one. Used by
+    // SocketAddress.parse(), which must return undefined rather than throw for
+    // something that is not an address.
+    URLParse: (input, base) => {
+      try {
+        return base === undefined ? new URL(input) : new URL(input, base);
+      } catch {
+        return null;
+      }
+    },
     URLSearchParams,
     isURL,
     urlToHttpOptions,

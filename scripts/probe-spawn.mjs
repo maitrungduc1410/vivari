@@ -2,6 +2,7 @@
 // ['--enable-source-maps', 'main.js'], {stdio:'inherit'}) work in-VM?
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
+import { initTransferList } from "../packages/kernel-host/worker-transfer.js";
 import { Worker, MessageChannel } from "node:worker_threads";
 
 const fsWorker = new Worker(new URL("./fs-worker.mjs", import.meta.url));
@@ -15,9 +16,10 @@ const spawnWorker = (info) => {
   const { port1, port2 } = new MessageChannel();
   fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
   const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
-  const transfer = [port1];
-  if (info.threadPort) { init.threadPort = info.threadPort; transfer.push(info.threadPort); }
-  w.postMessage(init, transfer);
+  if (info.threadPort) init.threadPort = info.threadPort;
+  // A worker pool (tinypool, piscina, synckit) puts a MessagePort in workerData;
+  // initTransferList is what knows those must be transferred on to the child.
+  w.postMessage(init, initTransferList(info, port1));
   return { terminate: () => { w.terminate(); fsWorker.postMessage({ type: "fs-unregister", client: info.pid }); }, postMessage: (m) => w.postMessage(m) };
 };
 const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, fetcher: async () => ({ ok: false, status: 404, headers: {}, body: new Uint8Array() }), stdout: (c) => process.stdout.write(c), stderr: (c) => process.stdout.write(c) });

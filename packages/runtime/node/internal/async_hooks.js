@@ -10,9 +10,15 @@
 export default function (exports, require, module, process, internalBinding, primordials) {
   "use strict";
 
-  const owner_symbol = Symbol("owner_symbol");
-  const async_id_symbol = Symbol("async_id_symbol");
-  const trigger_async_id_symbol = Symbol("trigger_async_id_symbol");
+  // Minted by internalBinding('symbols') rather than here, so the vendored modules
+  // that read them from the binding (internal/blocklist.js) and the ones that read
+  // them from this module (lib/zlib.js, lib/net.js) get the SAME symbols. They used
+  // to be minted here, which was fine only while this module was the sole source.
+  const {
+    owner_symbol,
+    async_id_symbol,
+    trigger_async_id_symbol,
+  } = internalBinding("symbols");
 
   let asyncIdCounter = 1;
   const newAsyncId = () => ++asyncIdCounter;

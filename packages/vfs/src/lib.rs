@@ -249,6 +249,11 @@ struct Inode {
     data: NodeData,
     mode: u32,
     mtime: f64,
+    // Last access time, in ms since the epoch. Kept because utimes(2) sets BOTH
+    // times and a caller that reads one back gets the one it wrote; nothing in
+    // here advances it on a plain read, the way a real filesystem mounted
+    // `relatime` mostly does not either.
+    atime: f64,
     // Number of directory entries pointing at this inode (POSIX st_nlink). Hard
     // links (VFS.link) share one inode across several names; the inode is only
     // freed when the last link is removed. Regular files/dirs have exactly 1.
@@ -290,6 +295,7 @@ impl VirtualFileSystem {
                 data,
                 mode,
                 mtime: Self::now(),
+                atime: Self::now(),
                 nlink: 0, // linked (nlink -> 1) when attached to a parent dir
                 wopen: 0,
             },
@@ -936,6 +942,70 @@ impl VirtualFileSystem {
             .count() as u32
     }
 
+    /// chmod(2) / lchmod: replace the permission bits at `path`. `follow` resolves
+    /// a trailing symlink (chmod) or changes the link itself (lchmod).
+    ///
+    /// The mode is stored, not enforced — there is one user here and no kernel
+    /// beneath us — but stored is what callers actually need: an extracted archive
+    /// keeps its executable bits, `access(X_OK)` answers from what chmod set, and a
+    /// build script that chmods its own output and then runs it works. Dropping
+    /// the call (which is what happened before) meant stat() reported a mode
+    /// nobody had asked for.
+    pub fn set_mode(&mut self, path: String, mode: u32, follow: bool) -> Result<(), String> {
+        (|| {
+            let id = self.resolve(&path, follow)?;
+            let node = self.inodes.get_mut(&id).ok_or(VfsError::NoEnt)?;
+            node.mode = mode & 0o7777;
+            Ok(())
+        })()
+        .map_err(VfsError::code)
+    }
+
+    /// fchmod(2): the same, for an open fd.
+    pub fn fset_mode(&mut self, fd: u32, mode: u32) -> Result<(), String> {
+        (|| {
+            let of = self.open_files.get(&(fd as u64)).ok_or(VfsError::Badf)?;
+            let inode = of.inode;
+            let node = self.inodes.get_mut(&inode).ok_or(VfsError::Badf)?;
+            node.mode = mode & 0o7777;
+            Ok(())
+        })()
+        .map_err(VfsError::code)
+    }
+
+    /// utimes(2) / lutimes: set access and modification times, in ms since the
+    /// epoch. `follow` resolves a trailing symlink (utimes) or stamps the link
+    /// itself (lutimes).
+    pub fn set_times(
+        &mut self,
+        path: String,
+        atime_ms: f64,
+        mtime_ms: f64,
+        follow: bool,
+    ) -> Result<(), String> {
+        (|| {
+            let id = self.resolve(&path, follow)?;
+            let node = self.inodes.get_mut(&id).ok_or(VfsError::NoEnt)?;
+            node.atime = atime_ms;
+            node.mtime = mtime_ms;
+            Ok(())
+        })()
+        .map_err(VfsError::code)
+    }
+
+    /// futimes(2): the same, for an open fd.
+    pub fn fset_times(&mut self, fd: u32, atime_ms: f64, mtime_ms: f64) -> Result<(), String> {
+        (|| {
+            let of = self.open_files.get(&(fd as u64)).ok_or(VfsError::Badf)?;
+            let inode = of.inode;
+            let node = self.inodes.get_mut(&inode).ok_or(VfsError::Badf)?;
+            node.atime = atime_ms;
+            node.mtime = mtime_ms;
+            Ok(())
+        })()
+        .map_err(VfsError::code)
+    }
+
     /// ftruncate(2): grow (zero-filled) or shrink the file behind an open fd.
     pub fn ftruncate(&mut self, fd: u32, len: u32) -> Result<(), String> {
         (|| {
@@ -997,11 +1067,12 @@ impl VirtualFileSystem {
             NodeData::Symlink(t) => ("symlink", t.len()),
         };
         format!(
-            "{{\"kind\":\"{}\",\"size\":{},\"mode\":{},\"mtimeMs\":{},\"ino\":{},\"nlink\":{}}}",
+            "{{\"kind\":\"{}\",\"size\":{},\"mode\":{},\"mtimeMs\":{},\"atimeMs\":{},\"ino\":{},\"nlink\":{}}}",
             kind,
             size,
             node.mode,
             node.mtime,
+            node.atime,
             id,
             node.nlink.max(1)
         )

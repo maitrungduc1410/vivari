@@ -131,10 +131,22 @@ function applyLifetime(c, now) {
   return c;
 }
 
+// Bounds, for the same reason browsers have them: a jar with none is a guest
+// setting cookies in a loop and a `header()` that walks every one of them on
+// every request. The numbers follow the browsers rather than RFC 6265's much
+// lower "at least 50" floor, so nothing an app does on a real machine hits these
+// first here.
+export const MAX_COOKIE_BYTES = 4096; // name + value, as Chrome and Firefox cap it
+export const MAX_COOKIES = 180; // per jar, i.e. per port
+
 /**
  * One jar. A cookie's identity is (name, path) — NOT name alone: a server may
  * legitimately hold `sid` for `/admin` and a different `sid` for `/`, and
  * collapsing them would have one silently overwrite the other.
+ *
+ * A jar outlives the process that filled it, deliberately: restart a dev server
+ * on the same port and a real browser still holds its cookies, so clearing on
+ * exit would log the user out on every reload of their own code.
  */
 export class CookieJar {
   constructor() {
@@ -169,11 +181,29 @@ export class CookieJar {
         this.cookies.delete(key);
         continue;
       }
+      // Oversized cookies are dropped rather than truncated: half a signed
+      // session id verifies as nothing, so a silent truncation would look like a
+      // corrupt session instead of a refused one.
+      if (parsed.name.length + parsed.value.length > MAX_COOKIE_BYTES) continue;
       // Re-setting a cookie keeps its original creation order (RFC 6265 §5.3
       // step 11), which is what decides ties in the Cookie header below.
       const prev = this.cookies.get(key);
       parsed.seq = prev ? prev.seq : this.seq++;
       this.cookies.set(key, parsed);
+      // Evict the oldest, which is what browsers do when a domain is over its
+      // limit. The cookie just set is never the victim.
+      while (this.cookies.size > MAX_COOKIES) {
+        let oldestKey = null;
+        let oldestSeq = Infinity;
+        for (const [k, c] of this.cookies) {
+          if (c.seq < oldestSeq) {
+            oldestSeq = c.seq;
+            oldestKey = k;
+          }
+        }
+        if (oldestKey == null || oldestKey === key) break;
+        this.cookies.delete(oldestKey);
+      }
       n++;
     }
     return n;

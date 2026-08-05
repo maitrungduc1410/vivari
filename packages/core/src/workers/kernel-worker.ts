@@ -20,6 +20,7 @@
 import { newProgress, onFetch, onOutput, idleClear, stallVerdict, servingPids, shouldReportStall } from "../../terminal-feedback.js";
 import { Kernel } from "../../../kernel-host/kernel.js";
 import { createKernelFs } from "../../../kernel-host/kernel-fs.js";
+import { initTransferList } from "../../../kernel-host/worker-transfer.js";
 import { ensureRealNpm } from "../../../kernel-host/load-real-npm.js";
 import { ensureRealYarn } from "../../../kernel-host/load-real-yarn.js";
 import { ensureRealPnpm } from "../../../kernel-host/load-real-pnpm.js";
@@ -1336,44 +1337,6 @@ async function boot() {
   const [codecModule, cryptoModule] = await codecsReady;
   post("log", { line: `  [boot] codecs compiled (+${Date.now() - t0}ms).`, dim: true });
 
-  // Find MessagePort(s) embedded anywhere in a spawned thread's workerData so they
-  // can be added to the init message's transfer list (a port can't be cloned).
-  // Bounded (depth cap + visited set) against cyclic/huge graphs.
-  const collectWorkerDataPorts = (workerData) => {
-    const MP = (globalThis as { MessagePort?: unknown }).MessagePort;
-    const out = [];
-    if (!MP) return out;
-    const seen = new Set();
-    const visited = new WeakSet();
-    const scan = (v, depth) => {
-      if (!v || typeof v !== "object" || depth > 6) return;
-      if (v instanceof (MP as new () => unknown)) {
-        if (!seen.has(v)) {
-          seen.add(v);
-          out.push(v);
-        }
-        return;
-      }
-      if (visited.has(v)) return;
-      visited.add(v);
-      if (Array.isArray(v)) {
-        for (const x of v) scan(x, depth + 1);
-        return;
-      }
-      for (const k of Object.keys(v)) {
-        let child;
-        try {
-          child = v[k];
-        } catch {
-          continue;
-        }
-        scan(child, depth + 1);
-      }
-    };
-    scan(workerData, 0);
-    return out;
-  };
-
   // Spawn a process as a *nested* worker under this kernel worker. Each gets a
   // human-readable name (shown in DevTools' JS VM instance list) with its PID —
   // a Worker's name is fixed at creation, so naming it here (not from a pre-warmed
@@ -1473,18 +1436,13 @@ async function boot() {
       // …and which of the two backends is meant to read it.
       init.debugLang = info.debugLang || "js";
     }
-    const transfer = [port1];
-    if (info.threadPort) {
-      init.threadPort = info.threadPort;
-      transfer.push(info.threadPort);
-    }
+    if (info.threadPort) init.threadPort = info.threadPort;
     // #16 stage 2b: a spawned thread's workerData may embed MessagePort(s) — the
-    // createSyncFn/synckit pattern. They were transferred to us on the thread-spawn
-    // message; transfer them ON to the child too, else structuredClone rejects the
-    // init message ("A MessagePort could not be cloned because it was not
-    // transferred") and Worker() startup hangs/throws.
-    for (const p of collectWorkerDataPorts(info.spec && info.spec.workerData)) transfer.push(p);
-    worker.postMessage(init, transfer);
+    // tinypool/piscina/createSyncFn pattern. They were transferred to us on the
+    // thread-spawn message and have to be transferred ON to the child, else
+    // structuredClone rejects the whole init message. initTransferList is shared with
+    // every other host that builds this message, so they cannot disagree about it.
+    worker.postMessage(init, initTransferList(info, port1));
     return {
       terminate: () => {
         worker.terminate();

@@ -23,7 +23,7 @@ const ok = await runViteSpike({
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
   "dependencies": { "solid-js": "^1.9.0" },
-  "devDependencies": { "typescript": "^5.7.0", "vite": "^8.0.0", "vite-plugin-solid": "^2.11.0" }
+  "devDependencies": { "typescript": "^5.7.0", "@rolldown/binding-wasm32-wasi": "~1.2.0", "vite": "^8.0.0", "vite-plugin-solid": "^2.11.0" }
 }
 `,
     "vite.config.ts": `import { defineConfig } from 'vite'

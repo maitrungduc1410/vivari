@@ -19,6 +19,7 @@
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
 import { stubNodeGyp } from "../packages/kernel-host/node-gyp-stub.js";
+import { initTransferList } from "../packages/kernel-host/worker-transfer.js";
 import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
@@ -61,12 +62,10 @@ const spawnWorker = (info) => {
   const { port1, port2 } = new MessageChannel();
   fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
   const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
-  const transfer = [port1];
-  if (info.threadPort) {
-    init.threadPort = info.threadPort;
-    transfer.push(info.threadPort);
-  }
-  w.postMessage(init, transfer);
+  if (info.threadPort) init.threadPort = info.threadPort;
+  // A worker pool (tinypool, piscina, synckit) puts a MessagePort in workerData;
+  // initTransferList is what knows those must be transferred on to the child.
+  w.postMessage(init, initTransferList(info, port1));
   return {
     terminate: () => {
       w.terminate();
@@ -328,9 +327,18 @@ if (bound) {
 // stream — thrown only during the App Router's RSC refresh render (the request the
 // client re-issues after `serverComponentChanges`), never on a plain document GET.
 // It only reproduces on the best-effort AsyncLocalStorage polyfill (the studio's
-// browser-worker path), so run this gate with VV_NO_HOST_ALS=1 to guard against a
-// regression there — a streaming render returns its promise early while React
-// keeps rendering across awaits, so run() must not zero the store on settle.
+// browser-worker path), so the runner gives this spike VV_NO_HOST_ALS=1 — the gate
+// used to *say* to run it that way and nothing did, which made it a guard over the
+// host's real ALS and not over the polyfill it was written for. A streaming render
+// returns its promise early while React keeps rendering across awaits, so run()
+// must not zero the store on settle.
+//
+// Next 16 answers a bare `RSC: 1` GET with a 307 to `?_rsc=<hash>` (its cache
+// buster) and only renders Flight at that URL, so the gate follows the redirect the
+// way the client does. It did not, counted every 307 as a failure, and printed
+// "workStore/workUnit invariant REGRESSED" for eight redirects — a report naming a
+// cause it had not observed, which is worse than a bare failure: it sends the next
+// person to the wrong layer. The two reasons are now counted, and named, apart.
 let rscOk = true;
 if (bound) {
   console.log("\n== RSC refresh render (App Router HMR re-render) ==");
@@ -344,16 +352,25 @@ if (bound) {
     });
   const decodeB = (b) => (typeof b === "string" ? b : Buffer.from(b).toString());
   let invariants = 0;
+  let badStatus = 0;
   for (let i = 0; i < 8; i++) {
     const before = out.length;
-    const r = await rsc("/");
+    let r = await rsc("/");
+    for (let hop = 0; hop < 3 && (r.status === 307 || r.status === 308) && r.headers && r.headers.location; hop++) {
+      r = await rsc(r.headers.location);
+    }
     const body = decodeB(r.body || "");
     const chunk = out.slice(before).join("") + body;
-    if (r.status !== 200 || /Expected work(Unit)?Store to be initialized/.test(chunk)) invariants++;
+    if (/Expected work(Unit)?Store to be initialized/.test(chunk)) invariants++;
+    else if (r.status !== 200) {
+      badStatus++;
+      if (badStatus === 1) console.log(`  first bad status: ${r.status} ${JSON.stringify(r.headers || {}).slice(0, 200)}`);
+    }
     await new Promise((r) => setTimeout(r, 120));
   }
-  rscOk = invariants === 0;
-  console.log(`  RSC refresh renders clean: ${rscOk} (${8 - invariants}/8 ok)${rscOk ? "" : " ← workStore/workUnit invariant REGRESSED"}`);
+  rscOk = invariants === 0 && badStatus === 0;
+  const why = invariants ? ` ← workStore/workUnit invariant REGRESSED (${invariants}/8)` : badStatus ? ` ← ${badStatus}/8 did not render (status, not the invariant)` : "";
+  console.log(`  RSC refresh renders clean: ${rscOk} (${8 - invariants - badStatus}/8 ok)${why}`);
 }
 
 // ── optional: probe the HMR WebSocket exactly like the browser preview does ───

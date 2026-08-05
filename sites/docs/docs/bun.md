@@ -46,12 +46,15 @@ adapter (use the `bun:sqlite` module), `Bun.build`'s `minify` / `splitting` /
 `sourcemap` options (see [Bundling](#bundling-with-bunbuild) below), and Bun
 macros, which need no capability the sandbox lacks.
 
-**Zstandard and brotli** are in that second group. `Bun.zstdCompressSync` and its
-three siblings throw, and so do `node:zlib`'s `brotli*` and `zstd*` functions:
-Vivari's compression codec is built on flate2, which implements deflate and gzip
-only. Nothing about either format is browser-hostile — closing this means adding
-the engine to the Rust crate. `gzipSync` / `gunzipSync` / `deflateSync` /
-`inflateSync` are real and unaffected, on both the `Bun` global and `node:zlib`.
+**Zstandard** is in that second group. `Bun.zstdCompressSync` and its three
+siblings throw, and so does `node:zlib`'s `zstd*` family: every Rust zstd
+compressor is a binding to the C library, which does not build for the Wasm
+target Vivari's codec compiles to. Nothing about the format is browser-hostile —
+closing this means putting a pure-Rust engine in the crate. Brotli used to be
+listed here and no longer is: `node:zlib`'s `brotli*` functions compress and
+decompress for real, interoperably with libbrotli. `gzipSync` / `gunzipSync` /
+`deflateSync` / `inflateSync` are real and unaffected, on both the `Bun` global
+and `node:zlib`.
 
 ### Two members that stay quiet on purpose
 

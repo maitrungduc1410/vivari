@@ -18,6 +18,7 @@ import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
 // Retained Turbo-analog npm — no longer shipped in COREUTILS; installed here as
 // an offline test fixture (see makeKernel below).
 import { NPM_PROGRAM } from "../packages/kernel-host/programs/npm.js";
+import { initTransferList } from "../packages/kernel-host/worker-transfer.js";
 
 // Build a real gzipped ustar tarball from { "package/<path>": "<contents>" } so
 // the npm-install proof (Phase 2 #10) exercises the actual gunzip + tar parser
@@ -93,12 +94,10 @@ async function makeKernel() {
     // #16 stage 2b: a spawned thread also receives its parentPort (a MessagePort
     // transferred from its creator through us) alongside its fs doorbell.
     const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
-    const transfer = [port1];
-    if (info.threadPort) {
-      init.threadPort = info.threadPort;
-      transfer.push(info.threadPort);
-    }
-    worker.postMessage(init, transfer);
+    if (info.threadPort) init.threadPort = info.threadPort;
+    // A worker pool (tinypool, piscina, synckit) puts a MessagePort in workerData;
+    // initTransferList is what knows those must be transferred on to the child.
+    worker.postMessage(init, initTransferList(info, port1));
     return {
       terminate: () => {
         worker.terminate();

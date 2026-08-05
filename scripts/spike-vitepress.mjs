@@ -21,6 +21,7 @@
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
 import { stubNodeGyp } from "../packages/kernel-host/node-gyp-stub.js";
+import { initTransferList } from "../packages/kernel-host/worker-transfer.js";
 import { createAliasedFetcher } from "./lib/aliased-fetcher.mjs";
 import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
@@ -67,12 +68,10 @@ const spawnWorker = (info) => {
   const { port1, port2 } = new MessageChannel();
   fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
   const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
-  const transfer = [port1];
-  if (info.threadPort) {
-    init.threadPort = info.threadPort;
-    transfer.push(info.threadPort);
-  }
-  w.postMessage(init, transfer);
+  if (info.threadPort) init.threadPort = info.threadPort;
+  // A worker pool (tinypool, piscina, synckit) puts a MessagePort in workerData;
+  // initTransferList is what knows those must be transferred on to the child.
+  w.postMessage(init, initTransferList(info, port1));
   return {
     terminate: () => {
       w.terminate();
@@ -274,12 +273,28 @@ if (bound) {
   console.log(`  GET ${BASEURL} -> ${root.status}  (${body.length} bytes)`);
   console.log("  body head: " + body.slice(0, 220).replace(/\n/g, " "));
 
-  // Guide page: must render (highlighting runs during transform, so a 200 here
-  // already proves no synckit deadlock) and carry Shiki markup.
+  // The guide ROUTE only ever returns the same app shell — `vitepress dev` is a
+  // Vite SPA, and its markdown becomes a module the browser imports. This gate used
+  // to read the route's HTML for Shiki markup and fail because it wasn't there;
+  // measured against a real host dev server, the host returns the same 417-byte
+  // shell for `/` and for `/guide/getting-started`, with no highlighting in either.
+  // So the route proves routing, and the MODULE proves highlighting: `?import` is
+  // what Vite serves the transformed markdown at, and it is where Shiki's output
+  // lives. Transform is also where a synckit deadlock would strand the request, so
+  // this is still the gate on languages being pre-loaded.
   const guide = await get(join("guide/getting-started"));
   const gbody = decode(guide.body || "");
-  hlOk = guide.status === 200 && /class="shiki|language-ts|style="color:|class="line"/.test(gbody);
-  console.log(`  GET ${join("guide/getting-started")} -> ${guide.status}  shiki=${hlOk}  (${gbody.length} bytes)`);
+  const routeOk = guide.status === 200 && /id="app"|VPContent|vp-doc/.test(gbody);
+  console.log(`  GET ${join("guide/getting-started")} -> ${guide.status}  shell=${routeOk}  (${gbody.length} bytes)`);
+
+  const mod = await get(join("guide/getting-started.md") + "?import");
+  const mbody = decode(mod.body || "");
+  // Both, and `shiki` by name: `language-ts` alone would also match the class Shiki
+  // is *asked* for, so it cannot tell "highlighted" from "handed back unhighlighted".
+  const hasShiki = /class=\\?"shiki/.test(mbody) && /class=\\?"line/.test(mbody);
+  hlOk = routeOk && mod.status === 200 && hasShiki;
+  console.log(`  GET ${join("guide/getting-started.md")}?import -> ${mod.status}  shiki=${hasShiki}  (${mbody.length} bytes)`);
+  if (!hasShiki && mbody) console.log("  module head: " + mbody.slice(0, 300).replace(/\n/g, " "));
 } else {
   console.log("\n---- dev output tail (last 4000 chars) ----\n" + out.slice(devStart).join("").slice(-4000));
 }

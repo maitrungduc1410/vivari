@@ -5384,13 +5384,17 @@ and the interaction with our own `loop.js` is precisely the thing no Node-side t
 - ⏳ `OP_CHMOD`/`OP_UTIMES` + `set_mode`/`set_mtime` on the VFS, which is what makes
   `chmod`/`chown`/`utimes` real and retires the `access(f, X_OK)` caveat. See "Persistence"
   in the deferred list above.
-- ⏳ `fsPromises.cp` routes into the deliberately-unimplemented sync path
-  (`lib/fs/promises.js` wires `cp: wrap("cpSync")`) even though async `fs.cp` works — a
-  one-line fix.
-- ⏳ Enumerating `net` still throws on the `BlockList`/`SocketAddress` getters. It is the last
-  instance of the trap AGENTS.md documents for `fs`, and it was not papered over with a stub
-  class on purpose: a subtly wrong CIDR matcher is worse than an honest throw for a primitive
-  callers use to decide whether to *accept* a connection.
+- ✅ `fsPromises.cp` routed into the deliberately-unimplemented sync path
+  (`lib/fs/promises.js` wires `cp: wrap("cpSync")`) even though async `fs.cp` worked. Filed here
+  as a one-line fix, which was wrong: re-routing the promise API would have left `fs.cpSync`
+  itself dead. `cpSync` is implemented instead — see "`fs.cpSync` was missing" below, and the
+  self-copy bug the gate found while proving it.
+- ✅ Enumerating `net` threw on the `BlockList`/`SocketAddress` getters — the last instance of
+  the trap AGENTS.md documents for `fs`. Not papered over with a stub class on purpose: a subtly
+  wrong CIDR matcher is worse than an honest throw for a primitive callers use to decide whether
+  to *accept* a connection. The objection was the missing test suite rather than the matcher, and
+  real Node turned out to be the suite — see "`net.BlockList` was refused for want of a test
+  suite" below.
 - ⏳ Promote the per-slice harnesses into `scripts/` (or fold their cases into
   `verify-node.mjs`) so none of the above can silently regress — per the standing rule that a
   new Node API gets a probe.
@@ -6713,7 +6717,6 @@ now say.
 **Still uncovered:** `HTMLRewriter`, `Bun.markdown`, `Bun.Image`, the `Bun.SQL` SQLite adapter,
 real zstd/brotli engines, and — newly — the guest's `uncaughtException`, which nothing dispatches.
 
-
 ## Two ways a failing program said it had succeeded (this change)
 
 Both of these were found by measuring, while auditing what was left to do for Bun, and neither
@@ -7538,7 +7541,6 @@ vendored napi/wasm runtime turned out to select a transport by `typeof postMessa
 — which rules out shadowing it with a throwing stub, and is why deletion (the value Node itself
 has) is the only safe form.
 
-
 ## Reading the whole surface, instead of adding APIs one request at a time
 
 Every previous batch answered a question someone had already asked. This one
@@ -7905,6 +7907,7 @@ would be worse than the silence. It stays a `TypeError` with the browser's error
 tier and refuses a connection to prove it, since a refused connection produces the
 same opaque failure as a CORS block — which is exactly why one can stand in for
 the other.
+
 ---
 
 ## Python: the two checkers, and the Django command that pretended to work
@@ -8396,3 +8399,657 @@ happy. Both now assert the sequence directly (`deepStrictEqual` on the event nam
 the http one counts its `error` events, since one error with the right code and two errors
 starting with the wrong one are the same test if you resolve on the first one you like.
 Reverting the fix now fails both, and the net check names the cause.
+
+## A red check that was older than the commit that turned it red (this change)
+
+*(Same defect as the entry above, found independently on this branch. That one schedules
+the close callback with `setImmediate`; this one gives the loop the close phase libuv
+actually has, and keeps `setImmediate` only as the fallback for the two probes that build
+the module graph with no loop to hand it. The reading below is why it was worth writing
+down twice: the check it turned red was older than the commit blamed for it.)*
+
+`npm run verify` went red on master immediately after "a failing guest now fails", on a
+single check: `Path B: real Node lib/http.js`. The obvious reading — a regression in the
+change that preceded it — was wrong, and worth writing down because the correct reading
+took a bisect to reach and the wrong one would have been reverted.
+
+That change made an uncaught error in a callback fatal, which it had never been. The check
+asserts `ECONNREFUSED` inside an `'error'` handler. What it had been receiving all along
+was `ECONNRESET "socket hang up"` first, failing the assertion, having the throw silently
+swallowed — and then receiving a **second** `'error'`, the real `ECONNREFUSED`, which
+satisfied the assertion and let the test print its success marker. Two bugs, the newer one
+holding the older one out of sight. Making uncaught errors fatal did not break the check;
+it stopped the check from lying.
+
+**The real defect is one line, and it is about which loop phase a close callback belongs
+to.** `Socket._destroy` queues the `'close'` emit through `handle.close(cb)` and only then
+calls `cb(exception)`, which is where the stream emits `'error'`. Our TCP binding scheduled
+that close callback with `process.nextTick`, so it was queued *first* and won; libuv runs
+close callbacks in their own phase, after the nextTick queue, so in Node the error wins.
+Every failed socket in the VM therefore announced `'close'` before `'error'`.
+
+*Nothing would have made that ordering look like the cause.* The component that reads it is
+`_http_client.socketCloseListener`, which sees a close with no error recorded, concludes the
+peer hung up, and synthesises a reset. So the visible symptoms were a wrong error code and a
+duplicate event, two layers above the scheduling decision that produced them. And the
+consequences reach past CI: an in-VM app calling a service that has not finished starting —
+a dev proxy, a health check, anything with a retry — got a vague "socket hang up" instead of
+`ECONNREFUSED`, plus a second `'error'` on a request Node guarantees emits exactly one,
+which is enough to crash a handler that assumes otherwise.
+
+The fix gives the loop a real close phase (`queueClose`, drained after `runImmediates()`,
+counted in `hasRefWork()` so the loop cannot exit still owing a `'close'`) and moves both
+binding close paths onto it. `verify` is green at 158 checks, and all 22 offline spikes pass.
+
+**The gate runs Node instead of describing it.** `spike-net-close-order.mjs` executes six
+scenarios — a refused `http.request`, a refused `net.connect`, nextTick/setImmediate against
+close, a destroyed live socket, `server.close(cb)`, a clean close — on the HOST's real Node
+*and* in the VM, and requires the two transcripts to be identical. Hand-written expectations
+would only have pinned what I believed about Node, and I was wrong about one of them while
+writing it: I asserted a `server.close(cb)` callback lands after a nextTick queued beside it,
+and real Node does the opposite, because `Server.close` registers the callback with
+`once('close', cb)` rather than passing it to the handle. The comparison caught my error
+against Node in the same run it confirmed the VM was right. Explicit invariants follow the
+comparison anyway, so a future Node that changes its own ordering fails loudly here rather
+than quietly redefining "correct". Reverting the one-line change turns 9 of these red.
+
+*Also folded in, both small.* The cookie jar shipped without bounds; it now refuses a cookie
+over 4096 bytes and evicts the oldest past 180 per port, as browsers do — an unbounded jar is
+a guest setting cookies in a loop, and an oversized cookie is dropped rather than truncated
+because half a signed session id verifies as nothing rather than looking corrupt. And the six
+files the last GitHub→GitLab sync left without a trailing newline have one again.
+---
+
+## `fs.cpSync` was missing, and `fs.cp(a, a)` quietly copied a file onto itself (this change)
+
+`fs.cp` worked. `fs.cpSync` threw `ERR_METHOD_NOT_IMPLEMENTED`, and `fsPromises.cp` threw with
+it, because `lib/fs/promises.js` wires `cp: wrap("cpSync")` — so the promise API inherited a gap
+the callback API did not have. That is the wrong way round: `fs/promises` is the surface modern
+code reaches for first, and `cpSync` is everywhere in build scripts. The roadmap had this filed
+as "a one-line fix", which turned out to be wrong in an instructive way: re-routing
+`fsPromises.cp` to the async implementation would have made the promise API work and left
+`fs.cpSync` dead, so the one-liner fixes the symptom that was noticed rather than the gap.
+
+*Upstream's `cp-sync.js` needs three helpers that are native in Node, and two of them we already
+had.* The vendored body calls `cpSyncCheckPaths`, `cpSyncOverrideFile` and `cpSyncCopyDir` on the
+fs binding. But `cpSyncCopyDir` is only a no-filter **fast path** — the file already walks the
+tree in JS for the filter case — and `cpSyncOverrideFile` is its own `copyFile` with a stat. So
+only the validation was genuinely missing, and it is now JS in `cp-sync.js`, above the binding
+line because the errors it must throw are `ERR_FS_CP_*` classes that live there.
+
+### Real Node as the oracle, because this is a thicket
+
+The validation is a dozen `ERR_FS_CP_*` codes with specific precedence, and a hand-written
+expectation would have pinned what I believed Node does. `scripts/spike-fs-cp.mjs` runs twenty
+cases on the host's real Node and in the VM and requires identical transcripts — file, tree,
+merge into an existing directory, `force: false` as a silent skip, `errorOnExist`, `filter`
+(including a promise-returning one), symlinks, and the six ways it should refuse. Transcripts
+carry no absolute paths, so the two sides are comparable. It answered questions I would have got
+wrong by reasoning: `cpSync` **does** create a missing destination parent, and a directory
+without `recursive` is `ERR_FS_EISDIR` rather than one of the `CP` codes.
+
+*One deliberate divergence, and both sides of it are pinned.* Node 22's native
+`cpSyncCheckPaths` reports `ERR_FS_EISDIR` for `cpSync(symlinkToAFile, dest,
+{ dereference: true })` — its message even names the source with a trailing slash. The same
+Node's async `fs.cp` copies the file, and so does its own `cpSync` once `recursive: true` is
+added. Identical operation, three answers, so the sync refusal is an upstream bug and not a
+contract worth reproducing. We copy the file. The spike asserts the host still misbehaves *and*
+that we do not, so a fixed Node reports the divergence as obsolete instead of leaving a stale
+exception in the tree for ever.
+
+### The bug the spike found on its way past, which was worse than the gap
+
+`src-equals-dest` came back `ok` from the VM while the host raised `ERR_FS_CP_EINVAL`. Node
+decides "src and dest are the same file" with
+`destStat.ino && destStat.dev && ino === ino && dev === dev`, and `writeStatsInto` reported
+`dev` as **0** — so the conjunction was falsy, the check never ran, and `fs.cp(a, a)` walked on
+into copying a file onto itself. This was never about `cpSync`: the **async** path had it too,
+and that one has been reachable all along. `dev` is now `1` — one virtual filesystem, one device
+id — which repairs both paths with a single value. The AGENTS.md gotcha is the general form: a
+zero in a stat field is not a neutral default when a vendored module reads it as a truthiness
+test, and `ino` being non-zero already is the only reason this was a silent wrong answer rather
+than a crash.
+
+*A second silent gap fell out of the same investigation.* `internalBinding('constants').os.errno`
+held exactly one entry, `EISDIR`, so every other name the cp modules destructure was `undefined`
+and every `ERR_FS_CP_*` error `fs.cp` has ever thrown carried `errno: undefined`. Destructuring
+a missing constant is not an error in JS, which is why this never announced itself. It now
+carries the POSIX table. The host is no oracle for that one — Node leaves `errno` off these
+errors too — so the spike checks the numbers against POSIX directly, which is also what keeps
+the table honest against `lib/constants.js`.
+
+### Gating
+
+`spike-fs-cp.mjs` joins the offline, Wasm-VFS group in `ci.yml`, so it runs on every push.
+Reverting the `cp-sync.js` change turns 24 checks red; reverting `dev` alone turns exactly the
+two that describe a self-copy red, which is the point of asserting it separately from the
+transcript. `npm run verify` stays at 158 ✓ and the full offline tier at 23/23 — worth stating,
+because `dev` and the errno table are read by everything that stats a file.
+
+---
+
+## `net.BlockList` was refused for want of a test suite, and the host was the suite (this change)
+
+`{ ...net }` threw. Not "returned something odd" — threw, with
+`Vivari: no vendored Node builtin 'internal/blocklist'`, because `net.BlockList` and
+`net.SocketAddress` are lazy getters and neither module was vendored. Anything that enumerates
+the module goes down with it, which is a promisify-all helper away from being a real user's
+problem, and it was the last instance of the trap AGENTS.md documents for `fs`.
+
+*It had been refused deliberately, and the refusal was right at the time.* A `BlockList` decides
+whether to **accept** a connection, so a CIDR matcher that is subtly wrong is worse than an
+honest throw — it beats the throw only in appearance. The recorded objection was
+"reimplementing v4/v6 subnet matching in JS **with no test suite**", and that is the part worth
+re-reading: the blocker was never the fifty lines of masking, it was having nothing to check
+them against.
+
+### Real Node is the test suite
+
+`scripts/spike-net-blocklist.mjs` runs 45 cases through the host's own `BlockList` and through
+ours and requires identical answers: every rule kind in both families, ranges that cross an
+octet boundary, `/25` and `/33` prefixes that split a byte, `/0`, `/32`, the IPv4-mapped bridge
+in both directions, the ten ways each API refuses, and `util.inspect` output. That is a stronger
+oracle than any table I would have written, and it earned its keep on the first run by catching
+a case I had already got wrong: RFC 5952 keeps the dotted-quad tail on an IPv4-mapped address,
+so `::ffff:1.2.3.4` must not print as `::ffff:102:304`. Nothing else I had would have noticed.
+
+*The bodies are the real ones.* `internal/blocklist.js` and `internal/socketaddress.js` are the
+genuine v22.23.2 builtins, read out of a local Node via `process.binding('natives')` the way the
+other vendored bodies here were, so the only code that is ours is
+`internalBinding('block_list')` in `bindings/block-list.js` — which is where Node's is native
+too. That split is the point: the JS above the binding line stays upstream's, and our substitute
+sits exactly where the C++ was.
+
+### Three smaller things it needed on the way
+
+- **`internalBinding('symbols')` did not exist.** `internal/async_hooks` minted
+  `owner_symbol`/`async_id_symbol` itself, which was fine while it was the only source — but the
+  vendored blocklist reads them from the binding, and two mints mean two identities, so a handle
+  stamped by one lookup is invisible to the other. The symbols are minted per realm in
+  `internal-binding.js` now and `internal/async_hooks` reads them from there, so everything that
+  already keyed on them (`lib/zlib.js`, `bindings/net.js`) keeps the same ones.
+- **`internal/worker/js_transferable` is a shim, and says so.** The real one marks an object for
+  Node's structured serializer through two more bindings. Nothing here goes through that
+  serializer, so there is nothing to mark; the honest limit — a `BlockList` cannot be
+  `postMessage`d to a Worker — is written down rather than faked.
+- **`internal/url` gained `URLParse`**, the non-throwing parse `SocketAddress.parse()` needs to
+  return `undefined` instead of throwing on rubbish.
+
+*And one small consolidation.* The IPv6 literal parser written for `cares_wrap` moved out of
+`bindings/net.js` into `bindings/ip.js`, because the block list needs the same one and two IPv6
+parsers that disagree about an edge case would be worse than either of them being wrong.
+
+### Gating
+
+`spike-net-blocklist.mjs` is Wasm-free, so it joins the offline group that runs on every push
+with no registration needed beyond `run-spikes.mjs`. `npm run verify` stays at 158 ✓ and the
+offline tier is 24/24 — worth stating because moving where `async_hooks` gets its symbols from
+touches every handle in the runtime.
+
+---
+
+## Sixteen templates stopped starting, and the tier that knew said nothing (this change)
+
+`vite: "^8.0.0"` floated onto Vite 8.2.0, which depends on rolldown `~1.2.0`, which resolved to
+**rolldown 1.2.2** — the release that dropped `@rolldown/binding-wasm32-wasi` from its
+`optionalDependencies`. Up to 1.2.1 npm's platform auto-select installed that package on
+`wasm32` and rolldown's loader found it with a plain `require`. After 1.2.2 nothing installs it,
+so the loader falls through to its last route: a WebContainer fallback that
+`execFileSync`s `pnpm i @rolldown/binding-wasm32-wasi@<version>` into `/tmp`. We advertise
+`process.versions.webcontainer` on purpose — it is what makes Next pick its wasm SWC — so that
+branch is ours to satisfy, and with only npm on the guest's PATH the spawn fails, the loader
+swallows the error, and the dev server dies reporting `Cannot find native binding. npm has a bug
+related to optional dependencies`. Which names the wrong cause: npm did nothing wrong, and there
+was no optional dependency left to install.
+
+Nothing in this repository changed. The templates broke on the day rolldown published 1.2.2.
+
+*The fix is to declare the dependency*, in all sixteen `vite: ^8` templates and the four spikes
+that cover them — the same move already documented for Next's `@next/swc-wasm-nodejs`, and better
+than the fallback on its own merits: no registry fetch at dev-server start, and no dependence on
+which package managers a particular guest happens to have. `spike-preact` goes from failing after
+251s, having waited out the full 240s dev-server timeout, to passing in **15s**. All four Vite 8
+spikes pass, in 11-16s each.
+
+### The part worth more than the fix
+
+Four spikes had been red for as long as it took someone to look, and nobody looked, because
+`spikes-net` is `continue-on-error: true` and scheduled-only. The tolerance was justified when it
+was written — 40-plus template installs against a live registry, and the tier would have been
+noise — but its effect is that the job reports success whatever happens inside it. That is the
+pm-gate lesson again, in its third form: **a report that cannot be negative is not a report.**
+The first was a gate that did not run; the second an ok-flag initialised `true`; this one is a
+job whose result is discarded.
+
+So the six framework-template spikes get `template-gate`, a job that **can** go red, on the same
+argument pm-gate was given. They are separable from the tier's tolerance on their own merits:
+11-16s each rather than the 40-plus installs that made it noisy, one small tree apiece, and a
+failure here is not registry weather but the product's headline surface refusing to start.
+Registry drift is precisely what the job exists to catch, so tolerating it would defeat it.
+
+*And the new job needed one guard of its own.* `run-spikes.mjs` exits 0 on an empty selection, so
+a filter naming no registered spike would turn a red-capable job into one that proves nothing
+while reporting success — the same defect, one level up. `spike-ci-tiers.mjs` already checked
+that for the offline step; it checks every `--net` step now too, and mistyping `qwik` as `qwikk`
+turns it red.
+
+### What this does not fix
+
+The binding's version range has to stay in step with rolldown's by hand. The check that would
+reject a mismatched pair only runs under `NAPI_RS_ENFORCE_VERSION_CHECK`, so a drifting range
+gets *used* rather than rejected, and the failure would be an ABI error rather than a missing
+module. `template-gate` is what turns that from a silent outage into a red run, which is the
+honest limit of a fix that pins a version by hand.
+
+Two open questions left deliberately: whether the studio's own guests reach the pnpm fallback
+successfully (they may, since `load-real-pnpm.js` can put a real pnpm on PATH — this change makes
+the answer not matter for startup), and the Starlight note's older observation that rolldown
+"does not load here" at all, whose reported symptom is a different one
+(`Class extends value undefined`) and which is still why `astro` pins to 5.
+
+---
+
+## Every `fs` error said `ENOENT` and nothing else (this change)
+
+`fs.readFileSync('/app/config.json')` on a missing file threw an error whose `code` was
+`ENOENT`, whose message was the five characters `ENOENT`, and whose `errno`, `syscall` and
+`path` were all absent. Real Node throws:
+
+```
+ENOENT: no such file or directory, open '/app/config.json'
+```
+
+Both errors are the same failure. Only one of them can be acted on.
+
+### Why it was that way, and why nobody noticed
+
+The syscall bridge has one string to spend. A VFS failure crosses the shared-memory window as
+an errno name — that is the whole payload the Rust side sends — so `fs-client.js` does the only
+thing it can with it, `new Error(code)`, and for a long time nothing added anything. The code
+was right, so `err.code === 'ENOENT'` worked, which is the check almost everyone writes and the
+only one most tests make. The four facts that were missing are missing *quietly*: reading an
+absent property is not an error in JavaScript, so there is no failure to trace back — the same
+shape of gap as the single-entry errno table two changes ago, and it went unseen for the same
+reason.
+
+What that costs is not evenly spread:
+
+- **`err.syscall` is control flow, not decoration.** `rimraf` retries on `EBUSY`/`EPERM` only
+  for the syscalls it recognises; `graceful-fs` queues and re-runs `EMFILE` failures the same
+  way. An absent `syscall` reads as "some other error", so the recovery path silently does not
+  run, and the resulting bug surfaces somewhere else entirely, usually as flakiness.
+- **`err.path` is the difference between a log and a riddle.** "ENOENT" in a build log with a
+  thousand file reads in it identifies nothing.
+- **`err.errno`** still has a long tail of numeric comparisons behind it.
+- **And the message is what a person actually reads**, which makes it the part that decides
+  whether the runtime feels like Node when something goes wrong. Getting the properties right
+  while leaving the message as a bare code would have fixed the libraries and left every human
+  where they started.
+
+### Where the fix goes
+
+Not in the bridge, which cannot know more than it is told. In `bindings/fs.js`, the layer that
+knows the operation *and* its arguments — which is exactly where Node builds these errors too
+(`uvException`, `src/node_errors.cc`, not libuv). `SYSCALL_LABELS` maps each binding method to
+the libuv syscall name and the argument indices its path and dest live at, and a wrapper
+relabels bare codes on the way out. 48 failing calls now produce byte-identical errors to the
+host's, message included.
+
+Four things it had to get right that guessing would have got wrong:
+
+- **The libuv name is frequently not the method name.** `readdir` reports `scandir`, `copyFile`
+  reports `copyfile`, `utimes` reports `utime`, `realpath` reports `lstat` (Node walks the path
+  with it), `truncate` and `readFileSync` both report `open`. `symlink` is the one call whose
+  two paths are not in (from, to) order. `mkdtemp` reports the *template* — `x-XXXXXX`, six X's
+  and all — because Node's native layer appends them before libuv substitutes them.
+- **`readFileSync` on a directory is `EISDIR` from `read`, with no path at all**, while writing
+  to one is `EISDIR` from `open` *with* a path. The reason is that opening a directory
+  read-only succeeds on Linux and the failure lands on the next call; our VFS refuses the open
+  in both cases, so the read-only variant is relabelled to the call the error would have come
+  from. The mechanism differs from Linux's, everything observable does not.
+- **The async path cannot be labelled by the wrapper**, because an async call hands its error to
+  `oncomplete` instead of throwing it. `dispatch` labels that one, reading the in-flight call
+  from a single-slot `callContext` — sufficient only because a syscall here is synchronous start
+  to finish, the same property the `Atomics.wait` bridge is built on.
+- **Only bare POSIX codes get labelled.** The `ERR_FS_*` errors the vendored `lib/` throws are
+  Node's own, with their own shapes, and must pass through untouched.
+
+### The gate, and the one thing it does not demand
+
+`spike-fs-errors.mjs` runs every case on the host's real Node and in the VM and requires
+identical transcripts — `code`, `errno`, `syscall`, `path`, `dest`, and the full message with
+the scratch root scrubbed. A written table of expectations would have pinned what I believed
+libuv's wording and numbers are; nine of the syscall names above are ones I would have gotten
+wrong, and the host knew all of them.
+
+One case is pinned as a deliberate divergence rather than fixed: `fsync` on a bad descriptor
+throws `EBADF` on the host and succeeds here. `fsync` is a documented no-op — the VFS *is* the
+storage, so a returned write is already as durable as it gets — and it deliberately skips fd
+validation because `write-file-atomic` calls it after every write npm makes, and the check is
+another synchronous round-trip on that path. A bad fd is a caller bug either way; catching it
+would be paid for by every correct call. Both sides of the divergence are pinned, so if either
+ever changes the spike says so instead of quietly allowing it.
+
+---
+
+## The rolldown binding, for the two spikes the last pass missed (this change)
+
+`tailwind` and `vitest` were failing on the same "Cannot find native binding" that took out the
+Vite 8 templates: rolldown 1.2.2 stopped declaring `@rolldown/binding-wasm32-wasi` as an
+optionalDependency, so it has to be asked for by name. The templates and four spikes were fixed;
+these two were not, because `tailwind` declares `vite: ^8` in a spike-local `package.json` and
+`vitest` declares its dependencies on an `npm install` command line — neither of which the earlier
+sweep looked at. `tailwind` goes from a 250s timeout to passing in 14s.
+
+`vitest` clears the binding error and is still red, for a reason that turned out to be worth
+more than the fix: it prints its banner and then exits **0, silently, having run no tests**. Four
+plausible explanations were ruled out by probe before the real one turned up — an unref'd worker
+failing to hold the loop open (workers hold it fine), unhandled rejections being swallowed (they
+are reported, with the right exit code), output lost to `process.exit` (it is not, and the code
+survives too), and `fork`/`spawn` being no-ops (both work). Pinning `vitest@^3` produces the same
+silence one line later, so it is not a vitest 4 regression either.
+
+The cause is that **a `MessagePort` cannot be transferred into a worker** — see the next entry.
+`tinypool`, which is vitest's worker pool, gives every worker a port that way, and `vitepress`
+fails on the same call with a visible `DataCloneError`. Both red spikes are one bug.
+
+---
+
+## A worker could not be handed a MessagePort, and a hung program reported success (this change)
+
+Four fixes that turned up by pulling on one thread: why did `vitest` print its banner
+and exit **0** having run no tests?
+
+### The port that could not be transferred
+
+`new Worker(f, { workerData: { port }, transferList: [port] })` threw DataCloneError,
+and threw it in the *host*, inside the kernel's `spawnWorker`, where a guest cannot
+catch it. That call is the handshake tinypool, piscina and synckit's `createSyncFn`
+each use to give a worker its own channel, so it is every worker pool. `vitepress`
+died on it outright.
+
+The cause was duplication rather than logic: each environment that hosts processes
+builds the process-worker `init` message itself — each opens its own channel to the
+File System Worker — and there were **36 hand-written copies** of the transfer list.
+The browser kernel's copy scanned `workerData` for embedded ports. The 35 in
+`scripts/` did not, so those ports were left to be cloned, which a MessagePort cannot
+be. `packages/kernel-host/worker-transfer.js` now owns the decision and all 36 call
+sites use it; `spike-worker-pool.mjs` holds five shapes of the handshake to the host's
+behaviour. `vitepress` goes from killing its host to serving 200s.
+
+### `require.main === module` was false
+
+`node` in the VM is a shim, and it ran the entry with `require(abs)` — which makes the
+entry an ordinary child of the shim, leaving `require.main` at `/bin/node.js`. The
+`if (require.main === module)` guard that a large share of npm's CLIs are built around
+was therefore **false**, and those programs loaded their imports and quietly did
+nothing. `Module.runMain(abs)` is the fix, and it pays for itself twice: it also hands
+back the module's top-level-await promise, which the next fix needs.
+
+### `-r` could not see the project's own dependencies
+
+`node -r dotenv/config app.js` reported `Cannot find module 'dotenv/config' from
+'/bin'`: preloads were resolved with the shim's own `require`, which lives at `/bin`,
+rather than as if required from the working directory. A `createRequire` anchored at
+the cwd fixes it, and `-e`'s injected `require` needed the same anchor. While there: a
+preload that fails is **fatal** on Node, and warning-and-continuing had been running
+programs without the instrumentation they asked for.
+
+### An empty loop is an event, and a suspended program is not a success
+
+Two things Node does when the loop runs dry that we did not. The first is emit
+`beforeExit`, whose whole purpose is to let a listener schedule more work — so the loop
+emits, drains, and looks again, and only a still-empty loop ends the process. The
+second matters more: a main module still suspended on a top-level await exits **13**
+with a warning naming the file, where we exited **0**, in silence, having done none of
+the work. Zero is the one answer that cannot be debugged, because it is
+indistinguishable from success.
+
+`module.js` tracks the main module's evaluation promise for this. Note the nesting:
+`runMain` is called twice for `node app.mjs` — the shim, then the user's file — and the
+shim's call returns *last*, so the tracker must not let the outer call clear the inner
+one's state. That bug cost an hour and would cost it again.
+
+### What is still red, and what it is not
+
+`vitest` is unfixed. It does not hang on a top-level await; it hangs on a floating
+promise inside its pool — an await on something that never arrives, with nothing ref'd
+holding the loop open. Node has no detection for that either, so nothing here can make
+it loud; the difference is that on Node the message arrives. The four probes that ruled
+out the easy explanations are recorded in the previous entry.
+
+`next` is also red, and **was already red before any of this**: the same spike fails at
+the commit before this stack, so it is drift under us (next@16 or the registry), not a
+regression from these changes. Worth its own look — the failing check is the
+workStore/workUnit invariant on an RSC refresh render, not startup.
+
+## `vitest run` exited 0 having run nothing, and a port with no listener was why (this change)
+
+The previous entry left `vitest` red and said so: "it hangs on a floating promise
+inside its pool — an await on something that never arrives". That was the right
+symptom and the wrong cause, and the two guesses that followed it were both aimed at
+`Worker.unref()`, which is where the trace draws your eye.
+
+`vitest run` printed **nothing**, exited **0**, and took 1.1 seconds. The negative
+control — a suite with a deliberately failing assertion — also exited 0. So the
+runner reported success for a test that would have failed, which is the worst
+available answer, and it did it without a line of output to read.
+
+**What it actually was.** Instrumenting the host with `getActiveResourcesInfo()` (and
+writing the trace to a FILE, because logging to stderr creates the very pipe handle
+that then shows up as the thing keeping the loop alive) leaves a window where the
+only thing holding Node open is a single `MessagePort`. Both wasi workers report
+`kHandle:false kPort:false kPublicPort:false` — every worker is unref'd. An
+`async_hooks` init stack names the owner:
+
+```
+MESSAGEPORT init
+    at new NodejsWaitingRequestCounter (@emnapi/runtime/dist/emnapi.js:2008)
+    at new Context (@emnapi/runtime)
+    at Object.<anonymous> (@rolldown/binding-wasm32-wasi/rolldown-binding.wasi.cjs)
+```
+
+which is:
+
+```js
+this.refHandle = new MessageChannel().port1
+increase() { if (this.count === 0) this.refHandle.ref(); this.count++ }
+decrease() { if (this.count === 1) this.refHandle.unref(); this.count-- }
+```
+
+Nothing is posted to that port. Nothing listens on it. It is a **handle**, ref'd for
+the duration of a native async request and released after, and Node's loop counts it.
+Ours had `if (!proto.ref) proto.ref = function () { return this; }` — so the counter
+counted nothing, the loop went idle in the middle of rolldown's load, and the process
+left while vitest was still waiting for it. `worker_threads` was in the trace because
+that is where the work was, not because unref() was the mechanism.
+
+**The rule, now measured rather than assumed.** A port holds the loop while it is
+ref'd: by `ref()`, or by having a `'message'` listener (listening start()s a port, and
+starting refs it). It stops on `unref()` or `close()`. The consequence that reads like
+a contradiction until you see the mechanism:
+
+```js
+w.unref(); w.on('message', …)   // waits, and hears the reply
+w.on('message', …); w.unref()   // exits, reply never arrives
+```
+
+`spike-port-liveness.mjs` runs eleven such cases against the host's real Node, one
+process each, comparing transcripts.
+
+Two things had to be got right underneath it. **Wrap, don't replace**: headless, the
+platform `MessagePort` IS the host's Node `MessagePort` and the runtime shares its
+realm, so that prototype also carries the runtime's own plumbing. Assigning
+`port.onmessage` refs a port — Node's bookkeeping calls `ref()` from its newListener
+hook — and the runtime does that on the Worker's half of the parent↔child channel and
+on the raw port behind `parentPort`. Replacing `ref()` outright pointed those internal
+calls at our counter and hung **every worker spawn**, a layer below anything a guest
+could see; those two assignments now run inside `internalPortSetup(…)`, which
+suppresses the guest hold while the runtime wires up its own ports. (Marking guest
+ports at construction instead was tried and is not enough: `@emnapi/runtime` takes
+`MessageChannel` off the global, not off `require('worker_threads')`, so the one port
+that mattered would have gone unmarked — and vitest went straight back to exit 0.)
+And **release has to wake the loop**:
+`retain()` woke it, `release()` did not, so a release from inside a host callback — a
+port delivery that closes its own port — left the loop parked in `waitForNext` with
+nothing to look at. Retaining without waking misses work; releasing without waking
+hangs a process that has just finished.
+
+One deliberate divergence, recorded because it is a divergence: removing the last
+`'message'` listener releases the port on Node, but `removeAllListeners('message')`
+does not — same listener gone, same port state, and Node hangs. We release in both.
+That can only turn a hang into an exit; the reverse is the direction that breaks
+programs.
+
+### Brotli is real now
+
+`node:zlib`'s `brotliCompressSync` and friends threw a sentence naming the missing
+engine. `packages/codec` now carries the pure-Rust `brotli` crate behind the same
+binding shape as the zlib family, and `spike-zlib-brotli.mjs` cross-checks both
+directions against the host's libbrotli — bytes we produce must decode there, bytes
+it produces must decode here, because a codec that only agrees with itself proves
+nothing about the wire format.
+
+Two costs to know about. The constants table turned out to be load-bearing beyond
+lookup: `lib/zlib.js` sizes its params array by the largest `BROTLI_PARAM_*` value in
+`constants`, so with none defined the array was length 1 and every
+`{ params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }` died as
+`ERR_BROTLI_INVALID_PARAM: undefined is not a valid Brotli parameter` — naming the
+caller's option instead of the missing constant. And the codec wasm went from ~50KB
+to ~1MB (~485KB gzipped) for the encoder's tables and static dictionary, paid at
+kernel boot. Zstandard stays absent for a *different* reason than brotli was: every
+Rust zstd compressor binds the C library, which does not build for
+`wasm32-unknown-unknown`.
+
+### The rest of the sweep
+
+`process.cpuUsage`/`resourceUsage` report elapsed time rather than throwing (callers
+diff them across a span of work, and in a single-threaded worker over a busy span
+elapsed time is roughly the CPU time — the same trade `memoryUsage` has always made).
+`util.getCallSites()` is built on `Error.prepareStackTrace`. `sys` is `util`, as it
+has been since 0.x. `trace_events` loads with tracing genuinely off, and
+`getEnabledCategories()` answers `undefined`, which is what Node answers when nothing
+is enabled. `dgram`, `domain` and `repl` deliberately stay `MODULE_NOT_FOUND`: they
+are the modules callers feature-detect with `try { require(…) } catch {}`, and a stub
+that loads and then throws on use turns a working fallback into a failure further
+from its cause.
+
+One bug fixed on the way past, from the crypto spike going red on a key it had
+generated: RSA JWK members were fixed-width, so `d` kept a leading zero byte whenever
+it happened to be under 2040 bits. RFC 7518 wants the minimum number of octets and
+OpenSSL emits that, so ours differed from Node's for the same key — about one key in
+256, which is exactly often enough to look like a flake.
+
+## Two gates that were lying, and four constant tables that had drifted (this change)
+
+### `next` was red for a redirect, and said "invariant REGRESSED"
+
+The RSC-refresh gate re-issues the request the App Router makes after
+`serverComponentChanges` and requires a clean render. It had been failing 0/8 — and
+printing `← workStore/workUnit invariant REGRESSED`, which names a cause it had not
+observed. The actual response:
+
+```
+[rsc 0] status=307  location=/?_rsc=f2VoNpDTu3vL93O1
+```
+
+Next 16 answers a bare `RSC: 1` GET with a 307 to its cache-buster URL and renders
+Flight only there. The client follows it; the gate did not, counted eight redirects
+as eight failures, and blamed the one thing it knows how to blame. A report that
+names the wrong layer is worse than a bare failure — it sends the next person to
+read `AsyncLocalStorage` code for a bug that is a missing hop. The gate follows the
+redirect now, and counts "did not render (status)" separately from "the invariant
+fired", so the next drift cannot borrow the invariant's name.
+
+Worse, the gate had never tested what it was written for. Its own comment said to run
+it with `VV_NO_HOST_ALS=1` — the flag that forces the best-effort
+`AsyncLocalStorage` polyfill, the studio's browser-worker path, which is the *only*
+configuration the workStore invariant reproduces in — and nothing set it, in CI or
+out. It had been guarding the host's real ALS, which is not the thing at risk. The
+runner sets it for this spike now, and the gate passes 8/8 with the polyfill forced.
+
+### `vitepress` was reading the wrong response
+
+`GET /guide/getting-started` returns a 415-byte app shell with no Shiki markup, so
+the gate failed on `shiki=false`. Measured against a real host dev server, the host
+returns *the same* 417-byte shell for `/` and for the guide route: `vitepress dev` is
+a Vite SPA, and its markdown is a module the browser imports, not HTML the server
+renders. The highlighting lives at `?import`:
+
+```
+GET /guide/getting-started.md          -> 132 bytes, text/markdown
+GET /guide/getting-started.md?import   -> 8147 bytes, text/javascript, class=\"shiki …
+```
+
+So the route gate proves routing and the module gate proves highlighting — and
+transform is still where a synckit deadlock would strand the request, which is what
+this spike exists to catch. The assertion also requires `shiki` by name now:
+`language-ts` alone matches the class Shiki is *asked* for, so it cannot tell
+"highlighted" from "handed back untouched".
+
+### The constant tables: four hand-written copies, all partial
+
+Node builds every constants surface from one internal table. We had four copies, one
+per consumer, and they had drifted from Node and from each other:
+
+| surface | had | Node has |
+|---|---|---|
+| `os.constants.signals` | `{}` | 33 names |
+| `os.constants.priority` | `{}` | 6 |
+| `os.constants.dlopen` | absent | 5 |
+| `fs.constants` | owner bits only | + group, other, `UV_FS_COPYFILE_*` |
+| `crypto.constants` | 7 | 56 |
+| `constants` (deprecated) | its own second copy of errno/signals, plus `WSAEINTR`/`WSAEBADF` on Linux | an aggregate of the table |
+
+`os.constants.signals.SIGKILL` was therefore `undefined`, and
+`child.kill(os.constants.signals.SIGKILL)` killed with `undefined`; a mode built from
+`S_IRWXG | S_IROTH` came out `NaN`. Neither can announce itself, because reading a
+missing constant is not an error — it is a number-shaped hole that only shows up in
+whatever the caller does next.
+
+There is now one table (`node/bindings/constants.js`) and the four surfaces are views
+over it, as in Node. The values are the host's, dumped from a real Linux Node: the
+OpenSSL `SSL_OP_*` bits are not derivable from anything we run — our crypto is Rust —
+so they exist to be read and compared, and the only thing that makes them right is
+matching Node's. `spike-constants.mjs` compares all five surfaces key by key and
+value by value (`Infinity` is tagged, because `JSON.stringify(Infinity)` is `null`
+and would have made `Z_MAX_CHUNK` "equal" to a host `null`), then checks the four
+behaviours the gaps broke: a signal number that reaches kill(2), a computed mode that
+round-trips through chmod, the deprecated aggregate agreeing with the modern views,
+and zstd failing because the codec is missing rather than inside a parameter lookup.
+
+Two deliberate subtractions. `zlib.constants` no longer carries `Z_TREES`,
+`Z_BINARY`, `Z_TEXT`, `Z_ASCII`, `Z_UNKNOWN`, `Z_DEFLATED`: they are real zlib values
+and Node does not expose them, and being a superset is the direction that makes code
+work here and fail there. And `defaultCipherList` stays in `lib/crypto.js` rather than
+in the table, because on Node it is a lib-level value (what `--tls-cipher-list`
+replaces) — putting it in the table would have left the deprecated `constants` module
+with one key more than Node's.
+
+The ZSTD parameter names ARE there despite zstd being unimplemented, for the reason
+the brotli round found the hard way: `lib/zlib.js` sizes its params array by the
+largest `ZSTD_c_*` value, so without them a plain `zstdCompressSync(buf)` fails as
+`ERR_ZSTD_INVALID_PARAM` naming the caller's option instead of the missing codec.
+
+### `jwk-widths-rsa` was a coin flip, and had been for two rounds
+
+It compared the byte widths of the host's RSA key to ours — two keys generated
+independently, one per side. EC coordinates are fixed-width, so those cases were
+sound; an RSA private exponent is minimally encoded, so its length is 256 bytes for
+most 2048-bit keys and 255 for the ~1 in 256 whose top byte is zero. The two sides
+therefore disagreed at that rate, and the failure looked exactly like the real bug
+that had been fixed earlier in this branch (we exported fixed-width, Node exports
+minimal), which is what made it worth chasing twice.
+
+The case now uses a fixed 2048-bit key, checked into the spike, picked so that `d`
+is one of the short ones: both runs export the same key, the comparison is exact, and
+it is exact on the encoding the bug gets wrong. The transcript prints the widths
+rather than only comparing them — `d=255` is the value that says the trimming is
+live, and a silent ✓ is also what a fixed-width exporter looks like on the other 255
+keys in 256.
+
+One process note, since it cost a tier run: the earlier net tier reported
+`rspack TIMED OUT (600s)` and it was not flaky. Files were being edited while the
+tier ran, and rspack's worker loaded `constants.js` during the seconds it had a
+syntax error — `SyntaxError: Unexpected token ','` is in that log above the timeout.
+Re-run on a stable tree: 51/51.

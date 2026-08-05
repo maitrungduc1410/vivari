@@ -30,6 +30,10 @@ export function bootProcess({
   // Breakpoint debugger command channel (a SharedArrayBuffer) — present only when
   // this process was spawned under a debug session. Forwarded to createRuntime.
   debugSab = null,
+  // Which debugger the SAB is for. `python` processes are targets too, but of
+  // the backend that lives inside the interpreter rather than the one that
+  // instruments JS. See the note in kernel.js.
+  debugLang = "js",
 }) {
   const { ctrl, data } = makeViews(sab);
   // #14: fs opcodes ring the File System Worker's doorbell directly (a
@@ -70,7 +74,9 @@ export function bootProcess({
     },
     // Breakpoint debugger: hand the runtime the debug SAB + an event sink. `send`
     // posts a CDP event/response to the kernel, which relays it to the studio.
-    debug: debugSab ? { sab: debugSab, send: (json) => send("dbg-event", { data: json }) } : null,
+    debug: debugSab
+      ? { sab: debugSab, lang: debugLang, send: (json) => send("dbg-event", { data: json }) }
+      : null,
   });
 
   // The fs doorbell port is duplex: we ring it (process -> FS worker) for every

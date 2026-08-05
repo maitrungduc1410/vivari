@@ -17,6 +17,7 @@ import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
 // the installer for this network smoke test (kept lightweight vs. vendoring the
 // ~12 MB real-npm asset just to drive an install against the live registry).
 import { NPM_PROGRAM } from "../packages/kernel-host/programs/npm.js";
+import { initTransferList } from "../packages/kernel-host/worker-transfer.js";
 import { Worker, MessageChannel } from "node:worker_threads";
 
 let failures = 0;
@@ -50,12 +51,10 @@ const spawnWorker = (info) => {
   // be included in both the init payload and the transfer list. Omitting it makes
   // nested workers boot with no parentPort and hang (vite build stalls forever).
   const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
-  const transfer = [port1];
-  if (info.threadPort) {
-    init.threadPort = info.threadPort;
-    transfer.push(info.threadPort);
-  }
-  w.postMessage(init, transfer);
+  if (info.threadPort) init.threadPort = info.threadPort;
+  // A worker pool (tinypool, piscina, synckit) puts a MessagePort in workerData;
+  // initTransferList is what knows those must be transferred on to the child.
+  w.postMessage(init, initTransferList(info, port1));
   return {
     terminate: () => {
       w.terminate();

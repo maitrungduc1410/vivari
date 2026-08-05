@@ -17,6 +17,8 @@
 //
 // Scope (Phase 2 #4): sync + callback API. Streams/promises/watch are deferred.
 
+import { describeCode, errnoFor } from "./uv-errors.js";
+
 // File type bits (Linux) — must match internalBinding('constants').fs.
 const S_IFDIR = 0o040000;
 const S_IFREG = 0o100000;
@@ -36,18 +38,57 @@ const X_OK = 1;
 
 const STAT_FIELDS = 18;
 
+// The six characters libuv substitutes with a random suffix. Node's native layer
+// appends them to the caller's prefix, so they show up in mkdtemp error messages.
+const MKDTEMP_TEMPLATE = "XXXXXX";
+
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
 
 const joinPath = (dir, name) => (dir.endsWith("/") ? dir + name : dir + "/" + name);
 
-function vvError(code, syscall, path) {
-  const err = new Error(`${code}: ${syscall}${path ? ` '${path}'` : ""}`);
+// The error a failed syscall throws, shaped the way libuv's does — because user
+// code reads all of it. `err.code` is the famous one, but `err.syscall` is how
+// rimraf and graceful-fs decide whether a failure is theirs to retry, `err.path`
+// is what a log needs in order to be actionable, `err.errno` is what a few
+// libraries still compare numerically, and the message is what a person sees:
+//
+//   ENOENT: no such file or directory, open '/app/config.json'
+//
+// Not `${code}: ${syscall}`, which is what this used to build, and which told
+// whoever read it neither what the code meant nor which file it happened to.
+// Mirrors uvException() in Node's src/node_errors.cc, including the details that
+// look like accidents and are not: `dest` only appears on the two-path calls, and
+// an fd-based call names no path at all ("EBADF: bad file descriptor, fstat").
+function vvError(code, syscall, path, dest) {
+  const description = describeCode(code);
+  let message = description ? `${code}: ${description}, ${syscall}` : `${code}: ${syscall}`;
+  if (path !== undefined && path !== null) message += ` '${path}'`;
+  if (dest !== undefined && dest !== null) message += ` -> '${dest}'`;
+
+  const err = new Error(message);
+  // libuv reports errno negated; Node puts that number straight on the error, so a
+  // code we do not have a number for is left off rather than guessed at.
+  const errno = errnoFor(code);
+  if (errno !== undefined) err.errno = errno;
   err.code = code;
   err.syscall = syscall;
-  if (path) err.path = path;
+  if (path !== undefined && path !== null) err.path = path;
+  if (dest !== undefined && dest !== null) err.dest = dest;
   return err;
 }
+
+// Is this a bare error from the syscall bridge — one that arrived as
+// `new Error('ENOENT')` carrying a code and nothing else? Those are the ones to
+// label. An error that already has a syscall has been through here (or through
+// statFor), and the ERR_FS_* / ERR_INVALID_ARG_* errors the vendored lib/ throws
+// are Node's own and must pass through untouched, so match the POSIX code shape
+// rather than merely the presence of `code`.
+const isBareSyscallError = (e) =>
+  e instanceof Error &&
+  e.syscall === undefined &&
+  typeof e.code === "string" &&
+  /^E[A-Z0-9]+$/.test(e.code);
 
 export function createFsBinding({ sys: rawSys, process }) {
   // Node resolves relative fs paths against the process cwd down in libuv; our
@@ -57,6 +98,11 @@ export function createFsBinding({ sys: rawSys, process }) {
     if (typeof p !== "string" || p.startsWith("/")) return p;
     const cwd = process.cwd() || "/";
     return (cwd.endsWith("/") ? cwd : cwd + "/") + p;
+  };
+  const nosys = () => {
+    const e = new Error("ENOSYS");
+    e.code = "ENOSYS";
+    throw e;
   };
   const sys = {
     ...rawSys,
@@ -73,6 +119,13 @@ export function createFsBinding({ sys: rawSys, process }) {
     rename: (a, b) => rawSys.rename(R(a), R(b)),
     symlink: (t, p) => rawSys.symlink(t, R(p)),
     readlink: (p) => rawSys.readlink(R(p)),
+    // A syscall bridge that predates these (or a test double that never had
+    // them) answers ENOSYS, the same code an older wasm VFS answers, so there is
+    // one degraded path to reason about rather than a TypeError from here.
+    chmod: (p, mode, follow) => (rawSys.chmod ? rawSys.chmod(R(p), mode, follow) : nosys()),
+    utimes: (p, a, m, follow) => (rawSys.utimes ? rawSys.utimes(R(p), a, m, follow) : nosys()),
+    fchmod: (fd, mode) => (rawSys.fchmod ? rawSys.fchmod(fd, mode) : nosys()),
+    futimes: (fd, a, m) => (rawSys.futimes ? rawSys.futimes(fd, a, m) : nosys()),
   };
 
   // Read a whole file through the chunked fd layer (open + read loop + close),
@@ -113,6 +166,12 @@ export function createFsBinding({ sys: rawSys, process }) {
     return null;
   };
 
+  // Which binding call is running, set by the labelling wrapper at the bottom of
+  // this factory. Declared here because `dispatch` needs it: on the async path the
+  // error is handed to oncomplete rather than thrown, so the wrapper's catch never
+  // sees it and this is the only place left to label it.
+  let callContext = null;
+
   // Run `work` synchronously; if a req is present, deliver via nextTick.
   const dispatch = (req, work) => {
     if (req) {
@@ -121,7 +180,7 @@ export function createFsBinding({ sys: rawSys, process }) {
       try {
         result = work();
       } catch (e) {
-        err = e;
+        err = labelError(e, callContext);
       }
       process.nextTick(() => {
         Reflect.apply(req.oncomplete, req, [err, result]);
@@ -131,18 +190,54 @@ export function createFsBinding({ sys: rawSys, process }) {
     return work();
   };
 
+  // Node's fs.js normalizes every time argument (a Date, a number, a numeric
+  // string) to SECONDS before it reaches a binding method; the VFS stores ms.
+  const secToMs = (sec) => Number(sec) * 1000;
+
+  // Run a metadata write, and treat "this VFS build does not have that method"
+  // as the old accept-and-discard rather than a failure. A wasm built before
+  // OP_CHMOD existed answers ENOSYS, and turning that into a rejection would
+  // break installs outright rather than degrade: npm's bin-links chmods every
+  // installed bin unconditionally and propagates the error (fix-bin.js), and
+  // node-tar fails an extracted entry when both futimes and utimes fail
+  // (unpack.js) — i.e. every tarball any package manager unpacks.
+  function acceptIfUnsupported(write, fallback) {
+    try {
+      write();
+    } catch (e) {
+      if (!e || e.code !== "ENOSYS") throw e;
+      if (fallback) fallback();
+    }
+  }
+
   function writeStatsInto(arr, st) {
     const perm = st.mode & 0o7777;
     const type = st.kind === "dir" ? S_IFDIR : st.kind === "symlink" ? S_IFLNK : S_IFREG;
     const ms = st.mtimeMs;
     const sec = Math.floor(ms / 1000);
     const ns = Math.round((ms - sec * 1000) * 1e6);
+    // atime is its own field now that utimes(2) can set it — a caller that writes
+    // both times and reads them back gets both, instead of mtime answering for
+    // all four. ctime and birthtime still follow mtime: the VFS keeps no separate
+    // inode-change or creation stamp, and inventing one would be a number that
+    // looks specific and means nothing. A wasm build predating `atimeMs` falls
+    // back to mtime, which is exactly what every build did before.
+    const ams = st.atimeMs === undefined ? ms : st.atimeMs;
+    const asec = Math.floor(ams / 1000);
+    const ans = Math.round((ams - asec * 1000) * 1e6);
     const blocks = Math.ceil(st.size / 512);
     // dev,mode,nlink,uid,gid,rdev,blksize,ino,size,blocks, a/m/c/birth (s,ns)*4
     // nlink comes from the VFS when available (hard links report >1, which pnpm
     // uses to detect already-linked store files); default 1 for older builds.
-    const v = [0, type | perm, st.nlink || 1, 0, 0, 0, 4096, st.ino, st.size, blocks,
-      sec, ns, sec, ns, sec, ns, sec, ns];
+    // `dev` is 1, not 0, and that is load-bearing rather than cosmetic. Node's
+    // own `fs.cp` decides "src and dest are the same file" with
+    // `destStat.ino && destStat.dev && ino === ino && dev === dev` — a 0 makes the
+    // whole conjunction falsy, so the check never fired and `fs.cp(a, a)` walked
+    // straight into copying a file onto itself instead of raising
+    // ERR_FS_CP_EINVAL. One virtual filesystem, so one device id; any non-zero
+    // value restores the upstream logic on the async and sync paths at once.
+    const v = [1, type | perm, st.nlink || 1, 0, 0, 0, 4096, st.ino, st.size, blocks,
+      asec, ans, sec, ns, sec, ns, sec, ns];
     const big = arr instanceof BigInt64Array;
     for (let i = 0; i < STAT_FIELDS; i++) arr[i] = big ? BigInt(Math.trunc(v[i])) : v[i];
     return arr;
@@ -345,13 +440,13 @@ export function createFsBinding({ sys: rawSys, process }) {
     // sync round-trip on that path, while the write that just happened through
     // this same fd already proves it is live.
     fchmod(fd, mode, ...rest) {
-      return dispatch(findReq(rest), () => {});
+      return dispatch(findReq(rest), () => acceptIfUnsupported(() => sys.fchmod(fd, mode & 0o7777)));
     },
     fchown(fd, uid, gid, ...rest) {
       return dispatch(findReq(rest), () => {});
     },
     futimes(fd, atime, mtime, ...rest) {
-      return dispatch(findReq(rest), () => {});
+      return dispatch(findReq(rest), () => acceptIfUnsupported(() => sys.futimes(fd, secToMs(atime), secToMs(mtime))));
     },
 
     // -- path ops --
@@ -512,39 +607,27 @@ export function createFsBinding({ sys: rawSys, process }) {
         sys.writeFile(dest, sys.readFile(src));
       });
     },
-    // ---- metadata writes the VFS cannot persist ----
-    // The Rust VFS keeps a per-inode `mode` (packages/vfs/src/lib.rs) but only
-    // ever assigns it at CREATION time (open(O_CREAT) honours its `mode`
-    // argument; write_file/mkdir hardcode 0o644/0o755), and it models neither
-    // uid/gid nor atime/ctime at all. There is no OP_CHMOD / OP_CHOWN /
-    // OP_UTIMES in packages/protocol/syscall.js, so none of these can change
-    // anything, and adding one is a Rust-side change.
+    // ---- metadata writes ----
+    // chmod and utimes reach the inode now (OP_CHMOD/OP_UTIMES → VFS set_mode /
+    // set_times). They used to be accepted and discarded, which was defensible
+    // only while the VFS had nowhere to put the change, and which quietly cost
+    // real behaviour: an unpacked archive lost every executable bit, and since
+    // `access` started enforcing X_OK for real, `chmod(f, 0o755)` followed by
+    // `access(f, X_OK)` THREW — the call said yes and the check said no.
     //
-    // They still report success, and that is a considered decision rather than
-    // the usual "shim that lies": this is a filesystem with no mutable
-    // permission/ownership model, which is precisely the case where real
-    // implementations accept the call and move on (Node on Windows, any FAT or
-    // permission-less mount). Nothing fabricates a result on the way back out -
-    // `stat` keeps reporting the mode/mtime the VFS actually holds - so a caller
-    // that chmods and then stats sees the honest, unchanged value.
+    // Node hands these binding methods a time in SECONDS (lib/fs.js runs every
+    // Date/number/string through toUnixTimestamp first); the VFS stores ms.
     //
-    // Failing them with ENOSYS was the obvious alternative and it breaks
-    // `npm install` outright, so it is not on the table until the VFS can
-    // actually store the change:
-    //   • npm's bin-links does an UNCONDITIONAL `chmod(file, mode)` per
-    //     installed bin and propagates the rejection (bin-links/lib/fix-bin.js).
-    //   • node-tar errors an extracted entry when futimes AND utimes both fail
-    //     (tar/lib/unpack.js) - i.e. every tarball npm/yarn/pnpm unpacks.
-    // FOLLOW-UP to make these real: add OP_CHMOD/OP_UTIMES to the syscall
-    // protocol + a set_mode/set_mtime on the VFS, then implement these against
-    // it (and tighten `access` below to match).
-    //
-    // What IS enforced - because it was a genuine lie and costs one stat - is
-    // that the target exists. Real Node throws ENOENT here; the old no-ops
-    // "succeeded" against a path that was never created, hiding the real fault
-    // (a build step that never emitted the file) far from its cause.
+    // chown/lchown/fchown stay no-ops, and that is not the same compromise: mode
+    // is state this filesystem now keeps, while uid/gid is a model it does not
+    // have at all — one user, no kernel, nothing to own a file. Real filesystems
+    // in that position accept the call too (Node on Windows, any FAT mount).
+    // They still confirm the path exists, because an ENOENT is a fault the caller
+    // wants to hear about and the old no-op swallowed it.
     chmod(path, mode, ...rest) {
-      return dispatch(findReq(rest), () => void statFor("chmod", path, true));
+      return dispatch(findReq(rest), () =>
+        acceptIfUnsupported(() => sys.chmod(path, mode & 0o7777, true), () => void statFor("chmod", path, true)),
+      );
     },
     chown(path, uid, gid, ...rest) {
       return dispatch(findReq(rest), () => void statFor("chown", path, true));
@@ -553,10 +636,20 @@ export function createFsBinding({ sys: rawSys, process }) {
       return dispatch(findReq(rest), () => void statFor("lchown", path, false));
     },
     utimes(path, atime, mtime, ...rest) {
-      return dispatch(findReq(rest), () => void statFor("utimes", path, true));
+      return dispatch(findReq(rest), () =>
+        acceptIfUnsupported(
+          () => sys.utimes(path, secToMs(atime), secToMs(mtime), true),
+          () => void statFor("utime", path, true),
+        ),
+      );
     },
     lutimes(path, atime, mtime, ...rest) {
-      return dispatch(findReq(rest), () => void statFor("lutimes", path, false));
+      return dispatch(findReq(rest), () =>
+        acceptIfUnsupported(
+          () => sys.utimes(path, secToMs(atime), secToMs(mtime), false),
+          () => void statFor("lutime", path, false),
+        ),
+      );
     },
     mkdtemp(prefix, encoding, ...rest) {
       const req = findReq(rest);
@@ -568,7 +661,7 @@ export function createFsBinding({ sys: rawSys, process }) {
             return dir;
           }
         }
-        throw vvError("EEXIST", "mkdtemp", prefix);
+        throw vvError("EEXIST", "mkdtemp", prefix + MKDTEMP_TEMPLATE);
       });
     },
     // require()/module loader hot path: 0 = file, 1 = dir, <0 = error.
@@ -580,6 +673,130 @@ export function createFsBinding({ sys: rawSys, process }) {
       }
     },
   };
+
+  // ---- labelling every failure with the call it came from --------------------
+  //
+  // The syscall bridge can only hand back a code — a Rust VFS error crossing a
+  // shared-memory window has nothing else to send — so the syscall name and the
+  // path have to be attached here, at the entry point that knows both. Node does
+  // the same thing in the same place (its native layer builds the error, not libuv).
+  //
+  // The name on the left is this binding's method; the name in `syscall` is what
+  // libuv calls the operation, and the two differ more often than one would guess:
+  // readdir reports `scandir`, copyFile reports `copyfile`, utimes reports `utime`,
+  // and every path-less fd call reports the bare verb. `path`/`dest` are argument
+  // INDICES, taken before any cwd resolution, because Node reports the path the
+  // caller passed rather than the absolute one it resolved to.
+  //
+  // Entries that cannot fail (existsSync, internalModuleStat — both swallow) and
+  // the ones that build their own error (statFor's callers, mkdtemp) are absent.
+  const READ_ONLY = (flags) => (flags & 3) === 0;
+
+  // Opening a directory for reading SUCCEEDS on Linux and the failure lands on the
+  // following read(2) — which is why `fs.readFileSync('/some/dir')` reports
+  // "EISDIR: illegal operation on a directory, read" with no path, while writing to
+  // one reports `open` WITH a path. Our VFS refuses the open in both cases, so the
+  // read-only variant is relabelled to the call the error would really have come
+  // from. The mechanism differs from Linux's; everything the caller can observe
+  // does not, which is the part that matters.
+  const asReadFailure = (code) =>
+    code === "EISDIR" ? { syscall: "read", path: undefined, dest: undefined } : null;
+
+  const SYSCALL_LABELS = {
+    readFileUtf8: { syscall: "open", path: 0, refine: asReadFailure },
+    // The whole-file write fast path lib/fs.js takes for a utf8 string: one call
+    // here, but an open(2) is what fails, and what the caller is told about.
+    writeFileUtf8: { syscall: "open", path: 0 },
+    open: {
+      syscall: "open",
+      path: 0,
+      refine: (code, args) => (READ_ONLY(args[1]) ? asReadFailure(code) : null),
+    },
+    close: { syscall: "close" },
+    read: { syscall: "read" },
+    readBuffers: { syscall: "read" },
+    writeBuffer: { syscall: "write" },
+    writeString: { syscall: "write" },
+    writeBuffers: { syscall: "write" },
+    fstat: { syscall: "fstat" },
+    ftruncate: { syscall: "ftruncate" },
+    fsync: { syscall: "fsync" },
+    fdatasync: { syscall: "fdatasync" },
+    fchmod: { syscall: "fchmod" },
+    fchown: { syscall: "fchown" },
+    futimes: { syscall: "futime" },
+    stat: { syscall: "stat", path: 0 },
+    lstat: { syscall: "lstat", path: 0 },
+    statfs: { syscall: "statfs", path: 0 },
+    access: { syscall: "access", path: 0 },
+    mkdir: { syscall: "mkdir", path: 0 },
+    readdir: { syscall: "scandir", path: 0 },
+    rename: { syscall: "rename", path: 0, dest: 1 },
+    rmdir: { syscall: "rmdir", path: 0 },
+    rmSync: { syscall: "rmdir", path: 0 },
+    unlink: { syscall: "unlink", path: 0 },
+    // symlink is the one call whose arguments are not in (from, to) order for the
+    // error: it is symlink(target, path), and Node prints target -> path.
+    symlink: { syscall: "symlink", path: 0, dest: 1 },
+    link: { syscall: "link", path: 0, dest: 1 },
+    readlink: { syscall: "readlink", path: 0 },
+    // realpathSync in Node walks the path with lstat, so that is the syscall a
+    // caller sees when it fails — not "realpath".
+    realpath: { syscall: "lstat", path: 0 },
+    // The metadata writes reach the VFS now, so their failures are raw syscall
+    // errors that need the same labelling as everyone else's. libuv's names, not
+    // Node's method names: utimes(2) reports "utime", lutimes "lutime".
+    chmod: { syscall: "chmod", path: 0 },
+    chown: { syscall: "chown", path: 0 },
+    lchown: { syscall: "lchown", path: 0 },
+    utimes: { syscall: "utime", path: 0 },
+    lutimes: { syscall: "lutime", path: 0 },
+    copyFile: { syscall: "copyfile", path: 0, dest: 1 },
+    // mkdtemp is reported against the TEMPLATE, not the prefix: Node's native layer
+    // appends the six X's that libuv replaces with the random suffix, so a caller
+    // who mistypes a directory sees "mkdtemp '/no/such/dir/x-XXXXXX'". The name we
+    // actually create is the substituted one, exactly as libuv would.
+    mkdtemp: { syscall: "mkdtemp", path: 0, refine: (code, args) => ({
+      syscall: "mkdtemp",
+      path: args[0] + MKDTEMP_TEMPLATE,
+      dest: undefined,
+    }) },
+  };
+
+  const labelError = (e, ctx) => {
+    if (!ctx || !isBareSyscallError(e)) return e;
+    const refined = ctx.refine ? ctx.refine(e.code, ctx.args) : null;
+    const { syscall, path, dest } = refined || ctx;
+    return vvError(e.code, syscall, path, dest);
+  };
+
+  for (const name of Object.keys(SYSCALL_LABELS)) {
+    const spec = SYSCALL_LABELS[name];
+    const inner = binding[name];
+    if (typeof inner !== "function") continue;
+    binding[name] = function labelled(...args) {
+      // The call in flight, for `dispatch` to read: an async call reports its error
+      // through oncomplete instead of throwing, so it never passes the catch below.
+      // A single slot is enough because a syscall here is synchronous start to
+      // finish — the same property that lets the bridge block on Atomics.wait — and
+      // it is saved/restored anyway, since fs calls do nest (rmSync, realpath).
+      const previous = callContext;
+      callContext = {
+        syscall: spec.syscall,
+        path: spec.path === undefined ? undefined : args[spec.path],
+        dest: spec.dest === undefined ? undefined : args[spec.dest],
+        refine: spec.refine,
+        args,
+      };
+      try {
+        return Reflect.apply(inner, this, args);
+      } catch (e) {
+        throw labelError(e, callContext);
+      } finally {
+        callContext = previous;
+      }
+    };
+  }
 
   return binding;
 }

@@ -51,6 +51,9 @@ import minimatchFactory from "./internal/deps/minimatch/index.js";
 import fsStreamsFactory from "./internal/fs/streams.js";
 import urlFactory from "./internal/url.js";
 import blobFactory from "./internal/blob.js";
+import blocklistFactory from "./internal/blocklist.js";
+import socketaddressFactory from "./internal/socketaddress.js";
+import jsTransferableFactory from "./internal/worker/js_transferable.js";
 import fileFactory from "./internal/file.js";
 import permissionFactory from "./internal/process/permission.js";
 import assertFactory from "./internal/assert.js";
@@ -64,6 +67,7 @@ import encodingFactory from "./internal/encoding.js";
 
 // stream (Phase 2 #6): Node's real lib/stream.js + internal/streams/* verbatim.
 import streamFactory from "./lib/stream.js";
+import streamConsumersFactory from "./lib/stream/consumers.js";
 import streamPromisesFactory from "./lib/stream/promises.js";
 import streamsLegacyFactory from "./internal/streams/legacy.js";
 import streamsDestroyFactory from "./internal/streams/destroy.js";
@@ -244,6 +248,12 @@ const FACTORIES = {
   "internal/fs/streams": fsStreamsFactory,
   "internal/url": urlFactory,
   "internal/blob": blobFactory,
+  // net.BlockList / net.SocketAddress. Registered so that ENUMERATING `net` stops
+  // throwing on its lazy getters, which was the last instance of the trap AGENTS.md
+  // documents for `fs`.
+  "internal/blocklist": blocklistFactory,
+  "internal/socketaddress": socketaddressFactory,
+  "internal/worker/js_transferable": jsTransferableFactory,
   "internal/file": fileFactory,
   "internal/process/permission": permissionFactory,
   "internal/assert": assertFactory,
@@ -264,6 +274,7 @@ const FACTORIES = {
   "internal/abort_controller": abortControllerFactory,
   "internal/encoding": encodingFactory,
   stream: streamFactory,
+  "stream/consumers": streamConsumersFactory,
   "stream/promises": streamPromisesFactory,
   // `stream/web` = the WHATWG streams, which the host realm provides as globals.
   // @edge-runtime/primitives (pulled by Next.js) does `require('stream/web')`.
@@ -364,8 +375,8 @@ const FACTORIES = {
 
 const strip = (name) => (name.startsWith("node:") ? name.slice(5) : name);
 
-export function createNodeModules({ process, syscalls, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks, pipeBridge }) {
-  const internalBinding = createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks, pipeBridge });
+export function createNodeModules({ process, syscalls, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks, pipeBridge, queueClose }) {
+  const internalBinding = createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks, pipeBridge, queueClose });
   const modules = new Map(); // id -> module object (kept for cycle resolution)
 
   function nodeRequire(name) {

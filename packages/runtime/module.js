@@ -744,6 +744,11 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     return target;
   }
 
+  // The main module's top-level-await promise while it is still pending, else null.
+  // See the note in runMain: this is what tells run() a program ended suspended.
+  let mainPendingPromise = null;
+  let mainPendingFile = null;
+
   function runMain(entry) {
     const abs = entry.startsWith("/") ? entry : path.resolve(process.cwd(), entry);
     const dir = path.dirname(abs);
@@ -787,7 +792,28 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     }
     // A top-level-await entry evaluates to a Promise; return it so run() can await
     // the top-level body while the loop drives timers/microtasks.
-    return mod.evaluating ? mod.evaluating : mod.exports;
+    // Remember whether the main module is still suspended on a top-level await.
+    // `node` inside the VM is itself a shim (/bin/node.js) that calls runMain again
+    // with the user's file, so the LAST call is the one that matters — and the entry
+    // the runtime handed us is not it. run() reads this when the loop runs dry: a
+    // main module still pending there will never finish, and Node exits 13 rather
+    // than pretending the program succeeded.
+    const evaluating = mod.evaluating;
+    if (evaluating && typeof evaluating.then === "function") {
+      mainPendingPromise = evaluating;
+      mainPendingFile = filename;
+      const settle = () => {
+        if (mainPendingPromise === evaluating) mainPendingPromise = null;
+      };
+      evaluating.then(settle, settle);
+    } else if (mainPendingFile === filename) {
+      // Re-running the same main: whatever it was suspended on no longer applies.
+      // Any OTHER module finishing must not clear it — `node app.mjs` nests two
+      // runMain calls, the /bin/node.js shim around the user's file, and the shim
+      // returns last. Clearing on it would erase the only thing worth reporting.
+      mainPendingPromise = null;
+    }
+    return evaluating ? evaluating : mod.exports;
   }
 
   // ── Make `Module` a real, patchable constructor ────────────────────────────
@@ -903,5 +929,14 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     return this.exports;
   };
 
-  return { runMain, makeRequire, resolveFilename, Module, cache, setMainModule: (m) => (mainModule = m) };
+  return {
+    runMain,
+    makeRequire,
+    resolveFilename,
+    Module,
+    cache,
+    setMainModule: (m) => (mainModule = m),
+    // True while the main module is still suspended on a top-level await.
+    isMainPending: () => mainPendingPromise !== null,
+  };
 }

@@ -7,7 +7,16 @@
 // wasm32-unknown-unknown, ~50KB). Covers the whole zlib family: deflate/inflate,
 // raw, and gzip. gzip framing (10-byte header, CRC32 + ISIZE trailer, header
 // parsing on decode) is layered here so the JS side stays a thin binding.
+//
+// Brotli (RFC 7932) comes from the pure-Rust `brotli` crate and is driven the
+// same way, through BrotliStream below. Zstandard is still absent: every Rust
+// zstd COMPRESSOR is a binding to the C library, which this target cannot build.
 
+use brotli::enc::encode::BrotliEncoderOperation;
+use brotli::enc::encode::BrotliEncoderStateStruct;
+use brotli::enc::encode::BrotliEncoderParameter;
+use brotli::enc::StandardAlloc;
+use brotli::{BrotliDecompressStream, BrotliResult, BrotliState};
 use flate2::{Compress, Compression, Crc, Decompress, FlushCompress, FlushDecompress, Status};
 use wasm_bindgen::prelude::*;
 
@@ -338,5 +347,230 @@ impl ZStream {
         self.errored = err;
         temp.truncate(produced);
         temp
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Brotli
+//
+// Same contract as ZStream — process(input, op, out_len) with a consumed count
+// and a pending FIFO — so the JS binding drives both engines with one code path.
+// The difference is what "op" means: brotli has no z_stream, it has operations
+// (PROCESS/FLUSH/FINISH), and the encoder holds input internally until it has a
+// whole metablock to emit. So input is always fully consumed and output arrives
+// when the encoder decides, which is what the pending FIFO is for.
+
+// Output is pulled from the engine in chunks this size and buffered in `pending`,
+// independent of the caller's out_len: brotli's encoder emits a metablock at a
+// time and there is no way to ask it for fewer bytes.
+const BROTLI_SCRATCH: usize = 16384;
+
+type Decoder = BrotliState<StandardAlloc, StandardAlloc, StandardAlloc>;
+
+enum BrotliCore {
+    Enc(Box<BrotliEncoderStateStruct<StandardAlloc>>),
+    Dec(Box<Decoder>),
+}
+
+fn new_decoder() -> Box<Decoder> {
+    Box::new(BrotliState::new(
+        StandardAlloc::default(),
+        StandardAlloc::default(),
+        StandardAlloc::default(),
+    ))
+}
+
+// The BROTLI_PARAM_* keys Node passes down in its params array, in the crate's
+// terms. Node sends the whole array with -1 for "not set"; anything outside this
+// list (the crate's tuning knobs, 150+) has no Node-side name and is ignored.
+fn brotli_param(key: usize) -> Option<BrotliEncoderParameter> {
+    Some(match key {
+        0 => BrotliEncoderParameter::BROTLI_PARAM_MODE,
+        1 => BrotliEncoderParameter::BROTLI_PARAM_QUALITY,
+        2 => BrotliEncoderParameter::BROTLI_PARAM_LGWIN,
+        3 => BrotliEncoderParameter::BROTLI_PARAM_LGBLOCK,
+        4 => BrotliEncoderParameter::BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING,
+        5 => BrotliEncoderParameter::BROTLI_PARAM_SIZE_HINT,
+        6 => BrotliEncoderParameter::BROTLI_PARAM_LARGE_WINDOW,
+        _ => return None,
+    })
+}
+
+fn new_encoder(params: &[i32]) -> Box<BrotliEncoderStateStruct<StandardAlloc>> {
+    let mut state = Box::new(BrotliEncoderStateStruct::new(StandardAlloc::default()));
+    for (key, &value) in params.iter().enumerate() {
+        if value < 0 {
+            continue; // Node's "unset" marker
+        }
+        if let Some(p) = brotli_param(key) {
+            state.set_parameter(p, value as u32);
+        }
+    }
+    state
+}
+
+#[wasm_bindgen]
+pub struct BrotliStream {
+    core: BrotliCore,
+    params: Vec<i32>,
+    pending: Vec<u8>,
+    last_consumed: u32,
+    stream_end: bool,
+    errored: bool,
+}
+
+#[wasm_bindgen]
+impl BrotliStream {
+    #[wasm_bindgen(constructor)]
+    pub fn new(encode: bool, params: Vec<i32>) -> BrotliStream {
+        let core = if encode {
+            BrotliCore::Enc(new_encoder(&params))
+        } else {
+            BrotliCore::Dec(new_decoder())
+        };
+        BrotliStream {
+            core,
+            params,
+            pending: Vec::new(),
+            last_consumed: 0,
+            stream_end: false,
+            errored: false,
+        }
+    }
+
+    /// Feed `input` under brotli operation `op`, return up to `out_len` bytes.
+    pub fn process(&mut self, input: &[u8], op: i32, out_len: usize) -> Vec<u8> {
+        self.errored = false;
+        self.last_consumed = 0;
+        let cap = out_len.max(1);
+        match self.core {
+            BrotliCore::Enc(_) => self.encode(input, op, cap),
+            BrotliCore::Dec(_) => self.decode(input, cap),
+        }
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn consumed(&self) -> u32 {
+        self.last_consumed
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn ended(&self) -> bool {
+        self.stream_end
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn errored(&self) -> bool {
+        self.errored
+    }
+
+    pub fn reset(&mut self) {
+        // Neither engine has an in-place reset that is cheaper than a new state,
+        // and a half-reset state is a correctness hazard, so rebuild.
+        self.core = match self.core {
+            BrotliCore::Enc(_) => BrotliCore::Enc(new_encoder(&self.params)),
+            BrotliCore::Dec(_) => BrotliCore::Dec(new_decoder()),
+        };
+        self.pending.clear();
+        self.stream_end = false;
+        self.errored = false;
+    }
+}
+
+impl BrotliStream {
+    fn drain(&mut self, out_len: usize) -> Vec<u8> {
+        let n = out_len.min(self.pending.len());
+        self.pending.drain(..n).collect()
+    }
+
+    fn encode(&mut self, input: &[u8], op: i32, out_len: usize) -> Vec<u8> {
+        let operation = match op {
+            1 => BrotliEncoderOperation::BROTLI_OPERATION_FLUSH,
+            2 => BrotliEncoderOperation::BROTLI_OPERATION_FINISH,
+            3 => BrotliEncoderOperation::BROTLI_OPERATION_EMIT_METADATA,
+            _ => BrotliEncoderOperation::BROTLI_OPERATION_PROCESS,
+        };
+        let mut available_in = input.len();
+        let mut input_offset = 0usize;
+        let mut scratch = vec![0u8; BROTLI_SCRATCH];
+        loop {
+            let mut available_out = scratch.len();
+            let mut output_offset = 0usize;
+            let mut total_out = None;
+            let (ok, finished, more) = match &mut self.core {
+                BrotliCore::Enc(state) => {
+                    let ok = state.compress_stream(
+                        operation,
+                        &mut available_in,
+                        input,
+                        &mut input_offset,
+                        &mut available_out,
+                        &mut scratch,
+                        &mut output_offset,
+                        &mut total_out,
+                        &mut |_, _, _, _| (),
+                    );
+                    (ok, state.is_finished(), state.has_more_output())
+                }
+                _ => unreachable!(),
+            };
+            self.pending.extend_from_slice(&scratch[..output_offset]);
+            if !ok {
+                self.errored = true;
+                break;
+            }
+            if finished {
+                self.stream_end = true;
+                break;
+            }
+            // Nothing left to give and nothing more to take: this operation is as
+            // far along as it can get without more input. FINISH is the exception
+            // that keeps looping, since it must run to `finished` on its own.
+            if available_in == 0 && !more && output_offset == 0 {
+                break;
+            }
+        }
+        self.last_consumed = (input.len() - available_in) as u32;
+        self.drain(out_len)
+    }
+
+    fn decode(&mut self, input: &[u8], out_len: usize) -> Vec<u8> {
+        let mut available_in = input.len();
+        let mut input_offset = 0usize;
+        let mut total_out = 0usize;
+        let mut scratch = vec![0u8; BROTLI_SCRATCH];
+        loop {
+            let mut available_out = scratch.len();
+            let mut output_offset = 0usize;
+            let result = match &mut self.core {
+                BrotliCore::Dec(state) => BrotliDecompressStream(
+                    &mut available_in,
+                    &mut input_offset,
+                    input,
+                    &mut available_out,
+                    &mut output_offset,
+                    &mut scratch,
+                    &mut total_out,
+                    state,
+                ),
+                _ => unreachable!(),
+            };
+            self.pending.extend_from_slice(&scratch[..output_offset]);
+            match result {
+                // Filled the scratch buffer; there is more where that came from.
+                BrotliResult::NeedsMoreOutput => continue,
+                BrotliResult::ResultSuccess => {
+                    self.stream_end = true;
+                    break;
+                }
+                BrotliResult::NeedsMoreInput => break,
+                BrotliResult::ResultFailure => {
+                    self.errored = true;
+                    break;
+                }
+            }
+        }
+        self.last_consumed = input_offset as u32;
+        self.drain(out_len)
     }
 }

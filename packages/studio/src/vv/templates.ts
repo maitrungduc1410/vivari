@@ -148,6 +148,7 @@ const reactPkg = (ts: boolean) => `{
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^5.0.0",
+    "@rolldown/binding-wasm32-wasi": "~1.2.0",
     "vite": "^8.0.0"${ts ? `,
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
@@ -286,6 +287,7 @@ const vuePkg = (ts: boolean) => `{
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.0",
+    "@rolldown/binding-wasm32-wasi": "~1.2.0",
     "vite": "^8.0.0"${ts ? `,
     "typescript": "^5.7.0",
     "vue-tsc": "^2.2.0"` : ""}
@@ -942,6 +944,7 @@ function wsDemoTemplate(): TemplateDef {
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@rolldown/binding-wasm32-wasi": "~1.2.0",
     "vite": "^8.0.0"
   }
 }
@@ -1309,6 +1312,7 @@ function vanillaTemplate(ts: boolean): TemplateDef {
     "preview": "vite preview"
   },
   "devDependencies": {
+    "@rolldown/binding-wasm32-wasi": "~1.2.0",
     "vite": "^8.0.0"${ts ? `,
     "typescript": "^5.7.0"` : ""}
   }
@@ -1489,7 +1493,7 @@ function bootstrapTemplate(): TemplateDef {
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
   "dependencies": { "bootstrap": "^5.3.3" },
-  "devDependencies": { "typescript": "^5.7.0", "vite": "^8.0.0" }
+  "devDependencies": { "typescript": "^5.7.0", "@rolldown/binding-wasm32-wasi": "~1.2.0", "vite": "^8.0.0" }
 }
 `,
       "index.html": `<!doctype html>
@@ -1568,7 +1572,7 @@ function threeTemplate(): TemplateDef {
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
   "dependencies": { "three": "^0.171.0" },
-  "devDependencies": { "@types/three": "^0.171.0", "typescript": "^5.7.0", "vite": "^8.0.0" }
+  "devDependencies": { "@types/three": "^0.171.0", "typescript": "^5.7.0", "@rolldown/binding-wasm32-wasi": "~1.2.0", "vite": "^8.0.0" }
 }
 `,
       "index.html": `<!doctype html>
@@ -1658,7 +1662,7 @@ function gsapReactTemplate(): TemplateDef {
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
   "dependencies": { "gsap": "^3.12.5", "react": "^19.0.0", "react-dom": "^19.0.0" },
-  "devDependencies": { "@vitejs/plugin-react": "^5.0.0", "vite": "^8.0.0" }
+  "devDependencies": { "@vitejs/plugin-react": "^5.0.0", "@rolldown/binding-wasm32-wasi": "~1.2.0", "vite": "^8.0.0" }
 }
 `,
       "vite.config.js": reactViteConfig,
@@ -7264,7 +7268,7 @@ function fullstackTemplate(): TemplateDef {
     "client": "vite --configLoader native --port 5173 --strictPort"
   },
   "dependencies": { "express": "^4.21.0", "react": "^19.0.0", "react-dom": "^19.0.0" },
-  "devDependencies": { "@vitejs/plugin-react": "^5.0.0", "vite": "^8.0.0" }
+  "devDependencies": { "@vitejs/plugin-react": "^5.0.0", "@rolldown/binding-wasm32-wasi": "~1.2.0", "vite": "^8.0.0" }
 }
 `,
       "dev.js": `const { spawn } = require('child_process');
@@ -7445,6 +7449,7 @@ function svelteKitTemplate(): TemplateDef {
     "@sveltejs/kit": "^2.8.0",
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "svelte": "^5.46.4",
+    "@rolldown/binding-wasm32-wasi": "~1.2.0",
     "vite": "^8.0.0"
   }
 }
@@ -7536,6 +7541,7 @@ function remixTemplate(): TemplateDef {
   },
   "devDependencies": {
     "@react-router/dev": "^7.1.0",
+    "@rolldown/binding-wasm32-wasi": "~1.2.0",
     "vite": "^8.0.0"
   }
 }
@@ -7753,7 +7759,7 @@ function preactTemplate(): TemplateDef {
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
   "dependencies": { "preact": "^10.25.0" },
-  "devDependencies": { "@preact/preset-vite": "^2.9.0", "typescript": "^5.7.0", "vite": "^8.0.0" }
+  "devDependencies": { "@preact/preset-vite": "^2.9.0", "typescript": "^5.7.0", "@rolldown/binding-wasm32-wasi": "~1.2.0", "vite": "^8.0.0" }
 }
 `,
       "vite.config.ts": `import { defineConfig } from 'vite'
@@ -7844,7 +7850,7 @@ function litTemplate(): TemplateDef {
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
   "dependencies": { "lit": "^3.2.0" },
-  "devDependencies": { "typescript": "^5.7.0", "vite": "^8.0.0" }
+  "devDependencies": { "typescript": "^5.7.0", "@rolldown/binding-wasm32-wasi": "~1.2.0", "vite": "^8.0.0" }
 }
 `,
       "index.html": `<!doctype html>
@@ -7932,7 +7938,7 @@ function solidTemplate(): TemplateDef {
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
   "dependencies": { "solid-js": "^1.9.0" },
-  "devDependencies": { "typescript": "^5.7.0", "vite": "^8.0.0", "vite-plugin-solid": "^2.11.0" }
+  "devDependencies": { "typescript": "^5.7.0", "@rolldown/binding-wasm32-wasi": "~1.2.0", "vite": "^8.0.0", "vite-plugin-solid": "^2.11.0" }
 }
 `,
       "vite.config.ts": `import { defineConfig } from 'vite'
@@ -8635,7 +8641,7 @@ function trpcTemplate(): TemplateDef {
     "react-dom": "^19.0.0",
     "zod": "^3.24.0"
   },
-  "devDependencies": { "@vitejs/plugin-react": "^5.0.0", "typescript": "^5.7.0", "vite": "^8.0.0" }
+  "devDependencies": { "@vitejs/plugin-react": "^5.0.0", "typescript": "^5.7.0", "@rolldown/binding-wasm32-wasi": "~1.2.0", "vite": "^8.0.0" }
 }
 `,
       "dev.js": `const { spawn } = require('child_process');
@@ -8784,7 +8790,7 @@ function monorepoTemplate(): TemplateDef {
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
   "dependencies": { "@repo/ui": "workspace:*", "react": "^19.0.0", "react-dom": "^19.0.0" },
-  "devDependencies": { "@vitejs/plugin-react": "^5.0.0", "vite": "^8.0.0" }
+  "devDependencies": { "@vitejs/plugin-react": "^5.0.0", "@rolldown/binding-wasm32-wasi": "~1.2.0", "vite": "^8.0.0" }
 }
 `,
       "apps/web/vite.config.js": reactViteConfig,
@@ -10334,6 +10340,7 @@ function tailwindTemplate(): TemplateDef {
     "@vitejs/plugin-react": "^5.0.0",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.0",
+    "@rolldown/binding-wasm32-wasi": "~1.2.0",
     "vite": "^8.0.0"
   }
 }

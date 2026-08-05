@@ -1,5 +1,13 @@
 // A stubbed `os` module. Values are plausible constants — enough to satisfy the
 // libraries that sniff the environment (StackBlitz does the same).
+//
+// `constants` is the exception: it is not plausible-looking, it is the host's real
+// table (see node/bindings/constants.js), because these are read as numbers and
+// used in bitmasks and kill(2) arguments. It used to be three empty objects, so
+// `os.constants.signals.SIGKILL` was `undefined` — and `undefined` reaches kill()
+// as a signal nobody sent.
+
+import { OS_SIGNALS, OS_ERRNO, OS_PRIORITY, OS_DLOPEN, UV_UDP_REUSEADDR } from "../node/bindings/constants.js";
 
 export function createOs() {
   return {
@@ -35,6 +43,12 @@ export function createOs() {
       shell: "/bin/sh",
       homedir: "/home/user",
     }),
-    constants: { signals: {}, errno: {}, priority: {} },
+    constants: {
+      UV_UDP_REUSEADDR,
+      dlopen: OS_DLOPEN,
+      errno: OS_ERRNO,
+      signals: OS_SIGNALS,
+      priority: OS_PRIORITY,
+    },
   };
 }

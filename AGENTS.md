@@ -714,6 +714,21 @@ the API in the VM rather than reading its export list, and treat a comment
 describing behaviour as a claim to test, not a fact.** An exported function is not
 an implemented one, and neither is a comment.
 
+Brotli has since gone the rest of the way: `packages/codec` carries the pure-Rust
+`brotli` crate, and `spike-zlib-brotli.mjs` round-trips it against the host's real
+libbrotli in both directions. Two things that cost time there are worth keeping.
+The constants table is **load-bearing beyond lookup** — `lib/zlib.js` sizes its
+params array by the largest `BROTLI_PARAM_*` value it can find in
+`constants`, so with none defined the array was length 1 and every
+`{ params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }` failed as
+`ERR_BROTLI_INVALID_PARAM: undefined is not a valid Brotli parameter`, naming the
+option rather than the missing constant. And the wasm went from ~50KB to ~1MB
+(~485KB gzipped) for the encoder's tables and static dictionary — real, and paid
+at kernel boot, so if that budget ever matters the engine is the thing to look at
+first. Zstandard stays absent for a *different* reason than brotli was: every Rust
+zstd compressor binds the C library, which does not build for
+`wasm32-unknown-unknown`.
+
 ### `capture: true` hides a process's stderr from `VV_LIVE=1`
 `kernel.start(cmd, args, { capture: true })` buffers the child's output into
 `r.stdout`/**`r.stderr`** and, on that path, the kernel's `stdout`/`stderr`
@@ -859,6 +874,14 @@ with a `Cookie` header at all.
 Also: `new Headers({...})` **stringifies an array**, and Node keeps `set-cookie`
 as an array — so `sw.js` turned two cookies into one comma-joined header, which an
 `Expires=Wed, 21 Oct ...` makes unsplittable. Append entries one at a time.
+
+Bounded like a browser's — 4096 bytes per cookie, 180 per jar, oldest evicted —
+because a jar with no limit is a guest setting cookies in a loop and a `header()`
+that walks all of them per request. An oversized cookie is dropped rather than
+truncated: half a signed session id verifies as nothing, so truncating would look
+like corruption instead of refusal. A jar deliberately **outlives** the process
+that filled it: restart a dev server on the same port and a real browser still
+holds its cookies, so clearing on exit would log you out on every code reload.
 
 Gated by `probe:cookie-jar` (semantics, pure), `spike-cookie-session.mjs`
 (offline, end to end through a real in-VM server) and `spike-session-studio.mjs`
@@ -1021,6 +1044,27 @@ what's installed": the emnapi-1 bindings (rspack, Tailwind's oxide) hang on thei
 own newer hosts, which take a threaded path the vendored one sidesteps. Both
 sides are gated by the nightly network tier — `spike-preact` for emnapi 2,
 `spike-rspack`/`spike-tailwind` for emnapi 1.
+
+### A Vite 8 template must DECLARE `@rolldown/binding-wasm32-wasi` — nothing else installs it
+Vite 8's bundler is rolldown, whose wasm binding is a separate package. Up to
+rolldown **1.2.1** that package was one of rolldown's `optionalDependencies`, so
+npm's platform auto-select installed it on `wasm32` and rolldown's loader found it
+by `require`. **1.2.2 removed it from that list**, and nothing replaced it: from
+then on the loader's only remaining route was its WebContainer fallback, which
+`execFileSync`s **`pnpm i @rolldown/binding-wasm32-wasi@<version>`** into
+`/tmp/rolldown-<version>` — a path that needs `pnpm` on the guest's PATH and a
+registry fetch at dev-server start. With npm alone the spawn fails, the loader
+swallows it, and you get `Error: Cannot find native binding. npm has a bug related
+to optional dependencies …`, which names the wrong cause. Every `vite: ^8` template
+therefore lists the binding itself — the same move AGENTS.md already documents for
+Next's `@next/swc-wasm-nodejs`, and it is better than the fallback either way: no
+runtime download and no dependency on which package managers a guest happens to
+have. Symptoms to recognise: the dev server never binds its port, and the log's
+last useful line is `[rolldown] Downloading … on WebContainer`. The version check
+that would reject a mismatched binding only runs under
+`NAPI_RS_ENFORCE_VERSION_CHECK`, so a binding whose range drifts away from
+rolldown's will be *used*, not rejected — keep the two ranges in step, and note that
+`template-gate` is what will tell you when they part.
 
 ### esbuild/rollup are aliased to their wasm drop-ins — DON'T add per-project overrides
 esbuild and rollup ship no `wasm32` build, and their WASM drop-ins live under a
@@ -2826,20 +2870,28 @@ function — `defineLazyProperties`, `defineReplaceableLazyAttribute`,
 `getLazy(() => require('id'))`, or a plain `require` in a cold branch — imports
 cleanly however wrong the `FACTORIES` table is, and throws only on first *use*. A
 static sweep of `node/lib/**` + `node/internal/**` for every id reachable that way
-found **13 unregistered; it is now 3**, all deliberate and all recorded in
+found **13 unregistered; the three that were left after that sweep are registered now** — what remains is deliberate and recorded in
 `roadmap.md`:
 - `util` is clean. `util.MIMEType`, `util.diff` and `util.setTraceSigInt` (an
   honest "not implemented" stub) resolve, so spreading `util` no longer throws;
   same for `fs.cp`/`cpSync`, `fs.rm` recursive, `fs.glob`/`globSync`,
   `path.matchesGlob`, `fs.watch(dir, {recursive:true})` and `events.on()`.
-- `net` is the one instance left, and it is on purpose: `net.BlockList` and
-  `net.SocketAddress` are getters over `internal/blocklist` /
-  `internal/socketaddress`, which need the C++ `block_list` CIDR matcher and
-  `internal/worker/js_transferable`. So `{...net}` (a promisify-all helper) still
-  throws. Reimplementing v4/v6 subnet matching in JS with no test suite is worse
-  than useless for a security primitive callers use to *accept* a connection — a
-  wrong `BlockList` beats an honest throw only in appearance. `util.getCallSites()`
-  likewise still throws, one layer lower than people expect: it needs
+- `net` **is done now**, and how it got unblocked is the transferable part. It was
+  left throwing on purpose: `net.BlockList`/`net.SocketAddress` are getters over
+  `internal/blocklist` / `internal/socketaddress`, which need the C++ `block_list`
+  CIDR matcher, and "reimplementing v4/v6 subnet matching in JS with no test suite
+  is worse than useless for a primitive callers use to *accept* a connection" — a
+  wrong `BlockList` beats an honest throw only in appearance. The objection was
+  never the matcher, it was the missing suite. **Real Node is the suite**:
+  `spike-net-blocklist.mjs` runs 45 cases through the host's `BlockList` and ours
+  and requires identical answers, which is a stronger oracle than anything
+  hand-written and caught a case on the first run (an IPv4-mapped address must print
+  its dotted-quad tail, `::ffff:1.2.3.4`, not `::ffff:102:304`). Both bodies are
+  vendored verbatim; only `internalBinding('block_list')` is ours, in
+  `bindings/block-list.js`. When you meet the same shape of refusal — a security-ish
+  primitive we decline to guess at — ask whether the host can be made to judge it
+  before concluding it cannot be done.
+- `util.getCallSites()` still throws, one layer lower than people expect: it needs
   `internalBinding('util').getCallSites`, so registering
   `internal/source_map/source_map_cache` would not fix it.
 When you vendor a `lib/` module, sweep it for lazily-required ids and register them
@@ -2952,6 +3004,153 @@ pass `fresh=true` to `makeStatArray` so each result is a private snapshot. Rule:
 any deferred/async syscall result that references a shared scratch buffer must
 snapshot it at call time, not at delivery time.
 
+### A zero in a `stat` field is not a neutral default — it can switch off logic upstream
+`writeStatsInto` in `bindings/fs.js` fills the fields the VFS cannot model with
+`0` (uid, gid, rdev). That is fine until a vendored module reads one as a
+**truthiness test** rather than a value. `dev` was 0 for exactly that reason, and
+Node's `fs.cp` decides "src and dest are the same file" with
+`destStat.ino && destStat.dev && ino === ino && dev === dev` — a zero `dev` makes
+the whole conjunction falsy, so the check never fired: `fs.cp(a, a)` skipped
+straight past ERR_FS_CP_EINVAL and copied a file onto itself. It is now `1` (one
+virtual filesystem, one device id), which repairs the async and sync copy paths at
+once. Two rules follow:
+- **Before filling a stat field with 0, grep the vendored lib for the field name**
+  and check whether anyone tests it for truth. `ino` was already non-zero, which is
+  the only reason this was a silent wrong answer instead of a crash.
+- **A field we cannot model is still better given a plausible constant** than a 0
+  that reads as "absent". The same applies to `nlink`, which defaults to 1 for this
+  reason — pnpm keys on it.
+
+### `node` is a shim, so "what Node does at startup and exit" is ours to get right
+`node` inside the VM is `/bin/node.js` (`packages/kernel-host/coreutils.js`), a program
+that parses the CLI and loads the user's. Three things it must do that are easy to get
+subtly wrong, and were:
+- **The entry has to BE the main module.** It used to run with `require(abs)`, which
+  makes the entry an ordinary child of the shim, so `require.main` stayed
+  `/bin/node.js` and `if (require.main === module)` was **false**. A large share of
+  npm's CLIs are written around that guard; they loaded their imports and did nothing.
+  Use `Module.runMain(abs)`, which also returns the module's top-level-await promise.
+- **`-r` resolves from the CWD, not from the shim.** Node resolves a preload as if
+  required from a file in the working directory. Ours used the shim's own `require`,
+  at `/bin`, so a project could not preload its own dependency
+  (`Cannot find module 'dotenv/config' from '/bin'`). Anchor a `createRequire` at the
+  cwd — and note `-e`'s injected `require` needs the same anchor.
+- **A preload that fails is fatal.** Node never starts the program. Warning and
+  continuing runs it without its instrumentation, and the only trace is one line above
+  output that otherwise looks normal.
+
+### A loop that runs dry is an event, not just an exit
+Two things Node does when the loop empties that we did not:
+- **`beforeExit` is emitted, and a listener may schedule more work** — that is the
+  whole point of it (a pool draining its last jobs, a logger flushing). So the loop
+  emits, drains microtasks, and looks again; only a still-empty loop ends the process.
+  A listener that always schedules keeps the process alive for ever, exactly as on
+  Node. It is NOT emitted after `process.exit()`, which is an explicit end.
+- **A main module still suspended on a top-level await exits 13, with a warning.** We
+  exited **0**, silently, having done none of the work — and 0 is the one answer that
+  cannot be debugged, because it is indistinguishable from success. `module.js` tracks
+  the main module's evaluation promise (`isMainPending()`); note that `runMain` nests,
+  because the `node` shim calls it again for the user's file and returns LAST, so the
+  tracker must not let the outer call clear the inner one's state.
+
+What this does *not* catch is a floating promise inside a program — an `await` on a
+message that never arrives, with nothing ref'd holding the loop open. Node has no
+detection for that either; the difference is that on Node the message usually arrives.
+`vitest` looked like exactly that and was not: something *was* holding Node's loop,
+and it was a `MessagePort` nobody was listening to (see below). The lesson is that
+"floating promise, nothing ref'd" is a conclusion to verify, not one to reach —
+`process.getActiveResourcesInfo()` on the host names what is holding the loop, and an
+`async_hooks` `init` hook names who created it.
+
+### The constant tables have ONE home: `node/bindings/constants.js`
+`os.constants`, `fs.constants`, `crypto.constants` and the deprecated `constants`
+module are views over it, as they are views over `internalBinding('constants')` on
+Node. Do not add a local copy holding the names your caller needed — that is how all
+four surfaces ended up partial and disagreeing:
+- `os.errno` held a single entry (`EISDIR`) for as long as one caller was known, so
+  `fs.cp` threw its `ERR_FS_CP_*` errors with `errno: undefined`. Invisible: the
+  `code` was right and almost nothing asserts the number.
+- `os.constants.signals` was `{}`, so `child.kill(os.constants.signals.SIGKILL)`
+  killed with `undefined`; `.priority` was `{}` and `.dlopen` absent.
+- `fs.constants` had the owner permission bits but neither group nor other, so a mode
+  built from `S_IRWXG | S_IROTH` came out `NaN`.
+- `crypto.constants` had 7 of 56 — the RSA padding the signer used, and nothing a
+  caller might read.
+
+None of that can announce itself: reading a missing constant is `undefined`, not an
+error, and `undefined` in a bitmask is a silently wrong number. Values are the host's,
+dumped rather than typed — the OpenSSL bits are not derivable from anything we run.
+`spike-constants.mjs` compares all five surfaces to the host, keys and values, and is
+also how you regenerate after a Node upgrade. Two rules that look like bugs and are
+not: we expose FEWER zlib names than zlib defines (matching Node — a superset makes
+code work here and fail there), and `defaultCipherList` lives in `lib/crypto.js`, not
+the table, because on Node it is a lib-level value.
+
+### A ref'd MessagePort holds the loop, listener or not
+`port.ref()` refs a handle. It does not need a `'message'` listener, and
+`@emnapi/runtime` — under rolldown's wasm binding, under Vite 8, under vitest —
+depends on precisely that: `new MessageChannel().port1`, `ref()` while a native
+async request is outstanding, `unref()` after, nothing ever posted or listened to.
+Ours had `ref()` as `return this`, so `vitest run` exited **0** in 1.1s having run
+nothing. Rules that now hold, each with a case in `spike-port-liveness.mjs` measured
+against the host:
+- A port holds the loop while ref'd — by `ref()`, or by having a `'message'`
+  listener (listening `start()`s a port, and starting refs it). `unref()` and
+  `close()` release it.
+- Order therefore matters and is not a contradiction: `w.unref(); w.on('message')`
+  **waits**, `w.on('message'); w.unref()` **leaves**.
+- **Wrap the platform's `ref`/`unref`/`close`, never replace them.** Headless, the
+  platform `MessagePort` is the host's own and the runtime shares its realm, so that
+  prototype also carries the runtime's own plumbing.
+- **Assigning `port.onmessage` refs the port** (Node's EventTarget bookkeeping calls
+  `ref()` from its newListener hook), and the runtime does that on its own ports —
+  the Worker's half of the parent↔child channel, and the raw port behind
+  `parentPort`. Those two assignments go through `internalPortSetup(…)`, which
+  suppresses the guest hold for the duration. Without it every worker spawn hung: the
+  parent waited on a child that its own runtime port was keeping alive for ever.
+- **`release()` must wake the loop, like `retain()` does.** A release can land inside
+  a host callback with the loop parked in `waitForNext`; retaining without waking
+  misses work, releasing without waking hangs a process that has just finished.
+
+### An `fs` error is five facts, not one — label it in the binding
+The syscall bridge can only report a **code**: a Rust VFS failure crossing the
+shared-memory window has one string to spend, so `fs-client.js` throws
+`new Error('ENOENT')` and nothing more. For a long time that error travelled all the
+way to user code, which meant every fs failure in the VM read `ENOENT` — no path, no
+syscall, no errno, and a message that could not tell you which file it was about.
+Real Node says `ENOENT: no such file or directory, open '/app/config.json'`, and
+that difference is not cosmetic:
+- `err.syscall` is how `rimraf` and `graceful-fs` decide a failure is theirs to
+  retry; an absent property reads as "some other error", so the recovery path
+  silently does not run and the bug looks like flakiness somewhere else.
+- `err.path` is the only thing that makes a log actionable.
+- `err.errno` is still compared numerically by a long tail of libraries.
+
+The fix belongs in `bindings/fs.js`, which is the layer that knows both the
+operation and its arguments — the same place Node builds these errors (`uvException`
+in `src/node_errors.cc`), for the same reason. `SYSCALL_LABELS` maps each binding
+method to the libuv syscall name plus the argument INDICES of its path and dest, and
+a wrapper relabels any bare code on the way out. Four things about it to know before
+touching it:
+- **The libuv name is often not the method name.** `readdir` reports `scandir`,
+  `copyFile` reports `copyfile`, `utimes` reports `utime`, `realpath` reports
+  `lstat` (Node walks the path with it), and `readFileSync` reports `open`. Do not
+  infer these — the spike asks the host.
+- **The async path is labelled in `dispatch`, not in the wrapper.** An async call
+  hands its error to `oncomplete` instead of throwing, so the wrapper's `catch`
+  never sees it. `dispatch` reads the in-flight call from `callContext`, a single
+  slot, which is sufficient only because a syscall here is synchronous start to
+  finish — the same property that lets the bridge block on `Atomics.wait`.
+- **Only bare codes get labelled** (`isBareSyscallError`: a POSIX-shaped `code` and
+  no `syscall`). The `ERR_FS_*` errors the vendored `lib/` throws are Node's own and
+  must pass through untouched.
+- **Paths are reported unresolved**, as the caller passed them, which is what Node
+  does; the cwd resolution in `R()` is for the VFS only.
+
+`scripts/spike-fs-errors.mjs` runs ~48 failing calls on the host and in the VM and
+demands identical transcripts, message included. It carries one pinned divergence:
+`fsync` on a bad fd, which we deliberately do not catch (see below).
+
 ### `chmod`/`chown`/`utimes` can't persist — and `access(f, X_OK)` now says so
 The VFS keeps a per-inode `mode` (`packages/vfs/src/lib.rs`) but only ever assigns
 it at **creation** — `open()` honours its `mode` argument on the `O_CREAT` branch,
@@ -2994,6 +3193,37 @@ Making these real is a Rust-side change — `OP_CHMOD`/`OP_UTIMES` in
 `protocol/syscall.js` plus `set_mode`/`set_mtime` on `VirtualFileSystem`, then
 `fs-client.js`/`fs-server.js` and the binding — and it retires the `access` caveat
 with it. Tracked in `roadmap.md`.
+
+### A handle's close callback belongs to the loop's CLOSE PHASE, never to nextTick
+`handle.close(cb)` in `bindings/net.js` schedules `cb` through `loop.queueClose`,
+which `drive()` runs after `runImmediates()` — libuv's order (timers → check →
+close), and specifically **after** the nextTick drain.
+
+This is not a nicety about phases. `Socket._destroy` queues the `'close'` emit via
+`handle.close(cb)` and only THEN calls `cb(exception)`, which is where the stream
+emits `'error'`. Put the close callback on nextTick and it is queued FIRST, so every
+failed socket announced `'close'` before `'error'` — the reverse of Node. What made
+that expensive is who reads the order: `_http_client.socketCloseListener` sees a
+close with no error recorded, concludes the peer hung up, and emits a synthetic
+`ECONNRESET "socket hang up"`. So `http.request` to a port nobody listens on
+reported a reset instead of `ECONNREFUSED`, and then emitted the real error as a
+**second** `'error'` on a request Node guarantees emits one — which can crash an app
+whose handler is not idempotent.
+
+Two lessons worth keeping:
+- **`hasRefWork()` must count queued close callbacks.** The handle is already out of
+  `isAlive` by then, so without it the loop can exit still owing a `'close'` event.
+- **A bug can be hidden by a worse one.** This shipped for a long time behind
+  uncaught-callback errors exiting 0: verify-node's assertion failed on the phantom
+  error, the throw was swallowed, and the real `ECONNREFUSED` arrived next and
+  satisfied the check. Making uncaught errors fatal did not break this — it revealed
+  it. When a long-green check goes red right after an error-handling change, suspect
+  the check, not only the change.
+
+Gated by `spike-net-close-order.mjs`, which runs each scenario on the HOST's real
+Node as well as in the VM and requires identical transcripts — Node is the oracle,
+not our belief about Node. Reverting the one-line scheduling change turns 9 of its
+checks red.
 
 ### The virtual network is loopback-only — `connect()` now rejects everything else
 `listen()` registers a **port** and `connect()` finds a server by port; no host ever

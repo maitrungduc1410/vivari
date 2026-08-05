@@ -34,6 +34,7 @@ import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
 import { ensureRealNpm } from "../packages/kernel-host/load-real-npm.js";
 import { hashDepKey } from "../packages/kernel-host/dep-cache.js";
+import { initTransferList } from "../packages/kernel-host/worker-transfer.js";
 import { createAliasedFetcher } from "./lib/aliased-fetcher.mjs";
 import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
@@ -77,12 +78,10 @@ const spawnWorker = (info) => {
   const { port1, port2 } = new MessageChannel();
   fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
   const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
-  const transfer = [port1];
-  if (info.threadPort) {
-    init.threadPort = info.threadPort;
-    transfer.push(info.threadPort);
-  }
-  w.postMessage(init, transfer);
+  if (info.threadPort) init.threadPort = info.threadPort;
+  // A worker pool (tinypool, piscina, synckit) puts a MessagePort in workerData;
+  // initTransferList is what knows those must be transferred on to the child.
+  w.postMessage(init, initTransferList(info, port1));
   return {
     terminate: () => {
       w.terminate();

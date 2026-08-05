@@ -17,7 +17,7 @@ const ok = await runViteSpike({
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
   "dependencies": { "lit": "^3.2.0" },
-  "devDependencies": { "typescript": "^5.7.0", "vite": "^8.0.0" }
+  "devDependencies": { "typescript": "^5.7.0", "@rolldown/binding-wasm32-wasi": "~1.2.0", "vite": "^8.0.0" }
 }
 `,
     "index.html": `<!doctype html>

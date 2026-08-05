@@ -165,6 +165,28 @@ export const OP_FETCH_ASYNC = 30;
 //   OP_PIPE_LISTEN        field0 = JSON {path} -> OK empty / ERR EADDRINUSE
 //   OP_PIPE_CONNECT       field0 = JSON {path} -> OK JSON {connId} / ERR ENOENT
 //   OP_PIPE_CLOSE_SERVER  field0 = JSON {path} -> OK empty
+// metadata writes (chmod/utimes). Both take a path, a f64 flag for "follow a
+// trailing symlink" (chmod vs lchmod, utimes vs lutimes) and land on the inode.
+// Before these existed the calls were accepted and discarded, so stat() reported
+// a mode and an mtime nobody had set: `chmod(f, 0o755)` then `access(f, X_OK)`
+// threw, and an unpacked archive lost every executable bit.
+//   OP_CHMOD   field0 = path, field1 = u32 mode, field2 = u32 follow  -> OK empty
+//   OP_UTIMES  field0 = path, field1 = f64 atimeMs, field2 = f64 mtimeMs,
+//              field3 = u32 follow                                    -> OK empty
+//   OP_FCHMOD  field0 = u32 fd, field1 = u32 mode                     -> OK empty
+//   OP_FUTIMES field0 = u32 fd, field1 = f64 atimeMs, field2 = f64 mtimeMs
+//                                                                     -> OK empty
+// 35-38, not 34-37: OP_READ_STDIN took 34 while this branch was in review, and two
+// features numbering the same opcode is a collision no type can catch — the request
+// would have been routed to the FS worker or to the kernel depending on which
+// constant the caller happened to import. spike-python-offline.mjs asserts 34 is
+// stdin's alone, which is what found it. Keep them contiguous: isFsOpcode() below
+// tests the range, and 34 has to stay outside it.
+export const OP_CHMOD = 35;
+export const OP_UTIMES = 36;
+export const OP_FCHMOD = 37;
+export const OP_FUTIMES = 38;
+
 export const OP_PIPE_LISTEN = 31;
 export const OP_PIPE_CONNECT = 32;
 export const OP_PIPE_CLOSE_SERVER = 33;
@@ -207,7 +229,8 @@ export function isFsOpcode(op) {
     (op >= OP_OPEN && op <= OP_FTRUNCATE) ||
     op === OP_LINK ||
     op === OP_WATCH ||
-    op === OP_UNWATCH
+    op === OP_UNWATCH ||
+    (op >= OP_CHMOD && op <= OP_FUTIMES)
   );
 }
 

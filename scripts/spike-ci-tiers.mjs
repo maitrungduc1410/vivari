@@ -146,6 +146,28 @@ console.log("\n== the Wasm-VFS offline spikes are wired into the one job that ca
 }
 
 // ---------------------------------------------------------------------------
+console.log("\n== the net steps name spikes that exist ==");
+// ---------------------------------------------------------------------------
+// Same defect as the stale-filter check above, on the other tier, and it now has a
+// job where it would matter: `template-gate` can go red, so a filter that matches
+// nothing turns it into a job that proves nothing while reporting success. The
+// runner exits 0 on an empty selection, which is what makes this invisible.
+{
+  const ci = read(".github/workflows/ci.yml");
+  const steps = [...ci.matchAll(/run: node scripts\/run-spikes\.mjs --net (.+)/g)];
+  ok(steps.length > 0, `ci.yml has ${steps.length} net step(s) that name spikes explicitly`);
+  for (const step of steps) {
+    const named = step[1].trim().split(/\s+/);
+    for (const f of named) {
+      ok(
+        SPIKES.some((s) => s.net && s.name.includes(f)),
+        `the net step's '${f}' filter matches a registered net spike`,
+      );
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 console.log("\n== the Wasm build pins its wasm-pack ==");
 // ---------------------------------------------------------------------------
 // `version: latest` is not the newest release — it is whatever the action

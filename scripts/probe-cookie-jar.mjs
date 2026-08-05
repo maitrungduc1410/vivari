@@ -13,7 +13,7 @@
 //
 // Run: node scripts/probe-cookie-jar.mjs
 
-import { CookieJar, defaultPath, pathMatches, parseSetCookie } from "../packages/kernel-host/cookie-jar.js";
+import { CookieJar, defaultPath, pathMatches, parseSetCookie, MAX_COOKIE_BYTES, MAX_COOKIES } from "../packages/kernel-host/cookie-jar.js";
 
 let failed = 0;
 function ok(cond, label) {
@@ -151,6 +151,24 @@ console.log("\n== identity and scoping ==");
   const jar = new CookieJar();
   jar.store("sid=abc; Path=/", "/");
   eq(jar.header("/x?a=1&b=2"), "sid=abc", "a query string is not part of the path");
+}
+
+console.log("\n== bounds, so a guest cannot grow the jar without limit ==");
+{
+  const jar = new CookieJar();
+  const big = "x".repeat(MAX_COOKIE_BYTES);
+  jar.store(`fits=${"x".repeat(MAX_COOKIE_BYTES - "fits".length)}; Path=/`, "/");
+  eq(jar.size, 1, "a cookie exactly at the size cap is kept");
+  jar.store(`toobig=${big}; Path=/`, "/");
+  eq(jar.size, 1, "…and one over it is dropped, not truncated — half a signed id verifies as nothing");
+}
+{
+  const jar = new CookieJar();
+  for (let i = 0; i < MAX_COOKIES + 25; i++) jar.store(`c${i}=v; Path=/`, "/");
+  eq(jar.size, MAX_COOKIES, `the jar stops at ${MAX_COOKIES} cookies`);
+  const header = jar.header("/");
+  ok(header.includes(`c${MAX_COOKIES + 24}=v`), "the most recent cookie survived");
+  ok(!header.includes("c0=v;") && !header.startsWith("c0=v"), "…and the oldest was the one evicted");
 }
 
 console.log(`\nRESULT: ${failed === 0 ? "PASS — cookie jar semantics pinned" : `FAIL — ${failed} check(s)`}`);

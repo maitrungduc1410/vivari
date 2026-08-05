@@ -344,12 +344,33 @@ for (; i < cli.length; i++) {
 }
 const rest = cli.slice(i + 1); // script's own args
 
-const req = (m) => require(m[0] === '.' || m[0] === '/' ? path.resolve(process.cwd(), m) : m);
-if (typeof require.resolve === 'function') {
-  req.resolve = (m) => require.resolve(m[0] === '.' || m[0] === '/' ? path.resolve(process.cwd(), m) : m);
+// Node resolves \`-r\` requests, and \`-e\`'s require, as if from a file in the CWD:
+// \`node -r dotenv/config app.js\` finds ./node_modules/dotenv. Ours used the plain
+// \`require\` of THIS shim, which lives at /bin, so a bare specifier was looked up in
+// /bin/node_modules and reported 'Cannot find module dotenv/config from /bin' — a
+// project's own dependencies were unreachable from its own preloads. A relative path
+// was already resolved against the cwd; the bare case is the one that was wrong.
+const Module = require('module');
+const cwdRequire =
+  typeof Module.createRequire === 'function'
+    ? Module.createRequire(path.resolve(process.cwd(), '[cli]'))
+    : require;
+const req = (m) => cwdRequire(m[0] === '.' || m[0] === '/' ? path.resolve(process.cwd(), m) : m);
+if (typeof cwdRequire.resolve === 'function') {
+  req.resolve = (m) => cwdRequire.resolve(m[0] === '.' || m[0] === '/' ? path.resolve(process.cwd(), m) : m);
 }
 for (const m of preload) {
-  try { req(m); } catch (e) { process.stderr.write('node: failed to preload ' + m + ': ' + ((e && e.message) || e) + '\\n'); }
+  // A preload that cannot be loaded is FATAL on Node: the program never starts.
+  // Warning and carrying on ran the program without its instrumentation — the
+  // register hook, the polyfill, the tracer — and the only sign was a line in the
+  // log above output that otherwise looked fine.
+  try {
+    req(m);
+  } catch (e) {
+    process.stderr.write('Error: Cannot find module ' + JSON.stringify(m) + '\\n');
+    process.stderr.write(((e && e.stack) || (e && e.message) || String(e)) + '\\n');
+    process.exit(1);
+  }
 }
 
 if (evalCode != null) {
@@ -370,7 +391,14 @@ if (evalCode != null) {
   if (!entry) { process.stderr.write('node: missing script\\n'); process.exit(1); }
   const abs = path.resolve(process.cwd(), entry);
   process.argv = ['node', abs, ...rest]; // script sees argv[1] = its own path
-  require(abs);
+  // runMain, not require: the entry has to BE the main module. \`require(abs)\` loaded
+  // it as an ordinary child of this shim, so \`require.main\` stayed /bin/node.js and
+  // the \`if (require.main === module)\` guard that half of npm's CLIs are built
+  // around was false — those programs ran their imports and then quietly did
+  // nothing. runMain also hands back the module's top-level-await promise, which is
+  // what lets the runtime notice a program that ends while still suspended instead
+  // of reporting success.
+  Module.runMain(abs);
 }
 `,
 
@@ -534,6 +562,10 @@ function runSimple(tokens) {
     const child = cp.spawn(cmd, args, { cwd: process.cwd(), env: envWith(assign) });
     currentChild = child;
     currentKill = (sig) => { try { child.kill(sig); } catch (e) {} };
+    // A single command with no redirects comes through here, not runPipeline —
+    // and \`sh -c cat\` is exactly that shape, so this is the branch \`execSync(cmd,
+    // { input })\` actually depends on.
+    if (script) inheritStdin(child);
     child.stdout.on('data', (d) => process.stdout.write(d));
     child.stderr.on('data', (d) => process.stderr.write(d));
     child.on('error', (e) => {
@@ -552,6 +584,39 @@ function resolvePath(f) { return path.isAbsolute(f) ? f : path.resolve(process.c
 // makes the ubiquitous \`cmd > /dev/null 2>&1\` / \`cmd 2>/dev/null\` / \`< /dev/null\`
 // patterns work.
 function isDevNull(f) { return resolvePath(f) === '/dev/null'; }
+
+// The shell's own stdin belongs to the foreground job's first stage — that is what
+// \`inherit\` means, and it is the whole of \`execSync('cat', { input })\`: the input
+// reaches \`sh -c cat\`, and \`cat\` is a DIFFERENT process, so without this hand-off
+// it reads a pipe nobody will ever write to or close.
+//
+// Only in batch mode (\`sh -c …\`, a script). The interactive REPL already routes
+// keystrokes to \`currentChild\` and would double-write them here. Bytes that arrive
+// before a command is running are held, not dropped: the kernel delivers a sync
+// child's input at spawn, which is well before the pipeline exists. And we unref
+// stdin after subscribing, because attaching a 'data' listener otherwise keeps the
+// loop alive on its own — an async \`sh -c 'node server.js'\`, whose stdin no one
+// ever ends, would then never be able to exit.
+const shStdin = { chunks: [], ended: false, sink: null };
+if (script) {
+  process.stdin.on('data', (c) => {
+    const buf = typeof c === 'string' ? Buffer.from(c) : c;
+    if (shStdin.sink) { try { shStdin.sink.stdin.write(buf); } catch (e) {} }
+    else shStdin.chunks.push(buf);
+  });
+  process.stdin.on('end', () => {
+    shStdin.ended = true;
+    if (shStdin.sink) { try { shStdin.sink.stdin.end(); } catch (e) {} }
+  });
+  if (process.stdin.unref) process.stdin.unref();
+}
+function inheritStdin(child) {
+  shStdin.sink = child;
+  for (const buf of shStdin.chunks.splice(0, shStdin.chunks.length)) {
+    try { child.stdin.write(buf); } catch (e) {}
+  }
+  if (shStdin.ended) { try { child.stdin.end(); } catch (e) {} }
+}
 
 // Execute a pipeline of >=1 stages: wire each stage's stdout into the next
 // stage's stdin, apply per-stage redirects, and resolve with the LAST stage's
@@ -635,6 +700,8 @@ function runPipeline(stages) {
           catch (e) { process.stderr.write('sh: ' + sp.stdinFile + ': ' + (e.code || e.message) + '\\n'); }
         }
         try { child.stdin.end(); } catch (e) {}
+      } else if (idx === 0 && script) {
+        inheritStdin(child);
       }
     }
   });

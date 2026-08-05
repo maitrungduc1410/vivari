@@ -48,7 +48,12 @@ const TIMEOUT_INSTALL = Number(process.env.VV_INSTALL_TIMEOUT || 600000);
 const ti = Date.now();
 let instTimedOut = false;
 const inst = await Promise.race([
-  kernel.start("npm", ["install", "vitest", "--no-audit", "--no-fund", "--loglevel=http"], { cwd: "/app", env, capture: !LIVE }),
+  // @rolldown/binding-wasm32-wasi comes along by name because vitest 4 pulls Vite 8,
+  // and rolldown 1.2.2 dropped the wasm32 binding from its optionalDependencies —
+  // without it the run dies at startup with "Cannot find native binding". This spike
+  // declares its dependencies on the install line rather than in a package.json, so
+  // that is where the binding goes.
+  kernel.start("npm", ["install", "vitest", "@rolldown/binding-wasm32-wasi@~1.2.0", "--no-audit", "--no-fund", "--loglevel=http"], { cwd: "/app", env, capture: !LIVE }),
   new Promise((r) => setTimeout(() => { instTimedOut = true; r({ code: 124, stdout: "", stderr: "TIMEOUT" }); }, TIMEOUT_INSTALL)),
 ]);
 console.log(`install exit=${inst.code}${instTimedOut ? " (TIMED OUT)" : ""}  (${((Date.now() - ti) / 1000).toFixed(1)}s)`);

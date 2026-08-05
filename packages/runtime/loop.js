@@ -78,6 +78,10 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
 
   let exiting = false;
   let exitCode = 0;
+  // Emits process's 'beforeExit', installed by the runtime (which owns `process`).
+  // The loop knows WHEN the event is due — it is the one that can see an empty
+  // loop — and nothing else does.
+  let emitBeforeExit = null;
   let netResolve = null; // resolver of an in-flight waitForNext (net branch)
   let netPending = false; // a wake arrived while not waiting
 
@@ -361,6 +365,35 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
     }
   };
 
+  // ---- close callbacks ------------------------------------------------------
+  // libuv's own phase, and it has to be its own phase here for the same reason:
+  // a handle's close callback must run AFTER the nextTick queue, not inside it.
+  //
+  // `Socket._destroy` queues the 'close' emit through `handle.close(cb)` and only
+  // THEN calls `cb(exception)`, which is where the stream emits 'error'. Both used
+  // to land in the nextTick queue, in that order, so a socket announced 'close'
+  // before 'error' — the reverse of Node. `http` believes it: its
+  // socketCloseListener saw a close with no error recorded yet and synthesised
+  // `ECONNRESET "socket hang up"`, so dialling a port nobody listens on reported a
+  // reset instead of ECONNREFUSED, and then emitted the real error a second time
+  // on a request Node guarantees emits 'error' once.
+  let closeCallbacks = [];
+
+  const queueClose = (fn) => {
+    closeCallbacks.push(fn);
+    wake(); // a pending close keeps the loop from parking, as an open handle would
+  };
+
+  const runCloseCallbacks = () => {
+    if (exiting) return;
+    const batch = closeCallbacks;
+    closeCallbacks = [];
+    for (const fn of batch) {
+      if (exiting) return;
+      runCallback(fn, []);
+    }
+  };
+
   // ---- microtask / nextTick draining ----------------------------------------
 
   const drainMicrotasks = async () => {
@@ -381,6 +414,10 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
 
   const hasRefWork = () => {
     if (nextTickQueue.length) return true;
+    // A queued close callback is still work: the handle it belongs to has already
+    // been dropped from `isAlive`, so without this the loop could exit before the
+    // 'close' event it owes anyone listening.
+    if (closeCallbacks.length) return true;
     if (immediates.some((im) => im._ref && !im._cancelled)) return true;
     for (const t of timers.values()) if (t._ref) return true;
     return !!isAlive();
@@ -407,7 +444,7 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
       let nextDue = Infinity;
       for (const t of timers.values()) if (t._due < nextDue) nextDue = t._due;
       if (nextDue !== Infinity) handle = hostSetTimeout(finish, Math.max(0, nextDue - now()));
-      if (immediates.length) finish(); // shouldn't happen (ran above), be safe
+      if (immediates.length || closeCallbacks.length) finish(); // shouldn't happen (ran above), be safe
     });
 
   // Drive the loop until no ref'd work remains (or process.exit was called).
@@ -428,6 +465,8 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
       await drainMicrotasks();
       runImmediates();
       await drainMicrotasks();
+      runCloseCallbacks(); // after check, as libuv orders it
+      await drainMicrotasks();
       // Run inside runCallback so a process.exit() thrown from an http handler or
       // an async child's 'exit'/'data' listener (emitted synchronously here) is
       // honoured as an exit, not leaked as an unhandled rejection out of drive().
@@ -441,7 +480,26 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
       await drainMicrotasks();
       runCallback(doStdin, []); // drain interactive stdin keystrokes
       await drainMicrotasks();
-      if (exiting || !hasRefWork()) break;
+      if (exiting) break;
+      if (!hasRefWork()) {
+        // An empty loop is not the end: Node emits 'beforeExit' here, and a listener
+        // is allowed to schedule more work — which is the whole point of the event,
+        // and how a pool drains its last jobs or a logger flushes. So emit, drain,
+        // and look again; only a loop that is STILL empty ends the process. A
+        // listener that always schedules keeps the process alive for ever, exactly
+        // as it does on Node.
+        //
+        // Not emitted after process.exit(): that is an explicit end, and Node skips
+        // the event for it.
+        if (!emitBeforeExit) break;
+        runCallback(emitBeforeExit, []);
+        await drainMicrotasks();
+        // Still nothing to do: the loop is genuinely done. hasRefWork() counts
+        // everything a listener could have scheduled — ticks, timers, immediates,
+        // handles — so it is the whole question.
+        if (exiting || !hasRefWork()) break;
+        continue;
+      }
       await waitForNext();
     }
   };
@@ -457,8 +515,14 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
     clearInterval: clearTimer,
     setImmediate,
     clearImmediate,
+    queueClose,
     // External nudge: a network request is queued for this process.
     wakeNet: wake,
+    // Install the 'beforeExit' emitter. Called once at boot; the loop invokes it
+    // every time it runs dry, and keeps going if the listener schedules more work.
+    setBeforeExitEmitter: (fn) => {
+      emitBeforeExit = fn;
+    },
     // Stop the loop with `code` and wake any idle wait so drive() returns promptly.
     // Used by process.exit() so it works even when its throw-sentinel escapes the
     // loop (e.g. called from a raw Promise microtask, outside runCallback).
@@ -497,6 +561,7 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
         timers: refd.length,
         immediates: immediates.filter((im) => im._ref && !im._cancelled).length,
         nextTicks: nextTickQueue.length,
+        closeCallbacks: closeCallbacks.length,
         // The count alone says "a timer holds this process" and stops there, which
         // is where the last hang investigation stalled — every process reported
         // exactly one and there was no way to tell WHICH. The shape identifies it:

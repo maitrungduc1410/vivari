@@ -31,7 +31,10 @@
 //
 // One process === one worker, so a per-binding registry is correctly per-process.
 
-export function createNetBindings({ process, liveness, syscalls, netServers, pipeBridge } = {}) {
+import { isIPv4, isIPv6, parseIPv6 } from "./ip.js";
+import { UV_CODES, errname, getErrorMap } from "./uv-errors.js";
+
+export function createNetBindings({ process, liveness, syscalls, netServers, pipeBridge, queueClose } = {}) {
   const nextTick = (fn, ...args) => process.nextTick(fn, ...args);
   // A handle's close callback must NOT run on the nextTick queue.
   //
@@ -49,14 +52,19 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
   // up` and then, a phase later, the real `ECONNREFUSED` — two `error` events on
   // one request, the first one wrong.
   //
-  // setImmediate is the check phase rather than the close phase (libuv runs close
-  // callbacks just after it), but the property lib/net.js relies on is only that
-  // the tick queue drains first.
-  const afterTicks = (fn) => {
-    const si = globalThis.setImmediate;
-    if (typeof si === "function") si(fn);
-    else nextTick(fn);
-  };
+  // The loop now HAS a close phase (see queueClose in runtime/loop.js), so that is
+  // the first choice. setImmediate is the fallback and remains correct: it is the
+  // check phase rather than the close phase (libuv runs close callbacks just after
+  // it), but the property lib/net.js relies on is only that the tick queue drains
+  // first. It matters that the last resort is not nextTick — two probes build the
+  // module graph with no loop to hand us, and a fallback that reinstated the tick
+  // would bring the bug back silently in the one configuration nothing gates.
+  const closePhase =
+    typeof queueClose === "function"
+      ? queueClose
+      : typeof setImmediate === "function"
+        ? (fn) => setImmediate(fn)
+        : (fn) => nextTick(fn);
   const buf = () => globalThis.Buffer; // real Buffer is installed before sockets run
 
   // Event-loop liveness: a listening server or an open connected socket keeps the
@@ -72,58 +80,8 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
   };
 
   // ---- uv: error constants (Linux errno-negated, matching libuv) ------------
-  const UV_CODES = {
-    UV_EOF: -4095,
-    UV_ECONNREFUSED: -111,
-    UV_ECONNRESET: -104,
-    UV_ECONNABORTED: -103,
-    UV_EADDRINUSE: -98,
-    UV_EADDRNOTAVAIL: -99,
-    UV_EBADF: -9,
-    UV_EINVAL: -22,
-    UV_ENOTCONN: -107,
-    UV_EPIPE: -32,
-    UV_ECANCELED: -125,
-    UV_ETIMEDOUT: -110,
-    UV_EAGAIN: -11,
-    UV_ENOENT: -2,
-    UV_EHOSTUNREACH: -113,
-    // libuv's UV_EAI_NONAME. Node's own errmap spells this one 'EAI_NONAME' and
-    // lets the dns layer translate it, but nothing here goes through that layer,
-    // and 'ENOTFOUND' is both what callers match on and what our lib/dns.js
-    // already returns for a name it can't resolve. Keep the two consistent.
-    UV_ENOTFOUND: -3008,
-  };
-  const UV_MESSAGES = {
-    [-4095]: ["EOF", "end of file"],
-    [-111]: ["ECONNREFUSED", "connection refused"],
-    [-104]: ["ECONNRESET", "connection reset by peer"],
-    [-103]: ["ECONNABORTED", "software caused connection abort"],
-    [-98]: ["EADDRINUSE", "address already in use"],
-    [-99]: ["EADDRNOTAVAIL", "address not available"],
-    [-9]: ["EBADF", "bad file descriptor"],
-    [-22]: ["EINVAL", "invalid argument"],
-    [-107]: ["ENOTCONN", "socket is not connected"],
-    [-32]: ["EPIPE", "broken pipe"],
-    [-125]: ["ECANCELED", "operation canceled"],
-    [-110]: ["ETIMEDOUT", "connection timed out"],
-    [-11]: ["EAGAIN", "resource temporarily unavailable"],
-    [-2]: ["ENOENT", "no such file or directory"],
-    [-113]: ["EHOSTUNREACH", "host is unreachable"],
-    [-3008]: ["ENOTFOUND", "name not resolved"],
-  };
-  const uv = {
-    ...UV_CODES,
-    errname: (code) => (UV_MESSAGES[code] ? UV_MESSAGES[code][0] : `Unknown system error ${code}`),
-    getErrorMap: () => {
-      const m = new Map();
-      for (const code of Object.keys(UV_MESSAGES)) {
-        const [name, msg] = UV_MESSAGES[code];
-        m.set(Number(code), [name, msg]);
-      }
-      return m;
-    },
-  };
+  // The table itself lives in ./uv-errors.js, shared with the fs binding.
+  const uv = { ...UV_CODES, errname, getErrorMap };
 
   // ---- stream_wrap: the shared read/write scratch state ----------------------
   const kReadBytesOrError = 0;
@@ -519,7 +477,7 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
         }
         if (this._peer && !this._peer._closed) enqueueToPeer(this._peer, EOF);
       }
-      if (typeof cb === "function") afterTicks(cb);
+      if (typeof cb === "function") closePhase(cb);
     }
 
     getsockname(out) {
@@ -767,7 +725,7 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
           enqueueToPeer(this._peer, EOF);
         }
       }
-      if (typeof cb === "function") afterTicks(cb);
+      if (typeof cb === "function") closePhase(cb);
     }
 
     // A pipe's "name" is its filesystem path; net.Server.address() surfaces it.
@@ -874,68 +832,11 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
   // lib/net.js calls convertIpv6StringToBuffer() while computing a server's
   // listen address (isIpv6LinkLocal), e.g. when a name resolves to `::1` — a
   // throwing stub crashes `server.listen()` (this is on Vite's dev-server path).
-  const isIPv4 = (s) =>
-    typeof s === "string" &&
-    /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(s) &&
-    s.split(".").every((o) => +o <= 255);
-  const isIPv6 = (s) => {
-    if (typeof s !== "string") return false;
-    const a = s.indexOf("%") === -1 ? s : s.slice(0, s.indexOf("%"));
-    if (a.indexOf(":") === -1) return false;
-    try {
-      convertIpv6StringToBuffer(a);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  // Parse an IPv6 literal into its 16-byte big-endian form. Handles `::`
-  // zero-compression, an optional zone id (`%eth0`), and an embedded IPv4 tail
-  // (`::ffff:1.2.3.4`). Returns a Uint8Array(16); callers only index bytes.
-  function convertIpv6StringToBuffer(addr) {
-    if (typeof addr !== "string") throw new TypeError("invalid IPv6 address");
-    const pct = addr.indexOf("%");
-    if (pct !== -1) addr = addr.slice(0, pct); // drop zone id
+  // The parsers live in ./ip.js because internalBinding('block_list') needs the same
+  // ones, and two IPv6 parsers that disagree about an edge case would be worse than
+  // either being wrong.
+  const convertIpv6StringToBuffer = parseIPv6;
 
-    // Fold a trailing embedded IPv4 (e.g. ::ffff:127.0.0.1) into two hextets.
-    const lastColon = addr.lastIndexOf(":");
-    const tail = addr.slice(lastColon + 1);
-    if (tail.indexOf(".") !== -1) {
-      const p = tail.split(".");
-      if (p.length !== 4) throw new Error("invalid IPv6 address: " + addr);
-      const o = p.map((x) => Number(x));
-      if (!o.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
-        throw new Error("invalid IPv6 address: " + addr);
-      }
-      const hi = ((o[0] << 8) | o[1]).toString(16);
-      const lo = ((o[2] << 8) | o[3]).toString(16);
-      addr = addr.slice(0, lastColon + 1) + hi + ":" + lo;
-    }
-
-    const halves = addr.split("::");
-    if (halves.length > 2) throw new Error("invalid IPv6 address: " + addr);
-    const head = halves[0] === "" ? [] : halves[0].split(":");
-    let groups;
-    if (halves.length === 2) {
-      const rest = halves[1] === "" ? [] : halves[1].split(":");
-      const missing = 8 - head.length - rest.length;
-      if (missing < 0) throw new Error("invalid IPv6 address: " + addr);
-      groups = head.concat(new Array(missing).fill("0"), rest);
-    } else {
-      groups = head;
-      if (groups.length !== 8) throw new Error("invalid IPv6 address: " + addr);
-    }
-
-    const buf = new Uint8Array(16);
-    for (let i = 0; i < 8; i++) {
-      const g = groups[i] || "0";
-      if (!/^[0-9a-fA-F]{1,4}$/.test(g)) throw new Error("invalid IPv6 address: " + addr);
-      const v = parseInt(g, 16) & 0xffff;
-      buf[i * 2] = v >> 8;
-      buf[i * 2 + 1] = v & 0xff;
-    }
-    return buf;
-  }
   const cares_wrap = {
     convertIpv6StringToBuffer,
     isIP: (s) => (isIPv4(s) ? 4 : isIPv6(s) ? 6 : 0),

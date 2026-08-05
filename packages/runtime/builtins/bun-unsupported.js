@@ -358,14 +358,16 @@ export function createBunUnsupported() {
 
   // --- Zstandard ------------------------------------------------------------
   // A gap, not a limit — hence shimMessage. Nothing about zstd is browser-hostile;
-  // it is missing because Vivari's codec crate (packages/codec) builds on flate2,
-  // which covers deflate/gzip and nothing else. The same hole is why node:zlib's
-  // brotli and zstd families throw (see packages/runtime/node/bindings/zlib.js),
-  // and it closes in one place: add the engine to the Rust crate.
+  // it is missing because every Rust zstd compressor is a binding to the C
+  // library, which does not build for wasm32-unknown-unknown. node:zlib's zstd
+  // family is unimplemented for the same reason (see
+  // packages/runtime/node/bindings/zlib.js). Brotli sat in this paragraph until
+  // the pure-Rust `brotli` crate went into packages/codec; zstd closes the same
+  // way, when a pure-Rust compressor exists to put there.
   const ZSTD_REASON =
-    "Vivari's compression codec (packages/codec) is built on flate2, which " +
-    "implements deflate and gzip only — there is no Zstandard engine behind it, " +
-    "and node:zlib's zstd family is unimplemented here for the same reason. " +
+    "Vivari's compression codec (packages/codec) implements deflate, gzip and " +
+    "brotli — there is no Zstandard engine behind it, and node:zlib's zstd family " +
+    "is unimplemented here for the same reason. " +
     "Bun.gzipSync/gunzipSync/deflateSync/inflateSync are real and work today. " +
     "Closing this means adding a zstd crate to packages/codec and rebuilding the " +
     "Wasm, not writing JavaScript.";

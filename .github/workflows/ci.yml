@@ -102,7 +102,7 @@ jobs:
       # but missing here runs nowhere at all: skipped in toolchain-gate for want of
       # the crates, and never selected in the only job that has them.
       - name: offline spikes that need the Wasm VFS
-        run: node scripts/run-spikes.mjs --offline dep-cache bun http-binary-body http-response-bytes cookie-session diag-liveness fatal-errors
+        run: node scripts/run-spikes.mjs --offline dep-cache bun http-binary-body http-response-bytes cookie-session fs-cp fs-errors worker-pool node-cli child-stdin fs-metadata crypto-jwk zlib-brotli port-liveness constants diag-liveness fatal-errors
       - run: npm run verify
 
   # --- package-manager gate: the North Star, gated on its own ----------------
@@ -151,6 +151,52 @@ jobs:
       # Provisions its own scratch dirs + studio delivery assets (see VENDORS);
       # a provisioning failure is reported as a FAIL, not skipped.
       - run: npm run spikes:pm
+
+  # --- framework-template gate: the shipped templates, on a job that can go red -
+  # Same argument as pm-gate, and it has now been paid for. `vite: ^8.0.0` floated
+  # onto rolldown 1.2.2, which dropped @rolldown/binding-wasm32-wasi from its
+  # optionalDependencies — so nothing installed the wasm binding any more, and the
+  # dev server in every Vite 8 template stopped starting. FOUR spikes went red and
+  # said so for as long as it took anyone to look, which was never: spikes-net is
+  # `continue-on-error: true`, so its run is green whatever happens inside it.
+  #
+  # These six are separable from that tolerance on their own merits. They are fast
+  # (11-16s each, versus the 40+ installs that made the tier noisy), they install one
+  # small tree apiece, and a failure here is not registry weather — it is the
+  # product's headline surface not starting. Registry drift is exactly what it is
+  # supposed to catch, so tolerating it defeats the job.
+  #
+  # Scheduled/dispatch rather than per-push for the reason pm-gate gives: the shared
+  # harness vendors a real npm CLI, and that provisioning is not cached yet.
+  template-gate:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: v0.13.1
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/*/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('packages/*/Cargo.lock') }}
+      # All three crates, for the reason pm-gate spells out: a real install verifies
+      # sha512 integrity and extracts .tgz tarballs.
+      - name: Build the Node Wasm crates
+        run: npm run build:vfs:node && npm run build:codec:node && npm run build:crypto:node
+      - name: framework templates must start their dev server
+        run: node scripts/run-spikes.mjs --net preact lit solid vue svelte qwik
 
   # --- network tier: real template installs from the live registry -----------
   # Manual (workflow_dispatch) or scheduled: slow and depends on

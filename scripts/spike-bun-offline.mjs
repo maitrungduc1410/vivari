@@ -5364,20 +5364,30 @@ console.log("== the type stripper and module clauses ==");
     ok(/packages\/codec/.test(msg), "…and names where the engine would go");
   }
 
-  console.log("\n== node:zlib's brotli/zstd handles fail with a sentence, not a TypeError ==");
+  console.log("\n== node:zlib's zstd handles fail with a sentence, not a TypeError ==");
   {
-    // The Bun names above are only half the story: lib/zlib.js exports
-    // brotliCompressSync and the zstd family unconditionally, so anything doing
-    // `typeof zlib.brotliCompressSync === "function"` takes that branch. Before
-    // these handles existed the branch died on "binding.BrotliEncoder is not a
+    // The Bun names above are only half the story: lib/zlib.js exports the zstd
+    // family unconditionally, so anything doing
+    // `typeof zlib.zstdCompressSync === "function"` takes that branch. Before
+    // these handles existed the branch died on "binding.ZstdCompress is not a
     // constructor" from inside Node's own source.
     const binding = createZlibBinding({ makeZStream: null, process });
-    for (const [cls, codec] of [["BrotliEncoder", "brotli"], ["BrotliDecoder", "brotli"], ["ZstdCompress", "Zstandard"], ["ZstdDecompress", "Zstandard"]]) {
+    for (const cls of ["ZstdCompress", "ZstdDecompress"]) {
       ok(typeof binding[cls] === "function", "the binding exposes " + cls);
       let msg = "";
       try { new binding[cls](); } catch (e) { msg = e.message; }
-      ok(msg.indexOf("is not implemented in Vivari") !== -1 && msg.indexOf(codec) !== -1, cls + " names the missing " + codec + " engine");
-      ok(/gzip/.test(msg), "…and points at the codec that does work here");
+      ok(msg.indexOf("is not implemented in Vivari") !== -1 && msg.indexOf("Zstandard") !== -1, cls + " names the missing Zstandard engine");
+      ok(/brotli/.test(msg), "…and points at the codecs that do work here");
+    }
+    // Brotli is no longer in that list — it has an engine now, so its handles
+    // construct. Their round trip is spike-zlib-brotli.mjs's business; what this
+    // holds is that they stopped being the "explain yourself" case, which is the
+    // half of the change a reader of the paragraph above would otherwise miss.
+    for (const cls of ["BrotliEncoder", "BrotliDecoder"]) {
+      ok(typeof binding[cls] === "function", "the binding exposes " + cls);
+      let threw = "";
+      try { new binding[cls](8); } catch (e) { threw = e.message; }
+      ok(threw === "", cls + " constructs rather than refusing" + (threw ? ": " + threw : ""));
     }
   }
 }

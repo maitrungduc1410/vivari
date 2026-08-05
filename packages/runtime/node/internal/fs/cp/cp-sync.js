@@ -4,22 +4,28 @@
 // The body is the v22.23.2 builtin source (read out of a local Node via
 // process.binding('natives')).
 //
-// NOT verbatim: one added guard, marked `VIVARI DELTA`. This module is
-// registered so that lib/fs.js's lazyLoadCp() — which requires cp AND cp-sync
-// together, on the async path too — can load, which is what makes fs.cp work.
-// fs.cpSync itself stays unimplemented and now says so explicitly.
+// NOT verbatim: the three helpers upstream calls on the native fs binding
+// (cpSyncCheckPaths / cpSyncOverrideFile / cpSyncCopyDir) are implemented here in
+// JS instead, marked `VIVARI DELTA`. Before that, `fs.cpSync` threw
+// ERR_METHOD_NOT_IMPLEMENTED and `fsPromises.cp` threw with it, since
+// lib/fs/promises.js wires `cp: wrap('cpSync')`. Gated by scripts/spike-fs-cp.mjs
+// against the host's real Node, case by case.
 // Wrapped as a builtin factory.
 export default function (exports, require, module, process, internalBinding, primordials) {
 'use strict';
 
 // This file is a modified version of the fs-extra's copySync method.
 
-const fsBinding = internalBinding('fs');
 const { isSrcSubdir } = require('internal/fs/cp/cp');
 const { codes: {
+  ERR_FS_CP_DIR_TO_NON_DIR,
   ERR_FS_CP_EEXIST,
   ERR_FS_CP_EINVAL,
+  ERR_FS_CP_FIFO_PIPE,
+  ERR_FS_CP_NON_DIR_TO_DIR,
+  ERR_FS_CP_SOCKET,
   ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY,
+  ERR_FS_EISDIR,
   ERR_INVALID_RETURN_VALUE,
 } } = require('internal/errors');
 const {
@@ -27,6 +33,8 @@ const {
     errno: {
       EEXIST,
       EINVAL,
+      EISDIR,
+      ENOTDIR,
     },
   },
 } = internalBinding('constants');
@@ -46,32 +54,154 @@ const {
   dirname,
   isAbsolute,
   join,
+  parse,
   resolve,
 } = require('path');
 const { isPromise } = require('util/types');
 
-function cpSyncFn(src, dest, opts) {
-  // VIVARI DELTA (the only one): upstream's sync copy is driven by three native
-  // helpers — cpSyncCheckPaths / cpSyncOverrideFile / cpSyncCopyDir — that our
-  // internalBinding('fs') (node/bindings/fs.js) does not implement. Without this
-  // guard the first call dies as `TypeError: fsBinding.cpSyncCheckPaths is not a
-  // function`, which reads like a bug in user code. Fail explicitly instead, and
-  // say what actually works. The module still has to LOAD, because lib/fs.js's
-  // lazyLoadCp() pulls cp AND cp-sync together — so the async fs.cp path (pure
-  // JS, fully working) would otherwise be unreachable too.
-  // `fsBinding` is undefined in a realm built without syscalls (loader.js only
-  // creates the fs binding when they are present), so probe it optionally.
-  if (typeof fsBinding?.cpSyncCheckPaths !== 'function') {
-    const err = new Error(
-      "Vivari: fs.cpSync is not implemented — Node's sync copy is native " +
-      "(internalBinding('fs').cpSyncCheckPaths/cpSyncOverrideFile/cpSyncCopyDir), " +
-      'and this runtime has no such binding. Use the async fs.cp(src, dest, cb), ' +
-      'which is implemented.',
-    );
-    err.code = 'ERR_METHOD_NOT_IMPLEMENTED';
-    throw err;
+// ── VIVARI DELTA ────────────────────────────────────────────────────────────
+// Upstream drives the sync copy through three helpers that are native in Node —
+// cpSyncCheckPaths / cpSyncOverrideFile / cpSyncCopyDir — and our
+// internalBinding('fs') has no such thing, so `fs.cpSync` threw
+// ERR_METHOD_NOT_IMPLEMENTED and `fsPromises.cp` inherited it (lib/fs/promises.js
+// wires `cp: wrap('cpSync')`), while the async `fs.cp` worked fine.
+//
+// Two of the three need no new logic: the file already implements `copyDir` in JS
+// for the filter case (the native is only a no-filter fast path), and `copyFile`
+// already does what an override does. So only the VALIDATION is new, and it is
+// written here rather than in the binding because the errors it must throw are
+// ERR_FS_CP_* classes that live above the binding line.
+//
+// Semantics are taken from the async `checkPaths` in internal/fs/cp/cp.js and
+// pinned against the host's real Node by spike-fs-cp.mjs, which compares
+// transcripts case by case — including the numeric `errno`, since these errors
+// carry one.
+//
+// ONE DELIBERATE DIVERGENCE, in the safe direction: Node 22's native
+// cpSyncCheckPaths reports ERR_FS_EISDIR for `cpSync(symlinkToAFile, dest,
+// { dereference: true })`, complaining about "a directory" and naming the source
+// with a trailing slash. The same Node's async `fs.cp` copies the file, and so does
+// its own cpSync once `recursive: true` is added — the operation is identical, so
+// the sync refusal is an upstream bug, not a contract. We copy the file. The spike
+// asserts BOTH sides of that, so if Node ever fixes it the divergence is reported
+// as obsolete rather than quietly kept.
+function cpSyncCheckPaths(src, dest, dereference, recursive) {
+  const statFn = dereference ? statSync : lstatSync;
+  // No `throwIfNoEntry: false` here on purpose: a missing source is an ENOENT from
+  // the stat itself, which is what the host reports.
+  const srcStat = statFn(src, { bigint: true });
+  const destStat = statFn(dest, { bigint: true, throwIfNoEntry: false });
+
+  if (destStat) {
+    if (destStat.ino && destStat.dev && destStat.ino === srcStat.ino &&
+        destStat.dev === srcStat.dev) {
+      throw new ERR_FS_CP_EINVAL({
+        message: 'src and dest cannot be the same',
+        path: dest,
+        syscall: 'cp',
+        errno: EINVAL,
+        code: 'EINVAL',
+      });
+    }
+    if (srcStat.isDirectory() && !destStat.isDirectory()) {
+      throw new ERR_FS_CP_DIR_TO_NON_DIR({
+        message: `cannot overwrite non-directory ${dest} with directory ${src}`,
+        path: dest,
+        syscall: 'cp',
+        errno: EISDIR,
+        code: 'EISDIR',
+      });
+    }
+    if (!srcStat.isDirectory() && destStat.isDirectory()) {
+      throw new ERR_FS_CP_NON_DIR_TO_DIR({
+        message: `cannot overwrite directory ${dest} with non-directory ${src}`,
+        path: dest,
+        syscall: 'cp',
+        errno: ENOTDIR,
+        code: 'ENOTDIR',
+      });
+    }
   }
 
+  if (srcStat.isDirectory() && isSrcSubdir(src, dest)) {
+    throw new ERR_FS_CP_EINVAL({
+      message: `cannot copy ${src} to a subdirectory of self ${dest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+
+  checkParentPathsSync(src, srcStat, dest);
+
+  if (srcStat.isDirectory() && !recursive) {
+    throw new ERR_FS_EISDIR({
+      message: `${src} is a directory (not copied)`,
+      path: src,
+      syscall: 'cp',
+      errno: EISDIR,
+      code: 'EISDIR',
+    });
+  }
+  if (srcStat.isFIFO()) {
+    throw new ERR_FS_CP_FIFO_PIPE({
+      message: `cannot copy a FIFO pipe: ${src}`,
+      path: src,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+  if (srcStat.isSocket()) {
+    throw new ERR_FS_CP_SOCKET({
+      message: `cannot copy a socket file: ${dest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+
+  // The async path creates a missing destination parent (checkParentDir), and the
+  // native sync one does too — verified against the host, which copies into
+  // `deep/nested/b.txt` without complaint.
+  const destParent = dirname(dest);
+  if (!statSync(destParent, { throwIfNoEntry: false })) {
+    mkdirSync(destParent, { recursive: true });
+  }
+}
+
+// Recursively check whether dest's parent is a subdirectory of src, by inode
+// rather than by string, so a symlinked path cannot slip past it.
+function checkParentPathsSync(src, srcStat, dest) {
+  const srcParent = resolve(dirname(src));
+  const destParent = resolve(dirname(dest));
+  if (destParent === srcParent || destParent === parse(destParent).root) return;
+  const destStat = statSync(destParent, { bigint: true, throwIfNoEntry: false });
+  if (!destStat) return;
+  if (destStat.ino && destStat.dev && destStat.ino === srcStat.ino &&
+      destStat.dev === srcStat.dev) {
+    throw new ERR_FS_CP_EINVAL({
+      message: `cannot copy ${src} to a subdirectory of self ${dest}`,
+      path: dest,
+      syscall: 'cp',
+      errno: EINVAL,
+      code: 'EINVAL',
+    });
+  }
+  return checkParentPathsSync(src, srcStat, destParent);
+}
+
+// What the native cpSyncOverrideFile does: replace an existing destination file.
+// copyFileSync already truncates, so this is `copyFile` with the stat it needs.
+function cpSyncOverrideFile(src, dest, mode, preserveTimestamps) {
+  const srcStat = statSync(src);
+  return copyFile(srcStat, src, dest, { mode, preserveTimestamps });
+}
+// ── end VIVARI DELTA ────────────────────────────────────────────────────────
+
+function cpSyncFn(src, dest, opts) {
   // Warn about using preserveTimestamps on 32-bit node
   if (opts.preserveTimestamps && process.arch === 'ia32') {
     const warning = 'Using the preserveTimestamps option in 32-bit ' +
@@ -86,7 +216,7 @@ function cpSyncFn(src, dest, opts) {
     if (!shouldCopy) return;
   }
 
-  fsBinding.cpSyncCheckPaths(src, dest, opts.dereference, opts.recursive);
+  cpSyncCheckPaths(src, dest, opts.dereference, opts.recursive);
 
   return getStats(src, dest, opts);
 }
@@ -116,7 +246,7 @@ function onFile(srcStat, destStat, src, dest, opts) {
   if (!destStat) return copyFile(srcStat, src, dest, opts);
 
   if (opts.force) {
-    return fsBinding.cpSyncOverrideFile(src, dest, opts.mode, opts.preserveTimestamps);
+    return cpSyncOverrideFile(src, dest, opts.mode, opts.preserveTimestamps);
   }
 
   if (opts.errorOnExist) {
@@ -171,17 +301,9 @@ function onDir(srcStat, destStat, src, dest, opts) {
 }
 
 function copyDir(src, dest, opts, mkDir, srcMode) {
-  if (!opts.filter) {
-    // The caller didn't provide a js filter function, in this case
-    // we can run the whole function faster in C++
-    // TODO(dario-piotrowicz): look into making cpSyncCopyDir also accept the potential filter function
-    return fsBinding.cpSyncCopyDir(src, dest,
-                                   opts.force,
-                                   opts.dereference,
-                                   opts.errorOnExist,
-                                   opts.verbatimSymlinks,
-                                   opts.preserveTimestamps);
-  }
+  // VIVARI DELTA: upstream takes a native fast path (cpSyncCopyDir) when there is
+  // no filter. The JS loop below is the same walk and already ran for the filter
+  // case, so it serves both — one code path rather than a fast one we do not have.
 
   if (mkDir) {
     mkdirSync(dest);

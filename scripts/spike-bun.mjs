@@ -2204,9 +2204,9 @@ console.log("\n== bun run crypto-surface.ts (sha, CSRF, dns, zstd) ==");
       '  stats: Bun.dns.getCacheStats().size,',
       "  dnsThrew: (() => { try { Bun.dns.lookup('example.com'); return false; } catch { return true; } })(),",
       "  zstdThrew: (() => { try { Bun.zstdCompressSync('x'); return false; } catch (e) { return /packages\\/codec/.test(e.message); } })(),",
-      // node:zlib is the other half: the function exists, so a feature detect
-      // takes the branch, and the branch has to explain itself.
-      "  brotli: (() => { try { require('zlib').brotliCompressSync(Buffer.from('x')); return 'compressed'; } catch (e) { return e.message.slice(0, 90); } })(),",
+      // node:zlib is the other half: the function exists, a feature detect takes
+      // the branch, and now the branch compresses instead of explaining itself.
+      "  brotli: (() => { const z = require('zlib'); const s = 'x'.repeat(200); return z.brotliDecompressSync(z.brotliCompressSync(Buffer.from(s))).toString() === s; })(),",
       "  gzipStillWorks: require('zlib').gunzipSync(require('zlib').gzipSync(Buffer.from('hi'))).toString(),",
       "};",
       'console.log("CRYPTO:" + JSON.stringify(out));',
@@ -2223,8 +2223,8 @@ console.log("\n== bun run crypto-surface.ts (sha, CSRF, dns, zstd) ==");
   ok(got && got.prefetch === true && got.stats === 0, "Bun.dns.prefetch is inert and the cache reports empty");
   ok(got && got.dnsThrew === true, "Bun.dns.lookup refuses");
   ok(got && got.zstdThrew === true, "Bun.zstdCompressSync names packages/codec rather than dying on undefined");
-  ok(got && /is not implemented in Vivari/.test(got.brotli), "node:zlib brotli explains itself: " + JSON.stringify((got && got.brotli) || ""));
-  ok(got && got.gzipStillWorks === "hi", "…while gzip round-trips, so the codec itself is fine");
+  ok(got && got.brotli === true, "node:zlib brotli round-trips inside Bun's runtime too");
+  ok(got && got.gzipStillWorks === "hi", "…and gzip still round-trips beside it");
 }
 
 // ---------------------------------------------------------------------------

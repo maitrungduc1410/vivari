@@ -3,6 +3,7 @@
 // exactly like `node <entry>` would - synchronously, inside a worker.
 
 import { createSyscalls } from "./fs-client.js";
+import { interruptView } from "../protocol/syscall.js";
 import { createEventLoop } from "./loop.js";
 import { createSignalDelivery } from "./signals.js";
 import { createNodeModules } from "./node/loader.js";
@@ -125,6 +126,9 @@ export function createRuntime({
   // real EventEmitter (it needs newListener/emit), so the syscall park loop and
   // the event loop reach it through these forward declarations.
   let onPendingSignals = () => {};
+  // Set once signal delivery exists (below). Lets a guest that handled a signal
+  // and is deliberately still running say so — see signals.js.
+  let signalStandDown = () => {};
   let drainSignals = () => {};
   let dispatchSignalEvent = () => {};
 
@@ -144,7 +148,16 @@ export function createRuntime({
   // for a process it decided is a target (debug mode on / VV_DEBUG, minus the
   // shell + package-manager skip-list). So attaching on the SAB's presence alone
   // avoids depending on env propagation timing.
-  const debugEnabled = !!(debug && debug.sab);
+  // Which BACKEND a debug target gets. A `python` process is a Node guest whose
+  // entry is our own launcher shim, so the JS backend would instrument that shim
+  // — probes through a 2500-line file that only calls into Pyodide, a start gate
+  // in front of it, and a target the user cannot set a useful breakpoint in. The
+  // .py source never passes through the JS module loader; the interpreter that
+  // runs it has its own debugging interface, and builtins/python-debugger.js
+  // speaks the same CDP over the same SAB. So the kernel says which it is, and
+  // exactly one of the two attaches.
+  const debugIsPython = !!(debug && debug.sab && debug.lang === "python");
+  const debugEnabled = !!(debug && debug.sab) && !debugIsPython;
 
   // Liveness counter for real net handles (Phase 2 #8): a listening net.Server or
   // an open socket keeps the loop alive, exactly like libuv's active handles.
@@ -306,6 +319,13 @@ export function createRuntime({
     },
     release: () => {
       if (threadLiveness.active > 0) threadLiveness.active--;
+      // Wake for the same reason retain() does, in the opposite direction: a
+      // release can happen inside a HOST event callback (a MessagePort delivery
+      // that closes its own port, say), and the loop is parked in waitForNext
+      // with no reason to look again. Retaining without waking would miss work;
+      // releasing without waking hangs a process that has just finished — which
+      // is worse, because it looks like the deadlock it is only after 30s.
+      loop.wakeNet();
     },
     registerDrain: (fn) => {
       drainThreadEvents = fn;
@@ -345,7 +365,7 @@ export function createRuntime({
   // `wake` to nudge the loop when inbound bytes arrive; it publishes `dispatch` so
   // kernel-delivered pipe messages route back into the binding. See bindings/net.js.
   const pipeBridge = { postRaw, wake: loop.wakeNet, dispatch: null };
-  const nodeModules = createNodeModules({ process, syscalls, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks, pipeBridge });
+  const nodeModules = createNodeModules({ process, syscalls, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks, pipeBridge, queueClose: loop.queueClose });
   const bufferModule = nodeModules.require("buffer");
   const Buffer = bufferModule.Buffer;
   const path = nodeModules.require("path");
@@ -416,6 +436,7 @@ export function createRuntime({
     onPendingSignals = signals.onPending;
     drainSignals = signals.drain;
     dispatchSignalEvent = signals.dispatch;
+    signalStandDown = signals.standDown;
   }
 
   // ---- fork IPC (child side): process.send / 'message' / disconnect ----------
@@ -1356,6 +1377,23 @@ export function createRuntime({
   // the npm client (#10) will build on; it'll get a proper wrapper then.
   globalThis.__ocfetch = (url, opts) => syscalls.fetch(String(url), opts);
 
+  // A blocking read of stdin, for an interpreter that cannot turn this event
+  // loop while it waits. Returns a string, or null at end of input.
+  //
+  // Deliberately a separate door from process.stdin rather than an option on it.
+  // Everything else here reads stdin as a flowing stream and must keep doing so:
+  // a Node program that parked its thread on a keystroke would stop serving its
+  // sockets, firing its timers and reaping its children, all of which are things
+  // its stdin handler might be waiting for. The one caller is Pyodide's stdin
+  // callback (builtins/python.js), which is a synchronous C-level read with no
+  // loop of its own to turn.
+  globalThis.__ocReadStdin = () => {
+    const bytes = syscalls.readStdin();
+    // Zero bytes is end of input, as a read(2) of zero is. An empty line is not
+    // zero bytes: it is a newline.
+    return bytes && bytes.length ? new TextDecoder().decode(bytes) : null;
+  };
+
   // Async, non-blocking outbound fetch (parallel downloads). Unlike __ocfetch -
   // which parks the whole worker on Atomics.wait, forcing a single process's
   // registry requests to run one-at-a-time - this hands the request to the kernel
@@ -1464,6 +1502,35 @@ export function createRuntime({
   // map both to what `path` carries (vitest's mocker requires `node:path/posix`).
   builtins["path/posix"] = path.posix || path;
   builtins["path/win32"] = path.win32 || path;
+  // `sys` is Node's original name for `util` and is still the same object; it has
+  // been "deprecated" since 0.x and never removed, and old packages still require
+  // it. Ours used to be MODULE_NOT_FOUND, which is not a deprecation, it is an
+  // absence.
+  builtins.sys = util;
+  // trace_events, with tracing genuinely off. `createTracing({categories})`
+  // returns a real Tracing object whose enable/disable/enabled work; nothing is
+  // recorded, and getEnabledCategories() says so by answering undefined — which
+  // is exactly what Node answers when no category is enabled, so a caller that
+  // checks before recording gets a true answer rather than a thrown one.
+  //
+  // dgram, domain and repl deliberately stay MODULE_NOT_FOUND. They are the
+  // modules callers FEATURE-DETECT with `try { require('domain') } catch {}`, and
+  // a stub that loads and then throws on use would turn a working fallback into
+  // a failure further from its cause. A load-safe shim is only an improvement
+  // where the surface behind it can be answered honestly.
+  builtins.trace_events = {
+    createTracing(options) {
+      const categories = (options && options.categories) || [];
+      let on = false;
+      return {
+        enable() { on = true; },
+        disable() { on = false; },
+        get enabled() { return on; },
+        get categories() { return categories.join(","); },
+      };
+    },
+    getEnabledCategories() { return undefined; },
+  };
 
   const moduleSystem = createModuleSystem({ fs, path, builtins, process, globals, nodeModules });
 
@@ -1667,7 +1734,17 @@ export function createRuntime({
   // __ocInstallPython(indexURL) to boot Pyodide (CPython/WASM) from a same-origin
   // vendored index only when a `python` process actually runs, so a plain node
   // process pays nothing. See packages/runtime/builtins/python.js.
-  const pythonRuntime = createPythonRuntime({ process, require: vvRootRequire, trackHost });
+  const pythonRuntime = createPythonRuntime({
+    process,
+    require: vvRootRequire,
+    trackHost,
+    debug: debugIsPython ? debug : null,
+    // The byte CPython polls for SIGINT, over this process's own syscall SAB.
+    // A worker running the interpreter cannot reach a JS signal handler, so this
+    // is the only path a Ctrl-C has into a busy interpreter.
+    interrupt: ctrl && ctrl.buffer ? interruptView(ctrl.buffer) : null,
+    signalHandled: (name) => signalStandDown(name),
+  });
   globalThis.__ocInstallPython = (indexUrl) => {
     // Pyodide's urllib bridge asks the realm for synchronous HTTP —
     // `hasattr(js, "XMLHttpRequest")` — and the realm sweep took XMLHttpRequest
@@ -1757,9 +1834,12 @@ export function createRuntime({
      * THIS process, delivered while it is RUNNING (paused commands ride the debug
      * SAB instead). No-op until a debug session is attached. */
     dispatchDebugCommand: (json) => {
-      if (!__dbg) return;
       try {
-        __dbg.onCommand(typeof json === "string" ? JSON.parse(json) : json);
+        const cmd = typeof json === "string" ? JSON.parse(json) : json;
+        // A python target has no JS backend: its debugger lives inside the
+        // interpreter, and the python runtime owns the same postMessage path.
+        if (__dbg) __dbg.onCommand(cmd);
+        else if (debugIsPython) pythonRuntime.dispatchDebugCommand(cmd);
       } catch {
         /* malformed command — ignore */
       }
@@ -1888,7 +1968,19 @@ export function createRuntime({
       // driving the loop - its awaits may depend on timers/microtasks the loop
       // pumps, so awaiting here would deadlock. Let it settle inside drive() and
       // just surface a process.exit() sentinel or an uncaught error from it.
+      // Did the entry's top-level await ever settle? Node treats a main module
+      // still suspended when the loop runs dry as an error worth naming — see the
+      // exit-13 branch below — and the only way to know is to watch the promise.
+      let entrySettled = !(started && typeof started.then === "function");
       if (started && typeof started.then === "function") {
+        started.then(
+          () => {
+            entrySettled = true;
+          },
+          () => {
+            entrySettled = true;
+          },
+        );
         started.then(undefined, (err) => {
           if (err && err.__processExit !== undefined) {
             loop.requestExit(err.__processExit);
@@ -1901,8 +1993,35 @@ export function createRuntime({
           }
         });
       }
+      // 'beforeExit': the loop is the only thing that can see itself run dry, so it
+      // owns the timing; `process` lives here, so the emit does. A listener that
+      // schedules work gets the loop going again, which is the event's whole purpose
+      // (draining a pool's last jobs, flushing a logger) and why it is emitted from
+      // inside drive() rather than after it.
+      loop.setBeforeExitEmitter(() => {
+        process.emit("beforeExit", process.exitCode == null ? 0 : process.exitCode | 0);
+      });
       await loop.drive();
-      const code = loop.exiting ? loop.exitCode : process.exitCode == null ? 0 : process.exitCode | 0;
+      let code = loop.exiting ? loop.exitCode : process.exitCode == null ? 0 : process.exitCode | 0;
+      // The loop ran dry while the entry module was still suspended on a top-level
+      // await that will now never resolve. Node calls this out and exits 13, and the
+      // reason it bothers is that the alternative is what we used to do: exit 0, in
+      // silence, having done none of the work. A test runner whose pool never
+      // handshakes ends exactly here, and "0" is the one answer that cannot be
+      // debugged — it looks like success. An explicit process.exit() is not this
+      // case, and neither is a rejection, which reports itself.
+      // `entrySettled` covers the entry the runtime ran; isMainPending() covers the
+      // module the `node` shim ran on its behalf, which is the user's program.
+      const stillSuspended = !entrySettled || moduleSystem.isMainPending();
+      if (stillSuspended && !loop.exiting && code === 0) {
+        try {
+          const where = (process.argv && process.argv[1]) || entry;
+          console.error(`Warning: Detected unsettled top-level await at ${where}`);
+        } catch {
+          /* reporting must never be the thing that fails */
+        }
+        code = 13;
+      }
       return finish(code);
     },
   };

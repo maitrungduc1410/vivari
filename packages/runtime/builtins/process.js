@@ -137,6 +137,48 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
   });
   memoryUsage.rss = () => 64 * MB;
 
+  // CPU accounting, as close as this platform allows. Neither a browser worker
+  // nor a Node worker exposes per-thread CPU time, so `user` is elapsed wall time
+  // since this process started and `system` is 0 — an over-report whenever the
+  // process is idle, and honest about being one.
+  //
+  // It reports rather than throws because of how the number is used: almost every
+  // caller takes a DIFFERENCE across a span of work (`const t = cpuUsage(); …;
+  // cpuUsage(t)`), and over a busy span in a single-threaded worker elapsed time
+  // IS roughly the CPU time. Health endpoints and benchmark reporters (pino,
+  // clinic, Nest's terminus) call it unconditionally, so the alternative is a
+  // TypeError in code that only wanted to log a stat. Same trade as memoryUsage
+  // above, which has reported plausible constants since it was written.
+  const cpuUsage = (prev) => {
+    const micros = Math.round((globalThis.performance?.now?.() ?? 0) * 1000);
+    const usage = { user: micros, system: 0 };
+    if (prev) return { user: usage.user - (prev.user || 0), system: usage.system - (prev.system || 0) };
+    return usage;
+  };
+
+  // getrusage(2)'s shape. The two fields we can answer are answered from the two
+  // measures above; the rest are counters for events this platform does not
+  // count (page faults, context switches, IPC), and zero is what Node itself
+  // reports for most of them on a platform that does not track them.
+  const resourceUsage = () => ({
+    userCPUTime: cpuUsage().user,
+    systemCPUTime: 0,
+    maxRSS: Math.round(memoryUsage.rss() / 1024),
+    sharedMemorySize: 0,
+    unsharedDataSize: 0,
+    unsharedStackSize: 0,
+    minorPageFault: 0,
+    majorPageFault: 0,
+    swappedOut: 0,
+    fsRead: 0,
+    fsWrite: 0,
+    ipcSent: 0,
+    ipcReceived: 0,
+    signalsCount: 0,
+    voluntaryContextSwitches: 0,
+    involuntaryContextSwitches: 0,
+  });
+
   // Worker pools (Piscina, which backs Angular's compiler, Vitest, tsup, ...) have
   // an Atomics fast-path that reads task results synchronously via
   // receiveMessageOnPort. Our cooperative worker_threads can't serve that reliably
@@ -219,6 +261,8 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     // stable numbers. Real tools only read these for reporting (e.g. yarn's
     // ConsoleReporter peak-memory counter), not correctness.
     memoryUsage,
+    cpuUsage,
+    resourceUsage,
     stdout: makeStream(stdout, 1),
     stderr: makeStream(stderr, 2),
     stdin: { fd: 0, on() {}, once() {}, read: () => null, isTTY: false },

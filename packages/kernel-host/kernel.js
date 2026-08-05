@@ -1522,6 +1522,15 @@ export class Kernel {
       { command: spec.command, programPath, args: spec.args || [], cwd, env: spec.env || {} },
       { parentPid: parent.pid, capture: !!spec.capture },
     );
+    // A synchronously spawned child's stdin is settled at birth: `input` if the
+    // caller passed any, and then EOF. Nothing else can ever arrive, because the
+    // parent is parked on Atomics.wait until this child exits — so leaving the
+    // pipe open only buys a program that reads stdin (`cat`, a formatter reading
+    // from a pipe) a wait with no end and no error. These posts are safe this
+    // early: a process worker queues kernel messages that arrive before its
+    // runtime is ready and replays them on boot.
+    if (spec.input) this.sendStdin(childPid, b64ToBytes(spec.input));
+    this.sendStdin(childPid, null);
     this.procs.get(childPid).onExit = (res) => {
       this.respondOk(
         parent,

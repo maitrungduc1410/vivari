@@ -440,6 +440,35 @@ export default function (exports, require, module, process, internalBinding) {
     return `-----BEGIN ${label}-----\n${lines.join("\n")}\n-----END ${label}-----\n`;
   }
 
+  // The JWK members Node insists on, per key type, in the order it checks them
+  // (internal/crypto/keys.js). Anything absent is an ERR_INVALID_ARG_TYPE naming
+  // the field — including RSA's dp/dq/qi, which RFC 7518 calls optional and Node
+  // requires anyway.
+  function requireJwkFields(jwk, isPrivate) {
+    const need =
+      jwk.kty === "OKP"
+        ? ["crv", "x", ...(isPrivate ? ["d"] : [])]
+        : jwk.kty === "EC"
+          ? ["crv", "x", "y", ...(isPrivate ? ["d"] : [])]
+          : jwk.kty === "RSA"
+            ? ["n", "e", ...(isPrivate ? ["d", "p", "q", "dp", "dq", "qi"] : [])]
+            : null;
+    if (!need) {
+      const err = new TypeError(`The property 'key.kty' must be one of: 'RSA', 'EC', 'OKP'. Received ${jwk.kty}`);
+      err.code = "ERR_INVALID_ARG_VALUE";
+      throw err;
+    }
+    for (const f of need) {
+      if (typeof jwk[f] !== "string") {
+        const err = new TypeError(
+          `The "key.${f}" property must be of type string. Received ${jwk[f] === undefined ? "undefined" : typeof jwk[f]}`,
+        );
+        err.code = "ERR_INVALID_ARG_TYPE";
+        throw err;
+      }
+    }
+  }
+
   // Pull a PKCS#8/SPKI DER out of any accepted key input; `isPrivate` records
   // which envelope it came from (PEM label wins; DER falls back to `want`).
   function extractKeyDer(input, want) {
@@ -486,8 +515,47 @@ export default function (exports, require, module, process, internalBinding) {
       );
     }
     if (format === "der") return { der: toBytes(keyData), isPrivate: want === "private" };
+    // A JWK comes in as a plain object, not bytes: this is how a key arrives from
+    // a JWKS endpoint, and jose's importJWK routes through createPublicKey with
+    // format 'jwk'. A `d` is what makes it private, exactly as RFC 7517 has it.
+    if (format === "jwk") {
+      const jwk = keyData;
+      if (!jwk || typeof jwk !== "object") throw new Error("Vivari crypto: a jwk key must be an object");
+      // What is being asked for decides, not what the JWK carries: Node's
+      // createPublicKey(privateJwk) hands back the PUBLIC key rather than
+      // refusing, the same way it does for a private PEM.
+      const isPrivate = want === "private";
+      // Node validates the members each kty needs, in this order, and reports a
+      // missing one as a plain argument-type error naming the field. Callers
+      // (jose, and anything reading a JWKS) branch on that code, so it is part
+      // of the contract, not decoration.
+      requireJwkFields(jwk, isPrivate);
+      const raw = (v) => (v === undefined ? undefined : new Uint8Array(Buffer.from(String(v), "base64url")));
+      if (isPrivate) {
+        return {
+          der: binding.jwkPrivateToDer(jwk.kty, jwk.crv, {
+            d: raw(jwk.d),
+            n: raw(jwk.n),
+            e: raw(jwk.e),
+            p: raw(jwk.p),
+            q: raw(jwk.q),
+          }),
+          isPrivate: true,
+        };
+      }
+      const isRsa = jwk.kty === "RSA";
+      return {
+        der: binding.jwkPublicToDer(jwk.kty, jwk.crv, raw(isRsa ? jwk.n : jwk.x), raw(isRsa ? jwk.e : jwk.y)),
+        isPrivate: false,
+      };
+    }
     throw new Error(`Vivari crypto: unsupported key format '${format}'`);
   }
+
+  // OpenSSL's curve names (what asymmetricKeyDetails reports) → the JOSE registry
+  // names a JWK must carry. The two vocabularies disagree for exactly these
+  // curves, and a JWK with `crv: "prime256v1"` is not a JWK anyone will accept.
+  const JWK_CURVES = { prime256v1: "P-256", secp384r1: "P-384", secp521r1: "P-521" };
 
   class AsymmetricKeyObject extends KeyObject {
     constructor(type, der, descriptor) {
@@ -510,7 +578,21 @@ export default function (exports, require, module, process, internalBinding) {
     }
     export(options = {}) {
       const format = options.format || "pem";
-      if (format === "jwk") throw new Error("Vivari crypto: JWK key export is not supported yet");
+      // JWK (RFC 7517). `kty` and `crv` come from what this object already knows;
+      // the numbers come from the codec, which holds the parsed key — see
+      // jwk_public_fields in packages/crypto. This is the export jose reaches for
+      // when a caller hands it a KeyObject and it needs a JWKS entry, and the
+      // shape has to be exact: a JWK is matched field by field by whoever
+      // consumes it.
+      if (format === "jwk") {
+        const der = this[kKeyMaterial];
+        const priv = this._type === "private";
+        const fields = priv ? binding.jwkPrivate(der) : binding.jwkPublic(der);
+        const kty = this._asymmetricKeyType === "rsa" ? "RSA" : this._asymmetricKeyType === "ed25519" ? "OKP" : "EC";
+        const crv =
+          kty === "OKP" ? "Ed25519" : kty === "EC" ? JWK_CURVES[this._details.namedCurve] : undefined;
+        return crv ? { kty, crv, ...fields } : { kty, ...fields };
+      }
       const der = this[kKeyMaterial];
       if (format === "der") return Buffer.from(der);
       if (options.type && options.type !== "pkcs8" && options.type !== "spki") {
@@ -565,17 +647,16 @@ export default function (exports, require, module, process, internalBinding) {
     return new AsymmetricKeyObject("public", norm, binding.inspectPublic(norm));
   }
 
-  // OpenSSL padding/salt constants (crypto.constants) — jsonwebtoken/jose read
-  // these to select RSA-PSS. Kept minimal to what our RSA surface honors.
-  const RSA_CONSTANTS = {
-    RSA_PKCS1_PADDING: 1,
-    RSA_NO_PADDING: 3,
-    RSA_PKCS1_OAEP_PADDING: 4,
-    RSA_PKCS1_PSS_PADDING: 6,
-    RSA_PSS_SALTLEN_DIGEST: -1,
-    RSA_PSS_SALTLEN_AUTO: -2,
-    RSA_PSS_SALTLEN_MAX_SIGN: -2,
-  };
+  // crypto.constants, from the one table (internalBinding('constants').crypto),
+  // which is where Node reads it too. This was a local copy of the seven RSA
+  // padding/salt values the signer below honours — right for the signer, and the
+  // other 49 names a caller might read came back undefined.
+  const RSA_CONSTANTS = internalBinding("constants").crypto;
+  // defaultCipherList is a lib-level value on Node, not part of the internal
+  // table: it starts as the core list and is what --tls-cipher-list would replace.
+  // Keeping it here rather than in the table is what keeps the deprecated
+  // `constants` module's key set equal to Node's, which aggregates only the table.
+  const CRYPTO_CONSTANTS = { ...RSA_CONSTANTS, defaultCipherList: RSA_CONSTANTS.defaultCoreCipherList };
 
   // A `{ key, ... }` options object (vs a bare KeyObject / PEM / DER buffer).
   function isKeyOptions(x) {
@@ -670,6 +751,68 @@ export default function (exports, require, module, process, internalBinding) {
     let err = null;
     try {
       out = scryptSync(password, salt, keylen, options);
+    } catch (e) {
+      err = e;
+    }
+    queueMicrotask(() => (err ? callback(err) : callback(null, out)));
+  }
+
+  // --- HKDF (RFC 5869) ----------------------------------------------------
+  // Extract-then-expand over the HMAC we already have. Written here rather than
+  // in the Rust codec because that is all HKDF is — two loops around HMAC — and
+  // a second implementation of the same primitive is a second thing to keep
+  // right. The callers that want it (jose, iron-webcrypto/@hapi/iron, WebAuthn
+  // and session libraries deriving a key per purpose from one secret) reach for
+  // hkdfSync directly, and it was simply absent: `crypto.hkdfSync is not a
+  // function`, which reads as "this Node is too old" rather than "this runtime
+  // has a gap".
+  function hkdfSync(digest, ikm, salt, info, keylen) {
+    const hashLen = binding.digest(digest, new Uint8Array(0)).length;
+    const max = 255 * hashLen;
+    if (!Number.isInteger(keylen) || keylen < 0) {
+      const err = new RangeError(
+        `The value of "length" is out of range. It must be >= 0 && <= ${max}. Received ${keylen}`,
+      );
+      err.code = "ERR_OUT_OF_RANGE";
+      throw err;
+    }
+    // Node's two refusals at the edges, and neither is the RangeError the shape
+    // of this argument suggests — both were checked against the real thing.
+    // Past 255·HashLen the expand loop runs out of counter (RFC 5869 §2.3), and
+    // Node reports that as an invalid key length; a zero length fails further
+    // down, in the derive itself, as a bare Error.
+    if (keylen > max) {
+      const err = new Error("Invalid key length");
+      err.code = "ERR_CRYPTO_INVALID_KEYLEN";
+      throw err;
+    }
+    if (keylen === 0) throw new Error("Deriving bits failed");
+    const keyBytes = ikm && ikm[kKeyObjectBrand] ? ikm[kKeyMaterial] : toBytes(ikm);
+    // A zero-length salt means "a string of HashLen zeros" (RFC 5869 §2.2), which
+    // is not the same as no salt and is what every interop test uses.
+    const saltBytes = toBytes(salt);
+    const prk = binding.hmac(digest, saltBytes.length ? saltBytes : new Uint8Array(hashLen), keyBytes);
+    const infoBytes = toBytes(info);
+    const out = new Uint8Array(keylen);
+    let prev = new Uint8Array(0);
+    for (let i = 1, off = 0; off < keylen; i++) {
+      const block = new Uint8Array(prev.length + infoBytes.length + 1);
+      block.set(prev, 0);
+      block.set(infoBytes, prev.length);
+      block[block.length - 1] = i;
+      prev = binding.hmac(digest, prk, block);
+      out.set(prev.subarray(0, Math.min(prev.length, keylen - off)), off);
+      off += prev.length;
+    }
+    // Node hands back an ArrayBuffer here, not a Buffer — unusually for this API
+    // family, and callers do `new Uint8Array(result)` on the strength of it.
+    return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
+  }
+  function hkdf(digest, ikm, salt, info, keylen, callback) {
+    let out = null;
+    let err = null;
+    try {
+      out = hkdfSync(digest, ikm, salt, info, keylen);
     } catch (e) {
       err = e;
     }
@@ -935,6 +1078,8 @@ export default function (exports, require, module, process, internalBinding) {
     Decipheriv,
     pbkdf2,
     pbkdf2Sync,
+    hkdf,
+    hkdfSync,
     randomBytes,
     randomFill,
     randomFillSync,
@@ -944,7 +1089,7 @@ export default function (exports, require, module, process, internalBinding) {
     getRandomValues: (arr) => webcrypto.getRandomValues(arr),
     getHashes: () => binding.getHashes(),
     getCiphers: () => ["aes-128-cbc", "aes-192-cbc", "aes-256-cbc", "aes-128-gcm", "aes-256-gcm"],
-    constants: { ...RSA_CONSTANTS },
+    constants: { ...CRYPTO_CONSTANTS },  // a copy: callers must not mutate the table
     webcrypto,
     // Key material. Secret (symmetric) via createSecretKey; asymmetric (ec/
     // ed25519) via createPrivateKey/createPublicKey. Note: createPrivateKey still

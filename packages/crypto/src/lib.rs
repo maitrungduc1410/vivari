@@ -495,6 +495,241 @@ pub fn inspect_public_der(der: &[u8]) -> Result<String, JsError> {
     Ok(kind_str(k))
 }
 
+// --- JWK export (RFC 7517/7518) ---------------------------------------------
+// A key's components as JSON, for KeyObject.export({ format: 'jwk' }). Done here
+// rather than by unpacking the DER in JS because the components ARE what these
+// crates already hold — the alternative is a second, hand-rolled ASN.1 reader
+// whose bugs would be silent and key-shaped. JS does the base64url and assembles
+// the object; this returns raw bytes as arrays so there is one encoder.
+//
+// The `d` of an EC or Ed25519 private key must be fixed-width (RFC 7518 §6.2.2.1:
+// the octet length of the curve order), which is what SecretKey::to_bytes and
+// SigningKey::to_bytes give. RSA's numbers are big-endian minimal, which is what
+// §6.3 asks for.
+// RFC 7518 §6.3: an RSA JWK member "MUST utilize the minimum number of octets
+// needed to represent the value", which is also what OpenSSL emits, so a padded
+// one differs from Node's for the same key. The rsa crate's big integers carry a
+// fixed precision and hand back a fixed 256 bytes for a 2048-bit key, so `d`
+// keeps a leading zero byte whenever it happens to be under 2040 bits — about
+// one key in 256, which is exactly often enough to look like a flake.
+//
+// EC and OKP go the other way (fixed width, zero-padded to the curve's octet
+// length), so this is applied to RSA members only.
+fn trim_leading_zeros(mut v: Vec<u8>) -> Vec<u8> {
+    let zeros = v.iter().take_while(|&&b| b == 0).count();
+    // A value of zero is one octet, not none.
+    let keep = zeros.min(v.len().saturating_sub(1));
+    v.drain(..keep);
+    v
+}
+
+fn b64_rsa_fields(pairs: Vec<(&str, Vec<u8>)>) -> String {
+    b64_fields(pairs.into_iter().map(|(k, v)| (k, trim_leading_zeros(v))).collect())
+}
+
+fn b64_fields(pairs: Vec<(&str, Vec<u8>)>) -> String {
+    let mut out = String::from("{");
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("\"{}\":\"{}\"", k, b64url(v)));
+    }
+    out.push('}');
+    out
+}
+
+fn b64url(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut s = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        s.push(T[(n >> 18) as usize & 63] as char);
+        s.push(T[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            s.push(T[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            s.push(T[n as usize & 63] as char);
+        }
+    }
+    s
+}
+
+// The JSON body of a JWK, minus `kty`/`crv`, which JS adds from the key's own
+// type — it already knows both and they need no encoding.
+#[wasm_bindgen]
+pub fn jwk_public_fields(der: &[u8]) -> Result<String, JsError> {
+    use elliptic_curve::sec1::ToEncodedPoint;
+    match detect_public(der)? {
+        Kind::Ed25519 => {
+            let pk = ed25519_dalek::VerifyingKey::from_public_key_der(der).map_err(je)?;
+            Ok(b64_fields(vec![("x", pk.to_bytes().to_vec())]))
+        }
+        Kind::P256 => {
+            let pk = p256::PublicKey::from_public_key_der(der).map_err(je)?;
+            let pt = pk.to_encoded_point(false);
+            Ok(b64_fields(vec![
+                ("x", pt.x().ok_or_else(|| JsError::new("no x"))?.to_vec()),
+                ("y", pt.y().ok_or_else(|| JsError::new("no y"))?.to_vec()),
+            ]))
+        }
+        Kind::P384 => {
+            let pk = p384::PublicKey::from_public_key_der(der).map_err(je)?;
+            let pt = pk.to_encoded_point(false);
+            Ok(b64_fields(vec![
+                ("x", pt.x().ok_or_else(|| JsError::new("no x"))?.to_vec()),
+                ("y", pt.y().ok_or_else(|| JsError::new("no y"))?.to_vec()),
+            ]))
+        }
+        Kind::Rsa => {
+            use rsa::traits::PublicKeyParts;
+            let pk = load_rsa_public(der)?;
+            Ok(b64_rsa_fields(vec![
+                ("n", pk.n().to_bytes_be()),
+                ("e", pk.e().to_bytes_be()),
+            ]))
+        }
+    }
+}
+
+#[wasm_bindgen]
+pub fn jwk_private_fields(der: &[u8]) -> Result<String, JsError> {
+    use elliptic_curve::sec1::ToEncodedPoint;
+    match detect_private(der)? {
+        Kind::Ed25519 => {
+            let sk = ed25519_dalek::SigningKey::from_pkcs8_der(der).map_err(je)?;
+            Ok(b64_fields(vec![
+                ("x", sk.verifying_key().to_bytes().to_vec()),
+                ("d", sk.to_bytes().to_vec()),
+            ]))
+        }
+        Kind::P256 => {
+            let sk = p256::SecretKey::from_pkcs8_der(der).map_err(je)?;
+            let pt = sk.public_key().to_encoded_point(false);
+            Ok(b64_fields(vec![
+                ("x", pt.x().ok_or_else(|| JsError::new("no x"))?.to_vec()),
+                ("y", pt.y().ok_or_else(|| JsError::new("no y"))?.to_vec()),
+                ("d", sk.to_bytes().to_vec()),
+            ]))
+        }
+        Kind::P384 => {
+            let sk = p384::SecretKey::from_pkcs8_der(der).map_err(je)?;
+            let pt = sk.public_key().to_encoded_point(false);
+            Ok(b64_fields(vec![
+                ("x", pt.x().ok_or_else(|| JsError::new("no x"))?.to_vec()),
+                ("y", pt.y().ok_or_else(|| JsError::new("no y"))?.to_vec()),
+                ("d", sk.to_bytes().to_vec()),
+            ]))
+        }
+        Kind::Rsa => {
+            use rsa::traits::PrivateKeyParts;
+            use rsa::traits::PublicKeyParts;
+            // dp/dq/qi are optional on a freshly parsed key; precompute fills
+            // them, and a JWK without them is one CRT-capable consumers reject.
+            let mut sk = load_rsa_private(der)?;
+            sk.precompute().map_err(je)?;
+            let primes = sk.primes();
+            let p = primes.first().ok_or_else(|| JsError::new("no p"))?;
+            let q = primes.get(1).ok_or_else(|| JsError::new("no q"))?;
+            Ok(b64_rsa_fields(vec![
+                ("n", sk.n().to_bytes_be()),
+                ("e", sk.e().to_bytes_be()),
+                ("d", sk.d().to_bytes_be()),
+                ("p", p.to_bytes_be()),
+                ("q", q.to_bytes_be()),
+                ("dp", sk.dp().ok_or_else(|| JsError::new("no dp"))?.to_bytes_be()),
+                ("dq", sk.dq().ok_or_else(|| JsError::new("no dq"))?.to_bytes_be()),
+                ("qi", sk.qinv().ok_or_else(|| JsError::new("no qi"))?.to_bytes_be().1),
+            ]))
+        }
+    }
+}
+
+// The other direction: a JWK's components back into the PKCS#8/SPKI DER every
+// other entry point here speaks. Exporting without importing would be half a
+// capability — a JWKS endpoint's keys arrive AS JWKs, which is the common way a
+// service gets the key it verifies tokens with.
+//
+// JS decodes base64url and passes raw bytes, so there is one decoder and it is
+// the one that already exists. Field names follow the JWK: for EC/OKP `a` is x
+// and `b` is y; for RSA `a` is the modulus n and `b` the exponent e.
+#[wasm_bindgen]
+pub fn jwk_public_to_der(kty: &str, crv: &str, a: &[u8], b: &[u8]) -> Result<Vec<u8>, JsError> {
+    use elliptic_curve::sec1::FromEncodedPoint;
+    match (kty, crv) {
+        ("OKP", "Ed25519") => {
+            let bytes: [u8; 32] = a.try_into().map_err(|_| JsError::new("Ed25519 x must be 32 bytes"))?;
+            let pk = ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(je)?;
+            Ok(pk.to_public_key_der().map_err(je)?.as_bytes().to_vec())
+        }
+        ("EC", "P-256") => {
+            let pt = p256::EncodedPoint::from_affine_coordinates(a.into(), b.into(), false);
+            let pk = Option::<p256::PublicKey>::from(p256::PublicKey::from_encoded_point(&pt))
+                .ok_or_else(|| JsError::new("JWK x/y is not a point on P-256"))?;
+            Ok(pk.to_public_key_der().map_err(je)?.as_bytes().to_vec())
+        }
+        ("EC", "P-384") => {
+            let pt = p384::EncodedPoint::from_affine_coordinates(a.into(), b.into(), false);
+            let pk = Option::<p384::PublicKey>::from(p384::PublicKey::from_encoded_point(&pt))
+                .ok_or_else(|| JsError::new("JWK x/y is not a point on P-384"))?;
+            Ok(pk.to_public_key_der().map_err(je)?.as_bytes().to_vec())
+        }
+        ("RSA", _) => {
+            use rsa::pkcs8::EncodePublicKey;
+            let pk = rsa::RsaPublicKey::new(
+                rsa::BigUint::from_bytes_be(a),
+                rsa::BigUint::from_bytes_be(b),
+            )
+            .map_err(je)?;
+            Ok(pk.to_public_key_der().map_err(je)?.as_bytes().to_vec())
+        }
+        _ => Err(JsError::new(&format!("unsupported JWK kty/crv '{kty}'/'{crv}'"))),
+    }
+}
+
+#[wasm_bindgen]
+pub fn jwk_private_to_der(
+    kty: &str,
+    crv: &str,
+    d: &[u8],
+    n: &[u8],
+    e: &[u8],
+    p: &[u8],
+    q: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    match (kty, crv) {
+        ("OKP", "Ed25519") => {
+            let bytes: [u8; 32] = d.try_into().map_err(|_| JsError::new("Ed25519 d must be 32 bytes"))?;
+            let sk = ed25519_dalek::SigningKey::from_bytes(&bytes);
+            Ok(sk.to_pkcs8_der().map_err(je)?.as_bytes().to_vec())
+        }
+        ("EC", "P-256") => {
+            let sk = p256::SecretKey::from_slice(d).map_err(je)?;
+            Ok(sk.to_pkcs8_der().map_err(je)?.as_bytes().to_vec())
+        }
+        ("EC", "P-384") => {
+            let sk = p384::SecretKey::from_slice(d).map_err(je)?;
+            Ok(sk.to_pkcs8_der().map_err(je)?.as_bytes().to_vec())
+        }
+        ("RSA", _) => {
+            use rsa::pkcs8::EncodePrivateKey;
+            // p and q are enough: the crate recomputes the CRT values, so a JWK
+            // that omits dp/dq/qi (they are optional in RFC 7518) still imports.
+            let sk = rsa::RsaPrivateKey::from_components(
+                rsa::BigUint::from_bytes_be(n),
+                rsa::BigUint::from_bytes_be(e),
+                rsa::BigUint::from_bytes_be(d),
+                vec![rsa::BigUint::from_bytes_be(p), rsa::BigUint::from_bytes_be(q)],
+            )
+            .map_err(je)?;
+            Ok(sk.to_pkcs8_der().map_err(je)?.as_bytes().to_vec())
+        }
+        _ => Err(JsError::new(&format!("unsupported JWK kty/crv '{kty}'/'{crv}'"))),
+    }
+}
+
 #[wasm_bindgen]
 pub fn public_der_from_private_der(der: &[u8]) -> Result<Vec<u8>, JsError> {
     match detect_private(der)? {

@@ -36,6 +36,10 @@ import {
   OP_SYMLINK,
   OP_READLINK,
   OP_LINK,
+  OP_CHMOD,
+  OP_UTIMES,
+  OP_FCHMOD,
+  OP_FUTIMES,
   OP_OPEN,
   OP_CLOSE,
   OP_FD_READ,
@@ -51,6 +55,7 @@ import {
   OP_CLOSE_SERVER,
   OP_FETCH,
   OP_FETCH_ASYNC,
+  OP_READ_STDIN,
   OP_WATCH,
   OP_UNWATCH,
   OP_PIPE_LISTEN,
@@ -151,6 +156,19 @@ export function createSyscalls({ ctrl, data, notify, onSignal = null }) {
       return bytesToU32(call(OP_FD_WRITE, encodeRequest([u32ToBytes(fd), f64ToBytes(pos), chunk])));
     },
     fstat: (fd) => JSON.parse(decodeBytes(call(OP_FSTAT, encodeRequest([u32ToBytes(fd)])))),
+    // Metadata writes. `follow` picks chmod/utimes (resolve a trailing symlink)
+    // over lchmod/lutimes (stamp the link itself). Times cross as f64 ms, the
+    // unit the VFS stores and stat reports, so nothing rounds on the way.
+    chmod: (path, mode, follow) =>
+      call(OP_CHMOD, encodeRequest([b(path), u32ToBytes(mode), u32ToBytes(follow ? 1 : 0)])),
+    utimes: (path, atimeMs, mtimeMs, follow) =>
+      call(
+        OP_UTIMES,
+        encodeRequest([b(path), f64ToBytes(atimeMs), f64ToBytes(mtimeMs), u32ToBytes(follow ? 1 : 0)]),
+      ),
+    fchmod: (fd, mode) => call(OP_FCHMOD, encodeRequest([u32ToBytes(fd), u32ToBytes(mode)])),
+    futimes: (fd, atimeMs, mtimeMs) =>
+      call(OP_FUTIMES, encodeRequest([u32ToBytes(fd), f64ToBytes(atimeMs), f64ToBytes(mtimeMs)])),
     ftruncate: (fd, len) => call(OP_FTRUNCATE, encodeRequest([u32ToBytes(fd), u32ToBytes(len)])),
 
     // ---- file watching (roadmap #19 stage B) ----
@@ -274,5 +292,18 @@ export function createSyscalls({ ctrl, data, notify, onSignal = null }) {
       };
       call(OP_FETCH_ASYNC, encodeRequest([b(JSON.stringify(req))]));
     },
+
+    // ---- blocking stdin ----
+    // Parks this process until there is input, and returns the bytes. An empty
+    // result is end of input, not an empty line — a line always carries its
+    // newline. See OP_READ_STDIN for why a synchronous reader needs its own
+    // syscall when process.stdin already exists.
+    //
+    // This is the ONLY way to read stdin without turning the event loop, and it
+    // is deliberately not wired into process.stdin: a Node program that blocked
+    // its loop on a keystroke would stop answering timers, sockets and its own
+    // children. The one caller is the Python interpreter's stdin callback, which
+    // has no loop to turn.
+    readStdin: () => call(OP_READ_STDIN, encodeRequest([b("{}")])),
   };
 }

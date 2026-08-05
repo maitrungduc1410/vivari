@@ -29,6 +29,13 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
       env: opts.env || process.env,
       capture: true,
     };
+    // `input` travels WITH the spawn, because there is no later. The caller is
+    // parked on Atomics.wait from here until the child exits, so it can never
+    // write to a pipe; the kernel hands these bytes to the child's stdin and then
+    // closes it (see handleSpawn). base64 because the spec crosses as JSON and
+    // input is often binary — a tarball piped into a checker, an image into a
+    // converter.
+    if (opts.input != null) spec.input = toBytes(opts.input, opts.encoding).toString("base64");
     let r;
     try {
       r = sys.spawn(spec);
@@ -237,6 +244,17 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
   // a single line — `sh -c "<command> <args...>"`. Tools rely on this (Nest's
   // `nest start` spawns `spawn('node --enable-source-maps dist/main', {shell})`);
   // without it we'd try to exec a program literally named "node --enable...".
+  // Everything Node accepts as `input`, as bytes. A string honors the call's
+  // encoding (that is what Node does with it); a view is read at its own offset
+  // and length, so a subarray of a larger buffer sends only its own slice.
+  function toBytes(value, encoding) {
+    if (typeof value === "string") return Buffer.from(value, Buffer.isEncoding(encoding) ? encoding : "utf8");
+    if (Buffer.isBuffer(value)) return value;
+    if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    if (value instanceof ArrayBuffer) return Buffer.from(value);
+    return Buffer.from(String(value));
+  }
+
   function withShell(command, args, opts) {
     if (!opts || !opts.shell) return { command, args };
     const shell = typeof opts.shell === "string" ? opts.shell : "sh";

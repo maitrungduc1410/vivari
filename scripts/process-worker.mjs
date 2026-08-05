@@ -49,13 +49,18 @@ const require = createRequire(import.meta.url);
 const CODEC_MOD = "../packages/codec/pkg-node/vivari_codec.js";
 const CRYPTO_MOD = "../packages/crypto/pkg-node/vivari_crypto.js";
 
+// BROTLI_DECODE / BROTLI_ENCODE in node_zlib_mode: the two modes the binding
+// serves from the codec's brotli engine rather than its zlib one.
+const BROTLI_MODES = new Set([8, 9]);
+
 let makeZStream = null;
 try {
   require.resolve(CODEC_MOD); // built? (throws if not — no compile either way)
-  let ZStream = null;
-  makeZStream = (mode, level, windowBits) => {
-    if (!ZStream) ({ ZStream } = require(CODEC_MOD));
-    return new ZStream(mode, level, windowBits);
+  let codec = null;
+  makeZStream = (mode, level, windowBits, brotliParams) => {
+    if (!codec) codec = require(CODEC_MOD);
+    if (BROTLI_MODES.has(mode)) return new codec.BrotliStream(mode === 9, brotliParams);
+    return new codec.ZStream(mode, level, windowBits);
   };
 } catch {
   // codec not built — zlib stays unavailable (crc32/constants still work).

@@ -70,11 +70,14 @@ function buildCodecs(codecModule, cryptoModule) {
   // gzip/deflate stream is created (never at boot).
   let zReady = false;
   const makeZStream = codecModule
-    ? (mode, level, windowBits) => {
+    ? (mode, level, windowBits, brotliParams) => {
         if (!zReady) {
           codecNs.initSync({ module: codecModule });
           zReady = true;
         }
+        // 8/9 are BROTLI_DECODE/BROTLI_ENCODE in node_zlib_mode: the modes the
+        // binding serves from the codec's brotli engine, not its zlib one.
+        if (mode === 8 || mode === 9) return new codecNs.BrotliStream(mode === 9, brotliParams);
         return new codecNs.ZStream(mode, level, windowBits);
       }
     : null;

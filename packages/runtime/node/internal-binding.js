@@ -11,58 +11,11 @@
 import { createBufferBinding } from "./bindings/buffer.js";
 import { createFsBinding } from "./bindings/fs.js";
 import { createNetBindings } from "./bindings/net.js";
+import { createBlockListBindings } from "./bindings/block-list.js";
 import { createHttpParserBinding } from "./bindings/http_parser.js";
 import { createZlibBinding, ZLIB_CONSTANTS } from "./bindings/zlib.js";
 import { createCryptoBinding } from "./bindings/crypto.js";
-
-// POSIX/libuv constants exposed as internalBinding('constants').fs. Node's real
-// lib/fs.js and internal/fs/utils.js destructure these; the O_* values MUST
-// match the flag bits the Rust VFS decodes in open(2) (Linux values).
-const FS_CONSTANTS = {
-  O_RDONLY: 0,
-  O_WRONLY: 1,
-  O_RDWR: 2,
-  O_CREAT: 0o100,
-  O_EXCL: 0o200,
-  O_NOCTTY: 0o400,
-  O_TRUNC: 0o1000,
-  O_APPEND: 0o2000,
-  O_DIRECTORY: 0o200000,
-  O_NOFOLLOW: 0o400000,
-  O_SYNC: 0o4010000,
-  O_DSYNC: 0o10000,
-  O_DIRECT: 0o40000,
-  O_NONBLOCK: 0o4000,
-  S_IFMT: 0o170000,
-  S_IFREG: 0o100000,
-  S_IFDIR: 0o040000,
-  S_IFCHR: 0o020000,
-  S_IFBLK: 0o060000,
-  S_IFIFO: 0o010000,
-  S_IFLNK: 0o120000,
-  S_IFSOCK: 0o140000,
-  S_IRWXU: 0o700,
-  S_IRUSR: 0o400,
-  S_IWUSR: 0o200,
-  S_IXUSR: 0o100,
-  F_OK: 0,
-  R_OK: 4,
-  W_OK: 2,
-  X_OK: 1,
-  COPYFILE_EXCL: 1,
-  COPYFILE_FICLONE: 2,
-  COPYFILE_FICLONE_FORCE: 4,
-  UV_FS_SYMLINK_DIR: 1,
-  UV_FS_SYMLINK_JUNCTION: 2,
-  UV_DIRENT_UNKNOWN: 0,
-  UV_DIRENT_FILE: 1,
-  UV_DIRENT_DIR: 2,
-  UV_DIRENT_LINK: 3,
-  UV_DIRENT_FIFO: 4,
-  UV_DIRENT_SOCKET: 5,
-  UV_DIRENT_CHAR: 6,
-  UV_DIRENT_BLOCK: 7,
-};
+import { OS_SIGNALS, OS_ERRNO, OS_PRIORITY, OS_DLOPEN, UV_UDP_REUSEADDR, FS_CONSTANTS, CRYPTO_CONSTANTS } from "./bindings/constants.js";
 
 // Node's v8::PropertyFilter values used by getOwnNonIndexProperties.
 const ALL_PROPERTIES = 0;
@@ -82,14 +35,14 @@ function getOwnNonIndexProperties(obj, filter) {
   return out;
 }
 
-export function createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks, pipeBridge } = {}) {
+export function createInternalBinding({ syscalls, process, netLiveness, netServers, codec, cryptoCodec, hostAsyncHooks, pipeBridge, queueClose } = {}) {
   // net (Phase 2 #7/#8): tcp_wrap/stream_wrap/uv/pipe_wrap/cares_wrap for the
   // in-process loopback beneath Node's real lib/net.js. Needs process.nextTick.
   // `syscalls` lets listen() register the port with the kernel (external routing,
   // stage 2); `netServers` counts kernel-registered listeners for `doNet`;
   // `pipeBridge` carries cross-process UNIX-socket AND TCP traffic through the
   // kernel (Nitro's :3000 proxying to its SSR worker's port in another process).
-  const net = createNetBindings({ process, liveness: netLiveness, syscalls, netServers, pipeBridge });
+  const net = createNetBindings({ process, liveness: netLiveness, syscalls, netServers, pipeBridge, queueClose });
   // http_parser (Phase 2 #8): real llhttp-in-Wasm with a pure-JS fallback. When
   // the Wasm backend is live, advertise it via process.versions.llhttp (as real
   // Node does), which also lets guest code / spikes confirm the backend.
@@ -103,6 +56,12 @@ export function createInternalBinding({ syscalls, process, netLiveness, netServe
   ) {
     process.versions.llhttp = String(httpParserBinding.llhttpVersion);
   }
+  const REALM_SYMBOLS = {
+    owner_symbol: Symbol("owner_symbol"),
+    async_id_symbol: Symbol("async_id_symbol"),
+    trigger_async_id_symbol: Symbol("trigger_async_id_symbol"),
+  };
+
   const bindings = {
     buffer: createBufferBinding(),
     // 'fs' needs the sync-bridge syscalls (to reach the Rust VFS) and process
@@ -113,6 +72,10 @@ export function createInternalBinding({ syscalls, process, netLiveness, netServe
     uv: net.uv,
     pipe_wrap: net.pipe_wrap,
     cares_wrap: net.cares_wrap,
+    // net.BlockList / net.SocketAddress. C++ in Node, so the vendored
+    // internal/blocklist.js and internal/socketaddress.js are the real bodies and
+    // only this half is ours.
+    block_list: createBlockListBindings(),
     // http_parser (Phase 2 #8): real llhttp (Wasm) beneath lib/http, JS fallback.
     http_parser: httpParserBinding,
     // zlib (Phase 2 #11): Node's real lib/zlib.js over the Rust/Wasm codec.
@@ -136,15 +99,53 @@ export function createInternalBinding({ syscalls, process, netLiveness, netServe
       constants: { ALL_PROPERTIES, ONLY_ENUMERABLE },
       getOwnNonIndexProperties,
       isInsideNodeModules: () => false,
+      // Backs util.getCallSites(). Upstream this reads V8's stack directly; the
+      // same information is reachable from here through the structured-stack API
+      // that Error.prepareStackTrace exposes, which is the same V8 CallSite the
+      // native version formats. Callers are loggers and error reporters wanting
+      // the frame that called THEM, so the answer has to be the caller's frame,
+      // not ours: the capture starts above getCallSites itself.
+      //
+      // scriptId is V8-internal and not reachable from JS; it is reported as the
+      // empty string rather than a fabricated number, because a caller keying a
+      // cache on it would be keying on a lie.
+      getCallSites: (frameCount) => {
+        const target = {};
+        const prevPrepare = Error.prepareStackTrace;
+        const prevLimit = Error.stackTraceLimit;
+        try {
+          Error.stackTraceLimit = frameCount;
+          Error.prepareStackTrace = (_err, sites) => sites;
+          Error.captureStackTrace(target, bindings.util.getCallSites);
+          const sites = target.stack || [];
+          return sites.slice(0, frameCount).map((s) => ({
+            functionName: s.getFunctionName() || "",
+            scriptId: "",
+            scriptName: s.getScriptNameOrSourceURL() || s.getFileName() || "",
+            lineNumber: s.getLineNumber() || 0,
+            columnNumber: s.getColumnNumber() || 0,
+            column: s.getColumnNumber() || 0,
+          }));
+        } finally {
+          Error.prepareStackTrace = prevPrepare;
+          Error.stackTraceLimit = prevLimit;
+        }
+      },
       privateSymbols: {
         untransferable_object_private_symbol: Symbol("untransferable_object"),
       },
     },
     // hasIntl=false keeps Buffer.transcode / ICU paths dormant (no icu binding).
     config: { hasIntl: false },
+    // Minted per realm and read by internal/async_hooks, which used to mint them
+    // itself. The identity has to be shared: lib/zlib.js and bindings/net.js both
+    // find a handle's owner through the same symbol, and the vendored
+    // internal/blocklist.js reaches for it through this binding.
+    symbols: REALM_SYMBOLS,
     constants: {
-      os: { signals: {}, errno: { EISDIR: 21 }, priority: {} },
+      os: { signals: OS_SIGNALS, errno: OS_ERRNO, priority: OS_PRIORITY, dlopen: OS_DLOPEN, UV_UDP_REUSEADDR },
       fs: FS_CONSTANTS,
+      crypto: CRYPTO_CONSTANTS,
       zlib: ZLIB_CONSTANTS,
     },
   };

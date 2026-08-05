@@ -42,6 +42,10 @@ import {
   OP_SYMLINK,
   OP_READLINK,
   OP_LINK,
+  OP_CHMOD,
+  OP_UTIMES,
+  OP_FCHMOD,
+  OP_FUTIMES,
   OP_OPEN,
   OP_CLOSE,
   OP_FD_READ,
@@ -422,6 +426,47 @@ export class FsServer {
       case OP_FTRUNCATE: {
         const fd = bytesToU32(fields[0]);
         vfs.ftruncate(fd, bytesToU32(fields[1]));
+        const path = this.fdPaths.get(fd);
+        if (path) {
+          if (p) p.onWrite(path);
+          this.notifyWatch(path, "change");
+        }
+        return EMPTY;
+      }
+      // Metadata writes. A wasm build predating them answers ENOSYS, which the
+      // runtime turns back into the old accept-and-discard: an OLD VFS must not
+      // start failing chmod outright just because the runtime learned to ask.
+      case OP_CHMOD: {
+        if (typeof vfs.set_mode !== "function") throw "ENOSYS";
+        const path = s(0);
+        vfs.set_mode(path, bytesToU32(fields[1]), bytesToU32(fields[2]) !== 0);
+        if (p) p.onWrite(path);
+        this.notifyWatch(path, "change");
+        return EMPTY;
+      }
+      case OP_UTIMES: {
+        if (typeof vfs.set_times !== "function") throw "ENOSYS";
+        const path = s(0);
+        vfs.set_times(path, bytesToF64(fields[1]), bytesToF64(fields[2]), bytesToU32(fields[3]) !== 0);
+        if (p) p.onWrite(path);
+        this.notifyWatch(path, "change");
+        return EMPTY;
+      }
+      case OP_FCHMOD: {
+        if (typeof vfs.fset_mode !== "function") throw "ENOSYS";
+        const fd = bytesToU32(fields[0]);
+        vfs.fset_mode(fd, bytesToU32(fields[1]));
+        const path = this.fdPaths.get(fd);
+        if (path) {
+          if (p) p.onWrite(path);
+          this.notifyWatch(path, "change");
+        }
+        return EMPTY;
+      }
+      case OP_FUTIMES: {
+        if (typeof vfs.fset_times !== "function") throw "ENOSYS";
+        const fd = bytesToU32(fields[0]);
+        vfs.fset_times(fd, bytesToF64(fields[1]), bytesToF64(fields[2]));
         const path = this.fdPaths.get(fd);
         if (path) {
           if (p) p.onWrite(path);

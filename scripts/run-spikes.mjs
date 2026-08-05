@@ -126,6 +126,39 @@ const SPIKES = [
   // postMessage cannot reach) as well as the default action, the grace window and
   // SIGKILL staying uncatchable. No VFS, no kernel-tier build needed.
   { name: "signals", file: "spike-signals.mjs", net: false, timeout: 60000 },
+  // A socket's 'close' must arrive after its 'error'. Runs every scenario on the
+  // HOST's real Node as well as in the VM and requires identical transcripts, so
+  // the oracle is Node itself rather than our belief about it. Wasm-free: real
+  // Kernel and Workers, but the guests are three-line node:net scripts.
+  { name: "net-close-order", file: "spike-net-close-order.mjs", net: false, timeout: 120000 },
+  // fs.cpSync / fsPromises.cp against the host's real Node, case by case. Needs the
+  // VFS (it copies real trees), so needsWasm; the host half runs as a child process.
+  { name: "fs-cp", file: "spike-fs-cp.mjs", net: false, needsWasm: true, timeout: 120000 },
+  { name: "fs-errors", file: "spike-fs-errors.mjs", net: false, needsWasm: true, timeout: 120000 },
+  { name: "worker-pool", file: "spike-worker-pool.mjs", net: false, needsWasm: true, timeout: 120000 },
+  { name: "node-cli", file: "spike-node-cli.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // A sync child's stdin: `input`, and the EOF that has to follow it. The failure
+  // it guards is a HANG, so the spike bounds its own VM run rather than letting CI
+  // discover the regression as a timeout with no name on it.
+  { name: "child-stdin", file: "spike-child-stdin.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // chmod/utimes have to CHANGE something, and stat has to read back what was
+  // written — mode, mtime and atime, through the path, fd and l- forms.
+  { name: "fs-metadata", file: "spike-fs-metadata.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // HKDF (against RFC 5869's own vectors) and keys as JWKs, both directions.
+  // Needs the crypto wasm, hence needsWasm; no network, no filesystem.
+  { name: "crypto-jwk", file: "spike-crypto-jwk.mjs", net: false, needsWasm: true, timeout: 180000 },
+  // node:zlib brotli, cross-checked both ways against the host's libbrotli —
+  // self-consistency is the one failure a round trip cannot catch alone.
+  { name: "zlib-brotli", file: "spike-zlib-brotli.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // A ref'd MessagePort holds the loop, with or without a listener. This is what
+  // `vitest run` was exiting 0 in the middle of; every case runs against the host.
+  { name: "port-liveness", file: "spike-port-liveness.mjs", net: false, needsWasm: true, timeout: 180000 },
+  // Every constant table against the host, values included — a missing constant is
+  // `undefined`, which is a silently wrong number rather than an error.
+  { name: "constants", file: "spike-constants.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // net.BlockList / net.SocketAddress against the host's real Node — every rule kind,
+  // both families, and the boundaries. Wasm-free: no filesystem is touched.
+  { name: "net-blocklist", file: "spike-net-blocklist.mjs", net: false, timeout: 120000 },
   // `__vv.diag()` must say WHY a process will not exit, not just that one hasn't.
   // Holds a guest open two different ways (a ref'd timer, a stdin reader) and
   // requires the reported `alive` breakdown to tell them apart — the distinction
@@ -188,7 +221,9 @@ const SPIKES = [
   { name: "svelte", file: "spike-svelte.mjs", net: true },
   { name: "qwik", file: "spike-qwik.mjs", net: true },
   { name: "vue", file: "spike-vue.mjs", net: true },
-  { name: "next", file: "spike-next.mjs", net: true, timeout: 600000 },
+  // VV_NO_HOST_ALS=1: its RSC-refresh gate exists for the AsyncLocalStorage
+  // POLYFILL (the studio's browser-worker path), which the host's real ALS hides.
+  { name: "next", file: "spike-next.mjs", net: true, env: { VV_NO_HOST_ALS: "1" }, timeout: 600000 },
   { name: "docusaurus", file: "spike-docusaurus.mjs", net: true, timeout: 600000 },
   { name: "vitepress", file: "spike-vitepress.mjs", net: true, timeout: 600000 },
   { name: "webpack", file: "spike-webpack.mjs", net: true },

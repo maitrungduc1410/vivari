@@ -303,6 +303,28 @@ export function createCryptoBinding({ codec } = {}) {
     needCodec("createPublicKey");
     return codec.inspect_public_der(der);
   }
+  // A key's components as a JWK body (RFC 7517), minus kty/crv which the JS
+  // KeyObject supplies from what it already knows about the key.
+  function jwkPublic(der) {
+    needCodec("export jwk");
+    return JSON.parse(codec.jwk_public_fields(der));
+  }
+  function jwkPrivate(der) {
+    needCodec("export jwk");
+    return JSON.parse(codec.jwk_private_fields(der));
+  }
+  // A JWK's components (already base64url-decoded by the caller) back into DER.
+  function jwkPublicToDer(kty, crv, a, b) {
+    needCodec("createPublicKey from jwk");
+    return new Uint8Array(codec.jwk_public_to_der(kty, crv || "", a, b || new Uint8Array(0)));
+  }
+  function jwkPrivateToDer(kty, crv, parts) {
+    needCodec("createPrivateKey from jwk");
+    const z = new Uint8Array(0);
+    return new Uint8Array(
+      codec.jwk_private_to_der(kty, crv || "", parts.d || z, parts.n || z, parts.e || z, parts.p || z, parts.q || z),
+    );
+  }
   function publicFromPrivate(der) {
     needCodec("createPublicKey");
     return new Uint8Array(codec.public_der_from_private_der(der));
@@ -383,6 +405,10 @@ export function createCryptoBinding({ codec } = {}) {
     generateKeyPair,
     inspectPrivate,
     inspectPublic,
+    jwkPublic,
+    jwkPrivate,
+    jwkPublicToDer,
+    jwkPrivateToDer,
     publicFromPrivate,
     asymSign,
     asymVerify,
