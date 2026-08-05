@@ -128,9 +128,10 @@ const SPIKES = [
   { name: "signals", file: "spike-signals.mjs", net: false, timeout: 60000 },
   // A socket's 'close' must arrive after its 'error'. Runs every scenario on the
   // HOST's real Node as well as in the VM and requires identical transcripts, so
-  // the oracle is Node itself rather than our belief about it. Wasm-free: real
-  // Kernel and Workers, but the guests are three-line node:net scripts.
-  { name: "net-close-order", file: "spike-net-close-order.mjs", net: false, timeout: 120000 },
+  // the oracle is Node itself rather than our belief about it. needsWasm: the
+  // guests are three-line node:net scripts that touch no file, but booting a
+  // kernel at all starts the fs worker, and that worker loads the VFS crate.
+  { name: "net-close-order", file: "spike-net-close-order.mjs", net: false, needsWasm: true, timeout: 120000 },
   // fs.cpSync / fsPromises.cp against the host's real Node, case by case. Needs the
   // VFS (it copies real trees), so needsWasm; the host half runs as a child process.
   { name: "fs-cp", file: "spike-fs-cp.mjs", net: false, needsWasm: true, timeout: 120000 },
@@ -157,8 +158,9 @@ const SPIKES = [
   // `undefined`, which is a silently wrong number rather than an error.
   { name: "constants", file: "spike-constants.mjs", net: false, needsWasm: true, timeout: 120000 },
   // net.BlockList / net.SocketAddress against the host's real Node — every rule kind,
-  // both families, and the boundaries. Wasm-free: no filesystem is touched.
-  { name: "net-blocklist", file: "spike-net-blocklist.mjs", net: false, timeout: 120000 },
+  // both families, and the boundaries. needsWasm for the same reason as
+  // net-close-order: it boots a kernel, which starts the fs worker.
+  { name: "net-blocklist", file: "spike-net-blocklist.mjs", net: false, needsWasm: true, timeout: 120000 },
   // `__vv.diag()` must say WHY a process will not exit, not just that one hasn't.
   // Holds a guest open two different ways (a ref'd timer, a stdin reader) and
   // requires the reported `alive` breakdown to tell them apart — the distinction

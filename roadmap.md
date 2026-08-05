@@ -9053,3 +9053,41 @@ One process note, since it cost a tier run: the earlier net tier reported
 tier ran, and rspack's worker loaded `constants.js` during the seconds it had a
 syntax error — `SyntaxError: Unexpected token ','` is in that log above the timeout.
 Re-run on a stable tree: 51/51.
+---
+
+## Two spikes that ran in no job they could survive (this change)
+
+`toolchain-gate` went red on master right after the Node-fidelity pass, on two of
+the nineteen offline spikes: `net-close-order` and `net-blocklist`, both with
+`Cannot find module '../packages/vfs/pkg-node/vivari_vfs.js'` out of
+`scripts/fs-worker.mjs`. Neither had failed anywhere else, and neither could:
+that job is the Wasm-free one, and it is the only place in CI without the crates.
+
+The registry entries said why, in their own comments. `net-blocklist` was
+registered "Wasm-free: no filesystem is touched", and `net-close-order` "Wasm-free:
+real Kernel and Workers, but the guests are three-line node:net scripts". Both
+statements are true about the guests and neither is the question. Booting a kernel
+starts the fs worker unconditionally, and the fs worker loads the VFS crate before
+any guest gets to run — so a spike that touches no file still cannot start without
+the crate that serves files. `needsWasm` is a claim about the boot, not the test.
+
+The fix is the flag on both entries, their names added to ci.yml's Wasm-VFS step
+(a `needsWasm` spike missing from that list runs in no job at all), and the
+comments corrected, since the wrong ones are what made the omission look
+deliberate to the next reader.
+
+What is worth more than the fix is that `spike-ci-tiers.mjs` already existed to
+prevent exactly this class — "a spike registered in a job that cannot run it" —
+and it held the implication in one direction only: every `needsWasm` offline spike
+must be named in CI. Nothing asserted that a spike which boots a kernel is one of
+them. That gate is now there, scoped to the offline tier (the flag changes nothing
+for a net spike, which only ever runs where the crates are built) and one-
+directional on purpose: a dozen spikes mark `needsWasm` without calling
+`bootSpikeKernel`, because they hand-roll a boot or load a crate directly, so
+booting implies the flag and not the reverse.
+
+The reason this needed a CI round-trip to find is worth naming: a developer's tree
+has `packages/vfs/pkg-node` built, so the tier is green locally no matter how the
+spike is registered. Reproducing it is one command — move that directory aside and
+run the offline tier. Before: 17/19, the two failures above. After: 17/17, both
+skipped with the note the other twenty get, and 39/39 with the crates present.

@@ -303,7 +303,8 @@ scripts/
   lib/spike-harness.mjs   shared kernel-boot/install/waitListen/httpGet helper for spikes.
   run-spikes.mjs       CI runner over the spikes (tiers: --offline / --net / --all).
   spike-ci-tiers.mjs   holds the tiers honest: no `net: false` spike may need the
-                       registry, and every `needsWasm` one must be wired into CI.
+                       registry, every `needsWasm` one must be wired into CI, and
+                       an offline spike that boots a kernel must say needsWasm.
   process-worker.mjs / fs-worker.mjs   Node worker_threads entries for headless.
   fixtures/napi-crc32/   vendored @node-rs/crc32 wasm32-wasi N-API addon (verify-node fixture).
 
@@ -770,6 +771,14 @@ registry-provisioned artifact, that the vendored path is read in exactly one
 place in the harness — which is what keeps that list of ways complete — and that
 every `needsWasm` offline spike is named in ci.yml's Wasm-VFS step, an invariant
 that until now was a comment enforced by nothing.
+
+It also asserts the converse, which the list above was missing: **an offline
+spike that boots a kernel must be marked `needsWasm`, even when its guest never
+opens a file.** `net-close-order` and `net-blocklist` were registered "Wasm-free:
+no filesystem is touched", which is true of the guests and irrelevant — booting a
+kernel starts the fs worker, and that worker loads the VFS crate before any guest
+runs. Both crashed `toolchain-gate` with `MODULE_NOT_FOUND`, and no local run
+could have caught it, because a developer's tree has the crates built.
 
 ### The 1 MiB SAB window — internalize this one
 `DATA_BYTES = 1 << 20`. **Every syscall request AND response must fit in 1 MiB.**

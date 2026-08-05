@@ -24,6 +24,13 @@
 //      the Wasm-free gate skips it for want of the crates, and it is never
 //      selected in the only job that has them. ci.yml says so in a comment; this
 //      is that comment, enforced.
+//   4. Every offline spike that boots a kernel is marked `needsWasm` — the
+//      converse of gate 3, and the hole it left. `net-close-order` and
+//      `net-blocklist` were registered without the flag because neither guest
+//      touches a file, which is true and is not the question: booting a kernel
+//      starts the fs worker, and that worker loads the VFS crate before any
+//      guest runs. Both crashed the Wasm-free gate with MODULE_NOT_FOUND, and
+//      nothing local reproduced it, because a developer's tree has the crates.
 //
 //   run:  node scripts/spike-ci-tiers.mjs
 
@@ -96,6 +103,31 @@ console.log("\n== every offline spike can actually run offline ==");
     }
 
     ok(problems.length === 0, `${s.name}: ${problems.length ? problems.join("; ") : "needs nothing the --net tier provisions"}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== an offline spike that boots a kernel says it needs the Wasm VFS ==");
+// The flag only changes anything in the Wasm-free gate, which runs the offline
+// tier alone — a net spike boots the same kernel, but only ever in the job that
+// builds the crates. So this is scoped to offline, exactly like gate 3.
+//
+// Scoped on the harness import for the same reason as the check above: this very
+// file names bootSpikeKernel in a regex, and a bare scan would flag it.
+//
+// One-directional on purpose. A spike may need the crates for something other
+// than a kernel — a dozen mark needsWasm and never call bootSpikeKernel, because
+// they hand-roll a boot or load a crate directly — so booting implies the flag,
+// not the reverse.
+// ---------------------------------------------------------------------------
+{
+  for (const s of SPIKES.filter((x) => !x.net)) {
+    const srcPath = path.join(ROOT, "scripts", s.file);
+    if (!fs.existsSync(srcPath)) continue;
+    const src = fs.readFileSync(srcPath, "utf8");
+    if (!/from "\.\/lib\/spike-harness\.mjs"/.test(src)) continue;
+    if (!/\bbootSpikeKernel\s*\(/.test(src)) continue;
+    ok(s.needsWasm, `${s.name}: boots a kernel, so it is marked needsWasm`);
   }
 }
 
