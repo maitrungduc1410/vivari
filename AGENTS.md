@@ -2671,6 +2671,26 @@ TS 7's compiler is Go, not JS. We ship the community `tsgo-wasm` build
 - Headless proof: `scripts/spike-ws-demo.mjs` (real `ws` backend, both directions via the
   kernel tunnel).
 
+### A same-origin iframe still needs its OWN COEP header — and only the deploy shows it
+Under `COEP: require-corp`, "same-origin subresources are exempt" does NOT extend to
+nested **documents**. An iframe must send `require-corp` (or `credentialless`) on its
+own response or the browser blocks the frame and renders "`<host>` refused to
+connect" — the identical error page `X-Frame-Options` produces, which sends you
+hunting for a CSP that was never there. It bit `/devtools-host.html`: it is hoisted to
+the origin ROOT by `scripts/assemble-site.mjs` (the SW claims root scope and hard-codes
+those paths), which put it outside the `/studio/*` rule in the generated `_headers`, so
+production served it bare while dev worked fine — Vite's `swScope()` stamps isolation on
+EVERY response, so no local run can reproduce it. Rules to keep:
+- **Hoisting a file out of `/studio/` means it leaves the header scope too.** Anything
+  hoisted that is *iframed* (today `devtools-host.html`) needs its own `_headers` entry;
+  a hoisted file only ever loaded as a *subresource* (`vv-devtools/chobitsu.js`) does not.
+- **List the extensionless form as well** (`/devtools-host` next to
+  `/devtools-host.html`). Cloudflare Pages' clean URLs redirect `/x.html` → `/x`, and the
+  header rule must match whichever URL finally answers `200`, not just the redirect.
+- **Dev/preview headers and deploy headers are two separate mechanisms**
+  (`packages/studio/vite.config.ts` vs. the generated `_headers`). A header change in one
+  is not a change in the other — this class of bug is production-only by construction.
+
 ### Preview iframes must start at about:blank, THEN navigate
 On a FRESH page load the studio document is fetched before the preview Service
 Worker takes control, so a brand-new iframe whose *first* navigation is a direct

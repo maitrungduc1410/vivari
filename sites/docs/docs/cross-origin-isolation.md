@@ -18,6 +18,14 @@ Under `require-corp`, every **cross-origin** subresource must opt in with
 `Cross-Origin-Resource-Policy` (or CORS). Same-origin subresources are fine,
 which is why Vivari self-hosts all of its workers and Wasm.
 
+**Iframes are the exception to "same-origin is fine".** A nested *document* does
+not inherit its embedder's policy: it must send `require-corp` (or
+`credentialless`) on its own response, even when it is same-origin. Miss it and
+the browser blocks the frame and renders its "*&lt;host&gt; refused to connect*" error
+page — the same page you get from `X-Frame-Options`, which sends you looking for a
+CSP that isn't there. So if you scope the headers by path, make sure every
+document you iframe is inside the scoped paths.
+
 Check at runtime:
 
 ```ts

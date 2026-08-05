@@ -773,7 +773,7 @@ clean and re-attaches. Outgoing URLs are scrubbed from the proxy form (`/preview
 the real in-VM address (`http://localhost:<port>/…`), so ws/SSE/fetch rows all read as the app
 actually sees them.
 
-Two non-obvious constraints keep this working:
+Three non-obvious constraints keep this working:
 
 - **`serveDevtools()` must send fixed-length bodies** (`fs.readFile` + `Content-Length`),
   not `createReadStream().pipe()`. The frontend fires a burst of ~50 concurrent module
@@ -784,6 +784,12 @@ Two non-obvious constraints keep this working:
   (like `/vv-devtools/`). They are our own app assets; routing them through
   `routeByClient` risked a spurious `fetch(event.request)` failure on the iframe
   navigation and could even proxy them into a preview that has no such file.
+- **The deploy must stamp COOP/COEP on `/devtools-host.html` itself.** Under
+  `COEP: require-corp` a nested *document* gets no same-origin exemption — it must
+  send `require-corp` on its own response or the browser blocks the frame ("refused
+  to connect"). The host page is hoisted to the origin root, outside the `/studio/*`
+  header rule, so `scripts/assemble-site.mjs` gives it (and `/devtools/*`) their own
+  `_headers` entries. Dev never shows this: Vite stamps isolation on every response.
 
 ### 8.6 Multi-root workspace, Home + templates (studio)
 

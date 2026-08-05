@@ -66,6 +66,22 @@ every surface that runs (or hosts) the runtime, plus the Service Worker:
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
 
+/blog/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/devtools-host.html
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/devtools-host
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/devtools/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
 /sw.js
   Service-Worker-Allowed: /
   Cross-Origin-Opener-Policy: same-origin
@@ -74,6 +90,16 @@ every surface that runs (or hosts) the runtime, plus the Service Worker:
 
 Preview responses (`/preview/<port>/…`) are synthesized by the Service Worker,
 which stamps their isolation headers itself — so they don't need an entry here.
+
+The DevTools entries look redundant — the frontend is same-origin, and same-origin
+subresources are exempt from CORP under `require-corp`. A nested **document** is
+not: an iframe must send `require-corp` (or `credentialless`) on its own response
+or the browser blocks the frame and shows "*&lt;host&gt; refused to connect*". Because
+`/devtools-host.html` is hoisted out of `/studio/` to the origin root, the
+`/studio/*` rule doesn't reach it, so it needs its own entry. Both the `.html` and
+the extensionless form are listed since Pages' clean URLs redirect `/x.html` to
+`/x` and the rule has to match whichever URL answers `200`. This is invisible in
+`npm run dev`, where Vite stamps isolation on every response.
 
 ## Preview isolation modes (optional)
 

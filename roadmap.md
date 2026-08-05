@@ -9123,3 +9123,49 @@ cache under `sourceMap: true` or `--enable-source-maps`, so plain `getCallSites(
 works today), but its justification had gone stale in a way nothing can catch: the
 probe tests whether an exemption is still *needed*, never whether the sentence
 next to it is still *true*, and that sentence is what it prints into the CI log.
+
+---
+
+## The one iframe that left the header scope (this change)
+
+"Open devtools" worked in `npm run dev` and showed Chrome's "vivari.run refused to
+connect" on the deploy. That error page is the tell that sent this the wrong way for
+a while: it is what `X-Frame-Options` and `frame-ancestors` produce, so the first
+instinct is to hunt for a CSP — and there is none anywhere in the repo, nor an
+`_headers` file to grep, because `_headers` is *generated* by
+`scripts/assemble-site.mjs` and never committed.
+
+The same page is also what a COEP frame block renders, and that is what this was.
+Under `COEP: require-corp` the familiar rule — cross-origin subresources need CORP,
+same-origin ones are fine — has an exception nobody remembers: a nested **document**
+is not a subresource. It must send `require-corp` (or `credentialless`) on its own
+response no matter whose origin it is on. `/devtools-host.html` is same-origin with
+the studio, so it looked exempt, and it wasn't.
+
+What put it out of scope was a decision made for an unrelated reason. The assembler
+**hoists** the SW runtime tree (`sw.js`, `vv-devtools/`, `devtools/`,
+`devtools-host.html`) to the origin root because the SW claims root scope and
+hard-codes those absolute paths. The generated `_headers` scopes isolation by path —
+`/studio/*`, `/embed/*`, `/docs/*`, `/blog/*`, `/sw.js` — deliberately, so the landing
+stays free of COEP. The hoist therefore carried the DevTools host page out of the only
+rule that covered it, and nothing else in production put a header back: the SW passes
+`/devtools-host.html` and `/devtools/**` straight to the network (correctly — that
+bypass fixed the earlier hanging-panel bug), and the mode-C Worker only answers on
+`<token>--<port>` preview hosts. The fix is three entries in that generated file.
+
+The part worth keeping is *why no local run could have caught it*. Dev and deploy get
+their isolation headers from two unrelated places: `vite.config.ts`'s `swScope()`
+middleware stamps COOP/COEP on **every** dev and preview response, while production
+gets only the paths `assemble-site.mjs` enumerates. Any file that dev serves and the
+deploy scopes differently is a production-only bug by construction — `bun run preview`
+included, since it runs the same middleware. So the invariant now written into
+AGENTS.md is not "add COEP to devtools", it is: **hoisting a file out of `/studio/`
+takes it out of the header scope too**, and if that file is ever *iframed* it needs its
+own entry. `vv-devtools/chobitsu.js` is hoisted the same way and needs nothing, because
+it is only ever loaded as a subresource — which is exactly the distinction that makes
+this easy to get wrong twice.
+
+One smaller trap came with it: Cloudflare Pages' clean URLs redirect `/x.html` to `/x`,
+so a rule keyed only on `/devtools-host.html` can end up decorating the 301 while the
+200 that actually renders the frame goes bare. Both forms are listed. The Worker's
+`ALIASES` map already encoded the same lesson for the bridge doc.
