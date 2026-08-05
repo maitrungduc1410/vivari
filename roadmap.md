@@ -9091,3 +9091,35 @@ has `packages/vfs/pkg-node` built, so the tier is green locally no matter how th
 spike is registered. Reproducing it is one command — move that directory aside and
 run the offline tier. Before: 17/19, the two failures above. After: 17/17, both
 skipped with the note the other twenty get, and 39/39 with the crates present.
+
+---
+
+## An allowlist that outlived its reason (this change)
+
+`probe:node-registry` went red on master with two stale entries:
+`internal/blocklist` and `internal/socketaddress` are "now registered — drop it
+from ALLOWED_MISSING_IDS". Nothing broke; the probe is built to fail when its own
+exemptions stop being true, and this is that check firing exactly as designed.
+
+The reasons those two carried are the ones the net work already answered. They
+read "a hand-written JS subnet matcher is a security primitive we cannot test
+here, so an honest throw beats a plausible-but-wrong answer" — and the objection
+was never the matcher, it was the missing suite. `spike-net-blocklist.mjs` made
+real Node the suite, both bodies are vendored verbatim, and only
+`internalBinding('block_list')` is ours. So the entries went out; the exemption
+had already been earned away.
+
+The gap is sequencing, not knowledge. AGENTS.md says to run this probe after
+touching `loader.js`, `primordials.js` or `internal-binding.js`, and that change
+touched two of the three. The probe takes under a second and needs no Wasm build,
+no browser and no network, which is what makes skipping it easy and pointless.
+
+The third entry stays, with its reason rewritten, and that rewrite is the part to
+notice. It claimed `internal/source_map/source_map_cache` "would still fail one
+layer lower on the absent `internalBinding('util').getCallSites`" — a binding the
+same change implemented. The entry is still correct (four further
+`internal/source_map/*` ids are unregistered, and `lib/util.js` only reaches the
+cache under `sourceMap: true` or `--enable-source-maps`, so plain `getCallSites()`
+works today), but its justification had gone stale in a way nothing can catch: the
+probe tests whether an exemption is still *needed*, never whether the sentence
+next to it is still *true*, and that sentence is what it prints into the CI log.

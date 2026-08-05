@@ -59,12 +59,8 @@ import { Parser, version as acornVersion } from "../packages/runtime/vendor/acor
 // entry here — a stale entry fails too, so the list can't rot into cover.
 
 const ALLOWED_MISSING_IDS = {
-  "internal/blocklist":
-    "net.BlockList — upstream is a shell over internalBinding('block_list'), the C++ CIDR matcher; a hand-written JS subnet matcher is a security primitive we cannot test here, so an honest throw beats a plausible-but-wrong answer.",
-  "internal/socketaddress":
-    "net.SocketAddress — same missing internalBinding('block_list'), plus internal/worker/js_transferable and internalBinding('messaging').",
   "internal/source_map/source_map_cache":
-    "util.getCallSites() with source maps — pulls four further unregistered internal/source_map/* ids, and would still fail one layer lower on the absent internalBinding('util').getCallSites.",
+    "util.getCallSites({ sourceMap: true }) — pulls four further unregistered internal/source_map/* ids. Plain getCallSites() does NOT come here: internalBinding('util').getCallSites exists now, and lib/util.js only reaches the cache under sourceMap:true or --enable-source-maps.",
 };
 
 const ALLOWED_MISSING_BINDINGS = {
