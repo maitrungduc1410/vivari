@@ -8348,3 +8348,51 @@ that deserves its own batch rather than a rushed corner of this one. Also notebo
 scikit-learn as a template, and the debugger's pause-on-exception and conditional
 breakpoints, which stay deferred: the studio sends neither `setPauseOnExceptions` nor a
 condition today, so both would be backend code no UI can reach.
+
+---
+
+## A refused request reported the wrong error, twice (this change)
+
+CI's `verify` job failed on one check: real Node's `lib/http.js` on llhttp-Wasm, at the
+last of its assertions — a request to a port nobody serves should surface `ECONNREFUSED`.
+It reported `ECONNRESET: socket hang up`. The check two lines above it, real `lib/net.js`
+dialling a dead port, passed, and so did every HTTP spike. The failure predates the Bun
+work; checking out the commit before it fails identically.
+
+The cause was ordering, in the TCP binding rather than in http or net. libuv runs a
+handle's close callback in the loop's close phase, and `Socket.prototype._destroy` is
+written against that: it calls `handle.close(cb2)` — `cb2` emits `close` — and then
+`cb(exception)` synchronously, leaving the stream to emit `error` on a tick of its own.
+Our `close(cb)` used `process.nextTick`, which queued the close *ahead* of that tick. So
+a failed socket emitted `close` and then `error`, the reverse of every other Node.
+
+For a bare `net.connect` that inversion is invisible, which is why that check passed: the
+test listens for both events and only reads the code. lib/http.js could not absorb it.
+`socketCloseListener` treats a close with no error yet recorded as the server hanging up,
+so the request got `ECONNRESET: socket hang up` first and the real `ECONNREFUSED` a phase
+later — two `error` events on one request, the first one wrong, the second one arriving
+after any caller had already handled and destroyed it. The event log, side by side with
+real Node's on the same program, was the whole diagnosis:
+
+```
+before   net:close, net:error:ECONNREFUSED, http:socket,
+         http:req-error:ECONNRESET:socket hang up, http:sock-close,
+         http:req-error:ECONNREFUSED, http:sock-error:ECONNREFUSED
+after    net:error:ECONNREFUSED, net:close, http:socket,
+         http:req-error:ECONNREFUSED, http:sock-error:ECONNREFUSED, http:sock-close
+real     net:error:ECONNREFUSED, net:close, http:socket,
+         http:req-error:ECONNREFUSED, http:sock-error:ECONNREFUSED, http:sock-close
+```
+
+The fix is one scheduling change in both handles, TCP and Pipe: the close callback goes
+through `setImmediate` instead of `nextTick`. That is the check phase, not quite libuv's
+close phase — libuv runs close callbacks just after it — but the property lib/net.js
+depends on is only that the tick queue drains first, and matching it exactly would mean
+adding a loop phase for one callback.
+
+What was missing was not coverage but a named invariant. The http check caught this, and
+its message says nothing about ordering; the net check, which is where the bug lived, was
+happy. Both now assert the sequence directly (`deepStrictEqual` on the event names) and
+the http one counts its `error` events, since one error with the right code and two errors
+starting with the wrong one are the same test if you resolve on the first one you like.
+Reverting the fix now fails both, and the net check names the cause.

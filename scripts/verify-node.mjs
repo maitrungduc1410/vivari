@@ -1423,15 +1423,26 @@ async function main() {
   });
   assert.strictEqual(total, '10', 'server counted 10 bytes across 3 writes');
 
-  // connecting to an unbound port rejects with ECONNREFUSED.
+  // connecting to an unbound port rejects with ECONNREFUSED -- and does so in the
+  // ORDER real Node uses, which is the part that was wrong and the part this
+  // assertion exists for. A handle close callback is a later loop phase in libuv,
+  // and lib/net.js leans on that: it closes the handle and then lets the stream
+  // emit "error" on a tick of its own. Our binding used to schedule the close
+  // callback on the tick queue, so "close" overtook "error". Reading only the code
+  // cannot see that, and the only thing that noticed was lib/http.js three checks
+  // below, which reported it as a mysterious ECONNRESET.
+  const order = [];
   await new Promise((resolve, reject) => {
     const c = net.connect(65530, '127.0.0.1');
     c.on('connect', () => reject(new Error('unexpectedly connected')));
     c.on('error', (e) => {
+      order.push('error:' + e.code);
       assert.strictEqual(e.code, 'ECONNREFUSED', 'refused sets code ECONNREFUSED');
-      resolve();
     });
+    c.on('close', () => { order.push('close'); resolve(); });
   });
+  assert.deepStrictEqual(order, ['error:ECONNREFUSED', 'close'],
+    'a refused connection emits error BEFORE close, as libuv does: ' + JSON.stringify(order));
 
   await new Promise((r) => server.close(r));
   await new Promise((r) => server2.close(r));
@@ -1556,15 +1567,24 @@ async function main() {
   assert.strictEqual(tr.body, 'trail', 'trailer response body');
   assert.strictEqual(tr.trailers['x-sum'], '42', 'response trailer parsed');
 
-  // connecting to an unbound port surfaces ECONNREFUSED on the request.
-  await new Promise((resolve, reject) => {
+  // connecting to an unbound port surfaces ECONNREFUSED on the request -- ONCE.
+  // While the socket emitted close before error, this arrived as TWO error events:
+  // "ECONNRESET: socket hang up" first, because socketCloseListener reads a close
+  // with no error recorded as the server hanging up, and the real ECONNREFUSED a
+  // phase later. The count matters as much as the code: a caller that has already
+  // handled the first one is destroyed by the second.
+  const httpErrors = [];
+  await new Promise((resolve) => {
     const req = http.request({ host: '127.0.0.1', port: 65531, path: '/', agent: false });
     req.on('error', (e) => {
+      httpErrors.push(e.code);
       assert.strictEqual(e.code, 'ECONNREFUSED', 'http refused sets ECONNREFUSED');
-      resolve();
+      setTimeout(resolve, 50);
     });
     req.end();
   });
+  assert.strictEqual(httpErrors.length, 1,
+    'a refused request emits exactly one error: ' + JSON.stringify(httpErrors));
 
   await new Promise((r) => server.close(r));
   console.log('HTTPB_OK');

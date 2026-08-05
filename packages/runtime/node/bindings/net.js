@@ -33,6 +33,30 @@
 
 export function createNetBindings({ process, liveness, syscalls, netServers, pipeBridge } = {}) {
   const nextTick = (fn, ...args) => process.nextTick(fn, ...args);
+  // A handle's close callback must NOT run on the nextTick queue.
+  //
+  // In libuv it is a close-phase callback, which is a later phase of the loop, and
+  // lib/net.js depends on that gap: `Socket.prototype._destroy` calls
+  // `handle.close(cb2)` and then `cb(exception)` synchronously, leaving the stream
+  // to emit `error` on a tick of its own. Scheduling cb2 with nextTick queued it
+  // BEFORE that one, so a socket emitted `close` and then `error` — the reverse of
+  // every other Node.
+  //
+  // For a plain `net.connect` that inversion is invisible: the test listens for
+  // both events and only reads the code. It is `lib/http.js` that cannot survive
+  // it. `socketCloseListener` treats a close with no error yet recorded as the
+  // server hanging up, so a refused connection reported `ECONNRESET: socket hang
+  // up` and then, a phase later, the real `ECONNREFUSED` — two `error` events on
+  // one request, the first one wrong.
+  //
+  // setImmediate is the check phase rather than the close phase (libuv runs close
+  // callbacks just after it), but the property lib/net.js relies on is only that
+  // the tick queue drains first.
+  const afterTicks = (fn) => {
+    const si = globalThis.setImmediate;
+    if (typeof si === "function") si(fn);
+    else nextTick(fn);
+  };
   const buf = () => globalThis.Buffer; // real Buffer is installed before sockets run
 
   // Event-loop liveness: a listening server or an open connected socket keeps the
@@ -495,7 +519,7 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
         }
         if (this._peer && !this._peer._closed) enqueueToPeer(this._peer, EOF);
       }
-      if (typeof cb === "function") nextTick(cb);
+      if (typeof cb === "function") afterTicks(cb);
     }
 
     getsockname(out) {
@@ -743,7 +767,7 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
           enqueueToPeer(this._peer, EOF);
         }
       }
-      if (typeof cb === "function") nextTick(cb);
+      if (typeof cb === "function") afterTicks(cb);
     }
 
     // A pipe's "name" is its filesystem path; net.Server.address() surfaces it.

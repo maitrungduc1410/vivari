@@ -3501,6 +3501,27 @@ which this runtime loads directly, and not being a Python package turned out to 
 best thing about it — a linter outside CPython costs no interpreter boot. Before writing a
 capability off because the obvious delivery channel does not carry it, check whether the
 thing ships in a form the host can load on its own.
+### A handle's close callback is a loop PHASE, not a nextTick
+
+When a binding hands lib/net.js a `close(cb)`, `cb` must not run on the tick queue.
+libuv runs it in the close phase, and `Socket.prototype._destroy` is written against
+that: it calls `handle.close(cb2)` — where `cb2` emits `close` — and then `cb(exception)`
+synchronously, leaving the stream to emit `error` on a tick of its own. Ours scheduled
+`cb2` with `process.nextTick`, which queued it *ahead* of that tick, so every failed
+socket emitted `close` and then `error`, backwards from the rest of Node.
+
+What makes this worth remembering is where it surfaced. `net.connect` to a dead port
+looked perfect, because the test listens for both events and only reads `e.code`. The
+only caller that could not survive the inversion was lib/http.js, two layers up:
+`socketCloseListener` reads a close with no error recorded as the server hanging up, so
+a refused request emitted **two** `error` events — `ECONNRESET: socket hang up`, then the
+real `ECONNREFUSED` a phase later. CI failed on the http check, and the bug was in the
+TCP binding's close.
+
+So when a check fails in a vendored Node lib, suspect the ORDER of what the binding
+under it emits, not just the values. Assert order explicitly — `deepStrictEqual` on an
+array of event names — and assert how many times `error` fires; both facts are invisible
+to a test that resolves on the first event it likes.
 
 ## Testing & verification
 
