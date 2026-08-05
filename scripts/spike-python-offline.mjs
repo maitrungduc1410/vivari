@@ -49,6 +49,7 @@ import {
   installMatplotlibShow,
   installStdin,
   makeLineReader,
+  maskBootEnv,
   readSnapshot,
   writeSnapshot,
   discardSnapshot,
@@ -98,6 +99,17 @@ import { driveRuff } from "./lib/python-drive.mjs";
 import { writeFakeIndex } from "./lib/fake-pyodide.mjs";
 import { readShippedManifests, readShippedTemplates, readTemplatesSource } from "./lib/shipped-templates.mjs";
 import { MODELLED_FRAGMENTS, STANDIN, normalize } from "./lib/urllib3-emscripten.mjs";
+import { captureHostRealm, sealGuestRealm } from "../packages/runtime/realm.js";
+import { makeBrowserRealm } from "./lib/browser-realm.mjs";
+import {
+  ASM_FRAGMENTS as PY_ASM_FRAGMENTS,
+  ASM_STANDIN as PY_ASM_STANDIN,
+  MODELLED_FRAGMENTS as PY_ENV_FRAGMENTS,
+  STANDIN as PY_ENV_STANDIN,
+  detectEmscriptenEnv,
+  detectRuntimeEnv,
+  normalize as normalizePyEnv,
+} from "./lib/pyodide-runtime-env.mjs";
 import { CPYTHON_EXITS, UNTRUNCATED, realCPythonExit } from "./lib/cpython-exit.mjs";
 import { drivePython, driveShim, servedApp } from "./lib/python-drive.mjs";
 import { fsDirective, get, hostRead, mirrorRuntime, scratchPort } from "./lib/python-mirror-drive.mjs";
@@ -651,6 +663,158 @@ print(json.dumps(out))
   ok(!/def is_in_node\(\):\s*\n\s*return False/.test(URLLIB3_REALM_PATCH), "…rather than being hard-coded to False");
   ok(/meta_path/.test(URLLIB3_REALM_PATCH) && !/^\s*import urllib3/m.test(URLLIB3_REALM_PATCH),
     "it hooks the import instead of importing urllib3 at boot (which would pull a wheel into every python process)");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== what Pyodide decides it is running in, inside a SWEPT guest realm ==");
+// The check that was missing, and the reason `python main.py` shipped broken.
+//
+// The guest realm a python process runs in is a browser Worker global with every
+// name a real Node 22 lacks shadowed away (packages/runtime/realm.js). Pyodide
+// refuses to boot until it can name the realm it is in, and it names a worker by
+// constructor identity — `self instanceof WorkerGlobalScope` — so the sweep took
+// exactly the binding that answer needs while leaving `self` behind. With
+// `window` gone too and IN_NODE masked on purpose, every branch was false and
+// the first line of every python command was "Cannot determine runtime
+// environment". Nothing here had a realm to be wrong in: the offline tier's
+// interpreter is scripts/lib/fake-pyodide.mjs, which is handed to code that has
+// already booted, and the tier that runs the real loader runs it in Node.
+//
+// So this sweeps a rebuilt Chrome worker global (scripts/lib/browser-realm.mjs,
+// the same one spike-realm.mjs uses), applies the SHIPPED boot mask, and runs
+// Pyodide's own detection over the result — both halves of it, since Emscripten
+// asks the same question again one layer down. See scripts/lib/pyodide-runtime-
+// env.mjs for what the models copy and which tier checks them against Pyodide.
+// ---------------------------------------------------------------------------
+{
+  const nodeProcess = () => ({
+    versions: { node: "22.23.2" },
+    release: { name: "node" },
+    env: {},
+  });
+
+  const sealed = () => {
+    const scope = makeBrowserRealm();
+    const captured = captureHostRealm(scope);
+    // The runtime installs its own process AFTER capture, which is what makes it
+    // untouchable by the sweep — and what makes it maskable afterwards.
+    scope.process = nodeProcess();
+    const hidden = sealGuestRealm(scope, captured);
+    return { scope, captured, hidden };
+  };
+
+  const { scope, captured, hidden } = sealed();
+  ok(hidden.includes("WorkerGlobalScope"), "an ordinary guest's realm still has no WorkerGlobalScope");
+  ok(typeof scope.WorkerGlobalScope === "undefined", "…shadowed, so a feature detection sees nothing");
+  ok(scope.self === scope, "…while `self` survives and still IS the global, which is the other half of Pyodide's test");
+  ok(typeof scope.importScripts === "undefined", "…and importScripts stays gone, capability and all");
+
+  // 1) The bug, reproduced: the two process masks alone, which is what the boot
+  //    held before this change.
+  {
+    const restore = maskBootEnv(scope, scope.process, null);
+    let thrown = "";
+    try { detectRuntimeEnv(scope); } catch (e) { thrown = String(e.message); }
+    ok(thrown.startsWith("Cannot determine runtime environment"),
+      `masking IN_NODE without answering "which browser realm" is refused outright (${thrown.slice(0, 48)}…)`);
+    ok(/"IN_BROWSER":true/.test(thrown) && /"IN_BROWSER_WEB_WORKER":false/.test(thrown) && /"IN_NODE":false/.test(thrown),
+      "…with the exact flag vector users reported: a browser that is neither a page nor a worker");
+    // And Emscripten, one layer down, does not merely fail to find the worker —
+    // it concludes SHELL and goes looking for d8's `read()`.
+    const asm = detectEmscriptenEnv(scope);
+    ok(asm.ENVIRONMENT_IS_SHELL === true && asm.ENVIRONMENT_IS_WORKER === false,
+      "…and the wall two lines behind it: Emscripten reads the same realm as a JS shell");
+    restore();
+  }
+
+  // 2) The fix: the binding handed back for the length of the boot.
+  {
+    const restore = maskBootEnv(scope, scope.process, captured.held.get("WorkerGlobalScope"));
+    // Caught rather than thrown: this is the assertion, and a spike that aborts
+    // here reports one stack trace instead of the dozen answers below it.
+    let env = null;
+    let refused = "";
+    try { env = detectRuntimeEnv(scope); } catch (e) { refused = String(e.message); env = {}; }
+    ok(!refused, refused ? "Pyodide refused the masked realm — " + refused.slice(0, 140) : "the masked realm is one Pyodide can name");
+    ok(env.IN_BROWSER_WEB_WORKER === true, "with the boot mask applied, Pyodide resolves to IN_BROWSER_WEB_WORKER");
+    ok(env.IN_NODE === false && env.IN_NODE_ESM === false, "…still not Node, so it never reaches for node:module");
+    ok(env.IN_BROWSER_MAIN_THREAD === false, "…and not a page either: `window` is not handed back, and must not be");
+    ok(env.IN_SHELL === false && env.IN_WORKERD === false && env.IN_SAFARI === false,
+      "…and the sweep's replacement navigator does not read as Safari or as a Cloudflare worker");
+
+    // The probe the fix newly puts in the path: reaching the worker branch means
+    // running isClassicWorker(), which CALLS a global the sweep has shadowed.
+    // A shadowed `undefined` is not callable, so it throws — and a throw is the
+    // answer a module worker owes it. Fixing one flag into a TypeError nobody
+    // catches would be no better than the original bug.
+    ok(env.IN_BROWSER_WEB_WORKER === true, "…having survived the isClassicWorker() probe, which calls the swept importScripts");
+
+    const asm = detectEmscriptenEnv(scope);
+    ok(asm.ENVIRONMENT_IS_WORKER === true, "Emscripten reads the same binding and takes its worker path");
+    ok(asm.ENVIRONMENT_IS_SHELL === false && asm.ENVIRONMENT_IS_NODE === false && asm.ENVIRONMENT_IS_WEB === false,
+      "…and only that one: not SHELL, not NODE, not a main-thread page");
+
+    // The narrow window is the point. A python guest gets the name while Pyodide
+    // is looking, and the realm it goes on running in is the node realm again.
+    restore();
+    ok(typeof scope.WorkerGlobalScope === "undefined", "the binding is taken back when the boot ends");
+    ok(scope.WorkerGlobalScope === undefined && Object.prototype.hasOwnProperty.call(scope, "WorkerGlobalScope"),
+      "…back to the sweep's own shadow, not to whatever the prototype chain holds");
+    ok(!("browser" in scope.process) && !("type" in scope.process),
+      "…and the two process masks are gone with it, as they already were");
+  }
+
+  // 3) The refusal that proves the probe runs at all: a CLASSIC worker, where
+  //    importScripts is callable, is the one realm Pyodide will not boot in.
+  {
+    const { scope: classic, captured: cap } = sealed();
+    classic.importScripts = () => {};
+    const restore = maskBootEnv(classic, classic.process, cap.held.get("WorkerGlobalScope"));
+    let thrown = "";
+    try { detectRuntimeEnv(classic); } catch (e) { thrown = String(e.message); }
+    ok(thrown === "Classic web workers are not supported",
+      `isClassicWorker() really is executed on this path (${thrown || "nothing was thrown"})`);
+    restore();
+  }
+
+  // 4) The models are only worth something if they are still Pyodide's code.
+  //    This end asserts the stand-ins have not drifted from the fragment list;
+  //    spike-python-bridge.mjs asserts the list has not drifted from Pyodide.
+  for (const { label, source } of PY_ENV_FRAGMENTS) {
+    ok(normalizePyEnv(PY_ENV_STANDIN).includes(normalizePyEnv(source)), `the loader stand-in reproduces ${label}`);
+  }
+  for (const { label, source } of PY_ASM_FRAGMENTS) {
+    ok(normalizePyEnv(PY_ASM_STANDIN).includes(normalizePyEnv(source)), `the Emscripten stand-in reproduces ${label}`);
+  }
+
+  // Drift guards for the wiring, which no amount of running the models can show.
+  const runtime = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  const realmSrc = fs.readFileSync(path.join(ROOT, "packages/runtime/realm.js"), "utf8");
+  const indexSrc = fs.readFileSync(path.join(ROOT, "packages/runtime/index.js"), "utf8");
+  ok(/const restoreEnv = maskBootEnv\(globalThis, process, workerGlobalScope\);/.test(runtime),
+    "bootPyodide masks the environment through the one function this drives");
+  ok(/} finally {\s*\n\s*restoreEnv\(\);/.test(runtime),
+    "…in a finally, so a boot that throws still leaves the guest its own realm back");
+  const hold = realmSrc.slice(realmSrc.indexOf("const HOLD = ["), realmSrc.indexOf("];", realmSrc.indexOf("const HOLD = [")));
+  ok(/"WorkerGlobalScope"/.test(hold), "realm.js holds WorkerGlobalScope back from the sweep for one subsystem");
+  const keep = realmSrc.slice(realmSrc.indexOf("const KEEP = ["), realmSrc.indexOf("];", realmSrc.indexOf("const KEEP = [")));
+  ok(!/WorkerGlobalScope/.test(keep),
+    "…and does NOT allow it, which would hand every node and bun guest a browser global back");
+  ok(/workerGlobalScope: HOST_REALM\.held\.get\("WorkerGlobalScope"\)/.test(indexSrc),
+    "and only __ocInstallPython's runtime is given it — a node or bun guest never sees the value at all");
+
+  // The other thing the worker path reads and the sweep took: `location`. Every
+  // browser branch in pyodide.mjs resolves URLs against it — `new URL(path,
+  // location)` for the wasm, `t === void 0 && (t = location)` in resolvePath —
+  // and a shadowed `location` is `undefined`, which those survive only because
+  // every URL they are handed is already absolute. `new URL("/vendor/pyodide/",
+  // undefined)` is "Invalid URL". So the kernel building the index URL off the
+  // worker's own origin is load-bearing for the boot, not just tidy.
+  const kernelSrc = fs.readFileSync(path.join(ROOT, "packages/core/src/workers/kernel-worker.ts"), "utf8");
+  const vendorUrl = kernelSrc.slice(kernelSrc.indexOf("function vendorUrl("), kernelSrc.indexOf("\n}", kernelSrc.indexOf("function vendorUrl(")));
+  ok(/self\.location(?:\s*&&\s*self\.location)?\.origin/.test(vendorUrl),
+    "VV_PYODIDE_INDEX_URL is absolute, which is the only reason the swept `location` costs Pyodide nothing");
+  ok(/VV_PYODIDE_INDEX_URL: vendorUrl\(/.test(kernelSrc), "…and it is what the python launcher is handed");
 }
 
 // ---------------------------------------------------------------------------

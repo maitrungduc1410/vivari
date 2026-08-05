@@ -3677,7 +3677,9 @@ only by the launcher, mirroring Bun's `__ocInstallBun`).
   auto-loads prebuilt wheels the code imports (`loadPackagesFromImports`). Boot masks
   **both** Node probes — `process.browser=true` (pyodide.mjs) and `process.type=
   "renderer"` (Emscripten's pyodide.asm.mjs) — or Pyodide `import("node:module")` (404s
-  in a Worker); both held across the whole boot, then restored.
+  in a Worker); both held across the whole boot, then restored. (A third mask joined them
+  later, when the realm sweep landed — see "the global Pyodide identifies a worker by"
+  below.)
 - **CLI** (`packages/kernel-host/programs/python.js`) + `uvicorn`/`flask` PATH shims
   (`coreutils.js`). `process.exit`'s control-flow throw is detected and returned quietly.
 - **Delivery** (`scripts/vendor-pyodide.mjs`): vendors the Pyodide core + selected wheels
@@ -9169,3 +9171,94 @@ One smaller trap came with it: Cloudflare Pages' clean URLs redirect `/x.html` t
 so a rule keyed only on `/devtools-host.html` can end up decorating the 301 while the
 200 that actually renders the frame goes bare. Both forms are listed. The Worker's
 `ALIASES` map already encoded the same lesson for the bridge doc.
+
+---
+
+## The realm sweep hid the global Pyodide identifies a worker by (this change)
+
+`python main.py` had stopped working entirely. Not slowly, not in one template —
+the first line of every python command was
+
+    python: Error: Cannot determine runtime environment: {"IN_BUN":false,
+    "IN_DENO":false,"IN_NODE":false,"IN_SAFARI":false,"IN_SHELL":false,
+    "IN_WORKERD":false,"IN_BROWSER":true,"IN_BROWSER_MAIN_THREAD":false,
+    "IN_BROWSER_WEB_WORKER":false,"IN_NODE_COMMONJS":false,"IN_NODE_ESM":false}
+
+thrown out of `pyodide.mjs` before Pyodide had done anything at all. `python
+--version` still answered, which is the shape of the bug in one line: that answer
+is a literal in the launcher and never boots an interpreter.
+
+Every flag in that object is false, and each one is false for a different reason.
+`IN_NODE` because `bootPyodide()` sets `process.browser = true` on purpose, to keep
+the loader off `import("node:module")`. `IN_BROWSER_MAIN_THREAD` because there is
+no `window` in a worker. And `IN_BROWSER_WEB_WORKER` because Pyodide identifies a
+worker by **constructor identity** — `globalThis.self instanceof
+globalThis.WorkerGlobalScope` — and the guest-realm sweep hides
+`WorkerGlobalScope`, correctly, since a real Node 22 process has no such global.
+`self` is on the sweep's KEEP list, so half of that expression survived and the
+half that names the realm did not.
+
+Nothing had changed in the Python work. The realm sweep changed the answer to a
+question Python was already asking, which is why the version drift that looked
+like the obvious suspect was not it: `scripts/vendor-pyodide.mjs` runs an unpinned
+`npm install pyodide`, but the version it installs today is 314.0.3, exactly the
+one `python.js` documents.
+
+**The fix is a third mask, in the same held-and-restored window as the other two.**
+`WorkerGlobalScope` joins `HOLD` in `realm.js` — captured before the sweep, handed
+to one subsystem rather than left on a global — `__ocInstallPython` passes it to
+the python runtime the way it already passes `XMLHttpRequest` back, and
+`maskBootEnv()` puts it on `globalThis` for the length of the boot and takes it
+away again. Not KEEP: an allowlist entry would hand the name to every node and bun
+guest forever, to fix one process's boot.
+
+The security question is worth stating plainly, because "hand a swept global back"
+should not be a comfortable sentence. It is a **name**, not a capability. The sweep
+shadows globals with own properties and deliberately leaves the prototype chain
+alone (that is what keeps the kernel's own `onmessage` working), so
+`WorkerGlobalScope.prototype` — and the `importScripts` on it — has always been two
+`getPrototypeOf` hops from `self`, for every guest, with or without this change.
+What the realm withholds is the name a feature detection reads, and that is what
+is being handed back, to one process, for about a second.
+
+**Fixing one flag would have hit the next wall two lines later.** Two things the
+worker path does that the sweep also touches:
+
+- Reaching the worker branch means running `isClassicWorker()`, which *calls*
+  `globalThis.importScripts("data:text/javascript,")` and reads a throw as "not a
+  classic worker". A shadowed `undefined` is not callable, so it throws — the right
+  answer, arrived at for a slightly different reason than upstream expects, and the
+  spike now asserts both that and the refusal a genuinely classic worker gets.
+- Emscripten asks the same question again inside `loadPyodide()`:
+  `ENVIRONMENT_IS_WORKER = !!globalThis.WorkerGlobalScope`. With WEB, WORKER and
+  NODE all false it concludes `ENVIRONMENT_IS_SHELL` and reaches for d8's `read()`.
+  The same binding fixes both, but only because the mask is held across
+  `loadPyodide()` and not just across the import.
+
+`location` is the one that is fine by luck and should be known about: every browser
+branch in `pyodide.mjs` resolves against it (`new URL(path, location)`), the sweep
+hides it, and `new URL(absolute, undefined)` works while `new URL("/vendor/...",
+undefined)` is `Invalid URL`. The kernel builds `VV_PYODIDE_INDEX_URL` from the
+worker's own origin, so every URL Pyodide is handed is already absolute. That is
+now an assertion rather than a coincidence.
+
+**Why CI was green through all of it, which is the part worth keeping.** The Python
+spikes drive `scripts/lib/fake-pyodide.mjs`, a stand-in handed to code that has
+already booted — it performs no environment detection, because nothing it models
+ever needed any. The tier that runs the real `pyodide.mjs`, `spike-python-bridge`,
+runs it in Node, where the detection has a true and different answer. So there was
+no realm anywhere in the harness for the detection to be wrong about, and the one
+thing that broke is the one thing nothing could see.
+
+`spike-python-offline.mjs` now sweeps a rebuilt Chrome worker global, applies the
+shipped `maskBootEnv()`, and runs Pyodide's own detection over the result — the
+counterfactual (the two process masks alone) reproduces the user's exact flag
+vector, and the fix resolves to `IN_BROWSER_WEB_WORKER` with Emscripten agreeing.
+The realm builder moved to `scripts/lib/browser-realm.mjs` so `spike-realm.mjs` and
+this share one, with its interface objects now real constructors and `self`
+returning the scope, since a realm whose `WorkerGlobalScope` is the string
+`"host:WorkerGlobalScope"` would answer an `instanceof` by accident. The detection
+itself is modelled in `scripts/lib/pyodide-runtime-env.mjs` and pinned from both
+ends the way `urllib3-emscripten.mjs` is: the offline tier asserts the model still
+contains every fragment, the bridge tier asserts every fragment is still in the
+real `pyodide.mjs.map` and `pyodide.asm.mjs`.

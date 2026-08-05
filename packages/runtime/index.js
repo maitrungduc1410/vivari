@@ -1744,13 +1744,21 @@ export function createRuntime({
     // is the only path a Ctrl-C has into a busy interpreter.
     interrupt: ctrl && ctrl.buffer ? interruptView(ctrl.buffer) : null,
     signalHandled: (name) => signalStandDown(name),
+    // The name Pyodide identifies a Web Worker by — it wants
+    // `self instanceof WorkerGlobalScope`, and the sweep took the constructor
+    // while `self` stayed. Handed in as a value rather than read off the global,
+    // because bootPyodide only puts it back for the length of one boot; see the
+    // HOLD entry in realm.js and maskBootEnv in builtins/python.js.
+    workerGlobalScope: HOST_REALM.held.get("WorkerGlobalScope") || null,
   });
   globalThis.__ocInstallPython = (indexUrl) => {
     // Pyodide's urllib bridge asks the realm for synchronous HTTP —
     // `hasattr(js, "XMLHttpRequest")` — and the realm sweep took XMLHttpRequest
     // away, because it is the one way out of this sandbox that never passes the
     // Fetcher Worker. Hand it back to the realm a python guest runs in, and only
-    // there: a node or bun guest still has no unmetered egress.
+    // there: a node or bun guest still has no unmetered egress. Pyodide's own
+    // boot is the second caller: once it is on the worker path, asm.mjs's
+    // readBinary is a synchronous XHR too.
     const xhr = HOST_REALM.held.get("XMLHttpRequest");
     if (xhr && globalThis.XMLHttpRequest === undefined) globalThis.XMLHttpRequest = xhr;
     return pythonRuntime.install(indexUrl);

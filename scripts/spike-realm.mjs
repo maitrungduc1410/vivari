@@ -5,13 +5,14 @@
 // broken sweep would pass. That blind spot is exactly how the host `Worker` leak
 // and the guest-visible `postMessage` both survived so long.
 //
-// So the browser realm is BUILT here, from a recording of a real one:
+// So the browser realm is BUILT, from a recording of a real one:
 // scripts/fixtures/realm-globals.json holds the 332 own properties and 35
 // prototype properties of a Chrome 143 DedicatedWorkerGlobalScope, including
 // which of them are accessors — the detail that decides whether `delete` works
 // (it does not, for 35 of them) and whether assigning `undefined` throws (it
 // does, for 17). Rebuilding the shape and sweeping THAT is a real test; asserting
-// against Node's own global is not.
+// against Node's own global is not. The builder lives in scripts/lib/browser-
+// realm.mjs, because spike-python-offline.mjs sweeps one too.
 //
 // Run: node scripts/run-spikes.mjs --offline realm
 
@@ -19,9 +20,9 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { captureHostRealm, sealGuestRealm, installBunRealm } from "../packages/runtime/realm.js";
+import { FIXTURE as fixture, makeBrowserRealm } from "./lib/browser-realm.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const fixture = JSON.parse(readFileSync(join(here, "fixtures", "realm-globals.json"), "utf8"));
 
 let failures = 0;
 const check = (label, ok, detail) => {
@@ -29,50 +30,6 @@ const check = (label, ok, detail) => {
   failures++;
   console.log("  FAIL " + label + (detail ? " — " + detail : ""));
 };
-
-// ---- a stand-in DedicatedWorkerGlobalScope ---------------------------------
-// Same names, same own/prototype split, same accessor/data split. Values are
-// stubs; the sweep never calls them, it only has to stop the guest reaching them.
-function makeBrowserRealm() {
-  const { own, proto } = fixture.browserWorker;
-  // Prototype chain: DedicatedWorkerGlobalScope -> WorkerGlobalScope -> EventTarget.
-  const eventTarget = Object.create(Object.prototype);
-  const workerScope = Object.create(eventTarget);
-  const dedicated = Object.create(workerScope);
-  const target = { EventTarget: eventTarget, WorkerGlobalScope: workerScope, DedicatedWorkerGlobalScope: dedicated };
-  for (const [name, info] of Object.entries(proto)) {
-    const host = target[info.on] || dedicated;
-    if (info.kind === "accessor") {
-      // The 17 that make `scope.x = undefined` throw in a real worker.
-      Object.defineProperty(host, name, {
-        get: () => "host:" + name,
-        configurable: true,
-        enumerable: true,
-      });
-    } else {
-      Object.defineProperty(host, name, {
-        value: () => "host:" + name,
-        writable: true,
-        configurable: true,
-        enumerable: false,
-      });
-    }
-  }
-  const scope = Object.create(dedicated);
-  for (const [name, kind] of Object.entries(own)) {
-    if (kind === "accessor") {
-      Object.defineProperty(scope, name, { get: () => "host:" + name, configurable: true });
-    } else {
-      Object.defineProperty(scope, name, { value: "host:" + name, writable: true, configurable: true });
-    }
-  }
-  // The two the runtime itself needs to survive the sweep, shaped as the browser
-  // has them.
-  Object.defineProperty(scope, "location", { get: () => ({ hostname: "studio.example" }), configurable: true });
-  Object.defineProperty(scope, "navigator", { get: () => ({ hardwareConcurrency: 384, userAgent: "Mozilla/5.0 …" }), configurable: true });
-  scope.globalThis = scope;
-  return scope;
-}
 
 console.log("\n1) the sweep, against a rebuilt Chrome worker global");
 {

@@ -19,9 +19,14 @@
 //   * pyodide.asm.mjs (Emscripten): ENVIRONMENT_IS_NODE = process.versions.node
 //     && process.type != "renderer"  → we set process.type = "renderer" (an
 //     Electron renderer is treated as a browser) so it uses the worker path.
-// Both masks are held across the whole boot and then restored, never leaving
-// globalThis.process undefined. Verified against the vendored Pyodide 314.0.3
-// getGlobalRuntimeEnv/calculateDerivedFlags and the asm.mjs env detection.
+// Telling Pyodide it is NOT in Node is only half of it: it then has to be able
+// to tell WHICH browser realm this is, and the answer to that is a global the
+// guest-realm sweep hides. So a third thing is masked, and it is not on
+// `process` — see maskBootEnv() below, which owns all three.
+// All of them are held across the whole boot and then restored, never leaving
+// globalThis.process undefined or the guest realm widened. Verified against the
+// vendored Pyodide 314.0.3 getGlobalRuntimeEnv/calculateDerivedFlags and the
+// asm.mjs env detection.
 //
 // Scope: run scripts + `-c` + a line REPL, streaming stdout/stderr to the
 // terminal, with the project directory mirrored into Pyodide's FS so file I/O and
@@ -1117,6 +1122,79 @@ def _vv_dispatch(req_json):
   );
 }
 
+// The environment Pyodide is allowed to see while it boots, and the undo for it.
+//
+// THREE probes decide which of Pyodide's code paths a boot takes, and all three
+// answer "Node" or "nowhere" unless they are masked. Two are questions about
+// `process` and one is a question about the realm:
+//
+//   * pyodide.mjs (the loader):  IN_NODE = process.versions.node && !process.browser
+//     — computed at module-eval time, so it has to be masked across the import
+//     itself. `process.browser = true` puts it in IN_BROWSER.
+//   * pyodide.asm.mjs (Emscripten): ENVIRONMENT_IS_NODE = process?.versions?.node
+//     && process?.type != "renderer" — computed inside loadPyodide(), when it
+//     imports asm.mjs. `process.type = "renderer"` (Emscripten treats an Electron
+//     renderer as a browser) puts it in the WEB/WORKER branch.
+//   * the realm: IN_BROWSER_WEB_WORKER = typeof globalThis.WorkerGlobalScope
+//     !== "undefined" && globalThis.self instanceof globalThis.WorkerGlobalScope
+//     (314.0.3 src/js/environments.ts), and asm.mjs's own
+//     ENVIRONMENT_IS_WORKER = !!globalThis.WorkerGlobalScope.
+//
+// The third one is the one this file used to get wrong, because it is the only
+// one that is not ours to set: the guest-realm sweep (packages/runtime/realm.js)
+// hides every host global a real Node 22 process lacks, and WorkerGlobalScope is
+// browser-only. `self` survives, `window` does not, and with IN_NODE masked away
+// too every branch of Pyodide's detection was false — so the FIRST thing a
+// `python main.py` did was throw "Cannot determine runtime environment:
+// {"IN_BROWSER":true,"IN_BROWSER_WEB_WORKER":false,…}". Masking IN_NODE without
+// restoring the name that says which browser we are is only half an answer.
+// Emscripten falls the same way one layer down: with WEB, WORKER and NODE all
+// false it concludes ENVIRONMENT_IS_SHELL and reaches for a `read()` no browser
+// has, so the second wall was two lines behind the first.
+//
+// Restoring it is not a widening of the sweep. The sweep shadows names and
+// leaves the prototype chain alone, so a guest that wants WorkerGlobalScope
+// already has it two getPrototypeOf hops from `self`; what the realm withholds
+// is the NAME a feature detection reads, and this hands that name back for the
+// length of one boot, in a python process only (realm.js HOLD → index.js
+// __ocInstallPython → here). Everything else on the worker path Pyodide now
+// takes is either already allowed (fetch, WebAssembly, Response) or already
+// handed back for the same reason (XMLHttpRequest, which asm.mjs's worker
+// readBinary uses synchronously, as urllib3 does); `importScripts` stays hidden,
+// which is what the isClassicWorker() probe needs — it calls
+// globalThis.importScripts("data:text/javascript,") and treats a throw as "not a
+// classic worker", which is the answer a module worker owes it.
+//
+// Nothing here may be left set: `process` is the guest's own, and the boot ends
+// with an interpreter the guest goes on using.
+export function maskBootEnv(scope, process, workerGlobalScope) {
+  const hadBrowser = Object.prototype.hasOwnProperty.call(process, "browser");
+  const prevBrowser = process.browser;
+  const hadType = Object.prototype.hasOwnProperty.call(process, "type");
+  const prevType = process.type;
+  const hadScope = Object.prototype.hasOwnProperty.call(scope, "WorkerGlobalScope");
+  const prevScope = scope.WorkerGlobalScope;
+
+  process.browser = true;
+  process.type = "renderer";
+  // Absent off a browser — the headless spike tiers are really Node, and there
+  // Pyodide's own answer is the true one.
+  if (workerGlobalScope) scope.WorkerGlobalScope = workerGlobalScope;
+
+  return function restoreBootEnv() {
+    if (hadBrowser) process.browser = prevBrowser;
+    else delete process.browser;
+    if (hadType) process.type = prevType;
+    else delete process.type;
+    if (!workerGlobalScope) return;
+    // `hadScope` is true and `prevScope` undefined on the path that matters: the
+    // sweep left an own, writable, non-enumerable `undefined` shadowing the real
+    // binding, and that shadow is what has to come back.
+    if (hadScope) scope.WorkerGlobalScope = prevScope;
+    else delete scope.WorkerGlobalScope;
+  };
+}
+
 export function createPythonRuntime({
   process,
   require,
@@ -1124,6 +1202,7 @@ export function createPythonRuntime({
   debug = null,
   interrupt = null,
   signalHandled = () => {},
+  workerGlobalScope = null,
 }) {
   const req = (name) => require(name);
 
@@ -1173,33 +1252,18 @@ export function createPythonRuntime({
     if (bootPromise) return bootPromise;
     const url = withTrailingSlash(indexUrl);
     bootPromise = (async () => {
-      // Pyodide has TWO independent Node probes, and our runtime masquerades as
-      // Node (process.versions.node is set — see packages/runtime/builtins/process.js),
-      // so BOTH would take the Node path and `await import("node:module")`, which
-      // 404s inside a module Web Worker. We mask each:
-      //   * pyodide.mjs (loader):  IN_NODE = … && !process.browser  — computed at
-      //     module-eval time → set process.browser = true while it is imported.
-      //   * pyodide.asm.mjs (Emscripten): ENVIRONMENT_IS_NODE =
-      //     process?.versions?.node && process?.type != "renderer"  — computed
-      //     when asm.mjs is imported *inside* loadPyodide() → set process.type =
-      //     "renderer" (Emscripten treats an Electron renderer as browser).
-      // Keep both masks set across the WHOLE boot (import + loadPyodide) and only
-      // then restore, so globalThis.process is never left undefined. process ===
-      // globalThis.process; each python invocation is its own process worker, so a
-      // node/bun process is never affected.
-      const hadBrowser = Object.prototype.hasOwnProperty.call(process, "browser");
-      const prevBrowser = process.browser;
-      const hadType = Object.prototype.hasOwnProperty.call(process, "type");
-      const prevType = process.type;
-      const restoreEnv = () => {
-        if (hadBrowser) process.browser = prevBrowser;
-        else delete process.browser;
-        if (hadType) process.type = prevType;
-        else delete process.type;
-      };
+      // Our runtime masquerades as Node (process.versions.node is set — see
+      // packages/runtime/builtins/process.js) inside a realm swept of the browser
+      // globals a real Node lacks, and Pyodide reads both of those to decide what
+      // it is running on. maskBootEnv above says which three answers have to
+      // change and why. The mask is held across the WHOLE boot — the import of
+      // pyodide.mjs, which computes the loader's flags at module-eval time, and
+      // the loadPyodide() that imports asm.mjs — and only then restored, so
+      // neither globalThis.process nor the guest's realm is left altered. process
+      // === globalThis.process; each python invocation is its own process worker,
+      // so a node/bun process is never affected.
+      const restoreEnv = maskBootEnv(globalThis, process, workerGlobalScope);
       try {
-        process.browser = true;
-        process.type = "renderer";
         const mod = await import(/* @vite-ignore */ url + "pyodide.mjs");
 
         // The fast path, when an earlier command in this session left one.

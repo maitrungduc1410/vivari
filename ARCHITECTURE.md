@@ -1974,6 +1974,19 @@ probes that would each `import("node:module")` (404 in a Worker). Both are maske
 the whole boot: `process.browser = true` (for `pyodide.mjs`) and `process.type =
 "renderer"` (for Emscripten's `pyodide.asm.mjs`), then restored.
 
+Telling Pyodide it is not in Node is only half the answer, because it then has to name
+the browser realm it *is* in — and it names a Web Worker by constructor identity,
+`self instanceof WorkerGlobalScope`. The guest-realm sweep (§13) hides
+`WorkerGlobalScope`, so with `window` gone as well every branch was false and the boot
+threw "Cannot determine runtime environment" before doing anything; Emscripten fell the
+same way one layer down and concluded `ENVIRONMENT_IS_SHELL`. So the mask has a third
+part, and it is a realm binding rather than a `process` field: `WorkerGlobalScope` is on
+the sweep's `HOLD` list, `__ocInstallPython` hands the held constructor to the python
+runtime, and `maskBootEnv()` puts it on `globalThis` for the length of the boot and takes
+it back afterwards. It grants no capability the realm did not already have — the sweep
+shadows names and leaves the prototype chain alone, so `WorkerGlobalScope.prototype` was
+always reachable from `self` — but a `node` or `bun` guest still never sees the name.
+
 **Web servers (Flask / FastAPI) — the HTTP bridge.** Pyodide has no real sockets, so a
 Python `uvicorn`/Werkzeug server can't bind a port. Instead the `python` launcher — itself
 a guest Node program on Vivari's Node runtime — stands up a tiny guest

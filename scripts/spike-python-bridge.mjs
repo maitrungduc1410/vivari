@@ -86,6 +86,11 @@ import {
 import { readShippedTemplates, readTemplatesSource } from "./lib/shipped-templates.mjs";
 import { CPYTHON_EXITS, UNTRUNCATED } from "./lib/cpython-exit.mjs";
 import { MODELLED_FRAGMENTS, normalize } from "./lib/urllib3-emscripten.mjs";
+import {
+  ASM_FRAGMENTS as ENV_ASM_FRAGMENTS,
+  MODELLED_FRAGMENTS as ENV_FRAGMENTS,
+  normalize as envNormalize,
+} from "./lib/pyodide-runtime-env.mjs";
 import { loaderLines } from "./lib/fake-pyodide.mjs";
 import { DRIVE_ENV, drivePython } from "./lib/python-drive.mjs";
 
@@ -292,6 +297,10 @@ const CASES = {
   "wsgi-environ": { kind: "wsgi-environ", synthetic: true },
   // Python's HTTP, and the Node masquerade that was switching it off.
   "urllib3-realm": { kind: "urllib3-realm", synthetic: true },
+  // The realm question Pyodide asks before anything else, held against the real
+  // pyodide.mjs.map and pyodide.asm.mjs — the half of that gate a Node harness
+  // cannot run, since it is a browser realm the detection has to be wrong about.
+  "runtime-env": { kind: "runtime-env", synthetic: true },
 
   // Where loadPackage writes when you do and do not hand it a callback, which
   // is what the offline stdout gate models — plus the version literal.
@@ -2437,6 +2446,43 @@ _out
       try { status = String(await P(code)); } catch (e) { status = String(e.message || e).split("\n").pop(); }
       ok(status === "200", `${label} reaches the network from Python with no patching at all (${status})`);
     }
+  }
+
+  // --- the realm question Pyodide asks before it does anything else ---------
+  if (spec.kind === "runtime-env") {
+    // The other half of the offline tier's bargain, and the one it cannot keep
+    // on its own. spike-python-offline.mjs runs Pyodide's environment detection
+    // against a swept guest realm using the stand-ins in
+    // scripts/lib/pyodide-runtime-env.mjs, because a browser realm is the one
+    // thing a Node harness cannot be. This is what keeps those stand-ins honest:
+    // every fragment they copy, found in the Pyodide this repo actually vendors.
+    //
+    // The loader's half is read off pyodide.mjs.map rather than pyodide.mjs —
+    // the bundle is minified past recognition (`i=n&&typeof globalThis.Worker…`),
+    // while the map carries src/js/environments.ts verbatim. Emscripten's half
+    // has no map and so is read off pyodide.asm.mjs directly, which is why those
+    // fragments are recorded in their minified form.
+    const dir = path.dirname(PYODIDE_ENTRY);
+    const version = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).version;
+    const map = JSON.parse(fs.readFileSync(path.join(dir, "pyodide.mjs.map"), "utf8"));
+    const at = map.sources.findIndex((s) => s.endsWith("src/js/environments.ts"));
+    ok(at >= 0, `pyodide ${version} still keeps its runtime detection in src/js/environments.ts`);
+    const loaderSrc = map.sourcesContent[at] || "";
+    for (const { label, source } of ENV_FRAGMENTS) {
+      ok(envNormalize(loaderSrc).includes(envNormalize(source)),
+        `real pyodide ${version} still writes ${label} exactly as the offline stand-in models it`);
+    }
+    const asmSrc = fs.readFileSync(path.join(dir, "pyodide.asm.mjs"), "utf8");
+    for (const { label, source } of ENV_ASM_FRAGMENTS) {
+      ok(envNormalize(asmSrc).includes(envNormalize(source)),
+        `…and pyodide.asm.mjs still opens with ${label}`);
+    }
+    // The consequence the offline tier states and cannot demonstrate: the worker
+    // branch reads its wasm through a SYNCHRONOUS XMLHttpRequest, which is the
+    // second reason __ocInstallPython hands that constructor back (the first
+    // being urllib3, above).
+    ok(/if\(ENVIRONMENT_IS_WORKER\)\{readBinary=url=>\{var xhr=new XMLHttpRequest/.test(asmSrc),
+      "…including the synchronous XMLHttpRequest its worker readBinary is built on");
   }
 
 
