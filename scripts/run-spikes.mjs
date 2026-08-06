@@ -53,6 +53,36 @@ const VENDORS = {
   corepack: { install: ["corepack@0.35.0"], dir: "/tmp/vv-vendor-corepack", arg: "node_modules/corepack", probe: "dist/corepack.js" },
   tsgo: { install: ["tsgo-wasm"], dir: "/tmp/vv-vendor-tsgo", arg: "node_modules/tsgo-wasm", probe: "tsgo.wasm" },
   wsDemo: { install: ["express@^4.21.0", "ws@^8.18.0"], dir: "/tmp/vv-vendor-wsdemo", arg: ".", probe: "node_modules/ws/package.json" },
+  // The studio's view layer has no test dependency of its own and the repo has no
+  // test runner, so the one spike that renders a React component brings its own:
+  // React (pinned to the studio's own major), a DOM, and the bundler that turns
+  // TSX + `~icons/*` + `@/…` into something node can import. Nothing is added to
+  // packages/studio for it. Keep react/react-dom in step with packages/studio/package.json.
+  //
+  // Babel and babel-plugin-react-compiler are not optional extras here. The
+  // studio ships every component through the React Compiler (studio vite.config:
+  // `babel({ presets: [reactCompilerPreset()] })`), the compiler memoises on
+  // identity, and the notebook's store mutates in place — so a bundle built
+  // without them renders a program with different behaviour from the one served,
+  // and did: the view spike was fully green while the shipped notebook did not
+  // repaint at all. Keep the plugin in step with packages/studio/package.json.
+  nbView: {
+    install: [
+      "react@^19.2.7",
+      "react-dom@^19.2.7",
+      "jsdom@^28.0.0",
+      "esbuild@^0.25.0",
+      "@babel/core@^8.0.1",
+      "babel-plugin-react-compiler@^1.0.0",
+    ],
+    dir: "/tmp/vv-vendor-nbview",
+    arg: ".",
+    probe: "node_modules/babel-plugin-react-compiler/package.json",
+  },
+  // The interpreter itself, as a directory rather than a packed asset: the
+  // notebook transport spike spawns a real `python` and needs pyodide.mjs and the
+  // wheels on disk exactly where the studio serves them from.
+  pyodide: { script: "vendor:pyodide", asset: "packages/studio/public/vendor/pyodide/pyodide.mjs" },
   npmAsset: { script: "vendor:npm", asset: "packages/studio/public/vendor/npm-pack.bin" },
   yarnAsset: { script: "vendor:yarn", asset: "packages/studio/public/vendor/yarn-pack.bin" },
   pnpmAsset: { script: "vendor:pnpm", asset: "packages/studio/public/vendor/pnpm-pack.bin" },
@@ -120,6 +150,11 @@ const SPIKES = [
   // `net` (see "python" below) — everything provable without it lives here so
   // that Python, like Bun, is gated on every PR rather than nightly.
   { name: "python-offline", file: "spike-python-offline.mjs", net: false, timeout: 60000 },
+  // The notebook: what a cell execution means, and what a save does to somebody
+  // else's .ipynb. The kernel program is stdlib-only Python, so this runs it on
+  // the HOST's CPython — persistence between cells, tracebacks and a real SIGINT
+  // are executed here rather than described. No kernel, no Wasm, no network.
+  { name: "notebook", file: "spike-notebook.mjs", net: false, timeout: 120000 },
   // Every shipped template's JavaScript parses. Templates are source stored in
   // template literals, where a backslash belongs to the OUTER literal first — a
   // regex can arrive in the generated project as a comment. No kernel, no Wasm,
@@ -310,6 +345,13 @@ const SPIKES = [
   // via micropip and pytest from the Pyodide CDN; the pyodide npm package is
   // provisioned into the same scratch dir vendor-pyodide.mjs uses.
   { name: "python", file: "spike-python-bridge.mjs", net: true, timeout: 600000 },
+  // The notebook's TRANSPORT: the launch string studio-kernel.ts types, typed at
+  // the real shell, driving the real launcher, runtime, driver and interpreter,
+  // with the frames required back into a real NotebookSession. Every other
+  // notebook gate tests one end of that wire; three "I pressed Run and nothing
+  // happened" reports shipped between them. `net` for the vendored interpreter,
+  // which is also why it is the one spike that boots Pyodide from Node.
+  { name: "notebook-transport", file: "spike-notebook-transport.mjs", net: true, vendor: VENDORS.pyodide, timeout: 600000 },
   // --- crypto-driven libraries (need `npm run build:crypto:node`) -------------
   // jsonwebtoken/jws: HS256/384/512 through the Wasm createHmac + the symmetric
   // KeyObject shim, and the RS256/PS256 asymmetric path through createSign/
@@ -370,6 +412,14 @@ const SPIKES = [
   // real `ws` backend on :3001 and relays frames BOTH ways (server push + a
   // client->server->client echo). No install in-VM, so a short budget is enough.
   { name: "ws-demo", file: "spike-ws-demo.mjs", net: true, needsWasm: true, vendor: VENDORS.wsDemo, timeout: 120000 },
+  // --- the one view test -----------------------------------------------------
+  // The notebook's SURFACE, rendered headlessly under <StrictMode>: does every
+  // cell get a live editor holding that cell's source. `net` only because it
+  // installs React and a DOM off the registry — it touches no network of its own
+  // and needs neither the kernel nor Wasm. It is here because the notebook
+  // shipped with every cell editor dead while spike-notebook's 186 assertions
+  // passed; see that file's header.
+  { name: "notebook-view", file: "spike-notebook-view.mjs", net: true, vendor: VENDORS.nbView, timeout: 120000 },
 ];
 
 const args = process.argv.slice(2);

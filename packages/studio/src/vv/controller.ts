@@ -28,6 +28,50 @@ import { createZip, encodeShare, decodeShare } from "../../../kernel-host/archiv
 import {
   parseGithubSpec, fetchGithubRepo, parseNpmSpec, fetchNpmPackage, type ProgressFn,
 } from "./import-remote";
+import { NotebookDoc } from "./notebook/doc.js";
+import { CellEditors, type CellEditorSlot } from "./notebook/cell-editors.js";
+import { NotebookSession } from "./notebook/session.js";
+import { NotebookKernel, isNotebookTerminal } from "./notebook/studio-kernel";
+
+/** How an open tab renders. Named rather than spelled out at each use: it was
+ *  written twice, and adding `notebook` to one of them type-checked everywhere
+ *  except the assignment between them. */
+export type TabKind = "text" | "image" | "directory" | "diff" | "notebook";
+
+/** One open `.ipynb`: its document, the interpreter running it, and the actions
+ *  the view drives. Handed out by `IdeController.notebook(abs)`. */
+export interface NotebookHandle {
+  readonly abs: string;
+  readonly doc: NotebookDoc;
+  readonly session: NotebookSession;
+  readonly kernel: NotebookKernel;
+  /** The cells' Monaco editors and models. Null until the first cell asks for
+   *  one, because Monaco is imported on demand. Owned by the HANDLE and not by
+   *  the effect that asked — see notebook/cell-editors.js for what went wrong
+   *  when it was the other way round. */
+  editors: CellEditors | null;
+  dispose(): void;
+  run(cellId: string): void;
+  runSelected(): void;
+  runAll(): void;
+  interrupt(): void;
+  restart(): void;
+  /** Move to the cell below after a Shift-Enter, appending one if there is none. */
+  focusAfter(cellId: string): void;
+  /**
+   * Build the editor for one cell. Resolves null — never rejects — when there is
+   * no editor to show: either the cell was deleted while Monaco loaded, or the
+   * build failed, in which case it has already been reported (status bar +
+   * console) rather than dropped. Both cases leave an empty box on screen, and
+   * an empty box that says nothing anywhere is how the first version of this
+   * feature looked merely "dead".
+   */
+  createCellEditor(
+    el: HTMLElement,
+    cellId: string,
+    language: "python" | "markdown",
+  ): Promise<CellEditorSlot | null>;
+}
 
 // Validate + normalize the build-time VITE_PREVIEW_ORIGIN (mode B). Returns the
 // bare origin (scheme+host+port) of a same-scheme, cross-origin absolute URL, or
@@ -189,7 +233,7 @@ export interface IdeSnapshot {
   files: string[]; // absolute paths (flat index for quick-open + search)
   openTabs: string[]; // absolute paths
   activeTab: string | null;
-  tabKinds: Record<string, "text" | "image" | "directory" | "diff">; // how each open tab renders
+  tabKinds: Record<string, TabKind>; // how each open tab renders
   previewTab: string | null; // the single "preview" (italic, single-click) tab
   dirty: string[]; // absolute paths with unsaved edits
   terminals: TerminalMeta[];
@@ -439,6 +483,10 @@ function isImagePath(path: string): boolean {
   const dot = path.lastIndexOf(".");
   return dot > 0 && IMAGE_EXTS.has(path.slice(dot + 1).toLowerCase());
 }
+/** Files that open as a notebook rather than as their JSON. */
+export function isNotebookPath(path: string): boolean {
+  return path.toLowerCase().endsWith(".ipynb");
+}
 // The MIME type for an image path, so the viewer's Blob renders correctly.
 function imageMime(path: string): string {
   const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
@@ -613,6 +661,7 @@ export class IdeController {
   private diffEditor: Monaco.editor.IStandaloneDiffEditor | null = null; // Source Control diff tab
   private diffModels: Monaco.editor.ITextModel[] = []; // throwaway [original, modified] for the diff editor
   private imageUrls = new Map<string, string>(); // abs -> object URL (image viewer)
+  private notebooks = new Map<string, NotebookHandle>(); // abs -> open .ipynb (doc + kernel)
   private depLibsByRoot = new Map<string, Map<string, string>>(); // root -> (extra-lib uri -> content)
   private depsSig = new Map<string, string>(); // root -> last node_modules fingerprint
   private dtsWarnedNoNM = new Set<string>(); // roots we've already noted lack node_modules
@@ -1478,13 +1527,15 @@ export class IdeController {
     let kind = this.snap.tabKinds[abs];
     if (!kind) {
       const info = await this.pathInfo(abs);
-      kind = info.isDir ? "directory" : isImagePath(abs) ? "image" : "text";
+      kind = info.isDir ? "directory" : isImagePath(abs) ? "image" : isNotebookPath(abs) ? "notebook" : "text";
       this.set({ tabKinds: { ...this.snap.tabKinds, [abs]: kind } });
     }
     if (kind === "image" && !this.imageUrls.has(abs)) {
       const bytes = await this.readFileBytes(abs);
       this.imageUrls.set(abs, URL.createObjectURL(new Blob([bytes as BlobPart], { type: imageMime(abs) })));
     }
+    // A notebook is opened (and, if it will not parse, downgraded to text) in
+    // openFile, which is where every other way of opening a file also lands.
     await this.openFile(abs, { preview, focus });
   }
 
@@ -1520,9 +1571,22 @@ export class IdeController {
     }
     this.set({ openTabs, previewTab, activeTab: abs });
 
+    // A `.ipynb` has to become a notebook tab HERE and not only in openEntry.
+    // openEntry is the Explorer's path, and it is far from the only one: ⌘P, a
+    // template's `entry` after create, and restoring a tab on reload all arrive
+    // straight at openFile — which would have shown the notebook's raw JSON.
+    // A notebook that will not parse falls back to text, the one view that can
+    // repair it.
+    // `!== "text"` rather than "has no kind": a notebook that failed to parse was
+    // downgraded once already, and must not be retried on every tab switch.
+    if (isNotebookPath(abs) && this.snap.tabKinds[abs] !== "text" && !this.notebooks.has(abs)) {
+      const opened = await this.openNotebook(abs);
+      this.set({ tabKinds: { ...this.snap.tabKinds, [abs]: opened ? "notebook" : "text" } });
+    }
+
     if (!this.editor || !this.monaco) return; // editor still loading — intent remembered
-    // Image / directory tabs don't get a Monaco model — the EditorGroup renders a
-    // custom pane for them. Detach the editor's model so it doesn't show stale text.
+    // Image / directory / notebook tabs don't get a Monaco model — the EditorGroup
+    // renders a custom pane. Detach the editor's model so it doesn't show stale text.
     const kind = this.snap.tabKinds[abs] ?? "text";
     if (kind !== "text") {
       if (this.snap.activeTab === abs) this.editor.setModel(null);
@@ -1653,7 +1717,7 @@ export class IdeController {
     if (url) { URL.revokeObjectURL(url); this.imageUrls.delete(abs); }
   }
   // Drop the render-kind entry for a closed/removed tab (image URLs revoked too).
-  private forgetKind(abs: string): Record<string, "text" | "image" | "directory" | "diff"> {
+  private forgetKind(abs: string): Record<string, TabKind> {
     this.revokeImage(abs);
     if (!(abs in this.snap.tabKinds)) return this.snap.tabKinds;
     const next = { ...this.snap.tabKinds };
@@ -1664,6 +1728,13 @@ export class IdeController {
   closeTab(abs: string) {
     const i = this.snap.openTabs.indexOf(abs);
     if (i === -1) return;
+    // Closing a notebook stops its interpreter. A kernel with no window is a
+    // process holding a Pyodide heap that nothing can reach or stop.
+    const nb = this.notebooks.get(abs);
+    if (nb) {
+      nb.dispose();
+      this.notebooks.delete(abs);
+    }
     const openTabs = this.snap.openTabs.filter((x) => x !== abs);
     const previewTab = this.snap.previewTab === abs ? null : this.snap.previewTab;
     const tabKinds = this.forgetKind(abs);
@@ -1681,6 +1752,8 @@ export class IdeController {
   // hot-updates/recompiles off the resulting notifyWatch.
   saveFile(abs: string) {
     if (!this.snap.dirty.includes(abs)) return;
+    // A notebook's text is generated from its cells, not held in a Monaco buffer.
+    if (this.saveNotebook(abs)) return;
     const contents = this.models.get(abs)?.getValue() ?? this.localFiles[abs] ?? "";
     this.localFiles[abs] = contents;
     this.bridge.post("vv-write", { path: abs, contents });
@@ -1689,6 +1762,182 @@ export class IdeController {
     const reload = folder ? this.folderManifests.get(folder.rootPath)?.reload : false;
     this.set({ dirty: this.snap.dirty.filter((x) => x !== abs) });
     this.status(reload ? `saved ${baseName(abs)} — recompiling…` : `saved ${baseName(abs)} — hot-updating…`);
+  }
+
+  // ── notebooks ──────────────────────────────────────────────────────────────
+  //
+  // A `.ipynb` opens as a notebook tab rather than as the JSON it is on disk.
+  // The document, the execution queue and the format live in `vv/notebook/*.js`,
+  // which `scripts/spike-notebook.mjs` drives directly; what is here is the part
+  // that needs the studio — the VFS, Monaco, and the terminal the kernel runs in.
+
+  /** Open (or reuse) the notebook for `abs`. False if the file will not parse,
+   *  which sends the caller back to the text editor. */
+  async openNotebook(abs: string): Promise<boolean> {
+    if (this.notebooks.has(abs)) return true;
+    if (!(abs in this.localFiles)) this.localFiles[abs] = await this.readFileText(abs);
+    let doc: NotebookDoc;
+    try {
+      const text = this.localFiles[abs] ?? "";
+      doc = text.trim() ? NotebookDoc.fromText(text) : new NotebookDoc();
+    } catch (err) {
+      this.status(`${baseName(abs)} is not a notebook this can open (${(err as Error).message}) — showing the raw file`);
+      return false;
+    }
+    const handle = this.makeNotebook(abs, doc);
+    this.notebooks.set(abs, handle);
+    return true;
+  }
+
+  /** The handle for an open notebook, for the view. */
+  notebook(abs: string): NotebookHandle | null {
+    return this.notebooks.get(abs) ?? null;
+  }
+
+  /** Which open notebook owns a terminal id, if any. */
+  private notebookTerminal(terminalId: string): NotebookHandle | null {
+    if (!isNotebookTerminal(terminalId)) return null;
+    for (const h of this.notebooks.values()) if (h.kernel.terminalId === terminalId) return h;
+    return null;
+  }
+
+  private makeNotebook(abs: string, doc: NotebookDoc): NotebookHandle {
+    const dir = abs.slice(0, abs.lastIndexOf("/")) || "/";
+    const kernel = new NotebookKernel({
+      bridge: this.bridge,
+      cwd: this.folderForPath(abs)?.rootPath ?? dir,
+      onOutput: (chunk) => session.feed(chunk),
+      onExit: (code) => {
+        const alive = session.status !== "off";
+        session.onExit(code);
+        // The status bar, as well as the notebook's own banner. A kernel dying is
+        // the kind of thing a user should not have to be looking at the right tab
+        // to find out about — and for a long time it produced no report anywhere,
+        // because the shell outlived the kernel and this never even ran.
+        if (!alive) return;
+        const why = session.exit?.ename
+          ? `${session.exit.ename}${session.exit.evalue ? `: ${session.exit.evalue}` : ""}`
+          : `exit code ${code}`;
+        this.status(`${baseName(abs)} — the Python kernel stopped (${why}); press Restart to run cells again`);
+      },
+    });
+    const session = new NotebookSession(kernel, doc.sink());
+
+    // The notebook's dirty flag rides the same tab-strip state as a text file's,
+    // so ⌘S, the close prompt and the dot on the tab all work unchanged.
+    const unsubscribe = doc.subscribe(() => {
+      const isDirty = this.snap.dirty.includes(abs);
+      if (doc.dirty && !isDirty) this.set({ dirty: [...this.snap.dirty, abs] });
+      else if (!doc.dirty && isDirty) this.set({ dirty: this.snap.dirty.filter((x) => x !== abs) });
+      if (doc.dirty && this.snap.previewTab === abs) this.set({ previewTab: null });
+    });
+
+    const handle: NotebookHandle = {
+      abs,
+      doc,
+      session,
+      kernel,
+      dispose: () => {
+        unsubscribe();
+        session.shutdown();
+        handle.editors?.disposeAll();
+        handle.editors = null;
+      },
+      editors: null,
+      run: (id) => {
+        const cell = doc.cell(id);
+        if (!cell) return;
+        if (cell.type !== "code") {
+          // Not silence. The toolbar's Run is `runSelected`, and a freshly opened
+          // notebook's selection is its FIRST cell — which is markdown in every
+          // template we ship, including the one the Python project starts with.
+          // So the most obvious button in the notebook did nothing at all, and
+          // said nothing about why, which reads as a broken kernel rather than as
+          // a cell with nothing to run.
+          this.status("markdown cells have nothing to run — select a code cell, or press its ▶");
+          return;
+        }
+        // The model is the truth while a cell is being typed in: `setSource` runs
+        // on change, but reading it here means a Run never sends stale text.
+        const model = handle.editors?.modelFor(id);
+        if (model) doc.setSource(id, model.getValue());
+        session.run(id, doc.cell(id)?.source ?? "");
+      },
+      runSelected: () => {
+        if (doc.selected) handle.run(doc.selected);
+      },
+      runAll: () => {
+        for (const cell of doc.cells) if (cell.type === "code") handle.run(cell.id);
+      },
+      interrupt: () => {
+        if (!session.interrupt()) this.status("nothing is running to interrupt");
+      },
+      restart: () => {
+        session.restart();
+        this.status(`${baseName(abs)} — restarting the interpreter`);
+      },
+      focusAfter: (id) => {
+        const next = doc.cells[doc.indexOf(id) + 1];
+        if (next) doc.select(next.id);
+        else doc.insert("code");
+      },
+      createCellEditor: (el, id, language) =>
+        this.createCellEditor(handle, el, id, language).catch((err: unknown) => {
+          // There is no error state for a cell. A cell whose editor did not get
+          // built renders as an empty bordered box and nothing else happens —
+          // which is indistinguishable, on screen, from a notebook that is simply
+          // broken. This promise had no rejection handler at all, anywhere, so
+          // whatever threw inside it never reached the console either.
+          console.error(`[notebook] ${baseName(abs)}: could not build the editor for cell ${id}`, err);
+          this.status(`${baseName(abs)} — a cell editor failed to load (details in the console)`);
+          return null;
+        }),
+    };
+    return handle;
+  }
+
+  /**
+   * A Monaco editor for one cell.
+   *
+   * All of the async is HERE and none of it is in the lifetime rules: Monaco is
+   * imported on demand, and once it has arrived `CellEditors.mount` is a
+   * synchronous step whose ordering guarantees hold whichever of two overlapping
+   * mounts lands first. That split is the fix for the dead-editor bug — see
+   * notebook/cell-editors.js, which is where the rules and the evidence live.
+   */
+  private async createCellEditor(
+    handle: NotebookHandle,
+    el: HTMLElement,
+    id: string,
+    language: "python" | "markdown",
+  ): Promise<CellEditorSlot | null> {
+    const monaco = this.monaco ?? (await import("monaco-editor"));
+    this.monaco ??= monaco;
+    // The one benign null: the cell was deleted while Monaco was loading, so
+    // there is nothing to build. Everything else throws and is reported by the
+    // wrapper in makeNotebook.
+    const cell = handle.doc.cell(id);
+    if (!cell) return null;
+    const editors = (handle.editors ??= new CellEditors(monaco, handle.abs));
+    if (language === "python") this.ensurePythonLanguage(editors.uriFor(id, language).path);
+    return editors.mount(el, id, language, cell.source, {
+      theme: monacoThemeFor(this.uiTheme),
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+    });
+  }
+
+  /** ⌘S on a notebook tab: serialise the document rather than a Monaco buffer. */
+  private saveNotebook(abs: string): boolean {
+    const handle = this.notebooks.get(abs);
+    if (!handle) return false;
+    const contents = handle.doc.toText();
+    this.localFiles[abs] = contents;
+    this.bridge.post("vv-write", { path: abs, contents });
+    handle.doc.dirty = false;
+    handle.doc.changed({ dirty: false });
+    this.set({ dirty: this.snap.dirty.filter((x) => x !== abs) });
+    this.status(`saved ${baseName(abs)}`);
+    return true;
   }
 
   // ── Source Control: diff tab + working-tree reload ──
@@ -1769,6 +2018,17 @@ export class IdeController {
 
   // Throw away unsaved edits, reverting the model to the last-saved text.
   discardFile(abs: string) {
+    const nb = this.notebooks.get(abs);
+    if (nb) {
+      // Rebuilt from the saved bytes rather than undone cell by cell: the edits
+      // being discarded include inserts, deletes and reorders, which no per-model
+      // revert would put back.
+      nb.dispose();
+      this.notebooks.delete(abs);
+      this.set({ dirty: this.snap.dirty.filter((x) => x !== abs) });
+      void this.openNotebook(abs);
+      return;
+    }
     const model = this.models.get(abs);
     const saved = this.localFiles[abs] ?? "";
     if (model && model.getValue() !== saved) model.setValue(saved); // fires onDidChangeContent → clears dirty
@@ -3135,6 +3395,11 @@ export class IdeController {
 
     // interactive terminals
     b.on("term-ready", (m) => {
+      const nb = this.notebookTerminal(m.terminalId as string);
+      if (nb) {
+        nb.kernel.onTerminalReady();
+        return;
+      }
       const t = this.terms.get(m.terminalId as string);
       if (t) {
         t.pid = m.pid as number;
@@ -3145,6 +3410,13 @@ export class IdeController {
       }
     });
     b.on("term-out", (m) => {
+      // A notebook kernel's terminal has no xterm: its stdout is the protocol,
+      // and the frames are pulled out of it by the session's FrameReader.
+      const nb = this.notebookTerminal(m.terminalId as string);
+      if (nb) {
+        nb.kernel.handleOutput(m.chunk as string);
+        return;
+      }
       const t = this.terms.get(m.terminalId as string);
       if (!t) return;
       if (t.openedAt) {
@@ -3155,6 +3427,11 @@ export class IdeController {
     });
     b.on("term-exit", (m) => {
       const id = m.terminalId as string;
+      const nb = this.notebookTerminal(id);
+      if (nb) {
+        nb.kernel.handleExit(m.code as number);
+        return;
+      }
       const t = this.terms.get(id);
       if (!t) return;
       t.term.write(`\r\n\x1b[90m[process exited — code ${m.code}]\x1b[0m\r\n`);

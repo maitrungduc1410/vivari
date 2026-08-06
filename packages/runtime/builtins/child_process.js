@@ -22,12 +22,22 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
       args = [];
     }
     const sh = withShell(command, args, opts);
+    // stdio:'inherit' means the child writes to OUR streams, and Node reports
+    // `stdout`/`stderr` as null on the result because it never held them. The
+    // kernel's `capture` flag is the same distinction: false lets the child's
+    // output go straight to the terminal as it is produced, which is the only way
+    // to see a slow child's progress — captured output cannot arrive before the
+    // exit that delivers it. Python's `subprocess.run` without `capture_output`
+    // wants exactly this, and so does every `spawnSync(..., {stdio:'inherit'})`
+    // that used to be silently captured and dropped on the floor.
+    const stdio = opts.stdio;
+    const inherit = stdio === "inherit" || (Array.isArray(stdio) && stdio[1] === "inherit" && stdio[2] === "inherit");
     const spec = {
       command: sh.command,
       args: sh.args,
       cwd: opts.cwd || process.cwd(),
       env: opts.env || process.env,
-      capture: true,
+      capture: !inherit,
     };
     // `input` travels WITH the spawn, because there is no later. The caller is
     // parked on Atomics.wait from here until the child exits, so it can never
@@ -49,6 +59,11 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
         output: [null, null, null],
         error: e,
       };
+    }
+    if (inherit) {
+      // Nothing was captured, so there is nothing to report — reporting an empty
+      // Buffer instead would read as "the child printed nothing".
+      return { status: r.code, signal: null, pid: r.pid, stdout: null, stderr: null, output: [null, null, null] };
     }
     const wrap = (s) => (opts.encoding ? s : Buffer.from(s || ""));
     const stdout = wrap(r.stdout);

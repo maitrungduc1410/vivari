@@ -4793,6 +4793,226 @@ never slows down the rest of the studio.
 }
 
 // ── Native: Python data science (NumPy + pandas via Pyodide) ─────────────────
+// The notebook starter. The .ipynb is BUILT rather than written as a template
+// literal: a notebook is JSON, JSON is full of backslash escapes, and a `\n` in a
+// template literal is a newline rather than the two characters the file needs.
+// That is the exact class of bug spike-template-syntax.mjs exists for, and
+// JSON.stringify cannot get it wrong.
+function notebookFile(cells: { type: "code" | "markdown"; source: string }[]): string {
+  return (
+    JSON.stringify(
+      {
+        cells: cells.map((c, i) => {
+          const cell: Record<string, unknown> = {
+            cell_type: c.type,
+            id: `starter${i + 1}`,
+            metadata: {},
+            // nbformat's "multiline string": the newline stays on every line but
+            // the last, which is what keeps notebook diffs line-by-line.
+            source: c.source.split("\n").map((l, j, all) => (j === all.length - 1 ? l : l + "\n")).filter((l, j, all) => l !== "" || j < all.length - 1),
+          };
+          if (c.type === "code") {
+            cell.execution_count = null;
+            cell.outputs = [];
+          }
+          return cell;
+        }),
+        metadata: {
+          kernelspec: { display_name: "Python (Pyodide)", language: "python", name: "python" },
+          language_info: { name: "python", mimetype: "text/x-python", file_extension: ".py" },
+        },
+        nbformat: 4,
+        nbformat_minor: 5,
+      },
+      null,
+      1,
+    ) + "\n"
+  );
+}
+
+function pythonNotebookTemplate(): TemplateDef {
+  return {
+    manifest: {
+      id: "python-notebook",
+      framework: "notebook",
+      icon: "python",
+      category: "Native",
+      name: "Python Notebook",
+      language: "Python",
+      description: "A .ipynb notebook on CPython (Pyodide) — cells, plots and DataFrames in the editor",
+      // No server: the notebook talks to its interpreter over the kernel's stdin,
+      // not over a port. Nothing binds this.
+      port: 8000,
+      openPath: "/",
+      entry: "analysis.ipynb",
+      hmr: false,
+      reload: false,
+      install: "python --version",
+      // Run is not how you use this template — the notebook has its own Run — but
+      // it is not nothing either: booting CPython once writes the interpreter
+      // snapshot (`/var/cache/vv-python`), so the notebook's own kernel starts
+      // from it in about a fifth of the time.
+      dev: "python warmup.py",
+      // Per AGENTS.md: a template graduates out of `experimental` when a spike
+      // proves it. scripts/spike-notebook.mjs proves the execution semantics and
+      // the .ipynb round-trip; scripts/spike-notebook-view.mjs mounts the surface
+      // headlessly and proves every cell gets a live editor holding its source —
+      // which it did not, the first time this shipped. What neither can do is
+      // launch the kernel in the VM or bring a figure back from the real
+      // matplotlib, so this stays flagged.
+      experimental: true,
+    },
+    files: {
+      "analysis.ipynb": notebookFile([
+        {
+          type: "markdown",
+          source:
+            "# A notebook, in the browser\n\nEvery cell below runs in **one** CPython interpreter (Pyodide), so a name\ndefined in one cell is there in the next. Press **Shift-Enter** to run a cell\nand move on, or **Ctrl-Enter** to run it and stay.\n\nThere are no threads here, so cells run strictly one at a time — press Run\nrepeatedly and they queue up. **Interrupt** stops the running one.",
+        },
+        {
+          type: "code",
+          source: "import sys\n\nprint(sys.version)\ntotal = 0",
+        },
+        {
+          type: "markdown",
+          source: "## State carries between cells\n\nThe cell below can see `total`, because it is the same interpreter.",
+        },
+        {
+          type: "code",
+          source: "for i in range(1, 11):\n    total += i\n\ntotal",
+        },
+        {
+          type: "markdown",
+          source: "## DataFrames render as tables\n\npandas is vendored, so this import is local and needs no network.",
+        },
+        {
+          type: "code",
+          source:
+            "import pandas as pd\n\ndf = pd.DataFrame(\n    {\n        \"city\": [\"Lisbon\", \"Oslo\", \"Osaka\", \"Lima\"],\n        \"population_m\": [0.55, 0.71, 2.75, 9.75],\n        \"hemisphere\": [\"N\", \"N\", \"N\", \"S\"],\n    }\n)\ndf.sort_values(\"population_m\", ascending=False)",
+        },
+        {
+          type: "markdown",
+          source: "## Plots appear under the cell that drew them\n\nNo `savefig`, no file to open: the notebook's matplotlib backend returns the\nfigure inline.",
+        },
+        {
+          type: "code",
+          source:
+            "import matplotlib.pyplot as plt\n\nfig, ax = plt.subplots(figsize=(6, 3))\nax.bar(df[\"city\"], df[\"population_m\"], color=\"#6366f1\")\nax.set_ylabel(\"population (millions)\")\nax.set_title(\"Cities\")\nplt.show()",
+        },
+        {
+          type: "markdown",
+          source:
+            "## What is different here\n\n- `input()` does not work in a cell — the kernel reads stdin itself to receive\n  cells. Run a script in a terminal if it needs to read input.\n- `numpy`, `pandas`, `matplotlib`, `scipy`, `scikit-learn` and `openpyxl` are\n  vendored, as are `httpx`, `requests`, `sqlalchemy` and `rich` — importing any\n  of them is local and works with the tab offline. Anything else is fetched from\n  the Pyodide CDN on first import, which needs network.\n- Saving writes a real `.ipynb`. Open one you brought from Jupyter and it keeps\n  the fields this editor does not understand.",
+        },
+      ]),
+      "warmup.py": `# Not the notebook's entry point — open analysis.ipynb for that.
+#
+# Booting CPython costs about 1.8s, and the runtime keeps the first boot of a
+# session as a snapshot (/var/cache/vv-python) that later ones start from. So
+# running this once makes the notebook's own kernel start warm.
+import sys
+
+
+def vendored() -> "list[tuple[str, bool]]":
+    """Which of the vendored scientific packages actually imported.
+
+    Every name below is spelled out in a real \`import\` statement, and that is
+    load-bearing rather than a matter of style. Vivari preloads Pyodide's wheels
+    with \`loadPackagesFromImports\`, which decides what to fetch by PARSING THIS
+    FILE for import statements (packages/runtime/builtins/python.js). An earlier
+    version of this script looped \`__import__(name)\` over a tuple of strings —
+    a call on a variable is not an import statement, so nothing was ever
+    preloaded, every import then failed for real, and the script reported a fully
+    vendored stack as missing. Which is the worst kind of wrong: it looked like
+    the environment was broken when only the report was.
+    """
+    found = []
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        found.append(("numpy", False))
+    else:
+        found.append(("numpy", True))
+    try:
+        import pandas  # noqa: F401
+    except ImportError:
+        found.append(("pandas", False))
+    else:
+        found.append(("pandas", True))
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError:
+        found.append(("matplotlib", False))
+    else:
+        found.append(("matplotlib", True))
+    try:
+        import scipy  # noqa: F401
+    except ImportError:
+        found.append(("scipy", False))
+    else:
+        found.append(("scipy", True))
+    try:
+        import sklearn  # noqa: F401
+    except ImportError:
+        found.append(("scikit-learn", False))
+    else:
+        found.append(("scikit-learn", True))
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError:
+        found.append(("openpyxl", False))
+    else:
+        found.append(("openpyxl", True))
+    return found
+
+
+def main() -> None:
+    print(f"CPython {sys.version.split()[0]} on {sys.platform} (Pyodide) — interpreter snapshot warmed.")
+    for name, ok in vendored():
+        print(f"  {name}: {'vendored, no network needed' if ok else 'NOT available'}")
+    print("\\nOpen analysis.ipynb and press Shift-Enter in the first cell.")
+
+
+if __name__ == "__main__":
+    main()
+`,
+      "README.md": `# Python Notebook
+
+A real \`.ipynb\` notebook running on **CPython compiled to WebAssembly**
+(Pyodide), entirely in your browser. Open \`analysis.ipynb\`.
+
+## Keys
+
+| | |
+| --- | --- |
+| \`Shift-Enter\` | run the cell, move to the next |
+| \`Ctrl-Enter\` / \`Cmd-Enter\` | run the cell, stay |
+| \`a\` / \`b\` | insert a cell above / below (outside an editor) |
+| \`m\` / \`y\` | make the selected cell markdown / code |
+
+## How it runs
+
+One interpreter serves every cell, so state carries between them. It has no
+threads, so cells run **one at a time** — pressing Run repeatedly queues them,
+and the count beside each cell (\`[1]\`, \`[2]\`, …) is the order the interpreter
+actually saw them in, which is not always the order they appear on screen.
+
+**Interrupt** sends a real \`SIGINT\`, so a runaway loop stops and the interpreter
+keeps everything it had defined. It only works while a cell is running.
+
+## Limits worth knowing
+
+- \`input()\` raises in a cell: the kernel reads stdin itself to receive cells.
+  Run the script in a terminal if it needs to read input.
+- \`numpy\`, \`pandas\` and \`matplotlib\` are vendored. Everything else in the
+  scientific stack is fetched from the Pyodide CDN on first import.
+- Saving writes real nbformat 4 JSON, and preserves the fields this editor does
+  not understand — so a notebook you brought from Jupyter goes back intact.
+`,
+    },
+  };
+}
+
 function pythonDataScienceTemplate(): TemplateDef {
   return {
     manifest: {
@@ -10831,6 +11051,7 @@ export const TEMPLATES: TemplateDef[] = [
   bunApisTemplate(),
   // Native
   pythonTemplate(),
+  pythonNotebookTemplate(),
   pythonDataScienceTemplate(),
   pythonMatplotlibTemplate(),
   fastapiTemplate(),

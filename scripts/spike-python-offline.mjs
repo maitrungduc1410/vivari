@@ -41,11 +41,14 @@ import {
   PYODIDE_PYTHON_VERSION,
   PYTHON_EXECUTABLE,
   BLOCKING_PATCH_SOURCE,
+  SUBPROCESS_SOURCE,
+  SPAWN_DEPTH_VAR,
+  MAX_SPAWN_DEPTH,
   MPL_BACKEND,
   MPL_SHOW_SOURCE,
   URLLIB3_REALM_PATCH,
   byteWriter,
-  dataPackagesFor,
+  hiddenImportsFor,
   installMatplotlibShow,
   installStdin,
   makeLineReader,
@@ -66,6 +69,10 @@ import {
   harvestBytecode,
   setExecutable,
   setupSource,
+  reloadSource,
+  isReloadTrigger,
+  reloadWatchDirs,
+  RELOAD_DEBOUNCE_MS,
   terminationFromError,
 } from "../packages/runtime/builtins/python.js";
 import { PY_DEBUG_SOURCE, createPythonDebugger } from "../packages/runtime/builtins/python-debugger.js";
@@ -111,6 +118,7 @@ import {
   normalize as normalizePyEnv,
 } from "./lib/pyodide-runtime-env.mjs";
 import { CPYTHON_EXITS, UNTRUNCATED, realCPythonExit } from "./lib/cpython-exit.mjs";
+import { vendoredPyPIPins } from "./lib/python-lsp-oracle.mjs";
 import { drivePython, driveShim, servedApp } from "./lib/python-drive.mjs";
 import { fsDirective, get, hostRead, mirrorRuntime, scratchPort } from "./lib/python-mirror-drive.mjs";
 import { makeFakeMonaco, makeHost, makeModel, makeToken } from "./lib/fake-monaco.mjs";
@@ -213,8 +221,19 @@ console.log("== python CLI dispatch (PYTHON_PROGRAM run as a real process) ==");
   r = run("-m", "gunicorn", "-w", "4");
   ok(/no app specified/.test(r.err), "…and its value is consumed rather than mistaken for the app spec");
 
+  // --reload used to warn that it was ignored, on the stated grounds that a
+  // watcher needs a thread. It is honoured now, so the assertion is inverted:
+  // the old wording reappearing would mean the feature had been reverted while
+  // the flag kept being accepted. Nothing is printed at all, because there is
+  // nothing to apologise for.
   r = run("-m", "gunicorn", "wsgi:app", "--reload");
-  ok(/--reload is ignored here/.test(r.err), "gunicorn --reload warns instead of pretending to watch files");
+  ok(!/--reload is ignored here/.test(r.err), "gunicorn --reload no longer claims to be ignored");
+  ok(!/needs a thread/.test(r.err), "…nor repeats the reason that was never true");
+  r = run("-m", "gunicorn", "wsgi:app", "--reload", "--reload-engine", "poll");
+  ok(/--reload-engine poll is ignored here/.test(r.err),
+    "…while the knob that really is not applied — the reload ENGINE — still says so");
+  r = run("-m", "gunicorn", "--reload", "--reload-engine", "poll");
+  ok(/no app specified/.test(r.err), "…and consumes its value rather than serving an app called 'poll'");
   r = run("-m", "gunicorn", "wsgi:app", "-D");
   ok(/-D is ignored here/.test(r.err), "gunicorn -D warns instead of pretending to daemonise");
 
@@ -227,11 +246,24 @@ console.log("== python CLI dispatch (PYTHON_PROGRAM run as a real process) ==");
   r = run("-m", "uvicorn", "--workers", "3");
   ok(/--workers is ignored here/.test(r.err) && /no app specified/.test(r.err), "uvicorn --workers warns and consumes its value");
   r = run("-m", "uvicorn", "main:app", "--reload");
-  ok(/--reload is ignored here/.test(r.err), "uvicorn --reload warns instead of pretending to watch files");
+  ok(!/--reload is ignored here/.test(r.err), "uvicorn --reload no longer claims to be ignored");
+  r = run("-m", "uvicorn", "main:app", "--reload", "--reload-include", "*.py");
+  ok(/--reload-include \*\.py is ignored here/.test(r.err),
+    "…while the filter flags, which the watch does not apply, say so by name");
+  r = run("-m", "uvicorn", "--reload", "--reload-dir", "src");
+  ok(/no app specified/.test(r.err), "…and consume their values rather than serving an app called 'src'");
 
   // --- flask ----------------------------------------------------------------
+  // --debug is the one flag here that names two features and gets one, so it is
+  // the reason a third honesty tier exists. "ignored" would understate it and
+  // silence would overstate it; the assertion is that it says which half landed.
   r = run("-m", "flask", "--app", "main", "run", "--debug");
-  ok(/--debug is ignored here/.test(r.err), "flask --debug warns (no reloader, no interactive debugger)");
+  ok(/--debug is half honoured here/.test(r.err), "flask --debug reports itself as half honoured, not ignored");
+  ok(/reloader restarts the app/.test(r.err), "…naming the half that happens");
+  ok(/interactive debugger does not/.test(r.err), "…and the half that does not");
+  r = run("-m", "flask", "--app", "main", "run", "--reload");
+  ok(!/is ignored here/.test(r.err) && !/half honoured/.test(r.err),
+    "flask --reload on its own has nothing to report, because all of it is honoured");
   r = run("-m", "flask", "--app", "main", "shell");
   ok(r.code === 1 && /only the "run" command/.test(r.err), "flask <other> names the one command it has");
 
@@ -388,6 +420,221 @@ console.log("\n== bridge dispatch source (setupSource) ==");
   ok(!/_vv_root \+ d\["path"\]/.test(wsgi), "…so it does not get the ASGI prefix treatment");
 
   ok(setupSource("pkg.mod", "app", "asgi").includes('"pkg.mod"'), "the module name is injected as a JSON literal");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== --reload: what decides that a save restarts the app ==");
+// The scope decisions, which are pure functions and so can be asserted directly
+// rather than inferred from a comment.
+// ---------------------------------------------------------------------------
+{
+  ok(isReloadTrigger("main.py"), "a .py save is what restarts the app");
+  ok(!isReloadTrigger("index.html") && !isReloadTrigger("style.css"),
+    "…and a template or a stylesheet is not, since neither is imported");
+  // The loop this closes is specific and would be invisible until it happened:
+  // a served app's writes are mirrored back to the VFS at the end of every
+  // request, and every one of those writes fires the same watch reload listens
+  // to. An app that touches SQLite on each request would restart on each
+  // request, forever.
+  ok(!isReloadTrigger("notes.sqlite") && !isReloadTrigger("app.db-journal"),
+    "…nor a database file a request just wrote, which is what stops a served app restarting itself in a loop");
+  ok(!isReloadTrigger(undefined) && !isReloadTrigger(null),
+    "a watch event with no filename is ignored rather than throwing on it");
+  ok(RELOAD_DEBOUNCE_MS > 0 && RELOAD_DEBOUNCE_MS <= 250,
+    `a burst of saves is coalesced over ${RELOAD_DEBOUNCE_MS}ms — under real uvicorn's 250ms poll, so no slower than the tool being stood in for`);
+
+  // The watch is a walk registering one non-recursive watch per directory, so
+  // what it walks IS the scope. Getting this wrong is not a crash, it is a
+  // registration per file in .venv — which is why it is asserted rather than
+  // trusted to the comment above it.
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), "vv-reload-scope-"));
+  for (const d of ["app", "app/routes", ".venv/lib/python3.14/site-packages/flask",
+                   "__pycache__", "node_modules/x", ".git/objects", "static"]) {
+    fs.mkdirSync(path.join(proj, d), { recursive: true });
+  }
+  const dirs = reloadWatchDirs(fs, proj).map((d) => d.slice(proj.length) || "/");
+  ok(dirs.includes("/") && dirs.includes("/app") && dirs.includes("/app/routes"),
+    "the watch covers the project root and its source directories, to any depth");
+  ok(dirs.includes("/static"), "…including ones that hold no Python, since a .py can be added to any of them");
+  for (const skipped of [".venv", "__pycache__", "node_modules", ".git"]) {
+    ok(!dirs.some((d) => d.split("/").includes(skipped)),
+      `…and never descends into ${skipped}, which is the same set the mirror already refuses`);
+  }
+  fs.rmSync(proj, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== --reload: the re-import, executed under the host's CPython ==");
+// reloadSource is ordinary Python — no Pyodide in it — so unlike setupSource it
+// can be RUN here rather than pattern-matched, and the things worth knowing
+// about a reloader are all behavioural. The interpreter is a stand-in for
+// Pyodide's, which is the same gap the urllib3 hook has and is stated for the
+// same reason: this proves the semantics, not that Pyodide runs them.
+//
+// The driver mimics serve(): import the app, bind _vv_app, then exec the shipped
+// reload source into the same namespace, exactly as runPython does.
+// ---------------------------------------------------------------------------
+{
+  const probe = spawnSync("python3", ["-c", "import sys; print(sys.version.split()[0])"], { encoding: "utf8" });
+  if (probe.status !== 0) {
+    // Loud, not skipped — a silent skip reads as green.
+    console.log("  ! no python3 on PATH: the reload LOGIC was not executed here — only the string guards below ran");
+  } else {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-reload-"));
+    const proj = path.join(dir, "proj");
+    fs.mkdirSync(proj, { recursive: true });
+    fs.writeFileSync(path.join(proj, "helper.py"), 'VALUE = "v1"\n');
+    fs.writeFileSync(path.join(proj, "main.py"), 'import helper\napp = "app-" + helper.VALUE\n');
+    fs.writeFileSync(path.join(dir, "reload.py"), reloadSource("main", "app", proj));
+
+    const w = (rel, body) => fs.writeFileSync(path.join(proj, rel), body);
+    const driver = `
+import json, sys
+sys.path.insert(0, ${JSON.stringify(proj)})
+import importlib
+_vv_app = getattr(importlib.import_module("main"), "app")
+exec(open(${JSON.stringify(path.join(dir, "reload.py"))}).read())
+out = {"initial": _vv_app, "owned": sorted(_vv_project_modules())}
+
+# 1) An edit to a SIBLING module, of exactly the same byte length. Same size and
+#    the same whole second as the file it replaces, which is the case a .pyc
+#    cannot tell apart from no edit at all.
+open(${JSON.stringify(path.join(proj, "helper.py"))}, "w").write('VALUE = "v2"\\n')
+out["same_size_err"] = _vv_reload()
+out["same_size_app"] = _vv_app
+
+# 2) A syntax error in the edited file, with a good sibling imported BEFORE it —
+#    so the reload gets half way, which is the state that must not survive. The
+#    module object to compare against is the one CURRENTLY serving, which the
+#    reload above already replaced.
+serving_helper = sys.modules["helper"]
+open(${JSON.stringify(path.join(proj, "helper.py"))}, "w").write('VALUE = "v9"\\n')
+open(${JSON.stringify(path.join(proj, "main.py"))}, "w").write('import helper\\napp = "broken" +\\n')
+err = _vv_reload()
+out["broken_failed"] = bool(err)
+out["broken_last_line"] = err.strip().splitlines()[-1] if err else ""
+out["broken_app"] = _vv_app
+out["broken_helper_value"] = sys.modules["helper"].VALUE
+out["broken_helper_is_same_object"] = sys.modules["helper"] is serving_helper
+
+# 3) A module that raises at import, and a sibling it never reaches.
+open(${JSON.stringify(path.join(proj, "boom.py"))}, "w").write('raise RuntimeError("boom at import")\\n')
+open(${JSON.stringify(path.join(proj, "main.py"))}, "w").write('import boom\\napp = "never"\\n')
+err = _vv_reload()
+out["raise_failed"] = bool(err)
+out["raise_last_line"] = err.strip().splitlines()[-1] if err else ""
+out["raise_app"] = _vv_app
+out["raise_left_boom"] = "boom" in sys.modules
+
+# 4) sys.exit() at import time must not take the server down with it.
+open(${JSON.stringify(path.join(proj, "main.py"))}, "w").write('import sys\\nsys.exit(3)\\napp = 1\\n')
+err = _vv_reload()
+out["exit_failed"] = bool(err)
+out["exit_app"] = _vv_app
+
+# 5) The attribute renamed out from under the app spec.
+open(${JSON.stringify(path.join(proj, "main.py"))}, "w").write('renamed = 1\\n')
+err = _vv_reload()
+out["attr_failed"] = bool(err)
+out["attr_last_line"] = err.strip().splitlines()[-1] if err else ""
+out["attr_app"] = _vv_app
+
+# 6) Fixed again: after all of that, a good save still reloads.
+open(${JSON.stringify(path.join(proj, "main.py"))}, "w").write('import helper\\napp = "fixed-" + helper.VALUE\\n')
+out["fixed_err"] = _vv_reload()
+out["fixed_app"] = _vv_app
+
+# 7) A module that did not exist when the server started.
+open(${JSON.stringify(path.join(proj, "brandnew.py"))}, "w").write('N = 42\\n')
+open(${JSON.stringify(path.join(proj, "main.py"))}, "w").write('import brandnew\\napp = "new-%d" % brandnew.N\\n')
+out["new_err"] = _vv_reload()
+out["new_app"] = _vv_app
+print(json.dumps(out))
+`;
+    fs.writeFileSync(path.join(dir, "driver.py"), driver);
+    const r = spawnSync("python3", [path.join(dir, "driver.py")], { encoding: "utf8" });
+    if (r.status !== 0) {
+      ok(false, `the reload source runs under CPython ${probe.stdout.trim()}`);
+      console.log((r.stderr || "").split("\n").slice(-14).map((l) => "      | " + l).join("\n"));
+    } else {
+      const o = JSON.parse(r.stdout.trim().split("\n").pop());
+      console.log(`  (CPython ${probe.stdout.trim()})`);
+
+      ok(o.initial === "app-v1", "the app is bound before anything reloads");
+      ok(o.owned.join(",") === "helper,main",
+        "the modules a reload re-imports are the project's own, and only those — a package in site-packages is not touched");
+
+      // The bug this found. Without dropping the bytecode first, this assertion
+      // reads "app-v1": CPython revalidates a .pyc on size + mtime-in-SECONDS,
+      // a save and its reload are inside one second, and an edit that keeps the
+      // file's length is therefore indistinguishable from no edit. Editing a
+      // string, flipping a comparison, renaming to the same width — all silent.
+      ok(o.same_size_err === "", "an edit reloads without error");
+      ok(o.same_size_app === "app-v2",
+        "…and a SAME-LENGTH edit is picked up, which needs the stale .pyc dropped (size + whole-second mtime cannot see it)");
+
+      ok(o.broken_failed === true, "a syntax error in the saved file fails the reload");
+      ok(/SyntaxError/.test(o.broken_last_line), `…reporting CPython's own error (${o.broken_last_line})`);
+      ok(o.broken_app === "app-v2", "…and the app that was serving is still the app that is serving");
+      ok(o.broken_helper_is_same_object === true,
+        "…including a sibling the failed attempt had already re-imported: the old module object is restored, not the new one");
+      ok(o.broken_helper_value === "v2",
+        "…so the running app sees the module state it was built against, not a half-applied edit");
+
+      ok(o.raise_failed === true && /RuntimeError: boom at import/.test(o.raise_last_line),
+        "a module that raises at import fails the reload and reports the exception");
+      ok(o.raise_app === "app-v2", "…leaving the previous app serving");
+      ok(o.raise_left_boom === false,
+        "…and the module that raised is not left in sys.modules, where the next import would find it already 'imported'");
+
+      ok(o.exit_failed === true, "sys.exit() at import time is a failed reload");
+      ok(o.exit_app === "app-v2",
+        "…not a stopped server: BaseException is caught precisely so a module cannot exit the process out from under the port");
+
+      ok(o.attr_failed === true && /AttributeError/.test(o.attr_last_line),
+        "the app attribute disappearing is a failed reload, named as an AttributeError");
+      ok(o.attr_app === "app-v2", "…and again nothing changes");
+
+      ok(o.fixed_err === "", "after four failed reloads a good save still works — the failures left no residue to recover from");
+      // "v9", not the "v2" the rolled-back interpreter was holding. The rollback
+      // restores what is RUNNING, and deliberately does not touch the files: the
+      // sibling edit that came in alongside the broken one is still on disk, so
+      // the reload that finally succeeds applies both. A rollback that also
+      // reverted the user's files would be a reloader that edits your code.
+      ok(o.fixed_app === "fixed-v9",
+        "…and it picks up the sibling edit that arrived with the broken save, because a rollback undoes the import, not the file");
+
+      ok(o.new_err === "" && o.new_app === "new-42",
+        "a module created after the server started is importable, which needs the import caches invalidated");
+
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  // --- the wiring, which needs a kernel and a browser to RUN --------------
+  // String-level and stated as such. Everything above is behaviour; this is a
+  // drift guard over the four decisions in serve() that no offline tier can
+  // execute, chosen because each one silently degrades rather than failing.
+  const runtime = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  ok(/const wantReload = !!\(opts && opts\.reload\)/.test(runtime),
+    "serve() reads reload off its opts, which is what the launcher sets from --reload");
+  ok(/if \(reloadApp\) startWatching\(\)/.test(runtime),
+    "…and starts watching inside listen(), so no event can arrive before there is an app to re-import");
+  ok(/server\.on\("close", \(\) => \{\s*\n\s*stopWatching\(\)/.test(runtime),
+    "…and closes the watches when the server closes: a persistent FSWatcher refs the loop and would outlive the port");
+  ok(/if \(inFlight > 0\) \{\s*\n\s*queued = true;/.test(runtime),
+    "a save during a request defers rather than re-importing under a suspended handler");
+  ok(/tracker\.writes\.delete\(full\)/.test(runtime),
+    "the copy-in un-tracks itself, so the next request does not mirror the file straight back out");
+
+  // Drift guards on the parts the run above cannot see, kept minimal.
+  const src = reloadSource("main", "app", "/projects/demo");
+  ok(/_VV_RELOAD_ROOT = "\/projects\/demo\/"/.test(src),
+    "the project root is injected with a trailing slash, so a sibling directory sharing a prefix is not swept in");
+  ok(/cache_from_source/.test(src),
+    "the bytecode drop goes through importlib's cache_from_source, which honours sys.pycache_prefix rather than assuming __pycache__");
+  ok(/except KeyboardInterrupt:/.test(src) && /raise$/m.test(src),
+    "Ctrl-C during a reload stays Ctrl-C rather than being reported as a failed import");
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,13 +1549,22 @@ console.log("\n== what a pip command actually puts on stdout ==");
   const runtimeSrc = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
   const callSites = [...runtimeSrc.matchAll(/\.(loadPackage|loadPackagesFromImports)\(([^;]*?)\);/g)];
   ok(callSites.length >= 8, `${callSites.length} package-loader call sites in the runtime`);
-  const bare = callSites.filter((m) => !/,\s*loaderTo(Stderr|Stdout)\s*\)?$/.test(m[2].trim()));
+  // `sink` is the parameter of loadImportsFor, the one function whose whole job is
+  // to be handed a stream by its caller — so it passes only if every call to THAT
+  // names one too, which is the assertion below.
+  const bare = callSites.filter((m) => !/,\s*(loaderTo(Stderr|Stdout)|sink)\s*\)?$/.test(m[2].trim()));
   ok(bare.length === 0,
     bare.length
       ? `these inherit Pyodide's default, which is the interpreter's stdout: ${bare.map((m) => m[0]).join(" | ")}`
       : "every package-loader call names the stream it writes to, so none can inherit the default");
   ok(/loaderToStdout/.test(runtimeSrc) && runtimeSrc.match(/loaderToStdout\b/g).length === 2,
     "…and exactly one of them opts into stdout (the definition plus its single use)");
+  const resolvers = [...runtimeSrc.matchAll(/loadImportsFor\(([^;]*?)\);/g)];
+  ok(resolvers.length >= 2, `${resolvers.length} call sites resolve a source's imports through the one resolver`);
+  ok(
+    resolvers.every((m) => /,\s*(loaderToStderr|toCell)\s*\)?$/.test(m[1].trim())),
+    "…and each of those names its stream too, so the sink cannot arrive undefined",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,6 +1595,16 @@ console.log("\n== the version literal /bin/python.js prints without booting ==")
 console.log("\n== the docs claims this change corrected ==");
 // These were published and wrong. A guard here is the cheapest way to stop the
 // old wording coming back in a later edit.
+//
+// This section's own history is the argument for it. It was written to pin the
+// claims one change had corrected, and then not extended — so the sentence
+// saying `--reload` was impossible sat in the docs, unguarded, long after the
+// file watcher it said was missing had shipped and Vite's dev server had started
+// using it. The lesson is not "the docs were wrong" but that a paragraph nothing
+// asserts is a paragraph that will go stale, and the ones stating a LIMIT go
+// stale fastest, because the work that lifts a limit has no reason to look at
+// the page that describes it. Anything below that names something as impossible
+// should be paired with the check that would fail when it stops being.
 // ---------------------------------------------------------------------------
 {
   const docs = fs.readFileSync(path.join(ROOT, "sites/docs/docs/python.md"), "utf8");
@@ -1370,6 +1636,86 @@ console.log("\n== the docs claims this change corrected ==");
   ok(/\npip freeze/.test(docs) && /\npip uninstall -y/.test(docs),
     "the verbs the store made possible are shown, uninstall with the -y this shim needs");
   ok(!/python -m pip/.test(docs), "…and shown as `pip`, since that is now on PATH");
+
+  // --- the --reload paragraph, which is why the note above this block exists --
+  ok(!/There is no `--reload` to do that for you/.test(docs),
+    "the 'there is no --reload' sentence is gone (it shipped a reloader's absence as a fact about browsers)");
+  ok(!/would need a file\s*\n?watcher and a subprocess/.test(docs),
+    "…and so is its reason, which was wrong twice: the watcher exists and the app needs no subprocess");
+  ok(/## Restarting on save/.test(docs), "…replaced by a section that says how it works");
+  ok(/--reload` now\s*\n?does that for you|`--reload` works, on all three entrypoints/.test(docs),
+    "…and the two-way mirroring paragraph now points at it rather than at a limitation");
+  ok(!/and any `--reload` file watcher/.test(docs),
+    "the no-threads limit no longer lists --reload among the things it rules out");
+  ok(/It does \*\*not\*\* rule out `--reload`/.test(docs),
+    "…and says so explicitly, since a reader who remembers the old claim needs it contradicted, not quietly dropped");
+
+  // The behaviour a user has to be able to rely on. If reload ever stops being
+  // atomic, this sentence becomes the lie and the check is what says so.
+  ok(/A failed re-import changes nothing/.test(docs),
+    "the docs promise that a broken save leaves the old app serving");
+  ok(/the packages under them are not/.test(docs),
+    "…and state the limit: your modules are re-executed, an installed package's state is not reset");
+
+  // --- the two overreaches in the 'will not start' list ---------------------
+  ok(!/there is no version of Vivari that runs them/.test(docs),
+    "the 'no version of Vivari runs them' sentence is gone — true of these packages, overreaching as a category claim");
+  ok(/What is ruled out is the Jupyter server,\s*\nnot the idea/.test(docs),
+    "…narrowed to the servers, with the notebook interface named as not covered by it");
+  // The sentence stopped being a promise and became a fact in the same batch, so
+  // this guards the stronger claim: not "a notebook would be possible" but "there
+  // is one, here". A page that still hedged would send a reader looking for a
+  // feature the sidebar already lists.
+  ok(/Vivari now has\s*\none — see \[Notebooks\]\(\.\/notebooks\.md\)/.test(docs),
+    "…and points at the notebook that now exists, rather than leaving it hypothetical");
+  ok(!/Streamlit\*\* stops on `watchdog`, its file-watching dependency/.test(docs),
+    "Streamlit is no longer blamed on file-watching, which is a thing this environment does");
+  ok(/watchdog` is a \*file\s*\n?watcher\*, and watching files is something this environment does do/.test(docs),
+    "…the reason is corrected to the unbuilt C extension, and the old reason called out");
+  ok(/its own server, which wants a socket and a\s*\n?WebSocket/.test(docs),
+    "…while the verdict stands, on the blocker that is real");
+
+  // --- subprocess, which was the same mistake in a second place -------------
+  // The no-threads paragraph ran "no OS threads" and "no processes" together and
+  // quoted CPython's fork error as evidence for both. One of those is a fact
+  // about this runtime and the other was a fact about fork.
+  ok(!/\*\*No OS threads, no processes\.\*\* `threading\.Thread\(\)\.start\(\)` and[\s\S]{0,400}`subprocess`\s*\nraises/.test(docs),
+    "the no-threads paragraph no longer offers subprocess as evidence that there are no processes");
+  ok(/No threads is not the same as no processes/.test(docs),
+    "…and separates the two explicitly, since a reader who remembers the old claim needs it contradicted rather than dropped");
+  ok(/## Running another program/.test(docs), "there is a section on spawning, rather than a line saying it cannot be done");
+  ok(/Errno 138/.test(docs) && /Unpatched, it does/.test(docs),
+    "the old error is still quoted — it is what a reader will search for — and placed as the unpatched behaviour");
+  ok(/it is about `fork`/.test(docs),
+    "…with the reason it was misread: the error is about fork, not about whether processes exist");
+
+  // The two limits that are real, stated as limits rather than left to be found.
+  ok(/\*\*`Popen` is refused\.\*\*/.test(docs), "Popen is documented as refused");
+  ok(/would make `communicate\(\)` pass and make `Popen\(\["uvicorn", …\]\)` hang forever/.test(docs),
+    "…including what the tempting fake would have cost, which is the argument for refusing rather than approximating");
+  ok(/\*\*`timeout=` is refused\*\*/.test(docs) && /never enforced/.test(docs),
+    "timeout= is documented as refused, with the reason it must not be quietly accepted");
+  ok(/child's stdin is closed immediately/.test(docs),
+    "the stdin-is-EOF behaviour is documented, since a child that asks a question would otherwise look hung");
+  ok(/Captured output is text/.test(docs) && /not byte-exact/.test(docs),
+    "…and so is the one place the capture is lossy, rather than being discovered on a binary pipe");
+  ok(/Three levels deep is allowed/.test(docs), "the nesting bound is documented as a number");
+  ok(/Ctrl-C does not arrive while a child is running/.test(docs),
+    "…and so is the fact that KeyboardInterrupt cannot fire mid-child, which a try/except around run() would otherwise imply");
+
+  // The claim that must not drift: the not-found message is the feature, and a
+  // doc that promised the wrong wording would send people looking for the wrong
+  // thing.
+  ok(/`git`, `ffmpeg`, `curl` and `gcc` are not part of Vivari/.test(docs),
+    "the docs name the binaries that are absent");
+  ok(/deliberately does not say processes are impossible/.test(docs),
+    "…and say the error avoids implying processes are impossible, which is the whole point of the wording");
+
+  // Security, stated rather than left implicit.
+  ok(/parity with guest Node/.test(docs) && /goes\s*\n?through the same syscall/.test(docs),
+    "the widening is framed as parity with Node and says why: it is the same syscall, not a new one");
+  ok(/Nothing here reaches outside the tab/.test(docs),
+    "…and the boundary that has not moved is stated, rather than left to be assumed");
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,6 +1915,599 @@ console.log("\n== the modules that cannot work here say why ==");
   ok(!seams.some((s) => SOCKET_MODULES.includes(s)), "no module is both intercepted and refused");
 }
 
+function checkSubprocess(o) {
+  // --- the two calls this feature exists for --------------------------------
+  ok(o.pytest_argv.join(" ") === "python -m pytest", "subprocess.run(['python','-m','pytest']) reaches the syscall as itself");
+  ok(o.ruff_argv.join(" ") === "ruff check .", "…and so does subprocess.run(['ruff','check','.'])");
+  ok(o.pytest_inherit === true,
+    "with no capture asked for, the child writes to the terminal — so a slow test run prints as it goes");
+  ok(o.pytest_stdout_is_none === true,
+    "…and stdout is None rather than an empty string, which is what real subprocess reports when it captured nothing");
+  ok(o.pytest_args_kept.join(" ") === "python -m pytest", "CompletedProcess.args is the argv that was passed");
+
+  // --- capture --------------------------------------------------------------
+  ok(o.cap_text === "hello\n", "capture_output with text=True returns str");
+  ok(o.cap_bytes_is_bytes === true, "…and without it bytes, which is real subprocess' default rather than a detail worth getting backwards");
+  ok(o.cap_not_inherit === false, "asking for the output stops it going to the terminal instead");
+
+  // --- exit codes, and the real exception -----------------------------------
+  ok(o.check_raises.ok === false && o.check_raises.type === "CalledProcessError", "check=True on a non-zero exit raises");
+  ok(o.cpe_real_class === true, "…the REAL CalledProcessError, so an existing except clause still catches it");
+  ok(o.cpe_code === 2 && o.cpe_stderr === "4 failed", `…carrying the code and the output (${o.cpe_code}, ${JSON.stringify(o.cpe_stderr)})`);
+  ok(o.call_rc === 3, "call() returns the exit code");
+  ok(o.check_call.ok === false && o.check_call.type === "CalledProcessError", "check_call() raises on a non-zero exit");
+  ok(o.check_output === "0.14.2", "check_output() returns the output");
+  ok(o.getstatusoutput.join("|") === "1|a line",
+    "getstatusoutput() returns (code, output) with one trailing newline stripped, as CPython's does");
+  ok(o.getoutput === "a line", "…and getoutput() the output alone");
+  ok(o.os_system === 512,
+    `os.system returns a wait status rather than an exit code (${o.os_system} for exit 2), because callers divide it by 256`);
+
+  // --- the arguments that are honoured --------------------------------------
+  ok(o.shell_argv.join(" ") === "sh -c ruff check . && echo done", "shell=True runs the line through sh, which is a real program here");
+  ok(o.str_noshell_command === "ruff check",
+    "a string without a shell is ONE program name — splitting it would run something nobody wrote");
+  ok(o.input_roundtrip === "fed in\n", "input= reaches the child's stdin");
+  ok(o.stdin_devnull.ok === true, "stdin=DEVNULL is accepted, since EOF is what the child gets anyway");
+  ok(o.stdin_file.ok === false && /Read the file yourself and pass input=/.test(o.stdin_file.msg),
+    "…and a file object is refused with the way round it, since the parent is parked and can never write to a pipe");
+  ok(o.merged_stdout === "OUTERR", "stderr=STDOUT merges into stdout");
+  ok(o.merged_stderr_is_none === true, "…leaving stderr None rather than an empty string");
+
+  // The redirect that was silently dropped: run(cmd, stdout=open(p,"w")) put the
+  // child's output on the terminal and left the file empty, which reads as a
+  // child that printed nothing. A wrong answer that looks right is worse than the
+  // OSError this replaced, so these hold the file paths to real CPython's result.
+  ok(o.sink_text === "TO-FILE\n", "stdout= a file object is written to, rather than ignored");
+  ok(o.sink_text_returns_none === true,
+    "…and CompletedProcess.stdout is None, which is what CPython reports when the output went to a file");
+  ok(o.sink_not_inherit === false,
+    "…and the child is not told to write to the terminal as well, so the output lands once");
+  ok(o.sink_bytes === "TO-FILE\n", "a binary-mode file gets bytes, a text-mode one gets str");
+  ok(o.sink_split.join("|") === "TO-FILE\n|TO-ERR\n", "stdout= and stderr= can point at different files");
+  ok(o.sink_merged === "TO-FILE\nTO-ERR\n", "…and stderr=STDOUT lands in the stdout file");
+  ok(o.sink_fd.ok === false && /no descriptor is inherited across the spawn/.test(o.sink_fd.msg),
+    "an integer descriptor is refused with the reason, since a child here is a worker rather than a fork");
+  ok(o.sink_junk.ok === false && o.sink_junk.type === "TypeError",
+    "…and a value that is neither a constant nor writable is a TypeError rather than a silent no-op");
+  ok(o.pathlike_command === "/bin/python" && o.pathlike_cwd === "/projects/app", "PathLike works for the program and for cwd");
+  ok(o.env_keys.join(",") === `A,${SPAWN_DEPTH_VAR}`,
+    `env= replaces the environment rather than adding to it (${o.env_keys.join(",")})`);
+
+  // --- re-entrancy ----------------------------------------------------------
+  ok(o.child_depth === "1", "the child is told how deep it is, in an environment variable it will pass on");
+  ok(o.too_deep.ok === false && o.too_deep.type === "RuntimeError", `a chain ${MAX_SPAWN_DEPTH} deep refuses to go further`);
+  ok(/could not be interrupted/.test(o.too_deep.msg),
+    "…and says why it matters: every level is another interpreter and every parent is blocked, so a runaway cannot be stopped");
+
+  // --- the refusals, by name ------------------------------------------------
+  ok(o.refuse_timeout.ok === false && o.refuse_timeout.type === "NotImplementedError", "timeout= is refused rather than ignored");
+  ok(/never enforced/.test(o.refuse_timeout.msg),
+    "…because accepting it quietly would turn the one argument written to bound a wait into an unbounded one");
+  for (const name of ["preexec_fn", "pass_fds", "start_new_session", "user", "umask"]) {
+    const e = o["refuse_" + name];
+    ok(e.ok === false && e.msg.includes(name + "="), `${name}= is refused by name`);
+  }
+
+  // --- …and the VALUE decides, which is the half that was missing -----------
+  // Refusing a name whatever it was set to is the honesty principle failing the
+  // other way round: it reports that this runtime cannot do something the caller
+  // never asked for. `timeout=None` means "no timeout", which is exactly what is on
+  // offer, and a wrapper that spells out the signature it forwards passes
+  // `start_new_session=False` and `process_group=-1` too. That is ordinary code and
+  // it raised.
+  const refusedDefaults = Object.entries(o.default_kwargs).filter(([, v]) => v !== "accepted");
+  ok(refusedDefaults.length === 0, `every refused argument is ACCEPTED at its CPython default (${JSON.stringify(refusedDefaults)})`);
+  const acceptedAsks = Object.entries(o.asking_kwargs).filter(([, v]) => v !== "refused");
+  ok(acceptedAsks.length === 0, `…while the same argument at a value that asks for something is still refused (${JSON.stringify(acceptedAsks)})`);
+  ok(o.pass_fds_empty_list === "accepted", "…and an empty container asks for nothing whatever its type: pass_fds=[] is pass_fds=()");
+  ok(o.awkward_value === "refused",
+    `…while a value whose own comparison raises is refused BY NAME rather than reported as an ambiguous truth value (${o.awkward_value})`);
+  ok(o.interrupt_in_eq === "propagated",
+    `…and a Ctrl-C landing inside that comparison is NOT absorbed by the argument check (${o.interrupt_in_eq})`);
+  ok(o.forwarding_wrapper === 0, "…so `def run(cmd, timeout=None, **kw): subprocess.run(cmd, timeout=timeout, **kw)` works, which is the reported shape");
+  // The maintenance hazard under all of the above, and the only one here that
+  // fires on a day nobody is editing this file. The refusal and warning tables are
+  // a hand copy of CPython's Popen signature, and the way a copy goes wrong is
+  // fail-open: a keyword the interpreter gains is in no table, reads as "not asked
+  // for", and the call proceeds as though the caller had not asked. 3.10's
+  // `pipesize` had already been sitting in that gap.
+  ok(o.popen_signature_readable === true, "the runtime can read the real Popen signature, so the comparison below means something");
+  ok(Array.isArray(o.unhandled_popen_kwargs) && o.unhandled_popen_kwargs.length === 0,
+    `…and every keyword this Python's Popen accepts is one the tables have an opinion about (${JSON.stringify(o.unhandled_popen_kwargs)})`);
+  ok(o.popen.ok === false && o.popen.type === "NotImplementedError", "Popen is refused rather than faked");
+  ok(/run\(\), call\(\), check_call\(\) and check_output\(\) DO work/.test(o.popen.msg),
+    "…and the refusal says what DOES work, which is the difference between a dead end and a redirect");
+  ok(/does not return until the child has exited/.test(o.popen.msg), "…and names the actual obstacle rather than 'unsupported'");
+  ok(o.os_popen.ok === false && /os\.popen is not supported/.test(o.os_popen.msg),
+    "os.popen gets its own message rather than inheriting one about a class the caller never named");
+  ok(o.both_capture.ok === false && o.both_capture.type === "ValueError", "capture_output with stdout= is the same error CPython gives");
+  ok(o.empty_argv.ok === false, "an empty argument list is an error rather than a spawn of nothing");
+
+  // --- the message that is most of the point --------------------------------
+  ok(o.git.ok === false && o.git.type === "FileNotFoundError",
+    "a missing program is FileNotFoundError, which is what real subprocess raises");
+  ok(o.enoent_errno === 2 && o.enoent_filename === "ffmpeg", "…with errno 2 and the name on it");
+  const m = o.enoent_msg || "";
+  ok(/no program named 'ffmpeg' exists in this Vivari VM/.test(m), "…and a message that says the BINARY is missing");
+  ok(/subprocess itself works here/.test(m),
+    "…explicitly not that processes are impossible, which is the wrong lesson and the old error's actual mistake");
+  ok(/emscripten does not support processes/.test(m),
+    "…naming the old error it replaces, since that string is what a reader saw before and will search for");
+  ok(/git, ffmpeg, curl and gcc are not/.test(m), "…and that a native tool is the usual case");
+  ok(/Programs that DO exist: .*pytest.*ruff/.test(m), "…then lists what CAN be run, read off /bin rather than hardcoded");
+  ok(/node_modules\/\.bin/.test(m), "…including where else a name resolves from");
+
+  // --- the ignored tier -----------------------------------------------------
+  const w = o.ignored_warnings || "";
+  ok(/bufsize= is ignored here/.test(w) && /close_fds= is ignored here/.test(w) && /creationflags= is ignored here/.test(w),
+    "arguments that mean nothing here are warned about rather than swallowed");
+  ok(!/Traceback/.test(w), "…and warning about them does not stop the call");
+  ok(o.repeat_warnings === "",
+    "…and are said once per process rather than once per call, so a run() in a loop does not bury its own output");
+  ok(o.default_ignored_silent === "", `…and a default is not a request either: close_fds=True and creationflags=0 warn about nothing (${JSON.stringify(o.default_ignored_silent)})`);
+
+  // --- a host with no terminal, which is the notebook kernel ----------------
+  // A cell's own print() was routed to the cell from the start, but a CHILD's
+  // output bypasses Python entirely and went to the process's stdout — which for
+  // the notebook kernel is the frame stream, so it was filed as kernel noise and
+  // the cell showed nothing. Same class as everything else in this round: the
+  // output exists, and it is not where anyone is looking.
+  ok(o.terminal_inherits === true, "a child writes straight to the terminal when there is one, so a slow build's output arrives while it runs");
+  ok(o.no_terminal_inherits === false, "…and does not when there is none — the parent captures on the caller's behalf instead");
+  ok(o.relayed_stdout === "child said this\n", "…handing what the child wrote to whatever sys.stdout is now, which in a cell is that cell's stream");
+  ok(o.relayed_stderr === "child warned\n", "…and the same for stderr, which a cell shows in red rather than dropping");
+  ok(o.relayed_returns_none[0] === null && o.relayed_returns_none[1] === null,
+    "…while the result still reports None, because the caller asked for nothing and CPython would report None too");
+  ok(o.captured_still_returns === "child said this\n", "capture_output= is unaffected by any of this…");
+  ok(o.captured_not_echoed === "", "…and output the caller asked to hold is not also echoed, which would double it");
+
+  // --- what was deliberately NOT touched -----------------------------------
+  ok(o.types_intact.join(",") === "-1,-2,-3", "PIPE, STDOUT and DEVNULL keep the values CPython gave them");
+  ok(o.timeoutexpired_still_real === true, "and the module's exception types are the real ones rather than replacements");
+}
+
+// The fake syscall the driver below runs against: it records the spec it was
+// handed and answers with whatever the current scenario wants, so one driver file
+// can walk every case without a child ever existing.
+function subprocessDriver(dir) {
+  const q = (p) => JSON.stringify(p);
+  return `
+import base64, io, json, os, pathlib, subprocess, sys
+
+ns = {}
+exec(compile(open(${q(path.join(dir, "vv_sub.py"))}).read(), "vv_sub.py", "exec"), ns)
+
+specs = []
+answer = {"code": 0, "stdout": "", "stderr": ""}
+depth = [0]
+
+
+def spawn(spec_json):
+    specs.append(json.loads(spec_json))
+    return json.dumps(answer)
+
+
+def programs():
+    return json.dumps(["python", "python3", "pytest", "ruff", "sh", "cat", "npm"])
+
+
+ns["_vv_install_subprocess"](spawn, programs, lambda: depth[0], 3)
+
+out = {}
+
+
+def grab(key, fn):
+    try:
+        out[key] = {"ok": True, "value": fn()}
+    except BaseException as exc:
+        out[key] = {"ok": False, "type": type(exc).__name__, "msg": str(exc)}
+
+
+# The headline case, and the one the whole feature is for. No capture asked for,
+# so the child must be told to write to the terminal itself: captured output
+# cannot arrive before the exit that carries it, and a test run that prints
+# nothing for a minute and then everything at once is a worse test run.
+r = subprocess.run(["python", "-m", "pytest"])
+out["pytest_inherit"] = specs[-1]["inherit"]
+out["pytest_argv"] = [specs[-1]["command"]] + specs[-1]["args"]
+out["pytest_stdout_is_none"] = r.stdout is None
+out["pytest_args_kept"] = r.args
+
+subprocess.run(["ruff", "check", "."])
+out["ruff_argv"] = [specs[-1]["command"]] + specs[-1]["args"]
+
+# Capture, in both shapes. Bytes is the DEFAULT in real subprocess, and getting
+# that backwards is the kind of thing every caller notices at once.
+answer.update(code=0, stdout="hello" + chr(10), stderr="")
+out["cap_text"] = subprocess.run(["x"], capture_output=True, text=True).stdout
+out["cap_bytes_is_bytes"] = isinstance(subprocess.run(["x"], capture_output=True).stdout, bytes)
+out["cap_not_inherit"] = specs[-1]["inherit"]
+
+# check=True raises the REAL CalledProcessError, with the output on it.
+answer.update(code=2, stdout="", stderr="4 failed")
+grab("check_raises", lambda: subprocess.run(["pytest"], capture_output=True, text=True, check=True))
+try:
+    subprocess.run(["pytest"], capture_output=True, text=True, check=True)
+except subprocess.CalledProcessError as exc:
+    out["cpe_real_class"] = type(exc) is subprocess.CalledProcessError
+    out["cpe_code"] = exc.returncode
+    out["cpe_stderr"] = exc.stderr
+
+# The other entry points, which all reduce to the same one syscall.
+answer.update(code=3, stdout="", stderr="")
+out["call_rc"] = subprocess.call(["x"])
+grab("check_call", lambda: subprocess.check_call(["x"]))
+answer.update(code=0, stdout="0.14.2", stderr="")
+out["check_output"] = subprocess.check_output(["ruff", "--version"], text=True)
+answer.update(code=1, stdout="a line" + chr(10), stderr="")
+out["getstatusoutput"] = list(subprocess.getstatusoutput("false"))
+out["getoutput"] = subprocess.getoutput("false")
+
+# os.system's return value is a WAIT STATUS, not an exit code. Callers divide it.
+answer.update(code=2)
+out["os_system"] = os.system("x")
+
+# shell=True goes through sh, which is a real program here.
+answer.update(code=0, stdout="", stderr="")
+subprocess.run("ruff check . && echo done", shell=True)
+out["shell_argv"] = [specs[-1]["command"]] + specs[-1]["args"]
+# Without a shell, a string is ONE program name — real subprocess does not split
+# on spaces, and splitting here would run something nobody wrote.
+subprocess.run("ruff check")
+out["str_noshell_command"] = specs[-1]["command"]
+
+# input= is the only way to feed a child, and it has to survive as bytes.
+subprocess.run(["cat"], input="fed in" + chr(10), capture_output=True, text=True)
+out["input_roundtrip"] = base64.b64decode(specs[-1]["input_b64"]).decode()
+grab("stdin_file", lambda: subprocess.run(["cat"], stdin=io.StringIO("x")))
+grab("stdin_devnull", lambda: subprocess.run(["cat"], stdin=subprocess.DEVNULL).returncode)
+
+# stderr=STDOUT merges into stdout, and leaves stderr None rather than "".
+answer.update(code=0, stdout="OUT", stderr="ERR")
+r = subprocess.run(["x"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+out["merged_stdout"] = r.stdout
+out["merged_stderr_is_none"] = r.stderr is None
+
+# stdout=/stderr= pointing at a FILE. The first version of this ignored them
+# silently: the file stayed empty and the output went to the terminal, which is
+# the failure mode this whole feature exists to stop making. Checked against real
+# CPython 3.11 with a real child, which reports CompletedProcess.stdout as None
+# and puts the bytes in the file.
+answer.update(code=0, stdout="TO-FILE" + chr(10), stderr="TO-ERR" + chr(10))
+_text = io.StringIO()
+r = subprocess.run(["x"], stdout=_text)
+out["sink_text"] = _text.getvalue()
+out["sink_text_returns_none"] = r.stdout is None
+out["sink_not_inherit"] = specs[-1]["inherit"]
+_bytes = io.BytesIO()
+subprocess.run(["x"], stdout=_bytes)
+out["sink_bytes"] = _bytes.getvalue().decode()
+_a, _b = io.StringIO(), io.StringIO()
+subprocess.run(["x"], stdout=_a, stderr=_b)
+out["sink_split"] = [_a.getvalue(), _b.getvalue()]
+_m = io.StringIO()
+subprocess.run(["x"], stdout=_m, stderr=subprocess.STDOUT)
+out["sink_merged"] = _m.getvalue()
+grab("sink_fd", lambda: subprocess.run(["x"], stdout=1))
+grab("sink_junk", lambda: subprocess.run(["x"], stdout="nope"))
+answer.update(code=0, stdout="", stderr="")
+
+# cwd, env, and PathLike everywhere a path can appear.
+answer.update(code=0, stdout="", stderr="")
+subprocess.run([pathlib.Path("/bin/python"), "x.py"], cwd=pathlib.Path("/projects/app"), env={"A": "b"})
+out["pathlike_command"] = specs[-1]["command"]
+out["pathlike_cwd"] = specs[-1]["cwd"]
+out["env_keys"] = sorted(specs[-1]["env"])
+
+# The depth counter, which rides in the child's environment so that it keeps
+# counting through a chain that goes Python -> Node -> Python.
+out["child_depth"] = specs[-1]["env"].get(${q(SPAWN_DEPTH_VAR)})
+depth[0] = 3
+grab("too_deep", lambda: subprocess.run(["python", "x.py"]))
+depth[0] = 0
+
+# Refusals. Each names the argument and says what is missing.
+for name, kwargs in (
+    ("timeout", {"timeout": 5}),
+    ("preexec_fn", {"preexec_fn": lambda: None}),
+    ("pass_fds", {"pass_fds": (3,)}),
+    ("start_new_session", {"start_new_session": True}),
+    ("user", {"user": "root"}),
+    ("umask", {"umask": 18}),
+):
+    grab("refuse_" + name, lambda kw=kwargs: subprocess.run(["x"], **kw))
+
+# THE VALUE, NOT JUST THE NAME. Every refused argument has a CPython default that
+# asks for nothing, and a refusal that fires on one is a false claim in the
+# opposite direction: it reports that this runtime cannot do a thing the caller
+# never asked for. The list of names was asserted from the start; the values were
+# not, and every one of these raised.
+answer.update(code=0, stdout="", stderr="")
+_defaults = (
+    ("timeout", None),
+    ("preexec_fn", None),
+    ("pass_fds", ()),
+    ("start_new_session", False),
+    ("process_group", -1),
+    ("restore_signals", True),
+    ("user", None),
+    ("group", None),
+    ("extra_groups", None),
+    ("umask", -1),
+)
+out["default_kwargs"] = {}
+for name, value in _defaults:
+    try:
+        subprocess.run(["x"], **{name: value})
+        out["default_kwargs"][name] = "accepted"
+    except BaseException as exc:
+        out["default_kwargs"][name] = type(exc).__name__
+
+# …and the same names at a value that DOES ask for something still raise, so this
+# is a narrowing rather than a hole.
+_asks = (
+    ("timeout", 5),
+    ("preexec_fn", lambda: None),
+    ("pass_fds", (3,)),
+    ("start_new_session", True),
+    ("process_group", 7),
+    ("restore_signals", False),
+    ("user", "root"),
+    ("group", "wheel"),
+    ("extra_groups", ["staff"]),
+    ("umask", 18),
+)
+out["asking_kwargs"] = {}
+for name, value in _asks:
+    try:
+        subprocess.run(["x"], **{name: value})
+        out["asking_kwargs"][name] = "accepted"
+    except NotImplementedError:
+        out["asking_kwargs"][name] = "refused"
+    except BaseException as exc:
+        out["asking_kwargs"][name] = type(exc).__name__
+
+# An empty container asks for nothing whatever its type.
+try:
+    subprocess.run(["x"], pass_fds=[])
+    out["pass_fds_empty_list"] = "accepted"
+except BaseException as exc:
+    out["pass_fds_empty_list"] = type(exc).__name__
+
+# THE TABLES ARE A COPY OF CPYTHON'S SIGNATURE, so the interesting question is not
+# whether they are right today but which way they fail when they go stale. A
+# keyword this Python has and the tables do not is read as "not asked for" and the
+# call runs — fail-open, in the module that argues a stub which lies is worse than
+# a refusal. The runtime computes the difference against the real class at install
+# time; this asserts it is empty, here rather than in review, because the day it
+# stops being empty is a Python bump nobody is reviewing this file for.
+out["unhandled_popen_kwargs"] = (
+    None if subprocess._vv_unhandled_kwargs is None else sorted(subprocess._vv_unhandled_kwargs)
+)
+# Only meaningful if the comparison had something to compare — see above.
+out["popen_signature_readable"] = subprocess._vv_unhandled_kwargs is not None
+
+
+# A value whose comparison RAISES rather than answering. numpy's __eq__ returns an
+# array and bool() of one is a ValueError, so an argument check reporting "truth
+# value of an array is ambiguous" is this runtime blaming the caller for its own
+# comparison. Not being able to show that a value is the default is not the same as
+# showing that it is.
+class _Awkward:
+    def __eq__(self, other):
+        raise ValueError("truth value of an array with more than one element is ambiguous")
+
+
+out["awkward_value"] = "accepted"
+try:
+    subprocess.run(["x"], timeout=_Awkward())
+except NotImplementedError as exc:
+    out["awkward_value"] = "refused" if "timeout=" in str(exc) else "refused-unnamed"
+except BaseException as exc:
+    out["awkward_value"] = type(exc).__name__ + ": " + str(exc)
+
+
+# The other thing a comparison can raise, and the one this must NOT absorb. Ctrl-C
+# arriving while __eq__ runs is the user asking for the interpreter, not a value
+# declining to be compared, and an argument check is the last place that should be
+# the one deciding to keep it. The distinction is exactly 'except Exception' versus
+# 'except BaseException', and under the second one this returns a refusal by name
+# and the interrupt is gone.
+class _Interrupting:
+    def __eq__(self, other):
+        raise KeyboardInterrupt()
+
+
+out["interrupt_in_eq"] = "swallowed"
+try:
+    subprocess.run(["x"], timeout=_Interrupting())
+except KeyboardInterrupt:
+    out["interrupt_in_eq"] = "propagated"
+except BaseException as exc:
+    out["interrupt_in_eq"] = type(exc).__name__
+
+# The shape that broke: a wrapper spelling out the signature it forwards. This is
+# the reported case, in the reporter's own shape.
+def _forwarding_wrapper(cmd, timeout=None, **kw):
+    return subprocess.run(cmd, timeout=timeout, **kw)
+
+
+try:
+    out["forwarding_wrapper"] = _forwarding_wrapper(["x"]).returncode
+except BaseException as exc:
+    out["forwarding_wrapper"] = type(exc).__name__
+
+grab("popen", lambda: subprocess.Popen(["uvicorn", "app:app"]))
+grab("os_popen", lambda: os.popen("ls"))
+grab("both_capture", lambda: subprocess.run(["x"], capture_output=True, stdout=subprocess.PIPE))
+grab("empty_argv", lambda: subprocess.run([]))
+
+
+# The not-found message, which is most of the point of the feature.
+def enoent(spec_json):
+    specs.append(json.loads(spec_json))
+    return json.dumps({"enoent": True})
+
+
+ns["_vv_install_subprocess"](enoent, programs, lambda: 0, 3)
+grab("git", lambda: subprocess.run(["git", "status"]))
+try:
+    subprocess.run(["ffmpeg", "-i", "a.mp4"])
+except FileNotFoundError as exc:
+    out["enoent_errno"] = exc.errno
+    out["enoent_filename"] = exc.filename
+    out["enoent_msg"] = exc.strerror
+
+# Ignored arguments warn on stderr and carry on.
+ns["_vv_install_subprocess"](spawn, programs, lambda: 0, 3)
+err = io.StringIO()
+_real_stderr = sys.stderr
+sys.stderr = err
+# Values that ask for something, so the warning is about the caller's request
+# rather than about CPython's defaults: close_fds=True and creationflags=0 are what
+# happens when nobody asks, and narrating those back is noise, not a warning.
+subprocess.run(["x"], bufsize=4096, close_fds=False, creationflags=1)
+sys.stderr = _real_stderr
+out["ignored_warnings"] = err.getvalue()
+
+_quiet = io.StringIO()
+sys.stderr = _quiet
+subprocess.run(["x"], bufsize=-1, close_fds=True, creationflags=0, startupinfo=None, executable=None)
+sys.stderr = _real_stderr
+out["default_ignored_silent"] = _quiet.getvalue()
+
+# The same call again: a run() in a loop must not repeat the same line forever
+# and bury the output the loop was for.
+err2 = io.StringIO()
+sys.stderr = err2
+for _ in range(3):
+    subprocess.run(["x"], bufsize=4096)
+sys.stderr = _real_stderr
+out["repeat_warnings"] = err2.getvalue()
+
+# A HOST WITH NO TERMINAL, which is the notebook kernel: its stdout is the frame
+# stream, so a child writing there directly lands in the collapsed kernel log rather
+# than under the cell that ran it. With the terminal disowned, the parent carries
+# the bytes and hands them to whatever sys.stdout is now — the cell's own stream.
+answer.update(code=0, stdout="child said this" + chr(10), stderr="child warned" + chr(10))
+subprocess.run(["ruff", "check", "."])
+out["terminal_inherits"] = specs[-1]["inherit"]
+
+ns["_vv_subprocess_no_terminal"]()
+_cell_out, _cell_err = io.StringIO(), io.StringIO()
+_keep_out, _keep_err = sys.stdout, sys.stderr
+sys.stdout, sys.stderr = _cell_out, _cell_err
+_relayed = subprocess.run(["ruff", "check", "."])
+sys.stdout, sys.stderr = _keep_out, _keep_err
+out["no_terminal_inherits"] = specs[-1]["inherit"]
+out["relayed_stdout"] = _cell_out.getvalue()
+out["relayed_stderr"] = _cell_err.getvalue()
+out["relayed_returns_none"] = [_relayed.stdout, _relayed.stderr]
+# …and a caller that DID ask for the output still gets it and nothing is echoed.
+_quiet_cell = io.StringIO()
+sys.stdout = _quiet_cell
+_captured = subprocess.run(["ruff", "check", "."], capture_output=True, text=True)
+sys.stdout = _keep_out
+out["captured_still_returns"] = _captured.stdout
+out["captured_not_echoed"] = _quiet_cell.getvalue()
+
+# The module's own types are untouched, which is what makes an existing
+# "except subprocess.CalledProcessError" keep working.
+out["types_intact"] = [subprocess.PIPE, subprocess.STDOUT, subprocess.DEVNULL]
+out["timeoutexpired_still_real"] = subprocess.TimeoutExpired.__module__ == "subprocess"
+
+print(json.dumps(out))
+`;
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== subprocess, executed under the host's CPython ==");
+// SUBPROCESS_SOURCE is ordinary Python with one JS function injected, so like
+// reloadSource it can be RUN here rather than pattern-matched. The injected
+// function stands in for the blocking syscall: what is under test is every
+// decision the Python side makes — which arguments are honoured, which are
+// refused and in what words, what shape comes back — and none of those depend on
+// a real child existing.
+//
+// What this tier CANNOT show is that OP_SPAWN delivers a child at all. That is
+// the bridge spike's job, and finally the browser's.
+// ---------------------------------------------------------------------------
+{
+  const probe = spawnSync("python3", ["-c", "import sys; print(sys.version.split()[0])"], { encoding: "utf8" });
+  if (probe.status !== 0) {
+    console.log("  ! no python3 on PATH: the subprocess LOGIC was not executed here — only the string guards ran");
+  } else {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-subproc-"));
+    fs.writeFileSync(path.join(dir, "vv_sub.py"), SUBPROCESS_SOURCE);
+    fs.writeFileSync(path.join(dir, "driver.py"), subprocessDriver(dir));
+    const r = spawnSync("python3", [path.join(dir, "driver.py")], { encoding: "utf8" });
+    if (r.status !== 0) {
+      ok(false, `SUBPROCESS_SOURCE runs under CPython ${probe.stdout.trim()}`);
+      console.log((r.stderr || "").split("\n").slice(-18).map((l) => "      | " + l).join("\n"));
+    } else {
+      console.log(`  (CPython ${probe.stdout.trim()})`);
+      checkSubprocess(JSON.parse(r.stdout.trim().split("\n").pop()));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== subprocess: the JS half, and what it is parity WITH ==");
+// The Python side above never sees a real spawn. This reads the shipped bridge
+// instead: which syscall it goes through, and whether the two halves agree about
+// the spec they pass between them.
+// ---------------------------------------------------------------------------
+{
+  const src = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  const bridge = /function subprocessBridge\(\) \{([\s\S]*?)\n    return \{ spawn, programs, depth \};/.exec(src);
+  ok(!!bridge, "the bridge is where this check expects to read it");
+  const b = bridge ? bridge[1] : "";
+
+  // It goes through the SAME shim a Node guest calls rather than a second private
+  // path to the syscall, which is the whole basis of the parity claim: this adds
+  // no capability to the VM that a one-line Node script did not already have.
+  ok(/req\("child_process"\)\.spawnSync/.test(b),
+    "the spawn goes through the same child_process.spawnSync a Node guest calls, not a private path to OP_SPAWN");
+  ok(/opts\.stdio = "inherit"/.test(b), "…asking for stdio:'inherit' when Python wants the child's output on the terminal");
+  ok(/enoent: true/.test(b), "ENOENT is flagged for the Python side to describe, since Python has the better message for it");
+  ok(/readdirSync\("\/bin"\)/.test(b),
+    "the list of what exists is read off /bin, so it cannot go stale the way a list written in this file would");
+  ok(/process\.env\[SPAWN_DEPTH_VAR\]/.test(b), "the depth is read from the environment, so it survives a Python -> Node -> Python chain");
+  ok(/input_b64/.test(b) && /"base64"/.test(b), "input crosses as base64, so bytes reach the child unmangled");
+
+  // SUBPROCESS_SOURCE is a JS template literal, so a backtick or a ${ in the
+  // Python — including inside a comment — ends the string and breaks the whole
+  // module at parse time, which is why it uses chr(10) instead of an escape.
+  // Guarded here for the same reason PYTHON_PROGRAM is guarded in the bridge
+  // tier: it is invisible in review and total at run time.
+  for (const bad of ["`", "${"]) {
+    ok(!SUBPROCESS_SOURCE.includes(bad), `the subprocess source contains no ${JSON.stringify(bad)}`);
+  }
+
+  // The Node shim had to learn stdio:'inherit' for this, and that is a Node
+  // fidelity fix in its own right: spawnSync used to capture output nobody asked
+  // for and drop it.
+  const cp = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/child_process.js"), "utf8");
+  const sync = /function spawnSync\(command, args = \[\], opts = \{\}\) \{([\s\S]*?)\n  \}/.exec(cp);
+  ok(!!sync && /capture: !inherit/.test(sync[1]), "spawnSync turns stdio:'inherit' into a non-capturing spawn");
+  ok(!!sync && /stdout: null, stderr: null/.test(sync[1]),
+    "…and reports stdout/stderr as null in that case, since an empty Buffer would read as 'the child printed nothing'");
+
+  // The two halves share one spec. A key renamed on one side and not the other
+  // would be a silent no-op, which is the failure this pins down.
+  for (const key of ["command", "args", "cwd", "env", "inherit"]) {
+    ok(new RegExp(`"${key}"`).test(SUBPROCESS_SOURCE), `the Python side writes "${key}" into the spec`);
+  }
+  ok(/spec\.inherit/.test(b) && /spec\.input_b64/.test(b) && /spec\.command/.test(b), "…and the JS side reads the same names back out");
+
+  // The old error is what someone will search for, so the docs must still contain
+  // it — and must no longer present it as the current behaviour.
+  const doc = fs.readFileSync(path.join(ROOT, "sites/docs/docs/python.md"), "utf8");
+  ok(/Errno 138/.test(doc), "the docs still name the Errno 138 error, which is the string a reader will search for");
+  ok(!/^- \*\*`subprocess`\*\*/m.test(doc) || /subprocess/.test(doc), "…and subprocess is discussed rather than only listed as impossible");
+}
+
 // ---------------------------------------------------------------------------
 console.log("\n== the checkers, and the Django command that would hang ==");
 // ---------------------------------------------------------------------------
@@ -1746,6 +2685,127 @@ console.log("\n== a served app's writes land while it is still serving ==");
   ok(hostRead(path.join(dir, "upload.txt")) === null, "a file the app deletes is deleted on the host");
 }
 
+// ---------------------------------------------------------------------------
+console.log("\n== --reload end to end: a save on disk changes what the server answers ==");
+// The other half of the feature, and the half no Python can prove. The CPython
+// section above holds reloadSource to its semantics; this holds the JavaScript
+// around it to delivering the bytes — a real fs.watch on a real directory, the
+// debounce, the copy of the edited file into the interpreter, and the decision
+// not to swap under an in-flight request. It runs the SHIPPED serve() with
+// reload on, and the stand-in app answers with main.py as the interpreter sees
+// it, so a copy that never landed reads as a stale response body.
+//
+// WHAT THIS IS NOT. The watch here is Node's own, over a real directory; in
+// production it is the VFS pushing events from the File System Worker. Those are
+// different implementations of the same fs.watch contract, and only a browser
+// exercises the second one. What this rules out is the whole class of bug where
+// the wiring is wrong — which is every bug this code has had so far.
+// ---------------------------------------------------------------------------
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vv-py-reload-"));
+  const port = scratchPort(7);
+  fs.writeFileSync(path.join(dir, "main.py"), "first\n");
+  fs.mkdirSync(path.join(dir, ".venv/lib"), { recursive: true });
+  const { api, out } = mirrorRuntime(dir);
+  const closed = api.serve({ app: "main:app", mode: "wsgi", port, cwd: dir, reload: true });
+  closed.catch(() => {});
+  for (let i = 0; i < 100 && !fs.existsSync(path.join(dir, ".fake-pyodide")); i++) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  await new Promise((r) => setTimeout(r, 200));
+
+  const said = () => out.join("");
+  // Waits for the debounce plus a margin, then for the reload line to appear.
+  const settle = async () => {
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, RELOAD_DEBOUNCE_MS / 2));
+      if (/^reload: (?!watching)/m.test(said().slice(mark))) return;
+    }
+  };
+  let mark = 0;
+
+  ok(/reload: watching \d+ director/.test(said()), "the server says it is watching, and how much");
+  ok(!/watching 0 director/.test(said()), "…which is not zero directories");
+
+  const before = await get(port, "/");
+  ok(before.body === "first", "the app answers out of the file the server started with");
+
+  // 1) The edit that is the whole point.
+  mark = said().length;
+  fs.writeFileSync(path.join(dir, "main.py"), "second\n");
+  await settle();
+  ok(/reload: main\.py changed — main:app re-imported/.test(said().slice(mark)),
+    "a .py save is noticed, and the terminal names the file and says the re-import happened");
+  const after = await get(port, "/");
+  ok(after.body === "second",
+    "…and the next request is answered by the new code, which needs the edit copied INTO the interpreter, not just noticed");
+
+  // 2) A file that is not Python, and a directory the scope excludes. Neither
+  //    should produce a reload — the .py rule is what stops a served app that
+  //    writes files from restarting on its own output, forever.
+  mark = said().length;
+  fs.writeFileSync(path.join(dir, "notes.sqlite"), "rows");
+  fs.writeFileSync(path.join(dir, "index.html"), "<p>");
+  fs.writeFileSync(path.join(dir, ".venv/lib/sneaky.py"), "nope\n");
+  await new Promise((r) => setTimeout(r, RELOAD_DEBOUNCE_MS * 4));
+  ok(!/^reload: (?!watching)/m.test(said().slice(mark)),
+    "a database write, an HTML save and a .py inside .venv all pass without a restart");
+  ok((await get(port, "/")).body === "second", "…and the app is still the one that was serving");
+
+  // 3) A broken save. The contract that makes reload worth switching on.
+  mark = said().length;
+  fs.writeFileSync(path.join(dir, "main.py"), "VVRELOAD-FAIL\n");
+  await settle();
+  const failed = said().slice(mark);
+  ok(/re-importing main:app failed/.test(failed), "a re-import that raises is reported as a failure");
+  ok(/previous version is still serving/.test(failed), "…in those words, so the state of the server is not left to be inferred");
+  ok(/main\.py changed/.test(failed), "…naming the file that triggered it");
+  ok(/SyntaxError/.test(failed), "…and carrying the interpreter's own traceback rather than a summary of it");
+  ok((await get(port, "/")).body === "second",
+    "and the app that was serving is STILL serving — a failed reload leaves a working server, not a broken one");
+
+  // 4) Recovery, which is the case a user hits immediately after (3).
+  mark = said().length;
+  fs.writeFileSync(path.join(dir, "main.py"), "third\n");
+  await settle();
+  ok((await get(port, "/")).body === "third", "fixing the file reloads normally: the failure left nothing to clear up");
+
+  // 5) A burst is one restart, not one per file.
+  mark = said().length;
+  fs.writeFileSync(path.join(dir, "a.py"), "x\n");
+  fs.writeFileSync(path.join(dir, "b.py"), "y\n");
+  fs.writeFileSync(path.join(dir, "main.py"), "fourth\n");
+  await settle();
+  await new Promise((r) => setTimeout(r, RELOAD_DEBOUNCE_MS * 3));
+  const burst = said().slice(mark).match(/^reload: (?!watching)/gm) || [];
+  ok(burst.length === 1, `a save-all of three files is ONE re-import, not three (saw ${burst.length})`);
+  ok((await get(port, "/")).body === "fourth", "…and it is the last state of the files that ends up serving");
+
+  // 6) A directory created after the walk. The watches are non-recursive, so
+  //    without adding one for it, edits in a package added later are invisible.
+  fs.mkdirSync(path.join(dir, "later"));
+  await new Promise((r) => setTimeout(r, RELOAD_DEBOUNCE_MS * 2));
+  mark = said().length;
+  fs.writeFileSync(path.join(dir, "later/mod.py"), "z\n");
+  await settle();
+  ok(/^reload: later\/mod\.py changed/m.test(said().slice(mark)),
+    "a .py inside a directory created after the server started is seen, so a new package is not a blind spot");
+
+  // 7) …and the harder version: the directory and the file arrive together, so
+  //    the file's own creation event went to a watch that did not exist yet.
+  //    Copying a folder in, or unzipping one, looks like this.
+  mark = said().length;
+  fs.mkdirSync(path.join(dir, "pkg/inner"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "pkg/__init__.py"), "\n");
+  fs.writeFileSync(path.join(dir, "pkg/inner/deep.py"), "d\n");
+  await settle();
+  const adopted = said().slice(mark);
+  ok(/^reload: .*pkg\//m.test(adopted),
+    `a directory that arrives WITH files in it is adopted whole, not waited on for a second save (${(adopted.match(/^reload:.*/m) || [""])[0]})`);
+  ok(/deep\.py/.test(adopted), "…including one nested two levels down, since the whole subtree is picked up");
+
+  fs.rmSync(dir, { recursive: true, force: true });
+}
 
 // ---------------------------------------------------------------------------
 console.log("\n== the Python language service: what gets registered ==");
@@ -2495,6 +3555,45 @@ console.log("\n== the wheels a template needs are the wheels that are vendored =
   const richCase = /"python-rich": \{([\s\S]*?)\n  \},/.exec(bridge);
   ok(!!richCase && /packages: \["rich", "pygments", "markdown-it-py"\]/.test(richCase[1]),
     "the python-rich case loads exactly the packages the fixup adds, so the tier proves the fixup is the right one");
+
+  // --- the scientific stack, which is a size decision and so is worth pinning --
+  for (const want of ["scipy", "scikit-learn"]) {
+    ok(names.includes(want), `${want} is vendored, so fitting a model does not need the network`);
+  }
+  // The point of vendoring these is not speed. Everything NOT vendored falls back
+  // to jsDelivr at run time, so before this the sklearn import was a request —
+  // which is why it is the offline claim that is being kept, not a latency one.
+  ok(/it is a NETWORK cost/.test(vend),
+    "…and the reason recorded is the network dependency, not the download time");
+  ok(/17\.59 MiB/.test(vend) && /scipy 13\.22, scikit-learn 4\.18/.test(vend),
+    "the size of the trade is written down as a measured figure, since it is the argument against it");
+  // The figures this replaced were self-consistent and wrong — they matched no
+  // unit against the pinned lock. Pinning HOW they were taken is what makes the
+  // next person able to check them rather than trust them.
+  ok(/Content-Length off each wheel on the jsDelivr full channel/.test(vend),
+    "…together with how it was measured, so the number can be re-taken rather than believed");
+
+  // --- openpyxl: vendored AND reachable, which are two different problems -----
+  ok(/name: "openpyxl"/.test(vend), "openpyxl is vendored from PyPI, since Pyodide's index does not carry it");
+  ok(/name: "et-xmlfile"/.test(vend), "…with et-xmlfile, its only dependency");
+  const openpyxlPin = /name: "openpyxl", version: "([^"]+)"/.exec(vend);
+  ok(!!openpyxlPin, `…and it is pinned (${openpyxlPin ? openpyxlPin[1] : "NOT PINNED"}), like every other PyPI wheel here`);
+  // The half that vendoring alone does not fix. pandas defers `import openpyxl`
+  // into read_excel, so the import scan never sees it: the wheel would sit there
+  // same-origin and unloaded while read_excel raised "Missing optional
+  // dependency". This is the same shape as tzdata and it is why that list exists.
+  ok(hiddenImportsFor("import pandas as pd\ndf = pd.read_excel('book.xlsx')").includes("openpyxl"),
+    "a source that reads a spreadsheet loads openpyxl, though it never names it");
+  ok(hiddenImportsFor("df.to_excel('out.xlsx')").includes("openpyxl"), "…and one that writes one");
+  ok(hiddenImportsFor("with pd.ExcelWriter('o.xlsx') as w: pass").includes("openpyxl"), "…and ExcelWriter");
+  ok(hiddenImportsFor("xl = pd.ExcelFile('b.xlsx')").includes("openpyxl"), "…and ExcelFile");
+  ok(hiddenImportsFor("import openpyxl").includes("openpyxl"), "…and naming it directly still works, as an ordinary import would");
+  // Generosity has a limit: a bare path in an unrelated string must not drag a
+  // wheel in, and .xls is a DIFFERENT engine (xlrd) that this would not be loading.
+  ok(hiddenImportsFor("import pandas as pd\ndf = pd.read_csv('data.csv')").length === 0,
+    "a pandas script that touches no spreadsheet loads nothing extra");
+  ok(!hiddenImportsFor("path = '/tmp/report.xlsx'").includes("openpyxl"),
+    "…and a filename in a string is not treated as a use, since matching the extension would claim an engine this does not load");
 }
 
 // ---------------------------------------------------------------------------
@@ -2668,10 +3767,10 @@ console.log("\n== the wheels a template needs are the wheels that are vendored =
   ok(/await main\(\)/.test(BLOCKING_PATCH_SOURCE), "…pointing at top-level await, which this runtime actually supports");
 
   // tzdata is loaded by matching the source, because no import statement names it.
-  ok(dataPackagesFor("from zoneinfo import ZoneInfo").includes("tzdata"),
+  ok(hiddenImportsFor("from zoneinfo import ZoneInfo").includes("tzdata"),
     "code that imports zoneinfo pulls tzdata in, which nothing else would");
-  ok(dataPackagesFor("import zoneinfo").includes("tzdata"), "…however it is spelled");
-  ok(dataPackagesFor("import datetime\nprint(datetime.datetime.now())").length === 0,
+  ok(hiddenImportsFor("import zoneinfo").includes("tzdata"), "…however it is spelled");
+  ok(hiddenImportsFor("import datetime\nprint(datetime.datetime.now())").length === 0,
     "…and code that does not mention it pays nothing");
   const vendorSrc = fs.readFileSync(path.join(ROOT, "scripts/vendor-pyodide.mjs"), "utf8");
   ok(/"tzdata"/.test(vendorSrc), "tzdata is vendored, so timezones do not depend on the network");
@@ -2774,6 +3873,77 @@ console.log("\n== stubs, so mypy's first message is about the user's code ==");
       `${stub} is vendored at a pinned version, so the editor's advice cannot change under the user`);
     ok(new RegExp(`name: "${stub}"[^}]*imports: \\[\\]`).test(vendorSrc),
       `…with no imports declared, so a script's interpreter never loads a stub package it cannot use`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== a build that is missing a vendored wheel has to say so ==");
+// A user's studio shipped with openpyxl configured, no openpyxl wheel on disk, and
+// no openpyxl entry in the lock — so `import openpyxl` failed in the browser for a
+// package this repo says is vendored, and nothing anywhere had said otherwise. Two
+// mechanisms, both silent:
+//
+//   * the vendor script warns and continues on a failed fetch (deliberate: a
+//     studio that boots without a formatter beats a build that will not finish),
+//     and then recorded what was REQUESTED — so the incomplete tree was cached as
+//     done and no later `npm run dev` retried it.
+//   * Pyodide's loadPackagesFromImports IGNORES an import with no lock entry, and
+//     loadPackage's throw for one was swallowed. The wheel was not merely absent;
+//     nothing asked for it and nothing reported it.
+//
+// Neither is a thing a spike can catch by running the vendor script (it needs the
+// network and 60 MB), so what is gated here is that both mechanisms now report.
+// ---------------------------------------------------------------------------
+{
+  const vend = fs.readFileSync(path.join(ROOT, "scripts/vendor-pyodide.mjs"), "utf8");
+  ok(/missing: unusable,/.test(vend), "the vendor marker records what is MISSING, not only what landed");
+  ok(/const stale = !Array\.isArray\(prev\.missing\)/.test(vend) && /!stale && missing\.length === 0/.test(vend),
+    "…and `already present` is gated on that list being empty, so an incomplete build is not cached as done");
+  ok(/if \(!retry\) fs\.rmSync\(OUT_DIR/.test(vend), "…while the retry keeps the wheels it has, so healing a build is not re-downloading 60 MB");
+  ok(/which is not in the vendored tree/.test(vend), "the build checks that a lock entry claiming a same-origin wheel has one on disk");
+  ok(/no lock entry at all, so nothing in the browser can even ask for it/.test(vend),
+    "…and that every PyPI-sourced package reached the lock, which is the failure that produced no error at all");
+
+  // The purpose table, which is what makes the report worth reading: the note used
+  // to name black whatever had failed, so the one run that shipped without openpyxl
+  // reported that formatting was affected.
+  const pins = vendoredPyPIPins(path.join(ROOT, "scripts/vendor-pyodide.mjs")).map((p) => p.name);
+  const purpose = /const PYPI_PURPOSE = \{([\s\S]*?)\n\};/.exec(vend);
+  ok(!!purpose, "the vendor script says what each PyPI wheel is for");
+  for (const name of pins) {
+    ok(purpose && new RegExp(`"?${name.replace(/[-.]/g, "\\$&")}"?:`).test(purpose[1]),
+      `…including ${name}, so a failed fetch can name what stops working`);
+  }
+
+  // The runtime half.
+  const py = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  ok(/No known package/.test(py) && /npm run vendor:pyodide -- --force/.test(py),
+    "the runtime turns Pyodide's `No known package` into the sentence that names the package and the fix");
+  ok(/function warnOnce\(/.test(py) && /warnedOnce\.has\(text\)/.test(py),
+    "…once per process, so a notebook running twenty cells does not bury them in it");
+
+  // And the developer's own build, when there is one. Gitignored, so CI never has
+  // it; the gate for CI is that the vendor script checks itself, above.
+  const outDir = path.join(ROOT, "packages/studio/public/vendor/pyodide");
+  const lockFile = path.join(outDir, "pyodide-lock.json");
+  if (!fs.existsSync(lockFile)) {
+    console.log("  ! no vendored Pyodide on this machine (gitignored build artifact) — the on-disk check did not run");
+  } else {
+    const lock = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+    const pkgs = lock.packages || {};
+    const norm = (s) => String(s).toLowerCase().replace(/[-_.]+/g, "-");
+    const bad = [];
+    for (const name of pins) {
+      const entry = pkgs[norm(name)];
+      if (!entry) bad.push(`${name} (no lock entry)`);
+      else if (!fs.existsSync(path.join(outDir, entry.file_name))) bad.push(`${name} (${entry.file_name} absent)`);
+    }
+    ok(bad.length === 0, bad.length ? `this machine's vendored build is incomplete: ${bad.join(", ")}` : `this machine's vendored build carries all ${pins.length} PyPI wheels, entry and file`);
+    const marker = path.join(outDir, ".vendor-manifest.json");
+    if (fs.existsSync(marker)) {
+      const m = JSON.parse(fs.readFileSync(marker, "utf8"));
+      ok(Array.isArray(m.missing), "…and its manifest records completeness, so `npm run dev` knows whether to retry");
+    }
   }
 }
 
@@ -3021,9 +4191,9 @@ console.log("\n== the bytecode a run compiled, kept for the run after it ==");
   const iInstall = pysrc.indexOf("installBytecodeCache(pyodide, process.env)");
   const iSnap = pysrc.indexOf("_makeSnapshot: making");
   ok(iSnap < iInstall, "the setting is applied per process, after the snapshot, like the other patches");
-  const iLoad = pysrc.indexOf("loadPackagesFromImports(importSource || source");
+  const iLoad = pysrc.indexOf("loadImportsFor(pyodide, importSource || source");
   const iRestore = pysrc.indexOf("restoreBytecode(req(\"fs\"), pyodide, process.env)");
-  const iRun = pysrc.indexOf("runPythonAsync(source, { filename })");
+  const iRun = pysrc.indexOf("runPythonAsync(source, ns ?");
   const iHarvest = pysrc.indexOf("harvestBytecode(req(\"fs\"), pyodide, process.env)");
   ok(iLoad < iRestore && iRestore < iRun,
     "the cache is put back after the packages are unpacked and before the first import, which is the point of it");
@@ -3275,7 +4445,7 @@ console.log("\n== breakpoints in a .py file, in the debug UI that already existe
   ok(iStdin < iAttach, "the debugger is armed after the boot patches, so a breakpoint cannot land inside one");
   const iRegister = pySrc.indexOf("dbg.registerScript(filename)");
   const iGate = pySrc.indexOf("dbg.waitForStart()");
-  const iRun = pySrc.indexOf("runPythonAsync(source, { filename })");
+  const iRun = pySrc.indexOf("runPythonAsync(source, ns ?");
   ok(iRegister > 0 && iRegister < iGate && iGate < iRun,
     "…and the file is announced, then the gate waits, then the program runs — in that order or breakpoints miss");
 }

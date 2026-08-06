@@ -68,8 +68,29 @@ const CORE_FILES = [
 // to be here rather than a CDN fetch away. requests is vendored for the same
 // reason: "talking to an API" should not be the one thing that needs the network
 // twice.
+// scipy and scikit-learn are the two biggest wheels in this file and the reason
+// the size of the distribution is a decision rather than an accident. Measured
+// against the lock for Pyodide 314.0.3 — resolving the closure the way this file
+// does and reading Content-Length off each wheel on the jsDelivr full channel —
+// the pair costs 17.59 MiB across four packages: scipy 13.22, scikit-learn 4.18,
+// plus joblib 0.17 and threadpoolctl 0.02, which scikit-learn depends on and
+// nothing else here pulls in. The rest of the closure does not move: 38 wheels
+// before, 42 after.
+//
+// The trade was taken because it is not a latency cost, it is a NETWORK cost.
+// Everything vendored here is reachable with the tab offline; everything not
+// vendored falls back to jsDelivr at runtime (see the hybrid lock below), which
+// means `from sklearn.linear_model import LinearRegression` was the one line in a
+// data-science demo that failed on a plane. Vivari's claim is a Python
+// environment in a tab, and "unless you want to fit a model" was a footnote on
+// it. scipy is also not really optional once scikit-learn is here: it is
+// scikit-learn's own dependency, so the choice was never between them.
+//
+// These are the wheels to reach for first if the distribution ever has to get
+// smaller — they are ~40% of it, and they are the two nothing else depends on.
 const DEFAULT_PACKAGES = [
   "numpy", "pandas", "matplotlib", "fastapi", "micropip", "jedi", "mypy", "httpx", "requests",
+  "scipy", "scikit-learn",
   // sqlalchemy is the ORM half of the sqlite story the runtime already tells,
   // and rich is what makes a terminal program look like the READMEs do. Both are
   // pure Python and small; between them they cost about 6 MB.
@@ -115,6 +136,17 @@ const PYPI_PACKAGES = [
   // runtime dependencies of the libraries they describe, which are already here.
   { name: "types-requests", version: "2.33.0.20260508", imports: [], depends: [] },
   { name: "pandas-stubs", version: "3.0.5.260730", imports: [], depends: [] },
+  // openpyxl is what `pandas.read_excel` and `DataFrame.to_excel` import, and
+  // Pyodide's index does not carry it — so a spreadsheet, which is the format
+  // data actually arrives in, was the one input pandas could not read. 0.26 MiB
+  // for the pair (openpyxl 0.24, et-xmlfile 0.02, read off PyPI at these exact
+  // versions), which is not the scipy conversation.
+  //
+  // Vendoring the wheel is only half of it: nothing in a user's source ever names
+  // openpyxl, so the import scan cannot load it. See HIDDEN_IMPORTS in
+  // builtins/python.js for the other half.
+  { name: "openpyxl", version: "3.1.5", imports: ["openpyxl"], depends: ["et-xmlfile"] },
+  { name: "et-xmlfile", version: "2.0.0", imports: ["et_xmlfile"], depends: [] },
 ];
 
 // Packages the lockfile under-declares: names they import at runtime that their
@@ -158,14 +190,36 @@ function log(msg) {
   process.stderr.write(`[vendor-pyodide] ${msg}\n`);
 }
 
+// An INCOMPLETE previous build is retried rather than treated as done.
+//
+// Every download here warns and continues by design (a studio that boots without
+// a formatter beats a build that will not finish), and the marker used to record
+// only what was REQUESTED — so one failed fetch shipped a tree quietly missing a
+// package, and every later `npm run dev` said "already present" and never tried
+// again. That is how a build reached a user with openpyxl in its configuration, no
+// openpyxl wheel on disk, and no entry in the lock: `import openpyxl` failed in the
+// browser for a package this file says is vendored, and nothing on the way there
+// said otherwise. The marker now records what is MISSING, and this is the retry.
+let retry = false;
 if (!force && fs.existsSync(path.join(OUT_DIR, "pyodide.mjs")) && fs.existsSync(MARKER)) {
   try {
     const prev = JSON.parse(fs.readFileSync(MARKER, "utf8"));
     if (prev && prev.packagesKey === requestedKey && prev.lockFormat === LOCK_FORMAT) {
-      log(`already present: ${path.relative(ROOT, OUT_DIR)} (packages: ${requestedKey || "core only"}; use --force to rebuild)`);
-      process.exit(0);
-    }
-    if (prev && prev.lockFormat !== LOCK_FORMAT) {
+      // `missing` is absent in a marker written before it existed, which is not a
+      // claim that nothing was missing — those get one verifying pass.
+      const stale = !Array.isArray(prev.missing);
+      const missing = stale ? [] : prev.missing;
+      if (!stale && missing.length === 0) {
+        log(`already present: ${path.relative(ROOT, OUT_DIR)} (packages: ${requestedKey || "core only"}; use --force to rebuild)`);
+        process.exit(0);
+      }
+      retry = true;
+      log(
+        stale
+          ? "the existing build predates the completeness record — checking it, and fetching anything absent"
+          : `the existing build is missing ${missing.length} package(s): ${missing.join(", ")} — retrying those`,
+      );
+    } else if (prev && prev.lockFormat !== LOCK_FORMAT) {
       log(`lock format changed (${prev && prev.lockFormat} -> ${LOCK_FORMAT}) — rebuilding`);
     } else {
       log(`package set changed (${prev && prev.packagesKey} -> ${requestedKey}) — rebuilding`);
@@ -176,8 +230,9 @@ if (!force && fs.existsSync(path.join(OUT_DIR, "pyodide.mjs")) && fs.existsSync(
 }
 
 // Fresh build: clear any prior (possibly different) vendored tree so stale wheels
-// from an earlier package set don't linger.
-fs.rmSync(OUT_DIR, { recursive: true, force: true });
+// from an earlier package set don't linger. NOT on a retry — the point of a retry
+// is to fetch the few wheels that are absent, not to re-download 40 that are not.
+if (!retry) fs.rmSync(OUT_DIR, { recursive: true, force: true });
 
 // 1) Install the pyodide npm package into a scratch dir (host npm + network).
 const PKG_DIR = path.join(SCRATCH, "node_modules", "pyodide");
@@ -366,18 +421,38 @@ async function vendorFromPyPI(spec) {
   return true;
 }
 
+// What each PyPI wheel is here FOR, so a failure can say what stopped working
+// rather than which file 404'd. Every one of these is reachable from something a
+// user does, and the old note named only black — so the run that shipped without
+// openpyxl reported "black is incomplete", which was both wrong and reassuring.
+const PYPI_PURPOSE = {
+  black: "Format Document",
+  "mypy-extensions": "Format Document (black's dependency)",
+  pathspec: "Format Document (black's dependency)",
+  pytokens: "Format Document (black's dependency)",
+  "markdown-it-py": "rich.markdown",
+  mdurl: "rich.markdown (markdown-it-py's dependency)",
+  "types-requests": "mypy's view of requests",
+  "pandas-stubs": "mypy's view of pandas",
+  openpyxl: "spreadsheets — pandas.read_excel and DataFrame.to_excel",
+  "et-xmlfile": "spreadsheets (openpyxl's dependency)",
+};
+
 let pypiOk = 0;
+const pypiFailed = [];
 for (const spec of PYPI_PACKAGES) {
   try {
     // eslint-disable-next-line no-await-in-loop
     if (await vendorFromPyPI(spec)) pypiOk++;
+    else pypiFailed.push(spec.name);
   } catch (e) {
     log(`  ! failed ${spec.name}: ${(e && e.cause && e.cause.code) || (e && e.message) || e}`);
+    pypiFailed.push(spec.name);
   }
 }
-log(`vendored ${pypiOk}/${PYPI_PACKAGES.length} wheels from PyPI (the editor's formatter)`);
-if (pypiOk < PYPI_PACKAGES.length) {
-  log("NOTE: black is incomplete — Format Document will report itself unavailable rather than no-op.");
+log(`vendored ${pypiOk}/${PYPI_PACKAGES.length} wheels from PyPI`);
+for (const name of pypiFailed) {
+  log(`NOTE: ${name} did NOT vendor. What stops working: ${PYPI_PURPOSE[name] || "whatever imports it"}.`);
 }
 
 // 3c) Record the under-declared deps in the lock the browser reads, now that 3b
@@ -423,17 +498,50 @@ for (const [key, pkg] of Object.entries(allPackages)) {
 fs.writeFileSync(lockPath, JSON.stringify(lock));
 log(`wrote pyodide-lock.json (${vendored.size} vendored, ${cdnCount} via CDN)`);
 
+// 5) Say what this build cannot do, by CHECKING rather than by assuming the
+// downloads above went the way they were reported.
+//
+// Two different failures end in the same place — a browser that cannot import a
+// package this file lists — and neither used to be visible from here:
+//
+//   * a lock entry that claims a vendored (relative) wheel with no file on disk.
+//     `loadPackage` then 404s same-origin instead of falling back to the CDN.
+//   * a PyPI package with no lock entry at all, because its fetch failed. That is
+//     the openpyxl case, and it is the quieter of the two: Pyodide's
+//     loadPackagesFromImports IGNORES an import it has no entry for, so the wheel
+//     is not merely absent, nothing even asks for it.
+const unusable = [];
+for (const [key, pkg] of Object.entries(allPackages)) {
+  if (!pkg || typeof pkg.file_name !== "string" || pkg.file_name.includes("://")) continue;
+  if (!fs.existsSync(path.join(OUT_DIR, pkg.file_name))) {
+    unusable.push(key);
+    log(`  ! ${key}: the lock points at ${pkg.file_name}, which is not in the vendored tree`);
+  }
+}
+for (const spec of PYPI_PACKAGES) {
+  const key = normName(spec.name);
+  if (allPackages[key]) continue;
+  if (!unusable.includes(key)) unusable.push(key);
+  log(`  ! ${key}: no lock entry at all, so nothing in the browser can even ask for it`);
+}
 if (okCount < closure.size) {
   const failed = [...closure].filter((k) => !vendored.has(k));
   log(`NOTE: ${closure.size - okCount}/${closure.size} requested wheel(s) not vendored offline: ${failed.join(", ")}`);
   log("  They will be fetched from the Pyodide CDN at runtime (needs network in the browser).");
-  log("  To vendor them offline instead, once your network/TLS allows it:");
+}
+if (unusable.length) {
+  log(`NOTE: this build is INCOMPLETE — ${unusable.length} package(s) unusable in the browser: ${unusable.join(", ")}`);
+  log("  The next run of this script retries exactly these (the marker records them),");
+  log("  so `npm run dev` is enough. If the fetch is being blocked rather than flaky:");
   log("    - point Node at your proxy's root CA:  export NODE_EXTRA_CA_CERTS=/path/to/corp-ca.pem");
   log("    - then re-run:                         npm run vendor:pyodide -- --force");
+} else {
+  log("every package in the requested set has a wheel on disk and an entry in the lock");
 }
 
-// Record only what was actually vendored so a later `--force` re-attempts the
-// missing wheels, while a repeat `npm run dev` with the same set stays a no-op.
+// Record what is MISSING as well as what landed. `packages`/`requested` alone could
+// not tell a complete build from one that warned and continued, which is why an
+// incomplete tree used to be permanently cached as done.
 fs.writeFileSync(
   MARKER,
   JSON.stringify(
@@ -443,6 +551,7 @@ fs.writeFileSync(
       packagesKey: requestedKey,
       requested: [...closure],
       packages: [...vendored],
+      missing: unusable,
     },
     null,
     2,

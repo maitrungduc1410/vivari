@@ -1758,7 +1758,18 @@ interpreter really is WASM (like the Wasm engines above), not a Node-backed shim
   ships no `python`. jedi is in Pyodide's own lock; **black is not**, so it and its
   closure (`mypy-extensions`, `pathspec`, `pytokens`, and the lock-resident `click` and
   `platformdirs`) are downloaded from PyPI, pinned, and injected into the lock. An
-  editor feature that only formats when the network is up is not the feature.
+  editor feature that only formats when the network is up is not the feature. The same
+  reasoning is why **scipy and scikit-learn** are vendored despite being the two biggest
+  wheels here: what the hybrid lock's CDN fallback costs is not latency but a **network
+  dependency**, and `from sklearn.linear_model import LinearRegression` was the one line
+  in a data-science demo that failed offline. Measured against the Pyodide 314.0.3 lock
+  (closure resolved as this file resolves it, `Content-Length` read per wheel off the
+  jsDelivr full channel) the pair plus joblib and threadpoolctl is 17.59 MiB and takes
+  the closure from 38 wheels to 42; they are also the first wheels to reach for if the
+  tree ever has to shrink, being the largest here and depended on by nothing else.
+  **openpyxl** (with `et_xmlfile`) comes from PyPI for
+  0.26 MiB and is what `pandas.read_excel` imports — but vendoring it is only half the
+  fix, because nothing in a user's source names it; see `hiddenImportsFor` below.
 
 **Three things are patched into every interpreter at boot**, each one line of Python on
 `sys.path` or in `os.environ`, so a process that never uses them pays nothing.
@@ -1770,10 +1781,29 @@ that reports itself in terms of WebAssembly rather than Python: `asyncio.run()` 
 for real first, so a browser with JSPI is untouched; otherwise pointed at top-level
 `await`, which works because files run under `runPythonAsync`). It used to rewrite
 `input()` too and no longer does — `installStdin` gives the interpreter a stdin that
-waits (below), so that call does what it says. And `dataPackagesFor` loads wheels that are **data**: tzdata
-is named by no import statement, so `loadPackagesFromImports` structurally cannot find it,
-and source mentioning `zoneinfo` pulls it in by text match — there is no async left to
-fetch a wheel once `zoneinfo` is being imported.
+waits (below), so that call does what it says. And `hiddenImportsFor` loads the wheels a
+program needs but never names — "hidden imports", in PyInstaller's sense. Two things hide a
+dependency from `loadPackagesFromImports`, which can only see what the source says: tzdata is
+**data**, imported by nobody, since `zoneinfo` is stdlib and finds its database through
+importlib at call time; and openpyxl is **code imported inside a function**, because pandas
+defers `import openpyxl` until `read_excel` runs. Both are matched on the source TEXT rather
+than the parsed imports, which is the whole trick — by the time the deferred import happens
+there is no async left to fetch a wheel in, so the decision has to be made before the first
+line does. A false positive costs one same-origin load of a wheel that already shipped, which
+is why the patterns can afford to be generous.
+
+**`subprocess` is one blocking syscall, and the module's types are left alone**
+(`SUBPROCESS_SOURCE` + `subprocessBridge` in `builtins/python.js`). `OP_SPAWN` parks the
+caller on `Atomics.wait` until the child exits, so Python calls a plain synchronous JS
+function, the worker blocks inside it, and Python resumes with the exit code and output — the
+same re-entrancy shape as the stdin syscall and the debugger's pause loop. The bridge goes
+through the very `child_process.spawnSync` a Node guest calls, which is what makes this parity
+rather than a new capability. Only the *execution* functions are replaced (`run`, `call`,
+`check_call`, `check_output`, `getoutput`, `getstatusoutput`, `os.system`); `CompletedProcess`,
+`CalledProcessError` and the `PIPE`/`DEVNULL`/`STDOUT` constants stay exactly as CPython built
+them, so an existing `except subprocess.CalledProcessError` catches the real class. `Popen`
+and `timeout=` are refused rather than approximated — see AGENTS.md for why each cheat would
+be worse than the refusal.
 
 **`input()`, pdb and the REPL read stdin through a syscall of their own** (`OP_READ_STDIN`;
 `installStdin` in `builtins/python.js`). Pyodide asks for input through a callback that must
@@ -2136,6 +2166,51 @@ and `DJANGO_ALLOW_ASYNC_UNSAFE` is checked against Django's source. What has no 
 authority is said to be self-referential rather than dressed up: the template-registry
 integrity checks are claims about our own registry, and the `setupSource` string assertions
 are a drift guard, not evidence of spec conformance.
+
+**Notebooks are a studio surface on this interpreter, and needed nothing new below it**
+(`packages/studio/src/vv/notebook/`). A `.ipynb` opens as a notebook tab — a `tabKinds`
+entry alongside `image`, `directory` and `diff` — with one Monaco editor per cell. Those
+editors are given the `python` language id and real file URIs under the notebook's own
+folder, and that is the entire integration with IntelliSense: `python-lsp.js` registers its
+providers globally against that language id and resolves a workspace root from
+`model.uri.path`, so cells get jedi completion, mypy markers and ruff diagnostics without the
+notebook arranging any of it.
+
+Execution needed a different trick, because the surface `__ocInstallPython` hands a guest is
+whole *programs* — `runFile`, `runCode`, `repl`, `serve` — with no `eval` that returns a
+value and no output hook, so JS cannot drive the interpreter cell by cell. But there is one
+Pyodide per process worker and `input()` is a real blocking syscall, so the kernel is a
+*Python* program instead: one long-lived `python /tmp/vv-notebook-kernel.py` reading one JSON
+request per line and writing `\x1e`-prefixed frames back. A cell's `sys.stdout` is swapped
+for a writer that emits one frame per write, which is what puts output under the cell that
+produced it rather than in a terminal, and what makes it stream rather than arrive at the
+end.
+
+That process runs in a **shell terminal with no xterm attached**, and the reason is the
+interrupt. `proc-spawn` is the cleaner channel and cannot signal — `proc-kill` routes to
+`kernel.stop` — so on it, interrupting a cell would mean discarding the interpreter and every
+name the user had defined. The shell passes a foreground child's stdin through verbatim and
+turns `\x03` into `SIGINT`, which is the path to `Py_EmscriptenSignalBuffer` that
+`setInterruptBuffer` already established for Ctrl-C. The studio therefore opens a shell,
+types the command into it, and sends `\x03` — the same route a person pressing Ctrl-C takes.
+Sharing that stream with the shell's echo and Pyodide's loader chatter is what the record
+separator on every frame is for; a line without one is treated as kernel noise and surfaced
+behind the status indicator rather than swallowed.
+
+Because there is one interpreter and no threads, cells run strictly one at a time and Run
+queues. Execution counts are assigned at dispatch, so they record the order the interpreter
+saw rather than the order the cells sit in, and interrupting abandons the queue. `.ipynb` is
+round-tripped rather than re-rendered: every cell keeps its parsed object, unedited cells are
+written back byte for byte, and unknown fields — cell metadata, vendor MIME types, whole
+output types, top-level sections — are handed back untouched. Output is
+`json.dumps(indent=1, sort_keys=True)` because that is what `nbformat.writes` does.
+
+One thing here is stricter than Jupyter. Jupyter gates output HTML on a trust signature;
+there is no signature store here, so output HTML goes through a tag and attribute allowlist
+instead (`render.js`). Tables, spans, inline styles and data-URL images survive — what pandas
+and friends actually emit — and scripts, iframes, event handlers and `javascript:` URLs do
+not. A `.ipynb` is a file people download from strangers, and opening one is not consent to
+run script in the studio's origin, which is the origin holding the kernel bridge.
 
 ---
 

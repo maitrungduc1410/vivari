@@ -1210,7 +1210,13 @@ map. Rules that bite if ignored:
   runs `node --check` over every shipped template on every push and catches exactly this —
   it was written after the S3 template shipped the bug above with a green network-tier spike.
   If a template's source outgrows a literal, move it to a sibling `.js` module the way
-  `s3-app-source.js` does, so the gate and the template read the same bytes.
+  `s3-app-source.js` does, so the gate and the template read the same bytes. The same split
+  is why the notebook is testable at all: its model, `.ipynb` round-trip, execution queue and
+  output policy are plain `.js` with sibling `.d.ts` in `vv/notebook/`, so
+  `spike-notebook.mjs` drives the exact bytes the studio ships. That is not a style
+  preference — a notebook is a UI surface and there is no browser in CI, so the line between
+  the `.js` modules and `NotebookView.tsx` is the line between what a spike can prove and
+  what it cannot. Keep new logic on the `.js` side; leave layout in the component.
 
 ### A sticky row needs a capped scrollport, the right containing block, and a z-index budget
 Four independent traps, none of them visible in the DOM, all hit while pinning the Explorer's
@@ -2327,9 +2333,13 @@ Gotchas:
   port) is the one they keep. What they cannot keep is the process model, so those flags
   are loud: `--worker-class`/`-k` (anything but `sync`, which is what the bridge already
   is) and `--factory` **refuse**, because they change what gets served; while
-  `--workers`/`--threads`/`--reload`/`-D` **warn** and carry on (the server
+  `--workers`/`--threads`/`-D` **warn** and carry on (the server
   still serves, just not the way the flag asked). Silently swallowing them is the argv
-  spelling of a placeholder return value. Flags that take a value must consume it even
+  spelling of a placeholder return value. There is now a **third tier, `warnPartial`**,
+  for a flag that names two things and gets one: `flask --debug` means reloader *and*
+  interactive debugger, and this runtime does the first and not the second, so "ignored"
+  understates it and silence overstates it. Reach for it only when the flag really is
+  two features — a flag that is merely approximated belongs in `warn`. Flags that take a value must consume it even
   when ignored, or it is read as the app spec — `gunicorn -t 30 wsgi:app` served an app
   called `30` until `-t` was recognised as `--timeout`'s short form. Which flags exist,
   and which of them take a value, is **read off the real tools' `--help`, not guessed**:
@@ -2478,6 +2488,106 @@ Gotchas:
   paths the inbound walk never descended into) — the store owns it, and a second
   writer would copy every wheel out again and could leave a half-written store
   looking valid.
+- **`--reload` re-imports, and the three things that makes load-bearing.** A Python
+  server's app is imported into `serve()`'s own process, so restart-on-save is a
+  re-import rather than a respawn — which is why it needs neither the thread nor the
+  subprocess the docs used to say it did. Three consequences, each of which fails
+  quietly rather than loudly:
+  (1) **Drop the module's bytecode before re-importing it.** A `.pyc` is revalidated on
+  the source's size and its mtime truncated to whole *seconds*, and save-then-reload is
+  inside one second by construction — so a same-length edit is indistinguishable from no
+  edit and the stale `.pyc` wins. This runtime makes it worse than upstream: Pyodide
+  ships `sys.dont_write_bytecode` set and the bytecode cache above deliberately unsets
+  it, so user modules get `.pyc` files here that they would not otherwise get. Use
+  `importlib.util.cache_from_source`, which honours `sys.pycache_prefix`.
+  (2) **A failed re-import must be a no-op, not a partial one.** The modules are popped
+  into a snapshot and put back if anything raises, including a sibling the failed attempt
+  had already re-imported — otherwise a syntax error leaves the server answering out of a
+  module set matching neither version of the code. Catch `BaseException` (a module calling
+  `sys.exit()` at import must not take the port down) but re-raise `KeyboardInterrupt`.
+  (3) **The watch scope is `SKIP_DIRS`, and the trigger is `.py` only.** One
+  non-recursive `fs.watch` per directory from an explicit walk — *not*
+  `{ recursive: true }`, which on this platform routes to Node's vendored JS fallback
+  and registers a watch per file with no way to exclude `.venv`. The `.py` filter is not
+  cosmetic: a served app's writes are mirrored back to the VFS at the end of every
+  request and fire this same watch, so a filter that let a SQLite commit through would
+  restart the app on every request, forever.
+- **`subprocess` works, and "no threads" is not why it did not.** The
+  `OSError: [Errno 138] emscripten does not support processes.` a reader will find is
+  CPython's, and it is about **fork** — Pyodide has no `_posixsubprocess`. It is not a
+  statement that this VM has no processes: every command is a real process with its own
+  worker, and guest Node has spawned them over `OP_SPAWN` since brick 4. `OP_SPAWN` is
+  blocking (the caller parks on `Atomics.wait` until the child exits), which is exactly
+  `subprocess.run()`'s shape and exactly *not* `Popen`'s. Four rules follow:
+  (1) **Refuse `Popen`, do not approximate it.** The cheat is to run the child to
+  completion in `__init__` and serve the buffered output from the pipes; then
+  `communicate()` passes and `Popen(["uvicorn", …])` blocks until the heat death of the
+  tab. Same for `timeout=`: with the caller parked and nothing able to interrupt it, a
+  timeout can be *accepted* but never *enforced*, so accepting it silently converts the
+  one argument written to bound a wait into an unbounded one. Both raise and name what
+  does work.
+  (2) **"Not found" must blame the missing binary, not the platform.** `git` and
+  `ffmpeg` are absent because they are not in the VM — a softer and completely different
+  fact from "the browser forbids processes", and the message a user sees decides which
+  lesson they take away. The list of what *does* exist is read from `/bin` at error
+  time; a list written into a source file starts lying the day a program is added.
+  (3) **No capture means `stdio: 'inherit'`, which the Node shim had to learn.**
+  Captured output cannot arrive before the exit that delivers it, so a captured
+  `pytest` prints nothing for a minute and then everything. `spawnSync` hardcoded
+  `capture: true`; it now honours `stdio:'inherit'` and reports `stdout`/`stderr` as
+  `null`, which is both real Node behaviour and what `subprocess.run` without
+  `capture_output` needs.
+  (4) **Bound the nesting, in the environment.** Every level is another worker with
+  another Pyodide boot, and every parent is parked — so a script that spawns itself
+  cannot be Ctrl-C'd out of. `VV_SPAWN_DEPTH` rides in the child's env so it keeps
+  counting through a Python → Node → Python chain, and `MAX_SPAWN_DEPTH` refuses the
+  fourth level. On security: this is **parity**, not expansion. It goes through the same
+  `child_process.spawnSync` a Node guest calls rather than a private path to the
+  syscall, so nothing is reachable from Python that a one-line Node script could not
+  already reach.
+  (5) **A `stdout=`/`stderr=` you do not recognise is not a no-op.** The first version
+  of this handled `PIPE`/`DEVNULL`/`STDOUT` and quietly let everything else fall
+  through to the inherit branch, so `run(cmd, stdout=open(p, "w"))` put the child's
+  output on the terminal and left the file empty. That is a worse failure than the
+  `OSError` this feature replaced, because it looks like it worked, and it is the
+  general trap in patching a stdlib module: the *unhandled* case has to be as
+  deliberate as the handled ones. A file object is now captured and written (at the
+  end, since the child is already gone), a descriptor is refused because nothing is
+  inherited across this spawn, and anything else is a `TypeError`.
+- **A notebook cell is not a script, and the channel that runs it must be able to
+  signal.** Two things about `packages/studio/src/vv/notebook/` that look like free
+  choices and are not. **The kernel runs in a SHELL terminal, not on `proc-spawn`, and
+  the reason is `SIGINT`.** `proc-spawn`/`proc-input`/`proc-out` is the better-shaped
+  channel and it is the wrong one, because `kernel-worker.ts` routes `proc-kill` to
+  `kernel.stop(pid)` and there is no `proc-signal` message at all — a notebook that
+  interrupts by ending the process has not interrupted anything, it has discarded every
+  name the user defined and called it a stop. The shell is the only host-side route to a
+  signal: it writes a foreground child's stdin through untouched and converts `\x03` to
+  `SIGINT`, which reaches `Py_EmscriptenSignalBuffer` through the `setInterruptBuffer`
+  wiring in `builtins/python.js`. **If you move this to `proc-spawn`, add `proc-signal`
+  first** and check it reaches `kernel.signal(pid, "SIGINT")` rather than `kernel.stop`.
+  The consequence is that the kernel's stdout carries shell echo and Pyodide loader
+  chatter as well as protocol frames, which is what the `\x1e` prefix on every frame is
+  for. And **`term-open` for the kernel must NOT pass `run`**: the `run` field is the Run
+  button's path, and `openTerminal` prepends `npm install` to it when the directory has
+  no `node_modules`, which every Python project is. Three smaller rules that are all the
+  same rule — fail where it can be seen. A cell may not read stdin, because the protocol
+  owns it and a cell calling `input()` would eat the next cell's request; `builtins.input`
+  is replaced for the duration of a cell with one that raises and points at the terminal,
+  where `input()` really does block on the real syscall, rather than returning `""`.
+  Interrupt is refused at an *idle* kernel, because Ctrl-C at an idle prompt still ends
+  the process rather than raising `KeyboardInterrupt`, so an idle interrupt would throw
+  the session away to stop nothing; the button is disabled rather than hidden, since "why
+  is that greyed out" is the better question. And the notebook's matplotlib backend is the
+  **same extension point as the script one, aimed somewhere else** — `MPL_BACKEND` writes
+  a figure into the project and prints where it went, which is right for a script and
+  wrong for a cell, so the kernel registers `vv_nb_mpl` in `sys.modules` and sets
+  `MPLBACKEND` before any cell runs. Do not add a second mechanism; matplotlib already
+  has one. Finally, **a field you do not understand in an `.ipynb` belongs to somebody who
+  does**: `ipynb.js` re-emits the parsed object with only managed fields written over it,
+  writes an unedited cell back byte for byte in the shape it arrived in, never silently
+  upgrades `nbformat_minor`, and writes a cell `id` only at 4.5+ (an `id` in a 4.4
+  notebook fails that notebook's own schema).
 - **`python --version` carries a literal, and it is pinned twice.** Same
   constraint as `BUN_PROGRAM`/`BUN_VERSION` above: `PYTHON_PROGRAM` is a
   no-interpolation template literal, so `/bin/python.js` cannot import the
@@ -3814,6 +3924,377 @@ which this runtime loads directly, and not being a Python package turned out to 
 best thing about it — a linter outside CPython costs no interpreter boot. Before writing a
 capability off because the obvious delivery channel does not carry it, check whether the
 thing ships in a form the host can load on its own.
+
+### A tier at each end of a wire is not a tier on the wire — the notebook's kernel transport
+
+The notebook has no server and no new capability behind it. `studio-kernel.ts` opens an
+ordinary shell terminal with no xterm attached and types
+`python --vv-notebook-kernel /tmp/vv-notebook-kernel.py; exit` into it, because the shell is
+the only channel here that can deliver a **signal**: it hands a foreground child's stdin
+through verbatim and turns a `\x03` in that stream into `SIGINT`, while `proc-*` has no
+`proc-signal` at all (`kernel-worker.ts` routes `proc-kill` to `kernel.stop`, which for a
+notebook is a restart wearing the label "interrupt"). The kernel program itself is
+`packages/studio/src/vv/notebook/kernel-source.js` — stdlib-only Python, one long-lived
+namespace, one request per line — but its read loop is in JS, in `driveNotebook`
+(`packages/runtime/builtins/python.js`), because the packages a cell imports can only be
+resolved after the cell arrives and fetching a wheel needs an `await` that Python has nowhere
+to put here. Answers come back as `\x1e`-framed JSON on a stdout shared with the shell's echo,
+through `FrameReader` into `NotebookSession` and `NotebookDoc`.
+
+That is five components and two languages between a click and a value, and the lesson is
+about how it was tested. **Three separate "I pressed Run and nothing happened" reports
+shipped past a suite that was green at each point**, because the suite was thick at both ENDS
+of that wire and had never run a byte down it: `spike-notebook.mjs` drives the kernel program
+under the host's own CPython with `spawnSync(python3, [kernel.py], { input })` — no shell, no
+launcher, no runtime, no driver; `spike-notebook-view.mjs` renders cells under jsdom — no
+kernel; `spike-python-bridge.mjs` execs a cell in real Pyodide from a namespace it builds
+itself — no launch string. Every one of the three bugs lived in a gap between two of them.
+
+- **`__file__` exists in only one of the two ways this program runs.** `_traceback()` compared a
+  frame's filename against it to drop the kernel's own frames, and it runs while HANDLING a
+  user's exception. `python kernel.py` defines the name; `eval_code_async`, which is how the
+  driver loads the same source, does not — so in the browser the first cell to raise died of a
+  `NameError` inside the error reporter and the notebook showed nothing at all. Invisible to
+  the host tier, which runs the file as a file. It is `emit.__code__.co_filename` now: a code
+  object knows the name it was compiled under however it was run.
+- **The import scan never ran for a cell.** `loadPackagesFromImports` decides what to fetch by
+  reading import statements out of source, and a cell's source is a string the kernel `exec`s
+  — so the scan read the kernel's own file, which names none of it, and `import pandas` failed
+  with the wheel vendored same-origin and unloaded, while the same line in a script worked
+  because a script is scanned before it runs. Third time for this class here (`__import__(name)`,
+  pandas' deferred `import openpyxl`, now a cell). The fix is not a cleverer scan: what gets
+  resolved is **code about to run**, not a file being started, so a script, a reloaded module
+  and a cell all go through `resolveImports`.
+- **The toolbar's Run hit a markdown cell and returned in silence.** `runSelected` runs
+  `doc.selected`, which defaults to the notebook's FIRST cell — markdown in every template we
+  ship, including the notebook the Python project opens with. So the most obvious control in
+  the feature was inert on every freshly opened notebook. **A control that does nothing and
+  says nothing is indistinguishable from a broken backend**: two of the three reports were
+  spent chasing a transport that was healthy, and that is paid in the user's trust rather
+  than in anyone's debugging time. Any handler that can decline must say that it declined.
+- **A FOURTH one was found by review inside the commit that wrote this lesson down**, which is
+  the part to take personally. `MIME_ORDER` ranks `image/svg+xml` above `text/html`, `DataView`
+  sent it to `sanitizeHtml`, and `svg` is not an allowed tag — correctly, it carries script — so
+  an SVG output was stripped to nothing and drew an empty div while the `text/plain` beside it
+  went unread. **A green assertion was pinning it**: the suite asserted `svg` must not be
+  allowlisted, which is true, and was read as settling what an SVG output DOES. Picking the
+  richest representation and rendering it are two decisions and only the first had a gate.
+  Note the shape when a fix requires changing an assertion: change it to the right thing, not
+  to whatever goes green. `svg` is still banned; the figure goes through an `<img>` and a
+  `data:` URL, where the image loader refuses script and external fetches. What closes the
+  class is the invariant, not the branch — `chooseRender` walks a bundle richest-first and
+  **never returns something it can tell draws nothing**, falling through when a renderer
+  produces nothing and naming the MIME types out loud when the bundle runs out. The hedge is
+  the honest limit: empty is decidable, blank is not (see the tally below).
+- **And the FIFTH was inside that invariant's own gate.** `svgDataUrl("")` returned
+  `"data:image/svg+xml;base64,"` — a truthy string with no payload — so an empty figure was
+  still accepted as an image and still drew a blank box. `{ "image/svg+xml": "" }` was already
+  a row in the gate's table, and the predicate was `if (r.kind === "image") return !r.src`:
+  it asked which FIELDS were set, not what a reader would see, so it certified the one
+  violation it enumerated. The guard checks the payload now, and the predicate decodes the data
+  URL and measures content. **An invariant about what a user sees has to be asserted in terms of
+  what a user sees**; a predicate written in the vocabulary of the implementation can only ever
+  agree with it. (An earlier version of this bullet credited the neighbouring PNG branch with
+  having had the right check all along. Measured, it had no check at all in the original commit
+  — the contrast was true only from the commit that introduced the bug it was contrasted with.
+  It is the fifth incident under *A count lives in one place, next to the thing it counts*.)
+- **A SIXTH, and the first that never reached a renderer at all.** `json.dumps` writes bare
+  `NaN` and `Infinity` for out-of-range floats and `JSON.parse` refuses all three, so a frame
+  could serialise perfectly in Python and arrive unreadable: the reader's catch filed it in the
+  collapsed kernel log, the `done` on the next line landed normally, and the cell went idle
+  having shown nothing. Reachable through the ordinary door — `_repr_mimebundle_` passes its
+  values through unconverted, and a missing value in a Vega-Lite or Plotly spec is routine. The
+  kernel's own `<display failed:>` handler could not catch it, because `dumps` SUCCEEDS; the
+  failure is on the far side of the frame boundary, which is why `allow_nan=False` belongs at
+  the writer and not at either end. **Two components agreeing on a format is not the same as one
+  of them emitting only what the other accepts**, and the difference is invisible from either
+  side alone — see *Ask what a policy PERMITS, not only what it forbids*, which is the same
+  question one layer down.
+
+So when a feature crosses a process, a language or a worker, one gate has to run the real
+string through the real components. `scripts/spike-notebook-transport.mjs` (net tier) is that
+gate: the launch string is READ OUT OF `studio-kernel.ts` rather than retyped, the shell,
+launcher, runtime, driver, interpreter, kernel, frame protocol, session and document are the
+shipped bytes, and the only substitution is the VM — a host `child_process` on an OS pipe
+instead of `OP_SPAWN` on a SharedArrayBuffer, with `scripts/lib/notebook-python-child.mjs`
+keeping that read **blocking**, because Pyodide's `input()` reads an EAGAIN answered with `""`
+as EOF. The first two rounds' bugs are pinned in it, the import one as an explicit
+failing-then-passing pair against the launch string it replaced. What is still tab-only,
+and why `python-notebook` keeps `experimental: true`: `bridge.post("term-input")` reaching the
+kernel worker, `kernel.sendStdin` choosing between a parked sync reader and the flowing
+stream, the guest shell forwarding a keystroke over `OP_SPAWN`, and Monaco painting. jsdom is
+not a tab.
+
+**A HARNESS MAY NOT STUB THE CAPABILITY THE DESIGN WAS CHOSEN FOR.** The shell was picked over
+`proc-*` because only a shell can deliver a signal, and for three rounds no tier delivered one:
+the child harness answered `process.on` with `() => proc`, a listener that is never called.
+That stub hid a fatal window. A cell's imports are resolved in JS, in an `await` that can take
+seconds, and the interrupt buffer was armed only around `handleLine` — so during "Loading
+pandas…" nothing was registered, and in the VM **a guest with no registered SIGINT handler is
+terminated rather than signalled** (`packages/runtime/signals.js`; the shell's `\x03` becomes
+`kill`). Pressing stop on a download destroyed the interpreter and every name in it. What came
+out of fixing it generalises:
+
+- The harness now MODELS the kernel's rule instead of stubbing it — no handler means exit,
+  a handler means the interrupt byte plus a delivery on a loop turn, and the guest's
+  `signalHandled` stand-down is printed so a spike can assert the promise that keeps a real
+  kernel alive. `deferInterrupts` in `python.js` holds the signal across the fetch, clears the
+  byte so it cannot land inside Pyodide's own loader Python, and re-delivers it to the cell.
+- **A request is the unit an interrupt belongs to.** CPython raises on whichever bytecode it is
+  running when it next reads the byte, and measurement — not reasoning — showed that bytecode
+  was the kernel's own `emit` of a busy frame, and then, once that was guarded, `json.loads` of
+  the request line (`except Exception` does not catch `KeyboardInterrupt`). Both escapes killed
+  the kernel. Guarding landing sites one at a time is a losing game: `handle_line` wraps the
+  whole request and reports the cell's `KeyboardInterrupt`. But a `try` covers only the code it
+  encloses — its own function-entry check and its own `except` clause are still outside — so the
+  guarantee is made total one level out, where it costs nothing to be total: `driveNotebook`'s
+  `catch` runs for EVERY escape, and asking `terminationFromError` what was raised closes every
+  landing site at once, including the ones nobody has been able to settle by reading. **When you
+  cannot predict where a failure will surface, catch it where everything surfaces and identify
+  it by what it is.** The half a single host thread still cannot reproduce is a byte written by
+  another thread while the interpreter is inside a cell.
+- **A design that accepts duplicates owes the reader a rule for recognising one.** Two reporters
+  for one request is the price of the paragraph above, knowingly paid, and the bill arrived at
+  the other end of the wire. The session's `done` was unconditional, and handling a `done`
+  dispatches the next cell SYNCHRONOUSLY — so a second report of the same interrupt put its
+  error under the cell that had just started, marked that cell finished while the interpreter
+  was still running it, and freed a third to be sent to a busy kernel. Nothing said any of this
+  had happened; the model of which cell is running was simply wrong from then on, which is worse
+  than the reported death the belt was added to prevent. The frames already carried the id, so
+  the fix is one condition — a frame naming a cell other than the one running is dropped and
+  logged — and it closes duplicates and late frames together rather than this one instance. When
+  a design decides that a message may arrive twice, the receiver needs identity, not an
+  assumption about order.
+- **A model is a claim about someone else's code, so it needs a gate of its own.** A rebase onto
+  a shell rewrite hung this tier: `sh` had begun saying `stdio: ['inherit', …]` for its
+  foreground job, and that word means literal fd inheritance on host Node and a question about
+  `isTTY` in the VM. So `child.stdin` was `null` on one side and a writable on the other, the
+  shell's forwarding threw into its own `catch`, and every byte was dropped in silence. The
+  product was never affected — nothing but that forwarding carries terminal bytes to a child
+  there — but note what the tier had actually been asserting for months. Its substitutions were
+  written down as the channel, the SharedArrayBuffer, the worker seam; the one that moved was a
+  **word the host and the VM had always happened to agree about**, which nobody had listed
+  because agreement is invisible. A model does not announce that it has stopped matching, and a
+  hang is the lucky version: had the two meanings diverged in a direction that still delivered
+  most bytes, the tier stays green and stops meaning anything. So the model now carries a gate
+  that tests neither the notebook nor the shell — it measures both meanings of the word and goes
+  red when they part company, which is the only moment worth checking. **Whatever your harness
+  substitutes, assert the substitution, not just the thing it stands in for.**
+
+### A new gate is not evidence until it has been run against the bug
+
+Six gates written in the MR above were **green against the build they were added to fail
+against**, and one of them was inside the fix for another. Each was written by someone who had
+just finished understanding the bug, which is exactly when a plausible-looking assertion is
+easiest to write and hardest to doubt. Two of the six were not written to fail against a
+specific build at all, and that turns out to be the distinction the rest of this section rests
+on, so it is drawn where it applies rather than assumed here.
+
+So the last step of a fix is not "the suite is green". It is **stash the fix, run the new gate,
+watch it fail, put the fix back** — and if it does not fail, the gate is testing something else
+and the bug is still unguarded. Cheap here because production code lives in plain `.js` and
+`.py` that a spike drives directly: `git show <base>:<file> > <file>`, run, restore. A minute a
+gate, and it is worth reading the failure rather than just seeing red: the message names which
+rows failed, and a gate that goes red for the wrong reason is the next version of this problem.
+
+**The tally, because the procedure has to be argued for out of what happened rather than out of
+the tidier version of it.** Three of the six were caught by running the gate; three were caught
+by a reviewer, each after the gate had landed and been offered as evidence.
+
+- Caught by running it: the first `<style>` gate, which used the shape the HTML parser hoists
+  into `<head>` and so exercised the safe placement. The never-draws-nothing predicate's
+  whitespace row, which passed because `"  \n"` encodes to eight perfectly good base64
+  characters. And the transport tier's ordering assertion, where `indexOf` answers `-1` for a
+  string that is not there and `-1 < anything` is true, so the obvious spelling of "reports the
+  interrupt before it reports a death" passes with the whole belt deleted.
+- Caught by review: the assertion that `svg` must not be allowlisted, which was true and was
+  read as settling what an SVG output does. The never-draws-nothing predicate itself, which
+  tested `!r.src` — the presence of a URL — against a table that already contained the
+  empty-payload row. And, in the round that wrote this section, one of the five assertions
+  covering the duplicate-frame guard: "the cell it belongs to says it once" stays green without
+  the guard, because the misattributed error lands on the NEXT cell, so the first still has
+  exactly one. Four of those five are red; that one is green for a reason other than the one
+  intended, which the run reported and the author did not read.
+
+The split is the argument, and the last member is the one that says what the procedure is
+actually worth. **The procedure was run for it.** Not skipped, not intended — the fix was
+stashed, the gate was run, the run went red, and the report claimed five red assertions where
+four were red and the fifth was green for a reason nobody looked at. So this is not a sixth
+case of not doing the step. It is the case that says doing the step is not the whole of it:
+**a gate that goes green in a red run is the same problem as a gate that never goes red.** Read
+the failures per assertion and count them; a colour is not a reading.
+
+**Two of** the three the procedure did not catch were written to *characterise* something rather
+than to fail against a specific broken build, and they are the ones that reached a reviewer
+wearing a green tick. A gate that has never been red is a comment with a green tick next to it.
+
+### A harness that BUILDS the code differently is not a harness for that code
+
+The round above ends with a view tier that mounts the shipped component, drives it under
+`<StrictMode>` because that is what the studio renders under, imports the real store and the
+real sanitiser, and stubs only leaves. It was written carefully and it was still testing a
+program this repo does not serve, because **it bundled the component with esbuild and the
+studio bundles it through the React Compiler** (`packages/studio/vite.config.ts`). The compiler
+memoises on identity; `NotebookDoc` mutates in place and bumps a version. So in the browser the
+notebook never repainted — press Run, nothing appears, switch tabs and back and the output is
+there — while a dozen assertions in the view tier said "printed output reaches the page", and
+had said so through every review of the commit that introduced them.
+
+The tell was that every link read correct. The store notified, the subscription was live, the
+document had the data, and there is no `React.memo` in the file. When every line you can read
+is right and the behaviour is wrong, **stop reading the source and read what is served**: the
+memo caches and their dependency lists are in the compiler's output, and the bug was written
+out in it in two `if ($[n] !== …)` lines.
+
+The general form, and it is not about React. A harness substitutes an environment, and the list
+of substitutions everyone checks is the interesting ones — the transport, the worker, the VM.
+The build is not on that list, because a build is supposed to preserve meaning. Optimising
+compilers preserve meaning **only for code that honours their assumptions**, and a mutable
+store shared with a compiler that assumes immutability does not. So: whatever transforms the
+shipped artefact — a compiler plugin, a minifier's property mangling, a bundler's tree shaking,
+`NODE_ENV` — either runs in the harness too, or is written down as a substitution and asserted,
+the same as any other. This one is now both: the view spike runs the plugin, and it asserts the
+bundle came out carrying memo caches, because a plugin that silently stops applying puts the
+tier straight back where it was.
+
+Note also what it cost to notice. Two of that round's four defects were inside jsdom's reach
+the whole time and were found by a user in a tab, which is the same shape as the entry above —
+a suite thick at both ends of something and never run down the middle. There the middle was a
+wire. Here it was the toolchain.
+
+The list above is the ONE enumeration of these six. Anywhere else that reasons about them —
+`roadmap.md` does — names this list rather than restating it, for the reason in the next
+section, which this tally is the worked example of.
+
+**And they are all in the same half of the feature, which is the most useful thing the list
+says.** Every one is in the part that is modelled or reasoned about — a sanitiser policy, a
+render decision, a predicate over a table, a session's bookkeeping — and not one is in the part
+a real interpreter executes. That is not luck. A model agrees with the reasoning that built it,
+so a gate written against a model can only disagree with its author by accident, while a gate
+that runs Python either produces the value or does not. It says which claim about this feature
+to distrust, and it is not a claim about the code: **it is the claim that the transport works.**
+Every tier substitutes the channel — a host pipe for `OP_SPAWN` on a SharedArrayBuffer — and the
+substitution sits exactly where the design's difficulty is: the synchronous syscall,
+`Atomics.wait`, the worker seam, `\x03` → SIGINT → `Py_EmscriptenSignalBuffer`. "The transport
+tier is green" means the framing, the launch string and the read loop are right *about a channel
+that behaves as described*. Nothing here has yet been wrong about the interpreter.
+
+**Where an invariant can honestly stop.** The one those gates guard is that `chooseRender`
+never returns something *it can tell* draws nothing, and the hedge is load-bearing. Emptiness
+is decidable — no bytes, no text, no elements — and it is what shipped both of the blank boxes
+above: the stripped SVG and the empty payload.
+Blankness is not: `{"image/svg+xml": "<svg/>"}` is a well-formed document that paints nothing,
+and knowing that requires laying it out, which nothing outside a browser can do. So the code
+stops at the decidable line, correctly, and the invariant should be stated at that line too.
+Note also that the spike's predicate is *stricter* than the implementation — it scores
+`<div></div>` as blank — so what holds the table green is the rows it chooses, not agreement
+between the two. Read that as a limit on the table rather than as slack.
+
+### Ask what a policy PERMITS, not only what it forbids
+
+An allowlist is reviewed by attacking it: pick a thing it refuses, find a way to smuggle that
+thing past. Both holes found that way in the notebook's HTML policy were real (`<style>`'s
+raw-text content, `<template>`'s unwalkable fragment), and the habit is worth keeping. But it
+can only ever find things the policy already has an opinion about, and twelve review passes over
+that file did not turn up the third hole, which was sitting in what the policy plainly allowed:
+the `style` attribute, refused for `url(` and otherwise waved through, is enough to cover the
+whole IDE with a fake sign-in panel. **The policy modelled execution and egress and had no
+category for layout** — so no amount of asking "can I get a script through" was going to reach
+it, because painting is not script.
+
+The question that does reach it is *what can a document do with exactly what I allow?* Run it
+against each permitted thing in turn and describe the worst honest use of it, in the vocabulary
+of the reader rather than of the check. The incident and the fix are in `roadmap.md`; the part
+that generalises is that a policy has categories it has never named, and the ones it has never
+named are not on the list you are reviewing.
+
+Related, and the reason the fix was containment rather than another refusal: **when the answer
+is a denylist of names, the category is usually the wrong size.** Refusing `position` and
+`z-index` would have missed `transform`, sticky positioning and negative margins, all measured
+in minutes, and would have been a regex over CSS text disagreeing with the renderer — the way
+sanitisers are always defeated. Bounding the whole category with `contain: layout paint` costs
+nothing for the case the attribute exists for and does not need a list to be complete.
+
+### A count lives in one place, next to the thing it counts
+
+Five separate corrections in that one MR were the same defect in prose, and none of them was a
+typo. In order: an attribution inverted (two catches credited to a procedure that made one);
+"four" written directly above a list of five; a count expanded from five to six that left a
+generalisation standing over three cases when it had only ever been true of two; a count
+corrected from four to five in one sentence, leaving its twin eight lines below in the same
+docblock still saying "those four"; and a claim that a neighbouring branch had "the right check
+the whole time", true of a later commit — the guard and the bug had arrived together — and
+never true of the one it was written about, which is what the measurement behind the fourth
+correction established.
+
+Every one has the same shape: **the claim lived in more than one sentence and only one copy was
+maintained.** Three clauses cover all five.
+
+1. **A count lives in exactly one place, next to the enumeration it counts.** Every sentence
+   outside that place names the enumeration instead of repeating the number. This is what makes
+   "four" over a list of five impossible to write, a stale twin impossible to leave, and an
+   attribution checkable — there is one list to check it against, and it is the list the reader
+   is already looking at.
+2. **Prefer naming the members to counting them, unless the number is doing work.** A name
+   cannot go stale without the thing it names changing; a number goes stale from a distance. "It
+   shipped both of the boxes above: the stripped SVG and the empty payload" survives a
+   recount that "it shipped four blank boxes" does not. When a number IS doing work — the flat
+   rate of one bad gate per review pass is an argument, and it needs the rate — keep it and put
+   it next to its enumeration, per clause 1. When it is not, delete it: a `FrameReader` entry
+   here said "this MR has now had five review passes" in a sentence arguing that a one-word fix
+   deserves its own review, which is equally true at one pass or at ten. It now says "several
+   review passes deep **on other subjects**", which is both unfalsifiable-by-time and the thing
+   the number never said — the *reason* such a fix rides in on an unrelated approval.
+3. **When a count changes, grep the number AND go looking for whatever else the correction
+   invalidated, wherever it lives.** The fifth incident is what the missing half looks like:
+   correcting the count required measuring the original commit, and that measurement retired a
+   claim written down in two places — one of them a hundred-odd lines from the count in the same
+   file, the other in a different file entirely, and the write-up of the measurement in a third
+   place again. Both copies survived, because neither contained a digit and no search for the
+   number would ever have surfaced either. A count is usually load-bearing for prose that never
+   mentions it, and that prose is not nearby — "re-read the surrounding text" was tried twice
+   here and is exactly the check that missed both times. Search for the claim, not for the
+   paragraph you are standing in. What to type, since this MR answered that twice without
+   writing it down: **grep the retracted fact's own idiom, repo-wide.** A restated fact reuses
+   its own phrasing, so "whole time", "all along", "had that check", "known to be necessary"
+   found the surviving copy in the other file in seconds, where two rounds of reading nearby
+   had not. The wording is the handle; the number never was.
+
+**And "one place" is about where the restatements live, not about how many there are.** The
+section above says "six" in several sentences, which is fine: they sit inside the one section,
+beside the enumeration, where a recount edits them together and a reader sees the list they
+refer to. The rule is broken by a restatement in another file, not by a digit appearing twice
+on a screen. Worth stating, because the obvious verification — grep the number, count the hits
+— answers a different question than the one the rule asks: run that way, this material was
+reported as "the count appears exactly once" while `six` was on six lines of these two sections
+at `9cdb7e8`, and the rule was satisfied anyway. **Make the check match the claim**, which is
+clause 3 one level up.
+
+That figure needs its own check named, which is the joke and also the point. Its scope is this
+section plus *A new gate is not evidence until it has been run against the bug* directly above,
+which is where the tally and every restatement of it live. Six is `rg -ci six` over those two;
+`rg -ci '\bsix\b'` says five, because one of the six lines says "sixth". Neither is wrong and
+they answer different questions, so a count is only checkable when the command that produced it
+is written beside it — and a count reported without one is a number
+somebody will re-derive differently and then have an argument about. Run either command against
+HEAD and it answers higher, because these two paragraphs are about the word and keep saying it;
+that is why the figure is pinned to a commit rather than to "now". A count with a command and a
+revision beside it is the only kind a reader can check without trusting whoever wrote it. The
+first draft of this paragraph asserted how much higher, and writing the sentence made it wrong.
+
+The blank-box COUNT was single-homed under this rule and has needed no correction since; the
+gate tally in the section above was not, and produced two more findings before it was.
+
+And then the fifth incident corrected itself once more, which is the strongest thing in this
+section. Its diagnosis is that the claim lived in more than one sentence and only one copy was
+maintained — and the commit that wrote that sentence maintained one copy. The other was in
+`roadmap.md`, where the same retracted fact had been *spent*: two branches side by side, one of
+them proof that the check was known to be necessary, an inference with nothing under it once
+the fact went. A correction is an edit to a claim, not to a paragraph, and a claim does not
+live where you happen to be reading. **Do not trust a rule's section to have applied the rule
+to itself**; this one demonstrably did not, twice, and it is more useful for saying so than it
+would be with a clean record.
+
 ### A handle's close callback is a loop PHASE, not a nextTick
 
 When a binding hands lib/net.js a `close(cb)`, `cb` must not run on the tick queue.

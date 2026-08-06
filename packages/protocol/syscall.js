@@ -83,6 +83,10 @@ export const OP_FTRUNCATE = 18;
 // the single field is a JSON spec {command,args,cwd,env,capture} and the OK
 // response is JSON {code,stdout,stderr,pid}. This is how execSync/spawnSync work:
 // the parent parks on Atomics.wait while the kernel drives the child to exit.
+// Python's `subprocess.run()` is the same call: one spawn, blocks, returns an exit
+// code — which is why `run` could be implemented over this and `Popen`, whose whole
+// contract is returning early, could not (see SUBPROCESS_SOURCE in
+// runtime/builtins/python.js).
 export const OP_SPAWN = 20;
 
 // async process control (Phase 2 #15). Unlike OP_SPAWN, these DO NOT park the

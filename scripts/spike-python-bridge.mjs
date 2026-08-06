@@ -57,13 +57,17 @@ import {
   PYTHON_EXECUTABLE,
   STATIC_SERVER_SOURCE,
   byteWriter,
-  dataPackagesFor,
+  hiddenImportsFor,
   installBlockingPatch,
   installMatplotlibShow,
   installStdin,
   installUrllib3RealmPatch,
   flushStreams,
+  resolveImports,
   setupSource,
+  reloadSource,
+  SUBPROCESS_SOURCE,
+  PYCACHE_PREFIX,
   terminationFromError,
 } from "../packages/runtime/builtins/python.js";
 import {
@@ -83,6 +87,7 @@ import {
   walkHost,
   walkPyodide,
 } from "../packages/runtime/builtins/python-store.js";
+import { NB_KERNEL_PATH, NB_KERNEL_PY } from "../packages/studio/src/vv/notebook/kernel-source.js";
 import { readShippedTemplates, readTemplatesSource } from "./lib/shipped-templates.mjs";
 import { CPYTHON_EXITS, CPYTHON_REPL_EXITS, UNTRUNCATED, realCPythonReplExit } from "./lib/cpython-exit.mjs";
 import { MODELLED_FRAGMENTS, normalize } from "./lib/urllib3-emscripten.mjs";
@@ -315,6 +320,27 @@ const CASES = {
   // What a served app writes, including a SQLite database, reaching the host —
   // and the FS tracking hooks the offline mirror gate is built on.
   "serve-persist": { kind: "serve-persist", synthetic: true },
+  // --reload's re-import on the interpreter it actually ships on: the version
+  // the offline tier's host CPython is standing in for, over Emscripten's MEMFS,
+  // with the bytecode cache configured the way the runtime configures it.
+  "reload": { kind: "reload", synthetic: true },
+  // The wheels the vendor script was told to carry, actually imported and used.
+  // The offline tier can only check the LIST; whether scipy links, whether
+  // scikit-learn fits, and whether pandas can reach openpyxl are facts about the
+  // wheels, and this is the only tier that has them.
+  "sci-stack": { kind: "sci-stack", synthetic: true },
+  // A notebook CELL, in the environment a cell actually runs in: the shipped
+  // kernel program handed to eval_code_async, with no __file__ anywhere, and its
+  // imports resolved per cell by the shipped resolver. Both of the notebook bugs
+  // the browser found are here as failing-then-passing pairs, because neither is
+  // reachable from a harness that runs the kernel as a file under host CPython —
+  // which is what scripts/spike-notebook.mjs, alone, was.
+  "notebook-cell": { kind: "notebook-cell", synthetic: true },
+  // subprocess, on the interpreter it ships on. The offline tier runs the same
+  // source under the host's CPython, which proves the semantics; this proves the
+  // patch takes on Pyodide's `subprocess` — a module that arrives out of
+  // python_stdlib.zip and whose execution path is the one that raises Errno 138.
+  "subprocess": { kind: "subprocess", synthetic: true },
 
   // jedi and black on a real interpreter, judged against the SAME driver run
   // under the CPython on this host.
@@ -862,6 +888,346 @@ str(sorted(f for f in os.listdir('/w') if f.startswith('tx.db')))
       `an open transaction leaves a journal on disk (${mid}) — so a mid-transaction copy carries its own rollback`);
   }
 
+  // --- --reload's re-import, on the interpreter it ships on ------------------
+  if (spec.kind === "reload") {
+    // The offline tier runs this same source under the host's CPython, which is
+    // a different version over a different filesystem. Three of the things it
+    // depends on are properties of THIS interpreter and not of Python in
+    // general, so they are checked where they are true: the bytecode cache is
+    // configured here the way the runtime configures it (sys.pycache_prefix set,
+    // dont_write_bytecode unset — upstream Pyodide ships it set), the filesystem
+    // is Emscripten's MEMFS, and the version is whatever Pyodide is pinned to.
+    py.FS.mkdirTree("/rl");
+    py.FS.mkdirTree(PYCACHE_PREFIX);
+    py.FS.writeFile("/rl/helper.py", new TextEncoder().encode('VALUE = "v1"\n'));
+    py.FS.writeFile("/rl/main.py", new TextEncoder().encode('import helper\napp = "app-" + helper.VALUE\n'));
+    // Exactly what BYTECODE_DIR's installBytecodeCache does, and the reason the
+    // stale-.pyc problem is sharper here than on a stock interpreter.
+    py.runPython(
+      `import sys\nsys.dont_write_bytecode = False\nsys.pycache_prefix = ${JSON.stringify(PYCACHE_PREFIX)}\n` +
+      `if "/rl" not in sys.path: sys.path.insert(0, "/rl")\n`,
+    );
+    py.runPython(`import importlib\n_vv_app = getattr(importlib.import_module("main"), "app")`);
+    ok(py.runPython("_vv_app") === "app-v1", "the app imports on the real interpreter");
+
+    // The generated source has to be accepted by THIS CPython, not only by the
+    // host's — a different minor version with different syntax rules.
+    py.runPython(reloadSource("main", "app", "/rl"));
+    const pyc = py.runPython(`import importlib.util as u; u.cache_from_source("/rl/helper.py")`);
+    ok(String(pyc).startsWith(PYCACHE_PREFIX),
+      `the bytecode this runtime writes for a user module really is under the prefix (${pyc}), which is where the reload has to look for it`);
+    ok(py.runPython(`import os; os.path.exists(${JSON.stringify(String(pyc))})`) === true,
+      "…and it really was written, so there is a stale .pyc to invalidate rather than a hypothetical one");
+
+    // The case that made dropping the bytecode necessary: same byte length, and
+    // inside the same whole second as the write it replaces.
+    const st = py.FS.stat("/rl/helper.py");
+    py.FS.writeFile("/rl/helper.py", new TextEncoder().encode('VALUE = "v2"\n'));
+    const st2 = py.FS.stat("/rl/helper.py");
+    ok(st.size === st2.size, "the edit leaves the file the same size");
+    ok(Math.floor(st.mtime / 1000) === Math.floor(st2.mtime / 1000),
+      "…and lands in the same whole second, which is all a .pyc's staleness check compares");
+    ok(py.runPython("_vv_reload()") === "", "the reload reports no error");
+    ok(py.runPython("_vv_app") === "app-v2",
+      "…and the same-length edit IS picked up on the real interpreter, which is only true because the .pyc was dropped");
+
+    // The contract the feature rests on, on the real thing.
+    py.FS.writeFile("/rl/main.py", new TextEncoder().encode('import helper\napp = "broken" +\n'));
+    const detail = py.runPython("_vv_reload()");
+    ok(/SyntaxError/.test(String(detail)), `a broken save fails the reload with CPython's own error (${String(detail).trim().split("\n").pop()})`);
+    ok(py.runPython("_vv_app") === "app-v2", "…and the app that was serving is still bound");
+    ok(py.runPython(`"main" in __import__("sys").modules`) === true,
+      "…with the previous module restored to sys.modules, not left missing");
+
+    py.FS.writeFile("/rl/main.py", new TextEncoder().encode('import helper\napp = "fixed-" + helper.VALUE\n'));
+    ok(py.runPython("_vv_reload()") === "" && py.runPython("_vv_app") === "fixed-v2",
+      "and a corrected save reloads normally afterwards");
+
+    // Only the project's modules. Getting this wrong would purge site-packages
+    // and re-import the framework on every keystroke.
+    const owned = py.runPython(`str(sorted(_vv_project_modules()))`);
+    ok(/helper/.test(owned) && /main/.test(owned), `the project's modules are the ones re-imported (${owned})`);
+    ok(!/'sys'|'json'|'importlib'/.test(owned), "…and the stdlib is not, though it is loaded and would be far more expensive");
+  }
+
+  // --- subprocess, on the interpreter that actually ships -------------------
+  if (spec.kind === "subprocess") {
+    // First, the failure being replaced — on this interpreter, unpatched. If this
+    // ever stops raising, the patch has become unnecessary and should go, and a
+    // spike that only tested the patch would never notice.
+    const before = py.runPython(`
+import subprocess
+_vv_before = "no error at all"
+try:
+    subprocess.run(["echo", "hi"])
+except BaseException as exc:
+    _vv_before = type(exc).__name__ + ": " + str(exc)
+_vv_before
+`);
+    ok(/OSError|NotImplementedError|Errno/.test(before), `unpatched, this interpreter refuses to spawn (${String(before).slice(0, 70)})`);
+    ok(/138|processes/.test(String(before)),
+      "…with the error the docs quote, so the thing being fixed is the thing that was documented");
+
+    // Now the shipped source, with a stand-in for the syscall. Pyodide's
+    // subprocess is a real stdlib module out of the zip, so this is the patch
+    // meeting the module it will actually meet.
+    py.runPython(SUBPROCESS_SOURCE);
+    const install = py.globals.get("_vv_install_subprocess");
+    const seen = [];
+    const PRESENT = ["python", "pytest", "ruff", "sh"];
+    install(
+      (specJson) => {
+        const s = JSON.parse(specJson);
+        seen.push(s);
+        // The kernel resolves a command against /bin and PATH and answers ENOENT
+        // when there is nothing to run, which is the branch the message under test
+        // exists for — so the stand-in has to be able to say no.
+        if (!PRESENT.includes(s.command)) return JSON.stringify({ enoent: true });
+        return JSON.stringify({ code: 0, stdout: "from the child", stderr: "" });
+      },
+      () => JSON.stringify(PRESENT),
+      () => 0,
+      3,
+    );
+    if (install.destroy) install.destroy();
+
+    const captured = py.runPython(`
+import subprocess
+subprocess.run(["python", "-m", "pytest"], capture_output=True, text=True).stdout
+`);
+    ok(captured === "from the child", `the patch takes on Pyodide's own subprocess module (${JSON.stringify(captured)})`);
+    ok(seen.length === 1 && seen[0].command === "python" && seen[0].args.join(" ") === "-m pytest",
+      "…and the spec that crossed to JS is the argv Python was given");
+    // A JS function called from Python, returning a value Python reads: the same
+    // conversion the HTTP bridge relies on, checked here because a PyProxy or a
+    // JsProxy leaking through would work in the offline tier and not in Pyodide.
+    ok(typeof seen[0].inherit === "boolean" && seen[0].inherit === false,
+      "…including the booleans, which crossed as JSON rather than as a proxy");
+
+    const rc = py.runPython(`
+import subprocess
+subprocess.run(["ruff", "check"]).returncode
+`);
+    ok(rc === 0, "the exit code comes back as an int");
+
+    const enoent = py.runPython(`
+import subprocess
+_vv_enoent = "no error at all"
+try:
+    subprocess.run(["git", "status"])
+except FileNotFoundError as exc:
+    _vv_enoent = exc.strerror
+_vv_enoent
+`);
+    ok(/no program named 'git' exists in this Vivari VM/.test(String(enoent)),
+      "the not-found message survives the trip through Pyodide intact");
+
+    const popen = py.runPython(`
+import subprocess
+_vv_popen = "no error at all"
+try:
+    subprocess.Popen(["uvicorn", "app:app"])
+except NotImplementedError as exc:
+    _vv_popen = str(exc)
+_vv_popen
+`);
+    ok(/does not return until the child has exited/.test(String(popen)), "…and so does the Popen refusal");
+
+    // The types are Pyodide's own, not something this patch built.
+    ok(py.runPython(`import subprocess; subprocess.CalledProcessError.__module__ == "subprocess"`) === true,
+      "CalledProcessError is still the stdlib's class on this interpreter too");
+
+    // Redirecting to a file picks text or bytes off the stream's own type, so it
+    // depends on `io.TextIOBase` being the class Pyodide's io actually uses. That
+    // is the one thing in this patch that a differently-built stdlib could break,
+    // and the offline tier checks it against a different CPython than the one
+    // that ships.
+    const sunk = py.runPython(`
+import io, subprocess
+_vv_t, _vv_b = io.StringIO(), io.BytesIO()
+subprocess.run(["ruff", "check"], stdout=_vv_t)
+subprocess.run(["ruff", "check"], stdout=_vv_b)
+[_vv_t.getvalue(), _vv_b.getvalue().decode()]
+`);
+    const sunkList = sunk && sunk.toJs ? sunk.toJs() : sunk;
+    ok(String(sunkList[0]) === "from the child" && String(sunkList[1]) === "from the child",
+      "a file object handed to stdout= is written to on this interpreter, text or binary");
+    if (sunk && sunk.destroy) sunk.destroy();
+  }
+
+  // --- the scientific stack the vendor script now carries -------------------
+  if (spec.kind === "sci-stack") {
+    // Vendoring is two claims, and the offline tier can only check the first: the
+    // NAME is in the list, and the WHEEL does what the name promises. scipy is a
+    // compiled Emscripten wheel — it either links under this interpreter or it
+    // does not, and a list cannot tell you which.
+    await ensure(["scipy", "scikit-learn", "joblib", "threadpoolctl"]);
+    const scipyV = py.runPython(`import scipy; scipy.__version__`);
+    ok(/^\d+\.\d+/.test(String(scipyV)), `scipy imports on the real interpreter (${scipyV})`);
+    // A compiled entry point, not just the package __init__: scipy's value is its
+    // Fortran/C kernels, and an import that works while linalg does not would be
+    // the misleading pass here.
+    const solved = py.runPython(`
+import numpy as np
+from scipy import linalg
+str(np.round(linalg.solve(np.array([[3.0,1.0],[1.0,2.0]]), np.array([9.0,8.0])), 6).tolist())
+`);
+    ok(solved.includes("2.0") && solved.includes("3.0"), `…and scipy.linalg solves a system (${solved.trim()})`);
+
+    const skl = py.runPython(`
+from sklearn.linear_model import LinearRegression
+import numpy as np
+m = LinearRegression().fit(np.array([[1.0],[2.0],[3.0],[4.0]]), np.array([3.0,5.0,7.0,9.0]))
+str((round(float(m.coef_[0]), 6), round(float(m.intercept_), 6)))
+`);
+    ok(/2\.0/.test(skl) && /1\.0/.test(skl), `scikit-learn fits a model and gets the right answer (y = 2x + 1 -> ${skl.trim()})`);
+    // The dependency the lock declares for scikit-learn and nothing else pulls in.
+    ok(py.runPython(`import joblib, threadpoolctl; joblib.__version__ != ""`) === true,
+      "…with joblib and threadpoolctl, which are only here because scikit-learn needs them");
+
+    // openpyxl: the round trip pandas users actually do. This is the assertion
+    // that would have failed if the wheel had been vendored without the
+    // HIDDEN_IMPORTS entry, because nothing in this source names openpyxl.
+    await ensure(["pandas", "openpyxl", "et-xmlfile"]);
+    const excel = py.runPython(`
+import pandas as pd
+pd.DataFrame({"n": [1, 2, 3], "s": ["a", "b", "c"]}).to_excel("/tmp/book.xlsx", index=False)
+back = pd.read_excel("/tmp/book.xlsx")
+str((list(back.columns), back["n"].sum(), list(back["s"])))
+`);
+    ok(/'n', 's'/.test(excel) && /6/.test(excel), `pandas writes and reads a real .xlsx through openpyxl (${excel.trim()})`);
+    // And the failure this replaces was pandas' own "Missing optional dependency"
+    // — so the engine really is openpyxl rather than something else answering.
+    ok(py.runPython(`import openpyxl; openpyxl.__version__`).startsWith("3."),
+      "…and the engine doing it is the pinned openpyxl, not a fallback");
+
+    // The source-scan half, on the real thing: what the runtime would have loaded
+    // for a script that reads a spreadsheet.
+    ok(hiddenImportsFor("import pandas as pd\npd.read_excel('b.xlsx')").includes("openpyxl"),
+      "the runtime's own scan asks for openpyxl on a source that never mentions it");
+  }
+
+  // --- a notebook cell, in the environment a notebook cell runs in -----------
+  if (spec.kind === "notebook-cell") {
+    // The kernel is started the way the runtime starts it and NOT the way the
+    // offline spike does: eval_code_async over the source, in a namespace whose
+    // __name__ is not "__main__". Everything the browser found came out of that
+    // difference, so it is reproduced rather than described.
+    py.FS.writeFile(NB_KERNEL_PATH, new TextEncoder().encode(NB_KERNEL_PY));
+    const ns = py.toPy({ __name__: "vv_notebook_kernel" });
+    await py.runPythonAsync(NB_KERNEL_PY, { filename: NB_KERNEL_PATH, globals: ns });
+    // The environment gap itself, asserted rather than assumed: if some future
+    // Pyodide DID define __file__ here, the pair of tiers would stop differing and
+    // this case would quietly go back to proving what the offline one proves.
+    ok(ns.get("__file__") === undefined,
+      "the kernel module has no __file__ in this environment — the fact the offline tier cannot see");
+
+    const fn = (name) => {
+      const f = ns.get(name);
+      ok(!!f, `the kernel program exposes ${name}() to its driver`);
+      return f;
+    };
+    const [start, sourceOf, handleLine, loading] =
+      ["start", "source_of", "handle_line", "loading"].map(fn);
+
+    // Frames, off the same stdout the runtime's FrameReader reads.
+    const frames = () => {
+      const text = out.join("");
+      out.length = 0;
+      return text.split("\n").filter((l) => l.startsWith("\x1e")).map((l) => JSON.parse(l.slice(1)));
+    };
+    const warns = [];
+    const toCell = { messageCallback: (m) => loading(String(m)), errorCallback: () => {} };
+    // The driver's step, minus the timer: resolve the cell's imports, then exec it.
+    const cell = async (id, source, { resolve = true } = {}) => {
+      const line = JSON.stringify({ op: "run", id, source });
+      const src = String(sourceOf(line) || "");
+      if (resolve && src) await resolveImports(py, src, toCell, (m) => warns.push(m));
+      const more = handleLine(line);
+      flushStreams(py);
+      return { more, frames: frames() };
+    };
+    const kind = (fs_, t) => fs_.filter((f) => f.t === t);
+
+    start();
+    const ready = frames();
+    ok(ready.length === 1 && ready[0].t === "ready" && /^3\./.test(ready[0].python || ""),
+      `the kernel starts and announces itself (${JSON.stringify(ready[0] || null)})`);
+
+    // ── Bug 1, reproduced: the user's first cell, whose import does not exist ──
+    // Before the fix this raised inside _traceback (NameError: __file__) and took
+    // the interpreter with it, so the notebook received no frame at all.
+    const boom = await cell("c1", "import definitely_not_a_real_module_xyz\n");
+    const err = kind(boom.frames, "error")[0];
+    ok(!!err && err.ename === "ModuleNotFoundError",
+      `a cell whose import fails comes back as an error frame (${err ? err.ename : "NO FRAME AT ALL"})`);
+    ok(boom.more === true && kind(boom.frames, "done")[0]?.status === "error",
+      "…the cell is reported done, and the kernel is still running");
+    // _SELF matched real code objects here. If it had not, the user's traceback
+    // would open on the kernel's own frames — which is what the trimming exists
+    // for and what a wrong filename silently switches off.
+    ok(!!err && err.traceback.every((l) => !l.includes(NB_KERNEL_PATH)),
+      `…and the traceback is the cell's frames only, with none of the kernel's (${JSON.stringify(err?.traceback?.[0] ?? null)})`);
+    ok(!!err && err.traceback.some((l) => l.includes("<cell c1>")),
+      "…and it names the cell, so the user can see where in it the error was");
+
+    // ── Bug 2, reproduced: a vendored package a cell imports ──────────────────
+    // First WITHOUT the per-cell resolution, which is exactly what shipped: the
+    // cell's source is invisible to the scan that ran over the kernel's own
+    // source, so the wheel is never fetched and the import fails on a package the
+    // build carries.
+    const unresolved = await cell("c2", "from PIL import Image\nImage.new('RGB', (2, 2)).size\n", { resolve: false });
+    ok(kind(unresolved.frames, "error")[0]?.ename === "ModuleNotFoundError",
+      "a cell importing a package in the index fails when nothing resolved the CELL's imports (the bug)");
+    // Then with it. Same cell, same interpreter, one await in front of the exec.
+    const resolved = await cell("c3", "from PIL import Image\nImage.new('RGB', (2, 2)).size\n");
+    ok(kind(resolved.frames, "error").length === 0,
+      "…and succeeds when the driver resolves them first, which is the fix");
+    const shown = kind(resolved.frames, "result")[0];
+    ok(shown?.data?.["text/plain"] === "(2, 2)",
+      `…returning the cell's value to the notebook (${JSON.stringify(shown?.data?.["text/plain"] ?? null)})`);
+    // What the user sees during the wait, from the real loader rather than a fake
+    // one: Pyodide's own progress text, on the cell, naming what is being fetched.
+    const load = kind(resolved.frames, "loading");
+    ok(load.length > 0 && /Pillow/i.test(load.map((f) => f.text).join(" ")),
+      `…and the wait is explained on the cell while it happens (${JSON.stringify(load[0]?.text ?? null)})`);
+
+    // The heavier one the user actually typed, with its rich display.
+    const pandas = await cell("c4", "import pandas as pd\npd.DataFrame({'n': [1, 2, 3]})\n");
+    ok(kind(pandas.frames, "error").length === 0, "`import pandas as pd` in a cell works");
+    const df = kind(pandas.frames, "result")[0];
+    ok(/<table/.test(df?.data?.["text/html"] || ""), "…and a DataFrame renders as the HTML table a notebook shows");
+    // One namespace across cells, on the real interpreter: the thing a notebook is.
+    const later = await cell("c5", "print(pd.__name__, len(pd.DataFrame({'n': [1]})))\n");
+    // Joined, because a frame is one WRITE and print() writes its separator and its
+    // newline separately — the property that lets a progress bar redraw a line.
+    const printed = kind(later.frames, "stream").map((f) => f.text).join("");
+    ok(printed === "pandas 1\n", `…and a later cell still sees it, so cells share one interpreter (${JSON.stringify(printed)})`);
+
+    // A package the index does NOT have, which is the other half of the hybrid
+    // lock. The name is asked for (pandas' read_excel imports openpyxl at call
+    // time, which no scan can see), Pyodide refuses it, and the runtime turns that
+    // refusal into a sentence naming the package and the fix. The regex that reads
+    // Pyodide's wording is only trustworthy against Pyodide's real wording.
+    warns.length = 0;
+    const excel = await cell("c6", "import pandas as pd\npd.read_excel('/tmp/nope.xlsx')\n");
+    ok(warns.some((w) => /openpyxl is not in this build's package index/.test(w)),
+      `a hidden import missing from the index is reported, not swallowed (${JSON.stringify(warns[0] ?? null)})`);
+    ok(warns.some((w) => /npm run vendor:pyodide -- --force/.test(w)),
+      "…with the command that fixes it, since only a broken vendored build gets here");
+    // …and the cell itself still comes back. A missing package is a cell error.
+    ok(kind(excel.frames, "error").length === 1 && excel.more === true,
+      "…and the cell reports its own failure without ending the kernel");
+
+    // Interrupting is not asserted here: SharedArrayBuffer interrupt delivery
+    // needs the real worker, and `python-interrupt` covers that seam separately.
+    const bye = await cell("c7", "1\n");
+    ok(kind(bye.frames, "result")[0]?.data?.["text/plain"] === "1", "the kernel is still healthy after all of that");
+    ok(sourceOf(JSON.stringify({ op: "shutdown" })) === "",
+      "a shutdown line resolves no imports — the driver asks the protocol, not the JSON");
+    ok(handleLine(JSON.stringify({ op: "shutdown" })) === false, "…and stops the kernel when the front end sends it");
+  }
+
   // --- the editor's language service, against the host's own CPython ---------
   if (spec.kind === "language-service") {
     // Two interpreters, ONE driver. Everything below runs the shipped
@@ -1405,9 +1771,9 @@ await main()
     // kernel half.
 
     // ZoneInfo, which needs a wheel nothing imports by name.
-    ok(dataPackagesFor("from zoneinfo import ZoneInfo").includes("tzdata"),
+    ok(hiddenImportsFor("from zoneinfo import ZoneInfo").includes("tzdata"),
       "source that mentions zoneinfo asks for tzdata");
-    await ensure(dataPackagesFor("from zoneinfo import ZoneInfo"));
+    await ensure(hiddenImportsFor("from zoneinfo import ZoneInfo"));
     const tz = String(py.runPython(`
 from zoneinfo import ZoneInfo
 import datetime

@@ -1507,7 +1507,12 @@ async function boot() {
     // server is worth interrupting somebody about.
     let pendingRequests = 0;
     for (const [, pend] of kernel.pendingHttp) if (pend.pid === pid) pendingRequests++;
-    if (!shouldReportStall({ serving, pendingRequests })) return;
+    // A shell that is waiting on a child is silent because it is waiting. Its child
+    // is watched too, so the report that matters still arrives — under the name of
+    // the program that is actually quiet.
+    let hasLiveChild = false;
+    for (const [, parent] of parentOf) if (parent === pid) hasLiveChild = true;
+    if (!shouldReportStall({ serving, pendingRequests, hasLiveChild })) return;
 
     const secs = Math.round(info.silentMs / 1000);
     const what = [info.command, ...(info.args || [])].join(" ").slice(0, 80);

@@ -114,6 +114,17 @@ console.log("\n── the stall verdict ──");
   check("an install is always reported",
     shouldReportStall({ serving: false, pendingRequests: 0 }));
 
+  // The report a user got out of the notebook template: `PID 2 (sh) has printed
+  // nothing for 139s … it looks stuck rather than slow`, about a shell whose python
+  // was fetching wheels. A shell waiting on a child is silent because waiting is
+  // what it does, and the child is watched under its own name.
+  check("a shell waiting on a live child is not reported",
+    !shouldReportStall({ serving: false, pendingRequests: 0, hasLiveChild: true }));
+  check("…but the child itself still is",
+    shouldReportStall({ serving: false, pendingRequests: 0, hasLiveChild: false }));
+  check("…and a parent with requests waiting on it is not excused",
+    shouldReportStall({ serving: true, pendingRequests: 2, hasLiveChild: true }));
+
   const wedged = stallVerdict({ grew: 0, files: 7_129, idleMs: 30_000, ports: [3000], pendingRequests: 3 });
   check("and is told it is stuck inside a handler", /3 requests waiting/.test(wedged) && /stuck inside a handler/.test(wedged));
 

@@ -35,11 +35,22 @@ function err(s) { process.stderr.write(s + NL); }
 
 // Swallowing a flag we cannot honour is the "stub that lies" failure in argv
 // form: real gunicorn -w 4 forks four workers, and accepting the flag in
-// silence tells the user we did. Two tiers, mirroring builtins/bun.js:
-//   warn   - the server still does the job, just not the way the flag asked
-//   refuse - the flag changes WHAT is served, so guessing would be wrong
+// silence tells the user we did. Three tiers, the first two mirroring
+// builtins/bun.js:
+//   warn    - the server still does the job, just not the way the flag asked
+//   refuse  - the flag changes WHAT is served, so guessing would be wrong
+//   partial - the flag names two things and only one of them happens
+//
+// The third tier exists because 'is ignored here' became a lie the moment
+// --reload started working. flask --debug means "reloader AND interactive
+// debugger", and this runtime now does the first and not the second, so both
+// 'ignored' and silence would misreport it — one by understating, the other by
+// overstating. Naming which half landed is the only version that is true.
 function warnIgnored(cmd, flag, why) {
   err(cmd + ': ' + flag + ' is ignored here - ' + why + '.');
+}
+function warnPartial(cmd, flag, honoured, missing) {
+  err(cmd + ': ' + flag + ' is half honoured here - ' + honoured + ', but ' + missing + '.');
 }
 function refuse(cmd, flag, why) {
   err(cmd + ': ' + flag + ' is not supported here - ' + why + '.');
@@ -345,6 +356,7 @@ async function doUvicorn(rest) {
   let app = '';
   let host = '';
   let port = 0;
+  let reload = false;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     const name = flagName(a);
@@ -357,7 +369,18 @@ async function doUvicorn(rest) {
     // silently would serve the factory function itself.
     else if (name === '--factory') { refuse('uvicorn', name, 'the bridge serves the imported attribute directly, so an app factory would be served instead of the app it builds'); }
     else if (name === '--workers' || name === '-w') { valueOf(); warnIgnored('uvicorn', name, 'the WASM VM has no OS threads and no fork, so there is exactly one worker'); }
-    else if (name === '--reload') { warnIgnored('uvicorn', name, 'reloading needs a file watcher, which needs a thread; restart the process to pick up changes'); }
+    else if (name === '--reload') { reload = true; }
+    // uvicorn's include/exclude globs narrow WHICH files restart the server. The
+    // watch here is .py under the project, and a glob that widened or narrowed
+    // that would be a claim about a filter that is not applied.
+    else if (name === '--reload-include' || name === '--reload-exclude' || name === '--reload-dir') {
+      const v = valueOf();
+      warnIgnored('uvicorn', name + ' ' + v, 'reload here watches .py files under the project directory, and does not take a filter');
+    }
+    else if (name === '--reload-delay') {
+      const v = valueOf();
+      warnIgnored('uvicorn', name + ' ' + v, 'the watch is pushed from the filesystem rather than polled, so a save is coalesced over a fixed short window instead of waiting out a delay');
+    }
     // Same rule as gunicorn: consume the value, or '--log-level debug main:app'
     // serves an app called 'debug'.
     else if (a.charAt(0) === '-') { if (inline === null && UVICORN_BOOLEAN.indexOf(name) === -1) valueOf(); }
@@ -366,7 +389,7 @@ async function doUvicorn(rest) {
   if (!app) { err('uvicorn: no app specified (expected module:attr, e.g. main:app)'); process.exit(1); return; }
   if (!port) port = parseInt(process.env.PORT || '8000', 10);
   const py = getPy();
-  await py.serve({ app: app, mode: 'asgi', host: host, port: port });
+  await py.serve({ app: app, mode: 'asgi', host: host, port: port, reload: reload });
   process.exit(0);
 }
 
@@ -375,6 +398,7 @@ async function doFlask(rest) {
   let host = '';
   let port = 0;
   let hasRun = false;
+  let reload = false;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === '--app' || a === '-A') { appSpec = rest[i + 1] || appSpec; i++; }
@@ -387,16 +411,27 @@ async function doFlask(rest) {
     else if (a.indexOf('--host=') === 0) { host = a.slice(7); }
     else if (a === '--port' || a === '-p') { port = parseInt(rest[i + 1] || '0', 10); i++; }
     else if (a.indexOf('--port=') === 0) { port = parseInt(a.slice(7), 10); }
-    // --debug turns on the reloader and the interactive debugger, both of which
-    // need a watcher thread; --reload asks for half of that on its own.
-    else if (a === '--debug' || a === '--reload') { warnIgnored('flask', a, 'the reloader and the interactive debugger both need a file watcher, which needs a thread'); }
-    else { /* --no-reload, --cert, and friends: nothing to contradict */ }
+    else if (a === '--reload') { reload = true; }
+    // --debug is two features under one flag: the reloader, which works here, and
+    // Werkzeug's interactive in-browser traceback console, which does not — the
+    // bridge calls the WSGI app directly and never installs the debug middleware.
+    // Honouring the flag whole would promise a console that is not there, so the
+    // half that works is done and the half that does not says so. This is the
+    // warn tier rather than refuse because the server still serves the app asked
+    // for; what changes is how a traceback is presented, not what is served.
+    else if (a === '--debug') {
+      reload = true;
+      warnPartial('flask', a, 'the reloader restarts the app on a .py save',
+        'the interactive debugger does not: the bridge calls your WSGI app directly and never installs the debug middleware, so a traceback goes to this terminal rather than the browser');
+    }
+    else if (a === '--no-reload') { reload = false; }
+    else { /* --no-debugger, --cert, and friends: nothing to contradict */ }
   }
   if (!hasRun) { err('flask: only the "run" command is supported in the Vivari shim.'); process.exit(1); return; }
   if (!appSpec) appSpec = 'app';
   if (!port) port = parseInt(process.env.PORT || '8000', 10);
   const py = getPy();
-  await py.serve({ app: appSpec, mode: 'wsgi', host: host, port: port });
+  await py.serve({ app: appSpec, mode: 'wsgi', host: host, port: port, reload: reload });
   process.exit(0);
 }
 
@@ -442,6 +477,7 @@ async function doGunicorn(rest) {
   let app = '';
   let host = '';
   let port = 0;
+  let reload = false;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     const name = flagName(a);
@@ -457,7 +493,13 @@ async function doGunicorn(rest) {
       if (cls !== 'sync') { refuse('gunicorn', name + ' ' + cls, 'the bridge serves WSGI in-process, so only the default sync worker exists here'); }
     }
     else if (name === '--workers' || name === '-w' || name === '--threads') { valueOf(); warnIgnored('gunicorn', name, 'the WASM VM has no OS threads and no fork, so there is exactly one worker'); }
-    else if (name === '--reload') { warnIgnored('gunicorn', name, 'reloading needs a file watcher, which needs a thread; restart the process to pick up changes'); }
+    else if (name === '--reload') { reload = true; }
+    // gunicorn's reloader can be inotify or poll, and can be pointed at extra
+    // files. Neither knob reaches the watch here, which is .py under the project.
+    else if (name === '--reload-engine' || name === '--reload-extra-file') {
+      const v = valueOf();
+      warnIgnored('gunicorn', name + ' ' + v, 'reload here watches .py files under the project directory over the VFS, so there is no engine to choose and no extra file to add');
+    }
     else if (name === '--daemon' || name === '-D') { warnIgnored('gunicorn', name, 'there is no process to detach into, so the server stays in the foreground'); }
     // Tuning and logging knobs with no worker to apply them to. Nothing to
     // honour or contradict, but the VALUE has to be consumed or it becomes the
@@ -468,7 +510,7 @@ async function doGunicorn(rest) {
   if (!app) { err('gunicorn: no app specified (expected module:attr, e.g. wsgi:application)'); process.exit(1); return; }
   if (!port) port = parseInt(process.env.PORT || '8000', 10);
   const py = getPy();
-  await py.serve({ app: app, mode: 'wsgi', host: host, port: port });
+  await py.serve({ app: app, mode: 'wsgi', host: host, port: port, reload: reload });
   process.exit(0);
 }
 
@@ -659,6 +701,25 @@ async function main() {
   if (!first) {
     const py = getPy();
     const rc = await py.repl();
+    process.exit(rc | 0);
+    return;
+  }
+
+  // The studio's notebook kernel: the same interpreter, driven one cell at a time
+  // from the runtime instead of by the program's own read loop, so that a cell's
+  // imports can be resolved (an async fetch) between arriving and being exec'd.
+  // See notebookKernel in packages/runtime/builtins/python.js and
+  // packages/studio/src/vv/notebook/studio-kernel.ts, which types this line.
+  //
+  // Not in HELP: nobody types this. It is spelled out here rather than inferred
+  // from the file's name because a magic path would be a rule nobody could see,
+  // and it fails loudly rather than falling through to a plain script run - that
+  // fallthrough is exactly the silent half-working kernel this flag replaces.
+  if (first === '--vv-notebook-kernel') {
+    const target = argv[1];
+    if (!target) { err('python --vv-notebook-kernel: no kernel program given'); process.exit(2); return; }
+    const py = getPy();
+    const rc = await py.notebookKernel(target);
     process.exit(rc | 0);
     return;
   }

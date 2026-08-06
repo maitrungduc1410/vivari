@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { FileIcon, FolderIcon } from "./fileIcon";
+import { NotebookView } from "./NotebookView";
 import { useIde } from "./useIde";
 
 const baseName = (rel: string) => rel.split("/").pop() ?? rel;
@@ -235,6 +236,7 @@ export function EditorGroup() {
         {activeKind === "image" && snap.activeTab && <ImageView key={snap.activeTab} abs={snap.activeTab} />}
         {activeKind === "directory" && snap.activeTab && <DirectoryView />}
         {activeKind === "diff" && snap.activeTab && <DiffView key={snap.activeTab} id={snap.activeTab} />}
+        {activeKind === "notebook" && snap.activeTab && <NotebookView key={snap.activeTab} abs={snap.activeTab} />}
         {!snap.activeTab && (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
             {snap.projectTitle ? "Open a file from the Workspace" : "Press Run to start a project"}

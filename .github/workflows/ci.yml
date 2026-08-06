@@ -37,6 +37,15 @@ jobs:
         with:
           node-version: 22
       - run: node scripts/run-spikes.mjs --offline
+      # The notebook's view, rendered under jsdom. It is `net` only because it
+      # installs React, a DOM and a bundler off the registry — it runs no
+      # container, needs no Wasm and touches no network of its own, so it belongs
+      # in the PR gate and not in spikes-net, which is schedule-only and
+      # `continue-on-error: true` and therefore gates nothing. That distinction is
+      # not academic here: the notebook shipped with every cell editor dead, and
+      # this is the only job that would have gone red for it.
+      - name: the notebook view mounts
+        run: node scripts/run-spikes.mjs --net notebook-view
       # The static probes. Both are Wasm-free and take under a second, and
       # neither was wired into any job before — probe:node-registry shipped as
       # the guard against unresolvable builtin ids and had never actually run in

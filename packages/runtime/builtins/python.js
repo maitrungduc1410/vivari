@@ -68,6 +68,10 @@ import {
 } from "./python-store.js";
 import { PY_DEBUG_SOURCE, createPythonDebugger } from "./python-debugger.js";
 import { makeDebugViews, readDebugCommandBlocking } from "../../protocol/debug.js";
+// The value the kernel writes into the interrupt byte, from the one place that
+// defines it: the notebook driver re-delivers a deferred SIGINT and must write the
+// same byte the kernel would have.
+import { INTERRUPT_SIGINT } from "../../protocol/syscall.js";
 
 // Directories we never mirror between the project and Pyodide's FS.
 // `.venv` is in here even though it is now the package store, and that is the
@@ -889,22 +893,110 @@ def _vv_run(main, **kwargs):
 _vv_asyncio.run = _vv_run
 `;
 
-// Packages that are data rather than code, which is why nothing else finds them.
+// Wheels a program needs and never names — "hidden imports", in the sense
+// PyInstaller uses the term for the same problem.
 //
 // loadPackagesFromImports works by reading the import statements, so it can only
-// load what the source names. tzdata is named by nobody: `zoneinfo` is stdlib,
-// and the timezone database it reads is a separate wheel it locates through
-// importlib at call time. So the import scan sees a stdlib import, loads
-// nothing, and ZoneInfo("Europe/Berlin") raises for every key on earth.
+// load what the source names. Two different things can hide a dependency from it,
+// and both end the same way: the wheel is vendored, `loadPackage` would have
+// worked, and the program fails at the line that needed it.
 //
-// Matching the text rather than the parsed imports is deliberate - by the time
-// zoneinfo is imported there is no async left to load a wheel in, so this has
-// to happen before the first line runs. A string that merely mentions zoneinfo
-// costs a 350 KB same-origin load and nothing else.
-export const DATA_PACKAGES = [{ name: "tzdata", when: /(^|[^\w.])zoneinfo\b/ }];
+//   * tzdata is DATA, imported by nobody. `zoneinfo` is stdlib, and the timezone
+//     database it reads is a separate wheel it locates through importlib at call
+//     time — so the scan sees a stdlib import, loads nothing, and
+//     ZoneInfo("Europe/Berlin") raises for every key on earth.
+//   * openpyxl is CODE, imported inside a function. pandas defers `import
+//     openpyxl` until read_excel/to_excel is actually called, so a source that
+//     says `import pandas` and reads a spreadsheet names pandas and nothing else.
+//     Excel is the format data arrives in, which made this the most reachable
+//     hole in the pandas story.
+//
+// Matching the TEXT rather than the parsed imports is the whole trick, and it is
+// deliberate: by the time the deferred import runs there is no async left to
+// fetch a wheel in, so the decision has to be made before the first line does.
+// The cost of a false positive is one same-origin load of an already-shipped
+// wheel, which is why the patterns can afford to be generous.
+export const HIDDEN_IMPORTS = [
+  { name: "tzdata", when: /(^|[^\w.])zoneinfo\b/ },
+  // pandas' four Excel entry points by name, plus the module itself.
+  //
+  // Deliberately NOT tzdata's `[^\w.]` guard: that one exists to stop
+  // `mypkg.zoneinfo` matching, and here the leading dot is the whole point —
+  // these are reached as `pd.read_excel`, `df.to_excel`. A plain \b matches after
+  // a dot, which is what is wanted.
+  //
+  // Also deliberately not `\.xlsx`: a filename in an unrelated string would drag
+  // the wheel in, and .xls is a different engine (xlrd) that this does not load,
+  // so matching the extension would be claiming an engine rather than finding one.
+  { name: "openpyxl", when: /\b(read_excel|to_excel|ExcelWriter|ExcelFile|openpyxl)\b/ },
+];
 
-export function dataPackagesFor(source) {
-  return DATA_PACKAGES.filter((p) => p.when.test(source || "")).map((p) => p.name);
+export function hiddenImportsFor(source) {
+  return HIDDEN_IMPORTS.filter((p) => p.when.test(source || "")).map((p) => p.name);
+}
+
+/**
+ * Load the packages a piece of source needs into THIS interpreter, and say so when
+ * one of them cannot be loaded at all.
+ *
+ * ONE function for every place that is about to execute Python, because the mistake
+ * it exists to stop has now been made three times and it is the same mistake each
+ * time: static import analysis cannot see a dynamic import.
+ * `loadPackagesFromImports` reads import STATEMENTS, so it missed `__import__(name)`
+ * in a template's own report of what was vendored, it missed the `import openpyxl`
+ * that lives inside pandas' read_excel (HIDDEN_IMPORTS, above), and it missed every
+ * import a notebook user types — because a cell is exec'd at runtime and the
+ * kernel's own source names none of it.
+ *
+ * The generalisation is not a cleverer scan. It is that the unit being resolved is
+ * CODE ABOUT TO RUN rather than a file being started: a script resolves its file, a
+ * reloaded app resolves its module, and a notebook cell resolves the cell — each
+ * through here, each before its first line executes.
+ *
+ * Silence was the other half of it. `loadPackagesFromImports` IGNORES a name with
+ * no entry in the lock and `loadPackage` throws for one, and both used to be
+ * swallowed — so a build that shipped without a wheel it was configured to carry
+ * failed later, in the user's own code, as though the package had never been asked
+ * for. `warn` is where that goes; it is called at most once per distinct message by
+ * the runtime, since a notebook would otherwise repeat it per cell.
+ *
+ * Module-level so both spike tiers drive the shipped function rather than a copy of
+ * its two interesting lines.
+ */
+export async function resolveImports(pyodide, source, sink, warn = () => {}) {
+  if (!source) return;
+  try {
+    await pyodide.loadPackagesFromImports(source, sink);
+  } catch (e) {
+    // A wheel that IS in the index but could not be fetched — the CDN half of the
+    // hybrid lock, with no network. The import will raise for real in a moment;
+    // this is the line that says why.
+    warn(`python: a package this code imports could not be loaded: ${(e && e.message) || e}`);
+  }
+  // One at a time: these are independent, and a name missing from the index must not
+  // stop the others from loading.
+  for (const name of hiddenImportsFor(source)) {
+    try {
+      await pyodide.loadPackage(name, sink);
+    } catch (e) {
+      const why = String((e && e.message) || e);
+      // Pyodide's own wording for "there is no such entry in the lock", which for
+      // one of these names can only mean the vendored build is incomplete: every
+      // package Pyodide distributes keeps an entry pointing at the CDN (see the
+      // hybrid lock in scripts/vendor-pyodide.mjs), so a name with no entry at all
+      // is a wheel whose vendor-time fetch failed and was warned about.
+      if (/No known package/i.test(why)) {
+        warn(
+          `python: ${name} is not in this build's package index, so the import that needs it will fail.\n` +
+            "  It is meant to be vendored into packages/studio/public/vendor/pyodide by\n" +
+            "  scripts/vendor-pyodide.mjs, which warns and continues when a wheel cannot be\n" +
+            "  fetched. To retry that fetch: npm run vendor:pyodide -- --force",
+        );
+      } else {
+        warn(`python: ${name} could not be loaded: ${why}`);
+      }
+    }
+  }
 }
 
 /**
@@ -1018,6 +1110,580 @@ export function installBlockingPatch(pyodide) {
     pyodide.runPython(BLOCKING_PATCH_SOURCE, { globals: pyodide.toPy({}) });
     return true;
   } catch {
+    return false;
+  }
+}
+
+// How deep a chain of Python-spawning-Python is allowed to get, and the name of
+// the counter that tracks it. Every level is a whole extra process worker with its
+// own Pyodide boot behind it, so this is not a stylistic limit: a script that
+// spawns itself would otherwise fill the tab with interpreters, and the parent of
+// each one is parked on Atomics.wait, so there is no Ctrl-C to stop it with.
+// Three deep covers the real chains (a script runs pytest, which runs a helper);
+// the fourth is a runaway.
+export const SPAWN_DEPTH_VAR = "VV_SPAWN_DEPTH";
+export const MAX_SPAWN_DEPTH = 3;
+
+// `subprocess`, over the kernel's blocking spawn syscall.
+//
+// WHY THIS IS POSSIBLE AT ALL, given that the docs said for a long time that it
+// was not. OP_SPAWN is synchronous: the caller is parked on Atomics.wait while
+// the kernel drives the child, and is woken with the child's exit code and its
+// captured output. That is not an approximation of `subprocess.run()`, it is the
+// same shape — one call, blocks, gives you a returncode and the output. Node
+// guests have had it as `spawnSync` since brick 4. The re-entrancy (Python calls
+// JS, JS parks the worker, Python resumes) is the shape the blocking stdin
+// syscall and the debugger's pause loop already use.
+//
+// What the earlier "emscripten does not support processes" came from is real, and
+// it is CPython's own: Pyodide has no fork/exec, so `_posixsubprocess` raises. The
+// mistake was reading that as "there are no processes here". There are; they are
+// just not made by forking this interpreter.
+//
+// WHAT IS AND IS NOT IMPLEMENTED, and why the line is drawn there.
+//
+// `run` / `call` / `check_call` / `check_output` / `getoutput` /
+// `getstatusoutput` all reduce to "start it, wait, hand me the result", which is
+// exactly one blocking syscall. They are implemented.
+//
+// `Popen` is refused. Its whole contract is that it returns while the child is
+// still running, so the parent can write to its stdin, read its stdout as it
+// arrives, and poll it. On one interpreter with no threads and a syscall that
+// does not return until the child is dead, none of that can be done. The
+// tempting cheat is to run the child to completion inside Popen.__init__ and
+// serve the buffered output from the pipes afterwards — `communicate()` would
+// pass, and `Popen(["uvicorn", ...])` to start a server alongside would hang
+// forever instead of returning. That is the stub that lies, so Popen says what it
+// cannot do and names run() instead.
+//
+// The module's TYPES are left exactly as CPython built them — only the execution
+// functions are replaced. So `except subprocess.CalledProcessError` catches the
+// real class, CompletedProcess is the real dataclass with the real repr, and
+// PIPE/DEVNULL/STDOUT keep their real values.
+//
+// Authoring note: this crosses as a JS template string, so it uses chr(10)
+// rather than a backslash escape for a newline — and no comment in here may
+// quote an identifier in backticks, however much the rest of this repo's prose
+// does, because a backtick ends the string and the error you get is a JS
+// SyntaxError pointing at a line of Python.
+//
+// Exported so scripts/spike-python-offline.mjs can hold the source itself to
+// account and the bridge tier can run it under a real interpreter.
+export const SUBPROCESS_SOURCE = `
+import base64
+import inspect
+import io
+import json
+import os
+import subprocess
+import sys
+
+_NL = chr(10)
+
+
+# Whether this process has a terminal for a child to write to. It does when Python
+# is a program in a shell; it does NOT in the notebook kernel, whose stdout is a
+# frame stream shared with the shell's echo - a child writing there produces bytes
+# with no record separator, which FrameReader files as kernel noise. So the output
+# of subprocess.run(["ruff", "check", "."]) in a cell landed in the collapsed kernel
+# log instead of under the cell, and swapping sys.stdout for the cell's stream did
+# not help because the child bypasses Python entirely.
+#
+# A list rather than a global, so the closures below read it at call time and the
+# host can flip it once after boot.
+_VV_TERMINAL = [True]
+
+
+def _vv_subprocess_no_terminal():
+    """Tell subprocess there is nowhere for a child to write directly.
+
+    Uncaptured output is then read back through the parent and written to
+    sys.stdout, which is where a host that has swapped it - a notebook cell - wants
+    it. The cost is that it arrives when the child exits rather than as it is
+    produced, which is the same trade every capture makes here.
+    """
+    _VV_TERMINAL[0] = False
+
+
+def _vv_install_subprocess(spawn, list_programs, depth, max_depth):
+    PIPE = subprocess.PIPE
+    STDOUT = subprocess.STDOUT
+    DEVNULL = subprocess.DEVNULL
+
+    # Options naming something this VM does not have. These RAISE, and the
+    # important one is timeout=: the caller is parked until the child exits with
+    # nothing able to interrupt that wait, so a timeout could be accepted and
+    # never enforced. Silence there would turn the one call written specifically
+    # to bound a hang into the hang, which is worse than refusing it.
+    #
+    # THE VALUE DECIDES, NOT THE NAME. Every one of these has a CPython default
+    # that asks for nothing, and forwarding arguments is ordinary code:
+    #
+    #     def run(cmd, timeout=None, **kw):
+    #         return subprocess.run(cmd, timeout=timeout, **kw)
+    #
+    # timeout=None means "no timeout", which is exactly what this runtime
+    # provides - so refusing it reports that we cannot do something the caller
+    # never asked for. That is the same dishonesty as a stub, pointing the other
+    # way, and it breaks working code: anything that spells out the full signature
+    # passes start_new_session=False and process_group=-1 too. So each name carries
+    # its default, and a value equal to the default is not a request.
+    _REFUSED = {
+        "timeout": (None, "the caller is parked until the child exits and nothing can interrupt that wait, so a timeout could be accepted here but never enforced - which would turn the one argument written to bound a wait into an unbounded one"),
+        "preexec_fn": (None, "there is no fork for a function to run between"),
+        "pass_fds": ((), "no file descriptors are inherited across this spawn"),
+        "start_new_session": (False, "there are no sessions to start"),
+        "process_group": (-1, "there are no process groups"),
+        "restore_signals": (True, "there are no POSIX signal dispositions to restore"),
+        "user": (None, "there is one user and no way to become another"),
+        "group": (None, "there is one user and no way to become another"),
+        "extra_groups": (None, "there is one user and no way to become another"),
+        "umask": (-1, "there is no umask"),
+    }
+    # Options that mean nothing here and whose absence changes nothing either, so
+    # they get a line on stderr rather than an exception. Same rule about values:
+    # bufsize=-1 and close_fds=True are what CPython does when nobody asks, and
+    # narrating a default back at the caller is noise, not a warning.
+    _IGNORED = {
+        "bufsize": (-1, "output is delivered whole when the child exits, so there is nothing left to buffer"),
+        "close_fds": (True, "no descriptors are inherited in the first place"),
+        "creationflags": (0, "a Windows option"),
+        "startupinfo": (None, "a Windows option"),
+        "executable": (None, "a program is resolved by name, against PATH and then /bin"),
+        "pipesize": (-1, "a child's output is delivered whole when it exits, so there is no pipe to size"),
+    }
+
+    # Said once per distinct message per process, not once per call. These live in
+    # the warn tier because the call still does its job, and a run() inside a loop
+    # would otherwise put the same line on stderr a hundred times and bury the
+    # output the loop was for. CPython's own warnings module defaults to "once
+    # per location" for the same reason.
+    _said = set()
+
+    def _warn(text):
+        if text in _said:
+            return
+        _said.add(text)
+        try:
+            sys.stderr.write("subprocess: " + text + _NL)
+        except Exception:
+            pass
+
+    def _asked_for_something(name, value, default):
+        # Identity first, which answers the common case without running anyone's
+        # code: the same None the signature has. It is not a defence against a
+        # hostile __eq__ - one that returns True for everything still gets read as
+        # "asked for nothing" on the line below - and there is no need for it to be,
+        # because this is an argument check inside the caller's own process and
+        # nothing here is a boundary. Then the type-appropriate emptiness test, then
+        # equality, because 1 and True are the same request, as are 0 and False.
+        #
+        # The try is for tests that RAISE rather than answer: numpy's __eq__ returns
+        # an array and bool() of one is a ValueError, so timeout=np.array([1,2])
+        # reported "truth value of an array is ambiguous" from inside an argument
+        # check. A value that cannot be compared has not been shown to be a default,
+        # and the refusal is the safe reading of that.
+        #
+        # Exception, not BaseException. A __eq__ that raises KeyboardInterrupt is
+        # Ctrl-C arriving mid-comparison, and swallowing it here would contradict the
+        # rest of this file, which goes to some length to make sure an interrupt is
+        # never lost. Same for SystemExit and MemoryError: those are the interpreter
+        # leaving, not this comparison failing.
+        if value is default:
+            return False
+        try:
+            if isinstance(default, tuple):
+                # An empty container is not a request whatever its type: pass_fds=[]
+                # and pass_fds=() say the same nothing.
+                return bool(value)
+            return not (value == default)
+        except Exception:
+            return True
+
+    def _check_kwargs(kw):
+        for name in sorted(kw):
+            if name in _REFUSED:
+                default, why = _REFUSED[name]
+                if _asked_for_something(name, kw[name], default):
+                    raise NotImplementedError(
+                        "subprocess: " + name + "= is not supported here - " + why + "."
+                    )
+        for name in sorted(kw):
+            if name in _IGNORED:
+                default, why = _IGNORED[name]
+                if _asked_for_something(name, kw[name], default):
+                    _warn(name + "= is ignored here - " + why + ".")
+        unknown = [n for n in sorted(kw) if n not in _REFUSED and n not in _IGNORED]
+        if unknown:
+            _warn("unrecognised argument(s) " + ", ".join(unknown) + " - ignored.")
+
+    def _programs():
+        try:
+            names = json.loads(list_programs())
+            return sorted(set(str(n) for n in names))
+        except Exception:
+            return []
+
+    # The message that is most of the point of this feature. git and ffmpeg are
+    # not here, and the reason is NOT that the browser forbids processes -
+    # it is that no such binary exists in this VM to run. Those are different
+    # facts with different answers, and the old error implied the first one.
+    def _not_found(name):
+        lines = [
+            "no program named " + repr(name) + " exists in this Vivari VM.",
+            "",
+            "subprocess itself works here: it spawns programs that live INSIDE the",
+            "VM, over the same blocking syscall Node's spawnSync uses. What is",
+            "missing is " + repr(name) + " - there is no binary to run. The browser is not",
+            "refusing to create a process, and this is not the old",
+            "'emscripten does not support processes'.",
+            "",
+            "Native tools are the usual case: git, ffmpeg, curl and gcc are not",
+            "part of the VM and cannot be installed into it.",
+        ]
+        avail = _programs()
+        if avail:
+            lines += [
+                "",
+                "Programs that DO exist: " + ", ".join(avail) + ".",
+                "Anything on PATH also resolves, including a project's node_modules/.bin",
+                "and its .venv console scripts.",
+            ]
+        err = FileNotFoundError(2, _NL.join(lines), name)
+        err.filename = name
+        return err
+
+    def _argv(args, shell):
+        # shell=True runs the line through sh, which is a real program here. Real
+        # subprocess passes a LIST's first element as the script and the rest as
+        # sh's positional parameters, which is surprising but is what it does, so
+        # it is what happens here too.
+        if shell:
+            if isinstance(args, (str, bytes)):
+                line = args.decode() if isinstance(args, bytes) else args
+                return ["sh", "-c", line]
+            parts = [_str(a) for a in args]
+            return ["sh", "-c", parts[0]] + parts[1:]
+        if isinstance(args, (str, bytes)):
+            # Without a shell, real subprocess treats a string as ONE program name
+            # - it does not split on spaces. Splitting it here would run something
+            # the caller did not write.
+            return [_str(args)]
+        out = [_str(a) for a in args]
+        if not out:
+            raise ValueError("subprocess: an empty argument list has no program in it")
+        return out
+
+    def _str(v):
+        if isinstance(v, bytes):
+            return v.decode("utf-8", "surrogateescape")
+        if isinstance(v, os.PathLike):
+            return os.fspath(v)
+        return str(v)
+
+    def _wants_capture(stream, capture_output):
+        return capture_output or stream == PIPE
+
+    def _sink(stream, which):
+        # A stdout=/stderr= that is neither one of subprocess' own constants nor
+        # None is a redirect the caller expects to be honoured, and the first
+        # version of this silently ignored it: run(cmd, stdout=open(p, "w")) left
+        # the file empty and put the child's output on the terminal instead. That
+        # is worse than the OSError this feature replaced, because it looks like
+        # it worked. A file object is honoured (see _to_sink); a descriptor
+        # cannot be, for the same reason pass_fds is refused.
+        if stream is None or stream in (PIPE, DEVNULL, STDOUT):
+            return None
+        if isinstance(stream, int):
+            raise NotImplementedError(
+                "subprocess: " + which + "= will not take a file descriptor here - a child is a "
+                "separate worker rather than a fork of this one, so no descriptor is inherited "
+                "across the spawn." + _NL +
+                "Pass the open file OBJECT instead and its output will be written to it, or ask "
+                "for it with capture_output=True."
+            )
+        if not hasattr(stream, "write"):
+            raise TypeError(
+                "subprocess: " + which + "= takes None, PIPE, DEVNULL, STDOUT or a writable file "
+                "object here, not " + type(stream).__name__ + "."
+            )
+        return stream
+
+    def _to_sink(fh, text, encoding, errors):
+        # The child has already exited by the time this runs, so its whole output
+        # arrives in one write. Real subprocess hands the file's descriptor to the
+        # child and those writes interleave with the parent's own; here they
+        # cannot, because the parent was parked for the entire life of the child.
+        # The content is the same, the ordering against the parent's own writes is
+        # not.
+        if not text:
+            return
+        if isinstance(fh, io.TextIOBase) or hasattr(fh, "encoding"):
+            fh.write(text)
+        else:
+            fh.write(text.encode(encoding or "utf-8", errors or "strict"))
+
+    def _run(args, capture_output=False, check=False, cwd=None, env=None, input=None,
+             stdin=None, stdout=None, stderr=None, shell=False, text=None,
+             encoding=None, errors=None, universal_newlines=None, **kw):
+        _check_kwargs(kw)
+        if depth() >= max_depth:
+            raise RuntimeError(
+                "subprocess: refusing to spawn more than " + str(max_depth) + " levels deep - "
+                "every level is another process with its own Python interpreter behind it, "
+                "and each parent is blocked until its child exits, so a chain that recurses "
+                "would fill the tab with interpreters and could not be interrupted."
+            )
+        if capture_output and (stdout is not None or stderr is not None):
+            raise ValueError("subprocess: capture_output may not be used with stdout= or stderr=")
+
+        argv = _argv(args, shell)
+        as_text = bool(text or universal_newlines or encoding or errors)
+
+        out_sink = _sink(stdout, "stdout")
+        err_sink = _sink(stderr, "stderr")
+
+        cap_out = _wants_capture(stdout, capture_output)
+        cap_err = _wants_capture(stderr, capture_output) or stderr == STDOUT
+        # Nothing to keep, nothing to redirect and nothing to throw away means the
+        # child can write straight to the terminal, which is both what real
+        # subprocess does without capture_output and the only way its output
+        # arrives while it is still running. Anything held cannot: it comes with
+        # the exit.
+        wants_terminal = (
+            not cap_out and not cap_err
+            and out_sink is None and err_sink is None
+            and stdout != DEVNULL and stderr != DEVNULL
+        )
+        # …unless there is no terminal to write to, in which case the parent has to
+        # carry the bytes itself and hand them to whatever sys.stdout is now.
+        inherit = wants_terminal and _VV_TERMINAL[0]
+        relay = wants_terminal and not inherit
+
+        child_env = dict(os.environ if env is None else env)
+        child_env[${JSON.stringify(SPAWN_DEPTH_VAR)}] = str(depth() + 1)
+
+        spec = {
+            "command": argv[0],
+            "args": argv[1:],
+            "cwd": os.fspath(cwd) if cwd is not None else os.getcwd(),
+            "env": dict((str(k), str(v)) for k, v in child_env.items()),
+            "inherit": inherit,
+        }
+        if input is not None:
+            data = input.encode(encoding or "utf-8", errors or "strict") if isinstance(input, str) else bytes(input)
+            spec["input_b64"] = base64.b64encode(data).decode("ascii")
+        elif stdin not in (None, PIPE, DEVNULL):
+            raise NotImplementedError(
+                "subprocess: stdin= accepts None, PIPE or DEVNULL here - a file or a "
+                "descriptor cannot be handed to the child, because the parent is parked "
+                "from the moment it starts and there is no pipe to write into. Read the "
+                "file yourself and pass input=."
+            )
+
+        res = json.loads(spawn(json.dumps(spec)))
+        if res.get("enoent"):
+            raise _not_found(argv[0])
+        if res.get("error"):
+            raise OSError("subprocess: " + str(res["error"]))
+
+        code = int(res.get("code") or 0)
+        raw_out = res.get("stdout") or ""
+        raw_err = res.get("stderr") or ""
+
+        if relay:
+            # The caller asked for nothing, so nothing is returned - None is what
+            # real subprocess reports when it captured nothing, and code that reads
+            # .stdout here would be reading it in CPython too. What the caller did
+            # ask for, implicitly, is to SEE the output, so it goes to sys.stdout:
+            # in a notebook cell that is the cell's own stream, and the child's
+            # output appears under the cell that ran it.
+            if raw_out:
+                sys.stdout.write(raw_out)
+            if raw_err:
+                sys.stderr.write(raw_err)
+            out_val = None
+            err_val = None
+        elif inherit:
+            # The child already wrote to the terminal; there is nothing held, and
+            # None is what real subprocess reports when it captured nothing.
+            out_val = None
+            err_val = None
+        else:
+            if stderr == STDOUT:
+                # The kernel captures the two streams separately, so what can be
+                # rebuilt here is stdout followed by stderr, not the interleaving
+                # the child actually produced. Real subprocess gives both the same
+                # descriptor and the order is whatever order the writes flushed
+                # in. Measured against CPython 3.11 with a child writing one line
+                # to each: it reports stderr first (unbuffered) where this reports
+                # stdout first. The lines are all present; their relative order is
+                # not recoverable once the kernel has split them.
+                raw_out = raw_out + raw_err
+                raw_err = ""
+            # A redirect is honoured before anything is passed through, so that a
+            # stream written to a file is not also written to the terminal.
+            if out_sink is not None:
+                _to_sink(out_sink, raw_out, encoding, errors)
+                raw_out = ""
+            if err_sink is not None:
+                _to_sink(err_sink, raw_err, encoding, errors)
+                raw_err = ""
+            if not cap_err and raw_err:
+                # Not asked for, not redirected and not discarded: it still
+                # belongs on stderr.
+                try:
+                    sys.stderr.write(raw_err)
+                except Exception:
+                    pass
+            if not cap_out and raw_out and stdout != DEVNULL:
+                try:
+                    sys.stdout.write(raw_out)
+                except Exception:
+                    pass
+            out_val = _shape(raw_out, as_text, encoding, errors) if cap_out else None
+            err_val = _shape(raw_err, as_text, encoding, errors) if (cap_err and stderr != STDOUT) else None
+            if stderr == STDOUT:
+                err_val = None
+
+        done = subprocess.CompletedProcess(args, code, out_val, err_val)
+        if check and code != 0:
+            raise subprocess.CalledProcessError(code, args, out_val, err_val)
+        return done
+
+    def _shape(s, as_text, encoding, errors):
+        # The syscall hands output back as text, so text mode is the native shape
+        # and bytes mode is an encode back. That makes bytes mode lossy for a
+        # child that writes real binary to stdout - it has already been decoded
+        # once before this function sees it.
+        if as_text:
+            return s
+        return s.encode(encoding or "utf-8", errors or "strict")
+
+    def _call(args, **kw):
+        kw.pop("capture_output", None)
+        return _run(args, **kw).returncode
+
+    def _check_call(args, **kw):
+        code = _call(args, **kw)
+        if code != 0:
+            raise subprocess.CalledProcessError(code, args)
+        return 0
+
+    def _check_output(args, **kw):
+        kw.setdefault("stdout", PIPE)
+        # check_output's own contract: a non-zero exit raises, and the output
+        # gathered so far rides on the exception.
+        return _run(args, check=True, **kw).stdout
+
+    def _getstatusoutput(cmd, encoding=None, errors=None, env=None):
+        try:
+            res = _run(cmd, shell=True, stdout=PIPE, stderr=STDOUT, text=True,
+                       encoding=encoding, errors=errors, env=env)
+            out = res.stdout or ""
+            code = res.returncode
+        except FileNotFoundError as exc:
+            return (127, str(exc))
+        if out.endswith(_NL):
+            out = out[:-1]
+        return (code, out)
+
+    def _getoutput(cmd, encoding=None, errors=None, env=None):
+        return _getstatusoutput(cmd, encoding=encoding, errors=errors, env=env)[1]
+
+    class _VvPopen:
+        # Refused rather than approximated. See the note above SUBPROCESS_SOURCE.
+        def __init__(self, *a, **kw):
+            name = ""
+            if a:
+                try:
+                    first = a[0]
+                    name = " (" + repr(first if isinstance(first, str) else list(first)[0]) + ")"
+                except Exception:
+                    name = ""
+            raise NotImplementedError(
+                "subprocess.Popen is not supported here" + name + " - it has to return while the "
+                "child is still running so you can stream its output and write to its stdin, and "
+                "this runtime spawns over a syscall that does not return until the child has "
+                "exited. There are no threads to do the streaming with either." + _NL +
+                "subprocess.run(), call(), check_call() and check_output() DO work, including "
+                "capture_output, input=, cwd=, env=, shell= and check=. If you were about to "
+                "call Popen(...).communicate(), run(..., capture_output=True) is the same thing."
+            )
+
+    # THE TABLES ABOVE ARE A COPY OF SOMEONE ELSE'S SIGNATURE, and this kind of copy
+    # rots in the direction that hurts. A keyword a later CPython adds appears in no
+    # table, so _check_kwargs reads it as "not asked for", warns once on stderr and
+    # runs the call anyway - a caller who asked for something is told nothing and
+    # gets the behaviour of not having asked. That is fail-open, in the module whose
+    # whole argument is that a stub which lies is worse than a refusal.
+    #
+    # It has already happened once: 3.10 added pipesize= and nothing here noticed
+    # until this line was written. So the difference is computed against the real
+    # class at install time instead of being remembered, and spike-python-offline.mjs
+    # asserts it empty - which makes the next bump a red test rather than a silent
+    # run. Captured BEFORE the assignment below, because after it the signature
+    # being read is ours.
+    try:
+        _real_popen_kwargs = set(inspect.signature(subprocess.Popen.__init__).parameters) - {"self", "args"}
+    except (TypeError, ValueError):
+        # A Popen this cannot introspect leaves nothing to compare; an empty set
+        # would read as "all covered", so say the check did not run.
+        _real_popen_kwargs = None
+    if _real_popen_kwargs is None:
+        subprocess._vv_unhandled_kwargs = None
+    else:
+        _acted_on = set(inspect.signature(_run).parameters) - {"args", "kw"}
+        subprocess._vv_unhandled_kwargs = frozenset(
+            _real_popen_kwargs - _acted_on - set(_REFUSED) - set(_IGNORED)
+        )
+
+    subprocess.run = _run
+    subprocess.call = _call
+    subprocess.check_call = _check_call
+    subprocess.check_output = _check_output
+    subprocess.getstatusoutput = _getstatusoutput
+    subprocess.getoutput = _getoutput
+    subprocess.Popen = _VvPopen
+
+    def _popen(cmd, mode="r", buffering=-1):
+        # os.popen is built on Popen, so without this it inherits an error that
+        # talks about a class the caller never named.
+        raise NotImplementedError(
+            "os.popen is not supported here - it returns a file you read while the child "
+            "is still writing, and this runtime spawns over a syscall that does not return "
+            "until the child has exited." + _NL +
+            "For mode 'r', subprocess.run(cmd, shell=True, capture_output=True, text=True)"
+            ".stdout is the same text; for mode 'w', pass what you were going to write as "
+            "input=."
+        )
+
+    # The other two doors to the same dead end. os.system lands in the same
+    # _posixsubprocess failure without this; its return value is a wait status,
+    # which is the exit code in the high byte, and callers do divide it by 256.
+    os.system = lambda cmd: _run(cmd, shell=True).returncode << 8
+    os.popen = _popen
+    return True
+`;
+
+/**
+ * Wire `subprocess` to the kernel's blocking spawn.
+ *
+ * `spawn` takes a JSON spec and returns a JSON result; `programs` returns a JSON
+ * list of the command names that exist, which is what the not-found error reads
+ * to tell someone what they CAN run. Both are plain synchronous JS functions —
+ * the blocking happens inside `spawn`, on the syscall.
+ */
+export function installSubprocess(pyodide, { spawn, programs, depth }) {
+  try {
+    pyodide.runPython(SUBPROCESS_SOURCE);
+    const install = pyodide.globals.get("_vv_install_subprocess");
+    install(spawn, programs, depth, MAX_SPAWN_DEPTH);
+    if (install.destroy) install.destroy();
+    return true;
+  } catch {
+    // A python that cannot spawn is worth far more than a python that will not
+    // boot, and the stdlib's own OSError is still there to explain itself.
     return false;
   }
 }
@@ -1232,6 +1898,203 @@ export function maskBootEnv(scope, process, workerGlobalScope) {
   };
 }
 
+// How long a burst of saves is allowed to settle before the app is re-imported.
+// "Save all" in an editor writes N files as N separate VFS writes, and a reload
+// per file would re-import the app N times and serve from the middle of the set.
+// Real uvicorn polls its watch list every 250ms, so anything under that is
+// already faster than the tool being impersonated; the useful ceiling is human,
+// and 200ms is below the ~250ms at which a reload stops feeling like a
+// consequence of the keystroke.
+export const RELOAD_DEBOUNCE_MS = 200;
+
+// Which saved file restarts the app. `.py` only, which is both what real
+// uvicorn and Flask watch by default and the answer to a hazard specific to
+// this design: a served app's own writes are mirrored back to the VFS at the end
+// of every request (see persist), and every one of those writes fires the same
+// watch this reload listens to. An app that writes a SQLite database, an upload
+// or a log on each request would otherwise restart itself on each request —
+// forever, at one full re-import per loop. Filtering to `.py` breaks that cycle
+// for everything except an app that rewrites its own source, which is not a
+// thing to design around.
+export function isReloadTrigger(filename) {
+  return typeof filename === "string" && filename.endsWith(".py");
+}
+
+// The directories a reload watches: the project tree, minus the ones the mirror
+// already refuses to copy.
+//
+// This is a walk registering one NON-recursive watch per directory rather than a
+// single `fs.watch(root, { recursive: true })`, and the difference is scope. The
+// recursive form is served on this platform by Node's own JS fallback
+// (node/internal/fs/recursive_watch.js — vendored verbatim, "do not edit the
+// body"), which walks the tree and registers a watch per FILE with no way to
+// exclude anything. Pointed at a project that has run `pip install`, that is a
+// registration for every file in `.venv`, and a `__pycache__` entry appearing
+// mid-run is a watch too. SKIP_DIRS is the set the mirror already uses to decide
+// what counts as project source, so reload agreeing with it means one answer to
+// that question rather than two.
+export function reloadWatchDirs(fs, root) {
+  const dirs = [];
+  const walk = (dir) => {
+    dirs.push(dir);
+    let names;
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (SKIP_DIRS.has(name)) continue;
+      const full = dir === "/" ? "/" + name : dir + "/" + name;
+      try {
+        if (fs.statSync(full).isDirectory()) walk(full);
+      } catch {
+        /* vanished between readdir and stat */
+      }
+    }
+  };
+  walk(root);
+  return dirs;
+}
+
+// Re-import the served app inside the interpreter that is already running, and
+// rebind the one name the dispatcher reads.
+//
+// WHY REBINDING ONE GLOBAL IS THE WHOLE SWAP. `_vv_dispatch` (setupSource above)
+// looks `_vv_app` up as a module-level global on every call, so there is no new
+// PyProxy for JS to fetch and hold, and a request already suspended inside
+// `await _vv_app(...)` keeps the object it started with rather than finishing
+// against a different app than it began on.
+//
+// WHY A FAILED RE-IMPORT MUST BE A NO-OP. This is the part that decides whether
+// the feature is worth having. An edit with a syntax error in it is the common
+// case, not the rare one, and a reload that tears the old app down before
+// finding out leaves the server answering out of a module set that matches
+// neither version of the code — the user fixes the typo, saves again, and is
+// now debugging the reloader. So the project's modules are POPPED into a
+// snapshot, and if the import raises anything at all the snapshot goes back and
+// `_vv_app` is left exactly as it was: the previous app keeps serving, and the
+// traceback goes to the terminal.
+//
+// WHAT IS NOT RESET, stated because the honest version of this feature is the
+// one that says where it stops. Real `--reload` restarts the process, so
+// everything starts over. Here the interpreter survives, and only modules whose
+// code is under the project root are re-imported — so state living inside an
+// installed package (a framework's route registry or app cache, a connection
+// pool an old module opened) is carried across. The `.py` files the user edits
+// are re-executed; the packages under them are not.
+//
+// Exported so scripts/spike-python-offline.mjs drives the SHIPPED source under
+// the host's own CPython rather than a copy that would drift away from it. It is
+// ordinary Python and needs no Pyodide to be correct.
+export function reloadSource(moduleName, attrName, workdir) {
+  const root = withTrailingSlash(workdir);
+  return `
+import sys as _vv_sys, os as _vv_os, importlib as _vv_importlib
+import importlib.util as _vv_ilutil, traceback as _vv_traceback
+
+_VV_RELOAD_ROOT = ${JSON.stringify(root)}
+_VV_RELOAD_SKIP = frozenset(${JSON.stringify([...SKIP_DIRS])})
+
+
+def _vv_project_owned(mod):
+    """Is this module's code a file the user edits, rather than a package's?
+
+    The project root, minus the directories the mirror refuses to copy. A
+    package installed into the store is restored to the interpreter's OWN
+    site-packages and so is never under the root; a copy of it that IS under the
+    root (<project>/.venv) is not what any import resolved to."""
+    f = getattr(mod, "__file__", None)
+    if not f or not f.startswith(_VV_RELOAD_ROOT):
+        return False
+    parts = f[len(_VV_RELOAD_ROOT):].split("/")[:-1]
+    return not any(seg in _VV_RELOAD_SKIP for seg in parts)
+
+
+def _vv_project_modules():
+    return [n for n, m in list(_vv_sys.modules.items())
+            if m is not None and n != "__main__" and _vv_project_owned(m)]
+
+
+def _vv_drop_bytecode(sources):
+    """Delete the cached bytecode for the files about to be re-imported.
+
+    This is not belt and braces: without it a reload silently does nothing for a
+    whole class of edit. A .pyc is revalidated against its source's SIZE and its
+    mtime truncated to whole SECONDS, and "save, then reload" is inside the same
+    second by construction — so an edit that happens not to change the file's
+    length is indistinguishable from no edit, and the stale .pyc wins. Changing
+    a string literal, flipping a comparison, renaming to a name of the same
+    width: all same-size, all common, all silently ignored.
+
+    This runtime makes that more likely rather than less. Pyodide ships with
+    sys.dont_write_bytecode set and the interpreter cache (see BYTECODE_DIR)
+    deliberately unsets it, so user modules DO get bytecode written here where
+    upstream Pyodide would write none; the note there is explicit that theirs
+    "keeps CPython's ordinary mtime checking", which is the checking this defeats.
+
+    cache_from_source honours sys.pycache_prefix, so this finds the .pyc wherever
+    that setting has put it rather than assuming __pycache__ next to the source.
+    """
+    for src in sources:
+        if not src.endswith(".py"):
+            continue
+        try:
+            pyc = _vv_ilutil.cache_from_source(src)
+        except (NotImplementedError, ValueError):
+            continue
+        try:
+            _vv_os.unlink(pyc)
+        except OSError:
+            pass  # never written, or already gone
+
+
+def _vv_reload():
+    """Re-import the app. Returns "" on success, or a traceback to print."""
+    global _vv_app
+    saved = {}
+    sources = []
+    for name in _vv_project_modules():
+        mod = _vv_sys.modules.pop(name)
+        saved[name] = mod
+        src = getattr(mod, "__file__", None)
+        if src:
+            sources.append(src)
+    _vv_drop_bytecode(sources)
+    # New and renamed files: the import system caches a directory's contents, so
+    # a module added since the server started is invisible without this.
+    _vv_importlib.invalidate_caches()
+
+    def _restore():
+        # Drop whatever the failed attempt got as far as importing BEFORE
+        # putting the old set back, so a half-imported sibling cannot outlive it
+        # and be found by the next import.
+        for name in _vv_project_modules():
+            if name not in saved:
+                del _vv_sys.modules[name]
+        _vv_sys.modules.update(saved)
+
+    try:
+        _vv_rebound = getattr(
+            _vv_importlib.import_module(${JSON.stringify(moduleName)}),
+            ${JSON.stringify(attrName)},
+        )
+    except KeyboardInterrupt:
+        # Ctrl-C stays Ctrl-C. Swallowing it here would break the documented
+        # contract that an interrupt reaches the program.
+        _restore()
+        raise
+    except BaseException:
+        # BaseException, not Exception: a module that calls sys.exit() at import
+        # time must not be able to take the running server down with it.
+        _vv_detail = _vv_traceback.format_exc()
+        _restore()
+        return _vv_detail
+    _vv_app = _vv_rebound
+    return ""
+`;
+}
+
 export function createPythonRuntime({
   process,
   require,
@@ -1280,6 +2143,88 @@ export function createPythonRuntime({
     messageCallback: (m) => process.stdout.write(String(m) + "\n"),
     errorCallback: (m) => process.stderr.write(String(m) + "\n"),
   };
+
+  // The three plain synchronous functions Python's `subprocess` is built on.
+  //
+  // `spawn` is where the blocking happens, and it is not this code's doing: it
+  // calls the same `child_process.spawnSync` a Node guest calls, which issues
+  // OP_SPAWN and parks this worker on Atomics.wait until the kernel reports the
+  // child's exit. Python is inside that call for the whole life of the child.
+  //
+  // Everything crosses as JSON strings, for the reason the HTTP bridge does: a JS
+  // string becomes a Python str with nothing to reason about, where an object
+  // would arrive as a PyProxy whose lifetime is the caller's problem.
+  function subprocessBridge() {
+    const spawn = (specJson) => {
+      let spec;
+      try {
+        spec = JSON.parse(specJson);
+      } catch (e) {
+        return JSON.stringify({ error: "malformed spawn spec" });
+      }
+      const opts = {
+        cwd: spec.cwd || undefined,
+        env: spec.env || undefined,
+        encoding: "utf8",
+      };
+      // The child writes to the terminal itself when nothing wants to keep its
+      // output, which is what makes a slow child's progress visible — see the
+      // `inherit` branch in spawnSync.
+      if (spec.inherit) opts.stdio = "inherit";
+      if (spec.input_b64) {
+        try {
+          opts.input = globalThis.Buffer.from(spec.input_b64, "base64");
+        } catch {
+          /* an unreadable input is better dropped than fatal */
+        }
+      }
+      let r;
+      try {
+        r = req("child_process").spawnSync(spec.command, spec.args || [], opts);
+      } catch (e) {
+        return JSON.stringify({ error: String((e && e.message) || e) });
+      }
+      // spawnSync reports a spawn that never happened as status 127 with the
+      // syscall's code on `error`. ENOENT is flagged rather than described,
+      // because Python has a far better message for that one than anything here
+      // could pass through — it is the whole point of the feature.
+      if (r && r.error) {
+        const code = String((r.error && (r.error.code || r.error.message)) || "");
+        if (code.includes("ENOENT")) return JSON.stringify({ enoent: true });
+        return JSON.stringify({ error: code || "the spawn failed" });
+      }
+      return JSON.stringify({
+        code: r ? (r.status | 0) : 1,
+        stdout: r && r.stdout != null ? String(r.stdout) : "",
+        stderr: r && r.stderr != null ? String(r.stderr) : "",
+      });
+    };
+
+    // What exists to be run, read off the filesystem rather than from a list in
+    // this file — a hardcoded list would start lying the day a program was added,
+    // and this is the list a user is shown when a command was not found.
+    const programs = () => {
+      const names = new Set();
+      try {
+        for (const name of req("fs").readdirSync("/bin")) {
+          names.add(String(name).replace(/\.js$/, ""));
+        }
+      } catch {
+        /* an unreadable /bin just means the error lists nothing */
+      }
+      return JSON.stringify([...names]);
+    };
+
+    // Read fresh each time rather than captured: the counter lives in the
+    // environment so that it keeps counting across a mixed chain, where a Python
+    // process spawns a Node one that spawns Python again.
+    const depth = () => {
+      const raw = Number.parseInt(String((process.env && process.env[SPAWN_DEPTH_VAR]) || "0"), 10);
+      return Number.isFinite(raw) && raw > 0 ? raw : 0;
+    };
+
+    return { spawn, programs, depth };
+  }
 
   // One Pyodide per process (a fresh process worker = a fresh boot). Cached so a
   // REPL / repeated calls in the same process reuse it.
@@ -1344,6 +2289,10 @@ export function createPythonRuntime({
         // input(), pdb and anything else that reads a line. One syscall's worth
         // of wiring; the interpreter is unmodified.
         installStdin(pyodide);
+        // subprocess, over the same blocking spawn Node guests already have. Also
+        // one syscall's worth of wiring: nothing is spawned until something calls
+        // it, so a process that never shells out pays for six function objects.
+        installSubprocess(pyodide, subprocessBridge());
         // Two settings, so that the imports this process is about to do leave
         // their bytecode somewhere it can be collected from afterwards.
         installBytecodeCache(pyodide, process.env);
@@ -1399,6 +2348,13 @@ export function createPythonRuntime({
   // there is an interpreter running to take the interrupt. Idle (a REPL waiting
   // at its prompt, a pip download), Ctrl-C means exactly what it has always
   // meant, which is better than a Ctrl-C that is quietly swallowed.
+  //
+  // There is one window where that reasoning was wrong, and `deferInterrupts`
+  // below is it: the notebook resolves a cell's imports in JS, so for seconds at a
+  // time a cell is RUNNING with no interpreter inside it. Unarmed, stop there took
+  // the whole session down — the cost of killing a long-lived namespace is not the
+  // cost of killing a REPL, so that window holds the handler and hands the signal
+  // to the cell instead.
   let interruptDepth = 0;
   const onSigint = () => {
     // There is nothing to DO here: the interpreter already raised
@@ -1441,6 +2397,58 @@ export function createPythonRuntime({
     } finally {
       disarmInterrupts(armed);
     }
+  }
+
+  /**
+   * An armed window with no interpreter in it, for the one place that has one: the
+   * notebook resolves a cell's imports in JS, and fetching a wheel takes seconds.
+   *
+   * Unarmed, that window is fatal. Registering the handler is what tells the kernel
+   * not to kill this process, so with nothing registered a Ctrl-C during
+   * "Loading pandas…" applies the default action and takes the interpreter down —
+   * every name the user had defined, gone, for pressing stop on a download. Which
+   * is the opposite of the promise the notebook is built on.
+   *
+   * Armed the ordinary way it is nearly as bad, in a way that took a while to see:
+   * `postSignal` sets the byte CPython polls, and Pyodide's loader runs Python of
+   * its own inside that window (finding the imports, installing the wheel). The
+   * interrupt would land in the loader rather than in the user's cell — a
+   * KeyboardInterrupt out of package machinery nobody typed.
+   *
+   * So this holds the handler and takes the byte back down, remembering that the
+   * signal arrived. The caller re-delivers it to the cell, where the user aimed it.
+   * The download itself cannot be cancelled — nothing here can abort a fetch — but
+   * the cell does not run, the interpreter survives with its state, and the user
+   * gets a KeyboardInterrupt where they asked for one.
+   */
+  function deferInterrupts() {
+    if (!interrupt) return null;
+    let arrived = false;
+    const onDefer = () => {
+      arrived = true;
+      // Down again before Pyodide's loader runs any Python of its own. The
+      // stand-down the kernel needs is sent by armInterrupts' own handler, which is
+      // registered alongside this one.
+      interrupt[0] = 0;
+    };
+    const armed = armInterrupts();
+    process.on("SIGINT", onDefer);
+    return {
+      /** Close the window. True if a SIGINT arrived while it was open. */
+      end() {
+        process.removeListener("SIGINT", onDefer);
+        // The byte may have been set between the kernel's write and our handler
+        // getting a turn — it cannot be lost, only late.
+        if (interrupt[0]) arrived = true;
+        disarmInterrupts(armed);
+        return arrived;
+      },
+    };
+  }
+
+  /** Set the byte CPython polls, so the next bytecode it runs raises. */
+  function requestInterrupt() {
+    if (interrupt) interrupt[0] = INTERRUPT_SIGINT;
   }
 
   // ---- the breakpoint debugger ------------------------------------------------
@@ -1701,6 +2709,19 @@ export function createPythonRuntime({
 
   // ---- execution -------------------------------------------------------------
 
+  // Diagnostics that describe the BUILD rather than the program. Repeating one per
+  // cell would bury the cell's own output, and the second copy says nothing the
+  // first did not.
+  const warnedOnce = new Set();
+  function warnOnce(text) {
+    if (warnedOnce.has(text)) return;
+    warnedOnce.add(text);
+    process.stderr.write(text.endsWith("\n") ? text : text + "\n");
+  }
+
+  /** `loadImportsFor` with this process's stderr as the place complaints go. */
+  const loadImportsFor = (pyodide, source, sink) => resolveImports(pyodide, source, sink, warnOnce);
+
   /** A script path as the VFS knows it, whatever the user typed to get here. */
   function absPath(p) {
     const s = String(p || "");
@@ -1713,7 +2734,7 @@ export function createPythonRuntime({
   }
 
   async function runSource(indexUrl, source, opts) {
-    const { filename = "<stdin>", argv, cwd, importSource } = opts || {};
+    const { filename = "<stdin>", argv, cwd, importSource, moduleName, drive } = opts || {};
     const pyodide = await bootPyodide(indexUrl);
     let snapshot = null;
     let tracker = null;
@@ -1741,13 +2762,7 @@ export function createPythonRuntime({
     // Auto-load any vendored prebuilt packages the script imports (numpy, …).
     // `importSource` is for callers whose real source imports nothing useful —
     // `python -m X` runs a runpy call, so the imports to scan for are X's.
-    try {
-      await pyodide.loadPackagesFromImports(importSource || source, loaderToStderr);
-      const data = dataPackagesFor(importSource || source);
-      if (data.length) await pyodide.loadPackage(data, loaderToStderr);
-    } catch {
-      /* a missing package surfaces as a Python ImportError below */
-    }
+    await loadImportsFor(pyodide, importSource || source, loaderToStderr);
     // After the packages are unpacked, because what is installed is what may
     // have bytecode worth putting back, and before the first import, which is
     // the thing being made faster.
@@ -1767,8 +2782,19 @@ export function createPythonRuntime({
       dbg.waitForStart();
     }
     let code = 0;
+    // `moduleName` runs the source in a namespace of its own, under a `__name__`
+    // that is not "__main__" — so a file with the usual guard at the bottom
+    // defines everything and starts nothing. The only caller is the notebook
+    // kernel, whose `main()` would otherwise take the stdin the driver reads.
+    const ns = moduleName ? pyodide.toPy({ __name__: moduleName }) : null;
     try {
-      await withInterrupts(() => pyodide.runPythonAsync(source, { filename }));
+      await withInterrupts(() =>
+        pyodide.runPythonAsync(source, ns ? { filename, globals: ns } : { filename }),
+      );
+      // The program is the definitions; `drive` is the run. Inside the same try so
+      // that a SystemExit or a Ctrl-C out of the loop is reported by the one place
+      // that knows how to read either.
+      if (drive) code = (await drive(pyodide, ns)) | 0;
       flushStreams(pyodide);
     } catch (e) {
       // Before our own report, so the script's output stays ahead of the error
@@ -1789,6 +2815,13 @@ export function createPythonRuntime({
       // only all there once they have all happened. Costs nothing when the
       // cache already holds everything this process imported.
       harvestBytecode(req("fs"), pyodide, process.env);
+      if (ns) {
+        try {
+          ns.destroy();
+        } catch {
+          /* the interpreter is going away with it */
+        }
+      }
     }
     return code;
   }
@@ -1825,6 +2858,195 @@ export function createPythonRuntime({
       filename: "<string>",
       argv: ["-c", ...(args || [])],
       cwd: process.cwd(),
+    });
+  }
+
+  // ---- the notebook kernel ---------------------------------------------------
+  //
+  // `python --vv-notebook-kernel <path>` runs the studio's kernel program (see
+  // packages/studio/src/vv/notebook/kernel-source.js) with the read loop on THIS
+  // side of the interpreter instead of inside it.
+  //
+  // WHY THE LOOP IS HERE. A notebook cell is source that appears at runtime, so
+  // the packages it imports can only be resolved once the cell has arrived — and
+  // resolving them means fetching a wheel, which is asynchronous. Python cannot
+  // wait for that: `await` would need a coroutine driven by the event loop of the
+  // very worker thread that a blocking wait parks, so the fetch could never
+  // complete. There is no JSPI here either (the same reason `asyncio.run` is
+  // refused). Moving the read to JS puts the await between the line and the exec,
+  // which is the only place it can go.
+  //
+  // The alternative shipped first and is what this replaces: `python
+  // <kernel>.py`, whose own `input()` loop leaves no await anywhere, so a cell
+  // that said `import pandas` failed on a vendored wheel that was sitting on disk
+  // — while the same import in a script worked, because a script's source is
+  // scanned before it runs.
+  //
+  // What this file knows about the notebook stops at five function names and
+  // "requests are lines". Everything a cell MEANS is still Python, in that file,
+  // driven under the host's own CPython by scripts/spike-notebook.mjs.
+  function driveNotebook(pyodide, ns) {
+    const fn = (name) => {
+      const f = ns && ns.get(name);
+      if (!f) throw new Error(`the notebook kernel program has no ${name}()`);
+      return f;
+    };
+    const start = fn("start");
+    const handleLine = fn("handle_line");
+    const sourceOf = fn("source_of");
+    const loading = fn("loading");
+    const died = fn("died");
+    // The fifth name, and the one that makes the interrupt guarantee total rather
+    // than nearly total: see the catch at the bottom of the loop.
+    const interrupted = fn("interrupted");
+
+    // THIS PROCESS HAS NO TERMINAL. Its stdout is the frame stream, shared with the
+    // shell's echo, so a child spawned by a cell that wrote there directly would
+    // produce unframed bytes — which FrameReader correctly files as kernel noise,
+    // putting `subprocess.run(["ruff", "check", "."])`'s output in the collapsed log
+    // instead of under the cell that ran it. Told once, here, because this is the
+    // only host in this file for which it is true.
+    //
+    // It is told from JS rather than by the kernel program, which would be the more
+    // obvious home for a fact about the kernel's own stdout, because the flag lives
+    // in Pyodide's globals and the kernel module runs in a namespace of its own — a
+    // bare name lookup down there would not find it. So `python <kernel>` run
+    // directly, the main() shape nothing ships, keeps the old behaviour.
+    try {
+      const noTerminal = pyodide.globals.get("_vv_subprocess_no_terminal");
+      if (noTerminal) {
+        noTerminal();
+        // A PyProxy is a reference the interpreter cannot collect on its own; the
+        // `install` call below the boot does the same thing for the same reason.
+        noTerminal.destroy();
+      }
+    } catch {
+      /* an interpreter without subprocess installed has nothing to tell */
+    }
+
+    // Loader progress goes to the CELL, not to stderr. stderr here is the kernel's
+    // terminal, which is a terminal nobody has open — and the wait being explained
+    // is long: the first `import pandas` in a session unpacks ~20 MB of wheels.
+    const toCell = {
+      messageCallback: (m) => {
+        try {
+          loading(String(m));
+        } catch {
+          /* the kernel is gone; the exit will say so */
+        }
+      },
+      errorCallback: (m) => process.stderr.write(String(m) + "\n"),
+    };
+
+    const readLine = makeLineReader(null, null);
+    start();
+
+    return new Promise((resolve, reject) => {
+      // One request per macrotask, for the reason the REPL does it: a `while` loop
+      // whose only suspension points are microtasks starves the process's own exit
+      // path, and a ref'd timer is what keeps this process alive between cells.
+      const step = async () => {
+        const line = readLine();
+        // stdin closed. The front end closes the terminal to stop a kernel, and
+        // sends {"op":"shutdown"} first, so this is the abrupt case.
+        if (line === null) return resolve(0);
+        try {
+          // BEFORE handle_line execs it. `source_of` returns "" for anything that
+          // is not a cell to run, so a shutdown or a malformed line costs nothing.
+          const src = String(sourceOf(line) || "");
+          // The fetch is the one part of running a cell that happens in JS, and it
+          // is the longest part — so it is also where a user is most likely to press
+          // stop. `deferInterrupts` keeps the process alive through it and reports
+          // whether the keystroke arrived; the interrupt is then handed to the cell
+          // rather than to Pyodide's loader.
+          // Not named `interrupted`: that is the kernel function the catch below
+          // calls, and a boolean by the same name in an enclosing block would be a
+          // trap set for whoever moves this declaration. It works from in here
+          // because the two scopes do not overlap, and it would keep working right
+          // up until it silently did not — the catch would call a boolean, throw
+          // inside the handler, and report the kernel dead, with the transport
+          // tier still green because that gate reads for the three strings and
+          // they would all still be present and in order.
+          let sawInterrupt = false;
+          if (src) {
+            const window = deferInterrupts();
+            try {
+              await loadImportsFor(pyodide, src, toCell);
+            } finally {
+              if (window) sawInterrupt = window.end();
+            }
+          }
+          // Sync, and armed for Ctrl-C: the cell runs inside this call, and
+          // CPython's interrupt byte is what turns a keystroke into a
+          // KeyboardInterrupt the cell can be stopped by (see withInterrupts).
+          const more = withInterruptsSync(() => {
+            // Armed a moment ago, so the byte is clear: put back the interrupt that
+            // arrived during the fetch and the cell raises on its first bytecode,
+            // reported by handle_line as the KeyboardInterrupt the user asked for.
+            if (sawInterrupt) requestInterrupt();
+            return handleLine(line);
+          });
+          flushStreams(pyodide);
+          if (!more) return resolve(0);
+        } catch (e) {
+          // AN INTERRUPT THAT ESCAPED THE KERNEL'S OWN GUARD, which is a thing that
+          // can happen however carefully that guard is written: a `try` covers the
+          // code it encloses, and CPython raises at whichever bytecode it reaches
+          // next — the function-entry check ahead of the guard, or the guard's own
+          // except clause while it is reporting. Nobody has been able to settle by
+          // reading where the Emscripten signal path lands, and this is what makes
+          // that question stop mattering: the catch runs for every escape, so
+          // recognising the exception rather than predicting its position closes
+          // every site at once, including ones not yet measured.
+          if (terminationFromError(e).kind === "interrupt") {
+            try {
+              const more = interrupted(line);
+              flushStreams(pyodide);
+              if (!more) return resolve(0);
+              setTimeout(step, 0);
+              return;
+            } catch {
+              /* the interpreter cannot even report; fall through and stop */
+            }
+          }
+          // A failure in the driver, not in a cell. The kernel is about to stop,
+          // so the reason goes down the protocol while it still can — a dead
+          // kernel that reported nothing is what the notebook showed before.
+          try {
+            died(String((e && e.message) || e));
+          } catch {
+            /* nothing left to report with */
+          }
+          return reject(e);
+        }
+        setTimeout(step, 0);
+      };
+      setTimeout(step, 0);
+    });
+  }
+
+  async function notebookKernel(indexUrl, filePath) {
+    const abs = absPath(filePath);
+    let source;
+    try {
+      source = req("fs").readFileSync(abs, "utf8");
+    } catch (e) {
+      process.stderr.write(
+        `python: can't open the notebook kernel '${filePath}': ${(e && e.code) || (e && e.message) || e}\n`,
+      );
+      return 2;
+    }
+    return runSource(indexUrl, source, {
+      filename: abs,
+      argv: [filePath],
+      // The notebook's own folder, so a cell reads and writes the user's project
+      // files exactly as a script run from there would.
+      cwd: process.cwd(),
+      // Definitions only — the driver owns the loop. Not "__main__", which is what
+      // Pyodide's default globals carry and what would start the program's own
+      // blocking read of the stdin this driver is reading.
+      moduleName: "vv_notebook_kernel",
+      drive: driveNotebook,
     });
   }
 
@@ -2612,6 +3834,7 @@ json.dumps({
   function serve(indexUrl, opts) {
     const { app, port, cwd } = opts || {};
     const mode = opts && opts.mode === "asgi" ? "asgi" : "wsgi";
+    const wantReload = !!(opts && opts.reload);
     const colon = String(app || "").indexOf(":");
     const moduleName = colon === -1 ? String(app || "main") : app.slice(0, colon);
     const attrName = colon === -1 ? "app" : app.slice(colon + 1) || "app";
@@ -2651,7 +3874,7 @@ json.dumps({
           const fs = req("fs");
           const src = fs.readFileSync(req("path").join(workdir, moduleName + ".py"), "utf8");
           await pyodide.loadPackagesFromImports(src, loaderToStderr);
-          const data = dataPackagesFor(src);
+          const data = hiddenImportsFor(src);
           if (data.length) await pyodide.loadPackage(data, loaderToStderr);
         } catch {
           /* module may be a package or unreadable; app import will report */
@@ -2661,13 +3884,193 @@ json.dumps({
         restoreBytecode(req("fs"), pyodide, process.env);
 
         let dispatch;
+        let reloadApp = null;
         try {
           pyodide.runPython(setupSource(moduleName, attrName, mode));
           dispatch = pyodide.globals.get("_vv_dispatch");
+          if (wantReload) {
+            pyodide.runPython(reloadSource(moduleName, attrName, workdir));
+            reloadApp = pyodide.globals.get("_vv_reload");
+          }
         } catch (e) {
           reject(new Error(`failed to import ${moduleName}:${attrName}: ${(e && e.message) || e}`));
           return;
         }
+
+        // ---- restart-on-save ---------------------------------------------------
+        //
+        // The project is copied into the interpreter once, when the server
+        // starts, so an edit afterwards is invisible until something copies it in
+        // again. `fs.watch` is what says when: the File System Worker is the one
+        // place that sees every client's writes — this process's, another
+        // process's, and the editor's ⌘S — and it pushes each one back over the
+        // fs doorbell port. No OS watcher and no thread; the events arrive on a
+        // loop turn like any other.
+        //
+        // Restarting means re-importing rather than re-execing, because the
+        // `python` launcher builds the app IN this process: `serve()` imported it
+        // and holds the dispatcher, so there is no child to kill and nothing to
+        // wait for.
+        const watchers = [];
+        const watched = new Set();
+        const edited = new Set();
+        let settleTimer = null;
+        let inFlight = 0;
+        let queued = false;
+
+        const applyEdit = (full) => {
+          const fs = req("fs");
+          let buf = null;
+          try {
+            buf = fs.readFileSync(full);
+          } catch {
+            buf = null; // deleted, or unreadable — mirror the absence
+          }
+          try {
+            if (buf === null) {
+              try {
+                pyodide.FS.unlink(full);
+              } catch {
+                /* already gone from the interpreter too */
+              }
+            } else {
+              if (buf.length > MAX_MIRROR_FILE) return;
+              pyodide.FS.mkdirTree(req("path").dirname(full));
+              pyodide.FS.writeFile(
+                full,
+                new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength),
+              );
+            }
+          } catch {
+            return;
+          }
+          // This write was ours, not the app's. Leaving it tracked would have the
+          // next request mirror the file straight back out to the host — the same
+          // reason trackWrites is installed after mirrorIn rather than before it.
+          if (tracker) {
+            tracker.writes.delete(full);
+            tracker.deletes.delete(full);
+          }
+        };
+
+        const relToWorkdir = (full) =>
+          full.startsWith(workdir === "/" ? "/" : workdir + "/")
+            ? full.slice(workdir === "/" ? 1 : workdir.length + 1)
+            : full;
+
+        const runReload = () => {
+          // A reload re-executes module-level code, and doing that underneath a
+          // suspended ASGI request would run it re-entrantly, interleaved with a
+          // handler mid-await. Requests are short and this only defers to the end
+          // of the one in flight.
+          if (inFlight > 0) {
+            queued = true;
+            return;
+          }
+          const files = [...edited];
+          edited.clear();
+          for (const full of files) applyEdit(full);
+          const names = files.map(relToWorkdir).sort();
+          let detail = "";
+          try {
+            detail = String(reloadApp());
+          } catch (e) {
+            detail = (e && e.stack) || String(e);
+          }
+          if (detail) {
+            process.stderr.write(
+              `reload: ${names.join(", ")} changed, but re-importing ${moduleName}:${attrName} failed. ` +
+                `The previous version is still serving.\n${detail}`,
+            );
+          } else {
+            process.stdout.write(`reload: ${names.join(", ")} changed — ${moduleName}:${attrName} re-imported\n`);
+          }
+          flushStreams(pyodide);
+        };
+
+        const schedule = () => {
+          if (settleTimer) clearTimeout(settleTimer);
+          settleTimer = setTimeout(() => {
+            settleTimer = null;
+            runReload();
+          }, RELOAD_DEBOUNCE_MS);
+        };
+
+        // A directory that appeared after the walk needs a watch of its own, or
+        // edits inside it are never seen — these watches are non-recursive. It may
+        // also already have files in it: a directory and its contents arrive
+        // together when a folder is created in the explorer, or a tree is
+        // unzipped, and those files' events went to a watch that did not exist
+        // yet. So the subtree is adopted whole and anything already in it counts
+        // as an edit, rather than waiting for a second save to notice it.
+        const adopt = (root) => {
+          const fs = req("fs");
+          for (const dir of reloadWatchDirs(fs, root)) {
+            addWatch(dir);
+            let names;
+            try {
+              names = fs.readdirSync(dir);
+            } catch {
+              continue;
+            }
+            for (const name of names) {
+              if (isReloadTrigger(name)) edited.add(dir === "/" ? "/" + name : dir + "/" + name);
+            }
+          }
+        };
+
+        const onEvent = (dir, event, filename) => {
+          if (!filename) return;
+          const full = dir === "/" ? "/" + filename : dir + "/" + filename;
+          if (isReloadTrigger(filename)) {
+            edited.add(full);
+            schedule();
+            return;
+          }
+          if (event !== "rename" || watched.has(full) || SKIP_DIRS.has(filename)) return;
+          try {
+            if (!req("fs").statSync(full).isDirectory()) return;
+          } catch {
+            return; // gone again before we looked
+          }
+          adopt(full);
+          if (edited.size) schedule();
+        };
+
+        function addWatch(dir) {
+          if (watched.has(dir)) return;
+          try {
+            const w = req("fs").watch(dir, (event, filename) => onEvent(dir, event, filename));
+            watched.add(dir);
+            watchers.push(w);
+          } catch {
+            /* an unwatchable directory costs reload in it, not the server */
+          }
+        }
+
+        const startWatching = () => {
+          const fs = req("fs");
+          for (const dir of reloadWatchDirs(fs, workdir)) addWatch(dir);
+          process.stdout.write(
+            `reload: watching ${watched.size} director${watched.size === 1 ? "y" : "ies"} under ${workdir} for .py changes\n`,
+          );
+        };
+
+        const stopWatching = () => {
+          if (settleTimer) clearTimeout(settleTimer);
+          settleTimer = null;
+          // A persistent FSWatcher refs the loop, so leaving these open would
+          // keep the process alive after the server closed.
+          for (const w of watchers) {
+            try {
+              w.close();
+            } catch {
+              /* already closed */
+            }
+          }
+          watchers.length = 0;
+          watched.clear();
+        };
 
         const http = req("http");
         const server = http.createServer((sreq, sres) => {
@@ -2699,8 +4102,13 @@ json.dumps({
                 root_path: rootPath,
                 body_b64: bodyBuf.length ? bodyBuf.toString("base64") : "",
               });
-              const resultJson =
-                mode === "asgi" ? await dispatch(reqJson) : dispatch(reqJson);
+              inFlight++;
+              let resultJson;
+              try {
+                resultJson = mode === "asgi" ? await dispatch(reqJson) : dispatch(reqJson);
+              } finally {
+                inFlight--;
+              }
               // A server never "ends", so a print() inside a view would sit in
               // Python's buffer until 8 KB of it accumulated. Flush per request
               // instead: the request already cost far more than this does.
@@ -2738,6 +4146,15 @@ json.dumps({
               // A 500 is exactly when a half-finished write is most likely, and
               // exactly when the user most wants to see what got as far as disk.
               persist(workdir, tracker);
+            } finally {
+              // A save that landed while this request was running deferred itself
+              // rather than re-importing underneath it. Now there is nothing to
+              // interleave with. Deliberately after persist(): the app's own
+              // writes reach the host before the copy in reads it back.
+              if (queued && inFlight === 0) {
+                queued = false;
+                runReload();
+              }
             }
           });
           sreq.on("error", () => {
@@ -2759,8 +4176,13 @@ json.dumps({
           process.stdout.write(
             `${kind} server (${moduleName}:${attrName}) running on http://localhost:${bindPort}\n`,
           );
+          // After the port is up, so the first line a user reads is the one with
+          // the URL in it, and so a watch can never fire before there is an app
+          // to re-import.
+          if (reloadApp) startWatching();
         });
         server.on("close", () => {
+          stopWatching();
           // The reconciling pass: everything tracked, plus a size diff over the
           // tree. Per-request mirroring should already have written all of it —
           // this is what makes a tracking regression cost a delay rather than
@@ -2790,6 +4212,7 @@ json.dumps({
         runFile: (filePath, args) => runFile(idx, filePath, args),
         runCode: (source, args) => runCode(idx, source, args),
         runModule: (mod, args, cwd) => runModule(idx, mod, args, cwd),
+        notebookKernel: (filePath) => notebookKernel(idx, filePath),
         serveStatic: (o) => serveStatic(idx, o),
         pipInstall: (names) => pipInstall(idx, names),
         pipInstallEditable: (target) => pipInstallEditable(idx, target),

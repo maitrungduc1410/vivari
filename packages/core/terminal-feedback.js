@@ -116,8 +116,20 @@ const MEANINGFUL_GROWTH = 25;
  * waiting — a server between requests has nothing pending, a server stuck inside
  * a handler has requests piling up behind it. Reporting the first is noise;
  * reporting the second is the most useful thing this watchdog can say.
+ *
+ * `hasLiveChild` is the same argument one step further out. A shell waiting on a
+ * foreground child prints nothing and makes no syscalls BY DEFINITION — that is
+ * what waiting is — so every signal read here says "silent" about the one process
+ * in the tree that has nothing to say. A user running the notebook template's
+ * warmup got `PID 2 (sh) has printed nothing for 139s … it looks stuck rather than
+ * slow` about a shell whose python was busy fetching wheels, which is a false
+ * alarm of exactly the kind this watchdog exists to avoid producing. The child is
+ * watched on its own terms and reported under its own name, so nothing is lost by
+ * staying quiet about the parent — and if the child really is wedged, its report
+ * names the program instead of the shell that launched it.
  */
-export function shouldReportStall({ serving, pendingRequests = 0 }) {
+export function shouldReportStall({ serving, pendingRequests = 0, hasLiveChild = false }) {
+  if (hasLiveChild && pendingRequests === 0) return false;
   return !serving || pendingRequests > 0;
 }
 

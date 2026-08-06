@@ -184,8 +184,29 @@ export function makeFakePyodide({ pythonVersion = "3.14.2", pyodideVersion = "31
     for (const [from, to] of spec.rename || []) FS.rename(from, to);
   };
 
+  // "Import main.py and bind it as the app." setupSource does this once at boot
+  // and reloadSource does it again on every save, so the stand-in models both
+  // through one function: the app's identity IS the file's contents. Returns a
+  // traceback string on failure, "" on success, matching _vv_reload's contract.
+  const bindApp = () => {
+    const here = FS.cwd === "/" ? "" : FS.cwd;
+    let text;
+    try {
+      text = new TextDecoder().decode(FS.readFile(`${here}/main.py`));
+    } catch {
+      return "ModuleNotFoundError: No module named 'main'\n";
+    }
+    // A source the test marks as broken stands in for any import that raises:
+    // the reload must report it and change nothing.
+    if (text.includes("VVRELOAD-FAIL")) return "SyntaxError: invalid syntax\n";
+    served.body = text.trim();
+    return "";
+  };
+
   const answer = (code) => {
     applyFsDirective(code);
+    // The generated dispatch source — serve()'s one-time app import.
+    if (code.includes("_vv_dispatch")) bindApp();
     // DIST_QUERY first: it calls sysconfig.get_path() too, so matching pyEnv's
     // probe on that alone answers this one with the wrong payload — silently,
     // since both are JSON.
@@ -213,6 +234,10 @@ export function makeFakePyodide({ pythonVersion = "3.14.2", pyodideVersion = "31
   // What was executed, and under what name. See runPythonAsync below.
   const ran = [];
 
+  // What the stand-in app answers with. "ok" until a reload rebinds it, which is
+  // how a test tells an app that picked up an edit from one that did not.
+  const served = { body: "ok" };
+
   return {
     FS,
     loaded,
@@ -236,14 +261,24 @@ export function makeFakePyodide({ pythonVersion = "3.14.2", pyodideVersion = "31
     // serve() runs setupSource() and then reads _vv_dispatch out of globals.
     // The stand-in app writes and deletes files on request, because "did a file
     // a request produced reach the host?" is the question serve() has to answer.
+    //
+    // With --reload there is a second question, and it is the one no amount of
+    // Python can answer: did the JS half — the watch, the debounce, the copy of
+    // the edited file INTO the interpreter — actually deliver the new bytes
+    // before asking for a re-import? So the stand-in app's response body is the
+    // contents of `main.py` as the interpreter sees it, which makes the answer
+    // readable off an HTTP response. A copy that never landed shows up as a
+    // stale body rather than as silence. reloadSource's own semantics are proved
+    // elsewhere, under a real CPython (spike-python-offline, "the re-import").
     globals: {
       get: (name) => {
+        if (name === "_vv_reload") return bindApp;
         if (name !== "_vv_dispatch") return undefined;
         return (reqJson) => {
           const r = JSON.parse(reqJson);
           const seg = r.path.split("/").filter(Boolean);
           const here = FS.cwd === "/" ? "" : FS.cwd;
-          let body = "ok";
+          let body = served.body;
           if (seg[0] === "write") FS.writeFile(`${here}/${seg[1]}`, decodeURIComponent(seg[2] || ""));
           else if (seg[0] === "delete") { try { FS.unlink(`${here}/${seg[1]}`); } catch { /* gone */ } }
           else if (seg[0] === "boom") {

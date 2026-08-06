@@ -68,11 +68,14 @@ interpreter cache it lives in the session's filesystem and goes when you reload.
 | | |
 | --- | --- |
 | **Scripts, the REPL, `-c`** | with the project directory mirrored in, so file I/O and sibling imports work |
-| **The scientific stack** | NumPy, pandas, Matplotlib, SciPy, scikit-learn, SymPy, Pillow — as prebuilt WASM wheels |
+| **The scientific stack** | NumPy, pandas, Matplotlib, SciPy and scikit-learn ship vendored and work offline; SymPy and Pillow come from Pyodide's CDN |
+| **Spreadsheets** | `pd.read_excel` / `to_excel`, through a vendored openpyxl |
 | **`sqlite3`** | compiled into the interpreter; databases are real files |
 | **Web frameworks** | Flask, FastAPI and Django, with a live preview |
+| **`--reload`** | save a `.py` file and the app is re-imported; a broken save leaves the old one serving |
 | **pytest** | including real exit codes, so `pytest && …` behaves |
 | **`python -m <module>`** | any importable module, through CPython's own `runpy` — `unittest`, `http.server`, `json.tool` |
+| **`subprocess.run`** | spawns the programs in the VM, so a script can drive `pytest` or `ruff`; `Popen` is refused by name |
 | **Pure-Python packages from PyPI** | installed at runtime through `micropip` |
 | **`pip install` that persists** | into a per-project `.venv`, with `list`/`freeze`/`show`/`uninstall`/`check` |
 | **Outbound HTTP** | `requests` or `httpx`, sync or async — subject to the target's CORS headers |
@@ -121,6 +124,81 @@ than hardcoding them** — `url_for()`, `reverse()`, `{% url %}`,
 under, so generated URLs stay inside the preview. A hardcoded `/about` will
 escape it.
 
+## Restarting on save
+
+`--reload` works, on all three entrypoints:
+
+```bash
+uvicorn main:app --reload --port 8000
+flask --app main run --reload --port 8000
+gunicorn wsgi:application --reload --bind 0.0.0.0:8000
+```
+
+Save a `.py` file and the app is re-imported; the next request is served by the
+new code. The terminal says which file changed and that the re-import happened,
+so a reload that did nothing is not something you have to infer.
+
+This page used to say it was impossible, on the grounds that a reloader needs a
+file watcher and a subprocess. Both halves were wrong, and it is worth saying why
+rather than just deleting the sentence, because the reasoning is the useful part.
+
+**The filesystem already says when a file changed.** A reloader on your laptop
+polls or asks the OS, and under WebAssembly there is no OS to ask. But every
+write here goes through one place — the component that owns the virtual
+filesystem — and it already tells interested processes what changed, because that
+is how Vite's dev server sees your edits and rebuilds. `fs.watch` in a Python
+server is the same subscription Vite has been using all along, so what looked
+like a missing capability was an unused one. Notably this means an editor save is
+seen the same way a write from another program is: the watch is on the
+filesystem, not on the editor.
+
+**And there is no process to restart.** `uvicorn` here is not the real uvicorn —
+it is an entrypoint that hands your app to the bridge (see above), and the bridge
+imports your app into the server's own process. Real `--reload` needs a
+subprocess because it has a real server to kill and respawn. Here the thing to
+replace is a Python object, so a reload re-imports the module and rebinds it.
+
+### What it re-imports, and what it does not
+
+**A failed re-import changes nothing.** This is the part worth trusting, because
+a syntax error in a file you just saved is the normal case rather than the
+exceptional one. Your project's modules are set aside, the import is attempted,
+and if it raises anything at all the previous set is put back and the app that
+was serving keeps serving — including any module that had already been
+re-imported before the failure. The traceback goes to the terminal, prefixed
+with which file triggered the attempt. Fix the file, save again, and the reload
+that follows behaves as though the broken one never happened.
+
+**Your modules are re-executed; the packages under them are not.** A re-import
+runs your files again, so module-level code in them runs again and module-level
+state in them resets — which is what restarting a process would have done. What
+does not reset is anything living inside an installed package: a framework's
+cached route table, a connection pool something opened, a registry a library
+populated on first import. Real `--reload` gets those for free by starting a new
+process, and there is no new process here. If a change is not showing up and it
+is not in your own code, restart the server; that is the case this does not
+cover.
+
+**`.py` files only, anywhere under the project.** Templates, CSS and data files
+are not watched — they are usually re-read per request anyway — and neither is
+anything inside `.venv`, `__pycache__`, `node_modules` or `.git`. The `.py`
+restriction is also what stops a server that writes files from restarting itself:
+those writes are mirrored back to the project at the end of every request, and a
+watch that fired on any of them would loop forever.
+
+**A burst of saves is one restart.** "Save all" writes several files; they are
+coalesced and the app is re-imported once, after about a fifth of a second of
+quiet. A save that lands while a request is in flight waits for that request to
+finish rather than re-importing underneath it.
+
+**Flags that narrow the watch are refused rather than ignored.**
+`uvicorn --reload-include`, `--reload-exclude`, `--reload-dir`, `--reload-delay`
+and `gunicorn --reload-engine`, `--reload-extra-file` all say on stderr that they
+are not applied — the watch is `.py` under the project and there is no filter to
+set. `flask --debug` means two things, a reloader and Werkzeug's in-browser
+debugger; the reloader happens, the debugger does not, and the flag says so
+rather than implying both.
+
 ## Running a module with `-m`
 
 `python -m <module>` runs whatever you name, through CPython's own `runpy` — the
@@ -138,7 +216,9 @@ and exits non-zero when they fail. `python -m http.server` is CPython's own
 `SimpleHTTPRequestHandler` — the real directory listings, the real MIME types,
 the real 404 — served over the same bridge as Flask and FastAPI rather than a
 socket, so `--directory` and `--bind` behave and a preview tab opens. `--cgi`
-does not, because it needs a subprocess.
+does not: it needs to write to a child's stdin and read its stdout while the
+child is still running, which is the one shape of subprocess this runtime cannot
+offer (see [Running another program](#running-another-program)).
 
 A handful of modules are refused up front, with the reason: `smtplib`, `ftplib`,
 `poplib`, `imaplib`, `socketserver`, `wsgiref.simple_server` and
@@ -149,6 +229,125 @@ like they had started, and then wait forever for bytes that never move.
 
 Anything else that is missing gets CPython's error, not ours:
 `python: No module named nosuchthing`, exit 1.
+
+## Running another program
+
+`subprocess.run()` works. A script can drive the other tools in the VM:
+
+```python
+import subprocess
+
+subprocess.run(["python", "-m", "pytest"], check=True)
+subprocess.run(["ruff", "check", "."], check=True)
+
+out = subprocess.run(["ruff", "--version"], capture_output=True, text=True).stdout
+```
+
+This page used to say `subprocess` raised `OSError: [Errno 138] emscripten does
+not support processes.` and leave it there. Unpatched, it does — that error is
+CPython's, and it is about `fork`, which Emscripten genuinely does not have. The
+mistake was reading it as *there are no processes here*. There are: Vivari runs
+every command as a real process with its own worker, and Node code in the same VM
+has spawned them since long before Python could. `subprocess.run()` is one
+blocking call that returns when the child exits, which is the shape the kernel's
+spawn already had.
+
+### What can be spawned, and what is simply not here
+
+Programs that exist **inside the VM**: `python`, `pytest`, `ruff`, `mypy`,
+`black`, `pip`, `node`, `npm`, `bun`, `sh`, `uvicorn`, `flask`, `gunicorn` and the
+handful of file utilities, plus anything on `PATH` — a project's
+`node_modules/.bin`, or a console script from your `.venv`.
+
+Native binaries are **not** here, and this is a different limit from the one
+above. `git`, `ffmpeg`, `curl` and `gcc` are not part of Vivari and cannot be
+installed into it, so:
+
+```python
+subprocess.run(["ffmpeg", "-i", "in.mp4", "out.webm"])
+```
+
+raises `FileNotFoundError` whose message says the binary is missing and lists
+what you *can* run. It deliberately does not say processes are impossible,
+because that would teach the wrong lesson about a call that works.
+
+### What is honoured
+
+`args` as a list or, with `shell=True`, a string run through `sh`. `cwd`, `env`,
+`check`, `capture_output`, `stdout`/`stderr` as `PIPE`, `DEVNULL`, `STDOUT` or an
+open file, `text=` / `encoding=`, and `input=`. Exit codes are the child's, and a non-zero
+one under `check=True` raises the real `subprocess.CalledProcessError` with the
+output on it — the stdlib's own class, so an existing `except` clause keeps
+working. `call()`, `check_call()`, `check_output()`, `getoutput()`,
+`getstatusoutput()` and `os.system()` all work, since they all reduce to the same
+one call.
+
+With no capture asked for, the child writes straight to your terminal as it goes,
+which is what you want watching a test run. Ask for the output and it arrives
+whole when the child exits — captured output cannot arrive before the exit that
+carries it.
+
+### What is refused, and why
+
+- **`Popen` is refused.** Its contract is that it returns while the child is
+  still running, so you can stream its output and write to its stdin. That needs
+  either threads or a non-blocking spawn, and this runtime has one interpreter, no
+  threads, and a spawn that does not return until the child is gone. Running the
+  child to completion inside `Popen()` and serving the buffered output afterwards
+  would make `communicate()` pass and make `Popen(["uvicorn", …])` hang forever,
+  so it says what it cannot do and points at `run()`. `os.popen` says the same.
+- **`timeout=` is refused**, rather than accepted and ignored. Once the child
+  starts, the caller is parked until it exits and nothing can interrupt that wait
+   — so a timeout could be taken and never enforced, which would turn the one
+  argument you wrote to bound a wait into an unbounded one.
+- **`stdin=` takes `None`, `PIPE` or `DEVNULL`.** A file or a descriptor is
+  refused: the parent is parked from the moment the child starts, so there is no
+  pipe left to write into. Pass what you were going to write as `input=`.
+- **A file descriptor is refused** where `stdout=` or `stderr=` would take one. A
+  child here is a separate worker rather than a fork of this process, so nothing
+  is inherited across the spawn. Pass the open file *object* instead — that is
+  honoured, and the child's output is written into it.
+- **A child's stdin is closed immediately** — it sees EOF rather than your
+  terminal. A child that stops to ask a question would otherwise wait for a
+  keystroke that can never arrive, so `input=` is the only way to answer it.
+- `preexec_fn`, `pass_fds`, `start_new_session`, `user`, `group` and `umask` are
+  refused by name; they describe POSIX facilities that have no counterpart here.
+  `bufsize`, `close_fds` and the Windows-only options warn on stderr and are
+  ignored.
+
+### Two things to know
+
+**Captured output is text.** The syscall carries the child's output back as a
+string, so `capture_output=True` without `text=True` gives you bytes that have
+been through a decode. Piping real binary out of a child is not byte-exact.
+
+**Held output arrives at the end, and merged output loses its interleaving.**
+Anything not going straight to the terminal — captured, or redirected to a file —
+is delivered when the child exits, so a file you passed as `stdout=` fills up in
+one write rather than as the child produces it. And because the two streams are
+captured separately, `stderr=STDOUT` gives you all of stdout followed by all of
+stderr, not the order the child actually wrote them in. Every line is there; on
+your own machine both streams share one descriptor and the order is whichever
+flushed first.
+
+**Ctrl-C does not arrive while a child is running.** Your code is inside a
+blocking call for as long as the child lives, so a `KeyboardInterrupt` cannot be
+raised in it until the child exits — a `try/except KeyboardInterrupt` around
+`subprocess.run` will not fire mid-child. Ctrl-C still reaches the process, and
+the kernel terminates it if nothing answers within its grace window. This is the
+same as `spawnSync` in Node and is not specific to Python.
+
+**Nesting is bounded.** Each level is another process with its own Python
+interpreter behind it, and each parent is blocked until its child exits — so a
+script that spawned itself would fill the tab with interpreters that nothing could
+interrupt. Three levels deep is allowed; the fourth is refused with that reason.
+
+**On what this widens.** Guest Python can now run the programs in the VM. That is
+parity with guest Node, which has had `child_process.spawnSync` all along and goes
+through the same syscall — Python was the odd one out, not the newly privileged
+one. Nothing here reaches outside the tab: there is no host filesystem and no host
+process to reach, and a spawned program is another sandboxed worker under the same
+kernel.
 
 ## Programs that ask questions
 
@@ -262,14 +461,38 @@ Most of the time `import` is enough on its own: Vivari reads your script and
 loads what it recognises before running it. When a name does have to be
 resolved, it is tried three ways.
 
-**Vendored, and fully offline.** NumPy, pandas, Matplotlib, FastAPI, httpx,
-requests, SQLAlchemy, rich, tzdata and micropip, plus everything they depend on,
-ship with Vivari and load from the same origin. These work with no network at
-all.
+**Vendored, and fully offline.** NumPy, pandas, Matplotlib, SciPy,
+scikit-learn, openpyxl, FastAPI, httpx, requests, SQLAlchemy, rich, tzdata and
+micropip, plus everything they depend on, ship with Vivari and load from the same
+origin. These work with no network at all.
 
-tzdata is the odd one, and is loaded differently: it is data rather than code,
-so no `import` statement names it and reading the imports cannot find it. Any
-file mentioning `zoneinfo` pulls it in.
+SciPy and scikit-learn are the expensive entries and are here deliberately.
+Measured against the pinned Pyodide lock, the two of them plus joblib and
+threadpoolctl — the only other packages they drag in — add 17.6 MiB of wheels,
+and openpyxl and its one dependency add another 0.26 MiB. What that buys is not a
+faster download, it is the removal of a
+*network dependency*: anything not vendored is fetched from Pyodide's CDN the
+first time it is used, so `from sklearn.linear_model import LinearRegression`
+used to be the one line in a data-science notebook that failed on a plane. SciPy
+was never really the separate half of that choice — scikit-learn depends on it.
+
+Nothing is paid for until it is used. The whole tree is fetched the first time a
+`python` process runs, and each wheel only when something imports it, so a
+project that never touches scikit-learn never downloads it.
+
+Two of these are loaded without any `import` statement naming them, which is a
+thing worth knowing about because the failure mode is confusing:
+
+- **tzdata** is data rather than code. Nothing imports it — `zoneinfo` is stdlib,
+  and it finds the database at call time — so any file mentioning `zoneinfo`
+  pulls it in on that basis.
+- **openpyxl** is code, but pandas imports it *inside* `read_excel`, not at the
+  top of the module. A script that says `import pandas` and reads a spreadsheet
+  names openpyxl nowhere, so any file mentioning `read_excel`, `to_excel`,
+  `ExcelWriter` or `ExcelFile` pulls it in. Without this, `pd.read_excel` raised
+  `ImportError: Missing optional dependency 'openpyxl'` with the wheel sitting
+  right there unloaded. Legacy `.xls` needs `xlrd`, which is a different engine
+  and is not vendored.
 
 Two more ship for the type checker and are never imported by anything:
 `types-requests` and `pandas-stubs`, the stubs for the only two vendored
@@ -283,8 +506,8 @@ so on a stock Pyodide `rich.syntax` and `rich.markdown` raise
 including markdown-it-py, which Pyodide does not distribute at all.
 
 **Pyodide's own distribution.** Anything else Pyodide has built a WASM wheel for
-— SciPy, scikit-learn, Pillow, SymPy — is fetched from its CDN the first time it
-is used.
+— Pillow, SymPy, statsmodels — is fetched from its CDN the first time it is
+used, which is the one step in this list that needs the network.
 
 **PyPI, through micropip**, for everything that remains, provided it is pure
 Python. This is how Flask and Django arrive.
@@ -345,9 +568,9 @@ install here is what it is anywhere: your source directory on the import path,
 so an edit takes effect without reinstalling, plus metadata so `pip list` admits
 it exists. Any `[project.scripts]` you declare become commands, as above.
 
-What it will not do is guess. There is no build backend in the browser — running
-one needs a subprocess, which does not exist here — so the metadata has to be
-readable rather than computed. A `pyproject.toml` with a static `[project]`
+What it will not do is guess. There is no build backend here to run, and pip's
+build isolation would fetch one from the network and execute it before your
+install could finish — so the metadata has to be readable rather than computed. A `pyproject.toml` with a static `[project]`
 `name` and `version` is enough. A dynamic version, a `setup.py` that computes its
 own name, or a Poetry project with only a `[tool.poetry]` table is refused with
 the reason and the fix, instead of being installed under a name nothing else
@@ -359,8 +582,10 @@ A few consequences of the way this works:
 - **You often do not need it.** Vivari reads your script and loads the packages
   it recognises before running, so `import numpy` works without installing
   anything, and a served app reads its `requirements.txt`.
-- **The store is capped at 64 MB**, which fits a scientific stack — SciPy is
-  around 13 MB — but not an unbounded one. An install that would go over is
+- **The store is capped at 64 MB**, which is generous for pure-Python packages
+  but not unbounded. It is mostly beside the point for the heavy scientific
+  wheels, which are vendored rather than installed and so never enter the store
+  at all — SciPy alone is 13.2 MiB of wheel. An install that would go over is
   refused outright and the store is left exactly as it was, rather than being
   grown half way to a package it cannot finish. `pip uninstall` makes room.
 - **It is stamped with the interpreter that built it.** If Vivari updates to a
@@ -631,17 +856,31 @@ browser tab.
 libraries that animate themselves: `rich`'s `Progress` and `Live` refresh from a
 background thread by default and need `auto_refresh=False` plus a `refresh()`
 call of your own, and `console.status()` cannot work at all, because the spinner
-*is* the thread. `subprocess`
-raises `OSError: [Errno 138] emscripten does not support processes.`,
-`multiprocessing` cannot even import, and `os.fork()` gives `OSError: [Errno 52]
-Function not implemented`. This rules out Celery, `pytest-xdist`, gunicorn's real
-worker model, and any `--reload` file watcher. `threading.Lock` and the other
+*is* the thread. `multiprocessing` cannot even import, and `os.fork()` gives
+`OSError: [Errno 52] Function not implemented`. This rules out Celery,
+`pytest-xdist` and gunicorn's real worker model. `threading.Lock` and the other
 synchronisation primitives do exist, since nothing ever contends for them.
 
-You do not have to discover this from the flags' silence: `gunicorn -w 4` and
-`uvicorn --reload` say on stderr that the flag is being ignored and why, and a
-flag that would change what gets served — `--worker-class gevent`, `--factory` —
-stops rather than serving you something else.
+**No threads is not the same as no processes**, and this page used to run the two
+together. There are processes here — they are just not made by forking this
+interpreter, which is the only thing CPython's `OSError: [Errno 138] emscripten
+does not support processes.` was ever about. `subprocess.run()` works: see
+[Running another program](#running-another-program). What remains true is that
+nothing here spawns a *thread*, so anything needing one concurrently with your own
+code — `Popen`'s streaming, a worker pool — is still out.
+
+It does **not** rule out `--reload`, which this page used to say it did. A
+reloader on your own machine needs a watcher thread and a subprocess because it
+is watching a real filesystem and restarting a real process; here the filesystem
+tells the runtime when a file changed, and the app is imported into the server's
+own process rather than launched beside it. Neither half needs the thing that is
+missing. See [Restarting on save](#restarting-on-save).
+
+You do not have to discover the rest from the flags' silence: `gunicorn -w 4`
+says on stderr that the flag is being ignored and why, a flag that would change
+what gets served — `--worker-class gevent`, `--factory` — stops rather than
+serving you something else, and a flag that names two things when only one of
+them can happen says which one it did.
 
 **No sockets, and no way around CORS.** Outbound HTTP does work — see [Talking to
 the network](#talking-to-the-network) — but it is the browser that makes the
@@ -694,21 +933,33 @@ gives `ValueError: Can't find a pure Python 3 wheel for 'psycopg2'.`
 That is the wall the most-reached-for tools hit, so it is worth knowing in
 advance which ones will not start:
 
-- **Streamlit** stops on `watchdog`, its file-watching dependency.
+- **Streamlit** stops at install time on `watchdog`, which carries a C extension
+  with no WASM wheel. Note what that is and is not: `watchdog` is a *file
+  watcher*, and watching files is something this environment does do — the VFS
+  pushes changes and `--reload` is built on them. What stops Streamlit is the
+  unbuilt extension, and then its own server, which wants a socket and a
+  WebSocket.
 - **Jupyter** stops on `tornado`, which it needs for a real server.
 - **Gradio** does install, then fails on `import gradio` with a missing
   dependency of its own — and could not have served anyway, since it wants a
   socket and a WebSocket.
 
-None of these are near misses. Each needs something the browser does not hand
-out, so there is no version of Vivari that runs them.
+None of these three is a near miss: each wants to listen on a socket, and that
+is the thing a tab does not get. Read that as a statement about these packages
+rather than about their whole category. A notebook *interface* driven straight
+from Pyodide needs no server, is not covered by any of this, and Vivari now has
+one — see [Notebooks](./notebooks.md). What is ruled out is the Jupyter server,
+not the idea.
 
-**Editor edits do not reach a running server.** Files written by your code —
-by `python script.py`, and by a running Flask, FastAPI or Django app — are
-mirrored back into the editor. A served app's writes land at the end of each
-request, so an upload or a SQLite commit is on disk and visible while the server
-is still running, and survives closing the tab rather than needing a clean
-shutdown. The reverse direction is the gap: the project is copied in when the
-server starts, so editing a file afterwards will not be seen until you restart
-it. There is no `--reload` to do that for you, since it would need a file
-watcher and a subprocess.
+**Files move in both directions, and `--reload` is how the inbound half
+happens.** Files written by your code — by `python script.py`, and by a running
+Flask, FastAPI or Django app — are mirrored back into the editor. A served app's
+writes land at the end of each request, so an upload or a SQLite commit is on
+disk and visible while the server is still running, and survives closing the tab
+rather than needing a clean shutdown.
+
+The other direction used to be a gap: the project is copied in when the server
+starts, so an edit afterwards was invisible until you restarted. `--reload` now
+does that for you — see [Restarting on save](#restarting-on-save). Without the
+flag the old behaviour stands, which is what a server started without it should
+do.
