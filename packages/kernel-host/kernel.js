@@ -563,7 +563,13 @@ export class Kernel {
       sab,
       debugSab,
       debugLang,
-      spec: { ...spec, pid, ppid: parentPid ?? 0 },
+      // `capture` goes to the guest too, as the answer to "am I attached to a
+      // terminal?". The kernel already treats it as that on the blocking read path
+      // below (handleReadStdin: "a captured process has no way to be typed at"),
+      // and the flowing path needs the same fact — process.stdin.isTTY was
+      // hardcoded true, so `node` with no script could not tell an interactive
+      // shell from a spawnSync and would sit at a prompt nobody could reach.
+      spec: { ...spec, pid, ppid: parentPid ?? 0, capture },
       // #16 stage 2b: a spawned thread gets its creator's MessageChannel end as a
       // transferable, delivered to the worker as parentPort at init.
       threadPort,
@@ -995,7 +1001,7 @@ export class Kernel {
     const cwd = opts.cwd || "/";
     const programPath = this.resolveProgram(command, cwd, opts.env || {});
     if (!programPath) return -1;
-    return this.createProcess(
+    const pid = this.createProcess(
       // Carry `command` so downstream logic keyed on it works — notably the
       // breakpoint debugger's skip-list (`sh`/`npm`/…): without it a debug-mode
       // shell has command=undefined and is wrongly treated as a debug target, so
@@ -1003,6 +1009,29 @@ export class Kernel {
       { command, programPath, args, cwd, env: opts.env || {} },
       { capture: !!opts.capture },
     );
+    // Captured here too. `start` grew this first, and leaving `launch` without it gave
+    // the kernel two spawn-captured paths that disagreed about fd 0: a captured bare
+    // `node` resolved through start() and hung forever through launch(). Whether a
+    // process has a terminal is a property of the process, not of which function made
+    // it. (The blocking stdin path in handleReadStdin already treated capture as EOF
+    // for both, which is why only the flowing side drifted.)
+    this.closeCapturedStdin(pid, opts);
+    return pid;
+  }
+
+  /**
+   * A captured process has no terminal, so nothing will EVER be typed at it: fd 0 is an
+   * empty pipe, and it has to reach EOF or a program that reads stdin waits for a
+   * writer that cannot exist. `node` with no script is exactly that program now that it
+   * reads its script from a non-terminal stdin (see the tty note in boot.js).
+   *
+   * handleSpawn does the same thing by hand rather than through here, because it has to
+   * order its own `input` before the EOF.
+   */
+  closeCapturedStdin(pid, opts) {
+    if (!opts || !opts.capture || pid < 0) return;
+    if (opts.input != null) this.sendStdin(pid, opts.input);
+    this.sendStdin(pid, null);
   }
 
   /** Stop a running process: terminate its worker + release its ports. */
@@ -1025,6 +1054,7 @@ export class Kernel {
       );
       const proc = this.procs.get(pid);
       proc.onExit = resolve;
+      this.closeCapturedStdin(pid, opts);
       // A worker fault is not an exit status, so reject rather than hand back a
       // fabricated code the caller would read as the program's own. The result is
       // attached so stdout/stderr collected before the fault aren't lost. This
@@ -1567,7 +1597,16 @@ export class Kernel {
     }
     const parentPid = parent.pid;
     const childPid = this.createProcess(
-      { command: spec.command, programPath, args: spec.args || [], cwd, env: spec.env || {} },
+      {
+        command: spec.command,
+        programPath,
+        args: spec.args || [],
+        cwd,
+        env: spec.env || {},
+        // Whether fd 0 is a pipe, when the spawner said so. Undefined leaves the
+        // capture-derived default in place — see the tty note in boot.js.
+        tty: spec.stdinIsPipe === undefined ? undefined : !spec.stdinIsPipe,
+      },
       { parentPid, stream: true },
     );
     this.procs.get(childPid).onExit = (res) => {

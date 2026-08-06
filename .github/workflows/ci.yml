@@ -102,7 +102,7 @@ jobs:
       # but missing here runs nowhere at all: skipped in toolchain-gate for want of
       # the crates, and never selected in the only job that has them.
       - name: offline spikes that need the Wasm VFS
-        run: node scripts/run-spikes.mjs --offline dep-cache bun http-binary-body http-response-bytes cookie-session fs-cp fs-errors worker-pool node-cli child-stdin fs-metadata crypto-jwk zlib-brotli port-liveness constants diag-liveness fatal-errors net-close-order net-blocklist
+        run: node scripts/run-spikes.mjs --offline dep-cache bun http-binary-body http-response-bytes cookie-session fs-cp fs-errors worker-pool node-cli repl stack-traces readline watch child-stdin fs-metadata crypto-jwk zlib-brotli port-liveness constants diag-liveness fatal-errors net-close-order net-blocklist
       - run: npm run verify
 
   # --- package-manager gate: the North Star, gated on its own ----------------
@@ -197,6 +197,11 @@ jobs:
         run: npm run build:vfs:node && npm run build:codec:node && npm run build:crypto:node
       - name: framework templates must start their dev server
         run: node scripts/run-spikes.mjs --net preact lit solid vue svelte qwik
+      # Its own step rather than an extra filter above, because it proves something
+      # different: that an interactive scaffolder can be ANSWERED, not that a template
+      # serves. Needs the vendored npm, hence the net tier.
+      - name: an interactive scaffolder must be answerable
+        run: node scripts/run-spikes.mjs --net scaffolder
 
   # --- network tier: real template installs from the live registry -----------
   # Manual (workflow_dispatch) or scheduled: slow and depends on

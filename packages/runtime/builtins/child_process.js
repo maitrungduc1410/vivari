@@ -262,6 +262,25 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
     return { command: shell, args: ["-c", line] };
   }
 
+  // 'pipe'/'ignore' -> the child has no terminal on fd 0. 'inherit' -> it gets what WE
+  // have, which is the whole meaning of the word: a shell running `node` from inside a
+  // captured `sh -c` must not hand the child a terminal the shell itself has not got.
+  //
+  // ABSENT MEANS 'pipe', which is node's own default and now ours. It used to mean
+  // "leave the kernel's guess alone", justified by the interactive `sh` spawning its
+  // foreground job without saying anything — but `sh` says so at both of its spawn
+  // sites now, as do the watch supervisor and the two transparent wrappers (`npx`, the
+  // `python -m` shims), so nothing is relying on the guess any more. And the guess was
+  // demonstrably wrong one level down: a grandchild spawned without a stdio, inside an
+  // already-captured `sh -c`, claimed isTTY=true when there was no terminal anywhere in
+  // the chain — the same false claim that made bare `node` open a prompt nobody could
+  // type at.
+  function stdinIsPipeFrom(stdio) {
+    const fd0 = Array.isArray(stdio) ? stdio[0] : stdio;
+    if (fd0 === "inherit") return !process.stdin.isTTY;
+    return true;
+  }
+
   function spawn(command, args, opts) {
     const n = normalizeArgs(command, args, opts);
     const sh = withShell(n.command, n.args, n.opts);
@@ -270,6 +289,13 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
       args: sh.args,
       cwd: n.opts.cwd || process.cwd(),
       env: n.opts.env || process.env,
+      // Does the child's stdin come from a PIPE or from the terminal? It decides the
+      // child's process.stdin.isTTY, and programs branch hard on that — `node` with no
+      // script has to answer "REPL" to a terminal and "read the script from stdin" to
+      // a pipe, which is how `echo 'console.log(1)' | node` works at all. A caller who
+      // wants the terminal passed through says `stdio: ['inherit', …]`, as node's own
+      // callers do; see stdinIsPipeFrom.
+      stdinIsPipe: stdinIsPipeFrom(n.opts.stdio),
     };
     let pid;
     try {

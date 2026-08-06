@@ -18,6 +18,7 @@ import { HomeView } from "./Home";
 import { ShareLoadingOverlay } from "./ShareLoadingOverlay";
 import { ImportRemoteDialog } from "./ImportRemoteDialog";
 import { useIde } from "./useIde";
+import { isWordWrapChord } from "@/vv/editor-prefs";
 
 export function AppShell() {
   const { c, snap } = useIde();
@@ -33,6 +34,34 @@ export function AppShell() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Alt+Z / ⌥Z, ABOVE the ⌘/Ctrl gate below, because it is the one binding here
+      // with no ⌘/Ctrl in it. Monaco embedded on its own has no such keybinding — Alt+Z
+      // is VS Code's, a layer this app does not have — so there is nothing to inherit
+      // and the shortcut has to be declared here.
+      //
+      // NOT with editor.addCommand: that would only fire while the editor has focus,
+      // and VS Code's is global. One window listener also covers the diff editor for
+      // free, and keeps the matching in one place rather than depending on how Monaco
+      // resolves an Option chord on a macOS layout.
+      //
+      // preventDefault matters on macOS even outside the editor: ⌥Z composes "Ω", and
+      // an editor with focus would otherwise type it into the file.
+      if (isWordWrapChord(e)) {
+        // …but not while a terminal has focus, because the key belongs to whatever the
+        // cursor is in and word wrap does nothing to a terminal. What it means there
+        // differs by platform: on Windows and Linux Alt+<key> is the meta prefix
+        // readline reads as ESC z, which is genuinely the shell's; on macOS it is NOT,
+        // since xterm defaults macOptionIsMeta to false and makeTerm does not change
+        // it, so the shell just receives the composed "Ω". That second case is how
+        // every Option chord has always behaved here and is not this shortcut's to
+        // fix — but neither is it a reason to take the key. The palette entry reaches
+        // word wrap from a terminal. Mirror of the terminal's own ⌘K, which is scoped
+        // to the focused xterm so it never clobbers the editor (see makeTerm).
+        if (document.activeElement?.closest(".vv-term-host")) return;
+        e.preventDefault();
+        c.toggleWordWrap();
+        return;
+      }
       const mod = e.metaKey || e.ctrlKey;
       if (!mod) return;
       const k = e.key.toLowerCase();

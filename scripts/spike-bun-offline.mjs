@@ -1228,8 +1228,17 @@ console.log("== bun CLI dispatch (BUN_PROGRAM run as a real process) ==");
     ok(publish.code === 1 && /authenticated npm session/.test(publish.text),
       "bun publish says which capability is missing rather than 'unknown command'");
     ok(publish.text.indexOf("file not found") === -1, "unknown verb no longer claims a missing file");
-    const watch = bun("--watch", "index.ts");
-    ok(watch.code === 1 && /bun --watch is not implemented/.test(watch.text), "an unsupported flag reports not-implemented too");
+    // --watch used to be the unsupported-flag case here. It is implemented now, and
+    // exercising it needs a kernel to respawn into, so the behaviour lives in
+    // spike-watch.mjs. What this tier can still hold is that the flag is RECOGNISED as
+    // a flag: with nothing to run it asks for a target, rather than reporting --watch
+    // as a missing file the way it used to.
+    const watchNoTarget = bun("--watch");
+    ok(
+      watchNoTarget.code === 1 && /--watch needs a file or a script/.test(watchNoTarget.text),
+      "--watch with no target asks for one: " + JSON.stringify(watchNoTarget.text.trim().slice(0, 60)),
+    );
+    ok(watchNoTarget.text.indexOf("file not found") === -1, "…and does not report the flag itself as a missing file");
 
     // The genuine run-a-file and run-a-script paths must survive that change.
     const relFile = bun("./hello.js", "world");

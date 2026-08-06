@@ -19,14 +19,9 @@
 //   * pyodide.asm.mjs (Emscripten): ENVIRONMENT_IS_NODE = process.versions.node
 //     && process.type != "renderer"  → we set process.type = "renderer" (an
 //     Electron renderer is treated as a browser) so it uses the worker path.
-// Telling Pyodide it is NOT in Node is only half of it: it then has to be able
-// to tell WHICH browser realm this is, and the answer to that is a global the
-// guest-realm sweep hides. So a third thing is masked, and it is not on
-// `process` — see maskBootEnv() below, which owns all three.
-// All of them are held across the whole boot and then restored, never leaving
-// globalThis.process undefined or the guest realm widened. Verified against the
-// vendored Pyodide 314.0.3 getGlobalRuntimeEnv/calculateDerivedFlags and the
-// asm.mjs env detection.
+// Both masks are held across the whole boot and then restored, never leaving
+// globalThis.process undefined. Verified against the vendored Pyodide 314.0.3
+// getGlobalRuntimeEnv/calculateDerivedFlags and the asm.mjs env detection.
 //
 // Scope: run scripts + `-c` + a line REPL, streaming stdout/stderr to the
 // terminal, with the project directory mirrored into Pyodide's FS so file I/O and
@@ -143,12 +138,6 @@ export function flushStreams(pyodide) {
 // integer, prints just that argument and exits 1. We used to dump the whole
 // WASM traceback for every sys.exit(), which meant a clean `sys.exit(0)` — what
 // `python -m pytest` does on every green run — looked like a crash.
-//
-// `kind` names WHICH of the three this was, because the interactive REPL has to
-// tell them apart and must not grow a second SystemExit parser to do it: an
-// `exit()` typed at a `>>>` ends the session with this code, a Ctrl-C returns to
-// a fresh prompt, and anything else is one statement's error in a session that
-// carries on. A script needs none of that distinction and ignores the field.
 export function terminationFromError(e) {
   const msg = (e && e.message) || String(e);
   const last = msg.trimEnd().split("\n").pop().trim();
@@ -156,14 +145,14 @@ export function terminationFromError(e) {
   // 128+SIGINT, and a shell that reports 130 is how a script author tells an
   // interrupted run from a failed one.
   if ((e && e.type === "KeyboardInterrupt") || /^KeyboardInterrupt\b/.test(last)) {
-    return { kind: "interrupt", code: 130, report: msg };
+    return { code: 130, report: msg };
   }
   const isExit = (e && e.type === "SystemExit") || /^SystemExit\b/.test(last);
-  if (!isExit) return { kind: "error", code: 1, report: msg };
+  if (!isExit) return { code: 1, report: msg };
   const m = /^SystemExit:\s*([\s\S]*)$/.exec(last);
   const value = m ? m[1].trim() : "";
-  if (!value || value === "None") return { kind: "exit", code: 0, report: "" }; // bare sys.exit()
-  if (/^-?\d+$/.test(value)) return { kind: "exit", code: Number(value) | 0, report: "" };
+  if (!value || value === "None") return { code: 0, report: "" }; // bare sys.exit()
+  if (/^-?\d+$/.test(value)) return { code: Number(value) | 0, report: "" };
   // Bools ARE ints in Python: sys.exit(True) exits 1 and sys.exit(False) exits
   // 0, printing nothing either way. The traceback spells both as
   // "SystemExit: True"/"False" — indistinguishable from sys.exit("True"), so
@@ -171,9 +160,9 @@ export function terminationFromError(e) {
   // `sys.exit(not ok)` is a common idiom; exiting with the literal string
   // "False" is not. It is also the reading that keeps a *successful* run
   // reporting success, which the string reading got backwards.
-  if (value === "True") return { kind: "exit", code: 1, report: "" };
-  if (value === "False") return { kind: "exit", code: 0, report: "" };
-  return { kind: "exit", code: 1, report: value }; // sys.exit("message")
+  if (value === "True") return { code: 1, report: "" };
+  if (value === "False") return { code: 0, report: "" };
+  return { code: 1, report: value }; // sys.exit("message")
 }
 
 // Undo one consequence of our own Node masquerade: it switches Python's HTTP off.
@@ -917,13 +906,8 @@ export function dataPackagesFor(source) {
  *
  * Returns null at end of input — but a part-typed line without its newline is
  * still a line, as it is in CPython when you type something and press Ctrl-D.
- *
- * With an `echo` sink this also becomes the line discipline a canonical-mode
- * terminal would provide, because nothing under it does: it shows each character
- * as it arrives and lets DEL rub one out. Only the interactive REPL passes one —
- * see repl(), which also decides when echoing is right at all.
  */
-export function makeLineReader(read, echo) {
+export function makeLineReader(read) {
   const readChunk = read || (() => (globalThis.__ocReadStdin ? globalThis.__ocReadStdin() : null));
   let buf = "";
   return () => {
@@ -943,33 +927,7 @@ export function makeLineReader(read, echo) {
         }
         return null;
       }
-      if (!echo) {
-        buf += chunk;
-        continue;
-      }
-      for (const ch of chunk) {
-        if (ch === "\x7f" || ch === "\b") {
-          // Erase within the line being typed only: a DEL at a fresh prompt must
-          // rub out neither the prompt that invited it nor a line already queued
-          // behind this one (a paste arrives as one chunk of several lines).
-          if (buf && !buf.endsWith("\n")) {
-            buf = buf.slice(0, -1);
-            echo("\b \b");
-          }
-          continue;
-        }
-        buf += ch;
-        // Control characters go on the screen as ^X, which is what a terminal
-        // with ECHOCTL does and is here for a sharper reason than fidelity: an
-        // arrow key arrives as the three bytes ESC [ A, and echoing those
-        // verbatim would move the terminal's cursor into output printed earlier
-        // and type the rest of the line there. Newline and tab are excluded
-        // because their effect on the screen is the point of them.
-        const code = ch.charCodeAt(0);
-        echo(code < 0x20 && ch !== "\n" && ch !== "\r" && ch !== "\t"
-          ? "^" + String.fromCharCode(code + 64)
-          : ch);
-      }
+      buf += chunk;
     }
   };
 }
@@ -1159,79 +1117,6 @@ def _vv_dispatch(req_json):
   );
 }
 
-// The environment Pyodide is allowed to see while it boots, and the undo for it.
-//
-// THREE probes decide which of Pyodide's code paths a boot takes, and all three
-// answer "Node" or "nowhere" unless they are masked. Two are questions about
-// `process` and one is a question about the realm:
-//
-//   * pyodide.mjs (the loader):  IN_NODE = process.versions.node && !process.browser
-//     — computed at module-eval time, so it has to be masked across the import
-//     itself. `process.browser = true` puts it in IN_BROWSER.
-//   * pyodide.asm.mjs (Emscripten): ENVIRONMENT_IS_NODE = process?.versions?.node
-//     && process?.type != "renderer" — computed inside loadPyodide(), when it
-//     imports asm.mjs. `process.type = "renderer"` (Emscripten treats an Electron
-//     renderer as a browser) puts it in the WEB/WORKER branch.
-//   * the realm: IN_BROWSER_WEB_WORKER = typeof globalThis.WorkerGlobalScope
-//     !== "undefined" && globalThis.self instanceof globalThis.WorkerGlobalScope
-//     (314.0.3 src/js/environments.ts), and asm.mjs's own
-//     ENVIRONMENT_IS_WORKER = !!globalThis.WorkerGlobalScope.
-//
-// The third one is the one this file used to get wrong, because it is the only
-// one that is not ours to set: the guest-realm sweep (packages/runtime/realm.js)
-// hides every host global a real Node 22 process lacks, and WorkerGlobalScope is
-// browser-only. `self` survives, `window` does not, and with IN_NODE masked away
-// too every branch of Pyodide's detection was false — so the FIRST thing a
-// `python main.py` did was throw "Cannot determine runtime environment:
-// {"IN_BROWSER":true,"IN_BROWSER_WEB_WORKER":false,…}". Masking IN_NODE without
-// restoring the name that says which browser we are is only half an answer.
-// Emscripten falls the same way one layer down: with WEB, WORKER and NODE all
-// false it concludes ENVIRONMENT_IS_SHELL and reaches for a `read()` no browser
-// has, so the second wall was two lines behind the first.
-//
-// Restoring it is not a widening of the sweep. The sweep shadows names and
-// leaves the prototype chain alone, so a guest that wants WorkerGlobalScope
-// already has it two getPrototypeOf hops from `self`; what the realm withholds
-// is the NAME a feature detection reads, and this hands that name back for the
-// length of one boot, in a python process only (realm.js HOLD → index.js
-// __ocInstallPython → here). Everything else on the worker path Pyodide now
-// takes is either already allowed (fetch, WebAssembly, Response) or already
-// handed back for the same reason (XMLHttpRequest, which asm.mjs's worker
-// readBinary uses synchronously, as urllib3 does); `importScripts` stays hidden,
-// which is what the isClassicWorker() probe needs — it calls
-// globalThis.importScripts("data:text/javascript,") and treats a throw as "not a
-// classic worker", which is the answer a module worker owes it.
-//
-// Nothing here may be left set: `process` is the guest's own, and the boot ends
-// with an interpreter the guest goes on using.
-export function maskBootEnv(scope, process, workerGlobalScope) {
-  const hadBrowser = Object.prototype.hasOwnProperty.call(process, "browser");
-  const prevBrowser = process.browser;
-  const hadType = Object.prototype.hasOwnProperty.call(process, "type");
-  const prevType = process.type;
-  const hadScope = Object.prototype.hasOwnProperty.call(scope, "WorkerGlobalScope");
-  const prevScope = scope.WorkerGlobalScope;
-
-  process.browser = true;
-  process.type = "renderer";
-  // Absent off a browser — the headless spike tiers are really Node, and there
-  // Pyodide's own answer is the true one.
-  if (workerGlobalScope) scope.WorkerGlobalScope = workerGlobalScope;
-
-  return function restoreBootEnv() {
-    if (hadBrowser) process.browser = prevBrowser;
-    else delete process.browser;
-    if (hadType) process.type = prevType;
-    else delete process.type;
-    if (!workerGlobalScope) return;
-    // `hadScope` is true and `prevScope` undefined on the path that matters: the
-    // sweep left an own, writable, non-enumerable `undefined` shadowing the real
-    // binding, and that shadow is what has to come back.
-    if (hadScope) scope.WorkerGlobalScope = prevScope;
-    else delete scope.WorkerGlobalScope;
-  };
-}
-
 export function createPythonRuntime({
   process,
   require,
@@ -1239,7 +1124,6 @@ export function createPythonRuntime({
   debug = null,
   interrupt = null,
   signalHandled = () => {},
-  workerGlobalScope = null,
 }) {
   const req = (name) => require(name);
 
@@ -1289,18 +1173,33 @@ export function createPythonRuntime({
     if (bootPromise) return bootPromise;
     const url = withTrailingSlash(indexUrl);
     bootPromise = (async () => {
-      // Our runtime masquerades as Node (process.versions.node is set — see
-      // packages/runtime/builtins/process.js) inside a realm swept of the browser
-      // globals a real Node lacks, and Pyodide reads both of those to decide what
-      // it is running on. maskBootEnv above says which three answers have to
-      // change and why. The mask is held across the WHOLE boot — the import of
-      // pyodide.mjs, which computes the loader's flags at module-eval time, and
-      // the loadPyodide() that imports asm.mjs — and only then restored, so
-      // neither globalThis.process nor the guest's realm is left altered. process
-      // === globalThis.process; each python invocation is its own process worker,
-      // so a node/bun process is never affected.
-      const restoreEnv = maskBootEnv(globalThis, process, workerGlobalScope);
+      // Pyodide has TWO independent Node probes, and our runtime masquerades as
+      // Node (process.versions.node is set — see packages/runtime/builtins/process.js),
+      // so BOTH would take the Node path and `await import("node:module")`, which
+      // 404s inside a module Web Worker. We mask each:
+      //   * pyodide.mjs (loader):  IN_NODE = … && !process.browser  — computed at
+      //     module-eval time → set process.browser = true while it is imported.
+      //   * pyodide.asm.mjs (Emscripten): ENVIRONMENT_IS_NODE =
+      //     process?.versions?.node && process?.type != "renderer"  — computed
+      //     when asm.mjs is imported *inside* loadPyodide() → set process.type =
+      //     "renderer" (Emscripten treats an Electron renderer as browser).
+      // Keep both masks set across the WHOLE boot (import + loadPyodide) and only
+      // then restore, so globalThis.process is never left undefined. process ===
+      // globalThis.process; each python invocation is its own process worker, so a
+      // node/bun process is never affected.
+      const hadBrowser = Object.prototype.hasOwnProperty.call(process, "browser");
+      const prevBrowser = process.browser;
+      const hadType = Object.prototype.hasOwnProperty.call(process, "type");
+      const prevType = process.type;
+      const restoreEnv = () => {
+        if (hadBrowser) process.browser = prevBrowser;
+        else delete process.browser;
+        if (hadType) process.type = prevType;
+        else delete process.type;
+      };
       try {
+        process.browser = true;
+        process.type = "renderer";
         const mod = await import(/* @vite-ignore */ url + "pyodide.mjs");
 
         // The fast path, when an earlier command in this session left one.
@@ -2315,10 +2214,8 @@ json.dumps({
         const console_ = pyodide.globals.get("_vv_console");
 
         let more = false;
-        let ended = false;
         const prompt = () => process.stdout.write(more ? "... " : ">>> ");
         const finish = (codeVal) => {
-          ended = true;
           try {
             console_.destroy && console_.destroy();
           } catch {
@@ -2331,25 +2228,6 @@ json.dumps({
             // InteractiveConsole.push returns True when more input is needed.
             more = !!withInterruptsSync(() => console_.push(line));
           } catch (e) {
-            const t = terminationFromError(e);
-            // exit(), quit(), sys.exit(): CPython's InteractiveInterpreter.runcode
-            // re-raises SystemExit instead of reporting it (Lib/code.py) precisely
-            // so that the loop driving it can end the session — and this is that
-            // loop. Treated as a printable error, as it used to be, `exit()`
-            // answered with a traceback and a fresh prompt: a crash report for
-            // the one line every user of a REPL knows how to type.
-            //
-            // The code and the message are the same reading a script's top-level
-            // SystemExit gets, from the same parser: exit()/exit(0) leave 0,
-            // exit(3) leaves 3, exit("bye") prints bye and leaves 1.
-            if (t.kind === "exit") {
-              flushStreams(pyodide);
-              if (t.report) {
-                process.stderr.write(t.report.endsWith("\n") ? t.report : t.report + "\n");
-              }
-              finish(t.code);
-              return;
-            }
             // Ctrl-C during a statement. CPython prints the name alone and gives
             // a fresh top-level prompt, abandoning any half-typed block — the
             // session survives, which is the whole point of interrupting it.
@@ -2380,29 +2258,7 @@ json.dumps({
         //
         // The cost is that this process's event loop does not turn while the
         // prompt waits, which is what CPython does at a `>>>` too.
-        //
-        // And it echoes, because in this system nobody else can. On a real
-        // terminal the keystroke a person types is shown by the line discipline
-        // in the kernel's tty layer, and there is none here: process.stdin
-        // records setRawMode and nothing more (packages/runtime/index.js), and
-        // the shell hands its foreground child raw keystrokes without echoing
-        // them (coreutils.js) exactly so the child can drive its own display.
-        // So the reader of a line is the thing that must show it, which is why
-        // the shell echoes at its own prompt and why this loop must at a `>>>`.
-        //
-        // Not one layer lower, in installStdin: that would echo every read the
-        // interpreter makes, including `getpass()`, and Python could not turn it
-        // off — Emscripten's tty answers tcgetattr with ECHO already clear and
-        // accepts a tcsetattr it then ignores, so getpass believes echo is off,
-        // prints no warning, and the password would go up on the screen.
-        //
-        // To stderr, not stdout, because echo is a write to the terminal and not
-        // part of what this process produces: `cat script.py | python > out` must
-        // not find the typed source in out. And only with a terminal attached
-        // (VV_TTY, the shell's own marker — the same one `ls` colours on), so a
-        // captured or scripted run stays byte-for-byte what it was.
-        const echo = process.env.VV_TTY === "1" ? (text) => process.stderr.write(text) : null;
-        const readLine = makeLineReader(null, echo);
+        const readLine = makeLineReader();
 
         // One statement per macrotask rather than a `while` loop, so timers and
         // the process's own exit path get their turn between lines.
@@ -2414,9 +2270,6 @@ json.dumps({
             return;
           }
           feed(line);
-          // An `exit()` on that line ended the session. Reading again would park
-          // this process on a stdin nobody is going to type into.
-          if (ended) return;
           setTimeout(step, 0);
         };
         prompt();

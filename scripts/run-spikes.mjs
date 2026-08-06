@@ -76,6 +76,10 @@ const SPIKES = [
   // merges green and breaks the site afterwards. Static, so it needs neither bun
   // nor the studio's node_modules.
   { name: "studio-types", file: "spike-studio-types.mjs", net: false, timeout: 60000 },
+  // Same reason this one is static: nothing in CI runs a browser, and no CI runner is a
+  // Mac. The word-wrap chord's whole failure mode is macOS-only, so the matcher is
+  // plain JS and this drives it with the event shapes macOS produces.
+  { name: "word-wrap", file: "spike-word-wrap.mjs", net: false, timeout: 60000 },
   { name: "http-llhttp", file: "spike-http-llhttp.mjs", net: false, timeout: 60000 },
   // The guest realm sweep. Node's own global object is the wrong thing to test a
   // browser sweep against, so this rebuilds a Chrome worker global from a
@@ -138,6 +142,23 @@ const SPIKES = [
   { name: "fs-errors", file: "spike-fs-errors.mjs", net: false, needsWasm: true, timeout: 120000 },
   { name: "worker-pool", file: "spike-worker-pool.mjs", net: false, needsWasm: true, timeout: 120000 },
   { name: "node-cli", file: "spike-node-cli.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // The interactive prompts. Slower than its assertion count suggests: a REPL is
+  // driven by keystrokes and every check has to wait for the guest's next turn,
+  // and one case deliberately waits out a timer to prove the loop is still going.
+  { name: "repl", file: "spike-repl.mjs", net: false, needsWasm: true, timeout: 180000 },
+  // A stack frame has to name the user's file at the user's line. Pins the LINE, not
+  // just the filename, because the two halves of that fix (naming the script, and
+  // keeping the TypeScript strip from deleting lines) fail independently — and a
+  // named file with a wrong line reads as authoritative while sending you elsewhere.
+  { name: "stack-traces", file: "spike-stack-traces.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // readline, which used to answer no question at all. Keystroke-driven like the repl
+  // spike, so it is slow for its assertion count. The scaffolder that motivated it is
+  // spike-scaffolder on the net tier, since a real npm is something only that tier has.
+  { name: "readline", file: "spike-readline.mjs", net: false, needsWasm: true, timeout: 180000 },
+  // --watch, for node and bun, on the shared supervisor. Slow by nature: every
+  // assertion waits for a debounce and a respawn, and shortening the waits is how
+  // a watch test becomes the flaky one everybody reruns.
+  { name: "watch", file: "spike-watch.mjs", net: false, needsWasm: true, timeout: 600000 },
   // A sync child's stdin: `input`, and the EOF that has to follow it. The failure
   // it guards is a HANG, so the spike bounds its own VM run rather than letting CI
   // discover the regression as a timeout with no name on it.
@@ -324,6 +345,9 @@ const SPIKES = [
   // postinstall, .bin shim creation, `npm exec`, and an `npm ci` reinstall — three
   // full installs, hence the long budget. All of that is VV_PHASE2.
   { name: "npm", file: "spike-npm.mjs", net: true, needsWasm: true, env: { VV_PHASE2: "1" }, timeout: 600000 },
+  // An interactive scaffolder, answered keystroke by keystroke. Net because it needs
+  // the vendored npm; the readline API it exercises is covered offline.
+  { name: "scaffolder", file: "spike-scaffolder.mjs", net: true, needsWasm: true, timeout: 180000 },
   { name: "npm-studio", file: "spike-npm-studio.mjs", net: true, needsWasm: true, vendor: VENDORS.npmAsset, env: { VV_NET: "1" }, timeout: 180000 },
   { name: "yarn", file: "spike-yarn.mjs", net: true, needsWasm: true, vendor: VENDORS.yarn, timeout: 600000 },
   { name: "yarn-studio", file: "spike-yarn-studio.mjs", net: true, needsWasm: true, vendor: VENDORS.yarnAsset, env: { VV_NET: "1" }, timeout: 180000 },

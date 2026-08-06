@@ -7,6 +7,12 @@
 import { NODE_GYP_STUB } from "./node-gyp-stub.js";
 import { BUN_PROGRAM, BUNX_PROGRAM } from "./programs/bun.js";
 import { PYTHON_PROGRAM } from "./programs/python.js";
+// The line editor + read/eval/print loop `node` (below) and `bun`
+// (programs/bun.js) both run. Appended to a program's source rather than
+// imported, because a guest program cannot import from the host — see
+// programs/repl-kit.js for why, and for the config contract.
+import { REPL_KIT_SRC } from "./programs/repl-kit.js";
+import { WATCH_KIT_SRC } from "./programs/watch-kit.js";
 import { RUFF_PROGRAM } from "./programs/ruff.js";
 
 // The bare-command spellings of the launcher's `-m` entrypoints, as
@@ -43,7 +49,11 @@ function pythonDelegates() {
     out[name] = `
 'use strict';
 const cp = require('child_process');
-const child = cp.spawn('python', ['-m', '${mod}'].concat(process.argv.slice(2)), { cwd: process.cwd(), env: process.env });
+// 'inherit' on fd 0: this is a transparent wrapper, so whatever terminal WE were
+// given belongs to the module we delegate to. Left implicit, the child would get a
+// pipe (child_process' default, and node's), and an interactive module would report
+// no terminal.
+const child = cp.spawn('python', ['-m', '${mod}'].concat(process.argv.slice(2)), { cwd: process.cwd(), env: process.env, stdio: ['inherit', 'pipe', 'pipe'] });
 if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
 if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
 child.on('exit', (code) => process.exit(code | 0));
@@ -144,7 +154,9 @@ if (!onPath(name)) {
 }
 // Run the local bin async (#15) so its output streams and a long-running tool
 // (e.g. a dev server) doesn't freeze npx. Resolved via node_modules/.bin on PATH.
-const child = cp.spawn(name, rest, { cwd, env });
+// 'inherit' on fd 0 for the same reason the python wrapper says: npx is transparent,
+// and the tool it runs (a dev server, a scaffolder) is entitled to our terminal.
+const child = cp.spawn(name, rest, { cwd, env, stdio: ['inherit', 'pipe', 'pipe'] });
 child.stdout.on('data', (d) => process.stdout.write(d));
 child.stderr.on('data', (d) => process.stderr.write(d));
 child.on('error', (e) => { process.stderr.write('npx: ' + ((e && e.message) || e) + '\\n'); process.exit(127); });
@@ -285,6 +297,74 @@ const VALUE_FLAGS = new Set([
   '--redirect-warnings', '--disable-proto', '--report-dir', '--report-filename',
 ]);
 
+// WHAT TO DO WITH A FLAG WE DO NOT IMPLEMENT. Every unrecognised flag used to be
+// dropped on the floor ('boolean flag — ignore'), which made the CLI lie in the worst
+// direction: \`node --watch server.js\` ran the server ONCE, printed nothing about
+// watching, and exited 0, so the only evidence that --watch did nothing was that
+// nothing ever restarted. \`node --check side.js\` EXECUTED the file it was asked only
+// to parse. A misspelled flag exited 0 too.
+//
+// Erroring on everything unknown is the opposite mistake: real tools pass flags down
+// (\`--enable-source-maps\`, \`--max-old-space-size=4096\`) that are genuinely harmless
+// here, and failing those would break working projects to make a point.
+//
+// So flags fall into three groups, and the line between the last two is whether
+// ignoring the flag means THE PROGRAM DOES NOT DO WHAT IT WAS ASKED:
+//   1. implemented        — handled in the parse loop above.
+//   2. ignorable          — the program still does its job, just without a
+//                           refinement we cannot offer (no source-map decoration, no
+//                           heap cap, no debugger port). Silence is honest enough.
+//   3. refused by name    — the flag IS the job. --watch that never restarts and
+//                           --test that runs no tests are not degraded runs, they are
+//                           wrong answers, so they get a named error and exit 9.
+const UNSUPPORTED_FLAGS = new Map([
+  ['--test', 'discovering and running test files'],
+  ['--test-name-pattern', 'discovering and running test files'],
+  ['--test-reporter', 'discovering and running test files'],
+  ['--test-concurrency', 'discovering and running test files'],
+  ['--test-only', 'discovering and running test files'],
+  ['--test-shard', 'discovering and running test files'],
+  ['--test-force-exit', 'discovering and running test files'],
+  ['--run', 'running a package.json script — use \`npm run\` instead'],
+  ['--permission', 'the permission model'],
+  ['--experimental-permission', 'the permission model'],
+]);
+
+// Group 2. Exact names first, then prefixes for the families that are open-ended
+// (V8 tuning, --trace-*, the experimental flags). \`--experimental-strip-types\` and
+// friends are in here for a different reason than the rest: types are ALWAYS stripped
+// here, so asking for it changes nothing.
+const IGNORED_FLAGS = new Set([
+  '--enable-source-maps', '--no-warnings', '--warnings', '--frozen-intrinsics',
+  '--preserve-symlinks', '--preserve-symlinks-main', '--zero-fill-buffers',
+  '--abort-on-uncaught-exception', '--interpreted-frames-native-stack',
+  '--pending-deprecation', '--expose-internals', '--expose-gc',
+  '--unhandled-rejections', '--input-type', '--network-family-autoselection',
+  '--force-node-api-uncaught-exceptions-policy', '--dns-result-order',
+  '--enable-network-family-autoselection', '--allow-child-process',
+  '--allow-worker', '--allow-fs-read', '--allow-fs-write', '--allow-addons',
+]);
+// Six names real node accepts that fell through to \`bad option\` — measured, not
+// guessed. All six are group 2 by the definition above (the program still does its job,
+// it just does not get the refinement), so refusing them was a misclassification. The
+// two that turn up in practice are --stack-trace-limit, which error-reporting libraries
+// set, and --nolazy, which debugger configs pass.
+const IGNORED_PREFIXES = [
+  '--stack-trace-limit', '--nolazy', '--es-module-specifier-resolution',
+  '--optimize-for-size', '--optimize-', '--force-context-aware', '--http-parser',
+  '--trace-', '--no-', '--experimental-', '--max-', '--min-', '--stack-size',
+  '--openssl-', '--tls-', '--secure-heap', '--use-', '--v8-', '--perf-', '--icu-',
+  '--snapshot-', '--build-snapshot', '--cpu-prof', '--heap-prof', '--heapsnapshot-',
+  '--prof', '--report-', '--redirect-warnings', '--disable-', '--inspect', '--title',
+  '--loader', '--conditions', '--diagnostic-dir', '--jitless', '--napi-modules',
+  '--policy-integrity', '--test-udp-no-try-send', '--throw-deprecation',
+];
+function ignorableFlag(name) {
+  if (IGNORED_FLAGS.has(name)) return true;
+  for (const p of IGNORED_PREFIXES) if (name.slice(0, p.length) === p) return true;
+  return false;
+}
+
 // \`--env-file[=path]\` / \`--env-file-if-exists\`: load KEY=VALUE lines into
 // process.env. A minimal .env parser (blank/#-comment lines skipped, optional
 // leading \`export \`, surrounding single/double quotes stripped). Like Node and
@@ -315,13 +395,23 @@ function loadEnvFile(file, optional) {
 }
 
 const preload = [];
-let evalCode = null, printResult = false, entry = null, i = 0;
+let evalCode = null, printResult = false, entry = null, forceRepl = false, checkOnly = false, watchMode = false, i = 0;
+const watchPaths = [];
 for (; i < cli.length; i++) {
   const a = cli[i];
-  if (a === '--') { i++; break; }
+  // Everything after \`--\` is the program and its args, so the next token IS the
+  // entry. Breaking with entry still null meant \`node -- app.js\` ran nothing at all.
+  if (a === '--') { entry = cli[++i] || null; break; }
+  // \`-\` is node's own spelling for "the program is on stdin". It is not a flag, so it
+  // must not reach the flag branch below, where it now matches no prefix and would be
+  // reported as a bad option.
+  if (a === '-') { break; }
   // \`node -v\`/\`--version\` prints the runtime version and exits (some tooling,
   // and users, probe it). Answer with the spoofed process.version.
   if (a === '-v' || a === '--version') { process.stdout.write(process.version + '\\n'); process.exit(0); }
+  // \`-i\`/\`--interactive\` forces the REPL even when stdin is not a terminal, which
+  // is the only way to get one out of a pipe (\`node -i < script.js\`).
+  if (a === '-i' || a === '--interactive') { forceRepl = true; continue; }
   if (a === '-e' || a === '--eval') { evalCode = cli[++i] || ''; continue; }
   if (a === '-p' || a === '--print') { evalCode = cli[++i] || ''; printResult = true; continue; }
   if (a[0] === '-') {
@@ -337,8 +427,33 @@ for (; i < cli.length; i++) {
       if (val) loadEnvFile(val, name === '--env-file-if-exists');
       continue;
     }
+    if (name === '-c' || name === '--check') { checkOnly = true; continue; }
+    // \`--watch\` and \`--watch-path\`: handled below by the shared watch kit. They
+    // used to be in UNSUPPORTED_FLAGS, which is where a capability lives until it
+    // exists — moving an entry out of that map is what implementing one looks like.
+    if (name === '--watch') { watchMode = true; continue; }
+    if (name === '--watch-path') {
+      const val = eq >= 0 ? a.slice(eq + 1) : cli[++i];
+      watchMode = true;
+      if (val) watchPaths.push(val);
+      continue;
+    }
+    // Node's \`--watch-preserve-output\` suppresses the screen clear. We do not clear
+    // in the first place (see the watch section below), so it is already true.
+    if (name === '--watch-preserve-output') { continue; }
     if (eq < 0 && VALUE_FLAGS.has(name)) i++; // consume the value token
-    continue; // boolean flag (e.g. --enable-source-maps) — ignore
+    // A flag we cannot honour is REFUSED BY NAME rather than dropped. See the note
+    // above UNSUPPORTED_FLAGS: this list is short on purpose.
+    if (UNSUPPORTED_FLAGS.has(name)) {
+      process.stderr.write('node: ' + name + ' is not implemented in the Vivari shim: ' + UNSUPPORTED_FLAGS.get(name) + '\\n');
+      process.exit(9);
+    }
+    if (ignorableFlag(name)) continue;
+    // Anything left is a flag neither we nor (probably) node knows. Node answers
+    // \`bad option\` and exits 9; matching that is what keeps a typo from looking like
+    // a successful run.
+    process.stderr.write('node: bad option: ' + name + '\\n');
+    process.exit(9);
   }
   entry = a; break; // first non-flag token is the script
 }
@@ -387,8 +502,116 @@ if (evalCode != null) {
   const fn = new Function('require', 'module', 'exports', '__filename', '__dirname', body);
   const r = fn(req, mod, mod.exports, '[eval]', dir);
   if (printResult) process.stdout.write(require('util').inspect(r) + '\\n');
+} else if (!entry) {
+  // No script and no \`-e\`: an interactive REPL, which is what \`node\` on its own
+  // has always meant everywhere else. It used to be 'node: missing script' and
+  // exit 1 — not because anything was missing, but because this third case had
+  // never been written: the shim was a two-way branch between \`-e\` and a file.
+  //
+  // Gated on a terminal (or an explicit \`-i\`), because with a pipe or a redirect on
+  // fd 0 the answer is a different one entirely: node READS THE PROGRAM FROM STDIN.
+  // That is how \`echo 'console.log(1)' | node\` and \`node < build.js\` work, and it is
+  // the shape a lot of generated tooling uses. We used to report 'missing script' —
+  // and once isTTY stopped lying about pipes (see boot.js) this branch started being
+  // reached, so it had to answer properly rather than refuse.
+  if (!forceRepl && !process.stdin.isTTY) {
+    let src = '';
+    process.stdin.on('data', (c) => { src += typeof c === 'string' ? c : c.toString('utf8'); });
+    process.stdin.on('end', () => {
+      // Node runs a piped program as CommonJS under the name '[stdin]' — same shape as
+      // the \`-e\` path above, which is why it is compiled the same way.
+      const mod = { exports: {}, id: '[stdin]', filename: '[stdin]', loaded: false, paths: [] };
+      try {
+        const fn = new Function('require', 'module', 'exports', '__filename', '__dirname', src);
+        fn(req, mod, mod.exports, '[stdin]', process.cwd());
+      } catch (e) {
+        process.stderr.write(((e && e.stack) || (e && e.message) || String(e)) + '\\n');
+        process.exit(1);
+      }
+    });
+    process.stdin.resume();
+    return;
+  }
+  // The REPL's own scope, matching Node's: \`require\` resolves from the cwd (that
+  // is what \`req\` above is), and module/__filename/__dirname exist. They go on
+  // the global because the kit evaluates through indirect eval, whose scope IS
+  // the global scope — see repl-kit.js.
+  globalThis.require = req;
+  globalThis.module = { exports: {}, id: '[repl]', filename: '[repl]', loaded: false, paths: [] };
+  globalThis.exports = globalThis.module.exports;
+  globalThis.__filename = '[repl]';
+  globalThis.__dirname = process.cwd();
+  createRepl({
+    banner: 'Welcome to Node.js ' + process.version + ' (Vivari).\\n' +
+      'Type ".help" for more information.',
+    prompt: '> ',
+    contPrompt: '... ',
+    historyFile: (process.env.HOME || '') + '/.node_repl_history',
+    isIncomplete: replIncomplete,
+    // \`let\`/\`const\`/\`class\` are hoisted to a global \`var\`, because an indirect
+    // eval's lexical declarations do not survive the call that made them — see
+    // replHoistDeclarations for the spec reason and for what it costs us.
+    rewrite: replHoistDeclarations,
+  });
+} else if (watchMode && entry) {
+  // Node dims these lines at a terminal and writes them plain when stderr is
+  // redirected, which is what makes its output diffable in a log.
+  const dimIfTty = (s) => (process.stderr.isTTY ? '\\x1b[2m' + s + '\\x1b[22m' : s);
+  // \`node --watch app.js\`. It used to run the program once and exit 0, so the only
+  // evidence that --watch had done nothing was that nothing ever restarted.
+  //
+  // The supervisor re-spawns \`node\` WITHOUT --watch — the child is an ordinary run,
+  // and re-passing the flag would make every restart supervise a supervisor.
+  const abs = path.resolve(process.cwd(), entry);
+  const label = entry;
+  const watched = watchPaths.length ? watchPaths.map((p) => path.resolve(process.cwd(), p)) : [abs];
+  createWatcher({
+    argv: ['node', abs, ...rest],
+    label: label,
+    paths: watched,
+    // --watch-path is the user naming what to watch, so the kit does not also apply its
+    // guess about which extensions matter. See isNoise in watch-kit.js.
+    explicitPaths: watchPaths.length > 0,
+    // Node's own wording, byte for byte, captured from \`node --watch\` on the host —
+    // including the second sentence, which is the part that tells a reader the process
+    // is still alive on purpose rather than hung. Dimmed the way node dims it, which
+    // it only does at a terminal.
+    onRunEnd: (code) => {
+      const verb = code === 0 ? 'Completed running' : 'Failed running';
+      const msg = verb + " '" + label + "'. Waiting for file changes before restarting...";
+      process.stderr.write(dimIfTty(msg) + '\\n');
+    },
+    onRestart: () => {
+      process.stderr.write(dimIfTty('Restarting ' + "'" + label + "'") + '\\n');
+    },
+    // Node clears the screen by default and --watch-preserve-output turns that off.
+    // We never clear: the terminal here is the user's whole session record, and a
+    // supervisor wiping it is worse than a scrollback that needs scrolling.
+    clear: false,
+  });
+} else if (checkOnly) {
+  // \`--check\` PARSES and stops. Routed through the loader's own pipeline (via the
+  // runtime's __ocCheckSyntax seam) so it answers about the program that would really
+  // run: a .ts file only parses once the types come off, and a module's \`import\` only
+  // once the ESM rewrite has turned it into a call. Before this, --check fell through
+  // to the ignore branch and the file was EXECUTED — side effects and all — which is
+  // the one thing the flag exists to avoid.
+  const abs = path.resolve(process.cwd(), entry);
+  const check = globalThis.__ocCheckSyntax;
+  if (typeof check !== 'function') {
+    process.stderr.write('node: --check is unavailable in this runtime build\\n');
+    process.exit(9);
+  }
+  try {
+    check(abs);
+  } catch (e) {
+    // Node prints the error and exits 1; the message already carries file and line
+    // now that wrappers name their script.
+    process.stderr.write(((e && e.stack) || (e && e.message) || String(e)) + '\\n');
+    process.exit(1);
+  }
+  process.exit(0);
 } else {
-  if (!entry) { process.stderr.write('node: missing script\\n'); process.exit(1); }
   const abs = path.resolve(process.cwd(), entry);
   process.argv = ['node', abs, ...rest]; // script sees argv[1] = its own path
   // runMain, not require: the entry has to BE the main module. \`require(abs)\` loaded
@@ -400,7 +623,7 @@ if (evalCode != null) {
   // of reporting success.
   Module.runMain(abs);
 }
-`,
+` + REPL_KIT_SRC + WATCH_KIT_SRC,
 
   // A minimal POSIX-ish shell: sequencing (;), and/or (&& ||), comments (#),
   // pipes (|), redirects (< > >> 2> 2>> 2>&1), builtins (cd, pwd, export, :,
@@ -559,7 +782,15 @@ function runSimple(tokens) {
     return Promise.resolve(0);
   }
   return new Promise((resolve) => {
-    const child = cp.spawn(cmd, args, { cwd: process.cwd(), env: envWith(assign) });
+    // A single command with no redirects takes our OWN fd 0, whatever that is. Saying
+    // so matters when we do not have a terminal: \`sh -c node\` inside a captured
+    // process must not hand the child a tty the shell itself has not got, or a bare
+    // \`node\` opens a prompt that nobody can ever type at and the process hangs.
+    const child = cp.spawn(cmd, args, {
+      cwd: process.cwd(),
+      env: envWith(assign),
+      stdio: ['inherit', 'pipe', 'pipe'],
+    });
     currentChild = child;
     currentKill = (sig) => { try { child.kill(sig); } catch (e) {} };
     // A single command with no redirects comes through here, not runPipeline —
@@ -640,11 +871,22 @@ function runPipeline(stages) {
     // A stage with no command (e.g. \`> file\`, or a bare \`FOO=bar\`) is not spawned;
     // its redirects still apply (opening \`>\` truncates the target), then it
     // completes with status 0. A leading NAME=value prefix scopes env to the stage.
-    const children = specs.map((sp) => {
+    const children = specs.map((sp, idx) => {
       if (!sp.argv.length) return null;
       const { assign, rest } = peelAssignments(sp.argv);
       if (!rest.length) return null;
-      return cp.spawn(rest[0], rest.slice(1), { cwd: process.cwd(), env: envWith(assign) });
+      // SAY WHERE STDIN COMES FROM. Only the first stage of a pipeline reads the
+      // terminal, and even it does not when a \`<\` redirect took fd 0. Every other
+      // stage is fed by the stage before it. The child needs to know, because
+      // process.stdin.isTTY is what a program branches on: \`echo 'console.log(1)' |
+      // node\` has to run that text as a program, and it used to see a terminal, open
+      // a REPL, and treat the program as keystrokes.
+      const stdin = idx === 0 && !sp.stdinFile ? 'inherit' : 'pipe';
+      return cp.spawn(rest[0], rest.slice(1), {
+        cwd: process.cwd(),
+        env: envWith(assign),
+        stdio: [stdin, 'pipe', 'pipe'],
+      });
     });
     // Interactive stdin goes to the FIRST stage (it reads the terminal); Ctrl+C
     // signals EVERY stage so the whole pipeline dies, not just one.

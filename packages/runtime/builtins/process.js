@@ -227,8 +227,12 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
       }
       _cwd = "/" + parts.join("/");
     },
-    exit: (code = 0) => {
-      const c = code | 0;
+    exit: (code) => {
+      // No argument means process.exitCode, and only THEN 0 — Node's documented
+      // default, and Bun's. It used to default straight to 0, so the two-step shape
+      // half of npm's CLIs use (`process.exitCode = 1` somewhere deep, a bare
+      // `process.exit()` at the end) reported success for a run that had failed.
+      const c = (code === undefined || code === null ? (process.exitCode == null ? 0 : process.exitCode) : code) | 0;
       // Proactively flag the loop to stop so drive() returns `c` even if the
       // throw below escapes the loop (e.g. exit() called from a Promise
       // microtask, outside the loop's runCallback try/catch). The throw still

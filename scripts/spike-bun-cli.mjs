@@ -135,15 +135,64 @@ console.log("\n6) the registry verbs, and the three that cannot work");
   const why = await kernel.start("bun", ["why", "nothing-installed-here"], { cwd: APP + "/pm", env: ENV, capture: true });
   ok(!/not implemented in the Vivari shim/.test(why.stderr || ""), "bun why reaches npm instead of refusing: " + JSON.stringify(((why.stdout || "") + (why.stderr || "")).slice(0, 60)));
 
+  // `repl` used to be the third entry here, refusing because "the REPL wants a tty
+  // and the sandbox has pipes rather than a terminal device". It is implemented
+  // now (scripts/spike-repl.mjs), and the reason it gave was not true when it was
+  // written: process.stdin is a flowing TTY with isTTY set, and the interactive
+  // shell forwards raw keystrokes to its foreground child.
   for (const [verb, phrase] of [
     ["publish", /authenticated npm session/],
     ["patch", /no git transport/],
-    ["repl", /wants a tty/],
   ]) {
     const r = await kernel.start("bun", [verb], { cwd: APP, env: ENV, capture: true });
     ok(phrase.test(r.stderr || ""), "bun " + verb + " refuses with the reason: " + JSON.stringify((r.stderr || "").slice(0, 60)));
     ok(r.code === 1, "…and exits 1");
   }
+}
+
+console.log("\n7) bun -e takes TypeScript, because bun has no JS-only mode");
+{
+  // Was handed straight to eval, so an annotated one-liner — which is how every
+  // example in Bun's docs is written — was a SyntaxError in the shim and nowhere
+  // else.
+  const ts = await kernel.start("bun", ["-e", 'const n: number = 41; console.log(n + 1)'], { cwd: APP, env: ENV, capture: true });
+  ok((ts.stdout || "").trim() === "42", "bun -e evaluates a type annotation: " + JSON.stringify(((ts.stdout || "") + (ts.stderr || "")).trim().slice(0, 80)));
+  ok(ts.code === 0, "…and exits 0");
+
+  const iface = await kernel.start("bun", ["-e", 'interface P { a: string }\nconst p: P = { a: "ok" }; console.log(p.a)'], { cwd: APP, env: ENV, capture: true });
+  ok((iface.stdout || "").trim() === "ok", "…including a type-only declaration that must vanish entirely");
+
+  const glob = await kernel.start("bun", ["-e", 'console.log(typeof Bun)'], { cwd: APP, env: ENV, capture: true });
+  ok((glob.stdout || "").trim() === "object", "…with the Bun global installed, as bun -e has it");
+}
+
+console.log("\n8) Bun.exit ends the process");
+{
+  // The one API on the whole Bun object that was missing for no architectural reason.
+  // Everything else absent is absent because a page cannot do it — dlopen, raw
+  // sockets, engine internals — and says so by name; this one just answered
+  // "Bun.exit is not a function".
+  const t = await kernel.start("bun", ["-e", "console.log(typeof Bun.exit)"], { cwd: APP, env: ENV, capture: true });
+  ok((t.stdout || "").trim() === "function", "it exists: " + JSON.stringify(((t.stdout || "") + (t.stderr || "")).trim().slice(0, 60)));
+
+  const three = await kernel.start("bun", ["-e", "Bun.exit(3)"], { cwd: APP, env: ENV, capture: true });
+  ok(three.code === 3, "Bun.exit(3) exits 3: " + three.code);
+  // Silence matters as much as the code: the sentinel process.exit throws to unwind
+  // must not surface as an error, the same way it must not in the REPL.
+  ok(
+    !((three.stdout || "") + (three.stderr || "")).trim(),
+    "…silently, with no sentinel leaking out: " + JSON.stringify(((three.stdout || "") + (three.stderr || "")).trim().slice(0, 60)),
+  );
+
+  const stops = await kernel.start("bun", ["-e", "console.log('before'); Bun.exit(5); console.log('after')"], { cwd: APP, env: ENV, capture: true });
+  ok(stops.code === 5 && /before/.test(stops.stdout || "") && !/after/.test(stops.stdout || ""),
+    "…and stops the program where it was called: exit " + stops.code + " " + JSON.stringify((stops.stdout || "").trim()));
+
+  // Bare Bun.exit() takes process.exitCode, like process.exit() and like node.
+  const bare = await kernel.start("bun", ["-e", "process.exitCode = 2; Bun.exit()"], { cwd: APP, env: ENV, capture: true });
+  ok(bare.code === 2, "a bare Bun.exit() honours process.exitCode: " + bare.code);
+  const zero = await kernel.start("bun", ["-e", "Bun.exit()"], { cwd: APP, env: ENV, capture: true });
+  ok(zero.code === 0, "…and is 0 when nothing set it: " + zero.code);
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: bun init and bun pm behave as the binary does");

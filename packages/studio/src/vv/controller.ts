@@ -20,6 +20,7 @@ import { KernelBridge, resetVfs } from "./kernel";
 import { DebugSession } from "./debug-session";
 import { ScmSession } from "./scm-session";
 import { EditorStatus } from "./editor-status";
+import { loadWordWrap, saveWordWrap } from "./editor-prefs";
 import { stateLabel } from "../../../runtime/builtins/python-lsp.js";
 import { StatusMessage } from "./status-message";
 import { getTemplate, type TemplateManifest } from "./templates";
@@ -203,6 +204,9 @@ export interface IdeSnapshot {
   sidebarCollapsed: boolean;
   panelCollapsed: boolean;
   previewCollapsed: boolean;
+  // Soft-wrap long lines in the text editor AND the diff editor. Persisted, since a
+  // reload that silently forgot it would read as the toggle not having worked.
+  wordWrap: boolean;
   panelTab: "console" | "terminal" | "ports";
   clipboard: Clipboard | null;
   paletteOpen: boolean;
@@ -582,6 +586,7 @@ export class IdeController {
     sidebarCollapsed: false,
     panelCollapsed: true,
     previewCollapsed: false,
+    wordWrap: loadWordWrap(),
     panelTab: "console",
     clipboard: null,
     paletteOpen: false,
@@ -1076,6 +1081,9 @@ export class IdeController {
       // Don't over-reserve the line-number column (Monaco defaults to 5 chars,
       // which right-aligns single digits and leaves a big gap to their left).
       lineNumbersMinChars: 2,
+      // Seeded from the persisted preference rather than set afterwards, so a wrapped
+      // session does not flash one unwrapped frame on every cold boot.
+      wordWrap: this.snap.wordWrap ? "on" : "off",
     });
     // Breakpoint debugger: wire gutter breakpoints + paused-line decorations.
     this.debug.attachEditor(this.editor, monaco);
@@ -1711,6 +1719,9 @@ export class IdeController {
       renderSideBySide: true,
       scrollBeyondLastLine: false,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      // Wrapping matters MORE here than in the text editor: a side-by-side diff gives
+      // each version half the width, so a long line is cut off twice over.
+      wordWrap: this.snap.wordWrap ? "on" : "off",
     });
     this.diffEditor = diff;
     const [head, work] = await Promise.all([
@@ -2926,6 +2937,19 @@ export class IdeController {
   togglePreview(force?: boolean) {
     const collapsed = force === undefined ? !this.snap.previewCollapsed : !force;
     this.set({ previewCollapsed: collapsed });
+  }
+  /** Soft-wrap long lines, VS Code's Alt+Z. Applied to both editors and persisted. */
+  toggleWordWrap(force?: boolean) {
+    const on = force === undefined ? !this.snap.wordWrap : force;
+    if (on === this.snap.wordWrap) return;
+    this.set({ wordWrap: on });
+    saveWordWrap(on);
+    // updateOptions on the LIVE editors, because the option is per-editor and neither
+    // one is remounted by a snapshot change. Both may be absent — the text editor
+    // before Monaco has loaded, the diff editor whenever no diff tab is open.
+    const wordWrap = on ? ("on" as const) : ("off" as const);
+    this.editor?.updateOptions({ wordWrap });
+    this.diffEditor?.updateOptions({ wordWrap });
   }
   openPalette(mode: "command" | "file") {
     this.set({ paletteOpen: true, paletteMode: mode });

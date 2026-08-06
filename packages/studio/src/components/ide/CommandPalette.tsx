@@ -5,6 +5,7 @@ import Home from "~icons/lucide/house";
 import TerminalIcon from "~icons/lucide/terminal";
 import PanelLeft from "~icons/lucide/panel-left";
 import PanelRight from "~icons/lucide/panel-right";
+import WrapText from "~icons/lucide/wrap-text";
 import Eraser from "~icons/lucide/eraser";
 import RefreshCw from "~icons/lucide/refresh-cw";
 import RotateCcw from "~icons/lucide/rotate-ccw";
@@ -54,6 +55,10 @@ export function CommandPalette() {
       { label: "Toggle Terminal Panel", icon: TerminalIcon, keys: "⌘J", run: () => c.togglePanel() },
       { label: "Toggle Sidebar", icon: PanelLeft, keys: "⌘B", run: () => c.toggleSidebar() },
       { label: "Toggle Preview Panel", icon: PanelRight, keys: "⌥⌘B", run: () => c.togglePreview() },
+      // ⌥Z is the macOS spelling of the one binding; on Windows and Linux the same
+      // chord reads Alt+Z. Every other entry here writes the macOS form too, so this
+      // stays consistent rather than growing a platform switch for one row.
+      { label: "Toggle Word Wrap", icon: WrapText, keys: "⌥Z", run: () => c.toggleWordWrap() },
       { label: "Clear Active Terminal", icon: Eraser, run: () => c.clearActiveTerminal() },
       { label: "Reload Preview", icon: RefreshCw, run: () => c.reloadPreview() },
       { label: "Measure Memory", icon: Gauge, run: () => void c.measureMemory() },

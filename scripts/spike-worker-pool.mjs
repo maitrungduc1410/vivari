@@ -95,7 +95,15 @@ const runCase = (name, makeWorkerData, expectPorts) =>
     }
     w.on('error', (e) => done('WORKER ERROR ' + e.message));
     w.on('message', (m) => {
-      if (String(m).startsWith('ports:')) seen.push(String(m));
+      if (String(m).startsWith('ports:')) {
+        seen.push(String(m));
+        // With no ports to hand back there is no echo to wait for, so this message IS
+        // the end of the case. It used to end on a 300ms timer instead, which is thin
+        // for booting a whole runtime in a Worker: under parallel load 'ports:' arrived
+        // after the deadline and the case reported a truthful-looking "ok" with the
+        // evidence missing. It was the only case in the file ending on a clock.
+        if (expectPorts === 0) done('ok ' + seen.sort().join(' '));
+      }
     });
     let echoes = 0;
     for (const p of channels) {
@@ -108,7 +116,6 @@ const runCase = (name, makeWorkerData, expectPorts) =>
         }
       });
     }
-    if (expectPorts === 0) setTimeout(() => done('ok ' + seen.sort().join(' ')), 300);
   });
 
 (async () => {

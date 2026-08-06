@@ -43,40 +43,10 @@ export const UNTRUNCATED = [
   { expr: "sys.exit(-1)", traceback: "SystemExit: -1", code: -1, report: "", cpython: 255 },
 ];
 
-// The same question asked of the REPL, because the answer arrives by a different
-// route there and the shim had it wrong. A script's SystemExit reaches the top
-// level; a typed one is re-raised by code.InteractiveInterpreter.runcode for the
-// loop driving it to act on, and a loop that treats it as an error prints a
-// traceback and prompts again. `exit()` is the interactive spelling, so the rows
-// are written the way a person types them rather than as sys.exit calls.
-export const CPYTHON_REPL_EXITS = [
-  // typed line(s)                      exit code   stderr
-  { lines: ["exit()"], code: 0, report: "" },
-  { lines: ["exit(0)"], code: 0, report: "" },
-  { lines: ["exit(3)"], code: 3, report: "" },
-  { lines: ['exit("bye")'], code: 1, report: "bye" },
-  { lines: ["quit()"], code: 0, report: "" },
-  { lines: ["import sys", "sys.exit()"], code: 0, report: "" },
-  { lines: ["import sys", "sys.exit(7)"], code: 7, report: "" },
-];
-
 // Run the expression under whatever CPython is on PATH. Returns null when
 // there is none, so callers can say so out loud instead of skipping quietly.
 export function realCPythonExit(expr, spawnSync) {
   const r = spawnSync("python3", ["-c", "import sys; " + expr], { encoding: "utf8" });
   if (r.error) return null;
   return { code: r.status, report: (r.stderr || "").trimEnd() };
-}
-
-// Type the lines at a real REPL. `-i` makes CPython run its interactive loop over
-// a piped stdin, and `-q` drops the banner; the prompts still go to stderr — which
-// is where CPython puts them, and where the message from exit("bye") lands too —
-// so they are subtracted to leave what the program actually said.
-export function realCPythonReplExit(lines, spawnSync) {
-  const r = spawnSync("python3", ["-q", "-i"], {
-    encoding: "utf8",
-    input: lines.map((l) => l + "\n").join(""),
-  });
-  if (r.error) return null;
-  return { code: r.status, report: (r.stderr || "").replace(/(>>>|\.\.\.) ?/g, "").trim() };
 }

@@ -1593,6 +1593,18 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     spawn: bunSpawn,
     spawnSync: bunSpawnSync,
     which: bunWhich,
+    // Bun.exit(code?) — the one API on the whole Bun object that was missing for no
+    // architectural reason, which is what made it worth adding: everything else absent
+    // here is absent because a page cannot do it (dlopen, raw sockets, engine
+    // internals) and says so by name. `bun -e 'Bun.exit(3)'` used to be
+    // "Bun.exit is not a function".
+    //
+    // It ends the process the way process.exit does, including the exitCode fallback
+    // when called bare, since that is the behaviour the two share and the one programs
+    // depend on. Whether the binary diverges from process.exit in some finer way — the
+    // ordering of 'exit' listeners, say — is NOT something this could be checked
+    // against without the real bun, so it is not claimed.
+    exit: (code) => process.exit(code),
     sleep,
     sleepSync,
     nanoseconds,

@@ -60,6 +60,13 @@ export function bootProcess({
     argv: [spec.programPath, ...(spec.args || [])],
     env: spec.env || {},
     cwd: spec.cwd || "/",
+    // Whether fd 0 is a terminal. `!capture` answers "can anybody type at us", which is
+    // close but not the same question: a pipeline stage is not captured and yet its
+    // stdin is a pipe, so `echo 'console.log(1)' | node` used to see isTTY true, open a
+    // REPL, and treat the piped program text as keystrokes. A spawner that KNOWS —
+    // the shell, for every stage of a pipeline and every `<` redirect — now says so, and
+    // that answer wins; `!capture` stays the default for everyone who does not.
+    tty: spec.tty === undefined ? !spec.capture : !!spec.tty,
     stdout: (chunk) => send("stdout", { chunk }),
     stderr: (chunk) => send("stderr", { chunk }),
     postRaw,

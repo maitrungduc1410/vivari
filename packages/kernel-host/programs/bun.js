@@ -50,6 +50,15 @@
 // import the runtime's BUN_VERSION; it carries the fallback literal below instead,
 // and scripts/spike-bun-offline.mjs asserts the two never drift.
 
+// The line editor + read/eval/print loop behind `bun repl`, shared with `node`'s.
+// APPENDED to the program source below rather than prepended, so this program's
+// own 'use strict' stays first in the file; `createRepl` is a hoisted function
+// declaration, so the position does not otherwise matter. The kit is a separate
+// template string with its own escaping — the no-backslash rule above is about
+// THIS string, not that one. See programs/repl-kit.js.
+import { REPL_KIT_SRC } from "./repl-kit.js";
+import { WATCH_KIT_SRC } from "./watch-kit.js";
+
 // The version the CLI reports when the Vivari runtime is not present to install
 // the Bun global (a plain `node` host, e.g. the offline spike). MUST equal
 // BUN_VERSION in packages/runtime/builtins/bun.js — that is the real definition,
@@ -156,6 +165,102 @@ function runFile(target, rest) {
     err('bun: ' + ((e && e.stack) || e));
     process.exit(1);
   }
+}
+
+// ---- TypeScript at the prompt ----------------------------------------------
+// Bun accepts TS/TSX everywhere it accepts JS, with no config and no build step,
+// so 'bun repl' and 'bun -e' have to as well. Bun.Transpiler is the same engine
+// the loader runs over a .ts file (packages/runtime/typescript-transform.js), so
+// what the prompt accepts and what a file accepts cannot drift.
+//
+// The TSX loader is Bun.Transpiler's own default and matches what real bun does
+// with -e. It carries TSX's one ambiguity with it: in a .tsx source an arrow
+// generic, 'const f = <T>(x: T) => x', parses as JSX. That is the binary's
+// behaviour in .tsx too; write 'const f = <T,>(x: T) => x' as you would there.
+//
+// A host with no Vivari runtime has no Bun global to ask, so the source passes
+// through untouched rather than the program dying at startup.
+function bunTranspile(code, what) {
+  const g = globalThis.Bun;
+  if (!g || typeof g.Transpiler !== 'function') return code;
+  try {
+    return new g.Transpiler({ loader: 'tsx' }).transformSync(code);
+  } catch (e) {
+    // Say WHICH input failed. A bare 'Unexpected token' out of a REPL that also
+    // evaluates is ambiguous between the transform and the evaluator.
+    const wrapped = new Error('bun: could not parse ' + (what || 'input') + ': ' + ((e && e.message) || e));
+    wrapped.stack = wrapped.message;
+    throw wrapped;
+  }
+}
+
+// ---- bun repl ---------------------------------------------------------------
+// An interactive prompt, on the shared kit in programs/repl-kit.js (appended to
+// this source at the bottom of the file). This used to refuse, on the grounds
+// that "the REPL wants a tty and the sandbox has pipes rather than a terminal
+// device" — which was simply not true by the time it was written: the runtime
+// gives a process a flowing TTY stdin with isTTY set, and the interactive shell
+// forwards raw keystrokes to its foreground child. Nothing was missing except
+// the loop itself.
+//
+// What is Bun's rather than the kit's is all in this config: TypeScript at the
+// prompt, the Bun global in scope, let/const hoisted to var, 'import' rewritten
+// to a dynamic import, and the _ / _error bindings. Those are the REPL semantics Bun
+// documents (https://bun.com/docs/runtime/repl).
+function doRepl(rest) {
+  const unknown = (rest || []).filter((a) => a.charAt(0) === '-');
+  if (unknown.length) {
+    err('bun repl: unrecognised flag ' + unknown[0]);
+    process.exit(1);
+    return;
+  }
+  installBun(true);
+  const ident = bunIdent();
+
+  // The prompt's own scope. require() resolves from the CWD, not from /bin, so
+  // require('./thing') at the prompt means what the user typing it means.
+  const moduleBuiltin = require('module');
+  const cwdRequire = typeof moduleBuiltin.createRequire === 'function'
+    ? moduleBuiltin.createRequire(path.resolve(cwd, '[repl]'))
+    : require;
+  globalThis.require = (m) => cwdRequire(m.charAt(0) === '.' || m.charAt(0) === '/' ? path.resolve(cwd, m) : m);
+
+  createRepl({
+    banner: 'Welcome to Bun v' + ident.version + ' (Vivari).' + NL + 'Type ".help" for more information.',
+    prompt: '> ',
+    contPrompt: '... ',
+    historyFile: (process.env.HOME || '') + '/.bun_repl_history',
+    // Before the transform, and it has to be: the transform below THROWS on
+    // 'function f() {', so a continuation decided from its error would never get
+    // one. See the contract note in programs/repl-kit.js.
+    isIncomplete: replIncomplete,
+    transform: (src) => bunTranspile(src, 'input'),
+    rewrite: (src) => {
+      // Imports first: the rewrite turns a statement-level import (illegal in
+      // an eval) into an awaited dynamic import, and the declaration hoist then
+      // treats what is left like any other line.
+      const imported = replRewriteImports(src);
+      const hoisted = replHoistDeclarations(imported.code);
+      const names = imported.names.slice();
+      for (let i = 0; i < hoisted.names.length; i++) {
+        if (names.indexOf(hoisted.names[i]) < 0) names.push(hoisted.names[i]);
+      }
+      return { code: hoisted.code, names: names, statement: hoisted.statement || imported.statement };
+    },
+    errorVar: '_error',
+    commands: {
+      '.copy': {
+        help: 'NOT AVAILABLE here: copy the last result to the clipboard',
+        run: (arg, api) => {
+          // Refused by name, the way bun publish and bun patch are, rather
+          // than silently doing nothing: a .copy that prints "copied" and copies
+          // nothing is worse than one that says it cannot.
+          api.write('.copy is not implemented in the Vivari shim: it writes to the SYSTEM clipboard, and a Web Worker cannot reach navigator.clipboard at all — that API needs a document and a user gesture, and a worker has neither.' + NL);
+          api.write('Select the text in the terminal and copy it with your browser instead.' + NL);
+        },
+      },
+    },
+  });
 }
 
 // ---- run a package.json script (with pre/post), via the shell --------------
@@ -538,6 +643,7 @@ function helpText() {
     '  bun <file.ts>            run a TS/JS/TSX file (Bun global + zero-config TS)',
     '  bun run <script|file>    run a package.json script or a file',
     '  bun install|add|remove   manage dependencies (delegates to npm; writes bun.lock)',
+    '  bun repl                 interactive prompt (TypeScript, Bun global, history)',
     '  bun x <pkg>              run a package binary (bunx)',
     '  bun build <entry>       bundle an entry point and its imports',
     '  bun test [filters]      run bun:test suites (-t, --bail, --timeout, -u, --reporter)',
@@ -853,7 +959,53 @@ function doCreate(args) {
   return doExec([pkgName].concat(rest));
 }
 
+// --watch / --hot, which bun takes anywhere before the target: 'bun --watch x.ts',
+// 'bun run --watch dev'. Peeled off wherever they appear, so the argv the supervisor
+// re-spawns is the same command MINUS the watch request — re-passing it would make
+// every restart supervise a supervisor.
+//
+// --hot is the one honest compromise here. In real bun it is a SOFT reload: the module
+// graph is swapped inside the running process, so globals survive and an open server
+// keeps its socket. Doing that needs the loader to invalidate and re-evaluate a
+// subgraph while everything else stays live, which is its own change. What runs here
+// is --watch, and the one-line notice below says exactly that, once, rather than
+// letting a program silently lose the state its author expected to keep.
+function peelWatchFlags(list) {
+  const kept = [];
+  let watch = false, hot = false;
+  for (const a of list) {
+    if (a === '--watch') { watch = true; continue; }
+    if (a === '--hot') { hot = true; continue; }
+    // Bun clears the screen on rerun and this flag turns that off. We never clear —
+    // the terminal is the user's whole session record — so it is already the default
+    // and is dropped rather than reported as unknown.
+    if (a === '--no-clear-screen') continue;
+    kept.push(a);
+  }
+  return { kept: kept, watch: watch || hot, hot: hot };
+}
+
 async function main() {
+  const w = peelWatchFlags(argv);
+  if (w.watch) {
+    const target = w.kept[0] === 'run' ? w.kept[1] : w.kept[0];
+    if (!target) { err('bun --watch needs a file or a script to run'); process.exit(1); }
+    if (w.hot) {
+      err('note: --hot runs as --watch in the Vivari shim (the process is RESTARTED, not soft-reloaded), so globals and open sockets do not survive a reload.');
+    }
+    createWatcher({
+      argv: ['bun'].concat(w.kept),
+      label: target,
+      paths: [path.resolve(cwd, target)],
+      // Bun prints no banner of its own around a rerun, so neither do we. The banners
+      // node prints are node's, and copying them here would describe bun wrongly.
+      onRunEnd: null,
+      onRestart: null,
+      clear: false,
+    });
+    return;
+  }
+
   const first = argv[0];
   if (!first || first === '--help' || first === '-h' || first === 'help') { out(helpText()); process.exit(0); }
   if (first === '--version' || first === '-v') { out(bunIdent().version); process.exit(0); }
@@ -862,7 +1014,11 @@ async function main() {
     installBun(true);
     const code = argv[1] || '';
     const fn = new Function('code', 'return eval(code)');
-    fn(code);
+    // Transpiled, because real bun -e takes TypeScript: bun has no JS-only mode,
+    // and every one of its docs' one-liners is written in TS. This handed the
+    // source straight to eval, so 'bun -e' was the one place in the shim where
+    // 'const n: number = 1' was a SyntaxError.
+    fn(bunTranspile(code, '-e'));
     process.exit(0);
   }
 
@@ -907,11 +1063,7 @@ async function main() {
       err('Edit the file in node_modules directly, or vendor the package into your source tree.');
       process.exit(1);
       return;
-    case 'repl':
-      err('bun repl is not implemented in the Vivari shim: the REPL wants a tty for line editing and history, and the sandbox has pipes rather than a terminal device.');
-      err('Use "bun run <file>" or "bun -e <code>" instead.');
-      process.exit(1);
-      return;
+    case 'repl': return doRepl(rest);
     default:
       // Bare bun <file> / bun <script> -> run it. Anything else is a subcommand we
       // do not have; say so instead of failing later as a missing file.
@@ -935,7 +1087,7 @@ main().catch((e) => {
   process.stderr.write('bun: ' + ((e && e.stack) || e) + NL);
   process.exit(1);
 });
-`;
+` + REPL_KIT_SRC + WATCH_KIT_SRC;
 
 // `bunx` — Bun's package runner. Same behaviour as `bun x`; delegates to npx.
 export const BUNX_PROGRAM = `

@@ -18,16 +18,64 @@ import { nativeAddonError } from "./builtins/bun-unsupported.js";
 // process actually calls Bun.plugin(), which no plain `node` process does.
 import { bunPluginsActive, bunPluginResolve, bunPluginLoad } from "./builtins/bun-build.js";
 
-// The constructor for `async function () {}` — used to (re)compile an ESM module
-// that uses top-level await (our normal wrapper is a plain, non-async function).
-const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-// Our module compiler must always use the NATIVE Function constructor. The
-// runtime later wraps the *global* Function (to redirect dynamic import() in
-// escape-hatch bodies like piscina's `new Function('s','return import(s)')`);
-// module wrappers already have their imports rewritten, so routing them through
-// that wrapper would only re-lex every module for nothing. Captured at import
-// time, before the global is wrapped.
-const RealFunction = Function;
+// Captured at import time so a guest that reassigns `globalThis.eval` cannot get
+// between the loader and the modules it compiles. (The runtime does wrap the global
+// `Function` — to redirect dynamic import() inside escape-hatch bodies like
+// piscina's `new Function('s','return import(s)')` — and module wrappers must never
+// go through that; they already had their imports rewritten.)
+const RealEval = eval;
+
+// Compile a module wrapper so that STACK FRAMES NAME THE USER'S FILE.
+//
+// `new Function(params, body)` produces an anonymous script, which is why every
+// guest frame used to read
+//
+//   at f (eval at compile (…/packages/runtime/module.js:585:11), <anonymous>:3:21)
+//
+// naming OUR loader and hiding theirs. V8 takes the name from a `//# sourceURL`
+// comment, but only on a script it parses as a whole — there is no way to attach
+// one through the Function constructor, whose body is spliced into a synthesised
+// `function anonymous(…) {\n … \n}` (a fixed but unreportable two-line offset).
+//
+// So we build the wrapper as a source text and hand it to INDIRECT eval, which
+// parses it as a script and honours the directive. `(0, RealEval)` is what makes it
+// indirect: the body then evaluates in global scope with no access to any binding
+// in here, exactly like a Function-constructed body. Nothing else about the
+// wrapper's semantics changes, and the CSP requirement is unchanged (both forms
+// need `unsafe-eval`).
+//
+// The header is deliberately kept on the SAME LINE as the body's first character:
+// that is what makes reported line numbers equal the file's own line numbers,
+// which is the whole point. The cost is that a COLUMN on line 1 is shifted right
+// by the header's width; lines 2+ are exact in both axes. Worth it — a wrong line
+// sends you to the wrong code, a wrong column on one line does not.
+function compileWrapper(params, body, filename, wantAsync) {
+  const head = (wantAsync ? "(async function (" : "(function (") + params.join(", ") + ") {";
+  // `\n` before the directive so a body ending in a line comment cannot eat it.
+  const text = head + body + "\n})\n//# sourceURL=" + sourceUrlFor(filename);
+  const fn = (0, RealEval)(text);
+  // A body with an unbalanced `}` can close the wrapper early and leave eval
+  // returning whatever the trailing garbage evaluated to. The Function constructor
+  // reported that as a SyntaxError; keep reporting it as one, or the failure
+  // resurfaces much later as "wrapper.call is not a function".
+  if (typeof fn !== "function") throw new SyntaxError("Unexpected end of input");
+  return fn;
+}
+
+// Stack frames should carry the same URL shape the debugger registers scripts under
+// (see toUrl in debugger.js), so a frame and a breakpoint agree on one identity.
+// The wrapper parameter lists. See the long note at the compile site in compile()
+// for why ESM gets __oc_-prefixed names and CJS gets the classic five.
+const ESM_PARAMS = ["__oc_exports", "__oc_require", "__oc_module"];
+const CJS_PARAMS = ["exports", "require", "module", "__filename", "__dirname"];
+
+function sourceUrlFor(filename) {
+  if (/^[a-z]+:\/\//i.test(filename)) return filename;
+  // A sourceURL runs to end-of-line, so a newline in the path would truncate the
+  // directive and silently re-anonymise the script.
+  const clean = String(filename).replace(/[\r\n]/g, "");
+  return clean.startsWith("/") ? "file://" + clean : "file:///" + clean;
+}
 
 // Pure: given a bin file's source, return the .js/.cjs/.mjs target token that a
 // shell cmd-shim `exec`s (with pnpm's `$basedir` left un-expanded), or null when
@@ -577,12 +625,16 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     // EVERYTHING under an __oc_ prefix — __oc_require (import rewrites, __oc_import,
     // __oc_meta.resolve), __oc_exports, __oc_module — and we inject those here.
     // import.meta.url is provided via __oc_meta.
+    //
+    // Both lists are module-level constants because compileWrapper interpolates them
+    // into the wrapper's header, and the header's width is what the line-1 column
+    // offset costs — see compileWrapper.
     let wrapper;
     let isAsync = false;
     try {
       wrapper = isEsm
-        ? new RealFunction("__oc_exports", "__oc_require", "__oc_module", source + "\n")
-        : new RealFunction("exports", "require", "module", "__filename", "__dirname", source + "\n");
+        ? compileWrapper(ESM_PARAMS, source, filename, false)
+        : compileWrapper(CJS_PARAMS, source, filename, false);
     } catch (err) {
       // Top-level await: real ESM allows `await` at the module top level, but our
       // CJS wrapper is a plain (non-async) function, so `new Function` rejects the
@@ -602,7 +654,7 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
       // reported. The retry is error-path only, so there's no cost on the happy path.
       if (isEsm) {
         try {
-          wrapper = new AsyncFunction("__oc_exports", "__oc_require", "__oc_module", source + "\n");
+          wrapper = compileWrapper(ESM_PARAMS, source, filename, true);
           isAsync = true;
         } catch (e2) {
           e2.message += ` (while compiling ${filename} [esm])`;
@@ -625,7 +677,7 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
         // await — which is also what Bun does. A file that was simply mis-typed
         // fails this compile too, and the ORIGINAL error is what gets reported.
         try {
-          wrapper = new AsyncFunction("exports", "require", "module", "__filename", "__dirname", source + "\n");
+          wrapper = compileWrapper(CJS_PARAMS, source, filename, true);
           isAsync = true;
         } catch {
           // Compilation (parse) errors are otherwise anonymous ("<anonymous>"); name
@@ -658,10 +710,10 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
           if (live != null) {
             let w2;
             try {
-              w2 = new RealFunction("__oc_exports", "__oc_require", "__oc_module", live + "\n");
+              w2 = compileWrapper(ESM_PARAMS, live, filename, false);
               isAsync = false;
             } catch {
-              w2 = new AsyncFunction("__oc_exports", "__oc_require", "__oc_module", live + "\n");
+              w2 = compileWrapper(ESM_PARAMS, live, filename, true);
               isAsync = true;
             }
             return w2.call(module.exports, module.exports, require, module);
@@ -929,10 +981,60 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     return this.exports;
   };
 
+  // `node --check` / `node -c`: parse a file and say whether it parses, WITHOUT
+  // running it. It has to go through the same transforms the loader would, or it
+  // would answer about a different program than the one that runs — a `.ts` file is
+  // a syntax error until the types come off, and a module's `import` is a syntax
+  // error until the ESM rewrite turns it into a call. The esbuild patch and the
+  // debugger weaving are skipped: neither can change whether the source parses.
+  //
+  // Throws the SyntaxError for the caller to report; returns nothing on success.
+  function checkSyntax(filename, providedSource) {
+    let source = providedSource != null ? providedSource : fs.readFileSync(filename, "utf8");
+    if (source.charCodeAt(0) === 0xfeff) source = source.slice(1);
+    if (source.startsWith("#!")) source = "//" + source.slice(2);
+    const ts = maybeTranspileTypeScript(source, filename, jsxOptionsFor(filename));
+    if (ts != null) source = ts;
+    let isEsm = false;
+    if (path.extname(filename) !== ".cjs") {
+      const esm = transpileEsm(source, filename);
+      if (esm != null) {
+        source = esm;
+        isEsm = true;
+      }
+    }
+    if (!isEsm) {
+      const rewritten = rewriteCjsDynamicImport(source, filename);
+      if (rewritten != null) source = rewritten;
+    }
+    // NOT compileWrapper. That one uses indirect eval so it can attach a sourceURL,
+    // and eval means a body can CLOSE THE WRAPPER EARLY and run whatever follows —
+    //
+    //     }); process.stdout.write('side effect'); (function(){
+    //
+    // evaluates as a complete script, and the `typeof fn !== "function"` guard does not
+    // notice because the last function expression is still the completion value. So
+    // --check ran the file it exists to avoid running. The Function constructor cannot
+    // be escaped that way: an unbalanced body is a SyntaxError, which is the answer
+    // --check wants. It also has no need for a sourceURL, since it produces no frames.
+    const params = isEsm ? ESM_PARAMS : CJS_PARAMS;
+    try {
+      new Function(params.join(", "), source);
+    } catch {
+      // Top-level await is legal in a module and in a file we run as one, so a plain
+      // wrapper rejecting the parse is not yet an answer — compile() does the same
+      // retry before it believes an error. Only the async attempt failing is a real
+      // syntax error, and that is the one worth reporting.
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      new AsyncFunction(params.join(", "), source);
+    }
+  }
+
   return {
     runMain,
     makeRequire,
     resolveFilename,
+    checkSyntax,
     Module,
     cache,
     setMainModule: (m) => (mainModule = m),

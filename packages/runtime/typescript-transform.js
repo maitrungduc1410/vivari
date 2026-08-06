@@ -393,7 +393,44 @@ const MEMBER_MODIFIERS = new Set(["public", "private", "protected", "readonly", 
 function stripTypes(src) {
   const toks = tokenize(src);
   let out = "";
-  const emit = (s) => { out += s; };
+
+  // ---- line preservation ----------------------------------------------------
+  // Stripping types must not MOVE the code that follows. A stack frame carries a
+  // line number, so a transform that deletes four lines of `interface` makes every
+  // frame below it point four lines too high — and once the loader names the real
+  // file (see the sourceURL wrapper in module.js) a wrong line is worse than an
+  // anonymous one, because it looks authoritative. Node's own type stripper
+  // (--experimental-strip-types) keeps positions for exactly this reason.
+  //
+  // The accounting is GLOBAL rather than per-deletion: `nlUpTo[k]` is how many
+  // newlines the source has before token k, `emittedNl` is how many the output has
+  // so far, and every drop tops the difference up. Doing it globally is what makes
+  // it self-correcting — the `enum` case emits generated code (with newlines of its
+  // own) BEFORE dropping the source it replaces, and a per-deletion counter would
+  // double-count those. It also cannot overshoot: the top-up only ever adds when
+  // the output is behind.
+  const N_TOKS = toks.length;
+  const nlUpTo = new Int32Array(N_TOKS + 1);
+  for (let k = 0; k < N_TOKS; k++) {
+    const v = toks[k].value;
+    let c = 0;
+    for (let p = 0; p < v.length; p++) if (v.charCodeAt(p) === 10) c++;
+    nlUpTo[k + 1] = nlUpTo[k] + c;
+  }
+  let emittedNl = 0;
+  const emit = (s) => {
+    out += s;
+    for (let p = 0; p < s.length; p++) if (s.charCodeAt(p) === 10) emittedNl++;
+  };
+  // Bring the output up to the source's line count as of token `k`. Newlines are
+  // whitespace everywhere a type can appear, so this is always syntactically inert:
+  // `const x: Array<\n number\n> = 1` becomes `const x\n\n = 1`, and `=` still
+  // continues the declaration across them (no ASI, because `const x` alone cannot
+  // end a statement).
+  const catchUpTo = (k) => {
+    const want = nlUpTo[k];
+    if (emittedNl < want) emit("\n".repeat(want - emittedNl));
+  };
 
   // A tiny stack tracking whether we're directly inside a class body, so we can
   // handle member modifiers + parameter properties + field annotations.
@@ -426,6 +463,7 @@ function stripTypes(src) {
   // stripped `!`/type/modifier stops fooling the "what came before" heuristics.
   const drop = (a, b) => {
     for (let k = a; k < b; k++) toks[k].__d = true;
+    catchUpTo(b);
     return b;
   };
   // Drop the token at `k` plus the run of trailing ws/comments after it. Always
@@ -663,6 +701,10 @@ function stripTypes(src) {
     raw(t);
     i++;
   }
+  // A deletion that ran to the end of the file (a trailing `export type`) leaves the
+  // output short, which matters for a stack frame in a module that is required after
+  // this one only in that it keeps the file's line count honest.
+  catchUpTo(N_TOKS);
   return out;
 
   // ---- inner helpers (closures over toks/N) ---------------------------------
@@ -1055,6 +1097,41 @@ function lowerJsx(src, pragma, fragment) {
   const n = src.length;
   let out = "";
 
+  // ---- line preservation ----------------------------------------------------
+  // Lowering turns an element that spanned eight lines into one call on one line,
+  // so without this every line BELOW a JSX block moves up by the height of the
+  // block — and .tsx files are mostly JSX, which made the drift large (3486 lines
+  // across this repo's own studio components). Same reasoning as stripTypes: a
+  // named file with a wrong line is worse than an anonymous one.
+  //
+  // Newlines are put back at the END of each lowered element, which is the one spot
+  // that is unconditionally safe. The element is an EXPRESSION, so whatever follows
+  // it either continues that expression (`,` `)` `]` an operator) or ends the
+  // statement — and a line break in front of either is inert. It cannot introduce an
+  // ASI hazard, because the newlines being restored were already inside the span
+  // that just collapsed.
+  //
+  // What this buys: the element's FIRST line is exact, and every line after the
+  // element is exact. What it does not: a position strictly INSIDE a multi-line
+  // element resolves to the element's own first line, unless it sits in an
+  // expression container (`{...}`), whose text is copied verbatim and so keeps its
+  // own newlines. Getting the interior exact needs the newline budget threaded
+  // through attribute and child assembly; this is the 90% at a fraction of the risk.
+  const nlBefore = new Int32Array(n + 1);
+  for (let k = 0; k < n; k++) nlBefore[k + 1] = nlBefore[k] + (src.charCodeAt(k) === 10 ? 1 : 0);
+  let emittedNl = 0;
+  const countNl = (s) => {
+    let c = 0;
+    for (let p = 0; p < s.length; p++) if (s.charCodeAt(p) === 10) c++;
+    return c;
+  };
+  // Every append to `out` goes through this so the running count stays true.
+  const add = (s) => { out += s; emittedNl += countNl(s); };
+  const catchUp = () => {
+    const want = nlBefore[i > n ? n : i];
+    if (emittedNl < want) add("\n".repeat(want - emittedNl));
+  };
+
   function peek() { return src[i]; }
   function skipTrivia() {
     while (i < n) {
@@ -1067,11 +1144,36 @@ function lowerJsx(src, pragma, fragment) {
 
   // Scan a balanced JS expression until an unbalanced `}` (for {expr}) — copies
   // strings/templates/regex/nested braces.
+  //
+  // Comments are copied as UNITS, and that is not cosmetic: without it an
+  // apostrophe inside one opened a string that never closed. A contraction in a
+  // comment is ordinary English, so
+  //
+  //   <A className={cn(
+  //     // the library's own state
+  //     "a"
+  //   )} />
+  //
+  // read `'s own state…` as a string literal, swallowed the rest of the file into
+  // this expression, and then handed all of it back to transformJsxInner — which
+  // re-scanned the same tail at every level and HUNG. Any .tsx with "don't" or
+  // "it's" in a comment inside a JSX expression container hit it; the shadcn/ui
+  // components in this repo's own studio do.
   function readExprUntilBrace() {
     let depth = 0;
     let s = "";
     while (i < n) {
       const c = src[i];
+      if (c === "/" && src[i + 1] === "/") {
+        while (i < n && src[i] !== "\n") { s += src[i]; i++; }
+        continue;
+      }
+      if (c === "/" && src[i + 1] === "*") {
+        s += "/*"; i += 2;
+        while (i < n && !(src[i] === "*" && src[i + 1] === "/")) { s += src[i]; i++; }
+        s += "*/"; i += 2;
+        continue;
+      }
       if (c === "{") { depth++; s += c; i++; continue; }
       if (c === "}") { if (depth === 0) { i++; break; } depth--; s += c; i++; continue; }
       if (c === '"' || c === "'" || c === "`") { s += readString(c); continue; }
@@ -1196,15 +1298,18 @@ function lowerJsx(src, pragma, fragment) {
   let prevNonSpace = "";
   while (i < n) {
     const c = src[i];
-    if (c === '"' || c === "'" || c === "`") { out += readString(c); prevNonSpace = c; continue; }
-    if (c === "/" && src[i + 1] === "/") { while (i < n && src[i] !== "\n") { out += src[i]; i++; } continue; }
-    if (c === "/" && src[i + 1] === "*") { out += "/*"; i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) { out += src[i]; i++; } out += "*/"; i += 2; continue; }
+    if (c === '"' || c === "'" || c === "`") { add(readString(c)); prevNonSpace = c; continue; }
+    if (c === "/" && src[i + 1] === "/") { while (i < n && src[i] !== "\n") { add(src[i]); i++; } continue; }
+    if (c === "/" && src[i + 1] === "*") { add("/*"); i += 2; while (i < n && !(src[i] === "*" && src[i + 1] === "/")) { add(src[i]); i++; } add("*/"); i += 2; continue; }
     if (c === "<" && isTagStart() && jsxAllowed(prevNonSpace)) {
-      out += parseElement();
+      add(parseElement());
+      // `i` now sits just past the element's closing `>`, so this restores exactly
+      // the lines the element occupied.
+      catchUp();
       prevNonSpace = ")";
       continue;
     }
-    out += c;
+    add(c);
     if (!/\s/.test(c)) prevNonSpace = c;
     i++;
   }

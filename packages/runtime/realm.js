@@ -133,19 +133,6 @@ const HOLD = [
   // `os.hostname()` and the `host.vivari.internal` alias resolve through
   // location.hostname, read lazily — i.e. after this sweep (index.js).
   "location",
-  // Pyodide asks the realm what it is running in by constructor identity:
-  // `globalThis.self instanceof globalThis.WorkerGlobalScope` (314.0.3,
-  // src/js/environments.ts, calculateDerivedFlags). `self` is on KEEP, but the
-  // interface object is browser-only, so the sweep took it — and with `window`
-  // gone as well and `process.browser` masked for the loader's Node probe, every
-  // branch of that detection is false and the boot dies on "Cannot determine
-  // runtime environment". bootPyodide() puts the name back for the length of the
-  // boot and takes it away again (builtins/python.js).
-  // Holding it grants the guest realm nothing `self` did not already grant: the
-  // sweep shadows names, it does not touch the prototype chain, so
-  // WorkerGlobalScope.prototype — and the `importScripts` on it — has always been
-  // one getPrototypeOf away from `self`. What is hidden here is the NAME.
-  "WorkerGlobalScope",
   // Only for its `hardwareConcurrency`: the replacement below reports the real
   // core count, and by the time it is built the browser's navigator is hidden.
   "navigator",

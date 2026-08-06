@@ -94,6 +94,11 @@ export function createRuntime({
   argv = [],
   env = {},
   cwd = "/",
+  // Is there a terminal on the other end of stdin? False for a CAPTURED process —
+  // spawnSync, an internal kernel.start — where the only party who could send
+  // stdin is parked waiting for this process to exit. Defaults true so an embedder
+  // that does not pass it keeps the interactive behaviour it had.
+  tty = true,
   stdout = () => {},
   stderr = () => {},
   codec = null,
@@ -644,7 +649,25 @@ export function createRuntime({
   // loop like an open handle so an idle shell waits for input instead of exiting.
   const stdin = new stream.Readable({ read() {} });
   stdin.fd = 0;
-  stdin.isTTY = true;
+  // Was hardcoded true, which made isTTY useless as the thing it is for: a
+  // program could not tell an interactive shell from a spawnSync. `node` with no
+  // script is where that stopped being academic — it has to answer "REPL" to one
+  // and "missing script" to the other, and a captured process that opens a prompt
+  // waits for input that by construction can never arrive.
+  //
+  // NOT THE WHOLE QUESTION, though. `capture` means "nobody can type at me", which
+  // is narrower than "there is no terminal here": an ASYNC child spawned with
+  // stdio:'pipe' goes through handleSpawnAsync with stream:true, so it is not
+  // captured and still reports isTTY true, where real Node would say false. This
+  // narrows a value that used to be true for every process in the system; it does
+  // not finish the job, and the remaining gap needs the parent's stdio intent
+  // plumbed through the spawn spec.
+  // `undefined` rather than `false` when it is not a terminal, which is what real node
+  // reports: isTTY is a property of tty.ReadStream, so on a pipe there is nothing to
+  // read it off. Both are falsy, so no `if (isTTY)` cares — but a program that prints
+  // it, and the differential spike that compares us against the host, both do.
+  if (tty) stdin.isTTY = true;
+  else delete stdin.isTTY;
   stdin.isRaw = false;
   let stdinRefed = false;
   const setStdinRef = (on) => {
@@ -1394,6 +1417,29 @@ export function createRuntime({
     return bytes && bytes.length ? new TextDecoder().decode(bytes) : null;
   };
 
+  // "I took that signal, dealt with it, and I am staying." Stands the force-kill
+  // window down (Kernel#handleSignalHandled) for a guest that catches a signal
+  // and legitimately goes back to what it was doing.
+  //
+  // It was already wired to the Python runtime, whose REPL turns a Ctrl-C into a
+  // KeyboardInterrupt and returns to its prompt — but only as a constructor
+  // option, so a guest PROGRAM had no way to make the same claim. /bin/node.js
+  // and /bin/bun.js are guest programs, and their REPLs need it for exactly the
+  // reason Python's does: without it, the first Ctrl-C at a prompt is answered by
+  // the escalation path that exists for signal-swallowing processes.
+  //
+  // Still opt-in, and still not implied by "a handler ran" — see
+  // packages/runtime/signals.js for why that distinction is the whole point.
+  //
+  // Putting it on globalThis does widen who can call it: from one runtime-owned
+  // caller to any guest code in the process, an npm dependency included. So the
+  // force-kill window for a CATCHABLE signal is now guest-defeatable, and a caller
+  // is trusted to only stand down when it has genuinely finished handling. The two
+  // paths that do not go through signal() are what keep that bounded: SIGKILL is
+  // uncatchable (packages/protocol/syscall.js) and Kernel#stop cascades over the
+  // subtree, so a terminal can always reclaim a process it owns.
+  globalThis.__ocSignalHandled = (name) => signalStandDown(name);
+
   // Async, non-blocking outbound fetch (parallel downloads). Unlike __ocfetch -
   // which parks the whole worker on Atomics.wait, forcing a single process's
   // registry requests to run one-at-a-time - this hands the request to the kernel
@@ -1533,6 +1579,13 @@ export function createRuntime({
   };
 
   const moduleSystem = createModuleSystem({ fs, path, builtins, process, globals, nodeModules });
+
+  // `node --check` lives in the /bin/node.js shim, which is guest source and so cannot
+  // import the loader. A global is how the runtime hands guest programs a seam it owns
+  // (see __ocInstallBun, __ocSignalHandled) — and the point of routing the check
+  // through the loader rather than a bare `new Function` is that it then answers about
+  // the same program that would actually run: types stripped, ESM rewritten.
+  globalThis.__ocCheckSyntax = (filename, source) => moduleSystem.checkSyntax(filename, source);
 
   // Dynamic-import escape hatch. Libraries that ship dual ESM/CJS sometimes build
   // a dynamic import at runtime to dodge transpiler rewrites - piscina & tinypool
@@ -1744,21 +1797,13 @@ export function createRuntime({
     // is the only path a Ctrl-C has into a busy interpreter.
     interrupt: ctrl && ctrl.buffer ? interruptView(ctrl.buffer) : null,
     signalHandled: (name) => signalStandDown(name),
-    // The name Pyodide identifies a Web Worker by — it wants
-    // `self instanceof WorkerGlobalScope`, and the sweep took the constructor
-    // while `self` stayed. Handed in as a value rather than read off the global,
-    // because bootPyodide only puts it back for the length of one boot; see the
-    // HOLD entry in realm.js and maskBootEnv in builtins/python.js.
-    workerGlobalScope: HOST_REALM.held.get("WorkerGlobalScope") || null,
   });
   globalThis.__ocInstallPython = (indexUrl) => {
     // Pyodide's urllib bridge asks the realm for synchronous HTTP —
     // `hasattr(js, "XMLHttpRequest")` — and the realm sweep took XMLHttpRequest
     // away, because it is the one way out of this sandbox that never passes the
     // Fetcher Worker. Hand it back to the realm a python guest runs in, and only
-    // there: a node or bun guest still has no unmetered egress. Pyodide's own
-    // boot is the second caller: once it is on the worker path, asm.mjs's
-    // readBinary is a synchronous XHR too.
+    // there: a node or bun guest still has no unmetered egress.
     const xhr = HOST_REALM.held.get("XMLHttpRequest");
     if (xhr && globalThis.XMLHttpRequest === undefined) globalThis.XMLHttpRequest = xhr;
     return pythonRuntime.install(indexUrl);
