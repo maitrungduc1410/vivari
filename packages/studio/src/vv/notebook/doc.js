@@ -15,9 +15,19 @@ import { newCell, newCellId, parseNotebook, serializeNotebook, emptyNotebook } f
 function appendStream(outputs, name, text) {
   const last = outputs[outputs.length - 1];
   if (last && last.output_type === "stream" && last.name === name) {
-    // The merged output is no longer the one that was read from disk, so its
-    // `raw` must go: keeping it would make the writer emit the original bytes and
-    // silently drop everything appended since.
+    // ONE LINE, TWO CONSUMERS — and the obvious shortening breaks only the second.
+    //
+    // `raw: null`, for the WRITER: the merged output is no longer the one read
+    // from disk, and keeping its `raw` would emit the original bytes and silently
+    // drop everything appended since.
+    //
+    // A NEW OBJECT, for the VIEW: `OutputView` in NotebookView.tsx is memoised on
+    // the output's identity — it is one of the components deliberately left
+    // memoised, and this assignment is the whole reason that is safe. Growing the
+    // output in place (`last.text += text`) would keep the round-trip correct, look
+    // obviously safe, and freeze a printing cell on screen. Asserted in
+    // spike-notebook.mjs beside the merge itself, because a claim that survives
+    // only while someone reads carefully is not protected.
     outputs[outputs.length - 1] = { output_type: "stream", name, text: last.text + text, raw: null };
     return;
   }

@@ -10096,6 +10096,21 @@ instead is make the *behaviour* the gate: the bundle now compiles the way the ap
 assertions are "the screen repaints where it stands, with no remount to rescue it". Those go
 red against the source that shipped.
 
+**The follow-up that retires the directive: identity on write.** Not immutable snapshots, which
+is the rewrite above and is why nobody was going to do it. The cheap version is already in this
+codebase and already working — `appendStream` replaces the output object instead of growing it,
+which is exactly why `OutputView` is safe to leave memoised. Doing the same at the other
+mutation sites in `doc.js` — replace the cell rather than assign into it — makes the store obey
+the contract the compiler assumes, one line per site, and then the three directives come off
+because they are no longer needed rather than because somebody decided they were not. The
+alternative worth weighing is freezing cells in dev so an in-place write throws where it
+happens, which is cheaper still and catches the next violation instead of preventing it. Either
+one turns *remember the rule* into *the machine notices*, which is the difference the directive
+cannot make on its own: today a new leaf reading `doc.stale` or `session.queue` breaks the
+screen without turning anything red, because the gate covers the surfaces that exist. Deferred
+deliberately and not attempted here — it touches every write path the notebook has, and it
+wants its own change and its own red run.
+
 ### A keyboard that only half worked, and the container it was hanging from
 
 The pattern was the diagnosis. Typing and Enter reach Monaco as `input` on its textarea;
@@ -10141,8 +10156,18 @@ as a security boundary, so that was the first thing checked: both sit on output 
 sanitised HTML and a markdown cell — and neither is an ancestor of a cell editor, so the
 security fix is not implicated and nothing was moved. It is one careless wrapper away from
 being implicated, though, and the failure would be a tooltip quietly going back to being
-clipped, so the gate now walks from a mounted cell editor to the page and fails on any of those
-six properties. If that ever goes red the fix is to move the boundary, never to delete it.
+clipped, so the gate now walks up from a mounted cell editor and fails on any of those six
+properties. If that ever goes red the fix is to move the boundary, never to delete it.
+
+The walk's scope is narrower than the sentence it first printed, and the correction is this
+round's own lesson landing on this round's own fix. `parentElement` climbs from the cell editor
+through the spike's mount root, and the studio's chrome is not in that tree — `EditorGroup`, the
+panel layout and the tab wrapper are never mounted there — so the only styled ancestors it can
+ever reach are notebook-owned. It proves *the notebook subtree traps nothing*, which is the half
+this work owns and the half a careless wrapper in `NotebookView.tsx` would break. It cannot
+speak for the chrome above it, and it now prints the chain it walked so the boundary is visible
+in the output rather than promised in a comment. The chrome goes on the browser tier's list with
+the tooltip: they are one question, since a trap anywhere on the real chain clips the same widget.
 
 `stickyScroll` went off in the same list, for a reason that is structural rather than taste: a
 cell has no vertical scrollbar and its height is its content's height, so a scroll-driven
@@ -10157,11 +10182,14 @@ successor.
 
 Not proved, and added to the browser tier's list rather than dressed up:
 
-- **The tooltip itself.** jsdom has no layout engine, so nothing here can show a widget being
-  clipped or not clipped. What is asserted is the option being set and the ancestor chain being
-  free of fixed-position traps: both are real conditions for the fix, neither is the user's
-  screen. This is the one of the four where the change is *reasoned from a measured mechanism*
-  rather than shown working, and it should be the first thing looked at in a tab.
+- **The tooltip itself, and the ancestors this tier cannot reach.** jsdom has no layout engine,
+  so nothing here can show a widget being clipped or not clipped. What is asserted is the option
+  being set and the notebook's own subtree being free of fixed-position traps: both are real
+  conditions for the fix, neither is the user's screen. The studio chrome between the notebook
+  and the page — `EditorGroup`, the panel layout, the tab wrapper — is not mounted in this tier
+  and so is checked by nothing today; a tab walks the real chain. This is the one of the four
+  where the change is *reasoned from a measured mechanism* rather than shown working, and it
+  should be the first thing looked at in a tab.
 - Whether suggestion, hover, parameter hints and the context menu land in the right PLACE once
   they are no longer clipped — `fixedOverflowWidgets` recomputes coordinates against
   `getBoundingClientRect`, which jsdom returns zeros for.

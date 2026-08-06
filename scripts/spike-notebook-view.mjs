@@ -48,9 +48,12 @@
 // What this still cannot do, and where each of those lives instead:
 //   · Show a widget being CLIPPED. jsdom has no layout engine, so the section on
 //     editor options asserts that `fixedOverflowWidgets` is set and that nothing
-//     above a cell traps a fixed-position descendant. Both are real conditions
-//     for the fix to work and neither is the user's tooltip. roadmap.md's
-//     browser tier holds the tooltip.
+//     in the notebook's own subtree traps a fixed-position descendant. Both are
+//     real conditions for the fix to work and neither is the user's tooltip. The
+//     ancestors ABOVE the notebook — EditorGroup, the panel layout, the tab
+//     wrapper — are not mounted here and so are not covered by that walk, which
+//     is a limit of the tree, not of jsdom. roadmap.md's browser tier holds the
+//     tooltip and those ancestors together.
 //   · Show that Monaco paints, that fonts resolve, or that suggestion, hover and
 //     the context menu land in the right place.
 //   · Prove a keystroke reaches the interpreter. `key()` proves dispatch, which
@@ -745,9 +748,20 @@ console.log("\n== the options a cell needs that a file editor does not ==");
   const { container } = await mountNotebook({ strict: true });
   const host = container.querySelector(".vv-cell-editor");
   ok(!!host, "a cell editor is on the page");
+  // SCOPE, because the walk cannot state it and the sentence used to overstate it.
+  // `parentElement` climbs from the cell editor through this spike's own mount root
+  // to `html`, so every styled ancestor in it is one the notebook owns. EditorGroup,
+  // the panel layout and whatever the studio wraps a tab in are not in this tree at
+  // all. So this proves the NOTEBOOK subtree traps nothing, which is the half this
+  // work owns and the half that would regress from an edit to this file; the studio
+  // chrome above it is on the browser tier's list beside the tooltip. The chain is
+  // printed rather than described, so a reader can see how far the walk reached
+  // instead of trusting this comment about it.
   const trapping = ["contain", "transform", "filter", "perspective", "backdropFilter", "willChange"];
+  const chain = [];
   const offenders = [];
   for (let node = host; node; node = node.parentElement) {
+    chain.push(node.className || node.tagName);
     const style = getComputedStyle(node);
     for (const prop of trapping) {
       const v = style[prop];
@@ -755,7 +769,7 @@ console.log("\n== the options a cell needs that a file editor does not ==");
     }
   }
   eq(offenders.length, 0,
-    `nothing between a cell editor and the page traps a fixed-position widget — that is what would put the tooltip back inside the clipping box (${JSON.stringify(offenders)})`);
+    `nothing in the notebook's own subtree traps a fixed-position widget — that is what would put the tooltip back inside the clipping box (walked ${JSON.stringify(chain)}${offenders.length ? `, found ${JSON.stringify(offenders)}` : ""})`);
 }
 
 // ───────────────────────────────────────────────────────────────────────────

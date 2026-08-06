@@ -147,7 +147,14 @@ An allowlist can say what an output may not fetch or execute; it cannot easily s
 what an output may not look like, and a permitted style can position an element
 over the editor as convincingly as a script could. So the box an output renders
 into clips its own painting and anchors anything positioned inside it. A table can
-colour its cells; nothing in a notebook can paint outside its output.
+colour its cells; nothing an output carries can paint outside that box.
+
+One thing on a notebook page does paint over it, deliberately: the editor's own
+hover and completion popups, which have to escape a cell that is only as tall as
+its code. What they show is documentation — docstrings from your project and from
+the packages you have installed — so it is third-party text like any output.
+Monaco renders and sanitises that itself, and Vivari does not relax it: those
+strings are untrusted, so `command:` links in a docstring do not resolve.
 
 An `image/svg+xml` output renders as an image rather than as inline markup, which
 is what keeps a figure a figure: SVG can carry script and external references,

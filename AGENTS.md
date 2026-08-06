@@ -4454,6 +4454,16 @@ the gap can't silently regress.
   add a new fs op, wire it in `kernel-fs.js` (kernel sync fs), the RPC switch, and the
   adapter together. It's LOCAL-ONLY (no remote/clone/push) — don't add network here.
 - **Ship the studio**: `npm run build:studio` (Vite build → `packages/studio/dist/`).
+- **Rebase onto master and hit a one-hunk conflict at the END of a file**: check whether the
+  only difference is the trailing newline before reading it as a collision. The merge tooling
+  strips them — 232 of the 538 tracked `.md`/`.js`/`.ts`/`.tsx`/`.mjs` files at `cfd34f1` are
+  missing one — so a file whose last line is otherwise identical conflicts on nothing, and taking
+  our side is correct and restores the byte. Do not restore them in passing: at that share it is
+  the repo's normal state rather than damage, and fixing the two files in front of you says the
+  rest are fine. Worth the check because the answer is not always this — an append-only conflict
+  at the end of `roadmap.md` has been a real one, two rounds genuinely appending to the same
+  section — and the two cases look identical from the conflict alone. Only the diff tells them
+  apart.
 
 ---
 

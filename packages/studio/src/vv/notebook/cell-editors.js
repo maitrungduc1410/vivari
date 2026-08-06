@@ -132,6 +132,21 @@ export function cellEditorOptions(overrides) {
     // neither is an ancestor of a cell editor. `spike-notebook-view.mjs` asserts
     // that stays true, because the failure mode is a tooltip that quietly goes
     // back to being clipped.
+    //
+    // AND WHAT THIS NOW PERMITS, which is the other half of the same question. A
+    // widget escaping its box paints over the whole page, and what it paints is
+    // hover and suggest documentation — docstrings out of the user's project and
+    // whatever is installed in it, which is third-party text arriving one round
+    // after "content out of a file painting outside its box" became this feature's
+    // security boundary. Monaco owns that sanitisation and we do not weaken it,
+    // verified in 0.55.1 rather than assumed: `getDomSanitizerConfig` defaults
+    // `isTrusted` to false, `command:` is added to the allowed schemes only when
+    // trusted, and the anchor pass drops `data:`, `javascript:` and untrusted
+    // `command:` outright. We never build an `IMarkdownString`, never register a
+    // hover provider and never pass `allowedLinkSchemes.augment`, so nothing here
+    // opts into trust. Setting `isTrusted` anywhere in this studio would make a
+    // docstring in an installed package a click away from a command, so it is a
+    // decision to take deliberately rather than a flag to reach for.
     fixedOverflowWidgets: true,
     // A cell does not scroll — it has no vertical scrollbar and its height is
     // its content's height — so the sticky header can never do its job here, and

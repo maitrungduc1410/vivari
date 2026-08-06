@@ -365,9 +365,17 @@ function IconBtn({ title, onClick, disabled, children }: { title: string; onClic
 function CellEditor({ cell, handle, onBlurMarkdown }: { cell: Cell; handle: NotebookHandle; onBlurMarkdown: () => void }) {
   const { doc } = handle;
   const hostRef = useRef<HTMLDivElement | null>(null);
-  // The cell object is replaced on every store change; the commands registered
-  // below outlive it, so they read the id through this rather than closing over
-  // the one that existed when the editor was made.
+  // NOT because the cell object is replaced — it never is, which is the fact the
+  // header's whole argument rests on, and a comment here once said the reverse.
+  // That is the more expensive mistake of the two: a reader who believes cells are
+  // replaced concludes the directive above is unnecessary on the component they are
+  // about to add.
+  //
+  // Closing over `cell` would work today. This is written for the store this one is
+  // meant to become: identity-on-write, named in the roadmap beside the pragma, is
+  // what retires those directives, and it retires them BY replacing the cell on
+  // every change. Handlers registered on a Monaco editor outlive the render that
+  // made them, so under that store a captured `cell` goes stale and this does not.
   const cellRef = useRef(cell);
   cellRef.current = cell;
 

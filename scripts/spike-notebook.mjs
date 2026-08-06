@@ -407,7 +407,18 @@ function harness(ids = ["a", "b", "c"]) {
   h.s.run("a", "print(1)");
   h.s.feed(RS + '{"t":"ready"}\n');
   h.s.feed(RS + '{"t":"stream","name":"stdout","text":"one"}\n');
+  const firstStream = h.doc.cell("a").outputs[0];
   h.s.feed(RS + '{"t":"stream","name":"stdout","text":" two\\n"}\n');
+  // A MERGED STREAM IS A NEW OBJECT, and that is load-bearing twice over. The
+  // writer needs it (see doc.js: a kept `raw` would emit the bytes read from disk
+  // and drop everything appended since), and so does the view: `OutputView` is
+  // memoised on `out`, so an output that grew in place would be handed back from
+  // the compiler's cache and the cell would freeze mid-print. The two consumers
+  // are one line apart in doc.js and could be separated by an edit that looks
+  // obviously safe, so the identity is asserted here rather than left to whoever
+  // reads the comment.
+  ok(h.doc.cell("a").outputs[0] !== firstStream,
+    "appending to a stream REPLACES the output object — memoised views key on that identity");
   h.s.feed(RS + '{"t":"stream","name":"stderr","text":"warn\\n"}\n');
   h.s.feed(RS + '{"t":"stream","name":"stdout","text":"three\\n"}\n');
   const outs = h.doc.cell("a").outputs;
