@@ -49,6 +49,7 @@ import {
   installMatplotlibShow,
   installStdin,
   makeLineReader,
+  maskBootEnv,
   readSnapshot,
   writeSnapshot,
   discardSnapshot,
@@ -98,6 +99,17 @@ import { driveRuff } from "./lib/python-drive.mjs";
 import { writeFakeIndex } from "./lib/fake-pyodide.mjs";
 import { readShippedManifests, readShippedTemplates, readTemplatesSource } from "./lib/shipped-templates.mjs";
 import { MODELLED_FRAGMENTS, STANDIN, normalize } from "./lib/urllib3-emscripten.mjs";
+import { captureHostRealm, sealGuestRealm } from "../packages/runtime/realm.js";
+import { makeBrowserRealm } from "./lib/browser-realm.mjs";
+import {
+  ASM_FRAGMENTS as PY_ASM_FRAGMENTS,
+  ASM_STANDIN as PY_ASM_STANDIN,
+  MODELLED_FRAGMENTS as PY_ENV_FRAGMENTS,
+  STANDIN as PY_ENV_STANDIN,
+  detectEmscriptenEnv,
+  detectRuntimeEnv,
+  normalize as normalizePyEnv,
+} from "./lib/pyodide-runtime-env.mjs";
 import { CPYTHON_EXITS, UNTRUNCATED, realCPythonExit } from "./lib/cpython-exit.mjs";
 import { drivePython, driveShim, servedApp } from "./lib/python-drive.mjs";
 import { fsDirective, get, hostRead, mirrorRuntime, scratchPort } from "./lib/python-mirror-drive.mjs";
@@ -651,6 +663,158 @@ print(json.dumps(out))
   ok(!/def is_in_node\(\):\s*\n\s*return False/.test(URLLIB3_REALM_PATCH), "…rather than being hard-coded to False");
   ok(/meta_path/.test(URLLIB3_REALM_PATCH) && !/^\s*import urllib3/m.test(URLLIB3_REALM_PATCH),
     "it hooks the import instead of importing urllib3 at boot (which would pull a wheel into every python process)");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== what Pyodide decides it is running in, inside a SWEPT guest realm ==");
+// The check that was missing, and the reason `python main.py` shipped broken.
+//
+// The guest realm a python process runs in is a browser Worker global with every
+// name a real Node 22 lacks shadowed away (packages/runtime/realm.js). Pyodide
+// refuses to boot until it can name the realm it is in, and it names a worker by
+// constructor identity — `self instanceof WorkerGlobalScope` — so the sweep took
+// exactly the binding that answer needs while leaving `self` behind. With
+// `window` gone too and IN_NODE masked on purpose, every branch was false and
+// the first line of every python command was "Cannot determine runtime
+// environment". Nothing here had a realm to be wrong in: the offline tier's
+// interpreter is scripts/lib/fake-pyodide.mjs, which is handed to code that has
+// already booted, and the tier that runs the real loader runs it in Node.
+//
+// So this sweeps a rebuilt Chrome worker global (scripts/lib/browser-realm.mjs,
+// the same one spike-realm.mjs uses), applies the SHIPPED boot mask, and runs
+// Pyodide's own detection over the result — both halves of it, since Emscripten
+// asks the same question again one layer down. See scripts/lib/pyodide-runtime-
+// env.mjs for what the models copy and which tier checks them against Pyodide.
+// ---------------------------------------------------------------------------
+{
+  const nodeProcess = () => ({
+    versions: { node: "22.23.2" },
+    release: { name: "node" },
+    env: {},
+  });
+
+  const sealed = () => {
+    const scope = makeBrowserRealm();
+    const captured = captureHostRealm(scope);
+    // The runtime installs its own process AFTER capture, which is what makes it
+    // untouchable by the sweep — and what makes it maskable afterwards.
+    scope.process = nodeProcess();
+    const hidden = sealGuestRealm(scope, captured);
+    return { scope, captured, hidden };
+  };
+
+  const { scope, captured, hidden } = sealed();
+  ok(hidden.includes("WorkerGlobalScope"), "an ordinary guest's realm still has no WorkerGlobalScope");
+  ok(typeof scope.WorkerGlobalScope === "undefined", "…shadowed, so a feature detection sees nothing");
+  ok(scope.self === scope, "…while `self` survives and still IS the global, which is the other half of Pyodide's test");
+  ok(typeof scope.importScripts === "undefined", "…and importScripts stays gone, capability and all");
+
+  // 1) The bug, reproduced: the two process masks alone, which is what the boot
+  //    held before this change.
+  {
+    const restore = maskBootEnv(scope, scope.process, null);
+    let thrown = "";
+    try { detectRuntimeEnv(scope); } catch (e) { thrown = String(e.message); }
+    ok(thrown.startsWith("Cannot determine runtime environment"),
+      `masking IN_NODE without answering "which browser realm" is refused outright (${thrown.slice(0, 48)}…)`);
+    ok(/"IN_BROWSER":true/.test(thrown) && /"IN_BROWSER_WEB_WORKER":false/.test(thrown) && /"IN_NODE":false/.test(thrown),
+      "…with the exact flag vector users reported: a browser that is neither a page nor a worker");
+    // And Emscripten, one layer down, does not merely fail to find the worker —
+    // it concludes SHELL and goes looking for d8's `read()`.
+    const asm = detectEmscriptenEnv(scope);
+    ok(asm.ENVIRONMENT_IS_SHELL === true && asm.ENVIRONMENT_IS_WORKER === false,
+      "…and the wall two lines behind it: Emscripten reads the same realm as a JS shell");
+    restore();
+  }
+
+  // 2) The fix: the binding handed back for the length of the boot.
+  {
+    const restore = maskBootEnv(scope, scope.process, captured.held.get("WorkerGlobalScope"));
+    // Caught rather than thrown: this is the assertion, and a spike that aborts
+    // here reports one stack trace instead of the dozen answers below it.
+    let env = null;
+    let refused = "";
+    try { env = detectRuntimeEnv(scope); } catch (e) { refused = String(e.message); env = {}; }
+    ok(!refused, refused ? "Pyodide refused the masked realm — " + refused.slice(0, 140) : "the masked realm is one Pyodide can name");
+    ok(env.IN_BROWSER_WEB_WORKER === true, "with the boot mask applied, Pyodide resolves to IN_BROWSER_WEB_WORKER");
+    ok(env.IN_NODE === false && env.IN_NODE_ESM === false, "…still not Node, so it never reaches for node:module");
+    ok(env.IN_BROWSER_MAIN_THREAD === false, "…and not a page either: `window` is not handed back, and must not be");
+    ok(env.IN_SHELL === false && env.IN_WORKERD === false && env.IN_SAFARI === false,
+      "…and the sweep's replacement navigator does not read as Safari or as a Cloudflare worker");
+
+    // The probe the fix newly puts in the path: reaching the worker branch means
+    // running isClassicWorker(), which CALLS a global the sweep has shadowed.
+    // A shadowed `undefined` is not callable, so it throws — and a throw is the
+    // answer a module worker owes it. Fixing one flag into a TypeError nobody
+    // catches would be no better than the original bug.
+    ok(env.IN_BROWSER_WEB_WORKER === true, "…having survived the isClassicWorker() probe, which calls the swept importScripts");
+
+    const asm = detectEmscriptenEnv(scope);
+    ok(asm.ENVIRONMENT_IS_WORKER === true, "Emscripten reads the same binding and takes its worker path");
+    ok(asm.ENVIRONMENT_IS_SHELL === false && asm.ENVIRONMENT_IS_NODE === false && asm.ENVIRONMENT_IS_WEB === false,
+      "…and only that one: not SHELL, not NODE, not a main-thread page");
+
+    // The narrow window is the point. A python guest gets the name while Pyodide
+    // is looking, and the realm it goes on running in is the node realm again.
+    restore();
+    ok(typeof scope.WorkerGlobalScope === "undefined", "the binding is taken back when the boot ends");
+    ok(scope.WorkerGlobalScope === undefined && Object.prototype.hasOwnProperty.call(scope, "WorkerGlobalScope"),
+      "…back to the sweep's own shadow, not to whatever the prototype chain holds");
+    ok(!("browser" in scope.process) && !("type" in scope.process),
+      "…and the two process masks are gone with it, as they already were");
+  }
+
+  // 3) The refusal that proves the probe runs at all: a CLASSIC worker, where
+  //    importScripts is callable, is the one realm Pyodide will not boot in.
+  {
+    const { scope: classic, captured: cap } = sealed();
+    classic.importScripts = () => {};
+    const restore = maskBootEnv(classic, classic.process, cap.held.get("WorkerGlobalScope"));
+    let thrown = "";
+    try { detectRuntimeEnv(classic); } catch (e) { thrown = String(e.message); }
+    ok(thrown === "Classic web workers are not supported",
+      `isClassicWorker() really is executed on this path (${thrown || "nothing was thrown"})`);
+    restore();
+  }
+
+  // 4) The models are only worth something if they are still Pyodide's code.
+  //    This end asserts the stand-ins have not drifted from the fragment list;
+  //    spike-python-bridge.mjs asserts the list has not drifted from Pyodide.
+  for (const { label, source } of PY_ENV_FRAGMENTS) {
+    ok(normalizePyEnv(PY_ENV_STANDIN).includes(normalizePyEnv(source)), `the loader stand-in reproduces ${label}`);
+  }
+  for (const { label, source } of PY_ASM_FRAGMENTS) {
+    ok(normalizePyEnv(PY_ASM_STANDIN).includes(normalizePyEnv(source)), `the Emscripten stand-in reproduces ${label}`);
+  }
+
+  // Drift guards for the wiring, which no amount of running the models can show.
+  const runtime = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  const realmSrc = fs.readFileSync(path.join(ROOT, "packages/runtime/realm.js"), "utf8");
+  const indexSrc = fs.readFileSync(path.join(ROOT, "packages/runtime/index.js"), "utf8");
+  ok(/const restoreEnv = maskBootEnv\(globalThis, process, workerGlobalScope\);/.test(runtime),
+    "bootPyodide masks the environment through the one function this drives");
+  ok(/} finally {\s*\n\s*restoreEnv\(\);/.test(runtime),
+    "…in a finally, so a boot that throws still leaves the guest its own realm back");
+  const hold = realmSrc.slice(realmSrc.indexOf("const HOLD = ["), realmSrc.indexOf("];", realmSrc.indexOf("const HOLD = [")));
+  ok(/"WorkerGlobalScope"/.test(hold), "realm.js holds WorkerGlobalScope back from the sweep for one subsystem");
+  const keep = realmSrc.slice(realmSrc.indexOf("const KEEP = ["), realmSrc.indexOf("];", realmSrc.indexOf("const KEEP = [")));
+  ok(!/WorkerGlobalScope/.test(keep),
+    "…and does NOT allow it, which would hand every node and bun guest a browser global back");
+  ok(/workerGlobalScope: HOST_REALM\.held\.get\("WorkerGlobalScope"\)/.test(indexSrc),
+    "and only __ocInstallPython's runtime is given it — a node or bun guest never sees the value at all");
+
+  // The other thing the worker path reads and the sweep took: `location`. Every
+  // browser branch in pyodide.mjs resolves URLs against it — `new URL(path,
+  // location)` for the wasm, `t === void 0 && (t = location)` in resolvePath —
+  // and a shadowed `location` is `undefined`, which those survive only because
+  // every URL they are handed is already absolute. `new URL("/vendor/pyodide/",
+  // undefined)` is "Invalid URL". So the kernel building the index URL off the
+  // worker's own origin is load-bearing for the boot, not just tidy.
+  const kernelSrc = fs.readFileSync(path.join(ROOT, "packages/core/src/workers/kernel-worker.ts"), "utf8");
+  const vendorUrl = kernelSrc.slice(kernelSrc.indexOf("function vendorUrl("), kernelSrc.indexOf("\n}", kernelSrc.indexOf("function vendorUrl(")));
+  ok(/self\.location(?:\s*&&\s*self\.location)?\.origin/.test(vendorUrl),
+    "VV_PYODIDE_INDEX_URL is absolute, which is the only reason the swept `location` costs Pyodide nothing");
+  ok(/VV_PYODIDE_INDEX_URL: vendorUrl\(/.test(kernelSrc), "…and it is what the python launcher is handed");
 }
 
 // ---------------------------------------------------------------------------
@@ -3192,7 +3356,7 @@ console.log("\n== input() waits, because stdin got a syscall ==");
 
   const pySrc = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
   const replBody = pySrc.slice(pySrc.indexOf("function repl(indexUrl)"), pySrc.indexOf("web server bridge"));
-  ok(/makeLineReader\(\)/.test(replBody), "the REPL takes its lines from the blocking reader");
+  ok(/makeLineReader\(null, echo\)/.test(replBody), "the REPL takes its lines from the blocking reader");
   // Comments stripped, or this matches the comment explaining the change.
   const replCode = replBody.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
   ok(!/stdin\.on\(/.test(replCode) && !/process\.stdin/.test(replCode),
@@ -3202,6 +3366,99 @@ console.log("\n== input() waits, because stdin got a syscall ==");
   ok(/__ocReadStdin/.test(runtimeSrc), "the runtime exposes it to the guest");
   ok(!/process\.stdin[\s\S]{0,200}readStdin/.test(runtimeSrc),
     "…and does NOT wire it into process.stdin, which would let a Node program park its own event loop");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== the >>> prompt: seeing what you type, and leaving ==");
+// One session produced both of these: the person's keystrokes never appeared, so
+// the only thing on screen was the output of the print() statements they were
+// typing blind, and `exit()` answered with a SystemExit traceback and another
+// prompt. Neither is reachable from here in full — repl() needs a booted
+// interpreter and a person at a terminal — so the parts are checked where they
+// live: the line discipline as a function, the classification as a function, and
+// the wiring between them as source. The interpreter half (that a typed exit()
+// really does raise out of InteractiveConsole.push, and that the exit code is the
+// one a real REPL leaves) is the bridge tier's `termination` case.
+// ---------------------------------------------------------------------------
+{
+  // Type `chunks` at a reader that echoes, and report what was shown and what
+  // Python would have been handed.
+  const typed = (chunks) => {
+    const shown = [];
+    const lines = [];
+    const read = makeLineReader(() => (chunks.length ? chunks.shift() : null), (t) => shown.push(t));
+    for (let line; (line = read()) !== null; ) lines.push(line);
+    return { shown: shown.join(""), lines };
+  };
+
+  const keystrokes = typed(["p", "r", "i", "n", "t", "(", "1", ")", "\n"]);
+  ok(keystrokes.shown === "print(1)\n", `each keystroke appears as it is typed (${JSON.stringify(keystrokes.shown)})`);
+  ok(keystrokes.lines.length === 1 && keystrokes.lines[0] === "print(1)",
+    "…and the interpreter still gets one line, not one line per keystroke");
+
+  const pasted = typed(["x = 1\ny = 2\n"]);
+  ok(pasted.shown === "x = 1\ny = 2\n", "a paste is shown whole, because a terminal echoes what arrives");
+  ok(pasted.lines.join("|") === "x = 1|y = 2", "…and is still the two lines it is");
+
+  // Erase. Without it the echo makes things worse than silence: the typo stays in
+  // the source for the parser AND is now on the screen.
+  const corrected = typed(["pritn", "\x7f\x7f", "nt", "(1)\n"]);
+  ok(corrected.lines[0] === "print(1)", `DEL takes the character out of the line (${corrected.lines[0]})`);
+  ok(corrected.shown === "pritn\b \b\b \bnt(1)\n", "…and off the screen, the way a cooked terminal does");
+
+  const atPrompt = typed(["\x7f", "1\n"]);
+  ok(atPrompt.shown === "1\n" && atPrompt.lines[0] === "1",
+    "a DEL at a fresh prompt rubs out nothing — what is to its left is the prompt, not a character");
+
+  // The newline is what submitted the line before it; erasing through it would
+  // splice two statements into one.
+  const acrossLines = typed(["a\n\x7fb\n"]);
+  ok(acrossLines.lines.join("|") === "a|b", `DEL does not reach back into the line already submitted (${acrossLines.lines.join("|")})`);
+
+  // An arrow key is ESC [ A. Echoed verbatim it would drive the terminal's cursor
+  // up into output printed earlier and put the rest of the line there, so control
+  // characters are shown the way a terminal with ECHOCTL shows them.
+  const arrow = typed(["\x1b[A", "\n"]);
+  ok(arrow.shown === "^[[A\n", `an arrow key is shown as ^[[A rather than steering the cursor (${JSON.stringify(arrow.shown)})`);
+  ok(arrow.lines[0] === "\x1b[A", "…while the bytes still reach Python, which is what a REPL with no readline gets anywhere");
+  ok(typed(["if x:\n\tpass\n"]).shown === "if x:\n\tpass\n",
+    "…but a tab is a tab, since indenting a block is the point of typing one");
+
+  // And with no echo sink the reader is the plain assembler it was, so nothing
+  // that reads stdin without a person at the other end changes behaviour.
+  ok(makeLineReader(() => "a\x7f\n")() === "a\x7f",
+    "without an echo sink, nothing is cooked and nothing is written");
+
+  // ---- which ending is which -------------------------------------------------
+  const kind = (type, message) => terminationFromError({ type, message }).kind;
+  ok(kind("SystemExit", "SystemExit: None") === "exit",
+    "a SystemExit is named as an exit, so the REPL can act on it without a second parser");
+  ok(kind("KeyboardInterrupt", "KeyboardInterrupt") === "interrupt",
+    "…a Ctrl-C as an interrupt, which a REPL survives");
+  ok(kind("ValueError", "ValueError: nope") === "error",
+    "…and everything else as one statement's error, which is the only one that prints a traceback");
+
+  // ---- the wiring ------------------------------------------------------------
+  const pySrc = fs.readFileSync(path.join(ROOT, "packages/runtime/builtins/python.js"), "utf8");
+  const replBody = pySrc.slice(pySrc.indexOf("function repl(indexUrl)"), pySrc.indexOf("web server bridge"));
+  const replCode = replBody.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+  ok(/process\.env\.VV_TTY === "1"/.test(replCode),
+    "the REPL echoes only with a terminal attached, so a captured or piped run is byte-for-byte what it was");
+  ok(/process\.stderr\.write\(text\)/.test(replCode),
+    "…to the terminal rather than into its own stdout, which may be a pipe or a redirect");
+  ok(/terminationFromError\(e\)/.test(replCode) && /kind === "exit"/.test(replCode) && !/SystemExit/.test(replCode),
+    "exit() is recognised by this file's one SystemExit parser, not by a second copy of it");
+  ok(/if \(ended\) return;/.test(replCode),
+    "…and the loop stops after it, rather than parking on a stdin nobody will type into");
+  ok(/KeyboardInterrupt/.test(replCode) && /more = false;/.test(replCode),
+    "a Ctrl-C still prints the name and goes back to a fresh prompt");
+
+  // The layer decision, as an assertion: echoing inside the interpreter's own
+  // stdin would echo getpass() too, and Python could not turn it off — Emscripten
+  // answers tcgetattr with ECHO already clear and accepts a tcsetattr it ignores,
+  // so getpass would print no warning and the password would be on the screen.
+  const stdinBody = pySrc.slice(pySrc.indexOf("export function installStdin"), pySrc.indexOf("export function installBlockingPatch"));
+  ok(!/write\(/.test(stdinBody), "the interpreter's own stdin does not echo, because getpass() could not switch it off");
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all offline Python checks passed");
