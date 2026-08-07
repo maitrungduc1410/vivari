@@ -502,6 +502,20 @@ export class Kernel {
       booted: false,
       handle: null,
       command: spec.command,
+      // A worker thread rather than a process the user started. Kept because every
+      // report about one has to say so — nobody launched `wasi-worker.mjs`, and a
+      // line naming it without that word sends the reader looking for a command they
+      // never ran. It is also what stops the watchdog watching one (`isUnobservable`
+      // in core/terminal-feedback.js).
+      //
+      // `&& !isFork` because child_process.fork rides the thread spawn path and is
+      // marked `isThread` on the wire, but a fork child is NOT a worker thread: it is
+      // a normal main-thread process, launched by user code, that prints to its
+      // parent's terminal. Both things this flag now feeds are wrong for one — it did
+      // not go unlaunched, and a fork that wedges before its first write must still be
+      // reported. runtime/boot.js draws the same distinction from the same spec for
+      // the same reason; this is the kernel-side half of it.
+      isThread: !!spec.isThread && !spec.isFork,
       // The launch args, kept so process exit can report the full invocation (e.g.
       // detecting an `npm install` completing, to snapshot the dependency cache).
       args: spec.args || [],
@@ -596,9 +610,10 @@ export class Kernel {
         // The guest gained or lost a `process.on('SIGTERM'|…)` listener, which is
         // what decides whether a signal is posted to it or applied to it.
         "signal-listen": (m) => this.handleSignalListen(pid, m),
-        // The guest is parked waiting for a HUMAN to type. Only it can know that,
-        // and the stall watchdog cannot tell it from wedged without being told.
-        "awaiting-input": (m) => this.handleAwaitingInput(pid, m),
+        // The guest is parked waiting for something outside itself — a person to
+        // type, a job to be handed to it. Only it can know that, and the stall
+        // watchdog cannot tell it from wedged without being told.
+        awaiting: (m) => this.handleAwaiting(pid, m),
         "signal-handled": (m) => this.handleSignalHandled(pid, m),
         // #19 stage C: this process relays a ws frame outward (in-VM ws server ->
         // browser preview) for a tunneled connection.
@@ -690,6 +705,11 @@ export class Kernel {
     // also not being watched by anyone staring at a terminal, so it is stamped too.)
     proc.lastOutput = proc.lastActivity = Date.now();
     proc.booted = true;
+    // Whether this process has EVER used the channel the watchdog measures. Without
+    // it, `lastOutput` cannot tell "quiet since it printed" from "quiet since it was
+    // created", and those mean opposite things for a process nobody launched — see
+    // `unobservable` in core/terminal-feedback.js.
+    proc.everOutput = true;
     if (proc.capture) {
       (isErr ? proc.errBuf : proc.outBuf).push(chunk);
       return;
@@ -815,6 +835,10 @@ export class Kernel {
             command: proc.command,
             args: proc.args || [],
             cwd: proc.cwd,
+            // Nobody launched a worker thread, so a report has to say what it is or
+            // it sends the reader looking for a command they never ran.
+            isThread: !!proc.isThread,
+            parentPid: proc.parentPid ?? 0,
             silentMs,
             // Kernel-level activity only — see the caveat above. Useful evidence, but
             // NOT sufficient to call a process wedged.
@@ -1706,22 +1730,29 @@ export class Kernel {
     else proc.sigHandlers.delete(m.signal);
   }
 
-  // "I have finished everything I was asked to do and I am waiting for a person."
+  // "I have finished everything I was asked to do and I am waiting." `m.reason` says
+  // what for: `input` (a shell at its prompt, waiting for a person) or `work` (a pool
+  // worker parked on its parentPort, waiting to be handed a job).
   //
-  // The stall watchdog reads silence, and a process waiting for a human is silent
-  // by definition — the same argument `hasLiveChild` makes about a shell waiting on
-  // a child, one step further out. The difference is that a live child is a fact the
-  // kernel can see for itself, and this one is not: an idle prompt and a wedged
-  // interpreter make identical syscalls, namely none. So it is announced rather than
-  // inferred, which means the watchdog stays quiet only about processes that SAID
-  // they were waiting, and a process that wedges without saying so is still reported.
-  // Inferring it instead (a shell with a terminal and no live child must be at a
-  // prompt) would have suppressed the genuinely wedged shell along with the idle one,
-  // permanently and invisibly, which is the failure this watchdog exists to avoid.
-  handleAwaitingInput(pid, m) {
+  // The stall watchdog reads silence, and a process that is waiting is silent by
+  // definition — the same argument `hasLiveChild` makes about a shell waiting on a
+  // child, one step further out. The difference is that a live child is a fact the
+  // kernel can see for itself, and these are not: an idle prompt and a wedged
+  // interpreter make identical syscalls, namely none, and a parked worker and a
+  // worker spinning inside wasm make identically none as well. So it is announced
+  // rather than inferred, which means the watchdog stays quiet only about processes
+  // that SAID they were waiting, and a process that wedges without saying so is still
+  // reported. Inferring it instead (a shell with a terminal and no live child must be
+  // at a prompt; a thread with no syscalls must be idle) would have suppressed the
+  // genuinely wedged one along with the idle one, permanently and invisibly, which is
+  // the failure this watchdog exists to avoid.
+  //
+  // ONE FLAG HOLDING THE REASON, not one boolean per kind. The second kind arrived
+  // within a month of the first, which is the argument for expecting a third.
+  handleAwaiting(pid, m) {
     const proc = this.procs.get(pid);
     if (!proc || !m) return;
-    proc.awaitingInput = !!m.waiting;
+    proc.awaiting = m.waiting ? String(m.reason || "work") : null;
   }
 
   // The guest ran its handler and is still here on purpose. Stand the force-kill
@@ -1861,6 +1892,14 @@ export class Kernel {
     const childPid = this.createProcess(
       {
         programPath,
+        // A thread is spawned by PATH, not by command name, so this is the one
+        // creator that never supplied a `command` — and `command` is what every
+        // human-facing surface prints. The stall watchdog reported `PID 7 ()` for
+        // four rolldown workers, and `__vv.diag()` listed them blank, which is the
+        // worst possible state for a diagnostic: a row the reader cannot identify,
+        // in the answer to "what is wrong with my machine". The file's basename is
+        // what a user could match against their own node_modules, so it is the name.
+        command: programPath.slice(programPath.lastIndexOf("/") + 1),
         args: spec.argv || [],
         cwd,
         env: spec.env || {},
