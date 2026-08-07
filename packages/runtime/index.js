@@ -309,6 +309,24 @@ export function createRuntime({
     unregister: (watchId) => watchHandlers.delete(watchId),
   };
 
+  // "I am waiting for a person to type." The stall watchdog reads silence and
+  // cannot tell an idle prompt from a wedge, so a program that knows it is parked
+  // at one says so and the watchdog stays quiet about it. Only programs that TAKE
+  // interactive input have any business calling this — see the shell's prompt in
+  // kernel-host/coreutils.js, which is the one caller today.
+  //
+  // It carries one bit and holds no state here on purpose: the announcement is the
+  // whole mechanism, so a program that stops announcing goes back to being watched
+  // rather than staying excused by something this file remembered about it.
+  process.__awaitingInput = (waiting) => {
+    if (!postRaw) return;
+    try {
+      postRaw({ type: "awaiting-input", waiting: !!waiting });
+    } catch {
+      /* kernel gone */
+    }
+  };
+
   // Wire the worker_threads host onto `process` so the lazily-required
   // node:worker_threads builtin (2b) can read this thread's identity, spawn nested
   // workers (brokered by the kernel), and pump its events through our loop.
@@ -771,6 +789,20 @@ export function createRuntime({
     const errStream = silent ? new stream.Readable({ read() {} }) : null;
     child.stdout = outStream;
     child.stderr = errStream;
+    // KNOWN DIVERGENCE, left deliberately. Node gives `child.stdin` a writable for
+    // `fork(mod, { silent: true })` (and for an explicit 'pipe' on fd 0) and null only
+    // when the child inherits — measured, not read off the docs. We answer null in
+    // every case, which is wrong for the silent one.
+    //
+    // It is left because the honest fix is not a value here. A forked child rides
+    // worker_threads, so `child.pid` below is a THREAD id, while the `child-stdin`
+    // channel is addressed by kernel pid (kernel.handleChildStdin looks up
+    // `procs.get(childPid)`). Handing back a writable would therefore accept bytes
+    // that either go nowhere or, if a threadId happened to match a live pid, reach
+    // somebody else's stdin. A null that says "you cannot write to this" is wrong in
+    // the direction that costs a caller an unused branch; an object would be wrong in
+    // the direction that loses or misroutes data. Making it right means giving forked
+    // children an addressable fd 0, which is a change to the fork model, not a line.
     child.stdin = null;
     child.stdio = [null, outStream, errStream, null];
     const pushOut = (s, chunk) => {

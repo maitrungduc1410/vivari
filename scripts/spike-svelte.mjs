@@ -21,6 +21,7 @@ button { border-radius: 8px; border: 1px solid transparent; padding: 0.6em 1.2em
 const ok = await runViteSpike({
   name: "Svelte",
   dir: "/svelte",
+  templateId: "svelte-ts",
   entryModule: "/src/App.svelte",
   titleMarker: /Vite \+ Svelte/,
   files: {

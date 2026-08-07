@@ -300,12 +300,22 @@ ok(COMMAND.includes(NB_KERNEL_PATH), "…on the path the studio writes the kerne
 section("fd0", "the substitution this tier makes on fd 0, asserted rather than assumed", async () => {
   /**
    * Every tier here substitutes the channel; this one substitutes a word. The
-   * shell hands its foreground job `stdio: ['inherit', …]` and then writes the
-   * terminal's bytes to `child.stdin`, and whether those two lines cooperate
-   * depends on whose `spawn` is underneath. Both halves are measured, because a
-   * model that silently stops matching is worse than no model: when host Node's
-   * meaning arrived under this tier, the symptom was every cell timing out with
-   * the kernel's own banner green above it.
+   * shell hands its foreground job `stdio: ['inherit', …]` and then has to get the
+   * terminal's bytes into it, and what that takes depends on whose `spawn` is
+   * underneath. Both halves are measured, because a model that silently stops
+   * matching is worse than no model: when host Node's meaning arrived under this
+   * tier, the symptom was every cell timing out with the kernel's banner green
+   * above it.
+   *
+   * This section used to assert that the VM handed back a writable `child.stdin`
+   * where host Node hands back null, and called the difference the substitution.
+   * It was a defect, and an expensive one — `if (child.stdin)` is how a caller asks
+   * which kind of fd 0 it got, npm's run-script asks exactly that before calling
+   * `end()`, and the EOF that produced shut down every template's dev server. So
+   * the API shapes now AGREE, and what is genuinely substituted is narrower: host
+   * Node's `inherit` shares a descriptor, ours routes, so ours needs a delivery
+   * path — and it is deliberately not `child.stdin`, because that name already
+   * answers a different question.
    */
   const probe = spawn(process.execPath, ["-e", "setTimeout(() => {}, 50)"], { stdio: ["inherit", "pipe", "pipe"] });
   const hostStdin = probe.stdin;
@@ -326,8 +336,9 @@ section("fd0", "the substitution this tier makes on fd 0, asserted rather than a
     childLiveness: { active: 0 }, wake() {}, postRaw() {},
   });
   const child = guest.spawn("python", ["kernel.py"], { stdio: ["inherit", "pipe", "pipe"] });
-  ok(child.stdin && typeof child.stdin.write === "function",
-    "…the VM reads the same word as a question about isTTY and hands over a writable stdin anyway");
+  eq(child.stdin, null, "…and the VM answers the same, because that is what the word means to everyone who asks");
+  ok(child._vvStdin && typeof child._vvStdin.write === "function",
+    "…while keeping a delivery path for the bytes, under a name that is visibly not node's API");
   eq(spawned[spawned.length - 1].stdinIsPipe, true, "…which is the only thing fd 0 decides there: what the child answers to isTTY");
 });
 

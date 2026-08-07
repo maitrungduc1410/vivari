@@ -9,6 +9,7 @@ import { runViteSpike } from "./spike-vite-lib.mjs";
 const ok = await runViteSpike({
   name: "Qwik",
   dir: "/qwik",
+  templateId: "qwik",
   entryModule: "/src/main.tsx",
   titleMarker: /Vite \+ Qwik/,
   files: {

@@ -17,7 +17,7 @@
 // where the real in-VM file watcher drives HMR (Vite) or a recompile+restart
 // (Nest --watch) exactly like local development.
 
-import { newProgress, onFetch, onOutput, idleClear, stallVerdict, servingPids, shouldReportStall } from "../../terminal-feedback.js";
+import { newProgress, onFetch, onOutput, idleClear, stallVerdict, servingPids, shouldReportStall, stallReportChunk } from "../../terminal-feedback.js";
 import { Kernel } from "../../../kernel-host/kernel.js";
 import { createKernelFs } from "../../../kernel-host/kernel-fs.js";
 import { initTransferList } from "../../../kernel-host/worker-transfer.js";
@@ -919,11 +919,15 @@ function terminalForPid(pid) {
 // coalesce fetch events into ONE in-place (\r) spinner line per terminal,
 // throttled, and clear it the instant the shell prints real output (below).
 const fetchProg = new Map(); // terminalId -> progress state (terminal-feedback.js)
+// Returns whether it actually erased a line, because a caller that wants to write
+// where the spinner was needs to know whether there WAS one. Without that answer
+// the only safe assumption is that the current line belongs to somebody else.
 function clearProgress(tid) {
   const s = fetchProg.get(tid);
-  if (!s) return;
+  if (!s) return false;
   const chunk = onOutput(s);
   if (chunk) post("term-out", { terminalId: tid, chunk });
+  return !!chunk;
 }
 // A spinner nobody is feeding is just a line that looks stuck. Sweep the idle ones
 // so the indicator ends when the traffic does, rather than freezing on its last
@@ -1512,7 +1516,11 @@ async function boot() {
     // the program that is actually quiet.
     let hasLiveChild = false;
     for (const [, parent] of parentOf) if (parent === pid) hasLiveChild = true;
-    if (!shouldReportStall({ serving, pendingRequests, hasLiveChild })) return;
+    // …and a shell sitting at its prompt is silent for the same reason, one step
+    // further out again: it is waiting for a person. That one is not visible from
+    // here, so the process announces it (kernel.handleAwaitingInput).
+    const awaitingInput = !!kernel.procs.get(pid)?.awaitingInput;
+    if (!shouldReportStall({ serving, pendingRequests, hasLiveChild, awaitingInput })) return;
 
     const secs = Math.round(info.silentMs / 1000);
     const what = [info.command, ...(info.args || [])].join(" ").slice(0, 80);
@@ -1536,8 +1544,8 @@ async function boot() {
       post("log", { line, dim: true });
       return;
     }
-    clearProgress(tid);
-    post("term-out", { terminalId: tid, chunk: `\r\x1b[2K\x1b[2m${line}\x1b[0m\r\n` });
+    const progressCleared = clearProgress(tid);
+    post("term-out", { terminalId: tid, chunk: stallReportChunk(line, { progressCleared }) });
   };
 
   kernel.onProcExit = (pid, res) => {

@@ -95,6 +95,31 @@ say('spawnSync-empty-input', () => {
   return JSON.stringify(r.stdout) + ' status=' + r.status;
 });
 
+// WHICH children have a stdin at all. \`child.stdin\` is a stream only when the
+// parent holds the write end of fd 0 — a pipe. For 'inherit' and 'ignore' node
+// answers null, because fd 0 then belongs to somebody else and the parent has no
+// end of it to write to.
+//
+// This is not decoration: \`if (child.stdin)\` is how a caller ASKS which it got.
+// npm's run-script does \`if (p.stdin) p.stdin.end()\`, correct against node, where
+// a script spawned with stdio:'inherit' answers null. We answered with an object,
+// so npm sent EOF to a child that had inherited the terminal — and vite treats
+// end-of-stdin as "my parent is gone" and shuts the dev server down. Every Vite
+// template's \`npm run dev\` died seconds after printing its URL.
+const shape = (stdio) => {
+  const c = cp.spawn(NODE, ['noop.js'], stdio === undefined ? {} : { stdio });
+  const s = c.stdin === null ? 'null' : c.stdin === undefined ? 'undefined' : 'stream';
+  const zero = Array.isArray(c.stdio) ? (c.stdio[0] == null ? 'null' : 'stream') : 'no-stdio-array';
+  try { c.kill(); } catch (e) {}
+  return s + ' stdio[0]=' + zero;
+};
+say('stdin-shape-default', () => shape(undefined));
+say('stdin-shape-pipe', () => shape('pipe'));
+say('stdin-shape-inherit', () => shape('inherit'));
+say('stdin-shape-ignore', () => shape('ignore'));
+say('stdin-shape-inherit-fd0', () => shape(['inherit', 'pipe', 'pipe']));
+say('stdin-shape-pipe-fd0', () => shape(['pipe', 'inherit', 'inherit']));
+
 // Regressions. The shell now listens to its own stdin; these are the two shapes
 // that would break if that listener held the loop open or swallowed the line.
 say('execSync-no-input', () => JSON.stringify(cp.execSync('echo hi', { encoding: 'utf8' })));
@@ -121,6 +146,10 @@ process.stdin.on('end', () => { process.stdout.write('read ' + n + ' bytes'); })
   "hex.js": `const parts = [];
 process.stdin.on('data', (c) => parts.push(Buffer.from(c)));
 process.stdin.on('end', () => { process.stdout.write(Buffer.concat(parts).toString('hex')); });
+`,
+  // Something to spawn that says nothing and leaves: the stdin-shape cases are
+  // about the object the PARENT gets back, which is answered at spawn time.
+  "noop.js": `process.exit(0);
 `,
 };
 

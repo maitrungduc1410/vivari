@@ -1,13 +1,34 @@
-// Validate the NestJS demo's real reload: `npm run start:dev` (= nest start
-// --watch) boots, then a source edit must recompile + restart the app child
-// (this is the path that calls childProcessRef.stdin.pause()) and serve the new
-// response. Mirrors DEMOS.nest in kernel-worker.js.
+// Spike (NETWORK): the NestJS template's real reload. `npm run start:dev` (= `nest
+// start --watch`, which is the shipped `nest-ts` manifest's dev command) boots, then a
+// source edit must recompile, restart the app child, and serve the new response.
 //
-//   node scripts/probe-nest-watch.mjs
+// WHY IT IS A SPIKE NOW. It was `probe-nest-watch.mjs`, wired into nothing — not the
+// registry, not CI, not package.json — and it had stopped working: it asked for `npm`
+// from `installCoreutils()`, that built-in was removed, and it died on `npm: not found`
+// before doing anything. Nothing noticed, because nothing ran it. It was then cited in
+// review as the guard for exactly the risk this MR touches, which is the failure mode
+// this MR is otherwise about: an artifact that looks like coverage while providing
+// none. It loads the vendored npm the way every other in-VM spike does, and it passes
+// in ~20s, which is cheap enough that leaving it unwired was the only real objection.
+//
+// It is also the live check on nest's side of the `child.stdin` change: `@nestjs/cli`
+// spawns the app with `stdio: 'inherit'` and guards `childProcessRef.stdin &&
+// childProcessRef.stdin.pause()` before killing it. On real node that guard is false;
+// it is now false here too, and this is the path where that runs.
+//
+// The app is a minimal one rather than the shipped template's, deliberately: what is
+// under test is the reload MECHANISM, and a tiny module recompiles in a second and
+// fails for one reason. The shipped template's own boot is a different question.
+//
+//   node scripts/spike-nest-watch.mjs
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
+import { stubNodeGyp } from "../packages/kernel-host/node-gyp-stub.js";
+import { applyRealNpmShims } from "../packages/kernel-host/load-real-npm.js";
 import { initTransferList } from "../packages/kernel-host/worker-transfer.js";
 import { Worker, MessageChannel } from "node:worker_threads";
+import fs from "node:fs";
+import path from "node:path";
 
 const fsWorker = new Worker(new URL("./fs-worker.mjs", import.meta.url));
 let onKernelFsMessage = () => {};
@@ -36,8 +57,34 @@ const listening = new Set();
 const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, fetcher, stdout: (s) => process.stdout.write(s), stderr: (s) => process.stderr.write(s) });
 kernel.onListen = (p) => { listening.add(p); console.log("  [onListen] :" + p); };
 kernel.installCoreutils();
-const write = (path, contents) => { kernel.mkdirp(path.slice(0, path.lastIndexOf("/"))); kernel.writeFile(path, contents); };
+const write = (p, contents) => { kernel.mkdirp(p.slice(0, p.lastIndexOf("/"))); kernel.writeFile(p, contents); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The vendored npm, into the VFS, plus the `/bin/npm` shim. This probe used to rely on
+// `installCoreutils()` supplying an `npm` command; that built-in was removed, and since
+// nothing runs this file, nothing noticed. It exited on `npm: not found` — an artifact
+// that looked like the guard for a risk while being unable to start.
+const VFS_NPM = "/usr/lib/node_modules/npm";
+const VENDOR_NPM = process.argv[2] || "/tmp/vv-vendor/node_modules/npm";
+if (!fs.existsSync(path.join(VENDOR_NPM, "bin/npm-cli.js"))) {
+  console.error(`No vendored npm at ${VENDOR_NPM} (expected bin/npm-cli.js).`);
+  console.error("Vendor it:  rm -rf /tmp/vv-vendor && mkdir -p /tmp/vv-vendor && (cd /tmp/vv-vendor && npm install npm@10.9.2 --no-save --no-audit --no-fund)");
+  process.exit(2);
+}
+function loadDir(hostDir, vfsDir) {
+  kernel.mkdirp(vfsDir);
+  for (const entry of fs.readdirSync(hostDir, { withFileTypes: true })) {
+    const hostPath = path.join(hostDir, entry.name);
+    const vfsPath = vfsDir + "/" + entry.name;
+    if (entry.isDirectory()) loadDir(hostPath, vfsPath);
+    else if (entry.isFile()) kernel.writeFile(vfsPath, fs.readFileSync(hostPath));
+  }
+}
+loadDir(VENDOR_NPM, VFS_NPM);
+stubNodeGyp(kernel, VFS_NPM);
+applyRealNpmShims(kernel);
+kernel.mkdirp("/home/user");
+kernel.mkdirp("/tmp/.npm/_logs");
 const decode = (b) => (typeof b === "string" ? b : Buffer.from(b).toString());
 
 const D = "/nest-app";
@@ -51,13 +98,20 @@ write(D + "/src/app.module.ts", "import { Module } from '@nestjs/common';\nimpor
 write(D + "/src/app.controller.ts", "import { Controller, Get } from '@nestjs/common';\nimport { AppService } from './app.service';\n@Controller()\nexport class AppController {\n  constructor(private readonly appService: AppService) {}\n  @Get()\n  getHello(): string { return this.appService.getHello(); }\n}\n");
 write(D + "/src/app.service.ts", "import { Injectable } from '@nestjs/common';\n@Injectable()\nexport class AppService {\n  getHello(): string { return 'Hello World!'; }\n}\n");
 
+const ENV = {
+  HOME: "/home/user",
+  PATH: D + "/node_modules/.bin:/bin",
+  npm_config_cache: "/tmp/.npm",
+  FORCE_COLOR: "0",
+};
+
 console.log("== npm install ==");
-const inst = await kernel.start("npm", ["install"], { cwd: D, capture: true });
+const inst = await kernel.start("npm", ["install", "--no-audit", "--no-fund"], { cwd: D, env: ENV, capture: true });
 console.log("  install code=" + inst.code);
 if (inst.code !== 0) { console.log((inst.stderr || "").slice(-1500)); process.exit(1); }
 
 console.log("== npm run start:dev (nest start --watch) ==");
-kernel.launch("npm", ["run", "start:dev"], { cwd: D, env: { FORCE_COLOR: "0" } });
+kernel.launch("npm", ["run", "start:dev"], { cwd: D, env: ENV });
 for (let i = 0; i < 6000 && !listening.has(PORT); i++) await sleep(20);
 console.log("  listening:", listening.has(PORT));
 if (!listening.has(PORT)) { console.log("  never listened"); process.exit(1); }

@@ -7,6 +7,7 @@ import { runViteSpike } from "./spike-vite-lib.mjs";
 const ok = await runViteSpike({
   name: "Lit",
   dir: "/lit",
+  templateId: "lit",
   entryModule: "/src/my-element.ts",
   titleMarker: /Vite \+ Lit/,
   files: {

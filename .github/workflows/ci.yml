@@ -204,8 +204,18 @@ jobs:
       # sha512 integrity and extracts .tgz tarballs.
       - name: Build the Node Wasm crates
         run: npm run build:vfs:node && npm run build:codec:node && npm run build:crypto:node
+      # `react` was missing from this list until the template most users start from
+      # turned out to be the one nothing ran. Each of these now boots its server the
+      # way the studio does — through the manifest's own dev command — rather than by
+      # calling the vite bin directly, which is the shortcut that let a broken shipped
+      # path sit behind six green spikes.
       - name: framework templates must start their dev server
-        run: node scripts/run-spikes.mjs --net preact lit solid vue svelte qwik
+        run: node scripts/run-spikes.mjs --net react preact lit solid vue svelte qwik
+      # Nest's dev command is a watch supervisor rather than a dev server, so its gate
+      # is that a SAVE reaches the browser: boot, edit, recompile, restart, new
+      # response. Separate step because a failure here means something different.
+      - name: the Nest template must survive a save
+        run: node scripts/run-spikes.mjs --net nest-watch
       # Its own step rather than an extra filter above, because it proves something
       # different: that an interactive scaffolder can be ANSWERED, not that a template
       # serves. Needs the vendored npm, hence the net tier.

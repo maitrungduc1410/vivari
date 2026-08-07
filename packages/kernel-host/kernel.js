@@ -596,6 +596,9 @@ export class Kernel {
         // The guest gained or lost a `process.on('SIGTERM'|…)` listener, which is
         // what decides whether a signal is posted to it or applied to it.
         "signal-listen": (m) => this.handleSignalListen(pid, m),
+        // The guest is parked waiting for a HUMAN to type. Only it can know that,
+        // and the stall watchdog cannot tell it from wedged without being told.
+        "awaiting-input": (m) => this.handleAwaitingInput(pid, m),
         "signal-handled": (m) => this.handleSignalHandled(pid, m),
         // #19 stage C: this process relays a ws frame outward (in-VM ws server ->
         // browser preview) for a tunneled connection.
@@ -1701,6 +1704,24 @@ export class Kernel {
     if (!proc || !m || !isCatchableSignal(m.signal)) return;
     if (m.active) proc.sigHandlers.add(m.signal);
     else proc.sigHandlers.delete(m.signal);
+  }
+
+  // "I have finished everything I was asked to do and I am waiting for a person."
+  //
+  // The stall watchdog reads silence, and a process waiting for a human is silent
+  // by definition — the same argument `hasLiveChild` makes about a shell waiting on
+  // a child, one step further out. The difference is that a live child is a fact the
+  // kernel can see for itself, and this one is not: an idle prompt and a wedged
+  // interpreter make identical syscalls, namely none. So it is announced rather than
+  // inferred, which means the watchdog stays quiet only about processes that SAID
+  // they were waiting, and a process that wedges without saying so is still reported.
+  // Inferring it instead (a shell with a terminal and no live child must be at a
+  // prompt) would have suppressed the genuinely wedged shell along with the idle one,
+  // permanently and invisibly, which is the failure this watchdog exists to avoid.
+  handleAwaitingInput(pid, m) {
+    const proc = this.procs.get(pid);
+    if (!proc || !m) return;
+    proc.awaitingInput = !!m.waiting;
   }
 
   // The guest ran its handler and is still here on purpose. Stand the force-kill

@@ -22,6 +22,7 @@ import {
   stallVerdict,
   servingPids,
   shouldReportStall,
+  stallReportChunk,
 } from "../packages/core/terminal-feedback.js";
 
 let failed = 0;
@@ -125,11 +126,74 @@ console.log("\n── the stall verdict ──");
   check("…and a parent with requests waiting on it is not excused",
     shouldReportStall({ serving: true, pendingRequests: 2, hasLiveChild: true }));
 
+  // The SAME report, from the same user on the same template, after the warmup
+  // finished: the shell went back to its prompt and was reported for waiting on a
+  // person instead of on a child. The fix above covered one kind of waiting, so the
+  // class came back wearing the other.
+  check("a shell parked at its prompt is not reported either",
+    !shouldReportStall({ serving: false, pendingRequests: 0, awaitingInput: true }));
+  // The half that a "terminal and no live child means it must be at a prompt" rule
+  // could not have given us: silence alone still buys nothing.
+  check("…but a silent shell that has NOT said it is waiting still is",
+    shouldReportStall({ serving: false, pendingRequests: 0, awaitingInput: false }));
+  check("…and the announcement does not excuse a process with requests waiting on it",
+    shouldReportStall({ serving: true, pendingRequests: 1, awaitingInput: true }));
+
   const wedged = stallVerdict({ grew: 0, files: 7_129, idleMs: 30_000, ports: [3000], pendingRequests: 3 });
   check("and is told it is stuck inside a handler", /3 requests waiting/.test(wedged) && /stuck inside a handler/.test(wedged));
 
   const unknown = stallVerdict({ grew: null, files: 500, idleMs: 100, ports: [] });
   check("an unknown first report still describes rather than diagnoses", /may just be slow/.test(unknown));
+}
+
+console.log("\n── a stall report does not erase what it did not write ──");
+{
+  // The evidence for this one is the byte stream, so this applies the bytes to a
+  // terminal rather than pattern-matching the escape. Enough of a VT to be honest
+  // about the two sequences involved: \r homes the cursor, \x1b[2K erases the
+  // current line, \n opens a new one, text overwrites from the cursor.
+  const feed = (screen, chunk) => {
+    let row = screen.length - 1;
+    let col = screen[row].length;
+    const put = (s) => {
+      const l = screen[row].padEnd(col, " ");
+      screen[row] = l.slice(0, col) + s + l.slice(col + s.length);
+      col += s.length;
+    };
+    for (let i = 0; i < chunk.length; i++) {
+      if (chunk[i] === "\r") { col = 0; continue; }
+      if (chunk[i] === "\n") { screen.push(""); row = screen.length - 1; col = 0; continue; }
+      if (chunk[i] === "\u001b") {
+        const m = /^\u001b\[[0-9;]*[A-Za-z]/.exec(chunk.slice(i));
+        if (m) { if (m[0] === "\u001b[2K") { screen[row] = ""; col = 0; } i += m[0].length - 1; continue; }
+      }
+      put(chunk[i]);
+    }
+    return screen;
+  };
+
+  const PROMPT = "notebook-py-app$ ";
+  const REPORT = "  [runtime] PID 2 (sh) has printed nothing for 139s.";
+
+  // What the user had on screen: a prompt, written with no trailing newline, so it
+  // IS the current line. This is the exact report they lost it to.
+  const withPrompt = feed([PROMPT], stallReportChunk(REPORT, { progressCleared: false }));
+  check("a report under a prompt leaves the prompt on screen",
+    withPrompt.some((l) => l.includes(PROMPT)), JSON.stringify(withPrompt));
+  check("…and still shows the report", withPrompt.some((l) => l.includes(REPORT)));
+  // Same guarantee, and the reason it is stated separately: the prompt is only the
+  // commonest thing on that line. A half-typed command is user input, and losing it
+  // is worse than losing a prompt the shell can redraw.
+  const typing = feed([PROMPT + "python war"], stallReportChunk(REPORT, { progressCleared: false }));
+  check("…and a half-typed command line survives it too",
+    typing.some((l) => l.includes(PROMPT + "python war")), JSON.stringify(typing));
+
+  // The case the erase was written for and is still right for: our own spinner.
+  // clearProgress has already wiped it, so the report writes where it stood rather
+  // than pushing a blank line in front of itself.
+  const cleared = feed([""], stallReportChunk(REPORT, { progressCleared: true }));
+  check("after clearing our own spinner the report needs no new line",
+    cleared[0].includes(REPORT), JSON.stringify(cleared));
 }
 
 console.log("\n── a server is not a stalled process ──");

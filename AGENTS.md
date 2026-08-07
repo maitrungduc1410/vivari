@@ -3590,11 +3590,22 @@ orphaned, keeps its port bound, and the respawn hits `EADDRINUSE`. Well-behaved
 parents `await` their children before exiting, so on a *normal* exit there are no
 live children to cascade to — this only fires on an actual kill. Two enablers this
 relies on: `process.kill(pid, sig)` is wired in `runtime/index.js` to
-`syscalls.kill` (Node tools manage their own children by pid), and
-`child.stdin` is a real binary-safe Writable sink — `write()`/`end()` accept an
-encoding + callback and pass Buffers/Uint8Arrays through byte-for-byte — plus the
-chainable stream surface (`pause`/`resume`/`cork`/…) tools poke at (NestJS's watch
-restart calls `child.stdin.pause()` before killing).
+`syscalls.kill` (Node tools manage their own children by pid), and the stdin sink is
+a real binary-safe Writable — `write()`/`end()` accept an encoding + callback and
+pass Buffers/Uint8Arrays through byte-for-byte — plus the chainable stream surface
+(`pause`/`resume`/`cork`/…) a caller holding a real pipe may poke at.
+
+That surface used to be justified here by NestJS's watch restart "calling
+`child.stdin.pause()` before killing", and the example is now wrong in a way worth
+keeping: `@nestjs/cli`'s `start.action.js` spawns with `stdio: 'inherit'` and writes
+`childProcessRef.stdin && childProcessRef.stdin.pause()`, so on real node the guard is
+false and `pause()` never runs. We used to hand that guard an object, so nest took a
+branch node never takes. **`child.stdin` is now null wherever node's is** (see *A
+harness that takes a shortcut…*, and the ChildProcess constructor), which makes nest a
+caller this repo got CORRECT rather than one that needed the surface. The sink is still
+there — as `child.stdin` for a piped fd 0, and as `_vvStdin` for `sh` and the `--watch`
+supervisor, which stand in for the kernel's fd table — and the cascade above is
+unaffected, because it turns on pids and not on stdin.
 
 ### Interactive stdin is event-driven, delivered off the SAB
 `process.stdin` is a real flowing **TTY Readable** (isTTY, setRawMode), NOT a
@@ -4069,17 +4080,38 @@ out of fixing it generalises:
   a shell rewrite hung this tier: `sh` had begun saying `stdio: ['inherit', …]` for its
   foreground job, and that word means literal fd inheritance on host Node and a question about
   `isTTY` in the VM. So `child.stdin` was `null` on one side and a writable on the other, the
-  shell's forwarding threw into its own `catch`, and every byte was dropped in silence. The
-  product was never affected — nothing but that forwarding carries terminal bytes to a child
-  there — but note what the tier had actually been asserting for months. Its substitutions were
-  written down as the channel, the SharedArrayBuffer, the worker seam; the one that moved was a
-  **word the host and the VM had always happened to agree about**, which nobody had listed
-  because agreement is invisible. A model does not announce that it has stopped matching, and a
-  hang is the lucky version: had the two meanings diverged in a direction that still delivered
-  most bytes, the tier stays green and stops meaning anything. So the model now carries a gate
-  that tests neither the notebook nor the shell — it measures both meanings of the word and goes
-  red when they part company, which is the only moment worth checking. **Whatever your harness
-  substitutes, assert the substitution, not just the thing it stands in for.**
+  shell's forwarding threw into its own `catch`, and every byte was dropped in silence. Note what
+  the tier had actually been asserting for months. Its substitutions were written down as the
+  channel, the SharedArrayBuffer, the worker seam; the one that moved was a **word the host and
+  the VM had always happened to agree about**, which nobody had listed because agreement is
+  invisible. A model does not announce that it has stopped matching, and a hang is the lucky
+  version: had the two meanings diverged in a direction that still delivered most bytes, the tier
+  stays green and stops meaning anything. **Whatever your harness substitutes, assert the
+  substitution, not just the thing it stands in for.**
+
+  **Two sentences of that are now retracted, and how they failed is worth more than the
+  correction.** This bullet used to acquit the divergence — *the product was never affected* —
+  and to close by saying the new gate "measures both meanings of the word and goes red when they
+  part company". The acquittal was true only of the byte-dropping, and read as a verdict on the
+  divergence itself; the divergence was the bug. Answering `child.stdin` with a writable where
+  node answers null is precisely what let npm's `if (p.stdin) p.stdin.end()` fire on a child that
+  had inherited the terminal, and every Vite template's dev server shut itself down on the
+  resulting EOF (*A harness that takes a shortcut the product cannot take is gating the
+  shortcut*). The gate's description went stale for the opposite reason — a good one: the fix was
+  to make the two meanings AGREE, so there is no longer a divergence to measure. It now asserts
+  the narrower thing that really is substituted, that our `'inherit'` routes where node's shares,
+  so ours needs a delivery path and that path is deliberately not called `stdin`.
+
+  So this bullet **predicted the failure it then missed**. It says in as many words that a
+  divergence still delivering most bytes would leave the tier green and meaningless — which is
+  what happened next, in the same word, about the same two programs. The general
+  warning did not help because the same paragraph had already filed this particular case as
+  harmless, and a reader who has been told the case is closed does not re-open it to ask whether
+  the warning applies. That is the !186 finding again in a new place: there, a correction landed
+  in the gate and not in the prose the gate was evidence for. **When you retract an assertion,
+  grep for the sentences that asserted it.** A gate that changes meaning leaves its old meaning
+  in every paragraph that cited it, and those paragraphs are what the next reader finds first —
+  they are indexed by their headings, and the gate is not.
 
 ### A new gate is not evidence until it has been run against the bug
 
@@ -4295,6 +4327,76 @@ live where you happen to be reading. **Do not trust a rule's section to have app
 to itself**; this one demonstrably did not, twice, and it is more useful for saying so than it
 would be with a clean record.
 
+### Fixing the instance leaves the class, and the class comes back wearing the other case
+
+The stall watchdog reports a process that has printed nothing for a while. A user ran the
+notebook template's warm-up and was told `PID 2 (sh) has printed nothing for 139s … it looks
+stuck rather than slow` about a healthy shell whose python was busy fetching wheels. The finding
+was general and correct: **a silent process is not a stuck one when something else is what it is
+waiting for**, and every signal the watchdog reads says "silent" about precisely the process
+that has nothing to say. The fix suppressed *a shell with a live child*.
+
+The same user, on the same template, with the same command, got the same message again — this
+time after the warm-up FINISHED, from a shell sitting at its prompt. Waiting on a person is not a
+variant of waiting on a child; both are instances of waiting, and only one of them had been
+enumerated. The finding was about a class and the fix was about a case, and nothing in between
+recorded the difference, so the gap was invisible until a user found it the same way twice.
+
+Two things generalise:
+
+- **When a diagnosis names a category, the fix and its gate have to be about the category, or
+  the write-up has to say plainly that it is not.** A comment saying "waiting on a child is
+  silent by definition" reads as complete. Had it said "this covers one kind of waiting; the
+  others are not handled", the second report would have been a lookup rather than a rediscovery.
+  The cheapest version of this is to enumerate the class out loud at fix time and let the
+  unhandled members be visible, even if you handle none of them.
+- **Suppression is where this is most dangerous, because a suppressed case produces no
+  evidence.** A rule that wrongly reports something gets complained about; a rule that wrongly
+  stays quiet is discovered only by whoever the silence failed. That asymmetry is the argument
+  for suppressing on an ANNOUNCEMENT rather than on an inference: the second fix here has each
+  process say "I am waiting for a person" instead of deducing it from a terminal and no live
+  child, so the rule cannot excuse a process that did not claim the excuse. The inference was
+  cheaper and would have hidden a genuinely wedged shell forever, which is the exact failure the
+  watchdog exists to prevent — an inference from absence, in a system where absence is what
+  every signal already reports.
+
+### A harness that takes a shortcut the product cannot take is gating the shortcut
+
+Every Vite template's `npm run dev` shut its own dev server down a few seconds after printing
+the URL. Seven spikes covered those templates and all seven were green, because `runViteSpike`
+started the server with `node node_modules/vite/bin/vite.js` while the studio ships
+`npm run dev -- --configLoader native`. The two programs the harness stepped over were where
+the defect lived: npm's run-script does `if (p.stdin) p.stdin.end()` — correct against node,
+where a child spawned with `stdio:'inherit'` has a **null** stdin — and our `ChildProcess`
+answered with an object, so npm sent an EOF to a program that had inherited the terminal, and
+vite reads end-of-stdin as "my parent is gone".
+
+The substitution was not hidden. It was in the harness in plain sight, and it looked like the
+same thing only faster, which is exactly why nobody weighed it: **a shortcut is judged by
+whether it reaches the same result, and the whole point of a gate is that we do not yet know
+what the result is.** Three things generalise:
+
+- **Name the substitution in the harness, where the next reader will be standing.** Not "runs
+  the dev server" but "runs the vite bin directly rather than the template's own dev command".
+  A substitution stated as a substitution invites the question; one stated as an equivalence
+  closes it.
+- **Prefer the shipped string to a copy of it.** The React spike takes the command from
+  `manifest.dev` and the files from the template itself via `lib/shipped-templates.mjs`, so a
+  change to how the studio starts a template changes what the gate runs. Its neighbours
+  hand-copy their template into the spike, which is a second place for the truth to live.
+- **A gate for a long-running thing has to outlive the requests it makes.** Every HTTP check
+  here passed while the server was dying, because they landed inside the window. "Still
+  listening after the checks" is a different assertion from "listening", and it is the one that
+  caught this.
+
+Related, and found in the same hour, because both are the same mistake about what a green tier
+means: **a skip that removes a spike from the selection also removes it from the denominator.**
+`run-spikes.mjs --offline` filters out `needsWasm` spikes when `pkg-node` is absent and then
+reports `19/19 passed`, exit 0 — 19 of 45, with the other 26 mentioned in a line of scrollback
+far above the summary. A sign-off was given on that basis. If a runner can skip, its summary
+has to carry the skipped count next to the passed one, or the number it prints is not about
+the tier at all.
+
 ### A handle's close callback is a loop PHASE, not a nextTick
 
 When a binding hands lib/net.js a `close(cb)`, `cb` must not run on the tick queue.
@@ -4401,7 +4503,7 @@ cost multiple sessions:
   network.** `probe-react.mjs` / `probe-nest.mjs` are the older API-gap probes.
 - `node scripts/probe-term.mjs` — interactive terminal: launches a live `sh`, feeds
   keystrokes via `kernel.sendStdin`, asserts echo + `cd`/`pwd`/backspace. No network.
-  `probe-nest-watch.mjs` validates the Nest save→recompile→restart reload.
+  `spike-nest-watch.mjs` (net tier, CI) validates the Nest save→recompile→restart reload.
 - `node scripts/spike-debugger.mjs` — the breakpoint debugger's spike gate:
   instrumentation, breakpoint binding (incl. conditional), pause/step, scope +
   `evaluateOnCallFrame` (with TDZ), top-level `debugger;`, the real SAB channel, and an

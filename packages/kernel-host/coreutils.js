@@ -829,24 +829,35 @@ function isDevNull(f) { return resolvePath(f) === '/dev/null'; }
 // loop alive on its own — an async \`sh -c 'node server.js'\`, whose stdin no one
 // ever ends, would then never be able to exit.
 const shStdin = { chunks: [], ended: false, sink: null };
+// Where to put bytes meant for a child's fd 0. \`child.stdin\` is null when the child
+// inherited fd 0, which is node's answer and now ours — but in here 'inherit' is a
+// routing decision rather than a shared descriptor, so the bytes still arrive at US
+// and somebody has to forward them. \`_vvStdin\` is that path, named so it cannot be
+// mistaken for the public stream. A shell is the only program entitled to use it:
+// it is standing in for the kernel's fd table.
+const fd0 = (child) => (child && (child.stdin || child._vvStdin)) || null;
 if (script) {
   process.stdin.on('data', (c) => {
     const buf = typeof c === 'string' ? Buffer.from(c) : c;
-    if (shStdin.sink) { try { shStdin.sink.stdin.write(buf); } catch (e) {} }
+    const sink = fd0(shStdin.sink);
+    if (sink) { try { sink.write(buf); } catch (e) {} }
     else shStdin.chunks.push(buf);
   });
   process.stdin.on('end', () => {
     shStdin.ended = true;
-    if (shStdin.sink) { try { shStdin.sink.stdin.end(); } catch (e) {} }
+    const sink = fd0(shStdin.sink);
+    if (sink) { try { sink.end(); } catch (e) {} }
   });
   if (process.stdin.unref) process.stdin.unref();
 }
 function inheritStdin(child) {
   shStdin.sink = child;
+  const sink = fd0(child);
+  if (!sink) return;
   for (const buf of shStdin.chunks.splice(0, shStdin.chunks.length)) {
-    try { child.stdin.write(buf); } catch (e) {}
+    try { sink.write(buf); } catch (e) {}
   }
-  if (shStdin.ended) { try { child.stdin.end(); } catch (e) {} }
+  if (shStdin.ended) { try { sink.end(); } catch (e) {} }
 }
 
 // Execute a pipeline of >=1 stages: wire each stage's stdout into the next
@@ -995,7 +1006,14 @@ function runInteractive() {
   let busy = false;
   const queue = [];
 
-  const prompt = () => process.stdout.write(promptStr());
+  // Tell the kernel whether we are parked at a prompt, so the stall watchdog does
+  // not report an idle shell as stuck. Absent when this file runs on host node
+  // (the spikes), which is why it is called through a guard rather than assumed.
+  const awaiting = (w) => { if (process.__awaitingInput) process.__awaitingInput(w); };
+  // Drawing a prompt IS the announcement: it is the only thing that hands control
+  // back to the person. \`redraw()\` deliberately does not, because mid-edit we are
+  // already waiting and the flag is already set.
+  const prompt = () => { awaiting(true); process.stdout.write(promptStr()); };
   // Redraw the current line in place (col 0 → clear → prompt+line) and put the
   // cursor back at \`pos\`. Used for edits that aren't a plain append-at-end.
   const redraw = () => {
@@ -1092,6 +1110,11 @@ function runInteractive() {
   const drain = async () => {
     if (busy) return;
     busy = true;
+    // Running something is the end of waiting, and it is retracted BEFORE the first
+    // command rather than after the last: everything from here until the prompt
+    // comes back is work this shell is answerable for, including a command that
+    // wedges before it ever spawns a child.
+    awaiting(false);
     while (queue.length) {
       const l = queue.shift().replace(/#.*$/, '').trim();
       if (l) { try { await runLine(l); } catch (e) { process.stderr.write(String((e && e.message) || e) + '\\n'); } }
@@ -1137,7 +1160,7 @@ function runInteractive() {
     // (Enter as newline), no line-edit/echo — the program drives the display.
     if (currentChild) {
       if (s.indexOf('\\x03') !== -1) { if (currentKill) currentKill('SIGINT'); else { try { currentChild.kill('SIGINT'); } catch (e) {} } }
-      else { try { currentChild.stdin.write(s.replace(/\\r/g, '\\n')); } catch (e) {} }
+      else { const sink = fd0(currentChild); if (sink) { try { sink.write(s.replace(/\\r/g, '\\n')); } catch (e) {} } }
       return;
     }
     for (let i = 0; i < s.length; i++) {

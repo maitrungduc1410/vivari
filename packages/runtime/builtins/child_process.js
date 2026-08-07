@@ -11,8 +11,14 @@
 //     events), so a long-running child (a dev server) streams live instead of
 //     freezing the parent until it exits.
 //
-// stdin (parent -> child): `child.stdin` is a binary-safe Writable-ish sink that
-// relays bytes to the kernel, which pushes them into the child's process.stdin.
+// stdin (parent -> child): a binary-safe Writable-ish sink that relays bytes to the
+// kernel, which pushes them into the child's process.stdin. WHETHER THE CALLER GETS
+// IT is node's rule, not ours: `child.stdin` is that sink only when fd 0 is a pipe,
+// and null for 'inherit'/'ignore', because then fd 0 is somebody else's and the
+// parent holds no end of it. It is reachable regardless as `_vvStdin`, for the two
+// programs that stand in for the kernel's fd table (`sh` and the --watch
+// supervisor) — see the ChildProcess constructor for why that distinction is load
+// bearing rather than pedantry.
 
 export function createChildProcess({ sys, process, Buffer, EventEmitter, Readable, childLiveness, wake, postRaw }) {
   // ---- synchronous subset (unchanged) --------------------------------------
@@ -95,13 +101,22 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
   const registry = new Map(); // childPid -> ChildProcess
   const inbox = []; // queued { type, childPid, chunk?, code?, signal? } events
 
-  // child.stdin: a Writable-ish sink that actually delivers to the child. write()
-  // relays the bytes to the kernel ({type:'child-stdin', childPid, chunk}); the
-  // kernel pushes them into the child process' own process.stdin (see
-  // kernel.handleChildStdin). end() sends EOF (null chunk). It also answers to the
-  // whole stream-ish surface tools poke at — NestJS's watch-restart, for one,
-  // calls `child.stdin.pause()` before recompiling, and chokidar/others cork or
-  // set encodings — so the rest are chainable no-ops rather than undefined.
+  // The sink itself: it actually delivers to the child. write() relays the bytes to
+  // the kernel ({type:'child-stdin', childPid, chunk}); the kernel pushes them into
+  // the child process' own process.stdin (see kernel.handleChildStdin). end() sends
+  // EOF (null chunk). Handed to the caller as `child.stdin` only for a piped fd 0,
+  // and kept as `_vvStdin` otherwise — the constructor has the argument.
+  //
+  // The rest of the stream-ish surface (pause/cork/setEncoding…) is chainable no-ops
+  // rather than undefined, because a caller holding a real pipe may poke at any of
+  // it. This used to be justified by NestJS's watch-restart calling
+  // `child.stdin.pause()` before recompiling, and that example is now WRONG in an
+  // instructive way: `@nestjs/cli`'s start.action.js spawns with `stdio: 'inherit'`
+  // and writes `childProcessRef.stdin && childProcessRef.stdin.pause()`, so on real
+  // node the guard is false and pause() never runs. We used to answer that guard
+  // with an object, so nest took a branch node never takes — it worked, for a reason
+  // that was not the reason. Nest is a caller this change makes CORRECT, not one
+  // that needs the surface; the surface stays for genuinely piped children.
   const makeStdin = (childPid) => ({
     writable: true,
     readable: false,
@@ -216,7 +231,7 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
   });
 
   class ChildProcess extends EventEmitter {
-    constructor(pid) {
+    constructor(pid, stdinIsPiped = true) {
       super();
       this.pid = pid;
       this.exitCode = null;
@@ -226,7 +241,24 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
       // 'data' listener), exactly like a real child's piped stdio.
       this.stdout = new Readable({ read() {} });
       this.stderr = new Readable({ read() {} });
-      this.stdin = makeStdin(pid);
+      // The sink always exists, because the kernel can always deliver bytes to a
+      // child's fd 0. What varies is whether NODE would have handed it to the
+      // caller: `child.stdin` is a stream only when fd 0 is a pipe, and null for
+      // 'inherit'/'ignore'/a fd, because with those the child's fd 0 is somebody
+      // else's and the parent has no end of it to write to.
+      //
+      // `if (child.stdin)` is how a caller ASKS which of those it got, and real
+      // programs ask: npm's run-script does `if (p.stdin) p.stdin.end()`, correct
+      // on node because a script run with stdio:'inherit' answers null. Answering
+      // an object made that end() fire on a child that had inherited the terminal,
+      // and EOF on fd 0 is a shutdown signal to anything watching for its parent to
+      // go away — vite closes the dev server on it. So this is null when node says
+      // null, and the sink stays reachable under a name that is visibly not node's,
+      // for the one caller that needs it: our own `sh`, which forwards terminal
+      // keystrokes to a foreground job because in here 'inherit' is a routing
+      // decision rather than a shared file descriptor.
+      this._vvStdin = makeStdin(pid);
+      this.stdin = stdinIsPiped ? this._vvStdin : null;
       this.stdio = [this.stdin, this.stdout, this.stderr];
     }
     kill(signal = "SIGTERM") {
@@ -296,6 +328,16 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
     return true;
   }
 
+  // Does the PARENT hold the write end of the child's fd 0 — i.e. is `child.stdin`
+  // a stream or null? Node's rule, and note it is not the same question as
+  // stdinIsPipeFrom above: that one is about what the CHILD sees on fd 0 (terminal
+  // or not, which sets its isTTY), this one is about what the parent gets back.
+  // Absent stdio means 'pipe', which is node's default.
+  function parentHoldsStdin(stdio) {
+    const fd0 = Array.isArray(stdio) ? stdio[0] : stdio;
+    return fd0 == null || fd0 === "pipe" || fd0 === "overlapped";
+  }
+
   function spawn(command, args, opts) {
     const n = normalizeArgs(command, args, opts);
     const sh = withShell(n.command, n.args, n.opts);
@@ -318,7 +360,7 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
     } catch (e) {
       // Node reports a spawn failure asynchronously via an 'error' event on the
       // returned ChildProcess, not by throwing.
-      const cp = new ChildProcess(-1);
+      const cp = new ChildProcess(-1, parentHoldsStdin(n.opts.stdio));
       process.nextTick(() => {
         const err = e instanceof Error ? e : new Error(String(e));
         err.code = e && e.code ? e.code : "ENOENT";
@@ -332,7 +374,7 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
       });
       return cp;
     }
-    const cp = new ChildProcess(pid);
+    const cp = new ChildProcess(pid, parentHoldsStdin(n.opts.stdio));
     registry.set(pid, cp);
     childLiveness.active++;
     // stdio: 'inherit' (or ['...','inherit','inherit']) means the child shares the

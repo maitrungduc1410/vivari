@@ -109,6 +109,30 @@ export function servingPids(listeners, parentOf) {
 const MEANINGFUL_GROWTH = 25;
 
 /**
+ * The bytes a stall report writes to a terminal.
+ *
+ * `\r\x1b[2K` — column 0, erase the whole line — is correct for the spinner,
+ * because the spinner is a line THIS module drew and is entitled to remove. It was
+ * also being used to open every stall report, and there it erased whatever the
+ * terminal happened to be showing. Normally that is the shell's prompt, which is
+ * written with no trailing newline and so IS the current line: the report deleted
+ * it, nothing redraws a prompt except a keystroke or a finished command, and the
+ * user was left looking at a terminal with no prompt under a message saying their
+ * shell looked stuck. A half-typed command line went the same way.
+ *
+ * So the rule is that a report may only erase a line it drew itself. When the
+ * spinner was showing, `clearProgress` has already erased it and the cursor is at
+ * column 0 of a line we own, so the report starts there. Otherwise the report
+ * starts on a NEW line and leaves the old one alone. That can cost a blank line
+ * when the cursor was already at column 0, which is the right way to be wrong:
+ * this is asynchronous output arriving under whatever the user was doing, exactly
+ * like a job-control notice, and cosmetic beats destructive.
+ */
+export function stallReportChunk(line, { progressCleared = false } = {}) {
+  return `${progressCleared ? "" : "\r\n"}\u001b[2m${line}\u001b[0m\r\n`;
+}
+
+/**
  * Is a stalled process worth telling anyone about?
  *
  * An idle server and a wedged one look identical from the kernel: both hold a
@@ -127,9 +151,35 @@ const MEANINGFUL_GROWTH = 25;
  * watched on its own terms and reported under its own name, so nothing is lost by
  * staying quiet about the parent — and if the child really is wedged, its report
  * names the program instead of the shell that launched it.
+ *
+ * `awaitingInput` is the SAME ARGUMENT AGAIN, and the reason it needs its own
+ * paragraph is that the fix above was written for the instance rather than the
+ * class. "A silent process is not necessarily a stuck one when something else is
+ * what it is waiting for" was the finding; "a shell waiting on a child" was the
+ * only case anybody enumerated. So the same user, on the same template, with the
+ * same command, got the same message again once the warmup FINISHED and the shell
+ * went back to its prompt — waiting on a person instead of on a child. Waiting for
+ * input is not a variant of waiting for a child; both are instances of waiting,
+ * and the list is only complete when every kind of waiting is on it.
+ *
+ * It is ANNOUNCED rather than inferred, and that is the load-bearing choice here.
+ * The cheap rule was available — a shell that has a terminal and no live child must
+ * be at a prompt — and it is wrong in the one direction that matters: a shell
+ * wedged in its own dispatch also has a terminal and no live child, so the rule
+ * would have suppressed the true positive along with the false one, silently and
+ * for good. An announcement can only ever excuse a process that made it, so the
+ * failure mode is a missing announcement (which reports a healthy process, the
+ * noise this watchdog already accepts) instead of a spurious one (which hides a
+ * wedge, the thing it exists to prevent).
+ *
+ * The trade-off accepted, stated because it is real: a process that wedges while
+ * it is genuinely parked at a prompt stays unreported. That is a narrower hole than
+ * it sounds — with nobody typing, an idle prompt and a prompt that would fail to
+ * respond are the same thing to the user, and the moment anybody does type, a shell
+ * that cannot answer stops echoing, which is a louder signal than this watchdog's.
  */
-export function shouldReportStall({ serving, pendingRequests = 0, hasLiveChild = false }) {
-  if (hasLiveChild && pendingRequests === 0) return false;
+export function shouldReportStall({ serving, pendingRequests = 0, hasLiveChild = false, awaitingInput = false }) {
+  if ((hasLiveChild || awaitingInput) && pendingRequests === 0) return false;
   return !serving || pendingRequests > 0;
 }
 

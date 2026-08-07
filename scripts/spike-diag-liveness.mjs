@@ -31,6 +31,7 @@
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
+import { shouldReportStall } from "../packages/core/terminal-feedback.js";
 import { Worker, MessageChannel } from "node:worker_threads";
 
 let failed = 0;
@@ -78,7 +79,14 @@ const spawnWorker = (info) => {
   return handle;
 };
 
-const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, stdout: () => {}, stderr: () => {} });
+// Captured rather than dropped: the awaiting-input section at the bottom needs to
+// see a prompt actually arrive, because a flag read without one proves only that
+// the flag exists.
+let term = "";
+const onTerm = (s) => {
+  term += s;
+};
+const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, stdout: onTerm, stderr: onTerm });
 kernel.installCoreutils();
 const APP = "/app";
 kernel.mkdirp(APP);
@@ -228,6 +236,75 @@ console.log("\n== a process that is genuinely working reports nothing exotic =="
     tick();
   });
   ok(gone, "a guest holding no handles exits on its own (the breakdown is not keeping it up)");
+}
+
+// The stall watchdog asks a neighbouring question — not "why won't it exit" but
+// "why has it said nothing" — and it has the same problem: an idle prompt and a
+// wedged interpreter make identical syscalls, namely none. It is answered by the
+// process announcing that it is waiting for a person (`process.__awaitingInput`),
+// the kernel recording it, and the watchdog excusing only processes that said so.
+//
+// That decision is unit-tested in probe-terminal-feedback.mjs, but the DELIVERY —
+// guest postRaw, to handleAwaitingInput, to the flag the watchdog reads — needs a
+// booted kernel with a real shell in it, and this spike has one. It is worth
+// gating separately because the whole argument for announcing over inferring is
+// that the announcement is load-bearing: if it never arrives, the rule silently
+// stops excusing anything, and nothing else here would notice.
+console.log("\n== a shell waiting for a person says so, and the watchdog can read it ==");
+{
+  const shPid = kernel.launch("sh", [], { cwd: APP, env: ENV, tty: true });
+  const promptAt = term.length;
+  const waited = await new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      const p = kernel.procs.get(shPid);
+      if (p && p.awaitingInput) return resolve(true);
+      if (Date.now() - t0 > 15000) return resolve(false);
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
+  ok(waited, "an interactive shell announces that it is waiting for input");
+  ok(/\$/.test(term.slice(promptAt)), "…and it announced it by drawing a prompt, which is the fact being claimed");
+  // End to end: the flag the guest set, read the way the watchdog reads it.
+  ok(
+    !shouldReportStall({ serving: false, pendingRequests: 0, hasLiveChild: false, awaitingInput: !!kernel.procs.get(shPid)?.awaitingInput }),
+    "…so the stall watchdog does not report it, however long it sits there",
+  );
+
+  // The other half, and the one the cheap rule (terminal + no live child = a
+  // prompt) could not have given us: silence on its own still buys nothing.
+  kernel.writeFile(APP + "/mute.js", 'setInterval(() => {}, 60000);\n');
+  const mutePid = kernel.launch("node", ["mute.js"], { cwd: APP, env: ENV });
+  await new Promise((r) => setTimeout(r, 2000));
+  const muteProc = kernel.procs.get(mutePid);
+  ok(!!muteProc && !muteProc.awaitingInput, "a process that is merely silent announces nothing");
+  ok(
+    shouldReportStall({ serving: false, pendingRequests: 0, hasLiveChild: false, awaitingInput: !!muteProc?.awaitingInput }),
+    "…and is still reported, which is what makes the announcement worth having",
+  );
+
+  // And the flag comes back DOWN when the shell starts working, or it would excuse
+  // the shell for the rest of the session after one prompt.
+  kernel.sendStdin(shPid, "node mute.js\n");
+  const retracted = await new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      const p = kernel.procs.get(shPid);
+      if (p && !p.awaitingInput) return resolve(true);
+      if (Date.now() - t0 > 15000) return resolve(false);
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
+  ok(retracted, "…and the shell retracts it the moment it starts running something");
+
+  try {
+    kernel.kill(shPid, "SIGKILL");
+    kernel.kill(mutePid, "SIGKILL");
+  } catch {
+    /* already gone */
+  }
 }
 
 fsWorker.terminate();

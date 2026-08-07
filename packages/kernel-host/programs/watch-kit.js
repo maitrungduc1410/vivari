@@ -282,10 +282,19 @@ function createWatcher(config) {
   // them to whichever child is current, so the 'inherit' declared above is true and a
   // watched program that prompts can be answered. Attached once, not per child: the
   // relay reads 'child' at delivery time, so a restart does not need to rewire it.
+  //
+  // \`child.stdin\` is null here, and that is correct rather than a problem: node hands
+  // back a stream only when fd 0 is a PIPE, and this child's is 'inherit'. \`_vvStdin\`
+  // is the delivery path for exactly this case — 'inherit' is a routing decision in
+  // here rather than a shared descriptor, so the bytes arrive at us and a supervisor
+  // has to pass them on. Same rule and same reason as the shell's; the two of them are
+  // the only programs entitled to it, because they are the ones standing in for the
+  // kernel's fd table.
   try {
     process.stdin.on('data', (d) => {
-      if (child && child.stdin && child.stdin.write) {
-        try { child.stdin.write(d); } catch (e) {}
+      const sink = child && (child.stdin || child._vvStdin);
+      if (sink && sink.write) {
+        try { sink.write(d); } catch (e) {}
       }
     });
     process.stdin.resume();

@@ -15,6 +15,7 @@ button { border-radius: 8px; border: 1px solid transparent; padding: 0.6em 1.2em
 const ok = await runViteSpike({
   name: "Vue",
   dir: "/vue",
+  templateId: "vue-ts",
   entryModule: "/src/App.vue",
   titleMarker: /Vite \+ Vue/,
   files: {

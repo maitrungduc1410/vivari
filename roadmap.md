@@ -1602,7 +1602,7 @@ none blocks the T2 goal; each is a coverage/perf/polish increment. Grouped by ki
     real `node` server as *its* child. Killing the shell orphaned `node`, which kept
     `:3000` bound. Fix: `kernel.finalize()` now cascades to the whole subtree
     (`parentPid === pid`, recursively), so killing the shell takes the server with it.
-    Validated headlessly (`scripts/probe-nest-watch.mjs`): boot → `GET / → Hello
+    Validated headlessly (`scripts/spike-nest-watch.mjs`): boot → `GET / → Hello
     World!`, edit `app.service.ts`, ~1 s later `GET / → Reloaded!`.
   - ✅ **Fixed (browser-only, surfaced by React demo):** `internal/errors` was missing
     most stream + http error *constructors* (`ERR_STREAM_DESTROYED`,
@@ -6314,6 +6314,179 @@ anyone noticing. The judgements are now pure functions in `packages/core/termina
 asserted by `npm run probe:terminal-feedback` in `toolchain-gate` — including the exact sequence
 that produced the bad output: install 104 packages, print, then serve, and check the app's first
 request reports one request rather than a hundred and five.
+
+### The same report twice: the fix was written for the case, the finding was about the class
+
+A user ran the notebook template's warm-up and watched the terminal report `PID 2 (sh) has printed
+nothing for 139s` about a shell whose python was busy fetching wheels. That was fixed: a shell
+waiting on a live child is silent because waiting is what it does, its child is watched under its
+own name, so the parent is not reported. The finding written down beside it was broader — a silent
+process is not a stuck one when something else is what it is waiting for — and the fix enumerated
+exactly one kind of waiting.
+
+The same user, on the same template, with the same command, reported it again. This time the
+warm-up had *finished*: the shell printed its prompt and went idle, waiting on a person rather than
+on a child, and no rule covered that. The general lesson is in AGENTS.md under *Fixing the instance
+leaves the class*; the part specific to here is that suppression is the worst place to make this
+mistake, because a case you wrongly suppress generates no evidence that you did.
+
+**Announced, not inferred.** The cheap rule was right there — a shell with a terminal and no live
+child must be at a prompt — and it fails in the one direction that matters, because a shell wedged
+in its own dispatch also has a terminal and no live child. It would have bought silence about the
+false alarm by permanently hiding the true one. So a process that is parked waiting for a human
+says so (`process.__awaitingInput`, one bit, posted on the same channel and in the same style as
+the existing `signal-listen` announcement), the kernel records it per-process, and the watchdog
+excuses only processes that made the claim. A process that wedges without announcing is still
+reported, which keeps the failure mode on the noisy side rather than the silent one. The shell has
+two call sites and they are the two edges of the fact: the flag goes up when it draws a prompt,
+and down at the top of `drain()` — before the first command rather than after the last, so a
+command that wedges before it ever spawns a child is still this shell's responsibility.
+
+The trade-off accepted: a process that wedges while genuinely parked at a prompt is not reported.
+That is narrower than it sounds, since with nobody typing an idle prompt and an unresponsive one
+are the same thing to the user, and the moment anybody types, a shell that cannot answer stops
+echoing — a louder signal than this watchdog's.
+
+**And the report was destroying the prompt.** Separate defect, same screen, and the reason the user
+called it a hang: every report opened with `\r\x1b[2K` — column 0, erase the line. That is correct
+for the fetch spinner, which this module draws and may remove, and it was used unconditionally.
+A prompt is written with no trailing newline, so the prompt IS the current line: each report
+deleted it, nothing redraws a prompt except a keystroke or a finished command, and the user was
+left staring at a terminal with no prompt beneath a message saying their shell looked stuck. A half-typed command
+line went the same way. A report may now only erase a line it drew itself; otherwise it starts on a
+new one, which costs a blank line when the cursor was already at column 0 and is the right way to be
+wrong for asynchronous output arriving under whatever the user was doing.
+
+Both gates are in `probe-terminal-feedback.mjs`, red before their fix and green after. The erasure
+one asserts on the byte stream rather than on the escape, applying the emitted chunk to a small
+model of a terminal line and checking the prompt is still on screen afterwards — red, it prints
+the user's screen: the report present, the prompt gone. Its neighbour, *a silent shell that has
+NOT said it is waiting is still reported*, is green on both sides on purpose; it is a tripwire on
+what the fix means, not evidence for it.
+
+**And the wire under it is gated too**, which it could not be when this was written: the tiers
+that boot a kernel need `pkg-node`, and the Wasm had never been built in that sandbox. It has now,
+so `spike-diag-liveness.mjs` — whose existing subject is the neighbouring question, *why will this
+process not exit* — boots a real shell and follows the announcement all the way through: guest
+`postRaw`, `handleAwaitingInput`, and the flag read exactly as the watchdog reads it. Delete
+`process.__awaitingInput` from the runtime and two of its six assertions go red while *…it
+announced it by drawing a prompt* stays green, which is the distinction worth having: the shell is
+still at a prompt, the delivery is what failed. That mattered more than the usual amount here,
+because the entire argument for announcing over inferring is that the announcement arrives — if it
+silently stops, the rule stops excusing anything and nothing else in the tree notices.
+
+### Every template's dev server shut itself down, behind seven green spikes
+
+`npm run dev` in the React template printed its URL, warned `Failed to run dependency scan.
+Skipping dependency pre-bundling. Error: The server is being restarted or closed`, and returned to
+a prompt. The warning is what got reported; it was the smaller half. Instrumenting the kernel
+through the user's exact path — interactive `sh`, `VV_RUN`, npm in the middle — put the whole
+sequence on one clock, and the dev server was not merely warning. It bound port 5173, closed it,
+and the entire tree (vite, the `sh -c` npm wraps it in, npm itself) exited **0** about a second
+after starting. There was no server left behind at all.
+
+**The cause is one wrong answer to a question npm asks correctly.** node gives `child.stdin` as a
+stream only when the parent holds the write end of fd 0 — a pipe — and **null** for `'inherit'`,
+because then fd 0 belongs to somebody else. `if (child.stdin)` is how a caller asks which it got,
+and npm's run-script asks: `if (p.stdin) p.stdin.end()`. Our `ChildProcess` always answered with an
+object, so npm ended the stdin of a program that had inherited the terminal. Vite registers
+`process.stdin.on("end", …)` as its "my parent has gone away" signal and calls `closeServerAndExit`
+on it. The dependency scan was simply what happened to be in flight when the server closed, which
+is why the visible symptom was a scan warning and not the missing server.
+
+The trace showed the EOF twice, one hop apart — npm to `sh -c`, then `sh -c` to vite — and the
+second hop is correct behaviour: a shell whose own stdin ended propagates that to its foreground
+job. Only the first was wrong. Fixing the root removes both.
+
+`child.stdin` is now null exactly where node says null. The sink is still built, because in here
+`'inherit'` is a routing decision rather than a shared descriptor and the bytes still arrive at us;
+it is reachable as `_vvStdin` for the one caller entitled to it, our own `sh`, which forwards
+terminal keystrokes to a foreground job — standing in for the kernel's fd table rather than using a
+public API. `spike-child-stdin.mjs` gates the contract, and it is the right home because it already
+runs the same program on host node and in the VM and requires identical transcripts: node is the
+oracle, so the six new cases are not our opinion about node's rule. Reverted, exactly the three
+where node answers null go red.
+
+**The part worth more than the fix.** Seven Vite templates ship this command and all seven spikes
+were green, because `runViteSpike` started the server with `node node_modules/vite/bin/vite.js`
+while the studio ships `npm run dev -- --configLoader native`. The defect lived in the two programs
+the harness stepped over. Confirmed rather than assumed: with the fix reverted, Preact fails
+identically to React, so this was every template rather than a React quirk — React's distinction
+was only that it had no spike at all, and was missing from the `template-gate` CI job while
+preact, lit, solid, vue, svelte and qwik were in it.
+
+So the harness now boots via an interactive `sh` running the template's own dev command, and gained
+the two assertions that would have caught this: **still listening after the HTTP checks** (all
+three of those passed while the server was dying — they landed inside the window), and
+`.vite/deps` non-empty, which is pre-bundling's positive control on disk rather than an absence in
+a log. `spike-react.mjs` is new, is in CI, and differs from its neighbours in reading the shipped
+bytes out of `templates.ts` instead of a hand-copy, so it follows the product rather than a
+snapshot of it. Red before the fix: binds, dies, three 502s, `scan failed: true`, `pre-bundled
+deps: 0`.
+
+**The fix reintroduced the bug it fixes, one level up, and review caught it.** The command was
+lifted out of `templates.ts` into a `VITE_DEV` constant in the harness with a comment warning that
+it must be kept in step — while react alone passed the manifest's own string. Two places for one
+fact, which is what this whole entry is about, with the divergence pre-arranged: change the shipped
+command and react gates the new one, its six neighbours gate the old one, seven green. Now each
+spike names the template it stands for (`templateId: "vue-ts"`) and the harness reads the command
+off that manifest, throwing if the id no longer resolves. **The fallback is the part to notice** —
+there isn't one, deliberately, because a default is exactly how the copy would come back the first
+time a template is renamed, and it would come back silently and green.
+
+**One artifact aimed at this risk existed, and could not start.** `probe-nest-watch.mjs` gates
+NestJS's save→recompile→restart, which is the one place a real dependency reads the guard this
+change alters: `@nestjs/cli` spawns with `stdio: 'inherit'` and writes `childProcessRef.stdin &&
+childProcessRef.stdin.pause()`. Asked to run it, it exited on `npm: not found` — it wanted an `npm`
+built-in that had been removed at some earlier point, and nothing noticed because it was wired into
+nothing: not the registry, not CI, not `package.json`. It had been cited in review as the guard for
+this behaviour. Repaired (it loads the vendored npm like every other in-VM spike), it passes in 20
+seconds, boot → `Hello World!` → edit → restart → `Reloaded!`. It is now `spike-nest-watch.mjs` in
+the net tier and a CI step of its own, and the rename is the honest part: in this repo `probe-*` is
+a discovery tool nobody runs and `spike-*` is something that fails the build, and it had been filed
+under the first while being described as the second. Nest is not a caller that needed our old
+behaviour — its guard means it gets null on real node and now gets null here, so this is a caller
+the change makes *correct*, which is why the spike is green rather than newly green.
+
+**A skip is not a pass, and the summary said it was.** Found in the same hour and the same mistake
+about what green means: `run-spikes.mjs --offline` drops `needsWasm` spikes when `pkg-node` is
+absent, and because the skip removes them from the selection it removes them from the denominator
+too — `19/19 passed`, exit 0, for a run that had not executed 26 of the tier's 45 gates. A sign-off
+was given on that number. With the Wasm built, all 45 pass, so nothing was hiding; the reporting
+was the defect, and the summary now names what it skipped and counts it against the tier.
+
+Reporting still left the number in a human's hands, so the second half is an exit code: **a spike
+named on the command line that does not run is a failure, not a skip.** The invariant is read off
+the invocation rather than configured, which is the whole point — `--offline` on a laptop without
+the crates may legitimately drop the Wasm gates, while every naming caller (all four of CI's) is
+one that listed these gates *because this job is where they run*. The alternative on the table was
+a `--no-skips` flag for CI, and it is worse for a specific reason: a flag protects the jobs someone
+remembered to put it on, and the job that will matter is the one added next year by someone who has
+not read this paragraph. This is the same preference as the fix above it — make the rule fall out
+of what the caller already said, rather than asking them to say it twice.
+
+**Left wrong on purpose: `fork(mod, { silent: true }).stdin`.** Review found `runtime/index.js`
+sets `child.stdin = null` for every fork, and node (measured, not read off the docs) gives a
+writable when the child is silent or fd 0 is explicitly piped, null only when it inherits. Not a
+regression — it was null before this change — and it stays null, because the one-line version is
+worse than the bug. A forked child rides `worker_threads`, so its `child.pid` is a THREAD id, while
+the `child-stdin` channel is addressed by kernel pid; handing back a writable would accept bytes
+that go nowhere, or reach an unrelated process if a threadId collided with a live pid. Null is
+wrong in the direction that costs a caller an unused branch, an object is wrong in the direction
+that loses or misroutes data. Making it right means giving forked children an addressable fd 0,
+which is a change to the fork model and needs its own evidence. Recorded at the site.
+
+**Not gated, deliberately: the null-chunk EOF.** `_drain` registers `s.once("end", done)` when the
+child exits, and `'close'` waits for both streams — so a stream that had ALREADY ended would leave
+`'close'` unfired forever, and npm's promise-spawn resolves on `'close'`. It cannot happen: the
+only sender is `onOutput`, whose chunk comes from a guest write that `decodeChunk` has already
+stringified, so `write(null)` reaches the kernel as the four characters `"null"`. A gate would have
+to hand `_drain` a message the kernel cannot produce, proving that our stub matches our belief —
+the same shape as a harness running a command the product does not run, which is the other half of
+this round. What is worth writing down instead: the safety is **accidental**, resting on a
+`String()` in a catch block three files away, and if the wire grows a per-stream EOF, `'close'` stops
+firing with no error anywhere. The hardening is one line (`s.readableEnded ? done() : s.once("end",
+done)`) and belongs with whatever change makes it reachable.
 
 ## `pip install` that survives the process that ran it (this change)
 
