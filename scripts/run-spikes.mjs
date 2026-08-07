@@ -268,6 +268,10 @@ const SPIKES = [
   { name: "session-studio", file: "spike-session-studio.mjs", net: true, needsWasm: true, timeout: 300000 },
   { name: "h3", file: "spike-h3.mjs", net: true },
   { name: "fastify", file: "spike-fastify.mjs", net: true },
+  // The flagship template, and the last of them to get a gate. It differs from its
+  // neighbours in reading the SHIPPED template rather than a copy of it, including
+  // the dev command — see the spike's header.
+  { name: "react", file: "spike-react.mjs", net: true, needsWasm: true, timeout: 600000 },
   { name: "preact", file: "spike-preact.mjs", net: true },
   { name: "lit", file: "spike-lit.mjs", net: true },
   { name: "solid", file: "spike-solid.mjs", net: true },
@@ -279,6 +283,10 @@ const SPIKES = [
   { name: "svelte", file: "spike-svelte.mjs", net: true },
   { name: "qwik", file: "spike-qwik.mjs", net: true },
   { name: "vue", file: "spike-vue.mjs", net: true },
+  // The Nest template's save -> recompile -> restart. Was probe-nest-watch.mjs, wired
+  // into nothing and unable to start for want of an `npm` built-in that had been
+  // removed; see the spike's header for why an unrunnable artifact was worse than none.
+  { name: "nest-watch", file: "spike-nest-watch.mjs", net: true, needsWasm: true, timeout: 600000 },
   // VV_NO_HOST_ALS=1: its RSC-refresh gate exists for the AsyncLocalStorage
   // POLYFILL (the studio's browser-worker path), which the host's real ALS hides.
   { name: "next", file: "spike-next.mjs", net: true, env: { VV_NO_HOST_ALS: "1" }, timeout: 600000 },
@@ -431,9 +439,15 @@ let selected = SPIKES.filter((s) => (tier === "all" ? true : tier === "net" ? s.
 if (filters.length) selected = selected.filter((s) => filters.some((f) => s.name.includes(f)));
 // Drop spikes whose file doesn't exist yet, with a note (keeps the runner robust
 // as the spike set evolves).
+// Everything dropped below is recorded rather than only announced, so the summary can
+// say what it did not run — see the note beside that line.
+const skipped = [];
 selected = selected.filter((s) => {
   const exists = fs.existsSync(path.join(ROOT, "scripts", s.file));
-  if (!exists) console.log(`  (skip ${s.name}: scripts/${s.file} not found)`);
+  if (!exists) {
+    console.log(`  (skip ${s.name}: scripts/${s.file} not found)`);
+    skipped.push({ name: s.name, why: `scripts/${s.file} not found` });
+  }
   return exists;
 });
 // Drop spikes that need the Node Wasm VFS when it hasn't been built. Keeps the
@@ -443,6 +457,7 @@ const WASM_VFS = path.join(ROOT, "packages/vfs/pkg-node/vivari_vfs.js");
 selected = selected.filter((s) => {
   if (s.needsWasm && !fs.existsSync(WASM_VFS)) {
     console.log(`  (skip ${s.name}: Wasm VFS not built — run 'npm run build:vfs:node')`);
+    skipped.push({ name: s.name, why: "Wasm VFS not built (npm run build:vfs:node)" });
     return false;
   }
   return true;
@@ -547,8 +562,30 @@ for (const s of selected) {
   results.push(await runSpike(s));
 }
 
+// A SPIKE YOU ASKED FOR BY NAME AND DID NOT GET IS A FAILURE, not a skip. The
+// distinction is in how the runner was invoked and so cannot be forgotten: a bare tier
+// (`--offline`) legitimately drops the Wasm gates on a machine without the crates,
+// while every naming invocation — all of CI's — is a caller who listed these gates
+// because this job is where they run. `--no-skips` was the other candidate and this is
+// better for one reason: a flag protects the jobs someone remembered to put it on, and
+// the next job added is the one that matters.
+const missing = filters.length ? skipped : [];
+
 const failed = results.filter((r) => !r.pass);
 console.log("\n──────────────── summary ────────────────");
 for (const r of results) console.log(`  ${r.pass ? "PASS" : "FAIL"}  ${r.name}`);
-console.log(`  ${results.length - failed.length}/${results.length} passed`);
-process.exit(failed.length ? 1 : 0);
+// The skipped ones are named HERE, not only where they were dropped. A skip takes a
+// spike out of the selection, so it leaves the denominator too, and this line used to
+// read `19/19 passed` for a run that had quietly not run 26 of the tier's 45 gates —
+// with the reason scrolled far above, and exit 0 under it. A sign-off was given on
+// that number. A count that moves with what was skipped is not a count of the tier.
+for (const s of skipped) console.log(`  ${missing.length ? "MISS" : "SKIP"}  ${s.name}  (${s.why})`);
+console.log(
+  `  ${results.length - failed.length}/${results.length} passed` +
+    (skipped.length ? `, ${skipped.length} SKIPPED of ${results.length + skipped.length} in this tier` : ""),
+);
+if (missing.length) {
+  console.log(`\n  ${missing.length} spike(s) named on the command line did not run. That is a failure:`);
+  console.log("  you asked for them here, so this is the job that was supposed to have what they need.");
+}
+process.exit(failed.length || missing.length ? 1 : 0);
