@@ -46,8 +46,17 @@ const makeMacrotask = () => {
   return (fn) => hostSetTimeout(fn, 0);
 };
 
-export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch, doStdin, doSignal } = {}) {
+export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch, doStdin, doSignal, onPark } = {}) {
   isAlive = isAlive || (() => false);
+  // Called with `true` immediately before the loop sleeps with nothing runnable,
+  // and `false` the moment it wakes. This is the only place in the system that can
+  // tell "waiting" from "wedged": a process wedged inside a callback never returns
+  // to the top of drive(), so it never gets here, while a process that is merely
+  // waiting arrives here every time. The loop reports the FACT of parking and takes
+  // no view on what it means — whether it is worth announcing depends on which
+  // handles are holding the process open, which is the runtime's knowledge, not
+  // this file's. See `parkedAwaitingWork` in runtime/index.js.
+  onPark = onPark || (() => {});
   doNet = doNet || (() => {});
   // #15: drain async child-process events (stdout/stderr/exit delivered as
   // postMessages) inside a controlled loop turn, like doNet drains HTTP.
@@ -500,7 +509,14 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
         if (exiting || !hasRefWork()) break;
         continue;
       }
+      // Ordering is the whole correctness argument here. The retraction is posted
+      // BEFORE the turn that handles whatever woke us, so a process that wedges
+      // inside that work is already un-excused when it wedges. Announcing after the
+      // work would leave a stale "I am parked" standing over a hang, which is the
+      // one failure this mechanism must not have.
+      onPark(true);
       await waitForNext();
+      onPark(false);
     }
   };
 

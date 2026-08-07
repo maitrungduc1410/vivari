@@ -17,7 +17,7 @@
 // where the real in-VM file watcher drives HMR (Vite) or a recompile+restart
 // (Nest --watch) exactly like local development.
 
-import { newProgress, onFetch, onOutput, idleClear, stallVerdict, servingPids, shouldReportStall, stallReportChunk } from "../../terminal-feedback.js";
+import { newProgress, onFetch, onOutput, idleClear, stallVerdict, shouldReportStallFor, stallReportChunk } from "../../terminal-feedback.js";
 import { Kernel } from "../../../kernel-host/kernel.js";
 import { createKernelFs } from "../../../kernel-host/kernel-fs.js";
 import { initTransferList } from "../../../kernel-host/worker-transfer.js";
@@ -1498,32 +1498,21 @@ async function boot() {
   // count is the signal that actually tracks reify progress, and only this side can
   // ask for it. Remembered per process so each report is a comparison, not a snapshot.
   const stallVfsSeen = new Map<number, number>();
+
   kernel.onProcStall = async (pid, info) => {
-    // A process that has bound a port got where it was going. It prints nothing
-    // between requests and makes no syscalls while idle, so every signal this
-    // watchdog reads says "silent" — and every report it produces is noise about
-    // a server doing exactly what a server does. Its shell is blocked waiting on
-    // it and is just as quiet, hence the ancestors too.
-    const parentOf = new Map<number, number>();
-    for (const [cpid, proc] of kernel.procs) parentOf.set(cpid, proc.parentPid ?? 0);
-    const serving = servingPids(kernel.listeners, parentOf).has(pid);
-    // …unless requests are waiting on it, which is the one case where a silent
-    // server is worth interrupting somebody about.
-    let pendingRequests = 0;
-    for (const [, pend] of kernel.pendingHttp) if (pend.pid === pid) pendingRequests++;
-    // A shell that is waiting on a child is silent because it is waiting. Its child
-    // is watched too, so the report that matters still arrives — under the name of
-    // the program that is actually quiet.
-    let hasLiveChild = false;
-    for (const [, parent] of parentOf) if (parent === pid) hasLiveChild = true;
-    // …and a shell sitting at its prompt is silent for the same reason, one step
-    // further out again: it is waiting for a person. That one is not visible from
-    // here, so the process announces it (kernel.handleAwaitingInput).
-    const awaitingInput = !!kernel.procs.get(pid)?.awaitingInput;
-    if (!shouldReportStall({ serving, pendingRequests, hasLiveChild, awaitingInput })) return;
+    // Every reason to stay quiet about a silent process — it is serving, its children
+    // are watched instead, it announced that it is waiting, nobody is watching it any
+    // more — together with the kernel state each is read from. All of that lives in
+    // terminal-feedback.js rather than here so that the spikes gate THIS decision
+    // instead of a copy of it that can drift out from under them.
+    if (!shouldReportStallFor(kernel, pid)) return;
 
     const secs = Math.round(info.silentMs / 1000);
-    const what = [info.command, ...(info.args || [])].join(" ").slice(0, 80);
+    // A worker thread is not something the user ran, so naming it like a command
+    // they typed sends them hunting for it. Say whose it is instead.
+    const what =
+      [info.command, ...(info.args || [])].join(" ").slice(0, 80) +
+      (info.isThread ? `, a worker thread of PID ${info.parentPid}` : "");
     const vfs = await queryVfsMem(1500);
     const files = vfs && vfs.files >= 0 ? vfs.files : null;
     const before = stallVfsSeen.get(pid);
@@ -1534,6 +1523,12 @@ async function boot() {
     // server between requests, not a slow install.
     const ports: number[] = [];
     for (const [port, owner] of kernel.listeners) if (owner === pid) ports.push(port);
+    // Read again here rather than threaded out of the decision above: this one is not
+    // a reason to report, it is something the REPORT says ("N requests waiting and no
+    // syscall for Ns — it looks stuck inside a handler"), and it is only reached on
+    // the path where a report is being written.
+    let pendingRequests = 0;
+    for (const [, pend] of kernel.pendingHttp) if (pend.pid === pid) pendingRequests++;
     const verdict = stallVerdict({ grew, files, idleMs: info.idleMs, ports, pendingRequests });
     const line =
       `  [runtime] PID ${pid} (${what}) has printed nothing for ${secs}s. ${verdict}` +

@@ -26,6 +26,7 @@ import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
 import { stubNodeGyp } from "../packages/kernel-host/node-gyp-stub.js";
 import { applyRealNpmShims } from "../packages/kernel-host/load-real-npm.js";
 import { loadShippedTemplates } from "./lib/shipped-templates.mjs";
+import { shouldReportStallFor } from "../packages/core/terminal-feedback.js";
 import { initTransferList } from "../packages/kernel-host/worker-transfer.js";
 import { createAliasedFetcher } from "./lib/aliased-fetcher.mjs";
 import { Worker, MessageChannel } from "node:worker_threads";
@@ -138,6 +139,33 @@ export async function runViteSpike({ name, dir, templateId, files, entryModule, 
     live.add(port);
   };
   kernel.onClose = (port) => live.delete(port);
+
+  // ── the stall watchdog, run against the real thing ─────────────────────────
+  //
+  // A user ran this exact template and watched the terminal fill with `[runtime] PID
+  // 7 () has printed nothing for 73s … it looks stuck rather than slow`, four times
+  // over, while the dev server it was accusing served their app and hot-reloaded it.
+  // Those pids were vite's rolldown worker threads, parked waiting for a job.
+  //
+  // The rendering belongs to kernel-worker.ts, which is browser-only and cannot run
+  // here, but the DECISION is `shouldReportStallFor` and that is shared — the same
+  // call the kernel worker makes, reading the same kernel. An earlier version of this
+  // harness re-derived the inputs itself, which made this gate an assertion about a
+  // copy: production could change and the copy would keep passing. The threshold is
+  // dropped to a few seconds because the point is to give the watchdog every chance
+  // to fire, not to wait out 60.
+  kernel.stallThresholdMs = Number(process.env.VV_STALL_MS || 6000);
+  kernel.stallCheckMs = 1000;
+  const stallReports = [];
+  kernel.onProcStall = (pid, info) => {
+    if (!shouldReportStallFor(kernel, pid)) return;
+    stallReports.push({
+      pid,
+      command: info.command,
+      isThread: !!info.isThread,
+      silentMs: info.silentMs,
+    });
+  };
   kernel.installCoreutils();
   let fetchN = 0;
   kernel.onFetch = (url, meta) => {
@@ -337,8 +365,110 @@ export async function runViteSpike({ name, dir, templateId, files, entryModule, 
   }
   if (!stillServing) console.log("\n---- dev output tail (last 3000 chars) ----\n" + devOut.slice(-3000));
 
+  // ── gate 8: a healthy dev server is not accused of hanging ─────────────────
+  //
+  // Everything above has just proved this server is healthy — bound, serving 200s,
+  // transforming the entry, still up, deps pre-bundled. So any stall report standing
+  // at this moment is false BY CONSTRUCTION, which is what makes this assertable at
+  // all rather than a judgement about noise.
+  //
+  // Deliberately narrower than "no reports": a genuinely busy-and-silent process is
+  // supposed to be reported, and this harness runs a real `npm install` first. The
+  // claim is about the processes the user was shown — the dev server's own tree, once
+  // it is up. Threads are checked by name too, because `PID 7 ()` was a separate
+  // defect from the false positive and a fix for one does not cover the other.
+  //
+  // WHAT THIS GATE DOES NOT COVER, so nobody reads it as covering everything: it
+  // cannot exercise `hasUnwatchedChild` at all. `vite` is excused by `serving` before
+  // that input is consulted, and each thread is excused before its parent is examined,
+  // so this reads 0 reports whether the revocation is right, wrong, or deleted. The
+  // revocation is gated synthetically in spike-diag-liveness, on a pool built to hold
+  // a watched and an unwatched child at the same time. This gate's job is the user's
+  // symptom, which is the threads themselves.
+  //
+  // WHICH RULE IS DOING THE WORK HERE, measured on this template by disabling one at
+  // a time, because the two are not interchangeable and the difference is not visible
+  // from a passing run:
+  //
+  //   unobservable off, awaiting on  -> reported: the threads that never announced
+  //   awaiting off, unobservable on  -> reported: none
+  //
+  // EVERY one of vite's threads has never printed, so `unobservable` covers all of
+  // them and is on its own sufficient here; `awaiting` covers those that also announce
+  // `work`, which is not all of them. So `unobservable` is the one this template cannot
+  // do without, and `awaiting` is not redundant for a reason this gate structurally
+  // cannot show: it is what covers a pool worker that PRINTS at boot and then parks,
+  // which no thread here does. spike-diag-liveness runs one.
+  //
+  // Stated without counting on purpose. The pool has come up with a different number
+  // of threads between runs on the same machine and template, so a count written here
+  // is a sentence that goes stale without anything being wrong — and the argument does
+  // not need one.
+  //
+  // Give the watchdog its chance, and prove it had one. Reports back off by doubling
+  // (T, 2T, 4T …), so idling past 2T means two opportunities have gone by; asserting
+  // the observed silence afterwards is what stops this gate passing vacuously because
+  // nothing was ever quiet for long enough to check.
+  const stallWindow = kernel.stallThresholdMs * 2 + 2000;
+  await new Promise((r) => setTimeout(r, stallWindow));
+
+  const devTreePids = new Set();
+  {
+    const kids = new Map();
+    for (const [cpid, p] of kernel.procs) kids.set(cpid, p.parentPid ?? 0);
+    for (const [cpid] of kernel.procs) {
+      let cur = cpid;
+      const seen = new Set();
+      while (cur && !seen.has(cur)) {
+        seen.add(cur);
+        if (cur === shPid) {
+          devTreePids.add(cpid);
+          break;
+        }
+        cur = kids.get(cur);
+      }
+    }
+  }
+  // Measured over the whole dev tree rather than its threads, because not every
+  // template has threads: Svelte's dev server runs without a rolldown pool, and a
+  // check keyed on threads reported "silent 0s" there and failed a healthy run. The
+  // server process itself is quiet between requests in every template, which is the
+  // same silence the watchdog reads and enough to prove it was given something to look
+  // at.
+  const quietest = [...kernel.procs.values()]
+    .filter((p) => !p.finalized && devTreePids.has(p.pid))
+    .reduce((m, p) => Math.max(m, Date.now() - (p.lastOutput || p.startedAt || Date.now())), 0);
+  const watchdogHadItsChance = quietest > kernel.stallThresholdMs;
+  console.log(
+    `  quietest process in the dev tree has been silent ${Math.round(quietest / 1000)}s ` +
+      `(threshold ${Math.round(kernel.stallThresholdMs / 1000)}s)`,
+  );
+
+  const falseStalls = stallReports.filter((r) => devTreePids.has(r.pid));
+  const threads = [...kernel.procs.values()].filter((p) => p.isThread && !p.finalized);
+  const unnamedThreads = threads.filter((p) => !p.command || !String(p.command).trim());
+  console.log(`  worker threads in the dev tree: ${threads.length} (${threads.map((p) => p.command || "??").join(", ")})`);
+  console.log(`  stall reports against the healthy dev tree: ${falseStalls.length}`);
+  for (const r of falseStalls) {
+    console.log(`    PID ${r.pid} (${r.command || ""})${r.isThread ? " [worker thread]" : ""} silent ${Math.round(r.silentMs / 1000)}s`);
+  }
+  if (unnamedThreads.length) console.log(`  UNNAMED worker threads: ${unnamedThreads.length}`);
+  const noFalseStalls = falseStalls.length === 0;
+  const threadsNamed = unnamedThreads.length === 0;
+
   const ok =
-    inst.code === 0 && viteBin && bound && rootOk && clientOk && entryOk && stillServing && !scanFailed && preBundled;
+    inst.code === 0 &&
+    viteBin &&
+    bound &&
+    rootOk &&
+    clientOk &&
+    entryOk &&
+    stillServing &&
+    !scanFailed &&
+    preBundled &&
+    noFalseStalls &&
+    threadsNamed &&
+    watchdogHadItsChance;
   console.log(
     `\nRESULT: ${ok ? `PASS — ${name} + Vite boots via \`${devCommand}\`, serves / (200), transforms ${entryModule}, and is still up` : `FAIL — see logs above`}`,
   );

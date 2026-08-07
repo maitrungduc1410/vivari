@@ -31,7 +31,8 @@
 
 import { Kernel } from "../packages/kernel-host/kernel.js";
 import { createKernelFs } from "../packages/kernel-host/kernel-fs.js";
-import { shouldReportStall } from "../packages/core/terminal-feedback.js";
+import { shouldReportStall, shouldReportStallFor, isUnobservable } from "../packages/core/terminal-feedback.js";
+import { initTransferList } from "../packages/kernel-host/worker-transfer.js";
 import { Worker, MessageChannel } from "node:worker_threads";
 
 let failed = 0;
@@ -67,7 +68,13 @@ const spawnWorker = (info) => {
   w.on("error", (e) => process.stderr.write(`[worker ${info.pid}] ${(e && e.stack) || e}\n`));
   const { port1, port2 } = new MessageChannel();
   fsWorker.postMessage({ type: "fs-register", client: info.pid, sab: info.sab, port: port2 }, [port2]);
-  w.postMessage({ type: "init", sab: info.sab, spec: info.spec, fsPort: port1 }, [port1]);
+  // A spawned worker_thread is handed its creator's MessageChannel end as its
+  // parentPort. This harness used to drop it, which was invisible while nothing here
+  // spawned threads and is not any more: without it `parentPort` is null in the child,
+  // and the pool worker below dies on its first line instead of parking.
+  const init = { type: "init", sab: info.sab, spec: info.spec, fsPort: port1 };
+  if (info.threadPort) init.threadPort = info.threadPort;
+  w.postMessage(init, initTransferList(info, port1));
   const handle = {
     terminate: () => {
       w.terminate();
@@ -113,7 +120,11 @@ const runHeld = async (name, source) => {
   const stillUp = kernel.procs.has(pid) && !kernel.procs.get(pid).finalized;
   console.log(`  ${name}: ${JSON.stringify(alive)}`);
   try {
-    kernel.kill(pid, "SIGKILL");
+    // `kernel.kill` does not exist and never did; the catch swallowed the TypeError,
+    // so every process this spike started stayed in the table for the rest of the run.
+    // Harmless for the checks above, which read one pid at a time — not harmless for
+    // the worker-thread section below, which counts a parent's live children.
+    kernel.signal(pid, "SIGKILL");
   } catch {
     /* already gone */
   }
@@ -245,7 +256,7 @@ console.log("\n== a process that is genuinely working reports nothing exotic =="
 // the kernel recording it, and the watchdog excusing only processes that said so.
 //
 // That decision is unit-tested in probe-terminal-feedback.mjs, but the DELIVERY —
-// guest postRaw, to handleAwaitingInput, to the flag the watchdog reads — needs a
+// guest postRaw, to handleAwaiting, to the flag the watchdog reads — needs a
 // booted kernel with a real shell in it, and this spike has one. It is worth
 // gating separately because the whole argument for announcing over inferring is
 // that the announcement is load-bearing: if it never arrives, the rule silently
@@ -258,17 +269,18 @@ console.log("\n== a shell waiting for a person says so, and the watchdog can rea
     const t0 = Date.now();
     const tick = () => {
       const p = kernel.procs.get(shPid);
-      if (p && p.awaitingInput) return resolve(true);
+      if (p && p.awaiting) return resolve(true);
       if (Date.now() - t0 > 15000) return resolve(false);
       setTimeout(tick, 50);
     };
     tick();
   });
   ok(waited, "an interactive shell announces that it is waiting for input");
+  ok(kernel.procs.get(shPid)?.awaiting === "input", "…and the announcement says WHICH kind of waiting it is");
   ok(/\$/.test(term.slice(promptAt)), "…and it announced it by drawing a prompt, which is the fact being claimed");
   // End to end: the flag the guest set, read the way the watchdog reads it.
   ok(
-    !shouldReportStall({ serving: false, pendingRequests: 0, hasLiveChild: false, awaitingInput: !!kernel.procs.get(shPid)?.awaitingInput }),
+    !shouldReportStall({ serving: false, pendingRequests: 0, hasLiveChild: false, awaiting: kernel.procs.get(shPid)?.awaiting ?? null }),
     "…so the stall watchdog does not report it, however long it sits there",
   );
 
@@ -278,9 +290,9 @@ console.log("\n== a shell waiting for a person says so, and the watchdog can rea
   const mutePid = kernel.launch("node", ["mute.js"], { cwd: APP, env: ENV });
   await new Promise((r) => setTimeout(r, 2000));
   const muteProc = kernel.procs.get(mutePid);
-  ok(!!muteProc && !muteProc.awaitingInput, "a process that is merely silent announces nothing");
+  ok(!!muteProc && !muteProc.awaiting, "a process that is merely silent announces nothing");
   ok(
-    shouldReportStall({ serving: false, pendingRequests: 0, hasLiveChild: false, awaitingInput: !!muteProc?.awaitingInput }),
+    shouldReportStall({ serving: false, pendingRequests: 0, hasLiveChild: false, awaiting: muteProc?.awaiting ?? null }),
     "…and is still reported, which is what makes the announcement worth having",
   );
 
@@ -291,7 +303,7 @@ console.log("\n== a shell waiting for a person says so, and the watchdog can rea
     const t0 = Date.now();
     const tick = () => {
       const p = kernel.procs.get(shPid);
-      if (p && !p.awaitingInput) return resolve(true);
+      if (p && !p.awaiting) return resolve(true);
       if (Date.now() - t0 > 15000) return resolve(false);
       setTimeout(tick, 50);
     };
@@ -300,8 +312,191 @@ console.log("\n== a shell waiting for a person says so, and the watchdog can rea
   ok(retracted, "…and the shell retracts it the moment it starts running something");
 
   try {
-    kernel.kill(shPid, "SIGKILL");
-    kernel.kill(mutePid, "SIGKILL");
+    kernel.signal(shPid, "SIGKILL");
+    kernel.signal(mutePid, "SIGKILL");
+  } catch {
+    /* already gone */
+  }
+}
+
+// The third kind of waiting, and the one that arrived from a user watching a healthy
+// dev server. The React template's `vite` spawns rolldown worker threads
+// (@rolldown/binding-wasm32-wasi/wasi-worker.mjs) which park waiting for a job; all
+// of them were reported as `PID 7 () has printed nothing for 73s … it looks stuck
+// rather than slow`, over and over, while the server served.
+//
+// This section stands in for that with worker threads of its own rather than a real
+// Vite. What is real here is everything the bug was actually about: kernel-spawned
+// threads, the runtime's loop parking, the announcement crossing the wire, and the
+// decision function the watchdog calls. What is NOT here is rolldown — the shipped
+// template is gated end to end by spike-react, which is where the real pool runs.
+console.log("\n== a worker thread waiting for a job, and one that cannot say anything ==");
+{
+  // (1) A pool worker that PRINTS at boot and then parks on its parentPort. Printing
+  // is the point: it puts this thread outside the "never printed" rule below, so what
+  // is being gated here is the announcement alone.
+  kernel.writeFile(
+    APP + "/pool-worker.js",
+    "const { parentPort } = require('node:worker_threads');\n" +
+      "process.stdout.write('pool worker ready\\n');\n" +
+      "parentPort.on('message', (m) => parentPort.postMessage(m));\n",
+  );
+  // (2) A worker that never prints and never returns to the event loop, which is what
+  // a wasm pthread body does. Atomics.wait on a SAB nobody notifies is the same shape
+  // measured on the real thing: no output, no syscalls, no messages answered, 0% CPU.
+  kernel.writeFile(
+    APP + "/gone-worker.js",
+    "require('node:worker_threads');\n" +
+      "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);\n",
+  );
+  kernel.writeFile(
+    APP + "/pool.js",
+    "const { Worker } = require('node:worker_threads');\n" +
+      "process.stdout.write('pool up\\n');\n" +
+      "new Worker('" + APP + "/pool-worker.js');\n" +
+      "new Worker('" + APP + "/gone-worker.js');\n" +
+      "setInterval(() => {}, 60000);\n",
+  );
+  const poolPid = kernel.launch("node", ["pool.js"], { cwd: APP, env: ENV });
+
+  const threadsOf = (ppid) => [...kernel.procs.values()].filter((p) => p.parentPid === ppid && !p.finalized);
+  const settled = await new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      const kids = threadsOf(poolPid);
+      if (kids.length >= 2 && kids.some((k) => k.awaiting === "work")) return resolve(kids);
+      if (Date.now() - t0 > 20000) return resolve(kids);
+      setTimeout(tick, 100);
+    };
+    tick();
+  });
+
+  // Defect 1: the kernel never had a name for a thread, because handleThreadSpawn is
+  // the one creator that spawns by path and never passed a `command`. Every report
+  // said `PID 7 ()`, and so did __vv.diag() — a row the reader cannot identify, in the
+  // answer to "what is wrong with my machine".
+  ok(settled.length >= 2, `the pool's worker threads are in the process table (${settled.length})`);
+  ok(
+    settled.every((k) => typeof k.command === "string" && k.command.length > 0),
+    "…and every one of them has a name",
+  );
+  ok(
+    settled.some((k) => k.command === "pool-worker.js") && settled.some((k) => k.command === "gone-worker.js"),
+    "…the name of the program it is actually running",
+  );
+  const named = kernel.diagnostics().procs.filter((p) => settled.some((k) => k.pid === p.pid));
+  ok(
+    named.length >= 2 && named.every((p) => p.command.trim().length > 0),
+    "…and __vv.diag() names them too, which is where the report sends the user",
+  );
+
+  // Identified by SPAWN ORDER, not by name and not by the flags under test. The names
+  // are what the checks above gate, so using them here would make one broken fix turn
+  // every check below it red as well — and a gate that goes red for a reason other
+  // than the one it names is worse than no gate. pool.js spawns the parking worker
+  // first, so it holds the lower pid.
+  const [parked, gone] = [...settled].sort((a, b) => a.pid - b.pid);
+
+  // Read through the SHIPPED decision, not a local copy of it. An earlier version of
+  // this gate re-implemented the rule, which meant it kept passing while asserting a
+  // rule production no longer had — the way a change to the real one would have gone
+  // unnoticed. `report` is exactly what the kernel worker calls.
+  const report = (pid) => shouldReportStallFor(kernel, pid);
+
+  // Defect 2a, the announced half: a thread parked on its parentPort says so, through
+  // the same one message the shell's prompt uses, carrying which kind of waiting it is.
+  ok(parked?.awaiting === "work", `a worker parked on its port announces it (${JSON.stringify(parked?.awaiting)})`);
+  ok(!!parked?.everOutput, "…and this one HAS printed, so only the announcement can be excusing it");
+  ok(!report(parked.pid), "…so the watchdog does not report it");
+
+  // Defect 2b, the unannounceable half: a thread inside a synchronous native call runs
+  // no JS at all, so nothing in it can announce anything. It is excused by never having
+  // used the channel the watchdog measures — see shouldReportStall for why that is a
+  // measurement rather than a category, and for what it admits to giving up.
+  ok(gone && !gone.everOutput && !gone.awaiting, "a thread inside a native call announces nothing, because nothing in it runs");
+  ok(isUnobservable(gone), "…and is marked as a thread nobody can watch");
+  ok(!report(gone.pid), "…so it is not reported either, which is the four lines the user was actually seeing");
+
+  // THE MIXED POOL, which is the state this whole compensation exists for and the one
+  // the first version of it got wrong. Right now the pool holds both kinds at once —
+  // one wedged thread nobody can watch, one healthy sibling parked for work — which is
+  // the rolldown pool's actual shape. Every thread in it is excused, so if the parent
+  // is excused too the wedge is reported NOWHERE, and it was reported before this
+  // change. Asserted while both children are alive: killing the sibling first, which
+  // is what this gate used to do, tests only the easy all-unobservable case.
+  const kids = threadsOf(poolPid);
+  ok(
+    kids.some((k) => isUnobservable(k)) && kids.some((k) => !isUnobservable(k)),
+    `the pool holds a watched and an unwatched child at once (${kids.length} live)`,
+  );
+  ok(report(poolPid), "…and its parent IS reported, so the wedge has somewhere to surface");
+
+  // The control for that, and the reason it is a revocation rather than a mute: with
+  // the unwatched child gone, the parent goes back to being excused by the sibling
+  // that is still watched. Without this, "always report parents of threads" would pass
+  // the check above and hand back the false positives this task started from.
+  kernel.signal(gone.pid, "SIGKILL");
+  const wedgedGone = await new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      const live = threadsOf(poolPid);
+      if (live.length === 1 && !isUnobservable(live[0])) return resolve(true);
+      if (Date.now() - t0 > 15000) return resolve(false);
+      setTimeout(tick, 100);
+    };
+    tick();
+  });
+  ok(wedgedGone, "once the unwatched child exits, only the watched sibling is left");
+  ok(!report(poolPid), "…and the parent is excused again, by the child that is still watched");
+
+  // The other control, and the reason none of this is just "stop reporting threads": a
+  // thread that HAS used the output channel and then goes quiet with nothing to excuse
+  // it is still reported.
+  kernel.procs.get(parked.pid).awaiting = null;
+  ok(report(parked.pid), "a thread that printed and then went silent without announcing is STILL reported");
+
+  try {
+    kernel.signal(poolPid, "SIGKILL");
+  } catch {
+    /* already gone */
+  }
+}
+
+// A fork child rides the same spawn path as a worker thread and is flagged the same
+// way on the wire, so the rule that stops watching threads will silence forks too
+// unless the kernel resolves the difference before storing it. A fork that wedges
+// before its first write is precisely a thing worth reporting: user code launched it
+// by module path, so its name means something to the person reading, and there is no
+// native call it could be trapped in that would make watching it pointless.
+console.log("\n== a forked child is not a worker thread ==");
+{
+  kernel.writeFile(APP + "/fork-child.js", "setInterval(() => {}, 60000);\n");
+  kernel.writeFile(
+    APP + "/forker.js",
+    "const { fork } = require('node:child_process');\n" +
+      "process.stdout.write('forker up\\n');\n" +
+      "fork('" + APP + "/fork-child.js');\n" +
+      "setInterval(() => {}, 60000);\n",
+  );
+  const forkerPid = kernel.launch("node", ["forker.js"], { cwd: APP, env: ENV });
+  const child = await new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      const kid = [...kernel.procs.values()].find((p) => p.parentPid === forkerPid && !p.finalized);
+      if (kid) return resolve(kid);
+      if (Date.now() - t0 > 20000) return resolve(null);
+      setTimeout(tick, 100);
+    };
+    tick();
+  });
+  ok(!!child, "a forked child is in the process table");
+  ok(!!child && !child.everOutput, "…and this one has never printed, which is the whole of the unobservable rule");
+  ok(!!child && !child.isThread, "…but it is not marked a worker thread, because it is not one");
+  ok(!!child && !isUnobservable(child), "…so it is still watched");
+  ok(!!child && shouldReportStallFor(kernel, child.pid), "…and a fork that goes quiet before its first write is still reported");
+
+  try {
+    kernel.signal(forkerPid, "SIGKILL");
   } catch {
     /* already gone */
   }

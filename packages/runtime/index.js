@@ -246,7 +246,58 @@ export function createRuntime({
     doWatch: () => drainWatchEvents(),
     doStdin: () => drainStdin(),
     doSignal: () => drainSignals(),
+    onPark: (parked) => announceParked(parked),
   });
+
+  // "I am parked waiting to be handed work." The stall watchdog reads silence and
+  // cannot tell a worker waiting for a job from one wedged inside it; this is the
+  // same answer the shell gives for a prompt (process.__awaitingInput), for the same
+  // reason, over the same wire — a parked worker is not a second kind of problem, it
+  // is a second kind of waiting.
+  //
+  // WHY IT IS SAFE TO EXCUSE, stated as the condition rather than the conclusion.
+  // Two facts have to hold together, and neither is a guess:
+  //
+  //   1. The loop is parked. Established by the loop itself, not inferred from
+  //      silence — a process wedged inside a callback never reaches that point.
+  //   2. Every liveness counter except `threadLiveness` is zero, so no operation of
+  //      its own is outstanding: no fetch in flight, no child process running, no
+  //      socket, no watcher, no stdin. On a worker thread the remaining counter is
+  //      normally its parentPort listener — an inbound channel it does not control.
+  //      It cannot make progress; it can only be given some.
+  //
+  // The second condition is what keeps a real hang reportable. A process waiting on
+  // something IT started — a fetch that never resolves, a child that never exits —
+  // holds a different counter, stays unexcused, and is still reported. That is the
+  // distinction the watchdog exists to draw, and it is drawn from handles rather
+  // than from how long anything has been quiet.
+  //
+  // The exception, stated because the counter cannot tell them apart: `threadLiveness`
+  // is incremented BOTH by the child-side parentPort listener and by each running
+  // Worker on the parent side (node/lib/worker_threads.js), so a worker that spawns a
+  // nested worker and parks waiting on it announces `work` too — waiting on something
+  // it started, which the paragraph above says is excluded. The watchdog covers that
+  // from the other side rather than here: the nested worker is watched under its own
+  // name, and if it is one of the threads nobody can watch, `hasUnwatchedChild`
+  // revokes this announcement (core/terminal-feedback.js). Splitting the counter would
+  // state it more precisely at the cost of a second liveness channel through every
+  // Worker path; the revocation already closes the hole.
+  //
+  // `isMainThread` is load bearing, not tidiness. Because of that same double
+  // counting, a PARENT parked while its pool works — exactly the process worth
+  // reporting when a pool hangs — would otherwise excuse itself.
+  const parkedAwaitingWork = () =>
+    !!(thread && !thread.isMainThread && thread.parentPort) &&
+    threadLiveness.active > 0 &&
+    netLiveness.active === 0 &&
+    childLiveness.active === 0 &&
+    hostLiveness.active === 0 &&
+    watchLiveness.active === 0 &&
+    wsLiveness.active === 0 &&
+    sseLiveness.active === 0 &&
+    stdinLiveness.active === 0;
+
+  const announceParked = (parked) => announceAwaiting("work", parked && parkedAwaitingWork());
 
   const os = createOs();
   const process = createProcess({
@@ -309,23 +360,55 @@ export function createRuntime({
     unregister: (watchId) => watchHandlers.delete(watchId),
   };
 
-  // "I am waiting for a person to type." The stall watchdog reads silence and
-  // cannot tell an idle prompt from a wedge, so a program that knows it is parked
-  // at one says so and the watchdog stays quiet about it. Only programs that TAKE
-  // interactive input have any business calling this — see the shell's prompt in
-  // kernel-host/coreutils.js, which is the one caller today.
+  // "I am waiting, and this is what for." The stall watchdog reads silence and
+  // cannot tell a process parked on something external from one wedged inside its
+  // own work, so a process that knows which it is says so and the watchdog stays
+  // quiet about it.
   //
-  // It carries one bit and holds no state here on purpose: the announcement is the
+  // ONE MESSAGE, CARRYING THE REASON, because there is one fact here with two
+  // instances. This started as `awaiting-input` for a shell at a prompt, and the
+  // second instance — a pool worker parked on its parentPort — arrived within the
+  // month and would have fitted a second mechanism just as well. Two mechanisms
+  // would have meant two suppression rules, two flags on the proc, and two chances
+  // for the next kind of waiting to be added to neither. The class is waiting; the
+  // reason says which kind, and is carried so a report can name it rather than
+  // guess.
+  //
+  // It holds no state about whether a program IS waiting: the announcement is the
   // whole mechanism, so a program that stops announcing goes back to being watched
   // rather than staying excused by something this file remembered about it.
-  process.__awaitingInput = (waiting) => {
+  //
+  // What it does keep is which reasons are currently claimed, and that is not
+  // bookkeeping — it is what stops the two announcers erasing each other. They run
+  // unconditionally and independently: the shell calls `input` when it draws a prompt,
+  // and the loop calls `work` on EVERY park and unpark, whatever the process is. So a
+  // shell sitting at its prompt parks, the loop announces `work: false` (a main thread
+  // is never parked-awaiting-work), and with one shared boolean that would retract the
+  // prompt's standing claim and report the idle shell — the bug this whole mechanism
+  // was added to fix. Keyed by reason, a claim can only be cleared by whoever made it.
+  //
+  // Only transitions of the OVERALL state go on the wire, which is also what keeps the
+  // loop's per-park call free: for the common process that never awaits anything, both
+  // sides of every park are already-false and nothing is sent.
+  const awaitingClaims = new Set();
+  const announceAwaiting = (reason, waiting) => {
     if (!postRaw) return;
+    const before = awaitingClaims.size > 0;
+    if (waiting) awaitingClaims.add(reason);
+    else awaitingClaims.delete(reason);
+    const after = awaitingClaims.size > 0;
+    if (before === after) return;
     try {
-      postRaw({ type: "awaiting-input", waiting: !!waiting });
+      postRaw({ type: "awaiting", reason: after ? reason : null, waiting: after });
     } catch {
       /* kernel gone */
     }
   };
+
+  // The interactive-input instance, and the API the shell already calls. Only
+  // programs that TAKE interactive input have any business calling this — see the
+  // prompt in kernel-host/coreutils.js, which is still its one caller.
+  process.__awaitingInput = (waiting) => announceAwaiting("input", waiting);
 
   // Wire the worker_threads host onto `process` so the lazily-required
   // node:worker_threads builtin (2b) can read this thread's identity, spawn nested

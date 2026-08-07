@@ -22,6 +22,7 @@ import {
   stallVerdict,
   servingPids,
   shouldReportStall,
+  isUnobservable,
   stallReportChunk,
 } from "../packages/core/terminal-feedback.js";
 
@@ -131,19 +132,100 @@ console.log("\n── the stall verdict ──");
   // person instead of on a child. The fix above covered one kind of waiting, so the
   // class came back wearing the other.
   check("a shell parked at its prompt is not reported either",
-    !shouldReportStall({ serving: false, pendingRequests: 0, awaitingInput: true }));
+    !shouldReportStall({ serving: false, pendingRequests: 0, awaiting: "input" }));
   // The half that a "terminal and no live child means it must be at a prompt" rule
   // could not have given us: silence alone still buys nothing.
   check("…but a silent shell that has NOT said it is waiting still is",
-    shouldReportStall({ serving: false, pendingRequests: 0, awaitingInput: false }));
+    shouldReportStall({ serving: false, pendingRequests: 0, awaiting: null }));
   check("…and the announcement does not excuse a process with requests waiting on it",
-    shouldReportStall({ serving: true, pendingRequests: 1, awaitingInput: true }));
+    shouldReportStall({ serving: true, pendingRequests: 1, awaiting: "input" }));
+
+  // Third time, third kind of waiting: the React template's dev server spawns
+  // rolldown worker threads that park on their parentPort, and a user watched four of
+  // them accused of being stuck while the server was serving. The parameter carries a
+  // REASON rather than being a second boolean, which is what these two checks are
+  // really about — one mechanism, extended, not a parallel one.
+  check("a worker parked waiting for a job is not reported",
+    !shouldReportStall({ serving: false, pendingRequests: 0, awaiting: "work" }));
+  check("…and a worker that has not said so still is",
+    shouldReportStall({ serving: false, pendingRequests: 0, awaiting: null }));
+
+  // The threads that cannot announce anything, because they handed themselves to a
+  // synchronous native call and no JS of theirs runs. `unobservable` is where that is
+  // decided; see terminal-feedback.js for why silence beats a guess, and why the
+  // paired change to hasLiveChild has to move with it.
+  check("a worker thread that has never printed anything is not reported",
+    !shouldReportStall({ serving: false, pendingRequests: 0, unobservable: true }));
+  check("…but requests waiting on a pid still beat every excuse there is",
+    shouldReportStall({ serving: true, pendingRequests: 1, unobservable: true, awaiting: "work", hasLiveChild: true }));
+
+  // The price of that rule, and the state review found it failing on. A rolldown pool
+  // is MIXED — one wedged thread nobody can watch beside healthy parked siblings — and
+  // every excuse in it holds at once: the wedged thread is unobservable, the siblings
+  // are awaiting, and the parent has a watched child. If the parent keeps its excuse
+  // there, the wedge is reported nowhere, and it WAS reported before this change.
+  check("a parent holding an unwatched child loses the excuse its watched children gave it",
+    shouldReportStall({ serving: false, pendingRequests: 0, hasLiveChild: true, hasUnwatchedChild: true }));
+  check("…and loses its own announcement too, since that delegates the same way",
+    shouldReportStall({ serving: false, pendingRequests: 0, awaiting: "work", hasUnwatchedChild: true }));
+  check("…but keeps it while every child is watched, or this is just a mute switch in reverse",
+    !shouldReportStall({ serving: false, pendingRequests: 0, hasLiveChild: true, hasUnwatchedChild: false }));
+  // Not revoked by an unwatched child, and deliberately: a server has a louder signal
+  // available than silence. If its pool is wedged, requests queue and the rule at the
+  // top reports it — which is the case immediately below.
+  check("a serving parent is not reported merely for holding an unwatched child",
+    !shouldReportStall({ serving: true, pendingRequests: 0, hasUnwatchedChild: true }));
+  check("…and IS reported once requests start queueing behind it",
+    shouldReportStall({ serving: true, pendingRequests: 2, hasUnwatchedChild: true }));
+
+  // Who the rule above actually applies to. `isUnobservable` is exported and shared
+  // rather than written at each of its three call sites, because the suppression, the
+  // revocation that compensates for it, and the gates all have to mean the same thing
+  // by it — three copies is how production changes and the gates keep passing.
+  check("a thread that has never printed is unobservable", isUnobservable({ isThread: true, everOutput: false }));
+  check("…but one that has printed is not", !isUnobservable({ isThread: true, everOutput: true }));
+  check("…and a plain process that has never printed is not either",
+    !isUnobservable({ isThread: false, everOutput: false }));
+  // This predicate does not look at `isFork` AT ALL, which is the point of the check
+  // below and the reason it is worded that way. A fork child rides the thread spawn
+  // path and arrives flagged `isThread` on the wire; the kernel resolves that away
+  // before storing it (createProcess), the same way runtime/boot.js does. So the
+  // division of labour is: the kernel decides what a fork is, this reads the decision.
+  //
+  // An earlier version of this check passed `isFork: true` under a name claiming forks
+  // were exempt. Nothing here reads that field, so it asserted only `isThread: false`
+  // and would have stayed green with the kernel-side resolution deleted — a check whose
+  // name claimed more than it tested, which is the defect this whole change keeps
+  // finding. What actually gates the resolution is spike-diag-liveness, with a real
+  // fork; what is gated here is that a stray `isFork` cannot rescue a process this
+  // predicate has already been told is a thread.
+  check("isFork is not consulted here — a thread flagged as a fork is still a thread",
+    isUnobservable({ isThread: true, isFork: true, everOutput: false }));
+  check("…so the exemption has to arrive already resolved, as isThread: false",
+    !isUnobservable({ isThread: false, isFork: true, everOutput: false }));
+  check("…and nothing at all is not unobservable", !isUnobservable(undefined));
 
   const wedged = stallVerdict({ grew: 0, files: 7_129, idleMs: 30_000, ports: [3000], pendingRequests: 3 });
   check("and is told it is stuck inside a handler", /3 requests waiting/.test(wedged) && /stuck inside a handler/.test(wedged));
 
+  // `grew: null` is the FIRST report about a pid — the baseline is taken when a report
+  // renders, so there has never been anything to compare against. That fell through to
+  // "a first install downloads and writes a lot", which reads as a finding and was
+  // actually a default: the user got it about four rolldown worker threads, seventy
+  // seconds after `npm install` had exited 0, about processes that had not existed
+  // while it ran. The sentence a reader trusts most is the one claiming to know what
+  // the process is doing, so it has to be one this function can actually support.
   const unknown = stallVerdict({ grew: null, files: 500, idleMs: 100, ports: [] });
-  check("an unknown first report still describes rather than diagnoses", /may just be slow/.test(unknown));
+  check("a first report does not invent an install to blame", !/install/.test(unknown), unknown);
+  check("…it says there is no baseline yet", /first check/.test(unknown) && /nothing to compare/.test(unknown));
+  check("…and says what would settle it", /next check/.test(unknown));
+
+  // The other half of what that default was hiding: a baseline exists, nothing grew,
+  // but the process made a syscall seconds ago. That is a different state from "no
+  // syscall for 148s" and now says so instead of sharing a sentence with the unknown.
+  const busyQuiet = stallVerdict({ grew: 1, files: 40_000, idleMs: 900, ports: [] });
+  check("a process with a recent syscall is not called stuck", !/stuck/.test(busyQuiet) && /doing something/.test(busyQuiet));
+  check("…nor blamed on an install either", !/install/.test(busyQuiet), busyQuiet);
 }
 
 console.log("\n── a stall report does not erase what it did not write ──");
