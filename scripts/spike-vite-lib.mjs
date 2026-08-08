@@ -279,7 +279,23 @@ export async function runViteSpike({ name, dir, templateId, files, entryModule, 
     // `sh: <cmd>: not found` is in here because the shipped path runs a COMMAND
     // rather than a file path, so it can now fail by not existing — and without
     // this that failure waits out the full bind timeout before saying so.
-    const m = tail.match(/Cannot find module '([^']+)'|sh: [^\n]*not found|Failed to resolve[^\n]*|\[plugin[^\]]*\][^\n]*|([A-Za-z]*Error: [^\n]*is not (?:a function|supported)[^\n]*)/);
+    //
+    // Every branch has to name something the dev server cannot come back from,
+    // because matching one ends the wait and reports the port as never bound. A
+    // plugin-TAGGED line is not that on its own: Vite tags ordinary compat
+    // warnings exactly the way it tags errors, and the Qwik optimizer prints
+    //   [plugin:vite-plugin-qwik] context method emitFile() is not supported in serve mode.
+    // on every serve-mode boot, a few hundred ms BEFORE "ready", after which the
+    // server binds and serves the app. Matching the bare tag therefore made the
+    // verdict a race between that warning and the bind, decided by which one a
+    // 100 ms poll happened to see first — the same commit passed and failed on
+    // consecutive runs, and under load it failed four times in six. So the tag
+    // now has to arrive WITH an error to count as one; Vite's own startup-failure
+    // banner is matched directly, which is the fatal case the bare tag was
+    // standing in for.
+    const m = tail.match(
+      /Cannot find module '([^']+)'|sh: [^\n]*not found|Failed to resolve[^\n]*|error when starting dev server[^\n]*|[^\n]*[Ee]rror[^\n]*\[plugin[^\]]*\][^\n]*|\[plugin[^\]]*\][^\n]*[Ee]rror[^\n]*|([A-Za-z]*Error: [^\n]*is not (?:a function|supported)[^\n]*)/,
+    );
     if (m) fatal = m[0];
   }
   if (fatal) console.log(`  early-abort: ${fatal}`);

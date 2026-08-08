@@ -24,6 +24,10 @@
 //      the Wasm-free gate skips it for want of the crates, and it is never
 //      selected in the only job that has them. ci.yml says so in a comment; this
 //      is that comment, enforced.
+//   3b. Every spike that exits 2 without a packed vendor asset declares that
+//      asset in the runner's VENDORS table. The asset is a gitignored build
+//      artifact, so an undeclared one makes the spike pass or fail on what ELSE
+//      the run happened to select before it.
 //   4. Every offline spike that boots a kernel is marked `needsWasm` — the
 //      converse of gate 3, and the hole it left. `net-close-order` and
 //      `net-blocklist` were registered without the flag because neither guest
@@ -37,6 +41,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+// The runner's own selection rule, imported rather than restated so this gate
+// cannot drift from the thing it is checking. Safe to import where run-spikes.mjs
+// is not: it declares one function and touches nothing (see its header).
+import { matchesFilter } from "./lib/spike-filter.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");
@@ -56,7 +64,13 @@ const SPIKES = [...runner.matchAll(/^ {2}\{ name: "([^"]+)", file: "([^"]+)"(.*)
   net: /\bnet:\s*true/.test(m[3]),
   needsWasm: /\bneedsWasm:\s*true/.test(m[3]),
   vendor: /\bvendor:\s*VENDORS\./.test(m[3]),
+  vendorKey: (m[3].match(/\bvendor:\s*VENDORS\.(\w+)/) || [])[1] || null,
 }));
+// The `{ script, asset }` half of VENDORS, keyed the way a spike names it. The
+// `{ install, dir }` half has no asset and simply does not appear here.
+const VENDOR_ASSETS = Object.fromEntries(
+  [...runner.matchAll(/^ {2}(\w+):\s*\{[^}]*\basset:\s*"([^"]+)"/gm)].map((m) => [m[1], m[2]]),
+);
 
 console.log("== the registry parses ==");
 ok(SPIKES.length > 40, `${SPIKES.length} spikes registered`);
@@ -103,6 +117,50 @@ console.log("\n== every offline spike can actually run offline ==");
     }
 
     ok(problems.length === 0, `${s.name}: ${problems.length ? problems.join("; ") : "needs nothing the --net tier provisions"}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== a spike that refuses without a packed vendor asset declares it ==");
+// A `-studio`-shape spike opens with a hard preflight: if its packed asset is not
+// on disk it prints "No vendor asset at …" and exits 2. The asset is a gitignored
+// build artifact, so on a fresh checkout it is NEVER on disk — the runner's
+// `vendor` spec is the only thing that puts it there.
+//
+// Without the spec the spike does not fail honestly, it fails ORDER-DEPENDENTLY.
+// `starlight-studio` and `starlight-depcache` both need npm-pack.bin and neither
+// declared it, so both exited 2 in 0.0s — and then `npm-studio`, which does
+// declare it and sorts after them, provisioned the very file they had just been
+// killed for. Run those two alone and they fail; run the whole tier and whether
+// they pass depends on what else was selected. That is the failure mode the
+// VENDORS table exists to remove, so the declaration is what gets checked.
+// ---------------------------------------------------------------------------
+{
+  for (const s of SPIKES) {
+    // This file is itself a registered spike, and the scan below is a plain text
+    // search — the marker it looks for is written twice right here, in the regex
+    // and in the comment above it, so the filter reads this file's own source as a
+    // spike demanding an asset. Today it gets no further, because nothing here
+    // matches the packed-path shape: add one documentation example of that path and
+    // the gate fails on itself, with a message about a spike that is not one. So
+    // this is deliberate rather than lucky, for the reason the harness-scoped scans
+    // above and below give for excluding this file from theirs.
+    if (s.file === "spike-ci-tiers.mjs") continue;
+    const srcPath = path.join(ROOT, "scripts", s.file);
+    if (!fs.existsSync(srcPath)) continue;
+    const src = fs.readFileSync(srcPath, "utf8");
+    // Only the spikes that REFUSE to run without one — a spike that merely reads
+    // the path, or provisions it itself, is not making a demand of the runner.
+    if (!/No vendor asset at/.test(src)) continue;
+    const packed = src.match(/path\.join\([^)]*"vendor",\s*"([^"]+)"\s*\)/);
+    if (!packed) continue;
+    const needs = `packages/studio/public/vendor/${packed[1]}`;
+    ok(
+      VENDOR_ASSETS[s.vendorKey] === needs,
+      s.vendorKey
+        ? `${s.name}: declares the ${packed[1]} it exits 2 without (VENDORS.${s.vendorKey})`
+        : `${s.name}: exits 2 without ${packed[1]} but declares no vendor, so it only runs if something else provisioned it first`,
+    );
   }
 }
 
@@ -165,15 +223,15 @@ console.log("\n== the Wasm-VFS offline spikes are wired into the one job that ca
 
   // The runner's filter is a substring match, so a name is covered when any
   // listed filter is a substring of it — that is how `bun` also pulls in
-  // `bun-templates`, deliberately.
+  // `bun-templates`, deliberately. A `$`-suffixed filter is anchored instead.
   for (const s of wasmOffline) {
-    ok(named.some((f) => s.name.includes(f)),
+    ok(named.some((f) => matchesFilter(s.name, f)),
       `${s.name} is selected by that step (else it runs in no job at all)`);
   }
   // And nothing stale: a filter matching no registered offline spike is a typo
   // that silently narrows the job.
   for (const f of named) {
-    ok(SPIKES.some((s) => !s.net && s.name.includes(f)), `the step's '${f}' filter still matches a registered offline spike`);
+    ok(SPIKES.some((s) => !s.net && matchesFilter(s.name, f)), `the step's '${f}' filter still matches a registered offline spike`);
   }
 }
 
@@ -192,7 +250,7 @@ console.log("\n== the net steps name spikes that exist ==");
     const named = step[1].trim().split(/\s+/);
     for (const f of named) {
       ok(
-        SPIKES.some((s) => s.net && s.name.includes(f)),
+        SPIKES.some((s) => s.net && matchesFilter(s.name, f)),
         `the net step's '${f}' filter matches a registered net spike`,
       );
     }

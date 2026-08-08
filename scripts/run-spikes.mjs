@@ -13,6 +13,8 @@
 //
 // Filters: any extra args are substring filters on the spike name, e.g.
 //   node scripts/run-spikes.mjs --net koa hono
+// Suffix one with `$` to anchor it to the whole name — `lit$` is the `lit` spike,
+// where a bare `lit` is also sqlite and pglite.
 //
 // Env: VV_SPIKE_TIMEOUT (per-spike ms, default 360000), VV_LIVE=1 (stream output).
 // Exit code is non-zero if any selected spike fails, so CI fails loudly.
@@ -21,6 +23,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { matchesFilter } from "./lib/spike-filter.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const VENDOR_DIR = "/tmp/vv-vendor";
@@ -308,11 +311,17 @@ const SPIKES = [
   // above drives npm through the kernel directly, which passed while the browser hung. This one
   // uses the shared loader + /bin shims + baseProcEnv + the interactive shell's VV_RUN, and
   // budgets the registry metadata a cold install pulls (see its header).
-  { name: "starlight-studio", file: "spike-starlight-studio.mjs", net: true, timeout: 900000 },
+  // Takes the packed npm asset for the same reason npm-studio does — it unpacks it through the
+  // shared loader — and so it carries the same `vendor`. Without one it did not fail honestly:
+  // it exited 2 on its own preflight in 0.0s, and whether that happened depended on whether
+  // some EARLIER spike in the same run had provisioned the asset first. `npm-studio` does, and
+  // sorts after both of these, so a full `spikes:net` run failed the pair and then provisioned
+  // the very thing they were missing.
+  { name: "starlight-studio", file: "spike-starlight-studio.mjs", net: true, vendor: VENDORS.npmAsset, timeout: 900000 },
   // Measures whether a PRE-BUILT dep-cache snapshot could replace a heavy template's first
   // install: install once, snapshot, wipe, restore, compare. Asserts a speedup RATIO rather
   // than a wall-clock budget so it does not go flaky on slower CI.
-  { name: "starlight-depcache", file: "spike-starlight-depcache.mjs", net: true, timeout: 900000 },
+  { name: "starlight-depcache", file: "spike-starlight-depcache.mjs", net: true, vendor: VENDORS.npmAsset, timeout: 900000 },
   { name: "vitest", file: "spike-vitest.mjs", net: true },
   // Tailwind v4: proves the lightningcss -> lightningcss-wasm alias + the
   // @tailwindcss/oxide-wasm32-wasi selection let the v4 dev server generate CSS
@@ -435,8 +444,18 @@ const tier = args.includes("--offline") ? "offline" : args.includes("--net") ? "
 const filters = args.filter((a) => !a.startsWith("--"));
 const DEFAULT_TIMEOUT = Number(process.env.VV_SPIKE_TIMEOUT || 360000);
 
+// A filter is a substring match and stays one: that is how the verify job's `bun`
+// deliberately re-runs bun-offline and bun-templates alongside it. But a substring
+// cannot say "this one and nothing else", and one of them could not: `lit` also
+// selects sqlite and pglite, so template-gate's "framework templates must start
+// their dev server" step was running two in-VM database spikes it does not name,
+// and a failure in either would have been read as a template that stopped booting.
+// A trailing `$` anchors the filter to the whole name, which is the only thing the
+// substring form cannot express. Opt-in, so every existing filter is unaffected.
+// Shared with spike-ci-tiers.mjs, which has to select the way this does — see the
+// header of lib/spike-filter.mjs.
 let selected = SPIKES.filter((s) => (tier === "all" ? true : tier === "net" ? s.net : !s.net));
-if (filters.length) selected = selected.filter((s) => filters.some((f) => s.name.includes(f)));
+if (filters.length) selected = selected.filter((s) => filters.some((f) => matchesFilter(s.name, f)));
 // Drop spikes whose file doesn't exist yet, with a note (keeps the runner robust
 // as the spike set evolves).
 // Everything dropped below is recorded rather than only announced, so the summary can

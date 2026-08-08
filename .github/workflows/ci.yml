@@ -209,8 +209,23 @@ jobs:
       # way the studio does — through the manifest's own dev command — rather than by
       # calling the vite bin directly, which is the shortcut that let a broken shipped
       # path sit behind six green spikes.
+      #
+      # Anchored (`name$`) because the filters are a substring match by default, and
+      # a bare `lit` also selects sqlite and pglite: this step was running two in-VM
+      # database spikes it does not name, on a job whose failures are supposed to mean
+      # "a shipped template stopped booting". Nine ran where seven were asked for.
       - name: framework templates must start their dev server
-        run: node scripts/run-spikes.mjs --net react preact lit solid vue svelte qwik
+        run: node scripts/run-spikes.mjs --net react$ preact$ lit$ solid$ vue$ svelte$ qwik$
+      # The two the step above used to pick up by accident, kept blocking on purpose.
+      # Anchoring `lit` would otherwise have moved them to spikes-net alone, which is
+      # `continue-on-error: true` — so a broken in-VM database would have stopped being
+      # able to turn the workflow red. They earn a step here on the same terms as the
+      # templates: a WASM SQL engine running in the browser is a headline capability,
+      # and at ~10s for the pair they are cheaper than anything else in this job. Their
+      # own step, because a failure here means something different from a template that
+      # will not boot — which was the whole problem with them arriving via `lit`.
+      - name: the in-VM databases must work
+        run: node scripts/run-spikes.mjs --net sqlite$ pglite$
       # Nest's dev command is a watch supervisor rather than a dev server, so its gate
       # is that a SAVE reaches the browser: boot, edit, recompile, restart, new
       # response. Separate step because a failure here means something different.
