@@ -63,9 +63,36 @@ export interface TemplateManifest {
   openPath: string;
   /** File (relative to the project root) to open in the editor after creation. */
   entry: string;
-  /** Vite-style hot module replacement (vs a full restart on change). */
+  /**
+   * A bundler-backed dev server whose first compile is expensive enough to be
+   * worth paying before the user ever sees the preview. That warm is what this
+   * flag gates, and all it gates: `warmDevServer` (`kernel-worker.ts:485`, and
+   * `:557` for demos) fetches `/` plus the entry module scripts, so Vite's dep
+   * pre-bundle — or a webpack/rspack first build — happens off the preview's
+   * clock instead of in the iframe.
+   *
+   * NOT Vite-only, and do not narrow it to Vite: `docusaurus` and `webpack` are
+   * webpack, `rspress`/`rsbuild`/`rsbuild-ts` are rspack, and all five warm the
+   * same way. Clearing the flag on them because "there's no Vite here" would
+   * silently take their warm away.
+   *
+   * For most such templates an edit also hot-updates in place, which is where
+   * the name comes from — but that is NOT what the flag controls, and the two
+   * come apart in both directions. Ember needs the warm (`hmr: true`) yet every
+   * edit is a full page reload (so `reload: true` as well). Next.js is the
+   * reverse: real Fast Refresh, but no dep pre-bundle to prime, so `hmr: false`.
+   * Whether an edit preserves in-page STATE is `reload`, below — not this.
+   */
   hmr: boolean;
-  /** Server restarts on change (Nest --watch, tsc) and the preview reloads. */
+  /**
+   * An edit costs a full restart rather than a hot update, so in-page state is
+   * lost. Two shapes qualify: a server that recompiles and restarts (Nest
+   * `--watch`, `tsc`), and a client that full-reloads (Ember — its Vite plugin
+   * implements no `import.meta.hot`). This is what picks the studio's
+   * "saved … — recompiling…" / "edits recompile + restart" wording over
+   * "hot-updating…" / "edits hot-reload", so getting it wrong tells the user
+   * their state will survive when it won't.
+   */
   reload: boolean;
   /** Install step (skipped automatically if node_modules already exists). */
   install: string;
@@ -10499,6 +10526,276 @@ code {
   };
 }
 
+// ── Ember ────────────────────────────────────────────────────────────────────
+// Ember 7 on Embroider + Vite, which is the whole reason it runs here: `ember()`
+// from @embroider/vite is an ordinary Vite plugin, so the app boots down the same
+// path as every other Vite template instead of through ember-cli's Broccoli build.
+// roadmap.md listed Ember as a documented drop on the strength of the old
+// webpack-era Embroider ("standalone webpack + native tooling"); that stopped being
+// true with Embroider v4, whose @ember/app-blueprint pins vite and makes Vite the
+// default build — no webpack, and no native binary the wasm shims don't already cover.
+//
+// Deliberately the LEAN (no-compat) shape rather than `ember new` output: no
+// ember-cli, no @embroider/compat, no classicEmberSupport(). Those exist to run v1
+// (Broccoli) addons and this app has none. The cost is that adding a v1 addon later
+// needs the compat build added back — see roadmap.md for the trade. What is NOT
+// leftover: package.json's `exports` `"./*": "./app/*"` is how @embroider/vite resolves
+// the app's own modules (`ember-app/router` → `app/router.js`); deleting it breaks boot.
+//
+// LEAN IS ABOUT THE BUILD, NOT THE INSTALL — this template says so because it once
+// claimed otherwise. ~565 packages land here against 120 for preact and 53 for lit, and
+// 25 of them are classic ember-cli/broccoli packages. None of them RUN: the build is
+// ember() + babel. They arrive because @embroider/core — a mandatory PEER of
+// @embroider/vite, which imports it in 7 of its modules — still declares broccoli-plugin,
+// broccoli-persistent-filter, fs-tree-diff and walk-sync; because @embroider/macros and
+// ember-source both declare ember-cli-babel; and because ember-source ships its
+// blueprint generators (recast, prettier, esprima). Measured per-dependency, nothing
+// here is removable: dropping @embroider/macros saves 0 packages (both core and vite
+// depend on it exactly) and ember-strict-application-resolver owns exactly 1. This is
+// the floor for a working Embroider v4 app, not slack.
+//
+// Two in-VM facts, both settled by scripts/spike-ember.mjs rather than assumed:
+// @embroider/vite runs exactly ONE (client) rolldown dep-optimize pass, so Vite 8
+// is fine here — the two-pass rolldown-wasi tokio panic that pins Svelte to Vite 7
+// needs an SSR optimize this app never performs; and content-tag's wasm (the .gjs
+// preprocessor) instantiates in-VM the way lightningcss-wasm does.
+//
+// Compiling a `.gjs` is TWO stages and BOTH must run: content-tag turns `<template>`
+// into a precompileTemplate(...) call, then babel-plugin-ember-template-compilation
+// compiles that call into createTemplateFactory(...) wire format. Stage two failing is
+// silent at build time and fatal at boot, which is exactly how it shipped once — see the
+// babel.config.mjs note below and the roadmap entry.
+function emberTemplate(): TemplateDef {
+  const EMBER = "~7.1.0";
+  const files: Record<string, string> = {
+    "package.json": `{
+  "name": "ember-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "exports": {
+    "./*": "./app/*"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.7",
+    "@babel/plugin-transform-runtime": "^7.29.7",
+    "@babel/runtime": "^7.29.7",
+    "@embroider/core": "^4.6.3",
+    "@embroider/macros": "^1.20.4",
+    "@embroider/vite": "^1.7.7",
+    "@glimmer/component": "^2.1.1",
+    "@rollup/plugin-babel": "^7.1.0",
+    "@rolldown/binding-wasm32-wasi": "~1.2.0",
+    "babel-plugin-ember-template-compilation": "^4.0.0",
+    "decorator-transforms": "^2.3.2",
+    "ember-source": "${EMBER}",
+    "ember-strict-application-resolver": "^0.1.1",
+    "vite": "^8.0.0"
+  },
+  "engines": {
+    "node": ">= 20.19.0"
+  }
+}
+`,
+    "vite.config.mjs": `import { defineConfig } from 'vite'
+import { extensions, ember } from '@embroider/vite'
+import { babel } from '@rollup/plugin-babel'
+
+// \`base\` matches the router's rootURL in app/router.js — Vivari serves this dev
+// server under /preview/4200/ and the template keeps that prefix (see the
+// keepPreviewPrefix note in its manifest). Both must agree, and both are rewritten
+// to '/' when the studio creates the project in per-port-origin (wildcard) mode.
+export default defineConfig({
+  base: '/preview/4200/',
+  plugins: [
+    ember(),
+    babel({ babelHelpers: 'runtime', extensions }),
+  ],
+})
+`,
+    // No @embroider/compat/babel here (babelCompatSupport / templateCompatSupport),
+    // which is what `ember new` emits — those transforms exist for v1 addons, and
+    // this app has none. The decorator runtime is a BARE specifier on purpose:
+    // the blueprint writes fileURLToPath(import.meta.resolve(…)), and in-VM
+    // import.meta.resolve returns a path rather than the file:// URL Node returns,
+    // so fileURLToPath throws "Invalid URL" and the config never loads.
+    //
+    // NO targetFormat here, and that is the whole point of this line. The default is
+    // 'wire', which compiles each <template> down to a createTemplateFactory(...) call.
+    // Passing 'hbs' instead leaves a live `precompileTemplate(...)` call in the output
+    // for "further processing before they're ready to execute" — a mode meant for
+    // codemods and library pre-publication, where a later stage finishes the job. An app
+    // has no later stage, so the call survives to runtime and hits ember-source's stub:
+    // "Attempted to call \`precompileTemplate\` at runtime, but this API is meant to be
+    // used at compile time." That shipped once. See roadmap.md.
+    "babel.config.mjs": `export default {
+  plugins: [
+    ['babel-plugin-ember-template-compilation'],
+    ['module:decorator-transforms', { runtime: { import: 'decorator-transforms/runtime-esm' } }],
+    ['@babel/plugin-transform-runtime', { useESModules: true, regenerator: false }],
+  ],
+  generatorOpts: { compact: false },
+}
+`,
+    // Plain HTML: no {{content-for}} placeholders and no @embroider/virtual/vendor
+    // imports, both of which are the classic (ember-cli) build's contract.
+    "index.html": `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Ember in Vivari</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="/app/styles/app.css">
+  </head>
+  <body>
+    <script type="module">
+      import Application from './app/app.js'
+
+      Application.create({ autoboot: true, rootElement: 'body' })
+    </script>
+  </body>
+</html>
+`,
+    // ember-strict-application-resolver instead of ember-resolver: it resolves from
+    // this explicit module map rather than by scanning an AMD registry the classic
+    // build would have populated, so every route/template is a real ES import and
+    // Vite can see the whole graph. Adding a route means adding it here too.
+    "app/app.js": `import EmberApp from 'ember-strict-application-resolver'
+
+import Router from './router.js'
+import AboutTemplate from './templates/about.gjs'
+import ApplicationTemplate from './templates/application.gjs'
+
+export default class App extends EmberApp {
+  modules = {
+    './router': { default: Router },
+    './templates/application': { default: ApplicationTemplate },
+    './templates/about': { default: AboutTemplate },
+  }
+}
+`,
+    "app/router.js": `import EmberRouter from '@ember/routing/router'
+
+export default class Router extends EmberRouter {
+  // History-mode routing off the iframe's own pathname, which under the Vivari
+  // preview is /preview/4200/…. Must match Vite's \`base\` in vite.config.mjs.
+  location = 'history'
+  rootURL = '/preview/4200/'
+}
+
+Router.map(function () {
+  this.route('about')
+})
+`,
+    "app/templates/application.gjs": `import Component from '@glimmer/component'
+import { tracked } from '@glimmer/tracking'
+import { on } from '@ember/modifier'
+import { LinkTo } from '@ember/routing'
+
+class Counter extends Component {
+  @tracked count = 0
+
+  increment = () => {
+    this.count = this.count + 1
+  }
+
+  <template>
+    <button type="button" {{on "click" this.increment}}>count is {{this.count}}</button>
+  </template>
+}
+
+<template>
+  <main>
+    <h1>Ember in Vivari</h1>
+    <Counter />
+    <p class="hint">Edit <code>app/templates/application.gjs</code> and save — Ember reloads the page</p>
+    <nav><LinkTo @route="about">About</LinkTo></nav>
+    {{outlet}}
+  </main>
+</template>
+`,
+    "app/templates/about.gjs": `import { LinkTo } from '@ember/routing'
+
+<template>
+  <section>
+    <h2>About</h2>
+    <p>A second route, so the client-side router is doing real work.</p>
+    <LinkTo @route="application">Back</LinkTo>
+  </section>
+</template>
+`,
+    "app/styles/app.css": `:root {
+  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
+}
+
+body { margin: 0; display: flex; place-items: center; min-width: 320px; min-height: 100vh; }
+main { max-width: 1280px; margin: 0 auto; padding: 2rem; text-align: center; }
+h1 { color: #e04e39; }
+
+button {
+  border-radius: 8px; border: 1px solid transparent; padding: 0.6em 1.2em;
+  font-size: 1em; font-weight: 500; font-family: inherit;
+  background-color: #1a1a1a; color: white; cursor: pointer; transition: border-color 0.25s;
+}
+button:hover { border-color: #e04e39; }
+
+nav { margin-top: 1.5rem; }
+a { color: #e04e39; }
+.hint { font-size: 0.9rem; opacity: 0.6; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #ffffff14; padding: 0.1rem 0.35rem; border-radius: 0.3rem; }
+`,
+  };
+  return {
+    manifest: {
+      id: "ember",
+      framework: "ember",
+      icon: "ember",
+      category: "Frontend",
+      name: "Ember",
+      language: "JavaScript",
+      // No "with hot reload" here, unlike angular/docusaurus/webpack. Ember has no
+      // HMR — measured, see the reload flag below.
+      description: "Ember 7 (Embroider + Vite)",
+      port: 4200,
+      openPath: "/",
+      entry: "app/templates/application.gjs",
+      // hmr gates the dep-optimize warm, which this template needs (57 pre-bundled
+      // deps). It does NOT mean edits preserve state here — that is `reload` below.
+      hmr: true,
+      // TRUE, and the pairing with hmr:true is deliberate. Ember has no component
+      // HMR: `ember new` ships none, @embroider/vite implements no import.meta.hot,
+      // and a save triggers `[vite] (client) page reload` — measured in a browser,
+      // counter at 5 went back to 0. With reload:false the studio would say "edits
+      // hot-reload" and "hot-updating…", which is simply untrue. true selects
+      // "edits recompile + restart" / "recompiling…", which is what a user sees.
+      // The one dependency that would add real HMR, ember-vite-hmr, does not install
+      // at these pins — see roadmap.md.
+      reload: true,
+      install: "npm install",
+      dev: VITE_DEV,
+      // Ember's router is client-routed and resolves from the iframe's own
+      // location.pathname, which is /preview/4200/…. Served at "/" it would read
+      // the proxy prefix as a route and land on the error substate, so the app runs
+      // under the prefix instead — Vite `base` + the router's `rootURL`.
+      // Confirmed in a real browser: after clicking a LinkTo, location.pathname is
+      // /preview/4200/about, back/forward walk correctly, and a reload on the child
+      // route renders it with no console errors. That browser check is also why
+      // there is no `experimental` flag here — it was the one contract the headless
+      // spike structurally cannot reach.
+      keepPreviewPrefix: true,
+    },
+    files,
+  };
+}
+
 // ── Tailwind CSS + shadcn/ui (React) ─────────────────────────────────────────
 // React + Vite + Tailwind CSS v4 via the first-class `@tailwindcss/vite` plugin,
 // plus a shadcn/ui-style Button: the `cn()` helper (clsx + tailwind-merge) and a
@@ -11024,6 +11321,7 @@ export const TEMPLATES: TemplateDef[] = [
   litTemplate(),
   solidTemplate(),
   qwikTemplate(),
+  emberTemplate(),
   tanstackRouterTemplate(),
   // Backend
   expressTemplate(false),

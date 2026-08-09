@@ -98,6 +98,13 @@ export const RUNTIME_DEFS: RuntimeDef[] = [
           { name: "Solid", icon: "solid" },
           { name: "Lit", icon: "lit" },
           { name: "Qwik", icon: "qwik" },
+          // Placed here by the mechanical check above, not by association.
+          // `scripts/spike-ember.mjs` exists, is registered `net: true` in
+          // `run-spikes.mjs`, and is named in the very same `template-gate` step
+          // as the seven above (`ci.yml:218`, `… qwik$ ember$`) — the step whose
+          // schedule is what earns this group "nightly". Same job, same trigger,
+          // same evidence, so this is the group its gate genuinely supports.
+          { name: "Ember", icon: "ember" },
         ],
       },
       {

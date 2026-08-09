@@ -1,7 +1,8 @@
 // Shared harness for the frontend-variant Vite spikes (Preact / Lit / Solid /
-// Qwik). Each of those templates is a plain Vite SPA that differs only in its
-// framework plugin + JSX transform, so the in-VM proof is identical: install the
-// real deps, boot the real `vite` dev server, and assert it serves the app.
+// Qwik / Ember). Each of those templates is a plain Vite SPA that differs only
+// in its framework plugin + JSX transform, so the in-VM proof is identical:
+// install the real deps, boot the real `vite` dev server, and assert it serves
+// the app.
 //
 // A spike PASSES when every gate is green:
 //   1. `npm install` exits 0 and the `vite` bin landed on disk.
@@ -63,9 +64,32 @@ async function shippedDevCommand(templateId) {
  * @param {Record<string,string>} opts.files  relPath -> contents (the template source).
  * @param {string} opts.entryModule  root-absolute module the index.html loads, e.g. "/src/main.tsx".
  * @param {RegExp}  opts.titleMarker Regex the served index.html must match, e.g. /Vite \+ Preact/.
+ * @param {string} [opts.base]  Vite `base`, WITH a trailing slash. Defaults to "/". A
+ *   keep-prefix template (Ember) serves everything — the shell and /@vite/client — under
+ *   `/preview/<port>/`, so the gates have to ask for it there or they check a redirect.
+ * @param {RegExp} [opts.entryMarker]  Asserted against the entry module's BODY. Optional
+ *   because for most templates a 200 is already proof: a transform that throws makes Vite
+ *   answer 500. It is not proof when the entry's extension is one Vite does not treat as
+ *   JavaScript — `.gjs` falls through to the static middleware, so the gate can collect a
+ *   200 carrying the file's raw bytes and the framework plugin need never have run. This
+ *   spike's own draft did exactly that and passed.
+ *
+ *   Pick the marker with care. It must be something only a CORRECTLY built module can
+ *   contain, checked against a known-good reference — not merely something a transformed
+ *   one happens to contain. Ember's first marker was `precompileTemplate`, which a
+ *   correctly compiled `.gjs` does NOT contain: the compiler is supposed to compile that
+ *   call away, so the gate was asserting the symptom of a real bug and stayed green while
+ *   the app threw on boot. A marker that a broken build also satisfies is worse than none.
+ * @param {(ctx: {get:Function, getRetry:Function, decode:Function, base:string}) =>
+ *   Promise<Array<{label:string, ok:boolean, detail?:string}>>} [opts.extraChecks]
+ *   Framework-specific assertions against the live dev server, run after the standard
+ *   gates and folded into the verdict. This exists so knowledge like "what a compiled
+ *   `.gjs` looks like" lives in the framework's own spike instead of accreting as
+ *   one-caller parameters here. Use it for anything the five standard gates cannot say:
+ *   a client-router deep link, a second route's module, an asserted ABSENCE.
  * @returns {Promise<boolean>} true on PASS.
  */
-export async function runViteSpike({ name, dir, templateId, files, entryModule, titleMarker }) {
+export async function runViteSpike({ name, dir, templateId, files, entryModule, titleMarker, base = "/", entryMarker, extraChecks }) {
   const devCommand = await shippedDevCommand(templateId);
   const LIVE = process.env.VV_LIVE === "1";
   const PORT = Number(process.env.VV_PORT || 5173);
@@ -320,21 +344,34 @@ export async function runViteSpike({ name, dir, templateId, files, entryModule, 
   let rootOk = false;
   let clientOk = false;
   let entryOk = false;
+  let extraOk = true;
   if (bound) {
-    const root = await getRetry("/");
+    const root = await getRetry(base);
     const rootBody = decode(root.body || "");
     rootOk = root.status === 200 && titleMarker.test(rootBody) && /<script[^>]+type="module"/.test(rootBody);
-    console.log(`  GET /               -> ${root.status}  (${rootBody.length} bytes)  marker=${titleMarker.test(rootBody)}`);
+    console.log(`  GET ${base.padEnd(15)} -> ${root.status}  (${rootBody.length} bytes)  marker=${titleMarker.test(rootBody)}`);
 
-    const client = await getRetry("/@vite/client");
+    const client = await getRetry(`${base}@vite/client`);
     clientOk = client.status === 200;
-    console.log(`  GET /@vite/client   -> ${client.status}`);
+    console.log(`  GET ${base}@vite/client   -> ${client.status}`);
 
     const entry = await getRetry(entryModule);
     const entryBody = decode(entry.body || "");
-    entryOk = entry.status === 200 && entryBody.length > 0;
-    console.log(`  GET ${entryModule.padEnd(15)} -> ${entry.status}  (${entryBody.length} bytes)`);
+    const transformed = !entryMarker || entryMarker.test(entryBody);
+    entryOk = entry.status === 200 && entryBody.length > 0 && transformed;
+    console.log(
+      `  GET ${entryModule.padEnd(15)} -> ${entry.status}  (${entryBody.length} bytes)` +
+        (entryMarker ? `  transformed=${transformed}` : ""),
+    );
     if (!entryOk) console.log("  entry body head: " + entryBody.slice(0, 300).replace(/\n/g, " "));
+
+    if (extraChecks) {
+      const results = await extraChecks({ get, getRetry, decode, base });
+      for (const r of results) {
+        console.log(`  ${r.ok ? "ok  " : "FAIL"}  ${r.label}${r.detail ? `  — ${r.detail}` : ""}`);
+        if (!r.ok) extraOk = false;
+      }
+    }
   } else {
     console.log("\n---- dev output tail (last 4000 chars) ----\n" + out.slice(devStart).join("").slice(-4000));
   }
@@ -479,6 +516,7 @@ export async function runViteSpike({ name, dir, templateId, files, entryModule, 
     rootOk &&
     clientOk &&
     entryOk &&
+    extraOk &&
     stillServing &&
     !scanFailed &&
     preBundled &&

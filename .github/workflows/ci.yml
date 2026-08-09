@@ -215,7 +215,7 @@ jobs:
       # database spikes it does not name, on a job whose failures are supposed to mean
       # "a shipped template stopped booting". Nine ran where seven were asked for.
       - name: framework templates must start their dev server
-        run: node scripts/run-spikes.mjs --net react$ preact$ lit$ solid$ vue$ svelte$ qwik$
+        run: node scripts/run-spikes.mjs --net react$ preact$ lit$ solid$ vue$ svelte$ qwik$ ember$
       # The two the step above used to pick up by accident, kept blocking on purpose.
       # Anchoring `lit` would otherwise have moved them to spikes-net alone, which is
       # `continue-on-error: true` — so a broken in-VM database would have stopped being

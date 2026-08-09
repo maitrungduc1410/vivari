@@ -2091,8 +2091,11 @@ Vite-based `dev` uses `--configLoader native` (Vite 8 / rolldown — no esbuild)
   `VV_PYODIDE_PACKAGES` before `vendor:pyodide`.
 - ⏳ **Phase 5 — documented drops (won't build):** all **NativeScript** (Mobile & XR — need a
   device/emulator runtime), **WordPress/PHP** (php-wasm),
-  **jq**, **Ember** (embroider = standalone webpack + native tooling), **Egg.js** (`cluster.fork`
+  **jq**, **Egg.js** (`cluster.fork`
   throws), **Nuxt 2** (webpack), **WebContainer API** (StackBlitz-proprietary).
+  (**Ember** was on this list — "embroider = standalone webpack + native tooling" — until
+  Embroider v4 made Vite the default and the reason expired. It ships now; see the entry at
+  the end of this file.)
 
 **On `experimental`.** Phase 2/3 templates are shipped `experimental` (the picker shows an `exp`
 badge) because they haven't yet passed a headless `scripts/spike-*.mjs` gate — the risk is that a
@@ -10371,3 +10374,284 @@ Not proved, and added to the browser tier's list rather than dressed up:
   host node or the widgets render unstyled, and that is not verifiable here.
 - Everything the entry above already lists: Monaco painting, fonts, and the interrupt path's
   cross-thread half.
+## Ember, which was on the drop list for a reason that had expired (this change)
+
+`roadmap.md` listed Ember under "documented drops (won't build)" with the reason
+"embroider = standalone webpack + native tooling". That was true of Embroider v2. Embroider
+v4 made **Vite** the default build for `ember new`, and the current app blueprint pins
+`vite: ^8.1.0` — so the thing the drop was about stopped existing, and nothing re-read the
+entry. `ember()` from `@embroider/vite` is an ordinary Vite plugin; an Ember app boots down
+the same rolldown path as every other Vite template here.
+
+**Vite 8, and the two-pass question answered rather than assumed.** The rolldown-wasi tokio
+panic that pins Svelte to Vite 7 needs TWO rolldown dep-optimize passes in one process — the
+napi tokio runtime is torn down after the first bundle and never re-inits under wasi — and
+what forces the second is an **SSR** optimize. `@embroider/vite` configures no ssr
+environment and forces no SSR optimize: an Ember app is a client-rendered SPA, FastBoot being
+separate and opt-in. So it runs exactly ONE pass. This is measured, not reasoned: the spike
+requires `.vite/deps` to be non-empty, so the client optimize has to have run and survived
+for it to pass, and it reports **50 pre-bundled deps** on Vite 8.2.1 with no panic and no
+`Failed to run dependency scan`. Ember therefore lands in the react/vue/preact bucket — Vite 8
+is fine, it just has to declare `@rolldown/binding-wasm32-wasi` like every other Vite 8
+template.
+
+**The lean (no-compat) shape, on purpose.** The template is `ember()` alone: no `ember-cli`,
+no `@embroider/compat`, no `classicEmberSupport()`, and `ember-strict-application-resolver`
+in place of `ember-resolver`. Those pieces exist to run v1 (Broccoli) addons, and a template
+has none. The cost is real and worth naming: adding a v1 addon later means adding the compat
+build back. `ember new` parity was the other option and was not taken.
+
+**"Lean" describes the BUILD, and this entry first said it described the install. It does
+not.** The first version of this entry claimed dropping compat "keeps the install inside a
+template's budget". A user ran it and reported ~2 minutes for 538 packages, with the stall
+watchdog firing at 62s of silence. Resolving the tree properly: **565 packages**, against 120
+for preact, 106 for solid, 69 for qwik and 53 for lit — roughly 5x the frontend templates it
+sits beside. **25 of them are classic ember-cli/broccoli packages**, in a template whose
+whole premise was not having those. Where they come from, measured rather than guessed:
+
+- `@embroider/core` is a **peerDependency** of `@embroider/vite` (which imports it in 7 of
+  its 19 dist modules), so it is not optional, and it still declares `broccoli-plugin`,
+  `broccoli-persistent-filter`, `broccoli-source`, `broccoli-node-api`, `fs-tree-diff`,
+  `walk-sync`, `fast-sourcemap-concat` and `jsdom`.
+- `ember-cli-babel` is declared by **`@embroider/macros`** *and* by **`ember-source`**.
+- `ember-source` also ships its blueprint generators — `recast`, `prettier`, `esprima`,
+  `ember-router-generator`, and `ember-cli-path-utils` / `ember-cli-string-utils`.
+
+None of it RUNS; the build is `ember()` + babel. But the install pays for all of it. Nothing
+meaningful is trimmable, and that was checked per-dependency rather than asserted: removing
+`@embroider/macros` saves **0** packages (both `@embroider/core` and `@embroider/vite` depend
+on it exactly), and `ember-strict-application-resolver` owns exactly **1** package unique to
+it. So this is the floor for a working Embroider v4 app. Recorded here and in the template
+header so the next person does not go looking for slack that is not there. The honest summary
+for a user: Ember is the heaviest frontend template here by a factor of about five, and that
+is Ember's shape, not this template's.
+
+**Two runtime bugs it found, neither of them Ember's.**
+
+1. **ESM default-importing a CJS module with `__esModule` and no `default` (`esm.js`).**
+   `__oc_def` was `m && m.__esModule ? m.default : m` — Babel's interop rule. But
+   `tsc --module commonjs` stamps `__esModule` on every file it emits, including the ones
+   that only ever assign named exports, so the flag means "transpiled", not "has a default".
+   `@embroider/core` is exactly that shape, and `import core from '@embroider/core'` inside
+   `@embroider/vite` therefore got `undefined`, dying at `const { cleanUrl } = core` before
+   the config could load. Node has no such hazard: a CJS default import is `module.exports`,
+   always. The fix requires the key to actually exist before unwrapping, which keeps the
+   Babel behaviour that real `export default` code depends on and falls back to Node's answer
+   otherwise. Isolated away from Ember first — a five-case matrix against host Node, in-VM
+   disagreeing on the three `__esModule` ones and agreeing on all five after. This is a
+   general Node-compat gap that any `tsc`-emitted CJS dependency could have hit.
+2. **`rootURL` was not in the keep-prefix rewrite (`controller.ts`).**
+   `rewritePreviewBaseToRoot` rewrites `base` / `basename` / `baseUrl` when a keep-prefix
+   template is created in per-port-origin (wildcard) mode. Ember spells the same setting
+   `rootURL`, and writes it as a class field (`rootURL = '/preview/4200/'`) rather than an
+   object key, so the separator had to admit `=` as well as `:`. Without both, mode C would
+   have rewritten Vite's `base` and left the router hunting a prefix the server no longer
+   served.
+
+**Keep-prefix, because Ember is a router first.** Ember's router is client-routed and
+resolves from the iframe's own `location.pathname`, which under the preview is
+`/preview/4200/`. Served at `/` it would read the proxy prefix as a route and land on the
+error substate — the Docusaurus/react-router symptom. So the template sets Vite `base` and
+the router's `rootURL` to `/preview/4200/` and flags `keepPreviewPrefix`. It ships with a
+real second route and a `<LinkTo>`, because a single-route app cannot exercise the thing the
+flag is for.
+
+**A gate that passed vacuously, and what it took to stop it.** `.gjs` is not an extension
+Vite treats as JavaScript, so a plain URL request for one falls through to the static
+middleware and returns the file's raw bytes with a 200. The first draft of `spike-ember.mjs`
+collected that 200 and called it green, while the body it had just fetched still contained an
+untransformed `<template>`. The entry gate now asks for `?import` — what Vite's own import
+analysis appends when a module graph reaches the file, confirmed by walking the graph, so it
+is the URL the browser really requests rather than a coaxing trick. `runViteSpike` grew an
+optional `entryMarker` asserted against the BODY, and an optional `base`, since a keep-prefix
+template serves its shell and `/@vite/client` under the prefix and gates asking for `/` would
+grade a redirect.
+
+**Then the replacement gate turned out to be INVERTED, and it shipped.** The marker chosen
+was `precompileTemplate`. A user ran the template in a browser and got
+`Uncaught Error: Attempted to call \`precompileTemplate\` at runtime, but this API is meant to
+be used at compile time` — on boot, from the first route module evaluated.
+
+Compiling a `.gjs` is two stages: `content-tag` rewrites `<template>` into a
+`precompileTemplate(...)` call, then `babel-plugin-ember-template-compilation` compiles that
+call away into `createTemplateFactory(...)` carrying Glimmer wire format. **A correctly built
+module therefore does not contain `precompileTemplate` at all** — the gate was asserting the
+output of stage one, which is the *symptom* of stage two not running. It was green precisely
+because the app was broken. That is worse than the vacuous version it replaced: a vacuous
+gate proves nothing, an inverted one actively certifies the defect.
+
+Root cause of the defect itself: the template's `babel.config.mjs` passed
+`targetFormat: 'hbs'`. The plugin documents that mode as leaving templates "in HBS format …
+they will still need further processing before they're ready to execute", for codemods and
+library pre-publication. An app has no further processing, so the call survived to runtime.
+The default is `'wire'`; the fix is to pass no `targetFormat` at all. Both route modules were
+broken identically — only `about.gjs` appeared in the stack trace because `app.js` imports it
+first, which is worth remembering: an app-level symptom named one file and the bug was in
+every file.
+
+The gate now asserts, over the whole module graph walked from `index.html` the way a browser
+walks it: **positively** that every `.gjs` contains `createTemplateFactory` and a `"block"`
+wire payload — checked against `@ember/app-blueprint`'s own output, not invented — and
+**negatively** that no app module contains a `precompileTemplate(` call or imports the
+compiler. Proven in both directions: re-introducing `targetFormat: 'hbs'` turns four
+assertions red and the spike exits 1. Walking the graph rather than checking the entry is
+deliberate, because a per-entry check would have cleared the second route.
+
+The general lesson, since this is twice now on the same gate: **a marker must be something
+only a CORRECT build can produce, verified against a known-good reference.** "The transform
+ran" is not the same claim as "the transform produced the right thing", and for a multi-stage
+pipeline the intermediate form is evidence of failure, not success. `runViteSpike`'s
+`entryMarker` docs now say so at the point of use.
+
+**Shipped `experimental` against the usual rule, and the flag earned its keep twice.** The
+stated rule (`AGENTS.md:4502`) is that a template graduates once its spike is green, and this
+one was green from the start. It stayed flagged because the keep-prefix line above is a
+BROWSER-side contract a headless gate cannot check. The browser run then found a boot-time
+crash every headless gate had passed, and a second pass found the manifest lying about HMR.
+Read that as a fact about the flag rather than about this template: `experimental` is what
+this repo has instead of a browser, and a template nobody has opened in one has not been
+tested, however many spikes are green.
+
+**Now graduated, and precisely on what.** I ran it in the studio and the checklist was
+then re-run under a real headless Chromium against a byte-identical server (all five app
+modules identical to the in-VM ones once Vite's `?v=` dep-optimizer hashes and change stamps
+are normalised; the host also reproduced the studio's `Local:` line and its
+`[vite] (client) page reload` line verbatim). Measured:
+
+| | |
+|---|---|
+| `location.pathname` on load | `/preview/4200/` |
+| rendered `LinkTo` href | `/preview/4200/about` |
+| after clicking About | `/preview/4200/about`, no full page load |
+| Back link, browser back, browser forward | `/preview/4200/` → `/preview/4200/about` → `/preview/4200/` |
+| reload sitting on the child route | stays, renders, **0 console errors** |
+
+That is the `keepPreviewPrefix` contract, discharged — the one thing the spike structurally
+could not reach — so `experimental` is gone. Same bar react-router 7 cleared. **What
+graduation does NOT claim:** it does not claim HMR (there is none, below), and it does not
+claim the `rootURL` arm of `rewritePreviewBaseToRoot` is verified (also below).
+
+**The observation that started it, and why it could not be answered from source.** The
+reported symptom was that clicking About gives `localhost:4200/about` with no preview prefix,
+which reads exactly like the react-router 7 failure this flag exists to prevent. It is not:
+the studio's address bar is synthetic. `syncTabLocation` (`controller.ts:3115-3124`) strips
+`/preview/<port>` deliberately, to show the in-server path. The trap is that **it renders a
+correct URL and a broken one identically** — feed it `/preview/4200/about` or a bare `/about`
+and both come out `localhost:4200/about`. So the report could not distinguish working from
+broken, and neither could reading the code. Only a browser could, which is the lesson: for a
+browser-side contract, add a browser, don't reason harder.
+
+**HMR: there is none, the manifest said there was, and that is now fixed.** Measured — counter
+set to 5, edit `application.gjs`, counter back to 0, a `window` marker gone, and
+`[vite] (client) page reload app/templates/application.gjs` in the console. This is **stock
+Ember**, not something the no-compat shape broke: `@ember/app-blueprint@7.1.1`'s generated
+`package.json` ships no HMR package, the blueprint never mentions hmr, and `@embroider/vite`
+contains no `import.meta.hot` anywhere.
+
+The fix is `reload: true`, keeping `hmr: true`, and the pairing is the point:
+
+- `hmr` does **not** gate hot updates. It gates `warmDevServer` (`kernel-worker.ts:485`),
+  which primes the cold dep-optimize before the preview opens. Ember needs that (57
+  pre-bundled deps), so it stays `true`.
+- `reload` is what picks the studio's wording — `controller.ts:1773` chooses
+  "recompiling…" over "hot-updating…", and `3508`/`3540` choose "edits recompile + restart"
+  over "edits hot-reload". With `reload: false` the studio was promising the user their
+  state would survive a save. It does not.
+
+Worth naming the fix that would have looked right and done nothing: copying Next's
+`hmr: false, reload: false`. That leaves `reload` false, so the studio still says "edits
+hot-reload", and it drops the dep-optimize warm as a bonus. The flag whose name matches the
+symptom was not the flag causing it. Both flag doc comments were widened to say what they
+actually gate, without redefining them for the templates where HMR *is* state-preserving.
+Two more copies of the false claim went with it: the picker description said "with hot
+reload", and the app's own on-page hint said "save to test HMR".
+
+**`ember-vite-hmr` is not available at these pins — checked, not assumed.** It is the only
+option (`patricklx/ember-vite-hmr`, alive: v2.2.3, updated 2026-07-29) and it does not
+install:
+
+- it requires `@embroider/compat: "*"` as a **peer** — the exact package the no-compat shape
+  exists to avoid, on the heaviest install in the repo;
+- it requires `babel-plugin-ember-template-compilation: "^2.2.2"`, and we pin `^4.0.0`,
+  which is the blueprint's own pin;
+- `peerDependenciesMeta` is empty, so neither is optional.
+
+`npm install ember-vite-hmr` fails `ERESOLVE` outright. Landing it would take
+`--force`/`--legacy-peer-deps` — a knowingly broken resolution in a starter template — plus
+the compat build, plus a new in-VM spike to show any of it works. Not worth it to make one
+manifest flag true when the flag can simply be correct instead. Revisit if the addon adopts
+the v4 plugin; that is the single condition.
+
+Not proved here, and listed rather than dressed up:
+
+- **The `rootURL` arm of `rewritePreviewBaseToRoot` is UNPROVEN, and shipping it did not
+  change that.** The regex was widened to rewrite `rootURL` (and to accept `=`, since Ember
+  writes it as a class field) so that in wildcard mode Vite's `base` and Ember's `rootURL`
+  are rewritten to `/` together rather than drifting apart. An attempt to demonstrate the
+  failure it prevents did not work: running the app with `base: '/'` against
+  `rootURL: '/preview/4200/'` rendered fine, navigated fine, and even survived a reload —
+  because hitting Vite directly is not wildcard mode, and Vite's SPA fallback answers any
+  path. **The test passed for the wrong reason, so it proves nothing**, and it is recorded
+  that way rather than as a green check. What justifies keeping the arm is structural (in
+  wildcard mode the SW serves at the origin root, so a router still emitting prefixed URLs
+  would emit URLs the SW does not route) plus a measured cost of nearly zero: across all 81
+  shipped templates the widened pattern matches **exactly one** additional construct
+  (`ember/app/router.js`) and loses nothing. Low risk, unvalidated benefit. Do not let
+  "we shipped it" harden into "it was verified" — validating it needs a studio run in
+  wildcard mode (mode C), which nobody has done.
+- **Anything about HMR beyond "there isn't any."** The full-reload behaviour is measured and
+  the manifest now says so, but no gate watches a save propagate; if a future Ember or
+  Embroider adds hot updates, nothing here will notice, and the flags will quietly go stale
+  in the other direction.
+- **`import.meta.resolve` returns a path in-VM where Node returns a `file://` URL.** Hit while
+  porting the blueprint's `babel.config.mjs`, which does
+  `fileURLToPath(import.meta.resolve('decorator-transforms/runtime-esm'))` and threw
+  "Invalid URL". Worked around in the template with a bare specifier rather than fixed in the
+  runtime, because the fix is a second behaviour change to a shared path and this change
+  already carries one. It is a real gap and it will be hit again.
+- **The dynamic-import path still reads `__esModule` the old way.** `__oc_def` now requires
+  the `default` key to exist; `__oc_ns` (`esm.js:155`), `rewriteCjsDynamicImport`
+  (`esm.js:449`) and `__ocImport` (`index.js:1752`) still treat the flag as proof of an ESM
+  namespace, so `(await import('<tsc-emitted-cjs>')).default` is `undefined` in-VM where Node
+  gives `module.exports`. Not fixed here on purpose: those helpers cannot tell our own
+  transpiled ESM (which sets the same flag, `esm.js:701`) from `tsc`'s CJS without a distinct
+  marker, and that is a second behaviour change to a shared path. Symptom to recognise:
+  "Named export 'default' not found" from Vite's SSR module runner.
+- **Anything needing a v1 addon**, per the no-compat trade above, and the **test story** —
+  `ember test`/testem are not in the template at all.
+
+**A correction about the deep-link check.** An earlier version of this entry called
+`GET /preview/4200/about -> 200` with the app shell "the strongest thing a headless gate can
+say about `keepPreviewPrefix`" and recommended shipping it as-is at graduation. It is much
+weaker than that, and both halves of why are now measured rather than argued: on the run
+where every route module threw on boot **that check still passed**, and
+`GET <base>definitely-not-a-route-xyz` returns the same 200 with the same 441 bytes as
+`<base>about`, because a SPA fallback answers every URL with the shell. It is carried in the
+spike, but as what it is: proof the fallback is wired **under the prefix**, so a reload on a
+child URL lands in the app rather than a 404. What proves a route works is its compiled
+module, which is why the gate walks the graph. Graduation did not rest on it; it rested on
+the browser run above, and there is no headless substitute for that.
+
+**Three follow-ups this turned up, all deliberately left out of this change.** Each is
+general rather than Ember's, and folding a shared-path fix into a template change is how the
+last two rounds of trouble started:
+
+- **The studio address bar cannot express the difference it is being read for.**
+  `syncTabLocation` renders `/preview/4200/about` and a bare `/about` identically, so for
+  every keep-prefix template the one URL a user would check to see whether the prefix
+  survived is the one thing the UI hides. It cost a round trip here and will cost the next
+  person one. A `title` attribute carrying the real href, or not stripping for keep-prefix
+  ports, would fix it.
+- **`warmDevServer` probably does nothing for keep-prefix templates.** It fetches `/` and
+  regex-matches `<script type="module" src=…>`. Under a Vite `base` that path is a 302 (host
+  measurement: `GET / -> 302`), so the body it parses is empty; and Ember's `index.html`
+  carries an inline module script with no `src`, so there would be nothing to match even at
+  the right URL. The consequence is mild — the user meets the cold dep-optimize in the
+  iframe instead of behind the "optimizing dependencies" status — but it means `hmr: true`
+  buys less than the flag implies for docusaurus, vitepress, rspress, starlight,
+  react-router, tanstack-router and ember alike. Not measured in-VM; flagged, not fixed.
+- **A browser gate does not exist in this repo, and twice now that has been the gap.** The
+  `precompileTemplate` crash and the HMR mis-flag both passed every headless tier and were
+  caught by a person opening the app. The measurements in this entry were taken with a
+  throwaway headless Chromium driving the shipped template; making that a real tier is a
+  much larger change than this one, but it is the change that would stop the pattern.

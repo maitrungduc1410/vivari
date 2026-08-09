@@ -110,15 +110,20 @@ function normalizePreviewWildcardDomain(raw: string | undefined): string | undef
 }
 
 // Rewrite a keep-prefix template's framework **base** config (`base` / `basename`
-// / `baseUrl` set to `"/preview/<port>/"`) to the origin root `"/"`. Keep-prefix
-// templates (Docusaurus, VitePress, Rspress, Starlight, React Router 7, TanStack
-// Router) hardcode that base for the path-multiplexed modes A/B; in mode C each
-// port is its OWN origin served at `/`, so the hardcoded base would 404. We touch
-// ONLY those config keys, so legitimate cross-service URLs in app code (e.g.
+// / `baseUrl` / `rootURL` set to `"/preview/<port>/"`) to the origin root `"/"`.
+// Keep-prefix templates (Docusaurus, VitePress, Rspress, Starlight, React Router 7,
+// TanStack Router, Ember) hardcode that base for the path-multiplexed modes A/B; in
+// mode C each port is its OWN origin served at `/`, so the hardcoded base would 404.
+// We touch ONLY those config keys, so legitimate cross-service URLs in app code (e.g.
 // `'/preview/' + PORT + '/api'`, which still route via the SW/shim in mode C) are
-// left intact.
+// left intact. `rootURL` is Ember's spelling of the same setting, and it has to be
+// listed for the same reason as the others: the template sets Vite `base` AND the
+// router's rootURL, and rewriting only the first leaves the router looking for a
+// prefix the server no longer serves. It also brings `=` into the separator, because
+// Ember writes it as a class field (`rootURL = '/preview/4200/'`) rather than an
+// object key — still only ever matched against a literal `/preview/<port>/` value.
 function rewritePreviewBaseToRoot(files: Record<string, string>): Record<string, string> {
-  const re = /((?:base|basename|baseUrl)\s*:\s*)(['"`])\/preview\/\d+\/\2/g;
+  const re = /((?:base|basename|baseUrl|rootURL)\s*[:=]\s*)(['"`])\/preview\/\d+\/\2/g;
   const out: Record<string, string> = {};
   for (const [path, content] of Object.entries(files)) {
     out[path] = content.replace(re, (_m, key: string, q: string) => `${key}${q}/${q}`);
@@ -505,7 +510,11 @@ function languageFor(path: string): string {
   if (/\.css$/.test(path)) return "css";
   if (/\.scss$/.test(path)) return "scss";
   if (/\.less$/.test(path)) return "less";
-  if (/\.(html?|vue|svelte)$/.test(path)) return "html";
+  // .gjs/.gts (Ember) join .vue/.svelte here rather than in the `typescript` line
+  // above: they embed a `<template>` block the TS worker parses as a syntax error, so
+  // routing them to a Monarch-only language buys highlighting without red squiggles
+  // over the markup. `.gjs` is the Ember template's `entry`, so it opens immediately.
+  if (/\.(html?|vue|svelte|g[jt]s)$/.test(path)) return "html";
   if (/\.json[5c]?$/.test(path)) return "json";
   if (/\.md$/.test(path)) return "markdown";
   // Python: Monarch highlights on the main thread, and — unlike every language

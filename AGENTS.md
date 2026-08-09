@@ -2887,15 +2887,19 @@ client agree. Templates doing this: **Docusaurus** (`baseUrl`), **Rspress** (`ba
 to Rsbuild as `server.base`), **Starlight** (Astro `base` — its sidebar/pager links are
 root-absolute, and the SW does not proxy a prefix-less *navigation*), **React Router 7**
 (`react-router.config.ts` `basename` + Vite `base`, both `/preview/5173/`, trailing
-slash required). Symptom if you forget: "not found" on first load / `No route matches
-URL "/preview/<port>/"`.
+slash required), **Ember** (the router's `rootURL` + Vite `base`, both
+`/preview/4200/`). Symptom if you forget: "not found" on first load / `No route
+matches URL "/preview/<port>/"`.
 
 **Mode C auto-adapts these.** In mode C each port is its own origin served at `/`, so
 the hardcoded `/preview/<port>/` base would 404. `createFromTemplate` calls
 `rewritePreviewBaseToRoot` when `previewMode === "wildcard"` && `keepPreviewPrefix`,
-which rewrites only the `base`/`basename`/`baseUrl` config keys to `"/"` (leaving
-legit cross-service URLs like `'/preview/'+PORT+'/api'` intact) and drops the flag —
-so every template runs correctly in every mode. Modes A/B keep the template verbatim.
+which rewrites the `base`/`basename`/`baseUrl`/`rootURL` settings to `"/"` — assigned
+with either `:` or `=`, since Ember writes `rootURL` as a class field, so this matches
+assignments and not only config keys — and only ever against a literal
+`/preview/<port>/` value, so legit cross-service URLs like `'/preview/'+PORT+'/api'`
+stay intact. It also drops the flag — so every template runs correctly in every mode.
+Modes A/B keep the template verbatim.
 
 ### `module` is a REAL constructor — route requires through `Module._load`
 `require('module')` returns the `Module` **constructor** (not a plain object);
@@ -3454,6 +3458,17 @@ also unchanged.
   `require()` returns `X` directly; `export { X as default }` sets
   `exports.default`. Getting these wrong yields `TypeError: x is not a function`
   on a plugin's default export.
+- **`__esModule` is not proof of a `default` — the static unwrap requires the key.**
+  `tsc --module commonjs` stamps the flag on every file it emits, including ones that
+  only assign named exports, so it means "transpiled", not "has a default". Babel's rule
+  (`m.__esModule ? m.default : m`) returns `undefined` for those, where Node — which
+  ignores the flag entirely — gives `module.exports`. So `__oc_def` is
+  `m && m.__esModule && 'default' in m ? m.default : m`: a strict narrowing that keeps the
+  Babel unwrap wherever a real `default` exists. `@embroider/core` is the shape that
+  exposed it (`import core from '@embroider/core'` → `undefined` → *"Cannot destructure
+  property 'cleanUrl' of 'core'"*, killing Ember's config load). Do NOT "simplify" it back;
+  the namespace helpers deliberately still read the flag the old way (see the comment at
+  `__oc_ns`, and the Ember entry in `roadmap.md`). Proven by `scripts/spike-esm.mjs`.
 - **Top-level await → compile as AsyncFunction on ANY parse failure.** Our CJS wrapper
   is a plain (non-async) function, so an ESM module with top-level `await` fails
   `new Function`. You can't sniff this from the error message: `await import('x')`

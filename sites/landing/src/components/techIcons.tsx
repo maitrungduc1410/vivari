@@ -85,6 +85,15 @@ import PreactIcon from "~icons/logos/preact";
 import SolidIcon from "~icons/logos/solidjs-icon";
 import LitIcon from "~icons/logos/lit-icon";
 import QwikIcon from "~icons/logos/qwik-icon";
+// Ember takes source 2 rather than source 1, on the legibility grounds the
+// `library` glyph note invokes. `logos:ember` is the horizontal lockup — 512x213,
+// mark plus an "Ember" wordmark — and these chips are 14x14, where the SVG's
+// default `preserveAspectRatio` letterboxes it to 14x6: an illegible smear of a
+// word the adjacent label already spells. `vscode-icons:file-type-ember` is the
+// same official mark on its own, square like every neighbour here. Not
+// `logos:ember-tomster`: the mascot is 132 paths, which is the weight the ASSET
+// note below exists to keep off the JS path.
+import EmberIcon from "~icons/vscode-icons/file-type-ember";
 
 // Meta-frameworks.
 import NextIcon from "~icons/logos/nextjs-icon";
@@ -180,6 +189,7 @@ const BRAND: Record<string, IconComponent> = {
   solid: SolidIcon,
   lit: LitIcon,
   qwik: QwikIcon,
+  ember: EmberIcon,
 
   next: NextIcon,
   nuxt: NuxtIcon,

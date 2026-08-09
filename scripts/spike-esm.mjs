@@ -235,5 +235,43 @@ console.log("\n== [esm] dynamic import() of CJS builds a namespace with default 
   check("ESM target (already __esModule) is returned unchanged", b === esmTarget);
 }
 
+// ── 6. static default import of CJS: `__esModule` is not proof of a `default` ─
+// `tsc --module commonjs` stamps `__esModule` on every file it emits, including the
+// ones that only ever assign named exports — so the flag means "transpiled", not "has
+// a default". Babel's rule (`m.__esModule ? m.default : m`) reads it as the second and
+// hands back `undefined`. @embroider/core is exactly that shape, and it is why
+// @embroider/vite died at `const { cleanUrl } = core` before Ember's config could load.
+// Node has no such hazard: a CJS default import is `module.exports`, always. So the
+// unwrap requires the key to be THERE, which keeps Babel's behaviour wherever a real
+// `default` exists. The first check below is the one that fails on the old predicate;
+// the second is what stops a fix from over-correcting into Node's rule outright.
+//
+// Note this is the STATIC path only — the namespace helpers still read the flag the old
+// way, deliberately and on the record. See the cross-reference at esm.js's __oc_ns.
+console.log("\n== [esm] default import of __esModule CJS with no `default` ==");
+{
+  // tsc's shape: the flag is non-enumerable, and there is no `default` key at all.
+  const namedOnly = {};
+  Object.defineProperty(namedOnly, "__esModule", { value: true });
+  namedOnly.cleanUrl = (u) => u;
+  // Babel's shape: the flag AND a real default export.
+  const withDefault = {};
+  Object.defineProperty(withDefault, "__esModule", { value: true });
+  withDefault.default = "D";
+  const plain = { x: 1 };
+
+  const src =
+    `import a from 'named-only';\nimport b from 'with-default';\nimport c from 'plain';\n` +
+    `__oc_exports.a = a; __oc_exports.b = b; __oc_exports.c = c;\n`;
+  const req = (s) => ({ "named-only": namedOnly, "with-default": withDefault, plain })[s];
+  const mod = { exports: Object.create(null) };
+  new Function("__oc_exports", "__oc_require", "__oc_module", transpileEsm(src, "/entry.js") + "\n")
+    .call(mod.exports, mod.exports, req, mod);
+
+  check("__esModule + named exports only -> module.exports, not undefined", mod.exports.a === namedOnly);
+  check("__esModule + a real `default` -> still unwrapped (Babel interop kept)", mod.exports.b === "D");
+  check("no __esModule -> module.exports", mod.exports.c === plain);
+}
+
 console.log(`\nRESULT: ${failures === 0 ? "PASS — esm.js live-binding + TLA loader guarantees hold" : `FAIL — ${failures} check(s) failed`}`);
 process.exit(failures === 0 ? 0 : 1);

@@ -286,6 +286,10 @@ const SPIKES = [
   { name: "svelte", file: "spike-svelte.mjs", net: true },
   { name: "qwik", file: "spike-qwik.mjs", net: true },
   { name: "vue", file: "spike-vue.mjs", net: true },
+  // Ember on Embroider + Vite, and the one frontend variant that is NOT pinned back:
+  // it runs a single (client) rolldown pass, so Vite 8 holds. Reads the shipped bytes,
+  // and gates the .gjs transform by content rather than by status — see its header.
+  { name: "ember", file: "spike-ember.mjs", net: true },
   // The Nest template's save -> recompile -> restart. Was probe-nest-watch.mjs, wired
   // into nothing and unable to start for want of an `npm` built-in that had been
   // removed; see the spike's header for why an unrunnable artifact was worse than none.

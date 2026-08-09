@@ -136,7 +136,22 @@ export function importMetaSource(fileUrl, filename) {
 // importing module.
 function helpers(fileUrl, filename) {
   return (
-    "const __oc_def=function(m){return m&&m.__esModule?m.default:m;};" +
+    // `__esModule` alone is NOT enough to unwrap to `.default`: `tsc --module
+    // commonjs` stamps the flag on every emitted file, including the ones that only
+    // ever assign named exports, so the flag says "transpiled" where the unwrap needs
+    // "has a default". @embroider/core is one of those — flag set, no `default` key —
+    // and `import core from '@embroider/core'` handed @embroider/vite `undefined`,
+    // failing Ember's config load at `const { cleanUrl } = core`. Node has no such
+    // hazard: a CJS default import is `module.exports`, always. Requiring the key to
+    // exist keeps the Babel unwrap that real `export default` code depends on and
+    // falls back to Node's answer otherwise.
+    "const __oc_def=function(m){return m&&m.__esModule&&'default' in m?m.default:m;};" +
+    // DELIBERATELY NOT the predicate above: __oc_ns still treats the flag as proof of an
+    // ESM namespace, so `(await import('<tsc-emitted-cjs>')).default` is `undefined` here
+    // where Node gives module.exports. Narrowing it the same way would be wrong — OUR
+    // transpiled ESM sets `__esModule` too (below), and one with no `export default` would
+    // get a synthesised `ns.default = m` Node never gives it. Telling the two apart needs a
+    // marker `__esModule` cannot carry. Known and recorded in roadmap.md, not an oversight.
     "const __oc_ns=function(m){if(m&&m.__esModule)return m;var ns=Object.create(null);if(m)for(var k of Object.keys(m)){Object.defineProperty(ns,k,{enumerable:true,configurable:true,get:(function(k){return function(){return m[k];};})(k)});}ns.default=m;Object.defineProperty(ns,'__esModule',{value:true});return ns;};" +
     // Each getter MUST close over its OWN `k` (per-iteration IIFE), not the shared
     // loop `var k` — otherwise every re-exported name resolves to the LAST key of

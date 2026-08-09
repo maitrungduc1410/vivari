@@ -18,6 +18,7 @@ import NextjsIcon from "~icons/vscode-icons/file-type-next";
 import WebpackIcon from "~icons/vscode-icons/file-type-webpack";
 import DocusaurusIcon from "~icons/vscode-icons/file-type-docusaurus";
 import AngularIcon from "~icons/vscode-icons/file-type-angular";
+import EmberIcon from "~icons/vscode-icons/file-type-ember";
 import PythonIcon from "~icons/vscode-icons/file-type-python";
 
 // Rsbuild/Rspack/Rspress ship no icon in any Iconify set, so bundle their official
@@ -363,6 +364,7 @@ const ICONS: Record<string, (p: IconProps) => React.ReactElement> = {
   lit: LitIcon,
   solid: SolidIcon,
   qwik: QwikIcon,
+  ember: (p) => <EmberIcon className={p.className} />,
   // Phase 3 — backends
   fastify: Badge({ text: "F", bg: "#121212" }),
   nitro: Badge({ text: "Ni", bg: "#c8a415", fg: "#1a1500" }),
