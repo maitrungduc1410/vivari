@@ -1,0 +1,257 @@
+---
+slug: cpython-startup-in-a-tab
+title: There was never a second import pandas, and PEP 552 is why there is now
+description: Every python command in the browser boots its own CPython, so __pycache__ never got a second run to be fast on. Fixing it took a memory snapshot and a twenty year old detail of how .pyc files decide they are stale.
+tags: [teardown, python, wasm]
+image: /img/og/cpython-startup-in-a-tab.png
+og_eyebrow: TEARDOWN 08
+---
+
+import Playground from '@site/src/components/Playground';
+
+On your laptop, the first `import pandas` of the day is slow and every one after
+it is fast. You have probably never thought about why. CPython compiles the
+package's `.py` files to bytecode, writes that bytecode into `__pycache__`, and
+never does it again.
+
+Run Python inside a browser tab, where every command is its own process with its
+own interpreter and a freshly unpacked copy of every package, and something
+uncomfortable follows. There is no second time. Every `import pandas` is the
+first one.
+
+{/* truncate */}
+
+## Whose work this is
+
+[Pyodide](https://pyodide.org) compiled CPython to WebAssembly, including the C
+extension modules that make NumPy and pandas possible at all. That is theirs,
+and this post does not improve on it. Vivari runs Pyodide's build of CPython
+3.14 unmodified.
+
+What Vivari adds is the operating system around it: a filesystem that outlives a
+process, a process table, and the caches described below. The first half of this
+post uses a Pyodide API and says so. The second half is a CPython behaviour that
+Pyodide deliberately turns off, and turning it back on correctly turned out to
+be the interesting part.
+
+## The problem, measured
+
+Every `python` command in Vivari is a real process with its own worker, and
+therefore its own interpreter. That is what makes a crashing script harmless,
+and it has an obvious cost: `python a.py && python b.py` boots CPython twice.
+
+On the vendored build, booting CPython costs **1843ms**. That is not a slow
+import or a slow download. It is the interpreter initialising itself, producing
+the same bytes it produced the last time and will produce the next time.
+
+Paying nearly two seconds before a one line script can print anything is the
+single worst thing about Python in this environment, and it is worth noticing
+that it is a pure waste rather than a tradeoff. Nothing about the result varies.
+
+## Saving the interpreter instead of rebuilding it
+
+Pyodide can serialise a just-booted interpreter's linear memory and start
+another interpreter from it. The API is `_makeSnapshot` on load and
+`makeMemorySnapshot()` afterwards, it is marked experimental, and it does the
+hard part. Vivari's contribution is narrower: making one process's snapshot
+usable by the next process.
+
+Measured on the same build:
+
+| step | cost |
+| --- | --- |
+| boot CPython normally | 1843ms |
+| restore from a snapshot | 205ms |
+| write the 31 MB snapshot | 71ms |
+| read it back through the VFS | 47ms |
+
+So the first command of a session boots the slow way and keeps the bytes, and
+every command after it spends about 250ms getting an interpreter instead of
+1843ms. The REPL, `pip`, `pytest`, all of them.
+
+**Why the filesystem and not memory.** The snapshot has to outlive the process
+that made it and be visible to a process that does not exist yet. Those
+processes share exactly one thing, which is the virtual filesystem. It goes in
+`/var/cache`, where the kernel already keeps transient caches and which the
+filesystem worker excludes from OPFS persistence.
+
+That exclusion is deliberate rather than incidental. A snapshot is only valid
+for the interpreter build that made it, and it is 31 MB. Persisting it across
+page reloads would spend a real and permanent storage cost to save 1.6 seconds
+on one command per session. So a reload starts cold, on purpose.
+
+**Why it is safe to share between processes.** Restoring a snapshot in a
+different JavaScript realm from the one that made it is the load-bearing
+assumption here, and it is tested rather than hoped: the test tier makes a
+snapshot in one worker thread and restores it in two others, then imports
+packages, writes files and raises a traceback in each. Two Web Workers are two
+realms in the same way.
+
+**Two guards, because a corrupt interpreter is a terrible failure mode.** The
+snapshot bytes are written first and a small JSON sidecar second, which makes
+the sidecar a commit record: a half-written cache is one whose sidecar does not
+agree with it, and it is ignored rather than restored. Then a restored
+interpreter is asked to prove it is one:
+
+```python
+__import__('json').dumps([__import__('sys').version_info[0], 1 + 1])
+```
+
+That costs about a millisecond, and it is deliberately not `2 + 2`. Arithmetic
+would survive a restore that had destroyed the import system. This touches the
+frozen stdlib and string formatting, which is the machinery a bad restore takes
+out. It cannot prove that subtle corruption is absent. What it buys is that an
+obviously broken snapshot costs one cold boot rather than a baffling failure
+inside somebody's own program.
+
+If anything at all goes wrong, the command boots the slow way and says nothing,
+because a cache that has to be explained is a cache with a bug.
+`VV_PYTHON_SNAPSHOT=0` turns it off.
+
+## The bigger number underneath
+
+Removing interpreter start-up exposes the thing it was hiding, which is larger.
+On the same build:
+
+- `import pandas`: **2.3s**
+- `import matplotlib.pyplot`: **1.9s**
+- `import numpy`: **0.5s**
+
+Almost none of that is the package doing anything. It is CPython compiling
+around a thousand `.py` files to bytecode, having compiled the same files to
+byte-identical bytecode a moment earlier in a different process.
+
+CPython solved this decades ago. The reason its solution does not apply here is
+one line: Pyodide sets `sys.dont_write_bytecode`. Which is a perfectly
+reasonable default when every interpreter is thrown away, and exactly wrong once
+one of them can leave something behind.
+
+Unsetting it is free. Measured on numpy, an import with bytecode writing enabled
+costs 423ms against 420ms with it disabled. So there is no compile step anywhere
+in what follows. There is only keeping what an import already produced.
+
+Both of those are checkable rather than something to take my word for, so check
+them. The interpreter below is running in this page, and it prints its own
+version and the two settings this section is about:
+
+<Playground scenario="python-interpreter" title="Real CPython, and the two settings behind the cache" height={520} />
+
+It is the standard library only, which is the stable part of Python here. Run it
+once and you pay for fetching the interpreter and a cold boot. Run it a second
+time and you are watching the snapshot from the first half of this post do its
+job, because that is a new process with a new interpreter in it.
+
+## Where it goes wrong: `.pyc` files have opinions about time
+
+Turning the flag back on and copying the `__pycache__` tree between processes
+does not work, and the reason is the good part of this post.
+
+A `.pyc` file records the mtime and size of the source it was compiled from. On
+import, CPython compares that recorded mtime against the source file's current
+mtime, and if they differ it throws the cached bytecode away and recompiles.
+This is correct, it is why editing a file takes effect, and it is fatal here.
+
+Pyodide's `loadPackage` unpacks the wheel afresh into each new interpreter. So
+the source files' mtimes are the time of the unpack, which is different on every
+single run. Every cached `.pyc` would be stale the moment it arrived, every
+time, and the cache would do nothing except cost disk.
+
+[PEP 552](https://peps.python.org/pep-0552/) has the answer, and has had it
+since Python 3.7. A `.pyc` can be **hash-based** instead of timestamp-based: it
+records a hash of the source rather than its mtime. That is precisely what a
+package installer writes, for precisely this reason, because an installer also
+cannot promise anything about the mtimes of the files it just wrote.
+
+Converting a timestamp-based `.pyc` to a hash-based one is header surgery, not
+compilation. The marshalled code object, which is the whole expensive part, is
+byte-identical. Only the sixteen byte header changes. Harvesting the entire
+bytecode tree for numpy and pandas costs **115ms**.
+
+PEP 552 also defines two flavours of hash-based `.pyc`, checked and unchecked,
+and the choice here matters. A checked one re-reads and re-hashes the source on
+every import, which is most of the I/O this cache exists to avoid. Unchecked
+files are taken on trust.
+
+The claim being made by choosing unchecked is that a wheel's files do not change
+while its version stays the same. That is not a shortcut invented here. It is
+the same claim pip makes, and the cache is keyed on package name and version so
+that the claim stays true.
+
+## Three details that were not obvious
+
+**The bytecode does not land next to the source.** `sys.pycache_prefix` puts it
+in a tree of its own. Otherwise `__pycache__` directories appear inside the
+user's project, show up in the file explorer, and get mirrored back into the
+virtual filesystem as though the script had written them.
+
+That setting has a trap in it worth writing down, because it fails silently.
+CPython builds the directory tree under the prefix by walking **up** from the
+`.pyc`'s intended directory until it finds something that already exists. If
+that walk runs off the top without finding one, it starts creating directories
+relative to the current working directory instead, says nothing, and no bytecode
+is ever written where you are looking for it. The prefix's root has to exist
+before the first import.
+
+**Only installed packages are cached, never your own modules.** The user's own
+code gets bytecode too, since it is the same interpreter setting, but theirs
+stays in the per-process prefix and dies with the process, keeping CPython's
+ordinary mtime checking. A released package's files do not change. Yours change
+constantly, and a file you just edited must never be at risk of running as a
+stale copy.
+
+**The cache is keyed on the interpreter's magic number** as well as on package
+name and version, because bytecode from a different CPython is not bytecode.
+
+Like the snapshot, this lives in the session's filesystem and goes when you
+reload, and `VV_PYTHON_BYTECODE=0` turns it off.
+
+## What is honest to claim
+
+CPython 3.14, `pip` and the REPL are shipped as **stable** in Vivari. The
+scientific stack that this post uses for its measurements, NumPy, pandas,
+Matplotlib, SciPy and scikit-learn, is **experimental**, along with `pytest` and
+the notebook. The caching described here applies to every Python command either
+way, and it is not what decides those labels.
+
+Two limits worth stating plainly:
+
+- **Both caches are per session.** A page reload starts cold, by design, for the
+  reason given above. Neither one is a persistent build cache and neither is
+  trying to be.
+- **The interpreter snapshot rests on an experimental Pyodide API.** If it
+  cannot be made or restored, everything still works and simply costs 1843ms.
+  That fallback is not decoration; it is the reason it was acceptable to build
+  on an experimental API at all.
+
+The numbers in this post are from the vendored build on one machine. They are
+here to show the shape of the problem, which is a factor of about seven on
+interpreter start-up once the read is counted, not to be a benchmark you should
+quote.
+
+## The general version
+
+Both halves of this came from the same question, asked twice: what is this
+program recomputing that it already computed?
+
+The interpreter produces identical bytes on every boot. Compiling pandas
+produces identical bytecode on every run. Neither is a hard problem in
+principle, and in both cases the actual work was not making the cache fast but
+making it **correct**: a commit record so a half-written snapshot is never
+restored, a probe so a broken one is caught, hash-based `.pyc` files so a
+cached compile is never wrongly trusted, and a hard line at the boundary of the
+user's own code so an edit always wins.
+
+That last one is the rule the whole thing hangs on. A cache that is occasionally
+wrong about your own source is worse than no cache, by a margin that no amount
+of saved seconds closes.
+
+More on all of this in [the Python docs](https://vivari.run/docs/python), and
+the previous post covers [how Flask, Django and FastAPI serve real requests with
+no socket underneath](/python-web-servers-without-sockets).
+
+---
+
+Vivari is an open-source, MIT-licensed WebContainer: no commercial licence, no
+per-seat fee, self-host every asset. The code is on
+[GitHub](https://github.com/maitrungduc1410/vivari) and the
+[Studio](https://vivari.run/studio/) runs in your browser.

@@ -18,6 +18,11 @@ nodejs:
   permalink: /nodejs
   description: Compatibility with the real Node.js API surface.
 
+python:
+  label: Python
+  permalink: /python
+  description: CPython on Pyodide, and the runtime Vivari builds around it.
+
 browser-platform:
   label: Browser platform
   permalink: /browser-platform

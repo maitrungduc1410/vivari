@@ -7,12 +7,25 @@ import { StatusDot } from "../components/ui";
 
 type Status = "booting" | "ready" | "running";
 
-export type NodeTerminalProps = {
+export type ScriptTerminalProps = {
   /** The script mounted at `filename` and run by the Run button. */
   source?: string;
   filename?: string;
-  /** ESM by default; a scenario demonstrating CommonJS can override this. */
-  packageJson?: string;
+  /**
+   * The interpreter the Run button spawns. `node` and `python` are both
+   * ordinary programs in the VM, so this is the only thing that differs
+   * between a Node scenario and a Python one.
+   */
+  command?: string;
+  /**
+   * ESM by default; a scenario demonstrating CommonJS can override this. Pass
+   * `null` to mount nothing: a Python scenario has no use for a package.json,
+   * and mounting one would put a file in the project that the demo never
+   * mentions.
+   */
+  packageJson?: string | null;
+  /** Syntax highlighting for the editor pane. Defaults to the command's language. */
+  language?: "javascript" | "python";
 };
 
 // A real Node script the visitor can edit and run: it uses Node core modules
@@ -41,28 +54,37 @@ const TERM_THEME = {
   selectionBackground: "#264f78",
 };
 
-export function NodeTerminal({
+export function ScriptTerminal({
   source = INDEX_JS,
   filename = "index.js",
+  command = "node",
   packageJson = '{ "name": "demo", "type": "module" }',
-}: NodeTerminalProps = {}) {
+  language = command === "python" ? "python" : "javascript",
+}: ScriptTerminalProps = {}) {
   const codeRef = useRef(source);
   const termHost = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const [mounted, setMounted] = useState(false);
 
   // No preview iframe here, so no Service Worker to register. Its own key keeps
-  // this off the default kernel that the React preview scenario boots.
+  // this off the default kernel that the React preview scenario boots. Every
+  // scenario built on this component shares that one kernel, which is the real
+  // model anyway: one VM, several programs.
   const { vivari, status: bootStatus, error: bootError } = useVivari({
-    instanceKey: "node-terminal",
+    instanceKey: "script-terminal",
     serviceWorkerUrl: false,
   });
 
   const writeToTerm = useCallback((chunk: string) => termRef.current?.write(chunk), []);
 
   // Spawning, output streaming, stdin and kill-on-unmount all come from the
-  // hook; this scenario used to hand-write every one of them.
-  const runner = useSpawn("node", [filename], {
+  // hook; this scenario used to hand-write every one of them. The instance is
+  // handed over explicitly because this component boots its own kernel rather
+  // than sitting under a <VivariProvider>, so there is no context for the hook
+  // to read. Null until the boot resolves is fine: useSpawn reads the instance
+  // when a run starts, not when it is called.
+  const runner = useSpawn(command, [filename], {
+    vivari,
     onOutput: writeToTerm,
     onExit: (code) =>
       termRef.current?.writeln(
@@ -118,7 +140,9 @@ export function NodeTerminal({
     void (async () => {
       try {
         await vivari.mount({
-          "package.json": { file: { contents: packageJson } },
+          ...(packageJson === null
+            ? {}
+            : { "package.json": { file: { contents: packageJson } } }),
           [filename]: { file: { contents: source } },
         });
         if (cancelled) return;
@@ -154,7 +178,7 @@ export function NodeTerminal({
     if (!vm || !term || !mounted || runner.status === "running") return;
 
     term.clear();
-    term.writeln(`\x1b[38;5;51m$\x1b[0m node ${filename}`);
+    term.writeln(`\x1b[38;5;51m$\x1b[0m ${command} ${filename}`);
     try {
       await vm.fs.writeFile(`/${filename}`, codeRef.current);
     } catch (err) {
@@ -171,7 +195,7 @@ export function NodeTerminal({
       <div className="embed__bar">
         <span className="embed__title">
           <StatusDot state={status} />
-          {status === "booting" ? "booting runtime..." : `node - ${filename}`}
+          {status === "booting" ? "booting runtime..." : `${command} - ${filename}`}
         </span>
         <span className="embed__spacer" />
         <button
@@ -191,6 +215,7 @@ export function NodeTerminal({
           <div className="pane__body">
             <Editor
               initialDoc={source}
+              language={language}
               onChange={(v) => (codeRef.current = v)}
               onSave={(v) => {
                 codeRef.current = v;

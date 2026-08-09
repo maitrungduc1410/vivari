@@ -274,6 +274,11 @@ export const Vivari = forwardRef<HTMLIFrameElement, VivariProps>(function Vivari
     <VivariPreview
       {...iframeProps}
       ref={ref}
+      // Handed over rather than left to context: this component boots the
+      // instance but publishes no provider, so a preview resolving through
+      // context alone finds nothing when <Vivari> is used on its own, and waits
+      // for a `server-ready` it never subscribed to.
+      vivari={vivari}
       port={previewPort}
       path={previewPath}
       fallback={fallback}

@@ -80,9 +80,12 @@ fs.cpSync(EMBED, embedOut, { recursive: true });
 // hoisted root /sw.js, so drop the redundant copy to avoid a stale duplicate.
 fs.rmSync(path.join(embedOut, "sw.js"), { force: true });
 // The embed's React live example runs `npm run dev`, so it needs the same
-// vendored package-manager assets as the studio. They ship in the studio build
+// vendored package-manager assets as the studio, and the Python examples need
+// vendor/pyodide from that same tree. They ship in the studio build
 // (packages/studio/public/vendor → /studio/vendor); the kernel worker fetches
-// them relative to the app base (/embed/vendor here), so copy the tree in.
+// them relative to the app base (/embed/vendor here), so copy the whole tree in.
+// Narrowing this to the package-manager subdirectories would break both Python
+// demos with a fetch error that says nothing about the cause.
 const studioVendor = path.join(studioOut, "vendor");
 if (fs.existsSync(studioVendor)) {
   fs.cpSync(studioVendor, path.join(embedOut, "vendor"), { recursive: true });

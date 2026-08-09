@@ -3,20 +3,28 @@ import { EditorView, basicSetup } from "codemirror";
 import { keymap } from "@codemirror/view";
 import { EditorState, Prec } from "@codemirror/state";
 import { javascript } from "@codemirror/lang-javascript";
+import { python } from "@codemirror/lang-python";
 import { oneDark } from "@codemirror/theme-one-dark";
 
 // A tiny CodeMirror 6 editor. Created once (uncontrolled) — the editor is the
 // source of truth and reports edits through onChange; the parent writes those
 // into the VFS. Cmd/Ctrl+S is captured (browser save dialog suppressed) and
 // routed to onSave so the visitor can save-to-HMR like a real editor.
+//
+// The language pack is chosen per scenario rather than sniffed from the
+// filename: a Python demo highlighted by the JavaScript grammar renders `#` as
+// ordinary text and misses every keyword, which is exactly the sort of detail
+// the audience for a Python post notices first.
 export function Editor({
   initialDoc,
   onChange,
   onSave,
+  language = "javascript",
 }: {
   initialDoc: string;
   onChange: (value: string) => void;
   onSave?: (value: string) => void;
+  language?: "javascript" | "python";
 }) {
   const host = useRef<HTMLDivElement>(null);
   const onChangeRef = useRef(onChange);
@@ -46,7 +54,7 @@ export function Editor({
             ]),
           ),
           basicSetup,
-          javascript({ jsx: true }),
+          language === "python" ? python() : javascript({ jsx: true }),
           oneDark,
           EditorView.theme({ "&": { height: "100%" } }),
           EditorView.updateListener.of((u) => {
@@ -56,7 +64,8 @@ export function Editor({
       }),
     });
     return () => view.destroy();
-    // Create once; initialDoc/onChange/onSave are read via refs.
+    // Create once; initialDoc/onChange/onSave are read via refs, and `language`
+    // is fixed for the lifetime of a scenario.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

@@ -1,0 +1,386 @@
+---
+slug: python-web-servers-without-sockets
+title: Flask, Django and FastAPI answering real requests, with no socket underneath
+description: Pyodide gave us CPython in the browser. It did not give us a socket, and a Python web server is mostly socket. Here is the bridge that runs WSGI and ASGI apps anyway, and the Starlette bug that took the longest to find.
+tags: [teardown, python, runtime]
+image: /img/og/python-web-servers-without-sockets.png
+og_eyebrow: TEARDOWN 07
+---
+
+import Playground from '@site/src/components/Playground';
+
+Every Python web framework bottoms out in the same two lines, whatever it calls
+them:
+
+```python
+sock.bind((host, port))
+sock.listen(backlog)
+```
+
+A browser tab does not have that. There is no TCP stack in a page, no file
+descriptor to bind, and no amount of WebAssembly changes it. So the interesting
+question is not whether you can run Flask's Python in a browser, because you
+can. It is what happens when someone types `flask run`.
+
+{/* truncate */}
+
+## What is Pyodide's, and what is not
+
+Worth being exact about this up front, because the rest of the post only makes
+sense once the line is drawn.
+
+[Pyodide](https://pyodide.org) compiled CPython to WebAssembly. That is their
+work, it is a large piece of engineering, and nothing here reimplements any of
+it. The interpreter running in Vivari is Pyodide's build of CPython 3.14, with
+its standard library and its C extension modules, unmodified. When this post
+says "the interpreter", it means theirs.
+
+What Pyodide does not ship, because it cannot, is an operating system: a
+filesystem shared with other programs, a process table, a port registry, a
+socket. Vivari is the layer that supplies those. This post is about exactly one
+of them, and it is the one people ask about first.
+
+## A socket that accepts everything and carries nothing
+
+The obvious expectation is that `import socket` fails and the frameworks fail
+loudly with it. That is not what happens, and the real behaviour is the reason
+this needed designing rather than documenting.
+
+There is a `socket` module, inherited from the POSIX layer underneath the
+WebAssembly build. `connect()` succeeds. `bind()` succeeds. `listen()` succeeds.
+Then no bytes ever move, and `select()` never reports the socket readable. That
+is not a defect anybody introduced; it is what a POSIX shaped API looks like
+when there is no network stack beneath it to say no.
+
+Point Django's development server at that and it does the worst possible thing.
+It prints its banner:
+
+```
+Starting development server at http://127.0.0.1:8000/
+Quit the server with CONTROL-C.
+```
+
+and then answers nothing, for as long as you leave it running. Nothing raised,
+nothing logged, no clue in the output that the server you are looking at is
+incapable of serving. A missing feature that announces itself is a small
+problem. A missing feature that looks like a working one costs somebody an
+afternoon.
+
+So the design rule for everything below is that a socket must never be the thing
+we quietly rely on.
+
+## The launcher is not a Python program
+
+Here is the piece that makes the rest possible, and it is an accident of how
+Vivari is put together rather than anything clever about Python.
+
+`python` in Vivari is not a Python program. It is a Node program, running on
+Vivari's Node-compatible runtime, and it boots Pyodide inside itself. That
+runtime has a real `require("http")`, a real event loop, and a working
+`server.listen(port)`, because Vivari's kernel implements virtual ports: an
+Express app in this environment gets a preview tab, and it does so without a TCP
+stack either.
+
+Which means the interpreter that cannot bind a port is running inside a process
+that already can.
+
+```
+browser  ->  service worker  ->  kernel virtual port
+                                       |
+                                       v
+                          guest Node http.createServer()      <- the "socket"
+                                       |
+                                 JSON, base64 body
+                                       v
+                                    Pyodide
+                                       |
+                          WSGI environ / ASGI scope
+                                       v
+                              your Flask or FastAPI app
+```
+
+Nothing in the Python half of that diagram believes it is talking to a network.
+It is handed a request the way a WSGI server hands one over, because that is
+precisely what the layer above it has become.
+
+## Writing the environ by hand
+
+WSGI is a good specification to be stuck with here, because it was never about
+sockets in the first place. PEP 3333 says a server calls
+`app(environ, start_response)` and reads the iterable that comes back. It says
+nothing about where the bytes came from.
+
+So the Node side parses the request it received, and the Python side builds the
+dict:
+
+```python
+environ = {
+    "REQUEST_METHOD": d["method"],
+    "SCRIPT_NAME": d.get("root_path", ""),
+    "PATH_INFO": d["path"],
+    "QUERY_STRING": d.get("query", ""),
+    "SERVER_PROTOCOL": "HTTP/" + d.get("http_version", "1.1"),
+    "wsgi.input": io.BytesIO(body),
+    "wsgi.errors": sys.stderr,
+    "wsgi.multithread": False,
+    "wsgi.multiprocess": False,
+    "wsgi.run_once": False,
+}
+```
+
+`wsgi.multithread` and `wsgi.multiprocess` are both `False` and, unusually, both
+are honestly `False`. There is one interpreter and there are no OS threads, so
+an app that checks those flags before deciding whether a cache can be a plain
+dict gets a true answer rather than a conservative one.
+
+Request bodies and response bodies cross the JavaScript and Python boundary as
+base64 inside a JSON string. That is not elegant and it was chosen anyway: JSON
+strings convert to Python `str` with no ambiguity, whereas handing typed arrays
+across the boundary means reasoning about proxy object lifetimes at every call
+site. The bridge is on the request path, so the failure mode that matters is a
+subtle one, not a slow one.
+
+That is a claim you should not take on trust, so here it is running. The code
+below is real CPython executing in this page, and you can edit it and run it
+again. It builds the environ above, hands it to a WSGI application, and passes
+the whole thing through `wsgiref.validate`, which is CPython's own PEP 3333
+conformance checker. If the standard library's validator returns without
+raising, what the bridge gives your app is a real WSGI call and not an
+impression of one.
+
+<Playground scenario="python-wsgi" title="A real WSGI call, with no socket" height={520} />
+
+Two honest notes about that demo. It uses only the standard library, because
+the CPython core is stable here while Flask, FastAPI and Django are shipped as
+experimental templates, and a live demo is the wrong place to blur that
+distinction. And it exercises the conversion rather than the tunnel: the
+environ, the application call and the validation are the real thing, while the
+part that carries bytes in from the browser is the guest Node server described
+above. The first run also has to fetch the interpreter, so it is slower than
+the ones after it, which is the subject of [the next post](/cpython-startup-in-a-tab).
+
+## The ASGI scope, and the bug that took longest
+
+ASGI needs more of the same, plus one thing that is easy to get wrong and
+produces a symptom that points nowhere near the cause.
+
+Previews in Vivari are served under a path prefix, `/preview/<port>/`. The
+preview tunnel strips that prefix before the request reaches your process and
+sets `x-forwarded-prefix` so the app can learn what it was mounted under. The
+Node side reads that header and passes it along as `root_path`.
+
+The obvious thing to do next is to set `scope["root_path"]` to the prefix and
+`scope["path"]` to the path the tunnel handed over. That is wrong, and it is
+wrong in a way that only shows up on `Mount()`.
+
+ASGI defines `path` as the **full** request path, including `root_path`.
+`root_path` names the prefix, it does not remove it. Starlette's
+`get_route_path()` subtracts `root_path` from `path` to get the routable
+remainder, so if you hand it a path that has already been stripped, it subtracts
+a prefix that is not there. Top-level routes still match, because the subtraction
+falls through harmlessly. Every `Mount()` misses, including the `StaticFiles`
+mount that a FastAPI app usually has, so the app comes up, the JSON endpoints
+work, and the CSS 404s.
+
+The fix is to put the prefix back before building the scope:
+
+```python
+_vv_root = d.get("root_path", "")
+_vv_path = _vv_root + d["path"] if _vv_root else d["path"]
+```
+
+WSGI needs no equivalent, and the reason is a small piece of design history
+worth appreciating. `SCRIPT_NAME` and `PATH_INFO` are already the split form:
+the prefix and the remainder are separate keys, so there is nothing to subtract
+and nothing to get wrong. ASGI collapsed them into one string plus a length
+convention, and this is the bug that convention buys you.
+
+## No threads, which FastAPI has an opinion about
+
+Starlette and FastAPI let you write `def` endpoints as well as `async def` ones.
+A sync endpoint cannot be awaited, so Starlette runs it on a threadpool through
+`anyio.to_thread.run_sync`, which ends at `threading.Thread`, which under Pyodide
+raises `RuntimeError: can't start new thread`.
+
+That would make every synchronous route in a FastAPI app a 500, which is most
+routes in most tutorials.
+
+There is one interpreter and nothing else can be running in it, so the
+threadpool is not buying isolation here, only a thread that does not exist.
+Running the callable inline is the correct answer for this execution model:
+
+```python
+import anyio.to_thread as _vv_att
+
+async def _vv_run_sync(func, *args, **kwargs):
+    return func(*args)
+
+_vv_att.run_sync = _vv_run_sync
+```
+
+Starlette reads `run_sync` at call time rather than binding it at import, so
+this takes effect for every sync route and every sync dependency, including ones
+defined after the patch.
+
+## The entrypoints do not import what they are named after
+
+`uvicorn`, `flask` and `gunicorn` exist as commands. None of them imports the
+package it is named after.
+
+```bash
+uvicorn main:app --port 8000                   # FastAPI and other ASGI apps
+flask --app main run --port 8000               # Flask
+gunicorn wsgi:application --bind 0.0.0.0:8000  # Django and any other WSGI app
+```
+
+Each one parses argv the way the real tool does, works out which module and
+attribute you meant, and hands that to the bridge. Calling them shims
+undersells what they have to get right: the observable contract of `gunicorn` is
+"your WSGI app is now served on this port", and that contract is met. What
+cannot be met is gunicorn's process model, so those flags say so out loud rather
+than being accepted and ignored. `-w 4` warns that there is exactly one worker.
+`--worker-class gevent` stops, because serving you a different concurrency model
+than the one you asked for is not a warning-level event.
+
+Choosing gunicorn as the WSGI entrypoint rather than writing a `django` command
+is the reason Django works at all here. gunicorn is the seam every WSGI
+framework already reaches for, so Bottle and Pyramid arrive for free.
+
+The argv parsing has one decision in it that is more interesting than argv
+parsing has any right to be. To know whether `--log-level debug main:app` has
+two tokens or three, you need to know which flags take a value. gunicorn's own
+`--help` declares about a dozen store-true flags and several dozen that take a
+value, and the shim hardcodes the boolean list rather than the value list.
+
+That is smaller, but the real reason is which way it fails. Mistake a boolean
+for a value-taker and it eats the next token, which is the app spec, and the
+command exits with `no app specified`. The user sees that immediately. Mistake a
+value-taker for a boolean and its value is left lying in argv to be picked up as
+the app spec, and the server cheerfully starts serving something nobody asked
+for. Both are bugs. Only one of them is quiet.
+
+## Django's runserver is refused, on purpose
+
+`python manage.py runserver` does not run. It stops and says why, and points at
+the command that works.
+
+This is the only refusal in the Python support that blocks something people
+demonstrably want, so it is worth defending. Every other entrypoint here hands
+you an app object, which is a thing the bridge can serve. `runserver` binds the
+socket itself. Given Pyodide's socket, that means it would start, print its
+banner, and answer nothing, which is the failure mode described at the top of
+this post.
+
+The rest of `manage.py` is untouched. `migrate`, `makemigrations`, `shell` and
+`createsuperuser` all run normally, because none of them is a socket.
+
+## Keeping CPython's own HTTP server, minus the socket
+
+`python -m http.server` is the neatest case, because it shows what the bridge
+makes possible when the thing being served is already in the standard library.
+
+Reimplementing a static file server is easy and would have been the wrong
+answer. The value of `-m http.server` is that it is the directory listing you
+know, the `mimetypes` table you know, the `Range` and `If-Modified-Since`
+handling you know, and the 404 you know. A lookalike is worth much less than the
+real one.
+
+So the handler stays and the socket goes. `BaseHTTPRequestHandler` does all of
+its I/O through `self.rfile` and `self.wfile`, which
+`StreamRequestHandler.setup()` builds from `self.connection` by calling
+`makefile()`. It never touches the socket directly. So a socket, as far as that
+class is concerned, is an object with `makefile()` and `sendall()`:
+
+```python
+class _VvConn:
+    """Everything StreamRequestHandler.setup() asks of a socket, and no more."""
+    def __init__(self, data):
+        self._data = data
+        self.out = bytearray()
+    def makefile(self, mode="rb", bufsize=-1, *a, **k):
+        return io.BytesIO(self._data) if "r" in mode else io.BytesIO()
+    def sendall(self, b):
+        self.out += bytes(b)
+```
+
+Feed it the raw request bytes, let CPython's own `SimpleHTTPRequestHandler` do
+the work, and collect the raw response bytes out of `out`. The same guest Node
+server carries them that carries Flask's.
+
+Duck typing gets used to defend some questionable things. This is the case it
+was invented for.
+
+## Two things that fell out for free
+
+Neither of these was designed. Both are consequences of the constraints, noticed
+afterwards, which is usually a sign the layering is right.
+
+**There is an exact moment when the filesystem is consistent.** A served app
+that writes a file, an upload or a SQLite commit, needs those writes mirrored
+back into the editor. On a normal server there is no clean moment to do that,
+because another thread is always mid-write. Here the handler has returned and
+there are no threads, so the end of a request is a point where "everything the
+app has written" is a complete and correct answer. Persistence happens there,
+after the response bytes are already out, and costs nothing on a request that
+wrote nothing.
+
+**`--reload` works, without a watcher thread or a subprocess.** Real reloaders
+need both: something to poll the filesystem, and a process to kill and respawn.
+Neither exists here and neither is needed. The virtual filesystem already pushes
+change notifications, because that is how Vite's dev server sees your edits. And
+there is no server process to restart, because your app is an object imported
+into the bridge's process, so a reload re-imports the module and rebinds one
+name. A failed re-import puts the previous modules back and the old app keeps
+serving, which matters because a syntax error in a file you just saved is the
+normal case rather than the exceptional one.
+
+## What is honest to claim
+
+The Python web frameworks here are shipped as **experimental** templates. That
+is the project's own word for them, it is what the README says, and this post is
+not the place to quietly upgrade it. Vivari's CPython core, `pip` and the REPL
+are stable. Flask, FastAPI and Django sit above them and are not.
+
+The limits worth knowing before you try it:
+
+- **Buffered request and response only.** Each request is converted, run and
+  returned whole. No streaming responses, no Server-Sent Events, no WebSocket
+  from Python. This is a property of the bridge, not a bug in it.
+- **One request at a time.** One interpreter, no threads.
+- **`runserver` is refused**, as described above.
+- **Generate your URLs.** The preview is served under a prefix, and the bridge
+  tells your framework what it is, so `url_for()`, `reverse()` and
+  `request.url_for()` stay inside the preview. A hardcoded `/about` escapes it.
+- **Nothing here makes an unbuilt C extension work.** `psycopg2` still has no
+  wheel. Streamlit still stops on `watchdog`. This bridge is about serving an
+  app you can already import.
+
+What is not caveated: a real Flask app, a real FastAPI app with real Starlette
+routing, and a real Django app served through real gunicorn argv handling, all
+answering real HTTP requests in a browser tab with no server anywhere and no
+socket underneath.
+
+## The pattern, again
+
+Every one of these posts has ended in the same place from a different direction.
+The [synchronous bridge](/blocking-in-a-browser) works because `Atomics.wait` is
+a real blocking primitive and the whole system was built to respect it. [Node's
+real `lib/`](/nodes-real-lib-in-the-browser) works because Node already had a
+seam and we cut along it.
+
+WSGI and ASGI are that same seam, and Python drew it years before any of this
+existed, with none of it in mind. The frameworks were already written against an
+interface that says nothing about sockets. All that was missing was something
+standing on the other side of it.
+
+The next post is about a different Python problem entirely: why the first
+`python` command in a session costs nearly two seconds, why the second one used
+to as well, and what PEP 552 has to do with fixing it. There is more detail on
+everything above in [the Python docs](https://vivari.run/docs/python).
+
+---
+
+Vivari is an open-source, MIT-licensed WebContainer: no commercial licence, no
+per-seat fee, self-host every asset. The code is on
+[GitHub](https://github.com/maitrungduc1410/vivari) and the
+[Studio](https://vivari.run/studio/) runs in your browser.

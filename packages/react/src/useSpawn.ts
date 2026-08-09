@@ -2,9 +2,9 @@
 
 // Run a command in the VM and observe it from React.
 //
-// This exists because the project's own React demo of running a Node process —
-// sites/embed/src/scenarios/NodeTerminal.tsx — could not be built on
-// @vivari/react at all. It imports @vivari/core directly and hand-writes the
+// This exists because the project's own React demo of running a process
+// (sites/embed/src/scenarios/ScriptTerminal.tsx) could not be built on
+// @vivari/react at all. It imported @vivari/core directly and hand-wrote the
 // status enum, the spawn, the stdin writer, the output pipe, the exit await and
 // the kill-on-unmount. All of that is below, once.
 
