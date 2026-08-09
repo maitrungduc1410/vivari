@@ -98,10 +98,14 @@ while taking over rendering. A function child receives the live boot state:
 <Vivari files={files} run="npm run dev">
   {(state) =>
     state.status === "ready"
-      ? <VivariPreview port={5173} style={{ height: 480 }} />
+      ? <VivariPreview port={5173} vivari={state.vivari} style={{ height: 480 }} />
       : <p>{state.status}…</p>}
 </Vivari>
 ```
+
+`<Vivari>` publishes nothing to the tree below it, so a nested `<VivariPreview>`
+takes the instance from `state` rather than from context. Under a
+`<VivariProvider>` you can leave `vivari` off and let it resolve on its own.
 
 ## Cross-origin isolation
 
@@ -319,15 +323,20 @@ opinionated dependency and every embedder wants different theming, addons and
 fit behaviour. `useSpawn` reduces the glue to this:
 
 ```tsx
+import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { useSpawn } from "@vivari/react";
+import { useSpawn, useVivari } from "@vivari/react";
 
 function NodeTerminal({ file }: { file: string }) {
   const host = useRef<HTMLDivElement>(null);
   const term = useRef<Terminal | null>(null);
 
+  // A terminal renders no preview, so it needs no Service Worker.
+  const { vivari, status: bootStatus } = useVivari({ serviceWorkerUrl: false });
+
   const { run, write, status } = useSpawn("node", [file], {
+    vivari,                           // this component owns the instance
     onOutput: (chunk) => term.current?.write(chunk),
     onExit: (code) => term.current?.writeln(`\r\n[exited with code ${code}]`),
   });
@@ -345,12 +354,25 @@ function NodeTerminal({ file }: { file: string }) {
 
   return (
     <>
-      <button onClick={() => run()} disabled={status === "running"}>Run</button>
+      <button
+        onClick={() => run()}
+        disabled={bootStatus !== "ready" || status === "running"}
+      >
+        Run
+      </button>
       <div ref={host} />
     </>
   );
 }
 ```
+
+There is no `<VivariProvider>` here, so this component boots its own kernel and
+hands the instance to `useSpawn` through the `vivari` option. Without it the
+hook has nothing to act on and every `run()` fails. Inside a provider, drop both
+the `useVivari` call and the option and the hook resolves the instance itself.
+Either way `vivari` is null until the boot lands, which is what `bootStatus`
+gates the button on: `useSpawn` reads the instance when a run starts, not when
+the hook is called.
 
 `run`, `kill` and `write` keep a stable identity, so they are safe in dependency
 arrays.
