@@ -32,5 +32,7 @@ export const seo = {
   twitterDescription:
     "An open-source, MIT-licensed WebContainer. Run Node, Bun and Python 100% client-side.",
   url: "https://vivari.run",
-  image: "https://vivari.run/og.jpg",
+  image: "https://vivari.run/og-v2.jpg",
+  imageWidth: "1200",
+  imageHeight: "630",
 } as const;

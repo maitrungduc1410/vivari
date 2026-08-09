@@ -19,6 +19,8 @@ function seoHead() {
     VV_TWITTER_DESCRIPTION: seo.twitterDescription,
     VV_URL: seo.url,
     VV_IMAGE: seo.image,
+    VV_IMAGE_WIDTH: seo.imageWidth,
+    VV_IMAGE_HEIGHT: seo.imageHeight,
   };
   return {
     name: "vivari-seo-head",
