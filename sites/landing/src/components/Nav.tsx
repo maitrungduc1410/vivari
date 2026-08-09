@@ -5,8 +5,8 @@ import { site } from "@/site";
 import { Logo } from "./Logo";
 
 const links = [
+  { label: "What it runs", href: "#runs" },
   { label: "Features", href: "#features" },
-  { label: "What it runs", href: "#proof" },
   { label: "How it works", href: "#how" },
   { label: "Embed", href: "#embed" },
   { label: "Docs", href: site.docsUrl },

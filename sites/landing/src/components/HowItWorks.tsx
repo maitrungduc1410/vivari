@@ -5,7 +5,7 @@ const STEPS = [
   {
     n: "01",
     title: "Synchronous FS bridge",
-    body: "Node's APIs are synchronous. On a Web Worker, Atomics.wait() can genuinely block — so fs.readFileSync() parks the thread until the host answers over a SharedArrayBuffer.",
+    body: "Node's APIs are synchronous. On a Web Worker, Atomics.wait() can genuinely block, so fs.readFileSync() parks the thread until the host answers over a SharedArrayBuffer.",
   },
   {
     n: "02",
@@ -28,7 +28,7 @@ export function HowItWorks() {
             The trick: <span className="text-gradient">blocking</span> on a worker
           </h2>
           <p className="mt-4 text-muted">
-            Browsers won't let you block on async work — except on a Web Worker
+            Browsers won't let you block on async work, except on a Web Worker
             thread, where <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-sm text-fg">Atomics.wait()</code>{" "}
             can park execution. That single primitive makes a synchronous Node
             runtime possible in the browser.

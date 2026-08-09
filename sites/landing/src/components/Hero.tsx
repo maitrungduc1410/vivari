@@ -1,7 +1,10 @@
+import { useState } from "react";
 import { motion, type Variants } from "motion/react";
 import { ArrowRight, BookOpen, Sparkles } from "lucide-react";
 import { site } from "@/site";
+import type { RuntimeId } from "@/runtimes";
 import { Workspace } from "./Workspace";
+import { RuntimeTabs } from "./RuntimeTabs";
 
 const container: Variants = {
   hidden: {},
@@ -13,6 +16,12 @@ const item: Variants = {
 };
 
 export function Hero() {
+  // Which scene the hero mock is playing. Visitor-driven: the headline already
+  // names all three runtimes at once, so nothing here cycles on a timer. An
+  // auto-advancing hero would be both harder to read and a WCAG 2.2.2 (Pause,
+  // Stop, Hide) obligation.
+  const [runtime, setRuntime] = useState<RuntimeId>("node");
+
   return (
     <section id="top" className="relative mx-auto max-w-7xl px-6 pt-32 pb-20 md:pt-40">
       <div className="grid items-center gap-12 lg:grid-cols-[0.9fr_1.1fr]">
@@ -38,9 +47,9 @@ export function Hero() {
           </motion.h1>
 
           <motion.p variants={item} className="mt-6 max-w-xl text-lg text-muted">
-            Vivari is a WebContainer you can embed: a virtual filesystem, a
-            Node-compatible runtime, and virtual networking, all client-side.
-            Not a shim: Node's real <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-sm text-fg">lib/</code>,
+            Vivari is a WebContainer you can embed: a virtual filesystem, a real
+            process model, and virtual networking, all client-side. Not a shim:
+            Node's real <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-sm text-fg">lib/</code>,
             the real npm, yarn and pnpm, and real CPython. Boot a project,{" "}
             <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-sm text-fg">npm install</code>,
             run a dev server, and preview it live. No backend does the work.
@@ -74,9 +83,23 @@ export function Hero() {
           initial={{ opacity: 0, scale: 0.96, y: 20 }}
           animate={{ opacity: 1, scale: 1, y: 0 }}
           transition={{ duration: 0.8, ease: "easeOut", delay: 0.2 }}
-          className="animate-float"
+          className="min-w-0"
         >
-          <Workspace />
+          <div className="mb-4 flex justify-center lg:justify-start">
+            <RuntimeTabs value={runtime} onChange={setRuntime} idPrefix="hero" />
+          </div>
+
+          {/* `animate-float` sits on an inner wrapper so the tabs above stay put
+              while the mock drifts. Pure CSS, so the global reduced-motion rule
+              in index.css already stops it. */}
+          <div
+            id="hero-panel"
+            role="tabpanel"
+            aria-labelledby={`hero-tab-${runtime}`}
+            className="animate-float"
+          >
+            <Workspace runtime={runtime} />
+          </div>
         </motion.div>
       </div>
     </section>

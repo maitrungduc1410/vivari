@@ -5,7 +5,7 @@ import { Logo } from "./Logo";
 export function Footer() {
   return (
     <footer className="border-t border-border">
-      <div className="mx-auto flex max-w-7xl flex-col items-center justify-between gap-6 px-6 py-10 sm:flex-row">
+      <div className="mx-auto flex max-w-7xl flex-col items-center justify-between gap-6 px-6 pt-10 sm:flex-row">
         <div className="flex items-center gap-2">
           <Logo className="h-6 w-6" />
           <span className="font-medium">{site.name}</span>
@@ -27,6 +27,17 @@ export function Footer() {
             GitHub
           </a>
         </nav>
+      </div>
+
+      {/* The "what it runs" grid shows third-party brand marks. They are used
+          nominatively, to state accurately that Vivari runs these tools, which is
+          what makes that use fair; this line says so out loud. */}
+      <div className="mx-auto max-w-7xl px-6 pb-10">
+        <p className="text-center text-xs text-faint sm:text-left">
+          All product names, logos and brands are the property of their respective
+          owners. Their use here indicates compatibility only, not endorsement or
+          affiliation.
+        </p>
       </div>
     </footer>
   );

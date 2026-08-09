@@ -42,8 +42,8 @@ export function Embed() {
           Embed it in <span className="text-gradient">a few lines</span>
         </h2>
         <p className="mt-4 text-muted">
-          The same runtime that powers the Studio ships as an embeddable SDK —
-          framework-agnostic core, plus first-class React bindings.
+          The same runtime that powers the Studio ships as an embeddable SDK:
+          a framework-agnostic core, plus first-class React bindings.
         </p>
       </Reveal>
 

@@ -19,7 +19,7 @@ export function CTA() {
           Build the impossible tab.
         </h2>
         <p className="mx-auto mt-4 max-w-xl text-muted">
-          Spin up a real Node environment in your browser right now — no install,
+          Spin up a real dev environment in your browser right now. No install,
           no sign-up, no server.
         </p>
 

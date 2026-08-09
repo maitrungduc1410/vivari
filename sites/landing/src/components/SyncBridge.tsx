@@ -94,7 +94,7 @@ export function SyncBridge() {
             Rust/Wasm <span className="text-brand-2">VFS</span> lookup
           </div>
           <div className="mt-2 text-[11px] text-emerald-400">
-            returns bytes — still synchronous
+            returns bytes, still synchronous
           </div>
         </div>
       </div>

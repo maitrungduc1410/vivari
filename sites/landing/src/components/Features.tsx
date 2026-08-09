@@ -16,8 +16,8 @@ const FEATURES = [
   },
   {
     icon: Cpu,
-    title: "Node-compatible runtime",
-    body: "Synchronous CommonJS require with node_modules resolution, plus core builtins: fs, path, process, http, child_process and more.",
+    title: "Three runtimes, one VM",
+    body: "A Node-compatible runtime with synchronous require and core builtins; an API-compatible Bun shim; and real CPython, compiled to WebAssembly.",
   },
   {
     icon: TerminalIcon,
@@ -27,7 +27,7 @@ const FEATURES = [
   {
     icon: Globe,
     title: "Virtual networking",
-    body: "http.createServer().listen() runs inside a worker and a Service Worker previews it live in an iframe - with no network involved.",
+    body: "http.createServer().listen() runs inside a worker and a Service Worker previews it live in an iframe, with no network involved.",
   },
   {
     icon: Package,
@@ -49,7 +49,7 @@ export function Features() {
           A whole toolchain, <span className="text-gradient">client-side</span>
         </h2>
         <p className="mt-4 text-muted">
-          Everything a Node project expects at runtime, reimplemented to run inside
+          Everything a real project expects at runtime, reimplemented to run inside
           the browser tab.
         </p>
       </Reveal>

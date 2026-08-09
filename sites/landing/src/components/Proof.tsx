@@ -38,10 +38,10 @@ const RUNS = [
     hrefLabel: "how it works",
   },
   {
-    title: "Vitest, webpack, Angular, Astro",
-    body: "Test runners and heavyweight build tools that assume a real Node install, because they get one.",
-    href: site.studioUrl,
-    hrefLabel: "try a template",
+    title: "Bun, without the Bun binary",
+    body: "A native Zig binary cannot run in a page, so Bun's API is reimplemented, and gated against recordings from the real one, all 88 test matchers included.",
+    href: `${site.docsUrl}bun`,
+    hrefLabel: "what the shim covers",
   },
 ];
 
@@ -53,9 +53,9 @@ export function Proof() {
           Yes, it really <span className="text-gradient">runs that</span>
         </h2>
         <p className="mt-4 text-muted">
-          A browser Node runtime is easy to demo and hard to finish. These are the
-          things that only work once the runtime is deep enough, each with the
-          teardown that shows what it took.
+          A browser runtime is easy to demo and hard to finish. These are the
+          things that only work once it is deep enough, each with the teardown
+          that shows what it took.
         </p>
       </Reveal>
 

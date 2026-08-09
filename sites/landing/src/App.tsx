@@ -1,6 +1,7 @@
 import { Background } from "./components/Background";
 import { Nav } from "./components/Nav";
 import { Hero } from "./components/Hero";
+import { Runtimes } from "./components/Runtimes";
 import { Features } from "./components/Features";
 import { Proof } from "./components/Proof";
 import { HowItWorks } from "./components/HowItWorks";
@@ -16,6 +17,7 @@ export default function App() {
       <Nav />
       <main>
         <Hero />
+        <Runtimes />
         <Features />
         <Proof />
         <HowItWorks />

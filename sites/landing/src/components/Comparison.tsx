@@ -1,7 +1,7 @@
 import { Check, X } from "lucide-react";
 import { Reveal } from "./Reveal";
 
-// Two groups on purpose. The capability rows are mostly parity — claiming a
+// Two groups on purpose. The capability rows are mostly parity, since claiming a
 // proprietary WebContainer can't run Next.js would be false and would be the
 // first thing anyone tested. The point is that parity is the price of entry,
 // and the terms below it are where the projects actually differ.
@@ -14,7 +14,11 @@ const GROUPS: Group[] = [
     title: "What it runs",
     note: "Table stakes. Both clear this bar.",
     rows: [
-      { label: "Node projects, fully in-browser", vivari: true, other: true },
+      // Deliberately not "Node, Bun and Python": the right-hand column is a
+      // claim about somebody else's product, and we have not verified what
+      // runtimes they ship. Dropping "Node" removes the Node-only framing
+      // without asserting anything we cannot stand behind.
+      { label: "Full projects, fully in-browser", vivari: true, other: true },
       { label: "The real npm / yarn / pnpm", vivari: true, other: true },
       { label: "Next.js App Router dev server", vivari: true, other: true },
       { label: "Databases in the VM (SQLite, Postgres)", vivari: true, other: true },
