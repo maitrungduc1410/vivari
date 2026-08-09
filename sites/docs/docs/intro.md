@@ -6,10 +6,13 @@ title: Introduction
 
 # Vivari
 
-**Vivari is an open-source WebContainer.** It runs Node-style projects (Vite,
-Express, and more) **100% inside the browser**: a virtual filesystem, a
-Node-compatible runtime, a process model, and virtual networking, all in Web
-Workers with no server doing the work.
+**Vivari is an open-source WebContainer.** It runs **Node, Bun and Python**
+projects **100% inside the browser**: a virtual filesystem, a Node-compatible
+runtime, a process model, and virtual networking, all in Web Workers with no
+server doing the work.
+
+It is not a shim over hand-written core modules. Vivari runs Node's own `lib/`
+JavaScript, the real `npm`, `yarn` and `pnpm`, and real CPython.
 
 :::info The name
 **Vivari** *(vih-VAH-ree)* comes from the Latin *vivarium*, a self-contained
@@ -43,10 +46,22 @@ synchronous Node runtime possible in the browser. See
 | Capability | What it means |
 | --- | --- |
 | Virtual filesystem | A POSIX-ish VFS in Rust/Wasm, persisted to OPFS |
-| Node runtime | Synchronous `require`, `node_modules` resolution, core builtins |
+| Node runtime | Node's own `lib/`, synchronous `require`, `node_modules` resolution, a REPL |
 | Process model | A kernel + PID table + shell; `execSync`, pipes, signals |
 | Virtual networking | `http.createServer().listen()` previewed live in an iframe |
-| Package managers | `npm` / `yarn` / `pnpm` with content-addressed caches |
+| Package managers | `npm` / `yarn` / `pnpm` / `corepack` with content-addressed caches |
+| Frameworks | Next.js 16 (App Router + RSC), Vite (React, Vue, Svelte 5, Solid, Qwik, Preact, Lit), Astro, Angular, and the servers (Express, NestJS, Fastify, Hono, …) |
+| [Bun](./bun) | `bun install` / `run` / `test`, `Bun.serve`, `Bun.build`, `bun:sqlite`, `bun repl`. An API-compatible shim, not the native binary |
+| [Python](./python) | Real CPython 3.14 via Pyodide, with `pip` and a REPL; the templates around it (`pytest`, the notebook, the scientific stack, the web frameworks) are experimental |
+| Databases | SQLite via `bun:sqlite`; the sql.js, Python `sqlite3`/SQLAlchemy and PGlite (Postgres) templates are experimental |
+| Debugger | Breakpoints, stepping and evaluation in guest Node processes over the Chrome DevTools Protocol (in the Studio) |
+
+**Experimental** does not mean a sketch: it runs, and you can go and try it. It
+means the thing is not yet held in place by a check that would catch it breaking.
+Most of these carry a per-template flag, whose bar for graduation is specific: a
+green spike of the template's own (`scripts/spike-<name>.mjs`). Nuxt, SvelteKit,
+TanStack Router, PGlite, sql.js and every Python template except the bare
+`python` starter are experimental today.
 
 ## Genuinely open
 

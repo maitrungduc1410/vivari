@@ -3567,8 +3567,8 @@ leaving the hole.
   so Next's `loadBindings` prefers the wasm build; npm skips native
   `@next/swc-<platform>` on arch `wasm32`). Only **Turbopack** is out (native Rust,
   no wasm build) — use `--webpack`. Proven by `scripts/spike-next.mjs`; shipped as the
-  `experimental` **Next.js** template. Vite (rolldown, wasm) is still the default
-  bundler path for the other templates.
+  **Next.js** template, graduated out of `experimental`. Vite (rolldown, wasm) is still
+  the default bundler path for the other templates.
 
 ### Ports & long-lived servers
 Each demo binds a port; a leftover long-lived server squatting a port causes

@@ -25,28 +25,30 @@ export function Hero() {
             className="glass inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs text-muted transition-colors hover:text-fg"
           >
             <Sparkles className="h-3.5 w-3.5 text-brand-2" />
-            Open-source &amp; MIT-licensed — no commercial license, no per-seat fee
+            Open-source &amp; MIT-licensed: no commercial license, no per-seat fee
           </motion.a>
 
           <motion.h1
             variants={item}
             className="mt-6 text-4xl font-semibold tracking-tight text-balance sm:text-5xl md:text-6xl lg:text-7xl"
           >
-            Run <span className="text-gradient">Node.js</span>{" "}
+            Run <span className="text-gradient">Node, Bun and Python</span>{" "}
             <br className="hidden md:block" />
             fully in the browser.
           </motion.h1>
 
           <motion.p variants={item} className="mt-6 max-w-xl text-lg text-muted">
             Vivari is a WebContainer you can embed: a virtual filesystem, a
-            Node-compatible runtime, and virtual networking — all client-side.
-            Boot a project, <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-sm text-fg">npm install</code>,
+            Node-compatible runtime, and virtual networking, all client-side.
+            Not a shim: Node's real <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-sm text-fg">lib/</code>,
+            the real npm, yarn and pnpm, and real CPython. Boot a project,{" "}
+            <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-sm text-fg">npm install</code>,
             run a dev server, and preview it live. No backend does the work.
           </motion.p>
 
           <motion.p variants={item} className="mt-4 max-w-xl text-sm text-muted/80">
             <span className="text-fg">Vivari</span>{" "}
-            <span className="font-mono text-xs">(vih-VAH-ree)</span> — from the
+            <span className="font-mono text-xs">(vih-VAH-ree)</span> comes from the
             Latin <em>vivarium</em>, a self-contained enclosure for living things.
           </motion.p>
 

@@ -1,7 +1,7 @@
 # @vivari/react
 
-React bindings for [Vivari](../core) — run Node.js projects fully client-side in
-the browser, embedded in your React app.
+React bindings for [Vivari](../core). Run Node, Bun and Python projects fully
+client-side in the browser, embedded in your React app.
 
 ```bash
 npm install @vivari/react @vivari/core react

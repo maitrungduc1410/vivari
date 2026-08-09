@@ -1,9 +1,16 @@
 # @vivari/core
 
-Run **Node.js projects fully client-side in the browser** — a virtual filesystem,
-a Node-compatible runtime, a process model, and virtual networking, all in Web
-Workers with no server doing the work. This is the framework-agnostic Vivari
-WebContainer SDK; see [`@vivari/react`](../react) for React bindings.
+Run **Node, Bun and Python projects fully client-side in the browser**: a
+virtual filesystem, a Node-compatible runtime, a process model, and virtual
+networking, all in Web Workers with no server doing the work.
+
+Not a shim: this runs Node's own `lib/` JavaScript, the real `npm`, `yarn` and
+`pnpm`, and real CPython via Pyodide. See the
+[capability table](https://github.com/maitrungduc1410/vivari#yes-it-really-runs-this)
+for what is stable and what is still experimental.
+
+This is the framework-agnostic Vivari WebContainer SDK; see
+[`@vivari/react`](../react) for React bindings.
 
 ```bash
 npm install @vivari/core
@@ -250,8 +257,9 @@ something ordinary, that's a gap in the public API — please open an issue.
 
 ## Stability
 
-Pre-1.0 (`0.x`): the surface above is still moving and minor versions may break.
-See the repository README for the road to a 1.0 freeze.
+`vivari.internal` (above) sits outside semver and can change on any release.
+Everything else on this page is the public surface, and a breaking change to it
+lands in a major version. Check the release notes before upgrading.
 
 ## License
 

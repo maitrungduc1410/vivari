@@ -12,7 +12,7 @@ const SITE_URL = "https://vivari.run";
 
 const config: Config = {
   title: "Vivari",
-  tagline: "Run Node.js projects fully client-side in the browser",
+  tagline: "Run Node, Bun and Python projects fully client-side in the browser",
   favicon: "img/favicon.svg",
 
   // Deployed as part of a single Cloudflare Pages site: the landing lives at `/`,

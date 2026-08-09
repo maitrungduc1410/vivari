@@ -10,7 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@vivari/core": "^0.0.1"
+    "@vivari/core": "^1.0.0"
   },
   "devDependencies": {
     "typescript": "~6.0.2",

@@ -1,13 +1,15 @@
 {
   "name": "@vivari/react",
-  "version": "0.0.1",
-  "description": "React bindings for Vivari — an embeddable browser-native WebContainer.",
+  "version": "1.0.0",
+  "description": "React bindings for Vivari. Run Node, Bun and Python projects fully client-side in the browser, embedded in your React app.",
   "keywords": [
     "webcontainer",
     "vivari",
     "react",
     "browser",
     "nodejs",
+    "bun",
+    "python",
     "sandbox"
   ],
   "license": "MIT",
@@ -42,12 +44,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {
-    "@vivari/core": "^0.0.1",
+    "@vivari/core": "^1.0.0",
     "react": "^18.0.0 || ^19.0.0"
   },
   "devDependencies": {
     "@types/react": "^19.2.18",
-    "@vivari/core": "^0.0.1",
+    "@vivari/core": "^1.0.0",
     "react": "^19.2.8",
     "typescript": "~6.0.2",
     "vite": "^8.2.0"

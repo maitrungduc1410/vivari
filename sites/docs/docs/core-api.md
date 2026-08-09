@@ -9,8 +9,8 @@ The framework-agnostic SDK. Everything below hangs off a booted `Vivari`
 instance.
 
 :::caution Upgrading from an earlier `0.0.x`
-Vivari is pre-1.0 and the API was recently hardened. If you wrote against an
-earlier `0.0.x`, several things moved:
+The API was hardened on the way to 1.0. If you wrote against an earlier `0.0.x`,
+several things moved:
 
 | Before | Now |
 | --- | --- |

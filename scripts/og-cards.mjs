@@ -155,7 +155,7 @@ function posts() {
 const DEFAULTS = [
   {
     out: DOCS_CARD,
-    title: "Run Node.js projects fully client-side in the browser",
+    title: "Run Node, Bun and Python projects fully client-side in the browser",
     eyebrow: "npm i @vivari/core",
   },
   {

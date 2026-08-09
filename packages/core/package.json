@@ -1,13 +1,17 @@
 {
   "name": "@vivari/core",
-  "version": "0.0.1",
-  "description": "Run Node.js projects fully client-side in the browser. The framework-agnostic Vivari WebContainer SDK.",
+  "version": "1.0.0",
+  "description": "Run Node, Bun and Python projects fully client-side in the browser: Node's real lib/, the real npm/yarn/pnpm, and real CPython. The framework-agnostic Vivari WebContainer SDK.",
   "keywords": [
     "webcontainer",
     "vivari",
     "browser",
     "nodejs",
+    "bun",
+    "python",
+    "nextjs",
     "wasm",
+    "webassembly",
     "sandbox",
     "runtime"
   ],

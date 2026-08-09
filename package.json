@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "An open-source WebContainer: run Node-style projects fully client-side in the browser.",
+  "description": "An open-source WebContainer: run Node, Bun and Python projects fully client-side in the browser.",
   "license": "MIT",
   "engines": {
     "node": ">=22"

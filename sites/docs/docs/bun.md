@@ -534,9 +534,16 @@ line. They are separate now, and `sh` grew the `exit` builtin it was missing —
 `exit 3` used to report 127, "not found", for something that is not a program.
 
 `bun why`, `bun outdated`, `bun info` and `bun audit` delegate to npm, which is
-already the install path here. `bun publish`, `bun patch` and `bun repl` refuse
-with the specific missing piece: an authenticated registry session, a git
-transport, and a tty.
+already the install path here. `bun publish` and `bun patch` refuse with the
+specific missing piece: an authenticated registry session and a git transport.
+
+`bun repl` used to refuse alongside them, on the grounds that it wanted a tty
+and the sandbox had pipes. That was not true by the time it was written. The
+runtime gives a process a flowing TTY stdin with `isTTY` set, and the
+interactive shell forwards raw keystrokes to its foreground child, so it is a
+working prompt now, with TypeScript at the prompt, the `Bun` global in scope,
+`let`/`const` hoisted so a redeclaration does not wedge the session, and the
+`_` / `_error` bindings Bun documents.
 
 ### `bun:test` has Bun's whole matcher table
 
