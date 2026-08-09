@@ -22,11 +22,9 @@ and real CPython. No server does the work.
 
 </div>
 
-<!-- DEMO MEDIA goes here: a GIF via ![alt](url), or a bare GitHub-hosted video URL
-     on its own line (.mp4/.mov/.webm, H.264). Limits: 10 MB for images/GIFs, and
-     10 MB for video on a free plan / 100 MB on a paid one. Upload by dragging the
-     file into a GitHub issue comment and copying the generated CDN link. Do not
-     commit the binary, or every clone pays for it forever. -->
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/5ee626a8-4970-4c1e-af77-8e2f4c5b7da4" controls loop muted></video>
+</div>
 
 **[Open the Studio](https://vivari.run/studio/)** to try it without installing
 anything: pick a template, run `npm install && npm run dev`, and watch a real dev
