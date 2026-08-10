@@ -23,6 +23,11 @@ python:
   permalink: /python
   description: CPython on Pyodide, and the runtime Vivari builds around it.
 
+bun:
+  label: Bun
+  permalink: /bun
+  description: The Bun-compatible surface Vivari implements on top of its Node runtime.
+
 browser-platform:
   label: Browser platform
   permalink: /browser-platform

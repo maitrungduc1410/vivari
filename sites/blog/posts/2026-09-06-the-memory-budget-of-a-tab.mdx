@@ -1,0 +1,238 @@
+---
+slug: the-memory-budget-of-a-tab
+title: A Nuxt dev server in a tab cost 3.46 GB, and the biggest thing we could actually shrink was the filesystem
+description: Three findings from profiling a real project in a browser tab, each of which contradicted the obvious guess. The largest addressable object in the process is node_modules, persisting 53 MB was costing 4.7 GB of writes, and the IDE was paying twice for one language service.
+tags: [teardown, browser-platform, wasm]
+image: /img/og/the-memory-budget-of-a-tab.png
+og_eyebrow: TEARDOWN 12
+---
+
+import Playground from '@site/src/components/Playground';
+
+A tab running `nuxt dev` was using 3.46 GB. That is not a number you optimise
+your way out of with a hunch, and the hunch everybody has is the same one:
+bundlers are memory hogs, so it must be the bundler.
+
+It was not the bundler, whose entire contribution was 22.5 MB. It was three
+other things, and they are not even measured in the same units: a filesystem
+holding 929 MB of `node_modules` as bytes, a persistence layer writing 4.7 GB to
+store 53 MB, and an editor spending 621 MB parsing one set of type definitions
+twice.
+
+This post is the autopsy rather than a list of tips, because the useful part is
+which assumptions turned out to be wrong.
+
+{/* truncate */}
+
+## Where the 3 GB actually was
+
+The tab had already come down to 3.09 GB when it was measured properly. The
+split, on one machine running one project:
+
+| what | resident |
+| --- | --- |
+| PID 8, the `nuxt dev` process worker | ~1.87 GB |
+| the filesystem worker | ~580 MB |
+| eight other small process workers | ~175 MB total |
+
+Inside that 1.87 GB dev server, the in-process esbuild Go heap was **22.5 MB**.
+
+That single measurement killed the plan everyone arrives with. Isolating
+esbuild, tearing it down between builds, moving it to its own worker: all of it
+would have saved approximately nothing, and all of it would have been weeks. The
+Go heap is 1.2% of the process it lives in.
+
+Meanwhile the filesystem worker, which holds nothing but bytes, was the second
+largest thing in the tab and the largest one we could do anything about. The
+1.87 GB above it is Nuxt's and Vite's heap, allocated by their code for their
+reasons. The 580 MB is ours. That is the finding.
+
+## Finding one: node_modules is the largest addressable object in the program
+
+Every file in this runtime lives in a Rust virtual filesystem compiled to Wasm,
+which means every byte of `node_modules` is sitting in one linear memory. A
+mid-sized project's dependency tree is a few hundred megabytes of text that is
+read once at startup and then almost never touched again.
+
+Text compresses. So cold file contents are zlib-compressed in place, behind a
+gate of two constants:
+
+```rust
+const MIN_COMPRESS_BYTES: usize = 4096;
+const MIN_COMPRESS_RATIO: f64 = 0.95;
+```
+
+Below 4096 bytes, do not bother: zlib's framing and the bookkeeping cost more
+than the win, and `node_modules` is full of eleven byte `index.js` files. Above
+a 0.95 ratio, do not bother either: the file is already compressed, storing it
+packed saves nothing measurable and every future read pays an inflate.
+
+Measured on Nuxt, in Chrome: VFS content went from **929.0 MB to 273.6 MB**, a
+29% ratio and 655 MB saved, and the whole Chrome tab dropped from **2.9 GB to
+2.1 GB**.
+
+It is on by default in the SDK, and only an explicit `compress: false` turns it
+off. The Rust struct itself defaults to compression off, which looks like a
+contradiction and is deliberate: it keeps the flag A/B testable from a
+benchmark without touching the shipped default.
+
+The gate is four lines of arithmetic, and it is the reason the number above is
+655 MB rather than something embarrassing. Here it is running against three
+kinds of file, using the same deflate from the same Rust crate the filesystem
+compresses with:
+
+<Playground scenario="vfs-compression" title="The gate the filesystem runs on every file" height={540} />
+
+The third block is the one to read twice. A megabyte of random bytes deflates to
+1,048,752 bytes, which is 176 bytes **larger** than what went in, and the gate
+correctly stores it raw. That is the whole case for the ratio test: without it,
+every `.tgz`, `.png` and `.wasm` in a dependency tree would be stored slightly
+bigger than it arrived and would pay an inflate on every read for the privilege.
+
+One honest note about that demo, because it matters. The virtual filesystem does
+not tell guest code what it decided about a file, so the script **recomputes**
+the gate in front of you rather than reading its verdict. It is the same test on
+the same bytes with the same compressor, and it is not instrumentation.
+
+The edit to make is `SIZE`. Drop it to 2048 and every sample is stored raw,
+including the one that deflates to a thousandth of its size, because it failed
+the size test and the size test is the one the VFS checks first. The script
+still prints a ratio for each, since it computes both tests rather than
+short-circuiting the way the Rust does, and seeing `beats 0.95 true` sit next to
+`the VFS keeps it RAW` is the clearest possible statement of what the first
+constant is for.
+
+## Finding two: persisting 53 MB cost 4.7 GB of writes
+
+A session survives a page reload by mirroring the filesystem into OPFS, the
+browser's origin-private file storage. The steady state is small: about 53 MB
+for a real project. Getting there was costing **4.7 GB of writes**.
+
+Three offenders, and none of them is a large file:
+
+- **npm's own cache temp directory.** One `_cacache/tmp/<uuid>` cost 1,461 MB
+  across 76 writes, and npm deletes it moments later. We were faithfully
+  persisting a scratch directory so that it could be faithfully persisted again
+  as it changed, and then removed.
+- **npm's debug log.** `_logs/*-debug-0.log` cost 607 MB across 3,799 writes,
+  because a log file is appended a line at a time and a mirror that does not
+  understand appends rewrites the file each time.
+- **The manifest.** The index of which paths exist was rewritten 12,847 times,
+  totalling roughly 2.1 GB, to describe about 3,000 paths. Every write touched
+  the whole thing.
+
+Total after fixing all three: about 144 MB, for the same 53 MB of durable state.
+
+The general shape here is worth naming, because it is not specific to browsers.
+Write amplification is invisible in every profiler you would normally reach for:
+memory looked fine, the filesystem looked fine, and the only symptom was that
+installs felt slower than the network could explain. You have to go and count
+the writes.
+
+## Finding three: the IDE was paying twice for one thing
+
+Monaco runs a **separate full language service for each of its `typescript` and
+`javascript` modes**. Each one parses the whole dependency `.d.ts` payload into
+roughly 310 MB, so a project with both kinds of file naively pays about 621 MB,
+measured, for two services doing identical work over identical inputs.
+
+Mapping `.js` files to the `typescript` mode halves it. TypeScript's language
+service handles JavaScript perfectly well; it is the same compiler.
+
+That is a configuration change, and it is in this post rather than a footnote
+because 310 MB is larger than most of the things people spend a week optimising,
+and it was found by reading a memory profile rather than by reasoning about the
+code.
+
+## What is emphatically not the bottleneck
+
+Two things that look like they should be slow, measured so nobody has to guess:
+
+**Filesystem write throughput.** Writing a 12,000 file tree, the first 1,000
+files cost 6.9 microseconds each and files 11,000 to 12,000 cost 3.6
+microseconds each. The whole tree lands in about 44 milliseconds. Install time
+lives in the network, in tar extraction, in npm's own JavaScript, and in the
+OPFS mirror. It does not live in the virtual filesystem.
+
+**Registry metadata, sort of.** A full install pulled 421 MB of packuments
+without an `.npmrc`, and 108 MB with one that restricts the fields requested.
+The registry gzips them about tenfold, so the wire cost is around 45 MB while
+the cost of holding and parsing them is the full 421 MB. That is a case where
+the network number and the memory number differ by an order of magnitude and
+only one of them is the problem.
+
+There is one more measurement in this family, from shipping a prebuilt
+`node_modules` snapshot for a template. Cold origin, Chrome, Starlight: fetch
+0.4s, restore 4.0s for 13,459 entries, dev server listening at 31.8s, and OPFS
+holding 112 MB instead of 246 MB. The asset is 111.4 MB raw and 26.0 MB gzipped,
+and its buffer is transferred rather than copied between workers. The
+interesting row is the restore: 4.0s in the browser against 0.1s headless, and
+the entire difference is the OPFS mirror. Again the storage layer, not the
+compute.
+
+## How it fails, which is not what you would expect
+
+A Node process that runs out of memory throws, prints a heap trace, and dies
+alone. Under a memory ceiling, a browser tab does not do that.
+
+Running the tab in a container with a roughly 1.6 GB ceiling, the kernel
+SIGKILLs the **renderer**, with error code 9 and a cgroup failure count
+climbing. Not one worker: the whole tab. What the user sees is Chrome's crash
+page, not a frozen terminal and not an error in the console, and nothing in the
+runtime gets a chance to report anything.
+
+That changes what the memory work is for. It is not about being tidy. Past the
+ceiling there is no graceful degradation available, because the process that
+would have degraded gracefully no longer exists.
+
+## What is honest to claim
+
+- **Every number here is one machine, one browser, one project.** Nuxt in
+  Chrome, Starlight in Chrome. They are here to show the shape and the ordering
+  of the costs, not to be benchmarks anyone should quote.
+- **You cannot reproduce these from inside the VM.** `process.memoryUsage()` in
+  a guest process returns fixed constants, so a script running in the sandbox
+  cannot observe any of this. Every figure above comes from browser task
+  manager and profiler measurements taken outside the runtime, which is also
+  why the demo above measures the gate rather than the saving.
+- **Compression is a tradeoff and the ratio test is where it is made.** A cold
+  file that is read again pays an inflate. The 0.95 constant is a judgement,
+  arrived at by measurement on one kind of workload, and a workload that reads
+  its dependency tree constantly would want a different one.
+- **The OPFS numbers are about write volume, not about durability.** Nothing
+  here changes what survives a reload; it changes how many bytes it costs to
+  keep it surviving.
+- **The Monaco figure is a Monaco figure.** It is what two language services
+  cost on one dependency payload, and it will move with the size of your
+  `.d.ts` files.
+
+## The general version
+
+Three findings, and the thing they have in common is that none of them is about
+the code that was doing the work.
+
+The bundler, the compiler, the dev server: those are what a profile looks like
+it should be about, and between them they were a rounding error against a
+filesystem full of text, a mirror writing gigabytes to store megabytes, and an
+editor holding two copies of the same parse.
+
+In a browser tab, the interesting resources are the ones the platform makes you
+implement yourself. On a laptop, `node_modules` costs page cache that the kernel
+reclaims when it feels like it, and nobody counts it. Here it is a Rust `HashMap`
+you allocated, and it is on your bill. Persistence is a mirror you wrote rather
+than a filesystem the OS provides, so its write amplification is yours too. The
+platform is not doing you any invisible favours, which is inconvenient and,
+occasionally, clarifying: everything that costs something is something you can
+see.
+
+More on the architecture in
+[the how-it-works docs](https://vivari.run/docs/how-it-works), and the post that
+explains why the filesystem lives in a Rust module at all is
+[the one about the single blocking primitive](/blocking-in-a-browser).
+
+---
+
+Vivari is an open-source, MIT-licensed WebContainer: no commercial licence, no
+per-seat fee, self-host every asset. The code is on
+[GitHub](https://github.com/maitrungduc1410/vivari) and the
+[Studio](https://vivari.run/studio/) runs in your browser.

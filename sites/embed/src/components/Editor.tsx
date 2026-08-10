@@ -15,6 +15,11 @@ import { oneDark } from "@codemirror/theme-one-dark";
 // filename: a Python demo highlighted by the JavaScript grammar renders `#` as
 // ordinary text and misses every keyword, which is exactly the sort of detail
 // the audience for a Python post notices first.
+//
+// `typescript` is a third option rather than always-on for the same reason: the
+// TypeScript grammar treats `interface` and `satisfies` as keywords, and turning
+// it on for a plain `.js` scenario would colour those words wherever they appear
+// as ordinary identifiers.
 export function Editor({
   initialDoc,
   onChange,
@@ -24,7 +29,7 @@ export function Editor({
   initialDoc: string;
   onChange: (value: string) => void;
   onSave?: (value: string) => void;
-  language?: "javascript" | "python";
+  language?: "javascript" | "typescript" | "python";
 }) {
   const host = useRef<HTMLDivElement>(null);
   const onChangeRef = useRef(onChange);
@@ -54,7 +59,9 @@ export function Editor({
             ]),
           ),
           basicSetup,
-          language === "python" ? python() : javascript({ jsx: true }),
+          language === "python"
+            ? python()
+            : javascript({ jsx: true, typescript: language === "typescript" }),
           oneDark,
           EditorView.theme({ "&": { height: "100%" } }),
           EditorView.updateListener.of((u) => {

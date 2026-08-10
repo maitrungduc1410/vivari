@@ -1,0 +1,327 @@
+---
+slug: synchronous-esm
+title: Node can require() an ES module now, and it refuses two things. We could not refuse either
+description: ESM is asynchronous by design and require() is synchronous by contract. Node resolves that by declining the hard cases. In a browser worker there is no escape hatch, so every import is rewritten to CommonJS by a lexer at load time, and this is what that costs.
+tags: [teardown, runtime, nodejs]
+image: /img/og/synchronous-esm.png
+og_eyebrow: TEARDOWN 10
+---
+
+import Playground from '@site/src/components/Playground';
+
+Recent Node versions will let you `require()` an ES module. It is a genuinely
+hard thing to have shipped, and it comes with two documented refusals:
+`ERR_REQUIRE_ASYNC_MODULE` if anything in the required graph uses top-level
+await, and `ERR_REQUIRE_CYCLE_MODULE` if the graph has a cycle that crosses the
+CommonJS boundary.
+
+Node can refuse, because `import()` is always sitting there as an escape hatch.
+Tell the user to await it and the problem is theirs.
+
+In a browser worker there is no escape hatch. `require()` is
+[synchronous all the way down](/blocking-in-a-browser) because the filesystem
+under it is, and a project's entry point is `require`d by a loader that cannot
+return a promise to anyone. Every `import` becomes CommonJS at load time or the
+program does not start. Refusing was not on the menu.
+
+{/* truncate */}
+
+## What the rewrite actually is
+
+There is no bundler here and no compile step. Each module is rewritten as it is
+read, by `es-module-lexer`, into the same synchronous CommonJS everything else
+in the runtime lives in. `import` becomes a `require`, `export` becomes a
+property on an exports object, `import.meta` becomes a small object built from
+the filename, and dynamic `import()` becomes a helper that returns an already
+resolved promise.
+
+Every generated identifier is namespaced: `__oc_require`, `__oc_import`,
+`__oc_exports`, `__oc_module`. That is not tidiness. User code is allowed to
+declare its own `require` and its own `module`, and a great deal of published
+code does.
+
+The interop helpers are all emitted on **one leading line**, which looks like
+somebody minifying for no reason. It is so that line numbers in the rewritten
+file still match the file you have open, which is what makes
+[breakpoints land on the right line](/a-debugger-with-no-inspector).
+
+That is the easy part. What follows is four years of other people's module
+graphs.
+
+## Live bindings, and the half of them that is not implemented
+
+An ESM export is a binding, not a value. If a module exports `let count` and
+increments it later, an importer that already read it sees the new number. Real
+ESM gets that by being lazy at both ends: the exporter exposes a binding rather
+than a copy, and the importer reads it at the point of use rather than at the
+point of import.
+
+This loader is lazy at one end and eager at the other, and the asymmetry is
+worth stating before anything else in this section, because it is the one place
+where the rewrite is knowingly not ESM.
+
+**The export side is getters.** A module's own exports are exposed as accessors
+on the exports object, which is how esbuild and rollup model the same thing.
+
+**The import side is a snapshot.** A used `import { X } from './m'` compiles to
+`const X = __oc_m['X']`: one read, at the top of the importing module, and that
+value is what the rest of the body sees. Increment `X` in the source module
+afterwards and the importer will not notice.
+
+Most code never sees the difference, because most imported names are functions,
+and a function is the same object before and after. It shows up on a mutable
+`let`, and it shows up hard in a cycle, which is the rest of this section.
+
+The load-bearing detail on the export side is not the getters. It is that they
+are emitted **before** the import requires.
+
+Consider a cycle, which npm is full of. Module A imports B, B imports A back. B
+runs while A's body is still on the stack. If A emitted its export getters after
+its own imports, B reads `undefined` from A, because A has not got to that line
+yet. yargs is the canonical case in the wild: `command.js` imports
+`isYargsInstance` from `yargs-factory.js`, which imports `command.js` right
+back. Put the getters first and an exported function, which is hoisted anyway,
+is reachable through its getter before A's body has run at all.
+
+The failure mode when this is wrong is what makes it expensive. You do not get
+"circular import detected". You get Astro's middleware reporting
+`Function.prototype.apply was called on undefined`, four frames from anything
+you wrote.
+
+A second, subtler version of the same bug: a barrel file that imports a name and
+then re-exports it. Astro's `render/index.js` does
+`import { Fragment } from './common.js'` and then `export { Fragment }`. When
+`common.js` is mid-cycle, the eager `const Fragment = common.Fragment` snapshot
+hits a `const` that is still in its temporal dead zone, and you get
+`Cannot access 'Fragment' before initialization`. So a re-export is compiled to
+a lazy live binding to the source module rather than a read of the snapshot,
+which defers the read until the cycle has settled, exactly as
+`export { X } from 'm'` already did.
+
+And the getters have to close over their own key. `export *` copies names in a
+loop, and a getter that closes over the shared loop variable resolves every name
+to the last key of the object. Vue's `index.mjs` re-exports everything, so
+`createApp` quietly became `withScopeId`, and Nuxt's server rendering then read
+`.config` off the wrong object. Per-iteration closure, one line, found the
+expensive way.
+
+## The fallback that buys back the other half
+
+That leaves the general case. A cycle whose imported name is a `const`, a class
+or a singleton has no barrel shape to exploit: the eager `const X = __oc_m['X']`
+simply runs too early and throws `Cannot access 'X' before initialization`. Astro's
+runtime is full of them, `apiContextRoutesSymbol`, `AstroConfigSchema`,
+`globalContentLayer`, `telemetry`.
+
+So there is a second compiler. When a module's eager attempt throws a
+`ReferenceError` whose message matches "before initialization" or "is not
+defined", the loader recompiles **that one module** with every import bound as a
+getter on an `__oc_live` object, and runs the whole body inside
+`with (__oc_live) { ... }`. A bare reference to an imported name then resolves
+lazily through the getter, at use, which is what real ESM does, while a local
+declaration that shadows the name still wins natively. That is what makes it
+scope-correct without rewriting a single reference, and rewriting references
+correctly is the part nobody wants to hand-roll.
+
+Two reasons it is a fallback rather than the default. `with` deoptimises the
+whole body and requires sloppy mode, so a normal module should not pay for it.
+And it is safe to re-run only because the eager attempt threw in the prelude,
+before the body ran: the retry re-defines configurable export getters and
+re-runs already cached requires, so there are no double side effects.
+
+Here is a module graph doing all of this, written into the virtual filesystem by
+the script itself and then imported. The line to look at is the first
+`reporter:` line, which prints `count = 0` from inside the cycle while
+`counter.mjs` is still evaluating.
+
+<Playground scenario="esm-live-bindings" title="A module graph, rewritten to CommonJS at load time" height={560} />
+
+**The last `reporter:` line is the whole section, and it is worth separating
+from the line under it.** That third `reporter:` line is `reporter.mjs` printing
+its own bare named import, `count`, after two `bump()` calls, and it says `2`.
+That looks like a live binding and is not one. It is the fallback:
+`reporter.mjs` reads `count` while `counter.mjs`'s `let count` is still in its
+temporal dead zone, that throws, and the recompile is what made the read lazy.
+
+The line below it, `read from the namespace`, also says `2` and proves nothing
+of the sort. That one is `counter.count`, a property access on the namespace
+object, which goes through the export getter every time it is evaluated. It is
+live with a cycle and without one, because the export side was never the
+problem.
+
+Take the cycle away and the two lines stop agreeing. A plain non-cyclic module
+that does `import { count, bump }`, calls `bump()` twice and then logs `count`,
+prints `0` here and `2` under Node, because nothing threw, so nothing was
+recompiled. Read the same value off a namespace instead and you get `2` either
+way. Nothing warns you which of the two you wrote. That is the sharpest edge in
+this loader and it is the reason the honest list at the end of this post has the
+bullet it has.
+
+Every module body in the demo is a string you can edit. The other instructive
+change is to delete the `__esModule` line from `legacy.cjs` and run it again,
+for the reason in the next section.
+
+## `__esModule` is not proof of a default export
+
+When you `import x from` a CommonJS module, what should `x` be? Node's answer is
+simple and total: `module.exports`, always. Babel's answer, which the entire
+transpiled ecosystem is built on, is that a module carrying the `__esModule`
+flag was originally ESM, so `x` should be its `.default`.
+
+Both are defensible. The trouble is that `tsc --module commonjs` stamps
+`__esModule` on every file it emits, including the ones that only ever assign
+named exports. The flag means "transpiled", and the unwrap needs "has a
+default".
+
+`@embroider/core` is one of those files: flag set, no `default` key. So
+`import core from '@embroider/core'` handed `@embroider/vite` `undefined`, and
+Ember's config load died at `const { cleanUrl } = core`. The fix is to require
+the key to exist as well as the flag, which keeps the Babel unwrap that real
+`export default` code depends on and falls back to Node's answer otherwise.
+
+Now the honest part, and it is in the source as a signed confession rather than
+something I am volunteering. The dynamic `import()` helper **deliberately does
+not** use that narrower test. It still treats `__esModule` as proof of an ESM
+namespace, so `(await import('<tsc-emitted-cjs>')).default` is `undefined` here
+where Node gives you `module.exports`.
+
+That is not laziness. Narrowing it the same way would break the other direction:
+our own transpiled ESM sets `__esModule` too, and a module with no
+`export default` would then get a synthesised `ns.default = m` that Node never
+gives it. Telling those two cases apart needs a marker that `__esModule` cannot
+carry. It is a known divergence, recorded rather than papered over, and it is
+the one place in the loader where two correct behaviours cannot both be had.
+
+There is a related constraint pulling the other way. Dynamic `import()` has to
+resolve to a module **namespace**, not the raw `require()` value. Returning the
+bare exports left a CommonJS default import with no `default` key, which almost
+nothing noticed because real code mostly reads it through the static path. Vite's
+server-side module runner does notice: it asserts `'default' in mod` for
+externalised CommonJS dependencies, and threw
+`Named export 'default' not found. The requested module 'cssesc' is a CommonJS module`
+on Astro.
+
+## Top-level await, and a compile error that lies
+
+Top-level await is the case Node declines outright, and it is not optional here:
+Vite's own binary starts with `await import('node:inspector')`.
+
+The wrapper each module is compiled into is a plain, non-async function, so
+`new Function` rejects the parse. The fix is to recompile the ESM body as an
+`AsyncFunction`, which makes the module evaluate to a promise that gets threaded
+through the entry point so the top-level body can await while the loop pumps.
+
+Deciding *when* to do that is where it got interesting, because the parser will
+not tell you. At the top level of a non-async function, `await x` parses `await`
+as an identifier, so the error names the **next** token. You do not get "await is
+only valid in async functions". SvelteKit's `core/sync/ts.js` does
+`ts = (await import('ts')).default`, which after the import rewrite is
+`await __oc_import('ts')`, and the parser's verdict is
+`SyntaxError: Unexpected identifier '__oc_import'`.
+
+Sniffing that message reliably is hopeless, so the loader does not try. Any
+compile failure on an ESM file is retried as an `AsyncFunction`. Real top-level
+await then compiles; a genuine syntax error fails again and is reported with the
+filename appended. The retry is on the error path only, so the happy path pays
+nothing.
+
+**The limit, stated plainly: only the entry module can block on top-level
+await.** A dependency deep in the graph that uses it is still not supported, and
+that is why [PGlite ships in the templates as its CommonJS build](/databases-and-the-http-parser)
+rather than its ESM one. Choosing CJS there avoids the problem instead of
+discovering it.
+
+## It is a lexer, which is fast and occasionally wrong
+
+`es-module-lexer` does not build an AST. It skims for the constructs it cares
+about, which is why this is affordable to do on every module of every install
+rather than once in a build step.
+
+The cost is that skimming has to be exactly right about where strings, template
+literals and comments end. A coarse template skip that ignores `${}`
+interpolation desyncs on modern bundled code: a regex inside an interpolation in
+`@vitest/pretty-format` was misread as a string, which swallowed the matching
+brace and lost every top-level `export` after it. The module then compiled with
+no exports and the importer got an empty object.
+
+So the skimmer descends into interpolations properly. It is still a skimmer, and
+that is the trade being made: a parse of every file would be correct and would
+cost more than the rest of module loading put together.
+
+## The TypeScript in front of it
+
+Node's loader is not the only thing that has to be synchronous. A `.ts` file has
+to become JavaScript before the ESM rewrite sees it, with no `tsc`, no esbuild,
+and no await, which means a dependency-free token rewriter whose output has to
+parse.
+
+The hard problem in a type stripper is `<`. Deciding whether it opens a generic
+or is a less-than comparison needs the previous token: an identifier, a closing
+parenthesis or a closing angle bracket means a generic at a declaration or call
+site. A generic **arrow** function is a separate case, because it begins an
+expression rather than a declaration.
+
+Three of its bugs made it into a release, and their symptoms are a nice ladder.
+The type skipper counted braces only at depth zero, so `Array<{ detail: string }>`
+left `}>;` behind as live code, which at least fails loudly at load. `as` and
+`satisfies` were treated as cast keywords after any token, so
+`Bun.semver.satisfies(...)` was eaten as a type assertion: the call vanished, the
+importer got `undefined`, and the process exited zero. A stripper bug that
+throws is a bug. A stripper bug that succeeds is a support ticket six months
+later.
+
+## What is honest to claim
+
+- **This is a rewrite, not an ESM implementation.** There is no module map, no
+  linking phase, no `import.meta.resolve` against a real registry of module
+  records. The semantics that survive are the ones that can be modelled in
+  CommonJS plus getters, which turns out to be most of them, and it is not all
+  of them.
+- **Named imports are eager snapshots on the default path.** Import-side
+  liveness exists, and it is a recompile that only fires when the eager read
+  throws. So a module that imports a mutable `let` from a module with no cycle,
+  and expects to see later writes to it, reads the value it saw at import time
+  and is given no warning. Two smaller consequences of the fallback itself:
+  assigning to an imported binding inside it is a silent no-op where real ESM
+  throws, and an import used at top-level initialisation inside a cycle still
+  cannot be satisfied, because the source genuinely is not ready.
+- **Top-level await works in the entry module only.**
+- **`(await import(x)).default` differs from Node for a `tsc`-emitted CommonJS
+  module**, deliberately, for the reason above.
+- **The scanner can be wrong on pathological source.** Every case found so far
+  is fixed and the fix is tested, which is not the same as a proof.
+- **`export * from` a module that later mutates its own exports object** is
+  outside what getters copied at load time can model.
+
+Every one of the bugs in this post came from running a real project rather than
+a test suite, which is a statement about coverage as much as about the bugs.
+Yargs, Vue, Astro, Ember, SvelteKit, Vitest and Vite each found something no
+fixture had.
+
+## The general version
+
+The interesting thing about this subsystem is that it exists because of a
+constraint one layer down. Nothing about ESM demanded a lexer and a getter
+protocol; the synchronous filesystem did, and the filesystem is synchronous
+because Node's `require()` is, and `require()` is synchronous because 2009.
+
+Node gets to draw a line and say `ERR_REQUIRE_ASYNC_MODULE`. That line is a
+luxury of having somewhere else to send people. Take it away and you find out
+which parts of the module system are semantics and which parts were always just
+scheduling.
+
+Mostly it is scheduling. The two exceptions, real top-level await in a
+dependency and the `__esModule` ambiguity, are documented above rather than
+hidden, because a loader that is quietly wrong about a module's shape is the
+worst possible thing to have underneath a package manager.
+
+More on the runtime in [the architecture docs](https://vivari.run/docs/how-it-works),
+and the post that explains why any of this has to be synchronous is
+[the one about the single blocking primitive](/blocking-in-a-browser).
+
+---
+
+Vivari is an open-source, MIT-licensed WebContainer: no commercial licence, no
+per-seat fee, self-host every asset. The code is on
+[GitHub](https://github.com/maitrungduc1410/vivari) and the
+[Studio](https://vivari.run/studio/) runs in your browser.

@@ -1,0 +1,238 @@
+---
+slug: bun-without-bun
+title: Bun runs in the tab and there is no Bun in it, so the interesting part is what refuses
+description: Bun is a Zig binary with no wasm32 build, so bun index.ts in a browser is an emulation over the Node runtime. The engineering worth reading about is bun:sqlite driving a bare sqlite3.wasm, and a refusal policy with two message shapes.
+tags: [teardown, runtime, bun]
+image: /img/og/bun-without-bun.png
+og_eyebrow: TEARDOWN 11
+---
+
+import Playground from '@site/src/components/Playground';
+
+Bun is a single native binary written in Zig around JavaScriptCore. There is no
+`wasm32` build of it, there is not going to be one soon, and a browser tab
+cannot execute a Mach-O or ELF file regardless.
+
+So `bun index.ts` in a page is not Bun. It is Bun's API, implemented on top of
+[the Node runtime these posts keep describing](/nodes-real-lib-in-the-browser),
+and the honest version of that sentence is the whole subject here. A
+compatibility shim is only useful if you can tell, from inside it, which parts
+are real. Most of this post is about the parts that are not, and how they say
+so.
+
+{/* truncate */}
+
+## What is actually on PATH
+
+`bun` and `bunx` are ordinary coreutils, installed eagerly rather than lazily
+unpacked on first use, because unlike the
+[real vendored npm, yarn and pnpm CLIs](/real-package-managers-in-the-browser)
+there is no tarball to unpack: they are purpose-built shims running on the same
+runtime your code runs on. `bun run`, `bun test`, `bun build` and the `Bun`
+global are all implemented here. `bun install` is not: it delegates to the real
+npm CLI, because reimplementing a resolver would be a worse lie than borrowing
+one. The TypeScript in `index.ts` is handled by
+[the synchronous stripper](/synchronous-esm) that every other `.ts` file in the
+runtime goes through, not by Bun's transpiler.
+
+Most of the surface is uninteresting in the good way. `Bun.escapeHTML`,
+`Bun.deepEquals`, `Bun.stringWidth`, `Bun.semver`, `Bun.Glob`, `Bun.which`,
+`Bun.gzipSync` are small pure functions with a specification and a test. There
+are two places where that stopped being true.
+
+## The one module that could not be shimmed
+
+Every other Bun API had something underneath it to delegate to. `bun:sqlite` did
+not: there is no SQLite in the Node runtime to borrow, and the API is
+**synchronous** by design. `db.query(sql).all()` returns rows, not a promise.
+There is nowhere to await an engine booting.
+
+The engine is the official `@sqlite.org/sqlite-wasm` build, the same C source
+SQLite's own test suite covers, compiled by the SQLite authors. It is
+**committed** to the repository at 844 KiB alongside a manifest recording the
+upstream version and SHA-256, rather than fetched at build time, because both
+spike tiers need it on a bare checkout and a spike that skips when its artifact
+is missing looks green while proving nothing. The refresh script validates the
+binary it pulls: magic bytes, required exports, that its imports are a subset of
+what the loader supplies, and that its declared memory minimum still fits. An
+upstream build that changed its ABI fails the refresh rather than failing at
+somebody's first query.
+
+**The Emscripten glue is not used.** The package ships 578 KB of it, and it is
+useless here twice over: it is async-init, meaning it fetches and calls
+`WebAssembly.instantiate`, and it routes file I/O through MEMFS or NODEFS,
+neither of which exists in this environment. So the loader supplies the module's
+36 imports itself and instantiates with a bare `new WebAssembly.Module(bytes)`
+followed by `new WebAssembly.Instance(...)`. Both are synchronous, which is
+illegal on a main thread and legal on a worker, which is where all guest code
+runs. It is the same trick
+[the llhttp binding uses](/databases-and-the-http-parser).
+
+The memory is created on this side, 128 pages initial and 2 GiB maximum,
+unshared, because the build imports memory rather than exporting it. Growth goes
+through `emscripten_resize_heap`, and every cached typed-array view has to be
+re-derived whenever `memory.buffer` identity changes, since growth detaches the
+old `ArrayBuffer`. That is the sort of detail the glue would normally handle and
+the reason people use the glue.
+
+**And then the part that makes it worth doing.** A `sqlite3_vfs` is registered
+whose `xOpen`, `xRead`, `xWrite`, `xTruncate`, `xFileSize`, `xDelete`, `xAccess`
+and `xFullPathname` call the runtime's own `fs`, which is
+[the SharedArrayBuffer syscall bridge](/blocking-in-a-browser). So a `.sqlite`
+file is an ordinary file in the virtual filesystem. It shows up in the file tree,
+it outlives the process that made it, and the next process reads it. The reads
+and writes take explicit offsets, which is exactly the `pread` and `pwrite` a
+SQLite VFS wants.
+
+SQLite needs real C function pointers for those callbacks, and
+`WebAssembly.Table.prototype.set` will not accept a plain JavaScript function.
+So each callback is wrapped in a hand-assembled 40-byte Wasm module that imports
+the function and re-exports it, and the export goes into
+`__indirect_function_table`. Forty bytes of hand-written Wasm per callback is
+either the ugliest thing in this repository or the most satisfying, depending on
+the day.
+
+Two semantics are implemented rather than approximated, because approximating
+them corrupts data. `safeIntegers` governs reads: `true` returns exact `BigInt`s,
+`false` returns `Number`s, lossily above 2^53, which is Bun's documented
+behaviour and the reason the toggle has to exist. Binding is exact either way, so
+a `bigint` argument goes in through `sqlite3_bind_int64` and one outside int64
+range throws a `RangeError` naming the value instead of wrapping it. And
+`db.transaction()` nests through SAVEPOINT, with nesting decided by
+`sqlite3_get_autocommit` rather than a counter we keep, so a hand-written
+`BEGIN` in the middle of things does not desync it.
+
+## Two sentences, and the difference between them is load-bearing
+
+Roughly thirty Bun APIs in this shim do nothing but throw. That file is the best
+writing in the repository, and its argument is this: there are two reasons an
+API can fail, and telling someone the wrong one wastes their afternoon.
+
+```
+"<api> is not supported in Vivari (browser sandbox): <reason>"
+"<api> is not implemented in the Vivari shim: <reason>"
+```
+
+The first means the capability does not exist in a page. A raw socket,
+`dlopen(3)`, an OS keychain, engine internals. No amount of shim work changes
+it, and the code has to run somewhere else. The second means it could work here
+and nobody has written it: a gap, not a limit.
+
+Conflating them is its own kind of dishonesty. "Not supported" tells you to stop
+and redesign. "Not implemented" tells you to file an issue or send a patch.
+Where an API is half of each, and a TCP client is exactly that, since it can
+reach another in-VM process forever but can never reach the internet, the
+message says both, in that order.
+
+There is a second rule, and it is the one that keeps projects alive. **The
+symbol is always exported. The throw is always on the call.** So
+`import { dlopen } from "bun:ffi"` still loads, and a property read during some
+dependency's module-level feature detection still returns a function. A
+load-time throw is strictly worse: one unused import at the top of a transitive
+dependency takes down a project that never touches the API.
+
+The catalogue covers `Bun.listen`, `Bun.connect`, `Bun.udpSocket`,
+`Bun.RedisClient`, `Bun.sql`, `Bun.postgres`, `Bun.Terminal`, `Bun.WebView`,
+`Bun.mmap`, `Bun.peek`, `Bun.secrets`, `Bun.dlopen`, the zstd helpers,
+`Bun.generateHeapSnapshot`, `Bun.openInEditor` and the whole of `bun:ffi`. The
+native addon half of the same file is not Bun-specific at all: `require("bcrypt")`
+from plain Node code hits precisely the same wall, and one catalogue of "impossible
+in a browser, and here is what to do instead" beats two that drift apart.
+
+All of that is checkable rather than something to take my word for. The script
+below is running Bun's API in this page: a block of one-line results, a visible
+pause while argon2id does its 64 MiB of work, real SQLite reporting its own
+version number and three rows, and then a refusal.
+
+<Playground scenario="bun-shim" title="Bun in a tab, including the parts that refuse" height={580} />
+
+The block at the bottom is the part to play with. Uncomment any line and run it
+again, and you get the exact sentence that API throws. The two message shapes
+are visibly different, which is the entire point of there being two.
+
+## The ones that are real, and one that was not
+
+**`Bun.password` is genuine argon2id** at Bun's own documented cost parameters:
+64 MiB of memory, two passes, one lane. Measured in Wasm under Node on one
+machine, hashing takes about 97ms and verifying takes about the same, and in a
+browser tab it is somewhat slower again, which is the pause you just sat through
+in the demo. That number is supposed to be large. A password hash that returns
+instantly is a password hash that is not doing its job, and the most common way to get
+compatibility wrong here would have been to substitute something cheaper and
+call it argon2id.
+
+**`Bun.hash` was wrong and is now pinned.** It started as a bespoke
+multiply-xor hash that agreed with real Bun on nothing at all, which is a
+perfectly good hash function and a completely useless compatibility shim, since
+the entire value of `Bun.hash` is that two systems compute the same number. It
+is now wyhash final v3, checked against published vectors.
+
+**`Bun.sleepSync` used to spin.** Right duration, one core pinned at 100% for
+it. It now parks on `Atomics.wait`, with the spin left in as a documented
+fallback for a browser main thread, where parking is illegal.
+
+**`bun:test` is stricter than real Bun in one place.**
+`expect(settledPromise).rejects.toThrow()` returns `undefined` in real Bun; this
+runner always returns a real promise, and drains outstanding async assertions
+after each test body. A snapshot file written here has been read and passed by a
+real `bun test`, which is the strongest compatibility evidence in the shim.
+
+## What `Bun.build` is not
+
+It is not esbuild. There is no tree shaking and no minifier, and `minify`,
+`splitting`, `sourcemap`, `bytecode` and `--compile` throw rather than silently
+producing something that does not match the option you asked for. It bundles,
+and that is the extent of the claim.
+
+Streaming is the other place to be careful. A `ReadableStream` response body is
+buffered in full: measured at 25 MB into an unread socket with `writableLength`
+never leaving zero. Backpressure never engages. It is left honestly buffered
+rather than half-implemented, which is the right call and is also a real limit
+if you were planning to stream a large file out of `Bun.serve`.
+
+## What is honest to claim
+
+- **This is not Bun and will never be byte-for-byte Bun.** It is Bun's API on
+  the Node runtime, so anything that depends on JavaScriptCore semantics,
+  Bun's transpiler output, or Bun's process startup is out of scope by
+  construction.
+- **`bun:sqlite` has three limits, each a sandbox fact rather than a
+  shortcut.** `xSync` is a no-op because the runtime's `fsync` is, so the
+  rollback journal is still written and replayed and a crash mid-transaction
+  recovers, but power loss is not survivable the way real SQLite promises.
+  There is no file locking, so two processes writing one database can corrupt
+  it, and this matches what upstream ships: the official build's default VFS is
+  literally `unix-none`, SQLite's lock-free one. And `journal_mode = WAL` needs
+  shared memory across processes, so it is declined with a one-time warning and
+  SQLite stays in `delete` mode, which is SQLite's own documented behaviour when
+  a VFS cannot do WAL. ORMs that set WAL opportunistically therefore keep
+  working.
+- **The argon2id timing is measured in Wasm under Node on one machine**, and a
+  tab is slower again. Treat it as an order of magnitude, not a benchmark.
+- **The refusal list is a snapshot.** Several entries are "not implemented"
+  rather than "not supported", which is a promise that they could move.
+
+## The general version
+
+The temptation in a compatibility layer is to make the surface as wide as
+possible, because the surface is what a table on a marketing page measures. Every
+API you stub to return a plausible empty value makes that table better and makes
+the layer worse, because the failure moves from your code to the user's, six
+frames deep, with a message that names neither of you.
+
+The two sentences at the top of that refusal file are worth more than any of the
+APIs underneath them. A shim's honesty is a feature with a spec: name the API,
+say which of the two kinds of failure this is, and say what to do instead. It
+costs one string per function and it is the difference between a limitation and
+a bug report.
+
+More on the Bun surface in [the Bun docs](https://vivari.run/docs/bun), and the
+previous post covers
+[why every import in this runtime is rewritten to CommonJS at load time](/synchronous-esm).
+
+---
+
+Vivari is an open-source, MIT-licensed WebContainer: no commercial licence, no
+per-seat fee, self-host every asset. The code is on
+[GitHub](https://github.com/maitrungduc1410/vivari) and the
+[Studio](https://vivari.run/studio/) runs in your browser.

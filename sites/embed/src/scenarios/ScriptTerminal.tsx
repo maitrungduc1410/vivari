@@ -24,8 +24,12 @@ export type ScriptTerminalProps = {
    * mentions.
    */
   packageJson?: string | null;
-  /** Syntax highlighting for the editor pane. Defaults to the command's language. */
-  language?: "javascript" | "python";
+  /**
+   * Syntax highlighting for the editor pane. Defaults to the command's
+   * language, which is only a guess for `bun`: it runs `.ts` and `.js` alike,
+   * so a TypeScript scenario says so explicitly.
+   */
+  language?: "javascript" | "typescript" | "python";
 };
 
 // A real Node script the visitor can edit and run: it uses Node core modules

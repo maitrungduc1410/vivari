@@ -32,12 +32,51 @@ const DOCS_CARD = path.join(root, "sites/docs/static/img/social-card.png");
 
 const WIDTH = 1200;
 const HEIGHT = 630;
-const TITLE_SIZE = 62;
-const TITLE_LINE_HEIGHT = 76;
 const MAX_TITLE_LINES = 4;
-// resvg does no line breaking, so titles are wrapped by hand. Average glyph
-// advance for this face is ~0.52em; the margin keeps long words inside the card.
-const TITLE_CHARS_PER_LINE = Math.floor((WIDTH - 200) / (TITLE_SIZE * 0.52));
+
+// The title block is bottom-anchored on this baseline, so a short title and a
+// long one both sit above the footer rather than drifting down the card.
+const TITLE_BASELINE = 470;
+// The floor for the title's first line. It clears the eyebrow band, not the
+// eyebrow baseline at 212: these are not all caps, so the band runs below the
+// baseline. The docs card's `npm i @vivari/core` reaches y=214, where an
+// all-caps TEARDOWN NN stops at 211. Without this, a four-line title started
+// near 197 and struck the marker out on three cards.
+const TITLE_TOP_LIMIT = 232;
+// Height of a title glyph above its baseline, in ems. Liberation Sans caps are
+// 0.69em and its tallest lowercase ascender is ~0.72em; the larger is the one
+// that collides.
+const TITLE_ASCENT = 0.72;
+
+// resvg does no line breaking, so titles are wrapped by hand, and a title long
+// enough to need a fourth line has to come down a size to fit between the
+// eyebrow and the rule at y=530. Each rung is a face size with its line height;
+// the first rung whose wrap clears TITLE_TOP_LIMIT wins. Anything that fits on
+// three lines therefore stays at 62 and renders exactly as it always has.
+const TITLE_RUNGS = [
+  { size: 62, lineHeight: 76 },
+  { size: 54, lineHeight: 66 },
+];
+
+// Average glyph advance for this face is ~0.52em; the margin keeps long words
+// inside the card. Derived per rung, so a smaller face re-wraps wider.
+const charsPerLine = (size) => Math.floor((WIDTH - 200) / (size * 0.52));
+
+// The last rung is the floor, so it has to survive the worst case the wrapper
+// can hand it. Silently overflowing that budget is the exact bug this ladder
+// exists to fix, so it is enforced here rather than left as a comment.
+{
+  const floor = TITLE_RUNGS[TITLE_RUNGS.length - 1];
+  const top =
+    TITLE_BASELINE - (MAX_TITLE_LINES - 1) * floor.lineHeight - floor.size * TITLE_ASCENT;
+  if (top < TITLE_TOP_LIMIT) {
+    throw new Error(
+      `og-cards: a ${MAX_TITLE_LINES}-line title at ${floor.size}px would start at ` +
+        `y=${top.toFixed(0)}, above the y=${TITLE_TOP_LIMIT} limit, and strike through the ` +
+        `eyebrow. Add a smaller rung to TITLE_RUNGS.`,
+    );
+  }
+}
 
 // Fonts are referenced by family name and resolved from the host. Liberation
 // Sans is metric-compatible with the Inter used on the site; the rest are
@@ -91,15 +130,27 @@ function wrap(text, maxChars) {
   return lines;
 }
 
+// Pick the largest rung whose wrapped title clears the eyebrow. Falling through
+// to the last rung is safe because of the floor check above, so the loop always
+// returns from inside.
+function layoutTitle(title) {
+  for (let i = 0; i < TITLE_RUNGS.length; i++) {
+    const { size, lineHeight } = TITLE_RUNGS[i];
+    const lines = wrap(title, charsPerLine(size));
+    const firstBaseline = TITLE_BASELINE - (lines.length - 1) * lineHeight;
+    const clears = firstBaseline - size * TITLE_ASCENT >= TITLE_TOP_LIMIT;
+    if (clears || i === TITLE_RUNGS.length - 1) {
+      return { size, lineHeight, lines, firstBaseline };
+    }
+  }
+}
+
 function cardSvg({ title, eyebrow }) {
-  const lines = wrap(title, TITLE_CHARS_PER_LINE);
-  // Bottom-anchor the title block so one-line and four-line titles both sit
-  // above the footer rather than drifting down the card.
-  const firstBaseline = 470 - (lines.length - 1) * TITLE_LINE_HEIGHT;
+  const { size, lineHeight, lines, firstBaseline } = layoutTitle(title);
   const tspans = lines
     .map(
       (l, i) =>
-        `<tspan x="96" y="${firstBaseline + i * TITLE_LINE_HEIGHT}">${escapeXml(l)}</tspan>`,
+        `<tspan x="96" y="${firstBaseline + i * lineHeight}">${escapeXml(l)}</tspan>`,
     )
     .join("");
 
@@ -124,7 +175,7 @@ function cardSvg({ title, eyebrow }) {
   </g>
   <text x="178" y="129" font-family="${SANS}" font-size="34" font-weight="bold" fill="#eef1f8">Vivari</text>
   <text x="96" y="212" font-family="${MONO}" font-size="24" fill="#22d3ee">${escapeXml(eyebrow)}</text>
-  <text font-family="${SANS}" font-size="${TITLE_SIZE}" font-weight="bold" fill="#eef1f8">${tspans}</text>
+  <text font-family="${SANS}" font-size="${size}" font-weight="bold" fill="#eef1f8">${tspans}</text>
   <rect x="96" y="530" width="60" height="4" rx="2" fill="url(#mark)"/>
   <text x="96" y="580" font-family="${SANS}" font-size="26" fill="#9aa3b8">An open-source WebContainer · vivari.run</text>
 </svg>`;

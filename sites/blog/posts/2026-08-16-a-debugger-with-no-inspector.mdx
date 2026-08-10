@@ -1,0 +1,258 @@
+---
+slug: a-debugger-with-no-inspector
+title: A step debugger with no inspector to talk to, and the second SharedArrayBuffer that makes it pause
+description: There is no V8 inspector in a Web Worker, so a breakpoint had to be built out of acorn probes and a second shared buffer. Then CPython arrived and needed none of it, which is how we found out the protocol was the right thing to have picked.
+tags: [teardown, runtime, nodejs, python]
+image: /img/og/a-debugger-with-no-inspector.png
+og_eyebrow: TEARDOWN 09
+---
+
+import Playground from '@site/src/components/Playground';
+
+A breakpoint is not a feature you write. It is a favour the engine does you.
+When you set one in VS Code, nothing in your program changes: V8's inspector
+holds the isolate, walks the real call stack, and hands back scopes it already
+had. Every step debugger you have used is a thin client in front of that.
+
+A Web Worker has no inspector. There is no `--inspect` port to open, no
+`inspector` binding to require, no way to ask the engine to stop. So the first
+question here was not how to build a debug UI. It was where a pause could
+possibly come from.
+
+{/* truncate */}
+
+## The pause has to come from the program itself
+
+If the engine will not stop your code, your code has to stop itself. That means
+the source that runs is not the source you wrote.
+
+`acorn` parses the guest's own file and weaves in probes: `__vvdbg.line` before
+each statement, `__vvdbg.brk` for a literal `debugger;`, `__vvdbg.push` and
+`__vvdbg.pop` around calls so there is a shadow call stack to report. Each
+lexical block also gets a `__vv_ev` eval closure, which is the unglamorous piece
+that makes Variables and `evaluateOnCallFrame` show the block you are actually
+standing in rather than the function's outermost scope.
+
+Where this happens in the pipeline is the part that took thought. The
+instrumentation runs **after** the TypeScript and JSX strip, so acorn is looking
+at plain ES rather than syntax it does not know, and **before**
+[the ESM to CommonJS rewrite](/synchronous-esm), so line numbers still match the
+file the reader has open in the editor. One layer earlier and the parse fails on
+a type annotation. One layer later and every breakpoint lands on the wrong line.
+
+There is a bailout, and it matters more than it looks. If acorn throws for any
+reason, the module self-heals to the original source and runs uninstrumented.
+You lose breakpoints in that one file. You do not lose the program.
+
+The whole thing lives in a lazy `import()` chunk of roughly 195 KB, fetched only
+when a debug buffer is present. A normal run never parses a byte of it.
+
+## The second SharedArrayBuffer
+
+[Everything else in the runtime](/blocking-in-a-browser) rides one 1 MiB
+`SharedArrayBuffer` per process: write a request, `Atomics.wait`, get notified,
+read the response. The debugger cannot use it, and the reason is a nice one.
+
+A process parked at a breakpoint is not sitting in the syscall loop. It is
+parked in the middle of a `__vvdbg.line` probe, halfway down the user's own call
+stack. The syscall buffer is a channel for a client that is asking questions. A
+paused process is answering them.
+
+So a debug target gets a second, independent buffer, allocated only when
+`VV_DEBUG` is set:
+
+```
+[ control: Int32 STATE, Int32 LEN ][ data region: JSON CDP command bytes ]
+
+STATE values: DBG_STATE_EMPTY = 0, DBG_STATE_CMD = 1
+LEN:          byte length of the command JSON
+```
+
+The paused worker blocks on `Atomics.wait(STATE, EMPTY)`. The kernel writes a
+CDP command into the data region, stores `DBG_STATE_CMD`, and notifies. The
+worker wakes up inside the probe, with the user's stack still intact above it,
+runs the command, and parks again. `stepOver`, `getProperties`,
+`evaluateOnCallFrame`, all of it happens on a thread that is technically in the
+middle of executing line 41.
+
+That gives two transports for one protocol, and the split is by state rather
+than by message type. A running process receives commands by `postMessage`,
+because it is still turning its event loop and can pick them up. A paused
+process receives them through the buffer, because it is not turning anything.
+There is also a `--inspect-brk`-style start gate, since a twelve line script
+would otherwise be finished before the frontend finished attaching.
+
+## Why Chrome DevTools Protocol, when nothing here is Chrome
+
+Speaking CDP to a runtime with no inspector looks like cargo cult. It was the
+best decision in this subsystem, and we only found out later.
+
+The alternative was a bespoke debug API, which would have been smaller and would
+have fit the shape of what actually exists here. What CDP bought instead was a
+contract that already had two consumers: the studio's debug panel drives Monaco
+gutter breakpoints, the paused-line highlight, and a VS Code style Call Stack,
+Variables and Watch tree, all in the vocabulary of `Debugger.scriptParsed`,
+`Debugger.paused` and `Runtime.getProperties`. None of that had to be invented.
+
+Then came Python.
+
+## The second backend, and the file that did not change
+
+`.py` files now get the same pause, step, inspect and evaluate over the same
+protocol and the same buffer. The studio is unchanged. It speaks CDP, it keeps
+breakpoints per virtual filesystem path, and it never had a reason to know what
+language is on the other end of the socket that is not a socket.
+
+Two things differ from the Node backend, and both differ in the same direction:
+CPython already has what the JavaScript side had to build.
+
+**No instrumentation.** CPython's frames are real. There is no acorn, no probe
+weaving, no shadow call stack, no line number preservation problem. What is left
+is the protocol and the transport, and those were reused as they stood.
+
+**PEP 669, not `sys.settrace`.** This is the interesting half, because it is the
+difference between a debugger you can leave attached and one you have to
+remember to turn off. A `settrace` hook is called on every line of every
+function and has no way to say "stop calling me about this one". Measured on
+this build, on one machine, with a 300,000 iteration loop:
+
+| what is attached | cost |
+| --- | --- |
+| nothing | 22ms |
+| `sys.settrace` with a hook that does a dict lookup and returns | 217ms |
+| `sys.monitoring` answering `DISABLE` | 23ms |
+| `sys.monitoring` with a breakpoint on the hot line | 83ms |
+
+A debugger that makes the program ten times slower is not observing the program;
+it is changing it. [PEP 669](https://peps.python.org/pep-0669/) landed in 3.12
+and this interpreter is 3.14, so the callback can return
+`sys.monitoring.DISABLE`, which permanently retires that bytecode location. A
+line that is not a breakpoint is asked about exactly once and then costs nothing
+for the rest of the run. The 83ms row is a breakpoint on the hot line itself,
+which is a line you were about to stop on anyway.
+
+That table is the whole argument, and it is the kind of claim that is easy to
+make and boring to take on trust. The interpreter below is running in this page,
+and it measures all three for itself. Watch the middle number, and then watch
+the two counts underneath it:
+
+<Playground scenario="python-monitoring" title="Why a debugger can be left on" height={560} />
+
+The timings depend on your machine and on what else it is doing, and the ratio
+between them is the part that holds. The counts do not depend on anything:
+`settrace` is handed 600,006 line events and `sys.monitoring` is handed 10. That
+is the same loop, the same breakpoint table, and five orders of magnitude
+between how often the debugger was asked.
+
+The edit worth making is at the bottom of the file. Put a line number from
+inside `hot()` into `BREAKPOINTS` and run it again: the third number climbs,
+because that one location stops answering `DISABLE` and CPython goes back to
+asking about it on every iteration. It does not climb all the way to the
+`settrace` figure, and the gap between the two is exactly what `DISABLE` is
+buying on every other line in the function.
+
+There is a price for `DISABLE`, and stepping is where you pay it. Once a
+location has been retired it never fires again, so single stepping has to call
+`restart_events()` to un-retire everything it disabled. Code outside the user's
+project roots is dropped on its first line, which is what keeps a breakpoint
+anywhere in your file from tracing all of `import pandas`.
+
+The hot path stays in Python: a set lookup per candidate line. JavaScript only
+gets involved once a pause has been decided, and then it runs the entire CDP
+conversation by calling back into the interpreter for frames, scopes, reprs and
+`eval`. JavaScript inside a Python call, calling Python again, is the same
+re-entrant shape as the blocking stdin syscall, which is either reassuring or
+alarming depending on your temperament.
+
+## Which backend attaches is decided, not guessed
+
+`python` and `python3` used to be on the debug skip list. They now carry a
+`debugLang: "python"` label that travels with the buffer from the kernel worker
+through the process worker into the runtime, and exactly one of the two backends
+attaches.
+
+Without the label the JavaScript backend does what it is supposed to do, which
+is the wrong thing: `python` is itself a Node program, so it would instrument
+our own four thousand line launcher shim and offer you breakpoints in it. That is a
+debugger correctly debugging a program nobody asked about.
+
+A related bug took a while to find and is worth writing down because the symptom
+was silence. Running `python main.py` compiled the script under the name
+`main.py`, while breakpoints are keyed on absolute virtual filesystem paths. So
+nothing ever matched, no breakpoint ever bound, and the program simply ran to
+completion. A debugger that does not stop looks exactly like a debugger that is
+not attached.
+
+## Ctrl-C into an interpreter that is not in JavaScript
+
+Signals are the other half of interrupting a program, and CPython broke the
+model. The pending signal bitmask is only ever observed by JavaScript, either at
+a syscall park or on an event loop turn. A guest running CPython in Wasm is
+doing neither: the worker thread is inside the interpreter's eval loop and will
+not return to JavaScript until the Python code finishes. The kernel's only
+option was the one it takes for any guest with no handler, which is to kill it.
+
+CPython's Emscripten build already solves its half by polling a byte of shared
+memory and raising `KeyboardInterrupt` at the next bytecode boundary. So SIGINT,
+and only SIGINT, is mirrored into the first byte of `control[5]`, previously
+reserved padding in the syscall control block. Wasm is little-endian by
+specification, so that is byte 20 everywhere this runs. The interpreter clears
+the byte itself when it acts. Measured latency is about 5ms.
+
+The handler is registered only while the interpreter is running user code,
+because registering it is what tells the kernel not to kill this process, and
+that is a promise you can only keep while there is an interpreter running to
+take the interrupt.
+
+## What is honest to claim
+
+The Node debugger is verified by a spike with 27 assertions covering
+instrumentation, breakpoint binding including conditional breakpoints,
+pause and step, scope and `evaluateOnCallFrame` including the temporal dead
+zone, a top-level `debugger;`, the real buffer channel, and an end-to-end
+`worker_threads` pause, evaluate and resume over that buffer. That is what it is
+tested to do.
+
+Four limits, by name:
+
+- **Preview browser JavaScript cannot be debugged this way, and may never be.**
+  A page in the preview iframe runs on a main thread, where `Atomics.wait` is
+  illegal. Pausing it needs a resumable transform, continuation passing or
+  generators, over the guest's source. Nobody has written that.
+- **A REPL parked at its prompt still cannot be interrupted.** Ctrl-C works
+  while the interpreter is running your code. Idle, parked in the blocking stdin
+  read, it keeps its old meaning, because interrupting a park needs the read
+  itself to return `EINTR` and it does not do that yet.
+- **Instrumented code is not your code.** Line numbers survive and the bailout
+  keeps a parse failure from being fatal, but anything that reads its own source
+  text, or measures its own throughput, is measuring the woven version.
+- **The timings are one machine, one build.** They are here to show that the gap
+  between 217ms and 23ms is a factor of roughly ten, not to be a benchmark
+  anyone should quote.
+
+## The general version
+
+The Node half of this is a workaround. Instrumenting source to fake a capability
+the platform withholds is not elegant, and if a browser worker ever grows an
+inspector, most of `instrument.js` should be deleted that afternoon.
+
+The part worth keeping is the protocol choice. Picking Chrome DevTools Protocol
+when there was no Chrome in the picture cost a little up front and paid for
+itself the day a second language arrived, because the expensive half of a
+debugger is the frontend, and the frontend never learned that Python existed.
+Two backends, one of which needs a parser and a shadow stack and one of which
+needs neither, meet at the same twenty CDP methods and the same three events.
+
+Picking somebody else's interface when you have no obligation to is usually
+overengineering. It is occasionally the cheapest thing you will ever do.
+
+More on the runtime in [the architecture docs](https://vivari.run/docs/how-it-works),
+and the previous post covers
+[why every `import pandas` in a tab used to be the first one](/cpython-startup-in-a-tab).
+
+---
+
+Vivari is an open-source, MIT-licensed WebContainer: no commercial licence, no
+per-seat fee, self-host every asset. The code is on
+[GitHub](https://github.com/maitrungduc1410/vivari) and the
+[Studio](https://vivari.run/studio/) runs in your browser.
