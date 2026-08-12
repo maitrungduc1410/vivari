@@ -47,6 +47,24 @@ npm run vendor:pnpm
 npm run vendor:corepack
 npm run vendor:tsgo
 npm run vendor:pyodide
+# ruff and sqlite were in prebuild:studio but not here, and this script is the
+# one that runs on the deploy — so /studio/vendor/sqlite/sqlite3.wasm answered
+# with the landing page's index.html and a 200. A 404 would have been noticed;
+# a 200 of the wrong content type is not, which is why the two lists must not
+# drift again. Keep them in step with `prebuild:studio` in package.json.
+npm run vendor:ruff
+npm run vendor:sqlite
+
+# --- Resolved lockfiles + prebuilt node_modules snapshots ----------------------
+# The two producers behind the first-install cost. `vendor:locks` resolves a
+# package-lock.json per template so Arborist never takes its full-packument
+# branch (measured on react-ts: 143.0 MiB of metadata down to zero), and
+# `vendor:depcache` installs the covered templates once, here, so a first run in
+# the browser restores the tree instead of building it. Both are pure
+# optimisations that fail soft — a template with no asset installs the way it
+# always has — and both are keyed on the lock, so locks must come first.
+npm run vendor:locks
+npm run vendor:depcache
 
 # --- Studio (served under /studio/) --------------------------------------------
 ( cd packages/studio && bun install && VV_BASE=/studio/ bun run build )

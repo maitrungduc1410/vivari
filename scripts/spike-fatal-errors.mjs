@@ -29,7 +29,7 @@
 // Both `bun` and `node` guests are covered: the loop is shared, so a fix that
 // only reached one of them would be a coincidence rather than a fix.
 
-import { bootSpikeKernel } from "./lib/spike-harness.mjs";
+import { bootSpikeKernel, waitListen } from "./lib/spike-harness.mjs";
 
 let failed = 0;
 const ok = (cond, msg) => {
@@ -293,6 +293,56 @@ console.log("\n== a guest cannot reach the kernel's mailbox ==");
   ok(got && got.postMessage === "function", "…while the NAME is still there, because Bun's main thread has one");
   ok(got && got.Worker === "function", "…and Bun's Worker survives the realm sweep that removed the rest");
   ok(got && got.reply === "echo:hi", "…and a worker still exchanges messages, so the runtime's own channel is intact");
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== a guest that only LOOKS fatal is not treated as one ==");
+// The mirror image of everything above, and it belongs beside them: those prove
+// a guest that fails says so, this proves a guest that merely prints something
+// alarming is not read as having failed.
+//
+// `waitListen` stops waiting when the quietest process in the dev tree prints
+// one of three patterns, which turned a 300s timeout into a 0.6s report when
+// rolldown could not load its wasm binding. None of the three is PROOF though:
+// each is a string a process can print and carry on from, and a toolchain that
+// logs a failed native load and falls back to its JS implementation is doing the
+// ordinary thing. A harness that stops on the string alone reports a server that
+// bound 200ms later as never bound — a healthy template turned red by a
+// diagnostic, which is the same shape of wrong as the timeout it replaced, just
+// faster and in the other direction.
+//
+// The pattern itself is gated statically in `install-latency`, next to the lock
+// rules it protects. This half cannot be: it needs a real server in a real
+// kernel, which is why it is here — `install-latency` runs in the Wasm-free job
+// where booting one is MODULE_NOT_FOUND for the VFS crate, and this spike is
+// `needsWasm` and already boots.
+// ---------------------------------------------------------------------------
+{
+  const h = await bootSpikeKernel({ npm: false });
+  const dir = "/c/fatalgrace";
+  h.kernel.mkdirp(dir);
+  const noise = `console.error("Error: Cannot find native binding. npm has a bug related to optional dependencies");`;
+  try {
+    h.kernel.writeFile(
+      `${dir}/recovers.cjs`,
+      `${noise}\nsetTimeout(() => require("node:http").createServer((_q, s) => s.end("ok")).listen(4171), 200);`,
+    );
+    ok(
+      await waitListen(h, { dir, port: 4171, argv: [`${dir}/recovers.cjs`] }),
+      "a server that prints a fatal-looking line and binds anyway is NOT reported as failed",
+    );
+    // The case the pattern exists for still has to be fast. Graced down so the
+    // assertion costs a moment rather than the five seconds a real run gives it.
+    h.kernel.writeFile(`${dir}/dead.cjs`, `${noise}\nsetInterval(() => {}, 1000);`);
+    process.env.VV_FATAL_GRACE = "300";
+    const t0 = Date.now();
+    const bound = await waitListen(h, { dir, port: 4172, argv: [`${dir}/dead.cjs`] });
+    const secs = (Date.now() - t0) / 1000;
+    ok(!bound && secs < 30, `…and one that means it still aborts in ${secs.toFixed(1)}s rather than sitting out the timeout`);
+  } finally {
+    delete process.env.VV_FATAL_GRACE;
+    await h.kernel.start("rm", ["-rf", dir], { cwd: "/", capture: true }).catch(() => {});
+  }
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: all fatal-error checks passed");

@@ -263,42 +263,67 @@ async function findKernelClient() {
 
 // roadmap: Packaging Stage 2 — precache the role bundles. Every Process Worker
 // spawn (and every reload) otherwise re-fetches its bundle — process-worker.js
-// alone is ~900 KB. With the bundles in the Cache Storage the browser serves
-// them from disk: spawns are instant and the app works offline.
+// alone is ~470 KB over the wire. With the bundles in the Cache Storage the
+// browser serves them from disk: spawns are instant and the app works offline.
 //
-// This is gated on a build id (`__VV_BUILD_ID__`, a build-time `define`). It is
-// currently never defined in the studio build, so BUILD_ID is null and ALL
-// caching is skipped — edits keep hot-
-// reloading exactly as before. `typeof` on an undeclared name is legal and
-// yields "undefined", so this is safe to reference in the un-built file.
-const BUILD_ID = typeof __VV_BUILD_ID__ !== "undefined" ? __VV_BUILD_ID__ : null;
+// The manifest is injected at build time by the `vvPrecacheAndHints()` plugin in
+// vite.config.ts. Nothing injects it in dev, `typeof` on an undeclared name is
+// legal and yields "undefined", so dev keeps hot-reloading over the network
+// exactly as before.
+//
+// This used to be gated on a bare `__VV_BUILD_ID__` define from
+// scripts/build-demo.mjs (esbuild), which the studio's Vite build never
+// performed — Vite's `define` does not transform files in `public/` — so
+// CACHE_ON has been permanently false since the studio moved to Vite. Two
+// things had rotted behind that dead flag and are why this is a manifest now
+// rather than a build id:
+//   - the precache list named unhashed bundles (`kernel-worker.js`), which no
+//     Vite build has ever emitted. Turning the flag back on would have cached
+//     nothing while looking like it worked, because precache() is per-URL
+//     best-effort and a 404 is just a warn.
+//   - scripts/assemble-site.mjs hoists this file to the ORIGIN ROOT, so a scope
+//     derived from `self.location` covers the landing, the docs and the blog
+//     too. Serving three other sites cache-first, keyed on the studio's build
+//     id, is not what "precache the role bundles" meant.
+const MANIFEST = typeof __VV_PRECACHE__ !== "undefined" ? __VV_PRECACHE__ : null;
+const BUILD_ID = MANIFEST ? MANIFEST.id : null;
 const CACHE_ON = BUILD_ID !== null;
 const CACHE_PREFIX = "vv-precache-";
 const CACHE_NAME = CACHE_PREFIX + BUILD_ID;
 
-// Directory this SW was served from (the studio origin root) — and its parent.
-// The wasm binaries live in sibling pkg dirs under the parent; everything else
-// (bundles, index.html) lives under the SW's own dir.
-const SCOPE_DIR = new URL("./", self.location.href).pathname;
-const PARENT_DIR = new URL("../", self.location.href).pathname;
+// The role bundles + the Wasm the kernel compiles at boot, as emitted (hashed)
+// paths. Absolute already — resolving against `self.location` would re-introduce
+// the origin-root bug above.
+const PRECACHE = MANIFEST ? MANIFEST.assets : [];
 
-// Precached up front on install (the expensive, frequently-spawned role bundles
-// + the shell). Resolved against the SW location so it works wherever mounted.
-const PRECACHE = [
-  "index.html",
-  "kernel-worker.js",
-  "process-worker.js",
-  "fs-worker.js",
-  "fetcher-worker.js",
-].map((f) => new URL(f, self.location.href).href);
+// The studio's own content-hashed output, and nothing else on the origin.
+// Notably NOT `vendor/`: those URLs are stable across deploys and invisible to
+// the build id, so cache-first there is unbounded staleness (see the prefixes
+// comment in vite.config.ts). Preview traffic never reaches here (handled
+// earlier).
+const ASSET_PREFIXES = MANIFEST ? MANIFEST.prefixes : [];
 
-// A same-origin GET we own and may serve cache-first: anything under our own dir
-// (bundles, index.html, vendor/*) or a runtime wasm binary in a sibling pkg dir.
-// Preview traffic never reaches here (handled earlier); this is only OUR assets.
+// The app shell. Deliberately NOT in `isOwnStatic`: it is the one file whose
+// staleness breaks everything (it names the hashed assets), it is ~1 KB, and it
+// is served `must-revalidate`, so it goes network-first with the cache as an
+// offline fallback rather than cache-first. See onFetch below.
+const SHELL = MANIFEST ? MANIFEST.shell : null;
+// Cloudflare Pages serves the shell at its clean URL, so the request that
+// actually arrives is `/studio/`, never `/studio/index.html`. Matching only the
+// manifest URL would make the shell rule dead code in production and alive in
+// `vite preview` — the kind of difference that is only ever found in production.
+const SHELL_DIR = SHELL ? SHELL.replace(/index\.html$/, "") : null;
+
+// Compare pathnames, not hrefs: every entry in the manifest is an absolute PATH
+// (`/studio/index.html`), so `url.href === SHELL` is a string compare between
+// "https://host/studio/index.html" and "/studio/index.html" and is never true.
+function isShell(url) {
+  return SHELL !== null && (url.pathname === SHELL || url.pathname === SHELL_DIR);
+}
+
 function isOwnStatic(url) {
   const p = url.pathname;
-  if (p.startsWith(SCOPE_DIR)) return true;
-  if (p.startsWith(PARENT_DIR) && p.endsWith(".wasm")) return true;
+  for (let i = 0; i < ASSET_PREFIXES.length; i++) if (p.startsWith(ASSET_PREFIXES[i])) return true;
   return false;
 }
 
@@ -347,6 +372,31 @@ async function cacheFirst(request) {
   }
   // Each awaiter needs its own readable body; the shared response is only cloned.
   return resp.clone();
+}
+
+// Network-first with a cached fallback, for the app shell. Refreshes the cached
+// copy on every success so the offline fallback tracks the last build the user
+// actually loaded.
+async function networkFirst(request) {
+  const cache = await caches.open(CACHE_NAME);
+  try {
+    const resp = await fetch(request);
+    if (resp && resp.ok) {
+      try {
+        await cache.put(request, resp.clone());
+      } catch (err) {
+        console.warn("[vv-sw] cache.put failed for shell -", err && err.message);
+      }
+    }
+    return resp;
+  } catch (err) {
+    // Fall back to SHELL as well as the request URL: the precache stores the
+    // manifest URL (/studio/index.html) but the navigation that gets here is
+    // usually the clean one (/studio/), which would otherwise never match.
+    const hit = (await cache.match(request)) || (SHELL ? await cache.match(SHELL) : undefined);
+    if (hit) return hit;
+    throw err;
+  }
 }
 
 // DevTools Network bridge for the shims. The ws/SSE polyfills below replace the
@@ -820,8 +870,36 @@ function injectWsShim(html, keepPrefix, devtools) {
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();
-  if (CACHE_ON) event.waitUntil(precache());
+  if (CACHE_ON) event.waitUntil(precacheIfStudio());
 });
+
+// The precache is ~4 MB of studio role bundles and Wasm, and this file is not
+// the studio's alone: assemble-site.mjs hoists it to the origin root, and the
+// /embed/ playground registers the very same /sw.js. The docs and the blog
+// iframe that playground with loading="lazy", so scrolling one into view would
+// bill a reader 4 MB of bundles the embed never loads — it is a separate Vite
+// build with its own hashed copies under /embed/assets/, which ASSET_PREFIXES
+// does not cover. They would pay the whole cost for none of the benefit.
+//
+// There is no scope to discriminate on (both register at "/"), so ask who is
+// actually open. Precache only on positive identification: if no window looks
+// like the studio, skip. Nothing is lost by skipping — cacheFirst populates the
+// same cache as assets are served — it only means the warm is not ahead of the
+// first request.
+async function precacheIfStudio() {
+  const clients = await self.clients.matchAll({ includeUncontrolled: true, type: "window" });
+  if (!clients.some((c) => isStudioClient(c.url))) return;
+  await precache();
+}
+
+function isStudioClient(href) {
+  if (!SHELL_DIR) return false;
+  try {
+    return new URL(href).pathname.startsWith(SHELL_DIR);
+  } catch {
+    return false;
+  }
+}
 
 // Best-effort, per-URL precache: unlike cache.addAll (atomic — one 404 discards
 // the whole batch), this stores whatever succeeds and logs the rest, so a stray
@@ -836,7 +914,7 @@ async function precache() {
   let kept = 0;
   let failed = 0;
   await Promise.all(
-    PRECACHE.map(async (url) => {
+    (SHELL ? PRECACHE.concat([SHELL]) : PRECACHE).map(async (url) => {
       if (await cache.match(url)) {
         kept++;
         return;
@@ -932,10 +1010,23 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Our own bundles/wasm/shell: serve from the precache (instant, offline). Only
-  // in the built demo (CACHE_ON); dev stays on the network so edits reload.
+  // Our own bundles and Wasm: serve from the precache (instant, offline). Only
+  // in the built app (CACHE_ON); dev stays on the network so edits reload.
+  // `isOwnStatic` covers content-hashed paths ONLY, which is what makes
+  // cache-first sound here: a changed byte is a changed URL, so a cached copy
+  // is by construction the right copy. Anything whose URL can outlive its
+  // contents — the vendor tree — must not be added to it.
   if (CACHE_ON && event.request.method === "GET" && isOwnStatic(url)) {
     event.respondWith(cacheFirst(event.request));
+    return;
+  }
+
+  // The shell: fresh when online, cached when not. Cache-first here would show a
+  // stale index.html for one navigation after every redeploy — it names the
+  // hashed bundles, so that is the one stale file that can break the app rather
+  // than just age it.
+  if (CACHE_ON && event.request.method === "GET" && isShell(url)) {
+    event.respondWith(networkFirst(event.request));
     return;
   }
 

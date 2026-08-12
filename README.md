@@ -81,7 +81,7 @@ cross-origin isolation also constrains what else that page may embed. The
 covers the consequences and the ways around them. `Vivari.boot()` rejects early
 with `ERR_NOT_ISOLATED` rather than failing somewhere confusing later.
 
-Node **>= 22** (see `.nvmrc`) is needed to build the project, not to run it.
+Node **>= 22.15** (`engines.node`) is needed to build the project, not to run it.
 
 ## Install
 
@@ -156,7 +156,15 @@ worker/      the Cloudflare Worker for wildcard per-port preview origins
 
 ## Develop
 
-Prereqs: **Node `>=22`** (see `.nvmrc`), plus Rust + `wasm-pack` for the Wasm crates.
+Prereqs: **Node `>=22.15`** (`engines.node`; `.nvmrc` says `22`, which resolves to the
+newest 22.x and is the version you want), plus Rust + `wasm-pack` for the Wasm crates.
+
+The build scripts import the studio's TypeScript directly, and Node only strips types
+unprompted from 22.18. On 22.15-22.17 that is handled for you — a one-line
+`[import-ts]` notice on stderr says an in-process stripper is doing it. Below the
+floor, on 22.6-22.14, prefixing commands with `NODE_OPTIONS=--experimental-strip-types`
+is what the resulting error will tell you to do; that range is untested rather than
+supported, since CI covers the floor and the newest 22.x and nothing between.
 
 ```bash
 npm install

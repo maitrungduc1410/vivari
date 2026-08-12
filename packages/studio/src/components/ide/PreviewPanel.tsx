@@ -1,5 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTheme } from "next-themes";
+import Loader from "~icons/lucide/loader-circle";
 import ArrowLeft from "~icons/lucide/arrow-left";
 import ArrowRight from "~icons/lucide/arrow-right";
 import RotateCw from "~icons/lucide/rotate-cw";
@@ -16,6 +17,7 @@ import {
   ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { useIde } from "./useIde";
+import { phaseLabel, type RunPhase } from "@/vv/run-phase";
 import type { PreviewTab } from "@/vv/controller";
 
 function ToolButton({
@@ -230,7 +232,7 @@ export function PreviewPanel() {
               Empty tab — type a local address like localhost:3000 and press Enter.
             </div>
           )}
-          {tabs.length === 0 && (
+          {tabs.length === 0 && (snap.runPhase ? <RunProgress phase={snap.runPhase} /> : (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-sidebar text-sm text-muted-foreground">
               <span>No preview open.</span>
               <button
@@ -240,7 +242,7 @@ export function PreviewPanel() {
                 <Plus className="size-3.5" /> New browser tab
               </button>
             </div>
-          )}
+          ))}
         </ResizablePanel>
         {snap.devtoolsOpen && (
           <>
@@ -258,6 +260,39 @@ export function PreviewPanel() {
           </>
         )}
       </ResizablePanelGroup>
+    </div>
+  );
+}
+
+// What the panel says between "Create" and the first frame — up to half a minute
+// on a cold install, during which it used to say "No preview open.", i.e. read
+// as *nothing is happening*.
+//
+// Deliberately not a bare spinner. The phase says which of two very differently
+// priced things is running (a snapshot restore or a real install), the counts
+// let the user judge whether it is moving, and the elapsed clock lets them
+// decide it is not. None of it is a forecast: nothing here knows a total, and a
+// fake progress bar that stalls at 90% is worse than an honest counter.
+function RunProgress({ phase }: { phase: RunPhase }) {
+  const [elapsed, setElapsed] = useState(() => Math.floor((Date.now() - phase.startedAt) / 1000));
+  useEffect(() => {
+    const t = setInterval(() => setElapsed(Math.floor((Date.now() - phase.startedAt) / 1000)), 1000);
+    return () => clearInterval(t);
+  }, [phase.startedAt]);
+  return (
+    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-sidebar px-6 text-center">
+      <div className="flex items-center gap-2 text-sm font-medium">
+        <Loader className="size-4 animate-spin text-primary" />
+        {phaseLabel(phase.phase)}
+      </div>
+      <div className="text-xs text-muted-foreground">
+        {phase.name}
+        {phase.detail ? ` · ${phase.detail}` : ""}
+        {elapsed >= 3 ? ` · ${elapsed}s` : ""}
+      </div>
+      <div className="max-w-xs text-xs text-muted-foreground">
+        The preview appears as soon as the dev server binds a port. Watch the terminal for detail.
+      </div>
     </div>
   );
 }

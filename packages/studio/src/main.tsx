@@ -4,6 +4,9 @@ import { ThemeProvider } from "next-themes";
 import "@xterm/xterm/css/xterm.css";
 import "./index.css";
 import App from "./App.tsx";
+import { markBoot } from "./vv/boot-marks";
+
+markBoot("js-executed");
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

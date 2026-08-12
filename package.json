@@ -6,7 +6,7 @@
   "description": "An open-source WebContainer: run Node, Bun and Python projects fully client-side in the browser.",
   "license": "MIT",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.15.0"
   },
   "workspaces": [
     "packages/core",
@@ -22,9 +22,11 @@
     "vendor:pyodide": "node scripts/vendor-pyodide.mjs",
     "vendor:ruff": "node scripts/vendor-ruff.mjs",
     "vendor:sqlite": "node scripts/vendor-sqlite.mjs",
-    "predev": "npm run vendor:npm && npm run vendor:yarn && npm run vendor:pnpm && npm run vendor:corepack && npm run vendor:tsgo && npm run vendor:pyodide && npm run vendor:ruff && npm run vendor:sqlite",
+    "vendor:locks": "node scripts/gen-template-locks.mjs",
+    "vendor:depcache": "node scripts/gen-depcache.mjs",
+    "predev": "npm run vendor:npm && npm run vendor:yarn && npm run vendor:pnpm && npm run vendor:corepack && npm run vendor:tsgo && npm run vendor:pyodide && npm run vendor:ruff && npm run vendor:sqlite && npm run vendor:locks && npm run vendor:depcache",
     "dev": "cd packages/studio && bun run dev",
-    "prebuild:studio": "npm run vendor:npm && npm run vendor:yarn && npm run vendor:pnpm && npm run vendor:corepack && npm run vendor:tsgo && npm run vendor:pyodide && npm run vendor:ruff && npm run vendor:sqlite",
+    "prebuild:studio": "npm run vendor:npm && npm run vendor:yarn && npm run vendor:pnpm && npm run vendor:corepack && npm run vendor:tsgo && npm run vendor:pyodide && npm run vendor:ruff && npm run vendor:sqlite && npm run vendor:locks && npm run vendor:depcache",
     "build:studio": "cd packages/studio && bun run build",
     "preview:studio": "cd packages/studio && bun run preview",
     "verify": "node scripts/verify-node.mjs",

@@ -43,6 +43,16 @@ const VENDOR_NPM = path.join(VENDOR_DIR, "node_modules/npm");
 //       idempotent (they skip when the asset exists), and the assets are
 //       gitignored build artifacts, so CI has to build them.
 //
+//       `always: true` drops the "is it already there" short-circuit and runs the
+//       script every time, for a producer whose output is a SET rather than a
+//       file. `asset` can then only be the manifest, and a manifest is exactly
+//       what an interrupted producer leaves behind pointing at files it had not
+//       written yet — so an existence check on it passes on a tree that is
+//       missing most of its locks, which is the tree that produced this note.
+//       Only the producer knows what the complete set is, so the producer is the
+//       idempotency check: it reuses what is on disk, rebuilds what is not, and
+//       costs ~0.3s when there is nothing to do. `args` are appended after `--`.
+//
 // Both shapes shell out to the live registry. That is why every spike carrying a
 // `vendor` is `net: true` even when its own assertions are offline — the tier
 // flag means "this spike cannot run without the network", not "it asserts over
@@ -91,6 +101,23 @@ const VENDORS = {
   pnpmAsset: { script: "vendor:pnpm", asset: "packages/studio/public/vendor/pnpm-pack.bin" },
   corepackAsset: { script: "vendor:corepack", asset: "packages/studio/public/vendor/corepack-pack.bin" },
   tsgoAsset: { script: "vendor:tsgo", asset: "packages/studio/public/vendor/tsgo-pack.bin" },
+  // One lock per covered template plus an index, which the studio fetches per
+  // template at project-create time and `runViteSpike` writes into the VFS so a
+  // template spike installs the bytes the studio installs.
+  //
+  // `--strict` because a missing lock is this provisioning step's whole subject.
+  // The generator's default is fail-soft — warn, exit 0, ship no lock — which is
+  // right for `cloudflare-build.sh`, where a registry outage must not cancel the
+  // deploy of a site whose locks are an optimisation. It is wrong here: exiting 0
+  // having written nothing would hand the spike the empty tree it is being
+  // provisioned to avoid, and it would fail one assertion deep instead of at the
+  // step that could not do its job.
+  locks: {
+    script: "vendor:locks",
+    args: ["--strict"],
+    asset: "packages/studio/public/vendor/locks/index.json",
+    always: true,
+  },
 };
 
 // The curated spike set. `net` marks spikes that cannot run without the live
@@ -104,11 +131,35 @@ const SPIKES = [
   // green here, exit 2 in the verify job. Pure static reads of this file, the
   // harness and ci.yml, so it costs nothing and runs in the earliest gate.
   { name: "ci-tiers", file: "spike-ci-tiers.mjs", net: false, timeout: 60000 },
+  // The install path's BUILD and BOOT wiring: the vendor steps the deploy runs,
+  // the manifest paths the producers write against the ones the kernel fetches,
+  // npm being loaded on demand rather than at boot, and the lock generator's
+  // eligibility rule. All static, because every failure it covers is silent at
+  // runtime — a vendor step nobody runs answers 200 with the SPA's index.html,
+  // and a manifest nobody writes is caught and read as "feature off". No kernel,
+  // no Wasm, so it runs in the earliest gate.
+  { name: "install-latency", file: "spike-install-latency.mjs", net: false, timeout: 60000 },
+  // The gates above read `public/vendor`, which is gitignored build output: it
+  // survives between commands on a developer's machine and has never existed on
+  // a fresh checkout. Three regressions came from that asymmetry, `predev` not
+  // running `vendor:locks` and a stale snapshot among them, and the third was
+  // six checks in `install-latency` itself that were green here and red in CI.
+  // This re-runs the affected gates on a tree of tracked files only. Sorts after
+  // them so a genuine failure is reported by the spike that owns it first.
+  { name: "clean-checkout", file: "spike-clean-checkout.mjs", net: false, timeout: 180000 },
   // No CI job compiles the studio — `tsc -b` runs in the Cloudflare build, which
   // is the deploy — so a JS module imported from TypeScript without a .d.ts
   // merges green and breaks the site afterwards. Static, so it needs neither bun
   // nor the studio's node_modules.
   { name: "studio-types", file: "spike-studio-types.mjs", net: false, timeout: 60000 },
+  // The studio's DELIVERY contract: the _headers Pages serves it under, the
+  // kernel-asset assertion, and the SW's cache-first prefixes. Nothing local can
+  // observe any of it — `vite preview` ignores _headers entirely — so the first
+  // environment that evaluates these rules is production, and a duplicated
+  // COOP/COEP there is comma-joined, fails to parse as a structured-field item,
+  // and silently drops the app to `unsafe-none`: no SharedArrayBuffer, no boot.
+  // Pure string and list work, so it runs in the earliest gate.
+  { name: "site-headers", file: "spike-site-headers.mjs", net: false, timeout: 60000 },
   // Same reason this one is static: nothing in CI runs a browser, and no CI runner is a
   // Mac. The word-wrap chord's whole failure mode is macOS-only, so the matcher is
   // plain JS and this drives it with the event shapes macOS produces.
@@ -244,6 +295,19 @@ const SPIKES = [
   // `needsWasm`: offline but requires the Node Wasm VFS build (pkg-node), so it
   // can't run in the Wasm-free toolchain-gate — it runs in the verify job.
   { name: "dep-cache", file: "spike-dep-cache.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // The other half of that: the seam between the BUILD-TIME producer
+  // (scripts/gen-depcache.mjs) and the browser. Packs a host tree through the
+  // shipped pack(), wraps it the way the producer ships it, and drives the
+  // kernel's own decoder + import + restore against the real Wasm VFS —
+  // including the key derivation, which is what decides whether a shipped asset
+  // is ever looked up at all. Offline: the fixture is hand-built, because what
+  // a real template adds is size and size is not what fails.
+  { name: "depcache-shipped", file: "spike-depcache-shipped.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // The Next template's postinstall seeds a 30.4 MB wasm SWC package into Next's
+  // cache dir. It has to LINK, not copy: a copy is 30 MB through the sync bridge
+  // plus 30 MB of duplicate in the VFS heap, at the end of the install where no
+  // progress UI is watching. Runs the shipped script and asserts the inode.
+  { name: "seed-swc", file: "spike-seed-swc.mjs", net: false, needsWasm: true, timeout: 120000 },
   // Bun runtime on the real kernel (offline): bun --version, zero-config `bun run
   // app.ts` (TS strip + Bun global), Bun.serve preview through the http bridge,
   // and `bun test`. Needs the Node Wasm VFS build → runs in the verify job.
@@ -274,22 +338,27 @@ const SPIKES = [
   // The flagship template, and the last of them to get a gate. It differs from its
   // neighbours in reading the SHIPPED template rather than a copy of it, including
   // the dev command — see the spike's header.
-  { name: "react", file: "spike-react.mjs", net: true, needsWasm: true, timeout: 600000 },
-  { name: "preact", file: "spike-preact.mjs", net: true },
-  { name: "lit", file: "spike-lit.mjs", net: true },
-  { name: "solid", file: "spike-solid.mjs", net: true },
+  // One gate for all 40 shipped lockfiles: installs each template in the VM from
+  // its generated lock and asserts the tree is usable. Measured at 163s for the
+  // full corpus on a warm in-VM npm cache; the timeout is generous because a
+  // cold runner pays for every tarball.
+  { name: "template-locks", file: "spike-template-locks.mjs", net: true, needsWasm: true, vendor: VENDORS.locks, timeout: 1800000 },
+  { name: "react", file: "spike-react.mjs", net: true, needsWasm: true, vendor: VENDORS.locks, timeout: 600000 },
+  { name: "preact", file: "spike-preact.mjs", net: true, vendor: VENDORS.locks },
+  { name: "lit", file: "spike-lit.mjs", net: true, vendor: VENDORS.locks },
+  { name: "solid", file: "spike-solid.mjs", net: true, vendor: VENDORS.locks },
   // Svelte + Qwik round out the Vite frontend variants (same runViteSpike gates as
   // preact/lit/solid: install, dev-server bind, GET / with the title marker,
   // /@vite/client, and the entry module — the last one is what catches a broken
   // Svelte compiler pass or Qwik optimizer plugin). Pinned to Vite 7 on purpose;
   // see the spike headers for the rolldown-wasi bug that rules Vite 8 out.
-  { name: "svelte", file: "spike-svelte.mjs", net: true },
-  { name: "qwik", file: "spike-qwik.mjs", net: true },
-  { name: "vue", file: "spike-vue.mjs", net: true },
+  { name: "svelte", file: "spike-svelte.mjs", net: true, vendor: VENDORS.locks },
+  { name: "qwik", file: "spike-qwik.mjs", net: true, vendor: VENDORS.locks },
+  { name: "vue", file: "spike-vue.mjs", net: true, vendor: VENDORS.locks },
   // Ember on Embroider + Vite, and the one frontend variant that is NOT pinned back:
   // it runs a single (client) rolldown pass, so Vite 8 holds. Reads the shipped bytes,
   // and gates the .gjs transform by content rather than by status — see its header.
-  { name: "ember", file: "spike-ember.mjs", net: true },
+  { name: "ember", file: "spike-ember.mjs", net: true, vendor: VENDORS.locks },
   // The Nest template's save -> recompile -> restart. Was probe-nest-watch.mjs, wired
   // into nothing and unable to start for want of an `npm` built-in that had been
   // removed; see the spike's header for why an unrunnable artifact was worse than none.
@@ -509,10 +578,11 @@ function vendorRoot(v) {
 async function ensureVendor(v) {
   const root = vendorRoot(v);
   const probe = v.script ? root : path.join(root, v.probe);
-  if (fs.existsSync(probe)) return true;
+  if (fs.existsSync(probe) && !v.always) return true;
   if (v.script) {
-    console.log(`\n== provisioning ${v.asset} (npm run ${v.script}) ==`);
-    const r = await spawnInherit("npm", ["run", v.script], ROOT);
+    const extra = v.args ? ["--", ...v.args] : [];
+    console.log(`\n== provisioning ${v.asset} (npm run ${[v.script, ...extra].join(" ")}) ==`);
+    const r = await spawnInherit("npm", ["run", v.script, ...extra], ROOT);
     return r === 0 && fs.existsSync(probe);
   }
   console.log(`\n== provisioning ${v.install.join(" ")} at ${v.dir} ==`);

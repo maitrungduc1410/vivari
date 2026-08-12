@@ -28,6 +28,8 @@
 //      asset in the runner's VENDORS table. The asset is a gitignored build
 //      artifact, so an undeclared one makes the spike pass or fail on what ELSE
 //      the run happened to select before it.
+//   3c. Every NET spike that reads the shipped template locks declares them, so
+//      a job cannot run a lock gate against a tree with no locks. Two jobs did.
 //   4. Every offline spike that boots a kernel is marked `needsWasm` — the
 //      converse of gate 3, and the hole it left. `net-close-order` and
 //      `net-blocklist` were registered without the flag because neither guest
@@ -38,6 +40,7 @@
 //
 //   run:  node scripts/spike-ci-tiers.mjs
 
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -165,6 +168,59 @@ console.log("\n== a spike that refuses without a packed vendor asset declares it
 }
 
 // ---------------------------------------------------------------------------
+// 3c. Every NET spike that reads the shipped template locks declares them.
+//
+// The gate above keys on one refusal marker — "No vendor asset at", the
+// `-studio` preflight — and the lock consumers do not use it. `template-locks`
+// refuses in its own words ("no generated lock at …") and the eight template
+// spikes do not refuse at all: `runViteSpike` prints "NO generated lockfile —
+// installing from ranges, which is not what the studio does" and carries on. So
+// `template-gate`, which had a `vendor:locks` step, and `spikes-net`, which did
+// not, ran the same nine spikes against different trees — one dead in 0.2s, the
+// other eight quietly gating a code path the studio never takes.
+//
+// Derived from what the source reads rather than from a list, and one hop deep,
+// because the eight reach the locks through scripts/lib/spike-vite-lib.mjs and a
+// ninth will reach them through something else. Restricted to `net: true`: an
+// offline spike cannot declare a vendor (gate 1 forbids it, since provisioning
+// shells out to the registry), and the offline ones that read locks are covered
+// instead by spike-clean-checkout.mjs, which runs them on a tree that has none.
+// That split is the whole answer to "why did nothing catch this": clean-checkout
+// covers the offline half by design and says so, and the net half is the
+// runner's job, which had no entry for the artifact.
+// ---------------------------------------------------------------------------
+{
+  const LOCKS = "packages/studio/public/vendor/locks";
+  console.log("\n== a net spike that reads the shipped locks declares them ==");
+  let checked = 0;
+  for (const s of SPIKES) {
+    if (!s.net) continue;
+    const srcPath = path.join(ROOT, "scripts", s.file);
+    if (!fs.existsSync(srcPath)) continue;
+    let text = fs.readFileSync(srcPath, "utf8");
+    for (const m of text.matchAll(/from\s+"(\.\/(?:lib\/)?[\w.-]+\.mjs)"/g)) {
+      const lib = path.join(ROOT, "scripts", m[1]);
+      if (fs.existsSync(lib)) text += fs.readFileSync(lib, "utf8");
+    }
+    if (!text.includes("vendor/locks")) continue;
+    checked++;
+    ok(s.vendorKey === "locks", `${s.name}: reads ${LOCKS} and declares VENDORS.locks`);
+  }
+  ok(checked >= 9, `${checked} net spikes read the shipped locks (template-locks + the template gates)`);
+  // The producer writes a SET, so its manifest existing proves nothing about the
+  // files it names — which is exactly the tree an interrupted run leaves. Pinned
+  // because reverting to a plain existence probe would restore the bug silently:
+  // every assertion above still passes, and CI goes back to running the lock
+  // spikes against whatever locks happened to survive.
+  ok(/\blocks:\s*\{[^}]*\balways:\s*true/.test(runner), "VENDORS.locks re-runs its producer rather than probing for one file");
+  ok(/\blocks:\s*\{[^}]*"--strict"/.test(runner), "…with --strict, so a producer that ships nothing fails the spike rather than the assertion");
+  ok(
+    (VENDOR_ASSETS.locks || "").startsWith(LOCKS),
+    `…and points at ${LOCKS}, so a failed run cannot report success`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 console.log("\n== an offline spike that boots a kernel says it needs the Wasm VFS ==");
 // The flag only changes anything in the Wasm-free gate, which runs the offline
 // tier alone — a net spike boots the same kernel, but only ever in the job that
@@ -282,6 +338,42 @@ console.log("\n== the Wasm build pins its wasm-pack ==");
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== no tracked file names a private host ==");
+// ---------------------------------------------------------------------------
+// A host reaches a published repo through documentation: a failure gets quoted
+// verbatim and the host inside the quote rides along, which is not something a
+// review reliably catches. Every host in an example therefore belongs to a
+// reserved TLD (RFC 2606: .invalid, .example, .test), so the substitute can
+// never resolve to a real machine, and this check holds that line.
+{
+  const HOSTS = [
+    // A bare `10.x` is RFC 1918 and appears legitimately in BlockList fixtures;
+    // one with a port is somebody's actual service.
+    /\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+\b/,
+  ];
+  // Tracked files only: node_modules, target/ and public/vendor/ are fetched or
+  // generated, and none of them is ours to keep clean.
+  const tracked = execFileSync("git", ["ls-files", "-z"], { cwd: ROOT, encoding: "utf8", maxBuffer: 64 << 20 })
+    .split("\0")
+    .filter((p) => p && /\.(m?js|cjs|ts|tsx|json|md|ya?ml|toml|sh|rs|html|css)$/.test(p));
+  ok(tracked.length > 100, `scanning ${tracked.length} tracked text files`);
+
+  const hits = [];
+  for (const rel of tracked) {
+    let text;
+    try {
+      text = fs.readFileSync(path.join(ROOT, rel), "utf8");
+    } catch {
+      continue; // deleted between ls-files and here
+    }
+    text.split("\n").forEach((line, i) => {
+      for (const re of HOSTS) if (re.test(line)) hits.push(`${rel}:${i + 1}`);
+    });
+  }
+  ok(hits.length === 0, hits.length ? `private hosts in: ${hits.slice(0, 8).join(", ")}` : "none found");
 }
 
 console.log(failed ? `\nFAIL: ${failed} check(s) failed` : "\nOK: the spike tiers match what CI can give them");

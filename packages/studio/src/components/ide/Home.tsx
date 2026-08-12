@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 import FilePlus from "~icons/lucide/file-plus-2";
 import LayoutTemplate from "~icons/lucide/layout-template";
 import Clock from "~icons/lucide/clock";
@@ -16,7 +17,8 @@ import {
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { TEMPLATES, TEMPLATE_CATEGORIES, type TemplateCategory, type TemplateDef } from "@/vv/templates";
+import type { TemplateCategory, TemplateDef } from "@/vv/templates";
+import { loadTemplates, prefetchTemplates } from "@/vv/templates-lazy";
 import { TemplateIcon } from "./templateIcons";
 import { useIde } from "./useIde";
 import { entriesFromDataTransfer, type ProjectMeta } from "@/vv/controller";
@@ -99,6 +101,11 @@ export function HomeView() {
           </button>
           <button
             onClick={() => setTemplateOpen(true)}
+            // The catalog is its own chunk now, so start it on the first sign of
+            // intent — a pointer arriving here is ~200ms of head start, which is
+            // about what the chunk costs.
+            onPointerEnter={prefetchTemplates}
+            onFocus={prefetchTemplates}
             className="group flex flex-col items-start gap-3 rounded-xl border bg-card p-5 text-left transition-colors hover:border-primary/60 hover:bg-accent/40"
           >
             <div className="flex size-11 items-center justify-center rounded-lg bg-primary/10 text-primary">
@@ -345,30 +352,170 @@ function useDirValidation(dir: string, enabled: boolean) {
   return error;
 }
 
+/**
+ * Far above any legitimate create, so that reaching it means the runtime is
+ * wedged rather than merely slow.
+ *
+ * Sized against the one component that is genuinely unbounded. The kernel gives
+ * the whole template-lock acquisition a single 8s deadline, but that deadline
+ * covers response HEADERS only: `fetchByDeadline` clears its abort timer when the
+ * fetch promise settles, so the `await r.text()` after it is unbounded, and an
+ * edge that answers 200 and then stalls the body wedges `vv-create-project` with
+ * a perfectly healthy worker. Nothing else in the span is long — the boot wait is
+ * awaited before the `try`, and the install and the dev-server start are not
+ * awaited at all — so the lawful worst case is well inside 15s.
+ *
+ * No copy of the kernel's constant lives here deliberately: it is in another
+ * package, and a duplicate that drifted could silently tighten this to below a
+ * working create. Which makes this comment the only record of the relationship,
+ * so it is worth keeping true.
+ *
+ * An escape hatch, not a cancellation. Nothing on this side can cancel a kernel
+ * request, so if the wedge later clears, the create still resolves and the
+ * project still opens — a while after a toast said it had not.
+ */
+const CREATE_DEADLINE_MS = 45_000;
+
+/** Reject if `work` has not settled within `ms`. Clears its timer either way. */
+function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`the runtime did not respond within ${Math.round(ms / 1000)}s`)),
+      ms,
+    );
+  });
+  // race() attaches handlers to both, so a late rejection from `work` after the
+  // deadline has already fired is handled rather than becoming an unhandled one.
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Create-on-submit that tolerates a kernel that has not booted yet.
+ *
+ * Naming a project is client-side work over a static array; it needs no runtime.
+ * These dialogs used to disable Create until `kernelReady` anyway, so a visitor
+ * spent the boot staring at a dead button and only *then* started deciding —
+ * two waits in series that could have been one. Now the form is live from the
+ * first paint and a submit made too early queues.
+ *
+ * Validation still waits for the kernel, because it genuinely needs the VFS:
+ * `useDirValidation` is inert until then, so a queued submit re-validates once
+ * the runtime is up and surfaces anything the live check could not see.
+ *
+ * The queue introduces a window that could not exist before — submitted, not yet
+ * started — so it has to be closable. `cancel()` is what `guardClose` calls when
+ * a dialog closes by any route (button, Escape, click-outside), and `run`
+ * re-checks it after every await: without that, dismissing a dialog that says
+ * *Waiting for the runtime…* still scaffolds the project and navigates to it a
+ * moment later.
+ *
+ * Once `create()` has been entered the dialog stops being dismissable, because
+ * from there the create genuinely cannot be undone: `vv-create-project` is one
+ * kernel request with no cancellation, and it now resolves a template lockfile
+ * over the network before it writes, so it is seconds long rather than instant.
+ * Letting Escape through during those seconds is the same bug in a smaller
+ * window — the project lands anyway — and "cancel" that leaves a scaffolded
+ * project behind would be worse than not offering it. So the button reads
+ * *Creating…* and is disabled, which is what the "Reset everything?" dialog
+ * already does for its own irreversible span.
+ *
+ * That refusal is only defensible while the create is still going to finish, so
+ * `run` guarantees it finishes. Refusing to close is a strictly worse failure
+ * than a stuck button — a stuck button is recoverable, an undismissable modal
+ * needs a page reload — and it is unjustified precisely when the create failed,
+ * since nothing was scaffolded and there is nothing a cancel could leave behind.
+ * Two ways it could not finish, and one deadline covers both: `bridge.request`
+ * REJECTS when the worker dies (`bridge.ts` `failPending(ERR_WORKER)`) or when
+ * post-reply work throws, and it never settles at all if the worker is wedged
+ * but alive, since these calls pass no timeout of their own. Either way the
+ * catch below toasts, clears `busy`, and hands every close route back.
+ */
+function useQueuedCreate(effectiveDir: string) {
+  const { c, snap } = useIde();
+  const [busy, setBusy] = useState(false);
+  const [queued, setQueued] = useState(false);
+  const [lateError, setLateError] = useState<string | null>(null);
+  const aborted = useRef(false);
+
+  // Stable so the dialogs can list them in an effect's deps without the effect
+  // re-running (and wiping the form) on every render.
+  const reset = useCallback(() => {
+    aborted.current = false;
+    setBusy(false); setQueued(false); setLateError(null);
+  }, []);
+  const cancel = useCallback(() => { aborted.current = true; }, []);
+
+  const run = async (create: () => Promise<void>) => {
+    aborted.current = false;
+    setBusy(true);
+    setLateError(null);
+    if (!snap.kernelReady) {
+      setQueued(true);
+      await c.whenKernelReady();
+      setQueued(false);
+      if (aborted.current) { setBusy(false); return false; }
+      const err = await c.validateNewDir(effectiveDir);
+      if (aborted.current) { setBusy(false); return false; }
+      if (err) { setLateError(err); setBusy(false); return false; }
+    }
+    try {
+      await withDeadline(create(), CREATE_DEADLINE_MS);
+      return true;
+    } catch (err) {
+      toast.error(`Couldn't create the project: ${err instanceof Error ? err.message : String(err)}`);
+      setBusy(false);
+      return false;
+    }
+  };
+
+  // In flight: submitted to the kernel, past the point of cancelling.
+  const inFlight = busy && !queued;
+
+  /**
+   * Wrap a dialog's `onOpenChange` so every close route obeys one policy:
+   * cancellable while queued, refused while the create is in flight.
+   */
+  const guardClose = (onOpenChange: (o: boolean) => void) => (o: boolean) => {
+    if (!o) {
+      if (inFlight) return;
+      cancel();
+    }
+    onOpenChange(o);
+  };
+
+  const label = queued ? "Waiting for the runtime…" : inFlight ? "Creating…" : "Create";
+  return { busy, queued, inFlight, lateError, label, reset, guardClose, run };
+}
+
 function NewBlankDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
   const { c, snap } = useIde();
   const [name, setName] = useState("");
   const [dir, setDir] = useState("");
   const [dirTouched, setDirTouched] = useState(false);
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    if (open) { setName(""); setDir(""); setDirTouched(false); setBusy(false); }
-  }, [open]);
 
   const effectiveDir = dirTouched ? dir : name.trim() ? c.defaultDirFor(name) : "";
-  const dirError = useDirValidation(effectiveDir, open && !!name.trim() && snap.kernelReady);
-  const canCreate = !!name.trim() && !!effectiveDir && !dirError && !busy && snap.kernelReady;
+  const { busy, inFlight, lateError, label, reset, guardClose, run } = useQueuedCreate(effectiveDir);
+  // Every close route funnels through Dialog's onOpenChange — the Cancel button,
+  // Escape and click-outside — so the cancel policy belongs here rather than on
+  // the button alone.
+  const close = guardClose(onOpenChange);
+
+  useEffect(() => {
+    if (open) { setName(""); setDir(""); setDirTouched(false); reset(); }
+  }, [open, reset]);
+
+  const liveError = useDirValidation(effectiveDir, open && !!name.trim() && snap.kernelReady);
+  const dirError = lateError ?? liveError;
+  const canCreate = !!name.trim() && !!effectiveDir && !dirError && !busy;
 
   const submit = async () => {
     if (!canCreate) return;
-    setBusy(true);
-    await c.createBlankProject({ name: name.trim(), dir: effectiveDir });
-    onOpenChange(false);
+    if (await run(() => c.createBlankProject({ name: name.trim(), dir: effectiveDir }))) onOpenChange(false);
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={close}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>New blank project</DialogTitle>
@@ -393,35 +540,70 @@ function NewBlankDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (
           </label>
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
-          <Button onClick={() => void submit()} disabled={!canCreate}>Create</Button>
+          <Button variant="outline" onClick={() => close(false)} disabled={inFlight}>Cancel</Button>
+          <Button onClick={() => void submit()} disabled={!canCreate}>{label}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
   );
 }
 
-// Categories that actually have at least one template, in canonical tab order.
-const ACTIVE_CATEGORIES = TEMPLATE_CATEGORIES.filter((cat) =>
-  TEMPLATES.some((t) => t.manifest.category === cat),
-);
+// The catalog, fetched on first open and kept for the tab's lifetime. `catalog`
+// is null only while the chunk is in flight — a first-open cost of ~99 KB that
+// buys the same amount off every visitor's entry chunk, including the ones who
+// never open this dialog.
+type Catalog = { templates: TemplateDef[]; categories: TemplateCategory[] };
+let cached: Catalog | null = null;
+
+function useTemplateCatalog(open: boolean): Catalog | null {
+  const [catalog, setCatalog] = useState<Catalog | null>(cached);
+  useEffect(() => {
+    if (!open || catalog) return;
+    let live = true;
+    void loadTemplates().then(
+      ({ TEMPLATES, TEMPLATE_CATEGORIES }) => {
+        // Only categories that actually have a template, in canonical tab order.
+        cached = {
+          templates: TEMPLATES,
+          categories: TEMPLATE_CATEGORIES.filter((cat) => TEMPLATES.some((t) => t.manifest.category === cat)),
+        };
+        if (live) setCatalog(cached);
+      },
+      () => {
+        if (live) toast.error("Couldn't load the template catalog — check your connection and try again.");
+      },
+    );
+    return () => { live = false; };
+  }, [open, catalog]);
+  return catalog;
+}
 
 function NewTemplateDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
   const { c, snap } = useIde();
+  const catalog = useTemplateCatalog(open);
   const [selected, setSelected] = useState<TemplateDef | null>(null);
-  const [activeCat, setActiveCat] = useState<TemplateCategory>(ACTIVE_CATEGORIES[0]);
+  const [activeCat, setActiveCat] = useState<TemplateCategory | null>(null);
   const [name, setName] = useState("");
   const [dir, setDir] = useState("");
   const [dirTouched, setDirTouched] = useState(false);
   const [runInit, setRunInit] = useState(true);
-  const [busy, setBusy] = useState(false);
+
+  const effectiveDir = dirTouched ? dir : name.trim() ? c.defaultDirFor(name) : "";
+  const { busy, inFlight, lateError, label, reset, guardClose, run } = useQueuedCreate(effectiveDir);
+  const close = guardClose(onOpenChange);
 
   useEffect(() => {
     if (open) {
-      setSelected(null); setActiveCat(ACTIVE_CATEGORIES[0]);
-      setName(""); setDir(""); setDirTouched(false); setRunInit(true); setBusy(false);
+      setSelected(null); setActiveCat(null);
+      setName(""); setDir(""); setDirTouched(false); setRunInit(true); reset();
     }
-  }, [open]);
+  }, [open, reset]);
+
+  // Default to the first populated category once the catalog lands. Kept out of
+  // the reset above because the reset runs before the chunk resolves.
+  useEffect(() => {
+    if (catalog && !activeCat) setActiveCat(catalog.categories[0]);
+  }, [catalog, activeCat]);
 
   const pick = (t: TemplateDef) => {
     setSelected(t);
@@ -432,37 +614,42 @@ function NewTemplateDialog({ open, onOpenChange }: { open: boolean; onOpenChange
     setDirTouched(false);
   };
 
-  const effectiveDir = dirTouched ? dir : name.trim() ? c.defaultDirFor(name) : "";
-  const dirError = useDirValidation(effectiveDir, open && !!selected && !!name.trim() && snap.kernelReady);
-  const canCreate = !!selected && !!name.trim() && !!effectiveDir && !dirError && !busy && snap.kernelReady;
+  const liveError = useDirValidation(effectiveDir, open && !!selected && !!name.trim() && snap.kernelReady);
+  const dirError = lateError ?? liveError;
+  const canCreate = !!selected && !!name.trim() && !!effectiveDir && !dirError && !busy;
 
   const submit = async () => {
     if (!canCreate || !selected) return;
-    setBusy(true);
-    await c.createFromTemplate({
+    const ok = await run(() => c.createFromTemplate({
       templateId: selected.manifest.id,
       name: name.trim(),
       dir: effectiveDir,
       runInit,
-    });
-    onOpenChange(false);
+    }));
+    if (ok) onOpenChange(false);
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={close}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>Start from a template</DialogTitle>
           <DialogDescription>Pick a template — we'll scaffold it and (optionally) install + run it.</DialogDescription>
         </DialogHeader>
 
+        {!catalog ? (
+          <div className="flex h-40 items-center justify-center gap-2 text-sm text-muted-foreground">
+            <Loader className="size-4 animate-spin" /> Loading templates…
+          </div>
+        ) : (
+        <>
         <Tabs
-          value={activeCat}
+          value={activeCat ?? catalog.categories[0]}
           onValueChange={(v) => setActiveCat(v as TemplateCategory)}
           className="border-b pb-2"
         >
           <TabsList variant="line" className="flex-wrap">
-            {ACTIVE_CATEGORIES.map((cat) => (
+            {catalog.categories.map((cat) => (
               <TabsTrigger key={cat} value={cat}>
                 {cat}
               </TabsTrigger>
@@ -471,7 +658,7 @@ function NewTemplateDialog({ open, onOpenChange }: { open: boolean; onOpenChange
         </Tabs>
 
         <div className="grid max-h-64 grid-cols-2 gap-1.5 overflow-auto sm:grid-cols-3">
-          {TEMPLATES.filter((t) => t.manifest.category === activeCat).map((t) => {
+          {catalog.templates.filter((t) => t.manifest.category === activeCat).map((t) => {
             const isSel = selected?.manifest.id === t.manifest.id;
             return (
               <button
@@ -540,10 +727,12 @@ function NewTemplateDialog({ open, onOpenChange }: { open: boolean; onOpenChange
             </label>
           </div>
         )}
+        </>
+        )}
 
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
-          <Button onClick={() => void submit()} disabled={!canCreate}>Create</Button>
+          <Button variant="outline" onClick={() => close(false)} disabled={inFlight}>Cancel</Button>
+          <Button onClick={() => void submit()} disabled={!canCreate}>{label}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

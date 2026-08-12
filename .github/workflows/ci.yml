@@ -64,6 +64,74 @@ jobs:
       # that nor an over-eager expiry shows up as an error anywhere.
       - run: npm run probe:cookie-jar
 
+  # --- the same gate, on the OLDEST Node package.json admits -----------------
+  # Every other job pins `node-version: 22`, and `.nvmrc` says `22`. Both resolve
+  # to the newest 22.x, so before this job existed NO MACHINE ANYWHERE ran the
+  # regime `engines.node` promises to support — not CI, not a contributor using
+  # nvm. That is not a hypothetical gap: `npm run dev` shipped broken on
+  # 22.0-22.17 twice, behind three rounds of green gates, because Node only
+  # strips TypeScript types unprompted from 22.18 and every runner had it.
+  #
+  # Pinned to the exact floor rather than a range, so that raising `engines.node`
+  # without raising this line leaves an untested version admitted, and lowering
+  # it without lowering this line is a promise nothing checks. The two are meant
+  # to be edited together; scripts/spike-install-latency.mjs asserts they match.
+  #
+  # Cheap by construction: it is the Wasm-free offline tier, the same one
+  # `toolchain-gate` runs, so it costs a second checkout and about a minute.
+  # Without the crates, run-spikes skips the `needsWasm` spikes — which is what
+  # keeps this job honest about Node versions rather than about OpenSSL: the
+  # `constants` spike compares the host's bundled OpenSSL and zlib against the
+  # VM's and legitimately differs on any Node but the newest.
+  toolchain-floor:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          # Keep in step with `engines.node`.
+          node-version: "22.15.0"
+      # Named separately from the tier below so that the failure this job exists
+      # to catch reads as itself. Thirteen scripts import the studio's templates
+      # out of a .ts file and two of them run on every `npm run dev`; when that
+      # broke, the generators failed soft and the only visible symptom was a dev
+      # server that was quietly slow.
+      - name: the studio templates must import on the floor, not only on latest
+        run: |
+          node --input-type=module -e "
+            const { loadShippedTemplates } = await import('./scripts/lib/shipped-templates.mjs');
+            const t = await loadShippedTemplates();
+            if (!Array.isArray(t) || t.length === 0) throw new Error('loaded no templates');
+            console.log('loaded ' + t.length + ' templates on Node ' + process.versions.node);
+          "
+      - run: node scripts/run-spikes.mjs --offline
+
+  # The corpus gate that installs each shipped lock in the VM lives in
+  # `template-gate`, which is schedule/dispatch only because it needs the Rust
+  # toolchain and an hour. That leaves merges unguarded against the change most
+  # likely to poison a lock: an edit to templates.ts, to the generator, or to
+  # the kernel's alias table. RESOLVING all of them needs none of that — no
+  # Wasm, no VM, ~35s — and resolution is where both guards run, so a template
+  # that starts pulling in an aliased native is refused here rather than on the
+  # deploy that ships it. It is not the in-VM gate and does not replace it; it
+  # is the part of that gate which is cheap enough to block a merge.
+  #
+  # `--strict`, because producing them IS this job's subject. The cost is that a
+  # registry outage reddens a PR — the same trade `template-gate` already makes
+  # for the same command, against the alternative of hearing it from a nightly.
+  lock-resolution-gate:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: every shipped lockfile must still resolve, and pass both guards
+        run: npm run vendor:locks -- --strict
+
   # SDK packaging + public-API contract guard (offline, no Wasm, no browser).
   # Also regression-checks the shipped preview sw.js branding + examples/basic.
   sdk-smoke:
@@ -111,7 +179,7 @@ jobs:
       # but missing here runs nowhere at all: skipped in toolchain-gate for want of
       # the crates, and never selected in the only job that has them.
       - name: offline spikes that need the Wasm VFS
-        run: node scripts/run-spikes.mjs --offline dep-cache bun http-binary-body http-response-bytes cookie-session fs-cp fs-errors worker-pool node-cli repl stack-traces readline watch child-stdin fs-metadata crypto-jwk zlib-brotli port-liveness constants diag-liveness fatal-errors net-close-order net-blocklist
+        run: node scripts/run-spikes.mjs --offline dep-cache depcache-shipped seed-swc bun http-binary-body http-response-bytes cookie-session fs-cp fs-errors worker-pool node-cli repl stack-traces readline watch child-stdin fs-metadata crypto-jwk zlib-brotli port-liveness constants diag-liveness fatal-errors net-close-order net-blocklist
       - run: npm run verify
 
   # --- package-manager gate: the North Star, gated on its own ----------------
@@ -214,6 +282,23 @@ jobs:
       # a bare `lit` also selects sqlite and pglite: this step was running two in-VM
       # database spikes it does not name, on a job whose failures are supposed to mean
       # "a shipped template stopped booting". Nine ran where seven were asked for.
+      # There is deliberately no `vendor:locks` step here. It used to be one, and
+      # a step is the wrong place for it: `spikes-net` runs the same lock-reading
+      # spikes with no such step, so `vendor/locks/` was empty there and
+      # `template-locks` died in 0.2s on the first missing file while the eight
+      # template spikes silently installed from RANGES — two jobs exercising
+      # different code paths for the same template, which is the one thing a
+      # second job must not do. Provisioning now belongs to the spikes that need
+      # it (`VENDORS.locks` in scripts/run-spikes.mjs), so every job that selects
+      # one gets the locks, and a job added tomorrow cannot forget.
+      # Every id in COVERAGE, installed in the VM from the lock the runner
+      # provisions for it. This is the gate that made COVERAGE forty templates
+      # instead of one: a spike per template would have been ~50 near-identical
+      # files, so this is one spike driven over the list. It installs and checks
+      # the tree is usable rather than booting a server — the step below is what
+      # boots servers, for the eight frameworks it names.
+      - name: every shipped lockfile must install into a usable tree
+        run: node scripts/run-spikes.mjs --net template-locks$
       - name: framework templates must start their dev server
         run: node scripts/run-spikes.mjs --net react$ preact$ lit$ solid$ vue$ svelte$ qwik$ ember$
       # The two the step above used to pick up by accident, kept blocking on purpose.

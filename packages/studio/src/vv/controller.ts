@@ -23,7 +23,13 @@ import { EditorStatus } from "./editor-status";
 import { loadWordWrap, saveWordWrap } from "./editor-prefs";
 import { stateLabel } from "../../../runtime/builtins/python-lsp.js";
 import { StatusMessage } from "./status-message";
-import { getTemplate, type TemplateManifest } from "./templates";
+import type { TemplateManifest } from "./templates";
+import { loadTemplates } from "./templates-lazy";
+import { markBoot } from "./boot-marks";
+import {
+  advance, fallBackToInstall, formatProgress, isInstallFallbackLine, isRestoreLine, readFetchProgress,
+  warmRegistryConnection, type RunPhase,
+} from "./run-phase";
 import { createZip, encodeShare, decodeShare } from "../../../kernel-host/archive.js";
 import {
   parseGithubSpec, fetchGithubRepo, parseNpmSpec, fetchNpmPackage, type ProgressFn,
@@ -224,6 +230,10 @@ export interface IdeSnapshot {
   bootPhase: string;
   bootDone: number;
   bootTotal: number;
+  // The project currently installing/starting, if any — what the preview shell
+  // and the status bar narrate while there is nothing to preview yet. Null once
+  // the preview paints (or the run tab exits).
+  runPhase: RunPhase | null;
   view: "home" | "workspace";
   // A shared link (#share=) is bootstrapping: show a full-screen blocking overlay.
   shareLoading: boolean;
@@ -614,6 +624,7 @@ export class IdeController {
     bootPhase: "init",
     bootDone: 0,
     bootTotal: 0,
+    runPhase: null,
     // A shared link lands straight on the (loading) workspace, never Home — so the
     // user can't accidentally start a new project while it bootstraps.
     view: hasSharePayload() ? "workspace" : "home",
@@ -784,12 +795,43 @@ export class IdeController {
       this.set({ shareLoading: true, shareMessage: "Booting the runtime…" });
       this.status("opening shared project…");
     }
-    const ok = await this.bridge.registerServiceWorker();
-    this.consoleLine(
-      ok ? "Service Worker registered (preview proxy ready)." : "Service workers unavailable — preview disabled.",
-      ok ? "32" : "31",
+    // Registration is NOT awaited before booting. It costs a script download, an
+    // install/activate and a `controllerchange` (capped at 1s in the bridge) on a
+    // first visit, and everything downstream — the kernel worker, three Wasm
+    // modules, the OPFS restore — used to queue behind it for no reason: the SW
+    // is preview-only (it passes editor navigations and assets straight through),
+    // and the kernel's own capability comes from the COOP/COEP response headers,
+    // not from the SW. The one thing that does need it is preview routing, and
+    // that is re-announced on every `listen` (`Vivari`'s bridge handler calls
+    // `announceKernelHost()` there), so a server that binds a port before the SW
+    // has claimed the page still gets routed once it has.
+    void this.bridge.registerServiceWorker().then(
+      (ok) => {
+        this.consoleLine(
+          ok ? "Service Worker registered (preview proxy ready)." : "Service workers unavailable — preview disabled.",
+          ok ? "32" : "31",
+        );
+      },
+      (err) => this.consoleLine(`Service Worker registration failed: ${String(err)} — preview disabled.`, "31"),
     );
     this.bridge.boot();
+  }
+
+  /**
+   * Resolves once the kernel + VFS are up. Lets UI accept an action before the
+   * runtime is ready and queue it, rather than disabling the control and making
+   * the user come back to it — the wait is the same either way, but only one of
+   * them lets the wait overlap with the user's own thinking.
+   */
+  whenKernelReady(): Promise<void> {
+    if (this.snap.kernelReady) return Promise.resolve();
+    return new Promise((resolve) => {
+      const off = this.subscribe(() => {
+        if (!this.snap.kernelReady) return;
+        off();
+        resolve();
+      });
+    });
   }
 
   // ── VFS queries (request/response over the bridge) ─────────────────────────
@@ -1145,6 +1187,7 @@ export class IdeController {
     });
     // Breakpoint debugger: wire gutter breakpoints + paused-line decorations.
     this.debug.attachEditor(this.editor, monaco);
+    this.editor.onDidChangeModelContent(() => this.enableTsIntelligence());
     this.wireEditorStatus(this.editor);
     // Seed the language service with any folders indexed before the editor was
     // ready (source files as models for cross-file IntelliSense; dependency types
@@ -1289,12 +1332,34 @@ export class IdeController {
     // eager sync, no extra libs) so its WorkerManager — created lazily on first
     // JS-model use — never starts.
     ts.typescriptDefaults.setCompilerOptions(compilerOptions);
-    ts.typescriptDefaults.setDiagnosticsOptions({ noSemanticValidation: false, noSyntaxValidation: false, onlyVisible: false });
-    ts.typescriptDefaults.setEagerModelSync(true);
+    this.applyTsIntelligence(this.snap.runPhase == null);
     ts.javascriptDefaults.setDiagnosticsOptions({ noSemanticValidation: true, noSyntaxValidation: true, onlyVisible: false });
     ts.javascriptDefaults.setEagerModelSync(false);
     // Mirror the worker's markers into a Problems count in the status bar.
     monaco.editor.onDidChangeMarkers(() => this.recomputeProblems());
+  }
+
+  // Whether the TypeScript language service is allowed to run. Off while a
+  // project installs.
+  //
+  // The service lives in ts.worker, a 1.36 MB (brotli) bundle that Monaco spawns
+  // the moment diagnostics or eager sync touch a TS model — which, after a
+  // create-from-template, is immediately, in the middle of the install. It then
+  // competes for bandwidth with the thing the user is actually waiting for, to
+  // type-check a project whose `node_modules` does not exist yet: every import
+  // is unresolved, so the answers it produces are wrong until the install ends
+  // anyway. Turned on by the run finishing, or by the first keystroke — whoever
+  // gets there first, because a user who starts editing wants it regardless.
+  private tsIntelligence = true;
+  private applyTsIntelligence(on: boolean) {
+    this.tsIntelligence = on;
+    const ts = this.monaco?.typescript;
+    if (!ts) return;
+    ts.typescriptDefaults.setDiagnosticsOptions({ noSemanticValidation: !on, noSyntaxValidation: !on, onlyVisible: false });
+    ts.typescriptDefaults.setEagerModelSync(on);
+  }
+  private enableTsIntelligence() {
+    if (!this.tsIntelligence) this.applyTsIntelligence(true);
   }
 
   // Wire cross-file "go to definition" (⌘/Ctrl+click, F12) into our tab system.
@@ -2208,7 +2273,7 @@ export class IdeController {
   async createFromTemplate({ templateId, name, dir, runInit }: {
     templateId: string; name: string; dir: string; runInit: boolean;
   }) {
-    const t = getTemplate(templateId);
+    const t = (await loadTemplates()).getTemplate(templateId);
     if (!t) {
       toast.error("Unknown template");
       return;
@@ -2261,7 +2326,7 @@ export class IdeController {
       return;
     }
     if (meta.template) {
-      const t = getTemplate(meta.template);
+      const t = (await loadTemplates()).getTemplate(meta.template);
       if (t) {
         this.folderManifests.set(root, t.manifest);
         this.bridge.post("vv-register-project", { dir: root, manifest: t.manifest, title: meta.name });
@@ -2299,9 +2364,52 @@ export class IdeController {
       this.openTerminalIn(root);
       return;
     }
+    markBoot("install-start");
+    warmRegistryConnection();
     const tid = this.newShellTerminal({ cwd: root, run: manifest.dev, label: manifest.dev });
     this.runningProjects.set(root, { terminalId: tid, port: null });
-    this.status("installing from npm + booting in-VM…");
+    this.beginRunPhase(root);
+  }
+
+  // ── run narration ──────────────────────────────────────────────────────────
+  // A run's phase, kept in the snapshot so the preview panel and the status bar
+  // say the same thing. `runTerminalId` is what ties terminal output back to the
+  // run: the fetch counters arrive as bytes on a terminal, and every other
+  // terminal's bytes must be ignored.
+  private runTerminalId: string | null = null;
+
+  private beginRunPhase(root: string) {
+    const running = this.runningProjects.get(root);
+    this.runTerminalId = running?.terminalId ?? null;
+    this.applyTsIntelligence(false);
+    const phase: RunPhase = {
+      rootPath: root,
+      name: this.snap.workspaceFolders.find((f) => f.rootPath === root)?.name || baseName(root),
+      phase: "installing",
+      detail: "",
+      startedAt: Date.now(),
+    };
+    this.set({ runPhase: phase });
+    this.status(`${phase.name}: installing dependencies…`);
+  }
+
+  private updateRunPhase(next: (cur: RunPhase) => RunPhase) {
+    const cur = this.snap.runPhase;
+    if (!cur) return;
+    const updated = next(cur);
+    if (updated !== cur) this.set({ runPhase: updated });
+  }
+
+  /** The run reached its end — a preview painted, or the run tab died. */
+  private endRunPhase(root?: string) {
+    if (!this.snap.runPhase) return;
+    if (root && this.snap.runPhase.rootPath !== root) return;
+    this.runTerminalId = null;
+    this.set({ runPhase: null });
+    this.enableTsIntelligence();
+    // node_modules exists now (or never will), so the types harvest is finally
+    // able to find something.
+    this.scheduleDependencyTypes();
   }
 
   // Run the currently-focused folder (TitleBar / command palette Run).
@@ -2865,6 +2973,7 @@ export class IdeController {
   // A demo's dev server is up — reuse the tab that already mirrors this port, or
   // open one, and make it active.
   private pointPreview(port: number) {
+    markBoot("preview-open");
     const existing = this.snap.previewTabs.find((t) => t.port === port);
     if (existing) {
       this.setTab(existing.id, { nonce: existing.nonce + 1, title: "" });
@@ -3081,6 +3190,13 @@ export class IdeController {
   // log and a fresh attach, exactly like the tab-switch path; onDevtoolsReady then
   // re-runs init against the reloaded document.
   onPreviewFrameLoad(id: string) {
+    // Only a tab bound to a real port counts as the app appearing; an empty tab
+    // loads `about:blank` and would otherwise mark the timeline far too early.
+    if (this.snap.previewTabs.find((t) => t.id === id)?.port != null) {
+      markBoot("preview-paint");
+      // There is something to look at now, so stop narrating.
+      this.endRunPhase();
+    }
     // Sync the address bar from the frame's real URL on every load. The vv-nav
     // script only rides in HTML responses, so navigating to a non-HTML endpoint
     // (a JSON API, a file, an image) never reports its path and the address bar
@@ -3360,7 +3476,16 @@ export class IdeController {
     b.on("log", (m) => {
       const stderr = m.stream === "stderr";
       const dim = (m.dim as boolean) || m.cls === "muted";
-      this.consoleLine(m.line as string, stderr ? "31" : dim ? "90" : undefined);
+      const line = m.line as string;
+      // A snapshot restore and a cold install look the same from the outside and
+      // take wildly different amounts of time; say which one is happening — and
+      // stop saying "restoring" the moment the restore gives up, since what
+      // follows is the long path, not the short one.
+      // Give-up first: its error text can quote a message containing "fetching",
+      // and the outcome is the less ambiguous signal of the two.
+      if (isInstallFallbackLine(line)) this.updateRunPhase(fallBackToInstall);
+      else if (isRestoreLine(line)) this.updateRunPhase((cur) => advance(cur, "restoring"));
+      this.consoleLine(line, stderr ? "31" : dim ? "90" : undefined);
     });
     // Cold-boot progress (relayed from the FS worker's OPFS restore + kernel
     // phase markers). Drives the Home boot indicator until `kernelReady`.
@@ -3373,8 +3498,12 @@ export class IdeController {
     });
     // The kernel + VFS are up (before the PM tarballs finish loading) — the Home
     // screen can create/open projects now, so don't make the user wait for `ready`.
-    b.on("kernel-online", () => this.set({ kernelReady: true, bootPhase: "" }));
+    b.on("kernel-online", () => {
+      markBoot("kernel-online");
+      this.set({ kernelReady: true, bootPhase: "" });
+    });
     b.on("ready", () => {
+      markBoot("kernel-ready");
       this.consoleLine("Kernel ready.", "32");
       this.set({ booted: true, kernelReady: true });
       this.status("ready — create or open a project");
@@ -3400,6 +3529,7 @@ export class IdeController {
       this.consoleLine(`[kernel] pid ${m.pid} listening on :${m.port}`, "90");
       this.portMap.set(m.port as number, m.pid as number);
       this.syncPorts();
+      this.updateRunPhase((cur) => advance(cur, "starting"));
     });
 
     // interactive terminals
@@ -3432,7 +3562,12 @@ export class IdeController {
         this.consoleLine(`[boot] shell (Process Worker) booted in ${Math.round(performance.now() - t.openedAt)}ms`, "90");
         t.openedAt = 0;
       }
-      t.term.write(m.chunk as string);
+      const chunk = m.chunk as string;
+      if (m.terminalId === this.runTerminalId) {
+        const p = readFetchProgress(chunk);
+        if (p) this.updateRunPhase((cur) => ({ ...cur, detail: formatProgress(p) }));
+      }
+      t.term.write(chunk);
     });
     b.on("term-exit", (m) => {
       const id = m.terminalId as string;
@@ -3459,6 +3594,10 @@ export class IdeController {
           this.runningProjects.delete(dir);
           if (r.port != null && this.portMap.delete(r.port)) this.syncPorts();
           this.syncKeepPrefixPorts();
+          // The run is over however it ended. An install that FAILED must stop
+          // claiming to be installing — the preview shell would otherwise sit
+          // there indefinitely while the answer is already in the terminal.
+          this.endRunPhase(dir);
           if (r.port != null && this.snap.previewTabs.some((t) => t.port === r.port))
             this.status("dev server stopped — preview will 502 until you Run again");
         }

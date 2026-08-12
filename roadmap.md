@@ -10655,3 +10655,691 @@ last two rounds of trouble started:
   caught by a person opening the app. The measurements in this entry were taken with a
   throwaway headless Chromium driving the shipped template; making that a real tier is a
   much larger change than this one, but it is the change that would stop the pattern.
+---
+
+## The install that downloaded 143 MB of metadata to install 60 MB of code (this change)
+
+The complaint was that installs are slow, "even a plain React TS project". Measured against
+the real registry, with `--cpu=wasm32 --os=linux` so the tree matches what the VM actually
+gets, a cold `react-ts` install moves **155.6 MiB — and 143 MiB of that is packument JSON**,
+for a `node_modules` of 59.8 MiB. `next-ts` is 201.3 MiB with 144.7 MiB of metadata. The
+install is not dominated by the code it installs; it is dominated by npm asking the registry
+what to install. Everything below follows from that one number.
+
+### A build-time lockfile takes the 143 MB to zero
+
+npm's Arborist resolves the whole graph from the registry when there is no lock, and its
+`#fetchManifest` hardcodes `fullMetadata: true`, so every candidate version of every package
+arrives in full. With a `package-lock.json` present the resolution has already happened and
+the packument traffic is **zero** — not smaller, zero.
+
+`scripts/gen-template-locks.mjs` (`npm run vendor:locks`) resolves one at build time and
+writes `public/vendor/locks/<id>.json` + an `index.json`. The `--cpu=wasm32 --os=linux`
+flags are not cosmetic: without them the generator resolves the *host's* optional binaries
+into the lock and the VM installs a tree it cannot run.
+
+**63 of 81 templates are eligible and 50 ship**, and the gap between those two numbers is
+the whole judgement. Eligibility is a derived rule — has a `package.json`, no lock of its
+own, installs with npm or bun, has dependencies — and it says a lock *could* be resolved,
+not that the resolved lock *works*. A lock resolved on a linux-x64 build host and reified in
+a wasm32 VM has a failure mode that is not "slower": it is a template that does not run, for
+every user, on the one deploy that introduced it. So `COVERAGE` is a separate, narrower list
+and an id joins it only after something has installed that template **from the generated
+lock in the VM**.
+
+That rule was originally met by a bespoke `--net` spike per id, which was right at one
+template and unpayable at fifty. `scripts/spike-template-locks.mjs` is the same rule driven
+once over the list: it installs each covered template in the VM from its own generated lock
+— with the template's own package manager, so the Bun tab goes through `bun install` — and
+asserts the tree is **usable**. Usable is derived, never listed: `install` exits 0, every
+direct dependency resolves to a real package directory, and every binary the dev command
+reaches is in `node_modules/.bin`, found by walking `manifest.dev` through package.json's
+`scripts` because the manifest only ever says `npm run <script>` or `node <file>`. One
+kernel serves the corpus, so the in-VM npm cache is warm from the second template onward:
+**49 templates in 214 s, 49/49 usable**, the 17 boots included.
+
+Installing was originally the whole gate, and that turned out to be the hole a broken
+template came through (below), so it now **imports and boots** the 27 ids whose lock carries
+an aliased entry — the risky subset — and the eight framework spikes in `template-gate` go further
+still and assert on the response. `spike-install-latency.mjs` stopped asking "is there a spike naming
+id X", which the corpus gate answers yes to by construction, and now asserts what can still
+drift: that the gate derives its list from `COVERAGE` rather than keeping a second copy,
+installs the shipped bytes from the shipped lock, and **fails** on a missing lock instead of
+quietly installing from ranges and proving nothing.
+
+`next-ts` is in, which was the largest remaining win at 144.7 MiB of packuments. It was
+blocked on `spike-next.mjs` hand-writing its own Next project; the corpus gate installs the
+shipped bytes, so the block is gone without touching that 250 MB gate.
+
+### A lock pins tarballs, which is the one layer the packument alias cannot reach
+
+The corpus gate's first run found 13 of 53 failing, all identically: `npm install` exiting 1
+on `Unsupported platform: linux wasm32 LE`, in `esbuild`'s install script.
+
+esbuild, rollup, lightningcss and bcrypt ship native binaries with no wasm32 build, and the
+kernel survives them by serving the drop-in's **packument** under the native name. Both
+fetchers leave tarball URLs alone in the same words — *deliberately left untouched* — and a
+lockfile is nothing but pinned tarball URLs. So a lock walks straight past the alias and
+installs the real native package. This is precisely the hazard the coverage rule was written
+against, and it took a gate to find rather than a reading: nobody had installed those
+templates from a generated lock, because until now nothing did.
+
+**The first guard keyed on `hasInstallScript`, and that shipped a broken template.** The
+reasoning was that only esbuild runs code on wasm32, while rollup and lightningcss install
+cleanly; the silent case — installs, then fails on import — was written off as having no
+instance, because "every lock pinning rollup also pins esbuild". **No shipped lock pinned
+rollup at all.** Every Vite template here is on rolldown, so that sentence was unfalsifiable
+rather than true, and it was guarding the wrong package: eighteen shipped locks pinned
+**lightningcss**. All four alias-table members have zero wasm32-capable optional deps, so the
+flag never tested whether there was breakage — only whether it would be loud at install or
+silent until import. Measured in the VM, installing from the shipped lock and then importing:
+
+| | what lands under `node_modules/lightningcss` | `require()` |
+|---|---|---|
+| with the lock | real `lightningcss`, no `.wasm`, 0 of 11 platform packages installable on wasm32 | **FAILED** |
+| without it | `lightningcss-wasm` with `lightningcss_node.wasm` | OK |
+
+Eighteen installed with exit 0 and seventeen booted anyway, because Vite only requires
+lightningcss with `css.transformer: 'lightningcss'`. **`tailwind` requires it** —
+`@tailwindcss/node` does so synchronously — so it passed every check the corpus gate had and
+then failed at `failed to load config from vite.config.js`, with the dev server never binding.
+
+#### The fix is to pin the package that works, not to excuse pinning one that does not
+
+The interim guard refused any pin of an alias-table member and let 17 ids ship one by
+exemption. That kept `tailwind` out and left the other refusals standing. The durable fix
+makes the substitution at generation instead: `resolveLock` resolves **twice**, and the second
+resolve carries `overrides` mapping each pinned position to `npm:<drop-in>@<that position's
+version>`. The lock then names `lightningcss-wasm` under `lightningcss` — the Fetcher's own
+substitution, applied in the layer the Fetcher cannot see.
+
+That recovered `tailwind` and all 13 esbuild refusals, taking `COVERAGE` from 49 to **59 of
+63 eligible**. Measured in the VM on a cold kernel, install only, no lock versus the shipped
+lock — nine of the ten recovered ids (`svelte-js` is `svelte-ts`'s twin):
+
+| template | without a lock | with the lock | transfer |
+|---|---|---|---|
+| `nitro` | 759 req / 465.9 MiB | 334 req / 18.7 MiB | **-96%** |
+| `astro` | 668 req / 436.3 MiB | 276 req / 30.2 MiB | **-93%** |
+| `angular` | 885 req / 305.4 MiB | 404 req / 40.1 MiB | -87% |
+| `react-router` | 450 req / 255.6 MiB | 199 req / 25.0 MiB | -90% |
+| `tailwind` | 241 req / 250.9 MiB | 90 req / 27.9 MiB | -89% |
+| `tanstack-router` | 245 req / 221.7 MiB | 93 req / 20.6 MiB | -91% |
+| `starlight` | 793 req / 139.3 MiB | 365 req / 28.8 MiB | -79% |
+| `svelte-ts` | 101 req / 104.4 MiB | 43 req / 13.7 MiB | -87% |
+| `qwik` | 47 req / 91.2 MiB | 17 req / 18.5 MiB | -80% |
+
+The 59-template corpus gate passes end to end in 338 s, with all 27 aliased ids importing the
+drop-in and binding their port.
+
+Details worth keeping: the override is **per position, at the version already resolved**
+(a flat one-version override measured the same — astro 277 req / 31.2 MiB vs 276 / 30.2 — so
+the version-preserving form wins on the argument it does not have to make); the overrides go
+into a temp package.json and npm records them nowhere in the lock, so template sources are
+untouched and the user never sees a dependency they did not choose; and lockstep publishing is
+checked rather than assumed, since lightningcss has 43 published versions to
+lightningcss-wasm's 42.
+
+The guard now refuses an alias-table member pinned **under its own name**, accepts one aliased
+to that native's registered drop-in, and refuses one aliased to anything else. It grants no
+exemptions, so `BOOT_PROVEN_ALIASED` is deleted; what survives it is the boot, owed by
+whichever ids actually alias something, read off each lock. Nineteen mutations — guard
+accepting any alias, guard keying on `hasInstallScript` again, overrides flattened to the root
+or pinned to one version, the second resolve not applied, the re-check dropped, `tailwind`
+quietly leaving `COVERAGE`, the corpus gate skipping the `require()` or ignoring which package
+answered or ignoring a dev server that never bound, and a shipped lock re-pinning the real
+lightningcss — each fail on the assertion that names them.
+
+#### Four eligible ids still get no lock, and none of them over its lock
+
+`NOT_BOOTABLE` records them. `nuxt`, `slidev` and `vitepress` resolve a clean aliased lock,
+install with exit 0 and import their aliased packages — and then do not boot, **with or
+without a lock**, measured both ways on a kernel booted fresh per arm: nuxt 597 req / 37.7 MiB
+against 1342 / 574.0, slidev 681 / 92.9 against 1376 / 347.3, vitepress 125 / 20.2 against
+293 / 165.3. The lock is a large win on all three and buys nothing. Nuxt's failure is
+`oxc-parser` throwing `Unsupported architecture on Linux: wasm32`, which is not an alias-table
+member, so nothing substitutes it. `vitest` is a test runner with no port, so the gate's
+strongest check has nothing to attach to. All four would ship the moment their template boots
+here, for reasons that have nothing to do with locks.
+
+### The Bun tab was excluded by a guess, and the guess was wrong by 16 MiB
+
+Bun cannot install in-browser; `bun install` delegates to the real npm CLI, so npm reads the
+lock. The ten Bun templates depend only on `@types/bun` (plus React types for bun-react),
+which read as "type-only, no tarball bulk, nothing to win". Measured in the VM instead:
+bun-react is **17 requests / 20.21 MiB without a lock and 9 / 3.70 MiB with one**, and the
+plain `bun` template 16.74 → 3.48 MiB. Almost all of it is the `@types/bun` packument — a
+package with no tarball bulk can still have enormous metadata.
+
+Safe only if it cannot move a Bun project's dep-cache key, and it cannot: both key sites take
+the pm from `pmName(pmHint)`, the install command, so `"bun"`; `LOCKFILES.bun` lists only
+`bun.lock`/`bun.lockb`, so `depKeyInput` falls through to `package.json` as before.
+`detectPm` is not on that path, and in the one window it runs against an uninstalled project
+it already answered `"npm"` with no lockfiles at all. Both are asserted. Pinning
+`@types/bun: "latest"` is the same bounded float every other template's ranges already get,
+since the locks are regenerated each deploy.
+
+A genuine `bun.lock` was not pursued: real Bun does not run here, and the shim's
+`writeBunLock` is explicitly a best-effort text approximation that nothing parses back.
+
+### Forty-nine locks stay lazy, and forty-nine resolutions stay quick
+
+2.7 MB of JSON is fine while each byte is a separate asset fetched by the one project that
+needs it, and a disaster the moment something inlines it. That held at one lock partly
+because 54 KiB is too small to notice, so it is now asserted: the manifest is 3,991 B and
+every entry is a `{asset, bytes}` pointer, no module imports a lock, `templates.ts` carries
+no `lockfileVersion`, and `vendor/` is still out of the service worker's precache prefixes.
+Confirmed against a real build: the precache manifest lists only hashed `/assets/*` and
+names no lock at all, and the only `lockfileVersion` in the bundle is the kernel's own
+runtime check on a lock it fetched.
+
+Resolution is round-trip bound, not CPU bound, so it runs a bounded pool over one shared npm
+cache. Measured cold over the 53 eligible templates: **169 s at `--jobs=1`, 49 s at 8, 52 s
+at 16** — 8 is the knee and more is worse. `predev` costs **32.6 s cold and 0.28 s warm**,
+because an existing asset is reused.
+
+**The warm path is where the shipped bytes are actually decided, so it stopped trusting a
+filename.** It reused any `<id>.json` that existed, which meant an interrupted cold run — and
+this runs from `predev`, under a `npm run dev` someone is waiting on, so Ctrl-C is the
+expected input — could leave a truncated lock that was then reused and published forever,
+with the manifest reporting its wrong length as fact. Locks are now written to a
+pid-suffixed scratch file and renamed, so a killed run leaves the previous file or none;
+stale scratch files are swept at the start of a run, because `public/` is copied into the
+deploy verbatim. The reuse path re-parses and re-runs **both guards**, which also stops a
+lock resolved under an older, laxer guard from shipping under the new one — the exact way
+`tailwind` would have survived being removed from `COVERAGE`. For the same reason a full run
+now prunes manifest entries and assets for ids no longer in `COVERAGE`: the locks are
+gitignored build output, so carrying an id forward on the strength of its file existing made
+removing a template a no-op for anyone without a clean checkout.
+
+Measured on the rebuilt corpus: SIGKILL mid-cold-run left 7 complete assets, **0 scratch
+files** and no manifest, and the next run reused those 7 and built the other 42. Two cold
+generators at once — 16 parallel `npm install --package-lock-only` on one shared cacache —
+produced 49 valid assets with no integrity errors, and every asset parses and matches its
+manifest byte count.
+
+`predev` and the deploy deliberately build the *same* list. A smaller local subset was the
+obvious way to protect `npm run dev`, and it would have reintroduced exactly the divergence
+that shipped twice on this branch: a producer the deploy runs and local dev does not is a
+producer nothing exercises until production. 34 s once, on a clone that has just paid for
+`npm install` and a Rust build, is the better side of that trade.
+
+`--all` resolves every eligible template for measuring what widening would buy.
+
+### The first generated lockfile pointed at a registry no user can reach
+
+Worth its own heading because it shipped through a full review and was caught by nothing
+except running the template. `resolved` in a lockfile is an **absolute URL**, so whatever
+registry the build host is configured with travels into the VM. Resolved behind a private
+mirror, react-ts's lock named `http://npm.mirror.invalid/vite/-/vite-8.2.1.tgz` — for all 102
+packages. In the VM every one of those fetches failed, `npm install` **exited 0 anyway**, and
+the project came up with no `node_modules/.bin/vite`. A template that used to install slowly
+did not run at all: precisely the trade the coverage rule above exists to refuse, arriving on
+the first template anyone tried.
+
+The generator now passes `--registry` *and* checks the file it produced
+(`assertPublicRegistry`), because pinning the input is not enough — a mirror also arrives via
+`.npmrc`, a per-scope registry, or `NPM_CONFIG_*`, and what ships is the output. The snapshot
+producer refuses a lock that fails the same check, since its key would belong to a lockfile
+nobody can install from. `spike-install-latency.mjs` asserts the check can actually fail, with
+this exact URL.
+
+Measured in the VM afterwards, same rig, `spike-react.mjs`: **`npm install` 10.8 s from
+ranges against 3.6 s from the lock**, both booting the dev server.
+
+### A peer dependency npm could not place as a singleton, and eight gates that hung on it
+
+`template-gate` went to 2/8 and `spike-net` to 49/57, all with the same tail: the dev server
+never binds, and the last thing printed is
+
+```
+[rolldown] Downloading @rolldown/binding-wasm32-wasi@1.2.3 on WebContainer...
+Error: Cannot find native binding. npm has a bug related to optional dependencies
+```
+
+That message is about a different bug. The real one is three layers down and the `error.cause`
+chain, which nothing printed, holds it: `this.bridge.setLastError is not a function`.
+
+**The pass/fail split was the whole diagnosis.** Failing: react, preact, lit, solid, vue,
+ember, vitest, tailwind. Passing in the same run: svelte, qwik, astro, angular, nitro,
+slidev, vitepress, starlight, and every non-Vite template. Several of the passing ones are
+Vite templates too, so "uses Vite" is not the line — **the line is Vite 8**, the release that
+replaced rollup with rolldown. Every failing template resolves `vite@8.2.1`; svelte and qwik
+are on 7.3.6, astro and starlight on 6.4.3, all rollup, and they never load a rolldown
+binding at all. angular pins `rolldown@1.0.0-rc.4`, from before the regression.
+
+The defect is upstream and is a peer contract npm could not honour.
+`@rolldown/binding-wasm32-wasi` 1.2.1–1.2.3 pins `@emnapi/core` and `@emnapi/runtime` at
+exactly `2.0.0-alpha.3`; the `@napi-rs/wasm-runtime` the same package depends on declares
+`peerDependencies: "^1.7.1 || ^2.0.0-alpha.4"`. alpha.3 satisfies neither branch — alpha.4
+was published on 2026-08-10, five days after the binding — so npm cannot use one copy. It
+places `@emnapi/*@1.11.3` at the root to satisfy napi-rs, nests alpha.3 under the binding,
+and exits 0. The alpha.3 runtime then calls into the 1.11.3 core and finds no
+`setLastError`. rolldown catches it, falls to its `process.versions.webcontainer` branch —
+this VM sets that flag on purpose, for Next's wasm SWC — and that branch runs `pnpm i` into
+`/tmp`, which does not exist here, so the misleading message is the one that survives.
+
+Measured in the VM, react-ts, installing and requiring the binding:
+
+| | tree | `require` |
+|---|---|---|
+| with the shipped lock | `@emnapi/*` 1.11.3 root + 2.0.0-alpha.3 nested | **FAILED** |
+| without any lock | identical | **FAILED** |
+| either, once upstream shipped 1.2.4 | single `@emnapi/*@2.0.0-alpha.4` | OK, binds in 1.1 s |
+
+**So the lock did not cause it** — the failure is byte-identical with and without one, and
+that arm was measured before assuming it. What the lock does is worse in a slower way: it
+would have frozen the broken tree past the upstream fix, while a lock-free template recovers
+by itself. Upstream published `1.2.4` mid-investigation, pinning alpha.4, and a freshly
+resolved lock is clean.
+
+`assertPeerProviders` refuses the shape: a package supplying its own dependency a copy other
+than the one npm reified for that dependency's peer. It reads npm's `peer: true` marker
+rather than evaluating ranges, so it adds no semver and no dependency. The narrowing is the
+part that matters — plain "appears twice" flags 25 of 59 locks including `tslib` and a benign
+`zod` duplicate, while this flags **18 of the stale set, every one this defect, and 0 after
+1.2.4**. A refusal is a skip, not a failure: nobody here can fix an upstream publish, and the
+lockless arm is the one that self-heals.
+
+**Why it was green here and red in CI, which is the reusable lesson.** Locks are gitignored
+build output. CI resolves them fresh on every run; the generator reuses whatever is on disk.
+So the corpus gate kept passing against locks resolved before the bad binding was published,
+and CI kept getting the bad one — the same gate, disagreeing because it was not looking at
+the same bytes. Both guards now also run in `unshippable`, so a stale lock that violates
+either is deleted and re-resolved instead of reused.
+
+**They are fetched at project-create, not inlined into `templates.ts`.** That was the plan
+and it did not survive the file: `templates.ts` is 413 KB already and is being code-split
+this same cycle, and 53 resolved locks is several MB that would ship to every visitor
+including the ones who open a Python template. `vv-create-project` consults the manifest and
+fetches the single lock it needs, on a timeout, skipping templates that ship their own lock
+or have no `package.json` — and writes it **into the same batch as the project files**, ahead
+of the reply that releases the studio to run, so the install behind it already sees the lock.
+
+The templates' `install:` stays `npm install` and does **not** become `npm ci`. There is
+nothing to gain — with a lock present `npm install` is already lockfile-driven and fetches no
+packuments — and something concrete to lose: `npm ci` deletes `node_modules` before it starts,
+which is precisely the tree the shipped snapshot just restored. The two features would cancel.
+
+### The shipped-snapshot feature had no producer, and so had never run
+
+`tryFetchShippedSnapshot` reads `vendor/depcache/index.json`, treats a missing manifest as
+"feature off", and falls back to a normal install on every error. All correct — and nothing
+in the repo ever wrote that manifest. The consumer shipped without a producer, the off-switch
+was welded off, and because every failure mode is a silent fallback there was no symptom to
+notice.
+
+`scripts/gen-depcache.mjs` (`npm run vendor:depcache`) is the missing half: it installs the
+tree on the host, packs it through `dep-cache.js`'s own `pack()` (via a VFS-shaped facade
+over the host fs, `scripts/lib/host-vfs-access.mjs`, so producer and runtime cannot drift),
+and writes the asset plus the manifest.
+
+It ships **`react-ts` only** — 59.8 MB packed, **12.4 MB on the wire** — and the allowlist is
+the point, not a shortcut. A tree containing install scripts must not be shipped, because
+restoring a snapshot never runs them and whatever the `postinstall` was going to produce is
+then missing in a way that surfaces much later; the generator refuses such a template. It
+reads `node_modules/.package-lock.json` (the tree **as installed** for wasm32-linux) rather
+than the resolved lock, which was the difference between correctly shipping `react-ts` and
+refusing it over `fsevents`, a Darwin-only optional dep that is never installed here.
+`next-ts` is genuinely refused. Widening the list is one line per template plus a look at the
+hosting bytes.
+
+### An optimisation producer must not be able to cancel the deploy
+
+Both generators originally exited 1 when they produced an empty manifest — a guard against
+silently losing the feature, which is the failure this whole change is about. Under
+`cloudflare-build.sh`'s `set -euo pipefail` that guard is a way to take the site offline:
+one failed `react-ts` install empties the index and aborts the deploy of the landing page,
+the docs, the blog and the studio. The triggers are routine — a registry flake partway
+through a 60 MB install, or a transitive package gaining an install script, which is the
+case `gen-depcache` is *deliberately written to refuse*. Choosing correctly would have
+taken the site down.
+
+Both now warn loudly and exit 0, and that holds for an *unexpected* throw as well
+(`installFailSoftHandler` catches `uncaughtException` and `unhandledRejection`) — neither
+script had guarded its own body, so a template loader that threw or a full disk would have
+walked straight past the contract. `--strict` is the invocation whose subject *is* the
+assets — CI resolving the locks before the template gate, or a human checking their work —
+and it is stricter than the old check as well: there, a template that was asked for and did
+not build is a failure even when others succeeded.
+
+**Failing soft has to mean writing no manifest, not an empty one**, and that only became the
+likely failure once fail-soft landed. `checkKernelAssets` decides an asset is present by
+testing for a non-empty *file*, and `{}\n` is three bytes: a producer that failed honestly
+and exited 0 was still counted, so the deploy's loudest check printed
+`✓ 24 kernel-fetchable asset paths present` with no `○` line, over a manifest that turns the
+largest install optimisation off for every visitor. Nothing breaks at runtime, which is
+exactly the shape this MR exists to remove. `writeOptionalManifest` writes nothing and
+deletes a stale file; verified by starving `gen-depcache` of its lockfile, which now exits 0
+with no manifest and makes the check report
+`✓ 22 kernel-fetchable asset paths present, 2 optional absent`. `spike-install-latency.mjs` asserts that
+every non-zero exit in both scripts is either a usage error or behind `strict`, and that the
+deploy invokes neither with `--strict`.
+
+One related correctness fix: the depcache index is *merged* rather than overwritten, so a
+run naming one id keeps the others — which also left a rebuilt asset reachable under the key
+of the lock it no longer contained. Observed for real when the react-ts lock was re-resolved
+off the mirror and the index kept both keys. A stale hit is worse than a miss, because a
+restore hit means `VV_RUN` has no `install &&` prefix and npm never runs to notice the tree
+and the lockfile disagree.
+
+### `cloudflare-build.sh` was missing two vendor steps before this, and would have missed four
+
+The deploy script listed its vendor steps by hand and had drifted from `prebuild:studio`:
+`vendor:ruff` and `vendor:sqlite` were in the latter and not the former, so the deployed
+studio fetched two assets that were never built. On a Pages SPA that is not a 404 — it is a
+**200 of `index.html`**, which is why it went unnoticed. Both are added, along with the two
+new steps, and `spike-install-latency.mjs` now diffs the two lists so the next omission fails
+CI instead of shipping.
+
+### A shipped snapshot needed a transport frame, because `pack()` emits raw bytes
+
+59.8 MB uncompressed is more to download than the install it replaces. Shipped assets are
+now wrapped in `[u32le headerLen][{v:2,c:"gz"}][compressed archive]` — deliberately the same
+shape as an archive's own `{v:1,entries:[…]}` header, so one parse distinguishes them and a
+pre-existing snapshot still imports. Only the transport is compressed; `storage` still holds
+the plain archive, so `restore()` and the LRU are untouched.
+
+Brotli was the recommendation and gzip is what shipped. Brotli q9 is ~30% smaller (8.6 MB
+against 12.5 MB here) and the repo has a Rust brotli codec — but no browser exposes a brotli
+`DecompressionStream`, so using it means instantiating `packages/codec` inside whichever
+worker decodes, and `dep-cache.js` is deliberately free of platform primitives. The codec is
+**named in the header** rather than assumed, so that is a one-field change later; an
+unimplemented codec returns null and the caller installs normally.
+
+### Three smaller ones, same theme: work nobody asked for
+
+- **`prefer-offline`.** npm revalidates each cached packument with a conditional request. On
+  a second project with the same deps that is **141 round-trips returning 304 with no body** —
+  pure latency, and 141 chances for a flaky network to stall. Now on.
+- **npm is loaded when npm is used.** `ensureRealNpm` ran between `kernel-online` and
+  `ready`, so a session that never installs anything still downloaded and unpacked the npm
+  CLI. It is a lazy program now.
+- **Next's postinstall linked instead of copied.** It seeds the 30.4 MB
+  `@next/swc-wasm-nodejs` into Next's wasm cache dir, and it was a byte copy: 30 MB read plus
+  30 MB written through the sync fs bridge, 30 MB of duplicate in the VFS's Wasm heap, at the
+  very end of the install where no progress UI is watching — so it reads as a hang.
+  `fs.linkSync`, falling back to a copy on a VFS without `OP_LINK`.
+
+### Corgi packuments: measured, then deliberately not shipped
+
+Requesting abbreviated (`application/vnd.npm.install-v1+json`) packuments cuts metadata
+transfer ~72%, and the abbreviated body really does carry every field resolution needs. It
+still should not ship as a fetcher-level `Accept` rewrite, because npm writes the response
+into `_cacache` **under a key it believes holds a full packument**. With the rewrite in
+place, `npm view react` in the same VM afterwards reported the license as "Proprietary" with
+no description and no homepage: npm read the abbreviated body back and rendered the absent
+fields as absent rather than as unfetched. That is a silently corrupted cache in exchange for
+72% of a number the lockfile work above already takes to 0%. Left out.
+
+### What the spikes actually pin
+
+- `spike-depcache-shipped.mjs` (`needsWasm`) drives the real producer→consumer seam: packs a
+  host tree, wraps it exactly as `gen-depcache.mjs` does, then decodes, imports and restores
+  it into the real Wasm VFS and `require()`s out of the result. Its load-bearing assertion is
+  that the **key the producer computes equals the key the VM looks up** — a mismatch there is
+  not an error, it is a cache miss that installs normally and looks like the feature is
+  merely not helping. It also feeds it a truncated asset, an HTML error page, and an
+  unimplemented codec.
+- `spike-seed-swc.mjs` (`needsWasm`) runs the shipped postinstall and asserts the **inode**,
+  because a regression to copying is invisible apart from being slow.
+- `spike-install-latency.mjs` (static, earliest tier) covers the failures that are silent by
+  construction: a vendor step the deploy does not run, a producer writing a path the kernel
+  does not read, an origin-absolute asset URL, an `await` creeping back onto the boot path,
+  and the lock generator's eligibility rule.
+
+Both `needsWasm` spikes are named in the `verify` job explicitly — the Wasm-free gate skips
+them, so a spike absent from that list runs in no job at all, which this repo has been bitten
+by twice.
+
+### Not done, and why
+
+- **The 40x gap in snapshot restore is still unexplained, and this change removes the wrong
+  explanation.** `AGENTS.md` attributed the 4.0 s browser restore (against 0.1 s headless) to
+  the OPFS mirror. It cannot be: `shouldPersist` rejects every path under `node_modules`,
+  which is precisely what makes `restore()`'s per-path callback a no-op. The remaining
+  candidates — Wasm heap growth for a ~100 MB tree, and the one-contiguous-`Uint8Array`
+  archive — are untested. This is the most valuable single measurement left on this path.
+- **51 of the 53 eligible templates ship no lock**, deliberately, until each has a `--net`
+  gate that installs it from one. `next-ts` is first in line and needs `spike-next.mjs`
+  converted to the shipped template. `--all` measures what the rest would buy.
+- **The 16 s worst case on project create is now 8 s**, because the lock budget was
+  per-request across two fetches (manifest, then asset) rather than per-create.
+  `fetchByDeadline` takes one deadline at the top of `fetchTemplateLock` and gives each
+  request what is left of it; a timed-out manifest is remembered as "not served", the same
+  as a 404, so at most one create in a session can pay the budget at all.
+
+### Tracked follow-ups from this path
+
+Three things were deliberately left for their own commits. They are written down here rather
+than in a review thread because each has a trigger that will not announce itself.
+
+- **Nothing bounds a vendor script's network, and two of them now run last on `predev`.**
+  Neither generator passes `timeout` to `execFileSync`, so behind a proxy that blackholes
+  rather than refuses, `npm install --package-lock-only` is bounded only by npm's own
+  defaults — `fetch-timeout=300000`, `fetch-retries=2`, about fifteen minutes before the dev
+  server starts, with nothing on screen saying why. The fail-soft exit-code rule does not
+  cover this: there is no exit code involved. None of the eight pre-existing
+  `scripts/vendor-*.mjs` bound their network either, which is why the fix is one commit
+  putting `{ timeout: 120_000 }` behind a shared helper across all ten and not two of them —
+  doing two would leave the other eight looking deliberately unbounded.
+- **`reportAbsentManifest` should be split, and `spike-install-latency.mjs` should import the
+  pure half.** The gate currently regex-slices the function out of `kernel-worker.ts`, strips
+  its type annotation and runs it through `new Function` with three stubbed globals, because
+  the worker cannot be imported from Node. Exporting `formatAbsentManifest(m) → { line,
+  stream?, dim?, console? }` from a small module and leaving only the posting in the worker
+  lets the spike import it the way `spike-site-headers.mjs` imports `run-phase.ts`. That
+  deletes the regex, the eval and the stubs, and gives the call-site assertions below type
+  coverage instead of pattern matching.
+- **A 200 whose body fails mid-transfer is currently diagnosed as a build defect.** The loud
+  arm keys on the status alone, so a truncated or aborted body gets "This build was assembled
+  without it… Fix: `npm run vendor:depcache`". Narrow, since both manifests are small, but the
+  discriminator is free: the defect signature is specifically a *parse* failure, so testing
+  `m.err instanceof SyntaxError` alongside the 2xx narrows it to exactly the shape the
+  docstring already claims. Worth folding into the extraction above rather than doing alone,
+  since that is when it gets a typed test.
+
+---
+
+## `npm run dev` was broken on Node 22.0-22.17, and CI could not see it (this change)
+
+A contributor pulled the branch, ran `npm run dev` on **Node 22.16.0**, and both new
+producers died before doing anything:
+
+```
+Error: could not load packages/studio/src/vv/templates.ts (Node 22.16.0 strips types on
+import; enums/namespaces/parameter properties are refused): Unknown file extension ".ts"
+```
+
+The fail-soft contract did its job — both exited 0, Vite came up — so the only symptom was
+a dev server with none of the speedup, explained by a message that was wrong twice over.
+`templates.ts` contains no enum. And that Node does not strip types **at all**.
+
+**The version table, because a wrong number in a comment is the whole bug.** Type stripping
+was added in **22.6.0 behind `--experimental-strip-types`** and became default-on in
+**22.18.0** (nodejs.org/docs/latest-v22.x/api/typescript.html). `shipped-templates.mjs` said
+"since 22.6 it strips type annotations from an imported .ts on its own", which describes
+neither release. This corrects roadmap.md:6144, which repeated it.
+
+**Why nothing caught it, and why that is the more interesting half.** `.nvmrc` is `22` and
+all six CI jobs pin `node-version: 22`; both resolve to the newest 22.x, so every machine
+that has ever run this code was ≥22.18. Meanwhile `engines.node` was `">=22"`, which
+promised support for precisely the range that could not work. The declaration and the test
+matrix disagreed, and the matrix is what everyone reads.
+
+The fragility is older than the work that exposed it — `shipped-templates.mjs` landed at
+`47b0d00` and thirteen scripts depend on it — but it was reachable only by running a spike.
+Putting `vendor:locks` and `vendor:depcache` on `predev` made it fire on **every**
+`npm run dev`, which is the difference between latent and guaranteed. It is also the same
+`engines.node` gap raised once before about `spike-site-headers.mjs`'s `run-phase.ts`
+import, where it was handled in that one spike and the cause left alone.
+
+**The fix is `scripts/lib/import-ts.mjs`, one module behind all thirteen callers.** It
+settles capability on a throwaway `.ts` in a fresh `mkdtemp`, and only then imports the
+caller's file. If the throwaway does not import, a `module.registerHooks` loader that strips
+through `module.stripTypeScriptTypes` goes in and a *second* throwaway proves it took effect.
+That covers 22.15-22.17 in-process; below 22.15 the hook API does not exist and the error
+names `NODE_OPTIONS=--experimental-strip-types`, which works from 22.6 (verified on 22.16).
+`engines.node` is now `">=22.15.0"`: the floor at which a clone works unassisted.
+
+Three alternatives, and why not:
+
+- **Re-exec with the flag** is the least code and was rejected on blast radius. Thirteen
+  callers include spikes that boot a kernel and run installs; restarting the process from
+  the top at the moment someone asks for a template repeats whatever came before it.
+- **A child process handing back JSON** is honest and isolated, and the payload turned out
+  to be only 431 KB with a lossless round-trip — but it can only carry *data*. `run-phase.ts`
+  exports functions, so that mechanism could never generalise to the sibling case.
+- **Requiring ≥22.18 and failing fast** is a legitimate outcome and is what the message does
+  below 22.15. Above it, a loader hook is a dozen lines and a contributor on a
+  pinned Node gets a fast dev server instead of a lecture.
+
+**The gate is in `spike-install-latency.mjs`.** A `resolve` hook counts what the loader is
+asked for, so the two properties that make the design work are asserted rather than
+inferred: the caller's specifier is resolved exactly **once**, and capability was settled on
+**two different** throwaway files. A third child replaces `registerHooks` with a function
+that accepts the registration and does nothing — indistinguishable from a working stripper
+by any `typeof` test — and asserts the error says the scratch file still would not import.
+Others delete both hook APIs to reach the 22.6-22.14 arm, check the message names the flag
+and 22.18 and does not blame a TypeScript feature, and confirm a module-scope throw keeps
+its own message. It also pins `engines.node` to the hook floor and to the CI job below.
+
+### The gate that passed was measuring the wrong runtime
+
+The first version of this fix retried the same specifier after installing the hook, on the
+stated grounds that a resolution failure is not memoised — "verified against the version
+that fails". It was verified against `node --no-experimental-strip-types` on 22.23. That is
+not the version that fails. It disables default stripping and leaves 22.23's loader
+machinery in place, and the two differ on precisely this:
+
+| after a `.ts` import fails | 22.16.0 | 22.23.2 `--no-experimental-strip-types` |
+| --- | --- | --- |
+| retry the **same** specifier, hooked | **still fails** | works |
+| import a **different** `.ts`, hooked | works | works |
+
+Every other row matches. So the proxy was convincing, the gate was green, and the bug
+shipped a second time — the same gate-on-a-proxy failure this branch spent three commits
+correcting. Downloading the real 22.16.0 tarball settled it in one command.
+
+Rejected on the way: a cache-busting `?v=n` retry. It does work on 22.16 once the hook's
+guard reads `new URL(u).pathname` rather than `url` — a query hides the `.ts` from
+`endsWith`, which is why it first appeared not to — but each distinct query is a distinct
+module instance, so module-scope code runs twice and `TEMPLATES` from one is not `TEMPLATES`
+from the other.
+
+**And the structural half: `toolchain-floor`.** An in-process gate cannot see a difference
+that only exists between binaries, so `.github/workflows/ci.yml` now pins `22.15.0` exactly,
+imports the templates there, and runs the Wasm-free offline tier on it. Before this, no
+machine anywhere ran the regime `engines.node` promised — not CI, not an nvm user — which is
+why one wrong sentence about the module map survived three reviews. Skipping `needsWasm`
+keeps it about Node versions: `constants` compares host OpenSSL and zlib against the VM's
+and differs on any Node but the newest (measured: 48/49 on 22.16, that being the one).
+
+### Not done
+
+- **`spike-site-headers.mjs` still has its own private answer.** Its `run-phase.ts` import
+  has a hand-rolled guard with the *correct* version facts, and it `process.exit(1)`s on
+  22.0-22.17 rather than falling back. `importTs` returns live bindings, so that spike could
+  drop the guard and simply work on 22.15+. It is the Frontend Expert's file, so the change
+  is theirs to make.
+- **`.nvmrc` deliberately still says `22`, and should.** It reads as a blind spot, since it
+  is half of why CI never saw this — but `22` resolves to the *newest* 22.x, which is the
+  regime that needs no fallback at all. Pinning it to `22.15` would hand every nvm user the
+  slower path on purpose. The blind spot was never `.nvmrc`; it was that nothing ran at the
+  bottom of the supported range, and that is now a CI job.
+- **Only the floor and the ceiling are tested, not 22.16 specifically.** 22.15.0 and the
+  newest 22.x are the two ends that matter — the hook regime and the ambient one — and a
+  full matrix would pay for a third runner to re-run the same two code paths.
+## Two jobs, one spike, different trees — and a stall report that was right (this change)
+
+Two GitHub Actions jobs ran the same nine lock-reading spikes and only one of them had
+locks. `template-gate` resolved them in a step of its own; `spikes-net` had no such step,
+and `packages/studio/public/vendor/locks/` is gitignored build output, so there it was
+empty. `template-locks` died in **0.2 s** on the first missing file, and the eight template
+gates did something worse than die: `runViteSpike` prints `NO generated lockfile —
+installing from ranges, which is not what the studio does` and carries on, so they went
+green having installed a tree the studio never installs.
+
+### A per-job step cannot be made safe, because the mistake is forgetting to write one
+
+The fix is not a second step. It is that provisioning belongs to the spike that needs the
+artifact, which is how the `-studio` spikes have always got their packed vendor assets:
+`VENDORS.locks` in `scripts/run-spikes.mjs`, declared by all nine. Any job that selects one
+gets the locks, and a job added next year cannot forget.
+
+Two details are load-bearing and neither is obvious:
+
+- **`always: true`.** Every other vendor spec is a single packed file, so `fs.existsSync`
+  on it is a complete answer. This producer writes a SET, `asset` can therefore only name
+  the manifest, and a manifest pointing at locks that were never written is *exactly* what
+  an interrupted run leaves behind. Only the producer knows what is missing, so the
+  producer is the idempotency check. It costs ~0.3 s when there is nothing to do.
+- **`--strict`.** The generator's default is fail-soft — warn, exit 0, ship no lock — which
+  is right under `cloudflare-build.sh`, where a registry outage must not cancel the deploy
+  of a whole site over an optimisation. It is wrong here, where a lock that cannot be
+  produced is the step's entire subject: exiting 0 having written nothing would hand the
+  spike the empty tree it is being provisioned to avoid.
+
+Three assertions in `install-latency` required the deleted step. They were replaced rather
+than dropped — that job is the only place a generated lock is reified in the wasm32 VM, and
+a lock the VM cannot build BREAKS its template rather than slowing it — and re-aimed at the
+property the bug violated: no job can exercise a lock-reading spike without locks. The set
+is derived from what each spike's source reads, one hop through its imports, because the
+eight reach the locks through `spike-vite-lib.mjs`. That derivation splits the class in
+two, and naming both halves is what makes it complete: **nine net spikes**, which must
+declare the vendor, and **three offline ones**, which must not — a `net: false` spike
+carrying a vendor is itself a `ci-tiers` failure, since provisioning shells out to the
+registry — and which are covered instead by `spike-clean-checkout` running them on a tree
+stripped to tracked files.
+
+The declaration is also only worth what the runner does with it, so `ensureVendor` is gated
+too: that it re-runs an `always` producer rather than short-circuiting, and that it
+forwards `args` so `--strict` reaches the producer instead of sitting in the table as
+decoration. Neither is checked anywhere else and either one silently undoes the fix.
+Thirteen mutations, thirteen caught by the assertion that names them.
+
+### The ember stall report was correct, and the gate was asking the wrong question
+
+`ember` failed `noFalseStalls` on one report — `PID 5 (vite) silent 7s` — with every
+functional assertion green. That gate exists because a user watched their terminal fill
+with `PID 7 () has printed nothing for 73s … it looks stuck rather than slow` while the dev
+server it was accusing served their app, so the presumption is that a report against a
+healthy tree is a product bug. Measured on the real tree, this one is not.
+
+It lands in the window between vite being spawned and vite binding its port, and in that
+window the kernel holds **no evidence whatsoever** that vite is alive: `everOutput` false,
+`syscalls` **0**, `idleMs === silentMs`, no port, and one `wasi-worker.mjs` child that is
+equally inert. Its three ancestors are excused by `hasLiveChild`; vite is not, because its
+only child is a thread, and a thread that has never printed is `isUnobservable`, which
+revokes that excuse by design so a wedge in an unwatched child surfaces at its parent.
+
+Nothing distinguishes that state from a vite that wedged on startup, and it is not knowable
+from there: file writes bypass the kernel entirely, and the fs worker has no notion of a
+pid, so there is no per-process progress signal to consult. Suppressing it would mean never
+reporting a dev server that dies during startup — a real detection traded for a quiet log.
+
+**Ember is not shaped differently from the other seven.** All eight are
+`sh -> npm -> sh -> vite -> pool`. The only difference is bind latency — react 1.4 s
+against ember 5.1-5.5 s locally, and CI is slower — so ember is the one template whose
+startup crosses this harness's deliberately-compressed 6 s threshold. Production's is 60 s.
+
+So the gate now counts reports made **while the server is serving**, which is the state the
+original bug happened in and the state in which a report is impossible unless `serving`,
+`unobservable` or the parent rules have broken. Startup-window reports are printed but not
+counted, so a change that starts flooding that window is still read here rather than
+hidden. And because counting reports at all depends on the watchdog's timing, the same
+property is now asked of the production `shouldReportStallFor` directly, for every live
+process in a tree that is serving right now.
+
+### Not done
+
+- **`watch` fails in a loaded tier and passes alone**, at the same 153 s either way. It is
+  timing-sensitive rather than broken — it spends 153 s of wall clock on 12.6 s of CPU,
+  waiting on filesystem-watch deadlines — and it passed in a full offline tier run with
+  nothing else competing. Left alone rather than given a longer deadline, because the
+  deadline is not what is wrong with it.
+- **`spike-clean-checkout` still cannot see a gate that passes vacuously.** Its own header
+  says so. The diagnosis it prints is now honest about *which* tree a failure belongs to —
+  it runs the failing gate in the working tree before blaming the checkout, having once
+  blamed absent build output for three stale assertions — but a gate whose assertions are
+  skipped rather than failed still reads as green from the outside.

@@ -221,21 +221,67 @@ export async function npmInstall(h, { dir, env = defaultEnv(dir), extraArgs = []
   return inst;
 }
 
-/** Start a dev server (argv relative to `dir`) and wait until `port` binds. */
-export async function waitListen(h, { dir, port, argv, env = defaultEnv(dir) }) {
+/**
+ * Start a dev server (argv relative to `dir`) and wait until `port` binds.
+ *
+ * `onPid` receives the server's pid so a caller that boots more than one
+ * template in a single kernel can stop it again — spike-template-locks.mjs does,
+ * and without it the second Vite template would find 5173 already held by the
+ * first and `h.listening` already saying it bound.
+ */
+export async function waitListen(h, { dir, port, argv, env = defaultEnv(dir), onPid }) {
   const devStart = h.out.length;
   console.log(`\n== start ${argv.join(" ")} ==`);
+  // start() creates the process synchronously inside its executor, so the new
+  // pid is the one that was not there a statement ago.
+  const before = new Set(h.kernel.procs.keys());
   h.kernel.start("node", argv, { cwd: dir, env });
+  if (onPid) onPid([...h.kernel.procs.keys()].find((p) => !before.has(p)));
   const BIND_TIMEOUT = Number(process.env.VV_BIND_TIMEOUT || 120000);
+  // How long a server gets to bind ANYWAY after saying something fatal-looking.
+  // Not zero, because none of these three patterns is proof: every one of them
+  // is a string a process can print and then carry on from, and a toolchain that
+  // logs a failed native load and falls back to its JS implementation is doing
+  // the normal thing rather than the exotic one. Measured on a server that
+  // prints `Cannot find native binding` and binds 200ms later, aborting on the
+  // match alone reports it as never bound — a healthy template turned red by a
+  // diagnostic, which costs a human an investigation. Five seconds buys that
+  // back and still reports the genuinely dead case in ~5s against a 300s
+  // timeout, which was the point.
+  const FATAL_GRACE = Number(process.env.VV_FATAL_GRACE || 5000);
   const tb = Date.now();
   let fatal = "";
-  while (!h.listening.has(port) && Date.now() - tb < BIND_TIMEOUT && !fatal) {
+  let fatalAt = 0;
+  while (!h.listening.has(port) && Date.now() - tb < BIND_TIMEOUT) {
     await new Promise((r) => setTimeout(r, 100));
-    const tail = h.out.slice(devStart).join("");
-    const m = tail.match(/Cannot find module '([^']+)'|Error: ([^\n]*is not (?:a function|supported)[^\n]*)/);
-    if (m) fatal = m[0];
+    if (!fatal) {
+      const tail = h.out.slice(devStart).join("");
+      // `Cannot find native binding` is napi-rs giving up on every candidate for
+      // a native module. It is listed because it does NOT match the other two:
+      // it names no module path, and the reason it failed lives in an
+      // `error.cause` chain the process never prints. Eight spikes sat out a
+      // 300s timeout on it rather than reporting in 20s.
+      //
+      // The whole line is kept, not just the fragment that matched. This exact
+      // sentence has had two unrelated causes on this repo already — a binding
+      // missing from optionalDependencies, and a split emnapi peer — so the
+      // match stops the waiting and the line is what someone reads to tell them
+      // apart. It is not a diagnosis and must not read like one.
+      const m = tail.match(
+        /^.*(?:Cannot find module '[^']+'|Cannot find native binding|Error: [^\n]*is not (?:a function|supported)[^\n]*).*$/m,
+      );
+      if (m) {
+        fatal = m[0].trim();
+        fatalAt = Date.now();
+      }
+    }
+    if (fatal && Date.now() - fatalAt >= FATAL_GRACE) break;
   }
-  if (fatal) console.log(`  early-abort: ${fatal}`);
+  // Only worth saying if it actually decided the outcome: a server that printed
+  // one of these and bound anyway is a server that recovered, and reporting an
+  // abort that did not happen is how a pattern match becomes a diagnosis.
+  if (fatal && !h.listening.has(port)) console.log(`  early-abort: ${fatal}`);
+  else if (fatal) console.log(`  (ignored, it bound anyway) ${fatal}`);
   const bound = h.listening.has(port);
   console.log(`  listening on ${port}: ${bound}  (${((Date.now() - tb) / 1000).toFixed(1)}s)`);
   if (!bound) console.log("\n---- dev output tail ----\n" + h.out.slice(devStart).join("").slice(-4000));

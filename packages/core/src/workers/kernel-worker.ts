@@ -26,7 +26,7 @@ import { ensureRealYarn } from "../../../kernel-host/load-real-yarn.js";
 import { ensureRealPnpm } from "../../../kernel-host/load-real-pnpm.js";
 import { ensureRealCorepack } from "../../../kernel-host/load-real-corepack.js";
 import { ensureRealTsgo } from "../../../kernel-host/load-real-tsgo.js";
-import { hashDepKey } from "../../../kernel-host/dep-cache.js";
+import { hashDepKey, decodeShippedSnapshot } from "../../../kernel-host/dep-cache.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
@@ -92,6 +92,32 @@ const REAL_TSGO_ASSET = "vendor/tsgo-pack.bin";
 // served, nothing is fetched and every project installs normally, so an origin that
 // doesn't ship snapshots pays nothing — not even a 404 per project.
 const DEPCACHE_MANIFEST = "vendor/depcache/index.json";
+// Per-template `package-lock.json`, resolved at build time by
+// scripts/gen-template-locks.mjs and written into a project as it is created.
+// Without one, Arborist has to resolve every edge from scratch and takes the
+// `fullMetadata: true` branch to do it: measured on react-ts, that is 151 extra
+// requests carrying 143.0 MiB of packument JSON, against 12.6 MiB of tarballs —
+// 92% of the install's bytes spent deciding what to install. With the lock in
+// place it is zero, and the dep-cache key becomes the lockfile hash, which is
+// the durable one the design wanted and the one a build-time snapshot (A2) can
+// be generated against.
+//
+// NOT inlined into templates.ts. That file is already 413 KB and the locks add
+// 30-120 KiB each, so inlining ~70 of them would put several MB of JSON that no
+// single session reads into a chunk every visitor downloads. Fetched per
+// template instead, exactly when a project of that template is created. Like the
+// depcache manifest, the index is the feature's on/off switch: not served means
+// not fetched, and every project installs the way it does today.
+const TEMPLATE_LOCK_MANIFEST = "vendor/locks/index.json";
+// A project create must not hang on a slow or hung asset host. The lock is an
+// optimisation, so past this budget the project is created without one.
+//
+// It is ONE budget for the whole acquisition, not one per request. Acquiring a
+// lock is two fetches (the manifest, then the asset), and a per-request timeout
+// would let a hung — as opposed to refusing — host hold the Create dialog for
+// twice this with a disabled button and nothing to read. `fetchByDeadline` gives
+// each request only what is left of the budget.
+const TEMPLATE_LOCK_BUDGET_MS = 8000;
 
 // Resolve a vendored asset name to a full URL against the app's configured base
 // (Vite's import.meta.env.BASE_URL — "/studio/", "/embed/", or "/"). The vendor
@@ -730,22 +756,184 @@ let depCacheManifestPromise: Promise<typeof depCacheManifest> | null = null;
 // fetch rather than one per project run.
 const depCacheAssetTried = new Set<string>();
 
+/**
+ * Report — once per session per manifest — that the kernel could not read one,
+ * saying what actually failed rather than asserting a single cause.
+ *
+ * Four conditions arrive here and only ONE of them is a build defect:
+ *
+ *   200 + unparseable — the producer never ran, and a Pages SPA answers a
+ *     missing file with 200 and index.html. This is the historical bug: it hid
+ *     the shipped-snapshot feature having no producer at all, and then hid
+ *     `predev` not running the two producers, at the cost of a user's afternoon.
+ *     Loud, on `stderr` (red in the studio terminal, where they were looking)
+ *     and on the console too, since the locks manifest is read at project-create
+ *     when no terminal may be attached yet — and it names the command, because
+ *     a warning that only reports is one more thing to scroll past.
+ *   404 — legitimately absent. `KERNEL_ASSETS` marks both manifests optional,
+ *     "opt-in by design", and an embedder hosting @vivari/core without a vendor
+ *     tree is the ordinary case. Prescribing a command from a repo they have
+ *     never seen, in red, in their users' terminal, would be this build's own
+ *     contract contradicting itself. Dim, and no remedy.
+ *   5xx, or a transport error, or the locks path's budget rejection — transient
+ *     and nothing to do with how the app was built. Dim, and no cause claimed.
+ *
+ * The distinction that keeps the loud case worth reading is one level down as
+ * well: a manifest that is present and simply has no entry for this project is
+ * the common case (coverage is one template), and says nothing at all. That is
+ * why this lives at the manifest load and not at the lookup.
+ */
+function reportAbsentManifest(m: {
+  tag: string;
+  manifest: string;
+  fix: string;
+  produces: string;
+  status: number;
+  err: unknown;
+}) {
+  const head = `  [${m.tag}] ${m.manifest}`;
+  if (m.status >= 200 && m.status < 300) {
+    const line =
+      `${head} could not be read (${errMsg(m.err)}). This build was assembled without it, ` +
+      `so nothing is prebuilt and every project installs from scratch. Fix: \`${m.fix}\`.`;
+    post("log", { line, stream: "stderr" });
+    console.warn(`[vivari]${line}`);
+    return;
+  }
+  const line =
+    m.status === 404
+      ? `${head} is not served — no prebuilt ${m.produces} for this origin.`
+      : `${head} could not be fetched (${m.status ? `HTTP ${m.status}` : errMsg(m.err)}).`;
+  post("log", { line, dim: true });
+}
+
 function loadDepCacheManifest() {
   if (depCacheManifest !== undefined) return Promise.resolve(depCacheManifest);
   if (!depCacheManifestPromise) {
     depCacheManifestPromise = (async () => {
+      // 0 until a response arrives, which is what separates a transport failure
+      // from an HTTP one further down.
+      let status = 0;
       try {
         const r = await fetch(vendorUrl(DEPCACHE_MANIFEST));
-        // Not served, or served as an SPA index.html fallback (which is why the
-        // parse below is inside the try): the feature is simply off.
-        depCacheManifest = r.ok ? await r.json() : null;
-      } catch {
+        status = r.status;
+        // A miss is also what an SPA index.html fallback looks like — served 200
+        // with HTML — which is why the parse is inside the try rather than after
+        // an `r.ok` check that would pass.
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        depCacheManifest = await r.json();
+      } catch (err) {
         depCacheManifest = null;
+        reportAbsentManifest({
+          tag: "depcache",
+          manifest: DEPCACHE_MANIFEST,
+          fix: "npm run vendor:depcache",
+          produces: "snapshots",
+          status,
+          err,
+        });
       }
       return depCacheManifest;
     })();
   }
   return depCacheManifestPromise;
+}
+
+// ---- shipped template lockfiles --------------------------------------------
+// Same lifecycle as the depcache manifest above: fetched at most once per
+// session, `null` remembered as "not served".
+let templateLockManifest: Record<string, { asset: string; bytes?: number }> | null | undefined;
+let templateLockManifestPromise: Promise<typeof templateLockManifest> | null = null;
+
+// Timing out is remembered as "not served", the same as a 404, so at most ONE
+// create in a session can pay the budget. Retrying per create would turn a hung
+// host into an 8 s tax on every project the user makes, to keep chasing an
+// optimisation that host has already failed to deliver once.
+function loadTemplateLockManifest(deadline: number) {
+  if (templateLockManifest !== undefined) return Promise.resolve(templateLockManifest);
+  if (!templateLockManifestPromise) {
+    templateLockManifestPromise = (async () => {
+      // Stays 0 when the budget runs out, since a rejected `fetchByDeadline`
+      // never reaches the assignment — which is how "lock budget exhausted"
+      // gets reported as transient rather than as a build defect.
+      let status = 0;
+      try {
+        const r = await fetchByDeadline(vendorUrl(TEMPLATE_LOCK_MANIFEST), deadline);
+        status = r.status;
+        // A miss here is also what an SPA index.html fallback looks like, which
+        // is why the parse is inside the try rather than after an `r.ok` check.
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        templateLockManifest = await r.json();
+      } catch (err) {
+        templateLockManifest = null;
+        reportAbsentManifest({
+          tag: "locks",
+          manifest: TEMPLATE_LOCK_MANIFEST,
+          fix: "npm run vendor:locks",
+          produces: "lockfiles",
+          status,
+          err,
+        });
+      }
+      return templateLockManifest;
+    })();
+  }
+  return templateLockManifestPromise;
+}
+
+/**
+ * `fetch` bounded by an absolute deadline rather than a per-call duration, so a
+ * sequence of them shares one budget. Rejects without touching the network once
+ * the deadline has passed.
+ */
+function fetchByDeadline(url: string, deadline: number) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(new Error("lock budget exhausted"));
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), remaining);
+  return fetch(url, { signal: ac.signal }).finally(() => clearTimeout(timer));
+}
+
+/**
+ * The resolved `package-lock.json` for template `id`, or null if none is served.
+ * Returns the raw text so the caller writes exactly the bytes the key was
+ * computed over at build time — re-serializing parsed JSON would change the
+ * hash and miss the snapshot the lock exists to unlock.
+ */
+async function fetchTemplateLock(id: string): Promise<string | null> {
+  if (!id) return null;
+  // One deadline for both fetches, taken once, here — this is the operation the
+  // user is waiting on, so this is where the budget belongs.
+  const deadline = Date.now() + TEMPLATE_LOCK_BUDGET_MS;
+  // Set only once the manifest has LISTED this template, which is what makes
+  // the difference between a template with no lock (silent, and the case for 52
+  // of the 53 eligible ones) and a lock that was promised and did not arrive.
+  let asset = "";
+  try {
+    const manifest = await loadTemplateLockManifest(deadline);
+    const entry = manifest && manifest[id];
+    if (!entry || !entry.asset) return null;
+    asset = entry.asset;
+    const r = await fetchByDeadline(vendorUrl(asset), deadline);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const text = await r.text();
+    // An SPA fallback answers 200 with HTML. Requiring it to parse as an object
+    // with `lockfileVersion` is what keeps that out of a project root, where npm
+    // would fail on it far from the cause.
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || !parsed.lockfileVersion) throw new Error("not a lockfile");
+    return text;
+  } catch (err) {
+    // A listed-but-unusable lock is a build defect, not a miss: the producer's
+    // merge step only carries an entry forward when its file exists, so the two
+    // were built apart — and it has the same 200-with-HTML signature as the
+    // manifest case above. Worth a line because the silent cost is the largest
+    // one measured here, 10.8 s of installing from ranges instead of 3.6 s.
+    // Dim, not red: the budget rejection lands here too, and that is a slow
+    // link rather than anyone's mistake.
+    if (asset) post("log", { line: `  [locks] ${asset} is listed but unusable (${errMsg(err)}) — resolving from ranges.`, dim: true });
+    return null;
+  }
 }
 
 // A dep-cache lookup missed, but the app may SHIP a snapshot for this exact key.
@@ -770,8 +958,12 @@ async function tryFetchShippedSnapshot(key: string, pm: string): Promise<boolean
       post("log", { line: `  [depcache] prebuilt snapshot unavailable (HTTP ${r.status}) — installing normally.`, dim: true });
       return false;
     }
-    const bytes = new Uint8Array(await r.arrayBuffer());
-    const res = await kernelFsRef.fs.depCacheImport(key, bytes);
+    const archive = await decodeShippedSnapshot(new Uint8Array(await r.arrayBuffer()));
+    if (!archive) {
+      post("log", { line: "  [depcache] prebuilt snapshot was not usable — installing normally.", dim: true });
+      return false;
+    }
+    const res = await kernelFsRef.fs.depCacheImport(key, archive);
     if (!res) {
       // The store validated the archive and rejected it (truncated download, wrong
       // asset, an error page served with a 200). Not fatal — just install.
@@ -975,6 +1167,15 @@ function baseProcEnv(dir) {
     // both off by default; a user can still run `npm audit` explicitly.
     npm_config_audit: "false",
     npm_config_fund: "false",
+    // Trust the persisted _cacache instead of revalidating it. npm's default is
+    // to send a conditional request per cached packument; measured on a second
+    // project with the same dependencies, that is 141 round-trips that all come
+    // back 304 with no body — pure latency, and 141 more chances for a flaky
+    // network to stall an install. The staleness this trades away is bounded:
+    // the cache is per-origin and a user who wants the newest version can pass
+    // --prefer-online or ask for a range npm has not resolved before, both of
+    // which still go to the registry.
+    npm_config_prefer_offline: "true",
     // Update checks are pointless in the VM (you can't `npm i -g` a new global),
     // and the `update-notifier` package (used by many CLIs, incl. Docusaurus)
     // spawns a *detached* background child to run the check — which fails ENOENT
@@ -1705,11 +1906,6 @@ async function boot() {
 
   kernel.installCoreutils();
 
-  // North Star: the shell's `npm`/`npx` IS the REAL npm CLI. The Turbo-analog is
-  // retired (no longer in COREUTILS), so this is the only npm — the tree persists
-  // in OPFS, so after the first boot ensureRealNpm only re-applies the cheap
-  // shims; a fresh origin fetches + unpacks the ~12 MB asset once (one batched
-  // VFS transfer). A missing asset simply means no `npm` on PATH, like yarn/pnpm.
   kernel.mkdirp("/home/user");
   // os.tmpdir() is "/tmp", so it MUST exist: tools call mkdtempSync(join(tmpdir(),
   // "x-")) at startup (e.g. Nuxt/vite-node's generateSocketPath), which mkdir's a
@@ -1730,32 +1926,10 @@ async function boot() {
   // below, which only matter once you actually run install/dev.
   post("kernel-online", {});
 
-  // Register the heavy, rarely-universal toolchains as ON-DEMAND programs (see
-  // below, after the eager npm load): tsc/tsgo, yarn, pnpm, corepack are only
-  // fetched + unpacked the first time their command is actually spawned, instead
-  // of paying for them on every boot. npm stays eager (below) — nearly every
-  // session installs, and `npx` shells out to it.
+  // Register the heavy, rarely-universal toolchains as ON-DEMAND programs:
+  // npm/npx, tsc/tsgo, yarn, pnpm and corepack are fetched + unpacked the first
+  // time their command is actually spawned, instead of on every boot.
   registerLazyTools();
-  try {
-    const npmT0 = Date.now();
-    const res = await ensureRealNpm(kernel, async () => {
-      const r = await fetch(vendorUrl(REAL_NPM_ASSET));
-      if (!r.ok) return null;
-      return new Uint8Array(await r.arrayBuffer());
-    });
-    if (res && res.restored) {
-      post("log", { line: `  [boot] real npm ready (restored from OPFS, +${Date.now() - npmT0}ms).`, dim: true });
-    } else if (res) {
-      post("log", {
-        line: `  [boot] real npm ${res.version} loaded (${res.fileCount} files, +${Date.now() - npmT0}ms).`,
-        dim: true,
-      });
-    } else {
-      post("log", { line: "  [boot] real npm asset unavailable — `npm` not installed.", dim: true });
-    }
-  } catch (e) {
-    post("log", { line: `  [boot] real npm load failed (${(e && e.message) || e}) — 'npm' not installed.`, dim: true });
-  }
 
   post("ready", {});
   post("log", { line: `  [boot] kernel ready in ${Date.now() - t0}ms.`, dim: true });
@@ -1816,6 +1990,24 @@ function registerLazyTools() {
     );
   };
 
+  // North Star: the shell's `npm`/`npx` IS the REAL npm CLI. The Turbo-analog is
+  // retired (no longer in COREUTILS), so this is the only npm — the tree persists
+  // in OPFS, so a returning visitor's first use only re-applies the cheap shims;
+  // a fresh origin fetches + unpacks the asset once (one batched VFS transfer).
+  // A missing asset simply means no `npm` on PATH, like yarn/pnpm.
+  //
+  // ON-DEMAND like the rest, though it is the one nearly every session ends up
+  // using. npm-pack.bin is 2.79 MB — 48.6% of the cold-boot payload — and it was
+  // awaited between `kernel-online` and `ready`, so it was on the path to the
+  // first project even in the case it exists to remove: a snapshot restore means
+  // `VV_RUN` is the dev command with no `install &&` prefix (see openTerminal),
+  // and npm is never spawned at all. Nothing between here and `ready` needs it:
+  // the /bin shims it writes are read at spawn, and every spawn path awaits
+  // `ensureCommandLoaded` first (kernel.js handleSpawn/handleSpawnAsync, and
+  // spawnProcess for the SDK) — including `bun install`, which reaches npm by
+  // spawning it like anything else.
+  lazyTool(["npm", "npx"], "npm", ensureRealNpm, REAL_NPM_ASSET,
+    "Downloading npm on first use…");
   // Real TypeScript 7 (tsgo, Go/wasm) — ~47 MB wasm, nothing at boot needs it.
   lazyTool(["tsc", "tsgo"], "tsgo", ensureRealTsgo, REAL_TSGO_ASSET,
     "Downloading TypeScript 7 (tsgo) on first use — this can take a few seconds…");
@@ -2615,6 +2807,15 @@ self.onmessage = async (event) => {
       const dir = m.dir;
       kernel.mkdirp(dir);
       const files = m.files || {};
+      // The resolved lockfile is fetched BEFORE the batch write and included in
+      // it, not written afterwards: the reply to this message is what releases
+      // the studio to start the run, so a lock landing after it would race the
+      // install it exists to shorten. See TEMPLATE_LOCK_MANIFEST — it is
+      // budgeted, and a template that ships no lock costs nothing here.
+      if (files["package.json"] && !files["package-lock.json"] && m.manifest && m.manifest.id) {
+        const lock = await fetchTemplateLock(m.manifest.id);
+        if (lock) files["package-lock.json"] = lock;
+      }
       const batch = Object.entries(files).map(([rel, contents]) => ({ path: dir + "/" + rel, contents }));
       if (batch.length) await kernel.writeFilesBatch(batch);
       if (m.manifest) registerProject(dir, m.manifest, m.title);

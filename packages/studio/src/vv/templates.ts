@@ -1141,9 +1141,16 @@ server.listen(PORT, () => console.log('[backend] listening on :' + PORT + ' (htt
 //
 // postinstall seeds Next's wasm cache from the installed package so first compile
 // is offline; if it is skipped, Next downloads the wasm on demand (also works).
-const nextSeedSwc = `// Best-effort: copy the installed @next/swc-wasm-nodejs into Next's wasm cache
+const nextSeedSwc = `// Best-effort: expose the installed @next/swc-wasm-nodejs under Next's wasm cache
 // dir so \`next dev\` loads the wasm SWC locally instead of downloading it at
 // first compile. Safe to fail — Next falls back to its own on-demand download.
+//
+// Each leaf is HARD-LINKED, not copied. The package is 30 MB and it is almost all
+// one .wasm; a byte copy is 30 MB read plus 30 MB written through the sync fs
+// bridge, and it lands at the very end of the install where no progress UI is
+// watching, so it reads as a hang. A link is a second name for the same inode, so
+// it also stops the tree costing 60 MB of the VFS's Wasm heap. A VFS build with no
+// OP_LINK needs no handling here — \`fs.link\` itself copies on ENOSYS/EINVAL.
 import fs from "node:fs";
 import path from "node:path";
 
@@ -1157,7 +1164,11 @@ try {
         const sp = path.join(s, e.name);
         const dp = path.join(d, e.name);
         if (e.isDirectory()) cp(sp, dp);
-        else fs.writeFileSync(dp, fs.readFileSync(sp));
+        else {
+          // The catch is for EEXIST: a partially-seeded dir from an interrupted
+          // run would otherwise throw here and abandon the rest of the tree.
+          try { fs.linkSync(sp, dp); } catch { fs.writeFileSync(dp, fs.readFileSync(sp)); }
+        }
       }
     };
     cp(src, dst);

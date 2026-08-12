@@ -55,6 +55,144 @@ export async function hashDepKey(pm, input, src = "lock") {
   return `${pm}:${src}:${hex}`;
 }
 
+// ---- shipped-snapshot transport container -----------------------------------
+// A snapshot built at BUILD time is downloaded before it is imported, and the
+// archive `pack()` emits is raw bytes — react-ts is 59.8 MiB of them. Shipping
+// that uncompressed costs more to download than the install it replaces, so a
+// shipped asset is wrapped in a second, outer frame that names a codec:
+//
+//   [u32le headerLen][headerJSON {v:2, c}][compressed archive]
+//
+// deliberately the SAME shape as the archive itself, because a v1 archive's own
+// header is `{v:1, entries:[…]}` — so one parse tells the two apart and a
+// snapshot produced before this existed still imports. Only the transport is
+// compressed: what lands in `storage` is always the plain archive, so `restore()`
+// and the LRU are untouched by this.
+//
+// The codec is NAMED rather than assumed because the right answer may change:
+// measured on next-ts, gzip is 57.2 MiB and brotli q9 is 35.5 MiB.
+//
+// Decoding lives HERE rather than at the callers, and the reason is a bug rather
+// than tidiness: the input is a download, so a corrupt one is expected, and
+// Node's `DecompressionStream` faults both halves of the stream at once. A
+// caller that awaited only the read side left the write side rejected and
+// unhandled, which Node treats as fatal — the try/catch saw a clean null and the
+// process died a few ticks later somewhere else. `inflateGzip` below awaits both
+// in one `Promise.all` so that cannot recur, and there is one copy of it.
+//
+// `DecompressionStream` is a global, not a dependency, and is present wherever
+// this module already runs (Node ≥ 18, and any browser that can give Vivari
+// COOP/COEP + SharedArrayBuffer) — the same standing this module's existing use
+// of `TextEncoder` and `crypto.subtle` has. What it must NOT acquire is a
+// BUNDLED decoder: brotli would mean importing packages/codec here, and hence
+// into every worker that touches the dep cache. That is the real cost behind
+// choosing gzip, and the reason `c` exists is so revisiting it is a header
+// field rather than a format break.
+export const SNAPSHOT_CONTAINER_VERSION = 2;
+
+/**
+ * Wrap a compressed `body` for shipping. `codec` is the name the reader will
+ * dispatch on ("gz"); `meta` is merged into the header for humans and tooling.
+ */
+export function writeSnapshotContainer(codec, body, meta = {}) {
+  const header = enc.encode(JSON.stringify({ v: SNAPSHOT_CONTAINER_VERSION, c: codec, ...meta }));
+  const out = new Uint8Array(4 + header.length + body.length);
+  new DataView(out.buffer).setUint32(0, header.length, true);
+  out.set(header, 4);
+  out.set(body, 4 + header.length);
+  return out;
+}
+
+/**
+ * Read the transport frame off a downloaded snapshot. Returns
+ * `{ codec, body }` — `codec: null` means `raw` is already a plain archive
+ * (a v1 asset, or one produced with no compression), so `body` is `raw` itself.
+ * Returns null only for bytes that are neither, which is the case that matters:
+ * an SPA index.html served with a 200 in place of a missing asset.
+ */
+export function readSnapshotContainer(raw) {
+  if (!(raw instanceof Uint8Array) || raw.length < 4) return null;
+  const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const headerLen = dv.getUint32(0, true);
+  if (!headerLen || headerLen > raw.length - 4) return null;
+  let header;
+  try {
+    header = JSON.parse(dec.decode(raw.subarray(4, 4 + headerLen)));
+  } catch {
+    return null;
+  }
+  if (!header || typeof header !== "object") return null;
+  if (header.v === SNAPSHOT_CONTAINER_VERSION && typeof header.c === "string") {
+    return { codec: header.c, body: raw.subarray(4 + headerLen) };
+  }
+  // Anything else with a parseable header is a plain archive; `inspect()` is
+  // what decides whether it is a VALID one.
+  return { codec: null, body: raw };
+}
+
+/**
+ * A downloaded snapshot's bytes → the plain archive `importArchive` takes, or
+ * null. Null for anything this build cannot turn into an archive: bytes that are
+ * neither a container nor an archive (the SPA index.html a missing asset answers
+ * with), a truncated download, or a codec named in the header that is not
+ * implemented here. Never "unpack it anyway" — the caller installs normally.
+ *
+ * gzip only. `DecompressionStream` is the one decoder every worker already has;
+ * brotli would be ~30% smaller (react-ts: 8.6 MB against 12.5 MB) but browsers
+ * expose no brotli DecompressionStream, so it would mean instantiating
+ * packages/codec in whichever worker calls this. `c` is the seam where that gets
+ * revisited if hosting bytes argue louder than they do today.
+ */
+export async function decodeShippedSnapshot(raw) {
+  const framed = readSnapshotContainer(raw);
+  if (!framed) return null;
+  if (!framed.codec) return framed.body;
+  if (framed.codec !== "gz") return null;
+  try {
+    return await inflateGzip(framed.body);
+  } catch {
+    return null;
+  }
+}
+
+// Read and write concurrently — awaiting the write before reading deadlocks once
+// the stream's internal buffer fills, which for a 60 MB snapshot is immediately.
+//
+// Both promises are awaited in the same `Promise.all`, and that is load-bearing
+// rather than tidy: the input here is a DOWNLOAD, so a corrupt one is expected,
+// and it fails on both halves at once. Handling only the read side leaves the
+// write side rejected and unhandled, which a browser reports as an unhandled
+// rejection and Node treats as fatal — the caller's try/catch sees a clean null
+// and the process dies anyway, a few ticks later, somewhere else.
+async function inflateGzip(bytes) {
+  const stream = new DecompressionStream("gzip");
+  const writer = stream.writable.getWriter();
+  const writing = (async () => {
+    await writer.write(bytes);
+    await writer.close();
+  })();
+  const reading = (async () => {
+    const reader = stream.readable.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.length;
+    }
+    return { chunks, total };
+  })();
+  const [, { chunks, total }] = await Promise.all([writing, reading]);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const c of chunks) {
+    out.set(c, o);
+    o += c.length;
+  }
+  return out;
+}
+
 export async function createDepCache({ access, storage, maxBytes = DEFAULT_MAX_BYTES }) {
   // index: key -> { size, atime } (a real snapshot) | { alias, atime } (a pointer).
   let index = { entries: {} };

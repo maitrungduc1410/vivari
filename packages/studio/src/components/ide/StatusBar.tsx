@@ -17,6 +17,7 @@ import GitBranch from "~icons/lucide/git-branch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { languageLabel } from "@/vv/controller";
+import { phaseLabel } from "@/vv/run-phase";
 import { StatusBarPickers, type StatusPicker } from "./StatusBarPickers";
 import { useIde } from "./useIde";
 
@@ -61,9 +62,19 @@ export function StatusBar() {
           <TriangleAlert className="ml-1 size-3.5" />
           {warnings}
         </StatusItem>
-        {/* Transient feedback for routine operations (save, run, import). Auto-
-            hides; `min-w-0` keeps a long path from shoving the right side off. */}
-        {message && <span className="min-w-0 truncate px-2">{message}</span>}
+        {/* A run in progress outranks the transient message: `status()` auto-
+            hides after a few seconds, and an install that runs for half a minute
+            behind a status bar that has gone quiet reads as a hang. */}
+        {snap.runPhase ? (
+          <span className="min-w-0 truncate px-2">
+            {phaseLabel(snap.runPhase.phase)} · {snap.runPhase.name}
+            {snap.runPhase.detail ? ` · ${snap.runPhase.detail}` : ""}
+          </span>
+        ) : (
+          /* Transient feedback for routine operations (save, run, import). Auto-
+             hides; `min-w-0` keeps a long path from shoving the right side off. */
+          message && <span className="min-w-0 truncate px-2">{message}</span>
+        )}
 
         <span className="flex-1" />
 

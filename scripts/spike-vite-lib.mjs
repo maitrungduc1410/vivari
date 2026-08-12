@@ -33,6 +33,7 @@ import { createAliasedFetcher } from "./lib/aliased-fetcher.mjs";
 import { Worker, MessageChannel } from "node:worker_threads";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const VFS_NPM = "/usr/lib/node_modules/npm";
 
@@ -158,9 +159,11 @@ export async function runViteSpike({ name, dir, templateId, files, entryModule, 
   const listening = new Set();
   const live = new Set();
   const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, fetcher, stdout: cap, stderr: cap });
+  let servingSince = 0;
   kernel.onListen = (port) => {
     listening.add(port);
     live.add(port);
+    if (port === PORT && !servingSince) servingSince = Date.now();
   };
   kernel.onClose = (port) => live.delete(port);
 
@@ -178,6 +181,36 @@ export async function runViteSpike({ name, dir, templateId, files, entryModule, 
   // copy: production could change and the copy would keep passing. The threshold is
   // dropped to a few seconds because the point is to give the watchdog every chance
   // to fire, not to wait out 60.
+  //
+  // WHAT COUNTS AS FALSE, and why it is the serving window rather than the whole run.
+  // Ember failed this gate in CI on one report — `PID 5 (vite) silent 7s` — and the
+  // report was RIGHT. Measured on the real tree, it lands in the window between vite
+  // being spawned and vite binding its port, and in that window the kernel holds no
+  // evidence whatsoever that vite is alive: `everOutput` false (it has never printed),
+  // `syscalls` 0, `idleMs === silentMs`, no port, and one `wasi-worker.mjs` child that
+  // is equally inert. Its three ancestors are excused by `hasLiveChild`; vite is not,
+  // because its only child is a thread and a thread that has never printed is
+  // `isUnobservable`, which revokes that excuse by design so a wedge in an unwatched
+  // child surfaces at its parent.
+  //
+  // Nothing distinguishes that state from a vite that wedged on startup, and the
+  // difference is not knowable from here: file writes bypass the kernel entirely
+  // (kernel.js says so, and syscalls=0 while vite is demonstrably working proves it),
+  // and the fs worker has no notion of a pid, so there is no per-process progress
+  // signal to consult. Suppressing it would mean never reporting a dev server that
+  // dies during startup — a real detection traded for a quiet log.
+  //
+  // Ember is not shaped differently from the other seven. All eight are
+  // sh -> npm -> sh -> vite -> pool. The only difference is how long vite takes to
+  // bind: react 1.4s against ember 5.1-5.5s here, and CI is slower still, so ember is
+  // the one template whose startup crosses a 6s threshold. Production's is 60s.
+  //
+  // So the window is the answer, not the pid. The bug this gate was built on happened
+  // WHILE THE SERVER SERVED — that is the first sentence above — and a report against
+  // a process that has bound its port is impossible unless `serving`, `unobservable`
+  // or the parent rules have broken, which is exactly what wants gating. A report
+  // before the bind is the watchdog doing its job on a process that has not yet
+  // proven anything, so it is printed rather than counted, and never hidden.
   kernel.stallThresholdMs = Number(process.env.VV_STALL_MS || 6000);
   kernel.stallCheckMs = 1000;
   const stallReports = [];
@@ -188,6 +221,7 @@ export async function runViteSpike({ name, dir, templateId, files, entryModule, 
       command: info.command,
       isThread: !!info.isThread,
       silentMs: info.silentMs,
+      at: Date.now(),
     });
   };
   kernel.installCoreutils();
@@ -230,6 +264,33 @@ export async function runViteSpike({ name, dir, templateId, files, entryModule, 
     const abs = dir + "/" + rel;
     kernel.mkdirp(abs.slice(0, abs.lastIndexOf("/")));
     kernel.writeFile(abs, contents);
+  }
+
+  // …and the build-time resolved lockfile, if one has been generated for this
+  // template, because the STUDIO writes it: `vv-create-project` fetches
+  // `vendor/locks/<id>.json` and puts it in the project before the install runs
+  // (kernel-worker.ts). Installing without it here would gate a tree that no user
+  // gets — and a lock is resolved on the host, so the failure it can introduce
+  // (an optional variant pinned that the VM cannot reify) is exactly the kind
+  // that only shows up in the VM. That makes this the gate for the locks: run
+  // `npm run vendor:locks -- <id>` before this spike and the install below is
+  // the product's install.
+  //
+  // Absent, this logs and installs from ranges. That is a real coverage hole
+  // rather than a neutral default, so it says so rather than staying quiet.
+  if (!files["package-lock.json"] && templateId) {
+    const lockPath = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      `../packages/studio/public/vendor/locks/${templateId}.json`,
+    );
+    if (fs.existsSync(lockPath)) {
+      const lock = fs.readFileSync(lockPath, "utf8");
+      kernel.writeFile(dir + "/package-lock.json", lock);
+      console.log(`[${name}] installing from the generated lockfile (${(lock.length / 1024).toFixed(0)} KiB)`);
+    } else {
+      console.log(`[${name}] NO generated lockfile — installing from ranges, which is not what the studio does.`);
+      console.log(`[${name}] Generate it:  npm run vendor:locks -- ${templateId}`);
+    }
   }
 
   const env = {
@@ -497,17 +558,42 @@ export async function runViteSpike({ name, dir, templateId, files, entryModule, 
       `(threshold ${Math.round(kernel.stallThresholdMs / 1000)}s)`,
   );
 
-  const falseStalls = stallReports.filter((r) => devTreePids.has(r.pid));
+  const inTree = stallReports.filter((r) => devTreePids.has(r.pid));
+  const falseStalls = inTree.filter((r) => servingSince && r.at >= servingSince);
+  const startupStalls = inTree.filter((r) => !servingSince || r.at < servingSince);
   const threads = [...kernel.procs.values()].filter((p) => p.isThread && !p.finalized);
   const unnamedThreads = threads.filter((p) => !p.command || !String(p.command).trim());
+  const show = (r) =>
+    `    PID ${r.pid} (${r.command || ""})${r.isThread ? " [worker thread]" : ""} silent ${Math.round(r.silentMs / 1000)}s`;
   console.log(`  worker threads in the dev tree: ${threads.length} (${threads.map((p) => p.command || "??").join(", ")})`);
-  console.log(`  stall reports against the healthy dev tree: ${falseStalls.length}`);
-  for (const r of falseStalls) {
-    console.log(`    PID ${r.pid} (${r.command || ""})${r.isThread ? " [worker thread]" : ""} silent ${Math.round(r.silentMs / 1000)}s`);
+  console.log(`  stall reports against the SERVING dev tree: ${falseStalls.length}`);
+  for (const r of falseStalls) console.log(show(r));
+  // Printed, not counted. These are reports about a process that had not yet bound
+  // anything, which the watchdog is right to make and this gate is not about; the
+  // header explains at length why. Visible so that a change which starts flooding
+  // the startup window is read here rather than discovered by a user.
+  if (startupStalls.length) {
+    console.log(`  (before the port bound, not counted: ${startupStalls.length})`);
+    for (const r of startupStalls) console.log(show(r));
   }
   if (unnamedThreads.length) console.log(`  UNNAMED worker threads: ${unnamedThreads.length}`);
   const noFalseStalls = falseStalls.length === 0;
   const threadsNamed = unnamedThreads.length === 0;
+
+  // The same property, asked directly of the production function instead of waiting
+  // for the watchdog to ask it. Counting reports depends on the watchdog's timing —
+  // its interval, the doubling backoff, how long the tree stayed quiet — so a broken
+  // suppressor could produce zero reports in a short run and still be broken. This
+  // asks about every live process in a tree that is serving right now, which is the
+  // state the original bug occurred in, and it cannot be passed by being lucky.
+  const reportableNow = [...kernel.procs.values()]
+    .filter((p) => !p.finalized && devTreePids.has(p.pid) && shouldReportStallFor(kernel, p.pid))
+    .map((p) => `PID ${p.pid} (${p.command || "?"})`);
+  const noneReportableWhileServing = stillServing && reportableNow.length === 0;
+  console.log(
+    `  reportable right now, with the server up: ${reportableNow.length}` +
+      (reportableNow.length ? ` — ${reportableNow.join(", ")}` : ""),
+  );
 
   const ok =
     inst.code === 0 &&
@@ -521,6 +607,7 @@ export async function runViteSpike({ name, dir, templateId, files, entryModule, 
     !scanFailed &&
     preBundled &&
     noFalseStalls &&
+    noneReportableWhileServing &&
     threadsNamed &&
     watchdogHadItsChance;
   console.log(

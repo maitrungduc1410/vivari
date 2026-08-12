@@ -2137,8 +2137,9 @@ warn rules above), CPython-faithful `SystemExit`, the generated dispatch source 
 no `needsWasm`, so `toolchain-gate`'s unfiltered `run-spikes.mjs --offline` runs it on every
 push and PR, and it asserts its own registration so the gate cannot be dropped silently.
 Both spikes read the shipped `templates.ts` through `scripts/lib/shipped-templates.mjs` —
-which `import`s the file and hands back the real exported objects, Node 22 stripping the
-types on the way in. It used to be ~160 lines of hand-written scanner looking for
+which `import`s the file and hands back the real exported objects, Node stripping the types
+on the way in (by default from 22.18, and through `scripts/lib/import-ts.mjs`'s in-process
+stripper below that). It used to be ~160 lines of hand-written scanner looking for
 `manifest: {…}` / `files: {…}` blocks, which could only see inline string literals: a file
 built by a helper (`backendDemoHtml("Bun")`) or interpolating a local came back skipped, or
 holding the UNEVALUATED `${…}` source. So neither can drift from what ships, and both drive the CLI seams through the one stub-runtime

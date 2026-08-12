@@ -32,12 +32,25 @@ export function EditorGroup() {
   const [dragTab, setDragTab] = useState<string | null>(null);
   const [overTab, setOverTab] = useState<{ rel: string; after: boolean } | null>(null);
 
-  const mountRef = useCallback(
-    (el: HTMLDivElement | null) => {
-      if (el) void c.mountEditor(el);
-    },
-    [c],
-  );
+  // Monaco is ~960 KB and this component is mounted the whole time, including
+  // under the Home overlay (see the comment at AppShell.tsx's `snap.view` check)
+  // — so the editor used to download before a project existed, competing with
+  // the kernel's own Wasm for a connection nobody had asked it to use.
+  //
+  // Deferring the CALL rather than the component is what keeps the deliberate
+  // "editor and terminals survive a round-trip to Home" property intact: the
+  // host div is still here, still keyed the same, and once `mountEditor` has run
+  // it never unmounts. Only the first mount waits.
+  const onHome = snap.view === "home";
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (onHome) return;
+    const el = hostRef.current;
+    if (el) void c.mountEditor(el);
+  }, [c, onHome]);
+  const mountRef = useCallback((el: HTMLDivElement | null) => {
+    hostRef.current = el;
+  }, []);
 
   // Keep the active tab on screen. Past ~7 open files the strip overflows, and
   // activating a tab from anywhere but the strip itself (Explorer click, ⌘P, a

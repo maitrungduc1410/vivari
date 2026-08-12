@@ -5,6 +5,7 @@ import tailwindcss from "@tailwindcss/vite";
 import Icons from "unplugin-icons/vite";
 import { fileURLToPath, URL } from "node:url";
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -137,6 +138,127 @@ function serveDevtools(): Plugin {
   };
 }
 
+// Two build-time facts the runtime cannot work out for itself, both derived from
+// the emitted (content-hashed) filenames:
+//
+//   1. `public/sw.js` needs the real names of the role bundles to precache them.
+//      It shipped a list of unhashed names (`kernel-worker.js`) that no Vite
+//      build has ever emitted — see the long note at the top of that file.
+//   2. `index.html` has exactly ONE `<script type="module">` and nothing else, so
+//      the preload scanner sees nothing past the entry chunk. The kernel worker
+//      is discovered only after ~1.7 MB of JS has downloaded AND executed, and
+//      the codec/crypto Wasm only after the worker's own module graph resolves:
+//      a five-round-trip chain, all of it serial, all of it on the critical path.
+//
+// One plugin because they consume the same thing — the bundle's filenames — and
+// splitting them meant two passes over `generateBundle` that could disagree.
+const CRITICAL = {
+  // Matched against the emitted file name (rolldown derives the prefix from the
+  // source module, so these survive a hash change but not a rename).
+  kernelWorker: /^assets\/kernel-worker-[^/]+\.js$/,
+  wasm: /^assets\/vivari_(codec|crypto|vfs)_bg-[^/]+\.wasm$/,
+};
+// Precached on install: the four role bundles, plus the Wasm the kernel compiles
+// before it can come online. process-worker is the expensive one — without a
+// precache it is re-fetched on EVERY process spawn.
+const PRECACHE_PATTERNS = [
+  /^assets\/(kernel|process|fs|fetcher)-worker-[^/]+\.js$/,
+  CRITICAL.wasm,
+];
+
+const MANIFEST_DECL = "const __VV_PRECACHE__ = ";
+
+function vvPrecacheAndHints(): Plugin {
+  let outDir = "dist";
+  let basePath = "/";
+  let manifest: { id: string; assets: string[]; prefixes: string[]; shell: string } | null = null;
+  let hints: string[] = [];
+  return {
+    name: "vv-precache-and-hints",
+    apply: "build",
+    configResolved(cfg) {
+      outDir = cfg.build.outDir;
+      basePath = cfg.base;
+    },
+    generateBundle(_opts, bundle) {
+      const names = Object.keys(bundle).sort();
+      const pick = (re: RegExp) => names.filter((n) => re.test(n));
+      const assets = PRECACHE_PATTERNS.flatMap(pick);
+      // A build id derived from the output, not from the clock: rebuilding
+      // unchanged sources must not invalidate every user's cache, and two
+      // deploys of the same commit must agree. The names already carry content
+      // hashes, so hashing the name list is hashing the content.
+      const id = createHash("sha256").update(names.join("\n")).digest("hex").slice(0, 16);
+      manifest = {
+        id,
+        assets: assets.map((a) => basePath + a),
+        // ONLY content-hashed output. The SW is hoisted to the origin root by
+        // scripts/assemble-site.mjs, so a prefix derived from `self.location`
+        // there would swallow the landing, the docs and the blog — hence an
+        // explicit list — but the narrowness matters for a second reason:
+        // cache-first is only safe for a URL that changes when its bytes do.
+        //
+        // `vendor/` is deliberately NOT here. Vite copies `public/` outside the
+        // rollup bundle, so no vendor file is in `bundle` and none of them
+        // contribute to the id above; their URLs are stable and unhashed, and
+        // the locks and snapshots under them are re-resolved on every CI
+        // checkout. Serving them cache-first under an id that cannot see them
+        // pins a returning visitor to the previous deploy's vendor tree with no
+        // invalidation path at all — and mixes trees, since a client can hold a
+        // cached depcache/index.json from deploy N while fetching deploy N+1's
+        // snapshot. They revalidate over HTTP instead, which is why
+        // assemble-site.mjs keeps `immutable` off `vendor/`.
+        prefixes: [basePath + "assets/"],
+        shell: basePath + "index.html",
+      };
+      // Fail loudly rather than emit a manifest that caches nothing. This is the
+      // exact failure the dead `__VV_BUILD_ID__` gate hid for the whole life of
+      // the Vite build: a precache whose every entry 404s looks identical to a
+      // healthy one, because precache() is per-URL best-effort by design.
+      for (const [label, re] of [["kernel worker", CRITICAL.kernelWorker], ["runtime wasm", CRITICAL.wasm]] as const) {
+        if (!pick(re).length) this.error(`vv-precache: no emitted ${label} matched ${re} — the precache manifest would be a no-op`);
+      }
+      // Only `dns-prefetch` ships. The obvious hints here — `modulepreload` for
+      // the kernel worker, `preload as=fetch` for the Wasm — were measured and
+      // removed: the kernel worker and the Wasm are fetched *from inside a
+      // Worker*, and neither the document's preload cache (destination mismatch)
+      // nor the HTTP cache (the hint's `crossorigin` makes it a separate cache
+      // key from the worker's credentialed fetch) served the second request.
+      // scripts/measure-studio-boot.mjs --json showed every hinted URL fetched
+      // twice over the network, 2.2 MiB uncompressed of pure waste per cold
+      // load, and that held even with the immutable headers below in place.
+      // Do not re-add these without a --json run proving the second fetch is
+      // `cached: true`.
+      hints = [
+        // Not `preconnect`: the registry is not touched until a user creates a
+        // project, which can be minutes away, and Chrome drops an unused
+        // preconnect after ~10s (and warns). The controller opens the real
+        // connection when a create is committed; this just pre-resolves DNS,
+        // which costs nothing and has no such timeout.
+        `<link rel="dns-prefetch" href="https://registry.npmjs.org">`,
+      ];
+    },
+    transformIndexHtml: {
+      order: "post",
+      handler: (html) => (hints.length ? html.replace("</head>", hints.join("\n    ") + "\n  </head>") : html),
+    },
+    closeBundle() {
+      if (!manifest) return;
+      // Rewritten on disk rather than through `define`: Vite copies `public/`
+      // verbatim and never transforms it, which is the original reason the
+      // build id never arrived.
+      const swFile = path.resolve(fileURLToPath(new URL("./", import.meta.url)), outDir, "sw.js");
+      const src = fs.readFileSync(swFile, "utf8");
+      // Strip any manifest already at the top before prepending. `emptyOutDir`
+      // defaults true so this is normally a fresh copy of public/sw.js, but a
+      // build into a kept outDir would otherwise declare the const twice — a
+      // syntax error, and one that surfaces only as a failed SW install.
+      const body = src.startsWith(MANIFEST_DECL) ? src.slice(src.indexOf("\n") + 1) : src;
+      fs.writeFileSync(swFile, `${MANIFEST_DECL}${JSON.stringify(manifest)};\n${body}`);
+    },
+  };
+}
+
 // For the unified Cloudflare Pages deploy the studio is served under `/studio/`
 // (the landing owns `/` and the docs own `/docs/`). Set `VV_BASE=/studio/` for that
 // build; local `npm run dev` keeps the default root base. The preview Service
@@ -160,6 +282,7 @@ export default defineConfig({
     // After swScope so its header middleware (COEP/COOP) runs first and stamps
     // these responses before we stream the vendored DevTools assets.
     serveDevtools(),
+    vvPrecacheAndHints(),
   ],
   resolve: {
     alias: {
