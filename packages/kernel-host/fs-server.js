@@ -282,7 +282,21 @@ export class FsServer {
       if (slash > 0) {
         const dir = e.path.slice(0, slash);
         if (!madeDirs.has(dir)) {
+          // Same rule as OP_MKDIR: every directory this creates is its own event,
+          // shallowest first. A batch write mostly lands before any watcher exists
+          // (vv-create-project writes a template into a fresh dir), but not always —
+          // `vv-import-tree` drops a folder into a workspace that may already have a
+          // dev server running, and a directory created without an event is one the
+          // userland recursive watcher never attaches to. Only computed when someone
+          // is actually watching; otherwise this stays the plain mkdir it was.
+          const created = [];
+          if (this.couldNotify(dir) && !this.vfs.exists(dir)) {
+            for (let q = dir; q && q !== "/" && !this.vfs.exists(q); q = q.slice(0, q.lastIndexOf("/")) || "/") {
+              created.unshift(q);
+            }
+          }
           try { this.vfs.mkdir(dir, true); } catch { /* exists */ }
+          for (const q of created) this.notifyWatch(q, "rename");
           madeDirs.add(dir);
         }
       }
@@ -323,9 +337,28 @@ export class FsServer {
         return encodeString(vfs.readdir(s(0)).join("\n"));
       case OP_MKDIR: {
         const path = s(0);
-        vfs.mkdir(path, (flags & FLAG_RECURSIVE) !== 0);
+        const recursive = (flags & FLAG_RECURSIVE) !== 0;
+        // A recursive mkdir can create SEVERAL directories, and every one of them
+        // is a filesystem event — real inotify fires one per level. Notifying only
+        // the deepest path starved Node's userland recursive watcher (lib's
+        // recursive_watch.js, one non-recursive watch per directory): the deepest
+        // path is not a direct child of any watched directory, so the event was
+        // dropped, no watcher was ever attached to the new intermediate level, and
+        // everything created beneath it stayed invisible until an unrelated event
+        // at an already-watched path forced a rescan. User-visible as "my new
+        // SvelteKit route 404s until I touch some other file" — gated by
+        // scripts/spike-watch-nested.mjs. Collect the missing ancestors BEFORE
+        // the mkdir (afterwards they all exist), shallowest first, notify each.
+        let created = [path];
+        if (recursive && this.couldNotify(path) && !vfs.exists(path)) {
+          created = [];
+          for (let q = path; q && q !== "/" && !vfs.exists(q); q = q.slice(0, q.lastIndexOf("/")) || "/") {
+            created.unshift(q);
+          }
+        }
+        vfs.mkdir(path, recursive);
         if (p) p.onWrite(path);
-        this.notifyWatch(path, "rename");
+        for (const q of created) this.notifyWatch(q, "rename");
         return EMPTY;
       }
       case OP_STAT:

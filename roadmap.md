@@ -11343,3 +11343,44 @@ process in a tree that is serving right now.
   it runs the failing gate in the working tree before blaming the checkout, having once
   blamed absent build output for three stale assertions — but a gate whose assertions are
   skipped rather than failed still reads as green from the outside.
+## A directory nobody was told about (this change)
+
+`fs.watch(dir, { recursive: true })` reported nothing at all when a directory appeared
+more than one level below the watched root in a single `mkdir -p`. Not the file, not the
+directory that was asked for, not the intermediate one. The events were not lost: they
+arrived later, in order, the moment any unrelated event on an already-watched path came
+through. That deferral is the worse failure — a route a user has just added 404s, they
+edit something else, and it starts working, so it reads as flakiness rather than as a bug.
+
+**Where it came from.** `OP_MKDIR` (`fs-server.js`) called `notifyWatch` once, with the
+path it was asked for. For a non-recursive mkdir that is the whole truth. For `mkdir -p`
+it is one event for what may be several directories, and it names the deepest. Node's
+recursive watch is userland — `node/internal/fs/recursive_watch.js` keeps one
+non-recursive watch per directory and learns about a new directory from an event naming
+it as a DIRECT CHILD of one it already watches. `a/b` is not that, so it was dropped and
+no watch was ever attached to `a`; everything created under it was then invisible too.
+A real filesystem does not have this problem because inotify fires once per level.
+
+**The fix, both places that create directories.** `OP_MKDIR` collects the missing
+ancestors before the mkdir — afterwards they all exist — and notifies each, shallowest
+first. `FsServer.writeBatch` does the same: it creates directories of its own, and
+`vv-import-tree` drops a folder into a workspace that may already have a dev server
+watching it. Both only compute the chain when something is actually watching, so a tree
+with no watchers pays nothing.
+
+**Blast radius, measured rather than assumed.** The repro is framework-free — `fs.watch`,
+`mkdirSync`, `writeFileSync`, no Vivari-specific API — and the same defect reaches the
+product through more than one framework. SvelteKit: `src/routes/api/ping/+server.js`
+(two new directories) 404s indefinitely while `src/routes/about/+page.svelte` (one) is
+served after a single retry. Next.js: `app/deep/nested/page.js` 404s for 30 s and never
+recovers; with the fix it serves in 1 s. Astro is unaffected, because `@astrojs` tracks
+directories itself instead of relying on the userland watcher — it is the control that
+says this is the watcher and not the frameworks.
+
+**Gated by `scripts/spike-watch-nested.mjs`** (offline, `needsWasm`), separate from
+`spike-watch.mjs`: that one is about the `--watch` supervisor restarting and is
+deliberately slow, this one is about event delivery and runs in ~25 s. Its assertions are
+the delivery, not the return code — including that a directory which already exists is
+NOT re-reported, so the fix cannot pass by notifying unconditionally, and that with
+nothing else touching the tree the events arrive on their own, which is the assertion
+that separates "fixed" from "deferred". On the unfixed tree 8 of its checks fail.

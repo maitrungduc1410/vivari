@@ -248,6 +248,11 @@ const SPIKES = [
   // assertion waits for a debounce and a respawn, and shortening the waits is how
   // a watch test becomes the flaky one everybody reruns.
   { name: "watch", file: "spike-watch.mjs", net: false, needsWasm: true, timeout: 600000 },
+  // What reaches Node's userland recursive watcher when a directory appears. Separate
+  // from `watch` above, which is about the --watch SUPERVISOR restarting: this one is
+  // about fs event DELIVERY, and it is fast (~25s) where that one is deliberately slow,
+  // so folding it in would hide a quick gate behind a six-minute one.
+  { name: "watch-nested", file: "spike-watch-nested.mjs", net: false, needsWasm: true, timeout: 120000 },
   // A sync child's stdin: `input`, and the EOF that has to follow it. The failure
   // it guards is a HANG, so the spike bounds its own VM run rather than letting CI
   // discover the regression as a timeout with no name on it.
