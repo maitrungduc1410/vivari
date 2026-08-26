@@ -14,6 +14,38 @@
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+// ---- untrusted entry paths -------------------------------------------------
+/**
+ * The relative path this archive/share entry may be unpacked to, or null if it
+ * would escape the directory it is unpacked into.
+ *
+ * Import sources are untrusted — an npm tarball, a GitHub tree, a `#share=` link
+ * — and every layer below joins the entry path onto the project dir verbatim,
+ * down to a VFS that resolves `..` the way a filesystem must. So a `..` segment
+ * or an absolute path overwrites another project or a dotfile in the persisted VM
+ * under an "imported N files" success message. Windows-shaped separators are
+ * folded in: a tar entry may use them, and `..\..\x` must not slip past a
+ * POSIX-only split.
+ *
+ * `.` and empty segments are NORMALIZED AWAY rather than refused. dep-cache.js
+ * refuses them and is right to, because it only ever reads archives it wrote
+ * itself; here the archive is somebody else's, and `tar czf x.tgz .` puts a `./`
+ * in front of every entry it writes. `..` is the segment that escapes, and it is
+ * refused outright rather than popped: popping would import a DIFFERENT file than
+ * the archive names, under the same success message.
+ */
+export function safeEntryPath(p) {
+  if (typeof p !== "string" || p === "") return null;
+  if (p.startsWith("/") || p.startsWith("\\") || /^[a-zA-Z]:/.test(p)) return null;
+  const segs = [];
+  for (const seg of p.split(/[/\\]/)) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") return null;
+    segs.push(seg);
+  }
+  return segs.length ? segs.join("/") : null;
+}
+
 // ---- stream helpers --------------------------------------------------------
 // Run `bytes` through a (De)CompressionStream and collect the output. We write
 // and read concurrently: awaiting write+close before reading can deadlock once
@@ -211,9 +243,15 @@ export async function decodeShare(payload) {
   const json = await gunzip(fromBase64url(payload));
   const manifest = JSON.parse(dec.decode(json));
   if (!manifest || !Array.isArray(manifest.files)) throw new Error("invalid share payload");
-  const files = manifest.files.map((e) => ({
-    path: e.p,
-    bytes: e.t !== undefined ? enc.encode(e.t) : fromBase64(e.b || ""),
-  }));
+  const files = manifest.files.map((e) => {
+    const path = safeEntryPath(e && e.p);
+    if (!path) {
+      throw new Error(`share payload entry escapes the project root: ${e && e.p}`);
+    }
+    return {
+      path,
+      bytes: e.t !== undefined ? enc.encode(e.t) : fromBase64(e.b || ""),
+    };
+  });
   return { name: manifest.name || "shared-project", files };
 }

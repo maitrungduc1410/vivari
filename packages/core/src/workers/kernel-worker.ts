@@ -19,6 +19,7 @@
 
 import { newProgress, onFetch, onOutput, idleClear, stallVerdict, shouldReportStallFor, stallReportChunk } from "../../terminal-feedback.js";
 import { Kernel } from "../../../kernel-host/kernel.js";
+import { safeEntryPath } from "../../../kernel-host/archive.js";
 import { createKernelFs } from "../../../kernel-host/kernel-fs.js";
 import { initTransferList } from "../../../kernel-host/worker-transfer.js";
 import { ensureRealNpm } from "../../../kernel-host/load-real-npm.js";
@@ -2910,15 +2911,25 @@ self.onmessage = async (event) => {
     try {
       const dir = String(m.dir || "").replace(/\/+$/, "");
       if (dir) kernel.mkdirp(dir);
+      // Every import vector converges here — the SDK's mount(), the studio's folder
+      // and remote imports, a `#share=` link — and each entry is joined onto `dir`
+      // and handed to a VFS that resolves `..` the way a filesystem must. Checked
+      // AFTER the leading-slash strip, because mount() legitimately sends
+      // "/package.json" for a file at the mount point's root.
+      const inside = (p: string) => {
+        const safe = safeEntryPath(p);
+        if (!safe) throw fsError("EINVAL", "import", p);
+        return safe;
+      };
       // Empty directories carry meaning in a mounted tree (and writeFilesBatch only
       // creates the parents its files need), so materialise them explicitly first.
       for (const d of Array.isArray(m.dirs) ? m.dirs : []) {
-        kernel.mkdirp(dir + "/" + String(d).replace(/^\/+/, ""));
+        kernel.mkdirp(dir + "/" + inside(String(d).replace(/^\/+/, "")));
       }
       const incoming = Array.isArray(m.files) ? m.files : [];
       const batch = incoming
         .filter((f) => f && typeof f.path === "string")
-        .map((f) => ({ path: dir + "/" + String(f.path).replace(/^\/+/, ""), bytes: f.bytes ?? f.contents ?? "" }));
+        .map((f) => ({ path: dir + "/" + inside(String(f.path).replace(/^\/+/, "")), bytes: f.bytes ?? f.contents ?? "" }));
       if (batch.length) await kernel.writeFilesBatch(batch);
       post("vv-reply", { reqId: m.reqId, ok: true, count: batch.length });
       postFsChanged(dir || "/", "rename");

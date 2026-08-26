@@ -192,6 +192,11 @@ const SPIKES = [
   // the shareable-URL codec round-tripped. Pure web primitives, no kernel/wasm.
   { name: "zip-share", file: "spike-zip-share.mjs", net: false, timeout: 60000 },
   { name: "tar", file: "spike-tar.mjs", net: false, timeout: 60000 },
+  // Every import vector (npm tarball, GitHub tree, #share= link, mount()) must
+  // refuse a `..`/absolute entry path and admit an ordinary `./`-prefixed
+  // archive. Pure JS: the share codec runs live, the two browser-worker
+  // consumers are pinned as source.
+  { name: "import-traversal", file: "spike-import-traversal.mjs", net: false, timeout: 60000 },
   // Bun support (pure-JS tier): the synchronous TS/JSX transform, the Bun global
   // API surface, the bun:test runner, and the /bin/bun.js CLI source — all proven
   // with no kernel/wasm, so this runs in the Wasm-free toolchain-gate.

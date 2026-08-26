@@ -27,6 +27,26 @@ const GH_RAW = "https://raw.githubusercontent.com";
 
 const isNodeModules = (p: string) => p.split("/").some((s) => s === "node_modules");
 const isGit = (p: string) => p.split("/").some((s) => s === ".git");
+// An entry path from a remote source is untrusted, and everything below joins it
+// onto the project dir verbatim — down to a VFS that resolves `..` like a real
+// filesystem must — so a crafted tarball or tree would overwrite another project
+// or a dotfile in the persisted VM and still report "imported N files". Same rule
+// as archive.js's `safeEntryPath` (which guards the `#share=` payload), spelled
+// out here because the studio resolves kernel-host modules through their .d.ts
+// and because this file's neighbouring predicates read the same way. It returns
+// the path to use, normalizing `.` and empty segments away — `tar czf x.tgz .`
+// prefixes every entry it writes with one — and refusing only what escapes.
+const safeEntryPath = (p: string): string | null => {
+  if (!p) return null;
+  if (p.startsWith("/") || p.startsWith("\\") || /^[a-zA-Z]:/.test(p)) return null;
+  const segs: string[] = [];
+  for (const s of p.split(/[/\\]/)) {
+    if (s === "" || s === ".") continue;
+    if (s === "..") return null;
+    segs.push(s);
+  }
+  return segs.length ? segs.join("/") : null;
+};
 const encPath = (p: string) => p.split("/").map(encodeURIComponent).join("/");
 
 // Run `fn` over `items` with bounded concurrency, preserving order.
@@ -96,12 +116,18 @@ export async function fetchGithubRepo(
   // Keep regular files (git-tree entries carry `size`), applying the count/byte caps.
   let bytes = 0;
   let truncated = !!tree.truncated;
-  const kept: { path: string }[] = [];
+  const kept: { path: string; remote: string }[] = [];
   for (const n of nodes) {
     if (n.type !== "blob" || isNodeModules(n.path) || isGit(n.path)) continue;
+    // `path` is where the file lands, `remote` is what the raw endpoint is asked
+    // for — the same string today, but the two stop being interchangeable the
+    // moment a path needs normalizing, and a silently mis-fetched file is worse
+    // than a refused one.
+    const safe = safeEntryPath(n.path);
+    if (!safe) throw new Error(`Repository entry escapes the project root: ${n.path}`);
     if (kept.length >= MAX_FILES || bytes + (n.size || 0) > MAX_BYTES) { truncated = true; continue; }
     bytes += n.size || 0;
-    kept.push({ path: n.path });
+    kept.push({ path: safe, remote: n.path });
   }
 
   if (!kept.length) throw new Error("That repository has no importable files.");
@@ -110,8 +136,8 @@ export async function fetchGithubRepo(
   const total = kept.length;
   onProgress?.(0, total, "Downloading files…");
   const files: FileTree = await mapPool(kept, CONCURRENCY, async (b) => {
-    const res = await fetch(`${GH_RAW}/${owner}/${repo}/${encodeURIComponent(ref!)}/${encPath(b.path)}`);
-    if (!res.ok) throw new Error(`Failed to download ${b.path} (HTTP ${res.status}).`);
+    const res = await fetch(`${GH_RAW}/${owner}/${repo}/${encodeURIComponent(ref!)}/${encPath(b.remote)}`);
+    if (!res.ok) throw new Error(`Failed to download ${b.remote} (HTTP ${res.status}).`);
     const buf = new Uint8Array(await res.arrayBuffer());
     onProgress?.(++done, total, "Downloading files…");
     return { path: b.path, bytes: buf };
@@ -163,7 +189,12 @@ export async function fetchNpmPackage(
   let bytes = 0;
   let truncated = false;
   for (const entry of parseTar(tar)) {
-    const rel = stripFirstSegment(entry.name);
+    // Normalize BEFORE stripping: an entry written as `./package/index.js` would
+    // otherwise lose the `.` to stripFirstSegment and keep the `package/` prefix
+    // that stripping exists to remove.
+    const norm = safeEntryPath(entry.name);
+    if (!norm) throw new Error(`Package entry escapes the project root: ${entry.name}`);
+    const rel = stripFirstSegment(norm);
     if (!rel) continue;
     if (isNodeModules(rel)) { excludedNodeModules = true; continue; }
     if (isGit(rel)) continue;
