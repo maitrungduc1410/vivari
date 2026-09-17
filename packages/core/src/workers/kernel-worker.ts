@@ -27,6 +27,7 @@ import { ensureRealPnpm } from "../../../kernel-host/load-real-pnpm.js";
 import { ensureRealCorepack } from "../../../kernel-host/load-real-corepack.js";
 import { ensureRealTsgo } from "../../../kernel-host/load-real-tsgo.js";
 import { hashDepKey, decodeShippedSnapshot } from "../../../kernel-host/dep-cache.js";
+import { fitsSharedWindow } from "../../../protocol/syscall.js";
 
 const post = (type, extra) => self.postMessage({ type, ...extra });
 
@@ -2045,6 +2046,81 @@ const replyNotReady = (reqId) =>
 // disappears or moves, "change" when existing contents are edited in place.
 const postFsChanged = (path, kind) => post("vv-fs-changed", { path, kind });
 
+// ── host-side reads and writes that outgrow the shared window ───────────────
+//
+// The kernel's fs client packs a whole request (path AND body) into one 1 MiB
+// SharedArrayBuffer, and answers into the same region. That is the right trade
+// for the syscall traffic it was built for, and the wrong one for the two places
+// where a HOST payload is arbitrarily large: the SDK's `fs.writeFile` / the
+// studio's binary import on the way in, and `fs.readFile` on the way out. Both
+// have a transfer-based route that was never bounded by the window; these pick it
+// when, and only when, the payload needs it.
+const fsTextEncoder = new TextEncoder();
+const fsTextDecoder = new TextDecoder();
+
+/**
+ * Write one file, picking the route the payload actually fits. Returns `existed`.
+ *
+ * ORDERING INVARIANT — neither branch may yield before it posts.
+ *
+ * Two writes to one path can now take two different routes, only one of which is
+ * async, which looks like it should let a small write overtake a large one and
+ * leave the stale big body on disk. It does not, and the reason is not this
+ * function: both routes are messages to the SAME File System Worker over the same
+ * channel (the transfer, and the syscall doorbell in kernel-fs.js), and that
+ * worker services its queue in post order. So writes land in the order their
+ * handlers posted, whatever they do afterwards.
+ *
+ * What would break it is one branch reaching its post LATER than the other — an
+ * `await` added above `writeLarge` but not above the sync call, say. Then the
+ * second handler posts first and the order inverts. Measured, not assumed: a
+ * 25ms sleep in the large branch alone flips case 7 of
+ * scripts/spike-large-fs-payloads.mjs to "REORDERED", while a yield in BOTH
+ * branches (or a microtask in either) does not, because it delays them equally.
+ */
+async function writeOne(path, contents) {
+  const slash = path.lastIndexOf("/");
+  if (slash > 0) kernel.mkdirp(path.slice(0, slash));
+  const existed = kernel.exists(path);
+  // `bytes` (a Uint8Array) is used for binary imports (dropped images / files);
+  // `contents` (a string) for text edits. Encode up front so the size test sees
+  // the bytes that actually travel, not a JS string length — the two differ for
+  // any non-ASCII file, and guessing from the wrong one is how a payload that
+  // "fits" still overflows.
+  const body = typeof contents === "string" ? fsTextEncoder.encode(contents) : contents;
+  if (fitsSharedWindow([fsTextEncoder.encode(path).length, body.length])) {
+    kernel.writeFile(path, body);
+  } else {
+    // writeLarge transfers (and detaches) the buffer it is given. `body` came off
+    // a postMessage, so this worker owns it and nothing reads it afterwards.
+    await kernel.writeLarge(path, body);
+  }
+  return existed;
+}
+
+/** Is this the FsServer's "too big for the shared window" signal, either direction? */
+const isWindowOverflow = (err) =>
+  String((err && (err.code || err.message)) || "").includes("EFBIG");
+
+/**
+ * Read a whole file for the host, falling back to the transfer path when the
+ * answer does not fit the shared window.
+ *
+ * The same shape the runtime uses in packages/runtime/node/bindings/fs.js: try the
+ * one-syscall fast path, and treat EFBIG — which FsServer raises deliberately for
+ * exactly this — as "retry on the unbounded route" rather than as a failure. A
+ * process in the VM retries down the chunked fd loop; the kernel's fs client has
+ * no fd opcodes, so it retries over a transfer instead.
+ */
+async function readWhole(path) {
+  try {
+    return kernel.readFileBytes(path);
+  } catch (err) {
+    if (!isWindowOverflow(err)) throw err;
+    return await kernel.readLarge(path);
+  }
+}
+
 // Recursively remove a path (file, or directory + contents).
 function rmRecursive(path) {
   let st;
@@ -2638,12 +2714,7 @@ self.onmessage = async (event) => {
       return;
     }
     try {
-      const slash = m.path.lastIndexOf("/");
-      if (slash > 0) kernel.mkdirp(m.path.slice(0, slash));
-      const existed = kernel.exists(m.path);
-      // `bytes` (a Uint8Array) is used for binary imports (dropped images /
-      // files); `contents` (a string) for text edits. writeFile accepts either.
-      kernel.writeFile(m.path, m.bytes ?? m.contents ?? "");
+      const existed = await writeOne(m.path, m.bytes ?? m.contents ?? "");
       if (m.reqId != null) post("vv-reply", { reqId: m.reqId, ok: true });
       postFsChanged(m.path, existed ? "change" : "rename");
     } catch (err) {
@@ -2702,7 +2773,8 @@ self.onmessage = async (event) => {
   if (m.type === "vv-read") {
     if (!kernel) { replyNotReady(m.reqId); return; }
     try {
-      post("vv-reply", { reqId: m.reqId, ok: true, path: m.path, contents: kernel.readFile(m.path) });
+      const contents = fsTextDecoder.decode(await readWhole(m.path));
+      post("vv-reply", { reqId: m.reqId, ok: true, path: m.path, contents });
     } catch (err) {
       replyErr(m.reqId, err);
     }
@@ -2713,7 +2785,7 @@ self.onmessage = async (event) => {
   if (m.type === "vv-read-bytes") {
     if (!kernel) { replyNotReady(m.reqId); return; }
     try {
-      const bytes = kernel.readFileBytes(m.path);
+      const bytes = await readWhole(m.path);
       post("vv-reply", { reqId: m.reqId, ok: true, path: m.path, bytes });
     } catch (err) {
       replyErr(m.reqId, err);

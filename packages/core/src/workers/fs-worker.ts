@@ -18,11 +18,12 @@
 // serving any syscall; afterwards FsServer forwards mutations to the adapter.
 
 import initKernel, { VirtualFileSystem } from "../../../vfs/pkg/vivari_vfs.js";
-import { FsServer } from "../../../kernel-host/fs-server.js";
+import { FsServer, transferableBuffer } from "../../../kernel-host/fs-server.js";
 import { createOpfsPersistence } from "../../../kernel-host/opfs-persistence.js";
 import { createDepCache } from "../../../kernel-host/dep-cache.js";
 
-const post = (type, extra) => self.postMessage({ type, ...extra });
+const post = (type, extra, transfer) =>
+  self.postMessage({ type, ...extra }, transfer && transfer.length ? transfer : undefined);
 
 let server = null;
 let vfsRef = null; // the live VFS, set as soon as it's constructed (pre-restore)
@@ -60,6 +61,15 @@ function handle(msg) {
         post("fs-write-large-ok", { id: msg.id });
       } catch (err) {
         post("fs-write-large-err", { id: msg.id, error: String(err?.message || err) });
+      }
+      break;
+    case "fs-read-large":
+      try {
+        const bytes = server.readLarge(msg.path);
+        const buffer = transferableBuffer(bytes);
+        post("fs-read-large-ok", { id: msg.id, buffer, byteLength: bytes.byteLength }, [buffer]);
+      } catch (err) {
+        post("fs-read-large-err", { id: msg.id, error: String(err?.message || err) });
       }
       break;
     case "fs-write-batch":

@@ -143,6 +143,14 @@ repeatedly:
 - **Large file I/O is chunked.** `FD_CHUNK = 512 KiB`; `fs.js` loops on short
   reads/writes, so an arbitrarily large file transfers in pieces. `writeLarge`
   bypasses the SAB entirely via a transferred `ArrayBuffer`.
+- **The HOST has no fd loop, so it transfers instead.** A process chunks; the
+  kernel's own fs client has no fd opcodes and cannot. Its whole-file surface —
+  the SDK's `fs.writeFile` / `fs.readFile` and the studio's binary import, all of
+  which hand over a complete file — therefore picks its route by size in
+  `writeOne` / `readWhole` (`kernel-worker.ts`): inside the window it uses the
+  SAB, past it `writeLarge` / `readLarge`. `fitsSharedWindow` decides, from the
+  frame layout rather than a guessed margin, because the path shares the frame
+  with the body. Both used to simply fail at ~1 MiB.
 - **Large HTTP responses are chunked.** A big response body (Vite serves ~2.8 MB
   pre-bundled dep files) cannot cross in one `OP_RESPOND`. The body travels as a
   **raw length-prefixed field** (never JSON-stringified — escaping doubles quotes/

@@ -229,6 +229,12 @@ const SPIKES = [
   // VFS (it copies real trees), so needsWasm; the host half runs as a child process.
   { name: "fs-cp", file: "spike-fs-cp.mjs", net: false, needsWasm: true, timeout: 120000 },
   { name: "fs-errors", file: "spike-fs-errors.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // The HOST fs surface against the 1 MiB shared window: `fs.writeFile` and
+  // `fs.readFile` hand over whole files, unlike a process's syscalls, which are
+  // chunked to fit. Both directions used to fail at ~1 MiB, the write side
+  // silently. Drives the real SDK + the real kernel worker through the headless
+  // twin (scripts/kernel-worker.mjs), so needsWasm.
+  { name: "large-fs-payloads", file: "spike-large-fs-payloads.mjs", net: false, needsWasm: true, timeout: 120000 },
   { name: "worker-pool", file: "spike-worker-pool.mjs", net: false, needsWasm: true, timeout: 120000 },
   { name: "node-cli", file: "spike-node-cli.mjs", net: false, needsWasm: true, timeout: 120000 },
   // The interactive prompts. Slower than its assertion count suggests: a REPL is

@@ -385,15 +385,40 @@ export function decodeBytes(bytes) {
   return decoder.decode(bytes);
 }
 
+/** The fixed part of a request frame: `[ flags: u32 ][ fieldCount: u32 ]`. */
+export const REQUEST_HEADER_BYTES = 8;
+/** Per-field overhead inside a request frame: `[ len: u32 ]`. */
+export const REQUEST_FIELD_HEADER_BYTES = 4;
+
+/** Bytes the request frame for fields of these lengths occupies. */
+export function requestFrameBytes(fieldLengths) {
+  let total = REQUEST_HEADER_BYTES;
+  for (const n of fieldLengths) total += REQUEST_FIELD_HEADER_BYTES + n;
+  return total;
+}
+
+/**
+ * Does a request with fields of these lengths fit the shared data window?
+ *
+ * A caller that can route around the window (a big `writeFile`, which can go
+ * over the transfer path instead) needs to decide BEFORE encoding, and the
+ * answer depends on every field, not just the payload: the path travels in the
+ * same frame, so a longer path lowers the payload ceiling. Deriving that here,
+ * next to the format it follows, is what keeps a caller's threshold from
+ * drifting into a guessed constant that is wrong by exactly the header size.
+ */
+export function fitsSharedWindow(fieldLengths) {
+  return requestFrameBytes(fieldLengths) <= DATA_BYTES;
+}
+
 /** Encode a request frame: a flags word + N length-prefixed byte fields. */
 export function encodeRequest(fields, flags = 0) {
-  let total = 8;
-  for (const f of fields) total += 4 + f.length;
+  const total = requestFrameBytes(fields.map((f) => f.length));
   const buf = new Uint8Array(total);
   const dv = new DataView(buf.buffer);
   dv.setUint32(0, flags, true);
   dv.setUint32(4, fields.length, true);
-  let off = 8;
+  let off = REQUEST_HEADER_BYTES;
   for (const f of fields) {
     dv.setUint32(off, f.length, true);
     off += 4;

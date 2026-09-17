@@ -104,6 +104,18 @@ export function createKernelFs(fsWorker) {
     });
   }
 
+  // Read a whole file back over a transfer instead of the SAB — the mirror of
+  // writeLarge, for a file too big for the shared window. The FS Worker answers
+  // with the bytes on a transferable buffer, so a multi-MB file never has to fit
+  // the 1 MiB window (and is never copied on the way out).
+  function readLarge(path) {
+    return new Promise((resolve, reject) => {
+      const id = seq++;
+      pending.set(id, { resolve, reject });
+      fsWorker.postMessage({ type: "fs-read-large", id, path });
+    });
+  }
+
   // Write many files in ONE transfer instead of one SAB round-trip each. Used to
   // deliver a package manager's tree at boot (npm ~2400 files): all bodies are
   // concatenated into a single fresh ArrayBuffer, transferred once, and written
@@ -182,6 +194,23 @@ export function createKernelFs(fsWorker) {
       if (p) {
         pending.delete(msg.id);
         p.resolve(msg.count);
+      }
+    } else if (msg.type === "fs-read-large-ok") {
+      const p = pending.get(msg.id);
+      if (p) {
+        pending.delete(msg.id);
+        p.resolve(new Uint8Array(msg.buffer, 0, msg.byteLength));
+      }
+    } else if (msg.type === "fs-read-large-err") {
+      const p = pending.get(msg.id);
+      if (p) {
+        pending.delete(msg.id);
+        const err = new Error(msg.error || "EIO");
+        // The VFS's errno IS the message (see `call()`, which sets `.code` from
+        // the same bytes), so a caller's `err.code === "ENOENT"` keeps working
+        // when a read is routed over the transfer path instead of the SAB.
+        err.code = msg.error || "EIO";
+        p.reject(err);
       }
     } else if (msg.type === "fs-write-large-err" || msg.type === "fs-write-batch-err") {
       const p = pending.get(msg.id);
@@ -266,6 +295,7 @@ export function createKernelFs(fsWorker) {
       call(OP_RENAME, encodeRequest([enc(from), enc(to)]));
     },
     writeLarge,
+    readLarge,
     writeFilesBatch,
     depCacheHas,
     depCacheSave,

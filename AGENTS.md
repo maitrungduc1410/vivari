@@ -1466,6 +1466,13 @@ throw that gets swallowed. Rules:
   syscall field.
 - Large **files** transfer in `FD_CHUNK` (512 KiB) pieces via the fd loop in
   `lib/fs.js`; `writeLarge` uses a transferred `ArrayBuffer` instead.
+- Whole-file work on the **host** side (SDK `fs.writeFile`/`fs.readFile`, the
+  studio's binary import) cannot use that fd loop — the kernel's fs client has no
+  fd opcodes — so it routes by size in `writeOne`/`readWhole` (`kernel-worker.ts`)
+  and falls out to `writeLarge`/`readLarge`. Ask `fitsSharedWindow` rather than
+  inventing a margin: the path rides in the same frame as the body. `readWhole`
+  treats the `EFBIG` from `FsServer.service()` as "retry unbounded", the same
+  signal `lib/fs.js` retries on. Gated by `spike-large-fs-payloads`.
 - Large **HTTP responses** cross as a **raw** length-prefixed body field (NOT
   JSON-stringified — escaping overflows) and are chunked into frames the kernel
   reassembles by `reqId` (`fs-client.respond` + `kernel.handleRespond`).
