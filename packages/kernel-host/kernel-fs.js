@@ -9,8 +9,12 @@
 // So the kernel gets its *own* SAB channel to the FS Worker and blocks on it the
 // same way a process does — Atomics.wait on the kernel thread (a Web Worker in
 // the browser; Node's main thread in headless, where Atomics.wait is allowed).
-// The one exception is writeLarge: fetched tarballs can exceed the 1 MiB SAB
-// window, so those go over a transferable ArrayBuffer message instead.
+// Payloads larger than the 1 MiB SAB window take one of two routes off it, and
+// which one is decided by whether the caller can await, not by size. A caller
+// that can (writeLarge, for fetched tarballs and editor saves) hands the bytes
+// over on a transferable ArrayBuffer: one hop, no copy. A caller that cannot —
+// the kernel's own synchronous tree walkers — goes through the fd layer in
+// slices, which is slower but stays synchronous.
 
 import {
   makeViews,
@@ -37,7 +41,25 @@ import {
   OP_LSTAT,
   OP_SYMLINK,
   OP_READLINK,
+  OP_OPEN,
+  OP_CLOSE,
+  OP_FD_READ,
+  OP_FD_WRITE,
+  OP_FSTAT,
+  u32ToBytes,
+  bytesToU32,
+  f64ToBytes,
+  fitsSharedWindow,
+  isWindowOverflow,
 } from "../protocol/syscall.js";
+
+// Slice size for whole-file I/O that does not fit the window, matching
+// runtime/fs-client.js: comfortably inside the 1 MiB window once frame headers
+// are counted, and few enough round trips that an 8 MiB file costs 16.
+const FD_CHUNK = 512 * 1024;
+const O_RDONLY = 0;
+// O_WRONLY | O_CREAT | O_TRUNC — the flags behind a whole-file overwrite.
+const O_WRITE_TRUNC = 1 | 0o100 | 0o1000;
 
 // The kernel registers as client 0; processes use their (>= 1) pid.
 export const KERNEL_CLIENT = 0;
@@ -104,16 +126,77 @@ export function createKernelFs(fsWorker) {
     });
   }
 
-  // Read a whole file back over a transfer instead of the SAB — the mirror of
-  // writeLarge, for a file too big for the shared window. The FS Worker answers
-  // with the bytes on a transferable buffer, so a multi-MB file never has to fit
-  // the 1 MiB window (and is never copied on the way out).
-  function readLarge(path) {
-    return new Promise((resolve, reject) => {
-      const id = seq++;
-      pending.set(id, { resolve, reject });
-      fsWorker.postMessage({ type: "fs-read-large", id, path });
+  // Whole-file I/O for a file too big for the shared window, over the fd layer.
+  //
+  // writeLarge's trick — hand the bytes over on a transfer — needs a Promise, and
+  // most of the kernel's own file access cannot await: the bulk tree walkers
+  // (export, recursive copy, search, the .d.ts and Python harvests) are
+  // synchronous several frames deep, and each one of them reads whole files. The
+  // fd opcodes carry an explicit (len, pos), so they are not bounded by the
+  // window and they stay synchronous. It is also the route the protocol already
+  // prescribes: an oversized read is answered with EFBIG precisely so the client
+  // retries here, which is what every process inside the VM already does for
+  // fs.readFileSync (runtime/node/bindings/fs.js). The kernel just never did.
+  function withFd(path, oflags, mode, body) {
+    const fd = bytesToU32(
+      call(OP_OPEN, encodeRequest([encodeString(path), u32ToBytes(oflags), u32ToBytes(mode)])),
+    );
+    try {
+      return body(fd);
+    } finally {
+      // Not conditional on success: the FS Worker's fd table is process-global,
+      // so an fd leaked by a failed read stays open for the life of the session.
+      // Nor allowed to throw — a close failure would replace whatever the body
+      // threw, which is the error worth seeing.
+      try {
+        call(OP_CLOSE, encodeRequest([u32ToBytes(fd)]));
+      } catch {
+        /* the fd is unusable either way */
+      }
+    }
+  }
+
+  function readChunked(path) {
+    return withFd(path, O_RDONLY, 0, (fd) => {
+      const size = JSON.parse(decodeBytes(call(OP_FSTAT, encodeRequest([u32ToBytes(fd)])))).size | 0;
+      const out = new Uint8Array(size);
+      let at = 0;
+      while (at < size) {
+        const chunk = call(
+          OP_FD_READ,
+          encodeRequest([u32ToBytes(fd), u32ToBytes(Math.min(FD_CHUNK, size - at)), f64ToBytes(at)]),
+        );
+        if (!chunk.length) break; // EOF early: the file shrank since fstat
+        out.set(chunk, at);
+        at += chunk.length;
+      }
+      return at === size ? out : out.subarray(0, at);
     });
+  }
+
+  function writeChunked(path, body) {
+    withFd(path, O_WRITE_TRUNC, 0o666, (fd) => {
+      let at = 0;
+      while (at < body.length) {
+        const slice = body.subarray(at, Math.min(at + FD_CHUNK, body.length));
+        const n = bytesToU32(
+          call(OP_FD_WRITE, encodeRequest([u32ToBytes(fd), f64ToBytes(at), slice])),
+        );
+        // A zero-length write is not a short write to retry, it is no progress:
+        // looping on it would hang the kernel thread inside Atomics.wait forever.
+        if (!n) throw new Error(`fs: stalled writing ${path} at ${at} of ${body.length}`);
+        at += n;
+      }
+    });
+  }
+
+  function readWhole(path) {
+    try {
+      return call(OP_READ_FILE, encodeRequest([encodeString(path)]));
+    } catch (err) {
+      if (!isWindowOverflow(err)) throw err;
+      return readChunked(path);
+    }
   }
 
   // Write many files in ONE transfer instead of one SAB round-trip each. Used to
@@ -195,23 +278,6 @@ export function createKernelFs(fsWorker) {
         pending.delete(msg.id);
         p.resolve(msg.count);
       }
-    } else if (msg.type === "fs-read-large-ok") {
-      const p = pending.get(msg.id);
-      if (p) {
-        pending.delete(msg.id);
-        p.resolve(new Uint8Array(msg.buffer, 0, msg.byteLength));
-      }
-    } else if (msg.type === "fs-read-large-err") {
-      const p = pending.get(msg.id);
-      if (p) {
-        pending.delete(msg.id);
-        const err = new Error(msg.error || "EIO");
-        // The VFS's errno IS the message (see `call()`, which sets `.code` from
-        // the same bytes), so a caller's `err.code === "ENOENT"` keeps working
-        // when a read is routed over the transfer path instead of the SAB.
-        err.code = msg.error || "EIO";
-        p.reject(err);
-      }
     } else if (msg.type === "fs-write-large-err" || msg.type === "fs-write-batch-err") {
       const p = pending.get(msg.id);
       if (p) {
@@ -241,16 +307,29 @@ export function createKernelFs(fsWorker) {
   const enc = encodeString;
   const fs = {
     readFile(path) {
-      return decodeBytes(call(OP_READ_FILE, encodeRequest([enc(path)])));
+      return decodeBytes(readWhole(path));
     },
     // Raw bytes — use for binary files (images) so a read→write round-trip through
     // copy doesn't corrupt them by decoding to a JS string.
+    //
+    // Size is not the caller's problem. The one-shot read is a single syscall and
+    // stays the path for the overwhelming majority of files; the chunk loop costs
+    // one cheap failed syscall to discover, and only for files that could not be
+    // read at all before. Making the DEFAULT safe is the point: every silent
+    // truncation this replaced came from a caller that had no idea there was a
+    // ceiling, and a second opt-in method would just wait for the next one.
     readFileBytes(path) {
-      return call(OP_READ_FILE, encodeRequest([enc(path)]));
+      return readWhole(path);
     },
+    // The write side can be measured before it is sent, so it is decided rather
+    // than discovered.
     writeFile(path, contents) {
       const body = typeof contents === "string" ? enc(contents) : contents;
-      call(OP_WRITE_FILE, encodeRequest([enc(path), body]));
+      if (fitsSharedWindow([enc(path).length, body.length])) {
+        call(OP_WRITE_FILE, encodeRequest([enc(path), body]));
+      } else {
+        writeChunked(path, body);
+      }
     },
     mkdirp(path) {
       call(OP_MKDIR, encodeRequest([enc(path)], FLAG_RECURSIVE));
@@ -295,7 +374,6 @@ export function createKernelFs(fsWorker) {
       call(OP_RENAME, encodeRequest([enc(from), enc(to)]));
     },
     writeLarge,
-    readLarge,
     writeFilesBatch,
     depCacheHas,
     depCacheSave,

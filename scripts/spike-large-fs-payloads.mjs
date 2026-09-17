@@ -219,11 +219,60 @@ ok(
     : `REORDERED — ${label(finalText.length)} B of stale body won`,
 );
 
+// ---------------------------------------------------------------------------
+// The bulk paths. Everything above moves ONE file the caller named; these walk a
+// tree and read whole files as they go, from code that is synchronous several
+// frames deep. Each one declares a budget in the tens of megabytes and then read
+// through a 1 MiB window, and each one swallowed the resulting error per file:
+// `catch { continue; }`. So they did not fail, they came back short — the same
+// shape as the reported bug, one level up.
+// ---------------------------------------------------------------------------
+
+console.log("\n8. export — the walk behind vivari.export() and the share link");
+{
+  // 64 MiB budget in the handler, and /huge-mount.bin is 8 MiB of it.
+  const m = await bridge.request("vv-read-tree", { root: "/", strict: true }, { signal: signal() });
+  const files = m.ok ? m.files || [] : [];
+  const got = files.find((f) => f.path === "huge-mount.bin");
+  ok(!!got, `the 8 MiB file is in the archive at all (${files.length} files exported)`);
+  ok(
+    !!got && got.bytes.byteLength === huge.length,
+    got
+      ? `exported whole: ${label(got.bytes.byteLength)} of ${label(huge.length)} B`
+      : "exported whole: the file never made it into the archive",
+  );
+  ok(m.truncated !== true, "the walk did not report itself truncated");
+}
+
+console.log("\n9. copy — a recursive copy reads AND writes past the window");
+{
+  // Both halves of `kernel.writeFile(to, kernel.readFileBytes(from))` are over
+  // the window here, so this fails if either direction regresses.
+  await bridge.request("vv-copy", { from: "/huge-mount.bin", to: "/copied.bin" }, { signal: signal() });
+  const size = await sizeOf("/copied.bin");
+  ok(size === huge.length, `copied ${size === null ? "nothing" : label(size)} of ${label(huge.length)} B`);
+}
+
+console.log("\n10. search & replace — a match inside a file past the window");
+{
+  // The needle sits at the END, past the point a truncated read would reach.
+  const path = "/replace-me.txt";
+  await fs.writeFile(path, "z".repeat(1_500_000) + "NEEDLE", { signal: signal() });
+  const m = await bridge.request(
+    "vv-replace",
+    { query: "NEEDLE", replacement: "FOUND", files: [path], matchCase: true },
+    { signal: signal() },
+  );
+  ok(m.ok === true && (m.filesChanged | 0) === 1, `replace reported ${m.filesChanged | 0} file changed`);
+  const after = await fs.readFile(path, "utf-8", { signal: signal() });
+  ok(after.endsWith("FOUND"), "the replacement actually landed in the file");
+}
+
 // The failure this whole spike exists for is the SILENT one: a write that
 // resolves and leaves nothing behind. Assert its absence as a category, so a
 // future route that swallows an error is caught even if every case above is
 // still individually green.
-console.log("\n8. no write resolved without leaving its bytes behind");
+console.log("\n11. no write resolved without leaving its bytes behind");
 const silent = Object.values(results).filter((r) => r.settled === "resolved" && r.present === null);
 ok(silent.length === 0, `silent drops (resolved but absent): ${silent.length}`);
 

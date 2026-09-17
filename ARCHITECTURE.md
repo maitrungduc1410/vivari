@@ -143,14 +143,20 @@ repeatedly:
 - **Large file I/O is chunked.** `FD_CHUNK = 512 KiB`; `fs.js` loops on short
   reads/writes, so an arbitrarily large file transfers in pieces. `writeLarge`
   bypasses the SAB entirely via a transferred `ArrayBuffer`.
-- **The HOST has no fd loop, so it transfers instead.** A process chunks; the
-  kernel's own fs client has no fd opcodes and cannot. Its whole-file surface —
-  the SDK's `fs.writeFile` / `fs.readFile` and the studio's binary import, all of
-  which hand over a complete file — therefore picks its route by size in
-  `writeOne` / `readWhole` (`kernel-worker.ts`): inside the window it uses the
-  SAB, past it `writeLarge` / `readLarge`. `fitsSharedWindow` decides, from the
-  frame layout rather than a guessed margin, because the path shares the frame
-  with the body. Both used to simply fail at ~1 MiB.
+- **The HOST takes the same fd loop, one layer lower.** The kernel's own fs
+  client (`kernel-fs.js`) reads and writes whole files for the SDK, the studio's
+  binary import, and its own bulk walkers — export, recursive copy, search, the
+  `.d.ts` and Python harvests. Those walkers are synchronous several frames deep,
+  so the route around the window has to be synchronous too: `readFile` /
+  `readFileBytes` treat `EFBIG` as "retry unbounded" and slice over the fd
+  opcodes, and `writeFile` asks `fitsSharedWindow` up front and slices if it must.
+  Callers never choose, which is the point — every one of them used to fail or,
+  worse, come back short, at ~1 MiB.
+- **A caller that can `await` transfers instead.** One hop and no copy beats N
+  slices, so `writeOne` (`kernel-worker.ts`) sends an oversized editor save or
+  binary import through `writeLarge`, and a mounted tree crosses in a single
+  `writeFilesBatch`. `fitsSharedWindow` decides, from the frame layout rather than
+  a guessed margin, because the path shares the frame with the body.
 - **Large HTTP responses are chunked.** A big response body (Vite serves ~2.8 MB
   pre-bundled dep files) cannot cross in one `OP_RESPOND`. The body travels as a
   **raw length-prefixed field** (never JSON-stringified — escaping doubles quotes/

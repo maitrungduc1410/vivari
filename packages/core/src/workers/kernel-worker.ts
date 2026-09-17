@@ -2098,29 +2098,6 @@ async function writeOne(path, contents) {
   return existed;
 }
 
-/** Is this the FsServer's "too big for the shared window" signal, either direction? */
-const isWindowOverflow = (err) =>
-  String((err && (err.code || err.message)) || "").includes("EFBIG");
-
-/**
- * Read a whole file for the host, falling back to the transfer path when the
- * answer does not fit the shared window.
- *
- * The same shape the runtime uses in packages/runtime/node/bindings/fs.js: try the
- * one-syscall fast path, and treat EFBIG — which FsServer raises deliberately for
- * exactly this — as "retry on the unbounded route" rather than as a failure. A
- * process in the VM retries down the chunked fd loop; the kernel's fs client has
- * no fd opcodes, so it retries over a transfer instead.
- */
-async function readWhole(path) {
-  try {
-    return kernel.readFileBytes(path);
-  } catch (err) {
-    if (!isWindowOverflow(err)) throw err;
-    return await kernel.readLarge(path);
-  }
-}
-
 // Recursively remove a path (file, or directory + contents).
 function rmRecursive(path) {
   let st;
@@ -2773,7 +2750,7 @@ self.onmessage = async (event) => {
   if (m.type === "vv-read") {
     if (!kernel) { replyNotReady(m.reqId); return; }
     try {
-      const contents = fsTextDecoder.decode(await readWhole(m.path));
+      const contents = fsTextDecoder.decode(kernel.readFileBytes(m.path));
       post("vv-reply", { reqId: m.reqId, ok: true, path: m.path, contents });
     } catch (err) {
       replyErr(m.reqId, err);
@@ -2785,7 +2762,7 @@ self.onmessage = async (event) => {
   if (m.type === "vv-read-bytes") {
     if (!kernel) { replyNotReady(m.reqId); return; }
     try {
-      const bytes = await readWhole(m.path);
+      const bytes = kernel.readFileBytes(m.path);
       post("vv-reply", { reqId: m.reqId, ok: true, path: m.path, bytes });
     } catch (err) {
       replyErr(m.reqId, err);

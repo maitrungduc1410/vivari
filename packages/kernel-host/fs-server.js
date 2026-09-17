@@ -17,6 +17,7 @@
 import {
   makeViews,
   encodeString,
+  WINDOW_OVERFLOW_ERROR,
   decodeBytes,
   decodeRequest,
   u32ToBytes,
@@ -95,26 +96,6 @@ const O_TRUNC = 0o1000;
 // this prefix are reported via onBodyConsumed so the kernel can free them.
 const FETCH_BODY_PREFIX = "/var/cache/vv-fetch/";
 const isFetchBody = (p) => typeof p === "string" && p.startsWith(FETCH_BODY_PREFIX);
-
-/**
- * A standalone ArrayBuffer for `bytes`, safe to put in a transfer list.
- *
- * A Uint8Array can be a VIEW into a larger buffer, and transferring that either
- * detaches unrelated data or throws outright. Detach only when the view owns its
- * whole buffer; otherwise copy out the exact bytes. Lives here, next to FsServer,
- * because BOTH File System Worker twins (packages/core/src/workers/fs-worker.ts
- * and scripts/fs-worker.mjs) hand its result to postMessage — a second copy of
- * this rule is a second chance for one of them to get it wrong.
- */
-export function transferableBuffer(bytes) {
-  const ownsWhole =
-    bytes.byteOffset === 0 &&
-    bytes.byteLength === bytes.buffer.byteLength &&
-    bytes.buffer instanceof ArrayBuffer;
-  return ownsWhole
-    ? bytes.buffer
-    : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-}
 
 export class FsServer {
   // `persistence` (optional) is the OPFS write-behind adapter. When present we
@@ -250,7 +231,9 @@ export class FsServer {
         // The response doesn't fit the shared window (e.g. a whole-file read of a
         // >1 MiB file). Signal EFBIG so the client retries via the chunked fd path
         // instead of throwing an opaque "offset is out of bounds" from data.set().
-        const e = encodeString("EFBIG: response exceeds shared window");
+        // Both clients now do: the runtime for fs.readFileSync, and the kernel's
+        // own fs for readFile/readFileBytes.
+        const e = encodeString(WINDOW_OVERFLOW_ERROR);
         data.set(e, 0);
         Atomics.store(ctrl, I_RES_LEN, e.length);
         Atomics.store(ctrl, I_STATE, STATE_RESPONSE_ERR);
@@ -282,25 +265,6 @@ export class FsServer {
     const p = this.persistence;
     if (p) p.onWrite(path);
     this.notifyWatch(path, existed ? "change" : "rename");
-  }
-
-  /**
-   * Read a whole file out for transfer, bypassing the 1 MiB SAB window — the
-   * mirror of writeLarge, and the read half of the same problem.
-   *
-   * A process inside the VM never needs this: `service()` answers an oversized
-   * OP_READ_FILE with EFBIG and the runtime retries down the chunked fd path
-   * (packages/runtime/node/bindings/fs.js). The kernel's own fs client has no fd
-   * opcodes, so the host side cannot do the same thing and needs a route that
-   * was never bounded by the window in the first place.
-   */
-  readLarge(path) {
-    const bytes = this.vfs.read_file(path);
-    // Mirrors OP_READ_FILE: a whole-file read means the reader is done, which is
-    // what lets the kernel drop a fetched body. Omitting it here would leak
-    // bodies for exactly the large fetches this path exists to carry.
-    if (this.onBodyConsumed && isFetchBody(path)) this.onBodyConsumed(path);
-    return bytes;
   }
 
   /**

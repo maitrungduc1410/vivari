@@ -411,6 +411,22 @@ export function fitsSharedWindow(fieldLengths) {
   return requestFrameBytes(fieldLengths) <= DATA_BYTES;
 }
 
+/**
+ * The error a server raises when the RESPONSE cannot fit the window.
+ *
+ * The request side can be measured before sending (`fitsSharedWindow`); the
+ * response side cannot, because the client asks for a whole file without
+ * knowing its size. So an oversized read is answered with this instead, and the
+ * client retries down the fd layer, which carries an explicit (len, pos) and is
+ * therefore not bounded by the window. Both halves of that contract live here so
+ * neither can be reworded out from under the other.
+ */
+export const WINDOW_OVERFLOW_ERROR = "EFBIG: response exceeds shared window";
+
+/** Is this the server's "retry down the fd layer" signal? */
+export const isWindowOverflow = (err) =>
+  String((err && (err.code || err.message)) || "").includes("EFBIG");
+
 /** Encode a request frame: a flags word + N length-prefixed byte fields. */
 export function encodeRequest(fields, flags = 0) {
   const total = requestFrameBytes(fields.map((f) => f.length));

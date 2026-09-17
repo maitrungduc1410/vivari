@@ -5,7 +5,7 @@
 
 import { parentPort } from "node:worker_threads";
 import { createRequire } from "node:module";
-import { FsServer, transferableBuffer } from "../packages/kernel-host/fs-server.js";
+import { FsServer } from "../packages/kernel-host/fs-server.js";
 import { createDepCache } from "../packages/kernel-host/dep-cache.js";
 
 const require = createRequire(import.meta.url);
@@ -88,18 +88,6 @@ parentPort.on("message", (msg) => {
         parentPort.postMessage({ type: "fs-write-large-ok", id: msg.id });
       } catch (err) {
         parentPort.postMessage({ type: "fs-write-large-err", id: msg.id, error: String(err?.message || err) });
-      }
-      break;
-    case "fs-read-large":
-      try {
-        const bytes = server.readLarge(msg.path);
-        const buffer = transferableBuffer(bytes);
-        parentPort.postMessage(
-          { type: "fs-read-large-ok", id: msg.id, buffer, byteLength: bytes.byteLength },
-          [buffer],
-        );
-      } catch (err) {
-        parentPort.postMessage({ type: "fs-read-large-err", id: msg.id, error: String(err?.message || err) });
       }
       break;
     case "fs-write-batch":

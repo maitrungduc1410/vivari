@@ -1466,13 +1466,18 @@ throw that gets swallowed. Rules:
   syscall field.
 - Large **files** transfer in `FD_CHUNK` (512 KiB) pieces via the fd loop in
   `lib/fs.js`; `writeLarge` uses a transferred `ArrayBuffer` instead.
-- Whole-file work on the **host** side (SDK `fs.writeFile`/`fs.readFile`, the
-  studio's binary import) cannot use that fd loop — the kernel's fs client has no
-  fd opcodes — so it routes by size in `writeOne`/`readWhole` (`kernel-worker.ts`)
-  and falls out to `writeLarge`/`readLarge`. Ask `fitsSharedWindow` rather than
-  inventing a margin: the path rides in the same frame as the body. `readWhole`
-  treats the `EFBIG` from `FsServer.service()` as "retry unbounded", the same
-  signal `lib/fs.js` retries on. Gated by `spike-large-fs-payloads`.
+- Whole-file work on the **host** side is size-independent in `kernel-fs.js`, not
+  at its call sites. `readFile`/`readFileBytes` take the `EFBIG` from
+  `FsServer.service()` as "retry unbounded" and slice the file over the same fd
+  loop `lib/fs.js` uses; `writeFile` asks `fitsSharedWindow` first and slices
+  rather than discovering. Do NOT add a size check at a call site, and do NOT add
+  an opt-in "large" variant: the kernel's bulk walkers (export, copy, search, the
+  `.d.ts` and Python harvests) are synchronous several frames deep, and every
+  silent truncation this replaced came from a caller that did not know there was
+  a ceiling. `writeLarge`/`writeFilesBatch` stay for callers that can `await` and
+  want one transfer instead of N slices — `writeOne` (`kernel-worker.ts`) picks
+  that with `fitsSharedWindow`, since the path rides in the same frame as the
+  body. Gated by `spike-large-fs-payloads`.
 - Large **HTTP responses** cross as a **raw** length-prefixed body field (NOT
   JSON-stringified — escaping overflows) and are chunked into frames the kernel
   reassembles by `reqId` (`fs-client.respond` + `kernel.handleRespond`).

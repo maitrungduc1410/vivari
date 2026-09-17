@@ -359,14 +359,15 @@ export class Kernel {
   writeFile(path, contents) {
     this.fs.writeFile(path, contents);
   }
-  // The two routes around the 1 MiB shared window, for a caller that can await.
+  // The route around the 1 MiB shared window for a caller that can await: one
+  // transfer, no copy. Reads need no equivalent — readFile/readFileBytes slice
+  // an oversized file over the fd layer themselves, so every caller of those is
+  // already size-independent, including the synchronous ones.
+  //
   // writeLarge does NOT create parent directories (unlike writeFilesBatch) — mkdirp
-  // first, exactly as the sync writeFile path requires. Both return a Promise.
+  // first, exactly as the sync writeFile path requires. Returns a Promise.
   writeLarge(path, bytes) {
     return this.fs.writeLarge(path, bytes);
-  }
-  readLarge(path) {
-    return this.fs.readLarge(path);
   }
   // Write many files in one transfer (boot delivery of a PM tree). Falls back to
   // per-file writes if the fs client predates writeFilesBatch. Returns a Promise.
