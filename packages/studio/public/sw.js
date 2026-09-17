@@ -1058,6 +1058,74 @@ self.addEventListener("fetch", (event) => {
   // it; the demo's own files live under /packages/ and go straight to network.
   if (url.pathname.startsWith("/packages/")) return;
 
+  // The DEV server's URL for a file outside the studio's own Vite root.
+  //
+  // `server.fs.allow` points at the monorepo root (studio vite.config.ts), so in
+  // dev every module the kernel worker and its nested workers import — all of
+  // packages/core, kernel-host, protocol, runtime, plus the three Wasm bundles —
+  // is served from `/@fs/<absolute host path>`, NOT from `/packages/`. The bypass
+  // directly above cannot match one of them, so they fell through to
+  // routeByClient, and on Firefox its `fetch(event.request)` pass-through failed
+  // outright ("A ServiceWorker intercepted the request and encountered an
+  // unexpected error"). That killed the kernel worker before it evaluated a line,
+  // and because a worker's own module-load failure is reported to the worker and
+  // not to the page, the studio just sat on "Starting runtime…" with an empty
+  // console. The built app never reaches this: everything is bundled to /assets/.
+  //
+  // Deliberately NOT a blanket `/@fs/` bypass, and deliberately not widened to
+  // `/@vite/` or `/@id/`. A Vite dev server running INSIDE the VM emits all three
+  // as root-absolute URLs from its preview iframe and those MUST be proxied into
+  // the VM — every in-VM Vite project requests `/@vite/client`, so bypassing that
+  // prefix would break preview outright. The discriminator is who asked: a
+  // preview's subresource carries a `/preview/<port>/` referrer (same-origin
+  // requests send a full-path Referer under the default referrer policy), the
+  // kernel worker's carries its own `/@fs/…/kernel-worker.ts`.
+  //
+  // An UNREADABLE referrer bypasses. That direction is deliberate and it is the
+  // second half of this fix: the first version required the referrer to positively
+  // prove the request came from outside a preview, so a `/@fs/` request with no
+  // readable referrer kept falling through to routeByClient — and the kernel
+  // worker went on dying in dev, just 66 seconds later and with an empty error
+  // instead of a console message. The two failure modes are not symmetric. Getting
+  // it wrong towards the VM costs one in-VM Vite project a file it only ever
+  // requests when it reaches OUTSIDE its own root; getting it wrong towards the SW
+  // costs the entire studio its runtime, in a way that reports nothing. So an
+  // unproven request goes to the network, and only a referrer that positively
+  // names a preview is proxied into the VM.
+  if (url.pathname.startsWith("/@fs/") && !referrerIsPreview(event.request.referrer)) return;
+
+  // …and anything one of those dev modules IMPORTS, whatever its own path.
+  //
+  // The bypass above is not sufficient, because not every module the kernel
+  // worker loads is served from `/@fs/`. Vite supports `import.meta.env` by
+  // injecting an import of `/node_modules/vite/dist/client/env.mjs` into the
+  // modules it serves — INCLUDING worker entries. That one URL is under the
+  // studio's Vite root, matches no bypass here, and was the request that killed
+  // the kernel worker on Firefox:
+  //
+  //   saw worker   /node_modules/vite/dist/client/env.mjs
+  //   INTERCEPTING /node_modules/vite/dist/client/env.mjs
+  //                referrer=…/packages/core/src/workers/kernel-worker.ts?worker_file&type=module
+  //
+  // Grepping the sources for it finds nothing: no file in the worker's graph
+  // imports it. Vite adds it during transform, which is why several rounds of
+  // looking at imports concluded the graph was `/@fs/` all the way down.
+  //
+  // The same URL is requested by the PAGE too, a few ms earlier and with a
+  // `/@vite/client` referrer, and that one is intercepted and works — the studio
+  // renders. Same SW, same code path, same URL, opposite outcome: pass-through
+  // succeeds for a window client and fails for a dedicated-worker client. That
+  // asymmetry is the whole Firefox bug, and it is why every previous fix that
+  // reasoned about WHICH PATH was requested missed: the path was never the
+  // variable.
+  //
+  // Keyed on the referrer rather than on `/node_modules/`, which cannot be
+  // bypassed wholesale — an in-VM Vite project requests `/node_modules/.vite/
+  // deps/…` root-absolute from its preview iframe and those must reach the VM. A
+  // `/@fs/` referrer can only be our own dev server: nothing inside the VM is
+  // ever served from one.
+  if (referrerIsOwnDevModule(event.request.referrer)) return;
+
   // A top-level navigation that reached here is NOT a preview (preview navigations
   // match the PREVIEW_MARKER branch above). It is the studio app's own document —
   // never proxy it: let the browser fetch it from the network so it loads even
@@ -1082,15 +1150,84 @@ async function routeByClient(event, url) {
     if (client) clientUrl = client.url;
   }
   const m = clientUrl.match(/\/preview\/(\d+)\//);
-  if (!m) {
-    // Defensive: a navigation Request must never be passed to fetch() inside a SW
-    // (mode:"navigate" is illegal for fetch() and throws). Re-issue a plain GET so
-    // pass-through never rejects. Real navigations already return at the top of the
-    // fetch handler; this only guards unexpected redirect artifacts.
-    if (event.request.mode === "navigate") return fetch(url.href, { credentials: "include" });
-    return fetch(event.request);
-  }
+  if (!m) return passThrough(event, url);
   return handlePreview(event, parseInt(m[1], 10), url.pathname + url.search);
+}
+
+// True when a referrer is a same-origin URL that is NOT a preview page. Lets the
+// studio's own dev-server requests past the SW without also releasing a
+// preview's. Conservative by construction: an absent referrer, a cross-origin
+// one and `about:client` all answer false, i.e. keep the existing routing.
+// True when the request was issued BY a module the dev server served from
+// `/@fs/` — i.e. by the studio's own out-of-root sources (the kernel worker and
+// its nested workers). Nothing in the VM is ever served from `/@fs/`, so this
+// cannot match a preview's traffic in any preview mode, including the wildcard
+// per-port origins where the path carries no `/preview/` marker at all.
+function referrerIsOwnDevModule(referrer) {
+  if (!referrer) return false;
+  let r;
+  try {
+    r = new URL(referrer);
+  } catch {
+    return false;
+  }
+  return r.origin === self.location.origin && r.pathname.startsWith("/@fs/");
+}
+
+function referrerIsPreview(referrer) {
+  if (!referrer) return false;
+  let r;
+  try {
+    r = new URL(referrer);
+  } catch {
+    return false;
+  }
+  if (r.origin !== self.location.origin) return false;
+  return /\/preview\/\d+\//.test(r.pathname);
+}
+
+// Hand a request that belongs to no preview back to the network.
+//
+// `fetch(event.request)` is the obvious implementation and it is the one thing in
+// this file that has repeatedly not worked: the `/vv-devtools/`, `/devtools/`,
+// `/vendor/` and `/packages/` bypasses above all exist because re-issuing an
+// intercepted Request failed under cross-origin isolation, and on Firefox it
+// failed for the kernel worker's `/@fs/` module imports too. Once respondWith()
+// has been called there is no way to un-intercept, so this function has to be the
+// part that cannot fail — a rejected respondWith() is a dead request with no
+// diagnostic attached, which is the failure this whole change exists to remove.
+//
+// Three attempts, cheapest first, and the last one always settles:
+//   1. the original Request — correct method, headers, credentials and cache key;
+//   2. a plain same-origin re-issue carrying none of the intercepted request's
+//      inherited state (what the navigation case has always done, for the same
+//      reason). Only equivalent for a body-less GET/HEAD, so nothing else is
+//      re-sent this way;
+//   3. a synthetic 502, so the caller sees an error instead of waiting forever.
+async function passThrough(event, url) {
+  const req = event.request;
+  // A navigation Request must never be passed to fetch(): mode:"navigate" is
+  // illegal there and throws. Real navigations already return at the top of the
+  // fetch handler; this only guards unexpected redirect artifacts.
+  if (req.mode !== "navigate") {
+    try {
+      return await fetch(req);
+    } catch (err) {
+      console.warn("[vv-sw] pass-through failed for", url.pathname, "-", err && err.message);
+    }
+  }
+  if (req.method === "GET" || req.method === "HEAD") {
+    try {
+      return await fetch(url.href, { method: req.method, credentials: "include" });
+    } catch (err) {
+      console.warn("[vv-sw] re-issue failed for", url.pathname, "-", err && err.message);
+    }
+  }
+  return new Response("vv-sw: could not pass " + url.pathname + " through to the network", {
+    status: 502,
+    statusText: "Pass-through failed",
+    headers: { "Content-Type": "text/plain" },
+  });
 }
 
 // A friendly "connecting…" gate for a standalone mode-B preview tab (isolated

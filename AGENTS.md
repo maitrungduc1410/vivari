@@ -1407,6 +1407,113 @@ first. Zstandard stays absent for a *different* reason than brotli was: every Ru
 zstd compressor binds the C library, which does not build for
 `wasm32-unknown-unknown`.
 
+### The guest realm is an ENGINE, not just a list of globals — and `typeof Error.captureStackTrace === "function"` is true on Firefox
+
+`realm.js` answers "what can the guest see", and for a long time that was taken to be
+the whole question. It is not. A guest can find all 141 of a real node's globals
+present and correct and still die on its first `require`, because the thing
+underneath them is **SpiderMonkey and not V8**, and a large part of npm is written
+against V8 extensions as if they were the language.
+
+The bill arrived as GitHub #4, *"Can't import express on Firefox"*. On Firefox 154,
+`node src/index.js` in the `express-js` template never reached a line of user code.
+The chain, from a real Firefox run:
+
+```
+src/index.js:1 -> express/index.js:11 -> express/lib/express.js:15
+  -> body-parser/index.js:14 -> depd('body-parser')
+  -> depd/index.js:109 -> depd/index.js:268   TypeError
+```
+
+depd@2.0.0's `getStack()` is the shape half the ecosystem copied:
+
+```js
+Error.prepareStackTrace = prepareObjectStackTrace   // (_obj, stack) => stack
+Error.captureStackTrace(obj)
+var stack = obj.stack.slice(1)                      // wants CallSite[]
+...
+callSiteLocation(stack[1]).callSite.getFileName()
+```
+
+**`Error.prepareStackTrace` is V8-only and does not exist in SpiderMonkey.** Not as a
+no-op — as nothing: assigning it there creates an ordinary property that no engine
+code ever reads. What SpiderMonkey *does* have, since **Firefox 138 (Mozilla bug
+1950508)**, is `Error.captureStackTrace`, and that is precisely what makes this so
+much worse than a missing function. Per MDN it installs `stack` as a plain
+**writable STRING data property**. So depd's guard passes, the call succeeds, and
+every line after it is quietly operating on the wrong type: `obj.stack` is a string,
+`.slice(1)` is a shorter *string* rather than a shorter array, `stack[1]` is the
+single character `"e"`, and `"e".getFileName` is `undefined`. The TypeError names a
+method on a character. It mentions neither express, nor Firefox, nor stacks. **A
+missing function would have been a better bug**, because the `typeof` guard the
+entire ecosystem writes would have caught it.
+
+**The wrong fix is to touch depd, or body-parser, or express** (golden rule 2).
+Nothing about depd is wrong; it is written against the engine every Node process has
+ever had underneath it, and Vivari's proposition is that a guest cannot tell it is in
+a browser — a guest that has to ask *which* browser is one we have already failed.
+depd is also only the first to fall over: `callsites`, `stack-trace`,
+`source-map-support`, `@sentry/node`, mocha and jest all read structured stacks the
+same way, and patching them one at a time is an unbounded list. The fix belongs in
+the engine-compat layer, which is what `packages/runtime/error-stack.js` now is, and
+it is installed from `sealGuestRealm()` because the realm's engine and the realm's
+globals are the same question asked twice.
+
+**It is strictly opt-in, and detected by BEHAVIOUR.** A compat shim that engages on
+Chrome would be a worse bug than the one it fixes, because it would be silent.
+`hasV8StructuredStacks()` therefore runs the API rather than reading it: install a
+`prepareStackTrace` hook, capture, read `.stack` back, and see whether real CallSite
+objects came through. Chrome and the Node twin answer yes and **nothing is
+installed**. Two details there are load-bearing. `typeof Error.captureStackTrace` is
+useless as a probe (that *is* the bug), and so is a user-agent test, because by the
+time the realm is sealed `navigator` has already been replaced with one that says
+Node. And the probe has to force `Error.stackTraceLimit` while it runs: a guest that
+had set it to `0` would otherwise make a perfectly good V8 look unsupported, and we
+would shim Chrome.
+
+**The second failure is the one the user actually saw, and it is the same root
+assumption one layer up.** `loop.js`'s `reportError` printed
+`String((e && e.stack) || e)`. That is the idiomatic way to print an error *because
+of a V8 convention*: V8 builds `stack` as `Name: message` followed by the frames, so
+the message comes along for free. SpiderMonkey's `stack` is frames and **only**
+frames. So the terminal in that Firefox run showed four bare frames and no
+`TypeError: …` line anywhere — the user was told where it broke and never what
+broke, which is why the first reading of the report blamed the module loader. The
+same one-liner existed in Bun's `reportError` in `realm.js`. Both now go through
+`formatUncaught()`, which adds the header only when the engine has not already put
+it there.
+
+**The trap inside the fix, worth recording because it took a re-read to see:** the
+shim eats itself. Its capture path reads `new Error().stack` to get the raw text, and
+once `Error.prototype.stack` is wrapped to honour `prepareStackTrace`, that read goes
+through the **guest's own hook** and comes back as whatever the hook returns — an
+array, for every consumer listed above. depd would have had its own hook applied to
+the frames it was about to be handed. The engine's original getter is saved at wrap
+time and used for capture. A second one: frames split on the **first** `@`, not the
+last, because every scoped package puts an `@` in its path, and
+`pick@/home/project/node_modules/@babel/core/lib/index.js:9:3` splits at the last one
+into a function called `pick@/home/project/node_modules/` in a file called
+`babel/core/lib/index.js`.
+
+**What the shim will not do is invent.** A V8 CallSite is a live view onto frames the
+engine still holds; SpiderMonkey hands us a string that was formatted after the fact,
+so `getThis`, `getFunction` and `isConstructor` are gone before we are called and
+return V8's don't-know values rather than something plausible. `getFileName`,
+`getLineNumber`, `getColumnNumber` and `getFunctionName` — the four that every
+consumer above actually reads — are exact.
+
+**This class is invisible to every existing gate, which is how it shipped.** Node is
+V8, so the whole offline tier passed while Firefox failed, exactly as with `toWeb`
+above. `scripts/spike-error-stack.mjs` therefore **builds** the engine — a fake
+`Error` whose `captureStackTrace` assigns a string the way MDN documents Firefox's,
+whose `stack` is canned SpiderMonkey text taken from the require chain in the issue —
+the same trick `spike-realm.mjs` uses for the browser global object, and for the same
+reason. It runs depd's verbatim `getStack()` against it and asserts the V8 host is
+left untouched. **Honest limit: the shim has not yet been run in a real Firefox.** It
+is proven against SpiderMonkey's documented format and against V8's measured
+semantics, not against the browser. Anyone with a Firefox to hand should run the
+`express-js` template in it and record the result here.
+
 ### `capture: true` hides a process's stderr from `VV_LIVE=1`
 `kernel.start(cmd, args, { capture: true })` buffers the child's output into
 `r.stdout`/**`r.stderr`** and, on that path, the kernel's `stdout`/`stderr`
@@ -1504,6 +1611,96 @@ throw that gets swallowed. Rules:
   Gated both directions by `spike-http-binary-body.mjs` (request) and
   `spike-http-response-bytes.mjs` (response), which assert the encoding chosen as
   well as the bytes — text that starts arriving base64 is a silent 33% inflation.
+
+### The preview SW ate the studio's OWN modules — `/packages/` is not `/@fs/` in dev
+`sw.js` has always bypassed `/packages/` because those are the studio's files, not a
+preview's. **On the dev server they are not served from `/packages/`.** The studio's
+Vite root is `packages/studio`, and `server.fs.allow` points at the monorepo root, so
+Vite serves everything above the root from **`/@fs/<absolute host path>`**. That is
+every module the kernel worker and its nested workers import — all of `packages/core`,
+`kernel-host`, `protocol`, `runtime`, plus the three Wasm bundles. The bypass matched
+none of them. They fell through to `routeByClient`, whose `fetch(event.request)`
+pass-through then failed on Firefox:
+
+```
+Failed to load '…/@fs/…/packages/kernel-host/kernel.js'.
+A ServiceWorker intercepted the request and encountered an unexpected error.
+```
+
+One module import, and the kernel worker died before evaluating a line.
+
+**Four things conspired to make this take days.** Internalize all four; each is a
+separate trap.
+
+1. **It cannot happen in production.** The build bundles everything to `/assets/`, so
+   no deployed URL ever starts `/@fs/`. The only environment that can reproduce it is
+   the one no CI job and no headless run touches.
+2. **It only reproduced in one browser.** Chrome served the same dev server fine.
+   Anything that renders as "works on my machine" gets blamed on the machine.
+3. **A nested worker's death is silent by construction.** A worker's module-load
+   failure is reported to the `Worker` object in the context that *created* it — for
+   `fs-worker` that is the kernel worker, not the page. Neither had a handler, `await
+   fsReady` had no reject path, and the studio had no listener on the bridge's
+   worker-error channel or on the kernel's own fatal `error`. All three now exist; if
+   you add a worker to the boot path, give it the same three.
+4. **`bootPhase` starts at `"init"` and `bootPhaseLabel` falls through to "Starting
+   runtime".** So the boot screen reads *exactly the same* whether the kernel worker
+   posted `phase:"init"` or never ran at all. Do not read a phase label as proof that
+   a stage was reached. `__vv.bridge.request("vv-diag", undefined, {timeout: 3000})`
+   is the real test: it answers `"kernel not ready"` from a worker that is alive and
+   parked, and times out from one that never evaluated.
+
+**The fix is not a blanket `/@fs/` bypass, and must never be widened to `/@vite/` or
+`/@id/`.** A Vite dev server running *inside the VM* emits all three as root-absolute
+URLs from its preview iframe, and those have to be proxied into the VM —
+`/@vite/client` is requested by every in-VM Vite project, so bypassing that prefix
+breaks preview outright. The discriminator is **who asked**: a preview's subresource
+carries a `/preview/<port>/` referrer, the kernel worker's carries its own
+`/@fs/…/kernel-worker.ts`. An unreadable referrer bypasses rather than falling back —
+the two ways of being wrong are not symmetric. Wrong towards the VM costs one in-VM
+project a file it only requests when it reaches outside its own root; wrong towards
+the SW costs the studio its whole runtime, silently.
+
+**The path is not the variable, and `/@fs/` alone does not cover it.** Vite supports
+`import.meta.env` by *injecting* an import of `/node_modules/vite/dist/client/env.mjs`
+into the modules it serves, worker entries included. Grepping the worker's sources for
+it finds nothing — it does not exist until transform — and it sits under the studio's
+Vite root, so the `/@fs/` bypass cannot match it. That single URL is what killed the
+kernel worker. The bypass therefore also keys on the **referrer**: anything imported by
+a `/@fs/` module is ours, whatever its own path. It cannot key on `/node_modules/`,
+which an in-VM Vite requests root-absolute from its preview iframe.
+
+**The same URL, requested by the page a few milliseconds earlier, is intercepted and
+works.** Same SW, same code path, same URL — pass-through succeeds for a window client
+and fails for a dedicated-worker client. That asymmetry *is* the Firefox bug, and it is
+why several fixes that reasoned about which path was requested all missed. When
+debugging this class, ask which **client** issued the request, not which path.
+
+**You cannot see any of this from the places you would look.** Firefox's Network panel
+does not list requests made by a worker, and a service worker's `console` output does
+not appear in the console of the page it controls. Between those two, the request log
+for the kernel worker's module graph is invisible from both DevTools panels you would
+reach for, which is what let this survive several rounds of confident, wrong diagnosis.
+The SW is the only context shown every one of those requests: when debugging this
+class, log from inside the `fetch` handler and relay it to the page (a controlling SW
+can `postMessage` its clients), rather than reasoning from what the page can see.
+
+**Register the SW after `kernel-online`, not at start-up.** Registering it during
+`start()` had it activate and `clients.claim()` roughly 10ms after the kernel worker
+was created — a controller change while the worker's module graph was still streaming
+in. Nothing needs the SW before the kernel is up: it is preview-only, isolation comes
+from the COOP/COEP response headers, and previews cannot exist yet.
+
+**And `routeByClient`'s pass-through is now the thing that cannot fail.** Once
+`respondWith()` has been called there is no way to un-intercept, so a rejected
+pass-through is a dead request with no diagnostic attached. `passThrough()` tries the
+original `Request`, then a plain same-origin re-issue, then returns a synthetic 502 —
+a visible error beats a hang. The `/vv-devtools/`, `/devtools/`, `/vendor/` and
+`/packages/` bypasses above it all exist because re-issuing an intercepted Request
+failed under cross-origin isolation; treat `fetch(event.request)` as unreliable, not
+as the default.
+
+`scripts/spike-sw-routing.mjs` drives the real `sw.js` under `vm` and gates all of it.
 
 ### A guest that emits root-absolute NAVIGATION URLs escapes the preview
 Under path routing (modes A/B) a preview lives at `<origin>/preview/<port>/`, and

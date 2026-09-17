@@ -230,6 +230,13 @@ export interface IdeSnapshot {
   bootPhase: string;
   bootDone: number;
   bootTotal: number;
+  // The runtime died on the way up, and is not coming back on its own. Set from
+  // the kernel's own fatal `error` and from the bridge's worker-error channel
+  // (a kernel worker that never evaluated its module graph). Null in the normal
+  // case; when it isn't, Home says so instead of spinning on a progress bar that
+  // will never finish — the studio used to have no listener on either channel,
+  // so a dead runtime and a slow one looked identical forever.
+  bootError: string | null;
   // The project currently installing/starting, if any — what the preview shell
   // and the status bar narrate while there is nothing to preview yet. Null once
   // the preview paints (or the run tab exits).
@@ -667,6 +674,7 @@ export class IdeController {
     bootPhase: "init",
     bootDone: 0,
     bootTotal: 0,
+    bootError: null,
     runPhase: null,
     // A shared link lands straight on the (loading) workspace, never Home — so the
     // user can't accidentally start a new project while it bootstraps.
@@ -838,25 +846,25 @@ export class IdeController {
       this.set({ shareLoading: true, shareMessage: "Booting the runtime…" });
       this.status("opening shared project…");
     }
-    // Registration is NOT awaited before booting. It costs a script download, an
-    // install/activate and a `controllerchange` (capped at 1s in the bridge) on a
-    // first visit, and everything downstream — the kernel worker, three Wasm
-    // modules, the OPFS restore — used to queue behind it for no reason: the SW
-    // is preview-only (it passes editor navigations and assets straight through),
-    // and the kernel's own capability comes from the COOP/COEP response headers,
-    // not from the SW. The one thing that does need it is preview routing, and
-    // that is re-announced on every `listen` (`Vivari`'s bridge handler calls
-    // `announceKernelHost()` there), so a server that binds a port before the SW
-    // has claimed the page still gets routed once it has.
-    void this.bridge.registerServiceWorker().then(
-      (ok) => {
-        this.consoleLine(
-          ok ? "Service Worker registered (preview proxy ready)." : "Service workers unavailable — preview disabled.",
-          ok ? "32" : "31",
-        );
-      },
-      (err) => this.consoleLine(`Service Worker registration failed: ${String(err)} — preview disabled.`, "31"),
-    );
+    // Service Worker registration is NOT here — it happens on `kernel-online`
+    // (see wireBridge). It was here, and not awaited, for a good reason: the SW is
+    // preview-only, the kernel's cross-origin isolation comes from the COOP/COEP
+    // response headers rather than from the SW, and making the kernel worker and
+    // three Wasm modules queue behind an install/activate bought nothing. But not
+    // awaiting it is not the same as it being harmless. Registering it here made
+    // the SW activate and call clients.claim() *while the kernel worker's module
+    // graph was still streaming in* — measured at ~10ms after the worker was
+    // created, on every run. That hands the page a service-worker controller
+    // change mid-load, and on Firefox the kernel worker never finished loading
+    // afterwards.
+    //
+    // Nothing needs the SW before the kernel is up: it exists to proxy previews,
+    // and there are no previews until a project runs. Preview routing is
+    // re-announced on every `listen` (the bridge handler calls
+    // `announceKernelHost()`), so a server that binds a port before the SW has
+    // claimed still gets routed once it has. Both orderings are equally good for
+    // everything the SW actually does, and only one of them has the race — so
+    // take the one that does not, rather than trying to survive the transition.
     this.bridge.boot();
   }
 
@@ -3526,6 +3534,22 @@ export class IdeController {
     this.set({ memInfo: { total, vfsBytes, vfsFiles, vfsLogicalBytes, ts: Date.now() } });
   }
 
+  /**
+   * The runtime died on the way up. First cause wins — a kernel worker that never
+   * evaluated produces follow-on failures, and the first one is the one that
+   * names the real problem. Clears the boot progress state so Home stops
+   * advertising progress that is never going to arrive.
+   */
+  private failBoot(message: string) {
+    if (this.snap.bootError) return;
+    this.consoleLine(message, "31");
+    this.set({ bootError: message, bootPhase: "", shareLoading: false });
+    toast.error("The Vivari runtime failed to start", {
+      description: message,
+      duration: Infinity,
+    });
+  }
+
   // ── kernel worker message handling (ported from host.js) ──────────────────
   private wireBridge() {
     const b = this.bridge;
@@ -3548,8 +3572,12 @@ export class IdeController {
     // Cold-boot progress (relayed from the FS worker's OPFS restore + kernel
     // phase markers). Drives the Home boot indicator until `kernelReady`.
     b.on("boot-progress", (m) => {
+      // Phase changes only. `restore` fires once per entry re-hydrated, which for
+      // a real project is thousands of events — tracing each would evict the whole
+      // boot narration under TRACE_CAP and tell us nothing the phase didn't.
+      const phase = (m.phase as string) || "";
       this.set({
-        bootPhase: (m.phase as string) || "",
+        bootPhase: phase,
         bootDone: (m.done as number) ?? 0,
         bootTotal: (m.total as number) ?? 0,
       });
@@ -3559,6 +3587,50 @@ export class IdeController {
     b.on("kernel-online", () => {
       markBoot("kernel-online");
       this.set({ kernelReady: true, bootPhase: "" });
+      // Only now: the kernel worker has loaded and evaluated, so the SW activating
+      // and claiming the page can no longer interrupt it. A preview cannot exist
+      // before this point either, so nothing is lost by waiting. If the runtime
+      // never comes up we never register — which is correct, because a preview
+      // proxy with no runtime to proxy to has nothing to do.
+      void this.bridge.registerServiceWorker().then(
+        (ok) => {
+          this.consoleLine(
+            ok
+              ? "Service Worker registered (preview proxy ready)."
+              : "Service workers unavailable — preview disabled.",
+            ok ? "32" : "31",
+          );
+        },
+        (err) => {
+          this.consoleLine(`Service Worker registration failed: ${String(err)} — preview disabled.`, "31");
+        },
+      );
+    });
+    // The two ways the runtime can die before `kernel-online`, neither of which
+    // had a listener here. Both used to leave Home spinning on "Starting runtime…"
+    // indefinitely, which is indistinguishable from a slow restore and gives the
+    // user nothing to report.
+    //
+    //   `error` (fatal) — the kernel worker ran and boot() threw; the worker posts
+    //                     this from boot().catch, and it carries a real message.
+    //   onWorkerError   — the kernel worker never got that far: its module graph
+    //                     failed to load or evaluate, so it can never post
+    //                     anything. Only the bridge's `onerror` hook sees it.
+    b.on("error", (m) => {
+      if (!m.fatal) return;
+      this.failBoot(String(m.message ?? "the runtime stopped during start-up"));
+    });
+    this.bridge.onWorkerError((message) => {
+      // The same test spawnWorker makes for process workers: a kernel worker that
+      // has already brought the runtime online plainly evaluated its module graph,
+      // so a later `error` from it is an uncaught exception — which per spec is
+      // reported without killing the worker — and not a failure to start. Say so
+      // rather than declaring a live runtime dead.
+      if (this.snap.kernelReady) {
+        this.consoleLine(`[kernel] uncaught worker error: ${message}`, "31");
+        return;
+      }
+      this.failBoot(`the kernel worker could not start: ${message}`);
     });
     b.on("ready", () => {
       markBoot("kernel-ready");

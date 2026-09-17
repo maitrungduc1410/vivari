@@ -64,6 +64,7 @@
 // `fs` that esbuild-wasm mirrors) can be swept by accident, list or no list.
 
 import { shimMessage } from "./builtins/bun-unsupported.js";
+import { installV8StackCompat, formatUncaught } from "./error-stack.js";
 
 // The globals of a real `node` (v22.23.2), recorded from the binary itself.
 // Regenerate with: node scripts/record-realm-globals.mjs --node
@@ -207,6 +208,15 @@ export function captureHostRealm(scope) {
  * Returns the names hidden, for `__vv.diag()` and for the spike to assert on.
  */
 export function sealGuestRealm(scope, captured) {
+  // The realm is not only a SET of names, it is an ENGINE, and until now nothing
+  // here said so. Every global below can be present and correct and a guest will
+  // still die at require time if `Error.captureStackTrace` hands back a string,
+  // which is what SpiderMonkey does — see error-stack.js for the express/depd
+  // chain this was written for. This is a no-op on a V8 host by construction: the
+  // installer probes the engine and returns without touching anything if the real
+  // structured-stack API is already there.
+  installV8StackCompat(scope);
+
   const allow = new Set(NODE_GLOBALS);
   for (const name of KEEP) allow.add(name);
   for (const name of REPLACE) allow.delete(name);
@@ -327,9 +337,14 @@ export function installBunRealm(scope, captured) {
 
   // Bun's reportError prints the error the way an uncaught one prints and keeps
   // going. The browser's would post it to the studio page's error handlers.
+  //
+  // `err.stack` alone was enough while every engine under this was V8, whose
+  // `stack` opens with the "Name: message" line. SpiderMonkey's does not, so that
+  // form printed frames and threw the message away — formatUncaught puts it back
+  // without duplicating it where the engine already supplies it.
   hide(scope, "reportError", function reportError(err) {
     try {
-      const text = (err && err.stack) || String(err);
+      const text = formatUncaught(err);
       scope.process.stderr.write("error: " + text + "\n");
     } catch {
       /* stderr is gone; there is nowhere left to report to */

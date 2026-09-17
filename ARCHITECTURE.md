@@ -109,6 +109,15 @@ Key relationships:
   npm tarball download/decompress never stalls syscall servicing.
 - The Kernel Worker also **spawns each Process Worker** and wires a
   `MessageChannel` between it and the File System Worker (its fs doorbell).
+- **Every worker on the boot path has an error path, and that is load-bearing.** A
+  nested worker that fails to load its module graph reports it to the worker that
+  *created* it — not to the page — so without a handler it is completely silent.
+  `fs-worker` has `onerror`/`onmessageerror`, `fsReady` rejects rather than parking
+  forever, the kernel posts a fatal `error` from `boot().catch`, and the studio
+  listens to both that and the bridge's `onWorkerError` (a kernel worker that never
+  evaluated can post nothing at all). `Home`'s boot panel renders the failure instead
+  of a progress bar. Before this a dead runtime and a slow one were indistinguishable
+  — see the `/@fs/` Service Worker gotcha in `AGENTS.md`.
 
 ---
 
@@ -396,6 +405,10 @@ Module system:
 - `index.js` — `createRuntime()`: wires builtins + globals + the HTTP bridge +
   the WebSocket client, and returns `run(entry)`.
 - `loop.js` — the **per-process event loop** (see §7.1).
+- `realm.js` — what the guest can SEE: the sweep that hides every host-realm global
+  a real Node process does not have, and the engine-compat install below.
+- `error-stack.js` — the **engine-compat layer** for V8-only error APIs
+  (`Error.captureStackTrace`, `Error.prepareStackTrace`), inert on V8 (see §7.3).
 - `boot.js` — process bootstrap shared by the browser and Node worker entries.
 
 ### 7.1 The event loop
@@ -526,6 +539,61 @@ the wrong program. The CDP shape
 is shared so the same backend can later also feed the chii Sources panel — distinct
 from §8.5, which debugs preview **browser** JS via chobitsu.
 
+### 7.3 The engine underneath (`error-stack.js`)
+
+A Process Worker's realm is two things, and for a long time only one of them was
+modelled. `realm.js` decides what the guest can **see** — 332 browser globals swept
+down to the 141 a real `node` has. What nothing described is that the realm is also
+an **engine**, and that a guest can find every global present and correct and still
+die on the first `require` because the engine underneath is not V8.
+
+`Error.captureStackTrace` and `Error.prepareStackTrace` are V8 extensions, not
+language. Node has never run on anything else, so a large part of npm reads
+structured stacks as if they were guaranteed — `depd` (therefore `body-parser`,
+therefore `express`), `callsites`, `stack-trace`, `source-map-support`, `@sentry/node`,
+mocha and jest. In Chrome that is free; in Firefox it is the difference between
+`express` importing and not. See the Critical gotcha in `AGENTS.md` for the failure
+in full.
+
+`error-stack.js` closes that gap, and its governing property is that it is **strictly
+opt-in by behaviour**. `hasV8StructuredStacks()` does not sniff a user agent (there is
+no honest `navigator` in a sealed realm anyway): it installs a `prepareStackTrace`
+hook, captures, reads `.stack` back and checks whether real CallSite objects arrived.
+Chrome and the Node twin answer yes and **nothing is installed at all** — no wrapper,
+no parse, not even a slower path. The same probe is what makes installation
+idempotent: once the shim is in, the engine passes its own test.
+
+Where the engine says no, `sealGuestRealm()` installs two things before the entry
+module runs:
+
+- **`Error.captureStackTrace`**, which parses the engine's own
+  `func@file:line:col` stack text into CallSite-shaped objects and installs `stack`
+  as V8 does — a lazy, memoising accessor that consults whatever
+  `Error.prepareStackTrace` is set at the moment of the **first read**, honours
+  `Error.stackTraceLimit`, and trims frames above a `constructorOpt`.
+- **A wrapper around `Error.prototype.stack`**, because half the ecosystem never
+  calls `captureStackTrace` and just reads `new Error().stack` with a hook installed.
+  With no hook set the wrapper returns the engine's own string byte for byte, so
+  guest code has to ask for V8 semantics before anything changes shape.
+
+What a formatted string cannot carry is not invented. `getFileName`,
+`getLineNumber`, `getColumnNumber` and `getFunctionName` — the four anyone actually
+reads — are exact; `getThis`, `getFunction` and `isConstructor` return V8's
+don't-know values, because a plausible-looking answer is worse than none.
+
+Two consumers sit on the same layer. `internalBinding('util').getCallSites` (which
+backs `util.getCallSites()`) goes through `captureCallSites()`, which validates the
+shape it got back rather than assuming an array. And `formatUncaught()` is how an
+uncaught error reaches the terminal from `loop.js` and from Bun's `reportError`:
+printing `err.stack` alone is a V8 idiom that works only because V8 builds `stack`
+as `Name: message` followed by frames, and on an engine that omits the header the
+message would otherwise be dropped on the floor.
+
+Gate: `scripts/spike-error-stack.mjs` (offline tier). It cannot use the host's
+`Error`, because the host is V8 and would pass — so it **builds** an engine whose
+`captureStackTrace` returns a string, the same way `spike-realm.mjs` builds a Chrome
+worker global, and runs depd's verbatim `getStack()` against it.
+
 ---
 
 ## 8. Networking
@@ -643,6 +711,34 @@ header, so a path-prefix-aware guest framework can advertise correct absolute UR
 even though it sees clean `/` paths. The Python bridge maps it to the ASGI
 `root_path` / WSGI `SCRIPT_NAME` (§9.3) — that's what makes FastAPI's Swagger UI
 (`/docs`, the `openapi.json` link, "Try it out") route back through the tunnel.
+
+**What the SW must NOT intercept, and why that list keeps growing.** The proxy is
+scoped to the whole origin, so every request the studio makes for its own assets
+crosses it too. Five prefixes return early before `routeByClient` — `/vv-devtools/`,
+`/devtools/`, `/vendor/`, `/packages/`, and `/@fs/` — and all five were added after
+the same failure: re-issuing an intercepted `Request` with `fetch(event.request)`
+failed under cross-origin isolation, and the asset never arrived. `/@fs/` is the
+dev-only one and the most expensive we have hit. The studio's Vite root is
+`packages/studio` while `server.fs.allow` points at the monorepo root, so in dev every
+module above the root — `packages/core`, `kernel-host`, `protocol`, `runtime`, the
+three Wasm bundles — is served from `/@fs/<absolute host path>` rather than
+`/packages/`. The kernel worker's own module graph therefore went through the proxy,
+one import died on Firefox, and the worker never evaluated. The built app cannot
+reproduce it (everything is bundled to `/assets/`).
+
+That bypass is conditioned on the **referrer**, not on the path alone, and is
+deliberately not extended to `/@vite/` or `/@id/`: a Vite dev server running *inside
+the VM* emits all three from its preview iframe and those must be proxied in. A
+preview's subresource carries a `/preview/<port>/` referrer; the kernel worker's
+carries its own worker script URL. Anything unreadable falls back to `routeByClient`.
+
+`routeByClient`'s non-preview branch is `passThrough()`, which is written on the
+assumption that `fetch(event.request)` can fail: it tries the original `Request`, then
+a plain same-origin re-issue, then returns a synthetic 502. Once `respondWith()` has
+been called the request cannot be handed back to the browser, so the one thing this
+path must never do is reject — a rejected `respondWith()` is a dead request carrying
+no diagnostic, which is precisely how the kernel worker died silently.
+`scripts/spike-sw-routing.mjs` drives the real `sw.js` under `vm` and gates it.
 
 **Preview iframes start at about:blank, then navigate.** On a fresh page load the
 studio document is fetched before the SW takes control, so a brand-new iframe whose

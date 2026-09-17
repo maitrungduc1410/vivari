@@ -20,6 +20,8 @@
 //     resolves the idle wait. The SAB channel stays free while idle, so a timer
 //     callback can freely run a sync fs syscall.
 
+import { formatUncaught } from "./error-stack.js";
+
 // Capture the host timer + macrotask primitives BEFORE the runtime overrides the
 // globals with our own versions (this module is imported before that happens).
 const hostSetTimeout = globalThis.setTimeout.bind(globalThis);
@@ -118,8 +120,14 @@ export function createEventLoop({ isAlive, doNet, doChildren, doThreads, doWatch
     },
   };
 
+  // Printing `e.stack` and nothing else is the V8 idiom, and it works ONLY
+  // because V8 builds `stack` as "Name: message" followed by the frames. On
+  // SpiderMonkey `stack` is frames and nothing else, so an uncaught TypeError in
+  // Firefox reached the terminal as four bare frames with no message on any line
+  // — the user was told where, never what. formatUncaught (error-stack.js) adds
+  // the header only when the engine has not already put it there.
   const reportError = (e) => {
-    const msg = String((e && e.stack) || e) + "\n";
+    const msg = formatUncaught(e) + "\n";
     try {
       process.stderr.write(msg);
     } catch {

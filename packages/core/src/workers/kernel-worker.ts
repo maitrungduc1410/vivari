@@ -1469,7 +1469,9 @@ async function boot() {
   // constructed). No-op on wasm builds that predate set_compression.
   fsWorker.postMessage({ type: "fs-set-compression", on: vfsCompression });
   let onKernelFsMessage = () => {};
-  const fsReady = new Promise((resolve) => {
+  let fsFailed = (_err) => {};
+  const fsReady = new Promise((resolve, reject) => {
+    fsFailed = reject;
     fsWorker.onmessage = (event) => {
       if (event.data.type === "ready") resolve();
       // The FS worker logs OPFS restore status; relay it to the host UI.
@@ -1491,6 +1493,33 @@ async function boot() {
       } else onKernelFsMessage(event.data);
     };
   });
+
+  // A nested worker that fails to load or evaluate its module graph fires `error`
+  // here and does nothing else: no `ready`, no exception in this worker, and no
+  // entry in the page's console — the event is delivered to the worker that
+  // created it, which is us. Without these two lines `await fsReady` below simply
+  // never returns, and the studio spins on "Starting runtime…" forever with an
+  // empty console. That is not hypothetical: a Service Worker eating ONE of the
+  // FS worker's `/@fs/` module imports in dev presented exactly that way, and
+  // cost days to find (see the `/@fs/` bypass in packages/studio/public/sw.js).
+  //
+  // Rejecting is safe after boot, not just before it: once `fsReady` has settled
+  // these are no-ops, so an uncaught exception from a RUNNING FS worker — which
+  // per spec is reported without killing the worker — cannot tear down a healthy
+  // boot. That is the same distinction spawnWorker draws below, in the one form
+  // it needs here, and deliberately no more than that.
+  fsWorker.onerror = (event) => {
+    fsFailed(
+      new Error(
+        "File System Worker failed to start: " +
+          (event && event.message ? event.message : "module load or evaluation error") +
+          (event && event.filename ? " (" + event.filename + ")" : ""),
+      ),
+    );
+  };
+  fsWorker.onmessageerror = () => {
+    fsFailed(new Error("File System Worker sent a message this thread could not deserialize"));
+  };
 
   // Fetcher Worker (Phase 2 #9): all outbound network goes through it, so
   // downloading/decompressing large npm payloads never stalls syscall servicing.

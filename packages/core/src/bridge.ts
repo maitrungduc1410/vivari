@@ -174,12 +174,17 @@ export class KernelBridge {
     // asset that 404s) never posts anything at all, so without this every caller
     // waiting on the kernel — `boot()` most visibly — would wait forever.
     this.worker.onerror = (event) => {
-      const message =
-        (typeof event === "object" && event && "message" in event
-          ? String((event as ErrorEvent).message)
-          : "") || "kernel worker failed to load";
-      for (const h of [...this.workerErrorHandlers]) h(message);
-      this.failPending(new VivariError("ERR_WORKER", message));
+      const e = (typeof event === "object" && event ? event : {}) as Partial<ErrorEvent>;
+      // `message` is empty for a module-graph load failure — the interesting case,
+      // and the one where the bare fallback below says nothing anyone can act on.
+      // `filename` is often still populated, and it names the module that actually
+      // failed, which is the single fact a caller needs and the one we spent two
+      // rounds of guessing without. Append it whenever it is there.
+      const where = e.filename ? ` (${e.filename}${e.lineno ? ":" + e.lineno : ""})` : "";
+      const message = (e.message ? String(e.message) : "") || "kernel worker failed to load";
+      const full = message + where;
+      for (const h of [...this.workerErrorHandlers]) h(full);
+      this.failPending(new VivariError("ERR_WORKER", full));
     };
 
     // Best-effort flush of the OPFS write-behind buffer as the page goes away.

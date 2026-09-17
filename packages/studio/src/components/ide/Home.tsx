@@ -9,6 +9,7 @@ import FolderInput from "~icons/lucide/folder-input";
 import Github from "~icons/lucide/github";
 import Loader from "~icons/lucide/loader-circle";
 import RotateCcw from "~icons/lucide/rotate-ccw";
+import TriangleAlert from "~icons/lucide/triangle-alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -232,6 +233,29 @@ function bootPhaseLabel(phase: string): string {
 
 function BootStatus() {
   const { snap } = useIde();
+  // A runtime that is never coming up must not keep animating a progress bar:
+  // the two states were indistinguishable, so a dead kernel worker read as a slow
+  // one for as long as the user was willing to wait.
+  if (snap.bootError) {
+    return (
+      <div className="mb-6 rounded-xl border border-destructive/40 bg-destructive/5 p-4">
+        <div className="flex items-start gap-3">
+          <TriangleAlert className="mt-0.5 size-5 shrink-0 text-destructive" />
+          <div className="min-w-0 flex-1 space-y-1">
+            <div className="text-sm font-medium">The runtime failed to start</div>
+            <div className="break-words text-xs text-muted-foreground">{snap.bootError}</div>
+            <div className="text-xs text-muted-foreground">
+              Reloading the page usually clears it. If it keeps happening, the browser console
+              has the underlying error.
+            </div>
+          </div>
+          <Button size="sm" variant="outline" className="shrink-0" onClick={() => location.reload()}>
+            Reload
+          </Button>
+        </div>
+      </div>
+    );
+  }
   const determinate = snap.bootPhase === "restore" && snap.bootTotal > 0;
   const pct = determinate
     ? Math.min(100, Math.round((snap.bootDone / snap.bootTotal) * 100))

@@ -16,6 +16,7 @@ import { createHttpParserBinding } from "./bindings/http_parser.js";
 import { createZlibBinding, ZLIB_CONSTANTS } from "./bindings/zlib.js";
 import { createCryptoBinding } from "./bindings/crypto.js";
 import { OS_SIGNALS, OS_ERRNO, OS_PRIORITY, OS_DLOPEN, UV_UDP_REUSEADDR, FS_CONSTANTS, CRYPTO_CONSTANTS } from "./bindings/constants.js";
+import { captureCallSites } from "../error-stack.js";
 
 // Node's v8::PropertyFilter values used by getOwnNonIndexProperties.
 const ALL_PROPERTIES = 0;
@@ -106,31 +107,26 @@ export function createInternalBinding({ syscalls, process, netLiveness, netServe
       // the frame that called THEM, so the answer has to be the caller's frame,
       // not ours: the capture starts above getCallSites itself.
       //
+      // The Error.prepareStackTrace dance that used to be written out here is now
+      // captureCallSites (runtime/error-stack.js), because on SpiderMonkey it
+      // silently returned nonsense: `target.stack` came back a STRING, `.slice`
+      // gave characters, and `s.getFunctionName()` threw inside a function whose
+      // whole job is to survive being called from an error reporter. The helper
+      // validates the shape it got and parses the engine's own stack text when
+      // there is no real CallSite to be had.
+      //
       // scriptId is V8-internal and not reachable from JS; it is reported as the
       // empty string rather than a fabricated number, because a caller keying a
       // cache on it would be keying on a lie.
-      getCallSites: (frameCount) => {
-        const target = {};
-        const prevPrepare = Error.prepareStackTrace;
-        const prevLimit = Error.stackTraceLimit;
-        try {
-          Error.stackTraceLimit = frameCount;
-          Error.prepareStackTrace = (_err, sites) => sites;
-          Error.captureStackTrace(target, bindings.util.getCallSites);
-          const sites = target.stack || [];
-          return sites.slice(0, frameCount).map((s) => ({
-            functionName: s.getFunctionName() || "",
-            scriptId: "",
-            scriptName: s.getScriptNameOrSourceURL() || s.getFileName() || "",
-            lineNumber: s.getLineNumber() || 0,
-            columnNumber: s.getColumnNumber() || 0,
-            column: s.getColumnNumber() || 0,
-          }));
-        } finally {
-          Error.prepareStackTrace = prevPrepare;
-          Error.stackTraceLimit = prevLimit;
-        }
-      },
+      getCallSites: (frameCount) =>
+        captureCallSites(frameCount, bindings.util.getCallSites).map((s) => ({
+          functionName: s.getFunctionName() || "",
+          scriptId: "",
+          scriptName: s.getScriptNameOrSourceURL() || s.getFileName() || "",
+          lineNumber: s.getLineNumber() || 0,
+          columnNumber: s.getColumnNumber() || 0,
+          column: s.getColumnNumber() || 0,
+        })),
       privateSymbols: {
         untransferable_object_private_symbol: Symbol("untransferable_object"),
       },

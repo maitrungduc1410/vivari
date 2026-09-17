@@ -166,6 +166,13 @@ const SPIKES = [
   // and silently drops the app to `unsafe-none`: no SharedArrayBuffer, no boot.
   // Pure string and list work, so it runs in the earliest gate.
   { name: "site-headers", file: "spike-site-headers.mjs", net: false, timeout: 60000 },
+  // The other half of the delivery contract: which requests the preview Service
+  // Worker takes over. Same reason it is static — the routing bug that motivated
+  // it (`/@fs/` in dev matching no bypass, so the kernel worker's own module
+  // imports went through the SW and died on Firefox) is invisible to the built
+  // app and to Chrome, i.e. to every environment CI has. sw.js is a classic
+  // script with no imports, so it runs under `vm` with a stub `self`.
+  { name: "sw-routing", file: "spike-sw-routing.mjs", net: false, timeout: 60000 },
   // Same reason this one is static: nothing in CI runs a browser, and no CI runner is a
   // Mac. The word-wrap chord's whole failure mode is macOS-only, so the matcher is
   // plain JS and this drives it with the event shapes macOS produces.
@@ -176,6 +183,12 @@ const SPIKES = [
   // recording (scripts/fixtures/realm-globals.json) and sweeps that. Pure
   // property work, no kernel/wasm.
   { name: "realm", file: "spike-realm.mjs", net: false, timeout: 60000 },
+  // The other half of "what engine is the guest standing on": Error.captureStackTrace
+  // and Error.prepareStackTrace are V8 extensions half of npm treats as the language,
+  // and SpiderMonkey has only the first one, returning a string. Node is V8, so a fake
+  // engine is built the way the realm spike builds a fake global object — running this
+  // on the host's own Error would pass while Firefox failed, which is how it shipped.
+  { name: "error-stack", file: "spike-error-stack.mjs", net: false, timeout: 60000 },
   // bun:jsc serialize/deserialize, compared case by case against a recording from
   // a real bun binary. Pure JS, no kernel/wasm.
   { name: "serialize", file: "spike-serialize.mjs", net: false, timeout: 60000 },
