@@ -175,6 +175,19 @@
   width: 100%;
   height: 100%;
 }
+/* Host for Monaco's overflowing widgets — see overflowWidgetsNode in
+   controller.ts for why they live outside the editor at all. Zero-size on
+   purpose: the node has to carry the `monaco-editor` class to inherit the theme's
+   colour variables, and that class also paints an editor-coloured background, so
+   an empty box is what keeps it from covering the app. The widgets inside are
+   `position: fixed` and so are laid out against the viewport regardless. */
+.vv-overflow-widgets {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+}
 /* Monaco paints its own background; make sure it fills the pane. */
 .vv-editor-host .monaco-editor,
 .vv-editor-host .monaco-editor .overflow-guard {

@@ -121,12 +121,16 @@ export function cellEditorOptions(overrides) {
     // in page coordinates, which is not clipped by an ancestor's overflow.
     //
     // What it does NOT do, checked in monaco-editor 0.55.1 rather than assumed:
-    // it does not REPARENT them (browser/view.js only moves them when an
-    // `overflowWidgetsDomNode` is supplied, which we do not). They stay inside
-    // the cell's div and merely stop being positioned by it. So this holds only
-    // while nothing between the widget and the viewport establishes a containing
-    // block for fixed descendants — `transform`, `filter`, `perspective`,
-    // `backdrop-filter`, `will-change`, or `contain` with layout/paint. The
+    // it does not REPARENT them. browser/view.js only moves them when an
+    // `overflowWidgetsDomNode` is supplied — the studio does supply one (see
+    // overflowWidgetsNode in controller.ts, which a cell needs for a second
+    // reason: the preview pane's iframe paints over anything that merely escapes
+    // its box), but this function is also mounted without one, and that is the
+    // case described here. Then they stay inside the cell's div and merely stop
+    // being positioned by it. So this holds only while nothing between the widget
+    // and the viewport establishes a containing block for fixed descendants —
+    // `transform`, `filter`, `perspective`, `backdrop-filter`, `will-change`, or
+    // `contain` with layout/paint. The
     // notebook has two `contain: layout paint` boundaries (NotebookView.tsx: the
     // sanitised output, and a markdown cell), both deliberate security ones, and
     // neither is an ancestor of a cell editor. `spike-notebook-view.mjs` asserts

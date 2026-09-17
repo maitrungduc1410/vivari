@@ -340,6 +340,49 @@ type UiTheme = "light" | "dark";
 const termThemeFor = (t: UiTheme) => (t === "light" ? TERM_THEME_LIGHT : TERM_THEME_DARK);
 const monacoThemeFor = (t: UiTheme) => (t === "light" ? "vs" : "vs-dark");
 
+/**
+ * The one node every Monaco editor here reparents its overflowing widgets into
+ * — hover, suggest, signature help, the context menu.
+ *
+ * Monaco already lifts those out of the editor's scrolling box into an
+ * `.overflowingContentWidgets` div, which is why a hover can extend past the
+ * gutter. What it cannot do on its own is lift them out of the PAGE: that div
+ * stays inside the editor's DOM, and the editor pane is an EARLIER sibling of
+ * the preview pane, whose iframe is positioned and so paints over anything
+ * reaching in from an earlier sibling. A hover on a long line was cut off at
+ * that seam.
+ *
+ * Reparenting is the part that fixes it (view.js moves both overflow containers
+ * into the supplied node), because this node is a later sibling of the whole app.
+ * `fixedOverflowWidgets` alone does NOT — measured against 0.55.1 in a browser,
+ * not assumed: it changes where a widget is laid out, not what paints over it,
+ * and the rendering was pixel-identical to the bug. It is still set, because it
+ * is the mode an external host implies: Monaco then lays widgets out in page
+ * coordinates clamped to the window rather than against the editor. With this
+ * node pinned at the viewport origin the two placements coincide for a hover
+ * that is already on screen (also measured), so the flag is about behaviour at
+ * the window edges, not about the fix.
+ *
+ * Two properties of this node are load-bearing:
+ * - `monaco-editor` is not decoration. The standalone theme service emits every
+ *   `--vscode-*` colour as a rule on `.monaco-editor, .monaco-diff-editor,
+ *   .monaco-component`, so a widget that lives outside one of those renders with
+ *   no background at all, over whatever it happens to cover. Verified by reading
+ *   `--vscode-editorHoverWidget-background` back off this node.
+ * - No z-index, deliberately. At `auto` it already beats the panes, which are
+ *   also `auto`, while still losing to the app's real overlays (HomeView's z-40,
+ *   the share overlay's z-50) — a modal should cover a tooltip, not the reverse.
+ */
+let overflowWidgetsHost: HTMLElement | null = null;
+function overflowWidgetsNode(): HTMLElement {
+  if (overflowWidgetsHost?.isConnected) return overflowWidgetsHost;
+  const node = document.createElement("div");
+  node.className = "vv-overflow-widgets monaco-editor";
+  document.body.appendChild(node);
+  overflowWidgetsHost = node;
+  return node;
+}
+
 // A diff tab is a synthetic open-tab id: `vv-diff:<abs>`. It reuses the tab strip
 // (kind "diff") but must never be treated as a real file path (no read/save). The
 // filename still renders because baseName() splits on "/".
@@ -1184,6 +1227,11 @@ export class IdeController {
       // Seeded from the persisted preference rather than set afterwards, so a wrapped
       // session does not flash one unwrapped frame on every cold boot.
       wordWrap: this.snap.wordWrap ? "on" : "off",
+      // Hovers and suggest lists have to survive leaving the editor pane — the
+      // preview iframe next door paints over anything that does not. See
+      // overflowWidgetsNode.
+      fixedOverflowWidgets: true,
+      overflowWidgetsDomNode: overflowWidgetsNode(),
     });
     // Breakpoint debugger: wire gutter breakpoints + paused-line decorations.
     this.debug.attachEditor(this.editor, monaco);
@@ -1997,6 +2045,13 @@ export class IdeController {
     return editors.mount(el, id, language, cell.source, {
       theme: monacoThemeFor(this.uiTheme),
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      // A notebook renders in the same pane as the text editor, so its cells have
+      // the same preview iframe beside them. `cellEditorOptions` already sets
+      // `fixedOverflowWidgets` for its own reasons; supplying the host here is
+      // what carries the widget out of the pane. Passed in rather than imported
+      // by cell-editors.js, which takes Monaco as a parameter precisely so it
+      // stays drivable without a DOM.
+      overflowWidgetsDomNode: overflowWidgetsNode(),
     });
   }
 
@@ -2045,6 +2100,9 @@ export class IdeController {
       // Wrapping matters MORE here than in the text editor: a side-by-side diff gives
       // each version half the width, so a long line is cut off twice over.
       wordWrap: this.snap.wordWrap ? "on" : "off",
+      // Same pane, same preview iframe next to it — see overflowWidgetsNode.
+      fixedOverflowWidgets: true,
+      overflowWidgetsDomNode: overflowWidgetsNode(),
     });
     this.diffEditor = diff;
     const [head, work] = await Promise.all([

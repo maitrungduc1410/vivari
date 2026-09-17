@@ -152,6 +152,12 @@ const SPIKES = [
   // merges green and breaks the site afterwards. Static, so it needs neither bun
   // nor the studio's node_modules.
   { name: "studio-types", file: "spike-studio-types.mjs", net: false, timeout: 60000 },
+  // Monaco's hover/suggest widgets have to leave the editor pane, because the
+  // preview iframe beside it paints over anything that does not. Static for the
+  // same reason studio-types is: no CI job runs a browser, and the failure is a
+  // paint-order fact that only shows up with a real long line in front of a real
+  // human. Pins the four decisions that fix rests on.
+  { name: "editor-widgets", file: "spike-editor-widgets.mjs", net: false, timeout: 60000 },
   // The studio's DELIVERY contract: the _headers Pages serves it under, the
   // kernel-asset assertion, and the SW's cache-first prefixes. Nothing local can
   // observe any of it — `vite preview` ignores _headers entirely — so the first
