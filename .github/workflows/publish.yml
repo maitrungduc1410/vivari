@@ -139,6 +139,3 @@ jobs:
 
             - `@vivari/core` — framework-agnostic browser WebContainer SDK
             - `@vivari/react` — React `<Vivari>` component + `useVivari()` hook
-
-            > Dry run: `${{ inputs.dry_run }}` — when `true`, the `.tgz` files below were
-            > built and attached but nothing was pushed to npm.
