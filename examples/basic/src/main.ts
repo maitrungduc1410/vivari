@@ -53,6 +53,7 @@ const project: FileSystemTree = {
       contents: [
         "import { createServer } from 'node:http';",
         "const server = createServer((req, res) => {",
+        "  console.log('request: ' + req.method + ' ' + req.url + ' from ' + req.socket.remoteAddress);",
         "  res.setHeader('content-type', 'text/html; charset=utf-8');",
         "  res.end('<h1>Served from inside your browser 🎉</h1>' +",
         "    '<p>Request: ' + req.method + ' ' + req.url + '</p>' +",
@@ -68,7 +69,12 @@ async function main() {
   runStatus.textContent = "booting the Vivari kernel…";
 
   // devtools defaults to false for embedders; serviceWorkerUrl defaults to /sw.js.
-  const vivari = await Vivari.boot();
+  //
+  // Optional: `?net=ws://127.0.0.1:7071/<token>` (printed by `node scripts/net-relay.mjs`)
+  // gives the VM a real network — the server below then also answers on
+  // http://localhost:3111 on YOUR machine, not just in the preview iframe.
+  const netRelay = new URLSearchParams(location.search).get("net") ?? undefined;
+  const vivari = await Vivari.boot({ netRelay });
   await vivari.mount(project);
 
   // --- Demo 1: run a script to completion, streaming its output ---

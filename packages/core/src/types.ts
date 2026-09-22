@@ -23,6 +23,18 @@ export interface BootOptions {
    */
   compress?: boolean;
   /**
+   * URL of an OPTIONAL network relay (`ws://…` / `wss://…`). Off by default: the
+   * VM's network is loopback-only and `net.connect()` to any other host is refused.
+   * With a relay, an external dial becomes a TCP connection made by the relay, and
+   * an in-VM `server.listen(port)` is also bound on the relay's host, so a browser
+   * redirected to `http://localhost:<port>/callback` (the OAuth CLI flow), `curl`,
+   * or any other client reaches the server running in the tab. The reference relay
+   * is `scripts/net-relay.mjs` — a local agent bound to 127.0.0.1 that prints the
+   * URL to pass here. From the guest, the relay's own machine is
+   * `host.vivari.internal` (in-VM `127.0.0.1` stays the VM's loopback).
+   */
+  netRelay?: string;
+  /**
    * The preview Service Worker. It must be served **same-origin** at a scope that
    * covers the URLs you want proxied into the VM (default scope `/`). Pass a URL
    * string to override the default (`"/sw.js"`), or `false` to skip registration

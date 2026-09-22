@@ -182,7 +182,7 @@ export class Vivari {
         // bare embedder won't. The SW defaults it on (for the studio), so opt out here.
         bridge.setDevtoolsEnabled(options.devtools ?? false);
       }
-      bridge.boot(options.compress ?? true);
+      bridge.boot(options.compress ?? true, options.netRelay);
     } catch (err) {
       // teardown() settles `ready` through the TEARDOWN_MESSAGE above, so this
       // drains rather than waiting out the timeout.

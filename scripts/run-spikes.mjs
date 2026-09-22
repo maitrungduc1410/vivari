@@ -328,6 +328,13 @@ const SPIKES = [
   // is ever looked up at all. Offline: the fixture is hand-built, because what
   // a real template adds is size and size is not what fails.
   { name: "depcache-shipped", file: "spike-depcache-shipped.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // The optional network relay (kernel-host/net-relay.js + scripts/net-relay.mjs):
+  // boots the reference relay as a child on a random loopback port and drives a
+  // real kernel through it both ways — an OAuth-shaped callback IN to an in-VM
+  // http server bound on the host, an echo round-trip OUT via net.connect — and
+  // that with no relay configured an external dial is refused exactly as before.
+  // Offline: every socket is loopback on this machine.
+  { name: "net-relay", file: "spike-net-relay.mjs", net: false, needsWasm: true, timeout: 90000 },
   // The Next template's postinstall seeds a 30.4 MB wasm SWC package into Next's
   // cache dir. It has to LINK, not copy: a copy is 30 MB through the sync bridge
   // plus 30 MB of duplicate in the VFS heap, at the end of the install where no
