@@ -45,7 +45,8 @@ export async function createOpfsPersistence({ access, shouldPersist = () => true
 
   // path (VFS absolute) -> { k:'file'|'dir'|'symlink', m:mode, t:target? }
   const meta = new Map();
-  // path -> 'w' (write/create) | 'd' (delete). Insertion order = drain order.
+  // path -> 'w' (write/create) | 'd' (delete) | 'r' (delete subtree,
+  // then recreate). Insertion order = drain order.
   const pending = new Map();
   let draining = false;
   let manifestDirty = false;
@@ -127,7 +128,8 @@ export async function createOpfsPersistence({ access, shouldPersist = () => true
   // ---- the write-behind queue ----------------------------------------------
   function onWrite(path) {
     if (!shouldPersist(path)) return;
-    pending.set(path, "w");
+    // A delete followed by a write must not leave old descendants on disk.
+    pending.set(path, pending.get(path) === "d" || pending.get(path) === "r" ? "r" : "w");
     kick();
   }
   function onDelete(path) {
@@ -157,13 +159,14 @@ export async function createOpfsPersistence({ access, shouldPersist = () => true
         const op = pending.get(path);
         pending.delete(path);
         try {
-          if (op === "d") {
+          if (op === "d" || op === "r") {
             await removePath(path);
             meta.delete(path);
             const pre = path + "/";
             for (const k of [...meta.keys()]) if (k.startsWith(pre)) meta.delete(k);
             manifestDirty = true;
-          } else {
+          }
+          if (op === "w" || op === "r") {
             const e = access.read(path); // current truth from the VFS
             if (!e) continue; // vanished between enqueue and drain
             if (e.kind === "file") await writeBytes(path, e.bytes);
