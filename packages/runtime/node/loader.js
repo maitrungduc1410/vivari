@@ -121,6 +121,7 @@ import freelistFactory from "./internal/freelist.js";
 import httpsFactory from "./lib/https.js";
 import fetchTransportFactory from "./internal/fetch-transport.js";
 import httpEgressFactory from "./internal/http-egress.js";
+import fetchLoopbackFactory from "./internal/fetch-loopback.js";
 import tlsFactory from "./lib/tls.js";
 import undiciFactory from "./internal/deps/undici/undici.js";
 
@@ -341,6 +342,8 @@ const FACTORIES = {
   // and the router that decides which http requests take it.
   "internal/fetch-transport": fetchTransportFactory,
   "internal/http-egress": httpEgressFactory,
+  // The guest global fetch()'s in-VM half (runtime/index.js routes to it).
+  "internal/fetch-loopback": fetchLoopbackFactory,
   tls: tlsFactory,
   "internal/deps/undici/undici": undiciFactory,
   dns: dnsFactory,

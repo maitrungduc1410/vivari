@@ -679,6 +679,20 @@ rather than a bare `ECONNREFUSED`. A protocol upgrade (WebSocket, `CONNECT`) can
 never ride a fetch — there is no socket to hand back — so those fail loudly with
 `ERR_VIVARI_UPGRADE_UNSUPPORTED` instead of hanging on a request that "succeeded".
 
+**The guest's global `fetch()`.** `fetch` is the host realm's own (the tab's, or
+undici headless), wrapped in `runtime/index.js` — the reverse arrangement of `http`,
+whose default is loopback. The wrapper first asks `internal/fetch-loopback.js`'s
+`route()`, using the same `isLocalDestination` predicate: an `http:` URL to a local
+host is sent through the vendored `http` client over the loopback above (same- or
+cross-process) and delivered as a real WHATWG `Response` — status, headers
+including multi-value `Set-Cookie`, a streaming body, `url`/`redirected`, redirect
+modes per the fetch spec, `AbortSignal`, and `ECONNREFUSED` as undici reports it.
+`https:` to a local host rejects with `ERR_VIVARI_LOOPBACK_TLS` (no in-VM TLS; the
+host would answer from another machine). Every other URL, `host.vivari.internal`
+included, is the host's fetch unchanged; a loopback redirect that leaves the VM
+hands the rest of the chain to it. Gate: `scripts/spike-fetch-loopback.mjs`, which
+diffs each scenario against real Node.
+
 ### 8.2 Cross-VM reachability (the kernel port registry)
 
 `listen()` also registers the port with the kernel (`OP_LISTEN` → `port → pid`

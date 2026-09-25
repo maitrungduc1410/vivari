@@ -11384,3 +11384,35 @@ Gate: `scripts/spike-opfs-delete-recreate.mjs` (offline, Wasm-free, earliest gat
 in-memory OPFS throws `TypeMismatchError` like the real one, which is what makes the
 kind-change cases fail on the old queue. The PR's `node --test` file was folded into it:
 nothing in this repo runs `node --test`, so it would have gated nothing.
+
+## `fetch()` reaches in-VM servers (issue #7) (this change)
+
+`fetch('http://localhost:<port>')` from a guest never reached a server listening on that
+port in the VM, while `http.get` to the same URL did. The guest's `fetch` was the host
+realm's own, wrapped only to rewrite `host.vivari.internal` and to explain opaque failures,
+so a loopback URL was answered by the browser's localhost — another machine — and failed
+with the "browser tab / CORS" explanation, which pointed away from the cause.
+
+- `node/internal/fetch-loopback.js` (new): the wrapper's loopback half. Routing is on the
+  destination host by `internalBinding('tcp_wrap').isLocalDestination`, the predicate
+  `connect()` and `http` egress already share — never on the port registry. A local
+  `http:` URL goes through the vendored `http` client (same- and cross-process servers) and
+  returns a real `Response`: method/headers/body (string, BufferSource, Blob,
+  URLSearchParams, FormData, ReadableStream with `duplex: 'half'`, Request input),
+  streaming body with backpressure, redirect `follow` (20 max, 301/302 POST→GET, 303→GET,
+  cross-origin credential stripping) / `manual` / `error`, `AbortSignal`, gzip/deflate/br
+  decoding, and `TypeError('fetch failed')` with `cause.code` `ECONNREFUSED`.
+- `https:` to a local host rejects with `ERR_VIVARI_LOOPBACK_TLS` instead of silently going
+  to the host. Non-local URLs and `host.vivari.internal` are unchanged.
+- Gate: `scripts/spike-fetch-loopback.mjs` (offline, needsWasm, in the CI Wasm-VFS list):
+  14 scenarios run on the host's real Node and in the VM with identical transcripts
+  required, plus VM-only invariants (TLS refusal, non-local path unchanged, an in-flight
+  fetch keeps the loop alive).
+
+### Not done
+- In a browser, a `Request` object built by the guest has already had forbidden headers
+  (`Cookie`, `Host`, …) stripped by the tab; pass them in `init.headers` instead. A plain
+  `init.headers` is not filtered.
+- `clone()` of a loopback response loses the own-property `url`/`redirected`/`type`
+  (and, in a browser, a `Set-Cookie`-bearing `headers`).
+- No connection pooling: each loopback fetch is its own connection (`agent: false`).

@@ -179,7 +179,7 @@ jobs:
       # but missing here runs nowhere at all: skipped in toolchain-gate for want of
       # the crates, and never selected in the only job that has them.
       - name: offline spikes that need the Wasm VFS
-        run: node scripts/run-spikes.mjs --offline dep-cache depcache-shipped seed-swc bun http-binary-body http-response-bytes cookie-session fs-cp fs-errors large-fs-payloads worker-pool node-cli repl stack-traces readline watch child-stdin fs-metadata crypto-jwk zlib-brotli port-liveness constants diag-liveness fatal-errors net-close-order net-blocklist net-listen-clash
+        run: node scripts/run-spikes.mjs --offline dep-cache depcache-shipped seed-swc bun http-binary-body http-response-bytes cookie-session fs-cp fs-errors large-fs-payloads worker-pool node-cli repl stack-traces readline watch child-stdin fs-metadata crypto-jwk zlib-brotli port-liveness constants diag-liveness fatal-errors net-close-order net-blocklist net-listen-clash fetch-loopback
       - run: npm run verify
 
   # --- package-manager gate: the North Star, gated on its own ----------------

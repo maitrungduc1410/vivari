@@ -1877,6 +1877,46 @@ protocol **upgrade** (WebSocket, `CONNECT`) can never ride a fetch, so it fails
 with `ERR_VIVARI_UPGRADE_UNSUPPORTED` rather than hanging. `ws://` to an in-VM
 server is unaffected: that's loopback.
 
+### The global `fetch()` has a loopback half too — same predicate, different direction
+The guest's `fetch` is the host realm's own (the tab's in the studio, undici
+headless), wrapped in `runtime/index.js`. Until issue #7 that wrapper never asked
+the virtual network anything, so `fetch('http://localhost:3000')` went to the
+*browser's* localhost — a different machine — while `http.get` to the same URL
+reached the in-VM server. The symptom was the opaque `Failed to fetch — the request
+was made from a browser tab…`, which reads as CORS and is nothing of the kind.
+
+`node/internal/fetch-loopback.js` is that half now. The wrapper asks its `route()`
+first; an `http:` URL (string, `URL` or `Request`) whose host
+`internalBinding('tcp_wrap').isLocalDestination` calls local goes through the
+**vendored `http` client** and comes back as a real WHATWG `Response` — so it
+reaches same-process and cross-process in-VM servers, and a port nobody serves is
+`TypeError('fetch failed')` with `cause.code === 'ECONNREFUSED'`, as under undici.
+Everything else, `host.vivari.internal` included, takes the host's fetch unchanged.
+Rules the same as the `http` egress entry above, mirrored: route on the **host**
+with that one predicate, never on the port registry; and this is not a second
+fetch-backed client — it only ever talks to the in-VM network. Four things that
+look like simplifications and are not:
+- **undici's default headers (`accept`, `accept-language`, `sec-fetch-mode`,
+  `user-agent`) are added per in-VM hop, never to the guest's `Headers`.** A
+  redirect that leaves the VM hands those `Headers` to the host's fetch; in a
+  browser the defaults are headers the guest never set, and a non-safelisted one
+  makes a plain GET preflight, so the external hop could fail where a direct fetch
+  works. The spike observes what the host path is handed.
+- **`https://localhost` rejects** (`ERR_VIVARI_LOOPBACK_TLS`). There is no in-VM
+  TLS, and falling through to the host would answer from the user's real machine —
+  the silent-wrong-answer class the whole split exists to prevent.
+- **The wrapper must not run loopback failures through `explainFetchFailure`.**
+  Our ECONNREFUSED is also message `fetch failed`, which is on its opaque list, and
+  would be rewritten into the "browser tab / CORS" explanation — wrong on both counts.
+- **`url`, `redirected`, `type` (and, in a browser, `headers` when there is a
+  `Set-Cookie`) are own properties on the constructed `Response`.** A constructed
+  Response cannot carry them, and a browser's response guard drops `Set-Cookie`;
+  a bare `Headers` has no guard. `clone()` of such a response loses them.
+The body is push-based with a 1 MiB byte high-water mark: small bodies drain whole,
+so an unread body cannot pin the process on an open socket. Gate:
+`node scripts/spike-fetch-loopback.mjs` — every scenario runs on real Node and in
+the VM, transcripts must match.
+
 ### `writeLarge` must transfer a STANDALONE ArrayBuffer
 The kernel hands a fetched tarball to the FS Worker over a *transferred* buffer
 (`kernel-fs.js` `writeLarge`), to bypass the 1 MiB SAB. The trap: a `Uint8Array`
