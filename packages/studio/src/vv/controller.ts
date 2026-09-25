@@ -79,6 +79,20 @@ export interface NotebookHandle {
   ): Promise<CellEditorSlot | null>;
 }
 
+// The optional network relay is opted into per page load with `?net=ws://…`
+// (BootOptions.netRelay). Only ws:/wss: URLs count; anything else is ignored.
+function readNetRelayParam(): string | undefined {
+  if (typeof location === "undefined") return undefined;
+  const raw = new URLSearchParams(location.search).get("net");
+  if (!raw) return undefined;
+  try {
+    const u = new URL(raw);
+    return u.protocol === "ws:" || u.protocol === "wss:" ? u.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // Validate + normalize the build-time VITE_PREVIEW_ORIGIN (mode B). Returns the
 // bare origin (scheme+host+port) of a same-scheme, cross-origin absolute URL, or
 // undefined for anything falsy / malformed / same-origin (→ mode A, the default).
@@ -865,7 +879,11 @@ export class IdeController {
     // claimed still gets routed once it has. Both orderings are equally good for
     // everything the SW actually does, and only one of them has the race — so
     // take the one that does not, rather than trying to survive the transition.
-    this.bridge.boot();
+    //
+    // `?net=<ws url>` opts into the optional network relay (BootOptions.netRelay):
+    // a local agent (`node scripts/net-relay.mjs`) that gives the VM real outbound
+    // TCP and binds in-VM listen() ports on the developer's machine. Off otherwise.
+    this.bridge.boot(true, readNetRelayParam());
   }
 
   /**

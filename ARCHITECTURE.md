@@ -865,6 +865,42 @@ Showcase template (Express multiplexing a per-second tick + a `metric` gauge + `
 log lines onto one stream) demonstrates it. A live SSE relay refs the process event loop
 (`sseLiveness`) so it keeps pumping like an open socket handle.
 
+### 8.4b Optional network relay (`kernel-host/net-relay.js`, `scripts/net-relay.mjs`)
+
+Everything above is loopback-only by design, and stays that way **unless** a deploy or
+developer configures a relay (`BootOptions.netRelay`, or `?net=<ws url>` on the studio
+and the basic example). The relay is a small agent the developer runs on their own
+machine (`node scripts/net-relay.mjs`, bound to 127.0.0.1, per-launch token in the URL,
+Origin allowlist); nothing in Vivari talks to it unless asked. With it, the VM gets a
+network in **both** directions, and both ride the kernel's existing cross-process pipe
+relay (§8.1) with the relay as a virtual peer (`NET_PID`):
+
+- **Outbound.** `TCP.connect()` to a destination `isLocalDestination` refuses used to
+  fail with `EHOSTUNREACH`/`ENOTFOUND`. It now first tries
+  `OP_PIPE_CONNECT` on the synthetic path `\0oc-egress:<port>:<host>`; the kernel answers
+  `ENOENT` when no relay is configured (so the refusal is unchanged), or opens a **Wisp v1**
+  stream (`CONNECT`/`DATA`/`CONTINUE`/`CLOSE` over one WebSocket, credit flow control) that
+  the relay terminates as a real TCP connection. The guest's socket is an ordinary
+  `_xproc` endpoint: bytes flow as `pipe-*` messages, exactly like a dial into another
+  process. In-VM `127.0.0.1`/`localhost` still mean the VM; the relay's machine is
+  `host.vivari.internal` (the same alias the Fetcher Worker uses).
+- **Inbound.** `OP_LISTEN` also sends the relay a `LISTEN <port>`; the relay binds
+  `127.0.0.1:<port>` on its host and hands each accepted TCP connection back as a
+  relay-initiated stream (ids carry the high bit so they can't collide with Wisp's
+  client-chosen ids). The kernel turns it into a `pipe-open` on the owning process
+  keyed by `tcpXKey(port)` — the server accepts a real `net.Socket` with the real peer
+  address. `OP_CLOSE_SERVER` and `finalize` send `UNLISTEN`. This is what lets a CLI's
+  `http.createServer().listen(port)` catch a **browser redirect** to
+  `http://localhost:<port>/callback?code=…` (the OAuth login flow), or `curl`, or Playwright.
+- **Not TLS.** A relay makes `net` real, not `tls`: `tls.connect` still throws until there
+  is a verifying TLS backend in-VM. `https`/`http` egress keep using the fetch transport.
+
+Wisp v1 has no listen/accept; the four extension packet types (`LISTEN`, `UNLISTEN`,
+`LISTENING`, `ACCEPT`, plus `SHUTDOWN` for TCP half-close) are documented at the top of
+`net-relay.js`, which is the client the reference relay serves. `scripts/spike-net-relay.mjs`
+gates both directions headless (an OAuth-shaped callback in, an echo round-trip out, and
+that nothing changes with no relay configured).
+
 ### 8.5 In-browser DevTools + local address bar (studio)
 
 Each `PreviewPanel` tab is a mini-browser. The address bar is **local-only**:

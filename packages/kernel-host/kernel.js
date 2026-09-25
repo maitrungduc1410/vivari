@@ -55,8 +55,23 @@ import {
 import { DBG_SAB_BYTES, makeDebugViews, writeDebugCommand } from "../protocol/debug.js";
 import { COREUTILS } from "./coreutils.js";
 import { CookieJar } from "./cookie-jar.js";
+import { NetRelay, CLOSE_REFUSED } from "./net-relay.js";
 
 const EMPTY = new Uint8Array(0);
+
+// ---- optional network relay (see net-relay.js) ----
+// The relay is a virtual peer in the cross-process pipe table: a pipe connection
+// whose client or server "pid" is NET_PID has the relay on that end, and bytes for
+// it go to the relay's stream instead of a process worker. Never a real pid.
+const NET_PID = -1;
+// The key a TCP server registers with the kernel pipe table (mirrors `tcpXKey` in
+// runtime/node/bindings/net.js) — an inbound relay connection is handed to the
+// owning process as a `pipe-open` on this key, exactly like a cross-process dial.
+const tcpXKey = (port) => "\u0000oc-tcp:" + (port >>> 0);
+// A process dials an EXTERNAL host by connecting to this synthetic path; the
+// kernel answers ENOENT when no relay is configured, so the binding falls back to
+// its normal refusal (EHOSTUNREACH / ENOTFOUND) and behavior is unchanged.
+const EGRESS_PREFIX = "\u0000oc-egress:";
 
 // A stdin chunk on its way to a parked reader. It arrives as a string from a
 // terminal and as bytes from a parent writing to a child's stdin, and the reader
@@ -171,6 +186,14 @@ export class Kernel {
     this.pipeListeners = new Map(); // socketPath -> pid of the server process
     this.pipeConns = new Map(); // connId -> { clientPid, serverPid }
     this.nextPipeConnId = 1;
+
+    // ---- optional network relay (net-relay.js) ----
+    // Off unless setNetRelay(url) is called. Maps the relay's stream ids onto pipe
+    // connIds so relay streams reuse the pipe relay above in both directions.
+    this.netRelay = null;
+    this.netStreamByConn = new Map(); // connId -> streamId
+    this.netConnByStream = new Map(); // streamId -> connId
+    this.onNetLog = null; // optional (line) => void
 
     // ---- network fetch (Phase 2 #9) ----
     // Injected by the environment: (url) => Promise<{ok,status,headers,body:Uint8Array}>.
@@ -960,6 +983,7 @@ export class Kernel {
       if (owner === pid) {
         this.listeners.delete(port);
         if (this.onClose) this.onClose(port, pid);
+        if (this.netRelay) this.netRelay.unlisten(port);
       }
     }
     for (const [reqId, pend] of this.pendingHttp) {
@@ -1000,7 +1024,8 @@ export class Kernel {
     for (const [connId, conn] of this.pipeConns) {
       if (conn.clientPid === pid || conn.serverPid === pid) {
         const otherPid = conn.clientPid === pid ? conn.serverPid : conn.clientPid;
-        this.postToProc(otherPid, { type: "pipe-close", connId });
+        if (otherPid === NET_PID) this.netFromProc({ type: "pipe-close", connId });
+        else this.postToProc(otherPid, { type: "pipe-close", connId });
         this.pipeConns.delete(connId);
       }
     }
@@ -1247,6 +1272,7 @@ export class Kernel {
       this.listeners.set(port, proc.pid);
       this.respondOk(proc, EMPTY);
       if (this.onListen) this.onListen(port, proc.pid);
+      if (this.netRelay) this.netRelay.listen(port);
       return;
     }
     // OP_CLOSE_SERVER
@@ -1254,8 +1280,92 @@ export class Kernel {
     if (this.listeners.get(port) === proc.pid) {
       this.listeners.delete(port);
       if (this.onClose) this.onClose(port, proc.pid);
+      if (this.netRelay) this.netRelay.unlisten(port);
     }
     this.respondOk(proc, EMPTY);
+  }
+
+  // ---- optional network relay (net-relay.js) --------------------------------
+  // Configure (or clear, with a falsy url) the relay. Ports already listening are
+  // announced so a relay configured after boot still forwards them.
+  setNetRelay(url) {
+    if (this.netRelay) {
+      const old = this.netRelay;
+      this.netRelay = null;
+      for (const connId of [...this.netStreamByConn.keys()]) this.netStreamClosed(connId);
+      old.dispose();
+    }
+    if (!url) return;
+    const log = (line) => {
+      if (this.onNetLog) this.onNetLog(line);
+    };
+    this.netRelay = new NetRelay(url, {
+      log,
+      onAccept: (streamId, port, remote) => this.netAccept(streamId, port, remote),
+      onData: (streamId, chunk) => {
+        const connId = this.netConnByStream.get(streamId);
+        const pid = this.netProcFor(connId);
+        if (pid != null) this.postToProc(pid, { type: "pipe-data", connId, chunk });
+      },
+      onShutdown: (streamId) => {
+        const connId = this.netConnByStream.get(streamId);
+        const pid = this.netProcFor(connId);
+        if (pid != null) this.postToProc(pid, { type: "pipe-shutdown", connId });
+      },
+      onClose: (streamId) => {
+        const connId = this.netConnByStream.get(streamId);
+        if (connId == null) return;
+        const pid = this.netProcFor(connId);
+        if (pid != null) this.postToProc(pid, { type: "pipe-close", connId });
+        this.netStreamClosed(connId);
+      },
+    });
+    for (const port of this.listeners.keys()) this.netRelay.listen(port);
+  }
+
+  // The process on the other end of a relay-backed pipe connection.
+  netProcFor(connId) {
+    const conn = connId == null ? null : this.pipeConns.get(connId);
+    if (!conn) return null;
+    const pid = conn.clientPid === NET_PID ? conn.serverPid : conn.clientPid;
+    return this.procs.has(pid) ? pid : null;
+  }
+
+  netStreamClosed(connId) {
+    const streamId = this.netStreamByConn.get(connId);
+    this.netStreamByConn.delete(connId);
+    if (streamId != null) this.netConnByStream.delete(streamId);
+    this.pipeConns.delete(connId);
+  }
+
+  // The relay accepted an inbound TCP connection on a port an in-VM process is
+  // serving. Open it on that process as a cross-process pipe connection — the
+  // binding accepts it as a net.Socket exactly as it would a dial from another PID.
+  netAccept(streamId, port, remote) {
+    const serverPid = this.listeners.get(port);
+    if (serverPid == null || !this.procs.has(serverPid) || !this.pipeListeners.has(tcpXKey(port))) {
+      this.netRelay.close(streamId, CLOSE_REFUSED);
+      return;
+    }
+    const connId = this.nextPipeConnId++;
+    this.pipeConns.set(connId, { clientPid: NET_PID, serverPid });
+    this.netStreamByConn.set(connId, streamId);
+    this.netConnByStream.set(streamId, connId);
+    this.postToProc(serverPid, { type: "pipe-open", connId, path: tcpXKey(port), remote });
+  }
+
+  // A process produced a pipe message whose other end is the relay.
+  netFromProc(m) {
+    const streamId = this.netStreamByConn.get(m.connId);
+    if (streamId == null || !this.netRelay) return;
+    if (m.type === "pipe-data") {
+      if (m.chunk && m.chunk.byteLength) this.netRelay.send(streamId, m.chunk);
+    } else if (m.type === "pipe-shutdown") {
+      this.netRelay.shutdown(streamId);
+    } else if (m.type === "pipe-close") {
+      this.netRelay.close(streamId);
+      this.netStreamClosed(m.connId);
+    }
   }
 
   // ---- cross-process pipe (UNIX socket) servicing --------------------------
@@ -1280,6 +1390,29 @@ export class Kernel {
       this.respondOk(proc, EMPTY);
       return;
     }
+    // OP_PIPE_CONNECT to an EXTERNAL host: only answerable through the relay.
+    // Path is "<EGRESS_PREFIX><port>:<host>" (host last — it may contain ':').
+    if (path.startsWith(EGRESS_PREFIX)) {
+      if (!this.netRelay) {
+        this.respondErr(proc, "ENOENT");
+        return;
+      }
+      const spec = path.slice(EGRESS_PREFIX.length);
+      const sep = spec.indexOf(":");
+      const port = sep > 0 ? Number(spec.slice(0, sep)) : NaN;
+      const host = sep > 0 ? spec.slice(sep + 1) : "";
+      if (!host || !(port > 0 && port < 65536)) {
+        this.respondErr(proc, "EINVAL");
+        return;
+      }
+      const streamId = this.netRelay.connect(host, port);
+      const connId = this.nextPipeConnId++;
+      this.pipeConns.set(connId, { clientPid: proc.pid, serverPid: NET_PID });
+      this.netStreamByConn.set(connId, streamId);
+      this.netConnByStream.set(streamId, connId);
+      this.respondOk(proc, encodeString(JSON.stringify({ connId })));
+      return;
+    }
     // OP_PIPE_CONNECT: resolve the path to a live server and open a connection.
     const serverPid = this.pipeListeners.get(path);
     if (serverPid == null || !this.procs.has(serverPid)) {
@@ -1302,6 +1435,10 @@ export class Kernel {
     const conn = this.pipeConns.get(m.connId);
     if (!conn) return;
     const otherPid = fromPid === conn.clientPid ? conn.serverPid : conn.clientPid;
+    if (otherPid === NET_PID) {
+      this.netFromProc(m); // relay end: bytes go out the stream, close tears it down
+      return;
+    }
     this.postToProc(otherPid, m);
     if (m.type === "pipe-close") this.pipeConns.delete(m.connId);
   }

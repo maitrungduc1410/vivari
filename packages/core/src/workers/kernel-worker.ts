@@ -1324,6 +1324,8 @@ let fsWorkerRef = null;
 // System Worker. On by default; a consumer sets it false only to trade memory
 // for a little less CPU.
 let vfsCompression = true;
+// Optional network relay URL (BootOptions.netRelay), applied once the kernel exists.
+let netRelayUrl: string | null = null;
 
 // A bound port isn't the same as a *serving* one: Vite 8 (rolldown) binds :port
 // a few times during startup (bind → close → rebind), so the first `listen`
@@ -1935,6 +1937,15 @@ async function boot() {
   kernel.onSseSend = (msg) => post("vv-sse", { msg });
 
   kernel.installCoreutils();
+
+  // Optional network relay (BootOptions.netRelay): its log lines go to the console
+  // stream so a developer can see "listening on relay host :3000" next to the
+  // server's own output. Off unless the page asked for it.
+  if (netRelayUrl) {
+    kernel.onNetLog = (line: string) => post("log", { line, dim: true });
+    kernel.setNetRelay(netRelayUrl);
+    post("log", { line: `[net-relay] enabled — external net.connect() and inbound listen() go through ${netRelayUrl.replace(/\/[^/]*$/, "/…")}`, dim: true });
+  }
 
   kernel.mkdirp("/home/user");
   // os.tmpdir() is "/tmp", so it MUST exist: tools call mkdtempSync(join(tmpdir(),
@@ -2596,6 +2607,7 @@ self.onmessage = async (event) => {
   if (m.type === "init") {
     // Default on: only an explicit `compress: false` (BootOptions.compress) disables it.
     vfsCompression = m.compress !== false;
+    netRelayUrl = typeof m.netRelay === "string" && m.netRelay ? m.netRelay : null;
     // `error` (not just `log`) so the SDK's boot() has something to reject on —
     // otherwise a kernel that dies here never posts `ready` and the caller waits
     // out its whole timeout with no idea why.

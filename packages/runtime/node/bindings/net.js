@@ -118,6 +118,9 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
   // The NUL prefix keeps it out of the real socket-path namespace (tools bind
   // `/tmp/*.sock`), so it can never collide with a genuine UNIX socket.
   const tcpXKey = (port) => "\u0000oc-tcp:" + (port >>> 0);
+  // The kernel's synthetic path for an EXTERNAL dial through its optional network
+  // relay (kernel.js EGRESS_PREFIX). Port first: the host may itself contain ':'.
+  const egressKey = (host, port) => "\u0000oc-egress:" + (port >>> 0) + ":" + host;
 
   // ---- who is a legitimate connect() destination? ---------------------------
   // The virtual network is loopback-only: `listen()` registers a PORT, and
@@ -324,6 +327,32 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
       if (unreachable) {
         this._remoteAddress = address;
         this._remotePort = p;
+        // An external destination is refused UNLESS the kernel has a network relay
+        // configured (BootOptions.netRelay): then the dial rides the same
+        // cross-process pipe relay as an in-VM connect, with the relay on the far
+        // end doing the real TCP. The kernel answers ENOENT when no relay is set,
+        // so the refusal below is exactly what happens today by default.
+        if (pipeBridge && pipeBridge.postRaw && syscalls && syscalls.pipeConnect) {
+          let connId = 0;
+          try {
+            connId = syscalls.pipeConnect(egressKey(host !== null ? host : address, p)).connId | 0;
+          } catch {
+            connId = 0;
+          }
+          if (connId > 0) {
+            this._localAddress = "127.0.0.1";
+            this._localPort = allocPort();
+            this._xproc = true;
+            this._connId = connId;
+            xpipeConns.set(connId, this);
+            nextTick(() => {
+              this._live = true;
+              recount(this);
+              req.oncomplete(0, this, req, true, true);
+            });
+            return 0;
+          }
+        }
         // afterConnect builds the error from req.address; point it at what the
         // caller actually asked for, or the message would name 127.0.0.1 and
         // hide the very mistake we're reporting.
@@ -800,7 +829,13 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
       peer._xproc = true;
       peer._connId = connId;
       if (peer instanceof Pipe) peer._remotePath = String(msg.path);
-      else peer._remoteAddress = "127.0.0.1";
+      else {
+        // A connection relayed in from outside the VM (kernel net relay) carries
+        // the real peer "ip:port"; an in-VM cross-process dial is loopback.
+        const m = typeof msg.remote === "string" ? /^(.*):(\d+)$/.exec(msg.remote) : null;
+        peer._remoteAddress = m ? m[1].replace(/^\[|\]$/g, "") : "127.0.0.1";
+        if (m) peer._remotePort = Number(m[2]);
+      }
       xpipeConns.set(connId, peer);
       peer._live = true;
       recount(peer);

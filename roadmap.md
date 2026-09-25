@@ -11416,3 +11416,37 @@ with the "browser tab / CORS" explanation, which pointed away from the cause.
 - `clone()` of a loopback response loses the own-property `url`/`redirected`/`type`
   (and, in a browser, a `Set-Cookie`-bearing `headers`).
 - No connection pooling: each loopback fetch is its own connection (`agent: false`).
+
+## An optional network relay — real TCP both ways, off by default (this change)
+
+"Outbound raw TCP is impossible in a browser" (above) is true of a tab on its own. It stops
+being true the moment a TCP relay the developer controls is in the path, and the shape of
+that relay decides what it can do: a hosted one can only dial *out* and must blocklist
+private ranges; a **local agent on the developer's machine** can dial anything the developer
+can — their own Postgres, a VPN'd API — and, because it is on the same machine the browser
+is, it can also **bind a port** there and hand inbound connections into the VM.
+
+That second half is the one that matters for CLIs. `gh auth login`, `vercel login`, Claude
+Code and the rest do `http.createServer().listen(port)`, send the browser to an IdP, and
+wait for the redirect to `http://localhost:<port>/callback?code=…`. Until now that redirect
+landed on the developer's machine where nothing listened, and most IdPs refuse a
+non-localhost `redirect_uri`, so no hosted relay could help. With the local relay the port is
+bound on the host, the redirect arrives, and the in-VM server answers it — proven in a real
+browser against the basic example (a fresh browser context 302'd from a fake IdP), and
+headless by `scripts/spike-net-relay.mjs`.
+
+Design choices, briefly:
+- **Reuse the kernel pipe relay** (OP_PIPE_LISTEN/CONNECT + `pipe-*`) with the relay as a
+  virtual pid rather than adding a second byte path. An egress dial is `pipeConnect` on a
+  synthetic path; an inbound accept is a `pipe-open` on the server's existing `tcpXKey`.
+- **Wisp v1 on the wire** for outbound (an existing, documented protocol with other server
+  implementations), plus a five-packet extension for listen/accept/half-close that Wisp
+  lacks. Relay-initiated stream ids carry the high bit.
+- **Off unless configured.** No relay → the kernel answers `ENOENT` and `TCP.connect`
+  refuses exactly as before; `verify` and `probe-xtcp` are unchanged.
+- **`host.vivari.internal` is the relay's machine.** In-VM `127.0.0.1` keeps meaning the VM.
+- **A relay is not TLS.** `tls.connect` still throws; that needs a verifying backend in-VM.
+
+Deferred: UDP streams (Wisp has them; the reference relay refuses them for now), a
+DNS opcode so `dns.resolve*` can answer truthfully when a relay is present, and surfacing
+the relay state in the studio UI beyond the console line.
