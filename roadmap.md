@@ -11364,3 +11364,23 @@ supported; this change only stops the eviction that made one happen.
 Gate: `scripts/spike-net-listen-clash.mjs` — the same-process transcript against the host's
 real Node, plus `handleHttpRequest` and a second process, bounded because the regression is
 a hang. It fails on the unguarded `close()` and passes with the guard.
+
+## The OPFS mirror lost a delete to the write that followed it (this change)
+
+The write-behind queue is `path -> op`, and `onWrite` used to set `'w'` unconditionally, so
+a delete followed by a write of the same path coalesced into a plain write. It only bites
+while the drain is busy with another entry (an idle drain picks the delete up
+synchronously) — which is exactly the state during an install or a scaffold. The live VFS
+was right; the deleted subtree's children stayed in the manifest and came back on reload.
+The fix (contributed as GitHub PR #8) keeps the two as one `'r'` op: remove the subtree
+from OPFS and the manifest, then mirror the recreated path.
+
+The same coalescing broke a path that changed KIND. A file replaced by a directory, or the
+reverse, reached OPFS as a write against an entry of the other kind; real OPFS throws
+`TypeMismatchError` there, drain() swallowed it, and the manifest kept the old kind. `'r'`
+removes before it writes, so that is fixed by the same change.
+
+Gate: `scripts/spike-opfs-delete-recreate.mjs` (offline, Wasm-free, earliest gate). Its
+in-memory OPFS throws `TypeMismatchError` like the real one, which is what makes the
+kind-change cases fail on the old queue. The PR's `node --test` file was folded into it:
+nothing in this repo runs `node --test`, so it would have gated nothing.

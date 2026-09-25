@@ -139,6 +139,11 @@ const SPIKES = [
   // and a manifest nobody writes is caught and read as "feature off". No kernel,
   // no Wasm, so it runs in the earliest gate.
   { name: "install-latency", file: "spike-install-latency.mjs", net: false, timeout: 60000 },
+  // The OPFS mirror must not lose a delete to the write of the same path that
+  // follows it while the drain is busy (old children came back after reload).
+  // Drives the real opfs-persistence.js against an in-memory OPFS — no kernel, no
+  // Wasm, so it runs in the earliest gate.
+  { name: "opfs-delete-recreate", file: "spike-opfs-delete-recreate.mjs", net: false, timeout: 60000 },
   // The gates above read `public/vendor`, which is gitignored build output: it
   // survives between commands on a developer's machine and has never existed on
   // a fresh checkout. Three regressions came from that asymmetry, `predev` not
