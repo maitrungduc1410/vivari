@@ -11343,6 +11343,80 @@ process in a tree that is serving right now.
   it runs the failing gate in the working tree before blaming the checkout, having once
   blamed absent build output for three stale assertions — but a gate whose assertions are
   skipped rather than failed still reads as green from the outside.
+
+## A failed `listen()` evicted the port's real server — and a self-dial hangs (this change)
+
+`TCP.close()` on a server handle deleted `listeners[port]` without checking the entry was
+its own. A second `listen()` on a taken port returns `EADDRINUSE` before it registers and
+`lib/net.js` then closes the handle, so the *failed* listen removed the *real* server from
+the process's routing table. The kernel registration survived, so in-VM callers in other
+processes kept being served and nothing logged anything; what broke was every dial from
+the owning process — including `bridgeHttp`, i.e. every browser request to that port. The
+guard is the one the `pipeServers` cleanup already had (contributed as GitHub PR #5).
+
+Why it *hung* rather than refused is worth keeping: with no local entry, the dial falls
+through to the cross-process pipe relay, which routes it back into the same process. There
+the dialing end and the accepted end share one `connId` in `xpipeConns`, and
+`handlePipeRelay` sends both directions to the same pid, so the response is delivered to
+the server's own endpoint. A same-process self-dial through the relay is still not
+supported; this change only stops the eviction that made one happen.
+
+Gate: `scripts/spike-net-listen-clash.mjs` — the same-process transcript against the host's
+real Node, plus `handleHttpRequest` and a second process, bounded because the regression is
+a hang. It fails on the unguarded `close()` and passes with the guard.
+
+## The OPFS mirror lost a delete to the write that followed it (this change)
+
+The write-behind queue is `path -> op`, and `onWrite` used to set `'w'` unconditionally, so
+a delete followed by a write of the same path coalesced into a plain write. It only bites
+while the drain is busy with another entry (an idle drain picks the delete up
+synchronously) — which is exactly the state during an install or a scaffold. The live VFS
+was right; the deleted subtree's children stayed in the manifest and came back on reload.
+The fix (contributed as GitHub PR #8) keeps the two as one `'r'` op: remove the subtree
+from OPFS and the manifest, then mirror the recreated path.
+
+The same coalescing broke a path that changed KIND. A file replaced by a directory, or the
+reverse, reached OPFS as a write against an entry of the other kind; real OPFS throws
+`TypeMismatchError` there, drain() swallowed it, and the manifest kept the old kind. `'r'`
+removes before it writes, so that is fixed by the same change.
+
+Gate: `scripts/spike-opfs-delete-recreate.mjs` (offline, Wasm-free, earliest gate). Its
+in-memory OPFS throws `TypeMismatchError` like the real one, which is what makes the
+kind-change cases fail on the old queue. The PR's `node --test` file was folded into it:
+nothing in this repo runs `node --test`, so it would have gated nothing.
+
+## `fetch()` reaches in-VM servers (issue #7) (this change)
+
+`fetch('http://localhost:<port>')` from a guest never reached a server listening on that
+port in the VM, while `http.get` to the same URL did. The guest's `fetch` was the host
+realm's own, wrapped only to rewrite `host.vivari.internal` and to explain opaque failures,
+so a loopback URL was answered by the browser's localhost — another machine — and failed
+with the "browser tab / CORS" explanation, which pointed away from the cause.
+
+- `node/internal/fetch-loopback.js` (new): the wrapper's loopback half. Routing is on the
+  destination host by `internalBinding('tcp_wrap').isLocalDestination`, the predicate
+  `connect()` and `http` egress already share — never on the port registry. A local
+  `http:` URL goes through the vendored `http` client (same- and cross-process servers) and
+  returns a real `Response`: method/headers/body (string, BufferSource, Blob,
+  URLSearchParams, FormData, ReadableStream with `duplex: 'half'`, Request input),
+  streaming body with backpressure, redirect `follow` (20 max, 301/302 POST→GET, 303→GET,
+  cross-origin credential stripping) / `manual` / `error`, `AbortSignal`, gzip/deflate/br
+  decoding, and `TypeError('fetch failed')` with `cause.code` `ECONNREFUSED`.
+- `https:` to a local host rejects with `ERR_VIVARI_LOOPBACK_TLS` instead of silently going
+  to the host. Non-local URLs and `host.vivari.internal` are unchanged.
+- Gate: `scripts/spike-fetch-loopback.mjs` (offline, needsWasm, in the CI Wasm-VFS list):
+  14 scenarios run on the host's real Node and in the VM with identical transcripts
+  required, plus VM-only invariants (TLS refusal, non-local path unchanged, an in-flight
+  fetch keeps the loop alive).
+
+### Not done
+- In a browser, a `Request` object built by the guest has already had forbidden headers
+  (`Cookie`, `Host`, …) stripped by the tab; pass them in `init.headers` instead. A plain
+  `init.headers` is not filtered.
+- `clone()` of a loopback response loses the own-property `url`/`redirected`/`type`
+  (and, in a browser, a `Set-Cookie`-bearing `headers`).
+- No connection pooling: each loopback fetch is its own connection (`agent: false`).
+
 ## An optional network relay — real TCP both ways, off by default (this change)
 
 "Outbound raw TCP is impossible in a browser" (above) is true of a tab on its own. It stops

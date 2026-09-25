@@ -1393,15 +1393,24 @@ export function createRuntime({
     // branch on.
     return e;
   };
+  // A destination INSIDE the VM (localhost, 127/8, ::1, … — decided by the virtual
+  // network's own isLocalDestination, never by the port) is not the tab's to
+  // answer: internal/fetch-loopback.js sends it through the vendored http client,
+  // so it reaches in-VM servers in this process and others exactly as http.get
+  // does. Everything else, host.vivari.internal included, is the host's fetch.
   if (typeof globalThis.fetch === "function") {
     const hostFetch = globalThis.fetch;
     if (!hostFetch.__ocHostWrapped) {
+      const loopbackFetch = nodeModules.require("internal/fetch-loopback");
       const wrappedFetch = function (input, init) {
-        return trackHost(
-          hostFetch.call(this, rewriteHostAlias(input), init).catch((err) => {
-            throw explainFetchFailure(input, err);
-          })
-        );
+        const viaHost = (i, n) =>
+          hostFetch.call(this, rewriteHostAlias(i), n).catch((err) => {
+            throw explainFetchFailure(i, err);
+          });
+        // "tls" (https to an in-VM host) rejects inside fetch(): there is no in-VM
+        // TLS, and the host would answer from a different machine.
+        if (loopbackFetch.route(input)) return trackHost(loopbackFetch.fetch(input, init, viaHost));
+        return trackHost(viaHost(input, init));
       };
       wrappedFetch.__ocHostWrapped = true;
       globalThis.fetch = wrappedFetch;

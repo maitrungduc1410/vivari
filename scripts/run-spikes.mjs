@@ -139,6 +139,11 @@ const SPIKES = [
   // and a manifest nobody writes is caught and read as "feature off". No kernel,
   // no Wasm, so it runs in the earliest gate.
   { name: "install-latency", file: "spike-install-latency.mjs", net: false, timeout: 60000 },
+  // The OPFS mirror must not lose a delete to the write of the same path that
+  // follows it while the drain is busy (old children came back after reload).
+  // Drives the real opfs-persistence.js against an in-memory OPFS — no kernel, no
+  // Wasm, so it runs in the earliest gate.
+  { name: "opfs-delete-recreate", file: "spike-opfs-delete-recreate.mjs", net: false, timeout: 60000 },
   // The gates above read `public/vendor`, which is gitignored build output: it
   // survives between commands on a developer's machine and has never existed on
   // a fresh checkout. Three regressions came from that asymmetry, `predev` not
@@ -244,6 +249,15 @@ const SPIKES = [
   // guests are three-line node:net scripts that touch no file, but booting a
   // kernel at all starts the fs worker, and that worker loads the VFS crate.
   { name: "net-close-order", file: "spike-net-close-order.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // A listen() that fails with EADDRINUSE must leave the port with the server that
+  // holds it. Same-process transcript against the host's real Node, plus the
+  // browser path (handleHttpRequest) and a second process, bounded because the
+  // regression is a hang. needsWasm for the same reason as net-close-order.
+  { name: "net-listen-clash", file: "spike-net-listen-clash.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // A guest's global fetch() to an in-VM server (issue #7): same-process and
+  // cross-process, every scenario run on the host's real Node and in the VM with
+  // identical transcripts required. needsWasm: it boots a kernel.
+  { name: "fetch-loopback", file: "spike-fetch-loopback.mjs", net: false, needsWasm: true, timeout: 180000 },
   // fs.cpSync / fsPromises.cp against the host's real Node, case by case. Needs the
   // VFS (it copies real trees), so needsWasm; the host half runs as a child process.
   { name: "fs-cp", file: "spike-fs-cp.mjs", net: false, needsWasm: true, timeout: 120000 },

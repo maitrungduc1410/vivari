@@ -476,7 +476,11 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
         this._closed = true;
         recount(this); // drop from liveness
         if (this.type === TCPConstants.SERVER) {
-          listeners.delete(this._localPort);
+          // Only if this handle is the one serving the port. A second listen() on a taken
+          // port returns EADDRINUSE without registering, and Node then closes that handle,
+          // so an unguarded delete drops the real server out of the map. The pipeServers
+          // cleanup below already guards the same way.
+          if (listeners.get(this._localPort) === this) listeners.delete(this._localPort);
           if (this._kernelPort != null && syscalls && syscalls.closeServer) {
             try {
               syscalls.closeServer(this._kernelPort);
