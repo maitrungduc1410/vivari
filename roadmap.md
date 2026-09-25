@@ -11343,3 +11343,24 @@ process in a tree that is serving right now.
   it runs the failing gate in the working tree before blaming the checkout, having once
   blamed absent build output for three stale assertions — but a gate whose assertions are
   skipped rather than failed still reads as green from the outside.
+
+## A failed `listen()` evicted the port's real server — and a self-dial hangs (this change)
+
+`TCP.close()` on a server handle deleted `listeners[port]` without checking the entry was
+its own. A second `listen()` on a taken port returns `EADDRINUSE` before it registers and
+`lib/net.js` then closes the handle, so the *failed* listen removed the *real* server from
+the process's routing table. The kernel registration survived, so in-VM callers in other
+processes kept being served and nothing logged anything; what broke was every dial from
+the owning process — including `bridgeHttp`, i.e. every browser request to that port. The
+guard is the one the `pipeServers` cleanup already had (contributed as GitHub PR #5).
+
+Why it *hung* rather than refused is worth keeping: with no local entry, the dial falls
+through to the cross-process pipe relay, which routes it back into the same process. There
+the dialing end and the accepted end share one `connId` in `xpipeConns`, and
+`handlePipeRelay` sends both directions to the same pid, so the response is delivered to
+the server's own endpoint. A same-process self-dial through the relay is still not
+supported; this change only stops the eviction that made one happen.
+
+Gate: `scripts/spike-net-listen-clash.mjs` — the same-process transcript against the host's
+real Node, plus `handleHttpRequest` and a second process, bounded because the regression is
+a hang. It fails on the unguarded `close()` and passes with the guard.
