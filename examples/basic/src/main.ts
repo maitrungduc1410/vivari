@@ -53,7 +53,6 @@ const project: FileSystemTree = {
       contents: [
         "import { createServer } from 'node:http';",
         "const server = createServer((req, res) => {",
-        "  console.log('request: ' + req.method + ' ' + req.url + ' from ' + req.socket.remoteAddress);",
         "  res.setHeader('content-type', 'text/html; charset=utf-8');",
         "  res.end('<h1>Served from inside your browser 🎉</h1>' +",
         "    '<p>Request: ' + req.method + ' ' + req.url + '</p>' +",
@@ -65,6 +64,23 @@ const project: FileSystemTree = {
   },
 };
 
+// A relay sees every byte the VM sends and can open connections into it, so a
+// page must not let its URL pick one: `?net=` only accepts a ws:/wss: relay on a
+// loopback host (the developer's own machine). Anything else is ignored.
+function readNetRelayParam(): string | undefined {
+  const raw = new URLSearchParams(location.search).get("net");
+  if (!raw) return undefined;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== "ws:" && u.protocol !== "wss:") return undefined;
+    const host = u.hostname;
+    const loopback = host === "localhost" || host === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+    return loopback ? u.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function main() {
   runStatus.textContent = "booting the Vivari kernel…";
 
@@ -73,8 +89,7 @@ async function main() {
   // Optional: `?net=ws://127.0.0.1:7071/<token>` (printed by `node scripts/net-relay.mjs`)
   // gives the VM a real network — the server below then also answers on
   // http://localhost:3111 on YOUR machine, not just in the preview iframe.
-  const netRelay = new URLSearchParams(location.search).get("net") ?? undefined;
-  const vivari = await Vivari.boot({ netRelay });
+  const vivari = await Vivari.boot({ netRelay: readNetRelayParam() });
   await vivari.mount(project);
 
   // --- Demo 1: run a script to completion, streaming its output ---

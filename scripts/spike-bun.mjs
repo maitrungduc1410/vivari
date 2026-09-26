@@ -1529,14 +1529,17 @@ console.log("\n== bun run ipc-parent.ts (Bun.spawn({ ipc }) across two processes
 // guest's own code, and it is the commonest way a program that works under a real
 // bun looks broken here. The runtime cannot say WHICH cause it was — the spec
 // forbids the browser from telling it — so the subject of this test is that both
-// causes are named and neither is claimed. A refused connection is the same
+// causes are named and neither is claimed. An unreachable host is the same
 // opaque failure as a CORS block, which is exactly why it can stand in for one.
+// It must not be a loopback URL: those are served by the VM's own network
+// (internal/fetch-loopback.js) and fail the way Node does, never reaching the
+// host's fetch. `.invalid` never resolves (RFC 6761), so this needs no network.
 console.log("\n== bun run fetch-blocked.ts (an opaque network failure explains itself) ==");
 {
   write("fetch-blocked.ts", [
     "const out: any = {};",
     "(async () => {",
-    "  try { await fetch('http://127.0.0.1:1/nope'); out.threw = false; }",
+    "  try { await fetch('http://vivari-unreachable.invalid:1/nope'); out.threw = false; }",
     "  catch (e: any) { out.threw = true; out.name = e.constructor.name; out.msg = String(e.message); out.cause = e.cause ? String(e.cause.message || e.cause) : null; }",
     "  console.log('FETCHFAIL:' + JSON.stringify(out));",
     "  process.exit(0);",
@@ -1554,7 +1557,7 @@ console.log("\n== bun run fetch-blocked.ts (an opaque network failure explains i
   ok(/browser tab/.test(got.msg || ""), "…and the message says who made the decision, rather than leaving two words of nothing");
   ok(/Access-Control-Allow-Origin/.test(got.msg || ""), "…names the CORS header the origin would have to send");
   ok(/host is unreachable/.test(got.msg || ""), "…and names the other cause too, since the browser will not say which it was");
-  ok(/127\.0\.0\.1:1/.test(got.msg || ""), "…and quotes the URL, so the line is actionable without a debugger");
+  ok(/vivari-unreachable\.invalid:1/.test(got.msg || ""), "…and quotes the URL, so the line is actionable without a debugger");
   ok(got.cause !== null, "…keeping the browser's own error as `cause` for anyone who wants the original");
 }
 

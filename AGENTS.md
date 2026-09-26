@@ -48,6 +48,9 @@ packages/
     fs-server.js   FsServer: owns the one VFS, services fs opcodes over each SAB.
     kernel-fs.js   kernel-side sync fs helper.
     coreutils.js   echo/cat/ls/pwd/... + a small `sh`.
+    net-relay.js   client for the OPTIONAL network relay (BootOptions.netRelay): Wisp v1 +
+                   listen/accept extension over one WebSocket; wire format in its header.
+                   Reference relay: scripts/net-relay.mjs (see ARCHITECTURE §8.4b).
     opfs-persistence.js  write-behind mirror of the VFS to OPFS (survives reload).
     node-gyp-stub.js     node-gyp no-op stub (native builds non-fatal) for real npm.
     load-real-npm.js     unpack the vendored real-npm asset into the VFS + shim /bin/npm.
@@ -311,6 +314,8 @@ scripts/
                        offline spike that boots a kernel must say needsWasm, and a
                        net spike reading the shipped locks must declare them.
   process-worker.mjs / fs-worker.mjs   Node worker_threads entries for headless.
+  net-relay.mjs        the reference LOCAL network relay a developer runs for
+                       BootOptions.netRelay / `?net=` (127.0.0.1 only, per-launch token).
   fixtures/napi-crc32/   vendored @node-rs/crc32 wasm32-wasi N-API addon (verify-node fixture).
 
 README.md · roadmap.md · research.md · ARCHITECTURE.md · AGENTS.md

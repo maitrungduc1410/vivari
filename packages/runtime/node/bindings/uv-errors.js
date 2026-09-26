@@ -42,6 +42,7 @@ export const UV_MESSAGES = {
   [-75]: ["EOVERFLOW", "value too large for defined data type"],
   [-98]: ["EADDRINUSE", "address already in use"],
   [-99]: ["EADDRNOTAVAIL", "address not available"],
+  [-101]: ["ENETUNREACH", "network is unreachable"],
   [-103]: ["ECONNABORTED", "software caused connection abort"],
   [-104]: ["ECONNRESET", "connection reset by peer"],
   [-107]: ["ENOTCONN", "socket is not connected"],
@@ -54,6 +55,9 @@ export const UV_MESSAGES = {
   // 'ENOTFOUND' is both what callers match on and what our lib/dns.js already
   // returns for a name it cannot resolve. Keep the two consistent.
   [-3008]: ["ENOTFOUND", "name not resolved"],
+  // A resolver that could not answer (no DNS reachable) — what a relay's host
+  // reports for a name it could not look up offline, passed through as-is.
+  [-3001]: ["EAI_AGAIN", "temporary failure"],
 };
 
 // UV_<NAME>: <errno>, derived from the table above so the two cannot drift.

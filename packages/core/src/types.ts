@@ -32,6 +32,13 @@ export interface BootOptions {
    * is `scripts/net-relay.mjs` — a local agent bound to 127.0.0.1 that prints the
    * URL to pass here. From the guest, the relay's own machine is
    * `host.vivari.internal` (in-VM `127.0.0.1` stays the VM's loopback).
+   *
+   * **Trust.** The relay sees every byte of every outbound connection and can
+   * open connections into any port the guest listens on. Pass only a relay you
+   * (or your user) run and trust — never a value taken from the page URL or other
+   * untrusted input without validating it; the studio and the basic example accept
+   * `?net=` only for a loopback host for exactly this reason. The kernel accepts
+   * inbound connections only on ports the relay confirmed it bound.
    */
   netRelay?: string;
   /**

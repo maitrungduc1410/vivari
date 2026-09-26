@@ -55,7 +55,7 @@ import {
 import { DBG_SAB_BYTES, makeDebugViews, writeDebugCommand } from "../protocol/debug.js";
 import { COREUTILS } from "./coreutils.js";
 import { CookieJar } from "./cookie-jar.js";
-import { NetRelay, CLOSE_REFUSED } from "./net-relay.js";
+import { NetRelay, CLOSE_NETWORK, CLOSE_REFUSED, CLOSE_UNREACHABLE, CLOSE_TIMEOUT } from "./net-relay.js";
 
 const EMPTY = new Uint8Array(0);
 
@@ -72,6 +72,23 @@ const tcpXKey = (port) => "\u0000oc-tcp:" + (port >>> 0);
 // kernel answers ENOENT when no relay is configured, so the binding falls back to
 // its normal refusal (EHOSTUNREACH / ENOTFOUND) and behavior is unchanged.
 const EGRESS_PREFIX = "\u0000oc-egress:";
+
+// The error a guest dial gets when the relay CLOSEs it before CONNECTED. The
+// reference relay sends the host's own Node code (+ the address it tried) as the
+// CLOSE detail, which is exactly what real Node would have reported; a relay
+// that sends only a Wisp reason gets it mapped. See net-relay.js "Outbound connect".
+const NET_DIAL_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "ETIMEDOUT", "ECONNRESET"]);
+function netDialError(reason, detail, host) {
+  const [code, address] = String(detail || "").split(" ");
+  if (NET_DIAL_CODES.has(code)) return { error: code, address: address || undefined };
+  const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":");
+  const error =
+    reason === CLOSE_UNREACHABLE ? (isIp ? "EHOSTUNREACH" : "ENOTFOUND")
+    : reason === CLOSE_TIMEOUT ? "ETIMEDOUT"
+    : reason === CLOSE_NETWORK ? "ECONNRESET"
+    : "ECONNREFUSED";
+  return { error, address: undefined };
+}
 
 // A stdin chunk on its way to a parked reader. It arrives as a string from a
 // terminal and as bytes from a parent writing to a child's stdin, and the reader
@@ -193,6 +210,7 @@ export class Kernel {
     this.netRelay = null;
     this.netStreamByConn = new Map(); // connId -> streamId
     this.netConnByStream = new Map(); // streamId -> connId
+    this.netPending = new Map(); // connId -> host, for an outbound dial awaiting CONNECTED
     this.onNetLog = null; // optional (line) => void
 
     // ---- network fetch (Phase 2 #9) ----
@@ -659,6 +677,8 @@ export class Kernel {
         "pipe-data": (m) => this.handlePipeRelay(pid, m),
         "pipe-shutdown": (m) => this.handlePipeRelay(pid, m),
         "pipe-close": (m) => this.handlePipeRelay(pid, m),
+        // The guest took in relayed chunks (network relay flow control only).
+        "pipe-read": (m) => this.handlePipeRelay(pid, m),
         // Breakpoint debugger: a CDP event/response from the in-guest backend.
         "dbg-event": (m) => this.handleDebugEvent(pid, m),
       },
@@ -1287,12 +1307,16 @@ export class Kernel {
 
   // ---- optional network relay (net-relay.js) --------------------------------
   // Configure (or clear, with a falsy url) the relay. Ports already listening are
-  // announced so a relay configured after boot still forwards them.
+  // announced so a relay configured after boot still forwards them. Streams on a
+  // relay being replaced die with it, and their guests hear so the way they would
+  // from a dead peer: a pending dial is refused, a live connection reset.
   setNetRelay(url) {
     if (this.netRelay) {
       const old = this.netRelay;
+      for (const connId of [...this.netStreamByConn.keys()]) {
+        this.netDeliverClose(connId, CLOSE_NETWORK, this.netPending.has(connId) ? "ECONNREFUSED" : "ECONNRESET");
+      }
       this.netRelay = null;
-      for (const connId of [...this.netStreamByConn.keys()]) this.netStreamClosed(connId);
       old.dispose();
     }
     if (!url) return;
@@ -1312,12 +1336,15 @@ export class Kernel {
         const pid = this.netProcFor(connId);
         if (pid != null) this.postToProc(pid, { type: "pipe-shutdown", connId });
       },
-      onClose: (streamId) => {
+      onConnected: (streamId, remote) => {
         const connId = this.netConnByStream.get(streamId);
-        if (connId == null) return;
+        if (connId == null || !this.netPending.delete(connId)) return;
         const pid = this.netProcFor(connId);
-        if (pid != null) this.postToProc(pid, { type: "pipe-close", connId });
-        this.netStreamClosed(connId);
+        if (pid != null) this.postToProc(pid, { type: "pipe-connected", connId, remote, ackReads: true });
+      },
+      onClose: (streamId, reason, detail) => {
+        const connId = this.netConnByStream.get(streamId);
+        if (connId != null) this.netDeliverClose(connId, reason, detail);
       },
     });
     for (const port of this.listeners.keys()) this.netRelay.listen(port);
@@ -1331,7 +1358,23 @@ export class Kernel {
     return this.procs.has(pid) ? pid : null;
   }
 
+  // The relay closed a stream: tell the guest endpoint, as the error Node would
+  // report. Before CONNECTED it is a failed dial (ECONNREFUSED, ENOTFOUND, …);
+  // after, a network-error close is a reset and anything else an orderly close.
+  netDeliverClose(connId, reason, detail) {
+    const host = this.netPending.get(connId);
+    const pid = this.netProcFor(connId);
+    if (pid != null) {
+      const m = { type: "pipe-close", connId };
+      if (host != null) Object.assign(m, netDialError(reason, detail, host));
+      else if (reason === CLOSE_NETWORK) m.error = String(detail).startsWith("ETIMEDOUT") ? "ETIMEDOUT" : "ECONNRESET";
+      this.postToProc(pid, m);
+    }
+    this.netStreamClosed(connId);
+  }
+
   netStreamClosed(connId) {
+    this.netPending.delete(connId);
     const streamId = this.netStreamByConn.get(connId);
     this.netStreamByConn.delete(connId);
     if (streamId != null) this.netConnByStream.delete(streamId);
@@ -1341,9 +1384,16 @@ export class Kernel {
   // The relay accepted an inbound TCP connection on a port an in-VM process is
   // serving. Open it on that process as a cross-process pipe connection — the
   // binding accepts it as a net.Socket exactly as it would a dial from another PID.
+  // Only a port the relay confirmed LISTENING for is accepted on: an ACCEPT for any
+  // other port is a relay reaching into the VM on its own initiative.
   netAccept(streamId, port, remote) {
     const serverPid = this.listeners.get(port);
-    if (serverPid == null || !this.procs.has(serverPid) || !this.pipeListeners.has(tcpXKey(port))) {
+    if (
+      !this.netRelay.isConfirmed(port) ||
+      serverPid == null ||
+      !this.procs.has(serverPid) ||
+      !this.pipeListeners.has(tcpXKey(port))
+    ) {
       this.netRelay.close(streamId, CLOSE_REFUSED);
       return;
     }
@@ -1351,7 +1401,7 @@ export class Kernel {
     this.pipeConns.set(connId, { clientPid: NET_PID, serverPid });
     this.netStreamByConn.set(connId, streamId);
     this.netConnByStream.set(streamId, connId);
-    this.postToProc(serverPid, { type: "pipe-open", connId, path: tcpXKey(port), remote });
+    this.postToProc(serverPid, { type: "pipe-open", connId, path: tcpXKey(port), remote, ackReads: true });
   }
 
   // A process produced a pipe message whose other end is the relay.
@@ -1360,6 +1410,8 @@ export class Kernel {
     if (streamId == null || !this.netRelay) return;
     if (m.type === "pipe-data") {
       if (m.chunk && m.chunk.byteLength) this.netRelay.send(streamId, m.chunk);
+    } else if (m.type === "pipe-read") {
+      this.netRelay.consumed(streamId, m.n >>> 0);
     } else if (m.type === "pipe-shutdown") {
       this.netRelay.shutdown(streamId);
     } else if (m.type === "pipe-close") {
@@ -1410,7 +1462,12 @@ export class Kernel {
       this.pipeConns.set(connId, { clientPid: proc.pid, serverPid: NET_PID });
       this.netStreamByConn.set(connId, streamId);
       this.netConnByStream.set(streamId, connId);
+      this.netPending.set(connId, host);
       this.respondOk(proc, encodeString(JSON.stringify({ connId })));
+      // A relay socket that could not even be constructed dropped the stream
+      // inside connect(), before it was mapped; fail the dial rather than leave
+      // it waiting for a CONNECTED that cannot come.
+      if (!this.netRelay.streams.has(streamId)) this.netDeliverClose(connId, CLOSE_NETWORK, "ECONNREFUSED");
       return;
     }
     // OP_PIPE_CONNECT: resolve the path to a live server and open a connection.
@@ -1439,6 +1496,7 @@ export class Kernel {
       this.netFromProc(m); // relay end: bytes go out the stream, close tears it down
       return;
     }
+    if (m.type === "pipe-read") return; // only relay-backed endpoints ack reads
     this.postToProc(otherPid, m);
     if (m.type === "pipe-close") this.pipeConns.delete(m.connId);
   }

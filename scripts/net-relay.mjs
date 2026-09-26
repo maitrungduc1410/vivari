@@ -12,7 +12,9 @@
 //             reach the server running in the tab.
 //
 // Wire protocol: Wisp v1 (github.com/MercuryWorkshop/wisp-protocol) for outbound
-// streams, plus a small listen/accept extension — documented in
+// streams, plus a small extension (listen/accept, half-close, a CONNECTED ack, the
+// host's error code on a failed dial's CLOSE, and relay→VM flow control via ACK) —
+// documented in
 // packages/kernel-host/net-relay.js, which is the client this relay serves.
 //
 // Security posture (this is a hole punched in the browser sandbox, on purpose):
@@ -42,16 +44,23 @@ const VV_UNLISTEN = 0x11;
 const VV_LISTENING = 0x12;
 const VV_ACCEPT = 0x13;
 const VV_SHUTDOWN = 0x14;
+const VV_CONNECTED = 0x15;
+const VV_ACK = 0x16;
 const ACCEPT_ID_FLAG = 0x80000000;
 
 const CLOSE_VOLUNTARY = 0x02;
 const CLOSE_NETWORK = 0x03;
 const CLOSE_INVALID = 0x41;
 const CLOSE_UNREACHABLE = 0x42;
-const CLOSE_REFUSED = 0x47;
+const CLOSE_TIMEOUT = 0x43;
+const CLOSE_REFUSED = 0x44;
 
 // Per-stream DATA budget granted to the client; topped up as bytes drain to TCP.
 const CREDIT = 32;
+// Relay→VM: DATA packets per stream the client may leave unacknowledged (VV_ACK)
+// before this relay stops reading the TCP socket. Without it a fast sender and a
+// slow guest meant the whole transfer buffered here and in the tab.
+const RELAY_WINDOW = 32;
 // Guest-side name for the machine running this relay (mirrors the Fetcher Worker).
 const HOST_ALIAS = "host.vivari.internal";
 
@@ -255,6 +264,19 @@ class Session {
         if (st) st.socket.end();
         return;
       }
+      case VV_ACK: {
+        const st = this.streams.get(id);
+        if (!st || p.length < 4) return;
+        const consumed = p.readUInt32LE(0);
+        // Cumulative, so only ever moves forward (mod 2^32).
+        if (((consumed - st.acked) >>> 0) > ((st.sent - st.acked) >>> 0)) return;
+        st.acked = consumed;
+        if (st.paused && ((st.sent - st.acked) >>> 0) < RELAY_WINDOW) {
+          st.paused = false;
+          st.socket.resume();
+        }
+        return;
+      }
       case VV_LISTEN:
         return this.listen(p.readUInt16LE(0), p[2]);
       case VV_UNLISTEN:
@@ -278,13 +300,28 @@ class Session {
     }
     log(`→ connect ${host}:${port}`);
     const socket = net.connect({ host, port });
-    this.attach(id, socket);
+    this.attach(id, socket, false);
+    // The client holds the guest's 'connect' until this arrives (Wisp has no
+    // success signal); the peer address is what the guest's remoteAddress reports.
+    socket.on("connect", () => {
+      const st = this.streams.get(id);
+      if (!st) return;
+      st.connected = true;
+      this.packet(VV_CONNECTED, id, Buffer.from(peerOf(socket), "utf8"));
+    });
   }
 
-  attach(id, socket) {
-    const st = { socket, used: 0, needDrain: false };
+  attach(id, socket, connected) {
+    const st = { socket, used: 0, needDrain: false, connected, sent: 0, acked: 0, paused: false };
     this.streams.set(id, st);
-    socket.on("data", (d) => this.packet(WISP_DATA, id, d));
+    socket.on("data", (d) => {
+      this.packet(WISP_DATA, id, d);
+      st.sent = (st.sent + 1) >>> 0;
+      if (!st.paused && ((st.sent - st.acked) >>> 0) >= RELAY_WINDOW) {
+        st.paused = true;
+        socket.pause();
+      }
+    });
     socket.on("end", () => this.packet(VV_SHUTDOWN, id));
     socket.on("drain", () => {
       st.needDrain = false;
@@ -293,13 +330,20 @@ class Session {
     socket.on("error", (e) => {
       if (!this.streams.has(id)) return;
       this.streams.delete(id);
-      const code = e && e.code;
-      const reason =
-        code === "ECONNREFUSED" ? CLOSE_REFUSED
-        : code === "ENOTFOUND" || code === "EHOSTUNREACH" || code === "ENETUNREACH" ? CLOSE_UNREACHABLE
+      const code = (e && e.code) || "";
+      // Before connect this is a failed dial and the reason says why; after it,
+      // any error is the connection dying (a reset, a timeout).
+      const reason = !st.connected
+        ? code === "ECONNREFUSED" ? CLOSE_REFUSED
+          : code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "EHOSTUNREACH" || code === "ENETUNREACH" ? CLOSE_UNREACHABLE
+          : code === "ETIMEDOUT" ? CLOSE_TIMEOUT
+          : CLOSE_NETWORK
         : CLOSE_NETWORK;
       log(`✗ stream ${id & 0x7fffffff}: ${code || e}`);
-      this.packet(WISP_CLOSE, id, Buffer.from([reason]));
+      // Detail: the host's own error code, then the address it tried (see the
+      // CLOSE row in packages/kernel-host/net-relay.js).
+      const detail = code ? code + (e.address ? " " + e.address : "") : "";
+      this.packet(WISP_CLOSE, id, Buffer.concat([Buffer.from([reason]), Buffer.from(detail, "utf8")]));
     });
     socket.on("close", () => {
       if (!this.streams.has(id)) return;
@@ -349,9 +393,9 @@ class Session {
 
   accept(port, socket) {
     const id = (ACCEPT_ID_FLAG | this.nextAcceptId++) >>> 0;
-    const remote = `${socket.remoteAddress}:${socket.remotePort}`;
+    const remote = peerOf(socket);
     log(`← accept :${port} from ${remote}`);
-    this.attach(id, socket);
+    this.attach(id, socket, true);
     const r = Buffer.from(remote, "utf8");
     const payload = Buffer.alloc(2 + r.length);
     payload.writeUInt16LE(port, 0);
@@ -368,6 +412,9 @@ class Session {
   }
 }
 
+function peerOf(socket) {
+  return `${socket.remoteAddress}:${socket.remotePort}`;
+}
 function u32(n) {
   const b = Buffer.alloc(4);
   b.writeUInt32LE(n >>> 0, 0);

@@ -11440,8 +11440,8 @@ Design choices, briefly:
   virtual pid rather than adding a second byte path. An egress dial is `pipeConnect` on a
   synthetic path; an inbound accept is a `pipe-open` on the server's existing `tcpXKey`.
 - **Wisp v1 on the wire** for outbound (an existing, documented protocol with other server
-  implementations), plus a five-packet extension for listen/accept/half-close that Wisp
-  lacks. Relay-initiated stream ids carry the high bit.
+  implementations), plus a seven-packet extension for listen/accept, half-close, the
+  connect ack and relay→VM flow control that Wisp lacks. Relay-initiated stream ids carry the high bit.
 - **Off unless configured.** No relay → the kernel answers `ENOENT` and `TCP.connect`
   refuses exactly as before; `verify` and `probe-xtcp` are unchanged.
 - **`host.vivari.internal` is the relay's machine.** In-VM `127.0.0.1` keeps meaning the VM.
@@ -11450,3 +11450,25 @@ Design choices, briefly:
 Deferred: UDP streams (Wisp has them; the reference relay refuses them for now), a
 DNS opcode so `dns.resolve*` can answer truthfully when a relay is present, and surfacing
 the relay state in the studio UI beyond the console line.
+
+Hardened before merge, each with a gate in `spike-net-relay`:
+- **`?net=` is loopback-only** in the studio and the basic example. The studio is public,
+  and a relay carries all of the VM's TCP, so a crafted link must not be able to choose one.
+  The kernel also honours an `ACCEPT` only on a port the relay confirmed `LISTENING`.
+- **Dials fail the way Node's do.** Wisp v1 has no success signal, so a refused dial read as
+  `connect` then `close`. The reference relay now acks with `CONNECTED` (carrying the real
+  peer address) and puts the host's own error code in a failed dial's `CLOSE`; the spike
+  compares each outcome with the host's real Node. The PR had also used `0x47` for
+  "refused", which in Wisp v1 means "data transfer timed out" (refused is `0x44`). A plain
+  Wisp v1 server is therefore not a supported relay.
+- **Reconnect** with backoff while ports are forwarded. Writing its gate surfaced that Node
+  22's `WebSocket` fires only `error` on a failed handshake, never `close`, which had wedged
+  the client whenever the relay was down.
+- **Replacing the relay** now tells guests their streams died instead of leaving them open.
+- **Relay→VM backpressure.** Only VM→relay had flow control (Wisp's `CONTINUE`); a fast
+  download into a guest that was not reading buffered entirely in the relay and the tab.
+  The relay now keeps a 32-packet window per stream and pauses TCP until the client ACKs,
+  and the client ACKs on the guest's reads, not on arrival. The gate measures what reaches
+  the kernel while the guest is paused (≈2 MB of 48 MB, vs all 48 MB without it) rather
+  than what the sender flushed, because host TCP autotuning can absorb tens of MB.
+- **The relay token stays out of logs**: every log line names the relay by origin only.

@@ -195,7 +195,7 @@ parentPort.on("message", (msg) => {
   else if (msg.type === "sse-open" || msg.type === "sse-close")
     onControl((c) => c.dispatchSse(msg));
   // A cross-process pipe (UNIX socket) message relayed by the kernel.
-  else if (msg.type === "pipe-open" || msg.type === "pipe-data" || msg.type === "pipe-shutdown" || msg.type === "pipe-close")
+  else if (msg.type === "pipe-open" || msg.type === "pipe-data" || msg.type === "pipe-shutdown" || msg.type === "pipe-close" || msg.type === "pipe-connected")
     onControl((c) => c.dispatchPipe(msg));
   // An interactive stdin chunk for this process (host terminal / parent -> child).
   else if (msg.type === "stdin") onControl((c) => c.dispatchStdin(msg));

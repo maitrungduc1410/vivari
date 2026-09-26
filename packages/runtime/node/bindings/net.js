@@ -179,14 +179,21 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
     // Pump queued inbound chunks into the stream while it wants to read.
     while (handle.reading && handle._inbox.length && !handle._closed) {
       const item = handle._inbox[0];
-      if (item === EOF) {
+      if (item === EOF || item.uvError) {
         handle._inbox.shift();
-        streamBaseState[kReadBytesOrError] = UV_CODES.UV_EOF;
+        streamBaseState[kReadBytesOrError] = item === EOF ? UV_CODES.UV_EOF : item.uvError;
         if (handle.onread) handle.onread.call(handle, undefined);
-        return; // no more data after EOF
+        return; // no more data after EOF or a read error
       }
       handle._inbox.shift();
       handle.bytesRead += item.byteLength;
+      // A relay-backed endpoint tells the kernel each chunk has been taken in, which
+      // is what lets the relay send more (relay→VM flow control, net-relay.js).
+      // Handed over here, not on arrival: a guest that stops reading stops this
+      // loop (readStop at the stream's highWaterMark), and so stops the relay.
+      if (handle._ackReads && handle._xproc && pipeBridge && pipeBridge.postRaw) {
+        pipeBridge.postRaw({ type: "pipe-read", connId: handle._connId, n: 1 });
+      }
       streamBaseState[kReadBytesOrError] = item.byteLength;
       streamBaseState[kArrayBufferOffset] = item.byteOffset;
       // onStreamRead builds new FastBuffer(arrayBuffer, offset, nread); it may
@@ -245,6 +252,8 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
       this._kernelPipe = null; // synthetic pipe key for cross-process dials (servers)
       this._xproc = false; // true once this endpoint bridges to another process
       this._connId = 0; // kernel-assigned id of the cross-process connection
+      this._pendingConnect = null; // { req, host } while a relayed dial awaits the relay
+      this._ackReads = false; // relay-backed: ack each delivered chunk (pipe-read)
       this._localAddress = "0.0.0.0";
       this._localPort = 0;
       this._remoteAddress = "";
@@ -344,12 +353,15 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
             this._localPort = allocPort();
             this._xproc = true;
             this._connId = connId;
+            // Not connected until the relay says so: `pipe-connected` completes the
+            // dial with the real peer address, a `pipe-close` first fails it with
+            // the error Node would give (see dispatchPipe). Live meanwhile, so the
+            // loop waits for the answer; no peer address until there is a peer.
+            this._remotePort = 0;
+            this._pendingConnect = { req, host };
             xpipeConns.set(connId, this);
-            nextTick(() => {
-              this._live = true;
-              recount(this);
-              req.oncomplete(0, this, req, true, true);
-            });
+            this._live = true;
+            recount(this);
             return 0;
           }
         }
@@ -828,6 +840,7 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
         server instanceof TCP ? new TCP(TCPConstants.SOCKET) : new Pipe(PipeConstants.SOCKET);
       peer._xproc = true;
       peer._connId = connId;
+      peer._ackReads = msg.ackReads === true;
       if (peer instanceof Pipe) peer._remotePath = String(msg.path);
       else {
         // A connection relayed in from outside the VM (kernel net relay) carries
@@ -850,6 +863,36 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
     }
     const ep = xpipeConns.get(connId);
     if (!ep) return;
+    const pending = ep._pendingConnect;
+    if (pending && (msg.type === "pipe-connected" || msg.type === "pipe-close")) {
+      ep._pendingConnect = null;
+      const { req, host } = pending;
+      if (msg.type === "pipe-connected") {
+        ep._ackReads = msg.ackReads === true;
+        const m = typeof msg.remote === "string" ? /^(.*):(\d+)$/.exec(msg.remote) : null;
+        if (m) {
+          ep._remoteAddress = m[1].replace(/^\[|\]$/g, "");
+          ep._remotePort = Number(m[2]);
+          ep._family = ep._remoteAddress.includes(":") ? "IPv6" : "IPv4";
+        } else {
+          ep._remotePort = req.port >>> 0;
+        }
+        nextTick(() => req.oncomplete(0, ep, req, true, true));
+      } else {
+        xpipeConns.delete(connId);
+        ep._xproc = false; // the kernel already dropped the connection
+        ep._live = false;
+        recount(ep);
+        const status = UV_CODES["UV_" + msg.error] || UV_CODES.UV_ECONNREFUSED;
+        // Name what the relay actually tried when it said, else what the caller
+        // asked for — never the 127.0.0.1 in-VM DNS flattened the name to.
+        if (msg.address) req.address = String(msg.address);
+        else if (host !== null) req.address = host;
+        nextTick(() => req.oncomplete(status, ep, req, false, false));
+      }
+      if (pipeBridge && pipeBridge.wake) pipeBridge.wake();
+      return;
+    }
     if (msg.type === "pipe-data") {
       let chunk = msg.chunk;
       if (chunk && !(chunk instanceof Uint8Array)) chunk = new Uint8Array(chunk);
@@ -858,7 +901,10 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
       ep._inbox.push(EOF);
       schedulePump(ep);
     } else if (msg.type === "pipe-close") {
-      ep._inbox.push(EOF);
+      // A relayed connection that died (rather than closed) reads as that error,
+      // the way libuv reports a reset: 'error' ECONNRESET, then 'close'.
+      const status = msg.error ? UV_CODES["UV_" + msg.error] : 0;
+      ep._inbox.push(status ? { uvError: status } : EOF);
       schedulePump(ep);
       xpipeConns.delete(connId);
     }

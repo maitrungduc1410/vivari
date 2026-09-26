@@ -879,10 +879,16 @@ relay (§8.1) with the relay as a virtual peer (`NET_PID`):
   fail with `EHOSTUNREACH`/`ENOTFOUND`. It now first tries
   `OP_PIPE_CONNECT` on the synthetic path `\0oc-egress:<port>:<host>`; the kernel answers
   `ENOENT` when no relay is configured (so the refusal is unchanged), or opens a **Wisp v1**
-  stream (`CONNECT`/`DATA`/`CONTINUE`/`CLOSE` over one WebSocket, credit flow control) that
+  stream (`CONNECT`/`DATA`/`CONTINUE`/`CLOSE` over one WebSocket, credit flow control VM→relay) that
   the relay terminates as a real TCP connection. The guest's socket is an ordinary
   `_xproc` endpoint: bytes flow as `pipe-*` messages, exactly like a dial into another
-  process. In-VM `127.0.0.1`/`localhost` still mean the VM; the relay's machine is
+  process. It is **not connected until the relay says so**: the binding holds
+  `req.oncomplete` until the kernel forwards the relay's `CONNECTED` as `pipe-connected`
+  (carrying the real peer `ip:port`, which becomes `remoteAddress`/`remotePort` — not the
+  127.0.0.1 in-VM DNS flattened the name to). A `CLOSE` first fails the dial the way Node
+  does — `'error'` with the host's own code (`ECONNREFUSED`, `ENOTFOUND`, `ETIMEDOUT`, …,
+  sent by the reference relay as the CLOSE detail; mapped from the Wisp reason otherwise)
+  and no `'connect'`. After connect a network-error `CLOSE` reads as `ECONNRESET`. In-VM `127.0.0.1`/`localhost` still mean the VM; the relay's machine is
   `host.vivari.internal` (the same alias the Fetcher Worker uses).
 - **Inbound.** `OP_LISTEN` also sends the relay a `LISTEN <port>`; the relay binds
   `127.0.0.1:<port>` on its host and hands each accepted TCP connection back as a
@@ -892,14 +898,39 @@ relay (§8.1) with the relay as a virtual peer (`NET_PID`):
   address. `OP_CLOSE_SERVER` and `finalize` send `UNLISTEN`. This is what lets a CLI's
   `http.createServer().listen(port)` catch a **browser redirect** to
   `http://localhost:<port>/callback?code=…` (the OAuth login flow), or `curl`, or Playwright.
+  Forwarded ports only exist while the relay holds the kernel's socket, so while any port
+  is forwarded a dropped socket is reopened with backoff (250 ms doubling to 10 s) and every
+  `LISTEN` re-sent: a relay restarted on the same URL gets the VM's servers back. Streams do
+  not survive a drop, and neither do they survive `setNetRelay` replacing the relay: either
+  way the guest hears it as a dead peer (a pending dial `ECONNREFUSED`, a live one
+  `ECONNRESET`). (Node 22's `WebSocket` fires only `error` on a failed handshake, never
+  `close`; `NetRelay` treats either as the end of a not-yet-open socket.)
 - **Not TLS.** A relay makes `net` real, not `tls`: `tls.connect` still throws until there
   is a verifying TLS backend in-VM. `https`/`http` egress keep using the fetch transport.
+- **Trust.** Whoever runs the relay sees all of the VM's outbound TCP and can dial into
+  its listeners, so the relay URL is embedder-controlled (`BootOptions.netRelay`, see its
+  JSDoc). The studio is public, so its `?net=` — and the basic example's — accepts only a
+  `ws:`/`wss:` URL on a loopback host (`127.0.0.0/8`, `localhost`, `[::1]`); a crafted link
+  cannot point a visitor's VM at someone else's relay. In the kernel, an `ACCEPT` is
+  honoured only for a port the relay answered `LISTENING ok` for on the current socket
+  (`NetRelay.isConfirmed`), withdrawn on `UNLISTEN`, a failed bind, or a dropped socket.
+- **Flow control, both directions.** VM→relay is Wisp's own `CONTINUE` credit. Relay→VM
+  is its mirror as an extension: the relay leaves at most 32 `DATA` packets per stream
+  unacknowledged and pauses that TCP socket until a cumulative `ACK` (`0x16`) catches up.
+  The client ACKs when the **guest** takes a chunk in — the binding posts `pipe-read` from
+  its delivery loop for relay-backed endpoints (flagged `ackReads` on `pipe-open` /
+  `pipe-connected`), and that loop stops at the stream's highWaterMark — so a guest that
+  stops reading stops the remote sender at TCP instead of the transfer piling up in the
+  relay and the tab. In-VM cross-process pipes do not ack and are unchanged.
 
-Wisp v1 has no listen/accept; the four extension packet types (`LISTEN`, `UNLISTEN`,
-`LISTENING`, `ACCEPT`, plus `SHUTDOWN` for TCP half-close) are documented at the top of
-`net-relay.js`, which is the client the reference relay serves. `scripts/spike-net-relay.mjs`
-gates both directions headless (an OAuth-shaped callback in, an echo round-trip out, and
-that nothing changes with no relay configured).
+Wisp v1 has no listen/accept, half-close or success signal; the extension packets
+(`LISTEN`, `UNLISTEN`, `LISTENING`, `ACCEPT`, `SHUTDOWN`, `CONNECTED`, `ACK`, and the
+optional CLOSE detail) are documented at the top of `net-relay.js`, which is the client the
+reference relay serves. Because a dial waits for `CONNECTED`, a plain Wisp v1 server is
+not a supported relay. `scripts/spike-net-relay.mjs` gates both directions headless (an
+OAuth-shaped callback in, an echo round-trip out, that nothing changes with no relay
+configured) and runs each outbound failure mode on the host's real Node and in the VM,
+requiring identical event transcripts.
 
 ### 8.5 In-browser DevTools + local address bar (studio)
 

@@ -2003,8 +2003,9 @@ export function createRuntime({
      * ({type:'sse-open'|'sse-close', connId, ...}). Streams text/event-stream. */
     dispatchSse: (msg) => dispatchSse(msg),
     /** External delivery from the kernel: a cross-process pipe (UNIX socket)
-     * message ({type:'pipe-open'|'pipe-data'|'pipe-shutdown'|'pipe-close',
-     * connId, ...}) for a connection this process is an endpoint of. */
+     * message ({type:'pipe-open'|'pipe-data'|'pipe-shutdown'|'pipe-close'|
+     * 'pipe-connected', connId, ...}) for a connection this process is an endpoint
+     * of. 'pipe-connected' completes a dial through the kernel's network relay. */
     dispatchPipe: (msg) => pipeBridge.dispatch && pipeBridge.dispatch(msg),
     /** External delivery from the kernel: an async fetch result
      * ({type:'fetch-done', fetchId, ok, meta|error}). Parallel downloads. */

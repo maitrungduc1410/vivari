@@ -80,14 +80,20 @@ export interface NotebookHandle {
 }
 
 // The optional network relay is opted into per page load with `?net=ws://…`
-// (BootOptions.netRelay). Only ws:/wss: URLs count; anything else is ignored.
+// (BootOptions.netRelay). Only a ws:/wss: URL on a LOOPBACK host counts: the
+// studio is public, and a relay carries every outbound TCP byte and every inbound
+// connection of the VM, so a crafted link naming someone else's relay must not
+// be able to route a visitor's VM through it. Anything else is ignored.
 function readNetRelayParam(): string | undefined {
   if (typeof location === "undefined") return undefined;
   const raw = new URLSearchParams(location.search).get("net");
   if (!raw) return undefined;
   try {
     const u = new URL(raw);
-    return u.protocol === "ws:" || u.protocol === "wss:" ? u.toString() : undefined;
+    if (u.protocol !== "ws:" && u.protocol !== "wss:") return undefined;
+    const host = u.hostname;
+    const loopback = host === "localhost" || host === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+    return loopback ? u.toString() : undefined;
   } catch {
     return undefined;
   }

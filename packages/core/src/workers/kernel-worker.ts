@@ -19,6 +19,7 @@
 
 import { newProgress, onFetch, onOutput, idleClear, stallVerdict, shouldReportStallFor, stallReportChunk } from "../../terminal-feedback.js";
 import { Kernel } from "../../../kernel-host/kernel.js";
+import { redactRelayUrl } from "../../../kernel-host/net-relay.js";
 import { createKernelFs } from "../../../kernel-host/kernel-fs.js";
 import { initTransferList } from "../../../kernel-host/worker-transfer.js";
 import { ensureRealNpm } from "../../../kernel-host/load-real-npm.js";
@@ -1944,7 +1945,7 @@ async function boot() {
   if (netRelayUrl) {
     kernel.onNetLog = (line: string) => post("log", { line, dim: true });
     kernel.setNetRelay(netRelayUrl);
-    post("log", { line: `[net-relay] enabled — external net.connect() and inbound listen() go through ${netRelayUrl.replace(/\/[^/]*$/, "/…")}`, dim: true });
+    post("log", { line: `[net-relay] enabled — external net.connect() and inbound listen() go through ${redactRelayUrl(netRelayUrl)}`, dim: true });
   }
 
   kernel.mkdirp("/home/user");

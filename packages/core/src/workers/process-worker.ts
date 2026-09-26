@@ -184,7 +184,7 @@ self.onmessage = async (event) => {
   else if (type === "sse-open" || type === "sse-close")
     onControl((c) => c.dispatchSse(event.data));
   // A cross-process pipe (UNIX socket) message relayed by the kernel.
-  else if (type === "pipe-open" || type === "pipe-data" || type === "pipe-shutdown" || type === "pipe-close")
+  else if (type === "pipe-open" || type === "pipe-data" || type === "pipe-shutdown" || type === "pipe-close" || type === "pipe-connected")
     onControl((c) => c.dispatchPipe(event.data));
   // An interactive stdin chunk for this process (host terminal / parent -> child).
   else if (type === "stdin") onControl((c) => c.dispatchStdin(event.data));
