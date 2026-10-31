@@ -3,6 +3,12 @@
 From 1.1.0 on, entries are generated from [changesets](https://github.com/changesets/changesets).
 `@vivari/core` and `@vivari/react` are released together under the same version.
 
+## 1.1.5
+
+### Patch Changes
+
+- [#19](https://github.com/maitrungduc1410/vivari/pull/19) [`86a20ce`](https://github.com/maitrungduc1410/vivari/commit/86a20cec6a0f20ea8b7cc43a9e1a49ec298e348e) Thanks [@kele23](https://github.com/kele23)! - Runtime: fall back to the next `exports` condition (and to `module`) when a package's declared `main`/`require` target is absent, so pruned ESM-only copies such as nitro's traced `dist/node_modules` load instead of throwing `MODULE_NOT_FOUND`.
+
 ## 1.1.4
 
 ### Patch Changes
