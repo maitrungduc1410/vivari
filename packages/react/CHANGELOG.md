@@ -4,6 +4,10 @@ From 1.1.0 on, entries are generated from [changesets](https://github.com/change
 `@vivari/core` and `@vivari/react` are released together under the same version, so a release
 that says "No changes in this release" changed only `@vivari/core`.
 
+## 1.1.5
+
+No changes in this release.
+
 ## 1.1.4
 
 No changes in this release.

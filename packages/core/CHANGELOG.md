@@ -3,6 +3,22 @@
 From 1.1.0 on, entries are generated from [changesets](https://github.com/changesets/changesets).
 `@vivari/core` and `@vivari/react` are released together under the same version.
 
+## 1.1.5
+
+### Patch Changes
+
+- [#22](https://github.com/maitrungduc1410/vivari/pull/22) [`a2843e8`](https://github.com/maitrungduc1410/vivari/commit/a2843e8e755f132f1041bcdc3b7f90c9cc912967) Thanks [@kele23](https://github.com/kele23)! - OPFS: a second Studio tab on the same origin no longer drops the first tab's paths from
+  the VFS mirror's index — the write is a read-merge-write of this kernel's changed paths,
+  serialized with a 'vv-vfs-manifest' Web Lock — and the index is replaced through a staged
+  copy, so a tab that boots while another is writing restores the tree instead of an empty
+  workspace.
+
+- [#19](https://github.com/maitrungduc1410/vivari/pull/19) [`86a20ce`](https://github.com/maitrungduc1410/vivari/commit/86a20cec6a0f20ea8b7cc43a9e1a49ec298e348e) Thanks [@kele23](https://github.com/kele23)! - Runtime: fall back to the next `exports` condition (and to `module`) when a package's declared `main`/`require` target is absent, so pruned ESM-only copies such as nitro's traced `dist/node_modules` load instead of throwing `MODULE_NOT_FOUND`.
+
+- [#20](https://github.com/maitrungduc1410/vivari/pull/20) [`682b821`](https://github.com/maitrungduc1410/vivari/commit/682b821f99b82a63756e8327df26d9a4e0ffe43f) Thanks [@kele23](https://github.com/kele23)! - Runtime: `import.meta.resolve()` now returns a URL string like Node, instead of the bare filesystem path `require.resolve()` returns: `file://…` for modules (escaped the way `pathToFileURL` does, so `@scope` stays literal) and `node:…` for Node core builtins. Other ids such as `bun:sqlite` and `bun` come back unchanged, as in Bun.
+
+- [#21](https://github.com/maitrungduc1410/vivari/pull/21) [`831c0d5`](https://github.com/maitrungduc1410/vivari/commit/831c0d50122a0ca89e91035a4ed061e4c1ab8ce9) Thanks [@kele23](https://github.com/kele23)! - Runtime: the OPFS mirror drains project paths ahead of package-manager cache paths and rewrites its manifest while the queue is busy, so an edit made during a cold install survives a reload instead of being lost behind the cache backlog.
+
 ## 1.1.4
 
 ### Patch Changes
