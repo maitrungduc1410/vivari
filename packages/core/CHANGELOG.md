@@ -3,6 +3,16 @@
 From 1.1.0 on, entries are generated from [changesets](https://github.com/changesets/changesets).
 `@vivari/core` and `@vivari/react` are released together under the same version.
 
+## 1.2.1
+
+### Patch Changes
+
+- [#31](https://github.com/maitrungduc1410/vivari/pull/31) [`b247789`](https://github.com/maitrungduc1410/vivari/commit/b2477891fac28cd5fc1d2a7ddb06405abb798064) Thanks [@kele23](https://github.com/kele23)! - Runtime: a module whose id reaches the ESM loader as a relative path no longer gets
+  `import.meta.url` = `file://home/…` (the first segment parsed as the URL host). The URL is
+  built from a root-relative path, the same rule stack frames already follow, and
+  `fileURLToPath()` now throws `ERR_INVALID_FILE_URL_HOST` for a hostful file URL instead of
+  silently reading `/user/…`.
+
 ## 1.2.0
 
 ### Minor Changes
