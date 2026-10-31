@@ -27,6 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { readPackVersion } from "./lib/pack-version.mjs";
 
 const PNPM_VERSION = "9.15.9"; // keep in sync with scripts/spike-pnpm.mjs
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
@@ -44,8 +45,15 @@ function log(msg) {
 }
 
 if (fs.existsSync(OUT_FILE) && !force) {
-  log(`asset already present: ${path.relative(ROOT, OUT_FILE)} (use --force to rebuild)`);
-  process.exit(0);
+  // The header carries the version the pack was built from. Reusing a pack whose
+  // stamp disagrees with the pin would silently ship the other pnpm, so compare
+  // (an unreadable header is stale).
+  const stamped = readPackVersion(OUT_FILE);
+  if (stamped === PNPM_VERSION) {
+    log(`asset already present: ${path.relative(ROOT, OUT_FILE)} (use --force to rebuild)`);
+    process.exit(0);
+  }
+  log(`existing ${path.relative(ROOT, OUT_FILE)} is pnpm@${stamped || "?"} — rebuilding …`);
 }
 
 // 1) Vendor a pinned pnpm into a scratch dir (host npm/network needed once).

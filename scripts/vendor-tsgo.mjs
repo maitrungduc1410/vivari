@@ -30,6 +30,7 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { readPackVersion } from "./lib/pack-version.mjs";
 
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
 const VENDOR_DIR = process.env.VV_VENDOR_TSGO_DIR || "/tmp/vv-vendor-tsgo";
@@ -46,8 +47,23 @@ function log(msg) {
 }
 
 if (fs.existsSync(OUT_FILE) && !force) {
-  log(`asset already present: ${path.relative(ROOT, OUT_FILE)} (use --force to rebuild)`);
-  process.exit(0);
+  // tsgo-wasm is vendored without a version pin, so the pack's stamp is compared
+  // against the tree already on disk when there is one: a refreshed tsgo-wasm must
+  // not leave the previous pack in place. An unreadable header is stale; with no
+  // vendored tree to compare against, the readable stamp is all there is.
+  const stamped = readPackVersion(OUT_FILE);
+  let vendored = "";
+  try {
+    const pkg = path.join(VENDOR_TSGO, "package.json");
+    if (fs.existsSync(pkg)) vendored = JSON.parse(fs.readFileSync(pkg, "utf8")).version || "";
+  } catch {
+    /* unreadable tree version → fall back to the header alone */
+  }
+  if (stamped && (!vendored || stamped === vendored)) {
+    log(`asset already present: ${path.relative(ROOT, OUT_FILE)} (use --force to rebuild)`);
+    process.exit(0);
+  }
+  log(`existing ${path.relative(ROOT, OUT_FILE)} is tsgo-wasm@${stamped || "?"}${vendored ? ` but the vendored tree is ${vendored}` : ""} — rebuilding …`);
 }
 
 // 1) Vendor tsgo-wasm into a scratch dir (host npm/network needed once).

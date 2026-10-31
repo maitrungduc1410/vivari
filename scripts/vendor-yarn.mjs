@@ -24,6 +24,7 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { readPackVersion } from "./lib/pack-version.mjs";
 
 const YARN_VERSION = "1.22.22"; // keep in sync with scripts/spike-yarn.mjs
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
@@ -43,8 +44,15 @@ function log(msg) {
 }
 
 if (fs.existsSync(OUT_FILE) && !force) {
-  log(`asset already present: ${path.relative(ROOT, OUT_FILE)} (use --force to rebuild)`);
-  process.exit(0);
+  // The header carries the version the pack was built from. Reusing a pack stamped
+  // by an older YARN_VERSION would silently ship that yarn under the new name, so
+  // compare — and treat an unreadable header as stale.
+  const stamped = readPackVersion(OUT_FILE);
+  if (stamped === YARN_VERSION) {
+    log(`asset already present: ${path.relative(ROOT, OUT_FILE)} (use --force to rebuild)`);
+    process.exit(0);
+  }
+  log(`existing ${path.relative(ROOT, OUT_FILE)} is yarn@${stamped || "?"} — rebuilding …`);
 }
 
 // 1) Vendor a pinned yarn into a scratch dir (host npm/network needed once).

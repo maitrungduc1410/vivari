@@ -29,8 +29,9 @@ import {
   ARBORIST_PEERSET_MARKER,
   patchArboristPeerSet,
 } from "../packages/kernel-host/node-gyp-stub.js";
+import { readPackVersion } from "./lib/pack-version.mjs";
 
-const NPM_VERSION = "10.9.2"; // keep in sync with scripts/spike-npm.mjs
+const NPM_VERSION = "12.2.1"; // keep in sync with scripts/spike-npm.mjs
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
 const VENDOR_DIR = process.env.VV_VENDOR_DIR || "/tmp/vv-vendor";
 const VENDOR_NPM = path.join(VENDOR_DIR, "node_modules", "npm");
@@ -57,11 +58,15 @@ function packHasArboristGuard(file) {
 }
 
 if (fs.existsSync(OUT_FILE) && !force) {
-  if (packHasArboristGuard(OUT_FILE)) {
+  // Both halves matter. The patch, because without it npm's peer loop hangs the
+  // install; the version, because a raised NPM_VERSION that found a pack left by an
+  // older pin would otherwise exit here and ship that older npm under the new
+  // version's name — invisible to every gate downstream.
+  if (packHasArboristGuard(OUT_FILE) && readPackVersion(OUT_FILE) === NPM_VERSION) {
     log(`asset already present: ${path.relative(ROOT, OUT_FILE)} (use --force to rebuild)`);
     process.exit(0);
   }
-  log(`existing ${path.relative(ROOT, OUT_FILE)} predates #loadPeerSet guard — rebuilding …`);
+  log(`existing ${path.relative(ROOT, OUT_FILE)} is stale (guard/version) — rebuilding …`);
 }
 
 // 1) Vendor a pinned npm into a scratch dir (host npm/network needed once).
