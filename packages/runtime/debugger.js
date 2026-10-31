@@ -31,8 +31,20 @@ export function createDebugger({ send, waitForCommand, readFileSync = null } = {
   const scripts = new Map(); // sid(number) -> { sid, url, path, source, breakable:Set<number> }
   const scriptByUrl = new Map(); // url -> sid
 
-  const toUrl = (p) => (/^[a-z]+:\/\//i.test(p) ? p : "file://" + p);
-  const fromUrl = (u) => (u && u.startsWith("file://") ? u.slice("file://".length) : u);
+  // A module id is a VFS path, so a relative id must never become the URL HOST
+  // ("file://home/…" parses `home` as the host and loses the leading slash), and a
+  // hostful URL must not turn back into a relative path. Same rule as fileMetaPath()
+  // in esm.js — a relative id is root-relative, which is what sourceUrlFor() already
+  // does for stack frames, so the script URL and the frame keep one identity.
+  const toUrl = (p) => {
+    if (/^[a-z]+:\/\//i.test(p)) return p;
+    return p.startsWith("/") ? "file://" + p : "file:///" + p;
+  };
+  const fromUrl = (u) => {
+    if (!u || !u.startsWith("file://")) return u;
+    const rest = u.slice("file://".length);
+    return rest.startsWith("/") ? rest : "/" + rest;
+  };
 
   // ── state ─────────────────────────────────────────────────────────────────
   let enabled = false;

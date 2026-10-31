@@ -19,6 +19,8 @@
 // Run:  node scripts/spike-esm.mjs
 
 import { transpileEsm, transpileEsmLive } from "../packages/runtime/esm.js";
+import urlFactory from "../packages/runtime/node/internal/url.js";
+import path from "node:path";
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 let failures = 0;
@@ -319,6 +321,117 @@ console.log("\n== [esm] comment between `export` and its declaration ==");
     namedOk = false;
   }
   check("a commented default function keeps its local binding", namedOk);
+}
+
+// ── 8. a relative module id must never become the URL host ────────────────────
+// `"file://" + id` is a three-slash file URL only when the id is absolute. With a
+// relative id ("home/user/…") the first segment parses as the HOST, so
+// `new URL('./pglite.data', import.meta.url)` resolves to file://home/user/… and
+// fileURLToPath() returns /user/… — the /home is gone. That is how a PGlite ESM
+// import failed with ENOENT while its stack frame looked right.
+console.log("\n== [esm] relative module id must not become import.meta.url's host ==");
+{
+  const src = "export const url = import.meta.url; export const dir = import.meta.dirname;";
+  const out = transpileEsm(src, "home/user/projects/app/node_modules/@electric-sql/pglite/dist/index.js");
+  const mod = { exports: Object.create(null) };
+  new Function("__oc_exports", "__oc_require", "__oc_module", out + "\n").call(
+    mod.exports,
+    mod.exports,
+    () => ({}),
+    mod,
+  );
+  const u = mod.exports.url;
+  check(
+    "import.meta.url is a three-slash file URL",
+    u === "file:///home/user/projects/app/node_modules/@electric-sql/pglite/dist/index.js",
+  );
+  check(
+    "a relative asset resolves under /home, not /user",
+    new URL("./pglite.data", u).pathname ===
+      "/home/user/projects/app/node_modules/@electric-sql/pglite/dist/pglite.data",
+  );
+  check(
+    "import.meta.dirname is absolute too",
+    mod.exports.dir === "/home/user/projects/app/node_modules/@electric-sql/pglite/dist",
+  );
+  check(
+    "the live-binding variant builds the same URL",
+    transpileEsmLive(src, "home/user/projects/app/x.js").includes('"file:///home/user/projects/app/x.js"'),
+  );
+}
+
+// ── 9. fileURLToPath recovers the path from a hostful file URL ───────────────
+// `"file:" + absolutePath` is how userland builds a file URL from `__filename`, and
+// PGlite's CJS build does exactly that. Chrome does not parse the result the same way
+// on every platform: url/url_parse_file.cc takes its WIN32 branch for anything that is
+// not `C:\` and is not exactly three slashes, and reads the rest as an UNC path — so
+// `file:/home/user/x` is `file://home/user/x` on Chrome/Windows, and
+// `file:///home/user/x` in Node and on Chrome/Linux (url_parse_unittest.cc pins both
+// tables). This VFS has no file hosts, so the segment the parser promoted is put back
+// in front of the pathname instead of throwing (which killed the database boot) or
+// dropping it (the old /user/… bug).
+//
+// The Windows branch is MODELLED here: the parser under test is the host's, and what
+// is checked is the reconstruction. Two slashes reproduce that parse on any host
+// (`file://home/user/x` is UNC everywhere), which is why this runs in CI.
+console.log("\n== [url] fileURLToPath recovers the path from a hostful file URL ==");
+{
+  const mod = { exports: {} };
+  urlFactory(mod.exports, () => { throw new Error("require is not available here"); }, mod, {}, {}, {});
+  const { fileURLToPath } = mod.exports;
+  // What Chrome/Windows makes of `"file:" + "/a/rest"`: host "a", pathname "/rest".
+  const asChromeOnWindows = (absPath) => new URL("file://" + String(absPath).replace(/^\/+/, ""));
+  check(
+    "the Chrome/Windows parse promotes the first path segment to the host",
+    asChromeOnWindows("/home/user/x").hostname === "home",
+  );
+  for (const p of [
+    "/home/user/projects/app/x.js",
+    "/home/user/projects/app/node_modules/@electric-sql/pglite/dist/index.cjs",
+    "/home/user/projects/my project/x.js",
+    "/home/user/progetti/città/x.js",
+    "/home/user/projects/app/",
+    "/home",
+  ]) {
+    check(`a hostful URL comes back as ${p}`, fileURLToPath(asChromeOnWindows(p)) === p);
+  }
+  check(
+    "the string form recovers too",
+    fileURLToPath("file://home/user/projects/x") === "/home/user/projects/x",
+  );
+  check(
+    "a three-slash file URL still converts",
+    fileURLToPath("file:///home/user/projects/x") === "/home/user/projects/x",
+  );
+  check(
+    "localhost keeps its normal meaning",
+    fileURLToPath("file://localhost/home/x") === "/home/x",
+  );
+  let scheme = null;
+  try {
+    fileURLToPath("https://example.com/x");
+  } catch (e) {
+    scheme = e.code;
+  }
+  check("a non-file scheme still throws", scheme === "ERR_INVALID_URL_SCHEME");
+  // pathToFileURL has to escape a literal "%" in a file NAME: URL#pathname leaves it
+  // alone, so without that "a%20b" would decode back as "a b" (Node's pathToFileURL
+  // encodes it, and the round trip is the contract).
+  const urlmod = { exports: {} };
+  urlFactory(
+    urlmod.exports,
+    (m) => (m === "path" ? path : () => { throw new Error("require is not available here"); }),
+    urlmod,
+    {},
+    {},
+    {},
+  );
+  const pct = urlmod.exports.pathToFileURL("/home/user/a%20b.js");
+  check("pathToFileURL escapes a literal % in a file name", pct.href === "file:///home/user/a%2520b.js");
+  check(
+    "…and fileURLToPath round-trips that name",
+    urlmod.exports.fileURLToPath(pct) === "/home/user/a%20b.js",
+  );
 }
 
 console.log(`\nRESULT: ${failures === 0 ? "PASS — esm.js live-binding + TLA loader guarantees hold" : `FAIL — ${failures} check(s) failed`}`);

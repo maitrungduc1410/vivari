@@ -97,7 +97,11 @@ function guessMime(p) {
   return map[ext] || "application/octet-stream";
 }
 
-export function createBunFile({ lazy, Buffer, process }) {
+// `fileURLToPath` is injected by bun.js rather than implemented here: `Bun.file(URL)` and
+// `Bun.fileURLToPath` must answer the same thing for the same URL, and a second copy of the
+// rule is how the two drift (the copy that used to live in this file stripped the "file://"
+// prefix, so a hostful URL became a RELATIVE path and the read landed in cwd).
+export function createBunFile({ lazy, Buffer, process, fileURLToPath }) {
   const fsmod = () => lazy("fs");
 
   const toBytes = (chunk) => {
@@ -608,28 +612,25 @@ export function createBunFile({ lazy, Buffer, process }) {
   // the same trap as `Bun.file(fd)`: `Bun.file()` used to hand back a handle on the
   // relative path "undefined", which reads as a plausible BunFile right up to an
   // ENOENT somewhere else entirely.
+  //
+  // The URL branch goes through bun.js's fileURLToPath, which knows that a "host" in a
+  // browser `file:` URL can only be the first path segment its parser promoted
+  // (`file://home/…` from `"file:" + __filename` on Chrome/Windows). The naive prefix
+  // strip that used to live here turned that into "home/…" — relative, so
+  // `Bun.file(url).text()` read whatever happened to sit under the cwd instead of the
+  // file the URL named.
   function toPath(pathOrUrl, api) {
     if (typeof pathOrUrl === "string") {
-      return pathOrUrl.startsWith("file://") ? fileUrlToPath(pathOrUrl) : pathOrUrl;
+      return pathOrUrl.startsWith("file://") ? fileURLToPath(pathOrUrl) : pathOrUrl;
     }
     if (pathOrUrl && typeof pathOrUrl === "object" && typeof pathOrUrl.href === "string") {
-      return fileUrlToPath(pathOrUrl.href);
+      return fileURLToPath(pathOrUrl);
     }
     throw new TypeError(
       (api || "Bun.file") +
         " expects a string path or a file: URL, got " +
         (pathOrUrl === null ? "null" : typeof pathOrUrl)
     );
-  }
-
-  function fileUrlToPath(href) {
-    let p = href.replace(/^file:\/\//, "");
-    try {
-      p = decodeURIComponent(p);
-    } catch {
-      /* leave the escaped form rather than losing the path */
-    }
-    return p || "/";
   }
 
   return { BunFile, FileSink, StdioFile, bunFile, bunWrite, stdout, stderr };

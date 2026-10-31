@@ -4566,6 +4566,30 @@ also unchanged.
   token 'export'` (the AsyncFunction retry reported the same thing — the transpiled
   source still contained the keyword). `skipSpaceAndComments` is the one place that rule
   lives; any token scanner added here must use it. Proven by `scripts/spike-esm.mjs`.
+- **`import.meta.url` must be built from an ABSOLUTE id — and a host in a `file:` URL
+  is never a file host.** `"file://" + id` is a three-slash file URL only when `id` starts
+  with `/`; a relative id (`home/user/…`) makes its first segment the URL **host**, so
+  `new URL('./pglite.data', import.meta.url)` resolves to `file://home/user/…` and
+  `fileURLToPath()` returns `/user/…` — `/home` is gone. PGlite's ESM build locates its
+  `.data`/`.wasm` that way, so the database died with ENOENT while the stack frame (built
+  by `sourceUrlFor()` from the same id) looked right: the mismatch is invisible.
+  `fileMetaPath()` root-relativises a relative id exactly as `sourceUrlFor()` does for
+  frames, so `import.meta.url` always carries three slashes.
+  The other half belongs to Chromium and is **platform-dependent**: `url/url_parse_file.cc`
+  takes its `#ifdef WIN32` branch for anything that is not `C:\` and is not exactly three
+  slashes, and parses the rest as an UNC path — so `"file:" + "/home/user/x"` (how userland
+  turns `__filename` into a URL; PGlite's CJS build does it) is `file://home/user/x` on
+  Chrome/Windows and `file:///home/user/x` in Node and on Chrome/Linux
+  (`url/url_parse_unittest.cc` pins both tables). This VFS has no file hosts, so
+  `fileURLToPath()` — Node's and Bun's, plus `Bun.file(URL)`, which all share one rule —
+  rebuilds `"/" + hostname + pathname` instead of throwing `ERR_INVALID_FILE_URL_HOST`. A
+  bare `"/"` pathname (`file:/home`) takes no join, `localhost` and the
+  `ERR_INVALID_URL_SCHEME` error are unchanged, and the invariant is that a converted path
+  always starts with `/` — a file URL must never come back relative. The one deliberate
+  deviation from Node: a real UNC URL (`file://server/share`) maps to `/server/share`
+  rather than throwing. `pathToFileURL()` likewise percent-encodes a literal `%` (URL#pathname
+  does not), so a file named `a%20b` round-trips. Regression: `scripts/spike-esm.mjs`
+  sections 8–9 (9 models the Windows parse) and `scripts/spike-bun-offline.mjs`.
 - **`esm.js` does NOT strip TypeScript types** — it only rewrites `import`/`export`.
   A raw `.ts` run through OC's loader (`node --experimental-strip-types x.ts`) is
   *not* type-stripped: `esm.js` removes the leading `export `/`import ` and leaves

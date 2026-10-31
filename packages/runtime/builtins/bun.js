@@ -375,7 +375,9 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
   //
   // `Bun.file(fd)` still throws (Phase 0): our fd numbers are VFS handles owned
   // by the runtime, not OS file descriptors, so there is no file to wrap.
-  const files = createBunFile({ lazy, Buffer, process });
+  // `fileURLToPath` is passed in (declared below, hoisted) so `Bun.file(URL)` and
+  // `Bun.fileURLToPath` share one URL→path rule instead of drifting apart.
+  const files = createBunFile({ lazy, Buffer, process, fileURLToPath });
   const bunFile = files.bunFile;
   const bunWrite = files.bunWrite;
 
@@ -1566,13 +1568,46 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     return new Uint8Array(zlib[name](toBuf(data, Buffer), opts || {}));
   };
 
+  // Bun's pathToFileURL resolves a relative path against cwd before building the
+  // URL, exactly as Node's does. "file://" + a relative path made its first segment
+  // the URL HOST ("file://home/…"), which fileURLToPath then turned into /user/… —
+  // the same silent wrong path as import.meta.url (see esm.js fileMetaPath). Build
+  // through URL#pathname so the pathname is percent-encoded like Node's, and keep a
+  // trailing separator (it is what keeps `new URL("./x", base)` inside the dir).
+  function pathToFileURL(p) {
+    const path = lazy("path");
+    const raw = String(p);
+    let resolved = path.resolve(typeof process.cwd === "function" ? process.cwd() : "/", raw);
+    if (raw.endsWith("/") && !resolved.endsWith("/")) resolved += "/";
+    const u = new URL("file:///");
+    // Same rule as node/internal/url.js pathToFileURL: URL#pathname leaves `%` alone,
+    // so a literal percent in a file name would decode back as an escape. Encode it, or
+    // the round trip through fileURLToPath loses the name.
+    u.pathname = resolved.replace(/%/g, "%25");
+    return u;
+  }
+  // Node/Bun reject a hostful file URL instead of returning a path with the host's
+  // leading segment silently missing. This runtime cannot: a host here can only be the
+  // first path segment a browser's `file:` parser promoted — `"file:" + __filename` is
+  // `file://home/…` on Chrome/Windows and `file:///home/…` elsewhere (Chromium's
+  // url/url_parse_file.cc takes its WIN32 branch for anything that is not `C:\` and not
+  // exactly three slashes) — so the segment goes back in front of the pathname. Same
+  // rule, same reasoning, as node/internal/url.js fileURLToPath; the two must agree.
   function fileURLToPath(url) {
-    const u = typeof url === "string" ? url : url.href;
-    let p = u.replace(/^file:\/\//, "");
-    try { p = decodeURIComponent(p); } catch {}
+    const u = typeof url === "string" ? new URL(url) : url;
+    if (u.protocol !== "file:") {
+      const err = new TypeError("The URL must be of scheme file");
+      err.code = "ERR_INVALID_URL_SCHEME";
+      throw err;
+    }
+    let p = u.pathname;
+    if (u.hostname && u.hostname !== "localhost") {
+      // `file:/home` parses as host "home" + pathname "/" — no join for a bare slash.
+      p = "/" + u.hostname + (u.pathname === "/" ? "" : u.pathname);
+    }
+    p = decodeURIComponent(p);
     return p || "/";
   }
-  function pathToFileURL(p) { return safeUrl("file://" + p); }
 
   // ---- the Bun global --------------------------------------------------------
   const formats = createBunFormats({ process });
