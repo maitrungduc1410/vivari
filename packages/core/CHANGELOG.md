@@ -3,6 +3,15 @@
 From 1.1.0 on, entries are generated from [changesets](https://github.com/changesets/changesets).
 `@vivari/core` and `@vivari/react` are released together under the same version.
 
+## 1.2.1
+
+### Patch Changes
+
+- [#29](https://github.com/maitrungduc1410/vivari/pull/29) [`3c31838`](https://github.com/maitrungduc1410/vivari/commit/3c31838fbe4e504deab307a9c4a4a4f556bc1cae) Thanks [@kele23](https://github.com/kele23)! - Runtime: the ESM→CJS transpiler now skips comments between `export` and the declaration it
+  prefixes. zod v4's build emits `export /*@__NO_SIDE_EFFECTS__*/ function`, which the scanner
+  read as "not an export" and left in the CJS body — every server route importing zod failed
+  in-VM with `Unexpected token 'export'`.
+
 ## 1.2.0
 
 ### Minor Changes
