@@ -41,12 +41,14 @@ jobs:
       # that API moves a lot between Node lines, so it only means something on the
       # line the runtime reports (process.version). Everything else here runs on 22,
       # where the spike skips that tier; this step runs it where it counts and makes
-      # the skip a failure.
+      # the skip a failure. Anchored, because a bare `node-sqlite` also names
+      # node-sqlite-vm, which needs the Wasm this job does not build, and a named
+      # spike that cannot run fails the step.
       - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: node:sqlite against a real Node 24
-        run: node scripts/run-spikes.mjs --offline node-sqlite
+        run: node scripts/run-spikes.mjs --offline node-sqlite$
         env:
           VV_REQUIRE_SQLITE_ORACLE: "1"
       - uses: actions/setup-node@v7

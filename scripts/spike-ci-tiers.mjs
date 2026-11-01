@@ -271,7 +271,10 @@ console.log("\n== the Wasm-VFS offline spikes are wired into the one job that ca
 // ---------------------------------------------------------------------------
 {
   const ci = read(".github/workflows/ci.yml");
-  const line = ci.match(/run: node scripts\/run-spikes\.mjs --offline (.+)/);
+  // By step name, not by the first filtered --offline line: toolchain-gate has one of
+  // its own (node-sqlite on Node 24), and reading that instead reports every spike here
+  // as selected by nothing.
+  const line = ci.match(/name: offline spikes that need the Wasm VFS\s+run: node scripts\/run-spikes\.mjs --offline (.+)/);
   ok(line, "ci.yml has an offline step that names spikes explicitly");
   const named = line ? line[1].trim().split(/\s+/) : [];
   const wasmOffline = SPIKES.filter((s) => !s.net && s.needsWasm);

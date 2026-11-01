@@ -215,6 +215,19 @@ function objectLiteralKeys(file, declName) {
   const problems = [];
   let found = false;
   walkAst(ast, (node) => {
+    // A key added afterwards as a lazy getter (`Object.defineProperty(bindings, "sqlite", …)`)
+    // is as implemented as one in the literal.
+    if (
+      node.type === "CallExpression" &&
+      node.callee.type === "MemberExpression" &&
+      node.callee.object.name === "Object" &&
+      node.callee.property.name === "defineProperty" &&
+      node.arguments[0]?.name === declName &&
+      node.arguments[1]?.type === "Literal"
+    ) {
+      keys.add(node.arguments[1].value);
+      return;
+    }
     if (node.type !== "VariableDeclarator") return;
     if (node.id.type !== "Identifier" || node.id.name !== declName) return;
     if (!node.init || node.init.type !== "ObjectExpression") return;
@@ -249,7 +262,8 @@ if (LIVE) {
     ok(false, "live cross-check: importing loader.js failed \u2014 the static scrape is unverified");
     detail(String(liveErr && liveErr.message));
   } else {
-    const disagree = [...FACTORIES].filter((id) => !liveHas(id));
+    // A PREFIX_ONLY id (`sqlite`) is served only under its scheme, so ask both ways.
+    const disagree = [...FACTORIES].filter((id) => !liveHas(id) && !liveHas("node:" + id));
     ok(disagree.length === 0, `live cross-check: createNodeModules().has() agrees on all ${FACTORIES.size} ids`);
     for (const id of disagree) detail(`scraped but not live: ${id}`);
   }

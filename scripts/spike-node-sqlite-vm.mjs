@@ -102,6 +102,7 @@ writeProject(kernel, APP, {
   "waiter.js": [
     "const { DatabaseSync } = require('node:sqlite');",
     "const db = new DatabaseSync('/app/shared.db', { timeout: 10000 });",
+    "require('fs').writeFileSync('/app/waiting', '1');",
     "const t0 = Date.now();",
     "db.exec('BEGIN IMMEDIATE');",
     "const waited = Date.now() - t0;",
@@ -207,6 +208,9 @@ console.log("two processes, one database:");
   ok(busy && busy.code === "ERR_SQLITE_ERROR" && (busy.errcode & 0xff) === 5,
     `a second writer with no timeout is refused with SQLITE_BUSY (${JSON.stringify(busy)}), not granted a lock someone holds`);
   const waiter = run("waiter.js");
+  // Count from the waiter being ready, not from its spawn: booting a process takes
+  // a few hundred ms on a CI runner, and that used to come out of the wait measured.
+  ok(await waitFor(() => kernel.exists(APP + "/waiting")), "the waiter has opened the database");
   await new Promise((r) => setTimeout(r, 400));
   kernel.writeFile(APP + "/release", "1");
   const [h, wres] = await Promise.all([holder.done, waiter.done]);
