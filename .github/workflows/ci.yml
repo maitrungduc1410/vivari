@@ -43,10 +43,14 @@ jobs:
       # where the spike skips that tier; this step runs it where it counts and makes
       # the skip a failure. Anchored, because a bare `node-sqlite` also names
       # node-sqlite-vm, which needs the Wasm this job does not build, and a named
-      # spike that cannot run fails the step.
+      # spike that cannot run fails the step. The version is exact because real Node
+      # is the oracle: node:sqlite's behaviour moves within a line (24.14 and 24.21
+      # bind booleans differently, for one), so a floating `24` turns a Node release into a
+      # red gate here with no change in this repo. Raise it on purpose, in a change
+      # that runs this spike on the new version.
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: "24.21.0"
       - name: node:sqlite against a real Node 24
         run: node scripts/run-spikes.mjs --offline node-sqlite$
         env:
