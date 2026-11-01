@@ -29,6 +29,7 @@
 // synchronously across a worker boundary).
 
 import { installMessagePort } from "../../message-port.js";
+import { fileUrlSpecifierToPath } from "../../file-url.js";
 
 export default function (exports, require, module, process) {
   const g = globalThis;
@@ -102,9 +103,13 @@ export default function (exports, require, module, process) {
       return id;
     }
     let p = filename;
-    if (p && typeof p === "object" && p.href) p = p.pathname || p.href; // URL
+    // `new Worker(new URL(...))` is a documented Node form, so take the whole href —
+    // `pathname` alone would drop a segment a parser promoted into the host — and map
+    // it through the runtime's ONE file: URL rule (../../file-url.js). A naive strip
+    // turns the hostful form Chrome/Windows produces into a RELATIVE path.
+    if (p && typeof p === "object" && typeof p.href === "string") p = p.href; // URL
     p = String(p);
-    if (p.startsWith("file://")) p = p.slice(7);
+    if (p.startsWith("file:")) p = fileUrlSpecifierToPath(p);
     return p;
   }
 

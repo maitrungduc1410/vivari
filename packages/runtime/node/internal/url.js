@@ -3,6 +3,8 @@
 // Node's real internal/url.js is a large parser bound to native ICU/ada. The
 // browser (and Node host) already provide a spec-compliant global URL, so we
 // re-export it and add the couple of helpers the http tree destructures.
+import { fileUrlToPath as recoverFilePath, pathToFileUrl as buildFileUrl } from "../../file-url.js";
+
 export default function (exports, require, module, process, internalBinding, primordials) {
   "use strict";
 
@@ -36,36 +38,16 @@ export default function (exports, require, module, process, internalBinding, pri
   }
 
   // fs.js / internal/fs/utils.js call these on path arguments (mostly plain
-  // strings) — preserve the pre-#8 behavior.
-  // Node throws on a non-file scheme and on a hostful file URL (posix); the scheme
-  // still throws here, but a HOST must not. Node's rule assumed a host can only name a
-  // machine, and that any other host was our own bug (`"file://" + relativeId`, see
-  // fileMetaPath in esm.js). Neither holds in a browser: Chrome parses `file:` URLs
-  // with url/url_parse_file.cc, whose WIN32 branch treats everything that is not
-  // `C:\` and not exactly three slashes as an UNC path — so `"file:" + "/home/user/x"`,
-  // the idiom a package uses to turn `__filename` into a URL (PGlite's CJS build does
-  // exactly that), is `file://home/user/x` on Windows and `file:///home/user/x`
-  // everywhere else (url_parse_unittest.cc pins both tables). This VFS has no file
-  // hosts, so a host can only be the first path segment that parser promoted: put it
-  // back in front of the pathname instead of failing a whole database boot over the
-  // browser's grammar. A three-slash URL, `localhost` and the scheme error are
-  // unchanged, and the one deliberate deviation from Node is that a real UNC URL
-  // (`file://server/share`) maps to "/server/share" instead of throwing.
+  // strings) — preserve the pre-#8 behavior. The rule itself lives in ../../file-url.js,
+  // and it is NOT quite Node's: the scheme error and the percent decoding are the same,
+  // but a HOST must not throw here. Node assumed a host can only name a machine and that
+  // any other one was our own bug (`"file://" + relativeId`, see fileMetaPath in esm.js).
+  // Neither holds in a browser: Chromium on Windows parses `"file:" + __filename` into
+  // `file://home/user/x` (url/url_parse_file.cc's WIN32 branch), and this VFS has no
+  // file hosts, so the promoted segment goes back in front of the pathname. That module
+  // is the one copy every caller in this runtime shares — do not re-derive it here.
   function fileURLToPath(url) {
-    const u = typeof url === "string" ? new URL(url) : url;
-    if (u.protocol !== "file:") {
-      const err = new TypeError("The URL must be of scheme file");
-      err.code = "ERR_INVALID_URL_SCHEME";
-      throw err;
-    }
-    let pathname = u.pathname;
-    if (u.hostname !== "" && u.hostname !== "localhost") {
-      // `file:/home` parses as host "home" + pathname "/" (the authority form adds a
-      // slash the intended path never had), so a bare "/" pathname takes no join.
-      pathname = "/" + u.hostname + (u.pathname === "/" ? "" : u.pathname);
-    }
-    pathname = decodeURIComponent(pathname);
-    return pathname || "/";
+    return recoverFilePath(url);
   }
   function toPathIfFileURL(fileURLOrPath) {
     if (
@@ -100,7 +82,8 @@ export default function (exports, require, module, process, internalBinding, pri
     // file: URL and percent-encodes the pathname. The old `new URL("file://"+p)`
     // threw "Invalid URL" for relative inputs (it parsed the first segment as the
     // host) — e.g. `pathToFileURL("@next/swc-wasm-nodejs")`, which Next.js's SWC
-    // loader relies on. Match Node: resolve, then let URL#pathname encode it.
+    // loader relies on. Match Node: resolve, then let ../../file-url.js encode it
+    // (three slashes, and a literal `%` escaped so fileURLToPath round-trips the name).
     pathToFileURL: (p) => {
       const path = require("path");
       const filepath = String(p);
@@ -116,13 +99,7 @@ export default function (exports, require, module, process, internalBinding, pri
       if (last === 47 /* '/' */ && resolved[resolved.length - 1] !== "/") {
         resolved += "/";
       }
-      const u = new URL("file:///");
-      // URL#pathname does not touch `%` (it is not in the path percent-encode set), so
-      // a literal percent in a file NAME would come back as an escape: "a%20b" would
-      // decode to "a b". Node's pathToFileURL percent-encodes it, and a path this builds
-      // has to survive fileURLToPath, so encode it before handing it to the setter.
-      u.pathname = resolved.replace(/%/g, "%25");
-      return u;
+      return buildFileUrl(resolved);
     },
   };
 }

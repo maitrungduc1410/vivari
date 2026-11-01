@@ -20,7 +20,11 @@
 
 import { transpileEsm, transpileEsmLive } from "../packages/runtime/esm.js";
 import urlFactory from "../packages/runtime/node/internal/url.js";
+import { fromFileUrl } from "../packages/runtime/module.js";
 import path from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, relative } from "node:path";
+import { fileURLToPath as hostFilePath } from "node:url";
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 let failures = 0;
@@ -432,6 +436,108 @@ console.log("\n== [url] fileURLToPath recovers the path from a hostful file URL 
     "…and fileURLToPath round-trips that name",
     urlmod.exports.fileURLToPath(pct) === "/home/user/a%20b.js",
   );
+
+  // THE RECOVERY IS LOSSY, and it cannot be otherwise: the platform normalises the host
+  // before anyone sees it. These three are what the parser hands back, not a choice this
+  // code makes, and they are pinned so the docs promise exactly what it delivers — "the
+  // path the URL now describes", not "the path it meant" (review of #35 asked for that
+  // limit to be stated rather than glossed over).
+  check("a lowercased host cannot be un-lowercased", fileURLToPath("file://MyApp/x") === "/myapp/x");
+  check("a numeric host is parsed as IPv4", fileURLToPath("file://123/x") === "/0.0.0.123/x");
+  check("localhost collapses to hostless, as in Node", fileURLToPath("file://localhost/x") === "/x");
+
+  // …and every CALL SITE that turns a specifier into a path shares that rule, which is the
+  // half the first version of this fix missed. `fromFileUrl` is what BOTH dynamic import()'s
+  // resolution and Module.createRequire() go through, and `"file:" + __filename` is
+  // `file://home/user/x` on Chrome/Windows — so a stripped prefix makes it "home/user/x",
+  // a RELATIVE path that resolves against nothing.
+  check(
+    "the loader recovers a hostful specifier instead of returning a relative path",
+    fromFileUrl("file://home/user/projects/app/node_modules/.bin/x.js") ===
+      "/home/user/projects/app/node_modules/.bin/x.js",
+  );
+  check("…with Vite's cache-busting query and hash", fromFileUrl("file:///app/x.js?t=1#frag") === "/app/x.js");
+  check("…and with one slash as well as two", fromFileUrl("file:/app/x.js") === "/app/x.js");
+  check(
+    "a file: specifier NEVER comes back relative",
+    ["file://home/user/x", "file:///app/x", "file:/app/x", "file://@scope/x", "file://", "file://home"].every(
+      (u) => fromFileUrl(u).startsWith("/"),
+    ),
+  );
+}
+
+// ── 10. no call site may hand-roll the file: URL → path conversion ───────────
+// Section 9 pins the rule; this keeps every call site ON it. The bug does not look like
+// one — `u.slice("file://".length)` reads as a tidy prefix strip and yields a perfectly
+// plausible RELATIVE path — which is why the same three lines were written in module.js
+// (twice), bun-worker.js, worker_threads.js and python-debugger.js AFTER the recovery
+// existed. Any conversion here has to go through packages/runtime/file-url.js.
+console.log("\n== [url] every file: URL → path conversion goes through one module ==");
+{
+  const RUNTIME = hostFilePath(new URL("../packages/runtime/", import.meta.url));
+  const files = [];
+  const walk = (dir) => {
+    for (const d of readdirSync(dir, { withFileTypes: true })) {
+      if (d.name === "node_modules") continue;
+      const p = join(dir, d.name);
+      if (d.isDirectory()) walk(p);
+      else if (d.name.endsWith(".js")) files.push(p);
+    }
+  };
+  walk(RUNTIME);
+
+  const STRIPS = [
+    { re: /slice\(\s*["']file:\/\/["']/, why: 'strips the "file://" prefix by hand' },
+    { re: /slice\(\s*0\s*,\s*7\s*\)/, why: "compares 7 characters of a file: URL" },
+    { re: /\.slice\(\s*7\s*\)/, why: "slices 7 characters off a file: URL" },
+    { re: /replace\(\s*\/\^file:/, why: "strips the file: scheme with a regex" },
+  ];
+  // A line only counts when it is about file: URLs (so net.js's `a.slice(7)` on an
+  // IPv4-mapped address is not a hit).
+  const hits = (file) => {
+    const lines = readFileSync(file, "utf8").split("\n");
+    const out = [];
+    lines.forEach((line, i) => {
+      // Comments are allowed to NAME the pattern — that is how the next person learns not
+      // to write it. Only executed code counts.
+      if (/^\s*(\/\/|\*|\/\*)/.test(line)) return;
+      const about = line.includes("file:") || (i > 0 && lines[i - 1].includes("file:"));
+      if (!about) return;
+      for (const s of STRIPS) if (s.re.test(line)) out.push(`${relative(RUNTIME, file)}:${i + 1} ${s.why}`);
+    });
+    return out;
+  };
+
+  // TWO files may keep one, and both are named here with the reason, not inferred.
+  const ALLOWED = new Map([
+    ["file-url.js", "the one implementation — this is what everything else calls"],
+    [
+      "debugger.js",
+      "fromUrl already rebuilds the promoted segment (it never returns relative); it is paired " +
+        "with a toUrl that does NOT escape %, so it must not decode either. Converting it is a " +
+        "debugger-identity change, not part of this fix",
+    ],
+    [
+      "esm.js",
+      "the Bun.resolveSync prelude is GENERATED source: it cannot import file-url.js, and " +
+        "inlining the rule as a string is the second copy this whole change deletes",
+    ],
+  ]);
+
+  const offenders = [];
+  for (const f of files) {
+    if (ALLOWED.has(relative(RUNTIME, f))) continue;
+    offenders.push(...hits(f));
+  }
+  check(
+    `no file: URL is converted outside file-url.js (${files.length} files scanned)` +
+      (offenders.length ? ` — ${offenders.join("; ")}` : ""),
+    offenders.length === 0,
+  );
+  // …and the allowlist cannot rot: an entry whose reason has been FIXED must be deleted,
+  // or the next hand-rolled strip gets waved through by a list nobody re-read.
+  const stale = [...ALLOWED.keys()].filter((rel) => hits(join(RUNTIME, rel)).length === 0);
+  check("every allowlist entry still has its strip" + (stale.length ? ` — stale: ${stale.join(", ")}` : ""), stale.length === 0);
 }
 
 console.log(`\nRESULT: ${failures === 0 ? "PASS — esm.js live-binding + TLA loader guarantees hold" : `FAIL — ${failures} check(s) failed`}`);

@@ -8,6 +8,7 @@
 // node_modules.
 
 import { transpileEsm, transpileEsmLive, rewriteCjsDynamicImport } from "./esm.js";
+import { fileUrlSpecifierToPath } from "./file-url.js";
 import { maybePatchEsbuildInProcess } from "./esbuild-inproc-patch.js";
 import { maybePatchPnpmStoreAliases } from "./toolchain-shims.js";
 import { maybeTranspileTypeScript } from "./typescript-transform.js";
@@ -76,6 +77,22 @@ function sourceUrlFor(filename) {
   // directive and silently re-anonymise the script.
   const clean = String(filename).replace(/[\r\n]/g, "");
   return clean.startsWith("/") ? "file://" + clean : "file:///" + clean;
+}
+
+// The other direction — a file: specifier back to a plain VFS path — and the reason
+// it is one shared rule (./file-url.js) instead of a `slice("file://".length)` per call
+// site: a HOST must never come back as a RELATIVE path. `"file:" + __filename` is
+// `file://home/user/x` on Chrome/Windows (url/url_parse_file.cc takes its WIN32 branch
+// for anything that is not `C:\` and not exactly three slashes), so a naive strip hands
+// the loader "home/user/x", which resolves against nothing and silently loads the wrong
+// file. Whatever a parser promoted goes back in front of the pathname, and the result
+// always starts with "/". Only file: specifiers come through here — bare specifiers,
+// relative paths and package.json subpath imports (`#foo`) must reach resolveFilename
+// verbatim (a `#` is NOT a URL hash); the caller does that check.
+// Exported for the offline unit test (scripts/spike-esm.mjs).
+export function fromFileUrl(request) {
+  const p = fileUrlSpecifierToPath(request);
+  return p === null ? request : p;
 }
 
 // Pure: given a bin file's source, return the .js/.cjs/.mjs target token that a
@@ -343,24 +360,10 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     return null;
   }
 
-  // Normalize a file:// module specifier to a plain VFS path. Dynamic `import()`
-  // is routinely called with a file:// URL plus a cache-busting query/hash —
-  // Vite's native/runner config loaders do `import(pathToFileURL(cfg)+'?t='+now)`
-  // and its module runner imports `file://.../dist/node/index.js`. Only file://
-  // specifiers are touched: bare specifiers, relative paths, and package.json
-  // subpath imports (`#foo`) must pass through verbatim (a `#` is NOT a URL hash).
-  function fromFileUrl(request) {
-    let r = request.slice("file://".length);
-    try { r = decodeURIComponent(r); } catch { /* leave as-is */ }
-    const h = r.indexOf("#");
-    if (h >= 0) r = r.slice(0, h);
-    const q = r.indexOf("?");
-    if (q >= 0) r = r.slice(0, q);
-    return r;
-  }
-
   function resolveFilename(request, fromDir) {
-    if (request.startsWith("file://")) request = fromFileUrl(request);
+    // Any file: specifier, not just "file://": `file:/home/user/x` is the same URL
+    // with one slash, and Node accepts it as a dynamic import.
+    if (request.startsWith("file:")) request = fromFileUrl(request);
     // Bun.plugin onResolve. It runs BEFORE builtin resolution, which is Bun's
     // order and the only useful one: a plugin that redirects `node:fs` or shadows
     // a package name has to be able to win against what is already there.
@@ -961,14 +964,12 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
   Module.syncBuiltinESMExports = () => {};
 
   Module.createRequire = (from) => {
-    let p = typeof from === "string" ? from : "/";
-    if (p.startsWith("file://")) {
-      try {
-        p = decodeURIComponent(p.slice("file://".length));
-      } catch {
-        p = p.slice("file://".length);
-      }
-    }
+    // Node takes a path or a URL, and the URL is the common argument
+    // (`createRequire(import.meta.url)`). A file: URL must not come back relative here
+    // — `"file:" + __filename` is `file://home/user/x` on Chrome/Windows — so this goes
+    // through the same rule as resolveFilename instead of its own prefix strip.
+    let p = typeof from === "string" ? from : from && typeof from.href === "string" ? from.href : "/";
+    if (p.startsWith("file:")) p = fromFileUrl(p);
     // Node treats a base path ENDING IN '/' as the directory itself (so its own
     // node_modules is searched), not that directory's parent. The trailing slash
     // is load-bearing: the Angular CLI does `createRequire(projectRoot + '/')` to

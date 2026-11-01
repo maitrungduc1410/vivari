@@ -38,6 +38,8 @@
 // again — is the same shape as the blocking stdin syscall, where CPython's read
 // calls JS which parks on Atomics.wait.
 
+import { fileUrlSpecifierToPath, pathToFileUrl } from "../file-url.js";
+
 /**
  * The Python half: a monitoring tool, a breakpoint table, and the ability to
  * describe a paused stack to something that has never heard of Python.
@@ -337,8 +339,13 @@ export function createPythonDebugger({ send, waitForCommand, pyodide, roots }) {
   const scopeIds = new Map(); // objectId -> { index, kind }
   let scopeSeq = 0;
 
-  const toUrl = (p) => (/^[a-z]+:\/\//i.test(p) ? p : "file://" + p);
-  const fromUrl = (u) => (u && u.startsWith("file://") ? u.slice("file://".length) : u);
+  // Both directions go through the runtime's ONE rule (../file-url.js), so a script
+  // URL and a breakpoint URL are the same string and a path never comes back RELATIVE.
+  // `"file://" + p` made a relative path's first segment the URL HOST — the bug the Node
+  // backend had — and a hostful URL is what Chrome/Windows builds from
+  // `"file:" + __filename`, so the naive strip turned it into "home/user/x".
+  const toUrl = (p) => (/^[a-z]+:\/\//i.test(p) ? p : pathToFileUrl(p).href);
+  const fromUrl = (u) => (u && u.startsWith("file:") ? fileUrlSpecifierToPath(u) : u);
 
   const emit = (method, params) => send({ method, params: params || {} });
   const reply = (id, result) => send({ id, result: result || {} });

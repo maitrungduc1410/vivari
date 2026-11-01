@@ -4581,15 +4581,39 @@ also unchanged.
   turns `__filename` into a URL; PGlite's CJS build does it) is `file://home/user/x` on
   Chrome/Windows and `file:///home/user/x` in Node and on Chrome/Linux
   (`url/url_parse_unittest.cc` pins both tables). This VFS has no file hosts, so
-  `fileURLToPath()` — Node's and Bun's, plus `Bun.file(URL)`, which all share one rule —
-  rebuilds `"/" + hostname + pathname` instead of throwing `ERR_INVALID_FILE_URL_HOST`. A
-  bare `"/"` pathname (`file:/home`) takes no join, `localhost` and the
-  `ERR_INVALID_URL_SCHEME` error are unchanged, and the invariant is that a converted path
-  always starts with `/` — a file URL must never come back relative. The one deliberate
-  deviation from Node: a real UNC URL (`file://server/share`) maps to `/server/share`
-  rather than throwing. `pathToFileURL()` likewise percent-encodes a literal `%` (URL#pathname
-  does not), so a file named `a%20b` round-trips. Regression: `scripts/spike-esm.mjs`
-  sections 8–9 (9 models the Windows parse) and `scripts/spike-bun-offline.mjs`.
+  `fileURLToPath()` rebuilds `"/" + hostname + pathname` instead of throwing
+  `ERR_INVALID_FILE_URL_HOST`. A bare `"/"` pathname (`file:/home`) takes no join,
+  `localhost` and the `ERR_INVALID_URL_SCHEME` error are unchanged, and the invariant is
+  that a converted path always starts with `/` — **a file URL must never come back
+  relative**. That invariant is why the rule is ONE module, `file-url.js`, and not a
+  `slice("file://".length)` per call site: three of them (`module.js`'s `fromFileUrl` and
+  `createRequire`, `bun-worker.js`, `worker_threads`' entry) kept returning a relative
+  path after the recovery was written, which is the same bug wearing different clothes.
+  Every caller goes through it — `internal/url.js`, `Bun.fileURLToPath`, those three —
+  and it has two shapes on purpose: `fileUrlToPath()` is strict (Node's errors),
+  `fileUrlSpecifierToPath()` never throws on a malformed escape and always returns an
+  absolute path, because a module specifier is not a validated URL.
+  **The recovery is lossy, and cannot be otherwise**, because the parser normalises the
+  host before anyone sees it:
+
+  | input | what the parser hands back | recovered |
+  | --- | --- | --- |
+  | `file://home/user/x` | host `home`, path `/user/x` | `/home/user/x` |
+  | `file://MyApp/x` | host `myapp` (lowercased) | `/myapp/x` |
+  | `file://123/x` | host `0.0.0.123` (parsed as IPv4) | `/0.0.0.123/x` |
+  | `file://localhost/x` | hostless, path `/x` | `/x` |
+  | `file://@scope/x` | `Invalid URL`, never parses | `/@scope/x` (tolerant read) |
+
+  So it returns the path the URL **now describes**, not "the path it meant". That is enough
+  because the URLs this runtime builds are all three-slash (`fileMetaPath`, `sourceUrlFor`,
+  the debugger), so a host only appears when a package built the URL itself from an absolute
+  path, whose first segment is a directory name (`home`, `user`, `app`) — not something the
+  parser normalises away. The one deliberate deviation from Node: a real UNC URL
+  (`file://server/share`) maps to `/server/share` rather than throwing.
+  `pathToFileURL()` likewise percent-encodes a literal `%` (URL#pathname does not), so a
+  file named `a%20b` round-trips. Regression: `scripts/spike-esm.mjs` sections 9–10 (9
+  models the Windows parse and pins the lossy table, 10 fails on any new hand-rolled
+  `file://` strip in the runtime) and `scripts/spike-bun-offline.mjs`.
 - **`esm.js` does NOT strip TypeScript types** — it only rewrites `import`/`export`.
   A raw `.ts` run through OC's loader (`node --experimental-strip-types x.ts`) is
   *not* type-stripped: `esm.js` removes the leading `export `/`import ` and leaves
