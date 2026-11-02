@@ -38,7 +38,7 @@
 // again — is the same shape as the blocking stdin syscall, where CPython's read
 // calls JS which parks on Atomics.wait.
 
-import { fileUrlSpecifierToPath, pathToFileUrl } from "../file-url.js";
+import { pathToScriptUrl, scriptUrlToPath } from "../file-url.js";
 
 /**
  * The Python half: a monitoring tool, a breakpoint table, and the ability to
@@ -339,13 +339,14 @@ export function createPythonDebugger({ send, waitForCommand, pyodide, roots }) {
   const scopeIds = new Map(); // objectId -> { index, kind }
   let scopeSeq = 0;
 
-  // Both directions go through the runtime's ONE rule (../file-url.js), so a script
-  // URL and a breakpoint URL are the same string and a path never comes back RELATIVE.
-  // `"file://" + p` made a relative path's first segment the URL HOST — the bug the Node
-  // backend had — and a hostful URL is what Chrome/Windows builds from
-  // `"file:" + __filename`, so the naive strip turned it into "home/user/x".
-  const toUrl = (p) => (/^[a-z]+:\/\//i.test(p) ? p : pathToFileUrl(p).href);
-  const fromUrl = (u) => (u && u.startsWith("file:") ? fileUrlSpecifierToPath(u) : u);
+  // A script URL is the VERBATIM CDP identity, not the URL grammar one: the studio's
+  // DevTools client builds and strips it with raw string ops
+  // (packages/studio/src/vv/debug-session.ts), so this half of file-url.js escapes and
+  // decodes nothing. Escaping it here put "/my%20project/" in a paused frame, and decoding
+  // the client's "file://" + p turned a file named `a%20b.py` into `a b.py` — both of
+  // which worked before this PR because master's pair was verbatim too.
+  const toUrl = pathToScriptUrl;
+  const fromUrl = scriptUrlToPath;
 
   const emit = (method, params) => send({ method, params: params || {} });
   const reply = (id, result) => send({ id, result: result || {} });

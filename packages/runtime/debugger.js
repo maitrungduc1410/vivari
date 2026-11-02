@@ -19,6 +19,7 @@
 // transport-agnostic.
 
 import { instrumentSource } from "./instrument.js";
+import { pathToScriptUrl, scriptUrlToPath } from "./file-url.js";
 
 const PROTOCOL_HASH = "vivari";
 
@@ -36,15 +37,12 @@ export function createDebugger({ send, waitForCommand, readFileSync = null } = {
   // hostful URL must not turn back into a relative path. Same rule as fileMetaPath()
   // in esm.js — a relative id is root-relative, which is what sourceUrlFor() already
   // does for stack frames, so the script URL and the frame keep one identity.
-  const toUrl = (p) => {
-    if (/^[a-z]+:\/\//i.test(p)) return p;
-    return p.startsWith("/") ? "file://" + p : "file:///" + p;
-  };
-  const fromUrl = (u) => {
-    if (!u || !u.startsWith("file://")) return u;
-    const rest = u.slice("file://".length);
-    return rest.startsWith("/") ? rest : "/" + rest;
-  };
+  //
+  // The conversion lives in file-url.js with the reason it is VERBATIM there: these URLs
+  // cross to the studio's DevTools client, which builds and strips them with raw string
+  // ops, so escaping on this side is what puts "%20" in a paused frame.
+  const toUrl = pathToScriptUrl;
+  const fromUrl = scriptUrlToPath;
 
   // ── state ─────────────────────────────────────────────────────────────────
   let enabled = false;

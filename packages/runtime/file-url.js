@@ -39,6 +39,13 @@
 // be told apart from the Windows form above, and a wrong path beats a dead boot —
 // the case that started this is PGlite's CJS build.
 //
+// TWO FAMILIES live here and they are NOT interchangeable. The pair above
+// (fileUrlToPath, fileUrlSpecifierToPath, pathToFileUrl) is the URL grammar one: Node and
+// Bun APIs, module ids, import.meta.url. The pair at the end (pathToScriptUrl,
+// scriptUrlToPath) is the CDP script identity, which is verbatim because the studio's
+// DevTools client builds and strips those URLs with raw string ops — escaping one there
+// is how a paused frame ends up showing `/my%20project/`.
+//
 // Regression: scripts/spike-esm.mjs sections 9-10 (9 pins the rule and its limits, 10
 // fails if any call site hand-rolls the conversion again) and scripts/spike-bun-offline.mjs.
 
@@ -71,9 +78,9 @@ export function fileUrlToPath(url) {
 }
 
 /**
- * The loader's variant, for a module specifier that IS a file: URL (`fromFileUrl`,
- * `Bun.resolveSync`'s parent, `worker_threads`' entry). Same rule, plus the two
- * tolerances a specifier needs and `fileURLToPath` must not have:
+ * The loader's variant, for a module specifier that IS a file: URL (`fromFileUrl` and
+ * `createRequire` in module.js, Bun's worker entry, `worker_threads`' entry). Same rule,
+ * plus the two tolerances a specifier needs and `fileURLToPath` must not have:
  *
  *  - Never throws. A URL the platform cannot parse at all (`file://@scope/x` is
  *    Invalid URL, because `@` cannot start a host) and a bad percent escape both
@@ -134,4 +141,42 @@ export function pathToFileUrl(p) {
   const u = new URL("file:///");
   u.pathname = pathname.replace(/%/g, "%25");
   return u;
+}
+
+/**
+ * The OTHER pair, and the one both CDP backends share: a script URL.
+ *
+ * Debugger script URLs never travel through the file: URL grammar — they go to the
+ * studio's DevTools client, which builds and strips them with the raw string ops a
+ * DevTools frontend uses so it can show the path the user typed
+ * (`toFileUrl`/`stripFileUrl` in packages/studio/src/vv/debug-session.ts:
+ * `"file://" + p` and `u.slice("file://".length)`). That makes this pair VERBATIM, and
+ * both halves are load-bearing:
+ *
+ *  - building does NOT escape. Escaping a directory called "my project" puts
+ *    `file:///home/user/my%20project/main.py` on the wire, and the client's raw strip
+ *    shows the user that escaped string in a paused frame.
+ *  - parsing does NOT decode, and does not let the URL grammar touch the string. The
+ *    client sends `"file://" + p`, so decoding turns a file named `a%20b.py` into
+ *    `a b.py`, and `new URL()` reads the `#` in `a#b.py` as a fragment and leaves
+ *    `/home/user/a` — a breakpoint then binds to a file that does not exist.
+ *
+ * Everything it shares with the loaders above is the host repair: `"file:" + __filename`
+ * is `file://home/user/x` on Chrome/Windows, generated code under the debugger included,
+ * so a segment a parser promoted goes back in front of the pathname — with none of the URL
+ * grammar around it.
+ */
+export function pathToScriptUrl(p) {
+  const s = String(p);
+  // A script that already lives at an authority-form URL (http(s):, webpack:, chii's own
+  // driver URLs) passes through untouched, which is what debugger.js always did: the
+  // client keys scripts by the URL string it was given.
+  if (/^[a-z]+:\/\//i.test(s)) return s;
+  return s.startsWith("/") ? "file://" + s : "file:///" + s;
+}
+
+export function scriptUrlToPath(u) {
+  if (!u || !u.startsWith("file://")) return u;
+  const rest = u.slice("file://".length);
+  return rest.startsWith("/") ? rest : "/" + rest;
 }

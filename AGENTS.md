@@ -4586,13 +4586,22 @@ also unchanged.
   `localhost` and the `ERR_INVALID_URL_SCHEME` error are unchanged, and the invariant is
   that a converted path always starts with `/` — **a file URL must never come back
   relative**. That invariant is why the rule is ONE module, `file-url.js`, and not a
-  `slice("file://".length)` per call site: three of them (`module.js`'s `fromFileUrl` and
+  `slice("file://".length)` per call site: four of them (`module.js`'s `fromFileUrl` and
   `createRequire`, `bun-worker.js`, `worker_threads`' entry) kept returning a relative
   path after the recovery was written, which is the same bug wearing different clothes.
-  Every caller goes through it — `internal/url.js`, `Bun.fileURLToPath`, those three —
+  Every caller goes through it — `internal/url.js`, `Bun.fileURLToPath`, those four —
   and it has two shapes on purpose: `fileUrlToPath()` is strict (Node's errors),
   `fileUrlSpecifierToPath()` never throws on a malformed escape and always returns an
   absolute path, because a module specifier is not a validated URL.
+  **The two CDP backends are the exception that is not one** — the trap to know about.
+  A debugger script URL is a VERBATIM mapping (`pathToScriptUrl()`/`scriptUrlToPath()` in
+  the same module), not a URL-grammar round trip, because the studio's DevTools client
+  builds and strips those strings with raw ops (`"file://" + p`,
+  `u.slice("file://".length)` in `debug-session.ts`). Escaping on this side looks right and
+  breaks only the UI: a paused frame shows `/home/user/my%20project/main.py`, a breakpoint
+  for `a%20b.py` binds to `a b.py`, and one for `a#b.py` binds to `/home/user/a`.
+  Node's backend and Python's both use that pair, and `spike-esm` asserts neither names the
+  escaping helpers.
   **The recovery is lossy, and cannot be otherwise**, because the parser normalises the
   host before anyone sees it:
 
@@ -4612,8 +4621,9 @@ also unchanged.
   (`file://server/share`) maps to `/server/share` rather than throwing.
   `pathToFileURL()` likewise percent-encodes a literal `%` (URL#pathname does not), so a
   file named `a%20b` round-trips. Regression: `scripts/spike-esm.mjs` sections 9–10 (9
-  models the Windows parse and pins the lossy table, 10 fails on any new hand-rolled
-  `file://` strip in the runtime) and `scripts/spike-bun-offline.mjs`.
+  models the Windows parse, pins the lossy table, and pins the verbatim script-URL pair; 10
+  fails on any new hand-rolled `file://` strip in the runtime, and on a debugger switching
+  to the escaping pair) and `scripts/spike-bun-offline.mjs`.
 - **`esm.js` does NOT strip TypeScript types** — it only rewrites `import`/`export`.
   A raw `.ts` run through OC's loader (`node --experimental-strip-types x.ts`) is
   *not* type-stripped: `esm.js` removes the leading `export `/`import ` and leaves

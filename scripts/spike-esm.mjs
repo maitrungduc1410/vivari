@@ -21,6 +21,7 @@
 import { transpileEsm, transpileEsmLive } from "../packages/runtime/esm.js";
 import urlFactory from "../packages/runtime/node/internal/url.js";
 import { fromFileUrl } from "../packages/runtime/module.js";
+import { pathToScriptUrl, scriptUrlToPath } from "../packages/runtime/file-url.js";
 import path from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -464,6 +465,38 @@ console.log("\n== [url] fileURLToPath recovers the path from a hostful file URL 
       (u) => fromFileUrl(u).startsWith("/"),
     ),
   );
+
+  // The CDP pair is the OTHER family (see file-url.js's header): VERBATIM, because the
+  // studio's DevTools client builds and strips script URLs with raw string ops
+  // (packages/studio/src/vv/debug-session.ts: `"file://" + p`, `u.slice("file://".length)`).
+  // These are exactly the cases that regressed when python-debugger.js used the grammar
+  // pair instead — a paused frame showed "/my%20project/" and a breakpoint bound to
+  // `/home/user/a` for a file called `a#b.py`.
+  check(
+    "a script URL is verbatim: a space is not escaped",
+    pathToScriptUrl("/home/user/my project/main.py") === "file:///home/user/my project/main.py",
+  );
+  check(
+    "…so the studio's raw prefix strip gives the path back",
+    scriptUrlToPath("file:///home/user/my project/main.py") === "/home/user/my project/main.py",
+  );
+  check(
+    "a file named a%20b.py keeps its name",
+    scriptUrlToPath(pathToScriptUrl("/home/user/a%20b.py")) === "/home/user/a%20b.py",
+  );
+  check("a '#' in a file name is not a URL fragment", scriptUrlToPath("file:///home/user/a#b.py") === "/home/user/a#b.py");
+  check(
+    "a non-ASCII path round-trips",
+    scriptUrlToPath(pathToScriptUrl("/home/user/progetti/città/main.py")) === "/home/user/progetti/città/main.py",
+  );
+  check(
+    "a hostful script URL is recovered, not relativised",
+    scriptUrlToPath("file://home/user/x.py") === "/home/user/x.py",
+  );
+  check(
+    "a script that already has an authority-form URL passes through untouched",
+    pathToScriptUrl("webpack:///./src/main.py") === "webpack:///./src/main.py",
+  );
 }
 
 // ── 10. no call site may hand-roll the file: URL → path conversion ───────────
@@ -508,15 +541,11 @@ console.log("\n== [url] every file: URL → path conversion goes through one mod
     return out;
   };
 
-  // TWO files may keep one, and both are named here with the reason, not inferred.
+  // ONE file may keep one, and it is named here with the reason, not inferred. (The two CDP
+  // backends used to be on this list; they now share file-url.js's VERBATIM script-URL pair,
+  // because the studio client strips those URLs by hand.)
   const ALLOWED = new Map([
     ["file-url.js", "the one implementation — this is what everything else calls"],
-    [
-      "debugger.js",
-      "fromUrl already rebuilds the promoted segment (it never returns relative); it is paired " +
-        "with a toUrl that does NOT escape %, so it must not decode either. Converting it is a " +
-        "debugger-identity change, not part of this fix",
-    ],
     [
       "esm.js",
       "the Bun.resolveSync prelude is GENERATED source: it cannot import file-url.js, and " +
@@ -538,6 +567,19 @@ console.log("\n== [url] every file: URL → path conversion goes through one mod
   // or the next hand-rolled strip gets waved through by a list nobody re-read.
   const stale = [...ALLOWED.keys()].filter((rel) => hits(join(RUNTIME, rel)).length === 0);
   check("every allowlist entry still has its strip" + (stale.length ? ` — stale: ${stale.join(", ")}` : ""), stale.length === 0);
+
+  // The subtle half: a debugger that switches to the GRAMMAR pair still passes every check
+  // above, and breaks the studio client on any path with a space or a "%" (it shows
+  // "/my%20project/" in a frame, or binds a breakpoint to a file that does not exist). So
+  // the two CDP backends may not name the escaping helpers at all.
+  const REPO = hostFilePath(new URL("../", import.meta.url));
+  for (const rel of ["packages/runtime/debugger.js", "packages/runtime/builtins/python-debugger.js"]) {
+    const code = readFileSync(join(REPO, rel), "utf8").replace(/^\s*\/\/.*$/gm, "");
+    check(
+      `${rel.split("/").pop()} uses the VERBATIM script-URL pair`,
+      !/\b(pathToFileUrl|fileUrlToPath|fileUrlSpecifierToPath)\b/.test(code),
+    );
+  }
 }
 
 console.log(`\nRESULT: ${failures === 0 ? "PASS — esm.js live-binding + TLA loader guarantees hold" : `FAIL — ${failures} check(s) failed`}`);
