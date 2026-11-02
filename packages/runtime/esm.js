@@ -81,6 +81,27 @@ function canStartRegex(src, i) {
 // `globalThis.Bun` rather than a bare `typeof Bun`: a module is free to declare
 // its own top-level `const Bun`, and this prelude runs in that same scope, so a
 // bare reference would hit the TDZ and throw before the module body starts.
+// A module id is a VFS path, and `"file://" + id` is a three-slash file URL only
+// when the id starts with "/". With a RELATIVE id ("home/user/…") the first segment
+// is parsed as the URL **host**: `import.meta.url` becomes `file://home/…`,
+// `new URL('./pglite.data', import.meta.url)` resolves to `file://home/user/…` and
+// `fileURLToPath` returns `/user/…` — the `/home` is gone. A package that locates
+// its wasm/data through `import.meta.url` (PGlite's ESM build was the case) then
+// fails with ENOENT while the stack frame, built by sourceUrlFor() in module.js,
+// still looks right. Root-relativise a relative id exactly as sourceUrlFor() does
+// for frames, so `import.meta.url` and the frame agree. Relative ids reach here
+// from a URL→id round-trip in a dev server; they must never become a URL host.
+function fileMetaPath(filename) {
+  const p = String(filename == null ? "" : filename).replace(/[\r\n]/g, "");
+  if (!p || /^[a-z][a-z0-9+.-]*:/i.test(p)) return p; // "" or an absolute URL
+  return p.startsWith("/") ? p : "/" + p;
+}
+
+function fileUrlFor(metaPath) {
+  if (!metaPath) return "file://";
+  return /^[a-z][a-z0-9+.-]*:/i.test(metaPath) ? metaPath : "file://" + metaPath;
+}
+
 export function importMetaSource(fileUrl, filename) {
   const fp = filename || "";
   const idx = fp.lastIndexOf("/");
@@ -733,9 +754,10 @@ export function transpileEsm(source, filename) {
       ",{enumerable:true,configurable:true,get:function(){return " + local + ";}});",
     );
   }
-  const fileUrl = "file://" + (filename || "");
+  const metaPath = fileMetaPath(filename);
+  const fileUrl = fileUrlFor(metaPath);
   const head =
-    helpers(fileUrl, filename) +
+    helpers(fileUrl, metaPath) +
     // Mark the module ESM, but defensively: some CJS/ESM-hybrid bundles (e.g. rsbuild
     // v2's dev-server middleware chunks) already carry an `__esModule` on their exports
     // object (an accessor, or a non-configurable data prop) before our head runs, so a
@@ -878,9 +900,10 @@ export function transpileEsmLive(source, filename) {
   // still runs under our sloppy `new Function` wrapper, same as the eager variant).
   let body = applyEdits(source, edits).replace(/^\uFEFF?\s*(["'])use strict\1\s*;?/, "");
 
-  const fileUrl = "file://" + (filename || "");
+  const metaPath = fileMetaPath(filename);
+  const fileUrl = fileUrlFor(metaPath);
   const head =
-    helpers(fileUrl, filename) +
+    helpers(fileUrl, metaPath) +
     "try{Object.defineProperty(__oc_exports,'__esModule',{value:true,configurable:true});}catch(_e){try{__oc_exports.__esModule=true;}catch(__e){}}" +
     "const __oc_live=Object.create(null);" +
     reexportEarly.join("") +

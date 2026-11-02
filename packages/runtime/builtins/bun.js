@@ -248,6 +248,7 @@
 // pure computation pinned by its own checks. See the header of each for why they
 // are not inline here, and bun-formats.js in particular for the vendoring
 // rationale per format.
+import { fileUrlToPath as bunFileUrlToPath, pathToFileUrl as bunPathToFileUrl } from "../file-url.js";
 import { createBunFormats } from "./bun-formats.js";
 import { createBunText } from "./bun-text.js";
 import { createBunBytes } from "./bun-bytes.js";
@@ -375,7 +376,9 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
   //
   // `Bun.file(fd)` still throws (Phase 0): our fd numbers are VFS handles owned
   // by the runtime, not OS file descriptors, so there is no file to wrap.
-  const files = createBunFile({ lazy, Buffer, process });
+  // `fileURLToPath` is passed in (declared below, hoisted) so `Bun.file(URL)` and
+  // `Bun.fileURLToPath` share one URL→path rule instead of drifting apart.
+  const files = createBunFile({ lazy, Buffer, process, fileURLToPath });
   const bunFile = files.bunFile;
   const bunWrite = files.bunWrite;
 
@@ -1566,13 +1569,24 @@ export function createBunRuntime({ process, Buffer, require, makeCwdRequire, res
     return new Uint8Array(zlib[name](toBuf(data, Buffer), opts || {}));
   };
 
-  function fileURLToPath(url) {
-    const u = typeof url === "string" ? url : url.href;
-    let p = u.replace(/^file:\/\//, "");
-    try { p = decodeURIComponent(p); } catch {}
-    return p || "/";
+  // Both directions are the runtime's ONE rule (../file-url.js), shared with
+  // node/internal/url.js rather than re-derived from a comment that says "the two must
+  // agree". Bun resolves a relative path against cwd before building the URL exactly as
+  // Node does, and keeps a trailing separator (it is what keeps `new URL("./x", base)`
+  // inside the directory), so only those two steps live here.
+  function pathToFileURL(p) {
+    const path = lazy("path");
+    const raw = String(p);
+    let resolved = path.resolve(typeof process.cwd === "function" ? process.cwd() : "/", raw);
+    if (raw.endsWith("/") && !resolved.endsWith("/")) resolved += "/";
+    return bunPathToFileUrl(resolved);
   }
-  function pathToFileURL(p) { return safeUrl("file://" + p); }
+  // Node/Bun reject a hostful file URL; this runtime recovers instead, because a host
+  // here can only be a path segment a browser's `file:` parser promoted — but a lost
+  // segment is not recoverable, so it must never come back as a RELATIVE path.
+  function fileURLToPath(url) {
+    return bunFileUrlToPath(url);
+  }
 
   // ---- the Bun global --------------------------------------------------------
   const formats = createBunFormats({ process });

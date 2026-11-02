@@ -19,6 +19,13 @@
 // Run:  node scripts/spike-esm.mjs
 
 import { transpileEsm, transpileEsmLive } from "../packages/runtime/esm.js";
+import urlFactory from "../packages/runtime/node/internal/url.js";
+import { fromFileUrl } from "../packages/runtime/module.js";
+import { pathToScriptUrl, scriptUrlToPath } from "../packages/runtime/file-url.js";
+import path from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, relative } from "node:path";
+import { fileURLToPath as hostFilePath } from "node:url";
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 let failures = 0;
@@ -319,6 +326,260 @@ console.log("\n== [esm] comment between `export` and its declaration ==");
     namedOk = false;
   }
   check("a commented default function keeps its local binding", namedOk);
+}
+
+// ── 8. a relative module id must never become the URL host ────────────────────
+// `"file://" + id` is a three-slash file URL only when the id is absolute. With a
+// relative id ("home/user/…") the first segment parses as the HOST, so
+// `new URL('./pglite.data', import.meta.url)` resolves to file://home/user/… and
+// fileURLToPath() returns /user/… — the /home is gone. That is how a PGlite ESM
+// import failed with ENOENT while its stack frame looked right.
+console.log("\n== [esm] relative module id must not become import.meta.url's host ==");
+{
+  const src = "export const url = import.meta.url; export const dir = import.meta.dirname;";
+  const out = transpileEsm(src, "home/user/projects/app/node_modules/@electric-sql/pglite/dist/index.js");
+  const mod = { exports: Object.create(null) };
+  new Function("__oc_exports", "__oc_require", "__oc_module", out + "\n").call(
+    mod.exports,
+    mod.exports,
+    () => ({}),
+    mod,
+  );
+  const u = mod.exports.url;
+  check(
+    "import.meta.url is a three-slash file URL",
+    u === "file:///home/user/projects/app/node_modules/@electric-sql/pglite/dist/index.js",
+  );
+  check(
+    "a relative asset resolves under /home, not /user",
+    new URL("./pglite.data", u).pathname ===
+      "/home/user/projects/app/node_modules/@electric-sql/pglite/dist/pglite.data",
+  );
+  check(
+    "import.meta.dirname is absolute too",
+    mod.exports.dir === "/home/user/projects/app/node_modules/@electric-sql/pglite/dist",
+  );
+  check(
+    "the live-binding variant builds the same URL",
+    transpileEsmLive(src, "home/user/projects/app/x.js").includes('"file:///home/user/projects/app/x.js"'),
+  );
+}
+
+// ── 9. fileURLToPath recovers the path from a hostful file URL ───────────────
+// `"file:" + absolutePath` is how userland builds a file URL from `__filename`, and
+// PGlite's CJS build does exactly that. Chrome does not parse the result the same way
+// on every platform: url/url_parse_file.cc takes its WIN32 branch for anything that is
+// not `C:\` and is not exactly three slashes, and reads the rest as an UNC path — so
+// `file:/home/user/x` is `file://home/user/x` on Chrome/Windows, and
+// `file:///home/user/x` in Node and on Chrome/Linux (url_parse_unittest.cc pins both
+// tables). This VFS has no file hosts, so the segment the parser promoted is put back
+// in front of the pathname instead of throwing (which killed the database boot) or
+// dropping it (the old /user/… bug).
+//
+// The Windows branch is MODELLED here: the parser under test is the host's, and what
+// is checked is the reconstruction. Two slashes reproduce that parse on any host
+// (`file://home/user/x` is UNC everywhere), which is why this runs in CI.
+console.log("\n== [url] fileURLToPath recovers the path from a hostful file URL ==");
+{
+  const mod = { exports: {} };
+  urlFactory(mod.exports, () => { throw new Error("require is not available here"); }, mod, {}, {}, {});
+  const { fileURLToPath } = mod.exports;
+  // What Chrome/Windows makes of `"file:" + "/a/rest"`: host "a", pathname "/rest".
+  const asChromeOnWindows = (absPath) => new URL("file://" + String(absPath).replace(/^\/+/, ""));
+  check(
+    "the Chrome/Windows parse promotes the first path segment to the host",
+    asChromeOnWindows("/home/user/x").hostname === "home",
+  );
+  for (const p of [
+    "/home/user/projects/app/x.js",
+    "/home/user/projects/app/node_modules/@electric-sql/pglite/dist/index.cjs",
+    "/home/user/projects/my project/x.js",
+    "/home/user/progetti/città/x.js",
+    "/home/user/projects/app/",
+    "/home",
+  ]) {
+    check(`a hostful URL comes back as ${p}`, fileURLToPath(asChromeOnWindows(p)) === p);
+  }
+  check(
+    "the string form recovers too",
+    fileURLToPath("file://home/user/projects/x") === "/home/user/projects/x",
+  );
+  check(
+    "a three-slash file URL still converts",
+    fileURLToPath("file:///home/user/projects/x") === "/home/user/projects/x",
+  );
+  check(
+    "localhost keeps its normal meaning",
+    fileURLToPath("file://localhost/home/x") === "/home/x",
+  );
+  let scheme = null;
+  try {
+    fileURLToPath("https://example.com/x");
+  } catch (e) {
+    scheme = e.code;
+  }
+  check("a non-file scheme still throws", scheme === "ERR_INVALID_URL_SCHEME");
+  // pathToFileURL has to escape a literal "%" in a file NAME: URL#pathname leaves it
+  // alone, so without that "a%20b" would decode back as "a b" (Node's pathToFileURL
+  // encodes it, and the round trip is the contract).
+  const urlmod = { exports: {} };
+  urlFactory(
+    urlmod.exports,
+    (m) => (m === "path" ? path : () => { throw new Error("require is not available here"); }),
+    urlmod,
+    {},
+    {},
+    {},
+  );
+  const pct = urlmod.exports.pathToFileURL("/home/user/a%20b.js");
+  check("pathToFileURL escapes a literal % in a file name", pct.href === "file:///home/user/a%2520b.js");
+  check(
+    "…and fileURLToPath round-trips that name",
+    urlmod.exports.fileURLToPath(pct) === "/home/user/a%20b.js",
+  );
+
+  // THE RECOVERY IS LOSSY, and it cannot be otherwise: the platform normalises the host
+  // before anyone sees it. These three are what the parser hands back, not a choice this
+  // code makes, and they are pinned so the docs promise exactly what it delivers — "the
+  // path the URL now describes", not "the path it meant" (review of #35 asked for that
+  // limit to be stated rather than glossed over).
+  check("a lowercased host cannot be un-lowercased", fileURLToPath("file://MyApp/x") === "/myapp/x");
+  check("a numeric host is parsed as IPv4", fileURLToPath("file://123/x") === "/0.0.0.123/x");
+  check("localhost collapses to hostless, as in Node", fileURLToPath("file://localhost/x") === "/x");
+
+  // …and every CALL SITE that turns a specifier into a path shares that rule, which is the
+  // half the first version of this fix missed. `fromFileUrl` is what BOTH dynamic import()'s
+  // resolution and Module.createRequire() go through, and `"file:" + __filename` is
+  // `file://home/user/x` on Chrome/Windows — so a stripped prefix makes it "home/user/x",
+  // a RELATIVE path that resolves against nothing.
+  check(
+    "the loader recovers a hostful specifier instead of returning a relative path",
+    fromFileUrl("file://home/user/projects/app/node_modules/.bin/x.js") ===
+      "/home/user/projects/app/node_modules/.bin/x.js",
+  );
+  check("…with Vite's cache-busting query and hash", fromFileUrl("file:///app/x.js?t=1#frag") === "/app/x.js");
+  check("…and with one slash as well as two", fromFileUrl("file:/app/x.js") === "/app/x.js");
+  check(
+    "a file: specifier NEVER comes back relative",
+    ["file://home/user/x", "file:///app/x", "file:/app/x", "file://@scope/x", "file://", "file://home"].every(
+      (u) => fromFileUrl(u).startsWith("/"),
+    ),
+  );
+
+  // The CDP pair is the OTHER family (see file-url.js's header): VERBATIM, because the
+  // studio's DevTools client builds and strips script URLs with raw string ops
+  // (packages/studio/src/vv/debug-session.ts: `"file://" + p`, `u.slice("file://".length)`).
+  // These are exactly the cases that regressed when python-debugger.js used the grammar
+  // pair instead — a paused frame showed "/my%20project/" and a breakpoint bound to
+  // `/home/user/a` for a file called `a#b.py`.
+  check(
+    "a script URL is verbatim: a space is not escaped",
+    pathToScriptUrl("/home/user/my project/main.py") === "file:///home/user/my project/main.py",
+  );
+  check(
+    "…so the studio's raw prefix strip gives the path back",
+    scriptUrlToPath("file:///home/user/my project/main.py") === "/home/user/my project/main.py",
+  );
+  check(
+    "a file named a%20b.py keeps its name",
+    scriptUrlToPath(pathToScriptUrl("/home/user/a%20b.py")) === "/home/user/a%20b.py",
+  );
+  check("a '#' in a file name is not a URL fragment", scriptUrlToPath("file:///home/user/a#b.py") === "/home/user/a#b.py");
+  check(
+    "a non-ASCII path round-trips",
+    scriptUrlToPath(pathToScriptUrl("/home/user/progetti/città/main.py")) === "/home/user/progetti/città/main.py",
+  );
+  check(
+    "a hostful script URL is recovered, not relativised",
+    scriptUrlToPath("file://home/user/x.py") === "/home/user/x.py",
+  );
+  check(
+    "a script that already has an authority-form URL passes through untouched",
+    pathToScriptUrl("webpack:///./src/main.py") === "webpack:///./src/main.py",
+  );
+}
+
+// ── 10. no call site may hand-roll the file: URL → path conversion ───────────
+// Section 9 pins the rule; this keeps every call site ON it. The bug does not look like
+// one — `u.slice("file://".length)` reads as a tidy prefix strip and yields a perfectly
+// plausible RELATIVE path — which is why the same three lines were written in module.js
+// (twice), bun-worker.js, worker_threads.js and python-debugger.js AFTER the recovery
+// existed. Any conversion here has to go through packages/runtime/file-url.js.
+console.log("\n== [url] every file: URL → path conversion goes through one module ==");
+{
+  const RUNTIME = hostFilePath(new URL("../packages/runtime/", import.meta.url));
+  const files = [];
+  const walk = (dir) => {
+    for (const d of readdirSync(dir, { withFileTypes: true })) {
+      if (d.name === "node_modules") continue;
+      const p = join(dir, d.name);
+      if (d.isDirectory()) walk(p);
+      else if (d.name.endsWith(".js")) files.push(p);
+    }
+  };
+  walk(RUNTIME);
+
+  const STRIPS = [
+    { re: /slice\(\s*["']file:\/\/["']/, why: 'strips the "file://" prefix by hand' },
+    { re: /slice\(\s*0\s*,\s*7\s*\)/, why: "compares 7 characters of a file: URL" },
+    { re: /\.slice\(\s*7\s*\)/, why: "slices 7 characters off a file: URL" },
+    { re: /replace\(\s*\/\^file:/, why: "strips the file: scheme with a regex" },
+  ];
+  // A line only counts when it is about file: URLs (so net.js's `a.slice(7)` on an
+  // IPv4-mapped address is not a hit).
+  const hits = (file) => {
+    const lines = readFileSync(file, "utf8").split("\n");
+    const out = [];
+    lines.forEach((line, i) => {
+      // Comments are allowed to NAME the pattern — that is how the next person learns not
+      // to write it. Only executed code counts.
+      if (/^\s*(\/\/|\*|\/\*)/.test(line)) return;
+      const about = line.includes("file:") || (i > 0 && lines[i - 1].includes("file:"));
+      if (!about) return;
+      for (const s of STRIPS) if (s.re.test(line)) out.push(`${relative(RUNTIME, file)}:${i + 1} ${s.why}`);
+    });
+    return out;
+  };
+
+  // ONE file may keep one, and it is named here with the reason, not inferred. (The two CDP
+  // backends used to be on this list; they now share file-url.js's VERBATIM script-URL pair,
+  // because the studio client strips those URLs by hand.)
+  const ALLOWED = new Map([
+    ["file-url.js", "the one implementation — this is what everything else calls"],
+    [
+      "esm.js",
+      "the Bun.resolveSync prelude is GENERATED source: it cannot import file-url.js, and " +
+        "inlining the rule as a string is the second copy this whole change deletes",
+    ],
+  ]);
+
+  const offenders = [];
+  for (const f of files) {
+    if (ALLOWED.has(relative(RUNTIME, f))) continue;
+    offenders.push(...hits(f));
+  }
+  check(
+    `no file: URL is converted outside file-url.js (${files.length} files scanned)` +
+      (offenders.length ? ` — ${offenders.join("; ")}` : ""),
+    offenders.length === 0,
+  );
+  // …and the allowlist cannot rot: an entry whose reason has been FIXED must be deleted,
+  // or the next hand-rolled strip gets waved through by a list nobody re-read.
+  const stale = [...ALLOWED.keys()].filter((rel) => hits(join(RUNTIME, rel)).length === 0);
+  check("every allowlist entry still has its strip" + (stale.length ? ` — stale: ${stale.join(", ")}` : ""), stale.length === 0);
+
+  // The subtle half: a debugger that switches to the GRAMMAR pair still passes every check
+  // above, and breaks the studio client on any path with a space or a "%" (it shows
+  // "/my%20project/" in a frame, or binds a breakpoint to a file that does not exist). So
+  // the two CDP backends may not name the escaping helpers at all.
+  const REPO = hostFilePath(new URL("../", import.meta.url));
+  for (const rel of ["packages/runtime/debugger.js", "packages/runtime/builtins/python-debugger.js"]) {
+    const code = readFileSync(join(REPO, rel), "utf8").replace(/^\s*\/\/.*$/gm, "");
+    check(
+      `${rel.split("/").pop()} uses the VERBATIM script-URL pair`,
+      !/\b(pathToFileUrl|fileUrlToPath|fileUrlSpecifierToPath)\b/.test(code),
+    );
+  }
 }
 
 console.log(`\nRESULT: ${failures === 0 ? "PASS — esm.js live-binding + TLA loader guarantees hold" : `FAIL — ${failures} check(s) failed`}`);

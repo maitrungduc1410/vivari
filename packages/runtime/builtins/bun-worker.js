@@ -24,6 +24,8 @@
 // and it is why the check that matters here asserts what the guest SEES rather
 // than what this file exports.
 
+import { fileUrlSpecifierToPath } from "../file-url.js";
+
 const WORKER_LAUNCHER = "/bin/bun.js";
 
 /**
@@ -120,14 +122,11 @@ export function createBunWorker({ lazy, process }) {
           "network. Write the code to a file in your project and pass that path."
       );
     }
-    if (spec.startsWith("file://")) {
-      try {
-        spec = decodeURIComponent(spec.slice("file://".length));
-      } catch {
-        spec = spec.slice("file://".length);
-      }
-    }
-    if (spec.startsWith("/")) return spec;
+    // A file: URL goes through the runtime's ONE rule (../file-url.js), not a prefix
+    // strip: on Chrome/Windows a hostful form is what `"file:" + __filename` produces,
+    // and stripping it would hand `path.resolve` a RELATIVE "home/user/x".
+    if (spec.startsWith("file:")) spec = fileUrlSpecifierToPath(spec);
+    if (spec && spec.startsWith("/")) return spec;
 
     const path = lazy("path");
     return path.resolve(process.cwd() || "/", spec);

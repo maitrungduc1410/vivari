@@ -4566,6 +4566,64 @@ also unchanged.
   token 'export'` (the AsyncFunction retry reported the same thing — the transpiled
   source still contained the keyword). `skipSpaceAndComments` is the one place that rule
   lives; any token scanner added here must use it. Proven by `scripts/spike-esm.mjs`.
+- **`import.meta.url` must be built from an ABSOLUTE id — and a host in a `file:` URL
+  is never a file host.** `"file://" + id` is a three-slash file URL only when `id` starts
+  with `/`; a relative id (`home/user/…`) makes its first segment the URL **host**, so
+  `new URL('./pglite.data', import.meta.url)` resolves to `file://home/user/…` and
+  `fileURLToPath()` returns `/user/…` — `/home` is gone. PGlite's ESM build locates its
+  `.data`/`.wasm` that way, so the database died with ENOENT while the stack frame (built
+  by `sourceUrlFor()` from the same id) looked right: the mismatch is invisible.
+  `fileMetaPath()` root-relativises a relative id exactly as `sourceUrlFor()` does for
+  frames, so `import.meta.url` always carries three slashes.
+  The other half belongs to Chromium and is **platform-dependent**: `url/url_parse_file.cc`
+  takes its `#ifdef WIN32` branch for anything that is not `C:\` and is not exactly three
+  slashes, and parses the rest as an UNC path — so `"file:" + "/home/user/x"` (how userland
+  turns `__filename` into a URL; PGlite's CJS build does it) is `file://home/user/x` on
+  Chrome/Windows and `file:///home/user/x` in Node and on Chrome/Linux
+  (`url/url_parse_unittest.cc` pins both tables). This VFS has no file hosts, so
+  `fileURLToPath()` rebuilds `"/" + hostname + pathname` instead of throwing
+  `ERR_INVALID_FILE_URL_HOST`. A bare `"/"` pathname (`file:/home`) takes no join,
+  `localhost` and the `ERR_INVALID_URL_SCHEME` error are unchanged, and the invariant is
+  that a converted path always starts with `/` — **a file URL must never come back
+  relative**. That invariant is why the rule is ONE module, `file-url.js`, and not a
+  `slice("file://".length)` per call site: four of them (`module.js`'s `fromFileUrl` and
+  `createRequire`, `bun-worker.js`, `worker_threads`' entry) kept returning a relative
+  path after the recovery was written, which is the same bug wearing different clothes.
+  Every caller goes through it — `internal/url.js`, `Bun.fileURLToPath`, those four —
+  and it has two shapes on purpose: `fileUrlToPath()` is strict (Node's errors),
+  `fileUrlSpecifierToPath()` never throws on a malformed escape and always returns an
+  absolute path, because a module specifier is not a validated URL.
+  **The two CDP backends are the exception that is not one** — the trap to know about.
+  A debugger script URL is a VERBATIM mapping (`pathToScriptUrl()`/`scriptUrlToPath()` in
+  the same module), not a URL-grammar round trip, because the studio's DevTools client
+  builds and strips those strings with raw ops (`"file://" + p`,
+  `u.slice("file://".length)` in `debug-session.ts`). Escaping on this side looks right and
+  breaks only the UI: a paused frame shows `/home/user/my%20project/main.py`, a breakpoint
+  for `a%20b.py` binds to `a b.py`, and one for `a#b.py` binds to `/home/user/a`.
+  Node's backend and Python's both use that pair, and `spike-esm` asserts neither names the
+  escaping helpers.
+  **The recovery is lossy, and cannot be otherwise**, because the parser normalises the
+  host before anyone sees it:
+
+  | input | what the parser hands back | recovered |
+  | --- | --- | --- |
+  | `file://home/user/x` | host `home`, path `/user/x` | `/home/user/x` |
+  | `file://MyApp/x` | host `myapp` (lowercased) | `/myapp/x` |
+  | `file://123/x` | host `0.0.0.123` (parsed as IPv4) | `/0.0.0.123/x` |
+  | `file://localhost/x` | hostless, path `/x` | `/x` |
+  | `file://@scope/x` | `Invalid URL`, never parses | `/@scope/x` (tolerant read) |
+
+  So it returns the path the URL **now describes**, not "the path it meant". That is enough
+  because the URLs this runtime builds are all three-slash (`fileMetaPath`, `sourceUrlFor`,
+  the debugger), so a host only appears when a package built the URL itself from an absolute
+  path, whose first segment is a directory name (`home`, `user`, `app`) — not something the
+  parser normalises away. The one deliberate deviation from Node: a real UNC URL
+  (`file://server/share`) maps to `/server/share` rather than throwing.
+  `pathToFileURL()` likewise percent-encodes a literal `%` (URL#pathname does not), so a
+  file named `a%20b` round-trips. Regression: `scripts/spike-esm.mjs` sections 9–10 (9
+  models the Windows parse, pins the lossy table, and pins the verbatim script-URL pair; 10
+  fails on any new hand-rolled `file://` strip in the runtime, and on a debugger switching
+  to the escaping pair) and `scripts/spike-bun-offline.mjs`.
 - **`esm.js` does NOT strip TypeScript types** — it only rewrites `import`/`export`.
   A raw `.ts` run through OC's loader (`node --experimental-strip-types x.ts`) is
   *not* type-stripped: `esm.js` removes the leading `export `/`import ` and leaves
