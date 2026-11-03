@@ -11904,3 +11904,13 @@ compiling .../zod/v4/core/core.js [esm])` — found when a Nitro server route im
 before deciding, which covers `export /*c*/ function`, `export /*c*/ const`, a line
 comment and `export /*c*/ default`. The regression case in `scripts/spike-esm.mjs`
 asserts the rewritten source has no bare `export`, compiles, and exports all four forms.
+
+
+### Tailwind pinned to 4.3.3: oxide's 4.3.4 wasm build hangs on load
+
+`template-gate` and `spikes-net` went red on `tailwind` with `vite` never binding and an empty
+log, starting with the 4.3.4 release on 2026-11-02. `require('@tailwindcss/oxide-wasm32-wasi')`
+at 4.3.4 spins at 100% CPU, and it does so on real Node 22 and 24 with no VM involved, so this is
+upstream and not a host or emnapi mismatch here. The template and `spike-tailwind` now pin
+`tailwindcss` and `@tailwindcss/vite` exactly. Lift the pin once a later release loads on plain
+Node (see AGENTS.md).

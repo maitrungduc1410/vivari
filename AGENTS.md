@@ -2115,6 +2115,16 @@ own newer hosts, which take a threaded path the vendored one sidesteps. Both
 sides are gated by the nightly network tier — `spike-preact` for emnapi 2,
 `spike-rspack`/`spike-tailwind` for emnapi 1.
 
+### `tailwind` is pinned to 4.3.3 because oxide's 4.3.4 wasm build never finishes loading
+`require('@tailwindcss/oxide-wasm32-wasi')` at 4.3.4 spins at 100% CPU inside
+`napi_register_wasm_v1`, printing nothing. It is not this VM: real Node 22 and 24 on
+macOS hang the same way with that package alone, and it hangs in the VM on the vendored
+host and on the host it bundles, so do not go looking in `emnapiMajor`. 4.3.3 loads in
+21 ms. From outside it reads as `vite` never binding its port, with an empty log. The
+template and `spike-tailwind` pin `tailwindcss` and `@tailwindcss/vite` exactly, and the
+latter pins oxide to its own version. To retry a newer release, run the package alone on
+host Node first, which takes seconds and needs no kernel.
+
 ### A Vite 8 template must DECLARE `@rolldown/binding-wasm32-wasi` — nothing else installs it
 Vite 8's bundler is rolldown, whose wasm binding is a separate package. Up to
 rolldown **1.2.1** that package was one of rolldown's `optionalDependencies`, so

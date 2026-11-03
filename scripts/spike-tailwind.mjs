@@ -142,7 +142,8 @@ kernel.writeFile(
         "react-dom": "^19.0.0",
       },
       devDependencies: {
-        "@tailwindcss/vite": "^4.0.0",
+        // Exact, like the template: oxide-wasm32-wasi 4.3.4 spins forever on load.
+        "@tailwindcss/vite": "4.3.3",
         "@vitejs/plugin-react": "^5.0.0",
         // Vite 8 bundles with rolldown, whose wasm32 binding stopped being an
         // optionalDependency in rolldown 1.2.2 — so it has to be asked for by name
@@ -150,7 +151,7 @@ kernel.writeFile(
         // reason, as the sixteen vite:^8 templates.
         "@rolldown/binding-wasm32-wasi": "~1.2.0",
         "@napi-rs/wasm-runtime": "1.2.5",
-        tailwindcss: "^4.0.0",
+        tailwindcss: "4.3.3",
         vite: "^8.0.0",
       },
     },

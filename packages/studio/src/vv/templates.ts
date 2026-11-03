@@ -10847,6 +10847,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: 
 // own `@tailwindcss/oxide-wasm32-wasi` optional dep (auto-selected by the in-VM
 // npm's wasm32 platform gating). No tailwind.config / postcss.config needed: v4
 // puts theme + content in src/index.css via @import/@theme.
+//
+// tailwindcss and @tailwindcss/vite are pinned exactly: @tailwindcss/oxide-wasm32-wasi
+// 4.3.4 spins forever while loading, on real Node as well as here, so `vite` never
+// binds. @tailwindcss/vite pins oxide to its own version, so these two decide it.
+// Move them together once a later release loads (scripts/spike-tailwind.mjs).
 function tailwindTemplate(): TemplateDef {
   return {
     manifest: {
@@ -10889,11 +10894,11 @@ function tailwindTemplate(): TemplateDef {
     "tailwind-merge": "^3.0.0"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.0.0",
+    "@tailwindcss/vite": "4.3.3",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^5.0.0",
-    "tailwindcss": "^4.0.0",
+    "tailwindcss": "4.3.3",
     "typescript": "^5.7.0",
     "@rolldown/binding-wasm32-wasi": "~1.2.0",
     "@napi-rs/wasm-runtime": "1.2.5",
