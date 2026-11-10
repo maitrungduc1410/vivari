@@ -3,6 +3,12 @@
 From 1.1.0 on, entries are generated from [changesets](https://github.com/changesets/changesets).
 `@vivari/core` and `@vivari/react` are released together under the same version.
 
+## 1.3.0
+
+### Minor Changes
+
+- [`3bc9309`](https://github.com/maitrungduc1410/vivari/commit/3bc93091a7545d546809f44e297cbd4b2e924347) Thanks [@maitrungduc1410](https://github.com/maitrungduc1410)! - The bundled pnpm is now 11. `tls.connect` to an outside host works for HTTP/1.1 clients such as the undici pnpm 11 ships: requests written into the socket are answered through fetch, and anything that is not HTTP is refused by name. New `vivari.snapshot(path)` and `vivari.restore(bytes, { mountPoint })` pack a directory, `node_modules` included, into opaque bytes and unpack them, so a warmed project can skip its install next session; restore validates the bytes before writing anything. `vivari.spawn(..., { terminal: { cols, rows } })` and `proc.resize({ cols, rows })` give a process its real terminal size: it sees `process.stdout.columns`/`rows`, then a `'resize'` event and `SIGWINCH` when the size changes, and children inherit it. `vivari.export()` now returns each file's bytes as `contents`, as documented; it used to leave `contents` undefined.
+
 ## 1.2.1
 
 ### Patch Changes
