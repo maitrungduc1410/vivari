@@ -241,41 +241,9 @@ export async function createDepCache({ access, storage, maxBytes = DEFAULT_MAX_B
   }
 
   // ---- pack ----------------------------------------------------------------
-  // Walk dir/node_modules and serialize it as [u32le headerLen][headerJSON][bytes].
-  // header = { v, entries: [{ p, k:'d'|'f'|'l', m, o?, l?, t? }] }, `p` relative
-  // to node_modules. Dirs/symlinks carry no bytes; files carry an (offset,len)
-  // slice into the trailing blob. Mirrors the vendor-asset pack format.
-  function pack(nodeModulesDir) {
-    const paths = access.walk(nodeModulesDir); // parents before children
-    const metaEntries = [];
-    const blobs = [];
-    let offset = 0;
-    for (const p of paths) {
-      const e = access.read(p);
-      if (!e) continue;
-      const rel = p === nodeModulesDir ? "" : p.slice(nodeModulesDir.length + 1);
-      if (e.kind === "dir") {
-        metaEntries.push({ p: rel, k: "d", m: e.mode | 0 });
-      } else if (e.kind === "symlink") {
-        metaEntries.push({ p: rel, k: "l", m: e.mode | 0, t: e.target });
-      } else {
-        const bytes = e.bytes || new Uint8Array(0);
-        metaEntries.push({ p: rel, k: "f", m: e.mode | 0, o: offset, l: bytes.length });
-        blobs.push(bytes);
-        offset += bytes.length;
-      }
-    }
-    const header = enc.encode(JSON.stringify({ v: 1, entries: metaEntries }));
-    const out = new Uint8Array(4 + header.length + offset);
-    new DataView(out.buffer).setUint32(0, header.length, true);
-    out.set(header, 4);
-    let o = 4 + header.length;
-    for (const b of blobs) {
-      out.set(b, o);
-      o += b.length;
-    }
-    return { archive: out, fileCount: blobs.length, entryCount: metaEntries.length };
-  }
+  // The archive format and its walk live in packTree() below the factory, shared
+  // with the SDK's whole-tree snapshot.
+  const pack = (nodeModulesDir) => packTree(access, nodeModulesDir);
 
   /**
    * Snapshot `dir/node_modules` under `key`, plus any `aliasKeys` (extra keys —
@@ -304,49 +272,9 @@ export async function createDepCache({ access, storage, maxBytes = DEFAULT_MAX_B
   }
 
   // ---- import an externally produced archive --------------------------------
-  // Is `raw` a well-formed archive, and does every entry stay inside the tree?
-  // Everything `save()` writes is trusted by construction, but an imported archive
-  // arrives over the network, so it is validated BEFORE it is stored: a truncated
-  // download, a half-written asset or an HTML error page served with a 200 must be
-  // rejected here rather than half-unpacked over a project's node_modules. Returns
-  // counts on success, null on anything suspect — callers treat null as "no
-  // snapshot" and fall back to a normal install.
-  function inspect(raw) {
-    if (!(raw instanceof Uint8Array) || raw.length < 4) return null;
-    const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-    const headerLen = dv.getUint32(0, true);
-    if (!headerLen || headerLen > raw.length - 4) return null;
-    let header;
-    try {
-      header = JSON.parse(dec.decode(raw.subarray(4, 4 + headerLen)));
-    } catch {
-      return null;
-    }
-    if (!header || !Array.isArray(header.entries) || header.entries.length === 0) return null;
-    const blobLen = raw.length - (4 + headerLen);
-    let fileCount = 0;
-    for (const e of header.entries) {
-      if (!e || typeof e.p !== "string") return null;
-      // Paths are relative to node_modules and must stay there. `restore()` joins
-      // them onto the project dir, so a leading slash or a `..` segment would
-      // escape the tree entirely — the one failure here that could damage a
-      // project rather than merely waste a fetch.
-      if (e.p.startsWith("/") || e.p.split("/").some((seg) => seg === ".." || seg === ".")) return null;
-      if (e.k === "f") {
-        // Slices must land inside the blob; otherwise restore reads whatever
-        // follows in memory, or nothing.
-        if (!Number.isInteger(e.o) || !Number.isInteger(e.l) || e.o < 0 || e.l < 0 || e.o + e.l > blobLen) {
-          return null;
-        }
-        fileCount++;
-      } else if (e.k === "l") {
-        if (typeof e.t !== "string") return null;
-      } else if (e.k !== "d") {
-        return null;
-      }
-    }
-    return { fileCount, entryCount: header.entries.length };
-  }
+  // Validation is inspectArchive() below the factory (shared with the SDK's
+  // restore, which takes bytes from an embedder just as untrusted as a download).
+  const inspect = inspectArchive;
 
   /**
    * Store an archive produced ELSEWHERE (a snapshot shipped with the app, built by
@@ -384,52 +312,14 @@ export async function createDepCache({ access, storage, maxBytes = DEFAULT_MAX_B
     const real = resolve(key);
     if (!real) return 0;
     const raw = await storage.get(real);
-    if (!raw || raw.length < 4) return 0;
-    const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-    const headerLen = dv.getUint32(0, true);
-    let header;
-    try {
-      header = JSON.parse(dec.decode(raw.subarray(4, 4 + headerLen)));
-    } catch {
-      return 0;
-    }
-    if (!header || !Array.isArray(header.entries)) return 0;
-    const blobStart = 4 + headerLen;
-    const nm = dir.replace(/\/+$/, "") + "/node_modules";
-    const abs = (rel) => (rel ? nm + "/" + rel : nm);
-    const notify = typeof onPath === "function" ? onPath : null;
-
-    access.mkdirp(nm);
-    if (notify) notify(nm);
-    // Dirs first (shallow → deep is already the walk order), then files, then
-    // symlinks (a symlink target may live anywhere in the tree).
-    for (const e of header.entries) {
-      if (e.k !== "d") continue;
-      access.mkdirp(abs(e.p));
-      if (notify) notify(abs(e.p));
-    }
-    for (const e of header.entries) {
-      if (e.k !== "f") continue;
-      const p = abs(e.p);
-      const slash = p.lastIndexOf("/");
-      if (slash > 0) access.mkdirp(p.slice(0, slash));
-      access.writeFile(p, raw.subarray(blobStart + e.o, blobStart + e.o + e.l));
-      if (notify) notify(p);
-    }
-    for (const e of header.entries) {
-      if (e.k !== "l") continue;
-      const p = abs(e.p);
-      const slash = p.lastIndexOf("/");
-      if (slash > 0) access.mkdirp(p.slice(0, slash));
-      access.symlink(e.t, p);
-      if (notify) notify(p);
-    }
+    const count = unpackArchive(access, raw, dir.replace(/\/+$/, "") + "/node_modules", onPath);
+    if (!count) return 0;
 
     // LRU touch so a just-used snapshot isn't the next evicted.
     const ent = index.entries[real];
     if (ent) ent.atime = Date.now();
     await persistIndex();
-    return header.entries.length;
+    return count;
   }
 
   // Evict least-recently-used snapshots until under the cap. `protectKey` (the
@@ -479,4 +369,235 @@ export async function createDepCache({ access, storage, maxBytes = DEFAULT_MAX_B
   }
 
   return { has, save, importArchive, restore, clear, hashDepKey };
+}
+// ---- the archive format, shared by the dep cache and the SDK snapshot --------
+//
+//   [u32le headerLen][headerJSON][bytes]
+//   header = { v: 1, entries: [{ p, k: 'd'|'f'|'l', m, o?, l?, t? }] }
+//
+// `p` is relative to the archived root ("" is the root itself). Dirs and symlinks
+// carry no bytes; files carry an (offset, length) slice into the trailing blob.
+// Walk order is parents before children.
+
+/**
+ * Pack the tree at `root`. `skip(name)` returning true leaves out that entry and
+ * everything under it (matched on the entry's own name, at any depth).
+ */
+export function packTree(access, root, skip) {
+  const paths = access.walk(root);
+  const metaEntries = [];
+  const blobs = [];
+  let offset = 0;
+  const skipped = [];
+  for (const p of paths) {
+    const rel = p === root ? "" : p.slice(root === "/" ? 1 : root.length + 1);
+    if (rel && skip) {
+      if (skipped.some((s) => rel === s || rel.startsWith(s + "/"))) continue;
+      if (skip(rel.slice(rel.lastIndexOf("/") + 1))) {
+        skipped.push(rel);
+        continue;
+      }
+    }
+    const e = access.read(p);
+    if (!e) continue;
+    if (e.kind === "dir") {
+      metaEntries.push({ p: rel, k: "d", m: e.mode | 0 });
+    } else if (e.kind === "symlink") {
+      metaEntries.push({ p: rel, k: "l", m: e.mode | 0, t: e.target });
+    } else {
+      const bytes = e.bytes || new Uint8Array(0);
+      metaEntries.push({ p: rel, k: "f", m: e.mode | 0, o: offset, l: bytes.length });
+      blobs.push(bytes);
+      offset += bytes.length;
+    }
+  }
+  const header = enc.encode(JSON.stringify({ v: 1, entries: metaEntries }));
+  const out = new Uint8Array(4 + header.length + offset);
+  new DataView(out.buffer).setUint32(0, header.length, true);
+  out.set(header, 4);
+  let o = 4 + header.length;
+  for (const b of blobs) {
+    out.set(b, o);
+    o += b.length;
+  }
+  return { archive: out, fileCount: blobs.length, entryCount: metaEntries.length };
+}
+
+/**
+ * Is `raw` a well-formed archive whose every entry stays inside the tree? An
+ * archive that arrives from outside (a shipped asset, bytes an embedder hands to
+ * restore()) is checked BEFORE anything is written: a truncated download or an
+ * HTML error page served with a 200 must be refused, not half-unpacked, and a
+ * `..` or absolute path would write outside the destination. Returns counts, or
+ * null on anything suspect.
+ */
+export function inspectArchive(raw) {
+  if (!(raw instanceof Uint8Array) || raw.length < 4) return null;
+  const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const headerLen = dv.getUint32(0, true);
+  if (!headerLen || headerLen > raw.length - 4) return null;
+  let header;
+  try {
+    header = JSON.parse(dec.decode(raw.subarray(4, 4 + headerLen)));
+  } catch {
+    return null;
+  }
+  if (!header || !Array.isArray(header.entries) || header.entries.length === 0) return null;
+  const blobLen = raw.length - (4 + headerLen);
+  let fileCount = 0;
+  for (const e of header.entries) {
+    if (!e || typeof e.p !== "string") return null;
+    if (e.p.startsWith("/") || e.p.split("/").some((seg) => seg === ".." || seg === ".")) return null;
+    if (e.k === "f") {
+      if (!Number.isInteger(e.o) || !Number.isInteger(e.l) || e.o < 0 || e.l < 0 || e.o + e.l > blobLen) {
+        return null;
+      }
+      fileCount++;
+    } else if (e.k === "l") {
+      if (typeof e.t !== "string") return null;
+    } else if (e.k !== "d") {
+      return null;
+    }
+  }
+  return { fileCount, entryCount: header.entries.length };
+}
+
+/**
+ * Unpack `raw` under `dest`. `onPath(absPath)` is called for every path created
+ * (the FS worker mirrors them to OPFS). Returns the number of entries, 0 if `raw`
+ * does not parse. Callers holding untrusted bytes run inspectArchive() first.
+ */
+export function unpackArchive(access, raw, dest, onPath) {
+  if (!raw || raw.length < 4) return 0;
+  const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const headerLen = dv.getUint32(0, true);
+  let header;
+  try {
+    header = JSON.parse(dec.decode(raw.subarray(4, 4 + headerLen)));
+  } catch {
+    return 0;
+  }
+  if (!header || !Array.isArray(header.entries)) return 0;
+  const blobStart = 4 + headerLen;
+  const base = dest === "/" ? "" : dest.replace(/\/+$/, "");
+  const abs = (rel) => (rel ? base + "/" + rel : base || "/");
+  const notify = typeof onPath === "function" ? onPath : null;
+  const parent = (p) => {
+    const slash = p.lastIndexOf("/");
+    if (slash > 0) access.mkdirp(p.slice(0, slash));
+  };
+
+  access.mkdirp(abs(""));
+  if (notify) notify(abs(""));
+  // Dirs first (the walk order is already shallow to deep), then files, then
+  // symlinks, since a symlink's target may live anywhere in the tree.
+  for (const e of header.entries) {
+    if (e.k !== "d" || !e.p) continue;
+    access.mkdirp(abs(e.p));
+    if (notify) notify(abs(e.p));
+  }
+  for (const e of header.entries) {
+    if (e.k !== "f") continue;
+    const p = abs(e.p);
+    parent(p);
+    access.writeFile(p, raw.subarray(blobStart + e.o, blobStart + e.o + e.l));
+    if (notify) notify(p);
+  }
+  for (const e of header.entries) {
+    if (e.k !== "l") continue;
+    const p = abs(e.p);
+    parent(p);
+    access.symlink(e.t, p);
+    if (notify) notify(p);
+  }
+  return header.entries.length;
+}
+
+// ---- the SDK snapshot: a whole tree, gzipped, in the shipped-asset frame ------
+//
+// Vivari.snapshot() returns this and Vivari.restore() takes it. It is the same
+// container a shipped dep-cache asset uses ({v:2, c:"gz"}), with `kind: "tree"`
+// so a node_modules-only asset and a whole-project snapshot cannot be mistaken
+// for each other by a reader that cares. Nothing outside this file should need
+// to know the layout; embedders treat the bytes as opaque.
+export const TREE_SNAPSHOT_KIND = "tree";
+
+export async function encodeTreeSnapshot(archive) {
+  const body = await gzipBytes(archive);
+  return writeSnapshotContainer("gz", body, { kind: TREE_SNAPSHOT_KIND });
+}
+
+/**
+ * Snapshot bytes → a validated plain archive, or null. Accepts the gzipped
+ * container encodeTreeSnapshot() writes and a bare archive; refuses anything that
+ * does not decode or does not pass inspectArchive().
+ */
+export async function decodeTreeSnapshot(bytes) {
+  const raw = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || 0);
+  const archive = await decodeShippedSnapshot(raw);
+  if (!archive || !inspectArchive(archive)) return null;
+  return archive;
+}
+
+// Same concurrency rule as inflateGzip: read and write together, await both.
+async function gzipBytes(bytes) {
+  const stream = new CompressionStream("gzip");
+  const writer = stream.writable.getWriter();
+  const writing = (async () => {
+    await writer.write(bytes);
+    await writer.close();
+  })();
+  const reading = (async () => {
+    const reader = stream.readable.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.length;
+    }
+    return { chunks, total };
+  })();
+  const [, { chunks, total }] = await Promise.all([writing, reading]);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const c of chunks) {
+    out.set(c, o);
+    o += c.length;
+  }
+  return out;
+}
+
+// The two FS-worker operations behind Vivari.snapshot()/restore(), in one place so
+// the browser fs-worker and its headless twin (scripts/fs-worker.mjs) cannot drift.
+// Errors carry a POSIX-shaped `code` the SDK maps onto its own.
+function codedError(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  return err;
+}
+
+/** Pack `root` (minus `exclude` names) into snapshot bytes. */
+export async function snapshotTreeOp(access, { root, exclude } = {}) {
+  const dir = root && root !== "/" ? String(root).replace(/\/+$/, "") : "/";
+  const top = access.read(dir);
+  if (!top) throw codedError("ENOENT", "snapshot: no such file or directory, " + dir);
+  if (top.kind !== "dir") throw codedError("ENOTDIR", "snapshot: not a directory, " + dir);
+  const names = new Set(Array.isArray(exclude) ? exclude.map(String) : []);
+  const { archive, fileCount, entryCount } = packTree(access, dir, names.size ? (n) => names.has(n) : null);
+  const bytes = await encodeTreeSnapshot(archive);
+  return { bytes, files: fileCount, entries: entryCount, rawBytes: archive.length };
+}
+
+/** Validate snapshot bytes, then unpack them under `dir`. */
+export async function restoreTreeOp(access, bytes, dir, onPath) {
+  const archive = await decodeTreeSnapshot(bytes);
+  if (!archive) throw codedError("EINVAL", "restore: not a Vivari snapshot, or a damaged one");
+  const info = inspectArchive(archive);
+  const dest = dir && dir !== "/" ? String(dir).replace(/\/+$/, "") : "/";
+  const target = access.read(dest);
+  if (target && target.kind !== "dir") throw codedError("ENOTDIR", "restore: not a directory, " + dest);
+  const entries = unpackArchive(access, archive, dest, onPath);
+  return { entries, files: info.fileCount };
 }

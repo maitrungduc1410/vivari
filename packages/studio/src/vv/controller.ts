@@ -1060,6 +1060,11 @@ export class IdeController {
       }
       this.bridge.post("term-input", { terminalId: id, chunk: data });
     });
+    // Every fit() that changes the grid lands here. The shell and whatever runs
+    // under it see new columns/rows and a SIGWINCH, so a TUI redraws to fit.
+    term.onResize(({ cols, rows }) => {
+      if (entry.started) this.bridge.post("term-resize", { terminalId: id, cols, rows });
+    });
     // Adopt as the active shell if none is selected yet (keeps the Terminal tab
     // pointing at a real shell even for the background boot terminal).
     if (this.snap.activeTermId === null) this.set({ activeTermId: id });
@@ -1080,7 +1085,14 @@ export class IdeController {
     entry.started = true;
     entry.openedAt = performance.now();
     const cwd = entry.cwd ?? this.activeFolder?.rootPath ?? undefined;
-    this.bridge.post("term-open", { terminalId: id, demo: entry.demo, cwd, run: entry.run ?? undefined });
+    this.bridge.post("term-open", {
+      terminalId: id,
+      demo: entry.demo,
+      cwd,
+      run: entry.run ?? undefined,
+      // The size the xterm has right now, so the shell starts at it rather than 80x24.
+      winsize: { cols: entry.term.cols, rows: entry.term.rows },
+    });
   }
 
   switchTerminal(id: string) {

@@ -6,14 +6,15 @@
 // -> .pnpm/<pkg>@<ver>/node_modules/<pkg>). Throwaway harness modelled on
 // scripts/spike-yarn.mjs.
 //
-// pnpm ships as bin/pnpm.cjs (tiny entry) -> dist/pnpm.cjs (~8.8 MB bundle) +
-// dist/worker.js + a real dist/node_modules (86 bundled deps) — ~902 files, 20 MB.
+// pnpm 11 ships as bin/pnpm.cjs -> bin/pnpm.mjs -> dist/pnpm.mjs (~15.6 MB bundle) +
+// dist/worker.js + dist/node_modules: ~450 files, 21 MB. Its store index is SQLite
+// (node:sqlite) and it reaches the registry with undici over tls.connect.
 // We force --package-import-method=copy (no hardlink/reflink CoW in our VFS) and
 // an explicit --store-dir. The node_modules symlink layout leans on the VFS's
 // symlink/readlink/lstat (which exist).
 //
 //   1) vendor:  rm -rf /tmp/vv-vendor-pnpm && mkdir -p /tmp/vv-vendor-pnpm \
-//        && (cd /tmp/vv-vendor-pnpm && npm install pnpm@9.15.9 --no-save --no-audit --no-fund)
+//        && (cd /tmp/vv-vendor-pnpm && npm install pnpm@11.28.9 --no-save --no-audit --no-fund)
 //   2) run:  node scripts/spike-pnpm.mjs [path-to-vendored-pnpm]
 //            VV_LIVE=1 streams pnpm's stdout/stderr; VV_NONET=1 skips the install gate.
 
@@ -26,7 +27,7 @@ import path from "node:path";
 
 const VENDOR_PNPM = process.argv[2] || "/tmp/vv-vendor-pnpm/node_modules/pnpm";
 const VFS_PNPM = "/usr/lib/node_modules/pnpm";
-const PNPM_VERSION = process.env.VV_PNPM_VERSION || "9.15.9";
+const PNPM_VERSION = process.env.VV_PNPM_VERSION || "11.28.9";
 const LARGE_THRESHOLD = 512 * 1024;
 
 if (!fs.existsSync(path.join(VENDOR_PNPM, "bin/pnpm.cjs"))) {

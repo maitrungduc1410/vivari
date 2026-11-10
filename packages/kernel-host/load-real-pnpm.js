@@ -17,7 +17,7 @@
 export const PNPM_VFS_ROOT = "/usr/lib/node_modules/pnpm";
 
 // Thin shims on PATH. `node /bin/pnpm.js <args>` loads the real entry
-// (bin/pnpm.cjs → dist/pnpm.cjs), which reads process.argv exactly like the
+// (bin/pnpm.cjs → bin/pnpm.mjs → dist/pnpm.mjs), which reads process.argv exactly like the
 // spike's /run-pnpm.js wrapper proved. `pnpx` is pnpm's `dlx` alias.
 const PNPM_SHIM = `// Vivari: real pnpm shim — see packages/kernel-host/load-real-pnpm.js.
 require(${JSON.stringify(PNPM_VFS_ROOT + "/bin/pnpm.cjs")});
@@ -30,7 +30,9 @@ require(${JSON.stringify(PNPM_VFS_ROOT + "/bin/pnpx.cjs")});
  *  Checks the big bundle, not just the tiny bin, so a half-written tree isn't
  *  mistaken for a complete one. */
 export function hasRealPnpm(kernel) {
-  return kernel.isFile(PNPM_VFS_ROOT + "/dist/pnpm.cjs");
+  // dist/pnpm.mjs is pnpm 11's bundle. A tree an earlier session restored from OPFS
+  // that only has 9.x's dist/pnpm.cjs fails this, so it is unpacked over again.
+  return kernel.isFile(PNPM_VFS_ROOT + "/dist/pnpm.mjs");
 }
 
 // gunzip via the platform-native DecompressionStream (browser workers + Node ≥ 18).
@@ -74,7 +76,7 @@ export function applyRealPnpmShims(kernel) {
 export async function loadRealPnpm(kernel, packBytes) {
   const { version, files } = await decodePnpmPack(packBytes);
   // One batched transfer (mkdirp + write in the FS Worker). Rides the whole tree
-  // — including pnpm's ~8.8 MB dist/pnpm.cjs — over a single transferable buffer.
+  // (including pnpm's ~15.6 MB dist/pnpm.mjs) over a single transferable buffer.
   await kernel.writeFilesBatch(files.map((f) => ({ path: PNPM_VFS_ROOT + "/" + f.path, bytes: f.bytes })));
   applyRealPnpmShims(kernel);
   return { version, fileCount: files.length };

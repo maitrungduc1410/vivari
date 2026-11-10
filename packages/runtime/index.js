@@ -101,6 +101,9 @@ export function createRuntime({
   // stdin is parked waiting for this process to exit. Defaults true so an embedder
   // that does not pass it keeps the interactive behaviour it had.
   tty = true,
+  // The terminal's size, { cols, rows }, when the spawner knows it (Vivari.spawn's
+  // `terminal`, the studio's xterm). Null means "unknown" and keeps 80x24.
+  winsize = null,
   stdout = () => {},
   stderr = () => {},
   codec = null,
@@ -137,6 +140,8 @@ export function createRuntime({
   // and is deliberately still running say so — see signals.js.
   let signalStandDown = () => {};
   let drainSignals = () => {};
+  let drainWinsize = () => {};
+  let dispatchWinsizeEvent = () => {};
   let dispatchSignalEvent = () => {};
 
   const syscalls = createSyscalls({
@@ -247,7 +252,10 @@ export function createRuntime({
     doThreads: () => drainThreadEvents(),
     doWatch: () => drainWatchEvents(),
     doStdin: () => drainStdin(),
-    doSignal: () => drainSignals(),
+    doSignal: () => {
+      drainWinsize();
+      drainSignals();
+    },
     onPark: (parked) => announceParked(parked),
   });
 
@@ -314,6 +322,7 @@ export function createRuntime({
     // process.exit() flags the loop so drive() returns the right code even when
     // exit() is called from a raw Promise microtask (its throw would escape).
     onExit: (code) => loop.requestExit(code),
+    winsize,
   });
 
   // process.kill(pid, signal): send a signal to another process via the kernel,
@@ -565,6 +574,40 @@ export function createRuntime({
     drainSignals = signals.drain;
     dispatchSignalEvent = signals.dispatch;
     signalStandDown = signals.standDown;
+  }
+
+  // ---- terminal size ----------------------------------------------------------
+  // The kernel posts { type: "winsize", cols, rows } when the terminal this process
+  // writes to changes size (Kernel#resize). Applied on a loop turn, like a signal,
+  // in Node's order: the std streams' 'resize' first (Node's tty.WriteStream
+  // refreshes its size from its own SIGWINCH listener, registered before any of
+  // the program's), then 'SIGWINCH' on process. SIGWINCH's default action is to
+  // do nothing, so it is emitted rather than sent through the kernel's signal
+  // path, whose default for an unhandled signal is to terminate.
+  {
+    let pendingWinsize = null;
+    dispatchWinsizeEvent = (msg) => {
+      const cols = msg && msg.cols | 0;
+      const rows = msg && msg.rows | 0;
+      if (!(cols > 0 && rows > 0)) return;
+      pendingWinsize = { cols, rows };
+      loop.wakeNet();
+    };
+    drainWinsize = () => {
+      if (!pendingWinsize) return;
+      const { cols, rows } = pendingWinsize;
+      pendingWinsize = null;
+      const changed = [process.stdout, process.stderr].filter(
+        (s) => s && (s.columns !== cols || s.rows !== rows),
+      );
+      if (!changed.length) return;
+      for (const s of changed) {
+        s.columns = cols;
+        s.rows = rows;
+      }
+      for (const s of changed) if (typeof s.emit === "function") s.emit("resize");
+      process.emit("SIGWINCH", "SIGWINCH");
+    };
   }
 
   // ---- fork IPC (child side): process.send / 'message' / disconnect ----------
@@ -2053,6 +2096,7 @@ export function createRuntime({
     /** External delivery from the kernel: a catchable signal for THIS process
      * ({type:'signal', signal:'SIGTERM'|'SIGINT'|…}). Emitted on a loop turn. */
     dispatchSignal: (msg) => dispatchSignalEvent(msg),
+    dispatchWinsize: (msg) => dispatchWinsizeEvent(msg),
     /** External delivery from the kernel: a CDP debugger command (JSON string) for
      * THIS process, delivered while it is RUNNING (paused commands ride the debug
      * SAB instead). No-op until a debug session is attached. */

@@ -11875,7 +11875,7 @@ What landed:
   gets the locks too.
 - `crypto.getCurves()` exists and returns `[]` until `createECDH` does (see AGENTS.md).
 
-**pnpm 11 itself is not shipped yet, and this is why.** With the above, pnpm 11.28.9 boots
+**pnpm 11 itself is not shipped yet, and this is why** (it shipped later: see "pnpm 11 ships" below). With the above, pnpm 11.28.9 boots
 in the VM (`pnpm --version` prints `11.28.9`) and opens its SQLite store index. The next
 wall is the network: unlike npm, which goes through `https.request` and so through
 `internal/fetch-transport.js`, pnpm 11 bundles **undici** and dials the registry itself with
@@ -11914,3 +11914,35 @@ at 4.3.4 spins at 100% CPU, and it does so on real Node 22 and 24 with no VM inv
 upstream and not a host or emnapi mismatch here. The template and `spike-tailwind` now pin
 `tailwindcss` and `@tailwindcss/vite` exactly. Lift the pin once a later release loads on plain
 Node (see AGENTS.md).
+
+
+### pnpm 11 ships, `tls.connect` egress, SDK snapshot/restore, terminal size
+
+**pnpm 11.28.9 is the vendored pnpm.** The wall recorded above (undici dialling the
+registry with `tls.connect`) is gone: `node/internal/tls-http-egress.js` gives an
+HTTP/1.1 client a socket whose requests are answered through the same fetch transport
+`https.request` uses. It refuses non-HTTP bytes (`ERR_VIVARI_TLS_NOT_HTTP`) and loopback
+hosts (`ERR_VIVARI_LOOPBACK_TLS`) rather than guessing. With that, `spike-pnpm` installs
+`is-number` in 1.9 s and `spike-pnpm-studio` passes through the shim with the studio's env.
+Two pnpm 11 changes needed more than the bump, both measured before writing them down:
+it reads `pnpm_config_*` and not `npm_config_*` (the studio now sets both; the studio
+spike goes red without the new spelling), and it ignores `node-linker` in `.npmrc`
+(`pnpm config get node-linker` says `undefined`), so the `monorepo` template also sets
+`nodeLinker: hoisted` in `pnpm-workspace.yaml`. `spike-pnpm-monorepo.mjs` (net) installs
+and serves that template under the vendored pnpm and fails four checks without the yaml
+line.
+
+**`Vivari.snapshot()` / `Vivari.restore()`.** The dep cache's archive format, applied to
+any directory and handed to the embedder as opaque gzipped bytes. The pack/inspect/unpack
+code moved out of `createDepCache` into shared functions so both features use one copy.
+Restore validates before writing; `spike-tree-snapshot.mjs` shows an archive with a `..`
+path really does escape when the check is removed.
+
+**Terminal size.** Processes get `{ cols, rows }` at spawn (studio xterm, SDK `terminal`),
+inherit it, and `Kernel#resize` updates a whole tree, which the guest turns into stdout /
+stderr `'resize'` then `SIGWINCH`. The order was measured on host Node under a real pty.
+`isTTY` on stdout is still false; flipping it would change colour detection everywhere and
+is its own decision.
+
+Not covered by any headless tier: the page-to-kernel relays (`vv-snapshot`, `vv-restore`,
+`proc-resize`, `term-resize`) and the studio's xterm wiring.

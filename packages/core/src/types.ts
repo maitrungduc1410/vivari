@@ -274,6 +274,31 @@ export interface ExportResult {
   truncated: boolean;
 }
 
+/** Options for {@link Vivari.snapshot}. */
+export interface SnapshotOptions {
+  /**
+   * Entry names to leave out, matched at any depth (`[".git", "dist"]`). Nothing
+   * is excluded by default: `node_modules` is usually the reason to snapshot.
+   */
+  exclude?: string[];
+  signal?: AbortSignal;
+}
+
+/** Options for {@link Vivari.restore}. */
+export interface RestoreOptions {
+  /** Directory to unpack into. Defaults to `/`. Created if missing. */
+  mountPoint?: string;
+  signal?: AbortSignal;
+}
+
+/** What {@link Vivari.restore} wrote. */
+export interface RestoreResult {
+  /** Files written (directories and symlinks are not counted). */
+  files: number;
+  /** Every entry written: files, directories and symlinks. */
+  entries: number;
+}
+
 /** Options for {@link Vivari.spawn}. */
 export interface SpawnOptions {
   /** Working directory for the process. Defaults to the VM root (or active project). */
@@ -285,6 +310,19 @@ export interface SpawnOptions {
    * `spawn()` reject with `ERR_ABORTED` without launching anything.
    */
   signal?: AbortSignal;
+  /**
+   * The size of the terminal you render this process into. The process (and
+   * anything it spawns) sees it as `process.stdout.columns` / `rows` from its
+   * first line; change it later with {@link VivariProcess.resize}. Without it a
+   * process reports 80x24.
+   */
+  terminal?: TerminalSize;
+}
+
+/** A terminal size in character cells. */
+export interface TerminalSize {
+  cols: number;
+  rows: number;
 }
 
 /** Whether a port started or stopped being served inside the VM. */

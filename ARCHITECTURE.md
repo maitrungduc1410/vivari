@@ -290,6 +290,12 @@ only wired when `VV_DEBUG` is set, so non-debug runs never allocate it.
   or, for a fresh template with no lockfile yet, `package.json` via an alias key — matches, so a
   second project with the same deps skips `install` entirely. Bounded LRU (512 MiB); also dropped by
   `?reset`. See roadmap "Persistent dependency cache".
+- **SDK snapshots** (`Vivari.snapshot()` / `Vivari.restore()`): the same archive format applied to
+  any directory, `node_modules` included. The FS worker packs it (`snapshotTreeOp`, gzipped in the
+  shipped-asset frame `{v:2, c:"gz", kind:"tree"}`) and hands the bytes back transferred; restore
+  (`restoreTreeOp`) validates the archive with the same `inspectArchive` an imported shipped
+  snapshot goes through, then unpacks it, mirroring each path to OPFS like any write. Messages:
+  page `vv-snapshot` / `vv-restore` → kernel worker → FS worker `fs-snapshot` / `fs-restore`.
 - **File watching** (`fs.watch`): `OP_WATCH` registers interest; the FS worker
   **pushes** change events back over the fs doorbell `MessagePort` (never the SAB —
   the process isn't parked on it). Events are bucketed by top-level tree to bound
@@ -388,6 +394,16 @@ only wired when `VV_DEBUG` is set, so non-debug runs never allocate it.
   `optionalDependencies`) was the temporary "Turbo-analog" — it is now **retired**
   from the shipped product (not in `COREUTILS`) and survives only as an offline
   fixture the `verify-node`/`verify-express` harnesses install themselves.
+
+**Terminal size.** Each process carries `winsize` (`{ cols, rows }` or null for
+80x24): given at spawn (`launch`/`start` `{ winsize }`, from the studio's xterm on
+`term-open` or the SDK's `spawn(..., { terminal })`), otherwise inherited from the
+parent, and handed to the guest in its spawn spec as `process.stdout/stderr.columns`
+and `rows`. `Kernel#resize(pid, cols, rows)` updates the pid and every live
+descendant and posts `{ type: "winsize" }`; the guest applies it on a loop turn and
+emits stdout `'resize'`, stderr `'resize'`, then `process` `'SIGWINCH'` (Node's
+order). SIGWINCH never goes through `Kernel#signal`, whose default for an unhandled
+signal is to terminate. Gate: `scripts/spike-terminal-size.mjs`.
 
 ---
 
@@ -718,6 +734,16 @@ host would answer from another machine). Every other URL, `host.vivari.internal`
 included, is the host's fetch unchanged; a loopback redirect that leaves the VM
 hands the rest of the chain to it. Gate: `scripts/spike-fetch-loopback.mjs`, which
 diffs each scenario against real Node.
+
+**Raw-socket HTTPS clients (`tls.connect`).** A client that dials a registry itself
+(undici, bundled by pnpm 11) gets a socket from `node/internal/tls-http-egress.js`
+instead of a TLS connection. It parses the HTTP/1.1 requests written into it
+(pipelined, chunked or Content-Length bodies), answers each through the same
+`fetch-transport` as `https.request`, strictly in order, and writes HTTP/1.1
+responses back (body re-framed as chunked; ALPN reported as `http/1.1`). Anything
+that is not HTTP/1.x is refused with `ERR_VIVARI_TLS_NOT_HTTP`, a loopback host with
+`ERR_VIVARI_LOOPBACK_TLS`. `net.connect` to an outside host is untouched. Gate:
+`scripts/spike-tls-egress.mjs`.
 
 ### 8.2 Cross-VM reachability (the kernel port registry)
 

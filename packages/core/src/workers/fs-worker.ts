@@ -20,7 +20,7 @@
 import initKernel, { VirtualFileSystem } from "../../../vfs/pkg/vivari_vfs.js";
 import { FsServer } from "../../../kernel-host/fs-server.js";
 import { createOpfsPersistence } from "../../../kernel-host/opfs-persistence.js";
-import { createDepCache } from "../../../kernel-host/dep-cache.js";
+import { createDepCache, snapshotTreeOp, restoreTreeOp } from "../../../kernel-host/dep-cache.js";
 
 const post = (type, extra, transfer) =>
   self.postMessage({ type, ...extra }, transfer && transfer.length ? transfer : undefined);
@@ -128,6 +128,31 @@ function handle(msg) {
           post("dep-cache-import-ok", { id: msg.id, result: res });
         } catch (err) {
           post("dep-cache-import-err", { id: msg.id, error: String(err?.message || err) });
+        }
+      })();
+      break;
+    // Vivari.snapshot()/restore(): a whole tree to opaque bytes and back. The ops
+    // live in dep-cache.js, shared with the headless twin (scripts/fs-worker.mjs).
+    // A restored tree is mirrored to OPFS like any other write, minus what
+    // shouldPersist already leaves out (node_modules among it).
+    case "fs-snapshot":
+      (async () => {
+        try {
+          const r = await snapshotTreeOp(accessRef, { root: msg.root, exclude: msg.exclude });
+          post("fs-snapshot-ok", { id: msg.id, result: r }, [r.bytes.buffer]);
+        } catch (err) {
+          post("fs-snapshot-err", { id: msg.id, error: String(err?.message || err), code: err?.code });
+        }
+      })();
+      break;
+    case "fs-restore":
+      (async () => {
+        try {
+          const onPath = server && server.persistence ? (p) => server.persistence.onWrite(p) : undefined;
+          const result = await restoreTreeOp(accessRef, msg.bytes, msg.dir, onPath);
+          post("fs-restore-ok", { id: msg.id, result });
+        } catch (err) {
+          post("fs-restore-err", { id: msg.id, error: String(err?.message || err), code: err?.code });
         }
       })();
       break;

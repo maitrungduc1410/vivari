@@ -1195,10 +1195,16 @@ function baseProcEnv(dir) {
     // memory sink). The VFS now supports link(2) (see OP_LINK); on a wasm build
     // that predates it, the runtime's fs.link transparently falls back to a copy,
     // so this is safe either way. The content-addressed store is persisted so it
-    // is shared across projects/reloads too. (npm_config_* is how pnpm reads
-    // config from env.)
+    // is shared across projects/reloads too. pnpm 9 and corepack-pinned older
+    // releases read npm_config_*; pnpm 11 reads only pnpm_config_*, so each
+    // setting is given in both spellings (spike-pnpm-studio checks the store
+    // lands where these say).
     npm_config_package_import_method: "hardlink",
     npm_config_store_dir: "/home/user/.local/share/pnpm/store",
+    pnpm_config_package_import_method: "hardlink",
+    pnpm_config_store_dir: "/home/user/.local/share/pnpm/store",
+    pnpm_config_strict_store_pkg_content_check: "false",
+    pnpm_config_update_notifier: "false",
     // Registry packument aliasing serves wasm drop-in tarballs (e.g.
     // lightningcss-wasm) under the native package name (lightningcss). Alongside
     // the load-time store-alias remap in toolchain-shims.js, disable pnpm's
@@ -1248,7 +1254,7 @@ function baseProcEnv(dir) {
 const execByPid = new Map(); // pid -> execId
 const pidByExec = new Map(); // execId -> pid
 
-async function spawnProcess(execId, command, args, cwd, extraEnv) {
+async function spawnProcess(execId, command, args, cwd, extraEnv, winsize) {
   if (!kernel) {
     post("proc-exit", { execId, code: 127, error: "kernel not ready" });
     return;
@@ -1262,7 +1268,7 @@ async function spawnProcess(execId, command, args, cwd, extraEnv) {
   // which the kernel gates itself), so the gate has to run here.
   await kernel.ensureCommandLoaded(command);
   if (!kernel) return;
-  const pid = kernel.launch(command, Array.isArray(args) ? args : [], { cwd: dir, env });
+  const pid = kernel.launch(command, Array.isArray(args) ? args : [], { cwd: dir, env, winsize });
   if (pid < 0) {
     post("proc-exit", { execId, code: 127, error: command + ": not found" });
     return;
@@ -1272,7 +1278,7 @@ async function spawnProcess(execId, command, args, cwd, extraEnv) {
   post("proc-started", { execId, pid });
 }
 
-async function openTerminal(terminalId, cwd, demoId, run) {
+async function openTerminal(terminalId, cwd, demoId, run, winsize) {
   if (!kernel) return;
   const d = demoId ? DEMOS[demoId] : null;
   if (d) scaffoldDemo(demoId);
@@ -1306,7 +1312,7 @@ async function openTerminal(terminalId, cwd, demoId, run) {
     if (p && p.env && typeof p.env === "object") Object.assign(env, p.env);
     projectDirByTerm.set(terminalId, dir);
   }
-  const pid = kernel.launch("sh", [], { cwd: dir, env });
+  const pid = kernel.launch("sh", [], { cwd: dir, env, winsize });
   if (pid < 0) {
     post("term-exit", { terminalId, code: 127 });
     return;
@@ -2713,13 +2719,19 @@ self.onmessage = async (event) => {
   // the project and auto-run its dev command in this shell (VV_RUN), so the server
   // lives in this tab.
   if (m.type === "term-open") {
-    await openTerminal(m.terminalId, m.cwd, m.demo, m.run);
+    await openTerminal(m.terminalId, m.cwd, m.demo, m.run, m.winsize);
     return;
   }
   // Keystrokes from an xterm — feed them to that terminal's shell stdin.
   if (m.type === "term-input") {
     const pid = pidByTerm.get(m.terminalId);
     if (pid != null && kernel) kernel.sendStdin(pid, m.chunk);
+    return;
+  }
+  // The xterm was resized: tell the shell and everything running under it.
+  if (m.type === "term-resize") {
+    const pid = pidByTerm.get(m.terminalId);
+    if (pid != null && kernel) kernel.resize(pid, m.cols, m.rows);
     return;
   }
   // The user closed a terminal tab — kill its shell (and any foreground child).
@@ -2733,7 +2745,7 @@ self.onmessage = async (event) => {
   // Run one command directly (no wrapping shell) and stream its output/exit back
   // by `execId`. See spawnProcess + the execByPid routing in boot().
   if (m.type === "proc-spawn") {
-    void spawnProcess(m.execId, m.command, m.args, m.cwd, m.env).catch((err) =>
+    void spawnProcess(m.execId, m.command, m.args, m.cwd, m.env, m.winsize).catch((err) =>
       post("proc-exit", { execId: m.execId, code: 127, error: (err && err.message) || String(err) }),
     );
     return;
@@ -2742,6 +2754,12 @@ self.onmessage = async (event) => {
   if (m.type === "proc-input") {
     const pid = pidByExec.get(m.execId);
     if (pid != null && kernel) kernel.sendStdin(pid, m.chunk == null ? null : m.chunk);
+    return;
+  }
+  // The embedder's terminal for a spawned process changed size (VivariProcess#resize).
+  if (m.type === "proc-resize") {
+    const pid = pidByExec.get(m.execId);
+    if (pid != null && kernel) kernel.resize(pid, m.cols, m.rows);
     return;
   }
   // Kill a spawned process (its exit is still reported via onProcExit → proc-exit).
@@ -2969,6 +2987,43 @@ self.onmessage = async (event) => {
         post("vv-reply", { reqId: m.reqId, ok: true, restored });
       } catch (err) {
         post("vv-reply", { reqId: m.reqId, ok: false, error: errMsg(err) });
+      }
+    })();
+    return;
+  }
+
+  // Vivari.snapshot(): pack a directory (node_modules included unless excluded) into
+  // opaque gzipped bytes. The walk and the packing run in the FS worker, which holds
+  // the VFS; the bytes come back transferred and go on to the page transferred.
+  if (m.type === "vv-snapshot") {
+    if (!kernel || !kernelFsRef) { replyNotReady(m.reqId); return; }
+    (async () => {
+      try {
+        const r = await kernelFsRef.fs.snapshotTree(String(m.root || "/"), Array.isArray(m.exclude) ? m.exclude : []);
+        self.postMessage(
+          { type: "vv-reply", reqId: m.reqId, ok: true, bytes: r.bytes, files: r.files, entries: r.entries },
+          [r.bytes.buffer],
+        );
+      } catch (err) {
+        replyErr(m.reqId, err);
+      }
+    })();
+    return;
+  }
+
+  // Vivari.restore(): validate snapshot bytes and unpack them under `dir`. The tree
+  // changed under every watcher at once, so one vv-fs-changed for the root.
+  if (m.type === "vv-restore") {
+    if (!kernel || !kernelFsRef) { replyNotReady(m.reqId); return; }
+    (async () => {
+      try {
+        const dir = String(m.dir || "/");
+        const bytes = m.bytes instanceof Uint8Array ? m.bytes : new Uint8Array(m.bytes || 0);
+        const r = await kernelFsRef.fs.restoreTree(bytes, dir);
+        postFsChanged(dir, "change");
+        post("vv-reply", { reqId: m.reqId, ok: true, files: r.files, entries: r.entries });
+      } catch (err) {
+        replyErr(m.reqId, err);
       }
     })();
     return;

@@ -9,7 +9,7 @@
 //   await vivari.spawn("npm", ["run", "dev"]);
 
 import { KernelBridge, TEARDOWN_MESSAGE, isCrossOriginIsolated } from "./bridge.js";
-import { VivariError } from "./errors.js";
+import { VivariError, VivariFsError, isFsErrorCode, toErrorCode } from "./errors.js";
 import { FileSystemAPI } from "./fs.js";
 import { mountTree } from "./mount.js";
 import { VivariProcess } from "./process.js";
@@ -22,6 +22,9 @@ import type {
   KernelMessage,
   ListenerOptions,
   MountOptions,
+  RestoreOptions,
+  RestoreResult,
+  SnapshotOptions,
   SpawnOptions,
   Unsubscribe,
   VivariEventMap,
@@ -29,6 +32,14 @@ import type {
 } from "./types.js";
 
 const DEFAULT_BOOT_TIMEOUT = 60_000;
+
+// A failed snapshot/restore reply → the error the caller sees. A filesystem code
+// keeps its path; anything else is ERR_UNKNOWN with the kernel's message.
+function replyError(m: KernelMessage, syscall: string, path: string): VivariError {
+  const code = toErrorCode(m.code);
+  const message = (m.error as string) || `${syscall} failed: ${path}`;
+  return isFsErrorCode(code) ? new VivariFsError(code, syscall, path, message) : new VivariError(code, message);
+}
 
 // Listeners are stored with their argument tuple erased. `never` as the rest type
 // makes every VivariListener assignable here (contravariance), so this is the one
@@ -227,10 +238,56 @@ export class Vivari {
     if (m.ok === false) {
       throw new VivariError("ERR_UNKNOWN", (m.error as string) || `export failed: ${path}`);
     }
+    // The kernel's walk (shared with the studio's zip export) names the bytes
+    // `bytes`; the public shape names them `contents`, like mount()'s tree.
+    const files = (m.files as { path: string; bytes: Uint8Array }[] | undefined) ?? [];
     return {
-      files: (m.files as ExportedFile[]) ?? [],
+      files: files.map((f): ExportedFile => ({ path: f.path, contents: f.bytes })),
       truncated: !!m.truncated,
     };
+  }
+
+  /**
+   * Pack a directory, `node_modules` included, into opaque bytes that
+   * {@link Vivari.restore} can unpack into this or another instance. Store them
+   * (IndexedDB, Cache Storage, your own CDN) and a later session skips the install:
+   * restoring is one unpack instead of a registry round-trip per package.
+   *
+   * The bytes are gzipped and their layout is private to Vivari. Treat them as a
+   * blob; a snapshot is readable by the same or a later `@vivari/core`.
+   */
+  async snapshot(path = "/", options: SnapshotOptions = {}): Promise<Uint8Array> {
+    const m = await this.internal.request(
+      "vv-snapshot",
+      { root: path, exclude: options.exclude },
+      { signal: options.signal },
+    );
+    if (m.ok === false) throw replyError(m, "snapshot", path);
+    return m.bytes as Uint8Array;
+  }
+
+  /**
+   * Unpack bytes from {@link Vivari.snapshot} under `options.mountPoint` (default
+   * `/`), overwriting files that exist and leaving other files alone. The bytes are
+   * validated before anything is written, so damaged or foreign input rejects with
+   * `EINVAL` and the filesystem is untouched.
+   *
+   * The buffer is transferred to the worker, not copied: after this call,
+   * `snapshot` is detached and reads as empty. Pass `snapshot.slice()` to keep it.
+   */
+  async restore(snapshot: Uint8Array | ArrayBuffer, options: RestoreOptions = {}): Promise<RestoreResult> {
+    const mountPoint = options.mountPoint ?? "/";
+    const bytes = snapshot instanceof Uint8Array ? snapshot : new Uint8Array(snapshot);
+    // Transfer only a buffer the view owns whole; otherwise copy the slice, so we
+    // never detach bytes that belong to something else.
+    const own = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? bytes : bytes.slice();
+    const m = await this.internal.request(
+      "vv-restore",
+      { bytes: own, dir: mountPoint },
+      { signal: options.signal, transfer: [own.buffer] },
+    );
+    if (m.ok === false) throw replyError(m, "restore", mountPoint);
+    return { files: (m.files as number) | 0, entries: (m.entries as number) | 0 };
   }
 
   /**

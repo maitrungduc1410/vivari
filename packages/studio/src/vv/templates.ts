@@ -9042,6 +9042,9 @@ function monorepoTemplate(): TemplateDef {
       // in-VM rolldown dep-optimizer can then bundle those transitive CJS deps; under
       // the isolated store it externalised `scheduler` → the preview crashed with
       // "Calling require for scheduler in an environment that doesn't expose require".
+      // pnpm 11 (the vendored one) reads this only from pnpm-workspace.yaml and
+      // ignores it in .npmrc; the .npmrc line is for an older pnpm a project pins
+      // through corepack.
       ".npmrc": `node-linker=hoisted
 `,
       "package.json": `{
@@ -9053,6 +9056,7 @@ function monorepoTemplate(): TemplateDef {
       "pnpm-workspace.yaml": `packages:
   - 'apps/*'
   - 'packages/*'
+nodeLinker: hoisted
 `,
       "packages/ui/package.json": `{
   "name": "@repo/ui",

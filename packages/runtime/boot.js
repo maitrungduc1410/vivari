@@ -67,6 +67,7 @@ export function bootProcess({
     // the shell, for every stage of a pipeline and every `<` redirect — now says so, and
     // that answer wins; `!capture` stays the default for everyone who does not.
     tty: spec.tty === undefined ? !spec.capture : !!spec.tty,
+    winsize: spec.winsize || null,
     stdout: (chunk) => send("stdout", { chunk }),
     stderr: (chunk) => send("stderr", { chunk }),
     postRaw,
@@ -111,6 +112,7 @@ export function bootProcess({
       dispatchPipe: runtime.dispatchPipe,
       dispatchStdin: runtime.dispatchStdin,
       dispatchSignal: runtime.dispatchSignal,
+      dispatchWinsize: runtime.dispatchWinsize,
       dispatchFetch: runtime.dispatchFetch,
       dispatchDebugCommand: runtime.dispatchDebugCommand,
       memStats: runtime.memStats,

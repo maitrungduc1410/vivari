@@ -144,6 +144,17 @@ function inboundBodyBytes(req) {
 // the url, headers and framing that share the frame.
 const INBOX_INLINE_MAX = DATA_BYTES - 16 * 1024;
 
+// A terminal size as the kernel keeps it: two positive integers, bounded so a
+// bad embedder value cannot become a guest allocating a 10^9-column line buffer.
+function normalizeWinsize(ws) {
+  if (!ws || typeof ws !== "object") return null;
+  const cols = Number(ws.cols);
+  const rows = Number(ws.rows);
+  if (!Number.isInteger(cols) || !Number.isInteger(rows)) return null;
+  if (cols < 1 || rows < 1 || cols > 10000 || rows > 10000) return null;
+  return { cols, rows };
+}
+
 export class Kernel {
   constructor({ fs, spawnWorker, stdout, stderr, fetcher, signalGraceMs }) {
     this.fs = fs;
@@ -606,6 +617,11 @@ export class Kernel {
       serverInbox: [], // queued { reqId, port, req } drained by non-blocking accept
       // #16 stage 2b: reqId -> child pid for worker_threads this process spawned.
       threads: null,
+      // The terminal size this process writes to, { cols, rows } or null for
+      // "unknown" (the guest then says 80x24). Given at spawn by whoever owns the
+      // terminal, otherwise inherited, because a child of a shell draws into the
+      // shell's terminal. Kept current by resize().
+      winsize: normalizeWinsize(spec.winsize) || (parentPid != null && this.procs.get(parentPid)?.winsize) || null,
     };
     this.procs.set(pid, proc);
 
@@ -655,7 +671,7 @@ export class Kernel {
       // and the flowing path needs the same fact — process.stdin.isTTY was
       // hardcoded true, so `node` with no script could not tell an interactive
       // shell from a spawnSync and would sit at a prompt nobody could reach.
-      spec: { ...spec, pid, ppid: parentPid ?? 0, capture },
+      spec: { ...spec, pid, ppid: parentPid ?? 0, capture, winsize: proc.winsize },
       // #16 stage 2b: a spawned thread gets its creator's MessageChannel end as a
       // transferable, delivered to the worker as parentPort at init.
       threadPort,
@@ -758,6 +774,31 @@ export class Kernel {
 
   // Post a message to a process' worker (out of band from the SAB). Used to relay
   // async child (#15) and worker_thread (2b) lifecycle to the parent's loop.
+  /**
+   * The terminal `pid` writes to changed size. Updates it and every live
+   * descendant (they draw into the same terminal) and posts each a `winsize`
+   * message, which the guest turns into stdout 'resize' and process 'SIGWINCH'.
+   * Returns false for an unknown pid or a size that is not two positive integers.
+   */
+  resize(pid, cols, rows) {
+    const size = normalizeWinsize({ cols, rows });
+    const root = this.procs.get(pid);
+    if (!size || !root || root.finalized) return false;
+    const inTree = (p) => {
+      for (let cur = p; cur; cur = cur.parentPid != null ? this.procs.get(cur.parentPid) : null) {
+        if (cur.pid === pid) return true;
+      }
+      return false;
+    };
+    for (const p of this.procs.values()) {
+      if (p.finalized || !inTree(p)) continue;
+      if (p.winsize && p.winsize.cols === size.cols && p.winsize.rows === size.rows) continue;
+      p.winsize = size;
+      this.postToProc(p.pid, { type: "winsize", cols: size.cols, rows: size.rows });
+    }
+    return true;
+  }
+
   postToProc(pid, msg) {
     const p = this.procs.get(pid);
     if (p && p.handle && p.handle.postMessage) {
@@ -1109,7 +1150,7 @@ export class Kernel {
       // breakpoint debugger's skip-list (`sh`/`npm`/…): without it a debug-mode
       // shell has command=undefined and is wrongly treated as a debug target, so
       // auto-attach lands on the shell instead of the `node` the user runs.
-      { command, programPath, args, cwd, env: opts.env || {} },
+      { command, programPath, args, cwd, env: opts.env || {}, winsize: opts.winsize },
       { capture: !!opts.capture },
     );
     // Captured here too. `start` grew this first, and leaving `launch` without it gave
@@ -1152,7 +1193,7 @@ export class Kernel {
         return;
       }
       const pid = this.createProcess(
-        { command, programPath, args, cwd, env: opts.env || {} },
+        { command, programPath, args, cwd, env: opts.env || {}, winsize: opts.winsize },
         { capture: !!opts.capture },
       );
       const proc = this.procs.get(pid);

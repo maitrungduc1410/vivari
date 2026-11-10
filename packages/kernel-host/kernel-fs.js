@@ -263,8 +263,38 @@ export function createKernelFs(fsWorker) {
     });
   }
 
+  // Vivari.snapshot()/restore() (dep-cache.js snapshotTreeOp/restoreTreeOp). The
+  // snapshot comes back transferred; restore TRANSFERS `bytes` in, so the caller's
+  // buffer is detached afterwards.
+  function snapshotTree(root, exclude) {
+    return depCacheCall("fs-snapshot", { root, exclude });
+  }
+  function restoreTree(bytes, dir) {
+    const own = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? bytes : bytes.slice();
+    return new Promise((resolve, reject) => {
+      const id = seq++;
+      pending.set(id, { resolve, reject });
+      fsWorker.postMessage({ type: "fs-restore", id, bytes: own, dir }, [own.buffer]);
+    });
+  }
+
   function onMessage(msg) {
     if (!msg) return;
+    if (msg.type === "fs-snapshot-ok" || msg.type === "fs-restore-ok") {
+      const p = pending.get(msg.id);
+      if (p) { pending.delete(msg.id); p.resolve(msg.result); }
+      return;
+    }
+    if (msg.type === "fs-snapshot-err" || msg.type === "fs-restore-err") {
+      const p = pending.get(msg.id);
+      if (p) {
+        pending.delete(msg.id);
+        const err = new Error(msg.error || "EIO");
+        err.code = msg.code || "EIO";
+        p.reject(err);
+      }
+      return;
+    }
     if (msg.type === "fetch-body-consumed") {
       // The FS worker saw a process finish reading a fetched body. Routed here
       // rather than in each embedder's message handler so the browser and headless
@@ -379,6 +409,8 @@ export function createKernelFs(fsWorker) {
     depCacheSave,
     depCacheRestore,
     depCacheImport,
+    snapshotTree,
+    restoreTree,
     // Called by the Kernel constructor to receive fetched-body read completions.
     setBodyConsumedHandler(fn) {
       onBodyConsumed = fn;

@@ -4,7 +4,7 @@
 
 import { nativeAddonError } from "./bun-unsupported.js";
 
-export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/", stdout, stderr, nextTick, onExit }) {
+export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/", stdout, stderr, nextTick, onExit, winsize = null }) {
   let _cwd = cwd || "/";
   // nextTick is owned by the event loop (loop.js): its queue drains ahead of
   // Promise microtasks each turn. Fall back to a microtask if no loop is wired.
@@ -56,39 +56,77 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     rows: 24,
     writable: true,
     destroyed: false,
-    // Writes go straight to the sink (never backpressured), so the EventEmitter /
-    // Writable surface is a no-op — but it must EXIST: real tools register
-    // listeners on stdout/stderr (e.g. yarn does `process.stdout.prependListener`
-    // during bootstrap). Missing methods throw "is not a function" and abort.
-    on() {
+    // Writes go straight to the sink (never backpressured), so nothing here ever
+    // emits 'drain' or 'error', but the EventEmitter surface must EXIST: real tools
+    // register listeners on stdout/stderr (e.g. yarn does
+    // `process.stdout.prependListener` during bootstrap). It is a real (small)
+    // emitter rather than a set of no-ops because one event does fire: 'resize',
+    // when the terminal on the other end changes size (see the runtime's
+    // dispatchWinsize). A TUI that listens for it has to actually hear it.
+    _vvListeners: null,
+    _vvAdd(event, fn, once, prepend) {
+      if (typeof fn !== "function") return this;
+      const map = (this._vvListeners ??= new Map());
+      const list = map.get(event) || [];
+      const entry = { fn, once };
+      if (prepend) list.unshift(entry);
+      else list.push(entry);
+      map.set(event, list);
       return this;
     },
-    once() {
+    on(event, fn) {
+      return this._vvAdd(event, fn, false, false);
+    },
+    addListener(event, fn) {
+      return this._vvAdd(event, fn, false, false);
+    },
+    once(event, fn) {
+      return this._vvAdd(event, fn, true, false);
+    },
+    prependListener(event, fn) {
+      return this._vvAdd(event, fn, false, true);
+    },
+    prependOnceListener(event, fn) {
+      return this._vvAdd(event, fn, true, true);
+    },
+    removeListener(event, fn) {
+      const list = this._vvListeners && this._vvListeners.get(event);
+      if (list) {
+        const i = list.findIndex((e) => e.fn === fn);
+        if (i >= 0) list.splice(i, 1);
+      }
       return this;
     },
-    addListener() {
+    off(event, fn) {
+      return this.removeListener(event, fn);
+    },
+    removeAllListeners(event) {
+      if (!this._vvListeners) return this;
+      if (event === undefined) this._vvListeners.clear();
+      else this._vvListeners.delete(event);
       return this;
     },
-    prependListener() {
-      return this;
+    emit(event, ...args) {
+      const list = this._vvListeners && this._vvListeners.get(event);
+      if (!list || !list.length) return false;
+      for (const e of list.slice()) {
+        if (e.once) this.removeListener(event, e.fn);
+        e.fn.apply(this, args);
+      }
+      return true;
     },
-    prependOnceListener() {
-      return this;
+    listeners(event) {
+      const list = this._vvListeners && this._vvListeners.get(event);
+      return list ? list.map((e) => e.fn) : [];
     },
-    removeListener() {
-      return this;
+    listenerCount(event) {
+      const list = this._vvListeners && this._vvListeners.get(event);
+      return list ? list.length : 0;
     },
-    removeAllListeners() {
-      return this;
-    },
-    emit() {
-      return false;
-    },
-    listeners() {
-      return [];
-    },
-    listenerCount() {
-      return 0;
+    // Node only has this on a tty.WriteStream; the size it reports is the
+    // terminal's when one was given at spawn (or by a resize), else 80x24.
+    getWindowSize() {
+      return [this.columns, this.rows];
     },
     setMaxListeners() {
       return this;
@@ -107,6 +145,17 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
       return this;
     },
   });
+
+  // The terminal size this process was started with (Vivari.spawn's `terminal`,
+  // inherited by children), so a TUI lays itself out for the real width on its
+  // first draw rather than for 80 columns and then on the first resize.
+  const sized = (stream) => {
+    if (winsize && winsize.cols > 0 && winsize.rows > 0) {
+      stream.columns = winsize.cols;
+      stream.rows = winsize.rows;
+    }
+    return stream;
+  };
 
   const nowNs = () =>
     BigInt(Math.round((globalThis.performance?.now?.() ?? Date.now()) * 1e6));
@@ -267,8 +316,8 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     memoryUsage,
     cpuUsage,
     resourceUsage,
-    stdout: makeStream(stdout, 1),
-    stderr: makeStream(stderr, 2),
+    stdout: sized(makeStream(stdout, 1)),
+    stderr: sized(makeStream(stderr, 2)),
     stdin: { fd: 0, on() {}, once() {}, read: () => null, isTTY: false },
     // No-op event surface so libraries calling process.on(...) don't crash.
     on() {

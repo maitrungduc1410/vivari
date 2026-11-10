@@ -76,6 +76,14 @@ kernel.mkdirp("/tmp");
 kernel.mkdirp("/home/user");
 kernel.mkdirp("/tmp/.pnpm-store");
 kernel.mkdirp("/app");
+// pnpm 11's store index is SQLite (node:sqlite). The studio points processes at the
+// engine by URL (VV_SQLITE_WASM_URL); with no HTTP server here it goes in the VFS.
+const SQLITE_ENGINE_VFS = "/usr/lib/vivari/sqlite3.wasm";
+kernel.mkdirp("/usr/lib/vivari");
+await kernelFs.fs.writeLarge(
+  SQLITE_ENGINE_VFS,
+  new Uint8Array(fs.readFileSync(path.join(ROOT, "packages", "runtime", "vendor", "sqlite", "sqlite3.wasm"))),
+);
 const t0 = Date.now();
 const loaded = await ensureRealPnpm(kernel, async () => new Uint8Array(fs.readFileSync(ASSET)));
 console.log(`ensureRealPnpm: version=${loaded && loaded.version} files=${loaded && loaded.fileCount} (${Date.now() - t0}ms)`);
@@ -85,22 +93,29 @@ const shim = kernel.readFile("/bin/pnpm.js") || "";
 const shimOk = /real pnpm shim/.test(shim) && shim.includes(PNPM_VFS_ROOT + "/bin/pnpm.cjs");
 console.log(`shim gate: ${shimOk ? "PASS" : "FAIL"}  (/bin/pnpm.js -> real bin/pnpm.cjs)`);
 
-// Mirror studio's openTerminal env (config via npm_config_*, NOT CLI flags).
+// Mirror studio's openTerminal env (config via environment, NOT CLI flags). pnpm 11
+// reads pnpm_config_*, not npm_config_*, so the studio sets both.
 const env = {
   HOME: "/home/user",
   PATH: "/bin",
   npm_config_package_import_method: "hardlink",
   npm_config_store_dir: "/tmp/.pnpm-store",
   npm_config_strict_store_pkg_content_check: "false",
+  pnpm_config_package_import_method: "hardlink",
+  pnpm_config_store_dir: "/tmp/.pnpm-store",
+  pnpm_config_strict_store_pkg_content_check: "false",
+  pnpm_config_update_notifier: "false",
+  VV_SQLITE_WASM_PATH: SQLITE_ENGINE_VFS,
   XDG_DATA_HOME: "/home/user/.local/share",
   XDG_CACHE_HOME: "/home/user/.cache",
   XDG_STATE_HOME: "/home/user/.local/state",
   XDG_CONFIG_HOME: "/home/user/.config",
 };
 
-// Gate B: `pnpm --version` resolved via PATH -> /bin/pnpm.js -> real pnpm == 9.15.9.
+// Gate B: `pnpm --version` resolved via PATH -> /bin/pnpm.js -> real pnpm, and the
+// version it prints is the one the asset was packed from.
 const v = await kernel.start("pnpm", ["--version"], { cwd: "/app", env, capture: true });
-const versionOk = v.code === 0 && /^\s*9\.15\.9\s*$/.test(v.stdout || "");
+const versionOk = v.code === 0 && !!loaded && (v.stdout || "").trim() === loaded.version;
 console.log(`version gate: ${versionOk ? "PASS" : "FAIL"}  pnpm --version -> ${JSON.stringify((v.stdout || "").trim())}`);
 if (!versionOk && v.stderr) console.log("stderr:\n" + v.stderr.trim());
 
@@ -143,6 +158,10 @@ if (process.env.VV_NET === "1") {
   const linked = kernel.exists(`/app/node_modules/${PKG}/package.json`);
   const virtualStore = kernel.exists("/app/node_modules/.pnpm");
   const lockfile = kernel.exists("/app/pnpm-lock.yaml");
+  // The env's store dir was honoured (pnpm 11 ignores npm_config_store_dir, so
+  // without pnpm_config_* the store would land under XDG_DATA_HOME instead).
+  const storeHonoured = kernel.exists("/tmp/.pnpm-store/v11");
+  console.log(`store at /tmp/.pnpm-store/v11: ${storeHonoured}`);
   console.log(
     `install exit=${inst0.code}/${inst.code} (${Date.now() - t1}ms)  node_modules/${PKG}: ${linked}  .pnpm: ${virtualStore}  lock: ${lockfile}  noStoreMismatch: ${noStoreMismatch}`,
   );
@@ -163,7 +182,7 @@ console.log("REQUIRE_OK " + typeof p + " " + real);`,
     requireOk = use.code === 0 && /REQUIRE_OK/.test(use.stdout || "");
     console.log("require installed pkg (via symlink + realpathSync.native): " + (requireOk ? "PASS " + use.stdout.trim() : "FAIL\n" + (use.stderr || use.stdout)));
   }
-  installOk = inst0.code === 0 && inst.code === 0 && noStoreMismatch && linked && virtualStore && requireOk;
+  installOk = inst0.code === 0 && inst.code === 0 && noStoreMismatch && storeHonoured && linked && virtualStore && requireOk;
   console.log(`install gate: ${installOk ? "PASS" : "FAIL"}`);
 } else {
   console.log("\n(install gate skipped — set VV_NET=1 to run it)");

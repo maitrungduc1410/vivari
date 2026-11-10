@@ -706,6 +706,29 @@ the same standing as the `TextEncoder` and `crypto.subtle` this module already u
 the seam where that gets revisited if hosting bytes ever argue louder than they do today. A
 codec this build does not implement returns null and the caller installs normally.
 
+### `Vivari.snapshot()` / `restore()` reuse the dep-cache archive, and restore validates first
+
+The SDK exposes what the dep cache already did internally: `vivari.snapshot(path)` packs
+a directory, `node_modules` included, into opaque bytes, and `vivari.restore(bytes,
+{ mountPoint })` unpacks them, so an embedder can store a warmed project and skip the
+install next session. The archive is the dep cache's own format (`packTree` /
+`inspectArchive` / `unpackArchive` in `kernel-host/dep-cache.js`, now shared by both), in
+the shipped-asset frame (`{v:2, c:"gz", kind:"tree"}`), gzipped by the FS worker. The ops
+are `snapshotTreeOp` / `restoreTreeOp`, called from both FS workers so the browser and the
+headless twin cannot drift; the kernel worker relays `vv-snapshot` / `vv-restore`.
+
+- **Restore takes bytes from an embedder, so it validates before it writes**, exactly as
+  an imported shipped snapshot does. Truncated bytes, an HTML page, or an archive with an
+  absolute or `..` path reject with `EINVAL` and nothing is written. With validation
+  removed, `spike-tree-snapshot.mjs`'s `..` archive really does write outside the
+  destination, which is why that check is in the spike.
+- **Both directions transfer.** The snapshot comes back transferred, and `restore()`
+  transfers its input (copying first only when the view does not own its whole buffer),
+  so the caller's array is detached afterwards. The SDK doc says so; do not "fix" it into
+  a copy, these are tens of MB.
+- **Restore merges.** Files the snapshot carries are overwritten, others are left alone.
+- The page-to-kernel relay is browser-only; the spike covers the FS-worker half.
+
 ### Ship the template's lockfile and npm stops downloading 143 MB of metadata
 Without a `package-lock.json`, npm's Arborist resolves from the registry, and its
 `#fetchManifest` hardcodes `fullMetadata: true`. Measured against the real registry:
@@ -2001,6 +2024,44 @@ so an unread body cannot pin the process on an open socket. Gate:
 `node scripts/spike-fetch-loopback.mjs` — every scenario runs on real Node and in
 the VM, transcripts must match.
 
+### `tls.connect` to an outside host is HTTP/1.1 over fetch, and nothing else
+
+There is no TLS and no raw outbound socket in a tab, so `tls.connect` used to throw
+`ERR_METHOD_NOT_IMPLEMENTED`. That was fine while every HTTP client went through
+`https.request` (npm does), and stopped being fine with pnpm 11: it bundles undici, and
+undici dials the registry itself with `tls.connect` and writes HTTP/1.1 into the socket.
+Every pnpm 11 install died on `ERR_PNPM_META_FETCH_FAIL ... fetch failed`.
+
+`node/internal/tls-http-egress.js` is the other end of that socket. It parses what the
+client writes (request line, headers, a Content-Length or chunked body, pipelined
+requests, a request split across any number of writes), sends each one through
+`internal/fetch-transport.js` (the transport `https.request` uses, so the same cache and
+egress-header policy), and writes an HTTP/1.1 response back for the client's own parser.
+Rules worth knowing before touching it:
+
+- **It refuses what it cannot carry, by name.** Bytes that are not an HTTP/1.x request
+  line destroy the socket with `ERR_VIVARI_TLS_NOT_HTTP`; a Postgres or SMTP client gets
+  that instead of waiting forever. A loopback host throws `ERR_VIVARI_LOOPBACK_TLS` (no
+  in-VM TLS server exists, and fetch would reach the user's real machine, same rule as
+  `fetch('https://localhost')`). `tls.connect({ socket })` (a proxy tunnel) and a `path`
+  still throw `ERR_METHOD_NOT_IMPLEMENTED`.
+- **The response is re-framed.** The body goes out chunked and `Content-Encoding` /
+  `Content-Length` are dropped, because fetch already decoded it and the kernel strips
+  both anyway. So a HEAD answer cannot report a size, the same limit `https.request` has.
+- **ALPN is always `http/1.1`.** That is what a server that only speaks 1.1 answers, so a
+  client offering `h2` falls back on its own.
+- **Responses go out strictly in order**, one request at a time per socket. Undici's
+  default pipelining of 1 never notices; a client that pipelines still gets correct
+  answers, just not concurrently.
+- `net.connect` to an outside host is unchanged (still `ENOTFOUND`/`EHOSTUNREACH`, see the
+  loopback-only gotcha). Plain-http raw-socket egress is not bridged, on purpose: a TCP
+  socket is far more likely than a TLS one to carry something that is not HTTP.
+
+Gated offline by `spike-tls-egress.mjs` (stub fetcher: pipelining, split writes, both
+body framings, HEAD/204, `Connection: close`, the refusals). Real undici is exercised by
+`spike-pnpm.mjs` / `spike-pnpm-studio.mjs` on the net tier. All 17 offline checks go red
+with the old `tls.js`.
+
 ### `writeLarge` must transfer a STANDALONE ArrayBuffer
 The kernel hands a fetched tarball to the FS Worker over a *transferred* buffer
 (`kernel-fs.js` `writeLarge`), to bypass the 1 MiB SAB. The trap: a `Uint8Array`
@@ -2640,13 +2701,29 @@ What makes pnpm special:
 - The VFS now supports real hard links (`link(2)`, `nlink` refcount), so pnpm can
   hard-link from its store instead of copying — several names share ONE inode's
   bytes in RAM. A user types bare `pnpm add` (no room for flags), so the shell env
-  carries the config the npm way: `npm_config_package_import_method=hardlink` +
-  `npm_config_store_dir=/home/user/.local/share/pnpm/store` (PERSISTED, so the store
-  is shared across projects/reloads) + `XDG_*` under `/home/user` (see `openTerminal`).
-  Keep these when editing the env.
+  carries the config: `package_import_method=hardlink` +
+  `store_dir=/home/user/.local/share/pnpm/store` (PERSISTED, so the store is shared
+  across projects/reloads) + `XDG_*` under `/home/user` (see `openTerminal`).
+  **Each setting is given twice, as `npm_config_*` AND `pnpm_config_*`.** The vendored
+  pnpm is 11, which reads only `pnpm_config_*`; a corepack-pinned older pnpm reads only
+  `npm_config_*`. Drop the pnpm spelling and pnpm 11 quietly puts its store under
+  `XDG_DATA_HOME` instead, which still works and is the wrong place to find it.
+  `spike-pnpm-studio` asserts the store lands at the configured path, and goes red
+  without the `pnpm_config_*` line (checked).
 - `vendor-pnpm.mjs` DROPS `*.node` files: pnpm ships prebuilt reflink addons only
   for darwin/win; Linux uses the JS fallback, so they're ~1.3 MB of dead weight.
-- `dist/pnpm.cjs` (~8.8 MB) exceeds the 1 MiB SAB window → loader uses writeLarge.
+- pnpm 11 is `bin/pnpm.cjs` (one line: `import('./pnpm.mjs')`) → `bin/pnpm.mjs` →
+  `dist/pnpm.mjs`, a ~15.6 MB ESM bundle. `hasRealPnpm` checks `dist/pnpm.mjs`, so a
+  9.x tree an earlier session restored from OPFS is unpacked over rather than kept.
+  pnpm 11 also keeps its store index in SQLite (`node:sqlite`, see that gotcha) and
+  reaches the registry with its bundled undici over `tls.connect` (see the tls egress
+  gotcha); both had to exist before the bump could land.
+- **pnpm 11 ignores pnpm settings in `.npmrc`.** Only auth and registry lines are read
+  there now; `nodeLinker`, `storeDir` and friends live in `pnpm-workspace.yaml`. Measured
+  on the host: `node-linker=hoisted` in `.npmrc` gives `pnpm config get node-linker` →
+  `undefined`. The `monorepo` template therefore says it in both files (the `.npmrc`
+  line is for an older pnpm pinned through corepack), and `spike-pnpm-monorepo.mjs`
+  checks the linker that actually ran.
 - Headless browser-shape gate: `scripts/spike-pnpm-studio.mjs` (`VV_NET=1`), which
   uses the SAME env (not CLI flags) so it verifies studio's actual config.
 - **pnpm bins are `#!/bin/sh` cmd-shims, NOT symlinks.** npm makes `node_modules/.bin/vite`
@@ -2668,8 +2745,8 @@ What makes pnpm special:
 - **pnpm's default isolated store hides transitive deps from Vite's in-VM dep
   optimizer.** react-dom's `scheduler` lives behind nested `.pnpm/` symlinks, and
   rolldown externalised it → the preview crashed with `Calling require for
-  "scheduler" …`. The `monorepo` template ships an `.npmrc` with
-  `node-linker=hoisted` — a FLAT node_modules of real dirs (npm-like); the
+  "scheduler" …`. The `monorepo` template sets `nodeLinker: hoisted` (in
+  `pnpm-workspace.yaml` for pnpm 11, `.npmrc` for older): a FLAT node_modules of real dirs (npm-like); the
   `workspace:*` package stays symlinked (the showcase) but external transitives
   become bundlable. Reach for this whenever a pnpm project's Vite preview is blank
   with an externalised-`require` error.
@@ -4881,6 +4958,29 @@ candidates). Terminals use xterm `convertEol:true`, so guest code should emit `\
   because Vite prepends `/@vite/env` to module workers and that file has no timer —
   the client is nonetheless loaded there. Only `timerDetail.createdAt`, the creation
   stack, settled it. Reach for the stack before the theory.
+
+### A process's terminal size comes from the spawner and changes by `Kernel#resize`
+
+Every process used to report 80x24. Now a size travels with the spawn: the studio sends
+its xterm's `cols`/`rows` on `term-open`, the SDK takes `spawn(..., { terminal })`, and
+`kernel.start` / `launch` accept `{ winsize }`. A process with no size given inherits its
+parent's (a child draws into its parent's terminal), else 80x24 as before.
+`Kernel#resize(pid, cols, rows)` updates that pid and every live descendant and posts
+each `{ type: "winsize" }`; the studio calls it from xterm `onResize`, the SDK from
+`VivariProcess#resize`.
+
+- **SIGWINCH is emitted, not signalled.** The kernel's signal path terminates a process
+  with no listener, and SIGWINCH's POSIX default is to do nothing. So the guest applies
+  the size on a loop turn (piggybacking `doSignal`) and emits, in Node's order: stdout
+  `'resize'`, stderr `'resize'`, then `process.emit('SIGWINCH')`, with the new size
+  already in place for all three. That order was measured on host Node under a real pty.
+- **`process.stdout` is a real (small) emitter now.** Its `on`/`emit` used to be no-ops,
+  which is fine for listeners nobody fires and useless for `'resize'`.
+- **`isTTY` on stdout is unchanged (false).** Size and TTY-ness are separate questions,
+  and flipping stdout to a TTY changes colour detection for every CLI. Not done here.
+- `spike-terminal-size.mjs` covers launch size, inheritance, the event order, that a
+  SIGWINCH listener does not hold the loop, and that a resize does not kill a process
+  with no listener.
 
 ### OPFS persistence
 The VFS mirrors to OPFS and **survives reload**. If a demo behaves as if old files

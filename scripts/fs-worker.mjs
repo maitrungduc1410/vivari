@@ -6,7 +6,7 @@
 import { parentPort } from "node:worker_threads";
 import { createRequire } from "node:module";
 import { FsServer } from "../packages/kernel-host/fs-server.js";
-import { createDepCache } from "../packages/kernel-host/dep-cache.js";
+import { createDepCache, snapshotTreeOp, restoreTreeOp } from "../packages/kernel-host/dep-cache.js";
 
 const require = createRequire(import.meta.url);
 const wasm = require("../packages/vfs/pkg-node/vivari_vfs.js");
@@ -147,6 +147,28 @@ parentPort.on("message", (msg) => {
           parentPort.postMessage({ type: "dep-cache-export-err", id: msg.id, error: "no snapshot for key" });
         }
       });
+      break;
+    // Vivari.snapshot()/restore(): a whole tree to opaque bytes and back. The ops
+    // live in dep-cache.js, shared with the browser fs-worker.
+    case "fs-snapshot":
+      (async () => {
+        try {
+          const r = await snapshotTreeOp(buildAccess(vfs), { root: msg.root, exclude: msg.exclude });
+          parentPort.postMessage({ type: "fs-snapshot-ok", id: msg.id, result: r }, [r.bytes.buffer]);
+        } catch (err) {
+          parentPort.postMessage({ type: "fs-snapshot-err", id: msg.id, error: String(err?.message || err), code: err?.code });
+        }
+      })();
+      break;
+    case "fs-restore":
+      (async () => {
+        try {
+          const result = await restoreTreeOp(buildAccess(vfs), msg.bytes, msg.dir);
+          parentPort.postMessage({ type: "fs-restore-ok", id: msg.id, result });
+        } catch (err) {
+          parentPort.postMessage({ type: "fs-restore-err", id: msg.id, error: String(err?.message || err), code: err?.code });
+        }
+      })();
       break;
     case "dep-cache-restore":
       depCacheReady.then(async () => {

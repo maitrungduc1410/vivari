@@ -62,7 +62,8 @@ const VENDOR_NPM = path.join(VENDOR_DIR, "node_modules/npm");
 // scripts/vendor-*.mjs (each of those already carries the same note).
 const VENDORS = {
   yarn: { install: ["yarn@1.22.22"], dir: "/tmp/vv-vendor-yarn", arg: "node_modules/yarn", probe: "bin/yarn.js" },
-  pnpm: { install: ["pnpm@9.15.9"], dir: "/tmp/vv-vendor-pnpm", arg: "node_modules/pnpm", probe: "bin/pnpm.cjs" },
+  // Probe pnpm 11's bundle, not bin/pnpm.cjs, so a dir left by the 9.x pin is re-provisioned.
+  pnpm: { install: ["pnpm@11.28.9"], dir: "/tmp/vv-vendor-pnpm", arg: "node_modules/pnpm", probe: "dist/pnpm.mjs" },
   corepack: { install: ["corepack@0.35.0"], dir: "/tmp/vv-vendor-corepack", arg: "node_modules/corepack", probe: "dist/corepack.js" },
   tsgo: { install: ["tsgo-wasm"], dir: "/tmp/vv-vendor-tsgo", arg: "node_modules/tsgo-wasm", probe: "tsgo.wasm" },
   wsDemo: { install: ["express@^4.21.0", "ws@^8.18.0"], dir: "/tmp/vv-vendor-wsdemo", arg: ".", probe: "node_modules/ws/package.json" },
@@ -277,6 +278,16 @@ const SPIKES = [
   // cross-process, every scenario run on the host's real Node and in the VM with
   // identical transcripts required. needsWasm: it boots a kernel.
   { name: "fetch-loopback", file: "spike-fetch-loopback.mjs", net: false, needsWasm: true, timeout: 180000 },
+  // tls.connect to an outside host answers HTTP/1.1 through fetch (pnpm 11's undici
+  // dials the registry this way). Stub fetcher, so offline; needsWasm: boots a kernel.
+  { name: "tls-egress", file: "spike-tls-egress.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // Vivari.snapshot()/restore()'s FS-worker half: a tree with node_modules, a symlink
+  // and a binary round-trips into a second kernel; damaged or path-escaping bytes are
+  // refused before anything is written. needsWasm: real VFS.
+  { name: "tree-snapshot", file: "spike-tree-snapshot.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // Terminal size: a launch size, inherited by children, changed by Kernel#resize into
+  // stdout 'resize' + SIGWINCH. needsWasm: it boots a kernel.
+  { name: "terminal-size", file: "spike-terminal-size.mjs", net: false, needsWasm: true, timeout: 120000 },
   // fs.cpSync / fsPromises.cp against the host's real Node, case by case. Needs the
   // VFS (it copies real trees), so needsWasm; the host half runs as a child process.
   { name: "fs-cp", file: "spike-fs-cp.mjs", net: false, needsWasm: true, timeout: 120000 },
@@ -560,6 +571,9 @@ const SPIKES = [
   // node_modules, on a ~20 MB / 900-file tree. Long budget for both.
   { name: "pnpm", file: "spike-pnpm.mjs", net: true, needsWasm: true, vendor: VENDORS.pnpm, timeout: 600000 },
   { name: "pnpm-studio", file: "spike-pnpm-studio.mjs", net: true, needsWasm: true, vendor: VENDORS.pnpmAsset, env: { VV_NET: "1" }, timeout: 300000 },
+  // The monorepo template under the vendored pnpm: pnpm 11 reads nodeLinker only
+  // from pnpm-workspace.yaml, and the isolated store breaks this template's preview.
+  { name: "pnpm-monorepo", file: "spike-pnpm-monorepo.mjs", net: true, needsWasm: true, vendor: VENDORS.pnpmAsset, timeout: 600000 },
   // corepack proves the download->gunzip->untar->sha512-verify->exec path, so a
   // project can pin any yarn/pnpm version rather than only our vendored one.
   { name: "corepack", file: "spike-corepack.mjs", net: true, needsWasm: true, vendor: VENDORS.corepack, timeout: 600000 },

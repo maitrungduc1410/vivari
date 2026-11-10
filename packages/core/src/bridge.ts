@@ -39,6 +39,8 @@ export interface RequestOptions {
   signal?: AbortSignal;
   /** Reject with `ERR_TIMEOUT` after this many ms. Unbounded when unset. */
   timeout?: number;
+  /** Buffers to transfer (not copy) to the kernel worker with the request. */
+  transfer?: Transferable[];
 }
 
 interface PendingRequest {
@@ -280,7 +282,7 @@ export class KernelBridge {
     extra?: Record<string, unknown>,
     options: RequestOptions = {},
   ): Promise<KernelMessage> {
-    const { signal, timeout } = options;
+    const { signal, timeout, transfer } = options;
     if (this.destroyed) {
       return Promise.reject(new VivariError("ERR_TORN_DOWN", `${type}: the Vivari instance was torn down`));
     }
@@ -308,7 +310,7 @@ export class KernelBridge {
       }
       signal?.addEventListener("abort", onAbort, { once: true });
       this.pending.set(reqId, { resolve, reject, dispose });
-      this.worker.postMessage({ type, reqId, ...extra });
+      this.worker.postMessage({ type, reqId, ...extra }, transfer ?? []);
     });
   }
 

@@ -201,6 +201,7 @@ parentPort.on("message", (msg) => {
   else if (msg.type === "stdin") onControl((c) => c.dispatchStdin(msg));
   // A catchable signal (SIGTERM/SIGINT) the kernel is delivering to us.
   else if (msg.type === "signal") onControl((c) => c.dispatchSignal(msg));
+  else if (msg.type === "winsize") onControl((c) => c.dispatchWinsize(msg));
   // An async fetch result relayed by the kernel (parallel downloads).
   else if (msg.type === "fetch-done") onControl((c) => c.dispatchFetch(msg));
 });

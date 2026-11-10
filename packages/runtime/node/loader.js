@@ -122,6 +122,7 @@ import httpsFactory from "./lib/https.js";
 import fetchTransportFactory from "./internal/fetch-transport.js";
 import httpEgressFactory from "./internal/http-egress.js";
 import fetchLoopbackFactory from "./internal/fetch-loopback.js";
+import tlsHttpEgressFactory from "./internal/tls-http-egress.js";
 import tlsFactory from "./lib/tls.js";
 import undiciFactory from "./internal/deps/undici/undici.js";
 
@@ -345,6 +346,8 @@ const FACTORIES = {
   "internal/http-egress": httpEgressFactory,
   // The guest global fetch()'s in-VM half (runtime/index.js routes to it).
   "internal/fetch-loopback": fetchLoopbackFactory,
+  // tls.connect to an outside host, for HTTP/1.1 clients that dial themselves.
+  "internal/tls-http-egress": tlsHttpEgressFactory,
   tls: tlsFactory,
   "internal/deps/undici/undici": undiciFactory,
   dns: dnsFactory,

@@ -8,7 +8,7 @@
 // need the missing backend (connect / listen / a real secure server) throw.
 // This lets http-only tooling (webpack-dev-server, Docusaurus) that transitively
 // pulls `tls` load and run over plain http.
-export default function (exports, require, module) {
+export default function (exports, require, module, process, internalBinding) {
   "use strict";
   const net = require("net");
   const Socket = (net && net.Socket) || class {};
@@ -75,9 +75,38 @@ export default function (exports, require, module) {
     }
   }
 
+  // tls.connect to an outside host: an HTTP/1.1 client (undici, which pnpm 11
+  // bundles) gets a socket whose requests are answered through fetch. See
+  // internal/tls-http-egress.js for what that socket will and will not carry.
+  function connect(...args) {
+    const { HttpEgressSocket, normalizeConnectArgs } = require("internal/tls-http-egress");
+    const { options, cb } = normalizeConnectArgs(args);
+    if (options.socket) notImpl("tls.connect over an existing socket (proxy tunnels)");
+    if (options.path) notImpl("tls.connect to a UNIX socket");
+    const host = String(options.host || options.servername || "localhost").replace(/^\[|\]$/g, "");
+    let local = false;
+    try {
+      local = internalBinding("tcp_wrap").isLocalDestination(host);
+    } catch {}
+    if (local) {
+      // No in-VM TLS server exists, and going out to the network would reach the
+      // user's real machine instead (same rule as fetch('https://localhost')).
+      const err = new Error("Vivari: there is no TLS inside the VM, so " + host + " cannot be reached over tls.connect");
+      err.code = "ERR_VIVARI_LOOPBACK_TLS";
+      throw err;
+    }
+    const socket = new HttpEgressSocket({
+      host,
+      port: Number(options.port) || 443,
+      protocol: "https:",
+      servername: options.servername,
+    });
+    if (cb) socket.once("secureConnect", cb);
+    return socket;
+  }
+
   module.exports = {
-    // Actual outbound TLS I/O is unsupported.
-    connect: () => notImpl("tls.connect"),
+    connect,
     createServer: () => notImpl("tls.createServer"),
     createSecurePair: () => notImpl("tls.createSecurePair"),
     // Benign at setup time; libs create these eagerly and only fail if they

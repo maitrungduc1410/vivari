@@ -9,7 +9,7 @@
 import type { KernelBridge } from "./bridge.js";
 import { TEARDOWN_MESSAGE } from "./bridge.js";
 import { VivariError } from "./errors.js";
-import type { KernelMessage, SpawnOptions } from "./types.js";
+import type { KernelMessage, SpawnOptions, TerminalSize } from "./types.js";
 
 /** Exit code reported when a process is still running when the instance is torn down. */
 const EXIT_TORN_DOWN = -1;
@@ -95,6 +95,8 @@ export class VivariProcess {
   ) {
     this.bridge = bridge;
     this.execId = execId;
+    // Before any listener is wired, so a bad size throws without leaking them.
+    const winsize = options.terminal ? toWinsize(options.terminal) : undefined;
 
     const merged = new StreamSink();
     const out = new StreamSink();
@@ -181,6 +183,7 @@ export class VivariProcess {
       args,
       cwd: options.cwd,
       env: options.env,
+      winsize,
     });
   }
 
@@ -194,12 +197,35 @@ export class VivariProcess {
     return this.code;
   }
 
+  /**
+   * Tell the process its terminal changed size, as an xterm `onResize` would. The
+   * process and every process under it see new `process.stdout.columns` / `rows`,
+   * a `'resize'` event on stdout and stderr, then `SIGWINCH`. Call it from your
+   * terminal's resize handler; a size equal to the current one does nothing.
+   */
+  resize(size: TerminalSize): void {
+    const ws = toWinsize(size);
+    if (this.code !== null) return;
+    this.bridge.post("proc-resize", { execId: this.execId, cols: ws.cols, rows: ws.rows });
+  }
+
   /** Terminate the process (SIGTERM). Its `exit` still resolves. */
   kill(): void {
     if (this.killed) return;
     this.killed = true;
     this.bridge.post("proc-kill", { execId: this.execId });
   }
+}
+
+// Validate here so a bad size is the caller's error at the call site, not a
+// message the kernel quietly drops.
+function toWinsize(size: TerminalSize): TerminalSize {
+  const cols = Number(size && size.cols);
+  const rows = Number(size && size.rows);
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1 || cols > 10000 || rows > 10000) {
+    throw new RangeError(`terminal size must be whole numbers from 1 to 10000, got ${cols}x${rows}`);
+  }
+  return { cols, rows };
 }
 
 /**

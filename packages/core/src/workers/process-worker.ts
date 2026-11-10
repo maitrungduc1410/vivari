@@ -190,6 +190,7 @@ self.onmessage = async (event) => {
   else if (type === "stdin") onControl((c) => c.dispatchStdin(event.data));
   // A catchable signal (SIGTERM/SIGINT) the kernel is delivering to us.
   else if (type === "signal") onControl((c) => c.dispatchSignal(event.data));
+  else if (type === "winsize") onControl((c) => c.dispatchWinsize(event.data));
   // An async fetch result relayed by the kernel (parallel downloads).
   else if (type === "fetch-done") onControl((c) => c.dispatchFetch(event.data));
   // A CDP debugger command for this process while it is RUNNING (paused commands

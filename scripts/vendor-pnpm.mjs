@@ -11,8 +11,10 @@
 //   [u32le headerLen][headerJSON][file bytes ...]        then gzip the whole lot
 //   header = { version, files: [{ p: relPath, o: offset, l: length }, ... ] }
 //
-// pnpm is bin/pnpm.cjs (tiny entry) -> dist/pnpm.cjs (~8.8 MB bundle) +
-// dist/worker.js + a real dist/node_modules (~902 files, 20 MB). We DROP the
+// pnpm 11 is bin/pnpm.cjs (a one-line `import('./pnpm.mjs')`) -> bin/pnpm.mjs ->
+// dist/pnpm.mjs (~15.6 MB ESM bundle) + dist/worker.js + dist/node_modules
+// (~450 files, 22 MB). It keeps its store index in SQLite through node:sqlite and
+// dials the registry with undici over tls.connect (internal/tls-http-egress.js). We DROP the
 // prebuilt `*.node` reflink addons: they only exist for darwin/win — on our
 // Linux target pnpm falls back to JS, and `--package-import-method=copy` avoids
 // reflink/hardlink entirely — so shipping ~1.3 MB of dead binaries is pointless.
@@ -29,7 +31,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { readPackVersion } from "./lib/pack-version.mjs";
 
-const PNPM_VERSION = "9.15.9"; // keep in sync with scripts/spike-pnpm.mjs
+const PNPM_VERSION = "11.28.9"; // keep in sync with scripts/spike-pnpm.mjs
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
 const VENDOR_DIR = process.env.VV_VENDOR_PNPM_DIR || "/tmp/vv-vendor-pnpm";
 const VENDOR_PNPM = path.join(VENDOR_DIR, "node_modules", "pnpm");
@@ -57,7 +59,16 @@ if (fs.existsSync(OUT_FILE) && !force) {
 }
 
 // 1) Vendor a pinned pnpm into a scratch dir (host npm/network needed once).
-if (!fs.existsSync(path.join(VENDOR_PNPM, "bin", "pnpm.cjs")) || force) {
+// A scratch dir left by an older pin would otherwise be packed under the new
+// version's stamp, so the installed version has to match too.
+function vendoredVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(VENDOR_PNPM, "package.json"), "utf8")).version;
+  } catch {
+    return null;
+  }
+}
+if (!fs.existsSync(path.join(VENDOR_PNPM, "bin", "pnpm.cjs")) || vendoredVersion() !== PNPM_VERSION || force) {
   log(`installing pnpm@${PNPM_VERSION} into ${VENDOR_DIR} …`);
   fs.rmSync(VENDOR_DIR, { recursive: true, force: true });
   fs.mkdirSync(VENDOR_DIR, { recursive: true });

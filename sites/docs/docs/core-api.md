@@ -100,7 +100,37 @@ for (const f of files) console.log(f.path, f.contents.byteLength);
 `truncated` is `true` if the walk hit the kernel's file-count / total-byte cap, in
 which case `files` is a prefix of the tree rather than all of it.
 
-## `vivari.spawn(command, args?, { cwd?, env?, signal? }): Promise<VivariProcess>`
+## `vivari.snapshot(path?, { exclude?, signal? }): Promise<Uint8Array>`
+
+Pack a directory, `node_modules` included, into one gzipped blob. Unlike
+`export()`, nothing is skipped by default and there is no size cap: the point is to
+keep an installed project and skip the install next time. `exclude` leaves out entry
+names at any depth (`[".git", "dist"]`). Treat the bytes as opaque; store them
+wherever you like (IndexedDB, Cache Storage, a CDN).
+
+```ts
+await (await vivari.spawn("npm", ["install"], { cwd: "/app" })).exit;
+const snap = await vivari.snapshot("/app");
+await saveSomewhere(snap);
+```
+
+## `vivari.restore(snapshot, { mountPoint?, signal? }): Promise<{ files, entries }>`
+
+Unpack bytes from `snapshot()` under `mountPoint` (default `"/"`). Files the
+snapshot carries are overwritten; anything else in the directory is left alone. The
+bytes are checked before anything is written: damaged or foreign input rejects with
+`EINVAL` and the filesystem is untouched.
+
+The buffer is **transferred** to the worker, not copied, so `snapshot` is empty
+afterwards. Pass `snapshot.slice()` if you need to keep it.
+
+```ts
+const snap = await loadFromSomewhere();
+if (snap) await vivari.restore(snap, { mountPoint: "/app" });
+else await (await vivari.spawn("npm", ["install"], { cwd: "/app" })).exit;
+```
+
+## `vivari.spawn(command, args?, { cwd?, env?, signal?, terminal? }): Promise<VivariProcess>`
 
 Run a command. Package managers (`npm` / `yarn` / `pnpm` / `corepack`) work out
 of the box with persisted, content-addressed caches. Rejects with
@@ -113,6 +143,7 @@ process that silently exits 127 with no output. A `VivariProcess` has:
 - `exit: Promise<number>`, the exit code (`-1` if the instance was torn down first)
 - `exitCode: number | null`, synchronous; `null` while still running
 - `pid: number`, the in-VM process id
+- `resize({ cols, rows }): void`, tell it the terminal changed size
 - `kill(): void`
 
 An `OutputStream` is a `ReadableStream<string>` plus `[Symbol.asyncIterator]` and
@@ -130,6 +161,22 @@ console.log("exit code:", await proc.exit);
 
 Reading `stdout` does not consume `output` — they are separate views of the same
 chunks, not copies.
+
+### Terminal size
+
+Pass `terminal: { cols, rows }` when you render the process into a terminal, and
+call `proc.resize()` when that terminal changes size. The process and everything it
+spawns see the size as `process.stdout.columns` / `rows` from their first line, and on
+a change get a `'resize'` event on stdout and stderr, then `SIGWINCH`, the same as
+real Node. Without `terminal` a process reports 80x24. `process.stdout.isTTY` stays
+`false` either way.
+
+```ts
+const proc = await vivari.spawn("node", ["tui.js"], {
+  terminal: { cols: term.cols, rows: term.rows },
+});
+term.onResize(({ cols, rows }) => proc.resize({ cols, rows }));
+```
 
 ## `vivari.fs`
 

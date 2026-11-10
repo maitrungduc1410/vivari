@@ -54,7 +54,7 @@ export const VFS_NPM = "/usr/lib/node_modules/npm";
  *
  * Guest output lands in `h.out` (and echoes to stderr when VV_LIVE=1).
  */
-export async function bootSpikeKernel({ npm = false } = {}) {
+export async function bootSpikeKernel({ npm = false, fetcher: fetcherOverride = null } = {}) {
   const fsWorker = new Worker(new URL("../fs-worker.mjs", import.meta.url));
   let onKernelFsMessage = () => {};
   await new Promise((resolve) => {
@@ -104,7 +104,8 @@ export async function bootSpikeKernel({ npm = false } = {}) {
   // (see scripts/lib/aliased-fetcher.mjs) so a plain in-VM `npm install` pulls
   // esbuild-wasm / @rollup/wasm-node / lightningcss-wasm instead of the native
   // binaries that die on wasm32.
-  const fetcher = createAliasedFetcher();
+  // A spike about egress itself can hand in a stub instead, so it runs offline.
+  const fetcher = fetcherOverride || createAliasedFetcher();
 
   const out = [];
   const cap = (s) => {
