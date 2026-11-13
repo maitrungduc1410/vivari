@@ -712,6 +712,18 @@ function runSpike(s) {
       const secs = ((Date.now() - started) / 1000).toFixed(1);
       const pass = !timedOut && code === 0;
       if (!pass && process.env.VV_LIVE !== "1") {
+        // The tail alone can miss the failing check: a spike that dumps its logs
+        // after the checks (net-relay does) pushes the ✗ line out of the window,
+        // and the CI log then says FAIL without saying which check. So print every
+        // ✗ line, with the indented detail lines under it, ahead of the tail.
+        const lines = buf.split("\n");
+        const failing = [];
+        for (let i = 0; i < lines.length; i++) {
+          if (!/^\s*✗ /.test(lines[i])) continue;
+          failing.push(lines[i]);
+          while (i + 1 < lines.length && /^ {5,}\S/.test(lines[i + 1])) failing.push(lines[++i]);
+        }
+        if (failing.length) console.log("  failed checks:\n" + failing.join("\n") + "\n  ── tail ──");
         console.log(buf.slice(-2000));
       }
       console.log(`  ${pass ? "PASS" : "FAIL"}  ${s.name.padEnd(16)} (${secs}s${timedOut ? ", TIMED OUT" : `, exit ${code}`})`);
