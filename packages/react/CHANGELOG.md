@@ -4,6 +4,12 @@ From 1.1.0 on, entries are generated from [changesets](https://github.com/change
 `@vivari/core` and `@vivari/react` are released together under the same version, so a release
 that says "No changes in this release" changed only `@vivari/core`.
 
+## 1.3.1
+
+### Patch Changes
+
+- [`d13e37f`](https://github.com/maitrungduc1410/vivari/commit/d13e37f3cd757c4d647f53e859f97c8fe1f5ac0b) Thanks [@maitrungduc1410](https://github.com/maitrungduc1410)! - ES modules that put a comment inside an `import { … }` or `export { … }` list now load correctly. parse5 8.1 does this, and the comment was being read as part of the name, so the export came out `undefined`; Astro Starlight pages that render Markdown failed with a 500 `MDXError`.
+
 ## 1.3.0
 
 ### Minor Changes
