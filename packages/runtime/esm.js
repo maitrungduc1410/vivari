@@ -285,8 +285,41 @@ function skipBalanced(src, i) {
   return i;
 }
 
+// Comments are legal between the names of a specifier list too, and parse5 8.1
+// writes `export { /** @internal */ Parser, InsertionMode } from './parser/index.js'`.
+// Split on commas with the comment left in and the name becomes
+// `/** @internal */ Parser`, which no module exports: the binding reads `undefined`,
+// so hast-util-raw's `Parser.getFragmentParser` threw and every Starlight page that
+// renders Markdown answered 500. Strip comments outside string literals first (a
+// quoted name like `"module.exports"` may itself contain `//`).
+function stripSpecifierComments(text) {
+  let out = "";
+  for (let i = 0; i < text.length; ) {
+    const ch = text[i];
+    if (ch === '"' || ch === "'") {
+      const end = text.indexOf(ch, i + 1);
+      const stop = end < 0 ? text.length : end + 1;
+      out += text.slice(i, stop);
+      i = stop;
+    } else if (ch === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      i = end < 0 ? text.length : end + 2;
+      out += " ";
+    } else if (ch === "/" && text[i + 1] === "/") {
+      const end = text.indexOf("\n", i + 2);
+      i = end < 0 ? text.length : end;
+      out += " ";
+    } else {
+      out += ch;
+      i++;
+    }
+  }
+  return out;
+}
+
 function namedFromBraces(text) {
-  const m = text.match(/\{([\s\S]*?)\}/);
+  // Strip before matching the braces, so a `}` inside a comment cannot end the list.
+  const m = stripSpecifierComments(text).match(/\{([\s\S]*?)\}/);
   if (!m) return [];
   return m[1]
     .split(",")
@@ -435,10 +468,15 @@ function scanExportEdits(src, isFrom) {
       }
       if (src[r] === "{") {
         // export { ... }  (local, or re-export handled elsewhere)
+        // The list may hold comments (parse5 8.1 does) and quoted names, and either
+        // can contain a `}`; stepping over them is what finds the real end.
         let j = r + 1;
-        while (j < n && src[j] !== "}") j++;
-        let k = j + 1;
-        while (k < n && /\s/.test(src[k])) k++;
+        while (j < n && src[j] !== "}") {
+          if (src[j] === "/" && (src[j + 1] === "*" || src[j + 1] === "/")) j = skipSpaceAndComments(src, j);
+          else if (src[j] === '"' || src[j] === "'") j = skipQuoted(src, j);
+          else j++;
+        }
+        const k = skipSpaceAndComments(src, j + 1);
         if (src.startsWith("from", k)) {
           // re-export; leave for the imports pass to remove
           i = j + 1;

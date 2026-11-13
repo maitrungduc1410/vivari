@@ -328,6 +328,44 @@ console.log("\n== [esm] comment between `export` and its declaration ==");
   check("a commented default function keeps its local binding", namedOk);
 }
 
+// ── 7b. comments inside a specifier list ──────────────────────────────────────
+// parse5 8.1 writes `export { /** @internal */ Parser, InsertionMode } from …`. The
+// list was split on commas with the comment still attached, so the re-export was
+// named `/** @internal */ Parser`, `Parser` read undefined, hast-util-raw threw on
+// `Parser.getFragmentParser`, and every Starlight page that renders Markdown was a 500.
+// Same parser for imports and local export lists, so all three shapes are checked.
+console.log("\n== [esm] comments inside `{ … }` specifier lists ==");
+{
+  const dep = { Parser: { getFragmentParser: () => "frag" }, InsertionMode: 7, used: 5, "a}b": 1 };
+  const src =
+    `export { /** @internal */ Parser, InsertionMode } from './dep.js';\n` +
+    `import { /* why */ used, // trailing\n } from './dep.js';\n` +
+    `const local = 1, other = 2;\n` +
+    `export { /* a } in a comment */ local as /* renamed */ renamed, other };\n` +
+    `export const sum = used + 1;\n`;
+  const out = transpileEsm(src, "/specifier-comments.js");
+  let compiled = true;
+  const mod = { exports: Object.create(null) };
+  try {
+    new Function("__oc_exports", "__oc_require", "__oc_module", out + "\n").call(
+      mod.exports,
+      mod.exports,
+      () => dep,
+      mod,
+    );
+  } catch (e) {
+    compiled = false;
+    console.log("    compile error:", e.message);
+  }
+  check("the rewritten module compiles", compiled);
+  check("a re-export after a comment resolves (parse5's Parser)", compiled && mod.exports.Parser === dep.Parser);
+  check("the name after it in the same list resolves too", compiled && mod.exports.InsertionMode === 7);
+  check("a commented import binding reads the real value", compiled && mod.exports.sum === 6);
+  check("a local export renamed across comments keeps its new name", compiled && mod.exports.renamed === 1);
+  check("a `}` inside a comment does not end the list early", compiled && mod.exports.other === 2);
+  check("no export is named after its comment", compiled && !Object.keys(mod.exports).some((k) => k.includes("/*")));
+}
+
 // ── 8. a relative module id must never become the URL host ────────────────────
 // `"file://" + id` is a three-slash file URL only when the id is absolute. With a
 // relative id ("home/user/…") the first segment parses as the HOST, so

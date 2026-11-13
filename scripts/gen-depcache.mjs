@@ -53,6 +53,7 @@ import { fileURLToPath } from "node:url";
 import { createDepCache, hashDepKey, readSnapshotContainer, writeSnapshotContainer } from "../packages/kernel-host/dep-cache.js";
 import { hostAccess, memoryStorage } from "./lib/host-vfs-access.mjs";
 import { loadShippedTemplates } from "./lib/shipped-templates.mjs";
+import { TARGET_FLAGS, targetPlatformEnv } from "./lib/npm-target-platform.mjs";
 import {
   REGISTRY,
   assertPeerProviders,
@@ -251,21 +252,27 @@ async function buildOne(template) {
   try {
     fs.writeFileSync(path.join(dir, "package.json"), packageJson);
     fs.writeFileSync(path.join(dir, "package-lock.json"), lockText);
-    execFileSync(
-      "npm",
-      [
-        "install",
-        "--cpu=wasm32",
-        "--os=linux",
-        "--ignore-scripts",
-        "--no-audit",
-        "--no-fund",
-        `--registry=${REGISTRY}/`,
-        "--cache",
-        CACHE,
-      ],
-      { cwd: dir, stdio: ["ignore", "ignore", "pipe"], encoding: "utf8" },
-    );
+    // TARGET_FLAGS alone do not reach a non-optional dependency's platform check;
+    // the preload does (see lib/npm-target-platform.mjs).
+    const target = targetPlatformEnv();
+    try {
+      execFileSync(
+        "npm",
+        [
+          "install",
+          ...TARGET_FLAGS,
+          "--ignore-scripts",
+          "--no-audit",
+          "--no-fund",
+          `--registry=${REGISTRY}/`,
+          "--cache",
+          CACHE,
+        ],
+        { cwd: dir, stdio: ["ignore", "ignore", "pipe"], encoding: "utf8", env: target.env },
+      );
+    } finally {
+      target.cleanup();
+    }
     const withScripts = installScriptPackages(dir);
     if (withScripts.length) {
       throw new Error(

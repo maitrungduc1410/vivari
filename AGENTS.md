@@ -2207,6 +2207,25 @@ that would reject a mismatched binding only runs under
 rolldown's will be *used*, not rejected — keep the two ranges in step, and note that
 `template-gate` is what will tell you when they part.
 
+### `--cpu=wasm32` does not reach a DIRECT dependency's platform check on the build host
+`@rolldown/binding-wasm32-wasi` 1.2.19 added `"cpu": ["wasm32"]`, and every Vite 8 template
+lists it directly (section above). From that release `gen-template-locks` failed 19 templates
+with `notsup … wanted {"cpu":"wasm32"} (current: {"cpu":"x64"})` and `gen-depcache` quietly
+skipped react-ts, so `template-gate` and `spikes-net` went red every night and the deploy
+lost its shipped snapshot. The flags were there. npm applies `--cpu`/`--os` only to OPTIONAL
+dependencies: Arborist's `build-ideal-tree.js` calls `checkPlatform(node.package, force)` with
+no environment for everything else, so `npm-install-checks` reads `process.arch`. Measured on
+npm 10.9.2 and 11.19.0, identical. Inside the VM the same install is fine, because there
+`process.arch` really is `wasm32`.
+
+`scripts/lib/npm-target-platform.mjs` is the one place that knows this. Its preload, loaded
+into npm with `--require` by both producers, wraps `checkPlatform` so a call with no
+environment gets the target the optional check already gets; an explicit environment still
+wins. Do not reach for `--force` instead: it also turns peer conflicts into warnings and
+would let a lock through that the VM cannot install. Any new host-side npm call made FOR the
+VM (resolve or install) needs the same preload, or it breaks the next time a direct
+dependency declares a `cpu`.
+
 ### esbuild/rollup are aliased to their wasm drop-ins — DON'T add per-project overrides
 esbuild and rollup ship no `wasm32` build, and their WASM drop-ins live under a
 DIFFERENT package name (`esbuild-wasm`, `@rollup/wasm-node`) that npm's
@@ -4653,6 +4672,15 @@ also unchanged.
   token 'export'` (the AsyncFunction retry reported the same thing — the transpiled
   source still contained the keyword). `skipSpaceAndComments` is the one place that rule
   lives; any token scanner added here must use it. Proven by `scripts/spike-esm.mjs`.
+- **Comments inside a specifier list, too.** parse5 8.1 writes
+  `export { /** @internal */ Parser, InsertionMode } from './parser/index.js'`.
+  `namedFromBraces` split the list on commas with the comment still attached, so the name
+  became `/** @internal */ Parser`, `Parser` read `undefined`, and hast-util-raw died on
+  `Parser.getFragmentParser`: every Starlight page with Markdown answered 500 `MDXError`.
+  It now strips comments (outside quoted names) before matching the braces, and the local
+  `export { … }` scan steps over comments and quoted names when looking for the closing
+  `}` and for a `from` after it. `spike-esm.mjs` section 7b covers re-export, import and
+  local-export lists, plus a `}` inside a comment; all seven checks fail without the fix.
 - **`import.meta.url` must be built from an ABSOLUTE id — and a host in a `file:` URL
   is never a file host.** `"file://" + id` is a three-slash file URL only when `id` starts
   with `/`; a relative id (`home/user/…`) makes its first segment the URL **host**, so

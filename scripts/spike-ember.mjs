@@ -102,7 +102,15 @@ const ok = await runViteSpike({
     // ── walk the app's module graph, from the shell, the way a browser does ──────
     const shell = await getRetry(base);
     const queue = [];
-    for (const m of decode(shell.body || "").matchAll(/<script[^>]+src="([^"]+)"/g)) queue.push(m[1]);
+    // An attribute value is HTML, so decode it the way the browser does before
+    // requesting it. Vite 8.3 writes the inline-module proxy as
+    // `index.html?html-proxy&amp;index=0.js`; taken literally that is a different URL,
+    // the walk stopped at the shell, and the gate reported "0 .gjs" against a healthy app.
+    const attr = (v) =>
+      v.replace(/&(amp|quot|apos|lt|gt|#39|#x27);/g, (_, e) =>
+        ({ amp: "&", quot: '"', apos: "'", lt: "<", gt: ">", "#39": "'", "#x27": "'" })[e],
+      );
+    for (const m of decode(shell.body || "").matchAll(/<script[^>]+src="([^"]+)"/g)) queue.push(attr(m[1]));
     // An app module: served under our base, and not a vendor/pre-bundled/Vite-internal
     // one. Those are third-party code we are not compiling and must not grade.
     const isApp = (u) =>

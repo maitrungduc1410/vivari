@@ -11946,3 +11946,26 @@ is its own decision.
 
 Not covered by any headless tier: the page-to-kernel relays (`vv-snapshot`, `vv-restore`,
 `proc-resize`, `term-resize`) and the studio's xterm wiring.
+
+### Nightly template-gate / spikes-net red: `--cpu=wasm32` ignored for direct dependencies
+
+`@rolldown/binding-wasm32-wasi` 1.2.19 started declaring `"cpu": ["wasm32"]`. Every Vite 8
+template depends on it directly, and npm checks a non-optional dependency's platform against
+`process.arch` regardless of `--cpu`/`--os` (Arborist `build-ideal-tree.js`, npm 10 and 11).
+So 19 locks failed to resolve under `--strict`, every lock-backed net spike failed to
+provision, and `gen-depcache` silently dropped the shipped react-ts snapshot from the deploy.
+`scripts/lib/npm-target-platform.mjs` preloads a wrapper that gives that check the VM's
+target; both producers use it. A fresh `--force --strict` resolve builds 59 of 59 locks, and
+the react-ts snapshot packs again (2,853 entries, 16.8 MB gz). See AGENTS.md.
+
+Two more causes were behind the same red nightlies once the locks provisioned again, and
+neither was the lock work:
+
+- **Starlight 500 `MDXError`.** parse5 8.1.0/8.1.1 (2026-11-01/07) put a comment inside an
+  export specifier list, which the ESM→CJS transpiler took as part of the name. Runtime fix
+  in `esm.js`, see AGENTS.md (ESM ↔ CJS interop).
+- **Ember "0 .gjs" in the module-graph gate.** Vite now writes the inline-module proxy as
+  `index.html?html-proxy&amp;index=0.js`. A browser decodes the attribute; the spike did
+  not, so it requested a different URL and stopped at the shell. Spike-only fix: decode
+  HTML entities before following a `src`.
+

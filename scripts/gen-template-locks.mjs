@@ -39,6 +39,17 @@
 // filtering happens at reify time either way — but resolution honours them too,
 // and generating on the host's arch is how a tree that cannot exist in the VM
 // gets pinned into the file the VM installs from.
+//
+// …except that npm only honours them for OPTIONAL dependencies. Arborist's
+// build-ideal-tree checks a non-optional package with `checkPlatform(pkg, force)`
+// and no environment, so `npm-install-checks` falls back to `process.arch`. That
+// was harmless while nothing a template depends on directly declared a `cpu`,
+// and stopped being harmless when `@rolldown/binding-wasm32-wasi` 1.2.19 added
+// `"cpu": ["wasm32"]`: every Vite 8 template lists it directly (see AGENTS.md),
+// so all of them failed with `notsup … wanted {"cpu":"wasm32"} (current:
+// {"cpu":"x64"})`. TARGET_PLATFORM_PRELOAD (scripts/lib/npm-target-platform.mjs)
+// gives that call the same target the optional check already gets, which is
+// what the VM itself reports.
 
 import { execFile } from "node:child_process";
 import fs from "node:fs";
@@ -51,6 +62,7 @@ const execFileP = promisify(execFile);
 
 import { loadShippedTemplates } from "./lib/shipped-templates.mjs";
 import { ARBORIST_PEERSET_PRELOAD } from "../packages/kernel-host/node-gyp-stub.js";
+import { TARGET_CPU, TARGET_OS, TARGET_PLATFORM_PRELOAD } from "./lib/npm-target-platform.mjs";
 import { NATIVE_DROPIN_ALIASES, NATIVE_WASM_ALIASES } from "../packages/runtime/toolchain-shims.js";
 
 // Driven by the kernel's own alias tables rather than a copy of them, so a
@@ -759,8 +771,8 @@ async function resolveLock(id, packageJson) {
       [
         "install",
         "--package-lock-only",
-        "--cpu=wasm32",
-        "--os=linux",
+        `--cpu=${TARGET_CPU}`,
+        `--os=${TARGET_OS}`,
         "--ignore-scripts",
         "--no-audit",
         "--no-fund",
@@ -771,7 +783,7 @@ async function resolveLock(id, packageJson) {
       { cwd: dir, encoding: "utf8", env: { ...process.env, NODE_OPTIONS: nodeOptions } },
     );
   try {
-    fs.writeFileSync(preload, ARBORIST_PEERSET_PRELOAD);
+    fs.writeFileSync(preload, ARBORIST_PEERSET_PRELOAD + "\n" + TARGET_PLATFORM_PRELOAD);
     fs.writeFileSync(path.join(dir, "package.json"), packageJson);
     await resolve();
     if (!fs.existsSync(lock)) throw new Error("npm wrote no package-lock.json");
