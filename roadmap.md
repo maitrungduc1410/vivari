@@ -11113,8 +11113,9 @@ by twice.
 
 ### Tracked follow-ups from this path
 
-Three things were deliberately left for their own commits. They are written down here rather
-than in a review thread because each has a trigger that will not announce itself.
+Three things were deliberately left for their own commits; the last two have since landed
+together. They are written down here rather than in a review thread because each has a
+trigger that will not announce itself.
 
 - **Nothing bounds a vendor script's network, and two of them now run last on `predev`.**
   Neither generator passes `timeout` to `execFileSync`, so behind a proxy that blackholes
@@ -11125,21 +11126,17 @@ than in a review thread because each has a trigger that will not announce itself
   `scripts/vendor-*.mjs` bound their network either, which is why the fix is one commit
   putting `{ timeout: 120_000 }` behind a shared helper across all ten and not two of them —
   doing two would leave the other eight looking deliberately unbounded.
-- **`reportAbsentManifest` should be split, and `spike-install-latency.mjs` should import the
-  pure half.** The gate currently regex-slices the function out of `kernel-worker.ts`, strips
-  its type annotation and runs it through `new Function` with three stubbed globals, because
-  the worker cannot be imported from Node. Exporting `formatAbsentManifest(m) → { line,
-  stream?, dim?, console? }` from a small module and leaving only the posting in the worker
-  lets the spike import it the way `spike-site-headers.mjs` imports `run-phase.ts`. That
-  deletes the regex, the eval and the stubs, and gives the call-site assertions below type
-  coverage instead of pattern matching.
-- **A 200 whose body fails mid-transfer is currently diagnosed as a build defect.** The loud
-  arm keys on the status alone, so a truncated or aborted body gets "This build was assembled
-  without it… Fix: `npm run vendor:depcache`". Narrow, since both manifests are small, but the
-  discriminator is free: the defect signature is specifically a *parse* failure, so testing
-  `m.err instanceof SyntaxError` alongside the 2xx narrows it to exactly the shape the
-  docstring already claims. Worth folding into the extraction above rather than doing alone,
-  since that is when it gets a typed test.
+- ✅ **`reportAbsentManifest` is split, and `spike-install-latency.mjs` imports the pure
+  half.** `formatAbsentManifest(m) → { line, stream?, dim?, console }` lives in
+  `packages/core/manifest-report.js`; the worker keeps only the posting. The regex lift, the
+  `new Function` eval and its three stubs are deleted, and the spike pins the worker's poster
+  structurally (it imports the formatter, delegates to it, and maps `stream`/`dim`/`console`
+  unchanged).
+- ✅ **A 200 whose body fails mid-transfer is no longer diagnosed as a build defect.** The loud
+  arm now requires a parse failure (`SyntaxError`, recognised by name as well as by identity so
+  a foreign-realm error still counts). An aborted body — `r.json()` rejecting with a
+  `TypeError` — reports dim as `could not be fetched (HTTP 200, then …)`, claiming no cause.
+  Both new spike cases were checked against the old rule and go red there.
 
 ---
 

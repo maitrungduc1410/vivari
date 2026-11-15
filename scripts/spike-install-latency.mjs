@@ -55,6 +55,7 @@ import {
 import { unreachable } from "./gen-depcache.mjs";
 import { STRIP_DEFAULT_FROM, STRIP_FLAG_FROM, STRIP_HOOKS_FROM } from "./lib/import-ts.mjs";
 import { hashDepKey, writeSnapshotContainer } from "../packages/kernel-host/dep-cache.js";
+import { formatAbsentManifest } from "../packages/core/manifest-report.js";
 import { checkKernelAssets } from "./lib/site-headers.mjs";
 import { loadShippedTemplates } from "./lib/shipped-templates.mjs";
 
@@ -491,45 +492,26 @@ console.log("\n== an unreadable manifest is loud; an uncovered template is not =
   ok(/if \(!entry \|\| !entry\.asset\) return false;/.test(untilReturn), "a template with no entry returns quietly");
   ok(!/reportAbsentManifest|console\.warn/.test(untilReturn), "…and says nothing, because that is the normal case");
 
-  // Run the reporter, one call per condition, rather than grepping for a string
-  // that proves nothing about which branch produces it. It is a pure function of
-  // its argument, so lifting it out of the worker and stubbing `post` is enough;
-  // the annotation strip is the only concession to it being TypeScript, and a
-  // signature change makes the assertion below fail rather than pass quietly.
-  const decl = "function reportAbsentManifest(m: {";
-  const from = worker.indexOf(decl);
-  const src = from < 0 ? "" : worker.slice(from, worker.indexOf("\n}\n", from) + 2);
-  const js = src.replace(/^function reportAbsentManifest\(m: \{[\s\S]*?\n\}\) \{/, "function reportAbsentManifest(m) {");
-  ok(from >= 0 && js.startsWith("function reportAbsentManifest(m) {"), "the reporter can be lifted out and run");
+  // Run the formatter, one call per condition, rather than grepping for a
+  // string that proves nothing about which branch produces it. It lives in
+  // packages/core/manifest-report.js precisely so this can be an import; the
+  // worker keeps only the posting, which is pinned structurally here.
+  const poster = worker.slice(worker.indexOf("function reportAbsentManifest("));
+  const posterBody = poster.slice(0, poster.indexOf("\n}\n") + 2);
+  ok(/import \{ formatAbsentManifest \} from "\.\.\/\.\.\/manifest-report\.js";/.test(worker),
+    "the worker imports the formatter the spike runs");
+  ok(/formatAbsentManifest\(m\)/.test(posterBody), "…and its reporter delegates to it");
+  ok(/stream: r\.stream/.test(posterBody) && /dim: true/.test(posterBody), "…posting its styling unchanged");
+  ok(/if \(r\.console\) console\.warn\(/.test(posterBody), "…and mirroring to the console only when told to");
 
-  const posted = [];
   const consoled = [];
-  let report = null;
-  try {
-    report = new Function(
-      "post", "errMsg", "console",
-      `${js}\nreturn reportAbsentManifest;`,
-    )((_k, m) => posted.push(m), (e) => (e && e.message) || String(e), { warn: (l) => consoled.push(l) });
-  } catch (err) {
-    // A gate that stack-traces says less than one that fails, so the shape
-    // assertions below degrade to a single legible failure.
-    ok(false, `the reporter could not be lifted (${err.message})`);
-  }
-
   const call = (status, err) => {
-    posted.length = 0;
     consoled.length = 0;
-    if (!report) return { line: "" };
-    try {
-      report({ tag: "depcache", manifest: "vendor/depcache/index.json", fix: "npm run vendor:depcache", produces: "snapshots", status, err });
-    } catch (e) {
-      // Construction succeeding does not mean invocation will: a body that grew
-      // a reference to a module binding outside the injected three throws here,
-      // not above. Degrade the same way rather than stack-tracing.
-      ok(false, `the reporter threw on status ${status} (${e.message})`);
-      return { line: "" };
-    }
-    return posted[0] || { line: "" };
+    const r = formatAbsentManifest({
+      tag: "depcache", manifest: "vendor/depcache/index.json", fix: "npm run vendor:depcache", produces: "snapshots", status, err,
+    });
+    if (r.console) consoled.push(r.line);
+    return r;
   };
 
   // 200 that will not parse: the producer never ran and a Pages SPA answered
@@ -541,6 +523,21 @@ console.log("\n== an unreadable manifest is loud; an uncovered template is not =
     ok(consoled.length === 1, "…and reaches the console too, for the create path");
     ok(m.line.includes("npm run vendor:depcache"), "…and names the command that fixes it");
     ok(m.line.includes("Unexpected token '<'"), "…and quotes what actually failed");
+  }
+  // 200 whose body failed MID-TRANSFER: the file is there, the link dropped
+  // it. `r.json()` rejects with a TypeError, not a SyntaxError, and the defect
+  // signature is specifically the parse failure — so this is transient.
+  {
+    const m = call(200, new TypeError("network error"));
+    ok(m.dim === true && m.stream !== "stderr", "a 200 that dies mid-transfer is dim, not red");
+    ok(consoled.length === 0, "…and stays out of the console");
+    ok(!m.line.includes("npm run") && !m.line.includes("assembled without"), "…claiming neither a cause nor a fix");
+    ok(m.line.includes("HTTP 200") && m.line.includes("network error"), "…and says a response arrived, then what failed");
+  }
+  // A SyntaxError from another realm still counts as the defect.
+  {
+    const foreign = Object.assign(new Error("Unexpected token '<'"), { name: "SyntaxError" });
+    ok(call(200, foreign).stream === "stderr", "a parse failure is recognised by name, not only by identity");
   }
   // 404: legitimately absent. KERNEL_ASSETS calls both manifests optional, and
   // an embedder hosting @vivari/core has no vendor tree and no such command.

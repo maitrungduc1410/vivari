@@ -612,15 +612,19 @@ Pages SPA a missing manifest answers **200 with HTML**, so the defect only shows
 parse failure.
 
 **And the sentence is derived from the failure shape, not asserted.** The first version said
-"This build was assembled without it… Fix: `npm run vendor:depcache`" for all four conditions
-that reach `reportAbsentManifest`, which is true for exactly one of them. A **200 that will
+"This build was assembled without it… Fix: `npm run vendor:depcache`" for every condition
+that reaches `reportAbsentManifest`, which is true for exactly one of them. A **200 that will
 not parse** is the defect and keeps that text, loud on `stderr` and on the console, naming
 the command. A **404** is legitimately absent — `KERNEL_ASSETS` marks both manifests
 `optional: true`, "opt-in by design" — so it says "not served" dim, with no remedy; the case
 that matters there is an embedder hosting `@vivari/core` with no vendor tree, where the old
 line was red, in a downstream product's terminal, in front of that product's users, naming a
 build command from a repo they have never seen. A **5xx or a transport error or the locks
-budget rejection** is transient and claims no cause at all. Getting this wrong in the safe
+budget rejection** is transient and claims no cause at all. So is a **2xx whose body failed
+mid-transfer**: the defect signature is a *parse* failure, and an aborted body rejects
+`r.json()` with a `TypeError`, not a `SyntaxError`, so only the latter takes the loud arm.
+The rules live in `formatAbsentManifest` (`packages/core/manifest-report.js`), which the
+spike imports. Getting this wrong in the safe
 direction still costs something: a warning that is wrong three times out of four is one
 everybody learns to skip, and then it is not there for the time it is right.
 
@@ -5562,30 +5566,22 @@ Note also that the spike's predicate is *stricter* than the implementation — i
 `<div></div>` as blank — so what holds the table green is the rows it chooses, not agreement
 between the two. Read that as a limit on the table rather than as slack.
 
-### Lifting a function out of the worker source to run it is a ONE-OFF, not a technique
+### A pure decision in a worker belongs in a sibling module, not in a lifted string
 
-`spike-install-latency.mjs` runs `reportAbsentManifest` by slicing it out of
-`kernel-worker.ts` with a regex, stripping its type annotation, and evaluating it through
-`new Function` with `post`, `errMsg` and `console` hand-stubbed. It earns its place: the
-worker cannot be imported from Node, and executing the shipped text is the only reason the
-four message shapes are gated by behaviour rather than by grepping for substrings — a review
-pass mutated the function fourteen ways and every behavioural mutant fails.
+The worker cannot be imported from Node, so for a while `spike-install-latency.mjs` ran
+`reportAbsentManifest` by slicing it out of `kernel-worker.ts` with a regex, stripping its
+type annotation and evaluating it through `new Function` with `post`, `errMsg` and `console`
+hand-stubbed. That was better than string matching, and still the wrong mechanism: it broke
+on any signature change and needed a guard for every module binding the body might grow.
 
-It is still the wrong mechanism, and the difference from `run-phase.ts` — which
-`spike-site-headers.mjs` simply imports — is the whole point. **A third use of this lift
-should be refused.** The right end state is written up under "Tracked follow-ups" in
-`roadmap.md`: export the pure formatter from a small module, leave the posting in the worker,
-import it. Reverting the lift before that lands would be worse than keeping it, because the
-alternative is not a better test, it is string matching.
-
-Two rules if you touch it before it is replaced. **Guard invocation, not just construction** —
-a body that grows a reference to a module binding outside the injected stubs throws when the
-lifted function is *called*, and a gate that stack-traces says less than one that fails by
-name. And **an eval harness only ever sees the argument you hand it**, so it proves nothing
-about the call sites: the two real ones are covered by separate assertions that the computed
-`status` is passed on as a variable rather than as a literal, which is exactly the mutant
-(`status: 0`) that type-checks, keeps every other assertion green, and silently routes a real
-build defect onto the transient arm.
+It is gone. The decision is `formatAbsentManifest` in `packages/core/manifest-report.js`, plain
+JS with no imports (the `terminal-feedback.js` pattern), which the worker and the spike both
+import; the worker keeps only the posting. **Do this, not a lift, for the next one.** One rule
+still holds after the move: **a test of the formatter only sees the argument you hand it**, so
+it proves nothing about the call sites. Those are covered by separate assertions that the
+computed `status` is passed on as a variable rather than as a literal, which is exactly the
+mutant (`status: 0`) that type-checks, keeps every other assertion green, and silently routes a
+real build defect onto the transient arm.
 
 ### Ask what a policy PERMITS, not only what it forbids
 
