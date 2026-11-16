@@ -502,6 +502,15 @@ console.log("\n== an unreadable manifest is loud; an uncovered template is not =
     "the worker imports the formatter the spike runs");
   ok(/formatAbsentManifest\(m\)/.test(posterBody), "…and its reporter delegates to it");
   ok(/stream: r\.stream/.test(posterBody) && /dim: true/.test(posterBody), "…posting its styling unchanged");
+  // …and never both on one message. `{ line, stream: r.stream, dim: true }` passes
+  // the check above, and the studio would still render it red (controller.ts
+  // lets stderr win), but an embedder listening to `log` would see the defect
+  // line marked dim.
+  const literals = posterBody.match(/\{[^{}]*\}/g) || [];
+  ok(
+    literals.some((o) => /\bstream\b/.test(o)) && !literals.some((o) => /\bstream\b/.test(o) && /\bdim\b/.test(o)),
+    "…with `stream` and `dim` never on the same message",
+  );
   ok(/if \(r\.console\) console\.warn\(/.test(posterBody), "…and mirroring to the console only when told to");
 
   const consoled = [];

@@ -761,9 +761,9 @@ const depCacheAssetTried = new Set<string>();
 
 /**
  * Report — once per session per manifest — that the kernel could not read one.
- * Which of the five failure shapes this is, and what to say about each, is
- * decided by `formatAbsentManifest` (packages/core/manifest-report.js), which
- * the offline spike imports; only the posting lives here.
+ * Which failure shape this is, and what to say about each, is decided by
+ * `formatAbsentManifest` (packages/core/manifest-report.js), which the offline
+ * spike imports; only the posting lives here.
  */
 function reportAbsentManifest(m) {
   const r = formatAbsentManifest(m);

@@ -24,7 +24,7 @@ export function isParseFailure(err) {
  * Decide what to say — once per session per manifest — when the kernel could
  * not read one, saying what actually failed rather than asserting one cause.
  *
- * Five conditions arrive here and only ONE of them is a build defect:
+ * Of the conditions that arrive here, only the first is a build defect:
  *
  *   2xx + a body that will not parse — the producer never ran, and a Pages SPA
  *     answers a missing file with 200 and index.html. This is the historical
@@ -42,8 +42,14 @@ export function isParseFailure(err) {
  *     tree is the ordinary case. Prescribing a command from a repo they have
  *     never seen, in red, in their users' terminal, would be this build's own
  *     contract contradicting itself. Dim, and no remedy.
- *   5xx, or a transport error, or the locks path's budget rejection — transient
- *     and nothing to do with how the app was built. Dim, and no cause claimed.
+ *   5xx — transient and nothing to do with how the app was built. Dim, and no
+ *     cause claimed.
+ *   A transport error (status 0, no response at all) — the same: dim, quoting
+ *     the error, no cause claimed.
+ *   The locks path's budget rejection — the manifest may be fine and the link
+ *     slow. Also status 0 when no response arrived; if the budget runs out while
+ *     the body is still downloading, it arrives as a 2xx with a non-parse error
+ *     and takes the mid-transfer arm. Dim either way.
  *
  * The distinction that keeps the loud case worth reading is one level down as
  * well: a manifest that is present and simply has no entry for this project is

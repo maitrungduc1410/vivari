@@ -624,9 +624,9 @@ budget rejection** is transient and claims no cause at all. So is a **2xx whose 
 mid-transfer**: the defect signature is a *parse* failure, and an aborted body rejects
 `r.json()` with a `TypeError`, not a `SyntaxError`, so only the latter takes the loud arm.
 The rules live in `formatAbsentManifest` (`packages/core/manifest-report.js`), which the
-spike imports. Getting this wrong in the safe
-direction still costs something: a warning that is wrong three times out of four is one
-everybody learns to skip, and then it is not there for the time it is right.
+spike imports. Getting this wrong in the safe direction still costs something: a warning
+that is wrong for most of the shapes that trigger it is one everybody learns to skip, and
+then it is not there for the time it is right.
 
 **One level down, a lock the manifest PROMISED and could not deliver is also worth a line.**
 `fetchTemplateLock` used to return null on any failure, so a listed `react-ts` whose asset
