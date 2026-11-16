@@ -47,9 +47,7 @@ export function isParseFailure(err) {
  *   A transport error (status 0, no response at all) — the same: dim, quoting
  *     the error, no cause claimed.
  *   The locks path's budget rejection — the manifest may be fine and the link
- *     slow. Also status 0 when no response arrived; if the budget runs out while
- *     the body is still downloading, it arrives as a 2xx with a non-parse error
- *     and takes the mid-transfer arm. Dim either way.
+ *     slow. Always status 0: the budget only bounds the wait for headers. Dim.
  *
  * The distinction that keeps the loud case worth reading is one level down as
  * well: a manifest that is present and simply has no entry for this project is
