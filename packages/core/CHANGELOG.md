@@ -3,6 +3,12 @@
 From 1.1.0 on, entries are generated from [changesets](https://github.com/changesets/changesets).
 `@vivari/core` and `@vivari/react` are released together under the same version.
 
+## 1.3.2
+
+### Patch Changes
+
+- [#42](https://github.com/maitrungduc1410/vivari/pull/42) [`b31486d`](https://github.com/maitrungduc1410/vivari/commit/b31486d67eb4e051155aab705a2c4bb5b672d30b) Thanks [@visveshkhanna](https://github.com/visveshkhanna)! - A vendor manifest whose body is cut off mid-transfer is now reported as a transient, dim line instead of a red "this build was assembled without it" error that names a build command. Only a body that arrives and fails to parse (an SPA fallback page, for example) is still reported as a build defect.
+
 ## 1.3.1
 
 ### Patch Changes
