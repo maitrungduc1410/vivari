@@ -17,6 +17,7 @@
 // where the real in-VM file watcher drives HMR (Vite) or a recompile+restart
 // (Nest --watch) exactly like local development.
 
+import { formatAbsentManifest } from "../../manifest-report.js";
 import { newProgress, onFetch, onOutput, idleClear, stallVerdict, shouldReportStallFor, stallReportChunk } from "../../terminal-feedback.js";
 import { Kernel } from "../../../kernel-host/kernel.js";
 import { redactRelayUrl } from "../../../kernel-host/net-relay.js";
@@ -759,54 +760,15 @@ let depCacheManifestPromise: Promise<typeof depCacheManifest> | null = null;
 const depCacheAssetTried = new Set<string>();
 
 /**
- * Report — once per session per manifest — that the kernel could not read one,
- * saying what actually failed rather than asserting a single cause.
- *
- * Four conditions arrive here and only ONE of them is a build defect:
- *
- *   200 + unparseable — the producer never ran, and a Pages SPA answers a
- *     missing file with 200 and index.html. This is the historical bug: it hid
- *     the shipped-snapshot feature having no producer at all, and then hid
- *     `predev` not running the two producers, at the cost of a user's afternoon.
- *     Loud, on `stderr` (red in the studio terminal, where they were looking)
- *     and on the console too, since the locks manifest is read at project-create
- *     when no terminal may be attached yet — and it names the command, because
- *     a warning that only reports is one more thing to scroll past.
- *   404 — legitimately absent. `KERNEL_ASSETS` marks both manifests optional,
- *     "opt-in by design", and an embedder hosting @vivari/core without a vendor
- *     tree is the ordinary case. Prescribing a command from a repo they have
- *     never seen, in red, in their users' terminal, would be this build's own
- *     contract contradicting itself. Dim, and no remedy.
- *   5xx, or a transport error, or the locks path's budget rejection — transient
- *     and nothing to do with how the app was built. Dim, and no cause claimed.
- *
- * The distinction that keeps the loud case worth reading is one level down as
- * well: a manifest that is present and simply has no entry for this project is
- * the common case (coverage is one template), and says nothing at all. That is
- * why this lives at the manifest load and not at the lookup.
+ * Report — once per session per manifest — that the kernel could not read one.
+ * Which failure shape this is, and what to say about each, is decided by
+ * `formatAbsentManifest` (packages/core/manifest-report.js), which the offline
+ * spike imports; only the posting lives here.
  */
-function reportAbsentManifest(m: {
-  tag: string;
-  manifest: string;
-  fix: string;
-  produces: string;
-  status: number;
-  err: unknown;
-}) {
-  const head = `  [${m.tag}] ${m.manifest}`;
-  if (m.status >= 200 && m.status < 300) {
-    const line =
-      `${head} could not be read (${errMsg(m.err)}). This build was assembled without it, ` +
-      `so nothing is prebuilt and every project installs from scratch. Fix: \`${m.fix}\`.`;
-    post("log", { line, stream: "stderr" });
-    console.warn(`[vivari]${line}`);
-    return;
-  }
-  const line =
-    m.status === 404
-      ? `${head} is not served — no prebuilt ${m.produces} for this origin.`
-      : `${head} could not be fetched (${m.status ? `HTTP ${m.status}` : errMsg(m.err)}).`;
-  post("log", { line, dim: true });
+function reportAbsentManifest(m) {
+  const r = formatAbsentManifest(m);
+  post("log", r.stream ? { line: r.line, stream: r.stream } : { line: r.line, dim: true });
+  if (r.console) console.warn(`[vivari]${r.line}`);
 }
 
 function loadDepCacheManifest() {
