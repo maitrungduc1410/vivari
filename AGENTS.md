@@ -2066,6 +2066,17 @@ body framings, HEAD/204, `Connection: close`, the refusals). Real undici is exer
 `spike-pnpm.mjs` / `spike-pnpm-studio.mjs` on the net tier. All 17 offline checks go red
 with the old `tls.js`.
 
+### A preview redirect needs COEP too — WebKit blocks a bare `Response.redirect()`
+
+The SW answers a preview's first, tokened navigation with a 302 to the clean URL (see
+ARCHITECTURE, "each preview goes to its own tab"). `Response.redirect()` builds a
+response with no headers, and WebKit (Safari and every iOS browser) refuses a redirect
+into a frame of a `COEP: require-corp` page unless the redirect itself carries COEP:
+`Refused to display … in a frame because of Cross-Origin-Embedder-Policy` /
+`Redirection was blocked by Cross-Origin-Embedder-Policy`, and the preview stays blank
+while Chromium shows it. Any response the SW hands a preview navigation, a redirect
+included, gets the preview document's COEP/CORP. Gate: `scripts/spike-sw-multitab.mjs`.
+
 ### `writeLarge` must transfer a STANDALONE ArrayBuffer
 The kernel hands a fetched tarball to the FS Worker over a *transferred* buffer
 (`kernel-fs.js` `writeLarge`), to bypass the 1 MiB SAB. The trap: a `Uint8Array`
