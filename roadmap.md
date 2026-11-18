@@ -11966,3 +11966,24 @@ neither was the lock work:
   not, so it requested a different URL and stopped at the shell. Spike-only fix: decode
   HTML entities before following a `src`.
 
+
+## Nuxt 4's vite-node socket: `listen()` leaves a file at the path (this change)
+
+`nuxt dev` on Nuxt 4.4.8 (Vite 7, no rolldown) bound `:3000` but never rendered: the SSR
+worker failed with `connect ENOENT /tmp/nuxt-vite-*/nuxt.sock` (#44). The relay was not the
+problem. `@nuxt/vite-builder` listens on that socket and, in the listen callback, chmods it
+to 0600; when the chmod throws it logs "Failed to restrict vite-node socket permissions",
+**closes the server** and removes the directory. `Pipe.listen()` registered the path with
+the kernel but created nothing in the VFS, so the chmod always threw ENOENT, and the worker
+then dialled a socket that had just been closed.
+
+A pipe server's `listen()` now writes an empty file at its socket path (the VFS has no
+socket file type) and `close()` unlinks it, as libuv does. Abstract and Windows names get
+no file, and so does a path whose directory is missing or that already exists, which keeps
+`listen()` succeeding where it did before rather than failing like a real `bind()`.
+`scripts/probe-xpipe.mjs` gained the gate: the parent chmods its socket in the listen
+callback before the child dials, and the file must be gone after `close()`.
+
+Measured headless with the spike harness: Nuxt 4.4.8 installs in 41.5 s and `GET /` renders
+12.6 s after `nuxt dev` starts; without the change it gets no answer. Nuxt 4.5+ (Vite 8) uses
+the same socket but first hangs on rolldown's WASI workers (#45).

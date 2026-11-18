@@ -12,6 +12,10 @@
 //      bytes flow (request out, response back).
 //   3) The reverse direction too: the PARENT hosts a socket server, the child
 //      dials it — covers both listen-in-parent and listen-in-child.
+//   4) listen() leaves a file at the socket path, and close() removes it. The
+//      parent chmods its socket to 0600 in the listen callback before the child
+//      dials, as @nuxt/vite-builder does with vite-node's `nuxt.sock` (it closes
+//      the server when that chmod throws, so the SSR worker's dial gets ENOENT).
 //
 // Run (Node 22+):  node scripts/probe-xpipe.mjs
 
@@ -64,6 +68,8 @@ const cap = (s) => {
 const kernel = new Kernel({ fs: kernelFs.fs, spawnWorker, stdout: cap, stderr: cap });
 kernel.installCoreutils();
 kernel.mkdirp("/home/user");
+// The sockets live in /tmp, which must exist for listen() to leave a file there (gate 4).
+kernel.mkdirp("/tmp");
 
 // ── child: HTTP server on a UNIX socket (the Nitro-worker shape) ──────────────
 kernel.writeFile(
@@ -105,12 +111,16 @@ if (process.send) process.send({ ready2: true });
 kernel.writeFile(
   "/parent.js",
   `const cp = require("child_process");
+const fs = require("fs");
 const http = require("http");
 
 const SOCK = "/tmp/xpipe-a.sock";
 const PSOCK = "/tmp/xpipe-b.sock";
 let doneA = false, doneB = false;
-const finish = () => { if (doneA && doneB) process.exit(0); };
+const finish = () => {
+  if (!doneA || !doneB) return;
+  server.close(() => { console.log("SOCKFILE after close: " + (fs.existsSync(PSOCK) ? "still there" : "removed")); process.exit(0); });
+};
 
 // Direction 1: child hosts an HTTP server on a socket; parent requests it.
 const child = cp.fork("/child.js", [], { env: { ...process.env, SOCK } });
@@ -134,6 +144,12 @@ const server = http.createServer((req, res) => {
   req.on("end", () => { res.writeHead(200); res.end("parent-got url=" + req.url + " body=" + body); });
 });
 server.listen(PSOCK, () => {
+  try {
+    fs.chmodSync(PSOCK, 0o600);
+    console.log("SOCKFILE chmod mode=" + (fs.statSync(PSOCK).mode & 0o777).toString(8));
+  } catch (e) {
+    console.log("SOCKFILE chmod ERR " + e.code);
+  }
   const child2 = cp.fork("/child2.js", [], { env: { ...process.env, PSOCK } });
   child2.on("message", (m) => {
     if (m && m.ready2) child2.send({ go: true });
@@ -156,8 +172,10 @@ const log = (r.stdout || "") + (r.stderr ? "\nstderr:\n" + r.stderr : "") + out.
 console.log("── parent output ──\n" + log.trim());
 const dir1 = /DIR1 200 :: child pid=\d+ url=\/from-parent body=ping-from-parent/.test(log);
 const dir2 = /DIR2 200 parent-got url=\/from-child body=ping-from-child/.test(log);
+const sockFile = /SOCKFILE chmod mode=600/.test(log) && /SOCKFILE after close: removed/.test(log);
 console.log("\n  DIR1 (child hosts socket, parent requests): " + dir1);
 console.log("  DIR2 (parent hosts socket, child requests): " + dir2);
-const ok = dir1 && dir2 && r.code === 0;
+console.log("  SOCKFILE (listen creates the path, chmod works, close removes it): " + sockFile);
+const ok = dir1 && dir2 && sockFile && r.code === 0;
 console.log("\nRESULT: " + (ok ? "PASS — cross-process UNIX sockets work both directions" : "FAIL — see logs above (exit=" + r.code + ")"));
 process.exit(ok ? 0 : 1);

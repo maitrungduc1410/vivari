@@ -620,6 +620,32 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
   // their endpoint by connId. See dispatchPipe below.
   const xpipeConns = new Map(); // connId -> local Pipe endpoint
 
+  // A real bind() leaves a socket file at the path, and tools act on it as soon as
+  // listen() returns: @nuxt/vite-builder chmods its vite-node `nuxt.sock` to 0600
+  // and, when that throws ENOENT, closes the server, so its SSR worker's dial then
+  // fails with ENOENT too. The VFS has no socket file type, so stand an empty file
+  // in for it. Abstract (`\0…`) and Windows (`\\.\pipe\…`) names have no file.
+  // Returns the path it created, or null (no fs, a name with no file, a file
+  // already there, or a missing directory, which keeps listen() succeeding as it
+  // did before rather than failing like a real bind would).
+  function createSocketFile(path) {
+    if (!path || path[0] === "\0" || /^[\\/][\\/][.?][\\/]pipe[\\/]/i.test(path)) return null;
+    if (!syscalls || !syscalls.writeFile || !syscalls.exists) return null;
+    // The VFS takes absolute paths only; resolve a relative one as libuv would.
+    let file = path;
+    if (!file.startsWith("/")) {
+      const cwd = (process && process.cwd && process.cwd()) || "/";
+      file = (cwd.endsWith("/") ? cwd : cwd + "/") + file;
+    }
+    try {
+      if (syscalls.exists(file)) return null;
+      syscalls.writeFile(file, new Uint8Array(0));
+      return file;
+    } catch {
+      return null;
+    }
+  }
+
   class Pipe {
     constructor(type) {
       this.type = type;
@@ -636,6 +662,7 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
       this._pipePath = null;
       this._remotePath = "";
       this._kernelPipe = null; // socket path registered with the kernel (servers)
+      this._sockFile = null; // the placeholder file listen() created at the path (servers)
       this._xproc = false; // true once this endpoint bridges to another process
       this._connId = 0; // kernel-assigned id of the cross-process connection
       this.bytesRead = 0;
@@ -662,6 +689,7 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
           return UV_CODES.UV_EADDRINUSE;
         }
       }
+      this._sockFile = createSocketFile(this._pipePath);
       pipeServers.set(this._pipePath, this);
       this._live = true;
       recount(this);
@@ -785,6 +813,15 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
               /* kernel gone */
             }
             this._kernelPipe = null;
+          }
+          if (this._sockFile != null) {
+            // libuv unlinks the socket file it bound when the server closes.
+            try {
+              syscalls.unlink(this._sockFile);
+            } catch {
+              /* already removed, e.g. with its directory */
+            }
+            this._sockFile = null;
           }
         }
         if (this._xproc) {
