@@ -5832,6 +5832,16 @@ under it emits, not just the values. Assert order explicitly — `deepStrictEqua
 array of event names — and assert how many times `error` fires; both facts are invisible
 to a test that resolves on the first event it likes.
 
+### A signal has two delivery paths, and only one may enqueue it
+The kernel posts each signal twice on purpose: it sets the process's bit in the shared
+control buffer, which a blocked syscall sees, and it posts a message, which an idle
+event loop sees. `dispatchSignalEvent` used to enqueue its own copy from the message
+while the bit stayed set, so a handler that made any syscall drained the bit and ran a
+second time. `nuxt dev` exited 130 with "Something went wrong" on the first Ctrl+C.
+The message path now only calls `takePendingSignals(ctrl)`, so the bit is the single
+source. Count how many times a handler runs (`spike-terminal-tty`, `spike-signals`),
+not just whether it ran.
+
 ## Testing & verification
 
 The runtime runs headless under Node `worker_threads`, so validate without a
