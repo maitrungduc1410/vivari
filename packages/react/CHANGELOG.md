@@ -4,6 +4,14 @@ From 1.1.0 on, entries are generated from [changesets](https://github.com/change
 `@vivari/core` and `@vivari/react` are released together under the same version, so a release
 that says "No changes in this release" changed only `@vivari/core`.
 
+## 1.3.3
+
+### Patch Changes
+
+- [#47](https://github.com/maitrungduc1410/vivari/pull/47) [`1d1ad56`](https://github.com/maitrungduc1410/vivari/commit/1d1ad56639c86ce0ce3ed5b4842ea0541e0b04c1) Thanks [@atinux](https://github.com/atinux)! - Previews now load on Safari and every iOS browser. The preview Service Worker's first redirect (which takes the routing token off the preview URL) carried no headers, and WebKit refused it inside a cross-origin isolated page ("Redirection was blocked by Cross-Origin-Embedder-Policy"), so the preview stayed blank; it now carries the same COEP/CORP as the preview document.
+
+- [#46](https://github.com/maitrungduc1410/vivari/pull/46) [`23e5f14`](https://github.com/maitrungduc1410/vivari/commit/23e5f14a320a6cd73edc585738b3139e7dedaf31) Thanks [@atinux](https://github.com/atinux)! - A server listening on a UNIX socket path now leaves a file at that path, as on a real system, and closing the server removes it. Tools that `chmod` or `stat` their socket right after `listen()` no longer fail with `ENOENT`; Nuxt 4's `nuxt dev` did exactly that with its vite-node `nuxt.sock`, closed the server, and its SSR worker's connection then failed with `connect ENOENT`.
+
 ## 1.3.2
 
 No changes in this release.
