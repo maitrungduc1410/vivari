@@ -221,6 +221,9 @@ const SPIKES = [
   // that exists (nitro's pruned ESM-only deps). createModuleSystem over host fs, no
   // kernel/wasm.
   { name: "resolve-fallback", file: "spike-resolve-fallback.mjs", net: false, timeout: 60000 },
+  // Module loader: a file: URL with a ?query or #hash gets its own instance, as in
+  // Node (c12/@nuxt/kit config reloads). createModuleSystem over host fs, no kernel/wasm.
+  { name: "import-query", file: "spike-import-query.mjs", net: false, timeout: 60000 },
   // Breakpoint debugger: the source instrumenter + in-guest CDP Debugger backend +
   // the debug-command SharedArrayBuffer channel (real Atomics across a worker).
   // Pure JS + vendored acorn, no kernel/wasm.
