@@ -62,7 +62,8 @@ function loadSw() {
 
   // A kernel window answers vv-http with its own name and the path it was handed,
   // and records anything else posted to it (ws/SSE frames).
-  const kernel = (id) => {
+  // `answer` replaces that reply, for a check on what the SW makes of a given response.
+  const kernel = (id, answer) => {
     const c = {
       id,
       url: `${ORIGIN}/`,
@@ -70,7 +71,7 @@ function loadSw() {
       got: [],
       postMessage(msg, transfer) {
         if (msg && msg.type === "vv-http") {
-          transfer[0].postMessage({ status: 200, headers: { "content-type": "text/plain" }, body: `${id}:${msg.req.url}` });
+          transfer[0].postMessage(answer ?? { status: 200, headers: { "content-type": "text/plain" }, body: `${id}:${msg.req.url}` });
         } else c.got.push(msg);
       },
     };
@@ -96,7 +97,7 @@ function loadSw() {
     for (const fn of listeners.fetch) fn(event);
     const res = await responded;
     if (!res) return { status: 0, body: "", location: null };
-    return { status: res.status, body: await res.text(), location: res.headers.get("location"), coep: res.headers.get("cross-origin-embedder-policy"), corp: res.headers.get("cross-origin-resource-policy") };
+    return { status: res.status, body: await res.text(), location: res.headers.get("location"), coep: res.headers.get("cross-origin-embedder-policy"), corp: res.headers.get("cross-origin-resource-policy"), xfo: res.headers.get("x-frame-options"), csp: res.headers.get("content-security-policy") };
   };
   const peek = (expr) => vm.runInContext(expr, ctx);
   return { ctx, clients, kernel, frame, message, request, peek };
@@ -164,6 +165,32 @@ console.log("\n== the token never reaches the app ==");
   // clean URL, which then takes the fallback.
   const lost = await sw.request({ url: "/preview/5173/?__vv_kernel=zzzzzz", mode: "navigate", resultingClientId: "f2" });
   ok(lost.status === 302 && lost.location === `${ORIGIN}/preview/5173/`, `an unknown token still redirects to the clean URL (${lost.status} ${lost.location})`);
+}
+
+console.log("\n== an app's error page can still be framed ==");
+{
+  // What Nitro's error handler, and so Nuxt's, answers a page that throws: a 500 that
+  // forbids framing. The preview IS a frame, so the browser showed "refused to connect"
+  // there, while the same URL in its own tab showed the error.
+  const sw = loadSw();
+  sw.kernel("tab-A", { status: 500, headers: { "content-type": "text/html", "x-frame-options": "DENY" }, body: "<h1>500</h1>" });
+  const r = await sw.request({ url: "/preview/3000/", mode: "navigate", resultingClientId: "frame-A" });
+  ok(r.status === 500 && r.body.includes("<h1>500</h1>"), `the error page reaches the frame as the app sent it (${r.status})`);
+  ok(r.xfo === null, `without its X-Frame-Options (${r.xfo})`);
+  ok(r.coep === "require-corp" && r.corp === "same-origin", `and with the preview's COEP/CORP (coep=${r.coep}, corp=${r.corp})`);
+
+  // CSP's frame-ancestors forbids framing too; the rest of the policy must survive.
+  const page = (csp) => {
+    const s = loadSw();
+    s.kernel("tab-A", { status: 200, headers: { "content-type": "text/html", "content-security-policy": csp }, body: "<h1>app</h1>" });
+    return s.request({ url: "/preview/3000/", mode: "navigate", resultingClientId: "frame-A" });
+  };
+  const mixed = await page("default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'");
+  ok(mixed.csp === "default-src 'self'; script-src 'self' 'unsafe-inline'", `frame-ancestors is dropped and the rest kept (${mixed.csp})`);
+  const two = await page("frame-ancestors 'self', img-src 'self'; frame-ancestors 'none'");
+  ok(two.csp === "img-src 'self'", `…in each of several policies, dropping one left empty (${two.csp})`);
+  const only = await page("frame-ancestors 'none'");
+  ok(only.csp === null, `a policy of only frame-ancestors goes entirely (${only.csp})`);
 }
 
 console.log("\n== keep-prefix is decided per tab ==");

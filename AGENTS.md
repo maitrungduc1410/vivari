@@ -2090,6 +2090,14 @@ into a frame of a `COEP: require-corp` page unless the redirect itself carries C
 while Chromium shows it. Any response the SW hands a preview navigation, a redirect
 included, gets the preview document's COEP/CORP. Gate: `scripts/spike-sw-multitab.mjs`.
 
+### A preview response loses its X-Frame-Options — error pages send DENY
+Nitro's error handler (and so Nuxt's) sends `X-Frame-Options: DENY` on every error
+page. The preview is a frame, so an app that threw rendered as the browser's "refused to
+connect" page in the IDE, while the same URL in its own tab showed the error. `servePreview`
+deletes the header from every preview response, and the `frame-ancestors` directive from
+its CSP (the rest of the policy stays); a dev server on localhost is never framed, so no
+app relies on either. Gate: `scripts/spike-sw-multitab.mjs`.
+
 ### Web streams a process builds carry Node's closed-promise — undici's fetch needs it
 A process's `ReadableStream`/`WritableStream` and `performance` are the browser Worker's,
 not Node's. `stream.finished()` on a web stream reads
