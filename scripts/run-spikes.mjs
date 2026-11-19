@@ -282,6 +282,9 @@ const SPIKES = [
   // cross-process, every scenario run on the host's real Node and in the VM with
   // identical transcripts required. needsWasm: it boots a kernel.
   { name: "fetch-loopback", file: "spike-fetch-loopback.mjs", net: false, needsWasm: true, timeout: 180000 },
+  // A web stream a process builds carries the closed-promise stream.finished() reads
+  // (undici's fetch, so pnpm 11, aborted every response without it). Host only.
+  { name: "web-globals", file: "spike-web-globals.mjs", net: false, needsWasm: false, timeout: 30000 },
   // tls.connect to an outside host answers HTTP/1.1 through fetch (pnpm 11's undici
   // dials the registry this way). Stub fetcher, so offline; needsWasm: boots a kernel.
   { name: "tls-egress", file: "spike-tls-egress.mjs", net: false, needsWasm: true, timeout: 120000 },

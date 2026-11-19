@@ -27,6 +27,7 @@ import {
 import { createPythonRuntime } from "./builtins/python.js";
 import { captureHostRealm, sealGuestRealm, installBunRealm } from "./realm.js";
 import { installMessagePort } from "./message-port.js";
+import { installWebGlobals } from "./web-globals.js";
 
 // The host realm as it was before a single line of ours ran. Taken at module
 // load, which is the last moment the answer is knowable: every global the runtime
@@ -1321,6 +1322,7 @@ export function createRuntime({
   globalThis.Buffer = Buffer;
   globalThis.console = consoleObj;
   globalThis.global = globalThis;
+  installWebGlobals(globalThis);
   // Worker-global alias: browser Workers already have `self`, but the headless
   // Node worker_threads runtime does not. Some libraries (e.g. esbuild-wasm's
   // browser build, which mirrors globals off `self`) rely on it existing.
