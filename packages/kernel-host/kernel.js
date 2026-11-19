@@ -374,6 +374,15 @@ export class Kernel {
     for (const name of Array.isArray(names) ? names : [names]) {
       this.lazyLoaders.set(name, loader);
       if (notice) this.lazyNotices.set(name, notice);
+      // On PATH before its first use, as a real install would be: a program that
+      // looks for the command itself (Nuxt's CLI stats `pnpm` in every PATH entry
+      // before `nuxt module add` installs with it) finds it there, and its spawn
+      // loads it. The placeholder only runs when the load failed.
+      if (!this.isFile("/bin/" + name + ".js")) {
+        this.mkdirp("/bin");
+        this.writeFile("/bin/" + name + ".js", `process.stderr.write(${JSON.stringify(name + ": not found\n")});\nprocess.exit(127);\n`);
+      }
+      this.linkBin(name);
     }
   }
 
@@ -389,6 +398,8 @@ export class Kernel {
    * stderr (routed to its terminal by the environment), once per load episode.
    */
   async ensureCommandLoaded(command, pid = null) {
+    // A program that found the command on PATH itself may spawn it by that path.
+    if (typeof command === "string") command = command.replace(/^\/bin\/([^/]+?)(\.js)?$/, "$1");
     const loader = this.lazyLoaders.get(command);
     if (!loader) return; // not lazy (or already loaded) — nothing to do
     let inflight = this.lazyInflight.get(loader);
@@ -489,6 +500,20 @@ export class Kernel {
     this.mkdirp("/bin");
     for (const [name, source] of Object.entries(COREUTILS)) {
       this.writeFile("/bin/" + name + ".js", source);
+      this.linkBin(name);
+    }
+  }
+
+  /**
+   * Link /bin/<name> to /bin/<name>.js. Spawns resolve either, but a program that
+   * searches PATH for a command itself, as `which` does, stats the bare name.
+   */
+  linkBin(name) {
+    const link = "/bin/" + name;
+    try {
+      this.fs.lstat(link);
+    } catch {
+      this.fs.symlink(name + ".js", link);
     }
   }
 
