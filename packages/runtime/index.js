@@ -3,7 +3,7 @@
 // exactly like `node <entry>` would - synchronously, inside a worker.
 
 import { createSyscalls } from "./fs-client.js";
-import { interruptView } from "../protocol/syscall.js";
+import { interruptView, takePendingSignals } from "../protocol/syscall.js";
 import { createEventLoop } from "./loop.js";
 import { createSignalDelivery } from "./signals.js";
 import { createNodeModules } from "./node/loader.js";
@@ -577,7 +577,17 @@ export function createRuntime({
     const signals = createSignalDelivery({ process, loop, postRaw });
     onPendingSignals = signals.onPending;
     drainSignals = signals.drain;
-    dispatchSignalEvent = signals.dispatch;
+    // The kernel marks a signal in the SAB and posts a message, and either can
+    // reach us first: the bits are harvested whenever we park in a syscall. So the
+    // message only says "look": the bits decide, and taking them leaves nothing
+    // for the other path to deliver again. Taking the message itself delivered
+    // SIGINT twice to a handler that made a syscall (it harvested the bit the
+    // message had already delivered), and Nuxt's dev server reads a second
+    // Ctrl-C as "exit now" (exit 130, "Something went wrong").
+    dispatchSignalEvent = () => {
+      const names = takePendingSignals(ctrl);
+      if (names) signals.onPending(names);
+    };
     signalStandDown = signals.standDown;
   }
 

@@ -105,5 +105,32 @@ process.stdin.on('keypress', (s, key) => {
   ok(text === "DONE", "…and nothing to a stream that is not one", text);
 }
 
+console.log("== Ctrl-C in the interactive shell ==");
+// The shell turns Ctrl-C into one SIGINT for its foreground job. It used to arrive
+// twice when the handler made a syscall (the kernel's message and the SAB bit
+// each delivered it, see dispatchSignalEvent in runtime/index.js), and Nuxt's dev
+// server reads a second Ctrl-C as "exit now".
+k.writeFile("/tmp/ctrlc.js", `const fs = require('fs');
+process.stdin.setRawMode(true);
+process.on('SIGINT', () => {
+  fs.appendFileSync('/tmp/ctrlc.log', 'SIGINT\\n');
+  setTimeout(() => process.exit(0), 500);
+});
+fs.writeFileSync('/tmp/ctrlc.log', '');
+process.stdout.write('READY\\n');
+setInterval(() => {}, 1000);`);
+{
+  const start = h.out.length;
+  const sh = k.launch("sh", [], { cwd: "/", env: { PATH: "/bin" }, winsize: SIZE });
+  await new Promise((r) => setTimeout(r, 1500));
+  k.sendStdin(sh, new TextEncoder().encode("node /tmp/ctrlc.js\r"));
+  for (let i = 0; i < 50 && !h.out.slice(start).join("").includes("READY"); i++) await new Promise((r) => setTimeout(r, 100));
+  k.sendStdin(sh, new TextEncoder().encode("\x03"));
+  await new Promise((r) => setTimeout(r, 1500));
+  const log = k.readFile("/tmp/ctrlc.log");
+  ok(log === "SIGINT\n", "one Ctrl-C is one SIGINT, though the handler makes a syscall", log);
+  k.stop(sh);
+}
+
 console.log(failed ? `\nFAILED: ${failed}` : "\nPASS: the terminal is a TTY to the programs drawing on it, and only to them");
 process.exit(failed ? 1 : 0);
