@@ -2105,7 +2105,8 @@ settles on close/error/cancel/abort, and adds a no-op `markResourceTiming`. Unde
 the native classes already carry the symbol and are left alone. Limits: platform-made
 streams (a `Response`'s body, `TransformStream` halves) still lack it, and a readable's
 promise resolves at `controller.close()`, before its queue drains, where Node waits.
-Gate: `scripts/spike-web-globals.mjs` (offline).
+Gate: `scripts/spike-web-globals.mjs` (offline), which also pins that timing gap against
+real Node; its other scenarios compare end states only, so they cannot see it.
 
 ### `writeLarge` must transfer a STANDALONE ArrayBuffer
 The kernel hands a fetched tarball to the FS Worker over a *transferred* buffer
@@ -2834,7 +2835,8 @@ result against the config it holds. `module.js` used to cache by path alone, so 
 got the first evaluation back and `nuxt dev` printed "nuxt.config.ts saved without changing
 config" for every edit. `load()` now keeps such modules in a second table keyed by path +
 suffix (`urlCache`); a plain path and a query-less URL still share `cache` (and
-`require.cache`). Gate: `scripts/spike-import-query.mjs` (offline).
+`require.cache`). Gate: `scripts/spike-import-query.mjs` (offline), including a dynamic
+`import()` from an ESM module, the path c12 takes.
 
 ### VitePress works in-VM (Docs template, graduated) — three in-VM gotchas
 VitePress runs **Vite 5** (esbuild config bundler, not rolldown). Getting it to boot + render

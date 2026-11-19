@@ -1,6 +1,7 @@
 // Spike (OFFLINE, host only): a web stream a process builds must carry the closed-promise
-// stream.finished() reads, settled as Node's own streams settle it, and
-// performance.markResourceTiming must exist.
+// stream.finished() reads, settled by the same events as Node's own, and
+// performance.markResourceTiming must exist. One timing difference is pinned rather than
+// hidden: see "known divergence" at the end.
 //
 // WHY THIS EXISTS. In a browser Worker a process's ReadableStream and WritableStream
 // are the platform's, which lack the closed-promise Node's own web streams carry under
@@ -16,6 +17,14 @@
 // transcripts must match line for line. A control run without installWebGlobals must
 // throw where eosWeb threw. (The host's own finished() is not the code under test:
 // newer Node tolerates the missing promise.)
+//
+// The scenarios compare each stream's END state, so they cannot see WHEN the promise
+// settles. That matters for one case: Node settles a readable's promise only when the
+// stream really closes, after its queued chunks are read, while web-globals.js settles it
+// at controller.close() because nothing observable fires when a platform queue drains.
+// So finished() reports a readable done while chunks are still queued. The last block
+// measures that on both sides and asserts the difference, so it goes red if the gap is
+// closed (update the docs then) or grows into the other events.
 //
 //   run:  node scripts/spike-web-globals.mjs
 
@@ -111,6 +120,27 @@ ok(typeof g.performance.markResourceTiming === "function", "performance.markReso
 const native = { ReadableStream, WritableStream, performance };
 installWebGlobals(native);
 ok(native.ReadableStream === ReadableStream && native.WritableStream === WritableStream, "Node's own classes are left alone");
+
+// Known divergence: when does a readable with queued chunks count as closed?
+console.log("== known divergence: a readable closed with chunks still queued ==");
+async function closeTiming(RS) {
+  const s = new RS({ start(c) { c.enqueue("a"); c.enqueue("b"); c.close(); } });
+  let settled = false;
+  s[k].promise.then(() => (settled = true));
+  await new Promise((r) => setTimeout(r, 20));
+  const before = settled;
+  const r = s.getReader();
+  while (!(await r.read()).done);
+  await new Promise((r) => setTimeout(r, 20));
+  return `before reading: ${before}, after reading: ${settled}`;
+}
+const nodeTiming = await closeTiming(ReadableStream);
+const oursTiming = await closeTiming(g.ReadableStream);
+ok(nodeTiming === "before reading: false, after reading: true", `Node settles only once the queue is read (${nodeTiming})`);
+ok(
+  oursTiming === "before reading: true, after reading: true",
+  `ours settles at controller.close(), before the queue is read (${oursTiming}); if this changes, the gap moved: update this check, AGENTS.md and roadmap.md`,
+);
 
 console.log(failed ? `\nFAILED: ${failed}` : "\nall passed");
 process.exit(failed ? 1 : 0);

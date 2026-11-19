@@ -51,6 +51,23 @@ try {
   check("new ?_2 evaluates the file again (v2)", value(`${url}?_2`) === 2);
   check("new #t2 evaluates the file again (v2)", value(`${url}#t2`) === 2);
   check("?_2 twice is one instance", require(`${url}?_2`) === require(`${url}?_2`));
+
+  // The way c12 actually reloads: a dynamic import() of an ESM config from an ESM
+  // module. That goes through the transpiler's __oc_import, not a plain require, so the
+  // query has to survive that path too.
+  const cfg = path.join(root, "cfg.mjs");
+  const cfgUrl = pathToFileURL(cfg).href;
+  fs.writeFileSync(cfg, "export default { value: 1 };");
+  fs.writeFileSync(
+    path.join(root, "reload.mjs"),
+    `export async function load(n) { return (await import(${JSON.stringify(cfgUrl)} + "?t=" + n)).default.value; }`,
+  );
+  const { load } = require(path.join(root, "reload.mjs"));
+  const first = await load(1);
+  fs.writeFileSync(cfg, "export default { value: 2 };");
+  const second = await load(2);
+  check(`ESM import() with ?t=1 loads v1 (${first})`, first === 1);
+  check(`ESM import() with a new ?t=2 sees the edit (${second})`, second === 2);
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

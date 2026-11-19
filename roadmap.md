@@ -12003,8 +12003,9 @@ path, so it returned the first evaluation and c12 saw no change.
 `load()` in `runtime/module.js` now keeps a module requested through a `file:` URL with a
 `?query` or `#hash` in a second table keyed by path + suffix. A plain path or a query-less URL
 still uses `cache`, so `require.cache` and everything that patches it see what they did before.
-`scripts/spike-import-query.mjs` is the offline gate (8 checks; the two "new query" and "new
-hash" checks fail on the old loader). With the same change in a patched `@vivari/core` 1.3.3,
+`scripts/spike-import-query.mjs` is the offline gate; its "new query", "new hash" and ESM
+`import()` checks fail on the old loader. The `import()` case was added after the merge, since
+that, not `require`, is the path c12 takes. With the same change in a patched `@vivari/core` 1.3.3,
 the Nuxt playground in Chromium and Playwright WebKit prints "nuxt.config.ts changed.
 Reloading Nuxt..." and `runtimeConfig updated` on save, and the server renders the new value.
 
@@ -12025,5 +12026,8 @@ or rejecting `start`/`pull`/`write`, `cancel`, `close` and `abort`, and adds a n
 `performance.markResourceTiming`. `instanceof` still accepts platform-made streams, the classes
 keep their names, and under Node (which has both already) nothing changes.
 `scripts/spike-web-globals.mjs` is the offline gate. Known gap: a readable's promise resolves
-when `controller.close()` is called, not when its queue drains as in Node. Measured in the Nuxt
+when `controller.close()` is called, not when its queue drains as in Node, so `finished()` can
+report a readable done while chunks are still queued. The spike's scenarios compare end states
+only and could not see this, so a block added after the merge measures the timing on both
+sides and pins the difference: it goes red if the gap closes or moves. Measured in the Nuxt
 playground on a patched `@vivari/core` 1.3.3: `pnpm add canvas-confetti` finished in 12.2 s.
