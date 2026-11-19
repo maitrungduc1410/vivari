@@ -653,7 +653,11 @@ end to end on top (real `ClientRequest`/`ServerResponse`/`IncomingMessage`,
 chunked bodies, keep-alive). This registry is **per-process** (one worker = one
 process). Writes never block — they queue into the peer's inbox and pump on
 `nextTick`. The same binding backs `pipe_wrap` (UNIX-domain sockets / named
-pipes) with an identical path-keyed loopback.
+pipes) with an identical path-keyed loopback. A pipe server's `listen()` also
+leaves an empty file at its socket path (the VFS has no socket file type) and
+`close()` unlinks it, as libuv does, because tools act on that file right away:
+`@nuxt/vite-builder` chmods its vite-node `nuxt.sock` and closes the server if
+that fails. Abstract (`\0…`) and Windows (`\\.\pipe\…`) names get no file.
 
 **Cross-process loopback (TCP + UNIX sockets).** When a `connect()` targets a
 port/path that isn't served in *this* process, another in-VM process may own it —

@@ -2066,6 +2066,18 @@ body framings, HEAD/204, `Connection: close`, the refusals). Real undici is exer
 `spike-pnpm.mjs` / `spike-pnpm-studio.mjs` on the net tier. All 17 offline checks go red
 with the old `tls.js`.
 
+### A UNIX socket server leaves a FILE at its path — tools chmod it right after `listen()`
+
+The kernel keys cross-process pipes by path string, so nothing needs a file for the
+connection itself. Tools still expect one: `@nuxt/vite-builder` chmods its vite-node
+`nuxt.sock` to 0600 in the listen callback and **closes the server** when that throws,
+so the SSR worker's dial then fails with `connect ENOENT …/nuxt.sock` and the preview
+sits on "Starting Nuxt…" (#44). `Pipe.listen()` in `bindings/net.js` therefore writes
+an empty placeholder file (the VFS has no socket type) and `close()` unlinks it, like
+libuv. It is skipped for abstract/Windows names and when the directory is missing or a
+file is already there, so a `listen()` that used to work still does. Gate:
+`scripts/probe-xpipe.mjs` (SOCKFILE).
+
 ### A preview redirect needs COEP too — WebKit blocks a bare `Response.redirect()`
 
 The SW answers a preview's first, tokened navigation with a 302 to the clean URL (see
