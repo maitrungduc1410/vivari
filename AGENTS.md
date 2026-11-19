@@ -2810,6 +2810,15 @@ resolves a `file://` specifier (including a `?t=` cache-buster) to its VFS path,
 NATIVE loader's config import and Vite's module-runner file:// imports resolve. It's the
 rolldown *bundling* step that fails, not the file:// import.
 
+### A file: URL with a `?query`/`#hash` gets its OWN module instance — config reloads depend on it
+Node's ESM loader keys a module by its whole URL, so `import(url + "?t=2")` evaluates the
+file again. c12 (through @nuxt/kit) reloads `nuxt.config.ts` exactly that way and diffs the
+result against the config it holds. `module.js` used to cache by path alone, so the reload
+got the first evaluation back and `nuxt dev` printed "nuxt.config.ts saved without changing
+config" for every edit. `load()` now keeps such modules in a second table keyed by path +
+suffix (`urlCache`); a plain path and a query-less URL still share `cache` (and
+`require.cache`). Gate: `scripts/spike-import-query.mjs` (offline).
+
 ### VitePress works in-VM (Docs template, graduated) — three in-VM gotchas
 VitePress runs **Vite 5** (esbuild config bundler, not rolldown). Getting it to boot + render
 in-VM required handling three distinct issues; all are reflected in the shipped template

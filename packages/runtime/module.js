@@ -116,6 +116,8 @@ export function parseShellShimTarget(source) {
 
 export function createModuleSystem({ fs, path, builtins, process, globals, nodeModules }) {
   const cache = Object.create(null);
+  // Modules imported by a file: URL with a ?query or #hash, keyed by path + suffix (see load).
+  const urlCache = Object.create(null);
   // The entry module (Node's `require.main` / `process.mainModule`). Set by
   // runMain; every require's `require.main` points at it.
   let mainModule = undefined;
@@ -472,17 +474,23 @@ export function createModuleSystem({ fs, path, builtins, process, globals, nodeM
     }
 
     const filename = realpath(r.id); // canonicalize symlinks (see realpath above)
-    if (cache[filename]) return cache[filename].exports;
+    // Node's ESM loader keys a module by its whole URL, so `import(url + "?t=2")`
+    // evaluates the file again: c12/@nuxt/kit reload nuxt.config that way. Such a
+    // file: URL gets its own instance here too; a plain path keeps `cache`.
+    const suffix = request.startsWith("file:") ? (/[?#].*$/.exec(request) || [""])[0] : "";
+    const store = suffix ? urlCache : cache;
+    const key = filename + suffix;
+    if (store[key]) return store[key].exports;
 
     const module = new Module(filename);
     module.paths = nodeModulesPaths(path.dirname(filename));
-    cache[filename] = module;
+    store[key] = module;
     let ok = false;
     try {
       compile(module, filename);
       ok = true;
     } finally {
-      if (!ok) delete cache[filename];
+      if (!ok) delete store[key];
     }
     module.loaded = true;
     return module.exports;
