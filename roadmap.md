@@ -11991,3 +11991,19 @@ rolldown 1.2.19 with its wasm binding) failed the same way and renders after the
 quietly instead of surfacing it, which made the render look stuck behind the
 `wasi-worker.mjs` threads. Those threads read `booted=false` in templates that work as well,
 so on their own they were never a sign of a hang. Not yet verified in a browser Studio.
+
+### A file: URL with a `?query` loads a fresh module: `nuxt.config.ts` edits apply in `nuxt dev`
+
+Editing `nuxt.config.ts` while `nuxt dev` ran printed "nuxt.config.ts saved without changing
+config" and nothing reloaded. c12, which @nuxt/kit uses to load the config, re-imports it with
+a cache-busting `?_N` query and compares the result with what it has. Node's ESM loader keys
+modules by their whole URL, so that import evaluates the file again; our loader keyed them by
+path, so it returned the first evaluation and c12 saw no change.
+
+`load()` in `runtime/module.js` now keeps a module requested through a `file:` URL with a
+`?query` or `#hash` in a second table keyed by path + suffix. A plain path or a query-less URL
+still uses `cache`, so `require.cache` and everything that patches it see what they did before.
+`scripts/spike-import-query.mjs` is the offline gate (8 checks; the two "new query" and "new
+hash" checks fail on the old loader). With the same change in a patched `@vivari/core` 1.3.3,
+the Nuxt playground in Chromium and Playwright WebKit prints "nuxt.config.ts changed.
+Reloading Nuxt..." and `runtimeConfig updated` on save, and the server renders the new value.
