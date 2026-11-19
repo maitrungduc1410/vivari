@@ -83,6 +83,12 @@ export default function (exports, require, module) {
 
       if (!this.input) return; // a stub interface, e.g. output-only cursor helpers
 
+      // Node decodes a terminal interface's input into 'keypress' events on the input,
+      // and prompt libraries listen there without asking for them: clack's confirm
+      // and select (Nuxt's CLI, create-* scaffolders) read 'y', arrows and Enter that
+      // way, and without this sat on their question whatever was typed.
+      if (this.terminal) emitKeypressEvents(this.input, this);
+
       if (this._interactive) this._startEditor();
       else this._startPipe();
     }
