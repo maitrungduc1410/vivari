@@ -274,6 +274,10 @@ const SPIKES = [
   // browser path (handleHttpRequest) and a second process, bounded because the
   // regression is a hang. needsWasm for the same reason as net-close-order.
   { name: "net-listen-clash", file: "spike-net-listen-clash.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // Cross-process UNIX sockets both ways, and the socket FILE a pipe server owns from
+  // listen() to close() (GitHub #44: Nuxt chmods it and shuts its vite-node server
+  // down when it is missing). needsWasm: it boots a kernel.
+  { name: "xpipe", file: "probe-xpipe.mjs", net: false, needsWasm: true, timeout: 120000 },
   // A guest's global fetch() to an in-VM server (issue #7): same-process and
   // cross-process, every scenario run on the host's real Node and in the VM with
   // identical transcripts required. needsWasm: it boots a kernel.

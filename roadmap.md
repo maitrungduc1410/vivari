@@ -11966,8 +11966,7 @@ neither was the lock work:
   not, so it requested a different URL and stopped at the shell. Spike-only fix: decode
   HTML entities before following a `src`.
 
-
-## Nuxt 4's vite-node socket: `listen()` leaves a file at the path (this change)
+### Nuxt 4's vite-node socket: `listen()` leaves a file at the path (GitHub #44, #45)
 
 `nuxt dev` on Nuxt 4.4.8 (Vite 7, no rolldown) bound `:3000` but never rendered: the SSR
 worker failed with `connect ENOENT /tmp/nuxt-vite-*/nuxt.sock` (#44). The relay was not the
@@ -11982,8 +11981,13 @@ socket file type) and `close()` unlinks it, as libuv does. Abstract and Windows 
 no file, and so does a path whose directory is missing or that already exists, which keeps
 `listen()` succeeding where it did before rather than failing like a real `bind()`.
 `scripts/probe-xpipe.mjs` gained the gate: the parent chmods its socket in the listen
-callback before the child dials, and the file must be gone after `close()`.
+callback before the child dials, and the file must be gone after `close()`. The probe runs
+in CI's `verify` job (`run-spikes.mjs --offline xpipe`); before this it ran nowhere.
 
 Measured headless with the spike harness: Nuxt 4.4.8 installs in 41.5 s and `GET /` renders
-12.6 s after `nuxt dev` starts; without the change it gets no answer. Nuxt 4.5+ (Vite 8) uses
-the same socket but first hangs on rolldown's WASI workers (#45).
+12.6 s after `nuxt dev` starts; without the change it gets no answer. Nuxt 4.6.4 (Vite 8,
+rolldown 1.2.19 with its wasm binding) failed the same way and renders after the change too,
+9.8 s after start. So #45 was this socket, not rolldown: its client retries a failed connect
+quietly instead of surfacing it, which made the render look stuck behind the
+`wasi-worker.mjs` threads. Those threads read `booted=false` in templates that work as well,
+so on their own they were never a sign of a hang. Not yet verified in a browser Studio.

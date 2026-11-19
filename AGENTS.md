@@ -2076,7 +2076,8 @@ sits on "Starting Nuxt…" (#44). `Pipe.listen()` in `bindings/net.js` therefore
 an empty placeholder file (the VFS has no socket type) and `close()` unlinks it, like
 libuv. It is skipped for abstract/Windows names and when the directory is missing or a
 file is already there, so a `listen()` that used to work still does. Gate:
-`scripts/probe-xpipe.mjs` (SOCKFILE).
+`scripts/probe-xpipe.mjs` (SOCKFILE), registered as `xpipe` in `run-spikes.mjs` and run by
+CI's `verify` job.
 
 ### A preview redirect needs COEP too — WebKit blocks a bare `Response.redirect()`
 
