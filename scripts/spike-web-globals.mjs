@@ -39,14 +39,26 @@ const ok = (cond, msg) => {
 
 function browserLike() {
   const strip = (Native) => {
-    // Node keeps it on an instance or behind a getter on the prototype, by version.
+    // Node keeps it on an instance or behind a getter on the prototype, by version. On
+    // Node 22 the constructor ASSIGNS it (`this[k] = …`) and Node's own internals read
+    // it back (readableStreamError does `stream[k].promise`), so it cannot just vanish:
+    // a browser keeps that state in a slot user code cannot see. The setter keeps the
+    // value aside and the getter hands it only to node:internal/webstreams callers.
+    const hidden = new WeakMap();
     const C = class extends Native {
       constructor(...args) {
         super(...args);
-        delete this[k];
+        const own = Object.getOwnPropertyDescriptor(this, k);
+        if (own) {
+          hidden.set(this, own.value);
+          delete this[k];
+        }
       }
       get [k]() {
-        return undefined;
+        return new Error().stack.includes("node:internal/webstreams") ? hidden.get(this) : undefined;
+      }
+      set [k](v) {
+        hidden.set(this, v);
       }
     };
     Object.defineProperty(C, "name", { value: Native.name });
