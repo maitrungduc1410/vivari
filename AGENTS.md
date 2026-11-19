@@ -2090,6 +2090,23 @@ into a frame of a `COEP: require-corp` page unless the redirect itself carries C
 while Chromium shows it. Any response the SW hands a preview navigation, a redirect
 included, gets the preview document's COEP/CORP. Gate: `scripts/spike-sw-multitab.mjs`.
 
+### Web streams a process builds carry Node's closed-promise — undici's fetch needs it
+A process's `ReadableStream`/`WritableStream` and `performance` are the browser Worker's,
+not Node's. `stream.finished()` on a web stream reads
+`stream[Symbol.for('nodejs.webstream.isClosedPromise')].promise` (vendored
+`end-of-stream.js` `eosWeb`); a browser's streams have no such property, so it threw
+"Cannot read properties of undefined (reading 'promise')". undici's fetch (bundled in
+pnpm 11's `dist/pnpm.mjs`) calls it on every response body, caught the TypeError and
+aborted the request, so `pnpm add` sat on `resolved 1, reused 0, downloaded 1` waiting
+out retries. Right after, undici reports timing with `performance.markResourceTiming`,
+which a browser's `performance` lacks. `runtime/web-globals.js` (`installWebGlobals`,
+called from `createRuntime`) subclasses both stream classes to carry a deferred that
+settles on close/error/cancel/abort, and adds a no-op `markResourceTiming`. Under Node
+the native classes already carry the symbol and are left alone. Limits: platform-made
+streams (a `Response`'s body, `TransformStream` halves) still lack it, and a readable's
+promise resolves at `controller.close()`, before its queue drains, where Node waits.
+Gate: `scripts/spike-web-globals.mjs` (offline).
+
 ### `writeLarge` must transfer a STANDALONE ArrayBuffer
 The kernel hands a fetched tarball to the FS Worker over a *transferred* buffer
 (`kernel-fs.js` `writeLarge`), to bypass the 1 MiB SAB. The trap: a `Uint8Array`

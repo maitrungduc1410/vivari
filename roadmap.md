@@ -12007,3 +12007,23 @@ still uses `cache`, so `require.cache` and everything that patches it see what t
 hash" checks fail on the old loader). With the same change in a patched `@vivari/core` 1.3.3,
 the Nuxt playground in Chromium and Playwright WebKit prints "nuxt.config.ts changed.
 Reloading Nuxt..." and `runtimeConfig updated` on save, and the server renders the new value.
+
+### Web streams a process builds carry Node's closed-promise: `pnpm add` in the browser
+
+`pnpm add` in a browser tab stalled at `Progress: resolved 1, reused 0, downloaded 1, added 0`
+and took minutes. pnpm 11 fetches the registry with the undici it bundles, and undici calls
+`stream.finished()` on every response body. Vivari's vendored `end-of-stream.js` reads
+`stream[Symbol.for('nodejs.webstream.isClosedPromise')].promise`, a deferred Node's own web
+streams carry; a browser Worker's `ReadableStream` has none, so `finished()` threw "Cannot read
+properties of undefined (reading 'promise')", undici aborted each response (`UND_ERR_INFO
+aborted`), and pnpm waited out its retries. With that fixed, undici's next call,
+`performance.markResourceTiming`, was missing too.
+
+`runtime/web-globals.js` subclasses the global `ReadableStream`/`WritableStream` so a stream a
+process constructs carries the deferred, settled by `controller.close()`/`error()`, a throwing
+or rejecting `start`/`pull`/`write`, `cancel`, `close` and `abort`, and adds a no-op
+`performance.markResourceTiming`. `instanceof` still accepts platform-made streams, the classes
+keep their names, and under Node (which has both already) nothing changes.
+`scripts/spike-web-globals.mjs` is the offline gate. Known gap: a readable's promise resolves
+when `controller.close()` is called, not when its queue drains as in Node. Measured in the Nuxt
+playground on a patched `@vivari/core` 1.3.3: `pnpm add canvas-confetti` finished in 12.2 s.
