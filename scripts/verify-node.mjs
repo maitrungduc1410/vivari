@@ -1553,6 +1553,52 @@ server.listen(0, '127.0.0.1', async () => {
     "kernel.onConnect reports each cross-process TCP connection with both pids and the client's parents" +
       (connOk ? "" : "\n    got " + JSON.stringify(connections) + "\n    expected " + JSON.stringify(expected)));
 
+  // A fork channel carries JSON, as Node's default `serialization: 'json'` does, and
+  // structured clone only with 'advanced'. It used to structured-clone every message,
+  // which throws on a Proxy, and send() swallowed the throw: Nuxt's CLI sends its
+  // citty args (a Proxy) to the fork it restarts into, and that fork waited forever.
+  // The expected values here were taken from real Node running the same files.
+  kernel.writeFile("/t/ipcj-child.js", `
+const mode = process.env.NODE_CHANNEL_SERIALIZATION_MODE ?? null;
+process.on('message', (m) => process.send({ type: 'echo', got: m.map instanceof Map ? null : m, isMap: m.map instanceof Map, mode }));
+process.send({ type: 'ready', date: new Date(0) });
+`);
+  kernel.writeFile("/t/ipcj.js", `
+const assert = require('assert');
+const cp = require('child_process');
+const childPath = '/t/ipcj-child.js';
+function run(options, payload) {
+  return new Promise((resolve, reject) => {
+    const child = cp.fork(childPath, [], options);
+    let ready;
+    const timer = setTimeout(() => reject(new Error('the child never answered')), 5000);
+    child.on('message', (m) => {
+      if (m.type === 'ready') { ready = m; child.send(payload); }
+      if (m.type === 'echo') { clearTimeout(timer); child.disconnect(); resolve({ ready, echo: m }); }
+    });
+  });
+}
+(async () => {
+  // citty hands its parsed args over as a Proxy, and Nuxt forwards them like this.
+  const json = await run({}, { args: new Proxy({ port: '3000', _: [] }, {}), map: new Map([[1, 2]]), skip() {} });
+  assert.deepStrictEqual(json.echo.got, { args: { port: '3000', _: [] }, map: {} }, 'json: a Proxy arrives as its data, a Map as {}, a function is dropped');
+  assert.strictEqual(typeof json.ready.date, 'string', 'json: a Date from the child arrives as a string');
+  assert.strictEqual(json.echo.mode, null, 'the child does not see NODE_CHANNEL_SERIALIZATION_MODE');
+  const advanced = await run({ serialization: 'advanced' }, { map: new Map([[1, 2]]) });
+  assert.strictEqual(advanced.echo.isMap, true, 'advanced: a Map survives');
+  assert(advanced.ready.date instanceof Date, 'advanced: a Date survives');
+  const child = cp.fork(childPath);
+  assert.throws(() => child.send({ n: 1n }, () => {}), TypeError, 'a message JSON cannot encode throws from send(), it is not dropped');
+  await new Promise((resolve) => child.once('message', resolve));
+  child.kill();
+  console.log('IPCJSON_OK');
+})().catch((e) => { console.log('IPCJSON_FAIL ' + e.message); process.exit(1); });
+`);
+  const ipcj = await kernel.start("node", ["/t/ipcj.js"], { cwd: "/t", capture: true });
+  assert(ipcj.code === 0 && ipcj.stdout.includes("IPCJSON_OK"),
+    "fork IPC: messages travel as JSON (a Proxy arrives, a Map is {}, a BigInt throws), as structured clone with 'advanced'" +
+      (ipcj.code === 0 && ipcj.stdout.includes("IPCJSON_OK") ? "" : "\n" + ipcj.stdout + ipcj.stderr));
+
   // The kernel refuses a cross-process dial with EADDRNOTAVAIL once every client
   // port is held, and the binding has to pass that code through rather than report
   // the server as having refused — it is listening; the kernel ran out of ports.

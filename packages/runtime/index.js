@@ -625,6 +625,17 @@ export function createRuntime({
     };
   }
 
+  // A fork channel carries what Node's default `serialization: 'json'` carries: the
+  // message's JSON. postMessage alone structured-clones, which throws on a Proxy, a
+  // function or a class instance with private state, where JSON keeps the plain data
+  // and drops the rest. Nuxt's CLI sends its citty args, a Proxy, to the fork it
+  // restarts into; the clone threw and the fork waited for them forever.
+  // `serialization: 'advanced'` is structured clone in Node too, so it passes through.
+  // Unlike Bun's channel, Node's default is "json". A message JSON cannot encode (a
+  // BigInt) throws out of send() in Node, callback or not, so it is encoded outside
+  // the try that turns a channel failure into the callback's error.
+  const ipcEncode = (msg, advanced) => (advanced ? requireMessage(msg) : JSON.parse(JSON.stringify(requireMessage(msg))));
+
   // ---- fork IPC (child side): process.send / 'message' / disconnect ----------
   // A forked child (child_process.fork) runs as a normal main-thread process, but
   // gets a dedicated IPC MessagePort to its parent. Expose Node's fork surface -
@@ -634,6 +645,9 @@ export function createRuntime({
   // over start options across this channel, so this is what unlocks Next dev.
   if (ipcPort) {
     process.connected = true;
+    // Read and removed before user code, as Node does.
+    const ipcAdvanced = !!env && env[IPC_MODE_ENV] === "advanced";
+    if (env) delete env[IPC_MODE_ENV];
     let msgListeners = 0;
     let ipcRefed = false;
     const ipcRetain = () => {
@@ -676,8 +690,9 @@ export function createRuntime({
         else loop.nextTick(() => process.emit("error", err));
         return false;
       }
+      const data = ipcEncode(msg, ipcAdvanced);
       try {
-        ipcPort.postMessage(msg);
+        ipcPort.postMessage(data);
       } catch (e) {
         if (cb) loop.nextTick(() => cb(e));
         return false;
@@ -975,11 +990,13 @@ export function createRuntime({
       onOut: (chunk) => (silent ? pushOut(outStream, chunk) : process.stdout.write(chunk)),
       onErr: (chunk) => (silent ? pushOut(errStream, chunk) : process.stderr.write(chunk)),
     };
+    const advanced = options.serialization === "advanced";
     let worker;
     try {
       worker = new wt.Worker(String(modulePath), {
         argv: (args || []).map(String),
-        env: options.env || process.env,
+        // Node tells the child its channel's serialization through this variable.
+        env: { ...(options.env || process.env), [IPC_MODE_ENV]: advanced ? "advanced" : "json" },
         cwd: options.cwd || process.cwd(),
         _ocFork: true,
       });
@@ -999,7 +1016,8 @@ export function createRuntime({
         if (cb) loop.nextTick(() => cb(err));
         return false;
       }
-      try { worker.postMessage(msg); } catch (e) { if (cb) loop.nextTick(() => cb(e)); return false; }
+      const data = ipcEncode(msg, advanced);
+      try { worker.postMessage(data); } catch (e) { if (cb) loop.nextTick(() => cb(e)); return false; }
       if (cb) loop.nextTick(() => cb(null));
       return true;
     };
