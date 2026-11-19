@@ -298,6 +298,9 @@ const SPIKES = [
   // Terminal size: a launch size, inherited by children, changed by Kernel#resize into
   // stdout 'resize' + SIGWINCH. needsWasm: it boots a kernel.
   { name: "terminal-size", file: "spike-terminal-size.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // A program whose stdout is the terminal sees a TTY (and one writing into a pipe
+  // does not); keypress events and cursor helpers work there. needsWasm: boots a kernel.
+  { name: "terminal-tty", file: "spike-terminal-tty.mjs", net: false, needsWasm: true, timeout: 120000 },
   // fs.cpSync / fsPromises.cp against the host's real Node, case by case. Needs the
   // VFS (it copies real trees), so needsWasm; the host half runs as a child process.
   { name: "fs-cp", file: "spike-fs-cp.mjs", net: false, needsWasm: true, timeout: 120000 },

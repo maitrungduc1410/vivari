@@ -105,6 +105,9 @@ export function createRuntime({
   // The terminal's size, { cols, rows }, when the spawner knows it (Vivari.spawn's
   // `terminal`, the studio's xterm). Null means "unknown" and keeps 80x24.
   winsize = null,
+  // Is what stdout and stderr write to the terminal? Then they are TTYs (see
+  // asTerminal in builtins/process.js). The kernel decides it (createProcess).
+  outputTty = false,
   stdout = () => {},
   stderr = () => {},
   codec = null,
@@ -324,6 +327,7 @@ export function createRuntime({
     // exit() is called from a raw Promise microtask (its throw would escape).
     onExit: (code) => loop.requestExit(code),
     winsize,
+    outputTty,
   });
 
   // process.kill(pid, signal): send a signal to another process via the kernel,

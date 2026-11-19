@@ -328,6 +328,13 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
     return true;
   }
 
+  // The same question for fd 1: 'inherit' passes on what OUR stdout is; anything
+  // else gives the child a pipe.
+  function stdoutIsTerminalFrom(stdio) {
+    const fd1 = Array.isArray(stdio) ? stdio[1] : stdio;
+    return fd1 === "inherit" && !!process.stdout.isTTY;
+  }
+
   // Does the PARENT hold the write end of the child's fd 0 — i.e. is `child.stdin`
   // a stream or null? Node's rule, and note it is not the same question as
   // stdinIsPipeFrom above: that one is about what the CHILD sees on fd 0 (terminal
@@ -353,6 +360,9 @@ export function createChildProcess({ sys, process, Buffer, EventEmitter, Readabl
       // wants the terminal passed through says `stdio: ['inherit', …]`, as node's own
       // callers do; see stdinIsPipeFrom.
       stdinIsPipe: stdinIsPipeFrom(n.opts.stdio),
+      // Is the child's stdout OUR terminal? Only when it inherits our stdout and
+      // that is a terminal; it decides the child's process.stdout.isTTY.
+      stdoutIsTerminal: stdoutIsTerminalFrom(n.opts.stdio),
     };
     let pid;
     try {

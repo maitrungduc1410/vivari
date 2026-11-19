@@ -86,6 +86,8 @@ import streamsComposeFactory from "./internal/streams/compose.js";
 import streamsOperatorsFactory from "./internal/streams/operators.js";
 import streamsDuplexpairFactory from "./internal/streams/duplexpair.js";
 import webstreamsAdaptersFactory from "./internal/webstreams/adapters.js";
+import readlineUtilsFactory from "./internal/readline/utils.js";
+import readlineEmitKeypressEventsFactory from "./internal/readline/emitKeypressEvents.js";
 import stringDecoderFactory from "./lib/string_decoder.js";
 import asyncHooksFactory from "./lib/async_hooks.js";
 
@@ -313,6 +315,8 @@ const FACTORIES = {
   "internal/streams/operators": streamsOperatorsFactory,
   "internal/streams/duplexpair": streamsDuplexpairFactory,
   "internal/webstreams/adapters": webstreamsAdaptersFactory,
+  "internal/readline/utils": readlineUtilsFactory,
+  "internal/readline/emitKeypressEvents": readlineEmitKeypressEventsFactory,
   string_decoder: stringDecoderFactory,
   async_hooks: asyncHooksFactory,
   net: netFactory,

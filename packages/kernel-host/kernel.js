@@ -660,6 +660,14 @@ export class Kernel {
       this.debugPaused.add(pid);
     }
 
+    // Does this process's stdout (and stderr) write to the terminal, so that it is
+    // a TTY (see asTerminal in runtime/builtins/process.js)? A child says so when
+    // its parent handed it the terminal (`stdio: 'inherit'` from a parent that has
+    // it, as the shell does for its foreground job). A top-level process has it
+    // when its owner gave the terminal's size (Vivari.spawn's `terminal`) and is
+    // not capturing its output. Everything else writes into a pipe: false.
+    const outputTty =
+      typeof spec.outputTty === "boolean" ? spec.outputTty : parentPid == null && !capture && !!normalizeWinsize(spec.winsize);
     proc.handle = this.spawnWorker({
       pid,
       sab,
@@ -671,7 +679,7 @@ export class Kernel {
       // and the flowing path needs the same fact — process.stdin.isTTY was
       // hardcoded true, so `node` with no script could not tell an interactive
       // shell from a spawnSync and would sit at a prompt nobody could reach.
-      spec: { ...spec, pid, ppid: parentPid ?? 0, capture, winsize: proc.winsize },
+      spec: { ...spec, pid, ppid: parentPid ?? 0, capture, winsize: proc.winsize, outputTty },
       // #16 stage 2b: a spawned thread gets its creator's MessageChannel end as a
       // transferable, delivered to the worker as parentPort at init.
       threadPort,
@@ -1964,6 +1972,8 @@ export class Kernel {
         // Whether fd 0 is a pipe, when the spawner said so. Undefined leaves the
         // capture-derived default in place — see the tty note in boot.js.
         tty: spec.stdinIsPipe === undefined ? undefined : !spec.stdinIsPipe,
+        // Whether its stdout is the terminal, when the spawner passed its own on.
+        outputTty: spec.stdoutIsTerminal === true,
       },
       { parentPid, stream: true },
     );
