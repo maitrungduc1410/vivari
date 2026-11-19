@@ -203,6 +203,10 @@ export default function (exports, require, module, process) {
       this._msgRefs = 0;
       this._portHeld = false;
       this._portClosed = false;
+      // Node's names for what holds the loop: a fork is a child process there, and
+      // its channel a pipe.
+      this._resource = options._ocFork ? "ProcessWrap" : "Worker";
+      this._portResource = options._ocFork ? "PipeWrap" : "MessagePort";
       this.on("newListener", (name) => { if (name === "message") this._msgRetain(); });
       this.on("removeListener", (name) => { if (name === "message") this._msgRelease(); });
 
@@ -222,7 +226,7 @@ export default function (exports, require, module, process) {
       try { port1.start && port1.start(); } catch { /* auto-starts */ }
 
       workers.set(reqId, this);
-      if (host) host.retain(); // a running Worker keeps the parent's loop alive
+      if (host) host.retain(this._resource); // a running Worker keeps the parent's loop alive
 
       const spec = {
         programPath: resolveEntry(filename, options),
@@ -277,11 +281,11 @@ export default function (exports, require, module, process) {
     // fail a test run. The second is what unref() is FOR: a parent that should not
     // be held open by a listener it left attached to a background worker.
     ref() {
-      if (!this._refed && !this._exited) { this._refed = true; host && host.retain(); }
+      if (!this._refed && !this._exited) { this._refed = true; host && host.retain(this._resource); }
       if (this._msgRefs > 0) this._portRef();
     }
     unref() {
-      if (this._refed && !this._exited) { this._refed = false; host && host.release(); }
+      if (this._refed && !this._exited) { this._refed = false; host && host.release(this._resource); }
       this._portRelease();
     }
 
@@ -291,10 +295,10 @@ export default function (exports, require, module, process) {
     // closed. The child closing parentPort closes it, as on Node: an unref'd
     // Worker then stops holding the parent even if the thread keeps running.
     _portRef() {
-      if (!this._portHeld && !this._exited && !this._portClosed && host) { this._portHeld = true; host.retain(); }
+      if (!this._portHeld && !this._exited && !this._portClosed && host) { this._portHeld = true; host.retain(this._portResource); }
     }
     _portRelease() {
-      if (this._portHeld && host) { this._portHeld = false; host.release(); }
+      if (this._portHeld && host) { this._portHeld = false; host.release(this._portResource); }
     }
     _closePort() {
       this._portClosed = true;
@@ -337,7 +341,7 @@ export default function (exports, require, module, process) {
       // up until the event is delivered — otherwise the loop goes idle first and
       // never drains this event.
       enqueue(w, "exit", [msg.code | 0], () => {
-        if (w._refed && host) host.release();
+        if (w._refed && host) host.release(w._resource);
         // The port's hold ends with the thread: there is nothing left that could
         // send a message, so listeners still attached must not pin the loop.
         w._msgRefs = 0;

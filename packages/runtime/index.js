@@ -207,6 +207,16 @@ export function createRuntime({
   // open TTY handle so an idle REPL/shell waits for the next keystroke instead of
   // exiting. Toggled by stdin.resume()/pause() below.
   const stdinLiveness = { active: 0 };
+  // A counter that holds more than one kind of handle also counts each kind by
+  // Node's name for it (`types`), so process.getActiveResourcesInfo() can say what
+  // is holding the loop: a fork child's IPC channel and a Worker share
+  // threadLiveness, a server and its sockets share netLiveness.
+  const countResource = (live, name, delta) => {
+    const types = live.types || (live.types = new Map());
+    const n = (types.get(name) || 0) + delta;
+    if (n > 0) types.set(name, n);
+    else types.delete(name);
+  };
   // Interactive stdin delivery: keystrokes the kernel pushes (host terminal ->
   // process worker -> here) are queued and drained inside a loop turn (doStdin),
   // like doNet/doChildren. Wired just below once `stream` exists.
@@ -339,6 +349,30 @@ export function createRuntime({
     return true;
   };
 
+  // Node's names for what keeps the loop alive: the ref'd handles, then one
+  // "Timeout" per ref'd timer and one "Immediate" per pending ref'd immediate, as
+  // Node lists them. Tools read it to explain a process that will not exit: Nuxt's
+  // CLI calls it when a dev server overruns its shutdown budget, and before this
+  // existed the TypeError replaced its "exiting anyway" with a hang.
+  // Host-backed work other than fetch (WebAssembly.compile, response body reads)
+  // has no handle in Node and is not listed.
+  process.getActiveResourcesInfo = () => {
+    const out = [];
+    const add = (name, n) => {
+      for (let i = 0; i < n; i++) out.push(name);
+    };
+    for (const live of [netLiveness, threadLiveness]) for (const [name, n] of live.types || []) add(name, n);
+    add("ProcessWrap", childLiveness.active);
+    add("FSEventWrap", watchLiveness.active);
+    // The preview's WebSocket and SSE relays, and fetch, are connections in Node.
+    add("TCPSocketWrap", wsLiveness.active + sseLiveness.active + pendingFetches.size);
+    add(process.stdin?.isTTY ? "TTYWrap" : "PipeWrap", stdinLiveness.active);
+    const { timers, immediates } = loop.handleStats();
+    add("Timeout", timers);
+    add("Immediate", immediates);
+    return out;
+  };
+
   // Wire the fs.watch host onto `process` (roadmap #19 stage B). The vendored
   // internal/fs/watchers builtin reaches this to register a watch with the File
   // System Worker and to receive the change events it pushes back. Each watchId is
@@ -435,12 +469,16 @@ export function createRuntime({
     workerData: thread ? thread.workerData : null,
     parentPort: thread ? thread.parentPort || null : null,
     wake: () => loop.wakeNet(),
-    retain: () => {
+    // `name` is Node's for the handle: "Worker", "ProcessWrap" for a fork (which
+    // rides a Worker here), "MessagePort" for a port with listeners.
+    retain: (name = "Worker") => {
       threadLiveness.active++;
+      countResource(threadLiveness, name, 1);
       loop.wakeNet();
     },
-    release: () => {
+    release: (name = "Worker") => {
       if (threadLiveness.active > 0) threadLiveness.active--;
+      countResource(threadLiveness, name, -1);
       // Wake for the same reason retain() does, in the opposite direction: a
       // release can happen inside a HOST event callback (a MessagePort delivery
       // that closes its own port, say), and the loop is parked in waitForNext
@@ -651,10 +689,15 @@ export function createRuntime({
     let msgListeners = 0;
     let ipcRefed = false;
     const ipcRetain = () => {
-      if (!ipcRefed) { ipcRefed = true; threadLiveness.active++; loop.wakeNet(); }
+      if (!ipcRefed) { ipcRefed = true; threadLiveness.active++; countResource(threadLiveness, "PipeWrap", 1); loop.wakeNet(); }
     };
     const ipcRelease = () => {
-      if (ipcRefed) { ipcRefed = false; if (threadLiveness.active > 0) threadLiveness.active--; loop.wakeNet(); }
+      if (ipcRefed) {
+        ipcRefed = false;
+        if (threadLiveness.active > 0) threadLiveness.active--;
+        countResource(threadLiveness, "PipeWrap", -1);
+        loop.wakeNet();
+      }
     };
     const doDisconnect = () => {
       if (!process.connected) return;
