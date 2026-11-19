@@ -831,7 +831,10 @@ per-boot token to same-origin preview URLs (`__vv_kernel`, built by
 `sameOriginPreviewUrl`) and sends the same token with `vv-kernel-host`. On a navigation
 the SW records the frame (`resultingClientId`) against the token's tab and answers with a
 302 to the URL without the token; the redirected navigation keeps the same
-`resultingClientId`, so it is routed by the record and the app never sees the token. A
+`resultingClientId`, so it is routed by the record and the app never sees the token. The
+302 carries `COEP: require-corp` and `CORP: same-origin` like a preview document:
+WebKit refuses a redirect into a frame of a `require-corp` page without them, so a
+bare `Response.redirect()` left the preview blank on Safari and every iOS browser. A
 non-navigation carrying the token is routed by it and served with the token stripped.
 Keep-prefix ports are tracked per tab (`keepPrefixByClient`) and decided after routing,
 and outbound ws/SSE frames go to the frame's own tab. All of it is in memory: a revived SW

@@ -96,7 +96,7 @@ function loadSw() {
     for (const fn of listeners.fetch) fn(event);
     const res = await responded;
     if (!res) return { status: 0, body: "", location: null };
-    return { status: res.status, body: await res.text(), location: res.headers.get("location") };
+    return { status: res.status, body: await res.text(), location: res.headers.get("location"), coep: res.headers.get("cross-origin-embedder-policy"), corp: res.headers.get("cross-origin-resource-policy") };
   };
   const peek = (expr) => vm.runInContext(expr, ctx);
   return { ctx, clients, kernel, frame, message, request, peek };
@@ -125,6 +125,9 @@ console.log("\n== a tab's first preview load reaches that tab, not the first ker
   const first = await sw.request({ url: "/preview/5173/?__vv_kernel=aaaaaa", mode: "navigate", resultingClientId: "frame-A" });
   ok(first.status === 302, `the tokened navigation is redirected (${first.status})`);
   ok(first.location === `${ORIGIN}/preview/5173/`, `…to the URL without the token (${first.location})`);
+  // WebKit blocks a redirect into a frame of a COEP: require-corp page unless the 302
+  // itself carries COEP, and Response.redirect() carries no headers at all.
+  ok(first.coep === "require-corp" && first.corp === "same-origin", `…and carries COEP/CORP, or WebKit blocks it (coep=${first.coep}, corp=${first.corp})`);
 
   // The redirected navigation keeps the same resultingClientId.
   const doc = await sw.request({ url: "/preview/5173/", mode: "navigate", resultingClientId: "frame-A" });
