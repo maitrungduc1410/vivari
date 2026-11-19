@@ -3,6 +3,14 @@
 From 1.1.0 on, entries are generated from [changesets](https://github.com/changesets/changesets).
 `@vivari/core` and `@vivari/react` are released together under the same version.
 
+## 1.3.4
+
+### Patch Changes
+
+- [#49](https://github.com/maitrungduc1410/vivari/pull/49) [`052c930`](https://github.com/maitrungduc1410/vivari/commit/052c93006d44f776596eddee13c9499878615da5) Thanks [@atinux](https://github.com/atinux)! - A `file:` URL imported with a `?query` or `#hash` now loads its own module instance, as in Node, instead of returning the module already loaded from that path. Config loaders that re-import a file with a cache-busting query now see the edited file: c12 does this for `nuxt.config.ts`, so `nuxt dev` used to print "nuxt.config.ts saved without changing config" for every edit and never reload.
+
+- [#50](https://github.com/maitrungduc1410/vivari/pull/50) [`5e3f524`](https://github.com/maitrungduc1410/vivari/commit/5e3f52462865b943db244971017b44c563315710) Thanks [@atinux](https://github.com/atinux)! - `stream.finished()` now works on web streams a process creates in the browser, and `performance.markResourceTiming` exists, as in Node. undici's `fetch` uses both on every response body; without them it aborted each response, so `pnpm add` in a browser tab waited out its retries on every package's metadata and took minutes.
+
 ## 1.3.3
 
 ### Patch Changes
