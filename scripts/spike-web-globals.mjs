@@ -62,6 +62,8 @@ function browserLike() {
       }
     };
     Object.defineProperty(C, "name", { value: Native.name });
+    // Safari's ReadableStream has neither values() nor Symbol.asyncIterator.
+    if (Native === ReadableStream) for (const key of ["values", Symbol.asyncIterator]) Object.defineProperty(C.prototype, key, { value: undefined, writable: true, configurable: true });
     return C;
   };
   return { ReadableStream: strip(ReadableStream), WritableStream: strip(WritableStream), performance: { now: () => performance.now() } };
@@ -121,6 +123,46 @@ const g = browserLike();
 installWebGlobals(g);
 const vm = await scenarios(g);
 for (let i = 0; i < oracle.length; i++) ok(vm[i] === oracle[i], `${vm[i]}${vm[i] === oracle[i] ? "" : `  (node: ${oracle[i]})`}`);
+
+// Async iteration, which pnpm reads every tarball with (`for await` over a fetch body).
+async function iteration(RS) {
+  const out = [];
+  const source = (log) => {
+    let n = 0;
+    return { pull(c) { n < 3 ? c.enqueue(n++) : c.close(); }, cancel(reason) { log.push(`cancel ${reason}`); } };
+  };
+  let log = [];
+  let s = new RS(source(log));
+  const all = [];
+  for await (const chunk of s) all.push(chunk);
+  out.push(`read to end: ${all} locked ${s.locked}`);
+  s = new RS(source((log = [])));
+  for await (const chunk of s) if (chunk === 1) break;
+  out.push(`break: ${log} locked ${s.locked}`);
+  s = new RS(source((log = [])));
+  for await (const chunk of s.values({ preventCancel: true })) if (chunk === 0) break;
+  out.push(`preventCancel: [${log}] locked ${s.locked}, next read ${(await s.getReader().read()).value}`);
+  s = new RS({ pull() { throw new Error("pull failed"); } });
+  try { for await (const _ of s); } catch (e) { out.push(`pull throws: ${e.message} locked ${s.locked}`); }
+  s = new RS({});
+  s.getReader();
+  try { s.values(); } catch (e) { out.push(`locked stream: ${e.constructor.name}`); }
+  const it = new RS({ start(c) { c.close(); } })[Symbol.asyncIterator]();
+  out.push(`after done: ${JSON.stringify(await it.next())} ${JSON.stringify(await it.next())} ${JSON.stringify(await it.return("v"))}`);
+  out.push(`is an async iterator: ${typeof it[Symbol.asyncIterator] === "function" && it[Symbol.asyncIterator]() === it}`);
+  return out;
+}
+console.log("== async iteration, browser-like (Safari) with installWebGlobals, against real Node ==");
+ok(typeof browserLike().ReadableStream.prototype[Symbol.asyncIterator] !== "function", "control: the browser-like ReadableStream is not async iterable, as in Safari");
+const nodeIter = await iteration(ReadableStream);
+const oursIter = await iteration(g.ReadableStream);
+for (let i = 0; i < nodeIter.length; i++) ok(oursIter[i] === nodeIter[i], `${oursIter[i]}${oursIter[i] === nodeIter[i] ? "" : `  (node: ${nodeIter[i]})`}`);
+const madeBefore = browserLike();
+const body = new madeBefore.ReadableStream({ start(c) { c.enqueue("x"); c.close(); } });
+installWebGlobals(madeBefore);
+const got = [];
+for await (const chunk of body) got.push(chunk);
+ok(got.join() === "x", "a stream the platform made before the install is async iterable too (a Response's body)");
 
 const platform = browserLike();
 const platformMade = new platform.ReadableStream();

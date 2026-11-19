@@ -2108,6 +2108,14 @@ promise resolves at `controller.close()`, before its queue drains, where Node wa
 Gate: `scripts/spike-web-globals.mjs` (offline), which also pins that timing gap against
 real Node; its other scenarios compare end states only, so they cannot see it.
 
+Safari's `ReadableStream` is also not async iterable (no `values()`, no
+`Symbol.asyncIterator`), and pnpm reads every tarball with
+`for await (const chunk of response.body)`, so on iOS each download failed with
+`undefined is not a function (near '...chunk of opts3.body...')` and pnpm waited out its
+retries. `installWebGlobals` puts the spec's iterator on the platform class's own
+prototype, so a `Response`'s body gets it too; the same spike compares it with Node's
+(early `break` cancels, `preventCancel`, errors and locking all release the reader).
+
 ### `writeLarge` must transfer a STANDALONE ArrayBuffer
 The kernel hands a fetched tarball to the FS Worker over a *transferred* buffer
 (`kernel-fs.js` `writeLarge`), to bypass the 1 MiB SAB. The trap: a `Uint8Array`
