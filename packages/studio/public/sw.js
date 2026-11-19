@@ -1189,7 +1189,21 @@ self.addEventListener("fetch", (event) => {
         // Unknown token (a revived SW lost the map): still redirect, and let the
         // clean navigation fall back to the single-kernel heuristic.
         if (kernel && event.resultingClientId) rememberFrame(event.resultingClientId, kernel);
-        event.respondWith(Response.redirect(url.href, 302));
+        // Not Response.redirect(): its headers are empty, and WebKit (Safari, every
+        // iOS browser) refuses a redirect into a frame of a COEP: require-corp page
+        // unless the 302 itself carries COEP — "Redirection was blocked by
+        // Cross-Origin-Embedder-Policy", and the preview stays blank. The same
+        // headers a same-origin preview document gets.
+        event.respondWith(
+          new Response(null, {
+            status: 302,
+            headers: {
+              Location: url.href,
+              "Cross-Origin-Embedder-Policy": "require-corp",
+              "Cross-Origin-Resource-Policy": "same-origin",
+            },
+          }),
+        );
         return;
       }
     }
