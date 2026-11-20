@@ -2748,6 +2748,20 @@ AFTER `installCoreutils()`. The loader unpacks the tree to
   failure there was "far too slow and memory-heavy", which no timeout catches
   reliably on fast CI.
 
+### `/bin` has every program under its bare name, before its first use
+
+Spawns resolve `/bin/<name>.js`, but a program that searches PATH itself (`which`, and
+Node CLIs that check for a package manager before using it) stats `<dir>/<name>`. `/bin`
+used to hold only the `.js` files, and the lazy programs (npm, yarn, pnpm, corepack, tsc)
+appeared only on their first spawn, so Nuxt's CLI stopped at "`pnpm` was not found" in a
+VM where `pnpm add` works. Every coreutil now gets a `/bin/<name>` symlink to
+`<name>.js` (`linkBin`), and `registerLazyProgram` writes the same link plus a placeholder
+`<name>.js` when there is none. The loader overwrites the placeholder, so it only runs
+(printing "not found", exit 127) when the load failed. `ensureCommandLoaded` accepts
+`/bin/<name>` and `/bin/<name>.js` too, for a guest that spawns the path it found.
+Side effect: `ls /bin` lists each program twice; tab completion de-duplicates. Gate:
+`scripts/spike-path-programs.mjs`.
+
 ### Real yarn (classic) is the studio shell's `yarn` — same pattern as npm
 Yarn is wired exactly like npm, one tier up: `scripts/vendor-yarn.mjs` packs
 `yarn@1.22.22` into `packages/studio/public/vendor/yarn-pack.bin` (same archive
@@ -3894,8 +3908,10 @@ Gotchas:
   reuses it), and return the byte count. Then `flushStreams()` wherever control comes back
   to us — end of a script, each REPL line, each served request — because Python
   block-buffers a non-tty stdout and holds the partial line until something asks. Do not
-  set `isatty`; the guest's own `process.stdout` reports `isTTY: false`, and claiming
-  otherwise makes pytest emit `\r` progress the terminal will not redraw.
+  set `isatty` on the writer. The guest's `process.stdout` is a TTY in the studio terminal
+  (see "stdout is a TTY when it writes to the terminal"), but Python's `sys.stdout.isatty()`
+  answers from the writer, not from that stream, and claiming a tty there makes pytest emit
+  `\r` progress the terminal will not redraw.
 - **`SystemExit` must not print a traceback.** CPython exits silently on an integer or
   bare `sys.exit()`, and prints only the argument for `sys.exit("text")`;
   `terminationFromError` matches that. **Bools are ints here** — `sys.exit(False)` is exit
@@ -4490,6 +4506,33 @@ and it was a `MessagePort` nobody was listening to (see below). The lesson is th
 `process.getActiveResourcesInfo()` on the host names what is holding the loop, and an
 `async_hooks` `init` hook names who created it.
 
+The guest has `process.getActiveResourcesInfo()` too, because tools call it on their
+way out: Nuxt's CLI calls it when a dev server overruns its shutdown budget, and the
+missing function's TypeError turned "exiting anyway" into a hang. It reports Node's
+handle names from the liveness counters (`TCPServerWrap`, `TCPSocketWrap`, `PipeWrap`,
+`ProcessWrap`, `MessagePort`, `Worker`, `FSEventWrap`, `TTYWrap`, then one `Timeout` or
+`Immediate` per ref'd timer or immediate). A counter that holds several kinds keeps a
+per-kind count beside its total (`countResource` in `runtime/index.js`, `recount` in
+`bindings/net.js`), so a new thing that retains the loop should pass its Node name to
+`retain`/`release`, or it is held but never listed. Gate:
+`scripts/spike-active-resources.mjs`, against what real Node prints for the same scripts.
+
+### A fork channel is JSON unless the parent asked for `'advanced'`
+
+`child_process.fork` rides `worker_threads` here, so its messages used to go through
+`postMessage`'s structured clone. Node's fork channel defaults to
+`serialization: 'json'`, and the difference is not cosmetic: a structured clone throws on
+a Proxy, a function or a class with private state, and `send()` swallowed that throw, so
+the message never arrived and the child waited for ever. Nuxt's CLI sends its citty args
+(a Proxy) to the fork it restarts into, and `r` hung at "Restarting Nuxt in a new
+process...". Messages are now JSON round-tripped (`ipcEncode`); `serialization:
+'advanced'` passes them through as a structured clone, which is what Node's advanced mode
+is. The parent tells the child its mode through `NODE_CHANNEL_SERIALIZATION_MODE`, which
+the child removes from `process.env` before user code, as Node does. A message JSON
+cannot encode (a BigInt) throws out of `send()`, callback or not. This is the fork
+channel only; `Bun.spawn({ ipc })` has its own (`bun-ipc.js`). Gate: the `IPCJSON` case in
+`verify-node.mjs`, whose expected values came from real Node.
+
 ### The constant tables have ONE home: `node/bindings/constants.js`
 `os.constants`, `fs.constants`, `crypto.constants` and the deprecated `constants`
 module are views over it, as they are views over `internalBinding('constants')` on
@@ -5076,11 +5119,40 @@ each `{ type: "winsize" }`; the studio calls it from xterm `onResize`, the SDK f
   already in place for all three. That order was measured on host Node under a real pty.
 - **`process.stdout` is a real (small) emitter now.** Its `on`/`emit` used to be no-ops,
   which is fine for listeners nobody fires and useless for `'resize'`.
-- **`isTTY` on stdout is unchanged (false).** Size and TTY-ness are separate questions,
-  and flipping stdout to a TTY changes colour detection for every CLI. Not done here.
+- **Size and TTY-ness are separate questions.** A size alone does not make stdout a
+  TTY; the next section says who gets one.
 - `spike-terminal-size.mjs` covers launch size, inheritance, the event order, that a
   SIGWINCH listener does not hold the loop, and that a resize does not kill a process
   with no listener.
+
+### stdout is a TTY when it writes to the terminal
+
+`process.stdout.isTTY` used to be false for every process, so a program in the studio
+terminal could not tell a person was watching. `nuxt dev` fell back to plain logs instead
+of its dashboard, and prompt libraries never heard a key. The kernel now decides
+`outputTty` per process (`kernel.js`, next to the spawn):
+
+- a top-level process has it when it was given a terminal size and is not captured;
+- a child has it when it inherits a terminal stdout (`stdout: 'inherit'` from a parent
+  that is a TTY, passed on as `stdoutIsTerminal`);
+- pipeline stages, redirects, captured runs (`execSync`, `spawnSync` with pipes) and
+  piped children stay false, as on a real machine.
+
+The shell gives its single foreground command `stdio: ['inherit', 'inherit', 'inherit']`
+in `runSimple`; pipelines and redirects go through `runPipeline` and keep their pipes. A
+TTY stream also gets `tty.WriteStream`'s drawing methods (`cursorTo`, `moveCursor`,
+`clearLine`, `clearScreenDown`, `getColorDepth`, `hasColors`; `asTerminal` in
+`builtins/process.js`), and `readline.createInterface` calls `emitKeypressEvents` on a
+terminal input, as Node does, because clack and similar libraries listen for `keypress`
+without asking for it.
+
+Every CLI in the studio terminal now behaves as it does on a real machine, and that is
+visible: Vite clears the screen when it starts (the install log above it goes), npm shows
+its spinner, and a CLI that asks questions only on a TTY now asks them. A template whose
+auto-run must not stop at a question has to switch it off itself, the way the Angular
+template sets `"analytics": false` and the Nuxt one `NUXT_TELEMETRY_DISABLED`. Gate:
+`scripts/spike-terminal-tty.mjs` (who gets a TTY, key parsing, the cursor helpers, and one
+Ctrl-C through the shell being one SIGINT).
 
 ### OPFS persistence
 The VFS mirrors to OPFS and **survives reload**. If a demo behaves as if old files

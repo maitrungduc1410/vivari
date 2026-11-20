@@ -12031,3 +12031,40 @@ report a readable done while chunks are still queued. The spike's scenarios comp
 only and could not see this, so a block added after the merge measures the timing on both
 sides and pins the difference: it goes red if the gap closes or moves. Measured in the Nuxt
 playground on a patched `@vivari/core` 1.3.3: `pnpm add canvas-confetti` finished in 12.2 s.
+
+### `nuxt dev` in a terminal: a TTY stdout, one SIGINT per Ctrl-C, JSON fork messages
+
+Running `nuxt dev` in a Vivari terminal (the Nuxt playground, through Vivari's `sh`) showed
+plain logs instead of its dashboard, and several of the dashboard's paths then failed. Each
+cause was a place where Vivari behaved differently from Node or a real browser, and none of
+the fixes names Nuxt in code; Nuxt was only the first tool to need them all.
+
+- **stdout was never a TTY.** `process.stdout.isTTY` was false for every process. The kernel
+  now decides `outputTty` per process (a top-level process with a terminal size that is not
+  captured, or a child inheriting a TTY stdout), the shell's foreground command inherits its
+  stdio, a TTY stream gets `tty.WriteStream`'s methods, and `emitKeypressEvents` is Node's
+  vendored one. `readline.createInterface` calls it on a terminal input, as Node does, which
+  clack's prompts rely on. Every CLI in the studio terminal now behaves as on a real
+  machine: Vite clears the screen on start and prompts that only appear on a TTY appear.
+- **A signal ran its handler twice.** The kernel marks a signal in the SAB and posts a
+  message; the message path enqueued its own copy, so a handler that made a syscall
+  harvested the bit as well. One Ctrl-C was two SIGINTs, and Nuxt reads the second as "exit
+  now" (exit 130). The message now only takes the bits.
+- **Fork messages were structured-cloned.** Node's fork channel is JSON by default; a clone
+  threw on Nuxt's citty args (a Proxy), `send()` swallowed it, and `r` hung at "Restarting
+  Nuxt in a new process...". Messages are JSON unless `serialization: 'advanced'`.
+- **`process.getActiveResourcesInfo()` was missing**, so Nuxt's shutdown deadline threw
+  instead of exiting and `q` sat at "Cleaning up...".
+- **`/bin` had no bare names**, so Nuxt's own PATH check for `pnpm` failed before
+  `nuxt module add`. Every program now has a `/bin/<name>` symlink, lazy ones included.
+- **Safari's `ReadableStream` is not async iterable**, which broke pnpm's tarball reads on
+  iOS; `installWebGlobals` adds the spec's iterator to the platform prototype.
+- **Nitro's error pages send `X-Frame-Options: DENY`**, so a 500 rendered as "refused to
+  connect" in the preview frame. The preview SW drops that header and CSP's
+  `frame-ancestors` from preview responses.
+
+Each fix has an offline gate that fails without it (`spike-terminal-tty`, `spike-readline`,
+`spike-active-resources`, `spike-path-programs`, `spike-web-globals`, `spike-sw-multitab`,
+and the `IPCJSON` case in `verify-node`). Checked in review by reverting each fix and
+re-running its gate. The author tested in the Nuxt playground on Chromium and the iOS 26.5
+Simulator; the Studio itself was not part of that test.

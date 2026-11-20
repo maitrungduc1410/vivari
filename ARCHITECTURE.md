@@ -330,7 +330,18 @@ only wired when `VV_DEBUG` is set, so non-debug runs never allocate it.
   timings to the Console.
 - **Signals & teardown**: `process.kill(pid, sig)` and `child.kill()` route to the
   kernel (`OP_KILL`); `finalize` **cascades to the whole subtree** (`parentPid`),
-  so killing a shell wrapper (`sh -c "node …"`) takes its server down too.
+  so killing a shell wrapper (`sh -c "node …"`) takes its server down too. A
+  catchable signal goes to a process with a handler two ways: a bit in its SAB
+  (`control[4]`, seen when it parks in a syscall) and a `{type:'signal'}` message
+  (seen by an idle event loop). The message only makes the guest take the bits
+  (`takePendingSignals`), so the bits are the single record and a signal both paths
+  see is delivered once.
+- **stdout/stderr as a TTY**: `process.stdout.isTTY` is true when the stream writes to
+  the terminal. The kernel decides `outputTty` per process: a top-level process with a
+  terminal size that is not captured, or a child that inherits a TTY stdout
+  (`stdio: 'inherit'`). Pipelines, redirects, captured runs and piped children stay
+  false. A TTY stream has `tty.WriteStream`'s cursor and colour methods, and a
+  terminal `readline` interface emits `keypress` events on its input, as in Node.
 - **stdin (interactive)**: delivered OUT of band, not via a blocking syscall. The
   host terminal's keystrokes → `kernel.sendStdin(pid)` → a `{type:'stdin'}`
   postMessage → the process' real flowing `process.stdin` (a TTY Readable, drained
@@ -354,8 +365,12 @@ only wired when `VV_DEBUG` is set, so non-debug runs never allocate it.
   as a discard sink (there are no VFS device nodes), so `cmd > /dev/null 2>&1`
   works. If `$VV_RUN` is set
   it auto-runs that command line at startup (echoed like you'd typed it) then stays
-  interactive — used to run a demo's dev server *inside a terminal tab*. Installed
-  into `/bin` by `installCoreutils()`.
+  interactive — used to run a demo's dev server *inside a terminal tab*. A single
+  foreground command inherits the shell's stdio, so it writes to the shell's
+  terminal (and is a TTY when the shell is). Installed into `/bin` by
+  `installCoreutils()` as `<name>.js` plus a `<name>` symlink, so a program that
+  searches PATH itself finds them; lazy programs (npm, yarn, pnpm, corepack, tsc)
+  get the same link and a placeholder at registration, before their first use.
 - **Demos run like local dev**: the "Run" button opens a dedicated shell tab whose
   `sh` has `VV_RUN="npm install && npm run dev …"` (install skipped once
   `node_modules` exists). The dev server is therefore a child of that tab's shell:
