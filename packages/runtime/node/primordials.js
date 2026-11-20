@@ -170,6 +170,11 @@ const SPECIALS = {
   SafeWeakSet: WeakSet,
   SafePromiseAll,
   SafeStringPrototypeSearch,
+  // Node's iterator over a string's code points that patched String.prototype
+  // cannot reach; the plain one is the same iteration (internal/readline).
+  SafeStringIterator: function SafeStringIterator(string) {
+    return String.prototype[Symbol.iterator].call(string);
+  },
   AsyncIteratorPrototype,
   SymbolDispose: Symbol.dispose ?? Symbol("nodejs.dispose"),
   SymbolAsyncDispose: Symbol.asyncDispose ?? Symbol("nodejs.asyncDispose"),

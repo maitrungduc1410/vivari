@@ -72,11 +72,22 @@ export function createNetBindings({ process, liveness, syscalls, netServers, pip
   // isAlive via a shared counter so a real net.Server behaves like Node's — the
   // loop stays up between requests and exits once servers/sockets close.
   const live = liveness || { active: 0 };
+  // Node's names for these handles, which process.getActiveResourcesInfo() reports
+  // from `live.types` (runtime/index.js countResource).
+  const resourceName = (h) =>
+    h instanceof TCP
+      ? h.type === TCPConstants.SERVER ? "TCPServerWrap" : "TCPSocketWrap"
+      : h.type === PipeConstants.SERVER ? "PipeServerWrap" : "PipeWrap";
   const recount = (h) => {
     const on = !!h._live && h._refed && !h._closed;
     if (on === h._counted) return;
     h._counted = on;
     live.active += on ? 1 : -1;
+    const types = live.types || (live.types = new Map());
+    const name = resourceName(h);
+    const n = (types.get(name) || 0) + (on ? 1 : -1);
+    if (n > 0) types.set(name, n);
+    else types.delete(name);
   };
 
   // ---- uv: error constants (Linux errno-negated, matching libuv) ------------

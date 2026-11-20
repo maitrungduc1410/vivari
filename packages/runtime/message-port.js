@@ -148,12 +148,12 @@ export function installMessagePort(g, host) {
   const hold = (port) => {
     if (port[HELD] || port[CLOSED] || !port[GUEST] || state.internal || !state.host) return;
     port[HELD] = true;
-    state.host.retain();
+    state.host.retain("MessagePort");
   };
   const drop = (port) => {
     if (!port[HELD]) return;
     port[HELD] = false;
-    if (state.host) state.host.release();
+    if (state.host) state.host.release("MessagePort");
   };
 
   const listenerAdded = (port) => {

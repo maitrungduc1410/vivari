@@ -1,14 +1,16 @@
-// Minimal `tty` builtin. There is no real terminal in the browser, so the only
-// contract userland libraries (e.g. `debug`, `supports-color`, `chalk`) actually
-// need is `tty.isatty()` returning false. The ReadStream/WriteStream classes are
-// thin stubs so `instanceof` checks and `new tty.WriteStream(fd)` don't throw.
+// Minimal `tty` builtin. `isatty(fd)` answers what the process's own std stream
+// says: stdin is a TTY when somebody can type at it, stdout and stderr when they
+// write to the terminal (see asTerminal in builtins/process.js). The
+// ReadStream/WriteStream classes are thin stubs so `instanceof` checks and
+// `new tty.WriteStream(fd)` don't throw.
 //
 // Factory signature matches the vendored Node loader:
 //   function (exports, require, module, process, internalBinding, primordials)
 
 export default function (exports, require, module, process) {
   function isatty(fd) {
-    return false;
+    const s = process && [process.stdin, process.stdout, process.stderr][fd];
+    return !!(s && s.isTTY);
   }
 
   class ReadStream {

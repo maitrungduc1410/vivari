@@ -68,6 +68,7 @@ export function bootProcess({
     // that answer wins; `!capture` stays the default for everyone who does not.
     tty: spec.tty === undefined ? !spec.capture : !!spec.tty,
     winsize: spec.winsize || null,
+    outputTty: !!spec.outputTty,
     stdout: (chunk) => send("stdout", { chunk }),
     stderr: (chunk) => send("stderr", { chunk }),
     postRaw,

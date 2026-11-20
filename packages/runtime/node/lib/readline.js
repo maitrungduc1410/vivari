@@ -19,10 +19,15 @@
 // The choice is made on input.isTTY rather than on the caller's `terminal`; see the
 // note on that in the constructor, which is where the difference bit.
 //
-// The cursor/clear helpers stay non-throwing no-ops that still invoke their callback.
-// Vite calls them on every rebuild to repaint its banner; a throw there would take a
-// dev server down, and there is nothing for them to do when the guest's output is a
-// message channel rather than a screen.
+// The cursor/clear helpers write Node's escape sequences to a stream that is a
+// terminal (process.stdout of a program the shell runs in the foreground), and stay
+// non-throwing no-ops that still invoke their callback on anything else. Vite calls
+// them on every rebuild to repaint its banner; a throw there would take a dev server
+// down, and captured output has no screen to move a cursor on.
+//
+// emitKeypressEvents is Node's own (internal/readline/emitKeypressEvents.js): a
+// full-screen program reads its keys as 'keypress' events (Nuxt's dev dashboard
+// does), and the no-op it replaced left them deaf to every key.
 
 import { createLineEditor } from "../../line-editor.js";
 
@@ -77,6 +82,12 @@ export default function (exports, require, module) {
       this._lineBuf = ""; // non-terminal mode's partial line
 
       if (!this.input) return; // a stub interface, e.g. output-only cursor helpers
+
+      // Node decodes a terminal interface's input into 'keypress' events on the input,
+      // and prompt libraries listen there without asking for them: clack's confirm
+      // and select (Nuxt's CLI, create-* scaffolders) read 'y', arrows and Enter that
+      // way, and without this sat on their question whatever was typed.
+      if (this.terminal) emitKeypressEvents(this.input, this);
 
       if (this._interactive) this._startEditor();
       else this._startPipe();
@@ -378,15 +389,35 @@ export default function (exports, require, module) {
   const createInterface = (input, output, completer, terminal) =>
     new Interface(input, output, completer, terminal);
 
-  const emitKeypressEvents = () => {};
+  const emitKeypressEvents = require("internal/readline/emitKeypressEvents");
   const done = (cb) => {
     if (typeof cb === "function") cb();
     return true;
   };
-  const clearLine = (stream, dir, cb) => done(cb);
-  const clearScreenDown = (stream, cb) => done(cb);
-  const cursorTo = (stream, x, y, cb) => done(typeof y === "function" ? y : cb);
-  const moveCursor = (stream, dx, dy, cb) => done(cb);
+  // Node's sequences (internal/readline/callbacks.js); written only to a terminal.
+  const draw = (stream, data, cb) => {
+    if (!data || !stream || !stream.isTTY || typeof stream.write !== "function") return done(cb);
+    return stream.write(data, cb);
+  };
+  const clearLine = (stream, dir, cb) =>
+    draw(stream, dir < 0 ? "\x1b[1K" : dir > 0 ? "\x1b[0K" : "\x1b[2K", cb);
+  const clearScreenDown = (stream, cb) => draw(stream, "\x1b[0J", cb);
+  const cursorTo = (stream, x, y, cb) => {
+    if (typeof y === "function") {
+      cb = y;
+      y = undefined;
+    }
+    if (typeof x !== "number" || Number.isNaN(x)) return done(cb);
+    return draw(stream, typeof y !== "number" || Number.isNaN(y) ? `\x1b[${x + 1}G` : `\x1b[${y + 1};${x + 1}H`, cb);
+  };
+  const moveCursor = (stream, dx, dy, cb) => {
+    let data = "";
+    if (dx < 0) data += `\x1b[${-dx}D`;
+    else if (dx > 0) data += `\x1b[${dx}C`;
+    if (dy < 0) data += `\x1b[${-dy}A`;
+    else if (dy > 0) data += `\x1b[${dy}B`;
+    return draw(stream, data, cb);
+  };
 
   exports.Interface = Interface;
   exports.createInterface = createInterface;

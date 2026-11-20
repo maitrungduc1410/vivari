@@ -14,6 +14,10 @@
 //     retries on each package's metadata, minutes for an add.
 //   • undici then reports the response's timing with performance.markResourceTiming,
 //     which Node's global performance has and a browser's does not.
+//   • Safari's ReadableStream is not async iterable (no values(), no
+//     Symbol.asyncIterator; Chrome and Firefox have both). pnpm reads every tarball
+//     with `for await (const chunk of response.body)`, so each download failed with
+//     "undefined is not a function" and pnpm waited out its retries.
 //
 // Streams this process constructs get the deferred here. Ones the platform makes
 // itself (a Response's body) are still without it; nothing in them can be hooked.
@@ -124,8 +128,55 @@ function writableSink(sink, closed) {
   });
 }
 
+// The Streams spec's async iterator, on the platform class's own prototype, so a
+// Response's body has it too: it holds a reader, releases it when the stream ends,
+// errors, or the loop leaves early, and cancels the stream on an early exit unless
+// values({ preventCancel: true }).
+function withAsyncIteration(Native) {
+  const proto = typeof Native === "function" ? Native.prototype : undefined;
+  if (!proto || typeof proto[Symbol.asyncIterator] === "function") return;
+  const AsyncIteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype);
+  function values({ preventCancel = false } = {}) {
+    const reader = this.getReader();
+    let finished = false;
+    const finish = () => {
+      finished = true;
+      reader.releaseLock();
+    };
+    return Object.create(AsyncIteratorPrototype, {
+      next: {
+        value() {
+          if (finished) return Promise.resolve({ done: true, value: undefined });
+          return reader.read().then(
+            (result) => {
+              if (result.done) finish();
+              return result.done ? { done: true, value: undefined } : result;
+            },
+            (e) => {
+              finish();
+              throw e;
+            },
+          );
+        },
+      },
+      return: {
+        value(value) {
+          if (finished) return Promise.resolve({ done: true, value });
+          const cancelled = preventCancel ? Promise.resolve() : reader.cancel(value);
+          finish();
+          return cancelled.then(() => ({ done: true, value }));
+        },
+      },
+    });
+  }
+  const method = { value: values, writable: true, configurable: true };
+  Object.defineProperty(proto, "values", method);
+  Object.defineProperty(proto, Symbol.asyncIterator, method);
+}
+
 /** Gives `g`'s web streams and performance what Node's have and libraries read. */
 export function installWebGlobals(g) {
+  withAsyncIteration(g.ReadableStream);
   g.ReadableStream = withClosedPromise(g.ReadableStream, readableSource);
   g.WritableStream = withClosedPromise(g.WritableStream, writableSink);
   // Node's adds a PerformanceResourceTiming entry; nothing in a process reads them back.

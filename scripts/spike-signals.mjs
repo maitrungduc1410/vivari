@@ -37,6 +37,7 @@ import {
   I_SIGNAL,
   OP_READ_FILE,
   SIGNAL_BITS,
+  takePendingSignals,
 } from "../packages/protocol/syscall.js";
 
 // ───────────────────────────────── guest side ─────────────────────────────────
@@ -107,7 +108,9 @@ if (!isMainThread) {
   drainSignals = signals.drain;
 
   // Which inbound path saw the signal first. `sab-only` deliberately unhooks the
-  // postMessage path so the SAB path has to carry the delivery on its own.
+  // postMessage path so the SAB path has to carry the delivery on its own. The
+  // message takes the SAB's bits rather than delivering its own signal, as
+  // packages/runtime/index.js does (dispatchSignalEvent).
   const seen = [];
   onPendingSignals = (names) => {
     seen.push("sab:" + names.join(","));
@@ -117,7 +120,8 @@ if (!isMainThread) {
     parentPort.on("message", (m) => {
       if (m && m.type === "signal") {
         seen.push("msg:" + m.signal);
-        signals.dispatch(m);
+        const names = takePendingSignals(ctrl);
+        if (names) signals.onPending(names);
       }
     });
   }

@@ -3,7 +3,7 @@
 // exactly like `node <entry>` would - synchronously, inside a worker.
 
 import { createSyscalls } from "./fs-client.js";
-import { interruptView } from "../protocol/syscall.js";
+import { interruptView, takePendingSignals } from "../protocol/syscall.js";
 import { createEventLoop } from "./loop.js";
 import { createSignalDelivery } from "./signals.js";
 import { createNodeModules } from "./node/loader.js";
@@ -105,6 +105,9 @@ export function createRuntime({
   // The terminal's size, { cols, rows }, when the spawner knows it (Vivari.spawn's
   // `terminal`, the studio's xterm). Null means "unknown" and keeps 80x24.
   winsize = null,
+  // Is what stdout and stderr write to the terminal? Then they are TTYs (see
+  // asTerminal in builtins/process.js). The kernel decides it (createProcess).
+  outputTty = false,
   stdout = () => {},
   stderr = () => {},
   codec = null,
@@ -204,6 +207,16 @@ export function createRuntime({
   // open TTY handle so an idle REPL/shell waits for the next keystroke instead of
   // exiting. Toggled by stdin.resume()/pause() below.
   const stdinLiveness = { active: 0 };
+  // A counter that holds more than one kind of handle also counts each kind by
+  // Node's name for it (`types`), so process.getActiveResourcesInfo() can say what
+  // is holding the loop: a fork child's IPC channel and a Worker share
+  // threadLiveness, a server and its sockets share netLiveness.
+  const countResource = (live, name, delta) => {
+    const types = live.types || (live.types = new Map());
+    const n = (types.get(name) || 0) + delta;
+    if (n > 0) types.set(name, n);
+    else types.delete(name);
+  };
   // Interactive stdin delivery: keystrokes the kernel pushes (host terminal ->
   // process worker -> here) are queued and drained inside a loop turn (doStdin),
   // like doNet/doChildren. Wired just below once `stream` exists.
@@ -324,6 +337,7 @@ export function createRuntime({
     // exit() is called from a raw Promise microtask (its throw would escape).
     onExit: (code) => loop.requestExit(code),
     winsize,
+    outputTty,
   });
 
   // process.kill(pid, signal): send a signal to another process via the kernel,
@@ -333,6 +347,30 @@ export function createRuntime({
   process.kill = (targetPid, signal = "SIGTERM") => {
     syscalls.kill(targetPid | 0, signal);
     return true;
+  };
+
+  // Node's names for what keeps the loop alive: the ref'd handles, then one
+  // "Timeout" per ref'd timer and one "Immediate" per pending ref'd immediate, as
+  // Node lists them. Tools read it to explain a process that will not exit: Nuxt's
+  // CLI calls it when a dev server overruns its shutdown budget, and before this
+  // existed the TypeError replaced its "exiting anyway" with a hang.
+  // Host-backed work other than fetch (WebAssembly.compile, response body reads)
+  // has no handle in Node and is not listed.
+  process.getActiveResourcesInfo = () => {
+    const out = [];
+    const add = (name, n) => {
+      for (let i = 0; i < n; i++) out.push(name);
+    };
+    for (const live of [netLiveness, threadLiveness]) for (const [name, n] of live.types || []) add(name, n);
+    add("ProcessWrap", childLiveness.active);
+    add("FSEventWrap", watchLiveness.active);
+    // The preview's WebSocket and SSE relays, and fetch, are connections in Node.
+    add("TCPSocketWrap", wsLiveness.active + sseLiveness.active + pendingFetches.size);
+    add(process.stdin?.isTTY ? "TTYWrap" : "PipeWrap", stdinLiveness.active);
+    const { timers, immediates } = loop.handleStats();
+    add("Timeout", timers);
+    add("Immediate", immediates);
+    return out;
   };
 
   // Wire the fs.watch host onto `process` (roadmap #19 stage B). The vendored
@@ -431,12 +469,16 @@ export function createRuntime({
     workerData: thread ? thread.workerData : null,
     parentPort: thread ? thread.parentPort || null : null,
     wake: () => loop.wakeNet(),
-    retain: () => {
+    // `name` is Node's for the handle: "Worker", "ProcessWrap" for a fork (which
+    // rides a Worker here), "MessagePort" for a port with listeners.
+    retain: (name = "Worker") => {
       threadLiveness.active++;
+      countResource(threadLiveness, name, 1);
       loop.wakeNet();
     },
-    release: () => {
+    release: (name = "Worker") => {
       if (threadLiveness.active > 0) threadLiveness.active--;
+      countResource(threadLiveness, name, -1);
       // Wake for the same reason retain() does, in the opposite direction: a
       // release can happen inside a HOST event callback (a MessagePort delivery
       // that closes its own port, say), and the loop is parked in waitForNext
@@ -573,7 +615,17 @@ export function createRuntime({
     const signals = createSignalDelivery({ process, loop, postRaw });
     onPendingSignals = signals.onPending;
     drainSignals = signals.drain;
-    dispatchSignalEvent = signals.dispatch;
+    // The kernel marks a signal in the SAB and posts a message, and either can
+    // reach us first: the bits are harvested whenever we park in a syscall. So the
+    // message only says "look": the bits decide, and taking them leaves nothing
+    // for the other path to deliver again. Taking the message itself delivered
+    // SIGINT twice to a handler that made a syscall (it harvested the bit the
+    // message had already delivered), and Nuxt's dev server reads a second
+    // Ctrl-C as "exit now" (exit 130, "Something went wrong").
+    dispatchSignalEvent = () => {
+      const names = takePendingSignals(ctrl);
+      if (names) signals.onPending(names);
+    };
     signalStandDown = signals.standDown;
   }
 
@@ -611,6 +663,17 @@ export function createRuntime({
     };
   }
 
+  // A fork channel carries what Node's default `serialization: 'json'` carries: the
+  // message's JSON. postMessage alone structured-clones, which throws on a Proxy, a
+  // function or a class instance with private state, where JSON keeps the plain data
+  // and drops the rest. Nuxt's CLI sends its citty args, a Proxy, to the fork it
+  // restarts into; the clone threw and the fork waited for them forever.
+  // `serialization: 'advanced'` is structured clone in Node too, so it passes through.
+  // Unlike Bun's channel, Node's default is "json". A message JSON cannot encode (a
+  // BigInt) throws out of send() in Node, callback or not, so it is encoded outside
+  // the try that turns a channel failure into the callback's error.
+  const ipcEncode = (msg, advanced) => (advanced ? requireMessage(msg) : JSON.parse(JSON.stringify(requireMessage(msg))));
+
   // ---- fork IPC (child side): process.send / 'message' / disconnect ----------
   // A forked child (child_process.fork) runs as a normal main-thread process, but
   // gets a dedicated IPC MessagePort to its parent. Expose Node's fork surface -
@@ -620,13 +683,21 @@ export function createRuntime({
   // over start options across this channel, so this is what unlocks Next dev.
   if (ipcPort) {
     process.connected = true;
+    // Read and removed before user code, as Node does.
+    const ipcAdvanced = !!env && env[IPC_MODE_ENV] === "advanced";
+    if (env) delete env[IPC_MODE_ENV];
     let msgListeners = 0;
     let ipcRefed = false;
     const ipcRetain = () => {
-      if (!ipcRefed) { ipcRefed = true; threadLiveness.active++; loop.wakeNet(); }
+      if (!ipcRefed) { ipcRefed = true; threadLiveness.active++; countResource(threadLiveness, "PipeWrap", 1); loop.wakeNet(); }
     };
     const ipcRelease = () => {
-      if (ipcRefed) { ipcRefed = false; if (threadLiveness.active > 0) threadLiveness.active--; loop.wakeNet(); }
+      if (ipcRefed) {
+        ipcRefed = false;
+        if (threadLiveness.active > 0) threadLiveness.active--;
+        countResource(threadLiveness, "PipeWrap", -1);
+        loop.wakeNet();
+      }
     };
     const doDisconnect = () => {
       if (!process.connected) return;
@@ -662,8 +733,9 @@ export function createRuntime({
         else loop.nextTick(() => process.emit("error", err));
         return false;
       }
+      const data = ipcEncode(msg, ipcAdvanced);
       try {
-        ipcPort.postMessage(msg);
+        ipcPort.postMessage(data);
       } catch (e) {
         if (cb) loop.nextTick(() => cb(e));
         return false;
@@ -961,11 +1033,13 @@ export function createRuntime({
       onOut: (chunk) => (silent ? pushOut(outStream, chunk) : process.stdout.write(chunk)),
       onErr: (chunk) => (silent ? pushOut(errStream, chunk) : process.stderr.write(chunk)),
     };
+    const advanced = options.serialization === "advanced";
     let worker;
     try {
       worker = new wt.Worker(String(modulePath), {
         argv: (args || []).map(String),
-        env: options.env || process.env,
+        // Node tells the child its channel's serialization through this variable.
+        env: { ...(options.env || process.env), [IPC_MODE_ENV]: advanced ? "advanced" : "json" },
         cwd: options.cwd || process.cwd(),
         _ocFork: true,
       });
@@ -985,7 +1059,8 @@ export function createRuntime({
         if (cb) loop.nextTick(() => cb(err));
         return false;
       }
-      try { worker.postMessage(msg); } catch (e) { if (cb) loop.nextTick(() => cb(e)); return false; }
+      const data = ipcEncode(msg, advanced);
+      try { worker.postMessage(data); } catch (e) { if (cb) loop.nextTick(() => cb(e)); return false; }
       if (cb) loop.nextTick(() => cb(null));
       return true;
     };

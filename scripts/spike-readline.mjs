@@ -217,5 +217,25 @@ console.log("\n7) the cursor/clear helpers stay non-throwing — Vite calls them
   ok(/HELPERS-OK\[5\]/.test(r.stdout || ""), "…and each still invokes its callback: " + JSON.stringify((r.stdout || "").trim()));
 }
 
+console.log("\n8) a terminal interface emits 'keypress' on its input, as clack's prompts expect");
+{
+  // What @clack/core's prompt() does: an interface with no output, then 'keypress'
+  // on the input, which only Node's createInterface ever asked to decode.
+  write("keys.js", [
+    "const readline = require('readline');",
+    "const rl = readline.createInterface({ input: process.stdin, prompt: '', terminal: true, escapeCodeTimeout: 50, tabSize: 2 });",
+    "rl.prompt();",
+    "process.stdin.setRawMode(true);",
+    "process.stdin.on('keypress', (ch, key) => {",
+    "  if (key && key.name === 'return') { console.log('SUBMIT'); rl.close(); process.exit(0); }",
+    "  console.log('KEY[' + ch + ']');",
+    "});",
+    "console.log('Do you also want to remove them?');",
+  ]);
+  const r = await run(["node", "keys.js"], ["y", "\r"]);
+  ok(/KEY\[y\]/.test(r.text), "'y' arrives as a keypress: " + JSON.stringify(r.text.slice(-40)));
+  ok(/SUBMIT/.test(r.text) && r.code() === 0, "…and Enter as 'return': code=" + r.code());
+}
+
 console.log(failed === 0 ? "\nOK: readline reads lines" : `\nFAIL: ${failed} check(s) failed`);
 process.exit(failed === 0 ? 0 : 1);

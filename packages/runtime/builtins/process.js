@@ -4,7 +4,7 @@
 
 import { nativeAddonError } from "./bun-unsupported.js";
 
-export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/", stdout, stderr, nextTick, onExit, winsize = null }) {
+export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/", stdout, stderr, nextTick, onExit, winsize = null, outputTty = false }) {
   let _cwd = cwd || "/";
   // nextTick is owned by the event loop (loop.js): its queue drains ahead of
   // Promise microtasks each turn. Fall back to a microtask if no loop is wired.
@@ -155,6 +155,69 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
       stream.rows = winsize.rows;
     }
     return stream;
+  };
+
+  // stdout and stderr are a tty.WriteStream when what they write to is the terminal:
+  // a program the interactive shell runs in the foreground, or one Vivari.spawn
+  // was given a `terminal` for (see outputTty in kernel-host/kernel.js). Then
+  // isTTY is true and the stream has tty.WriteStream's methods, which full-screen
+  // programs draw with: Nuxt's dev dashboard is only shown on a TTY. A captured or
+  // piped program keeps isTTY false, as on a real machine.
+  const ESC = "\x1b[";
+  // Node's lib/internal/tty.js getColorDepth, for the environment variables a
+  // browser terminal can have: 1, 4, 8 or 24 bits.
+  const colorDepth = (e = process.env) => {
+    const force = e.FORCE_COLOR;
+    if (force !== undefined) {
+      if (force === "" || force === "1" || force === "true") return 4;
+      if (force === "2") return 8;
+      if (force === "3") return 24;
+      return 1;
+    }
+    if (e.NODE_DISABLE_COLORS !== undefined || e.NO_COLOR !== undefined || e.TERM === "dumb") return 1;
+    if (e.COLORTERM === "truecolor" || e.COLORTERM === "24bit") return 24;
+    if (e.TERM && /-256(color)?$/i.test(e.TERM)) return 8;
+    return 4;
+  };
+  const asTerminal = (stream) => {
+    if (!outputTty) return stream;
+    const draw = (data, cb) => {
+      if (data) stream.write(data);
+      if (typeof cb === "function") scheduleTick(cb);
+      return true;
+    };
+    return Object.assign(stream, {
+      isTTY: true,
+      getColorDepth: colorDepth,
+      hasColors(count = 16, e) {
+        if (typeof count === "object") {
+          e = count;
+          count = 16;
+        }
+        return count <= 2 ** colorDepth(e);
+      },
+      cursorTo(x, y, cb) {
+        if (typeof y === "function") {
+          cb = y;
+          y = undefined;
+        }
+        return draw(typeof y === "number" ? `${ESC}${y + 1};${x + 1}H` : `${ESC}${x + 1}G`, cb);
+      },
+      moveCursor(dx, dy, cb) {
+        let data = "";
+        if (dx < 0) data += `${ESC}${-dx}D`;
+        else if (dx > 0) data += `${ESC}${dx}C`;
+        if (dy < 0) data += `${ESC}${-dy}A`;
+        else if (dy > 0) data += `${ESC}${dy}B`;
+        return draw(data, cb);
+      },
+      clearLine(dir, cb) {
+        return draw(dir < 0 ? `${ESC}1K` : dir > 0 ? `${ESC}0K` : `${ESC}2K`, cb);
+      },
+      clearScreenDown(cb) {
+        return draw(`${ESC}0J`, cb);
+      },
+    });
   };
 
   const nowNs = () =>
@@ -316,8 +379,8 @@ export function createProcess({ pid = 1, ppid = 0, argv = [], env = {}, cwd = "/
     memoryUsage,
     cpuUsage,
     resourceUsage,
-    stdout: sized(makeStream(stdout, 1)),
-    stderr: sized(makeStream(stderr, 2)),
+    stdout: asTerminal(sized(makeStream(stdout, 1))),
+    stderr: asTerminal(sized(makeStream(stderr, 2))),
     stdin: { fd: 0, on() {}, once() {}, read: () => null, isTTY: false },
     // No-op event surface so libraries calling process.on(...) don't crash.
     on() {

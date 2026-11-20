@@ -2090,6 +2090,14 @@ into a frame of a `COEP: require-corp` page unless the redirect itself carries C
 while Chromium shows it. Any response the SW hands a preview navigation, a redirect
 included, gets the preview document's COEP/CORP. Gate: `scripts/spike-sw-multitab.mjs`.
 
+### A preview response loses its X-Frame-Options — error pages send DENY
+Nitro's error handler (and so Nuxt's) sends `X-Frame-Options: DENY` on every error
+page. The preview is a frame, so an app that threw rendered as the browser's "refused to
+connect" page in the IDE, while the same URL in its own tab showed the error. `servePreview`
+deletes the header from every preview response, and the `frame-ancestors` directive from
+its CSP (the rest of the policy stays); a dev server on localhost is never framed, so no
+app relies on either. Gate: `scripts/spike-sw-multitab.mjs`.
+
 ### Web streams a process builds carry Node's closed-promise — undici's fetch needs it
 A process's `ReadableStream`/`WritableStream` and `performance` are the browser Worker's,
 not Node's. `stream.finished()` on a web stream reads
@@ -2107,6 +2115,14 @@ streams (a `Response`'s body, `TransformStream` halves) still lack it, and a rea
 promise resolves at `controller.close()`, before its queue drains, where Node waits.
 Gate: `scripts/spike-web-globals.mjs` (offline), which also pins that timing gap against
 real Node; its other scenarios compare end states only, so they cannot see it.
+
+Safari's `ReadableStream` is also not async iterable (no `values()`, no
+`Symbol.asyncIterator`), and pnpm reads every tarball with
+`for await (const chunk of response.body)`, so on iOS each download failed with
+`undefined is not a function (near '...chunk of opts3.body...')` and pnpm waited out its
+retries. `installWebGlobals` puts the spec's iterator on the platform class's own
+prototype, so a `Response`'s body gets it too; the same spike compares it with Node's
+(early `break` cancels, `preventCancel`, errors and locking all release the reader).
 
 ### `writeLarge` must transfer a STANDALONE ArrayBuffer
 The kernel hands a fetched tarball to the FS Worker over a *transferred* buffer
@@ -5831,6 +5847,16 @@ So when a check fails in a vendored Node lib, suspect the ORDER of what the bind
 under it emits, not just the values. Assert order explicitly — `deepStrictEqual` on an
 array of event names — and assert how many times `error` fires; both facts are invisible
 to a test that resolves on the first event it likes.
+
+### A signal has two delivery paths, and only one may enqueue it
+The kernel posts each signal twice on purpose: it sets the process's bit in the shared
+control buffer, which a blocked syscall sees, and it posts a message, which an idle
+event loop sees. `dispatchSignalEvent` used to enqueue its own copy from the message
+while the bit stayed set, so a handler that made any syscall drained the bit and ran a
+second time. `nuxt dev` exited 130 with "Something went wrong" on the first Ctrl+C.
+The message path now only calls `takePendingSignals(ctrl)`, so the bit is the single
+source. Count how many times a handler runs (`spike-terminal-tty`, `spike-signals`),
+not just whether it ran.
 
 ## Testing & verification
 

@@ -6,15 +6,14 @@
 // module is the receiving half of the fix — the kernel now *posts* a catchable
 // signal to the process instead of applying it (see Kernel#signal).
 //
-// Two inbound paths, one queue:
-//   - `dispatch(msg)` — the kernel's postMessage. The normal case: an idle
-//     server parks in the event loop's async wait, not in Atomics.wait, so this
-//     arrives within a turn.
-//   - `onPending(names)` — harvested from the syscall SAB by the park loop in
-//     fs-client.js. This is the case postMessage cannot serve: a guest blocked
-//     mid-syscall is not draining its message queue at all.
+// One inbound path: `onPending(names)`, the bits taken from the syscall SAB.
+// The park loop in fs-client.js takes them when a guest blocked mid-syscall is
+// woken (it is not draining its message queue at all), and the kernel's
+// postMessage, which reaches an idle process within a turn, takes them too (see
+// dispatchSignalEvent in index.js). The bits are the record of what is pending,
+// so a signal that both paths see is still delivered once.
 //
-// Both only ENQUEUE. Delivery happens in `drain()`, which the event loop calls
+// It only ENQUEUES. Delivery happens in `drain()`, which the event loop calls
 // on a turn (loop.js `doSignal`), for the same reason worker_threads messages,
 // fork IPC and stdin are delivered that way: a handler that calls
 // process.exit() must be honoured as an exit, and its microtasks must flush
@@ -24,8 +23,7 @@
 //
 // The pending set is a Set, not a queue, because that is what Unix pending
 // signals are: two SIGTERMs that arrive before the process gets a turn collapse
-// into one delivery. It also makes the two inbound paths idempotent, so the
-// kernel can safely use both for the same signal.
+// into one delivery, as two Ctrl-Cs a process has not had a turn for do.
 
 import { isCatchableSignal, defaultSignalExitCode } from "../protocol/syscall.js";
 
@@ -90,11 +88,7 @@ export function createSignalDelivery({ process, loop, postRaw = null }) {
 
   return {
     standDown,
-    /** Kernel postMessage: { type:'signal', signal }. */
-    dispatch: (msg) => {
-      if (msg && msg.signal) enqueue(msg.signal);
-    },
-    /** Signal bits harvested from the SAB while parked in a syscall. */
+    /** Signal bits taken from the SAB: while parked in a syscall, or on the kernel's message. */
     onPending: (names) => {
       for (const name of names) enqueue(name);
     },

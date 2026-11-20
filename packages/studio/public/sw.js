@@ -1622,6 +1622,23 @@ async function servePreview(event, port, route, explicitKeepPrefix, served = {})
     if (Array.isArray(v)) for (const one of v) respHeaders.append(k, one);
     else if (v != null) respHeaders.append(k, v);
   }
+  // A preview exists to be framed by its IDE, and X-Frame-Options would forbid exactly
+  // that: Nitro's error handler, which Nuxt's uses, sends DENY on every error page, so
+  // an app's 500 page became the browser's "refused to connect" in the preview frame
+  // while the same URL in its own tab showed the error. A dev server on localhost is
+  // never framed, so nothing there relies on it. CSP's frame-ancestors forbids the same,
+  // so it goes too, and the rest of the policy stays.
+  respHeaders.delete("x-frame-options");
+  const csp = respHeaders.get("content-security-policy");
+  if (csp) {
+    // Policies are comma-separated (two headers arrive joined), directives ;-separated.
+    const kept = csp
+      .split(",")
+      .map((policy) => policy.split(";").filter((d) => !/^\s*frame-ancestors(\s|$)/i.test(d)).join(";").trim())
+      .filter((policy) => policy.replace(/;/g, "").trim());
+    if (kept.length) respHeaders.set("content-security-policy", kept.join(", "));
+    else respHeaders.delete("content-security-policy");
+  }
   if (sink.cross) {
     // Mode B: the preview is a DIFFERENT origin from the IDE. Let its subresources
     // be embedded cross-origin (CORP) and keep the preview cross-origin isolated

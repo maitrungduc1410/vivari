@@ -131,7 +131,8 @@ console.log("\n== a lazy tool that fails to load says why, and can be retried ==
 {
   // ensureCommandLoaded over a bare `this`: no kernel, no Wasm.
   const { Kernel } = await import("../packages/kernel-host/kernel.js");
-  const host = { lazyLoaders: new Map(), lazyNotices: new Map(), lazyInflight: new Map(), out: [] };
+  // isFile + linkBin: registration puts the names on PATH, which spike-path-programs covers.
+  const host = { lazyLoaders: new Map(), lazyNotices: new Map(), lazyInflight: new Map(), out: [], isFile: () => true, linkBin() {} };
   host.stderr = (s, pid) => host.out.push({ s, pid });
   const load = (cmd, pid) => Kernel.prototype.ensureCommandLoaded.call(host, cmd, pid);
   let fail = true;

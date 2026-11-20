@@ -786,10 +786,15 @@ function runSimple(tokens) {
     // so matters when we do not have a terminal: \`sh -c node\` inside a captured
     // process must not hand the child a tty the shell itself has not got, or a bare
     // \`node\` opens a prompt that nobody can ever type at and the process hangs.
+    //
+    // Its stdout and stderr are ours too, as a real shell's foreground job writes to
+    // the shell's terminal: 'inherit' makes the child a TTY exactly when we are one,
+    // which full-screen programs (Nuxt's dev dashboard) wait for. child_process
+    // copies what it writes to our streams.
     const child = cp.spawn(cmd, args, {
       cwd: process.cwd(),
       env: envWith(assign),
-      stdio: ['inherit', 'pipe', 'pipe'],
+      stdio: ['inherit', 'inherit', 'inherit'],
     });
     currentChild = child;
     currentKill = (sig) => { try { child.kill(sig); } catch (e) {} };
@@ -797,8 +802,6 @@ function runSimple(tokens) {
     // and \`sh -c cat\` is exactly that shape, so this is the branch \`execSync(cmd,
     // { input })\` actually depends on.
     if (script) inheritStdin(child);
-    child.stdout.on('data', (d) => process.stdout.write(d));
-    child.stderr.on('data', (d) => process.stderr.write(d));
     child.on('error', (e) => {
       currentChild = null; currentKill = null;
       process.stderr.write('sh: ' + (e && e.code === 'ENOENT' ? cmd + ': not found' : ((e && e.message) || e)) + '\\n');
