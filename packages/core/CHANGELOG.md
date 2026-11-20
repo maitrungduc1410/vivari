@@ -3,6 +3,24 @@
 From 1.1.0 on, entries are generated from [changesets](https://github.com/changesets/changesets).
 `@vivari/core` and `@vivari/react` are released together under the same version.
 
+## 1.3.5
+
+### Patch Changes
+
+- [#52](https://github.com/maitrungduc1410/vivari/pull/52) [`bf47e79`](https://github.com/maitrungduc1410/vivari/commit/bf47e79e1affc794b586daa9181eec8e0766600b) Thanks [@atinux](https://github.com/atinux)! - `process.getActiveResourcesInfo()` exists and names what keeps a process alive, as Node does: its listening servers, sockets, child processes, fork channel, watchers, ref'd timers and immediates. Nuxt's CLI calls it when `nuxt dev` overruns its shutdown budget, to say what is still open before it exits anyway; the TypeError used to replace that exit, so `q` could sit at "Cleaning up..." until every close hook finished, or forever.
+
+- [#52](https://github.com/maitrungduc1410/vivari/pull/52) [`873a06d`](https://github.com/maitrungduc1410/vivari/commit/873a06dc478f797430523540506e216f9228fdfe) Thanks [@atinux](https://github.com/atinux)! - `child_process.fork` messages now travel as JSON, as Node's default `serialization: 'json'` does, and as structured clone with `'advanced'`. Sending used to structured-clone every message, which throws on a Proxy, and `send()` swallowed the throw: Nuxt's CLI sends its citty args (a Proxy) to the fork it hard-restarts into, and that fork waited for them forever, so `nuxt dev`'s `r` hung at "Restarting Nuxt in a new process...". A message JSON cannot encode (a BigInt) now throws out of `send()`, as in Node, instead of being dropped.
+
+- [#52](https://github.com/maitrungduc1410/vivari/pull/52) [`f3d9678`](https://github.com/maitrungduc1410/vivari/commit/f3d9678f6b9abd72550faf82b05d9b8ea1a3eee4) Thanks [@atinux](https://github.com/atinux)! - `/bin`'s programs are on `PATH` under their bare names (`/bin/pnpm` next to `/bin/pnpm.js`), and npm, pnpm, yarn, corepack and tsc are there before their first use, as an installed tool would be. A program that searches `PATH` itself, as `which` does, found nothing: Nuxt's CLI checks for `pnpm` that way before `nuxt module add` installs with it, and stopped at "`pnpm` was not found" in a VM where `pnpm add` works. A tool found that way and spawned by its `/bin` path also loads on first use.
+
+- [#52](https://github.com/maitrungduc1410/vivari/pull/52) [`d8a7a50`](https://github.com/maitrungduc1410/vivari/commit/d8a7a5040852d839cdb164f709cac86ab9ff1060) Thanks [@atinux](https://github.com/atinux)! - A preview's error page shows in the preview frame. The Service Worker drops `X-Frame-Options` and CSP's `frame-ancestors` (keeping the rest of the policy) from preview responses: Nitro's error handler, which Nuxt's uses, sends `DENY` on every error page, so an app's 500 rendered as the browser's "refused to connect" in the IDE's frame, while the same URL in its own tab showed the error.
+
+- [#52](https://github.com/maitrungduc1410/vivari/pull/52) [`adb8d1b`](https://github.com/maitrungduc1410/vivari/commit/adb8d1b7637f02b52cd0ba0681c723ca75fcca10) Thanks [@atinux](https://github.com/atinux)! - A process's `ReadableStream` is async iterable in Safari too (`for await` and `values()`), including a `fetch` response's body. pnpm reads every tarball that way, so `pnpm install` and `pnpm add` failed on iOS with `undefined is not a function`.
+
+- [#52](https://github.com/maitrungduc1410/vivari/pull/52) [`eab0b05`](https://github.com/maitrungduc1410/vivari/commit/eab0b05f551ed8d95dc8f396d060354b9e9baa35) Thanks [@atinux](https://github.com/atinux)! - `readline.createInterface()` on a terminal decodes its input into `keypress` events, as Node's does. Prompt libraries listen for them without asking: clack's confirm and select prompts (Nuxt's CLI, create-* scaffolders) sat on their question whatever was typed, so `nuxt module remove @nuxt/ui` never got past "Do you also want to remove them?".
+
+- [#52](https://github.com/maitrungduc1410/vivari/pull/52) [`33806ef`](https://github.com/maitrungduc1410/vivari/commit/33806ef767a0ba36ea4fa6d776b21d3904eef63b) Thanks [@atinux](https://github.com/atinux)! - A process whose stdout writes to the terminal now sees `process.stdout.isTTY` (and `tty.isatty(1)`) as true, with `getColorDepth`, `hasColors` and the cursor methods, and `readline.emitKeypressEvents` works. A child spawned with `stdio: 'inherit'` from a TTY gets the same. CLIs that draw a dashboard only on a TTY, such as `nuxt dev`, now draw it. A signal is also delivered once: a SIGINT handler that made a syscall used to run twice.
+
 ## 1.3.4
 
 ### Patch Changes
