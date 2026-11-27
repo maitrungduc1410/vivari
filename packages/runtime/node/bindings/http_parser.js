@@ -102,6 +102,9 @@ export function createJsHttpParserBinding() {
       this.maxHeaderSize = maxHeaderSize || 80 * 1024;
       this._resource = resource;
       this._reset(type);
+      // Joins the server's ConnectionsList (requests only); remove() leaves it.
+      this._connections = connectionsList;
+      connectionsList?.push(this);
       return 0;
     }
 
@@ -137,7 +140,10 @@ export function createJsHttpParserBinding() {
     // advertise isStreamBase, so this is not used — keep no-ops for the API.
     consume() {}
     unconsume() {}
-    remove() {}
+    remove() {
+      this._connections?.pop(this);
+      this._connections = undefined;
+    }
     free() {}
     pause() {}
     resume() {}
@@ -157,6 +163,7 @@ export function createJsHttpParserBinding() {
       // Accumulate; parse as much as possible. Returns bytes consumed (all of
       // this chunk on success) or an Error on malformed input.
       const buf = B().isBuffer(chunk) ? chunk : B().from(chunk);
+      if (buf.length) this._inMessage = true;
       this._pending = this._pending.length ? B().concat([this._pending, buf]) : buf;
       const consumed = buf.length;
 
@@ -437,6 +444,7 @@ export function createJsHttpParserBinding() {
     }
 
     _complete() {
+      this._inMessage = false;
       const cb = this[kOnMessageComplete];
       if (cb) cb.call(this);
       // Reset for the next message on a kept-alive connection; keep leftover
@@ -459,16 +467,25 @@ export function createJsHttpParserBinding() {
   HTTPParser.kLenientNone = 0;
   HTTPParser.kLenientAll = 0xffff;
 
-  // Native tracks per-connection header/request timeouts here; inert for us.
+  // The server's connections, which close{All,Idle}Connections() destroy: without
+  // them server.close() waits for every keep-alive or streaming response to end.
+  // Native also expires header/request timeouts here; we don't.
   class ConnectionsList {
+    #parsers = new Set();
+    push(parser) {
+      this.#parsers.add(parser);
+    }
+    pop(parser) {
+      this.#parsers.delete(parser);
+    }
     all() {
-      return [];
+      return [...this.#parsers];
     }
     idle() {
-      return [];
+      return this.all().filter((parser) => !parser._inMessage);
     }
     active() {
-      return [];
+      return this.all().filter((parser) => parser._inMessage);
     }
     expired() {
       return [];

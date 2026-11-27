@@ -368,6 +368,8 @@ const SPIKES = [
   // no VFS needed.
   { name: "diag-liveness", file: "spike-diag-liveness.mjs", net: false, needsWasm: true, timeout: 60000 },
   { name: "active-resources", file: "spike-active-resources.mjs", net: false, needsWasm: true, timeout: 120000 },
+  // server.close() and close{Idle,All}Connections() reach a server's connections, on both parser backends.
+  { name: "http-connections", file: "spike-http-connections.mjs", net: false, needsWasm: true, timeout: 120000 },
   // /bin programs, lazy ones included, found by a guest that searches PATH itself.
   { name: "path-programs", file: "spike-path-programs.mjs", net: false, needsWasm: true, timeout: 120000 },
   // Exit codes and kernel survival when a guest fails; needs the VFS, so needsWasm.
