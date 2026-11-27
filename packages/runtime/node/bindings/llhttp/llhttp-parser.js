@@ -140,12 +140,16 @@ export function createLlhttpBinding() {
           /* older builds may lack a setter — best effort */
         }
       }
+      // Joins the server's ConnectionsList (requests only); remove() leaves it.
+      this._connections = connectionsList;
+      connectionsList?.push(this);
       return 0;
     }
 
     // ---- llhttp span callbacks (called re-entrantly during execute) --------
 
     _onMessageBegin() {
+      this._inMessage = true;
       return 0;
     }
     _onUrl(s) {
@@ -245,6 +249,7 @@ export function createLlhttpBinding() {
         for (let i = 0; i < this._pairs.length; i++) this._headers.push(this._pairs[i]);
         this._pairs = [];
       }
+      this._inMessage = false;
       const cb = this[kOnMessageComplete];
       if (cb) cb.call(this);
       // Ready the accumulators for the next message on a kept-alive connection
@@ -349,7 +354,10 @@ export function createLlhttpBinding() {
     // We never advertise isStreamBase, so the consume() fast path is unused.
     consume() {}
     unconsume() {}
-    remove() {}
+    remove() {
+      this._connections?.pop(this);
+      this._connections = undefined;
+    }
     pause() {}
     resume() {}
     getCurrentBuffer() {
@@ -378,16 +386,25 @@ export function createLlhttpBinding() {
   HTTPParser.kLenientNone = 0;
   HTTPParser.kLenientAll = 0xffff;
 
-  // Native tracks per-connection header/request timeouts here; inert for us.
+  // The server's connections, which close{All,Idle}Connections() destroy: without
+  // them server.close() waits for every keep-alive or streaming response to end.
+  // Native also expires header/request timeouts here; we don't.
   class ConnectionsList {
+    #parsers = new Set();
+    push(parser) {
+      this.#parsers.add(parser);
+    }
+    pop(parser) {
+      this.#parsers.delete(parser);
+    }
     all() {
-      return [];
+      return [...this.#parsers];
     }
     idle() {
-      return [];
+      return this.all().filter((parser) => !parser._inMessage);
     }
     active() {
-      return [];
+      return this.all().filter((parser) => parser._inMessage);
     }
     expired() {
       return [];
